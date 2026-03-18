@@ -1,0 +1,82 @@
+version: "2"
+
+run:
+  go: "1.26.1"
+  timeout: 5m
+  tests: false
+
+linters:
+  enable:
+    # Core linters
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - gocyclo
+    - gocritic
+    - revive
+    - nolintlint
+    # Security-focused linters
+    - bodyclose        # HTTP response body close
+    - nilerr           # Returns nil even when checking error
+    - noctx            # HTTP requests without context
+    - reassign         # Reassigning top-level variables
+    - usestdlibvars    # Use stdlib constants instead of literals
+    - durationcheck    # Duration multiplication mistakes
+    - copyloopvar      # Loop variable capture in closures (replaces exportloopref)
+    - makezero         # Slice make with non-zero length then append
+    - unconvert        # Unnecessary type conversions
+    - unparam          # Unused function parameters
+    - wastedassign     # Wasted assignments
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+          - gocyclo
+      - path: mock_
+        linters:
+          - unused
+          - revive
+      - path: pkg/crypto/
+        linters:
+          - revive
+        text: "avoid package names"
+      - path: pkg/discovery/multicast\.go
+        linters:
+          - revive
+        text: "exported method.*should have comment"
+
+  settings:
+    gocyclo:
+      # Targeted nolint:gocyclo directives are used on justified high-complexity
+      # functions (StartShard, saveSnapshot, processCommitPendingInbox).
+      min-complexity: 25
+    lll:
+      line-length: 120
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        # Opinionated checks that require extensive refactoring
+        - hugeParam          # Would require changing many API signatures
+        - rangeValCopy       # Would require significant changes to loops
+        - sloppyReassign     # Minor stylistic preference
+        - badLock            # Intentional pattern for lock barriers
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: context-as-argument
+        - name: error-return
+        - name: error-naming
+        - name: var-naming
+          disabled: true

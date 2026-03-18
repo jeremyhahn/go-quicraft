@@ -1,0 +1,28 @@
+{
+  "name": "go-quicraft",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/app",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
+  "remoteUser": "root",
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ],
+      "settings": {
+        "go.testFlags": ["-race", "-count=1", "-v"],
+        "go.lintTool": "golangci-lint",
+        "go.lintFlags": ["--timeout=5m"]
+      }
+    }
+  },
+  "postCreateCommand": "go mod download",
+  "forwardPorts": [],
+  "containerEnv": {
+    "GOFLAGS": "-race"
+  }
+}

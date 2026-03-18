@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="982" viewBox="0 0 1100 982" font-family="Arial, Helvetica, sans-serif">
+  <rect x="0" y="0" width="1100" height="982" fill="#ffffff"/>
+  <rect x="0" y="0" width="1100" height="56" fill="#1a1a2e"/>
+  <text x="550" y="36" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">dragonboat Performance</text>
+  <line x1="337" y1="66" x2="337" y2="912" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="475" y1="66" x2="475" y2="912" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="612" y1="66" x2="612" y2="912" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="750" y1="66" x2="750" y2="912" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <rect x="0" y="122" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="145" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election (WAL)</text>
+  <rect x="200" y="126" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="145" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">49.1 ops/s</text>
+  <text x="904" y="145" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 19.50ms</text>
+  <line x1="20" y1="167" x2="1080" y2="167" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="164" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="187" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential (WAL)</text>
+  <rect x="200" y="168" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="187" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.68K ops/s</text>
+  <text x="904" y="187" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 340.4us</text>
+  <line x1="20" y1="209" x2="1080" y2="209" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="206" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="229" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 (WAL)</text>
+  <rect x="200" y="210" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="229" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">13.44K ops/s</text>
+  <text x="904" y="229" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 581.5us</text>
+  <line x1="20" y1="251" x2="1080" y2="251" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="248" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="271" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency (WAL)</text>
+  <rect x="200" y="252" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="271" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.69K ops/s</text>
+  <text x="904" y="271" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 342.1us</text>
+  <line x1="20" y1="293" x2="1080" y2="293" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="290" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="313" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read (WAL)</text>
+  <rect x="200" y="294" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="313" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">119.64K ops/s</text>
+  <text x="904" y="313" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 6.4us</text>
+  <line x1="20" y1="335" x2="1080" y2="335" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="332" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="355" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read (WAL)</text>
+  <rect x="200" y="336" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="355" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.15M ops/s</text>
+  <text x="904" y="355" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 163ns</text>
+  <line x1="20" y1="377" x2="1080" y2="377" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="374" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="397" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election 3N (WAL)</text>
+  <rect x="200" y="378" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="397" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">47.2 ops/s</text>
+  <text x="904" y="397" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 18.69ms</text>
+  <line x1="20" y1="419" x2="1080" y2="419" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="416" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="439" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential 3N (WAL)</text>
+  <rect x="200" y="420" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="439" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">646.3 ops/s</text>
+  <text x="904" y="439" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 978.1us</text>
+  <line x1="20" y1="461" x2="1080" y2="461" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="458" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="481" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 3N (WAL)</text>
+  <rect x="200" y="462" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="481" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.14K ops/s</text>
+  <text x="904" y="481" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 950.8us</text>
+  <line x1="20" y1="503" x2="1080" y2="503" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="500" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="523" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency 3N (WAL)</text>
+  <rect x="200" y="504" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="523" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">913.9 ops/s</text>
+  <text x="904" y="523" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 823.9us</text>
+  <line x1="20" y1="545" x2="1080" y2="545" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="542" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="565" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read 3N (WAL)</text>
+  <rect x="200" y="546" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="565" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.71K ops/s</text>
+  <text x="904" y="565" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 104.7us</text>
+  <line x1="20" y1="587" x2="1080" y2="587" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="584" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="607" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read 3N (WAL)</text>
+  <rect x="200" y="588" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="607" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.87M ops/s</text>
+  <text x="904" y="607" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 163ns</text>
+  <line x1="20" y1="629" x2="1080" y2="629" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="626" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="649" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election 5N (WAL)</text>
+  <rect x="200" y="630" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="649" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">49.6 ops/s</text>
+  <text x="904" y="649" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 18.43ms</text>
+  <line x1="20" y1="671" x2="1080" y2="671" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="668" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="691" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential 5N (WAL)</text>
+  <rect x="200" y="672" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="691" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">593.8 ops/s</text>
+  <text x="904" y="691" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.06ms</text>
+  <line x1="20" y1="713" x2="1080" y2="713" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="710" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="733" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 5N (WAL)</text>
+  <rect x="200" y="714" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="733" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.67K ops/s</text>
+  <text x="904" y="733" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.11ms</text>
+  <line x1="20" y1="755" x2="1080" y2="755" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="752" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="775" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency 5N (WAL)</text>
+  <rect x="200" y="756" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="775" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">424.9 ops/s</text>
+  <text x="904" y="775" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 972.2us</text>
+  <line x1="20" y1="797" x2="1080" y2="797" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="794" width="1100" height="42" fill="#ffffff"/>
+  <text x="188" y="817" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read 5N (WAL)</text>
+  <rect x="200" y="798" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="817" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.92K ops/s</text>
+  <text x="904" y="817" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 150.4us</text>
+  <line x1="20" y1="839" x2="1080" y2="839" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="836" width="1100" height="42" fill="#f8f9fa"/>
+  <text x="188" y="859" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read 5N (WAL)</text>
+  <rect x="200" y="840" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="859" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.93M ops/s</text>
+  <text x="904" y="859" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 165ns</text>
+  <line x1="20" y1="881" x2="1080" y2="881" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="922" width="1100" height="60" fill="#f8f9fa"/>
+  <line x1="0" y1="922" x2="1100" y2="922" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="200" y="944" width="14" height="14" fill="#FF9800" rx="3"/>
+  <text x="220" y="956" font-size="12" font-weight="normal" text-anchor="start" fill="#333333">dragonboat</text>
+</svg>

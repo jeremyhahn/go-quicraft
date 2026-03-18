@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="2884" viewBox="0 0 1100 2884" font-family="Arial, Helvetica, sans-serif">
+  <rect x="0" y="0" width="1100" height="2884" fill="#ffffff"/>
+  <rect x="0" y="0" width="1100" height="56" fill="#1a1a2e"/>
+  <text x="550" y="36" font-size="18" font-weight="bold" text-anchor="middle" fill="#ffffff">Performance Comparison: quicraft vs etcd</text>
+  <line x1="337" y1="66" x2="337" y2="2814" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="475" y1="66" x2="475" y2="2814" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="612" y1="66" x2="612" y2="2814" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <line x1="750" y1="66" x2="750" y2="2814" stroke="#e0e0e0" stroke-width="1" stroke-dasharray="4,4" opacity="0.5"/>
+  <rect x="0" y="122" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="141" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election (WAL)</text>
+  <text x="188" y="167" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="149" width="517" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="167" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">52.6 ops/s</text>
+  <text x="894" y="167" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.54ms</text>
+  <text x="188" y="197" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="179" width="550" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">56.0 ops/s</text>
+  <text x="894" y="197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.28ms</text>
+  <text x="964" y="197" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <line x1="20" y1="216" x2="1080" y2="216" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="225" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="244" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election (Memory)</text>
+  <text x="188" y="270" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="252" width="488" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="270" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">51.8 ops/s</text>
+  <text x="894" y="270" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.66ms</text>
+  <text x="188" y="300" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="282" width="550" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="300" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">58.3 ops/s</text>
+  <text x="894" y="300" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.09ms</text>
+  <text x="964" y="300" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="300" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.13x)</text>
+  <line x1="20" y1="319" x2="1080" y2="319" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="328" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="347" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential (WAL)</text>
+  <text x="188" y="373" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="355" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="373" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.62K ops/s</text>
+  <text x="894" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">155.1us</text>
+  <text x="964" y="373" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(3.12x)</text>
+  <text x="188" y="403" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="385" width="177" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.80K ops/s</text>
+  <text x="894" y="403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">523.8us</text>
+  <line x1="20" y1="422" x2="1080" y2="422" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="431" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="450" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential (Memory)</text>
+  <text x="188" y="476" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="458" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="476" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">60.67K ops/s</text>
+  <text x="894" y="476" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">13.4us</text>
+  <text x="964" y="476" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="476" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(19.99x)</text>
+  <text x="188" y="506" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="488" width="28" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="506" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.03K ops/s</text>
+  <text x="894" y="506" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">45.3us</text>
+  <line x1="20" y1="525" x2="1080" y2="525" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="534" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="553" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 (WAL)</text>
+  <text x="188" y="579" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="561" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="579" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">23.44K ops/s</text>
+  <text x="894" y="579" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">295.5us</text>
+  <text x="964" y="579" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="579" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.51x)</text>
+  <text x="188" y="609" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="591" width="219" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">9.35K ops/s</text>
+  <text x="894" y="609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">844.4us</text>
+  <line x1="20" y1="628" x2="1080" y2="628" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="637" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="656" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 (Memory)</text>
+  <text x="188" y="682" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="664" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="682" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">148.69K ops/s</text>
+  <text x="894" y="682" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">49.1us</text>
+  <text x="964" y="682" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="682" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(4.02x)</text>
+  <text x="188" y="712" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="694" width="137" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="712" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">36.99K ops/s</text>
+  <text x="894" y="712" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">106.7us</text>
+  <line x1="20" y1="731" x2="1080" y2="731" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="740" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="759" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency (WAL)</text>
+  <text x="188" y="785" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="767" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="785" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.87K ops/s</text>
+  <text x="894" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">148.1us</text>
+  <text x="964" y="785" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(3.35x)</text>
+  <text x="188" y="815" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="797" width="164" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.75K ops/s</text>
+  <text x="894" y="815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">537.2us</text>
+  <line x1="20" y1="834" x2="1080" y2="834" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="843" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="862" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency (Memory)</text>
+  <text x="188" y="888" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="870" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="888" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">57.65K ops/s</text>
+  <text x="894" y="888" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">14.5us</text>
+  <text x="964" y="888" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="888" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(18.20x)</text>
+  <text x="188" y="918" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="900" width="30" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="918" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.17K ops/s</text>
+  <text x="894" y="918" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">40.8us</text>
+  <line x1="20" y1="937" x2="1080" y2="937" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="946" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="965" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read (WAL)</text>
+  <text x="188" y="991" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="973" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="991" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">290.95K ops/s</text>
+  <text x="894" y="991" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.6us</text>
+  <text x="964" y="991" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1021" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1021" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1040" x2="1080" y2="1040" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1049" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="1068" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read (Memory)</text>
+  <text x="188" y="1094" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1076" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1094" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">281.03K ops/s</text>
+  <text x="894" y="1094" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.6us</text>
+  <text x="964" y="1094" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1124" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1124" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1143" x2="1080" y2="1143" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1152" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="1171" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read (WAL)</text>
+  <text x="188" y="1197" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1179" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.80M ops/s</text>
+  <text x="894" y="1197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">131ns</text>
+  <text x="964" y="1197" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1227" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1227" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1246" x2="1080" y2="1246" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1255" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="1274" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read (Memory)</text>
+  <text x="188" y="1300" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1282" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1300" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.02M ops/s</text>
+  <text x="894" y="1300" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">129ns</text>
+  <text x="964" y="1300" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1330" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1330" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1349" x2="1080" y2="1349" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1358" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="1377" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election 3N (WAL)</text>
+  <text x="188" y="1403" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1385" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">54.6 ops/s</text>
+  <text x="894" y="1403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.28ms</text>
+  <text x="964" y="1403" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1403" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(6.73x)</text>
+  <text x="188" y="1433" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="1415" width="82" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="1433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.1 ops/s</text>
+  <text x="894" y="1433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">80.05ms</text>
+  <line x1="20" y1="1452" x2="1080" y2="1452" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1461" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="1480" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential 3N (WAL)</text>
+  <text x="188" y="1506" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1488" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1506" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.41K ops/s</text>
+  <text x="894" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">398.5us</text>
+  <text x="964" y="1506" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.76x)</text>
+  <text x="188" y="1536" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="1518" width="199" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="1536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">873.7 ops/s</text>
+  <text x="894" y="1536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.12ms</text>
+  <line x1="20" y1="1555" x2="1080" y2="1555" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1564" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="1583" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 3N (WAL)</text>
+  <text x="188" y="1609" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1591" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">11.97K ops/s</text>
+  <text x="894" y="1609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">429.6us</text>
+  <text x="964" y="1609" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1609" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.78x)</text>
+  <text x="188" y="1639" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="1621" width="198" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="1639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.31K ops/s</text>
+  <text x="894" y="1639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.82ms</text>
+  <line x1="20" y1="1658" x2="1080" y2="1658" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1667" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="1686" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency 3N (WAL)</text>
+  <text x="188" y="1712" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1694" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1712" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.48K ops/s</text>
+  <text x="894" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">387.9us</text>
+  <text x="964" y="1712" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.87x)</text>
+  <text x="188" y="1742" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="1724" width="192" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="1742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">862.6 ops/s</text>
+  <text x="894" y="1742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.14ms</text>
+  <line x1="20" y1="1761" x2="1080" y2="1761" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1770" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="1789" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 3N (WAL)</text>
+  <text x="188" y="1815" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1797" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.47K ops/s</text>
+  <text x="894" y="1815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">109.2us</text>
+  <text x="964" y="1815" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1845" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1845" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1864" x2="1080" y2="1864" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1873" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="1892" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 3N (WAL+LeaseRead)</text>
+  <text x="188" y="1918" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="1900" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1918" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">142.03K ops/s</text>
+  <text x="894" y="1918" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.4us</text>
+  <text x="964" y="1918" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="1948" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="1948" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="1967" x2="1080" y2="1967" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="1976" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="1995" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read 3N (WAL)</text>
+  <text x="188" y="2021" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2003" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2021" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.44M ops/s</text>
+  <text x="894" y="2021" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">142ns</text>
+  <text x="964" y="2021" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="2051" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="2051" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="2070" x2="1080" y2="2070" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2079" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="2098" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election 5N (WAL)</text>
+  <text x="188" y="2124" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2106" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2124" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">54.6 ops/s</text>
+  <text x="894" y="2124" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.75ms</text>
+  <text x="964" y="2124" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2124" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(14.39x)</text>
+  <text x="188" y="2154" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="2136" width="38" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="2154" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.8 ops/s</text>
+  <text x="894" y="2154" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">140.58ms</text>
+  <line x1="20" y1="2173" x2="1080" y2="2173" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2182" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="2201" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential 5N (WAL)</text>
+  <text x="188" y="2227" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2209" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2227" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.23K ops/s</text>
+  <text x="894" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">413.6us</text>
+  <text x="964" y="2227" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.81x)</text>
+  <text x="188" y="2257" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="2239" width="196" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="2257" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">794.3 ops/s</text>
+  <text x="894" y="2257" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.24ms</text>
+  <line x1="20" y1="2276" x2="1080" y2="2276" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2285" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="2304" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 5N (WAL)</text>
+  <text x="188" y="2330" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2312" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2330" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.53K ops/s</text>
+  <text x="894" y="2330" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">630.2us</text>
+  <text x="964" y="2330" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2330" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.44x)</text>
+  <text x="188" y="2360" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="2342" width="382" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="2360" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.84K ops/s</text>
+  <text x="894" y="2360" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.03ms</text>
+  <line x1="20" y1="2379" x2="1080" y2="2379" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2388" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="2407" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency 5N (WAL)</text>
+  <text x="188" y="2433" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2415" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.44K ops/s</text>
+  <text x="894" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">391.9us</text>
+  <text x="964" y="2433" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(3.09x)</text>
+  <text x="188" y="2463" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <rect x="200" y="2445" width="178" height="24" rx="3" fill="#4CAF50" opacity="0.9"/>
+  <text x="764" y="2463" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">791.3 ops/s</text>
+  <text x="894" y="2463" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.24ms</text>
+  <line x1="20" y1="2482" x2="1080" y2="2482" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2491" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="2510" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 5N (WAL)</text>
+  <text x="188" y="2536" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2518" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">7.27K ops/s</text>
+  <text x="894" y="2536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">128.7us</text>
+  <text x="964" y="2536" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="2566" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="2566" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="2585" x2="1080" y2="2585" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2594" width="1100" height="103" fill="#ffffff"/>
+  <text x="14" y="2613" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 5N (WAL+LeaseRead)</text>
+  <text x="188" y="2639" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2621" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">107.16K ops/s</text>
+  <text x="894" y="2639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">6.1us</text>
+  <text x="964" y="2639" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="2669" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="2669" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="2688" x2="1080" y2="2688" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2697" width="1100" height="103" fill="#f8f9fa"/>
+  <text x="14" y="2716" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read 5N (WAL)</text>
+  <text x="188" y="2742" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
+  <rect x="200" y="2724" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.56M ops/s</text>
+  <text x="894" y="2742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">134ns</text>
+  <text x="964" y="2742" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="188" y="2772" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">etcd</text>
+  <text x="208" y="2772" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
+  <line x1="20" y1="2791" x2="1080" y2="2791" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="0" y="2824" width="1100" height="60" fill="#f8f9fa"/>
+  <line x1="0" y1="2824" x2="1100" y2="2824" stroke="#dee2e6" stroke-width="1"/>
+  <rect x="200" y="2846" width="14" height="14" fill="#2196F3" rx="3"/>
+  <text x="220" y="2858" font-size="12" font-weight="normal" text-anchor="start" fill="#333333">quicraft</text>
+  <rect x="340" y="2846" width="14" height="14" fill="#4CAF50" rx="3"/>
+  <text x="360" y="2858" font-size="12" font-weight="normal" text-anchor="start" fill="#333333">etcd</text>
+</svg>

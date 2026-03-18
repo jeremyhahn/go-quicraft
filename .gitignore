@@ -1,0 +1,18 @@
+.build-cache/
+*.log
+*.test
+*.out
+*.prof
+build/
+data/
+
+# Performance test generated artifacts
+test/performance/openraft/target/
+test/performance/perfcompare
+test/performance/profiles/
+
+.serena
+.claude
+CLAUDE.md
+go.work
+go.work.sum
