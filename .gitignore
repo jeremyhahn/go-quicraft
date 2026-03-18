@@ -1,0 +1,21 @@
+.build-cache/
+*.log
+*.test
+*.out
+*.prof
+build/
+data/
+
+# Performance test generated artifacts
+test/performance/openraft/target/
+test/performance/perfcompare
+test/performance/profiles/
+
+# Staging directory for go-qrdb Docker builds (created by go-qrdb Makefile)
+contrib/qrdb/
+
+.serena
+.claude
+CLAUDE.md
+go.work
+go.work.sum
