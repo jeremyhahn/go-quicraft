@@ -1,0 +1,147 @@
+# docker-compose.integration.yml - 3-node QuicRaft cluster for integration tests.
+#
+# Usage:
+#   docker compose -f .devcontainer/docker-compose.integration.yml up --build \
+#       --abort-on-container-exit --exit-code-from test-runner
+#
+# The test-runner service waits for all three nodes to become healthy
+# before executing the compiled integration test binary.
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Raft node 1
+  # --------------------------------------------------------------------------
+  node1:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.integration
+      target: node
+    image: go-quicraft-integration-node:latest
+    hostname: node1
+    command:
+      - start
+      - --listen=0.0.0.0:63001
+      - --raft-address=node1:63001
+      - --data-dir=/data
+      - --sm=memory
+      - --discovery=static
+      - --peers=1=node1:63001,2=node2:63001,3=node3:63001
+      - --shard-id=1
+      - --replica-id=1
+    volumes:
+      - node1-data:/data
+    networks:
+      - raftnet
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/nodehost/host.id"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Raft node 2
+  # --------------------------------------------------------------------------
+  node2:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.integration
+      target: node
+    image: go-quicraft-integration-node:latest
+    hostname: node2
+    command:
+      - start
+      - --listen=0.0.0.0:63001
+      - --raft-address=node2:63001
+      - --data-dir=/data
+      - --sm=memory
+      - --discovery=static
+      - --peers=1=node1:63001,2=node2:63001,3=node3:63001
+      - --shard-id=1
+      - --replica-id=2
+    volumes:
+      - node2-data:/data
+    networks:
+      - raftnet
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/nodehost/host.id"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Raft node 3
+  # --------------------------------------------------------------------------
+  node3:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.integration
+      target: node
+    image: go-quicraft-integration-node:latest
+    hostname: node3
+    command:
+      - start
+      - --listen=0.0.0.0:63001
+      - --raft-address=node3:63001
+      - --data-dir=/data
+      - --sm=memory
+      - --discovery=static
+      - --peers=1=node1:63001,2=node2:63001,3=node3:63001
+      - --shard-id=1
+      - --replica-id=3
+    volumes:
+      - node3-data:/data
+    networks:
+      - raftnet
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/nodehost/host.id"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Test runner
+  # --------------------------------------------------------------------------
+  test-runner:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.integration
+      target: test-runner
+    image: go-quicraft-integration-runner:latest
+    hostname: test-runner
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    environment:
+      - INTEGRATION_NODE1_ADDR=node1:63001
+      - INTEGRATION_NODE2_ADDR=node2:63001
+      - INTEGRATION_NODE3_ADDR=node3:63001
+      - INTEGRATION_SHARD_ID=1
+    networks:
+      - raftnet
+    cap_add:
+      - NET_ADMIN
+    # Pass -test.v for verbose output and -test.timeout for a hard ceiling.
+    command: ["-test.v", "-test.timeout=120s"]
+
+networks:
+  raftnet:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

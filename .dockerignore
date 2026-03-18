@@ -1,0 +1,30 @@
+# Build artifacts
+build/coverage/
+build/quicraft
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test data (created by integration tests running as root in Docker)
+**/data/
+integration-test.log
+
+# Rust build artifacts (openraft benchmark)
+test/performance/openraft/target/
+
+# Go workspace (breaks sub-module Docker builds)
+go.work
+go.work.sum
+
+# Agent / AI context files
+.claude/
+.cursor/
+.codex/

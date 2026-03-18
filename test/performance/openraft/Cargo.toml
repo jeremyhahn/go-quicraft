@@ -1,0 +1,20 @@
+[package]
+name = "openraft-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "openraft-bench"
+path = "src/main.rs"
+
+[dependencies]
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+bincode = "1"
+tempfile = "3"
