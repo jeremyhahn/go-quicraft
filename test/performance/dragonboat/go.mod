@@ -44,8 +44,3 @@ require (
 	golang.org/x/text v0.27.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 )
-
-replace (
-	github.com/jeremyhahn/go-quicraft/test/performance => ../
-	github.com/lni/dragonboat/v4 => /home/jhahn/sources/dragonboat
-)

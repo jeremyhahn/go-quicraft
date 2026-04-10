@@ -1947,6 +1947,18 @@ func (h *Host) StopShard(shardID uint64) error {
 	h.nodes.Delete(shardID)
 	h.activeNodes.Add(-1)
 
+	// Close the state machine to release any resources it holds (e.g.,
+	// Pebble file locks). Without this a stopped shard leaves its
+	// DiskStateMachine open and a subsequent StartShard on the same data
+	// directory fails with "lock held by current process".
+	if ns.rsm != nil {
+		if err := ns.rsm.Close(); err != nil {
+			h.logger.Warn("state machine close failed during stop shard",
+				"shard_id", shardID, "error", err)
+		}
+		ns.rsm = nil
+	}
+
 	// Remove all registered members for this shard from the registry.
 	ns.nodesMu.RLock()
 	for replicaID := range ns.nodes {
@@ -3357,6 +3369,20 @@ func (h *Host) Close() error {
 		// already-completed entries is a safe no-op.
 		for _, ns := range stoppedNodes {
 			h.failPendingRequests(ns, ErrClosed)
+		}
+
+		// Close each node's state machine to release resources such as
+		// on-disk file locks (e.g., Pebble). Without this, a stopped
+		// shard would leave its DiskStateMachine open, causing "lock
+		// held by current process" errors on Host restart.
+		for _, ns := range stoppedNodes {
+			if ns.rsm != nil {
+				if err := ns.rsm.Close(); err != nil {
+					h.logger.Warn("state machine close failed during host close",
+						"shard_id", ns.shardID, "error", err)
+				}
+				ns.rsm = nil
+			}
 		}
 
 		// Close LogDB.

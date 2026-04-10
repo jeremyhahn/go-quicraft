@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320" role="img" aria-labelledby="title desc">
-  <title id="title">QuicRaft hero icon</title>
-  <desc id="desc">The approved QuicRaft hero icon using the primary project colors.</desc>
+  <title id="title">QUICRaft hero icon</title>
+  <desc id="desc">The approved QUICRaft hero icon using the primary project colors.</desc>
   <defs>
     <linearGradient id="panel" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#10243c"/>
