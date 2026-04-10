@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320" role="img" aria-labelledby="title desc">
-  <title id="title">QuicRaft icon</title>
-  <desc id="desc">The QuicRaft symbol with a quorum ring, three cluster nodes, transport waves, and a central raft motif.</desc>
+  <title id="title">QUICRaft icon</title>
+  <desc id="desc">The QUICRaft symbol with a quorum ring, three cluster nodes, transport waves, and a central raft motif.</desc>
   <defs>
     <linearGradient id="panel" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#10243c"/>

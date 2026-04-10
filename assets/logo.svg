@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-labelledby="title desc">
-  <title id="title">QuicRaft project logo</title>
-  <desc id="desc">A stylized logo combining a quorum ring, three cluster nodes, and a raft motif to represent the QuicRaft consensus library built on QUIC.</desc>
+  <title id="title">QUICRaft project logo</title>
+  <desc id="desc">A stylized logo combining a quorum ring, three cluster nodes, and a raft motif to represent the QUICRaft consensus library built on QUIC.</desc>
   <defs>
     <linearGradient id="panel" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#10243c"/>
@@ -87,7 +87,7 @@
   </g>
 
   <g transform="translate(314 86)">
-    <text x="0" y="72" fill="#10243c" font-size="78" font-weight="700" font-family="'Trebuchet MS', 'Segoe UI', sans-serif" letter-spacing="1">QuicRaft</text>
+    <text x="0" y="72" fill="#10243c" font-size="78" font-weight="700" font-family="'Trebuchet MS', 'Segoe UI', sans-serif" letter-spacing="1">QUICRaft</text>
     <text x="2" y="112" fill="#2b5c76" font-size="26" font-weight="600" font-family="'Trebuchet MS', 'Segoe UI', sans-serif" letter-spacing="3">CONSENSUS OVER QUIC</text>
     <path d="M2 144 h420" stroke="#d8e7ef" stroke-width="4" stroke-linecap="round"/>
     <text x="0" y="186" fill="#48687c" font-size="24" font-family="'Trebuchet MS', 'Segoe UI', sans-serif">
