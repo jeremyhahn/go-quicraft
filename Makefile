@@ -700,7 +700,7 @@ vuln:
 
 .PHONY: trivy
 trivy:
-	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 --skip-dirs contrib/qrdb .
+	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 .
 
 .PHONY: trivy-image
 trivy-image: docker-build
