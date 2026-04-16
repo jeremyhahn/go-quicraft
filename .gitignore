@@ -11,9 +11,6 @@ test/performance/openraft/target/
 test/performance/perfcompare
 test/performance/profiles/
 
-# Staging directory for go-qrdb Docker builds (created by go-qrdb Makefile)
-contrib/qrdb/
-
 .serena
 .claude
 CLAUDE.md
