@@ -144,7 +144,17 @@ func (t *QUICTransport) acceptLoop() {
 		if t.stopped.Load() {
 			return
 		}
-		t.acceptLoopIteration(sem, ipTracker)
+		// On a recovered panic, back off before re-entering to avoid a tight
+		// CPU loop and log flood, mirroring sendQueueWorker and
+		// connectionCleanup. A normal iteration (no panic) re-enters
+		// immediately so accept latency is unaffected.
+		if panicked := t.acceptLoopIteration(sem, ipTracker); panicked {
+			select {
+			case <-t.stopC:
+				return
+			case <-time.After(workerPanicRestartDelay):
+			}
+		}
 	}
 }
 
@@ -154,10 +164,12 @@ func (t *QUICTransport) acceptLoop() {
 // the deferred recover logs the panic with a full stack trace and
 // returns control to the outer for-loop, which checks the stopped flag
 // and re-enters the next iteration. This ensures the accept loop is
-// never permanently killed by a panic.
-func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConnTracker) {
+// never permanently killed by a panic. It returns true if a panic was
+// recovered so the caller can apply a restart backoff.
+func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConnTracker) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
+			panicked = true
 			slog.Error("panic recovered in acceptLoop, restarting",
 				"panic", fmt.Sprint(r),
 				"stack", string(debug.Stack()),
@@ -213,6 +225,7 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 			)
 		}
 	}
+	return
 }
 
 // handleConnection accepts streams on an inbound connection and dispatches
@@ -221,6 +234,10 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 // goroutines to MaxStreamsPerConnection, preventing resource exhaustion from
 // peers opening excessive streams.
 func (t *QUICTransport) handleConnection(conn *quic.Conn) {
+	// Drop the per-connection SourceAddress authorization cache entry when this
+	// inbound connection's handler returns, so the cache does not grow unbounded
+	// across connection churn.
+	defer t.forgetInboundConnAuth(conn)
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic recovered in handleConnection",
@@ -237,7 +254,18 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 	// AcceptStream on half-open connections without depending on the
 	// transport's stopC signal.
 	connCtx := conn.Context()
+	// streamSem bounds concurrent data-stream processing goroutines per
+	// connection. A stream initially holds a streamSem slot while its first
+	// frame header is read; if the stream turns out to be a snapshot, the
+	// slot is handed off to the dedicated snapSem (sized to
+	// MaxConcurrentSnapshotRecv) for the duration of the slow transfer. This
+	// guarantees that concurrent multi-second snapshot transfers never consume
+	// the data-stream budget and starve acceptance of replication/heartbeat
+	// streams. The QUIC MaxIncomingStreams limit (set in NewQUICTransport)
+	// reserves snapshotStreamHeadroom on top of the data-stream pool so flow
+	// control matches this combined processing capacity.
 	streamSem := make(chan struct{}, t.cfg.MaxStreamsPerConnection)
+	snapSem := make(chan struct{}, t.cfg.MaxConcurrentSnapshotRecv)
 
 	for {
 		stream, err := conn.AcceptStream(connCtx)
@@ -256,7 +284,8 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 			return
 		}
 
-		// Acquire stream semaphore to limit concurrent goroutines per connection.
+		// Acquire a data-stream slot before dispatch. Snapshot streams hand
+		// this slot off to snapSem inside handleStream once detected.
 		select {
 		case streamSem <- struct{}{}:
 		case <-connCtx.Done():
@@ -272,8 +301,7 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			defer func() { <-streamSem }()
-			t.handleStream(conn, stream)
+			t.handleStream(conn, stream, streamSem, snapSem)
 		}()
 	}
 }
@@ -286,7 +314,22 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 // of a channel select on every iteration. The stream's read deadline and
 // QUIC connection close (triggered by Stop) naturally break the loop,
 // making the channel check redundant overhead on the hot receive path.
-func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream) {
+//
+// On entry the caller holds one slot in streamSem. handleStream releases that
+// slot exactly once: either when it returns (data stream) or, for a snapshot
+// stream, immediately after it has acquired a snapSem slot, so the slow
+// snapshot transfer is accounted against the dedicated snapshot budget rather
+// than the data-stream budget.
+func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream, streamSem, snapSem chan struct{}) {
+	// streamSemHeld tracks ownership of the data-stream slot so it is released
+	// exactly once. It is set false once the slot is released (on snapshot
+	// handoff) to prevent a double release in the deferred cleanup.
+	streamSemHeld := true
+	defer func() {
+		if streamSemHeld {
+			<-streamSem
+		}
+	}()
 	defer func() {
 		if closeErr := stream.Close(); closeErr != nil {
 			slog.Debug("transport: stream close failed after handleStream",
@@ -321,6 +364,19 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		}
 
 		if flags&FlagSnapshot != 0 {
+			// Hand off from the data-stream budget to the dedicated snapshot
+			// budget for the (potentially slow) transfer. The handoff releases
+			// the streamSem slot first so it is not held for the transfer's
+			// duration, then tries to acquire a snapSem slot.
+			acquired := t.handoffToSnapSem(streamSem, snapSem, inboundConn)
+			streamSemHeld = false
+			if !acquired {
+				// Snapshot budget exhausted or connection closing: streamSem is
+				// already released by handoffToSnapSem, so drop the snapshot
+				// rather than blocking acceptance of new streams.
+				return
+			}
+			defer func() { <-snapSem }()
 			t.handleSnapshotStream(stream, length)
 			return
 		}
@@ -328,6 +384,36 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		if err := t.handleMessageFrame(inboundConn, stream, length, flags); err != nil {
 			return
 		}
+	}
+}
+
+// handoffToSnapSem transfers a stream's budget from the data-stream semaphore
+// to the dedicated snapshot semaphore. It first releases the held streamSem
+// slot (unconditionally, so the slow snapshot transfer is never charged against
+// the data-stream budget) and then attempts a non-blocking acquire of snapSem.
+//
+// It returns true when a snapSem slot was acquired — the caller then owns that
+// slot and must release it when the transfer completes. It returns false when
+// the snapshot budget is exhausted or the connection/transport is shutting
+// down; in that case no snapSem slot is held and the caller must drop the
+// snapshot. Either way the streamSem slot is released exactly once, so across
+// the handoff exactly one of streamSem/snapSem transitions and neither is
+// leaked.
+func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inboundConn *quic.Conn) bool {
+	<-streamSem
+	select {
+	case snapSem <- struct{}{}:
+		return true
+	case <-inboundConn.Context().Done():
+		return false
+	case <-t.stopC:
+		return false
+	default:
+		slog.Warn("snapshot stream dropped: per-connection snapshot limit reached",
+			"remote", inboundConn.RemoteAddr().String(),
+			"limit", t.cfg.MaxConcurrentSnapshotRecv,
+		)
+		return false
 	}
 }
 
@@ -437,15 +523,10 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		}
 	}
 
-	// Detect stale outbound connections on the receive path. If our
-	// cached outbound to the sender is dead (context cancelled) OR is a
-	// different connection than the one delivering this message (peer
-	// restarted and dialed us fresh), forcibly evict the stale outbound
-	// so response messages (ReplicateResp, HeartbeatResp) don't hang on
-	// a dead connection waiting for the write deadline to expire.
-	t.evictStaleOutboundOnRecv(batch.SourceAddress, inboundConn)
-
-	// Validate deployment ID.
+	// Validate deployment ID FIRST, before any connection-state mutation, so
+	// a foreign-deployment (or replayed) batch cannot perturb our epoch
+	// tracking / evict a live outbound. mTLS already authenticated the peer;
+	// this adds deployment isolation as a precondition for trusting the batch.
 	if batch.DeploymentID != t.cfg.DeploymentID {
 		batch.Reset()
 		batchPool.Put(batch)
@@ -455,6 +536,37 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		returnSnappyBuf()
 		return ErrPeerIdentityMismatch
 	}
+
+	// Bind the claimed SourceAddress to the inbound connection's authenticated
+	// peer certificate. SourceAddress and SourceEpoch travel in-band in the
+	// batch header, which mTLS does NOT bind to the sending peer's identity, so
+	// a peer could otherwise inject an address its certificate does not cover —
+	// poisoning the engine's (shardID,replicaID)->address registry and the
+	// epoch-based outbound eviction. If the claimed address is not authorized by
+	// the connection's certificate, clear it before the batch reaches the
+	// handler so neither the registry nor eviction can learn it. The messages
+	// themselves remain (separately) mTLS-authenticated and are still delivered.
+	// The decision is cached per connection, so the costly cert check runs at
+	// most once per (connection, claimed-address) rather than on every batch.
+	if batch.SourceAddress != "" && !t.inboundAuthorizedForCached(inboundConn, batch.SourceAddress) {
+		remote := "<unknown>"
+		if inboundConn != nil {
+			remote = inboundConn.RemoteAddr().String()
+		}
+		slog.Warn("clearing spoofed source address: not covered by peer certificate",
+			"claimed_source", batch.SourceAddress,
+			"remote", remote,
+		)
+		batch.SourceAddress = ""
+	}
+
+	// Detect stale outbound connections on the receive path. A change in the
+	// sender's boot epoch (peer restart) or a dead cached outbound evicts the
+	// stale outbound so response messages (ReplicateResp, HeartbeatResp) don't
+	// hang on a black-holed connection until the write deadline expires. When
+	// SourceAddress was cleared above (unauthorized), this early-returns without
+	// touching epoch tracking or eviction.
+	t.evictStaleOutboundOnRecv(batch.SourceAddress, batch.SourceEpoch, inboundConn)
 
 	// Validate message count.
 	if len(batch.Requests) > maxMessagesPerBatch {

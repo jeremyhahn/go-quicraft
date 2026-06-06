@@ -216,6 +216,11 @@ func (e *ChunkFilepathTraversalError) Is(target error) bool {
 	return target == ErrChunkFilepathTraversal
 }
 
+// ErrEmptyDialHost is returned when a dial target has an empty host portion.
+// Dialing with an empty host would verify the peer certificate against a
+// hardcoded "localhost" ServerName, masking misconfiguration; we reject it.
+var ErrEmptyDialHost = errors.New("transport: dial target has empty host")
+
 // DialError is returned when a connection dial fails due to an invalid
 // target address. It wraps the underlying parse error and includes the
 // target address for diagnostic context.

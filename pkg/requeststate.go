@@ -115,6 +115,21 @@ type RequestState struct {
 	// released prevents double-Release and use-after-Release.
 	released atomic.Bool
 
+	// outstanding counts the references held by pending maps. Registering
+	// the RequestState in a pending map is +1 (acquireRef); removing it is
+	// -1 (releaseRef). The object is only returned to the pool when the
+	// caller has released it AND no pending-map references remain. This
+	// closes the use-after-Release window where a Sync* caller times out
+	// and releases while the request is still registered in a pending map:
+	// the late OnApplied/sweep removes its reference and recycles the
+	// object then, never delivering into a recycled (foreign) request.
+	outstanding atomic.Int64
+
+	// recycled guards the single return-to-pool. Whichever of Release or
+	// releaseRef observes released==true && outstanding==0 wins the CAS and
+	// performs the pool.Put exactly once.
+	recycled atomic.Bool
+
 	// completed prevents double-complete. The first complete() wins;
 	// subsequent calls are no-ops. This guards against races where
 	// multiple engine paths (e.g., apply + leadership change) try to
@@ -152,6 +167,8 @@ func newRequestState(pool *sync.Pool, key uint64, deadline time.Time) *RequestSt
 	rs.createdAt = time.Now()
 	rs.pool = pool
 	rs.released.Store(false)
+	rs.recycled.Store(false)
+	rs.outstanding.Store(0)
 	rs.completed.Store(false)
 	rs.committedDone.Store(false)
 	// Drain any stale result from a previous use.
@@ -237,11 +254,57 @@ func (rs *RequestState) ApplyResultC() <-chan RequestResult {
 	return rs.completedC
 }
 
-// Release returns the RequestState to its pool. Release is idempotent;
-// subsequent calls are safe no-ops. After Release, Result returns
-// ErrReleased and ResultC returns nil.
+// Release marks the RequestState as released by the caller. Release is
+// idempotent; subsequent calls are safe no-ops. After Release, Result
+// returns ErrReleased and ResultC returns nil.
+//
+// The object is NOT returned to the pool until both the caller has
+// released it AND every pending-map reference has been removed (see
+// acquireRef/releaseRef). This prevents the use-after-Release hazard
+// where a Sync* caller times out and releases while the request is
+// still registered in a pending map; recycling early would hand the
+// same object to a new request and deliver a stale/foreign result into
+// it. The late OnApplied/sweep removes the final reference and recycles
+// the object then.
 func (rs *RequestState) Release() {
 	if !rs.released.CompareAndSwap(false, true) {
+		return
+	}
+	rs.tryRecycle()
+}
+
+// acquireRef records that a pending map now holds a reference to this
+// RequestState. Must be paired with releaseRef when the entry is removed
+// from the map. Called at registration time (Propose/ReadIndex/
+// RequestSnapshot) before the object is exposed to completion callbacks.
+func (rs *RequestState) acquireRef() {
+	rs.outstanding.Add(1)
+}
+
+// releaseRef records that a pending map no longer holds a reference to
+// this RequestState. Called at every map-removal site (OnApplied,
+// OnReadyToRead, OnReadIndexFailed, OnProposalFailed, OnSnapshotCompleted,
+// failPendingRequests, the sweep, and the registration-error rollbacks).
+// When the caller has already released and this was the last reference,
+// the object is returned to the pool.
+func (rs *RequestState) releaseRef() {
+	if rs.outstanding.Add(-1) == 0 {
+		rs.tryRecycle()
+	}
+}
+
+// tryRecycle returns the object to its pool exactly once, but only when
+// the caller has released it and no pending-map references remain. The
+// recycled CAS ensures a single pool.Put even when Release and the final
+// releaseRef race.
+func (rs *RequestState) tryRecycle() {
+	if !rs.released.Load() {
+		return
+	}
+	if rs.outstanding.Load() != 0 {
+		return
+	}
+	if !rs.recycled.CompareAndSwap(false, true) {
 		return
 	}
 	// Drain any unconsumed result to reset channel state.

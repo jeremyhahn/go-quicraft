@@ -2,7 +2,7 @@
 
 This document covers deployment, monitoring, configuration tuning, and day-to-day administration of QuicRaft clusters.
 
-**Sources:** `pkg/host.go`, `pkg/config/`, `pkg/metrics.go`, `pkg/metrics_prometheus.go`, `pkg/logdb/waldb/diskmon.go`, `pkg/seal/barrier.go`, `pkg/bootstrap/`, `pkg/internal/server/rate.go`
+**Sources:** `pkg/host.go`, `pkg/config/`, `pkg/metrics.go`, `pkg/metrics_prometheus.go`, `pkg/logdb/waldb/diskmon.go`, `pkg/seal/barrier.go`, `pkg/internal/server/rate.go`
 
 ## Deployment
 
@@ -26,44 +26,26 @@ members := map[uint64]string{1: "127.0.0.1:63001"}
 host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg)
 ```
 
-### Multi-Node (Static Peers)
+### Multi-Node Cluster Formation
 
-For clusters with known members at deploy time, use static discovery. Each node specifies the full member map programmatically (see Programmatic Bootstrap below).
+go-quicraft itself only provides the primitive `Host.StartShard(members, join, createFn, cfg)`, which takes an explicit `map[uint64]string` member map. The caller is responsible for producing that map.
 
-### Multi-Node (Dynamic Discovery)
+Peer discovery (static / multicast / DNS SRV / token), quorum validation, and bootstrap orchestration live in **go-qrdb** (`pkg/discovery` + `pkg/cluster`). To form a multi-node cluster, use go-qrdb's `cluster.BootstrapShard` (or run the `qrdbd` daemon, which wraps it). See go-qrdb's `docs/discovery.md` and `docs/12-configuration.md`.
 
-When member addresses are not known in advance, use multicast or DNS SRV discovery. The bootstrapper handles peer discovery, quorum validation, and shard startup.
+### Programmatic Shard Start (primitive)
 
-**Multicast** (LAN only, HMAC-SHA256 authenticated): Use `discovery.NewMulticastDiscovery` with a shared secret. Non-static discovery auto-generates `replica-id`, selects free ports, and namespaces data directories per replica to allow multiple nodes on the same host.
-
-**DNS SRV** (WAN, requires `_raft._udp.<domain>` records): Use `discovery.NewDNSDiscovery` with the SRV domain.
-
-### Programmatic Bootstrap
+When the member map is already known, call the quicraft primitive directly:
 
 ```go
-disc := discovery.NewStaticDiscovery(discovery.StaticConfig{
-    Peers: []discovery.Peer{
-        {NodeID: 1, Address: "10.0.0.1:63001"},
-        {NodeID: 2, Address: "10.0.0.2:63001"},
-        {NodeID: 3, Address: "10.0.0.3:63001"},
-    },
-})
-
-bs := bootstrap.NewBootstrapper(bootstrap.Config{
-    NodeID:      1,
-    Address:     "10.0.0.1:63001",
-    ShardID:     100,
-    ReplicaID:   1,
-    Discovery:   disc,
-    CreateFn:    sm.NewCreateFunc(newKV),
-    ShardConfig: shardCfg,
-    MinPeers:    3,  // default
-}, host)
-
-err := bs.Bootstrap()
+members := map[uint64]string{
+    1: "10.0.0.1:63001",
+    2: "10.0.0.2:63001",
+    3: "10.0.0.3:63001",
+}
+err := host.StartShard(members, false /* join */, sm.NewCreateFunc(newKV), shardCfg)
 ```
 
-The bootstrapper sequence: discover peers, add self, validate `len(peers) >= QuorumSize(MinPeers)`, build member map, call `Host.StartShard`.
+For discovery-driven formation (multicast/DNS/token/static-with-quorum), use go-qrdb's `cluster.BootstrapShard`, which discovers peers, adds self, validates quorum, builds the member map, and calls `Host.StartShard`.
 
 ### Directory Layout
 
@@ -196,6 +178,12 @@ type RevocationConfig struct {
 ```
 
 Enables certificate revocation checking via CRL and/or OCSP. Optional; used only if present.
+
+**Operational behavior:**
+
+- **Leaf-only checks:** Only the peer's leaf (end-entity) certificate is revocation-checked, not the full presented chain. The leaf is what gets revoked when a node is decommissioned or compromised; the CA chain is governed by the CA's own lifecycle. This avoids per-handshake OCSP latency for rarely-changing intermediate/root certificates. Checks run via the TLS `VerifyConnection` callback, so they also apply to resumed TLS sessions.
+- **OCSP negative cache:** When an OCSP responder is unreachable (down, timeout, network error), the failure is cached for a short 10 s window. During that window, reconnect handshakes do not re-query the dead responder, so they avoid adding the full `OCSPTimeoutSeconds` to every handshake while the responder is down. The negative cache only suppresses re-queries — it never reports a cert as "good" or "revoked" — and its TTL is far shorter than the positive-result cache (`OCSPCacheSeconds`, default 300 s), so the responder is retried promptly once it recovers.
+- **Fail-closed:** With `EnforceRevocation: true`, peers are rejected when revocation status cannot be determined (responder down, no CRL). The default (`false`) is soft-fail.
 
 ## Monitoring
 
@@ -635,6 +623,17 @@ rs, _ := host.RequestAddWitness(ctx, shardID, replicaID, "10.0.0.6:63001")
 host.RequestLeaderTransfer(ctx, shardID, targetReplicaID)
 ```
 
+> **Stable addresses for non-voting members.** Observers and witnesses do not
+> run election timers, so — unlike a full voting replica, which re-advertises
+> its address by campaigning after a restart — a non-voting member that
+> restarts at a *new* address cannot teach the leader its new location until a
+> committed config change re-registers it. Always give observers and witnesses
+> a **stable advertised `RaftAddress`** (not an ephemeral port). A voting
+> replica self-heals an address change on its next election timeout; a
+> non-voting member relies on its address being stable or on an operator
+> re-issuing the config change. (A periodic self-advertisement for non-voting
+> members is a planned post-v1.0 enhancement.)
+
 `OrderedConfigChange: true` (default) serializes membership changes so only one is in-flight at a time, as required by the Raft specification.
 
 ### Membership Queries
@@ -726,7 +725,7 @@ The transport layer also compresses message batches with Snappy. Compression is 
 
 **`MaxConcurrentSnapshotReceives` (4 default):** Limit concurrent inbound snapshot streams to prevent memory exhaustion.
 
-**`MaxSnapshotReceiveRate` (256 MB/s default):** Per-connection bandwidth limit for inbound snapshots. Prevents snapshot transfers from saturating the network.
+**`MaxSnapshotReceiveRate` (256 MB/s default):** Per-connection bandwidth limit for inbound snapshots. Prevents snapshot transfers from saturating the network. The receiver enforces this by sleeping proportional to each chunk's size. A non-zero value below `MinMaxSnapshotReceiveRate` (64 KB/s) is rejected by config validation, because an absurdly low rate would compute a multi-day per-chunk sleep that holds the snapshot concurrency semaphore and memory budget for the entire transfer, stalling availability. Set to 0 to use the default. As a defense-in-depth backstop, each individual per-chunk sleep is also capped at 5 s regardless of the configured rate; the configured rate is still honored on average across chunks.
 
 **`MaxSnapshotReceiveMemory` (1 GB default):** Total memory budget for all in-flight snapshot receives.
 

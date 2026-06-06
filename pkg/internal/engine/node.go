@@ -19,6 +19,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/queue"
@@ -242,8 +243,25 @@ type Node struct {
 	// call, corrupting state machine state.
 	recovering atomic.Bool
 
+	// applyInFlight counts apply closures that are currently executing (or
+	// about to check the recovering gate) for this node. It is incremented at
+	// the very top of the per-item apply closure — BEFORE the recovering
+	// check — and decremented when the closure returns. Snapshot recovery uses
+	// it as a drain barrier: after setting recovering=true, the snapshot
+	// worker waits for applyInFlight to reach 0 before touching the state
+	// machine, guaranteeing no apply is mid-`SM.Apply` when RecoverFromSnapshot
+	// replaces SM state. The increment-then-check / set-then-wait ordering is
+	// a standard lock-free quiesce: any apply that passed the gate must have
+	// incremented first, so the drain observes it.
+	applyInFlight atomic.Int64
+
 	// stopC is closed when the node is unloaded from the engine.
 	stopC chan struct{}
+	// stopOnce guards the close of stopC so Stop() is idempotent and safe
+	// against concurrent callers (a future second caller would otherwise
+	// double-close and panic; today the sole caller is engine.Stop's serial
+	// teardown, but this makes the contract explicit and race-proof).
+	stopOnce sync.Once
 }
 
 // NewNode creates a new engine Node for the given shard. The node must
@@ -393,6 +411,18 @@ func (n *Node) LastSnapshotIndex() uint64 {
 	return n.lastSnapshotIndex.Load()
 }
 
+// SeedLastApplied initializes the node's applied markers to a recovered
+// index on restart, before the node is loaded into the engine pipeline.
+// Both lastApplied and lastSnapshotIndex are set so that follower and
+// linearizable reads can be served immediately after recovery without
+// waiting for a subsequent write to advance the applied marker. This must
+// be called before LoadNode and must match the raft peer's processed
+// marker. For a fresh start (idx == 0) this is a harmless no-op.
+func (n *Node) SeedLastApplied(idx uint64) {
+	n.lastApplied.Store(idx)
+	n.lastSnapshotIndex.Store(idx)
+}
+
 // IsFailed returns true if the circuit breaker has tripped.
 func (n *Node) IsFailed() bool {
 	return n.failed.Load()
@@ -450,6 +480,26 @@ func (n *Node) SetRecovering(v bool) {
 	n.recovering.Store(v)
 }
 
+// WaitForApplyDrain blocks until no apply closure is in flight for this node,
+// or until stopC is closed. It MUST be called only after SetRecovering(true):
+// the recovering gate stops new applies from accessing the state machine, and
+// this drains the at-most-one apply that may have passed the gate before the
+// flag was set. Together they guarantee RecoverFromSnapshot has exclusive
+// access to the state machine. Returns false if it stopped early due to stopC.
+func (n *Node) WaitForApplyDrain(stopC <-chan struct{}) bool {
+	for n.applyInFlight.Load() > 0 {
+		select {
+		case <-stopC:
+			return false
+		default:
+		}
+		// Apply closures are short and bounded (a single SM.Apply batch). A
+		// brief yield avoids a hot spin while the in-flight apply completes.
+		time.Sleep(50 * time.Microsecond)
+	}
+	return true
+}
+
 // StopC returns a read-only channel that is closed when the node stops.
 // Used to pass cancellation to state machine operations like Open.
 func (n *Node) StopC() <-chan struct{} {
@@ -496,10 +546,7 @@ func (n *Node) DiagRemotes() string {
 
 // Stop signals the node to stop. Called when unloading from the engine.
 func (n *Node) Stop() {
-	select {
-	case <-n.stopC:
-		// Already stopped.
-	default:
+	n.stopOnce.Do(func() {
 		close(n.stopC)
-	}
+	})
 }

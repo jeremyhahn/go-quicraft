@@ -294,6 +294,14 @@ func (ef *ErrorFile) Write(p []byte) (int, error) {
 	return ef.delegate.Write(p)
 }
 
+// WriteAt implements waldb.File.
+func (ef *ErrorFile) WriteAt(p []byte, off int64) (int, error) {
+	if err := ef.efs.tick("WriteAt"); err != nil {
+		return 0, err
+	}
+	return ef.delegate.WriteAt(p, off)
+}
+
 // Read implements waldb.File.
 func (ef *ErrorFile) Read(p []byte) (int, error) {
 	if err := ef.efs.tick("Read"); err != nil {

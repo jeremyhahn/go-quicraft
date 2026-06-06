@@ -1038,7 +1038,7 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMembership_MaxResponsesEnforced(t *testing.T) {
-	t.Run("response limit exceeded returns error from Apply", func(t *testing.T) {
+	t.Run("response limit exceeded rejects entry as SESSION_EXPIRED without applying", func(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
@@ -1064,14 +1064,31 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 			}
 		}
 
-		// Fourth series without respondedTo should hit the limit.
+		// Fourth series without respondedTo hits the capacity gate. Under
+		// the at-most-once fix, the entry is rejected as SESSION_EXPIRED
+		// BEFORE the user SM mutation, so Apply succeeds (no error), the
+		// result carries ResultSessionExpired, and the user SM is NOT
+		// mutated. This is critical: an entry that cannot be cached must
+		// never be applied, otherwise a replay would re-apply it.
 		entries := []proto.Entry{
 			{Index: 4, ClientID: 10, SeriesID: 4, Cmd: makeCmd("mr4", "v")},
 		}
 		results := make([]sm.Result, 1)
-		err = rsm.Apply(entries, results)
-		if err == nil {
-			t.Fatal("Apply should fail when response limit exceeded")
+		if err := rsm.Apply(entries, results); err != nil {
+			t.Fatalf("Apply over-capacity entry should not error, got %v", err)
+		}
+		if results[0].Value != sm.ResultSessionExpired {
+			t.Fatalf("over-capacity series result = %d, want ResultSessionExpired (%d)",
+				results[0].Value, sm.ResultSessionExpired)
+		}
+		// The user SM must NOT have been mutated by the rejected entry:
+		// the key written by series 4 must be absent.
+		got, lerr := rsm.Lookup(context.Background(), "mr4")
+		if lerr != nil {
+			t.Fatalf("Lookup = %v", lerr)
+		}
+		if s, _ := got.(string); s != "" {
+			t.Fatalf("over-capacity entry was applied: mr4 = %q, want empty", s)
 		}
 	})
 

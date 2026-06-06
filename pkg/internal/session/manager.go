@@ -118,6 +118,49 @@ func (m *Manager) CheckDuplicate(clientID, seriesID, index uint64) (sm.Result, b
 	return sm.Result{}, false, nil
 }
 
+// CanRecord reports whether a new (non-duplicate) result for the given
+// client could be cached without exceeding the per-session response
+// limit. It performs the same respondedTo-advance and eviction
+// computation as RecordResult but WITHOUT mutating any state, so it is
+// safe to call before the user state machine applies the entry.
+//
+// pending is the number of new series for this same client that have
+// already been admitted earlier in the current apply batch but not yet
+// recorded (RecordResult runs after the batched user-SM Update). Counting
+// them prevents a batch of new series from collectively overflowing the
+// cache: each entry is gated against the projected post-batch size, not
+// just the pre-batch size.
+//
+// It returns nil if the result can be recorded, ErrSessionNotFound if the
+// client is not registered, or ErrResponseLimitExceeded if the cache
+// would still be full after eviction. Callers use this to reject an
+// over-capacity entry BEFORE applying it to the user state machine,
+// preserving at-most-once semantics: an entry that cannot be cached must
+// never be applied, otherwise a later replay would re-apply it because no
+// cached response exists to deduplicate against.
+func (m *Manager) CanRecord(clientID, seriesID, respondedTo, pending uint64) error {
+	sess, exists := m.sessions[clientID]
+	if !exists {
+		return ErrSessionNotFound
+	}
+	// Compute the effective respondedTo after the advance RecordResult
+	// would perform, then count responses that would survive eviction.
+	effectiveRespondedTo := sess.respondedTo
+	if respondedTo > effectiveRespondedTo {
+		effectiveRespondedTo = respondedTo
+	}
+	surviving := uint64(0)
+	for sid := range sess.responses {
+		if sid > effectiveRespondedTo {
+			surviving++
+		}
+	}
+	if surviving+pending >= m.maxResponses {
+		return ErrResponseLimitExceeded
+	}
+	return nil
+}
+
 // RecordResult caches the result for a proposal from the given client.
 // Also evicts all cached responses with seriesID <= respondedTo and
 // advances the session's respondedTo marker. The index parameter is
@@ -137,11 +180,15 @@ func (m *Manager) RecordResult(clientID, seriesID, respondedTo, index uint64, re
 		sess.respondedTo = respondedTo
 	}
 	sess.evictUpTo(sess.respondedTo)
+	// Advance the activity marker first: an entry was applied for this
+	// session, so it was demonstrably active even if its response cache is
+	// full. Doing this before the limit check prevents an active-but-full
+	// session from looking idle to deterministic expiry.
+	sess.touchIndex(index)
 	if uint64(len(sess.responses)) >= m.maxResponses {
 		return ErrResponseLimitExceeded
 	}
 	sess.responses[seriesID] = result
-	sess.touchIndex(index)
 	return nil
 }
 

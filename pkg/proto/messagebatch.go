@@ -17,7 +17,7 @@ package proto
 // MessageBatch is a batch of Raft messages for transport. One batch per
 // network frame. The wire format is:
 //
-//	[BinVer:8][DeploymentID:8][SourceAddress:len+data][RequestsCount:4][requests...]
+//	[BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][RequestsCount:4][requests...]
 //
 // BinVer is the FIRST field so the receiver can validate the wire version
 // before parsing the rest of the batch. UnmarshalFrom validates the
@@ -30,14 +30,20 @@ type MessageBatch struct {
 	// DeploymentID identifies the deployment for cross-deployment
 	// message rejection.
 	DeploymentID uint64
+	// SourceEpoch is the sender's per-process boot epoch. It changes only
+	// when the sending node restarts, letting a receiver detect a genuine
+	// peer restart (vs a benign re-dial) and evict the now-stale cached
+	// outbound connection promptly instead of waiting for MaxIdleTimeout.
+	SourceEpoch uint64
 	// SourceAddress is the sender's network address.
 	SourceAddress string
 	// Requests contains the batched Raft messages.
 	Requests []Message
 }
 
-// messageBatchFixedSize is the wire size of the two fixed uint64 fields.
-const messageBatchFixedSize = 2 * 8 // 16 bytes
+// messageBatchFixedSize is the wire size of the three fixed uint64 fields
+// (BinVer, DeploymentID, SourceEpoch).
+const messageBatchFixedSize = 3 * 8 // 24 bytes
 
 // Size returns the total marshaled size of the batch in bytes.
 func (mb *MessageBatch) Size() int {
@@ -58,6 +64,7 @@ func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 	}
 	putUint64(buf[0:], mb.BinVer)
 	putUint64(buf[8:], mb.DeploymentID)
+	putUint64(buf[16:], mb.SourceEpoch)
 	offset := messageBatchFixedSize
 	offset += putString(buf[offset:], mb.SourceAddress)
 	putUint32(buf[offset:], uint32(len(mb.Requests)))
@@ -86,6 +93,7 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 		return 0, ErrUnsupportedVersion
 	}
 	mb.DeploymentID = getUint64(buf[8:])
+	mb.SourceEpoch = getUint64(buf[16:])
 	offset := messageBatchFixedSize
 	addr, n, err := getString(buf[offset:], MaxAddressLength)
 	if err != nil {
@@ -131,6 +139,7 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 func (mb *MessageBatch) Reset() {
 	mb.BinVer = 0
 	mb.DeploymentID = 0
+	mb.SourceEpoch = 0
 	mb.SourceAddress = ""
 	mb.Requests = mb.Requests[:0]
 }

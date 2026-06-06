@@ -17,6 +17,7 @@ package quicraft
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -457,6 +458,7 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 			ChunkID:    1,
 			ChunkCount: 3,
 			Data:       chunk2Data,
+			Epoch:      5,
 		},
 		{
 			ShardID:    1,
@@ -467,6 +469,7 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 			ChunkID:    2,
 			ChunkCount: 3,
 			Data:       chunk3Data,
+			Epoch:      5,
 		},
 	}
 
@@ -1140,9 +1143,9 @@ func TestCopyMapUint64Bool(t *testing.T) {
 }
 
 // TestHostMessageHandler_HandleMessage_SourceAddressLearning verifies that
-// when a MessageBatch carries a non-empty SourceAddress, the handler
-// registers the sender's address in the host registry for each request.
-// This covers the address-learning path (messagehandler.go lines 65-72).
+// when a MessageBatch carries a non-empty SourceAddress, the handler learns
+// the sender's address in the host registry — but ONLY for senders that are
+// authorized members of a loaded shard.
 func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -1159,6 +1162,15 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	eng.Start()
 	defer eng.Stop()
 
+	// Load shard 1 with membership {1, 10} so replica 10 is an authorized
+	// member whose address may be learned.
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1:  "127.0.0.1:5001",
+		10: "127.0.0.1:5010",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
 	reg := registry.NewRegistry()
 	h := &Host{
 		cfg:      cfg,
@@ -1174,30 +1186,223 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 		SourceAddress: "10.0.0.5:9000",
 		Requests: []proto.Message{
 			{ShardID: 1, From: 10, To: 1, Type: proto.Heartbeat},
-			{ShardID: 2, From: 20, To: 2, Type: proto.Replicate},
 		},
 	}
 
-	err := handler.HandleMessage(batch)
-	if err != nil {
+	if err := handler.HandleMessage(batch); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
-	// Verify that the registry learned both senders' addresses.
-	addr1, err1 := reg.Resolve(1, 10)
-	if err1 != nil {
-		t.Fatalf("Resolve(1, 10) failed: %v", err1)
+	// The authorized member's address was learned.
+	addr, err := reg.Resolve(1, 10)
+	if err != nil {
+		t.Fatalf("Resolve(1, 10) failed: %v", err)
 	}
-	if addr1 != "10.0.0.5:9000" {
-		t.Errorf("Resolve(1, 10) = %q, want %q", addr1, "10.0.0.5:9000")
+	if addr != "10.0.0.5:9000" {
+		t.Errorf("Resolve(1, 10) = %q, want %q", addr, "10.0.0.5:9000")
+	}
+}
+
+// TestHostMessageHandler_HandleMessage_NoLearnForUnloadedShard verifies that
+// the handler does NOT learn an address for a shard that is not loaded
+// locally. The arbitrary replicaID in From cannot be verified as a real
+// member until the shard is loaded with its configured membership, so
+// learning is deferred to prevent registry poisoning.
+func TestHostMessageHandler_HandleMessage_NoLearnForUnloadedShard(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	reg := registry.NewRegistry()
+	h := &Host{cfg: cfg, registry: reg}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	// Shard 7 is NOT loaded; the message is still delivered (bootstrap
+	// path) but no address is learned for it.
+	batch := proto.MessageBatch{
+		SourceAddress: "10.0.0.9:9000",
+		Requests: []proto.Message{
+			{ShardID: 7, From: 3, To: 1, Type: proto.Replicate},
+		},
+	}
+	if err := handler.HandleMessage(batch); err != nil {
+		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
-	addr2, err2 := reg.Resolve(2, 20)
-	if err2 != nil {
-		t.Fatalf("Resolve(2, 20) failed: %v", err2)
+	if _, err := reg.Resolve(7, 3); err == nil {
+		t.Fatal("expected no learned address for unloaded shard, but one was registered")
 	}
-	if addr2 != "10.0.0.5:9000" {
-		t.Errorf("Resolve(2, 20) = %q, want %q", addr2, "10.0.0.5:9000")
+}
+
+// TestHostMessageHandler_HandleMessage_NoLearnForNonMember verifies that the
+// handler does NOT learn an address for a sender that is not a member of a
+// loaded shard (the message is dropped before learning).
+func TestHostMessageHandler_HandleMessage_NoLearnForNonMember(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	// Load shard 1 with membership {1, 2}. Replica 999 is NOT a member.
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1: "127.0.0.1:5001",
+		2: "127.0.0.1:5002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
+	reg := registry.NewRegistry()
+	h := &Host{cfg: cfg, registry: reg}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	batch := proto.MessageBatch{
+		SourceAddress: "10.0.0.6:9000",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 999, To: 1, Type: proto.Heartbeat},
+		},
+	}
+	if err := handler.HandleMessage(batch); err != nil {
+		t.Fatalf("HandleMessage returned unexpected error: %v", err)
+	}
+
+	if _, err := reg.Resolve(1, 999); err == nil {
+		t.Fatal("expected no learned address for non-member, but one was registered")
+	}
+}
+
+// TestHostMessageHandler_HandleMessage_UpdatesAddressForRecovery verifies that
+// an inbound message from an authorized member with a NEW SourceAddress updates
+// the registry. This overwrite is required for liveness: a node that recovers
+// at a new address (and, during quorum loss, has no leader to propagate a
+// config change) must be relearned from its own traffic or the cluster can
+// never re-form a quorum. Anti-poisoning is enforced one layer down, at the
+// transport, which clears any SourceAddress not covered by the sender's
+// verified TLS certificate (covered by the transport package's tests); this
+// handler-level test exercises the post-binding overwrite behavior.
+func TestHostMessageHandler_HandleMessage_UpdatesAddressForRecovery(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1: "127.0.0.1:5001",
+		2: "127.0.0.1:5002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
+	reg := registry.NewRegistry()
+	// Replica 2's old address is known (e.g. from bootstrap/config).
+	reg.Register(1, 2, "127.0.0.1:5002")
+
+	h := &Host{cfg: cfg, registry: reg}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	// Replica 2 recovered at a NEW address and sends traffic. The transport
+	// has already cert-bound this SourceAddress; the handler must update the
+	// mapping so peers can reach the recovered node.
+	const newAddr = "127.0.0.1:5999"
+	batch := proto.MessageBatch{
+		SourceAddress: newAddr,
+		Requests: []proto.Message{
+			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
+		},
+	}
+	if err := handler.HandleMessage(batch); err != nil {
+		t.Fatalf("HandleMessage returned unexpected error: %v", err)
+	}
+
+	addr, err := reg.Resolve(1, 2)
+	if err != nil {
+		t.Fatalf("Resolve(1, 2) failed: %v", err)
+	}
+	if addr != newAddr {
+		t.Errorf("address was not updated for recovery: got %q, want %q", addr, newAddr)
+	}
+}
+
+// TestHostMessageHandler_HandleMessage_SameAddressNoChange verifies that a
+// repeated claim of the SAME address is a harmless no-op (idempotent).
+func TestHostMessageHandler_HandleMessage_SameAddressNoChange(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1: "127.0.0.1:5001",
+		2: "127.0.0.1:5002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
+	reg := registry.NewRegistry()
+	h := &Host{cfg: cfg, registry: reg}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	batch := proto.MessageBatch{
+		SourceAddress: "10.0.0.2:9000",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
+		},
+	}
+	// First message learns the address.
+	if err := handler.HandleMessage(batch); err != nil {
+		t.Fatalf("HandleMessage returned unexpected error: %v", err)
+	}
+	// Second identical message is a no-op (no overwrite, no warning needed).
+	if err := handler.HandleMessage(batch); err != nil {
+		t.Fatalf("HandleMessage returned unexpected error: %v", err)
+	}
+
+	addr, err := reg.Resolve(1, 2)
+	if err != nil {
+		t.Fatalf("Resolve(1, 2) failed: %v", err)
+	}
+	if addr != "10.0.0.2:9000" {
+		t.Errorf("Resolve(1, 2) = %q, want %q", addr, "10.0.0.2:9000")
 	}
 }
 
@@ -1542,5 +1747,216 @@ func TestHostMessageHandler_HandleSnapshot_NoEngineDelivery(t *testing.T) {
 	err := handler.HandleSnapshot(chunks)
 	if err != nil {
 		t.Fatalf("HandleSnapshot should succeed (write to disk + logdb), got: %v", err)
+	}
+}
+
+// newSnapshotHandler builds a handler with a real engine + memdb LogDB and a
+// host rooted at the returned nodeHostDir, for chunk-validation tests.
+func newSnapshotHandler(t *testing.T) (*hostMessageHandler, string) {
+	t.Helper()
+	nodeHostDir := t.TempDir()
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           nodeHostDir,
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	ldb := memdb.New()
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	t.Cleanup(eng.Stop)
+
+	h := &Host{cfg: cfg, logdb: ldb}
+	return &hostMessageHandler{engine: eng, host: h}, nodeHostDir
+}
+
+// assertValidateError fails the test unless err is a *SnapshotReceiveError
+// with Op == "validate".
+func assertValidateError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a validation error, got nil")
+	}
+	var snapErr *SnapshotReceiveError
+	if !errors.As(err, &snapErr) {
+		t.Fatalf("expected *SnapshotReceiveError, got %T: %v", err, err)
+	}
+	if snapErr.Op != "validate" {
+		t.Fatalf("SnapshotReceiveError.Op = %q, want %q", snapErr.Op, "validate")
+	}
+}
+
+// TestHandleSnapshot_RejectsGap verifies a chunk set with a missing ChunkID
+// (gap) is rejected without persisting anything.
+func TestHandleSnapshot_RejectsGap(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	// ChunkCount 3 but only ChunkIDs 0 and 2 present (1 is missing).
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 3, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c")},
+	}
+	// Note: len(chunks)=2 != ChunkCount=3, so this also trips the count check;
+	// either way it must be a validate error.
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsMissingMiddleChunk verifies a chunk set whose
+// count is correct but contains a duplicate filling another slot (so a
+// middle ChunkID is absent) is rejected as a gap.
+func TestHandleSnapshot_RejectsMissingMiddleChunk(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	// Three chunks, ChunkIDs {0, 2, 2}: ID 1 is missing, ID 2 duplicated.
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 3, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c2")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsDuplicate verifies a chunk set with a duplicate
+// ChunkID is rejected.
+func TestHandleSnapshot_RejectsDuplicate(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a-dup")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsWrongCount verifies a chunk set whose declared
+// ChunkCount disagrees with the number of chunks received is rejected.
+func TestHandleSnapshot_RejectsWrongCount(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	// Two chunks received, but each declares ChunkCount 5.
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 5, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 5, Data: []byte("b")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsInconsistentCount verifies that chunks declaring
+// different ChunkCount values are rejected.
+func TestHandleSnapshot_RejectsInconsistentCount(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 3, Data: []byte("b")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsIdentityMismatch verifies that a chunk whose
+// identity/metadata (here Term) differs from chunk 0 is rejected. This is
+// the core BUG C fix: chunks[0] is no longer blindly trusted for the set.
+func TestHandleSnapshot_RejectsIdentityMismatch(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
+		// Term 6 differs from chunk 0's Term 5.
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 6, ChunkID: 1, ChunkCount: 2, Data: []byte("b")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsEpochMismatch verifies that a chunk whose Epoch
+// differs from chunk 0 is rejected (the production sender stamps the same
+// Epoch on every chunk).
+func TestHandleSnapshot_RejectsEpochMismatch(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Epoch: 3, Data: []byte("a")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, Epoch: 9, Data: []byte("b")},
+	}
+	assertValidateError(t, handler.HandleSnapshot(chunks))
+	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+}
+
+// TestHandleSnapshot_RejectsFileSizeMismatch verifies that when the declared
+// FileSize does not equal the reassembled byte count, the snapshot is
+// rejected (truncated or forged size).
+func TestHandleSnapshot_RejectsFileSizeMismatch(t *testing.T) {
+	handler, _ := newSnapshotHandler(t)
+
+	// Two chunks totaling 6 bytes, but FileSize declares 100.
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, FileSize: 100, Data: []byte("abc")},
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, FileSize: 100, Data: []byte("def")},
+	}
+	err := handler.HandleSnapshot(chunks)
+	if err == nil {
+		t.Fatal("expected FileSize mismatch error, got nil")
+	}
+	var snapErr *SnapshotReceiveError
+	if !errors.As(err, &snapErr) {
+		t.Fatalf("expected *SnapshotReceiveError, got %T: %v", err, err)
+	}
+	if snapErr.Op != "validate" {
+		t.Errorf("Op = %q, want %q", snapErr.Op, "validate")
+	}
+}
+
+// TestHandleSnapshot_ReassemblesOutOfOrder verifies that chunks delivered in
+// arrival order != ChunkID order are reassembled in ChunkID order, so the
+// on-disk snapshot is byte-correct regardless of delivery ordering.
+func TestHandleSnapshot_ReassemblesOutOfOrder(t *testing.T) {
+	handler, nodeHostDir := newSnapshotHandler(t)
+
+	// Arrival order: 2, 0, 1. Correct assembly must be "AAABBBCCC".
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 4, ReplicaID: 1, From: 2, Index: 700, Term: 9, ChunkID: 2, ChunkCount: 3, Data: []byte("CCC")},
+		{ShardID: 4, ReplicaID: 1, From: 2, Index: 700, Term: 9, ChunkID: 0, ChunkCount: 3, Data: []byte("AAA")},
+		{ShardID: 4, ReplicaID: 1, From: 2, Index: 700, Term: 9, ChunkID: 1, ChunkCount: 3, Data: []byte("BBB")},
+	}
+	if err := handler.HandleSnapshot(chunks); err != nil {
+		t.Fatalf("HandleSnapshot returned error: %v", err)
+	}
+
+	snapshotDir := filepath.Join(
+		nodeHostDir, "snapshots", "shard-4", "replica-1",
+		"snapshot-00000000000000000700",
+	)
+	data, err := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
+	if err != nil {
+		t.Fatalf("failed to read reassembled snapshot: %v", err)
+	}
+	if string(data) != "AAABBBCCC" {
+		t.Fatalf("reassembled data = %q, want %q (must follow ChunkID order)",
+			string(data), "AAABBBCCC")
+	}
+}
+
+// assertNoSnapshotDir fails the test if a snapshot directory exists for the
+// given identity, confirming an invalid chunk set persisted nothing.
+func assertNoSnapshotDir(t *testing.T, nodeHostDir string, shardID, replicaID, index uint64) {
+	t.Helper()
+	snapshotDir := filepath.Join(
+		nodeHostDir, "snapshots",
+		fmt.Sprintf("shard-%d", shardID),
+		fmt.Sprintf("replica-%d", replicaID),
+		fmt.Sprintf("snapshot-%020d", index),
+	)
+	if _, err := os.Stat(snapshotDir); !os.IsNotExist(err) {
+		t.Fatalf("expected no snapshot directory for invalid chunk set, but %q exists", snapshotDir)
 	}
 }

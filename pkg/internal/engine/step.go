@@ -346,10 +346,22 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 	if !ok || len(deferred) == 0 {
 		return
 	}
+	// Only drop messages that were successfully delivered. Deliver returns
+	// false when the inbox queue is full; those messages must be retained
+	// for a later retry rather than discarded, otherwise a transient full
+	// inbox would permanently drop a deferred InstallSnapshot. Filter in
+	// place by compacting the undelivered messages to the front.
+	kept := deferred[:0]
 	for _, msg := range deferred {
-		node.Deliver(msg)
+		if !node.Deliver(msg) {
+			kept = append(kept, msg)
+		}
 	}
-	w.deferredSnapshots[shardID] = deferred[:0]
+	// Zero the tail so retained references to dropped messages are released.
+	for i := len(kept); i < len(deferred); i++ {
+		deferred[i] = proto.Message{}
+	}
+	w.deferredSnapshots[shardID] = kept
 }
 
 // drainAndHandleInbox drains transport messages (Replicate, Heartbeat,

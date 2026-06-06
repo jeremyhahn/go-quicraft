@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance/quicraft
 
-go 1.26.1
+go 1.26.3
 
 require (
 	github.com/jeremyhahn/go-quicraft v0.0.0
@@ -21,10 +21,10 @@ require (
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 

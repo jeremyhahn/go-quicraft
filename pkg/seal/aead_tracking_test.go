@@ -895,22 +895,55 @@ func TestNonceTracker_NonceKeyConsistency(t *testing.T) {
 	}
 }
 
-// TestNonceTracker_NonceKeyShortNonce verifies that nonces shorter than 12
-// bytes are zero-padded and still correctly distinguished.
-func TestNonceTracker_NonceKeyShortNonce(t *testing.T) {
+// TestNonceTracker_NonceKeyVerbatim verifies that nonceKey uses the full nonce
+// verbatim — no truncation and no padding — so the key length always equals the
+// nonce length and nonces of any length are tracked exactly.
+func TestNonceTracker_NonceKeyVerbatim(t *testing.T) {
 	t.Parallel()
 
 	short := []byte{0x01, 0x02, 0x03}
 	key := nonceKey(short)
 
-	// First 3 bytes should match, rest should be zero.
-	if key[0] != 0x01 || key[1] != 0x02 || key[2] != 0x03 {
-		t.Fatalf("short nonce prefix mismatch: got %x", key[:3])
+	if key != string(short) {
+		t.Fatalf("nonceKey not verbatim: got %x, want %x", key, short)
 	}
-	for i := 3; i < 12; i++ {
-		if key[i] != 0 {
-			t.Fatalf("expected zero padding at index %d, got %x", i, key[i])
-		}
+	if len(key) != len(short) {
+		t.Fatalf("key length %d != nonce length %d (unexpected padding/truncation)", len(key), len(short))
+	}
+}
+
+// TestNonceTracker_XChaCha24BytePrefixCollision verifies that two distinct
+// 24-byte XChaCha20-Poly1305 nonces sharing the same 12-byte prefix are tracked
+// as distinct. A fixed [12]byte key would truncate both to the same key and
+// falsely reject the second unique nonce as reuse (availability bug).
+func TestNonceTracker_XChaCha24BytePrefixCollision(t *testing.T) {
+	t.Parallel()
+
+	nt := NewNonceTracker(true)
+
+	prefix := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}
+
+	nonce1 := append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B)
+	nonce2 := append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0xFF)
+
+	if len(nonce1) != 24 || len(nonce2) != 24 {
+		t.Fatalf("expected 24-byte nonces, got %d and %d", len(nonce1), len(nonce2))
+	}
+
+	if err := nt.CheckAndRecordNonce(nonce1); err != nil {
+		t.Fatalf("recording nonce1 failed: %v", err)
+	}
+	// nonce2 shares the 12-byte prefix of nonce1 but is distinct; it must be
+	// accepted, not falsely rejected as reuse.
+	if err := nt.CheckAndRecordNonce(nonce2); err != nil {
+		t.Fatalf("recording nonce2 falsely rejected as reuse (12-byte prefix collision): %v", err)
+	}
+	// True reuse of nonce1 must still be detected.
+	if err := nt.CheckAndRecordNonce(nonce1); !errors.Is(err, ErrNonceReuse) {
+		t.Fatalf("expected ErrNonceReuse on true reuse, got %v", err)
+	}
+	if got := nt.Count(); got != 2 {
+		t.Fatalf("Count() = %d, want 2", got)
 	}
 }
 

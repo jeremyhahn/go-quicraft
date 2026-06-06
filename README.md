@@ -20,7 +20,7 @@ QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/) with
 - **Full Raft spec** -- Leader election, log replication, membership changes, snapshots, ReadIndex, LeaseRead, PreVote, leadership transfer, CheckQuorum
 - **Client sessions** -- At-most-once delivery with deterministic expiry and deduplication across replicas (PhD Figure 6.1)
 - **Three state machine types** -- `StateMachine`, `ConcurrentStateMachine`, and `DiskStateMachine` interfaces for different workload profiles
-- **Cluster discovery** -- Static, multicast, and DNS SRV discovery with automated bootstrap orchestration
+- **Cluster primitives** -- explicit per-shard member maps via StartShard; discovery and bootstrap orchestration live in go-qrdb
 - **Observability** -- Prometheus metrics for proposals, commits, elections, snapshots, transport, and WAL operations
 - **Lock-free hot paths** -- Atomics and lock-free algorithms over mutexes on performance-critical paths
 - **Batch proposal/read coalescing** -- ReadIndex requests are batched to amortize heartbeat quorum rounds
@@ -303,98 +303,9 @@ host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg)
 
 ### Cluster discovery and bootstrap
 
-Instead of hardcoding a members map, use the discovery and bootstrap packages to form a cluster automatically. Three discovery methods are available: static, multicast (LAN), and DNS SRV.
+go-quicraft provides only the primitive `Host.StartShard(members, join, createFn, cfg)`, which takes an explicit `map[uint64]string` member map. The caller supplies that map.
 
-**Multicast discovery** -- zero-config LAN bootstrap. Nodes announce themselves on a multicast group and discover peers automatically. An HMAC-SHA256 shared secret prevents unauthorized nodes from joining.
-
-```go
-import (
-    "context"
-    "log"
-    "time"
-
-    quicraft "github.com/jeremyhahn/go-quicraft/pkg"
-    "github.com/jeremyhahn/go-quicraft/pkg/bootstrap"
-    "github.com/jeremyhahn/go-quicraft/pkg/config"
-    "github.com/jeremyhahn/go-quicraft/pkg/discovery"
-    "github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
-)
-
-func main() {
-    hostCfg := config.HostConfig{
-        WALDir:        "/var/data/quicraft/wal",
-        NodeHostDir:   "/var/data/quicraft",
-        RaftAddress:   "host1:63100",
-        ListenAddress: "0.0.0.0:63100",
-        DeploymentID:  1,
-    }
-
-    host, err := quicraft.NewHost(hostCfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer host.Close()
-
-    // Multicast discovery -- peers find each other on the LAN
-    disc, err := discovery.NewMulticastDiscovery(discovery.MulticastConfig{
-        NodeID:           1,
-        Address:          "host1:63100",
-        DeploymentID:     1,                          // Must match all nodes
-        SharedSecret:     []byte("my-cluster-secret"), // HMAC-SHA256 authentication
-        AnnounceInterval: 500 * time.Millisecond,
-        DiscoverTimeout:  5 * time.Second,
-        MinPeers:         2,                          // Wait for at least 2 other nodes
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer disc.Stop()
-
-    // Bootstrap: discover peers, check quorum, build member map, start shard
-    bs := bootstrap.NewBootstrapper(bootstrap.Config{
-        NodeID:    1,
-        Address:   "host1:63100",
-        ShardID:   1,
-        ReplicaID: 1,
-        Discovery: disc,
-        CreateFn:  kv.NewMemoryCreateFunc(),
-        ShardConfig: config.Config{
-            ShardID:   1,
-            ReplicaID: 1,
-        },
-        MinPeers: 3, // Require 3 nodes for quorum
-    }, host)
-
-    if err := bs.Bootstrap(context.Background()); err != nil {
-        log.Fatal(err)
-    }
-    // Cluster is running -- propose and read as usual
-}
-```
-
-**Static discovery** -- for environments where node addresses are known ahead of time (e.g. Kubernetes StatefulSets, Terraform outputs):
-
-```go
-disc := discovery.NewStaticDiscovery(discovery.StaticConfig{
-    Peers: []discovery.Peer{
-        {NodeID: 2, Address: "host2:63100"},
-        {NodeID: 3, Address: "host3:63100"},
-    },
-})
-```
-
-**DNS SRV discovery** -- resolve peers from DNS SRV records:
-
-```go
-disc := discovery.NewDNSDiscovery(discovery.DNSConfig{
-    Service:       "_raft",
-    Proto:         "_udp",
-    Domain:        "cluster.example.com",
-    LookupTimeout: 5 * time.Second,
-})
-```
-
-All three implement the `discovery.Method` interface and plug directly into the bootstrapper.
+Peer discovery (static / multicast / DNS SRV / token), quorum validation, and bootstrap orchestration (discover → quorum → `StartShard`), plus opt-in dynamic membership, live one layer up in **go-qrdb** (`pkg/discovery` + `pkg/cluster`) — the layer that owns the cluster. To form a multi-node cluster automatically, use go-qrdb's `cluster.BootstrapShard` (or run the `qrdbd` daemon, which wraps it). See go-qrdb's `docs/discovery.md`.
 
 ### At-rest encryption
 
@@ -535,7 +446,6 @@ make test-<pkg>                        # Any package: proto, config, seal, rsm, 
 make integration-test                  # All integration tests
 make integration-test-e2e              # Multi-node E2E cluster tests
 make integration-test-linearizability  # Porcupine linearizability verification
-make integration-test-bootstrap        # Cluster bootstrap tests
 
 # Fuzz testing
 make fuzz-all                          # All fuzz targets (proto, transport, WAL, seal, session)
@@ -583,7 +493,7 @@ Full documentation lives in [docs/](docs/README.md), organized by component:
 - [Public API](docs/api/reference.md) -- Host methods, RequestState, Session API, error types
 - [Deployment](docs/operations/deployment.md) -- Configuration, monitoring, tuning
 - [Lifecycle](docs/operations/lifecycle.md) -- Startup, shutdown, crash recovery
-- [Discovery & Bootstrap](docs/discovery/bootstrap.md) -- Static, multicast, DNS SRV
+- [Discovery & Bootstrap](docs/discovery/bootstrap.md) -- moved to go-qrdb; quicraft exposes Raft primitives only
 
 **Quality**
 - [Performance](docs/performance/architecture.md) -- Zero-alloc paths, compression, rate limiting

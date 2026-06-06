@@ -215,7 +215,24 @@ func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64,
 
 All share `requestConfigChange()` which serializes a `proto.ConfigChange`, wraps it in an `EntryConfigChange` entry, and delivers via the engine inbox.
 
-**Errors:** Same as `Propose` (requires leader, rate limit checks, inbox capacity). `*HostInitError` if config change serialization fails.
+**Pre-validation:** Before the change is proposed, `requestConfigChange()` validates it against the current published membership snapshot via `Peer.ValidateConfigChange()`. An invalid change returns promptly with a typed error instead of being delivered and then leaving the caller's `*RequestState` to hang until its deadline. The proposal path itself reaches `membership.apply` directly and deliberately does **not** re-check the voting-member cap (so committed changes always replay deterministically), which is why the cap and other invariants are enforced here at request time. Validation runs against the lock-free atomic membership snapshot, so it is conservative: a config change that commits concurrently may produce a benign false rejection, which the caller resolves by re-reading the membership and retrying.
+
+Validation errors (from `pkg/internal/raft`):
+
+| Error                       | Condition                                                             |
+|-----------------------------|-----------------------------------------------------------------------|
+| `ErrZeroReplicaID`          | `replicaID == 0`                                                      |
+| `ErrEmptyAddress`           | Add operation with an empty address                                  |
+| `ErrNodeNotFound`           | Remove targets a replica that is not a current member                |
+| `ErrNodeAlreadyExists`      | Add targets a replica already present as voter or witness            |
+| `ErrNodeRemoved`            | Add/remove targets a replica that was previously removed (tombstone) |
+| `ErrTooManyVotingMembers`   | Add/AddWitness would exceed the 64 voting-member cap                  |
+| `ErrRemoveLastFullReplica`  | Remove targets the last full (non-witness) voting replica            |
+| `ErrRemoveLastVoter`        | Remove targets the last voting member (witness-only edge case)       |
+
+> **Behavior change:** `RequestRemoveNode` for a replica that is not a current member now returns `ErrNodeNotFound`. Previously this was a silent no-op success.
+
+**Errors:** Validation errors above, plus the same delivery errors as `Propose` (requires leader, rate limit checks, inbox capacity). `*StaleConfigChangeError` if `configChangeIndex` does not match the current `ConfigChangeID`. `*HostInitError` if config change serialization fails.
 
 **Concurrency:** When `OrderedConfigChange` is true (default), only one membership change is processed at a time per shard.
 
@@ -271,7 +288,11 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 
 Streams the latest snapshot data to the provided writer. Reads from LogDB metadata to locate the snapshot file on disk.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSnapshotNotFound`.
+Exported snapshots are always **plaintext**. When a barrier (at-rest encryption) is configured, the on-disk `snapshot.dat` is stored in the encrypted frame format. If the snapshot was encrypted (`Epoch > 0`), a barrier is configured, and the barrier is not sealed, `ExportSnapshot` decrypts the frames to plaintext before writing them to the writer; otherwise the bytes are copied verbatim. This matches `ImportSnapshot`, which stores its input verbatim with `Epoch=0` (the no-decrypt recovery path), making export → import a lossless round-trip across hosts with independent barrier keys.
+
+> **Corrected behavior:** Previously the raw on-disk ciphertext was exported, so importing it into a host with a different barrier key (or feeding it back through `RecoverFromSnapshot`, which would not decrypt `Epoch=0` data) corrupted the round-trip. Export now emits decryptable plaintext.
+
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSnapshotNotFound`, plus any barrier decryption or `ctx.Err()` error.
 
 #### ImportSnapshot
 
@@ -279,9 +300,11 @@ Streams the latest snapshot data to the provided writer. Reads from LogDB metada
 func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) error
 ```
 
-Imports a snapshot from the reader. The shard **must be stopped** before calling. Writes snapshot data to disk and records metadata in LogDB for recovery on next `StartShard`.
+Imports a snapshot from the reader. The shard **must be stopped** before calling. Writes snapshot data to disk verbatim and records metadata in LogDB for recovery on next `StartShard`.
 
-**Errors:** `ErrClosed`, `ErrInvalidOperation` (shard running or no LogDB), `ErrShardNotFound`.
+The imported metadata is recorded with `Epoch=0`, marking the data as **plaintext**: recovery (`StartShard` → `RecoverFromSnapshot`) must not attempt to decrypt it. This pairs with `ExportSnapshot`, which always emits plaintext. The recorded `Term` is set to `1` (the minimum valid term) so the snapshot is not treated as uninitialized by the Raft engine.
+
+**Errors:** `ErrClosed`, `ErrInvalidOperation` (shard running or no LogDB), `ErrShardNotFound`, plus any `ctx.Err()` or filesystem/LogDB error.
 
 ### Informational
 
@@ -984,7 +1007,8 @@ Source: `pkg/config/hostconfig.go`
 | `CommitCBufferSize`     | `int`           | `64`                 | Commit channel buffer size               |
 | `ShutdownTimeout`       | `time.Duration` | `30s`                | Graceful shutdown timeout                |
 | `MaxWALDiskSize`        | `uint64`        | `0` (unlimited)      | Max WAL directory size (bytes)           |
-| `MaxApplyRetries`       | `uint64`        | `100`                | Circuit breaker threshold                |
+| `NoSyncWAL`             | `bool`          | `false`              | Disable WAL fdatasync (testing only)     |
+| `MaxApplyRetries`       | `uint64`        | `100`                | Reserved; apply errors are fail-fast (see note) |
 | `MaxTotalInMemLogSize`  | `uint64`        | `0` (disabled)       | Global rate limiter threshold (bytes)    |
 | `KeyRotationInterval`   | `time.Duration` | `0` (disabled)       | Barrier key rotation interval            |
 | `EnableMetrics`         | `bool`          | `false`              | Enable metrics collection                |
@@ -992,6 +1016,10 @@ Source: `pkg/config/hostconfig.go`
 | `EventListener`         | `*EventListener`| `nil`                | Event callbacks                          |
 | `TransportConfig`       | `TransportConfig`| (see below)         | Transport tuning                         |
 | `LogConfig`             | `LogConfig`     | text/info            | Logging format and level                 |
+
+> **`MaxApplyRetries` note:** Apply is now **fail-fast** — the first `SM.Apply()` or decompression error marks the shard failed (it goes offline until reload or snapshot recovery) and `lastApplied` is not advanced. The field is still present and validated (must be `> 0`), but it no longer gates an apply retry loop or circuit-breaker threshold; nothing in the apply path currently consumes it. Advancing `lastApplied` past a failed batch would diverge the state machine from its peers, so retrying in place is not done.
+
+> **`NoSyncWAL` note:** Disables `fdatasync` on Raft WAL segment writes, trading durability for throughput. Intended only for test environments where filesystem (e.g. overlay2/Docker) fsync latency causes proposal timeouts. Never enable in production.
 
 ### Config (per-shard)
 
@@ -1028,7 +1056,7 @@ Source: `pkg/config/transportconfig.go`
 |--------------------------------|-----------------|-------------|-----------------------------------|
 | `StreamPoolSize`               | `int`           | `16`        | QUIC streams per connection       |
 | `MaxStreamPoolSize`            | `int`           | `256`       | Upper bound for stream pool       |
-| `MaxSnapshotReceiveRate`       | `int64`         | `256 MB/s`  | Inbound snapshot bandwidth limit  |
+| `MaxSnapshotReceiveRate`       | `int64`         | `256 MB/s`  | Inbound snapshot bandwidth limit (floor 64 KB/s) |
 | `MaxConcurrentSnapshotReceives`| `int`           | `4`         | Concurrent inbound snapshots      |
 | `MaxSnapshotReceiveMemory`     | `int64`         | `1 GB`      | Total snapshot receive buffer     |
 | `MaxDecompressedSize`          | `uint32`        | `16 MB`     | Max Snappy decompressed payload   |
@@ -1037,6 +1065,8 @@ Source: `pkg/config/transportconfig.go`
 | `SendBatchMaxSize`             | `int`           | `64 KB`     | Max send buffer before flush      |
 | `Enable0RTT`                   | `bool`          | `false`     | QUIC 0-RTT (replayable, caution)  |
 | `DisableCompression`           | `bool`          | `false`     | Disable Snappy compression        |
+
+> **`MaxSnapshotReceiveRate` note:** `0` selects the default (256 MB/s). A non-zero value below the floor `MinMaxSnapshotReceiveRate` (64 KB/s = `64 * 1024`) is rejected by `TransportConfig.Validate`, and negative values are also rejected. The floor exists because a pathologically small rate would make the receiver's proportional-sleep limiter compute multi-day per-chunk sleeps while holding the snapshot concurrency semaphore and memory budget. As defense-in-depth, each per-chunk rate-limit sleep is additionally capped at `maxRateLimitChunkSleep` (5 s); the configured rate is still honored on average across chunks.
 
 ## State Machine Registration
 

@@ -3440,8 +3440,12 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 	if !bytes.Contains([]byte(logOutput), []byte("config change apply skipped")) {
 		t.Errorf("expected 'config change apply skipped' in log, got:\n%s", logOutput)
 	}
-	if !bytes.Contains([]byte(logOutput), []byte("level=DEBUG")) {
-		t.Errorf("expected DEBUG level for apply skip, got:\n%s", logOutput)
+	// The apply-skip is now logged at WARN: the Host membership API
+	// pre-validates against current membership before proposing, so any skip
+	// on the leader's own freshly proposed entry is unexpected and should be
+	// visible to operators rather than buried at DEBUG.
+	if !bytes.Contains([]byte(logOutput), []byte("level=WARN")) {
+		t.Errorf("expected WARN level for apply skip, got:\n%s", logOutput)
 	}
 }
 
@@ -5375,5 +5379,74 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	if p.r.remoteLastAck[3] != ackTick {
 		t.Fatalf("expected witness 3 ack tick %d to be preserved, got %d",
 			ackTick, p.r.remoteLastAck[3])
+	}
+}
+
+// --- ValidateConfigChange (H4) ---
+
+// TestPeer_ValidateConfigChange_DuplicateAdd verifies that validating an
+// AddNode for a replica that is already a voting member returns
+// ErrNodeAlreadyExists without mutating state.
+func TestPeer_ValidateConfigChange_DuplicateAdd(t *testing.T) {
+	cfg := testConfig()
+	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 1, Address: "addr1"}
+	if err := p.ValidateConfigChange(cc); !errors.Is(err, ErrNodeAlreadyExists) {
+		t.Fatalf("ValidateConfigChange(duplicate) = %v, want ErrNodeAlreadyExists", err)
+	}
+}
+
+// TestPeer_ValidateConfigChange_RemoveLastVoter verifies that validating the
+// removal of the last full replica returns ErrRemoveLastFullReplica.
+func TestPeer_ValidateConfigChange_RemoveLastVoter(t *testing.T) {
+	cfg := testConfig()
+	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+
+	cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}
+	if err := p.ValidateConfigChange(cc); !errors.Is(err, ErrRemoveLastFullReplica) {
+		t.Fatalf("ValidateConfigChange(remove last voter) = %v, want ErrRemoveLastFullReplica", err)
+	}
+}
+
+// TestPeer_ValidateConfigChange_ExceedsCap builds a membership at the
+// 64-voting-member cap and verifies that ValidateConfigChange rejects both a
+// 65th full replica and a 65th witness with ErrTooManyVotingMembers — the
+// check the Host membership API relies on to avoid the rebuildReplicaToBit
+// invariant panic. An observer add (which does not affect quorum) is still
+// accepted at the cap.
+func TestPeer_ValidateConfigChange_ExceedsCap(t *testing.T) {
+	cfg := testConfig()
+	addrs := make(map[uint64]string, maxVotingMembers)
+	for id := uint64(1); id <= maxVotingMembers; id++ {
+		addrs[id] = "addr"
+	}
+	p := newTestPeer(t, cfg, proto.State{}, proto.Membership{Addresses: addrs})
+
+	addNode := proto.ConfigChange{Type: proto.AddNode, ReplicaID: maxVotingMembers + 1, Address: "addr"}
+	if err := p.ValidateConfigChange(addNode); !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("ValidateConfigChange(AddNode over cap) = %v, want ErrTooManyVotingMembers", err)
+	}
+
+	addWitness := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: maxVotingMembers + 2, Address: "addr"}
+	if err := p.ValidateConfigChange(addWitness); !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("ValidateConfigChange(AddWitness over cap) = %v, want ErrTooManyVotingMembers", err)
+	}
+
+	addObserver := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: maxVotingMembers + 3, Address: "addr"}
+	if err := p.ValidateConfigChange(addObserver); err != nil {
+		t.Fatalf("ValidateConfigChange(AddNonVoting over cap) = %v, want nil", err)
+	}
+}
+
+// TestPeer_ValidateConfigChange_Valid verifies that a legitimate config
+// change passes validation.
+func TestPeer_ValidateConfigChange_Valid(t *testing.T) {
+	cfg := testConfig()
+	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 2, Address: "addr2"}
+	if err := p.ValidateConfigChange(cc); err != nil {
+		t.Fatalf("ValidateConfigChange(valid add) = %v, want nil", err)
 	}
 }

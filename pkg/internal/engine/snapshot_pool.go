@@ -26,6 +26,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +138,13 @@ type snapshotPool struct {
 	// rather than waiting for the next tick interval.
 	workSignal *WorkSignal
 
+	// nodes enumerates every node currently loaded in the engine. It is
+	// wired by NewEngine after the Engine struct is assembled so the pool
+	// can compute a GLOBAL safe-purge floor across all shards sharing the
+	// process-wide barrier. May be nil in standalone tests, in which case
+	// the global floor falls back to the calling shard only.
+	nodes func() []*Node
+
 	// metrics collects raft-level metrics. Nil when disabled.
 	metrics RaftMetrics
 }
@@ -154,6 +162,12 @@ const (
 	// of snapshot data. 64 KB balances between per-chunk overhead and
 	// memory usage during encryption.
 	snapshotEncryptChunkSize = 64 * 1024
+
+	// maxSnapshotFrameOverhead bounds the AEAD framing a single encrypted
+	// snapshot frame adds over its plaintext chunk: epoch(8) + algID(1) +
+	// nonce(<=24) + tag(16). 256 is a generous ceiling used to reject a
+	// corrupt frame-length prefix before allocation during recovery.
+	maxSnapshotFrameOverhead = 256
 )
 
 // newSnapshotPool creates a snapshot pool with the given worker count.
@@ -261,8 +275,29 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// for recovery requests. This gates the apply worker and
 	// step worker from operating on the state machine while
 	// RecoverFromSnapshot executes in this goroutine.
+	//
+	// Setting the flag stops NEW applies at the gate, but an apply that
+	// already passed the gate could still be inside SM.Apply. Drain it
+	// before RecoverFromSnapshot touches the state machine, otherwise the
+	// two would race and corrupt SM/session state. The increment-then-check
+	// (apply) / set-then-drain (here) ordering guarantees any in-flight
+	// apply is observed by the drain.
 	if !req.save {
 		req.node.SetRecovering(true)
+		// If the drain aborts because the node is stopping, do NOT touch the
+		// state machine: an apply may still be in flight (engine Stop closes
+		// stopC before the apply workers drain), and RecoverFromSnapshot would
+		// race it. Abort the recovery cleanly instead.
+		if !req.node.WaitForApplyDrain(req.node.StopC()) {
+			req.node.SetRecovering(false)
+			p.inFlight.Delete(req.shardID)
+			req.node.snapshotting.Store(false)
+			if p.workSignal != nil {
+				p.workSignal.Notify(req.shardID)
+			}
+			panicked = false
+			return
+		}
 	}
 	index, err := p.handleSnapshot(req)
 
@@ -501,9 +536,24 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	}
 
 	// Encrypt the snapshot data file in-place when a barrier is configured.
+	// The recorded epoch is the MINIMUM epoch across all encrypted frames
+	// (returned by encryptSnapshotFile), not a post-hoc CurrentEpoch() read.
+	// A key rotation can run concurrently on a separate goroutine, so frames
+	// written before the rotation are sealed at epoch E and frames after at
+	// E+1; recording the min guarantees the global DEK-purge floor never
+	// purges a DEK any retained frame still needs. As defense-in-depth,
+	// RegisterInFlightEpoch pins the epoch live at save start so a concurrent
+	// purge cannot remove it mid-save; the deregister runs after encryption.
 	var epoch uint64
 	if p.barrier != nil && !p.barrier.IsSealed() {
-		encryptErr := p.encryptSnapshotFile(dataPath)
+		inFlightEpoch := p.barrier.CurrentEpoch()
+		p.barrier.RegisterInFlightEpoch(inFlightEpoch)
+		// Hold the pin until saveSnapshot returns — past the metadata-file and
+		// LogDB snapshot-record writes below — so a concurrent purge cannot
+		// remove this epoch's DEK in the window before the snapshot's recorded
+		// epoch becomes durable and visible to the snapshot-floor scan.
+		defer p.barrier.DeregisterInFlightEpoch(inFlightEpoch)
+		minEpoch, encryptErr := p.encryptSnapshotFile(dataPath)
 		if encryptErr != nil {
 			return 0, &SnapshotError{
 				ShardID:   req.shardID,
@@ -512,7 +562,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				Err:       encryptErr,
 			}
 		}
-		epoch = p.barrier.CurrentEpoch()
+		epoch = minEpoch
 	}
 
 	// Use the term captured at request creation time. The caller captures
@@ -704,11 +754,25 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		snapshotDir = dir
 	}
 
-	// Decrypt the snapshot data file in-place when the snapshot was
-	// encrypted (non-zero epoch) and a barrier is available.
+	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
+	// is available, decrypt it to a throwaway SIBLING file and recover from
+	// that, leaving the canonical encrypted snapshot.dat untouched. Decrypting
+	// in place is NOT crash/retry-safe: if RecoverFromSnapshot then fails or the
+	// process crashes, snapshot.dat would be plaintext while LogDB still records
+	// Epoch>0, so every later recovery/restart would re-attempt decryption on
+	// plaintext and fail — permanently losing an otherwise-valid snapshot.
 	dataPath := filepath.Join(snapshotDir, snapshotDataFile)
+	recoverPath := dataPath
+
+	// Sweep stale decrypt scratch files left by a crash during a prior
+	// recovery. decryptSnapshotToSibling writes plaintext to a sibling
+	// .decrypt-*.tmp file and removes it via defer once recovery completes,
+	// but a process crash orphans these files. Without this sweep a crash
+	// loop would leak disk in the snapshot directory.
+	sweepStaleDecryptTmp(snapshotDir)
+
 	if logdbSnap.Epoch > 0 && p.barrier != nil && !p.barrier.IsSealed() {
-		decryptErr := p.decryptSnapshotFile(dataPath, logdbSnap.Epoch)
+		plainPath, decryptErr := p.decryptSnapshotToSibling(dataPath, logdbSnap.Epoch)
 		if decryptErr != nil {
 			return &SnapshotError{
 				ShardID:   req.shardID,
@@ -717,11 +781,22 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 				Err:       decryptErr,
 			}
 		}
+		recoverPath = plainPath
+		defer func() {
+			if rmErr := os.Remove(plainPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				slog.Debug("snapshot: failed to remove decrypted scratch file",
+					"shard_id", req.shardID,
+					"replica_id", req.replicaID,
+					"path", plainPath,
+					"error", rmErr,
+				)
+			}
+		}()
 	}
 
-	// Open the snapshot data file. The engine.Snapshotter interface
+	// Open the (plaintext) snapshot data file. The engine.Snapshotter interface
 	// accepts io.Reader, and *os.File satisfies io.Reader.
-	f, err := os.Open(dataPath)
+	f, err := os.Open(recoverPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // snapshot file was cleaned up, skip recovery
@@ -738,7 +813,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 			slog.Debug("snapshot: file close failed during recovery",
 				"shard_id", req.shardID,
 				"replica_id", req.replicaID,
-				"path", dataPath,
+				"path", recoverPath,
 				"error", closeErr,
 			)
 		}
@@ -774,16 +849,25 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 // [ChunkLen:4 | EncryptedChunk]...
 // where each EncryptedChunk includes the barrier's epoch+nonce+tag prefix.
 //
+// It returns the MINIMUM epoch used across all encrypted frames. A key
+// rotation can run concurrently on a different goroutine, so chunks written
+// before the rotation use epoch E while chunks written after use E+1. Each
+// frame embeds its own epoch in its ciphertext header (so decryption is
+// per-frame correct), but the snapshot's single recorded Epoch must be the
+// minimum so the DEK-purge floor (globalSafePurgeFloor) never purges a DEK
+// that any retained frame still needs. The returned epoch is 0 only when the
+// source file is empty (no frames written).
+//
 // Atomic write: output goes to a temporary file in the same directory,
 // synced to disk, then renamed over the original. If any step fails the
 // temp file is removed and the original is preserved intact.
-func (p *snapshotPool) encryptSnapshotFile(path string) error {
+func (p *snapshotPool) encryptSnapshotFile(path string) (uint64, error) {
 	// Open the plaintext file for streaming reads. Only one chunk
 	// (snapshotEncryptChunkSize = 64KB) is held in memory at a time,
 	// avoiding OOM on large snapshot files.
 	srcFile, err := os.Open(path)
 	if err != nil {
-		return &SnapshotEncryptError{Op: "read", Err: err}
+		return 0, &SnapshotEncryptError{Op: "read", Err: err}
 	}
 	defer func() {
 		if closeErr := srcFile.Close(); closeErr != nil {
@@ -797,7 +881,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string) error {
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, ".encrypt-*.tmp")
 	if err != nil {
-		return &SnapshotEncryptError{Op: "create_temp", Err: err}
+		return 0, &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
 	tmpPath := tmpFile.Name()
 	committed := false
@@ -818,65 +902,84 @@ func (p *snapshotPool) encryptSnapshotFile(path string) error {
 		}
 	}()
 
-	// Encrypt in chunks to bound memory usage.
+	// Encrypt in chunks to bound memory usage. Track the minimum epoch used
+	// across all frames: a concurrent rotation can advance the barrier epoch
+	// between chunks, so EncryptWithEpoch returns the epoch each frame was
+	// sealed with and minEpoch records the lowest. The caller persists
+	// minEpoch as the snapshot's Epoch so the DEK-purge floor protects every
+	// frame. minEpoch stays 0 for an empty file (no frames), which the caller
+	// treats as a plaintext/unencrypted snapshot.
 	chunkBuf := make([]byte, snapshotEncryptChunkSize)
 	var frameBuf [4]byte
+	var minEpoch uint64
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
 		if n > 0 {
-			encrypted, encErr := p.barrier.Encrypt(nil, chunkBuf[:n])
+			encrypted, frameEpoch, encErr := p.barrier.EncryptWithEpoch(nil, chunkBuf[:n])
 			if encErr != nil {
-				return &SnapshotEncryptError{Op: "encrypt", Err: encErr}
+				return 0, &SnapshotEncryptError{Op: "encrypt", Err: encErr}
+			}
+			if minEpoch == 0 || frameEpoch < minEpoch {
+				minEpoch = frameEpoch
 			}
 
 			// Write frame: 4-byte little-endian length + encrypted data.
 			binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(encrypted)))
 			if _, err := tmpFile.Write(frameBuf[:]); err != nil {
-				return &SnapshotEncryptError{Op: "write_frame", Err: err}
+				return 0, &SnapshotEncryptError{Op: "write_frame", Err: err}
 			}
 			if _, err := tmpFile.Write(encrypted); err != nil {
-				return &SnapshotEncryptError{Op: "write_data", Err: err}
+				return 0, &SnapshotEncryptError{Op: "write_data", Err: err}
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return &SnapshotEncryptError{Op: "read", Err: readErr}
+			return 0, &SnapshotEncryptError{Op: "read", Err: readErr}
 		}
 	}
 
 	// Fsync before rename to guarantee durability.
 	if err := tmpFile.Sync(); err != nil {
-		return &SnapshotEncryptError{Op: "sync", Err: err}
+		return 0, &SnapshotEncryptError{Op: "sync", Err: err}
 	}
 	if err := tmpFile.Close(); err != nil {
-		return &SnapshotEncryptError{Op: "close", Err: err}
+		return 0, &SnapshotEncryptError{Op: "close", Err: err}
 	}
 
 	// Atomic rename replaces the original file. Both paths are internal
 	// (tmpPath from os.CreateTemp, path from snapshot metadata) — not
 	// user-controlled, so path traversal is not a concern.
 	if err := os.Rename(tmpPath, path); err != nil { // #nosec G703 -- paths are internal, not user input
-		return &SnapshotEncryptError{Op: "rename", Err: err}
+		return 0, &SnapshotEncryptError{Op: "rename", Err: err}
 	}
 	committed = true
-	return nil
+	return minEpoch, nil
 }
 
-// decryptSnapshotFile reads the encrypted snapshot data file, decrypts
-// each chunk using the barrier for the given epoch, and atomically
-// replaces the file with the plaintext output for recovery.
+// decryptSnapshotToSibling reads the encrypted snapshot data file and writes
+// its decrypted plaintext to a NEW sibling temp file in the same directory,
+// returning that temp file's path. It does NOT modify or replace the source
+// file: the canonical encrypted snapshot.dat is left intact.
 //
-// Atomic write: output goes to a temporary file in the same directory,
-// synced to disk, then renamed over the original. If any step fails the
-// temp file is removed and the encrypted original is preserved intact.
-func (p *snapshotPool) decryptSnapshotFile(path string, epoch uint64) error {
-	// Open the encrypted file for streaming reads. Only one frame at a
-	// time is held in memory, avoiding OOM on large snapshot files.
+// This is deliberately not an in-place transform. Decrypting in place (rename
+// plaintext over snapshot.dat) is not crash/retry-safe: a recovery failure or
+// a crash after the rename would leave plaintext on disk while LogDB still
+// records Epoch>0, so any subsequent recovery/restart would re-attempt
+// decryption on plaintext and fail permanently, losing an otherwise-valid
+// snapshot. The caller is responsible for removing the returned temp file once
+// recovery is done. Only one frame is held in memory at a time, so this is
+// safe for large snapshots.
+//
+// The epoch parameter is advisory: each frame is decrypted with the epoch
+// embedded in its own ciphertext header (via barrier.Decrypt), not with this
+// value. It is retained only for log context. The caller uses the recorded
+// epoch solely to decide whether decryption is needed at all (Epoch>0).
+func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64) (string, error) {
 	srcFile, err := os.Open(path)
 	if err != nil {
-		return &SnapshotEncryptError{Op: "read", Err: err}
+		return "", &SnapshotEncryptError{Op: "read", Err: err}
 	}
 	defer func() {
 		if closeErr := srcFile.Close(); closeErr != nil {
@@ -888,19 +991,10 @@ func (p *snapshotPool) decryptSnapshotFile(path string, epoch uint64) error {
 		}
 	}()
 
-	// If the file is empty, nothing to decrypt.
-	info, err := srcFile.Stat()
-	if err != nil {
-		return &SnapshotEncryptError{Op: "read", Err: err}
-	}
-	if info.Size() == 0 {
-		return nil
-	}
-
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, ".decrypt-*.tmp")
 	if err != nil {
-		return &SnapshotEncryptError{Op: "create_temp", Err: err}
+		return "", &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
 	tmpPath := tmpFile.Name()
 	committed := false
@@ -923,107 +1017,155 @@ func (p *snapshotPool) decryptSnapshotFile(path string, epoch uint64) error {
 		}
 	}()
 
-	// Read and decrypt each frame. Frame format: [4-byte LE length][data].
+	// Read and decrypt each frame. Frame format: [4-byte LE length][data]. An
+	// empty source yields an immediate EOF and an empty plaintext temp file,
+	// which RecoverFromSnapshot treats as a no-op — matching the prior behavior.
 	var frameLenBuf [4]byte
 	for {
-		// Read the 4-byte frame length header.
 		_, readErr := io.ReadFull(srcFile, frameLenBuf[:])
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
+			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
 		}
 		frameLen := binary.LittleEndian.Uint32(frameLenBuf[:])
-
-		// Read the encrypted frame data.
-		frame := make([]byte, frameLen)
-		if _, readErr = io.ReadFull(srcFile, frame); readErr != nil {
-			return &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
+		// A frame is exactly one encrypted plaintext chunk
+		// (snapshotEncryptChunkSize) plus AEAD framing overhead (epoch + algID
+		// + nonce + tag, < 256 bytes). Reject a corrupt/oversized length prefix
+		// before allocating, so a damaged frame header cannot trigger a
+		// multi-GB allocation during recovery.
+		if frameLen > snapshotEncryptChunkSize+maxSnapshotFrameOverhead {
+			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
 		}
 
-		plaintext, decErr := p.barrier.DecryptForEpoch(nil, frame, epoch)
+		frame := make([]byte, frameLen)
+		if _, readErr = io.ReadFull(srcFile, frame); readErr != nil {
+			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
+		}
+
+		// Decrypt using the epoch embedded in each frame's ciphertext header
+		// rather than the single recorded snapshot epoch. A snapshot saved
+		// concurrently with a key rotation can contain frames at different
+		// epochs (earlier chunks at E, later chunks at E+1); recording one
+		// epoch and decrypting every frame with it would fail AEAD on the
+		// mismatched frames. barrier.Decrypt reads the embedded epoch and
+		// selects the correct DEK, matching the WAL replay path. The recorded
+		// epoch parameter is advisory only (it gates whether decryption is
+		// attempted at all, and pins the DEK-purge floor at the minimum frame
+		// epoch so no frame's DEK is purged while the snapshot is retained).
+		plaintext, decErr := p.barrier.Decrypt(nil, frame)
 		if decErr != nil {
-			return &SnapshotEncryptError{Op: "decrypt", Err: decErr}
+			return "", &SnapshotEncryptError{Op: "decrypt", Err: decErr}
 		}
 
 		if _, err := tmpFile.Write(plaintext); err != nil {
-			return &SnapshotEncryptError{Op: "write", Err: err}
+			return "", &SnapshotEncryptError{Op: "write", Err: err}
 		}
 	}
 
-	// Fsync before rename to guarantee durability.
 	if err := tmpFile.Sync(); err != nil {
-		return &SnapshotEncryptError{Op: "sync", Err: err}
+		return "", &SnapshotEncryptError{Op: "sync", Err: err}
 	}
 	if err := tmpFile.Close(); err != nil {
-		return &SnapshotEncryptError{Op: "close", Err: err}
+		return "", &SnapshotEncryptError{Op: "close", Err: err}
 	}
-
-	// Atomic rename replaces the original file. Both paths are internal
-	// (tmpPath from os.CreateTemp, path from snapshot metadata) — not
-	// user-controlled, so path traversal is not a concern.
-	if err := os.Rename(tmpPath, path); err != nil { // #nosec G703 -- paths are internal, not user input
-		return &SnapshotEncryptError{Op: "rename", Err: err}
-	}
-	committed = true
-	return nil
+	committed = true // ownership of tmpPath passes to the caller
+	return tmpPath, nil
 }
 
-// purgeOldEpochs scans remaining snapshots and live WAL records for the
-// oldest epoch still in use and purges barrier DEKs for older epochs.
-// This is called after log compaction and snapshot garbage collection to
-// reclaim old key material. The barrier must be non-nil and unsealed.
+// globalSafePurgeFloor computes the minimum barrier epoch still required by
+// ANY shard sharing this process-wide barrier. It is the single source of
+// truth for safe DEK purging and is the minimum over:
 //
-// The purge floor is min(snapshotMinEpoch, walMinEpoch). This prevents
-// premature DEK purging when WAL segments still contain records encrypted
-// at an older epoch than the oldest retained snapshot. Without this
-// check, a crash after purge would fail WAL replay with WALDecryptError.
-func (p *snapshotPool) purgeOldEpochs(snapshotDir string, shardID, replicaID uint64) {
+//	(a) every loaded shard's retained encrypted-snapshot epoch, and
+//	(b) the global WAL MinLiveEpoch (the LogDB is per-host, so MinLiveEpoch
+//	    already spans all shards).
+//
+// The second return value is false when the floor cannot be safely
+// determined: any snapshot-dir scan error, a MinLiveEpoch error, or when
+// nothing encrypted is retained. Callers MUST NOT purge when ok is false.
+// This is the fail-safe contract: when in doubt, purge nothing.
+//
+// The barrier (one per host) is shared by all shards, so a per-shard floor
+// is unsafe — shard A could purge a DEK that shard B's retained snapshot
+// still needs. Globalizing over all loaded nodes' snapshot dirs and the
+// already-global WAL floor closes that data-loss hole.
+func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
+	// Scan every loaded shard's snapshot directories for the global minimum
+	// retained encrypted-snapshot epoch. A nil enumerator (standalone tests)
+	// means no global view is available and purging must not proceed.
+	if p.nodes == nil {
+		return 0, false
+	}
+
+	var snapshotMinEpoch uint64
+	for _, node := range p.nodes() {
+		dirs, err := listSnapshotDirs(node.SnapshotDir(), node.ShardID(), node.ReplicaID())
+		if err != nil {
+			// Fail safe: a scan error means we cannot know which epochs are
+			// still referenced, so we must not purge anything.
+			return 0, false
+		}
+		for _, d := range dirs {
+			epoch := readSnapshotEpoch(d.path)
+			if epoch == 0 {
+				continue // unencrypted snapshot, contributes no floor
+			}
+			if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
+				snapshotMinEpoch = epoch
+			}
+		}
+	}
+
+	// Determine the global WAL floor. The LogDB is per-host, so MinLiveEpoch
+	// already spans all shards (verified: waldb.DB.MinLiveEpoch ranges all
+	// shards). A query error is fail-safe: skip purge entirely.
+	var walMinEpoch uint64
+	if epochDB, ok := p.logdb.(logdb.EpochAwareLogDB); ok {
+		var walErr error
+		walMinEpoch, walErr = epochDB.MinLiveEpoch()
+		if walErr != nil {
+			slog.Warn("epoch purge skipped: WAL epoch query failed",
+				"error", walErr,
+			)
+			return 0, false
+		}
+	}
+
+	// Combine the two floors. Either may be zero (no encrypted snapshots, or
+	// no encrypted WAL records). The global floor is the minimum of the
+	// non-zero values; if both are zero nothing encrypted is retained.
+	floor := snapshotMinEpoch
+	if walMinEpoch > 0 && (floor == 0 || walMinEpoch < floor) {
+		floor = walMinEpoch
+	}
+	if floor == 0 {
+		return 0, false // nothing encrypted retained, nothing to purge
+	}
+	return floor, true
+}
+
+// purgeOldEpochs purges barrier DEKs for epochs strictly below the GLOBAL
+// safe-purge floor — the minimum epoch still needed by ANY shard's retained
+// encrypted snapshot or any live WAL record. This is called after log
+// compaction and snapshot garbage collection to reclaim old key material.
+//
+// The barrier is shared across all shards in the host, so the floor MUST be
+// global. Computing the floor from only the calling shard's snapshots would
+// let one shard purge a DEK another shard's retained snapshot still needs,
+// permanently bricking that encrypted snapshot. The barrier's in-flight
+// epoch protection inside PurgeEpochsBefore remains as the last line of
+// defense. The shardID/replicaID parameters are retained only for log
+// context; the scan itself is global.
+func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
 	if p.barrier == nil || p.barrier.IsSealed() {
 		return
 	}
 
-	dirs, err := listSnapshotDirs(snapshotDir, shardID, replicaID)
-	if err != nil || len(dirs) == 0 {
-		return
-	}
-
-	// Find the minimum epoch across retained snapshots by reading metadata.
-	var snapshotMinEpoch uint64
-	for _, d := range dirs {
-		epoch := readSnapshotEpoch(d.path)
-		if epoch == 0 {
-			continue // unencrypted snapshot, skip
-		}
-		if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
-			snapshotMinEpoch = epoch
-		}
-	}
-
-	if snapshotMinEpoch == 0 {
-		return // all plaintext snapshots, nothing to purge
-	}
-
-	// Query the WAL/LogDB for the minimum epoch across all live records.
-	// If the LogDB supports epoch awareness, use the WAL's minimum epoch
-	// as an additional floor to prevent purging DEKs still needed for
-	// WAL recovery.
-	purgeFloor := snapshotMinEpoch
-	if epochDB, ok := p.logdb.(logdb.EpochAwareLogDB); ok {
-		walMinEpoch, walErr := epochDB.MinLiveEpoch()
-		if walErr != nil {
-			// When the WAL epoch query fails, skip purge entirely to
-			// avoid data loss. The DEKs remain in memory until the next
-			// successful purge cycle.
-			slog.Warn("epoch purge skipped: WAL epoch query failed",
-				"error", walErr,
-			)
-			return
-		}
-		if walMinEpoch > 0 && walMinEpoch < purgeFloor {
-			purgeFloor = walMinEpoch
-		}
+	purgeFloor, ok := p.globalSafePurgeFloor()
+	if !ok {
+		return // fail safe: floor unknown or nothing encrypted retained
 	}
 
 	// Only purge if the floor is above epoch 1 (epoch 1 is the initial
@@ -1032,15 +1174,59 @@ func (p *snapshotPool) purgeOldEpochs(snapshotDir string, shardID, replicaID uin
 		purged, purgeErr := p.barrier.PurgeEpochsBefore(purgeFloor)
 		if purgeErr != nil {
 			slog.Warn("epoch purge failed",
+				"shard_id", shardID,
+				"replica_id", replicaID,
 				"purge_floor", purgeFloor,
-				"snapshot_min_epoch", snapshotMinEpoch,
 				"error", purgeErr,
 			)
 		} else if purged > 0 {
 			slog.Info("snapshot epoch purge completed",
+				"shard_id", shardID,
+				"replica_id", replicaID,
 				"purged", purged,
 				"purge_floor", purgeFloor,
-				"snapshot_min_epoch", snapshotMinEpoch,
+			)
+		}
+	}
+}
+
+// sweepStaleDecryptTmp removes orphaned decrypt scratch files from the
+// given snapshot directory. These files are created by
+// decryptSnapshotToSibling with the os.CreateTemp pattern ".decrypt-*.tmp"
+// and are normally removed via defer after recovery completes, but a
+// process crash mid-recovery orphans them. This sweep, run at recovery
+// start, prevents crash loops from leaking disk.
+//
+// The sweep is strictly scoped to the snapshot directory and only matches
+// the ".decrypt-*.tmp" pattern, so it never touches the canonical
+// snapshot.dat / snapshot.meta files or any unrelated content. Errors are
+// logged and ignored: a failed cleanup must not abort recovery.
+func sweepStaleDecryptTmp(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Debug("snapshot: stale decrypt tmp sweep: read dir failed",
+				"dir", dir,
+				"error", err,
+			)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Match the os.CreateTemp(".decrypt-*.tmp") naming: a ".decrypt-"
+		// prefix and a ".tmp" suffix.
+		if !strings.HasPrefix(name, ".decrypt-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		stalePath := filepath.Join(dir, name)
+		if rmErr := os.Remove(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Debug("snapshot: stale decrypt tmp sweep: remove failed",
+				"path", stalePath,
+				"error", rmErr,
 			)
 		}
 	}

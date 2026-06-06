@@ -16,6 +16,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -159,6 +160,12 @@ type Aggregator struct {
 	closeChan chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+	// flushDone is closed when flushLoop returns. A Submit blocked on the
+	// close path uses it as a terminator: once the loop has exited, any
+	// proposal not already flushed will never be flushed, so Submit must not
+	// wait on resultCh forever (a caller with a non-cancellable context would
+	// otherwise hang).
+	flushDone chan struct{}
 
 	// Metrics.
 	metrics     *aggregatorMetrics
@@ -181,6 +188,7 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 		logger:    slog.Default(),
 		registry:  prometheus.DefaultRegisterer,
 		closeChan: make(chan struct{}),
+		flushDone: make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -231,13 +239,32 @@ func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) er
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-a.closeChan:
-		return &ClosedError{}
+		// Close raced with this submission. If the proposal was enqueued
+		// before flushLoop's close branch drained the queue, that branch
+		// flushes it and sends the real result on resultCh — returning a
+		// spurious ClosedError would wrongly tell the caller the write
+		// failed while the command is in fact replicated, so we prefer the
+		// genuine result. But the enqueue may also have landed in the
+		// buffered queue AFTER flushLoop already drained and exited, in
+		// which case no result will ever arrive; flushDone bounds the wait
+		// so a caller with a non-cancellable context cannot hang. On
+		// flushDone we make one final non-blocking check (the result may
+		// have been delivered just before the loop returned) and otherwise
+		// report closed.
+		select {
+		case err := <-p.resultCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-a.flushDone:
+			select {
+			case err := <-p.resultCh:
+				return err
+			default:
+				return &ClosedError{}
+			}
+		}
 	}
-}
-
-// QueueLen returns the number of proposals waiting in the queue channel.
-func (a *Aggregator) QueueLen() int {
-	return len(a.queue)
 }
 
 // BatchLen returns the number of proposals in the current unflushed batch.
@@ -265,6 +292,8 @@ func (a *Aggregator) Close() error {
 // timer expiry.
 func (a *Aggregator) flushLoop() {
 	defer a.wg.Done()
+	// Signal Submit's close-path waiters that no further flushing will occur.
+	defer close(a.flushDone)
 
 	timer := time.NewTimer(a.cfg.FlushInterval)
 	defer timer.Stop()
@@ -459,24 +488,42 @@ func (a *Aggregator) initMetrics() {
 		}
 
 		// Register metrics, tolerating AlreadyRegisteredError for
-		// multi-aggregator or test scenarios.
-		collectors := []prometheus.Collector{
-			m.batchesTotal,
-			m.batchSize,
-			m.flushDuration,
-			m.queueDepth,
-			m.flushReasonTotal,
-		}
-		for _, c := range collectors {
-			if err := a.registry.Register(c); err != nil {
-				// If already registered, this is expected in test or
-				// multi-aggregator scenarios. Log at debug level only.
-				a.logger.Debug("metric already registered",
-					slog.String("error", err.Error()),
-				)
-			}
-		}
+		// multi-aggregator or test scenarios. On conflict we adopt the
+		// ALREADY-REGISTERED collector instead of keeping our fresh,
+		// unregistered one — otherwise increments/observations would go to a
+		// collector that is never scraped and the batch metrics would silently
+		// vanish.
+		m.batchesTotal = registerOrExisting(a.registry, m.batchesTotal, a.logger)
+		m.batchSize = registerOrExisting(a.registry, m.batchSize, a.logger)
+		m.flushDuration = registerOrExisting(a.registry, m.flushDuration, a.logger)
+		m.queueDepth = registerOrExisting(a.registry, m.queueDepth, a.logger)
+		m.flushReasonTotal = registerOrExisting(a.registry, m.flushReasonTotal, a.logger)
 
 		a.metrics = m
 	})
+}
+
+// registerOrExisting registers c with reg. If an equivalent collector is
+// already registered, it returns that existing collector (so metric updates
+// target the scraped instance); otherwise it returns c. Other registration
+// errors are logged and c is returned unchanged.
+func registerOrExisting[T prometheus.Collector](reg prometheus.Registerer, c T, logger *slog.Logger) T {
+	if err := reg.Register(c); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(T); ok {
+				return existing
+			}
+			// A collector is already registered under this name but is a
+			// different concrete type than T — a genuine name/type collision.
+			// Returning the fresh collector below means its updates are never
+			// scraped, so log it loudly rather than letting it fall through as
+			// a generic "registration issue".
+			logger.Warn("metric name/type collision: existing collector has a different type, updates will not be scraped",
+				slog.String("error", err.Error()))
+			return c
+		}
+		logger.Debug("metric registration issue", slog.String("error", err.Error()))
+	}
+	return c
 }

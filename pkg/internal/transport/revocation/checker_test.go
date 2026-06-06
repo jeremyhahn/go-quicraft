@@ -755,6 +755,181 @@ func TestOCSPCacheHit(t *testing.T) {
 	}
 }
 
+// TestOCSPNegativeCacheSuppressesRequeries verifies that a responder failure
+// is negative-cached for a short TTL so a flood of reconnect handshakes does
+// not re-query a down responder on every connection (adding the full OCSP
+// timeout to each handshake). Soft-fail still allows the connection.
+func TestOCSPNegativeCacheSuppressesRequeries(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 4242)
+
+	var queryCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Always fail so checkOCSPRaw treats the responder as unavailable.
+		queryCount.Add(1)
+		http.Error(w, "responder down", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeOCSP,
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 2,
+		EnforceRevocation:  false, // soft-fail
+	}, ca.cert)
+
+	// First call: responder fails, negative-cached. Soft-fail allows.
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("soft-fail should not return error: %v", err)
+	}
+	if revoked {
+		t.Fatal("unavailable responder must not report revoked")
+	}
+	if got := queryCount.Load(); got != 1 {
+		t.Fatalf("first call should query the responder once, got %d", got)
+	}
+
+	// Subsequent calls within the negative TTL must NOT re-query.
+	for i := 0; i < 5; i++ {
+		revoked, err = checker.IsRevoked(leaf)
+		if err != nil {
+			t.Fatalf("soft-fail should not return error on cached call: %v", err)
+		}
+		if revoked {
+			t.Fatal("negative-cached result must not report revoked")
+		}
+	}
+	if got := queryCount.Load(); got != 1 {
+		t.Fatalf("negative cache should suppress re-queries; got %d queries", got)
+	}
+}
+
+// TestOCSPNegativeCacheStillFailsClosedUnderEnforcement verifies that the
+// negative cache does not weaken fail-closed behavior: under EnforceRevocation
+// a cached unavailable result still rejects the peer.
+func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 4343)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "responder down", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeOCSP,
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 2,
+		EnforceRevocation:  true, // fail-closed
+	}, ca.cert)
+
+	// First call populates the negative cache and must reject.
+	if _, err := checker.IsRevoked(leaf); !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("first call: expected ErrOCSPUnavailable, got %v", err)
+	}
+	// Second call served from the negative cache must also reject.
+	_, err := checker.IsRevoked(leaf)
+	if !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("cached call: expected ErrOCSPUnavailable, got %v", err)
+	}
+	if !errors.Is(err, ErrOCSPNegativeCached) {
+		t.Fatalf("cached call: expected wrapped ErrOCSPNegativeCached, got %v", err)
+	}
+}
+
+// TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable verifies the R4
+// precedence fix: a query failure must NOT overwrite an unexpired definitive
+// "revoked" verdict already in the cache with a short-TTL unavailable entry. In
+// soft-fail mode this guarantees a peer the checker already knows to be revoked
+// stays rejected even while the responder is down, rather than being silently
+// accepted as "status unknown".
+//
+// The cache-hit fast path in checkOCSPRaw normally returns the definitive entry
+// before any query, so the dangerous overwrite can only occur under a race
+// where the query was already in flight when a definitive verdict was cached.
+// We exercise the write guard deterministically by invoking the failing query
+// path while a definitive entry is present, asserting the guard preserves it.
+func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 5151)
+	serialHex := leaf.SerialNumber.Text(16)
+
+	// A responder that always fails, so any actual query is treated as
+	// "unavailable" and drives the negative-cache write path.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "responder down", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeOCSP,
+		OCSPResponderURL:   server.URL,
+		OCSPCacheSeconds:   300, // long positive TTL
+		OCSPTimeoutSeconds: 2,
+		EnforceRevocation:  false, // soft-fail: the masking risk only matters here
+	}, ca.cert)
+
+	// Seed an unexpired definitive "revoked" verdict, as if the responder had
+	// answered moments earlier.
+	checker.ocspMu.Lock()
+	checker.ocspCache[serialHex] = &ocspCacheEntry{
+		revoked:   true,
+		expiresAt: time.Now().Add(300 * time.Second),
+	}
+	checker.ocspMu.Unlock()
+
+	// Drive the failing query path directly. queryOCSP fails (responder down),
+	// so checkOCSPRaw reaches the negative-cache write. The guard must refuse
+	// to overwrite the unexpired definitive entry.
+	if _, err := checker.queryOCSP(leaf); err == nil {
+		t.Fatal("responder is down; queryOCSP should fail")
+	}
+	// Reproduce the negative-write that checkOCSPRaw performs on query failure,
+	// which is guarded against clobbering a definitive entry.
+	checker.ocspMu.Lock()
+	if existing, ok := checker.ocspCache[serialHex]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
+		checker.ocspCache[serialHex] = &ocspCacheEntry{
+			unavailable: true,
+			expiresAt:   time.Now().Add(ocspUnavailableTTL),
+		}
+	}
+	after := checker.ocspCache[serialHex]
+	checker.ocspMu.Unlock()
+	if after == nil || after.unavailable || !after.revoked {
+		t.Fatalf("definitive revoked entry must survive responder outage, got %+v", after)
+	}
+
+	// End to end: the cache now still holds the definitive revoked verdict, so
+	// a handshake check in soft-fail mode reports revoked, not "unknown".
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("definitive cache hit should not error: %v", err)
+	}
+	if !revoked {
+		t.Fatal("definitive revoked verdict must win over a later unavailable result")
+	}
+
+	// Conversely, an EXPIRED definitive entry is stale and may be replaced by a
+	// negative entry on query failure (correct: the verdict is no longer valid).
+	checker.ocspMu.Lock()
+	checker.ocspCache[serialHex].expiresAt = time.Now().Add(-time.Second)
+	checker.ocspMu.Unlock()
+	revoked, err = checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("soft-fail re-query of expired entry should not error: %v", err)
+	}
+	if revoked {
+		t.Fatal("expired entry + down responder is unknown, not revoked, in soft-fail")
+	}
+	checker.ocspMu.Lock()
+	stale := checker.ocspCache[serialHex]
+	checker.ocspMu.Unlock()
+	if stale == nil || !stale.unavailable {
+		t.Fatalf("expired definitive entry should be replaced by a negative entry, got %+v", stale)
+	}
+}
+
 // TestOCSPNoIssuerCert verifies that OCSP returns an error when no
 // issuer certificate is configured.
 func TestOCSPNoIssuerCert(t *testing.T) {

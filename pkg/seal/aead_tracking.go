@@ -34,9 +34,10 @@ const (
 	DefaultRotationThreshold float64 = 95.0
 
 	// NonceSize is the standard AEAD nonce size in bytes (96-bit for
-	// AES-GCM and ChaCha20-Poly1305). The full nonce is used as the
-	// sync.Map key ([12]byte) to eliminate false positives from hash
-	// truncation.
+	// AES-GCM and ChaCha20-Poly1305). XChaCha20-Poly1305 uses a 192-bit
+	// (24-byte) nonce. The full nonce — of whatever length — is used as the
+	// sync.Map key (a string) so that nonces of any length are tracked
+	// exactly, with no truncation and therefore no false positives.
 	NonceSize = 12
 )
 
@@ -218,9 +219,11 @@ func (ic *InMemoryInvocationCounter) Close() error {
 // key, enabling arbitrary message forgery. For ChaCha20-Poly1305, reuse leaks
 // keystream and compromises confidentiality.
 //
-// Nonces are stored as full [12]byte array keys in a sync.Map for lock-free
-// reads and zero false positives. Using the full nonce eliminates the ~2^32
-// collision window that existed with truncated SHA-256 fingerprints.
+// Nonces are stored as full-length string keys in a sync.Map for lock-free
+// reads and zero false positives. Using the entire nonce — regardless of its
+// length — eliminates the ~2^32 collision window that existed with truncated
+// SHA-256 fingerprints and the truncation collisions that a fixed [12]byte key
+// would cause for 24-byte XChaCha20-Poly1305 nonces sharing a 12-byte prefix.
 // An atomic counter provides O(1) Count(). Memory grows linearly with the number
 // of encryption operations; plan for key rotation to bound memory usage.
 //
@@ -246,14 +249,13 @@ func NewNonceTracker(enabled bool) *InMemoryNonceTracker {
 	return nt
 }
 
-// nonceKey converts a nonce byte slice to a [12]byte array key for use in
-// sync.Map. Using the full nonce eliminates false positives from hash
-// truncation. Nonces shorter than 12 bytes are zero-padded; nonces longer
-// than 12 bytes are truncated to the standard AEAD nonce size.
-func nonceKey(nonce []byte) [12]byte {
-	var key [12]byte
-	copy(key[:], nonce)
-	return key
+// nonceKey converts a nonce byte slice to a string key for use in sync.Map.
+// The full nonce of any length is used verbatim, so 12-byte (AES-GCM,
+// ChaCha20-Poly1305) and 24-byte (XChaCha20-Poly1305) nonces are tracked
+// exactly. There is no truncation, so two distinct nonces that share a 12-byte
+// prefix never collide and a unique nonce is never falsely rejected as reuse.
+func nonceKey(nonce []byte) string {
+	return string(nonce)
 }
 
 // CheckAndRecordNonce checks whether nonce has been seen before and, if unique,

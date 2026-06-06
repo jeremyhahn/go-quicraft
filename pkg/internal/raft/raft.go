@@ -518,10 +518,19 @@ func (r *raft) step(msg proto.Message) error {
 		} else if msg.Term < r.term {
 			// Stale message from an older term.
 			if msg.Type == proto.Heartbeat || msg.Type == proto.Replicate || msg.Type == proto.InstallSnapshot {
-				// Send a response so the sender learns the new term.
+				// Send a corrective response so the stale sender learns the
+				// newer term (send() fills Term = r.term). Mark it Reject:true:
+				// this node did NOT accept the message, so a non-rejected
+				// ReplicateResp would be a false success in handleAppendResp.
+				// Carry the committed index as the hint. The sender steps down
+				// on the higher term before acting on the reject, so this is
+				// purely defensive, but it keeps the response semantically
+				// honest. (dragonboat behaves the same way.)
 				r.send(proto.Message{
-					Type: proto.ReplicateResp,
-					To:   msg.From,
+					Type:     proto.ReplicateResp,
+					To:       msg.From,
+					Reject:   true,
+					LogIndex: r.log.committed,
 				})
 			}
 			if msg.Type == proto.RequestVote || msg.Type == proto.RequestPreVote {
@@ -946,16 +955,26 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		canVote = logOK && (r.vote == noNode || r.vote == msg.From)
 	}
 
-	// PreVote responses must echo the requested term (msg.Term), not the
-	// responder's current term. Without this, a pre-candidate at term T
-	// receiving a PreVoteResp from a follower at term T-1 would see
-	// msg.Term < r.term and drop it as stale in step(). This causes
-	// election liveness failures after leader failover. For real votes,
-	// Term=0 lets send() fill in r.term (which matches msg.Term since
-	// becomeFollower updated it).
+	// PreVote response term depends on the outcome:
+	//   - GRANT: echo the requested (prospective) term msg.Term so the
+	//     pre-candidate counts the grant at the term it is campaigning for.
+	//     This also fixes the failover case where a follower at term T-1
+	//     would otherwise reply with a term < the pre-candidate's and have
+	//     its grant dropped as stale in step().
+	//   - REJECT: use the responder's OWN current term r.term. Echoing the
+	//     prospective term on a rejection is unsafe: step() treats a rejected
+	//     RequestPreVoteResp with msg.Term > r.term as term-advancing, so the
+	//     pre-candidate would becomeFollower(T+1) and then, via its stale-term
+	//     reply to the real leader's heartbeat, force the legitimate leader to
+	//     step down — exactly the disruption PreVote exists to prevent.
+	// For real votes, Term=0 lets send() fill in r.term.
 	respTerm := uint64(0)
 	if isPreVote {
-		respTerm = msg.Term
+		if canVote {
+			respTerm = msg.Term
+		} else {
+			respTerm = r.term
+		}
 	}
 
 	if canVote {
@@ -1371,7 +1390,13 @@ func (r *raft) sendSnapshot(to uint64) {
 
 	ss := r.log.snapshot()
 	if ss == nil {
-		// No snapshot available; nothing we can do.
+		// The follower needs entries that have been compacted away, but no
+		// snapshot exists yet to bring it forward. It cannot make progress
+		// until one is created. Surface this rather than stalling silently.
+		slog.Warn("cannot send snapshot to lagging follower: no snapshot available",
+			"shard", r.shardID,
+			"to", to,
+		)
 		return
 	}
 

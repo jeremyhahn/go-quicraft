@@ -46,12 +46,23 @@ func newCompactor(fs FS, dir string, blockSize int) *compactor {
 // GarbageCollect removes segment files that are no longer referenced by
 // any node index. It compares the set of segment files on disk against
 // the set of segment IDs still referenced in the provided liveSegments
-// map. Any segment file not present in liveSegments and with an ID
-// strictly less than maxLiveID is deleted.
+// map. A segment file is deleted only when all of the following hold:
 //
-// maxLiveID prevents deletion of the active (currently being written to)
-// segment which may not yet appear in any index.
-func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID uint64) (int, error) {
+//   - its ID is strictly less than maxLiveID (the active segment, which may
+//     not yet appear in any index, is never deleted);
+//   - its ID is less than or equal to maxCommittedID (the commit high-water
+//     mark); and
+//   - it is not present in liveSegments.
+//
+// The maxCommittedID guard closes a cross-goroutine window. SaveState writes
+// a record durably in its Phase 1 (possibly rotating to a new segment) but
+// updates the in-memory index and meta pins only in its Phase 3, releasing
+// shard.mu in between. A concurrent same-shard Compact running in that window
+// would not see the just-written segment in liveSegments and could delete it.
+// Because maxCommittedID is advanced only at the Phase-3 commit point (and at
+// the writeBootstrap commit), any durably-written-but-not-yet-indexed segment
+// has an ID greater than maxCommittedID and is therefore preserved.
+func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID, maxCommittedID uint64) (int, error) {
 	dirEntries, err := c.fs.ReadDir(c.dir)
 	if err != nil {
 		return 0, &CompactionReadDirError{Dir: c.dir, Err: err}
@@ -71,6 +82,13 @@ func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID uint6
 
 		// Never delete the active segment or any segment >= maxLiveID.
 		if segID >= maxLiveID {
+			continue
+		}
+
+		// Never delete a segment that has not yet committed its in-memory
+		// index/pins. Such a segment is durably written but invisible to
+		// liveSegments, so deleting it would lose its records on recovery.
+		if segID > maxCommittedID {
 			continue
 		}
 

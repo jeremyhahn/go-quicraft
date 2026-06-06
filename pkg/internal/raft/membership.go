@@ -219,6 +219,11 @@ func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	if m.isWitness(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
+	// NOTE: The voting-member cap is enforced ONLY at propose/validate time
+	// (validateAddNode). It must NOT be re-checked here: apply() runs on
+	// already-committed config-change entries (replication, post-truncation
+	// rebuildMembershipFromLog), and rejecting a committed change would make
+	// replicas diverge from the agreed membership — a Raft safety violation.
 	// Promote from observer if applicable.
 	if m.isObserver(cc.ReplicaID) {
 		delete(m.observers, cc.ReplicaID)
@@ -290,6 +295,9 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	if m.isMember(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
+	// The voting-member cap (witnesses count toward it) is enforced ONLY at
+	// propose/validate time (validateAddWitness). Re-checking here would let a
+	// replica reject an already-committed change and diverge — see handleAddNode.
 	if m.witnesses == nil {
 		m.witnesses = make(map[uint64]string)
 	}
@@ -311,6 +319,9 @@ func validateAddNode(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.isWitness(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
+	}
+	if m.numVotingMembers() >= maxVotingMembers {
+		return ErrTooManyVotingMembers
 	}
 	// Observer promotion is allowed, so no error for isObserver.
 	return nil
@@ -358,6 +369,9 @@ func validateAddWitness(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.isMember(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
+	}
+	if m.numVotingMembers() >= maxVotingMembers {
+		return ErrTooManyVotingMembers
 	}
 	return nil
 }

@@ -1477,8 +1477,10 @@ func TestReceiveChunksSetReadDeadlineError(t *testing.T) {
 	}
 }
 
-// TestReceiveChunksReadFrameHeaderEOF verifies the EOF break path
-// when the stream ends before all chunks are read.
+// TestReceiveChunksReadFrameHeaderEOF verifies the EOF break path when the
+// stream ends before all chunks are read. An early EOF is a TRUNCATED transfer:
+// the snapshot must NOT be committed, because persisting a partial snapshot as
+// the latest snapshot would let recovery load it as if whole (data corruption).
 func TestReceiveChunksReadFrameHeaderEOF(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)
@@ -1495,13 +1497,10 @@ func TestReceiveChunksReadFrameHeaderEOF(t *testing.T) {
 
 	sr.receiveChunks(reader, hdr, stopC)
 
-	// Should have received the 1 available chunk.
+	// The truncated transfer must be discarded: no snapshot committed.
 	snaps := handler.getSnapshots()
-	if len(snaps) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(snaps))
-	}
-	if len(snaps[0]) != 1 {
-		t.Fatalf("expected 1 chunk, got %d", len(snaps[0]))
+	if len(snaps) != 0 {
+		t.Fatalf("expected 0 snapshots for truncated transfer, got %d", len(snaps))
 	}
 }
 
@@ -1527,8 +1526,11 @@ func TestReceiveChunksReadFrameHeaderNonEOFError(t *testing.T) {
 	}
 }
 
-// TestReceiveChunksZeroLengthChunk verifies the zero-length chunk
-// continue path.
+// TestReceiveChunksZeroLengthChunk verifies the zero-length chunk continue
+// path: a zero-length frame is skipped and does not contribute a chunk. Here a
+// leading zero-length frame consumes one of the two expected loop iterations,
+// so only 1 real chunk is collected against an expected count of 2. That is an
+// incomplete transfer and must NOT be committed (no snapshot delivered).
 func TestReceiveChunksZeroLengthChunk(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)
@@ -1553,12 +1555,10 @@ func TestReceiveChunksZeroLengthChunk(t *testing.T) {
 
 	sr.receiveChunks(reader, hdr, stopC)
 
+	// Only 1 chunk collected (zero-length skipped) but 2 expected: incomplete.
 	snaps := handler.getSnapshots()
-	if len(snaps) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(snaps))
-	}
-	if len(snaps[0]) != 1 {
-		t.Fatalf("expected 1 chunk (zero-length skipped), got %d", len(snaps[0]))
+	if len(snaps) != 0 {
+		t.Fatalf("expected 0 snapshots for incomplete transfer, got %d", len(snaps))
 	}
 }
 
