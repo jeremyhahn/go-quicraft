@@ -71,6 +71,39 @@ func (t *testEpochTracker) deregisteredCount(epoch uint64) int {
 	return t.deregistered[epoch]
 }
 
+// TestRateLimitChunkSleep_Capped verifies that the per-chunk rate-limit sleep
+// is capped at maxRateLimitChunkSleep so an absurdly low configured rate
+// cannot produce a multi-day sleep that holds the snapshot semaphore and
+// memory budget, while normal rates pass through uncapped.
+func TestRateLimitChunkSleep_Capped(t *testing.T) {
+	// 1 byte/s with a 1 MB chunk would naively sleep ~1,048,576 seconds
+	// (~12 days). It must be capped.
+	if got := rateLimitChunkSleep(1<<20, 1); got != maxRateLimitChunkSleep {
+		t.Fatalf("tiny rate: got %v, want cap %v", got, maxRateLimitChunkSleep)
+	}
+
+	// A few bytes/sec with a large chunk must also be capped.
+	if got := rateLimitChunkSleep(64<<20, 8); got != maxRateLimitChunkSleep {
+		t.Fatalf("low rate large chunk: got %v, want cap %v", got, maxRateLimitChunkSleep)
+	}
+
+	// A normal rate (256 MB/s) with a 2 MB chunk yields a small sleep well
+	// under the cap and must pass through uncapped.
+	want := time.Duration(2<<20) * time.Second / time.Duration(256*1024*1024)
+	if got := rateLimitChunkSleep(2<<20, 256*1024*1024); got != want {
+		t.Fatalf("normal rate: got %v, want %v (uncapped)", got, want)
+	}
+	if want >= maxRateLimitChunkSleep {
+		t.Fatalf("test precondition: normal-rate sleep %v should be below cap %v", want, maxRateLimitChunkSleep)
+	}
+
+	// The 64 KB/s floor (MinMaxSnapshotReceiveRate equivalent) with a max
+	// frame-sized chunk must stay at or below the cap.
+	if got := rateLimitChunkSleep(uint32(MaxFrameSize), 64*1024); got > maxRateLimitChunkSleep {
+		t.Fatalf("floor rate: got %v exceeds cap %v", got, maxRateLimitChunkSleep)
+	}
+}
+
 // TestSnapshotSingleChunkRoundTrip verifies snapshot transfer with a single chunk.
 func TestSnapshotSingleChunkRoundTrip(t *testing.T) {
 	t1, _, _, handler2, cleanup := transportPair(t, 42)
@@ -1213,6 +1246,136 @@ func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 	}
 	stopC := make(chan struct{})
 	sr.receiveChunks(reader, hdr, stopC)
+}
+
+// TestReceiveChunks_TruncatedTransferNotCommitted verifies that a snapshot
+// stream that EOFs after fewer chunks than the header's ChunkCount is treated
+// as a failed receive: HandleSnapshot is NOT called and the partial snapshot
+// is discarded. A truncated transfer must never be committed as the latest
+// snapshot because recovery would load it as if whole (data corruption).
+func TestReceiveChunks_TruncatedTransferNotCommitted(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
+
+	rejected := make(chan config.SnapshotInfo, 1)
+	sr.listener = &config.EventListener{
+		OnSnapshotRejected: func(info config.SnapshotInfo) {
+			select {
+			case rejected <- info:
+			default:
+			}
+		},
+	}
+
+	// Provide only 2 chunks on the wire.
+	chunks := make([]proto.SnapshotChunk, 2)
+	for i := range chunks {
+		chunks[i] = proto.SnapshotChunk{
+			ShardID:      1,
+			ReplicaID:    2,
+			From:         1,
+			Index:        50,
+			Term:         3,
+			ChunkID:      uint64(i),
+			ChunkCount:   4,
+			ChunkSize:    5,
+			Data:         []byte("hello"),
+			DeploymentID: 42,
+		}
+	}
+	data := buildChunkFrames(t, chunks)
+	reader := &testChunkReader{data: data}
+
+	// Header claims 4 chunks, but the stream EOFs after 2.
+	hdr := &SnapshotHeader{
+		ShardID:    1,
+		ReplicaID:  2,
+		Index:      50,
+		Term:       3,
+		ChunkCount: 4,
+	}
+	stopC := make(chan struct{})
+	sr.receiveChunks(reader, hdr, stopC)
+
+	if snaps := handler.getSnapshots(); len(snaps) != 0 {
+		t.Fatalf("expected 0 snapshots committed for truncated transfer, got %d", len(snaps))
+	}
+	if handler.snapshotCount.Load() != 0 {
+		t.Fatalf("HandleSnapshot must not be called on a truncated transfer, called %d times",
+			handler.snapshotCount.Load())
+	}
+
+	select {
+	case info := <-rejected:
+		if info.ShardID != 1 || info.ReplicaID != 2 || info.Index != 50 {
+			t.Fatalf("unexpected rejection info: %+v", info)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected OnSnapshotRejected to fire for truncated transfer")
+	}
+
+	// Memory budget must be fully restored.
+	if got := sr.AvailableMemory(); got != sr.maxMemory {
+		t.Fatalf("expected memory budget %d restored, got %d", sr.maxMemory, got)
+	}
+}
+
+// TestReceiveChunks_CompleteTransferCommitted verifies that when exactly
+// ChunkCount chunks arrive, the snapshot IS committed via HandleSnapshot. This
+// is the positive counterpart to the truncation test, guarding against an
+// over-strict completeness check rejecting valid transfers.
+func TestReceiveChunks_CompleteTransferCommitted(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
+
+	chunks := make([]proto.SnapshotChunk, 3)
+	for i := range chunks {
+		chunks[i] = proto.SnapshotChunk{
+			ShardID:      1,
+			ReplicaID:    2,
+			From:         1,
+			Index:        50,
+			Term:         3,
+			ChunkID:      uint64(i),
+			ChunkCount:   3,
+			ChunkSize:    5,
+			Data:         []byte("hello"),
+			DeploymentID: 42,
+		}
+	}
+	data := buildChunkFrames(t, chunks)
+	reader := &testChunkReader{data: data}
+
+	hdr := &SnapshotHeader{
+		ShardID:    1,
+		ReplicaID:  2,
+		Index:      50,
+		Term:       3,
+		ChunkCount: 3,
+	}
+	stopC := make(chan struct{})
+	sr.receiveChunks(reader, hdr, stopC)
+
+	if snaps := handler.getSnapshots(); len(snaps) != 1 || len(snaps[0]) != 3 {
+		t.Fatalf("expected 1 committed snapshot of 3 chunks, got %d deliveries", len(snaps))
+	}
+}
+
+// TestReceiveChunks_ZeroChunkCountCommitsNothing verifies that a header with
+// ChunkCount==0 persists nothing (no HandleSnapshot, no rejection-as-corruption
+// concern since there is no partial state).
+func TestReceiveChunks_ZeroChunkCountCommitsNothing(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
+
+	reader := &testChunkReader{data: nil}
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 0}
+	stopC := make(chan struct{})
+	sr.receiveChunks(reader, hdr, stopC)
+
+	if handler.snapshotCount.Load() != 0 {
+		t.Fatalf("expected no HandleSnapshot for ChunkCount=0, got %d", handler.snapshotCount.Load())
+	}
 }
 
 // errorSnapshotHandler is a MessageHandler that returns errors from

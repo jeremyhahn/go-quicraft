@@ -399,6 +399,83 @@ func makeCmd(key, value string) []byte {
 	return cmd
 }
 
+// aliasingSM is a user state machine whose Update returns a Result whose
+// Data directly aliases the input Entry.Cmd. In zero-copy mode this Cmd
+// aliases the engine's pooled buffer, so a correct rsm must deep-copy the
+// result before caching it for session deduplication.
+type aliasingSM struct{}
+
+func (aliasingSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	for i := range entries {
+		results[i] = sm.Result{Value: 1, Data: entries[i].Cmd}
+	}
+	return nil
+}
+
+func (aliasingSM) Lookup(_ context.Context, _ interface{}) (interface{}, error) {
+	return nil, nil
+}
+
+func (aliasingSM) SaveSnapshot(_ context.Context, _ io.Writer, _ <-chan struct{}) error {
+	return nil
+}
+
+func (aliasingSM) RecoverFromSnapshot(_ context.Context, _ io.Reader, _ <-chan struct{}) error {
+	return nil
+}
+
+func (aliasingSM) Close(_ context.Context) error { return nil }
+
+// TestApply_ZeroCopySessionResultIsDeepCopied verifies the at-most-once
+// fix: in zero-copy mode, a session-managed result whose Data aliases the
+// entry Cmd buffer is deep-copied before being cached, so recycling the
+// entry buffer after Apply cannot corrupt the cached response.
+func TestApply_ZeroCopySessionResultIsDeepCopied(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return aliasingSM{}
+	})
+	// zeroCopyEntryCmd = true (last argument).
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, true)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	if err := rsm.Sessions().Register(10, 0); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+
+	// Apply a session-managed entry. The aliasing SM returns Data == Cmd.
+	original := []byte("payload-v1")
+	entries := []proto.Entry{
+		{Index: 1, ClientID: 10, SeriesID: 1, Cmd: append([]byte(nil), original...)},
+	}
+	results := make([]sm.Result, 1)
+	if err := rsm.Apply(entries, results); err != nil {
+		t.Fatalf("Apply = %v", err)
+	}
+
+	// Simulate the engine recycling the pooled buffer: mutate the entry Cmd.
+	for i := range entries[0].Cmd {
+		entries[0].Cmd[i] = 'X'
+	}
+
+	// Re-apply the same series: it is now a duplicate and must return the
+	// cached result. If the cache aliased the recycled buffer, the Data
+	// would read back as all 'X' instead of the original payload.
+	dup := []proto.Entry{
+		{Index: 2, ClientID: 10, SeriesID: 1, Cmd: append([]byte(nil), original...)},
+	}
+	dupResults := make([]sm.Result, 1)
+	if err := rsm.Apply(dup, dupResults); err != nil {
+		t.Fatalf("Apply(dup) = %v", err)
+	}
+	if string(dupResults[0].Data) != string(original) {
+		t.Fatalf("cached session result corrupted by buffer recycle: got %q, want %q",
+			dupResults[0].Data, original)
+	}
+}
+
 func TestNewStateMachine(t *testing.T) {
 	t.Run("regular state machine", func(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
@@ -2262,7 +2339,12 @@ func TestApply_ConfigChangeEntries(t *testing.T) {
 		}
 	})
 
-	t.Run("config change entry is forwarded to user SM", func(t *testing.T) {
+	t.Run("config change entry with Cmd is NOT forwarded to user SM", func(t *testing.T) {
+		// Config change entries are always skipped by the RSM because their Cmd
+		// payload is a serialized proto.ConfigChange, not an application command.
+		// Forwarding them would cause the application SM to receive Raft
+		// internals and return an UnknownOpError. The Raft layer handles
+		// config changes via processConfigChanges before entries reach here.
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
@@ -2272,7 +2354,6 @@ func TestApply_ConfigChangeEntries(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		// Config change with Cmd data is forwarded to user SM.
 		entries := []proto.Entry{
 			{
 				Index: 1,
@@ -2284,13 +2365,14 @@ func TestApply_ConfigChangeEntries(t *testing.T) {
 		if err := rsm.Apply(entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
-		// testKV should have stored it.
+		// Config change must NOT be stored in the user SM — the application
+		// state machine should not process Raft membership change payloads.
 		val, lookupErr := rsm.Lookup(context.Background(), "cc")
 		if lookupErr != nil {
 			t.Fatalf("Lookup = %v", lookupErr)
 		}
-		if val.(string) != "val" {
-			t.Errorf("Lookup(cc) = %q, want %q", val, "val")
+		if val.(string) != "" {
+			t.Errorf("Lookup(cc) = %q, want empty string (config change must not reach user SM)", val)
 		}
 	})
 }
@@ -4471,5 +4553,173 @@ func TestStateMachine_NALookupBuf_PoolReuse(t *testing.T) {
 			t.Errorf("iter %d: NALookupBuf(b) = %q, want %q", i, r2, "beta")
 		}
 		rel2()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// In-batch session deduplication (at-most-once across a single Apply batch)
+// ---------------------------------------------------------------------------
+
+// countingSM is a state machine that records how many times each command was
+// applied via Update. It is used to prove an operation is applied exactly once
+// even when the same (clientID, seriesID) proposal appears twice in one batch.
+type countingSM struct {
+	mu      sync.Mutex
+	applies map[string]int // command string -> apply count
+	total   int            // total Update entries processed
+}
+
+func newCountingSM() *countingSM {
+	return &countingSM{applies: make(map[string]int)}
+}
+
+func (c *countingSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, e := range entries {
+		c.applies[string(e.Cmd)]++
+		c.total++
+		// Return a unique, deterministic result derived from the command so
+		// the test can confirm a mirror copies the FIRST occurrence's result.
+		results[i] = sm.Result{Value: uint64(len(e.Cmd)), Data: append([]byte(nil), e.Cmd...)}
+	}
+	return nil
+}
+
+func (c *countingSM) Lookup(_ context.Context, _ interface{}) (interface{}, error) {
+	return nil, nil
+}
+
+func (c *countingSM) SaveSnapshot(_ context.Context, _ io.Writer, _ <-chan struct{}) error {
+	return nil
+}
+
+func (c *countingSM) RecoverFromSnapshot(_ context.Context, _ io.Reader, _ <-chan struct{}) error {
+	return nil
+}
+
+func (c *countingSM) Close(_ context.Context) error { return nil }
+
+// TestApply_InBatchDuplicateAppliedOnce verifies that when a single Apply
+// batch contains two entries with the SAME (clientID, seriesID) — a committed
+// client retry — the user operation is applied EXACTLY ONCE and both results[]
+// entries carry the identical (first-occurrence) result. This is the R1
+// at-most-once correctness fix.
+func TestApply_InBatchDuplicateAppliedOnce(t *testing.T) {
+	cs := newCountingSM()
+	createFn := func(shardID, replicaID uint64) interface{} {
+		return cs
+	}
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	if err := rsm.Sessions().Register(7, 0); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+
+	// Two entries, same clientID/seriesID, in ONE batch (committed retry).
+	entries := []proto.Entry{
+		{Index: 1, ClientID: 7, SeriesID: 1, Cmd: makeCmd("k", "v")},
+		{Index: 2, ClientID: 7, SeriesID: 1, Cmd: makeCmd("k", "v")},
+	}
+	results := make([]sm.Result, len(entries))
+	if err := rsm.Apply(entries, results); err != nil {
+		t.Fatalf("Apply = %v", err)
+	}
+
+	// The operation must have hit the user SM exactly once.
+	if cs.total != 1 {
+		t.Errorf("user SM Update entry count = %d, want 1 (at-most-once)", cs.total)
+	}
+	if got := cs.applies[string(makeCmd("k", "v"))]; got != 1 {
+		t.Errorf("command applied %d times, want 1", got)
+	}
+
+	// Both results must be the identical first-occurrence result.
+	if results[0].Value != results[1].Value {
+		t.Errorf("results differ: [0].Value=%d [1].Value=%d, want equal",
+			results[0].Value, results[1].Value)
+	}
+	if !bytes.Equal(results[0].Data, results[1].Data) {
+		t.Errorf("results Data differ: [0]=%q [1]=%q, want equal",
+			results[0].Data, results[1].Data)
+	}
+	if results[0].Value == sm.ResultSessionExpired {
+		t.Errorf("first occurrence wrongly rejected as SESSION_EXPIRED")
+	}
+
+	// The cached session response must equal the single applied result, and a
+	// later replay of the same series must dedup to it (not re-apply).
+	replay := []proto.Entry{
+		{Index: 3, ClientID: 7, SeriesID: 1, Cmd: makeCmd("k", "v")},
+	}
+	replayResults := make([]sm.Result, 1)
+	if err := rsm.Apply(replay, replayResults); err != nil {
+		t.Fatalf("Apply replay = %v", err)
+	}
+	if cs.total != 1 {
+		t.Errorf("after replay, user SM apply count = %d, want 1", cs.total)
+	}
+	if replayResults[0].Value != results[0].Value {
+		t.Errorf("replay result = %d, want cached %d", replayResults[0].Value, results[0].Value)
+	}
+}
+
+// TestApply_BatchExceedsMaxResponses verifies that a single multi-entry Apply
+// batch from one client whose distinct new series collectively exceed
+// maxResponses rejects the over-capacity NEW series as SESSION_EXPIRED without
+// applying it, while the admitted series each apply exactly once. This
+// exercises the admittedThisBatch capacity gate through the real Apply path.
+func TestApply_BatchExceedsMaxResponses(t *testing.T) {
+	cs := newCountingSM()
+	createFn := func(shardID, replicaID uint64) interface{} {
+		return cs
+	}
+	// maxResponses = 2: the third distinct new series in the batch overflows.
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 2, 0, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	if err := rsm.Sessions().Register(9, 0); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+
+	// Three distinct new series in one batch, but RespondedTo=0 so none can be
+	// evicted: with maxResponses=2 the third must be rejected.
+	entries := []proto.Entry{
+		{Index: 1, ClientID: 9, SeriesID: 1, RespondedTo: 0, Cmd: makeCmd("a", "1")},
+		{Index: 2, ClientID: 9, SeriesID: 2, RespondedTo: 0, Cmd: makeCmd("b", "2")},
+		{Index: 3, ClientID: 9, SeriesID: 3, RespondedTo: 0, Cmd: makeCmd("c", "3")},
+	}
+	results := make([]sm.Result, len(entries))
+	if err := rsm.Apply(entries, results); err != nil {
+		t.Fatalf("Apply = %v", err)
+	}
+
+	// First two admitted and applied exactly once each.
+	if results[0].Value == sm.ResultSessionExpired {
+		t.Errorf("series 1 wrongly rejected as SESSION_EXPIRED")
+	}
+	if results[1].Value == sm.ResultSessionExpired {
+		t.Errorf("series 2 wrongly rejected as SESSION_EXPIRED")
+	}
+	// Third over-capacity series rejected and NOT applied.
+	if results[2].Value != sm.ResultSessionExpired {
+		t.Errorf("over-capacity series 3 result = %d, want SESSION_EXPIRED (%d)",
+			results[2].Value, sm.ResultSessionExpired)
+	}
+
+	// Exactly two operations reached the user SM (the rejected one did not).
+	if cs.total != 2 {
+		t.Errorf("user SM apply count = %d, want 2 (over-capacity entry not applied)", cs.total)
+	}
+	if cs.applies[string(makeCmd("c", "3"))] != 0 {
+		t.Errorf("rejected command 'c' was applied %d times, want 0",
+			cs.applies[string(makeCmd("c", "3"))])
 	}
 }

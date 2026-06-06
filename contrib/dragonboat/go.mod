@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/contrib/dragonboat
 
-go 1.26.1
+go 1.26.3
 
 require github.com/jeremyhahn/go-quicraft v0.0.0
 

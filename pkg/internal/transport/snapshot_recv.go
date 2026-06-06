@@ -33,10 +33,33 @@ const (
 	// chunks. Corresponds to POSIX PATH_MAX.
 	maxSnapshotFilepathLen = 4096
 
-	// maxSnapshotChunkDataLen is the maximum data payload length for a
-	// single snapshot chunk. Matches the default MaxApplyEntrySize (64MB).
-	maxSnapshotChunkDataLen = 64 * 1024 * 1024
+	// snapshotChunkFixedOverhead is the minimum number of bytes a SnapshotChunk
+	// occupies for its non-Data fields (see SnapshotChunk.Size): 9 fixed uint64
+	// fields (72) + filepath length prefix (4) + FileChunkID/FileChunkCount (16)
+	// + HasFileInfo (8) + OnDiskIndex/DeploymentID/BinVer/Epoch (32) + Data
+	// length prefix (4). Filepath content, FileInfo, and Membership only add to
+	// this, so it is a safe lower bound on the per-chunk framing overhead.
+	snapshotChunkFixedOverhead = 9*8 + 4 + 2*8 + 8 + 4*8 + 4 // 136 bytes
+
+	// maxSnapshotChunkDataLen is the maximum Data payload length for a single
+	// snapshot chunk. Every chunk travels inside one transport frame, whose
+	// total payload is already capped at MaxFrameSize by ReadFrameHeader. Since
+	// Data is length-prefixed *within* that frame alongside the fixed fields
+	// above, the largest Data that can legitimately arrive is MaxFrameSize minus
+	// the chunk framing overhead. Bounding it at the full MaxFrameSize (as a
+	// prior version did) made the check unreachable; subtracting the fixed
+	// overhead makes a malformed/oversized Data length prefix actually catchable.
+	maxSnapshotChunkDataLen = int(MaxFrameSize) - snapshotChunkFixedOverhead
 )
+
+// maxRateLimitChunkSleep caps the per-chunk rate-limit sleep. A pathologically
+// small MaxSnapshotReceiveRate (combined with a large chunk) could otherwise
+// compute a multi-day sleep, holding the concurrency semaphore and memory
+// budget for the entire duration and stalling availability. The ceiling bounds
+// any single sleep to a few seconds; the configured rate is still honored on
+// average across chunks. TransportConfig.Validate also enforces a sane
+// minimum rate, so this ceiling is a defense-in-depth backstop.
+const maxRateLimitChunkSleep = 5 * time.Second
 
 // chunkReader abstracts the stream operations needed for receiving snapshot
 // chunks: setting a read deadline and reading bytes. This enables testing
@@ -155,6 +178,19 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	sr.receiveChunks(stream, hdr, stopC)
 }
 
+// rateLimitChunkSleep computes the per-chunk rate-limit sleep for a chunk of
+// length bytes at the given bytesPerSec rate, capped at maxRateLimitChunkSleep.
+// The cap bounds the worst case so an absurdly low rate cannot produce a
+// multi-day sleep that holds the snapshot concurrency semaphore and memory
+// budget. The caller must ensure bytesPerSec > 0.
+func rateLimitChunkSleep(length uint32, bytesPerSec int64) time.Duration {
+	d := time.Duration(length) * time.Second / time.Duration(bytesPerSec)
+	if d > maxRateLimitChunkSleep {
+		return maxRateLimitChunkSleep
+	}
+	return d
+}
+
 // receiveChunks reads snapshot chunks from the stream, enforces the memory
 // budget, applies rate limiting, and dispatches chunks to the handler.
 func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
@@ -187,20 +223,32 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 	defer rateLimitTimer.Stop()
 
+	// truncated tracks whether the transfer ended before all expected chunks
+	// arrived (early EOF or stop). A truncated transfer must NOT be committed
+	// as a snapshot: a partial snapshot persisted as the latest snapshot is
+	// usable for recovery and would corrupt state.
+	truncated := false
+
 	for i := uint64(0); i < hdr.ChunkCount; i++ {
 		select {
 		case <-stopC:
-			return
+			truncated = true
+			break
 		default:
+		}
+		if truncated {
+			break
 		}
 
 		if err := stream.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			return
+			truncated = true
+			break
 		}
 
 		length, _, err := ReadFrameHeader(stream)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				truncated = true
 				break
 			}
 			return
@@ -265,9 +313,11 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			return
 		}
 
-		// Apply rate limiting: sleep proportional to chunk size.
+		// Apply rate limiting: sleep proportional to chunk size, capped so a
+		// pathologically small configured rate cannot sleep for days while
+		// holding the concurrency semaphore and memory budget.
 		if sr.bytesPerSec > 0 {
-			chunkDuration := time.Duration(length) * time.Second / time.Duration(sr.bytesPerSec)
+			chunkDuration := rateLimitChunkSleep(length, sr.bytesPerSec)
 			if chunkDuration > time.Microsecond {
 				rateLimitTimer.Reset(chunkDuration)
 				select {
@@ -278,6 +328,31 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 				}
 			}
 		}
+	}
+
+	// Only commit a snapshot when the transfer is COMPLETE: every expected
+	// chunk arrived. A truncated transfer (peer disconnect / early EOF /
+	// shutdown) leaves fewer chunks than hdr.ChunkCount; committing it would
+	// persist a partial snapshot as the latest snapshot, which recovery would
+	// then load as if whole — data corruption. Treat it as a failed receive:
+	// log, fire the rejection listener, and do NOT call HandleSnapshot. An
+	// hdr.ChunkCount of 0 also falls here and persists nothing.
+	if truncated || uint64(len(chunks)) != hdr.ChunkCount {
+		slog.Warn("snapshot receive incomplete, discarding partial transfer",
+			"shard", hdr.ShardID,
+			"replica", hdr.ReplicaID,
+			"index", hdr.Index,
+			"received_chunks", len(chunks),
+			"expected_chunks", hdr.ChunkCount,
+		)
+		if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
+			sr.listener.OnSnapshotRejected(config.SnapshotInfo{
+				ShardID:   hdr.ShardID,
+				ReplicaID: hdr.ReplicaID,
+				Index:     hdr.Index,
+			})
+		}
+		return
 	}
 
 	if len(chunks) > 0 {

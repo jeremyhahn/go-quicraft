@@ -167,6 +167,21 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 // uses ticks to drive election timeouts (followers/candidates) and
 // heartbeat intervals (leaders).
 func (p *Peer) Tick() {
+	// A joining node suppresses its own election timer until it receives
+	// a snapshot from the existing cluster's leader (at which point
+	// MarkJoining is cleared). Without this suppression, the joining node
+	// would start elections whose rejected responses carry the existing
+	// cluster's high term — causing the joining node to reject the
+	// leader's AppendEntries (lower term) and force a re-election that
+	// disrupts the running cluster.
+	//
+	// A joining node is passive: it waits for the leader to contact it
+	// after the AddNode config change is committed. Once the leader sends
+	// an AppendEntries, the node becomes a follower and replays the log.
+	if p.joining.Load() {
+		p.syncLeaderID()
+		return
+	}
 	p.r.tickFunc(p.r)
 	p.syncLeaderID()
 }
@@ -348,6 +363,34 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 	return nil
 }
 
+// ValidateConfigChange checks a proposed config change against the current
+// published membership without mutating any state. It enforces the same
+// safety rules as ProposeConfigChange's propose-time validation (the
+// 64-voting-member cap, duplicate-add rejection, last-voter protection),
+// returning the validation error if the change would be rejected.
+//
+// This is used by the Host membership API (RequestAddNode, RequestAddWitness,
+// RequestRemoveNode, etc.), whose proposals are delivered through the engine
+// inbox and reach membership.apply directly — a path that deliberately does
+// NOT re-check the cap so that committed changes always replay deterministically.
+// Pre-validating here gives the caller a prompt error instead of a hung
+// RequestState (or, for a 65th voting member, an invariant panic in
+// rebuildReplicaToBit).
+//
+// Safe for concurrent access from any goroutine: it validates against an
+// immutable, atomically published membership snapshot rather than the
+// step-worker-owned mutable membership. Like the Host's ConfigChangeID
+// staleness check, this validation is conservative — a config change that
+// commits concurrently may cause a benign false rejection, which the caller
+// resolves by re-reading the membership and retrying.
+func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return newMembership(proto.Membership{}).validate(cc)
+	}
+	return newMembership(snap.toProto()).validate(cc)
+}
+
 // syncRaftRemotes synchronizes the raft state machine's remote tracking
 // maps from the peer's membership. This ensures the raft layer tracks
 // the correct set of peers after config changes.
@@ -524,14 +567,21 @@ func (p *Peer) rebuildMembershipFromLog() {
 				)
 				continue
 			}
-			// Validation errors are expected during rebuild: entries
-			// may reference already-removed nodes or duplicate adds
-			// from the base membership. Log at debug level.
+			// Some apply errors are expected during rebuild (duplicate adds
+			// already present in the base membership, or adds of a replica
+			// that a later committed entry removes — the removed tombstone is
+			// intentional: a removed replicaID can only rejoin under a NEW id).
+			// These are benign and replay deterministically. We log at WARN
+			// rather than DEBUG so that an UNEXPECTED skip (which would mean
+			// the rebuilt membership diverges from the committed config) is
+			// visible to operators instead of silently swallowed.
 			if applyErr := p.membership.apply(cc, entries[i].Index); applyErr != nil {
-				slog.Debug("rebuildMembershipFromLog: config change apply skipped",
+				slog.Warn("rebuildMembershipFromLog: config change apply skipped during replay",
 					"shard_id", p.shardID,
 					"replica_id", p.replicaID,
 					"entry_index", entries[i].Index,
+					"change_type", cc.Type,
+					"cc_replica_id", cc.ReplicaID,
 					"error", applyErr,
 				)
 			}
@@ -577,7 +627,15 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 			continue
 		}
 		if err := p.membership.apply(cc, entries[i].Index); err != nil {
-			slog.Debug("config change apply skipped",
+			// A skip here is benign on the committed-replay path (duplicate
+			// adds, removed-tombstone re-adds): apply must NOT reject already
+			// committed changes or replicas would diverge. But the Host
+			// membership API now pre-validates against current membership
+			// (ValidateConfigChange) before proposing, so a skip on the
+			// leader's own freshly proposed entry is unexpected and would mean
+			// the caller's RequestState hangs until deadline. Log at WARN so
+			// such a skip is visible to operators rather than silently swallowed.
+			slog.Warn("config change apply skipped",
 				"shard_id", p.shardID,
 				"replica_id", p.replicaID,
 				"entry_index", entries[i].Index,
@@ -592,6 +650,23 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 		// Publish immutable snapshot for concurrent readers.
 		p.publishMembership()
 		p.syncRaftRemotes()
+
+		// NOTE: do NOT clear p.joining here on config-change application.
+		// The initial cluster members are established via bootstrap confState,
+		// NOT as config-change entries in the log, so a joining node that has
+		// only applied its own AddNode entry has an INCOMPLETE membership
+		// (just itself). Clearing joining at that point would make the node
+		// start rejecting messages from the real members (including the
+		// leader) as unauthorized and enable its election timer with a
+		// one-member view — causing it to campaign, win a higher term, and
+		// disrupt the cluster. The joining flag is cleared only when a
+		// snapshot delivers the full cluster membership (see the
+		// InstallSnapshot path in Handle) — the mechanism for conveying the
+		// bootstrapped confState (which is NOT in the log) to a new node. A
+		// node that instead catches up purely by log replay (leader never
+		// compacted, so no snapshot is sent) may remain joining until a later
+		// snapshot; that is harmless — while joining it still votes, follows,
+		// and replicates, it simply does not initiate elections.
 	}
 }
 

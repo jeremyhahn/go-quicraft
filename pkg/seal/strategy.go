@@ -16,9 +16,11 @@
 // pattern. The Barrier holds a root key, derives data encryption keys (DEKs) via
 // HKDF-SHA256, and provides AES-256-GCM encrypt/decrypt operations for all at-rest data.
 //
-// Sealing strategies abstract the key-wrapping mechanism. The built-in SoftwareStrategy
-// uses Argon2id + AES-GCM for passphrase-based protection. Optional strategies for
-// PKCS#11, TPM2, and cloud KMS are available in the quicraft/crypto/xkms module.
+// Sealing strategies abstract the key-wrapping mechanism. The built-in software
+// (passphrase) strategy uses Argon2id + AES-GCM. Hardware/cloud strategies
+// (PKCS#11, TPM2, AWS/GCP/Azure KMS, Vault) live in go-xkms; the Shamir
+// strategy lives in go-qrdb. This package defines only StrategyPassphrase and
+// StrategyNone.
 package seal
 
 import (
@@ -29,25 +31,21 @@ import (
 // StrategyID uniquely identifies a sealing strategy.
 type StrategyID string
 
-// Strategy identifiers for supported sealing backends.
+// Strategy identifiers for the strategies go-quicraft (Layer 1) actually
+// implements. The consensus engine intentionally does NOT name strategies it
+// does not implement: hardware/cloud strategy IDs (tpm2/pkcs11/awskms/gcpkms/
+// azurekv/vault) are owned by go-xkms, and shamir by go-qrdb (which owns the
+// StrategyID namespace + barrier registry). There is no implicit
+// preference-order default; strategy selection is always explicit.
 const (
-	StrategyTPM2     StrategyID = "tpm2"
-	StrategyPKCS11   StrategyID = "pkcs11"
-	StrategyAWSKMS   StrategyID = "awskms"
-	StrategyGCPKMS   StrategyID = "gcpkms"
-	StrategyAzureKV  StrategyID = "azurekv"
-	StrategyVault    StrategyID = "vault"
-	StrategyShamir   StrategyID = "shamir"
-	StrategySoftware StrategyID = "software"
-)
+	// StrategyPassphrase uses password-based encryption (Argon2id/PBKDF2 + AEAD).
+	StrategyPassphrase StrategyID = "passphrase"
 
-// DefaultPreferenceOrder defines the priority order for selecting a sealing
-// strategy when multiple strategies are available. Hardware-backed strategies
-// are preferred over software-only strategies.
-var DefaultPreferenceOrder = []StrategyID{
-	StrategyTPM2, StrategyPKCS11, StrategyAWSKMS, StrategyGCPKMS,
-	StrategyAzureKV, StrategyVault, StrategyShamir, StrategySoftware,
-}
+	// StrategyNone disables barrier encryption entirely; data is stored in
+	// plaintext. Intended for development, testing, or deployments that rely
+	// on OS-level full-disk encryption. Selected explicitly; never auto-selected.
+	StrategyNone StrategyID = "none"
+)
 
 // Credentials holds authentication material for sealing strategies. The Secret
 // field is interpreted differently by each strategy: the software strategy treats
@@ -61,8 +59,9 @@ type Credentials struct {
 // Implementations protect the root key at rest using different backends:
 // software (passphrase + Argon2id), PKCS#11 (HSM), TPM2, or cloud KMS.
 type SealingStrategy interface {
-	// ID returns a unique identifier for this strategy (e.g., StrategySoftware,
-	// StrategyTPM2, StrategyPKCS11, StrategyAWSKMS).
+	// ID returns a unique identifier for this strategy (e.g., StrategyPassphrase
+	// or StrategyNone for the L1 strategies; higher layers define their own IDs
+	// such as "tpm2"/"shamir").
 	ID() StrategyID
 
 	// Available reports whether this strategy can be used on the current

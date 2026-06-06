@@ -67,6 +67,8 @@ Drains proposals from lock-free MPSC `EntryQueue` and ReadIndex requests from de
 
 **Ownership guard**: Checks `node.commitPending.Load()` before calling `Tick()` or `Handle()`. When true, skips the node entirely to prevent concurrent Peer access with commit/apply workers.
 
+**Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
+
 **Lock-free proposal queue**: Proposal entry queue is MPSC without locks (zero-copy shard boundary). Reduces step worker contention vs shared proposals map.
 
 
@@ -86,7 +88,7 @@ Receives `Update` from step worker, persists entries to LogDB (sharded WAL with 
 
 **DrainFreeOrderMessages**: On shutdown, preserves ordered messages (VoteResp, HeartbeatResp) that must stay in sequence. Only drains free-order messages to avoid correctness issues during rolling restart.
 
-**SaveState retry**: Exponential backoff: 10ms, 50ms, 200ms, 500ms, 1s (total ~1.76s). On exhaustion, clears `commitPending` and forwards error to step worker via `handleError`, preventing hang.
+**SaveState retry**: Exponential backoff: 10ms, 50ms, 200ms, 500ms, 1s (total ~1.76s). Both terminal outcomes — retry exhaustion AND shutdown cancellation (`stopC` fired during a retry backoff) — funnel through the shared `failBatchSaveState` helper. For every node in the batch it marks `failed = true`, clears `commitPending`, reports a `SaveStateError` via `handleError`, and fails the batch's pending proposals via `OnProposalFailed`, so callers see an immediate error rather than blocking until their context deadline. The batch's entries were extracted but never persisted, so the node is left permanently failed (recover by reloading the shard) to avoid acknowledging unpersisted entries.
 
 **Peer.Commit()**: Advances internal Peer state (log truncation, stable storage markers). Populates `LogReader.termRingBuffer` (O(log n) binary search term lookups, zero GC pressure) for efficient term resolution on restart.
 
@@ -105,7 +107,7 @@ Per-shard goroutines gated by semaphore (MaxApplyWorkers limit). Fan-out dispatc
 
 **Semaphore per-call (not per-goroutine)**: Acquired at apply time, released after. Idle shard goroutines do not hold slots, preventing deadlock when shards > MaxApplyWorkers.
 
-**Circuit breaker**: Consecutive `SM.Apply()` failures increment `applyRetries`. At threshold (`maxApplyRetries`), sets `node.failed = true` and step worker skips node permanently. Sub-threshold failures call `handleError` and continue.
+**Fail-fast on apply error**: Any `SM.Apply()` or decompression error is terminal. The shared `failApply` helper fails the batch's pending proposals via `OnProposalFailed`, sets `node.failed = true` immediately (on the FIRST error — no retry counting), and reports an `ApplyError` via `handleError`. `lastApplied` is deliberately NOT advanced: skipping the batch while advancing the watermark would silently diverge this state machine from its peers, violating Raft's state-machine safety property. The step worker then skips the shard (`IsFailed()` check) until operator intervention (reload or snapshot recovery). This mirrors the SM-panic recovery path, which already took the shard offline on the first panic.
 
 **Post-apply flow**:
 1. Callback delivers results to Host layer for completing pending proposals
@@ -134,7 +136,7 @@ Atomic flag blocks step worker from concurrent Peer access during commit/apply p
 
 **Inbox**: Buffered channel (capacity 256). Transport goroutines deliver messages via non-blocking `Deliver()` (drops on full). Step worker drains to reusable `[]proto.Message` buffer, feeds to `peer.Handle()` sequentially.
 
-**Circuit breaker**: On SM.Apply failure, increments `applyRetries`. At threshold, sets `failed = true`. Step worker checks `IsFailed()` and skips node entirely, removing from pipeline until operator intervention.
+**Failed shard gate**: On any SM.Apply or decompression error (and on SM panic), the apply worker sets `failed = true` immediately — there is no retry counting. The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the node entirely, removing it from the pipeline until operator intervention (reload or snapshot recovery). The `applyRetries`/`maxApplyRetries` fields remain on the `Node` struct but are no longer consulted by the apply path.
 
 **stopC channel**: Closed by `Stop()` to signal cancellation for snapshot operations (used in SaveSnapshot/RecoverFromSnapshot context).
 
@@ -251,28 +253,28 @@ Step worker re-processes shard (inner loop)
 ```
 
 **Error paths**:
-- SaveState exhausts retries: commitPending cleared, SaveStateError to handleError, step worker resumes
+- SaveState exhausts retries OR shutdown cancels mid-backoff: `failBatchSaveState` marks node failed, clears commitPending, reports SaveStateError to handleError, fails pending proposals (OnProposalFailed)
 - Peer.Commit fails (log gap): commitPending cleared, CommitError to handleError, batch continues
-- DecompressEntries fails: Same circuit breaker path as SM.Apply failures
-- SM.Apply fails (retries < threshold): applyRetries++, ApplyError to handleError, commitPending cleared, step worker resumes
-- SM.Apply fails (retries >= threshold): failed.Store(true), CircuitBreakerError to handleError, step worker skips node permanently
+- DecompressEntries fails: fail-fast — `failApply` marks node failed, reports ApplyError, fails pending proposals; lastApplied NOT advanced; step worker skips shard until operator intervention
+- SM.Apply fails: fail-fast — same `failApply` path as decompression (shard offline on first error, no retry counting)
+- SM.Apply panics: recovered, node failed, SMPanicError to handleError, step worker skips node
 
 
 ## Error Types
 
 | Type                      | Trigger                                 | Effect                    |
 |---------------------------|-----------------------------------------|---------------------------|
-| `SaveStateError`          | LogDB SaveState exhausts retries        | commitPending cleared     |
+| `SaveStateError`          | SaveState retries exhausted / shutdown  | node.failed = true        |
 | `CommitError`             | Peer.Commit() fails (log gap)           | commitPending cleared     |
-| `ApplyError`              | SM.Apply fails (retries < threshold)    | commitPending cleared     |
-| `CircuitBreakerError`     | SM.Apply fails (retries >= threshold)   | node.failed = true        |
+| `ApplyError`              | SM.Apply or decompression fails         | node.failed = true        |
+| `SMPanicError`            | SM.Apply panics (recovered)             | node.failed = true        |
 | `SnapshotDuplicateError`  | Snapshot already in-flight for shard    | Request rejected          |
 | `SnapshotPoolBusyError`   | Snapshot pool request channel full      | Request rejected (retry)  |
 | `SnapshotError`           | Snapshot save/recover fails             | Reported via callback     |
 | `SnapshotTooLargeError`   | Snapshot exceeds MaxSnapshotSize        | Snapshot dir cleaned up   |
 | `MessageHandleError`      | Peer.Handle() returns error             | Logged at slog.Warn       |
 
-Sentinels: `ErrShardFailed` (circuit breaker tripped), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
+Sentinels: `ErrShardFailed` (shard taken offline; `SMPanicError` matches it via `errors.Is`. `ApplyError` and `SaveStateError` also set `node.failed` but are distinct typed errors), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
 
 ## Interfaces
 

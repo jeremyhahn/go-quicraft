@@ -25,10 +25,9 @@ import (
 )
 
 const (
-	// softwareStrategyName is the identifier stored in SealedRootKey.Strategy
-	// and used as AAD. Kept as a string constant for backward compatibility
-	// with existing sealed data.
-	softwareStrategyName = "software"
+	// passphraseStrategyName is the identifier stored in SealedRootKey.Strategy
+	// and used as AAD.
+	passphraseStrategyName = "passphrase"
 
 	// kdfSaltLen is the KDF salt length prepended to the ciphertext.
 	kdfSaltLen = 32
@@ -158,8 +157,8 @@ func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams
 	}, nil
 }
 
-// ID returns the strategy identifier StrategySoftware.
-func (s *SoftwareStrategy) ID() StrategyID { return StrategySoftware }
+// ID returns the strategy identifier StrategyPassphrase.
+func (s *SoftwareStrategy) ID() StrategyID { return StrategyPassphrase }
 
 // Available always returns true because the software strategy has zero
 // external dependencies.
@@ -221,20 +220,20 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	// Generate a random salt for KDF.
 	salt := make([]byte, kdfSaltLen)
 	if _, err := io.ReadFull(s.randReader, salt); err != nil {
-		return nil, &Error{Strategy: softwareStrategyName, Err: err}
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
 	// Open passphrase enclave for KDF derivation.
 	ppBuf, err := s.passphrase.Open()
 	if err != nil {
-		return nil, &Error{Strategy: softwareStrategyName, Err: err}
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
 	// Derive wrapping key from passphrase using the configured KDF.
 	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, s.kdfVersion, s.kdfParams)
 	ppBuf.Destroy()
 	if err != nil {
-		return nil, &Error{Strategy: softwareStrategyName, Err: err}
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 	defer wipeBytes(wrappingKey)
 
@@ -251,7 +250,7 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	// Generate a random nonce.
 	nonce := make([]byte, aead.NonceSize())
 	if _, err := io.ReadFull(s.randReader, nonce); err != nil {
-		return nil, &Error{Strategy: softwareStrategyName, Err: err}
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
 	// Build ciphertext: [KDFSalt | Nonce | EncryptedRootKey | Tag]
@@ -261,7 +260,7 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	// AAD binds the strategy name to the ciphertext, preventing cross-context
 	// key substitution where a ciphertext sealed by one strategy could be
 	// presented to another.
-	aad := []byte(softwareStrategyName)
+	aad := []byte(passphraseStrategyName)
 	ciphertext := make([]byte, kdfSaltLen, kdfSaltLen+aead.NonceSize()+len(rootKey)+aead.Overhead())
 	copy(ciphertext, salt)
 	ciphertext = append(ciphertext, nonce...)
@@ -271,7 +270,7 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	metadata := []byte{byte(s.kdfVersion)}
 
 	return &SealedRootKey{
-		Strategy:   StrategySoftware,
+		Strategy:   StrategyPassphrase,
 		Ciphertext: ciphertext,
 		Metadata:   metadata,
 	}, nil
@@ -311,13 +310,13 @@ func (s *SoftwareStrategy) unsealRootKeyDeferred(_ context.Context, sealed *Seal
 // unsealRootKeyBound performs the unseal operation using the bound passphrase.
 func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, error) {
 	if sealed == nil {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: ErrBarrierNotInit}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
 	}
 
 	// Minimum ciphertext: kdfSalt(32) + nonce(12) + tag(16) = 60 bytes.
 	minLen := kdfSaltLen + wrappingGCMNonceSize + wrappingGCMTagSize
 	if len(sealed.Ciphertext) < minLen {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: ErrCiphertextTooShort}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
 	}
 
 	// Determine KDF version from metadata. Backward compatibility: absent
@@ -332,14 +331,14 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	// Open passphrase enclave for KDF derivation.
 	ppBuf, err := s.passphrase.Open()
 	if err != nil {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: err}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
 
 	// Derive the wrapping key from passphrase + KDF salt.
 	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, version, params)
 	ppBuf.Destroy()
 	if err != nil {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: err}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
 	defer wipeBytes(wrappingKey)
 
@@ -355,19 +354,19 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 
 	nonceSize := aead.NonceSize()
 	if len(rest) < nonceSize {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: ErrCiphertextTooShort}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
 	}
 
 	// Extract nonce and decrypt. The AAD must match the strategy name used
 	// during SealRootKey to authenticate that this ciphertext was produced by the
 	// same strategy type, preventing cross-context key substitution.
-	aad := []byte(softwareStrategyName)
+	aad := []byte(passphraseStrategyName)
 	nonce := rest[:nonceSize]
 	encrypted := rest[nonceSize:]
 
 	plaintext, err := aead.Open(nil, nonce, encrypted, aad)
 	if err != nil {
-		return nil, &UnsealError{Strategy: softwareStrategyName, Err: ErrDecryptionFailed}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrDecryptionFailed}
 	}
 
 	return plaintext, nil
@@ -386,8 +385,13 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 // with matching params.
 func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersion, KDFParams) {
 	if len(metadata) < metadataKDFVersionLen {
-		// Pre-FIPS sealed data: no metadata present, use the strategy's
-		// configured KDF (which is KDFArgon2id for legacy constructors).
+		// Metadata-less (pre-FIPS) sealed data does not record which KDF or
+		// params produced it, so the only correct choice is the strategy's
+		// OWN configured KDF/params — that data was sealed by a strategy with
+		// the same configuration. (Using a hardcoded default would break
+		// round-tripping data sealed with custom Argon2id params.) A genuine
+		// KDF-config change between seal and unseal on metadata-less data is
+		// inherently ambiguous and fails closed via AES-GCM authentication.
 		return s.kdfVersion, s.kdfParams
 	}
 

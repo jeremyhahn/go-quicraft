@@ -16,7 +16,9 @@ package transport
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
@@ -98,9 +100,20 @@ type streamKey struct {
 // leader liveness even under heavy replication load.
 //
 // The pattern matches dragonboat's per-target send queue architecture.
+//
+// closed is set true by the worker (under sendQueuesMu) immediately before
+// it removes itself from the sendQueues map and exits on idle timeout. The
+// enqueue path in Send checks this flag after a successful channel send: a
+// producer may have obtained this *sendQueue from getOrCreateSendQueue and
+// then enqueued into a channel that no longer has a drainer (the worker
+// already pruned the map entry and returned). On observing closed, the
+// producer re-acquires a fresh queue via getOrCreateSendQueue and re-enqueues
+// once, so the message is delivered by the newly started worker instead of
+// being orphaned.
 type sendQueue struct {
-	ch   chan proto.Message
-	hbCh chan proto.Message // high-priority heartbeat channel
+	ch     chan proto.Message
+	hbCh   chan proto.Message // high-priority heartbeat channel
+	closed atomic.Bool        // set by worker before idle-prune delete+return
 }
 
 // QUICTransport provides QUIC-based message delivery for the Raft engine.
@@ -127,11 +140,20 @@ type QUICTransport struct {
 	conns     map[string]*quic.Conn
 	dialGroup singleflight.Group
 
-	// lastInbound tracks the most recently seen inbound *quic.Conn per
-	// peer address. When a new inbound differs from the last, the peer
-	// restarted and the cached outbound must be evicted.
-	lastInboundMu sync.Mutex
-	lastInbound   map[string]*quic.Conn
+	// bootEpoch is this process's per-start identity, stamped into every
+	// outgoing MessageBatch (SourceEpoch). It changes only when this node
+	// restarts.
+	bootEpoch uint64
+
+	// peerEpoch tracks the last-seen bootEpoch per peer address. A change in
+	// a peer's epoch means that peer's process restarted: its view of our
+	// previously-dialed outbound connection is gone (that outbound is now
+	// black-holed), so we evict it immediately rather than waiting for
+	// MaxIdleTimeout. Keying on the epoch (not the inbound *quic.Conn
+	// identity) avoids the eviction cascade that benign re-dials caused,
+	// because a re-dial from the same process carries the SAME epoch.
+	peerEpochMu sync.Mutex
+	peerEpoch   map[string]uint64
 
 	streamShards [streamShardCount]streamShard
 
@@ -180,6 +202,45 @@ type QUICTransport struct {
 	// Nil when revocation checking is disabled. Created in NewQUICTransport
 	// when Config.RevocationConfig is non-nil.
 	revocationChecker *revocation.Checker
+
+	// srcAddrAuth caches, per inbound *quic.Conn, the result of validating a
+	// batch's claimed SourceAddress against that connection's verified peer
+	// certificate. inboundAuthorizedFor calls ConnectionState()+VerifyHostname,
+	// which is too costly to run on every batch (heartbeats are frequent); a
+	// peer's certificate and advertised address are stable for a connection's
+	// lifetime, so the decision is computed once per (conn, claimed-address)
+	// and reused. Entries are removed when the inbound connection's handler
+	// returns (handleConnection). Keyed by *quic.Conn, value *srcAddrAuthEntry.
+	srcAddrAuth sync.Map
+}
+
+// srcAddrAuthEntry caches the SourceAddress authorization decision for a single
+// inbound connection. addr is the last claimed SourceAddress that was verified
+// against the connection's peer certificate; authorized records whether that
+// address is covered by the certificate. A connection advertises a stable
+// address, so a single-entry cache suffices for the common case while still
+// re-verifying if the claimed address ever changes.
+type srcAddrAuthEntry struct {
+	mu         sync.Mutex
+	addr       string
+	authorized bool
+	valid      bool
+}
+
+// newBootEpoch returns a per-process boot epoch used to detect peer restarts
+// (evictStaleOutboundOnRecv compares the SourceEpoch carried on inbound
+// batches and evicts the cached outbound connection when it changes). It mixes
+// the wall clock with a random salt so two processes that start within the
+// same nanosecond — or after a backward clock step — still receive distinct
+// epochs. Restart detection keys on any *change* in this value, not ordering,
+// so the salt cannot weaken correctness; it only closes the same-nanosecond
+// collision window that would otherwise fall back to the 30s QUIC idle timeout.
+func newBootEpoch() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return uint64(time.Now().UnixNano()) ^ binary.LittleEndian.Uint64(b[:])
+	}
+	return uint64(time.Now().UnixNano())
 }
 
 // NewQUICTransport creates a new QUIC transport with the given configuration.
@@ -227,10 +288,40 @@ func NewQUICTransport(
 		return nil, err
 	}
 
+	// Align the QUIC-level incoming-stream limit with the number of streams
+	// we will actually service concurrently. handleConnection sizes its
+	// data-stream semaphore to MaxStreamsPerConnection and a SEPARATE snapshot
+	// semaphore to MaxConcurrentSnapshotRecv; snapshot streams are accounted
+	// against the latter for the duration of their (slow) transfer so they
+	// never displace data streams. The incoming-stream budget therefore
+	// reserves MaxConcurrentSnapshotRecv slots on top of the data-stream pool,
+	// so QUIC flow-control backpressure kicks in exactly when our combined
+	// processing capacity (data + snapshot) is reached. Advertising a much
+	// larger limit (the old hardcoded 4096) let a peer open streams that then
+	// sat accepted-but-unserviced.
+	maxIncomingStreams := cfg.MaxStreamsPerConnection
+	if maxIncomingStreams < 1 {
+		maxIncomingStreams = defaultMaxStreamsPerConnection
+	}
+	snapStreams := cfg.MaxConcurrentSnapshotRecv
+	if snapStreams < 1 {
+		snapStreams = defaultMaxConcurrentSnapRecv
+	}
+	maxIncomingStreams += snapStreams
+	// Guarantee the incoming-stream budget always leaves room for a peer's
+	// full outbound ordered-stream pool (StreamPoolSize) plus its dedicated
+	// snapshot/ephemeral streams. Without this floor an operator who raises
+	// StreamPoolSize toward MaxStreamsPerConnection could starve snapshot
+	// delivery: the peer's snapshot OpenStreamSync would block on QUIC
+	// flow control until its dial deadline expired.
+	if minStreams := cfg.StreamPoolSize + snapshotStreamHeadroom; maxIncomingStreams < minStreams {
+		maxIncomingStreams = minStreams
+	}
+
 	qcfg := &quic.Config{
 		MaxIdleTimeout:             30 * time.Second,
 		HandshakeIdleTimeout:       5 * time.Second,
-		MaxIncomingStreams:         4096,
+		MaxIncomingStreams:         int64(maxIncomingStreams),
 		MaxIncomingUniStreams:      -1,
 		KeepAlivePeriod:            10 * time.Second,
 		InitialStreamReceiveWindow: 2 << 20,  // 2 MB
@@ -254,7 +345,8 @@ func NewQUICTransport(
 		tlsPair:        pair,
 		quicCfg:        qcfg,
 		conns:          make(map[string]*quic.Conn),
-		lastInbound:    make(map[string]*quic.Conn),
+		bootEpoch:      newBootEpoch(),
+		peerEpoch:      make(map[string]uint64),
 		sendQueues:     make(map[string]*sendQueue),
 		stopC:          make(chan struct{}),
 		shutdownCtx:    shutdownCtx,
@@ -424,9 +516,9 @@ func (t *QUICTransport) Stop() error {
 	}
 	t.connMu.Unlock()
 
-	t.lastInboundMu.Lock()
-	clear(t.lastInbound)
-	t.lastInboundMu.Unlock()
+	t.peerEpochMu.Lock()
+	clear(t.peerEpoch)
+	t.peerEpochMu.Unlock()
 
 	// Close all pooled streams.
 	for i := range t.streamShards {
@@ -509,9 +601,28 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 		if err != nil {
 			continue
 		}
+		if !t.enqueueToTarget(addr, msg) {
+			return // transport stopped
+		}
+	}
+}
+
+// enqueueToTarget resolves the per-target send queue and enqueues msg on the
+// appropriate channel (heartbeat-priority or data). It returns false only when
+// the transport is stopped (the queue could not be created).
+//
+// After a successful channel send it checks sq.closed: if the worker pruned
+// this queue on idle timeout between getOrCreateSendQueue and the send, the
+// message landed in an orphaned channel with no drainer. In that case it
+// re-acquires a fresh queue (which starts a new worker) and re-enqueues once.
+// The retry is bounded to a single attempt because the freshly created queue
+// returned by getOrCreateSendQueue cannot have been pruned yet (its worker has
+// not run its idle timer), so a second orphaning is impossible.
+func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message) bool {
+	for attempt := 0; attempt < 2; attempt++ {
 		sq := t.getOrCreateSendQueue(addr)
 		if sq == nil {
-			return // transport stopped
+			return false // transport stopped
 		}
 		// Route heartbeats to the priority channel so they are never
 		// blocked behind a backlog of data messages. This prevents
@@ -520,6 +631,7 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 			select {
 			case sq.hbCh <- msg:
 			default:
+				return true // queue full; Raft retransmits
 			}
 		} else {
 			// Non-blocking enqueue. If the queue is full, the message is
@@ -535,9 +647,18 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 					"msg_type", proto.MessageTypeName(msg.Type),
 					"queue_cap", defaultSendQueueLen,
 				)
+				return true
 			}
 		}
+		// The send succeeded. If the worker pruned this queue on idle
+		// timeout concurrently, the message is orphaned: re-acquire a fresh
+		// queue and re-enqueue. A non-closed queue means the message will be
+		// drained, so we are done.
+		if !sq.closed.Load() {
+			return true
+		}
 	}
+	return true
 }
 
 // getOrCreateSendQueue returns the send queue for the given target address,
@@ -549,11 +670,11 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 		return nil
 	}
 
-	// Fast path: queue already exists.
+	// Fast path: queue already exists and is not pruned.
 	t.sendQueuesMu.RLock()
 	sq, ok := t.sendQueues[target]
 	t.sendQueuesMu.RUnlock()
-	if ok {
+	if ok && !sq.closed.Load() {
 		return sq
 	}
 
@@ -563,9 +684,12 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 		t.sendQueuesMu.Unlock()
 		return nil
 	}
-	// Double-check after acquiring write lock.
+	// Double-check after acquiring write lock. A queue that has been marked
+	// closed by an idle-pruning worker is treated as absent: the worker sets
+	// closed=true and deletes the map entry under this same lock, so any
+	// entry we observe here as closed is mid-prune and must be replaced.
 	sq, ok = t.sendQueues[target]
-	if ok {
+	if ok && !sq.closed.Load() {
 		t.sendQueuesMu.Unlock()
 		return sq
 	}
@@ -643,7 +767,9 @@ func (t *QUICTransport) sendQueueWorkerOnce(target string, sq *sendQueue) (panic
 		}
 	}()
 
-	batch := make([]proto.Message, 0, 64)
+	// Pre-size to the drain cap (1 initial + up to 255 more = 256) so a full
+	// burst does not force a slice re-grow on the send path.
+	batch := make([]proto.Message, 0, 256)
 	idleTimer := time.NewTimer(sendQueueIdleTimeout)
 	defer idleTimer.Stop()
 
@@ -710,6 +836,13 @@ func (t *QUICTransport) sendQueueWorkerOnce(target string, sq *sendQueue) (panic
 				resetIdleTimer()
 				continue
 			}
+			// Mark the queue closed before removing it from the map so a
+			// producer that already holds this *sendQueue and enqueues after
+			// the delete observes closed=true and re-enqueues into a fresh
+			// queue. Both the flag set and the map delete happen under
+			// sendQueuesMu, and the producer's closed-check runs after its
+			// channel send, establishing the happens-before edge.
+			sq.closed.Store(true)
 			delete(t.sendQueues, target)
 			t.sendQueuesMu.Unlock()
 			slog.Debug("send queue idle pruned", "target", target)
@@ -757,6 +890,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	mb := proto.MessageBatch{
 		BinVer:        proto.WireVersion,
 		DeploymentID:  t.cfg.DeploymentID,
+		SourceEpoch:   t.bootEpoch,
 		SourceAddress: t.localAddr(),
 		Requests:      msgs,
 	}
@@ -839,6 +973,19 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	snappyBuf = nil //nolint:wastedassign // defensive nil to prevent use-after-pool-return
 
 	if err != nil {
+		// A MarshalFrame failure here is almost always ErrPayloadTooLarge: the
+		// serialized batch exceeds MaxFrameSize (e.g. a Replicate batch bounded
+		// by maxReplicationPayload that is larger than the 16MB frame cap).
+		// Surface it loudly — a silent drop would stall replication to a
+		// lagging follower with no diagnostic. (NOTE: the underlying limit
+		// mismatch — maxReplicationPayload/MaxBatchSize vs MaxFrameSize/
+		// MaxDecompressedSize — should be reconciled in config.)
+		slog.Error("transport: dropping batch that failed to marshal into a frame",
+			"target", target,
+			"payload_bytes", len(payload),
+			"max_frame_size", MaxFrameSize,
+			"error", err,
+		)
 		t.putBuf(bufPtr)
 		return
 	}
@@ -1001,7 +1148,10 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	// stalled WriteFrame holds the snapshotTracker slot forever, making
 	// Stop() -> ShutdownAndWait() block indefinitely.
 	for i := range chunks {
-		chunk := &chunks[i]
+		// Copy the chunk by value so stamping DeploymentID does not mutate
+		// the caller's backing array. SendSnapshotStreaming already operates
+		// on a by-value copy via its emit callback.
+		chunk := chunks[i]
 		chunk.DeploymentID = t.cfg.DeploymentID
 		chunkSz := chunk.Size()
 		chunkBuf := make([]byte, chunkSz)
@@ -1188,9 +1338,15 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	return nil
 }
 
-// localAddr returns the cached string representation of the local listen
-// address. Before Start() is called, falls back to the configured address.
+// localAddr returns the address this node advertises to peers as its
+// reachable Raft transport address. When AdvertiseAddress is set in the
+// config it takes priority over the OS-reported local socket address so
+// that nodes behind NAT or in Docker containers advertise their external
+// hostname/IP rather than 0.0.0.0 or [::].
 func (t *QUICTransport) localAddr() string {
+	if t.cfg.AdvertiseAddress != "" {
+		return t.cfg.AdvertiseAddress
+	}
 	if t.localAddrStr != "" {
 		return t.localAddrStr
 	}

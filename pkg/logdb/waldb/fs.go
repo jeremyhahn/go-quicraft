@@ -25,6 +25,7 @@ import (
 // implementations for error injection.
 type File interface {
 	Write(p []byte) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
 	Read(p []byte) (int, error)
 	ReadAt(p []byte, off int64) (int, error)
 	Stat() (fs.FileInfo, error)
@@ -102,6 +103,11 @@ type osFile struct {
 
 // Write writes bytes to the file.
 func (o *osFile) Write(p []byte) (int, error) { return o.f.Write(p) }
+
+// WriteAt writes bytes to the file at the given offset without changing the
+// file's current position. Used by the segment writer to keep blocks aligned
+// to the block grid across partial (mid-block) syncs.
+func (o *osFile) WriteAt(p []byte, off int64) (int, error) { return o.f.WriteAt(p, off) }
 
 // Read reads bytes from the file.
 func (o *osFile) Read(p []byte) (int, error) { return o.f.Read(p) }

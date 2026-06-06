@@ -66,21 +66,32 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 	if checker != nil {
 		cfg := checker.CfgRef()
 		verifyConn = func(cs tls.ConnectionState) error {
-			// Check all peer certificates for revocation. On fresh handshakes,
-			// PeerCertificates contains the verified chain. On resumed sessions,
-			// it still contains the peer's certificates from the original handshake.
-			for _, cert := range cs.PeerCertificates {
-				revoked, checkErr := checker.IsRevoked(cert)
-				if checkErr != nil {
-					return checkErr
+			// Only revocation-check the LEAF certificate (PeerCertificates[0]).
+			// The leaf is the end-entity cert that authenticates the peer; it is
+			// the certificate that can be individually revoked when a node is
+			// decommissioned or compromised. Checking the entire presented chain
+			// (intermediates, root) on every handshake added per-handshake OCSP
+			// latency for certificates that change rarely and are governed by the
+			// CA's own lifecycle rather than per-node revocation. The CA trust
+			// pool already validated the chain before VerifyConnection runs.
+			//
+			// On fresh handshakes PeerCertificates contains the verified chain;
+			// on resumed sessions it still contains the peer's certificates from
+			// the original handshake, so leaf checking works on both paths.
+			if len(cs.PeerCertificates) == 0 {
+				return nil
+			}
+			leaf := cs.PeerCertificates[0]
+			revoked, checkErr := checker.IsRevoked(leaf)
+			if checkErr != nil {
+				return checkErr
+			}
+			if revoked {
+				serial := leaf.SerialNumber.Text(16)
+				if cfg.OnCertRevoked != nil {
+					cfg.OnCertRevoked(serial)
 				}
-				if revoked {
-					serial := cert.SerialNumber.Text(16)
-					if cfg.OnCertRevoked != nil {
-						cfg.OnCertRevoked(serial)
-					}
-					return &revocation.CertificateRevokedError{Serial: serial}
-				}
+				return &revocation.CertificateRevokedError{Serial: serial}
 			}
 			return nil
 		}

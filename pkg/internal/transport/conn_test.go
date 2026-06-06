@@ -984,7 +984,7 @@ func TestEvictStaleOutboundEmptyTarget(t *testing.T) {
 	defer cleanup()
 
 	// Should return immediately without panic or side effects.
-	t1.evictStaleOutbound("")
+	t1.evictStaleOutboundOnRecv("", 0, nil)
 
 	// No connections should have been touched.
 	if t1.ConnectionCount() != 0 {
@@ -1000,7 +1000,7 @@ func TestEvictStaleOutboundNoConnection(t *testing.T) {
 	defer cleanup()
 
 	// Call with a target that has no cached outbound connection.
-	t1.evictStaleOutbound("192.168.1.1:4001")
+	t1.evictStaleOutboundOnRecv("192.168.1.1:4001", 0, nil)
 
 	// No connections should exist.
 	if t1.ConnectionCount() != 0 {
@@ -1036,7 +1036,7 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 	streamsBefore := t1.StreamCount()
 
 	// evictStaleOutbound should detect the connection is alive and skip eviction.
-	t1.evictStaleOutbound(target)
+	t1.evictStaleOutboundOnRecv(target, 0, nil)
 
 	if t1.ConnectionCount() != connsBefore {
 		t.Fatalf("expected %d connections after alive check, got %d",
@@ -1083,7 +1083,7 @@ func TestEvictStaleOutboundDeadConnection(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// evictStaleOutbound should detect the dead context and clean up.
-	t1.evictStaleOutbound(target)
+	t1.evictStaleOutboundOnRecv(target, 0, nil)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections after eviction, got %d", t1.ConnectionCount())
@@ -1120,7 +1120,7 @@ func TestEvictStaleOutboundOnRecvDelegatesToEvictStaleOutbound(t *testing.T) {
 
 	// Call evictStaleOutboundOnRecv with nil inbound — should delegate
 	// to evictStaleOutbound and clean up the dead connection.
-	t1.evictStaleOutboundOnRecv(target, nil)
+	t1.evictStaleOutboundOnRecv(target, 0, nil)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections after nil-inbound eviction, got %d",
@@ -1160,7 +1160,7 @@ func TestEvictStaleOutboundOnRecv_AliveOutboundNotEvicted(t *testing.T) {
 	}
 
 	// Call evictStaleOutboundOnRecv with the different (alive) inbound.
-	t1.evictStaleOutboundOnRecv(target, inbound)
+	t1.evictStaleOutboundOnRecv(target, 0, inbound)
 
 	// Outbound should NOT be evicted: it is alive.
 	if t1.ConnectionCount() != 1 {
@@ -1201,7 +1201,7 @@ func TestEvictStaleOutboundOnRecv_DeadOutboundEvicted(t *testing.T) {
 	}
 
 	// evictStaleOutboundOnRecv should detect the dead outbound and evict.
-	t1.evictStaleOutboundOnRecv(target, inbound)
+	t1.evictStaleOutboundOnRecv(target, 0, inbound)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections after dead eviction, got %d",
@@ -1233,7 +1233,7 @@ func TestEvictStaleOutboundOnRecv_NoOutboundNoAdoption(t *testing.T) {
 	}
 
 	// Call evictStaleOutboundOnRecv with the inbound. Should be a no-op.
-	t1.evictStaleOutboundOnRecv(t2.Addr().String(), inbound)
+	t1.evictStaleOutboundOnRecv(t2.Addr().String(), 0, inbound)
 
 	// Inbound should NOT be adopted.
 	if t1.ConnectionCount() != 0 {
@@ -1249,7 +1249,7 @@ func TestEvictStaleOutboundOnRecv_EmptyTargetNoop(t *testing.T) {
 	defer cleanup()
 
 	// Should return immediately without panic.
-	t1.evictStaleOutboundOnRecv("", nil)
+	t1.evictStaleOutboundOnRecv("", 0, nil)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections, got %d", t1.ConnectionCount())
@@ -1286,7 +1286,7 @@ func TestEvictStaleOutboundOnRecv_SameConnectionNoop(t *testing.T) {
 	streamsBefore := t1.StreamCount()
 
 	// Call with the same connection as inbound.
-	t1.evictStaleOutboundOnRecv(target, outbound)
+	t1.evictStaleOutboundOnRecv(target, 0, outbound)
 
 	if t1.ConnectionCount() != connsBefore {
 		t.Fatalf("expected %d connections (same-conn noop), got %d",
@@ -1898,7 +1898,7 @@ func TestEvictStaleOutbound_EmptyTarget(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	tr.evictStaleOutbound("") // Should not panic.
+	tr.evictStaleOutboundOnRecv("", 0, nil) // Should not panic.
 }
 
 // TestEvictStaleOutbound_NoConnection verifies that evictStaleOutbound
@@ -1920,7 +1920,7 @@ func TestEvictStaleOutbound_NoConnection(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	tr.evictStaleOutbound("127.0.0.1:9999") // No connection, no-op.
+	tr.evictStaleOutboundOnRecv("127.0.0.1:9999", 0, nil) // No connection, no-op.
 }
 
 // ---------------------------------------------------------------------------
@@ -1945,7 +1945,7 @@ func TestEvictStaleOutboundOnRecv_EmptyTarget(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	tr.evictStaleOutboundOnRecv("", nil) // Should not panic.
+	tr.evictStaleOutboundOnRecv("", 0, nil) // Should not panic.
 }
 
 // TestEvictStaleOutboundOnRecv_NilInbound verifies that nil inbound
@@ -1967,7 +1967,7 @@ func TestEvictStaleOutboundOnRecv_NilInbound(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	tr.evictStaleOutboundOnRecv("127.0.0.1:9999", nil) // Falls back to evictStaleOutbound.
+	tr.evictStaleOutboundOnRecv("127.0.0.1:9999", 0, nil) // Falls back to evictStaleOutbound.
 }
 
 // TestEvictStaleOutboundOnRecv_NoOutbound verifies that eviction is a
@@ -1994,7 +1994,7 @@ func TestEvictStaleOutboundOnRecv_NoOutbound(t *testing.T) {
 
 	// Now evictStaleOutboundOnRecv with a real inbound conn but no outbound.
 	// Should not panic, just return early (no outbound to evict).
-	t1.evictStaleOutboundOnRecv(target, conn)
+	t1.evictStaleOutboundOnRecv(target, 0, conn)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections, got %d", t1.ConnectionCount())
@@ -2653,24 +2653,30 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 		t.Fatal("expected outbound connection to exist")
 	}
 
-	// Simulate receiving from a "new" inbound connection by calling
-	// evictStaleOutboundOnRecv with the outbound as "first inbound",
-	// then with a different connection as "second inbound" (inboundChanged).
-	t1.evictStaleOutboundOnRecv(t2Addr, outbound) // sets lastInbound
+	// First recv establishes the peer's boot epoch (1). Keep the original
+	// outbound cached so the second call compares against it.
+	t1.evictStaleOutboundOnRecv(t2Addr, 1, outbound)
 
-	// Now call with a nil-like different conn. We need a real different
-	// *quic.Conn. Let's dial t2 from t1 again to get a second connection.
 	conn2, dialErr := t1.dialConnection(t2Addr)
 	if dialErr != nil {
 		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
 		return
 	}
+	t1.connMu.Lock()
+	t1.conns[t2Addr] = outbound
+	t1.connMu.Unlock()
 
-	// Now evictStaleOutboundOnRecv with the new conn should detect inboundChanged.
-	t1.evictStaleOutboundOnRecv(t2Addr, conn2)
+	// Second recv carries a DIFFERENT epoch (2) → the peer restarted → the
+	// alive-but-stale outbound must be evicted promptly.
+	t1.evictStaleOutboundOnRecv(t2Addr, 2, conn2)
 
-	// The outbound should have been evicted (or replaced).
 	time.Sleep(200 * time.Millisecond)
+	t1.connMu.RLock()
+	current, stillExists := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
+	if stillExists && current == outbound {
+		t.Fatal("stale outbound was NOT evicted after peer epoch changed (restart)")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2680,7 +2686,19 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 // TestSendBatch_DirectCallSnappyPoolPaths verifies the snappy encode pool
 // get/put paths by directly calling sendBatch with compression enabled.
 
-func TestEvictStaleOutboundOnRecv_InboundChangedEvictsAliveOutbound(t *testing.T) {
+// TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound documents the
+// corrected behaviour after fixing a regression where an inbound identity
+// change was treated as a peer-restart signal. In small clusters that
+// heuristic produced a self-sustaining eviction cascade (node A evicts its
+// outbound -> redials -> B observes new inbound -> B evicts its outbound ->
+// B redials -> A observes new inbound -> ... ) that starved leader election.
+//
+// The contract is now: while the outbound's own context is still alive,
+// evictStaleOutboundOnRecv must leave it alone even if the inbound identity
+// changes. Peer restarts naturally kill the outbound (MaxIdleTimeout /
+// keepalive / explicit close) which flips the context to Done and is
+// handled by the dead-connection branch.
+func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T) {
 	mtls := testMTLSConfig(t)
 	handler1 := newTestHandler()
 	handler2 := newTestHandler()
@@ -2730,35 +2748,115 @@ func TestEvictStaleOutboundOnRecv_InboundChangedEvictsAliveOutbound(t *testing.T
 		t.Fatal("expected outbound connection to exist")
 	}
 
-	// Simulate "first inbound" by setting lastInbound.
-	t1.evictStaleOutboundOnRecv(t2Addr, outbound)
+	// Seed the peer epoch (7) with a prior recv.
+	t1.evictStaleOutboundOnRecv(t2Addr, 7, outbound)
 
-	// Dial a second connection to t2. This stores conn2 in conns[t2Addr].
+	// Open a second connection and simulate a recv on that new *quic.Conn —
+	// i.e. "the peer dialled us from a fresh connection" — but with the SAME
+	// boot epoch (7): a benign re-dial, NOT a restart.
 	conn2, dialErr := t1.dialConnection(t2Addr)
 	if dialErr != nil {
 		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
 	}
-
-	// Restore the original outbound in the conns map so that when
-	// evictStaleOutboundOnRecv runs, outbound != conn2 (the new inbound),
-	// and inboundChanged is true.
 	t1.connMu.Lock()
 	t1.conns[t2Addr] = outbound
 	t1.connMu.Unlock()
 
-	// Now call with conn2 as the "new inbound". This triggers:
-	// - prevInbound = outbound, inboundConn = conn2 -> inboundChanged = true
-	// - outbound (from conns) = outbound != conn2 -> different connections
-	// - outbound is alive -> enters the inboundChanged branch at line 564
-	t1.evictStaleOutboundOnRecv(t2Addr, conn2)
+	t1.evictStaleOutboundOnRecv(t2Addr, 7, conn2)
 
-	// The outbound should have been evicted.
+	// The alive outbound must still be present (same epoch ⇒ no eviction).
 	time.Sleep(200 * time.Millisecond)
 	t1.connMu.RLock()
-	_, stillExists := t1.conns[t2Addr]
+	current, stillExists := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
-	if stillExists {
-		t.Fatal("expected outbound to be evicted after inbound changed")
+	if !stillExists {
+		t.Fatal("alive outbound was evicted after inbound changed; cascade regression re-introduced")
+	}
+	if current != outbound {
+		t.Fatal("alive outbound was replaced even though it was not evicted")
+	}
+}
+
+// TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored verifies the
+// authentication gate on restart-eviction: a restart hint (epoch change) whose
+// target is NOT covered by the inbound connection's verified certificate must
+// be ignored. Without it, an authenticated-but-malicious cluster member could
+// stamp another node's SourceAddress with a mutating SourceEpoch and force
+// eviction of our live outbound to that victim (a liveness/DoS vector). The
+// shared test certificate covers loopback/:: only, so a TEST-NET-1 host
+// (RFC 5737, 192.0.2.0/24) is guaranteed absent from its SANs.
+func TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored(t *testing.T) {
+	mtls := testMTLSConfig(t)
+	handler1 := newTestHandler()
+	handler2 := newTestHandler()
+	reg1 := registry.NewRegistry()
+	reg2 := registry.NewRegistry()
+
+	t1, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+	}, handler1, reg1)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(1) failed: %v", err)
+	}
+	if err := t1.Start(); err != nil {
+		t.Fatalf("t1.Start failed: %v", err)
+	}
+	defer t1.Stop()
+
+	t2, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+	}, handler2, reg2)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(2) failed: %v", err)
+	}
+	if err := t2.Start(); err != nil {
+		t.Fatalf("t2.Start failed: %v", err)
+	}
+	defer t2.Stop()
+
+	// Two live, fully-handshaked connections to t2. Both present t2's
+	// certificate, which covers loopback/:: but NOT the spoofed host below.
+	cachedConn, dialErr := t1.dialConnection(t2.Addr().String())
+	if dialErr != nil {
+		t.Fatalf("dialConnection(cached) failed: %v", dialErr)
+	}
+	inboundConn, dialErr := t1.dialConnection(t2.Addr().String())
+	if dialErr != nil {
+		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
+	}
+
+	// Cache an ALIVE outbound under a spoofed target whose host is not in any
+	// node's certificate. inboundConn differs from cachedConn so the same-conn
+	// fast path does not short-circuit the eviction logic.
+	const spoofed = "192.0.2.50:4001"
+	t1.connMu.Lock()
+	t1.conns[spoofed] = cachedConn
+	t1.connMu.Unlock()
+
+	// Distinct epochs would signal a restart if the claim were trusted.
+	t1.evictStaleOutboundOnRecv(spoofed, 100, inboundConn)
+	t1.evictStaleOutboundOnRecv(spoofed, 200, inboundConn)
+
+	// The live outbound must survive: the cert does not authorize the spoofed
+	// target, so the restart hint is ignored. (removeConnection mutates the
+	// map synchronously, so no wait is required.)
+	t1.connMu.RLock()
+	current, stillExists := t1.conns[spoofed]
+	t1.connMu.RUnlock()
+	if !stillExists || current != cachedConn {
+		t.Fatal("live outbound was evicted on a cert-unauthorized (spoofed) restart hint")
+	}
+
+	// The unauthorized epoch must not have been recorded either.
+	t1.peerEpochMu.Lock()
+	_, epochRecorded := t1.peerEpoch[spoofed]
+	t1.peerEpochMu.Unlock()
+	if epochRecorded {
+		t.Fatal("peerEpoch recorded an unauthorized (spoofed) SourceAddress")
 	}
 }
 
@@ -3001,7 +3099,7 @@ func TestDialConnection_OnConnectionFailedEvent(t *testing.T) {
 // TestDialConnection_EmptyHostUsesLocalhost verifies that dialConnection
 // treats empty host as "localhost", covering conn.go:95-97.
 
-func TestDialConnection_EmptyHostUsesLocalhost(t *testing.T) {
+func TestDialConnection_EmptyHostRejected(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
 	tr, err := NewQUICTransport(Config{
@@ -3017,16 +3115,12 @@ func TestDialConnection_EmptyHostUsesLocalhost(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	// ":12345" has empty host which gets set to "localhost"
+	// ":12345" has an empty host. Rather than silently verifying the peer
+	// certificate against a hardcoded "localhost" ServerName (masking a
+	// misconfiguration), dialConnection must reject it with ErrEmptyDialHost.
 	_, err = tr.dialConnection(":12345")
-	// The dial will fail because nothing is listening, but it should
-	// NOT fail on SplitHostPort or the empty host check.
-	if err != nil {
-		// Verify it's a dial error, not a parse error
-		var dialErr *DialError
-		if errors.As(err, &dialErr) {
-			t.Fatalf("expected dial timeout, not parse error: %v", err)
-		}
+	if !errors.Is(err, ErrEmptyDialHost) {
+		t.Fatalf("expected ErrEmptyDialHost for empty-host target, got %v", err)
 	}
 }
 

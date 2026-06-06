@@ -15,9 +15,47 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"testing"
+	"time"
 )
+
+// testMTLSMaterial generates a valid self-signed CA/cert/key PEM triple for
+// tests. Validation now trial-parses the keypair and CA, so placeholder bytes
+// no longer suffice.
+func testMTLSMaterial() (caPEM, certPEM, keyPEM []byte) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test"},
+		NotBefore:             time.Unix(0, 0),
+		NotAfter:              time.Unix(1<<31-1, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		panic(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, certPEM, keyPEM
+}
 
 // validTransportConfig returns a TransportConfig with defaults applied and
 // transport disabled so that numeric field validation tests do not require
@@ -34,10 +72,11 @@ func validTransportConfig() TransportConfig {
 func validTransportConfigWithMTLS() TransportConfig {
 	var tc TransportConfig
 	tc.SetDefaults()
+	ca, cert, key := testMTLSMaterial()
 	tc.MTLSConfig = &MTLSConfig{
-		CACert: []byte("ca"),
-		Cert:   []byte("cert"),
-		Key:    []byte("key"),
+		CACert: ca,
+		Cert:   cert,
+		Key:    key,
 	}
 	return tc
 }
@@ -206,6 +245,28 @@ func TestTransportConfig_Validate_SnapshotReceiveRate(t *testing.T) {
 	t.Run("zero rate is valid (unlimited)", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxSnapshotReceiveRate = 0
+		if err := tc.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("non-zero rate below floor rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxSnapshotReceiveRate = MinMaxSnapshotReceiveRate - 1
+		err := tc.Validate()
+		assertTransportValidationError(t, err, "TransportConfig.MaxSnapshotReceiveRate")
+	})
+
+	t.Run("tiny rate (1 byte/s) rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxSnapshotReceiveRate = 1
+		err := tc.Validate()
+		assertTransportValidationError(t, err, "TransportConfig.MaxSnapshotReceiveRate")
+	})
+
+	t.Run("rate at floor is valid", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxSnapshotReceiveRate = MinMaxSnapshotReceiveRate
 		if err := tc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
@@ -457,5 +518,26 @@ func assertTransportValidationError(t *testing.T, err error, expectedField strin
 	}
 	if ve.Field != expectedField {
 		t.Errorf("error field = %q, want %q", ve.Field, expectedField)
+	}
+}
+
+// TestTransportConfig_Validate_RejectsEmptyMTLS is the regression test for M3:
+// an enabled transport with present-but-empty mTLS material must fail at
+// config validation, not at handshake time.
+func TestTransportConfig_Validate_RejectsEmptyMTLS(t *testing.T) {
+	cases := map[string]*MTLSConfig{
+		"all empty":   {},
+		"empty cert":  {CACert: []byte("x"), Key: []byte("y")},
+		"bad keypair": {CACert: []byte("x"), Cert: []byte("notpem"), Key: []byte("notpem")},
+	}
+	for name, mtls := range cases {
+		t.Run(name, func(t *testing.T) {
+			var tc TransportConfig
+			tc.SetDefaults()
+			tc.MTLSConfig = mtls
+			if err := tc.Validate(); err == nil {
+				t.Fatal("expected validation error for empty/invalid mTLS material, got nil")
+			}
+		})
 	}
 }

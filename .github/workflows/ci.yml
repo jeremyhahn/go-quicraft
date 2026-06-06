@@ -11,7 +11,7 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.26.1"
+  GO_VERSION: "1.26.3"
   COVERAGE_THRESHOLD: 91
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
         run: go vet ./...
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.7.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
       - name: golangci-lint
         run: golangci-lint run --timeout=5m ./...
@@ -56,15 +56,23 @@ jobs:
       - name: Install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
+      # Writes SARIF (uploaded below) and still exits non-zero on findings to
+      # gate the build. Tests, examples and contrib adapters are excluded.
       - name: Run gosec
-        run: gosec -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test/performance -severity=medium -confidence=medium ./...
+        run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
+
+      - name: Upload gosec SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run govulncheck
-        run: |
-          govulncheck ./... || true
+        run: govulncheck ./...
 
   trivy:
     name: Trivy
@@ -72,14 +80,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Trivy filesystem scan
+      # A fresh source-scoped scan is uploaded to GitHub code scanning on every
+      # run, so the dashboard never reflects a stale analysis. Benchmark
+      # harnesses (test/performance/*), examples, and contrib adapters are
+      # excluded — none ship in a release; their deps are tracked via Dependabot.
+      # NOTE: do NOT image-scan the .devcontainer dev image into code scanning;
+      # that surfaces base-OS/toolchain CVEs that are not go-quicraft source vulns.
+      - name: Trivy scan (SARIF for code scanning)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-fs
+
+      - name: Trivy gate (fail on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
           severity: CRITICAL,HIGH
           exit-code: 1
           format: table
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
 
   build:
     name: Build

@@ -38,8 +38,8 @@ func TestDeferredSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 		t.Fatalf("SealRootKey failed: %v", err)
 	}
 
-	if sealed.Strategy != StrategySoftware {
-		t.Fatalf("expected strategy=%q, got %q", StrategySoftware, sealed.Strategy)
+	if sealed.Strategy != StrategyPassphrase {
+		t.Fatalf("expected strategy=%q, got %q", StrategyPassphrase, sealed.Strategy)
 	}
 	if len(sealed.Metadata) != metadataKDFVersionLen {
 		t.Fatalf("expected %d-byte metadata, got %d bytes", metadataKDFVersionLen, len(sealed.Metadata))
@@ -125,8 +125,8 @@ func TestDeferredSoftwareStrategy_Properties(t *testing.T) {
 	s := NewDeferredSoftwareStrategy()
 	defer s.Close()
 
-	if s.ID() != StrategySoftware {
-		t.Fatalf("expected ID=%q, got %q", StrategySoftware, s.ID())
+	if s.ID() != StrategyPassphrase {
+		t.Fatalf("expected ID=%q, got %q", StrategyPassphrase, s.ID())
 	}
 	if !s.Available() {
 		t.Fatal("expected Available() to return true")

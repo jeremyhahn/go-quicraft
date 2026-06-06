@@ -438,6 +438,75 @@ func TestManagerRecordResult(t *testing.T) {
 	})
 }
 
+func TestManagerCanRecord(t *testing.T) {
+	t.Run("unregistered client", func(t *testing.T) {
+		m := NewManager(10, 3)
+		if err := m.CanRecord(99, 1, 0, 0); !errors.Is(err, ErrSessionNotFound) {
+			t.Errorf("CanRecord(unregistered) = %v, want ErrSessionNotFound", err)
+		}
+	})
+
+	t.Run("room available is non-mutating", func(t *testing.T) {
+		m := NewManager(10, 3)
+		if err := m.Register(1, 100); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		if err := m.RecordResult(1, 1, 0, 101, sm.Result{Value: 1}); err != nil {
+			t.Fatalf("RecordResult = %v", err)
+		}
+		// CanRecord must report room without mutating state.
+		if err := m.CanRecord(1, 2, 0, 0); err != nil {
+			t.Errorf("CanRecord = %v, want nil", err)
+		}
+		// Calling it must not have advanced respondedTo or evicted.
+		if got := m.sessions[1].respondedTo; got != 0 {
+			t.Errorf("respondedTo mutated to %d, want 0", got)
+		}
+		if got := len(m.sessions[1].responses); got != 1 {
+			t.Errorf("responses mutated to %d entries, want 1", got)
+		}
+	})
+
+	t.Run("full cache rejected", func(t *testing.T) {
+		m := NewManager(10, 3)
+		if err := m.Register(1, 100); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		for i := uint64(1); i <= 3; i++ {
+			if err := m.RecordResult(1, i, 0, 100+i, sm.Result{Value: i}); err != nil {
+				t.Fatalf("RecordResult(%d) = %v", i, err)
+			}
+		}
+		// A new series with no eviction must be rejected.
+		if err := m.CanRecord(1, 4, 0, 0); !errors.Is(err, ErrResponseLimitExceeded) {
+			t.Errorf("CanRecord(full) = %v, want ErrResponseLimitExceeded", err)
+		}
+		// With respondedTo advancing to evict series 1 and 2, there is room.
+		if err := m.CanRecord(1, 4, 2, 0); err != nil {
+			t.Errorf("CanRecord(after eviction) = %v, want nil", err)
+		}
+	})
+
+	t.Run("pending same-batch peers count toward limit", func(t *testing.T) {
+		m := NewManager(10, 3)
+		if err := m.Register(1, 100); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		// One response cached, two more already admitted this batch =>
+		// effective size 3 == limit, so the next must be rejected.
+		if err := m.RecordResult(1, 1, 0, 101, sm.Result{Value: 1}); err != nil {
+			t.Fatalf("RecordResult = %v", err)
+		}
+		if err := m.CanRecord(1, 4, 0, 2); !errors.Is(err, ErrResponseLimitExceeded) {
+			t.Errorf("CanRecord(pending=2) = %v, want ErrResponseLimitExceeded", err)
+		}
+		// One pending leaves room (1 cached + 1 pending = 2 < 3).
+		if err := m.CanRecord(1, 4, 0, 1); err != nil {
+			t.Errorf("CanRecord(pending=1) = %v, want nil", err)
+		}
+	})
+}
+
 func TestManagerExpireSessions(t *testing.T) {
 	t.Run("expires inactive sessions", func(t *testing.T) {
 		m := NewManager(10, 10)

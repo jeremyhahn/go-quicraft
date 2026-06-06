@@ -256,6 +256,12 @@ rsm.StateMachine.Open(stopper)
 
 If a snapshot exists at a higher index than the SM's `lastApplied`, the snapshot pool handles recovery via `RecoverFromSnapshot` after the node is loaded (triggered when the Raft peer detects the gap).
 
+### In-Memory State Machine Recovery (StartShard)
+
+On-disk SMs persist their own state, but in-memory SMs start empty and must replay their last snapshot on restart. During `StartShard`, after the SM is opened, the host queries `logdb.GetSnapshot(shardID, replicaID)`. If a snapshot record exists (`Index > 0` and a non-empty `Filepath`), the host opens `<Filepath>/snapshot.dat` and feeds it to `RecoverFromSnapshot`.
+
+A recorded snapshot whose data file cannot be opened is **fatal**: `StartShard` returns a `HostInitError` (`Field: "snapshot_open"`) rather than silently skipping recovery. This is required for correctness — the Raft layer initializes the processed index to the snapshot index, and the pre-snapshot entries are compacted away, so a skipped recovery would bring the in-memory state machine up empty and it could never replay them. A failed close of the snapshot file (`snapshot_close`) or a failed `RecoverFromSnapshot` (`snapshot_recovery`) are likewise fatal `HostInitError`s.
+
 ---
 
 ## Snapshot Recovery Protocol
@@ -613,18 +619,21 @@ Per-Shard Goroutine  (sequential ordering per Raft requirements)
 
 ---
 
-## Error Handling and Circuit Breaker
+## Error Handling and Shard Failure
 
-The apply worker implements a circuit breaker pattern for SM.Apply failures:
+The apply worker is fail-fast: any terminal apply-path error takes the shard offline immediately rather than retrying.
 
-- Each failure increments `node.applyRetries`
-- When `applyRetries >= maxApplyRetries` (default from `HostConfig.MaxApplyRetries`):
-  - `node.failed.Store(true)`
-  - Step worker skips the shard entirely (`IsFailed()` check)
-  - `CircuitBreakerError` reported via event listener
-- Successful apply resets `node.applyRetries = 0`
+- On any `SM.Apply()` error or entry-decompression error (`failApply`):
+  - The batch's pending proposals are failed via `OnProposalFailed`
+  - `node.failed.Store(true)` is set on the FIRST error — there is no retry counting
+  - An `ApplyError` is reported via the node's error handler
+  - `node.lastApplied` is deliberately NOT advanced: skipping the batch while advancing the watermark would silently diverge this state machine from its peers, breaking Raft's state-machine safety property
+- An SM panic during `Apply()` is recovered, sets `node.failed`, and reports `SMPanicError` (same offline outcome).
+- The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the shard entirely. Recovery requires operator intervention: stop and restart (reload) the shard, or recover it from a snapshot.
 
-LogDB write failures (`SaveState`) also clear `commitPending` for all shards in the failed batch and report `SaveStateError` via the node's error handler.
+The `MaxApplyRetries` / `DefaultMaxApplyRetries` config field and the `node.applyRetries`/`maxApplyRetries` fields still exist but are no longer consulted on the apply path — the apply path is now unconditionally fail-fast.
+
+LogDB write failures (`SaveState`) — both retry exhaustion and shutdown cancellation during a retry backoff — funnel through `failBatchSaveState`: for every node in the batch it marks `failed = true`, clears `commitPending`, reports `SaveStateError`, and fails the batch's pending proposals (`OnProposalFailed`) so callers do not hang until their context deadline. The node is left permanently failed (recover by reloading the shard) because its Raft state advanced past stable storage.
 
 ---
 

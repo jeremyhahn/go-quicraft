@@ -597,6 +597,74 @@ func TestRaft_Election_PreVoteRejected(t *testing.T) {
 	}
 }
 
+// TestRaft_PreVoteReject_UsesResponderTerm is the regression test for the
+// PreVote term-inflation bug (C4). It drives a real RequestPreVote through
+// handleVoteRequest on a follower that currently has an active leader, then
+// asserts the emitted rejection carries the responder's OWN term, not the
+// prospective (T+1) term. Echoing the prospective term on a rejection let the
+// pre-candidate advance its term and ultimately forced the legitimate leader
+// to step down.
+func TestRaft_PreVoteReject_UsesResponderTerm(t *testing.T) {
+	r := newTestRaft(1)
+	// Establish an active leader so the follower rejects pre-votes.
+	r.leaderID = 2
+	r.electionTick = 0
+	responderTerm := r.term
+
+	// A real pre-candidate campaigns at the prospective term r.term+1.
+	if err := r.step(proto.Message{
+		Type:     proto.RequestPreVote,
+		From:     3,
+		Term:     responderTerm + 1,
+		LogIndex: r.log.lastIndex(),
+		LogTerm:  r.log.lastTerm(),
+	}); err != nil {
+		t.Fatalf("step RequestPreVote: %v", err)
+	}
+
+	resps := collectMessages(r, proto.RequestPreVoteResp)
+	if len(resps) != 1 {
+		t.Fatalf("expected exactly one PreVoteResp, got %d", len(resps))
+	}
+	resp := resps[0]
+	if !resp.Reject {
+		t.Fatal("expected the pre-vote to be rejected (active leader present)")
+	}
+	if resp.Term != responderTerm {
+		t.Fatalf("rejected PreVoteResp term = %d, want responder term %d (must NOT echo prospective term %d)",
+			resp.Term, responderTerm, responderTerm+1)
+	}
+	// The responder itself must not have advanced its term.
+	if r.term != responderTerm {
+		t.Fatalf("responder term advanced to %d, want %d", r.term, responderTerm)
+	}
+}
+
+// TestRaft_PreVoteReject_DoesNotAdvancePreCandidate verifies the end-to-end
+// invariant: a pre-candidate that receives a rejection produced by the real
+// responder path (term = responder's term, which equals the pre-candidate's
+// current term) does NOT advance its term in step().
+func TestRaft_PreVoteReject_DoesNotAdvancePreCandidate(t *testing.T) {
+	pc := newTestRaft(1)
+	pc.becomePreCandidate()
+	pc.broadcastPreVote()
+	startTerm := pc.term
+
+	// Responder (node 2) at the same term rejects; this is what the corrected
+	// handleVoteRequest emits (Term == responder's current term).
+	if err := pc.step(proto.Message{
+		Type:   proto.RequestPreVoteResp,
+		From:   2,
+		Term:   startTerm,
+		Reject: true,
+	}); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	if pc.term != startTerm {
+		t.Fatalf("pre-candidate term advanced to %d on rejection, want %d", pc.term, startTerm)
+	}
+}
+
 func TestRaft_Election_PreVoteDoesNotIncrementTermOnPartition(t *testing.T) {
 	r := newTestRaft(1)
 	initialTerm := r.term

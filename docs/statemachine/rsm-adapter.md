@@ -110,6 +110,14 @@ Engine Apply Worker
   +--------------------------------------------+
   |  For each proto.Entry:                     |
   |                                            |
+  |  0a. IsConfigChange()?                     |
+  |     YES -> result = {} ; continue          |
+  |           (applied by processConfigChanges)|
+  |                                            |
+  |  0b. non-session & empty Cmd (no-op)?      |
+  |     YES -> result = {} ; continue          |
+  |           (leader election no-op entry)    |
+  |                                            |
   |  1. IsNewSessionRequest()?                 |
   |     YES -> sessions.Register(clientID)     |
   |            result = {Value: clientID}      |
@@ -123,7 +131,11 @@ Engine Apply Worker
   |  3. IsSessionManaged()?                    |
   |     YES -> sessions.CheckDuplicate()       |
   |            duplicate? -> return cached     |
-  |            continue                        |
+  |            session error? -> SESSION_EXPIRED|
+  |            sessions.CanRecord() (admission)|
+  |            over capacity? -> SESSION_EXPIRED|
+  |              (reject, do NOT apply)        |
+  |            else: admittedThisBatch[cid]++  |
   |                                            |
   |  4. Forward to user SM                     |
   |     append to smEntries/smResults/indexMap |
@@ -161,7 +173,7 @@ The adapter converts `proto.Entry` (internal, Raft-aware) to `sm.Entry` (public,
 | proto.Entry field | sm.Entry field | Notes |
 |-------------------|----------------|-------|
 | `Index` | `Index` | Preserved |
-| `Cmd` | `Cmd` | Preserved (aliased, not copied) |
+| `Cmd` | `Cmd` | Preserved (owned copy by default; aliased in zero-copy mode — see below) |
 | `Term` | -- | Excluded (SMs are term-agnostic) |
 | `Key` | -- | Internal dedup key |
 | `ClientID` | -- | Session routing |
@@ -185,18 +197,52 @@ indexMap  := s.indexMapBuf[:0]
 
 This is safe because `Apply()` is called from a single apply goroutine per shard and the buffers are fully consumed before `Apply()` returns. Buffers grow on demand and are retained at their grown capacity for subsequent calls.
 
+### Zero-Copy Entry Cmd and Session-Result Safety
+
+`StateMachine.zeroCopyEntryCmd` (mirrors `Config.ZeroCopyEntryCmd`) controls how `Apply()` hands the command payload to the user SM:
+
+- **Default (`false`):** for each non-empty `Cmd`, `Apply()` makes a fresh owned copy before placing it on `sm.Entry`, so the SM may retain it past `Update()`.
+- **Zero-copy (`true`):** `sm.Entry.Cmd` aliases the engine's pooled `CommittedEntries` buffer directly (zero-alloc). The SM **MUST** copy `Cmd` if it retains it beyond `Update()`, because the engine recycles that buffer after the apply.
+
+Zero-copy aliasing also affects **session results**. A session-managed entry's result is cached in the session manager, which outlives the `Apply()` call. In zero-copy mode a user SM may return a `sm.Result` whose `Data` aliases the same recycled entry buffer; caching that alias directly would let a later apply corrupt the cached response and break at-most-once delivery. To prevent this, when zero-copy mode is enabled and the result has non-empty `Data`, `Apply()` **deep-copies `cached.Data` into owned memory before calling `sessions.RecordResult`**:
+
+```go
+if s.zeroCopyEntryCmd && len(cached.Data) > 0 {
+    owned := make([]byte, len(cached.Data))
+    copy(owned, cached.Data)
+    cached.Data = owned
+}
+```
+
+The default (non-zero-copy) path already hands the SM owned command memory, so it skips this extra copy and is not penalized.
+
 ### Duplicate Detection Flow
 
 For session-managed entries (non-register, non-unregister):
 
 ```
-sessions.CheckDuplicate(clientID, seriesID)
+sessions.CheckDuplicate(clientID, seriesID, index)
        |
-       |-- session not found? -> treat as new (no dedup)
+       |-- session error (not found / response evicted)? -> SESSION_EXPIRED
        |-- seriesID <= respondedTo? -> client already acked, not a dup
        |-- found in response cache? -> return cached result (duplicate)
-       |-- not found? -> new proposal, forward to user SM
+       |-- not found? -> new proposal, ADMISSION GATE then forward to user SM
 ```
+
+### Session Admission Gate (CanRecord)
+
+A new (non-duplicate) session series is **admitted before** it is forwarded to the user SM:
+
+```
+sessions.CanRecord(clientID, seriesID, respondedTo, admittedThisBatch[clientID])
+       |
+       |-- response cache has room? -> admittedThisBatch[clientID]++ ; forward to user SM
+       |-- over capacity?           -> result = SESSION_EXPIRED ; do NOT apply to user SM
+```
+
+This check runs **before** the user SM mutation. The reason is at-most-once delivery: `RecordResult` only runs after the batched `Update`, so if the response cache is already full (a misbehaving client not advancing its `respondedTo` watermark), applying the entry without being able to cache its result would let a later replay find no cached response and re-apply the mutation. Rejecting it up front — treated as `SESSION_EXPIRED`, identical to an evicted response per Raft PhD Figure 6.1 step 3 — keeps the entry from ever mutating the state machine.
+
+Because `RecordResult` runs only after the whole batch's `Update`, the gate must also account for series already admitted earlier in the *same* batch. `admittedThisBatch` is a per-client counter (a `map[uint64]uint64`, lazily allocated on first session-managed entry) that `CanRecord` adds to the in-cache count, so a batch of new series cannot collectively overflow the cache. The check is deterministic across replicas (index/series driven, no wall clock).
 
 After the user SM processes the entry, the result is recorded:
 
@@ -243,12 +289,12 @@ When `entry.IsEndOfSessionRequest()` is true:
 
 1. Call `sessions.Unregister(entry.ClientID)`
 2. On success: `results[i] = sm.Result{Value: entry.ClientID}`
-3. On `ErrSessionNotFound`: `results[i] = sm.Result{}` (not fatal)
+3. On `ErrSessionNotFound`: `results[i] = sm.Result{Value: sm.ResultSessionExpired}` (not fatal) -- signalled the same way as session-managed entries with an unregistered session, so the host layer translates it to `ErrSessionExpired` → `ErrRejected`
 4. Skip user SM entirely
 
 ### Why Not Fatal
 
-Register/unregister errors (already exists, not found) produce empty results rather than propagating errors. These are idempotent operations -- a duplicate register after snapshot recovery or a double-unregister from a retry should not crash the node. The result simply reflects that the operation had no effect.
+Register/unregister errors (already exists, not found) are not propagated as fatal. These are idempotent operations -- a duplicate register after snapshot recovery or a double-unregister from a retry should not crash the node. A failed register reports `sm.Result{}` (no effect), while a failed unregister reports `sm.Result{Value: sm.ResultSessionExpired}` so the host layer surfaces it as `ErrRejected` to the caller.
 
 ### Session Manager Limits
 
@@ -445,7 +491,7 @@ Defined in `pkg/internal/session/errors.go`:
 
 - Errors from `smWrapper.Update()` propagate directly from `Apply()` -- the engine treats these as fatal for the shard.
 - `ErrResponseLimitExceeded` from `sessions.RecordResult()` propagates from `Apply()` -- indicates a misbehaving client.
-- Session register/unregister errors (`ErrSessionAlreadyExists`, `ErrSessionNotFound`) are handled inline with empty results -- not propagated. These are idempotent and expected during replay.
+- Session register/unregister errors (`ErrSessionAlreadyExists`, `ErrSessionNotFound`) are handled inline -- not propagated as fatal. A failed register yields `sm.Result{}`; a failed unregister yields `sm.Result{Value: sm.ResultSessionExpired}`. These are idempotent and expected during replay.
 - Errors from `SaveSnapshot`, `RecoverFromSnapshot`, and `Close` propagate directly to the engine.
 - The RSM never swallows errors with `_`. All error returns from user SM methods and session operations are either propagated or explicitly handled.
 

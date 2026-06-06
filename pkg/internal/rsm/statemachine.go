@@ -120,6 +120,20 @@ type StateMachine struct {
 	smEntryBuf  []sm.Entry
 	smResultBuf []sm.Result
 	indexMapBuf []int
+
+	// readGuard serializes read access (Lookup/NALookup/NALookupBuf) against
+	// Close. Readers hold RLock for the duration of their access — including
+	// the lifetime of a pooled NALookupBuf buffer, released via its release
+	// func — so the underlying state machine is never closed out from under a
+	// reader. Close takes the write lock, which blocks until all in-flight
+	// readers and outstanding buffers drain. Apply is NOT guarded here: the
+	// engine stops the apply worker before Close, so Apply never races Close.
+	readGuard sync.RWMutex
+	// closed is set under readGuard.Lock by Close so that any reader which was
+	// blocked acquiring RLock observes the closed state and returns ErrClosed
+	// rather than touching a closed SM (in-memory backends do not self-track
+	// closure and would otherwise return stale data post-Close).
+	closed bool
 }
 
 // NewStateMachine creates a managed state machine wrapper using the
@@ -212,8 +226,56 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	smResults := s.smResultBuf[:0]
 	indexMap := s.indexMapBuf[:0]
 
+	// admittedThisBatch counts, per client, the new session-managed series
+	// admitted earlier in this batch. RecordResult runs only after the
+	// batched user-SM Update, so the capacity gate below must account for
+	// peers already queued in the same batch to avoid a batch of new series
+	// collectively overflowing the response cache. nil until first use to
+	// avoid an allocation for batches with no session-managed entries.
+	var admittedThisBatch map[uint64]uint64
+
+	// batchSeen maps (clientID, seriesID) to the entry index of the FIRST
+	// occurrence of that proposal within this batch. A client may retry a
+	// request whose original proposal has not yet committed; if both the
+	// original and the retry commit and land in the same apply batch, both
+	// carry the same (clientID, seriesID) and neither is yet in the session
+	// table — so CheckDuplicate reports both as new. Applying both would run
+	// the user operation twice, violating at-most-once delivery. batchSeen
+	// lets us detect the second (and later) occurrence and mirror the first
+	// occurrence's result without re-applying. nil until first use, local to
+	// this call, never leaked across Apply invocations.
+	var batchSeen map[uint64]map[uint64]int
+	// mirrors maps an in-batch duplicate's entry index to the entry index of
+	// the first occurrence whose result it must copy. Resolved after the
+	// user-SM Update populates results for the first occurrences.
+	var mirrors map[int]int
+
 	for i := range entries {
 		entry := &entries[i]
+
+		// Skip config change entries. These are Raft membership change proposals
+		// (AddNode, RemoveNode, AddNonVoting, AddWitness) committed by the Raft
+		// layer. They must NOT be forwarded to the user state machine — the
+		// membership change is applied by processConfigChanges in peer.go before
+		// entries reach here. Forwarding config change Cmd to the user SM would
+		// cause it to decode the config change wire format as an application op
+		// and return an UnknownOpError.
+		if entry.IsConfigChange() {
+			results[i] = sm.Result{}
+			continue
+		}
+
+		// Skip the leader's no-op entry (and any other empty-command,
+		// non-session entry). Raft commits an empty EntryNormal on election to
+		// advance the commit index; it carries no user command and must NOT be
+		// forwarded to the user state machine (which would otherwise receive
+		// an empty Cmd and could panic or miscount). lastApplied still advances
+		// because the engine tracks the batch's last index regardless.
+		if !entry.IsSessionManaged() && !entry.IsNewSessionRequest() &&
+			!entry.IsEndOfSessionRequest() && len(entry.Cmd) == 0 {
+			results[i] = sm.Result{}
+			continue
+		}
 
 		// Handle session registration: register the client and return
 		// the clientID as the result Value. Skip user SM.
@@ -265,6 +327,62 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 				results[i] = cached
 				continue
 			}
+			// In-batch duplicate detection. This MUST run before the CanRecord
+			// capacity gate and before admittedThisBatch is incremented: a retry
+			// that lands in the same batch as its original consumes no new cache
+			// slot (the first occurrence already accounts for it), so gating it
+			// could spuriously reject it as "cache full" and, worse, applying it
+			// would mutate the user SM a second time. Record this entry as a
+			// mirror of the first occurrence and skip the user-SM path entirely.
+			if seriesMap, ok := batchSeen[entry.ClientID]; ok {
+				if firstIdx, seen := seriesMap[entry.SeriesID]; seen {
+					if mirrors == nil {
+						mirrors = make(map[int]int)
+					}
+					mirrors[i] = firstIdx
+					continue
+				}
+			}
+			// Capacity gate: reject a new series that could not be cached
+			// BEFORE applying it to the user SM. If the response cache is
+			// already full (a misbehaving client not advancing respondedTo),
+			// applying the entry without being able to cache its result
+			// would break at-most-once: a later replay would find no cached
+			// response and re-apply the mutation. Rejecting it up front
+			// (treated as SESSION_EXPIRED, same as an evicted response per
+			// Raft PhD Figure 6.1 step 3) keeps the entry from ever mutating
+			// the state machine. The check is deterministic across replicas
+			// (index/series driven, no wall clock).
+			if err := s.sessions.CanRecord(
+				entry.ClientID, entry.SeriesID, entry.RespondedTo,
+				admittedThisBatch[entry.ClientID]); err != nil {
+				slog.Warn("rsm: session response cache full, returning SESSION_EXPIRED",
+					"shardID", s.shardID,
+					"replicaID", s.replicaID,
+					"clientID", entry.ClientID,
+					"seriesID", entry.SeriesID,
+					"index", entry.Index,
+					"error", err,
+				)
+				results[i] = sm.Result{Value: sm.ResultSessionExpired}
+				continue
+			}
+			if admittedThisBatch == nil {
+				admittedThisBatch = make(map[uint64]uint64)
+			}
+			admittedThisBatch[entry.ClientID]++
+			// Record this as the first occurrence of (clientID, seriesID) in the
+			// batch so a later retry in the same batch is detected as an in-batch
+			// duplicate and mirrors this entry's result.
+			if batchSeen == nil {
+				batchSeen = make(map[uint64]map[uint64]int)
+			}
+			seriesMap := batchSeen[entry.ClientID]
+			if seriesMap == nil {
+				seriesMap = make(map[uint64]int)
+				batchSeen[entry.ClientID] = seriesMap
+			}
+			seriesMap[entry.SeriesID] = i
 		}
 
 		// Non-session or new session proposal — forward to user SM.
@@ -300,17 +418,44 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 			entry := &entries[origIdx]
 
 			if entry.IsSessionManaged() {
+				cached := smResults[j]
+				// In zero-copy mode, the user SM received Cmd as a direct
+				// alias into the engine's pooled CommittedEntries buffer
+				// and may have returned a Result whose Data aliases that
+				// buffer. The session cache outlives this Apply call, but
+				// the engine recycles the buffer afterward, so a later
+				// apply could corrupt the cached response — breaking
+				// at-most-once delivery. Deep-copy the Data before caching
+				// it. The non-zero-copy path already hands the SM owned
+				// command memory, so it is not penalized here.
+				if s.zeroCopyEntryCmd && len(cached.Data) > 0 {
+					owned := make([]byte, len(cached.Data))
+					copy(owned, cached.Data)
+					cached.Data = owned
+				}
 				if err := s.sessions.RecordResult(
 					entry.ClientID,
 					entry.SeriesID,
 					entry.RespondedTo,
 					entry.Index,
-					smResults[j],
+					cached,
 				); err != nil {
 					return err
 				}
 			}
 		}
+	}
+
+	// Resolve in-batch duplicates: each mirror copies the result of its
+	// first occurrence, which the user-SM Update + RecordResult loop above
+	// has now populated in results[]. The first occurrence's RecordResult
+	// already cached the (clientID, seriesID) response, so a mirror must NOT
+	// call RecordResult again (it would be redundant and could push a
+	// genuine new series out of the cache). This preserves at-most-once: the
+	// operation was applied exactly once, and every duplicate observes the
+	// identical result.
+	for mirrorIdx, firstIdx := range mirrors {
+		results[mirrorIdx] = results[firstIdx]
 	}
 
 	// Retain grown buffers for the next Apply() call.
@@ -342,6 +487,11 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 // this is serialized with Apply by the caller. For concurrent and on-disk
 // types, the user SM handles its own synchronization.
 func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
+	s.readGuard.RLock()
+	defer s.readGuard.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
 	// Fast path: try NALookup for []byte queries to avoid boxing.
 	if key, ok := query.([]byte); ok {
 		result, supported, err := s.sm.NALookup(key)
@@ -358,6 +508,11 @@ func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface
 // NALookup performs a byte-slice lookup if the underlying state machine
 // supports it. Returns (nil, false, nil) if not supported.
 func (s *StateMachine) NALookup(key []byte) ([]byte, bool, error) {
+	s.readGuard.RLock()
+	defer s.readGuard.RUnlock()
+	if s.closed {
+		return nil, false, ErrClosed
+	}
 	return s.sm.NALookup(key)
 }
 
@@ -374,6 +529,18 @@ func (s *StateMachine) NALookup(key []byte) ([]byte, bool, error) {
 // Returns (nil, nopRelease, false, nil) when the SM supports neither
 // NALookupInto nor NALookup for []byte keys.
 func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), supported bool, err error) {
+	// Hold the read guard for the duration of the lookup AND, on the pooled
+	// fast path, until the caller releases the returned buffer (the buffer may
+	// alias SM-owned memory). The releaseOnce guard ensures RUnlock happens
+	// exactly once across every exit path / the returned release func.
+	s.readGuard.RLock()
+	var releaseOnce sync.Once
+	unlock := func() { releaseOnce.Do(s.readGuard.RUnlock) }
+	if s.closed {
+		unlock()
+		return nil, nopRelease, false, ErrClosed
+	}
+
 	// Fast path: try NALookupInto with a pooled buffer.
 	poolBuf := lookupBufPool.Get().(*[]byte)
 	filled, ok, lookupErr := s.sm.NALookupInto(key, *poolBuf)
@@ -382,6 +549,7 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 			// Return the pool buffer unused on error.
 			*poolBuf = (*poolBuf)[:0]
 			lookupBufPool.Put(poolBuf)
+			unlock()
 			return nil, nopRelease, true, lookupErr
 		}
 		// The SM may have grown the buffer via append; update the pool entry to
@@ -390,6 +558,7 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 		rel := func() {
 			*poolBuf = (*poolBuf)[:0]
 			lookupBufPool.Put(poolBuf)
+			unlock() // release the read guard once the caller is done with buf
 		}
 		return filled, rel, true, nil
 	}
@@ -399,6 +568,7 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 
 	// Slow path: fall back to standard NALookup (allocates).
 	result2, ok2, err2 := s.sm.NALookup(key)
+	unlock()
 	if ok2 {
 		return result2, nopRelease, true, err2
 	}
@@ -456,6 +626,13 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 // Close releases resources held by both the session manager and the
 // user state machine.
 func (s *StateMachine) Close() error {
+	// Acquire the write lock to block until all in-flight reads and any
+	// outstanding NALookupBuf buffers release, then mark closed so a reader
+	// that was blocked acquiring RLock returns ErrClosed instead of touching
+	// the now-closed SM.
+	s.readGuard.Lock()
+	s.closed = true
+	s.readGuard.Unlock()
 	return s.sm.Close(context.Background())
 }
 

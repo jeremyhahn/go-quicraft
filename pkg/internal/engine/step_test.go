@@ -2907,6 +2907,74 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 	}
 }
 
+// TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered verifies
+// that redeliverDeferredSnapshots only drops messages that were
+// successfully delivered. When the node's inbox is full (Deliver returns
+// false), the deferred InstallSnapshot must be retained for a later retry
+// rather than silently dropped.
+func TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 16)
+	stopC := make(chan struct{})
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	// Fill the inbox to capacity so the next Deliver returns false.
+	full := false
+	for i := 0; i < defaultInboxQueueSize+1; i++ {
+		if !node.Deliver(proto.Message{Type: proto.Heartbeat}) {
+			full = true
+			break
+		}
+	}
+	if !full {
+		t.Fatal("failed to saturate inbox queue")
+	}
+
+	// Seed a deferred InstallSnapshot for the shard.
+	snap := proto.Message{
+		Type:     proto.InstallSnapshot,
+		From:     2,
+		To:       1,
+		ShardID:  1,
+		Snapshot: proto.Snapshot{Index: 500, Term: 10},
+	}
+	sw.deferredSnapshots[1] = []proto.Message{snap}
+
+	// Redeliver: the inbox is full, so the snapshot must be retained.
+	sw.redeliverDeferredSnapshots(1, node)
+	if got := len(sw.deferredSnapshots[1]); got != 1 {
+		t.Fatalf("deferred snapshot dropped while inbox full: len = %d, want 1", got)
+	}
+	if sw.deferredSnapshots[1][0].Snapshot.Index != 500 {
+		t.Fatalf("retained snapshot index = %d, want 500",
+			sw.deferredSnapshots[1][0].Snapshot.Index)
+	}
+
+	// Drain the inbox so there is room, then redeliver succeeds and the
+	// deferred buffer is cleared.
+	_ = node.DrainInbox(nil)
+	sw.redeliverDeferredSnapshots(1, node)
+	if got := len(sw.deferredSnapshots[1]); got != 0 {
+		t.Fatalf("deferred snapshot not cleared after successful redelivery: len = %d, want 0", got)
+	}
+	delivered := node.DrainInbox(nil)
+	foundSnap := false
+	for i := range delivered {
+		if delivered[i].Type == proto.InstallSnapshot && delivered[i].Snapshot.Index == 500 {
+			foundSnap = true
+		}
+	}
+	if !foundSnap {
+		t.Fatal("InstallSnapshot was not redelivered to the inbox")
+	}
+}
+
 // TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll verifies
 // that when the inbox contains ONLY InstallSnapshot messages during
 // commitPending, all are deferred and processCommitPendingInbox returns
@@ -4165,10 +4233,12 @@ func TestExecutePiggyback_WithFreeOrderMessages(t *testing.T) {
 // TestExecutePiggyback_SkipsSaveState verifies that executePiggyback
 // skips the SaveState call (commit index persistence is deferred to
 // the next batch).
-func TestExecutePiggyback_SkipsSaveState(t *testing.T) {
+func TestExecutePiggyback_PersistFailureNoApply(t *testing.T) {
 	ldb := newTestLogDB()
-	// Even with a save error configured, executePiggyback should not
-	// call SaveState at all (optimization: defer commit index persist).
+	// The piggyback path now persists the commit index before applying. With
+	// SaveState configured to fail, the persist fails and executePiggyback
+	// must NOT forward to apply (crash-safety: never apply before the commit
+	// index is durable).
 	ldb.setSaveError(errors.New("disk error"))
 	commitC := make(chan *commitItem, 16)
 	applyC := make(chan *applyItem, 16)
@@ -4199,19 +4269,17 @@ func TestExecutePiggyback_SkipsSaveState(t *testing.T) {
 
 	cw.executePiggyback(node, piggyback)
 
-	// SaveState should NOT have been called (optimization).
-	if ldb.saveCount.Load() > 0 {
-		t.Fatal("executePiggyback should skip SaveState (commit index deferred)")
+	// SaveState must have been attempted (commit-index persist).
+	if ldb.saveCount.Load() == 0 {
+		t.Fatal("executePiggyback should persist the commit index via SaveState")
 	}
 
-	// Apply item should be forwarded since we skip SaveState.
+	// With the persist failing, no apply item must be forwarded.
 	select {
-	case ai := <-applyC:
-		if ai.update.ShardID != 1 {
-			t.Fatalf("expected shardID 1 in apply item, got %d", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item within timeout")
+	case <-applyC:
+		t.Fatal("apply item must NOT be forwarded when commit-index persist fails")
+	case <-time.After(100 * time.Millisecond):
+		// expected
 	}
 }
 
