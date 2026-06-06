@@ -989,11 +989,12 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	}
 }
 
-// TestApplyWorker_ApplyError_LastAppliedAdvances verifies that
-// lastApplied is advanced even when SM.Apply returns an error. This
-// is critical because the commit worker has already advanced processed;
-// not advancing lastApplied would create a permanent gap.
-func TestApplyWorker_ApplyError_LastAppliedAdvances(t *testing.T) {
+// TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied verifies the
+// fail-fast invariant: when SM.Apply returns an error, lastApplied is NOT
+// advanced and the shard is marked failed. Advancing lastApplied while
+// skipping the failed batch would diverge this state machine from its
+// peers, violating Raft state-machine safety.
+func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	var wg sync.WaitGroup
@@ -1035,12 +1036,12 @@ func TestApplyWorker_ApplyError_LastAppliedAdvances(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Wait for lastApplied to advance.
+	// Wait for the shard to be marked failed (confirms the error path ran).
 	deadline := time.After(5 * time.Second)
-	for node.lastApplied.Load() == 0 {
+	for !node.failed.Load() {
 		select {
 		case <-deadline:
-			t.Fatal("timed out waiting for lastApplied to advance")
+			t.Fatal("timed out waiting for shard to fail")
 		default:
 		}
 		time.Sleep(time.Millisecond)
@@ -1050,14 +1051,15 @@ func TestApplyWorker_ApplyError_LastAppliedAdvances(t *testing.T) {
 	<-runDone
 	wg.Wait()
 
-	// lastApplied must be the highest index in the batch.
-	if got := node.lastApplied.Load(); got != 7 {
-		t.Fatalf("lastApplied = %d, want 7", got)
+	// lastApplied must remain at zero under fail-fast.
+	if got := node.lastApplied.Load(); got != 0 {
+		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", got)
 	}
 }
 
 // TestApplyWorker_ApplyError_NilCallbackDoesNotPanic verifies that
-// a nil callback does not cause a panic when apply fails.
+// a nil callback does not cause a panic when apply fails. Under fail-fast
+// semantics the shard is marked failed and lastApplied is NOT advanced.
 func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -1093,12 +1095,12 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Wait for lastApplied to advance (confirms the error path ran).
+	// Wait for the shard to be marked failed (confirms the error path ran).
 	deadline := time.After(5 * time.Second)
-	for node.lastApplied.Load() == 0 {
+	for !node.failed.Load() {
 		select {
 		case <-deadline:
-			t.Fatal("timed out waiting for lastApplied to advance with nil callback")
+			t.Fatal("timed out waiting for shard to be marked failed with nil callback")
 		default:
 		}
 		time.Sleep(time.Millisecond)
@@ -1108,17 +1110,18 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 	<-runDone
 	wg.Wait()
 
-	// lastApplied must still be advanced despite nil callback.
-	if got := node.lastApplied.Load(); got != 3 {
-		t.Fatalf("lastApplied = %d, want 3", got)
+	// Fail-fast: lastApplied must NOT advance on apply error. Advancing it
+	// while skipping the batch would diverge the SM from its peers.
+	if got := node.lastApplied.Load(); got != 0 {
+		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", got)
 	}
 }
 
-// TestApplyWorker_ApplyError_CircuitBreakerStillTrips verifies that
-// the circuit breaker continues to work correctly after the fix.
-// After maxApplyRetries consecutive failures, the shard is marked
-// as failed and a CircuitBreakerError is reported.
-func TestApplyWorker_ApplyError_CircuitBreakerStillTrips(t *testing.T) {
+// TestApplyWorker_ApplyError_FailsFast verifies that an SM.Apply error is
+// terminal: the shard is marked failed on the FIRST error, an ApplyError
+// is reported through the listener, OnProposalFailed is invoked, and
+// lastApplied is not advanced.
+func TestApplyWorker_ApplyError_FailsFast(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	var wg sync.WaitGroup
@@ -1131,12 +1134,8 @@ func TestApplyWorker_ApplyError_CircuitBreakerStillTrips(t *testing.T) {
 	testSm.setApplyError(errors.New("persistent failure"))
 	rsmSM := newTestApplier(testSm)
 
-	// maxApplyRetries = 3 so the circuit breaker trips on the 3rd failure.
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	// Use a buffered channel to collect errors reported through the
-	// listener. atomic.Value panics when storing different concrete
-	// types (*ApplyError vs *CircuitBreakerError).
 	errorsCh := make(chan error, 8)
 	listener := &config.EventListener{
 		OnShardFailed: func(info config.ShardFailedInfo) {
@@ -1147,58 +1146,53 @@ func TestApplyWorker_ApplyError_CircuitBreakerStillTrips(t *testing.T) {
 
 	go aw.run()
 
-	// Send 3 items to trip the circuit breaker.
-	for i := uint64(1); i <= 3; i++ {
-		node.commitPending.Store(true)
-		item := applyPool.Get().(*applyItem)
-		item.update = proto.Update{
-			ShardID:   1,
-			ReplicaID: 1,
-			CommittedEntries: []proto.Entry{
-				{Term: 1, Index: i, Cmd: []byte("fail")},
-			},
-		}
-		item.node = node
-		applyC <- item
+	// A single failing item must trip fail-fast immediately.
+	node.commitPending.Store(true)
+	item := applyPool.Get().(*applyItem)
+	item.update = proto.Update{
+		ShardID:   1,
+		ReplicaID: 1,
+		CommittedEntries: []proto.Entry{
+			{Term: 1, Index: 1, Cmd: []byte("fail")},
+		},
+	}
+	item.node = node
+	applyC <- item
 
-		// Wait for this item to complete before sending the next.
-		deadline := time.After(5 * time.Second)
-		for node.lastApplied.Load() < i {
-			select {
-			case <-deadline:
-				t.Fatalf("timed out waiting for item %d to process", i)
-			default:
-			}
-			time.Sleep(time.Millisecond)
+	// Wait for the shard to be marked failed.
+	deadline := time.After(5 * time.Second)
+	for !node.failed.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for shard to fail")
+		default:
 		}
+		time.Sleep(time.Millisecond)
 	}
 
-	// Verify circuit breaker tripped.
-	if !node.failed.Load() {
-		t.Fatal("expected node to be marked as failed after circuit breaker trip")
+	// lastApplied must not advance under fail-fast.
+	if got := node.lastApplied.Load(); got != 0 {
+		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", got)
 	}
 
-	// Drain the error channel and find the CircuitBreakerError.
-	var foundCBErr bool
-	for {
+	// An ApplyError must be reported through the listener.
+	var foundApplyErr bool
+	deadline = time.After(2 * time.Second)
+	for !foundApplyErr {
 		select {
 		case reported := <-errorsCh:
-			var cbErr *CircuitBreakerError
-			if errors.As(reported, &cbErr) {
-				foundCBErr = true
+			var applyErr *ApplyError
+			if errors.As(reported, &applyErr) {
+				foundApplyErr = true
 			}
-		default:
-			goto doneErrors
+		case <-deadline:
+			t.Fatal("expected ApplyError to be reported through listener")
 		}
 	}
-doneErrors:
-	if !foundCBErr {
-		t.Fatal("expected CircuitBreakerError to be reported through listener")
-	}
 
-	// Verify OnProposalFailed was called for each batch.
-	if cb.proposalFailedCount.Load() != 3 {
-		t.Fatalf("expected 3 OnProposalFailed calls, got %d", cb.proposalFailedCount.Load())
+	// OnProposalFailed must be invoked exactly once for the failed batch.
+	if cb.proposalFailedCount.Load() != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
 	}
 
 	close(stopC)

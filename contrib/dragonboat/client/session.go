@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"sync/atomic"
+	"time"
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
@@ -78,17 +79,32 @@ func generateClientID(rng Source) uint64 {
 		}
 		// Fall through to crypto/rand if rng returned zero.
 	}
-	for {
+	// Try crypto/rand a bounded number of times. A transient RNG failure must
+	// not crash the host process from a client-session allocation, so on
+	// persistent failure fall back to a process-unique, monotonic value rather
+	// than panicking. The fallback is not cryptographically random, but a
+	// client ID only needs to be unique within the deployment, which the
+	// nanosecond clock mixed with a monotonic counter provides.
+	for attempt := 0; attempt < 8; attempt++ {
 		var buf [8]byte
 		if _, err := rand.Read(buf[:]); err != nil {
-			panic("client: failed to generate random client ID: " + err.Error())
+			break
 		}
-		id := binary.LittleEndian.Uint64(buf[:])
+		if id := binary.LittleEndian.Uint64(buf[:]); id != 0 {
+			return id
+		}
+	}
+	for {
+		id := uint64(time.Now().UnixNano()) ^ (fallbackClientIDCounter.Add(1) * 0x9E3779B97F4A7C15)
 		if id != 0 {
 			return id
 		}
 	}
 }
+
+// fallbackClientIDCounter backs the non-crypto client-ID fallback used only
+// when crypto/rand is persistently unavailable (see generateClientID).
+var fallbackClientIDCounter atomic.Uint64
 
 // NewNoOPSession returns a no-op session that bypasses at-most-once
 // deduplication. Use for idempotent operations that do not require

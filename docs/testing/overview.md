@@ -440,8 +440,6 @@ Tests verify:
 | `test-quicraft`   | `./pkg`                            |
 | `test-errors`     | `./pkg`                            |
 | `test-sm`         | `./pkg/sm/...`                     |
-| `test-discovery`  | `./pkg/discovery/...`              |
-| `test-bootstrap`  | `./pkg/bootstrap/...`              |
 | `test-server`     | `./pkg/internal/server/...`        |
 | `test-writemode`  | `./pkg/writemode/...`              |
 | `test-batch`      | `./pkg/batch/...`                  |

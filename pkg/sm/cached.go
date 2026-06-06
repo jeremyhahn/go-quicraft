@@ -98,6 +98,16 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	for _, e := range entries {
 		key, value := c.extractKV(e.Cmd)
 		if key != "" {
+			// Copy the value before caching. extractKV may return a sub-slice
+			// of e.Cmd, which under ZeroCopyEntryCmd aliases an internal buffer
+			// the engine recycles after Update returns. Caching the alias would
+			// let a later write corrupt previously-cached reads. A nil value is
+			// preserved as nil (it signals a delete to the cache).
+			if value != nil {
+				cached := make([]byte, len(value))
+				copy(cached, value)
+				value = cached
+			}
 			c.cache.Put(key, value)
 		}
 	}

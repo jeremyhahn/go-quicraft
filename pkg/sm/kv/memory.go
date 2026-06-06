@@ -227,7 +227,17 @@ func (m *MemoryStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stoppe
 		return err
 	}
 
-	newData := make(map[string][]byte, int(count))
+	// count is an untrusted length prefix from a peer snapshot. Do NOT size the
+	// map directly from it: a hostile/corrupt count (up to ~4 billion) would
+	// trigger a multi-GB map preallocation before a single record is read.
+	// Cap the hint; if the snapshot really has more entries the map grows
+	// organically, and a count larger than the actual stream simply ends the
+	// loop early when io.ReadFull hits EOF.
+	hint := int(count)
+	if hint > maxSnapshotMapHint {
+		hint = maxSnapshotMapHint
+	}
+	newData := make(map[string][]byte, hint)
 	for i := uint32(0); i < count; i++ {
 		select {
 		case <-stopper:
@@ -238,6 +248,9 @@ func (m *MemoryStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stoppe
 		if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
 			return err
 		}
+		if keyLen > MaxKeyLength {
+			return errCorruptSnapshotLength
+		}
 		key := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, key); err != nil {
 			return err
@@ -245,6 +258,9 @@ func (m *MemoryStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stoppe
 		var valLen uint32
 		if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
 			return err
+		}
+		if valLen > MaxValueLength {
+			return errCorruptSnapshotLength
 		}
 		val := make([]byte, valLen)
 		if _, err := io.ReadFull(r, val); err != nil {

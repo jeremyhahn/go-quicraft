@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -175,7 +176,26 @@ func (w *applyWorker) dispatch(item *applyItem) {
 			"shard", shardID,
 			"channel_cap", cap(ch),
 		)
-		ch <- item
+		// Block until the shard drains, BUT remain responsive to shutdown:
+		// without the stopC guard a stalled/stopped shard goroutine whose
+		// channel is full would wedge the dispatcher forever, preventing the
+		// engine from tearing down. Committed entries are still never dropped
+		// in normal operation — this branch only abandons delivery when the
+		// engine is already stopping.
+		select {
+		case ch <- item:
+		case <-w.stopC:
+			slog.Warn("apply dispatcher shutting down; committed item not delivered",
+				"worker", w.workerID, "shard", shardID)
+			// Mirror the unloaded-shard cleanup: release committed entries,
+			// clear commitPending, and return the item to the pool so we
+			// don't leak pooled state or wedge the node on shutdown.
+			item.update.ReleaseCommittedEntries()
+			if item.node != nil {
+				item.node.commitPending.Store(false)
+			}
+			w.applyPool.Put(item)
+		}
 	}
 }
 
@@ -204,6 +224,12 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 		node := item.node
 		entries := item.update.CommittedEntries
 		func() {
+			// Mark an apply in flight BEFORE the recovering gate below. Paired
+			// with the snapshot worker's set-recovering-then-drain, this lets
+			// recovery prove no apply is mid-SM.Apply before it replaces SM
+			// state. Registered first so it decrements LAST (after all work).
+			node.applyInFlight.Add(1)
+			defer node.applyInFlight.Add(-1)
 			defer func() {
 				// Return pooled committed entries slice before releasing
 				// the applyItem. The entries are no longer referenced
@@ -268,82 +294,45 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			// attacks from malicious entries in the log.
 			maxDecompressSize := int(node.cfg.MaxEntrySize)
 			if err := raft.DecompressEntries(entries, maxDecompressSize); err != nil {
-				retries := node.applyRetries.Add(1)
-				applyErr := &ApplyError{
-					ShardID:   node.shardID,
-					ReplicaID: node.replicaID,
-					Err:       err,
-				}
-				// Fail pending proposals immediately so callers see
-				// the apply error instead of waiting for a timeout.
-				// The entries are consumed from the pipeline (the
-				// commit worker already advanced processed), so they
-				// will not be re-applied. We must advance lastApplied
-				// to avoid a permanent gap.
-				if w.callback != nil {
-					w.callback.OnProposalFailed(node.shardID, entries, applyErr)
-				}
-				lastIdx := entries[len(entries)-1].Index
-				node.lastApplied.Store(lastIdx)
-				if retries >= node.maxApplyRetries {
-					node.failed.Store(true)
-					node.handleError(&CircuitBreakerError{
-						ShardID:          node.shardID,
-						ReplicaID:        node.replicaID,
-						ConsecutiveFails: retries,
-						LastErr:          err,
-					})
-				} else {
-					node.handleError(applyErr)
-				}
+				// Fail-fast: a decompression error means these committed
+				// entries cannot be applied. Skipping them while advancing
+				// lastApplied would silently diverge this state machine
+				// from its peers, violating Raft's state-machine safety
+				// property. Instead, fail pending proposals, mark the shard
+				// failed (lastApplied is NOT advanced), and take it offline
+				// until reload/snapshot recovery — mirroring the SM-panic
+				// recovery path above.
+				w.failApply(node, entries, err)
 				return
 			}
 
-			// Acquire semaphore to limit concurrent Apply calls.
-			w.sem <- struct{}{}
-			applyStart := time.Now()
-			err := node.sm.Apply(entries, results)
-			applyElapsed := time.Since(applyStart)
-			<-w.sem // release semaphore
-			if w.metrics != nil {
-				w.metrics.ObserveApplyLatency(node.shardID, applyElapsed)
-			}
-			slog.Debug("state machine apply completed",
-				"shard", node.shardID,
-				"replica", node.replicaID,
-				"entries", len(entries),
-				"apply_ns", applyElapsed.Nanoseconds(),
-			)
+			// Acquire the semaphore to limit concurrent Apply calls and
+			// release it via defer relative to the Apply call, so a
+			// panicking user SM.Apply (recovered above) cannot leak the
+			// slot. Leaking enough slots across distinct panicking shards
+			// would deadlock all applies.
+			var err error
+			func() {
+				w.sem <- struct{}{}
+				defer func() { <-w.sem }()
+				applyStart := time.Now()
+				err = node.sm.Apply(entries, results)
+				applyElapsed := time.Since(applyStart)
+				if w.metrics != nil {
+					w.metrics.ObserveApplyLatency(node.shardID, applyElapsed)
+				}
+				slog.Debug("state machine apply completed",
+					"shard", node.shardID,
+					"replica", node.replicaID,
+					"entries", len(entries),
+					"apply_ns", applyElapsed.Nanoseconds(),
+				)
+			}()
 
 			if err != nil {
-				retries := node.applyRetries.Add(1)
-				applyErr := &ApplyError{
-					ShardID:   node.shardID,
-					ReplicaID: node.replicaID,
-					Err:       err,
-				}
-				// Fail pending proposals immediately so callers see
-				// the apply error instead of waiting for a timeout.
-				// The entries are consumed from the pipeline (the
-				// commit worker already advanced processed), so they
-				// will not be re-applied. We must advance lastApplied
-				// to avoid a permanent gap.
-				if w.callback != nil {
-					w.callback.OnProposalFailed(node.shardID, entries, applyErr)
-				}
-				lastIdx := entries[len(entries)-1].Index
-				node.lastApplied.Store(lastIdx)
-				if retries >= node.maxApplyRetries {
-					node.failed.Store(true)
-					node.handleError(&CircuitBreakerError{
-						ShardID:          node.shardID,
-						ReplicaID:        node.replicaID,
-						ConsecutiveFails: retries,
-						LastErr:          err,
-					})
-				} else {
-					node.handleError(applyErr)
-				}
+				// Fail-fast: an SM.Apply error is terminal. See the
+				// decompression path above for the safety rationale.
+				w.failApply(node, entries, err)
 				return
 			}
 			// Notify callback before resetting circuit breaker state.
@@ -352,8 +341,6 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			if w.callback != nil {
 				w.callback.OnApplied(node.shardID, entries, results[:len(entries)])
 			}
-			// Reset circuit breaker on success.
-			node.applyRetries.Store(0)
 			// Update lastApplied to the highest index in the batch.
 			lastIdx := entries[len(entries)-1].Index
 			node.lastApplied.Store(lastIdx)
@@ -390,6 +377,27 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			}
 		}()
 	}
+}
+
+// failApply handles a terminal apply or decompression error for a shard
+// using fail-fast semantics. It fails the batch's pending proposals so
+// callers observe the error immediately, marks the shard as failed, and
+// reports the error through the node's error handler. lastApplied is
+// deliberately NOT advanced: advancing it while skipping the batch would
+// diverge this state machine from its peers, breaking Raft's
+// state-machine safety property. The shard stays offline until it is
+// reloaded or recovered from a snapshot.
+func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
+	applyErr := &ApplyError{
+		ShardID:   node.shardID,
+		ReplicaID: node.replicaID,
+		Err:       err,
+	}
+	if w.callback != nil {
+		w.callback.OnProposalFailed(node.shardID, entries, applyErr)
+	}
+	node.failed.Store(true)
+	node.handleError(applyErr)
 }
 
 // requestUnload sends a shard removal request to the dispatcher goroutine

@@ -28,4 +28,8 @@ var (
 	// ErrStopped is returned when an operation is interrupted because
 	// the stopper channel was closed.
 	ErrStopped = errors.New("rsm: operation stopped")
+
+	// ErrClosed is returned by read operations (Lookup/NALookup/NALookupBuf)
+	// when the state machine has been closed.
+	ErrClosed = errors.New("rsm: state machine is closed")
 )

@@ -27,7 +27,7 @@ import (
 // number of messages varies.
 //
 // The full prefix size is computed at runtime from the local address length.
-const heartbeatBatchFixedPrefix = 8 + 8 + 4 // 20 bytes (before address data)
+const heartbeatBatchFixedPrefix = 8 + 8 + 8 + 4 // 28 bytes: BinVer+DeploymentID+SourceEpoch+AddrLen
 
 // heartbeatWriteDeadline is the write deadline for heartbeat stream writes.
 // Shorter than the 5s general deadline since heartbeats are tiny.
@@ -37,9 +37,9 @@ const heartbeatWriteDeadline = 2 * time.Second
 // are identical for every heartbeat frame: BinVer, DeploymentID, and
 // SourceAddress. Called once from Start() after the local address is known.
 //
-// Wire layout of the prefix:
+// Wire layout of the prefix (must match proto.MessageBatch's fixed region):
 //
-//	[BinVer:8][DeploymentID:8][SourceAddrLen:4][SourceAddr:N]
+//	[BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddrLen:4][SourceAddr:N]
 func (t *QUICTransport) initHeartbeatPrefix() {
 	addr := t.localAddr()
 	prefixLen := heartbeatBatchFixedPrefix + len(addr)
@@ -47,8 +47,9 @@ func (t *QUICTransport) initHeartbeatPrefix() {
 
 	binary.LittleEndian.PutUint64(t.hbPrefix[0:], proto.WireVersion)
 	binary.LittleEndian.PutUint64(t.hbPrefix[8:], t.cfg.DeploymentID)
-	binary.LittleEndian.PutUint32(t.hbPrefix[16:], uint32(len(addr)))
-	copy(t.hbPrefix[20:], addr)
+	binary.LittleEndian.PutUint64(t.hbPrefix[16:], t.bootEpoch)
+	binary.LittleEndian.PutUint32(t.hbPrefix[24:], uint32(len(addr)))
+	copy(t.hbPrefix[28:], addr)
 }
 
 // sendHeartbeatBatch is the fast path for heartbeat-only message batches.

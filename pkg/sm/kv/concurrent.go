@@ -292,6 +292,12 @@ func (cs *ConcurrentStore) RecoverFromSnapshot(_ context.Context, r io.Reader, s
 			}
 			return err
 		}
+		if keyLen > MaxKeyLength {
+			for j := range cs.buckets {
+				cs.buckets[j].mu.Unlock()
+			}
+			return errCorruptSnapshotLength
+		}
 		key := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, key); err != nil {
 			for j := range cs.buckets {
@@ -306,6 +312,12 @@ func (cs *ConcurrentStore) RecoverFromSnapshot(_ context.Context, r io.Reader, s
 				cs.buckets[j].mu.Unlock()
 			}
 			return err
+		}
+		if valLen > MaxValueLength {
+			for j := range cs.buckets {
+				cs.buckets[j].mu.Unlock()
+			}
+			return errCorruptSnapshotLength
 		}
 		val := make([]byte, valLen)
 		if _, err := io.ReadFull(r, val); err != nil {

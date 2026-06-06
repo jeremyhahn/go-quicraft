@@ -739,6 +739,97 @@ func TestClose_FlushesRemaining(t *testing.T) {
 	}
 }
 
+// countingProposer records how many distinct commands it received across
+// all batches and always succeeds. It is used to confirm that a proposal
+// reported as failed (ClosedError) was not in fact flushed to Raft.
+type countingProposer struct {
+	mu       sync.Mutex
+	commands int
+}
+
+func (c *countingProposer) SyncPropose(_ context.Context, _ uint64, cmd []byte) error {
+	decoded, err := DecodeBatch(cmd)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.commands += len(decoded)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *countingProposer) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.commands
+}
+
+// TestSubmit_CloseRaceReportsRealResult exercises the shutdown race where
+// Close() fires while a caller is blocked waiting for its proposal's result.
+// The proposal has already been enqueued, so the flush loop's close branch
+// (drainQueue then flush) still proposes it and sends the genuine result on
+// resultCh. The caller must observe that result (nil here), never a spurious
+// ClosedError that would falsely report a write the cluster actually applied.
+func TestSubmit_CloseRaceReportsRealResult(t *testing.T) {
+	t.Parallel()
+
+	// Many iterations to reliably interleave Submit's second select with
+	// Close closing closeChan.
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		cp := &countingProposer{}
+		reg := newTestRegistry(t)
+		agg, err := NewAggregator(cp,
+			WithConfig(Config{
+				// Large batch and long timer so neither size nor timer
+				// flushes the proposal: only the close path will flush it,
+				// maximizing the closeChan race window in Submit.
+				MaxBatchSize:  1000,
+				FlushInterval: 10 * time.Second,
+				QueueSize:     100,
+			}),
+			WithRegistry(reg),
+		)
+		if err != nil {
+			t.Fatalf("NewAggregator failed: %v", err)
+		}
+
+		resultCh := make(chan error, 1)
+		go func() {
+			resultCh <- agg.Submit(context.Background(), 1, []byte("close-race"))
+		}()
+
+		// Yield so the proposal is enqueued and the goroutine is parked in
+		// Submit's second select before we close.
+		runtime.Gosched()
+
+		if closeErr := agg.Close(); closeErr != nil {
+			t.Fatalf("Close failed: %v", closeErr)
+		}
+
+		submitErr := <-resultCh
+
+		var ce *ClosedError
+		if errors.As(submitErr, &ce) {
+			// A ClosedError is only acceptable if the proposal was never
+			// flushed (e.g. Close won before the proposal was enqueued).
+			if cp.count() != 0 {
+				t.Fatalf("iter %d: Submit returned ClosedError but proposal was flushed (proposer saw %d commands)", i, cp.count())
+			}
+			continue
+		}
+
+		// Any non-ClosedError result means the proposal was processed: it
+		// must have succeeded and reached the proposer exactly once.
+		if submitErr != nil {
+			t.Fatalf("iter %d: unexpected Submit error: %v", i, submitErr)
+		}
+		if cp.count() != 1 {
+			t.Fatalf("iter %d: Submit returned success but proposer saw %d commands, want 1", i, cp.count())
+		}
+	}
+}
+
 func TestClose_Idempotent(t *testing.T) {
 	t.Parallel()
 	agg, _ := newTestAggregator(t)

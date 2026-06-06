@@ -49,6 +49,12 @@ const (
 	defaultMaxStreamsPerConnection = 256
 	defaultUDPRecvBufSize          = 7 * 1024 * 1024 // 7 MB
 	defaultUDPSendBufSize          = 7 * 1024 * 1024 // 7 MB
+
+	// snapshotStreamHeadroom is the number of streams reserved on top of a
+	// peer's outbound ordered-stream pool (StreamPoolSize) when sizing the
+	// QUIC incoming-stream limit, so a peer's dedicated snapshot/ephemeral
+	// streams never block on flow control behind a saturated pool.
+	snapshotStreamHeadroom = 4
 )
 
 // Configuration validation errors. Each is a distinct typed error to allow
@@ -105,6 +111,15 @@ type MTLSConfig struct {
 type Config struct {
 	// ListenAddress is the local address to listen on (e.g. ":4001" or "0.0.0.0:4001").
 	ListenAddress string
+
+	// AdvertiseAddress is the address this node advertises to peers as its
+	// reachable Raft transport address. When non-empty it is used as the
+	// SourceAddress in outbound message batches so that peers can dial back
+	// to this node using the correct external address rather than the local
+	// bind address (which may be "0.0.0.0" or "[::]:port" on multi-homed hosts
+	// and Docker containers). When empty, the OS-reported local address from
+	// the bound UDP socket is used (backward-compatible behaviour).
+	AdvertiseAddress string
 
 	// DeploymentID identifies this deployment. Connections from peers with
 	// a different DeploymentID are rejected.

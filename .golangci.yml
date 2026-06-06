@@ -1,7 +1,7 @@
 version: "2"
 
 run:
-  go: "1.26.1"
+  go: "1.26.3"
   timeout: 5m
   tests: false
 
@@ -46,10 +46,6 @@ linters:
         linters:
           - revive
         text: "avoid package names"
-      - path: pkg/discovery/multicast\.go
-        linters:
-          - revive
-        text: "exported method.*should have comment"
 
   settings:
     gocyclo:

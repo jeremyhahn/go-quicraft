@@ -1,0 +1,102 @@
+version: 2
+
+# Keep every module on current, patched dependencies. The shipped library is
+# the repository root; the remaining modules are the dragonboat compatibility
+# adapter and the benchmark harnesses (etcd / dragonboat / openraft / quicraft
+# comparison rigs). They are not released, but they are tracked here so no
+# module accrues known-vulnerable dependencies. Trivy/gosec code scanning is
+# scoped to the shipped library only (see .github/workflows/ci.yml); Dependabot
+# is what keeps the non-shipped modules current.
+updates:
+  # --- Go modules ---
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/contrib/dragonboat"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/test/performance"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/test/performance/quicraft"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/test/performance/dragonboat"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/test/performance/etcd"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  # --- Rust (openraft benchmark) ---
+  - package-ecosystem: cargo
+    directory: "/test/performance/openraft"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-dependencies:
+        patterns: ["*"]
+
+  # --- GitHub Actions ---
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # --- Docker base images (dev + benchmark containers) ---
+  - package-ecosystem: docker
+    directory: "/.devcontainer"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/test/performance/quicraft"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/test/performance/dragonboat"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/test/performance/etcd"
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: "/test/performance/openraft"
+    schedule:
+      interval: weekly

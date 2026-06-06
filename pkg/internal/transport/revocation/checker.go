@@ -58,6 +58,30 @@ const (
 	// maxOCSPResponseSize limits the OCSP response body to prevent
 	// memory exhaustion from a malicious or misconfigured responder.
 	maxOCSPResponseSize = 1 << 20 // 1 MB
+
+	// ocspUnavailableTTL is the negative-cache TTL for "responder
+	// unavailable" results. When an OCSP query fails (responder down,
+	// timeout, network error), the failure is cached for this short window
+	// so a flood of reconnect handshakes does not re-query a dead responder
+	// on every connection, adding the full OCSP timeout to each handshake.
+	// It is intentionally short so the responder is retried promptly once it
+	// recovers, and far shorter than the positive-result cache TTL so a
+	// genuine revocation that the responder reports after recovery is picked
+	// up quickly. This cache only suppresses re-queries; it never turns an
+	// unavailable result into "revoked" or "good".
+	//
+	// Soft-fail tradeoff: under EnforceRevocation=false, a cached unavailable
+	// entry causes the peer to be accepted (status unknown). After the
+	// responder recovers and would report a cert as revoked, that revocation
+	// can go undetected for at most ocspUnavailableTTL (until the negative
+	// entry expires and the next handshake re-queries). This bounded delay is
+	// inherent to soft-fail: with no reachable responder there is by
+	// definition no fresh verdict to act on. It is NOT a masking of a verdict
+	// already known to this checker — a definitive cached "revoked" (or
+	// "good") is never overwritten by a later unavailable result (see
+	// checkOCSPRaw). Under EnforceRevocation=true the cached unavailable entry
+	// fails closed regardless.
+	ocspUnavailableTTL = 10 * time.Second
 )
 
 // Config holds revocation checking configuration.
@@ -112,10 +136,16 @@ func (c *Config) SetDefaults() {
 	}
 }
 
-// ocspCacheEntry holds a cached OCSP revocation result with expiry.
+// ocspCacheEntry holds a cached OCSP result with expiry. It represents either
+// a definitive status (revoked true/false) or, when unavailable is true, a
+// short-lived negative cache of a responder failure so repeated handshakes do
+// not re-query a down responder. The two cases use different TTLs: definitive
+// results use OCSPCacheSeconds; unavailable results use the much shorter
+// ocspUnavailableTTL.
 type ocspCacheEntry struct {
-	revoked   bool
-	expiresAt time.Time
+	revoked     bool
+	unavailable bool
+	expiresAt   time.Time
 }
 
 // Checker performs certificate revocation checking using CRL files and/or
@@ -354,8 +384,15 @@ func (c *Checker) checkCRL(serial string) bool {
 // checkOCSP queries the OCSP responder for the certificate's revocation
 // status, using the cache when available. When the OCSP check fails
 // (unreachable, no URL, no issuer cert), behavior depends on
-// EnforceRevocation: if true, returns the error; if false (soft-fail),
-// returns (false, nil).
+// EnforceRevocation: if true, returns the error (fail closed, including on a
+// negative-cache hit); if false (soft-fail), returns (false, nil).
+//
+// In soft-fail mode an unavailable result accepts the peer, so a revocation
+// the responder would report only after it recovers can go undetected for at
+// most ocspUnavailableTTL. This bounded latency is inherent to soft-fail and
+// is distinct from masking a known verdict: a definitive cached "revoked" is
+// never overwritten by a later unavailable result, so checkOCSPRaw still
+// returns the revoked verdict from cache even while the responder is down.
 func (c *Checker) checkOCSP(cert *x509.Certificate) (bool, error) {
 	revoked, err := c.checkOCSPRaw(cert)
 	if err != nil {
@@ -380,21 +417,48 @@ func (c *Checker) checkOCSPRaw(cert *x509.Certificate) (bool, error) {
 
 	serial := cert.SerialNumber.Text(16)
 
-	// Check cache first (read lock for concurrent handshakes).
+	// Check cache first (read lock for concurrent handshakes). A cached
+	// unavailable entry short-circuits the query so a down responder does not
+	// add its full timeout to every reconnect handshake during its negative
+	// TTL window.
 	c.ocspMu.RLock()
 	entry, cached := c.ocspCache[serial]
 	c.ocspMu.RUnlock()
 	if cached && time.Now().Before(entry.expiresAt) {
+		if entry.unavailable {
+			return false, &OCSPUnavailableError{URL: c.cfg.OCSPResponderURL, Err: ErrOCSPNegativeCached}
+		}
 		return entry.revoked, nil
 	}
 
 	// Query the OCSP responder.
 	revoked, err := c.queryOCSP(cert)
 	if err != nil {
+		// Negative-cache the failure for a short window so a flood of
+		// reconnect handshakes does not re-query a dead responder. This never
+		// upgrades to "revoked" or "good"; it only suppresses re-queries.
+		//
+		// Precedence: a definitive cached verdict (revoked or good) always
+		// wins over an unavailable result, so a query failure never clobbers a
+		// revocation status this checker already determined. Without this
+		// guard, a transient responder outage occurring after a definitive
+		// "revoked" verdict would replace that entry with an unavailable one
+		// and, in soft-fail mode, cause the known-revoked peer to be accepted
+		// — masking a verdict a cheap cache lookup would otherwise produce.
+		// We therefore only write the negative entry when no unexpired
+		// definitive entry exists for this serial.
+		c.ocspMu.Lock()
+		if existing, ok := c.ocspCache[serial]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
+			c.ocspCache[serial] = &ocspCacheEntry{
+				unavailable: true,
+				expiresAt:   time.Now().Add(ocspUnavailableTTL),
+			}
+		}
+		c.ocspMu.Unlock()
 		return false, &OCSPUnavailableError{URL: c.cfg.OCSPResponderURL, Err: err}
 	}
 
-	// Cache the result.
+	// Cache the definitive result.
 	c.ocspMu.Lock()
 	c.ocspCache[serial] = &ocspCacheEntry{
 		revoked:   revoked,

@@ -768,11 +768,65 @@ leader.
 
 ### Safety Validations
 
+- Cannot remove the last full (non-witness) replica (`ErrRemoveLastFullReplica`).
 - Cannot remove the last voting member (`ErrRemoveLastVoter`).
 - Cannot add a previously removed node (`ErrNodeRemoved`).
 - Cannot add a node that already exists (`ErrNodeAlreadyExists`).
+- Cannot remove a node that is not a member (`ErrNodeNotFound`).
+- Reject a config change with a zero replica ID (`ErrZeroReplicaID`) or an
+  empty address on an add (`ErrEmptyAddress`).
+- Cannot exceed the 64-voting-member cap (`ErrTooManyVotingMembers`).
 - Observer-to-voter promotion: `handleAddNode` deletes from observers
   before adding to addresses.
+
+### Validation at Propose Time, Not Apply Time
+
+Membership changes are validated when they are **proposed**, not when they
+are applied. `membership.validate(cc)` (`membership.go:175`) runs the
+read-only `configChangeValidators` table, which checks the same
+preconditions as the mutating handlers but performs no mutation. It is
+invoked on two paths:
+
+1. **Internal propose** (`Peer.ProposeConfigChange`, `peer.go:313`): the
+   leader calls `p.membership.validate(cc)` before serializing and
+   stepping the entry into the log.
+2. **Public Host API** (`Peer.ValidateConfigChange`, `peer.go:386`): the
+   Host membership API (`RequestAddNode`, `RequestAddWitness`,
+   `RequestRemoveNode`, etc.) delivers proposals through the engine inbox,
+   which reaches `membership.apply` directly without going through
+   `ProposeConfigChange`. `ValidateConfigChange` pre-checks the change
+   against the atomically published membership snapshot so the caller gets
+   a prompt error instead of a hung `RequestState`.
+
+**The 64-voting-member cap** (`maxVotingMembers = 64`, `raft.go:60`) exists
+because ReadIndex and vote quorum tracking use a `uint64` `ackBits`
+bitfield, mapping replica IDs to bit positions 0..63. A 65th voting member
+would alias bit positions and break quorum checks. The cap is enforced in
+`validateAddNode` and `validateAddWitness` (which return
+`ErrTooManyVotingMembers` when `numVotingMembers() >= maxVotingMembers`).
+
+**Apply deliberately does NOT re-check the cap.** `handleAddNode` and
+`handleAddWitness` (`membership.go`) skip the `numVotingMembers` check by
+design. `membership.apply` runs not only on the proposing leader but also
+on followers replicating a committed entry and during
+`rebuildMembershipFromLog` after log truncation. Rejecting an
+already-committed config change at apply time would make that replica
+diverge from the agreed membership — a Raft safety violation. The cap is a
+propose-time admission control, so the only way an over-cap change reaches
+apply is if validation was bypassed; in that case the invariant assertion
+in `rebuildReplicaToBit` (`raft.go:2611`) panics rather than silently
+aliasing bits. Other invariants (duplicate-add via `ErrNodeAlreadyExists`,
+last-voter protection via `ErrRemoveLastVoter` /
+`ErrRemoveLastFullReplica`) are checked by both the validators and the
+handlers, since those checks remain correct regardless of replay.
+
+`processConfigChanges` (`peer.go:609`) applies committed config-change
+entries via `membership.apply`. An apply error there is logged and skipped:
+on the committed-replay path (duplicate adds, removed-tombstone re-adds) a
+skip is benign because apply must not reject already-committed changes, but
+on the leader's own freshly proposed entry a skip is unexpected — which is
+why the Host membership API pre-validates via `ValidateConfigChange` before
+proposing.
 
 ### CampaignSkipped Event
 

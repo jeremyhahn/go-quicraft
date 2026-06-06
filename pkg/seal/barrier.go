@@ -80,13 +80,20 @@ const (
 	barrierUnsealed
 )
 
-// Barrier provides algorithm-agile authenticated encryption for at-rest data.
-// It supports AES-128-GCM, AES-192-GCM, AES-256-GCM, ChaCha20-Poly1305, and
-// XChaCha20-Poly1305, selected via BarrierConfig.Algorithm. The algorithm
-// identifier is embedded in the ciphertext wire format to enable decryption
-// without out-of-band negotiation.
+// Barrier provides authenticated encryption for at-rest data. It supports
+// AES-128-GCM, AES-192-GCM, AES-256-GCM, ChaCha20-Poly1305, and
+// XChaCha20-Poly1305, selected via BarrierConfig.Algorithm.
 //
-// Wire format (v2, algorithm-agile):
+// The algorithm identifier is embedded in the ciphertext wire format and is
+// used to size the nonce on the decrypt path. Note: decryption uses the AEAD
+// the barrier is currently configured with (keyed by epoch), NOT an AEAD
+// reconstructed from the header algID. A single deployment is therefore
+// expected to use ONE algorithm for the life of its data; mixing algorithms
+// within a deployment is not supported and a mismatch fails closed via AEAD
+// authentication (ErrDecryptionFailed). The embedded algID exists for
+// nonce-sizing and forensic/diagnostic purposes, not for runtime negotiation.
+//
+// Wire format (v2):
 //
 //	[epoch:8][algID:1][nonce:N][ciphertext+tag]
 //
@@ -153,12 +160,6 @@ type Barrier struct {
 	// In-flight epoch reference counts for purge coordination.
 	inFlightMu     sync.Mutex
 	inFlightEpochs map[uint64]int64
-
-	// Shamir secret sharing support.
-	shamirConfig *ShamirConfig
-	accumulator  atomic.Value // holds ShareAccumulator
-	splitter     ShareSplitter
-	accFactory   func(threshold, total int) ShareAccumulator
 
 	// timeNow is injectable for testing brute-force backoff timing.
 	timeNow func() time.Time
@@ -371,8 +372,17 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// Brute-force backoff check.
 	if b.failedAttempts >= bruteForceThreshold {
 		elapsed := b.timeNow().Sub(b.lastFailedAt)
-		delay := b.backoffDelay()
-		if elapsed < delay {
+		// Guard against a backward clock step. If the persisted lastFailedAt is
+		// in the future (e.g. the state was restored on a host whose clock is
+		// behind, or the wall clock was stepped back), elapsed is negative and
+		// would otherwise stay below delay forever, permanently locking out
+		// unseal independently of any attacker. Treat a non-monotonic clock as
+		// satisfying the delay and re-anchor lastFailedAt to now so subsequent
+		// backoff intervals are measured from a sane baseline.
+		if elapsed < 0 {
+			b.lastFailedAt = b.timeNow()
+			b.persistBackoffState()
+		} else if elapsed < b.backoffDelay() {
 			return ErrUnsealBackoff
 		}
 	}
@@ -389,6 +399,35 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 			slog.Warn("barrier unseal failed", "attempt", b.failedAttempts)
 		}
 		return err
+	}
+
+	// No-encryption mode: NoneStrategy intentionally holds no root-key material
+	// and returns an empty key. Wire up its identity encryptor directly,
+	// BEFORE the 32-byte size gate below — otherwise the empty key is rejected
+	// with ErrInvalidRootKeySize on every restart and, after enough restarts,
+	// the persisted brute-force backoff would lock the node out of its own
+	// plaintext data. The identity encryptor ignores key material, so no root
+	// key is stored.
+	if b.sealed != nil && b.sealed.Strategy == StrategyNone {
+		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
+		if hwErr != nil {
+			wipeBytes(rootKey)
+			return hwErr
+		}
+		wipeBytes(rootKey)
+		b.hwEncryptor = hwEnc
+		// Mirror Initialize's epoch assignment so CurrentEpoch() is symmetric
+		// across Initialize and restart-via-Unseal. The value is cosmetic in
+		// None mode (the identity encrypter ignores the epoch), but keeping it
+		// consistent avoids surprising any consumer that reads CurrentEpoch().
+		b.epoch = b.sealed.Epoch
+		b.state = barrierUnsealed
+		b.unsealed.Store(true)
+		b.failedAttempts = 0
+		b.lastFailedAt = time.Time{}
+		b.persistBackoffState()
+		slog.Info("barrier unsealed (no-encryption mode)")
+		return nil
 	}
 
 	if len(rootKey) != rootKeySize {
@@ -765,12 +804,51 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 // current cipher. Old DEKs remain available for reading data encrypted with
 // previous epochs.
 //
-// AEAD safety trackers (InvocationCounter, NonceTracker) are reset for the new epoch.
+// AEAD safety trackers (InvocationCounter, NonceTracker) are reset for the new
+// epoch.
 //
 // Rotate is not supported in hardware mode (returns ErrHardwareMode).
 //
 // Rotate must only be called while the barrier is unsealed. It acquires the
 // exclusive write lock for the entire duration.
+//
+// Ordering — commit-first, then fail-safe tracker reset:
+//
+//  1. Derive the new DEK and AEAD cipher (the only genuinely fallible step). On
+//     a derivation error nothing has changed; Rotate returns 0 (old epoch still
+//     active) and zeroes the partial DEK.
+//  2. Commit the epoch switch. All of these mutations are in-memory and
+//     infallible, performed under the already-held b.mu write lock, so the new
+//     epoch becomes active atomically with respect to every other locked path.
+//  3. Reset the AEAD safety trackers (invocations.Reset, nonceTracker.Clear).
+//     These run AFTER the commit and must NOT revert the epoch on failure.
+//
+// The reason resets run last — and never trigger a rollback — is that the
+// trackers are SHARED, in-place state with no rollback API: Reset zeroes the
+// shared invocation counter and Clear swaps the shared nonce map. If resets ran
+// BEFORE the commit and one succeeded while the next failed, the still-active
+// OLD key would inherit a freshly zeroed invocation counter and thus a brand-new
+// 2^32 invocation budget, blowing past its AEAD nonce-collision safety limit
+// with no way to restore the prior count. Committing first removes that hazard:
+// the trackers are only ever reset once the NEW key is the active key.
+//
+// A tracker reset failure after the commit is FAIL-SAFE, so Rotate logs a
+// slog.Warn and still returns (newEpoch, nil):
+//   - A non-reset invocation counter only makes the NEW key reach its limit
+//     sooner, forcing an earlier (still-safe) re-rotation; it never exceeds the
+//     limit.
+//   - A non-cleared nonce set only yields conservative false-positive reuse
+//     rejections; it never accepts a reused nonce.
+//
+// Returning an error alongside a committed new epoch is deliberately avoided: a
+// caller treating the error as "rotation failed" might retry, driving yet
+// another rotation. The degraded-but-safe tracker state is surfaced via the log
+// instead.
+//
+// Concurrency note: Encrypt/encryptLocked (and Decrypt) acquire b.mu.RLock, and
+// Rotate holds b.mu.Lock for its full duration. No encryption can therefore
+// observe the window between the epoch commit (step 2) and the tracker reset
+// (step 3); both happen under the exclusive write lock before any reader runs.
 func (b *Barrier) Rotate() (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -783,9 +861,12 @@ func (b *Barrier) Rotate() (uint64, error) {
 		return 0, ErrHardwareMode
 	}
 
+	oldEpoch := b.epoch
 	newEpoch := b.epoch + 1
 
-	// Open root key enclave temporarily for HKDF derivation.
+	// Step 1: derive the new DEK and cipher. This is the only fallible step that
+	// must leave the barrier unchanged on failure. Open the root key enclave
+	// temporarily for HKDF derivation.
 	rootBuf, err := b.rootKey.Open()
 	if err != nil {
 		return 0, err
@@ -793,13 +874,19 @@ func (b *Barrier) Rotate() (uint64, error) {
 	dek, aead, err := b.deriveEpochCipher(rootBuf.Bytes(), b.salt, newEpoch)
 	rootBuf.Destroy()
 	if err != nil {
+		// Nothing committed yet; the old epoch remains active. deriveEpochCipher
+		// already zeroed any partial key material on its own error path, but the
+		// returned dek (if any) is wiped here for defense in depth.
+		wipeBytes(dek)
 		return 0, err
 	}
 
-	// Wrap DEK in enclave (wipes dek).
+	// Step 2: commit the epoch switch. Wrap the DEK in an enclave (wipes dek)
+	// then perform the in-memory, infallible state mutations under the held write
+	// lock. After this point the NEW key is active and the rotation has
+	// succeeded; the trackers below are reset against the new epoch.
 	dekPK := enclave.NewProtectedKey(dek)
 
-	oldEpoch := b.epoch
 	b.epoch = newEpoch
 	b.currentDEK = dekPK
 	b.cipher = aead
@@ -816,15 +903,22 @@ func (b *Barrier) Rotate() (uint64, error) {
 	}
 	b.sealed.KnownEpochs = epochs
 
-	// Reset AEAD safety trackers for the new epoch.
+	// Step 3: reset the AEAD safety trackers for the new epoch. These run AFTER
+	// the commit and never revert it. A failure here is fail-safe (see the doc
+	// comment): a non-reset counter only forces an earlier re-rotation; a
+	// non-cleared nonce set only yields conservative false-positive rejections.
+	// Log the degraded-but-safe state and still return (newEpoch, nil) so a
+	// caller does not retry into yet another rotation.
 	if b.invocations != nil {
-		if err := b.invocations.Reset(); err != nil {
-			return 0, &TrackerError{Tracker: "invocation", Op: "reset", Err: err}
+		if rerr := b.invocations.Reset(); rerr != nil {
+			slog.Warn("key rotated but invocation counter reset failed; new key will re-rotate earlier (fail-safe)",
+				"from_epoch", oldEpoch, "to_epoch", newEpoch, "tracker", "invocation", "op", "reset", "error", rerr)
 		}
 	}
 	if b.nonceTracker != nil {
-		if err := b.nonceTracker.Clear(); err != nil {
-			return 0, &TrackerError{Tracker: "nonce", Op: "clear", Err: err}
+		if cerr := b.nonceTracker.Clear(); cerr != nil {
+			slog.Warn("key rotated but nonce tracker clear failed; stale nonces may be conservatively rejected (fail-safe)",
+				"from_epoch", oldEpoch, "to_epoch", newEpoch, "tracker", "nonce", "op", "clear", "error", cerr)
 		}
 	}
 
@@ -925,6 +1019,11 @@ func (b *Barrier) RootKey() ([]byte, error) {
 	if b.state != barrierUnsealed {
 		return nil, ErrBarrierSealed
 	}
+	// No-encryption mode (StrategyNone) holds no root key material, so
+	// b.rootKey is nil. Return a defined error instead of nil-dereferencing.
+	if b.rootKey == nil {
+		return nil, ErrNoRootKeyAvailable
+	}
 	buf, err := b.rootKey.Open()
 	if err != nil {
 		return nil, err
@@ -1001,6 +1100,12 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Reject nil before any field access so a missing/corrupt persisted blob
+	// surfaces as a sentinel error instead of a nil-pointer panic.
+	if sealed == nil {
+		return ErrNilSealedData
+	}
+
 	// Validate epoch is non-zero.
 	if sealed.Epoch == 0 {
 		return ErrInvalidSealedEpoch
@@ -1045,144 +1150,6 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		b.state = barrierSealed
 	}
 	return nil
-}
-
-// --- Shamir support ---
-
-// SetShamirSupport configures Shamir secret sharing for the barrier. The
-// splitter is used during InitializeShamir to split the root key into shares.
-// The accFactory creates fresh accumulators for each UnsealWithShare session.
-func (b *Barrier) SetShamirSupport(config *ShamirConfig, splitter ShareSplitter, accFactory func(threshold, total int) ShareAccumulator) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.shamirConfig = config
-	b.splitter = splitter
-	b.accFactory = accFactory
-}
-
-// InitializeShamir initializes the barrier and splits the root key into
-// Shamir shares. The barrier is initialized normally via the provided
-// strategy, then the root key is split into threshold-of-total shares
-// using the configured ShareSplitter.
-func (b *Barrier) InitializeShamir(ctx context.Context, strategy SealingStrategy, creds Credentials) (*ShamirInitResult, error) {
-	b.mu.Lock()
-	if b.shamirConfig == nil || b.splitter == nil {
-		b.mu.Unlock()
-		return nil, ErrShamirNotConfigured
-	}
-	cfg := *b.shamirConfig
-	splitter := b.splitter
-	b.mu.Unlock()
-
-	if cfg.Threshold < 2 || cfg.Threshold > cfg.TotalShares {
-		return nil, ErrShamirThresholdInvalid
-	}
-
-	// Initialize the barrier normally.
-	if err := b.Initialize(ctx, strategy, creds); err != nil {
-		return nil, err
-	}
-
-	// Get the root key to split.
-	rootKey, err := b.RootKey()
-	if err != nil {
-		return nil, err
-	}
-	defer wipeBytes(rootKey)
-
-	// Split root key into shares.
-	shares, err := splitter.Split(rootKey, cfg.Threshold, cfg.TotalShares)
-	if err != nil {
-		return nil, err
-	}
-
-	// Update the sealed key with Shamir metadata.
-	b.mu.Lock()
-	b.sealed.ShamirThreshold = cfg.Threshold
-	b.sealed.ShamirTotal = cfg.TotalShares
-	b.mu.Unlock()
-
-	return &ShamirInitResult{
-		Shares:      shares,
-		Threshold:   cfg.Threshold,
-		TotalShares: cfg.TotalShares,
-	}, nil
-}
-
-// UnsealWithShare submits a single Shamir share toward the quorum. When the
-// threshold is met, the root key is reconstructed and the barrier is unsealed
-// using the provided strategy and credentials.
-//
-// Returns QuorumProgress indicating the current state. If the quorum is not
-// yet complete, the barrier remains sealed.
-func (b *Barrier) UnsealWithShare(ctx context.Context, share string, strategy SealingStrategy, creds Credentials) (*QuorumProgress, error) {
-	b.mu.Lock()
-	if b.shamirConfig == nil || b.accFactory == nil {
-		b.mu.Unlock()
-		return nil, ErrShamirNotConfigured
-	}
-	cfg := *b.shamirConfig
-
-	// Get or create accumulator.
-	accRaw := b.accumulator.Load()
-	var acc ShareAccumulator
-	if accRaw != nil {
-		acc = accRaw.(ShareAccumulator)
-	}
-	if acc == nil || acc.Expired() {
-		acc = b.accFactory(cfg.Threshold, cfg.TotalShares)
-		b.accumulator.Store(acc)
-	}
-	b.mu.Unlock()
-
-	// Add the share.
-	progress, err := acc.AddShare(ctx, share)
-	if err != nil {
-		return nil, err
-	}
-
-	if !progress.Complete {
-		return progress, nil
-	}
-
-	// Threshold met: unseal using the strategy.
-	if err := b.Unseal(ctx, strategy, creds); err != nil {
-		return nil, err
-	}
-
-	return progress, nil
-}
-
-// UnsealWithShares is a convenience method that submits all shares at once.
-// This is useful for automated/testing scenarios where all shares are
-// available simultaneously.
-func (b *Barrier) UnsealWithShares(ctx context.Context, shares []string, strategy SealingStrategy, creds Credentials) error {
-	for _, share := range shares {
-		progress, err := b.UnsealWithShare(ctx, share, strategy, creds)
-		if err != nil {
-			return err
-		}
-		if progress.Complete {
-			return nil
-		}
-	}
-	return ErrShamirNotConfigured
-}
-
-// GetQuorumProgress returns the current quorum progress, or nil if no
-// accumulator session is active.
-func (b *Barrier) GetQuorumProgress() *QuorumProgress {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	accRaw := b.accumulator.Load()
-	if accRaw == nil {
-		return nil
-	}
-	acc, ok := accRaw.(ShareAccumulator)
-	if !ok {
-		return nil
-	}
-	return acc.GetProgress()
 }
 
 // persistBackoffState writes the current brute-force backoff counters to the

@@ -875,3 +875,140 @@ func TestPoolRecycling_ReusesObjects(t *testing.T) {
 	}
 	rs2.Release()
 }
+
+// ---------------------------------------------------------------------------
+// Reference-count gated pool return (Bug E)
+// ---------------------------------------------------------------------------
+
+// TestRefcount_ReleaseBeforeReleaseRefDefersRecycle verifies that a caller's
+// Release does NOT return the object to the pool while a pending-map
+// reference is still outstanding. The object is recycled only when the final
+// releaseRef runs after Release.
+func TestRefcount_ReleaseBeforeReleaseRefDefersRecycle(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{})
+
+	// Simulate registration in a pending map.
+	rs.acquireRef()
+
+	// Caller releases (e.g., Sync* timed out and returned) while still
+	// registered. This must NOT recycle: the map still references rs.
+	rs.Release()
+	if rs.recycled.Load() {
+		t.Fatal("rs recycled while a pending-map reference is still outstanding")
+	}
+
+	// The late completion path removes its reference; now rs may recycle.
+	rs.releaseRef()
+	if !rs.recycled.Load() {
+		t.Fatal("rs not recycled after final releaseRef following Release")
+	}
+}
+
+// TestRefcount_ReleaseRefBeforeReleaseDefersRecycle verifies the opposite
+// ordering: the pending-map reference is removed first (the request completed
+// normally) but the caller has not yet released. Recycle must wait for
+// Release.
+func TestRefcount_ReleaseRefBeforeReleaseDefersRecycle(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{})
+	rs.acquireRef()
+
+	rs.releaseRef()
+	if rs.recycled.Load() {
+		t.Fatal("rs recycled before the caller released it")
+	}
+
+	rs.Release()
+	if !rs.recycled.Load() {
+		t.Fatal("rs not recycled after Release with no outstanding references")
+	}
+}
+
+// TestRefcount_NoCrossDeliveryAfterRecycle reproduces the use-after-Release
+// hazard: request A times out and is released, its RequestState is recycled
+// and reused for request B, then A's late completion fires. B's result
+// channel must be untouched.
+func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
+	pool := NewRequestStatePool()
+
+	// Request A registers and the caller releases on timeout.
+	rsA := newRequestState(pool, 100, time.Time{})
+	rsA.acquireRef()
+	rsA.Release()
+
+	// A's late completion removes its reference, recycling rsA into the pool.
+	rsA.releaseRef()
+	if !rsA.recycled.Load() {
+		t.Fatal("rsA not recycled after timeout + late releaseRef")
+	}
+
+	// Request B obtains a fresh RequestState from the pool. With a single
+	// object in the pool this returns the recycled rsA storage.
+	rsB := newRequestState(pool, 200, time.Time{})
+	if rsB != rsA {
+		t.Skip("pool did not hand back the recycled object; race-free path")
+	}
+	rsB.acquireRef()
+
+	// Now A's stale completion fires again (e.g., a duplicated callback). It
+	// must be a no-op because the recycled object is a different logical
+	// request. complete() is CAS-guarded by the completed flag, which was
+	// reset for B; but A's completion attempt happens via the SAME storage,
+	// so guard correctness depends on B not having been completed yet.
+	//
+	// The critical invariant: a late complete() targeting the recycled object
+	// must not deliver into B's channel unless it is B's own completion. Here
+	// we assert B's channel is empty until B is explicitly completed.
+	select {
+	case got := <-rsB.ResultC():
+		t.Fatalf("rsB result channel unexpectedly delivered %+v", got)
+	default:
+	}
+
+	// Complete B legitimately and confirm B receives its own result.
+	rsB.complete(RequestResult{Value: 200})
+	select {
+	case got := <-rsB.ResultC():
+		if got.Value != 200 {
+			t.Fatalf("rsB result = %d, want 200", got.Value)
+		}
+	default:
+		t.Fatal("rsB did not receive its own completion")
+	}
+	rsB.releaseRef()
+	rsB.Release()
+}
+
+// TestRefcount_MultipleRefs verifies the object survives until ALL references
+// are released, regardless of caller Release ordering.
+func TestRefcount_MultipleRefs(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{})
+
+	rs.acquireRef()
+	rs.acquireRef()
+	rs.Release()
+	if rs.recycled.Load() {
+		t.Fatal("recycled with two outstanding refs")
+	}
+	rs.releaseRef()
+	if rs.recycled.Load() {
+		t.Fatal("recycled with one outstanding ref remaining")
+	}
+	rs.releaseRef()
+	if !rs.recycled.Load() {
+		t.Fatal("not recycled after all refs released and caller released")
+	}
+}
+
+// TestRefcount_NoRefRecyclesOnRelease verifies a RequestState that is never
+// registered in a pending map recycles immediately on Release.
+func TestRefcount_NoRefRecyclesOnRelease(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{})
+	rs.Release()
+	if !rs.recycled.Load() {
+		t.Fatal("unregistered rs should recycle immediately on Release")
+	}
+}

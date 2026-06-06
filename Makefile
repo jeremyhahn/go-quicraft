@@ -70,8 +70,6 @@ PKG_TRANSPORT   := ./pkg/internal/transport/...
 PKG_QUICRAFT    := ./pkg
 PKG_ERRORS      := ./pkg
 PKG_SM          := ./pkg/sm/...
-PKG_DISCOVERY   := ./pkg/discovery/...
-PKG_BOOTSTRAP   := ./pkg/bootstrap/...
 PKG_SERVER      := ./pkg/internal/server/...
 PKG_WRITEMODE   := ./pkg/writemode/...
 PKG_BATCH       := ./pkg/batch/...
@@ -189,14 +187,6 @@ test-errors:
 test-sm:
 	$(GOTEST) $(PKG_SM)
 
-.PHONY: test-discovery
-test-discovery:
-	$(GOTEST) $(PKG_DISCOVERY)
-
-.PHONY: test-bootstrap
-test-bootstrap:
-	$(GOTEST) $(PKG_BOOTSTRAP)
-
 .PHONY: test-server
 test-server:
 	$(GOTEST) $(PKG_SERVER)
@@ -251,13 +241,6 @@ integration-test-e2e:
 	docker compose -f $(INT_COMPOSE) up --build --abort-on-container-exit --exit-code-from test-runner
 	docker compose -f $(INT_COMPOSE) down -v
 
-.PHONY: integration-test-bootstrap
-integration-test-bootstrap:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running bootstrap integration tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration make _integration-test-bootstrap
-
 # Internal targets: executed inside the devcontainer. Not intended for host use.
 
 .PHONY: _integration-test
@@ -275,10 +258,6 @@ _integration-test-host:
 .PHONY: _integration-test-e2e
 _integration-test-e2e:
 	$(GOTEST) -tags=integration $(INT_TEST_DIR)/e2e/...
-
-.PHONY: _integration-test-bootstrap
-_integration-test-bootstrap:
-	$(GOTEST) -tags=integration $(INT_TEST_DIR)/bootstrap/...
 
 .PHONY: integration-test-linearizability
 integration-test-linearizability:
@@ -326,14 +305,6 @@ bench-transport:
 .PHONY: bench-quicraft
 bench-quicraft:
 	$(GOBENCH) $(PKG_QUICRAFT)
-
-.PHONY: bench-discovery
-bench-discovery:
-	$(GOBENCH) $(PKG_DISCOVERY)
-
-.PHONY: bench-bootstrap
-bench-bootstrap:
-	$(GOBENCH) $(PKG_BOOTSTRAP)
 
 .PHONY: bench-server
 bench-server:
@@ -603,16 +574,6 @@ coverage-sm: | $(COVER_DIR)
 	$(GOTEST) -coverprofile=$(COVER_DIR)/sm.out $(PKG_SM)
 	$(call check-coverage,$(COVER_DIR)/sm.out,sm)
 
-.PHONY: coverage-discovery
-coverage-discovery: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/discovery.out $(PKG_DISCOVERY)
-	$(call check-coverage,$(COVER_DIR)/discovery.out,discovery)
-
-.PHONY: coverage-bootstrap
-coverage-bootstrap: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/bootstrap.out $(PKG_BOOTSTRAP)
-	$(call check-coverage,$(COVER_DIR)/bootstrap.out,bootstrap)
-
 .PHONY: coverage-server
 coverage-server: | $(COVER_DIR)
 	$(GOTEST) -coverprofile=$(COVER_DIR)/server.out $(PKG_SERVER)
@@ -793,14 +754,13 @@ help:
 	@echo "    packages: proto, config, queue, stopper, invariant, logdb,"
 	@echo "              raft, waldb, seal, rsm, session, snapshot,"
 	@echo "              registry, engine, transport, quicraft, errors, sm,"
-	@echo "              discovery, bootstrap, server, writemode"
+	@echo "              server, writemode"
 	@echo ""
 	@echo "Integration Tests (run in devcontainer automatically):"
 	@echo "  integration-test            Run all integration tests in devcontainer"
 	@echo "  integration-test-raft       Run raft integration tests in devcontainer"
 	@echo "  integration-test-host       Run Host API tests in devcontainer"
 	@echo "  integration-test-e2e        Run E2E multi-node cluster tests (Docker Compose)"
-	@echo "  integration-test-bootstrap  Run bootstrap integration tests in devcontainer"
 	@echo "  integration-test-linearizability  Run porcupine linearizability tests in devcontainer"
 	@echo ""
 	@echo "Fuzz Testing:"
@@ -815,7 +775,7 @@ help:
 	@echo "Benchmarks:"
 	@echo "  bench-<pkg>            Run benchmarks for a specific package"
 	@echo "    packages: proto, raft, waldb, seal, registry, engine, transport, quicraft,"
-	@echo "              discovery, bootstrap, server, writemode"
+	@echo "              server, writemode"
 	@echo ""
 	@echo "Performance Comparison (via perfcompare orchestrator):"
 	@echo "  perf-build                   Build the perfcompare orchestrator"
@@ -838,7 +798,7 @@ help:
 	@echo "    packages: proto, config, queue, stopper, invariant, logdb,"
 	@echo "              raft, waldb, seal, rsm, session, snapshot,"
 	@echo "              registry, engine, transport, quicraft, errors, sm,"
-	@echo "              discovery, bootstrap, server, writemode"
+	@echo "              server, writemode"
 	@echo ""
 	@echo "CI Pipeline:"
 	@echo "  ci                     Run full CI pipeline (fmt→vet→lint→gosec→vuln→trivy→build→test)"

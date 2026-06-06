@@ -1,0 +1,15 @@
+# Trivy ignore list for go-quicraft.
+#
+# The CI Trivy job is a SOURCE filesystem scan (scan-type: fs, scan-ref: .) of
+# the shipped Go module, with test/, examples/ and contrib/ skipped. It is NOT
+# an image scan. Do not scan a built dev image (.devcontainer/*) into GitHub
+# code scanning: that surfaces the base image's OS-package CVEs (binutils, perl,
+# gnupg, glibc, …) and the bundled tool binaries (trivy, gosec) and the Go
+# module cache — none of which are go-quicraft source vulnerabilities. The
+# production library is independently verified clean by govulncheck and gosec.
+#
+# Add specific advisory IDs below only when a finding is confirmed
+# not-applicable or unfixable, with a one-line justification.
+#
+# Example:
+# CVE-XXXX-XXXXX  # <reason this advisory does not apply to go-quicraft>

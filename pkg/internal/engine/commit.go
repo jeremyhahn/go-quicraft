@@ -337,6 +337,15 @@ func (w *commitWorker) processBatch() {
 			}
 			if attempt < saveStateMaxRetries-1 {
 				if cancelled := w.retryWait(attempt); cancelled {
+					// Shutdown fired during the retry backoff. The batch
+					// was never persisted, so its committed entries will
+					// never reach the apply worker. Clear commitPending
+					// and fail pending proposals for every node in the
+					// batch before returning, mirroring the saveErr
+					// cleanup path below. Without this, callers block
+					// until their context deadline and the nodes are left
+					// stuck with commitPending=true.
+					w.failBatchSaveState(saveErr)
 					return
 				}
 			}
@@ -344,44 +353,7 @@ func (w *commitWorker) processBatch() {
 	}
 
 	if saveErr != nil {
-		// Clear commitPending for all shards in the batch to prevent
-		// them from being stuck forever. Also fail pending proposals so
-		// callers see an immediate error instead of blocking until
-		// context deadline timeout. The committed entries from the
-		// failed batch were already extracted via GetUpdate and will
-		// never reach the apply worker.
-		//
-		// Mark each node as failed so the step worker skips it on
-		// subsequent ticks. The node's internal Raft state has diverged
-		// from stable storage (entries were extracted via GetUpdate,
-		// advancing prevState, but never persisted). Allowing the node
-		// to continue would violate Raft's durability invariant: the
-		// node could acknowledge entries to the leader that were never
-		// written to WAL, causing silent data loss on crash.
-		// Circuit breaker: mark nodes as permanently failed. There is
-		// intentionally no automatic reset for SaveState failures.
-		// The node's internal Raft state has diverged from stable
-		// storage, making automatic recovery unsafe. The recovery
-		// path is to unload and reload the shard, which reconstructs
-		// the Raft state from the last consistent WAL checkpoint.
-		// This conservative approach prevents silent data loss that
-		// could occur if the node continued operating with stale
-		// persisted state.
-		for i, u := range w.batch {
-			node := w.batchNodes[i]
-			node.failed.Store(true)
-			node.commitPending.Store(false)
-			saveStateErr := &SaveStateError{
-				ShardID:   u.ShardID,
-				ReplicaID: u.ReplicaID,
-				Err:       saveErr,
-			}
-			node.handleError(saveStateErr)
-			if w.callback != nil && len(u.CommittedEntries) > 0 {
-				w.callback.OnProposalFailed(u.ShardID, u.CommittedEntries, saveStateErr)
-			}
-		}
-		w.clearBatch()
+		w.failBatchSaveState(saveErr)
 		return
 	}
 
@@ -490,7 +462,13 @@ func (w *commitWorker) processBatch() {
 			}
 
 			// Piggyback path: persist updated state, send messages, apply.
-			w.executePiggyback(node, piggyback)
+			// On shutdown mid-delivery it returns false; stop processing the
+			// batch entirely rather than iterating cleared/nil batch slots
+			// (which would nil-deref node.raftMu on the next item).
+			if !w.executePiggyback(node, piggyback) {
+				w.clearBatch()
+				return
+			}
 			continue
 		}
 
@@ -517,9 +495,49 @@ func (w *commitWorker) processBatch() {
 			case <-w.stopC:
 				slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
 					"shard", ai.update.ShardID)
+				ai.update.ReleaseCommittedEntries()
+				w.applyPool.Put(ai)
 				w.clearBatch()
 				return
 			}
+		}
+	}
+	w.clearBatch()
+}
+
+// failBatchSaveState handles a terminal SaveState failure (either the
+// retry budget was exhausted or shutdown fired during the retry backoff)
+// for the current batch. The batch's committed entries were already
+// extracted via GetUpdate but never persisted, so they will never reach
+// the apply worker.
+//
+// For every node in the batch it clears commitPending (so the node is not
+// stuck forever), marks the node failed, reports a SaveStateError, and
+// fails the batch's pending proposals so callers see an immediate error
+// instead of blocking until their context deadline. Finally it clears the
+// batch buffers for reuse.
+//
+// Nodes are marked as permanently failed with no automatic reset: their
+// internal Raft state has diverged from stable storage (entries were
+// extracted, advancing prevState, but never written to WAL). Allowing
+// such a node to continue would violate Raft's durability invariant — it
+// could acknowledge entries to the leader that were never persisted,
+// causing silent data loss on crash. Recovery is to unload and reload the
+// shard, reconstructing Raft state from the last consistent WAL
+// checkpoint.
+func (w *commitWorker) failBatchSaveState(saveErr error) {
+	for i, u := range w.batch {
+		node := w.batchNodes[i]
+		node.failed.Store(true)
+		node.commitPending.Store(false)
+		saveStateErr := &SaveStateError{
+			ShardID:   u.ShardID,
+			ReplicaID: u.ReplicaID,
+			Err:       saveErr,
+		}
+		node.handleError(saveStateErr)
+		if w.callback != nil && len(u.CommittedEntries) > 0 {
+			w.callback.OnProposalFailed(u.ShardID, u.CommittedEntries, saveStateErr)
 		}
 	}
 	w.clearBatch()
@@ -580,43 +598,26 @@ func (w *commitWorker) requestReload(shardID uint64) {
 	}
 }
 
-// executePiggyback sends messages with proper free/ordered split, commits
-// the piggyback to advance the processed marker, and forwards committed
-// entries to the apply worker. Eliminates the second pipeline cycle for
-// multi-node proposals. Called with raftMu already released.
+// executePiggyback sends messages with proper free/ordered split, persists the
+// piggybacked commit index, advances the peer, sends ordered responses, and
+// forwards committed entries to the apply worker. Eliminates the second pipeline
+// cycle for multi-node proposals. Called with raftMu already released.
 //
-// Commit Index Persistence: The piggyback commit index is NOT persisted
-// to WAL here. This eliminates the second fsync that was previously
-// required per batch. The commit index will be persisted in the next
-// batch's SaveState call. This is safe because:
+// Commit-index durability: this path DOES persist the advanced commit index via
+// SaveState before applying or sending ordered responses (see below). An earlier
+// version skipped that fsync as an optimization, but that could leave an on-disk
+// state machine whose durable lastApplied exceeded the recovered HardState.Commit
+// (violating lastApplied <= committed). The state-only SaveState does not truncate
+// entries, so the cost is one fsync without touching the durable log.
 //
-//  1. Raft safety only requires Term and Vote to be durable before
-//     responding to vote requests (PhD thesis 3.6.1). The commit index
-//     is a performance optimization, not a safety requirement.
-//
-//  2. On recovery, the commit index is recomputed from the durable log
-//     entries and follower acknowledgments. The leader recalculates the
-//     commit point by checking which entries have been replicated to a
-//     majority.
-//
-//  3. The entries themselves are already durable from the first fsync
-//     in processBatch(). Only the commit index metadata was being
-//     redundantly persisted here.
-//
-// On crash-recovery between piggyback apply and the next SaveState, the
-// node may re-apply entries between the persisted and actual commit index.
-// This is safe because state machine Apply is idempotent: each entry is
-// identified by its unique log index, and the session mechanism (client
-// sequence tracking) prevents duplicate side-effects from re-applied
-// proposals.
-//
-// This optimization reduces fsync operations by ~50% for batches that
-// trigger piggyback commits, improving throughput significantly on
-// workloads with concurrent multi-node proposals.
-func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) {
-	// Split messages: free-order sent immediately, ordered after commit.
-	// Reuse pre-allocated buffers to avoid the msgs[:0:0] allocation
-	// pattern on every piggyback call.
+// It returns false only when the worker is shutting down (stopC fired mid-
+// delivery); in that case the caller must stop processing the batch (the shared
+// batch buffers are no longer safe to iterate). It returns true for normal
+// completion AND for per-node errors (the caller continues with the next item).
+func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool {
+	// Split messages: free-order may go immediately (they do not depend on
+	// commit-index durability); ordered responses go AFTER the commit index
+	// is durable. Reuse pre-allocated buffers.
 	w.freeOrderBuf = w.freeOrderBuf[:0]
 	w.orderedMsgSplitBuf = w.orderedMsgSplitBuf[:0]
 	if len(piggyback.Messages) > 0 {
@@ -632,23 +633,39 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) {
 		}
 	}
 
-	// Skip commit index persistence - it will be included in the next
-	// batch's SaveState. The entries are already durable from the first
-	// fsync, and the commit index can be recomputed on recovery.
-
-	// Send ordered messages. Although we skipped WAL persistence for the
-	// commit index, the original entries are already durable, so it's
-	// safe to send responses.
-	if w.sender != nil && len(w.orderedMsgSplitBuf) > 0 {
-		w.sendOrderedMessages(w.orderedMsgSplitBuf)
+	// Persist the advanced commit index (hard state) BEFORE applying or
+	// sending ordered responses. The piggyback's entries were already
+	// fsynced, but the commit-index advance was not part of this batch's
+	// SaveState. Skipping it (the old behavior) meant a crash could leave an
+	// on-disk state machine whose durable lastApplied exceeded the recovered
+	// HardState.Commit — violating lastApplied <= committed and risking
+	// re-apply. piggyback.State is the peer's current hard state (set by
+	// GetPiggybackUpdate via hardState()), so persisting it is correct.
+	if w.logdb != nil {
+		stateUpdate := []logdb.Update{{
+			ShardID:   piggyback.ShardID,
+			ReplicaID: piggyback.ReplicaID,
+			State: logdb.State{
+				Term:   piggyback.State.Term,
+				Vote:   piggyback.State.Vote,
+				Commit: piggyback.State.Commit,
+			},
+		}}
+		if saveErr := w.logdb.SaveState(stateUpdate); saveErr != nil {
+			slog.Warn("piggyback commit-index persist failed",
+				"shard", piggyback.ShardID, "replica", piggyback.ReplicaID, "error", saveErr)
+			piggyback.ReleaseCommittedEntries()
+			node.commitPending.Store(false)
+			node.handleError(&CommitError{
+				ShardID:   piggyback.ShardID,
+				ReplicaID: piggyback.ReplicaID,
+				Err:       saveErr,
+			})
+			return true
+		}
 	}
 
-	// OnCommitted callback (WAL-durable notification).
-	if w.callback != nil && node.notifyCommit && len(piggyback.CommittedEntries) > 0 {
-		w.callback.OnCommitted(piggyback.ShardID, piggyback.CommittedEntries)
-	}
-
-	// Commit piggyback to advance processed markers.
+	// Commit piggyback to advance processed markers (in-memory).
 	node.raftMu.Lock()
 	pbCommitErr := node.peer.Commit(piggyback)
 	node.raftMu.Unlock()
@@ -663,7 +680,16 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) {
 			ReplicaID: piggyback.ReplicaID,
 			Err:       pbCommitErr,
 		})
-		return
+		return true
+	}
+
+	// Now that the commit index is durable, it is safe to send ordered
+	// responses and fire the WAL-durable commit notification.
+	if w.sender != nil && len(w.orderedMsgSplitBuf) > 0 {
+		w.sendOrderedMessages(w.orderedMsgSplitBuf)
+	}
+	if w.callback != nil && node.notifyCommit && len(piggyback.CommittedEntries) > 0 {
+		w.callback.OnCommitted(piggyback.ShardID, piggyback.CommittedEntries)
 	}
 
 	if w.metrics != nil {
@@ -685,8 +711,12 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) {
 		case <-w.stopC:
 			slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
 				"shard", piggyback.ShardID)
-			w.clearBatch()
-			return
+			ai.update.ReleaseCommittedEntries()
+			w.applyPool.Put(ai)
+			// Signal the caller to stop: it must NOT keep iterating the
+			// shared batch (clearBatch will run in the caller).
+			return false
 		}
 	}
+	return true
 }

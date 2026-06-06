@@ -94,8 +94,8 @@ func TestBarrier_Initialize(t *testing.T) {
 	if sealed == nil {
 		t.Fatal("SealedRootKeyData returned nil after Initialize")
 	}
-	if sealed.Strategy != StrategySoftware {
-		t.Fatalf("expected strategy=%q, got %q", softwareStrategyName, sealed.Strategy)
+	if sealed.Strategy != StrategyPassphrase {
+		t.Fatalf("expected strategy=%q, got %q", passphraseStrategyName, sealed.Strategy)
 	}
 	if sealed.Epoch != 1 {
 		t.Fatalf("expected sealed epoch=1, got %d", sealed.Epoch)
@@ -1012,6 +1012,47 @@ func TestBarrier_BruteForceBackoff(t *testing.T) {
 	}
 }
 
+// TestBarrier_BackoffBackwardClockStep verifies that a backward clock step
+// (a persisted lastFailedAt in the future) does not permanently lock out
+// Unseal. With a naive elapsed<delay check, a future lastFailedAt yields a
+// negative elapsed that stays below delay forever, returning ErrUnsealBackoff
+// indefinitely. The clamp must treat a non-monotonic clock as satisfying the
+// delay and re-anchor lastFailedAt to now.
+func TestBarrier_BackoffBackwardClockStep(t *testing.T) {
+	b := NewBarrier(DefaultBarrierConfig(1))
+	s := testStrategy(t)
+	defer s.Close()
+
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	// Controllable clock anchored at a fixed "now".
+	now := time.Now()
+	b.timeNow = func() time.Time { return now }
+
+	// Simulate restored state: past the brute-force threshold with a
+	// lastFailedAt stamped one hour in the FUTURE (clock stepped back / state
+	// restored on an earlier-clock host).
+	b.failedAttempts = bruteForceThreshold + 1
+	b.lastFailedAt = now.Add(time.Hour)
+
+	// Unseal with the correct strategy must NOT be locked out by the future
+	// timestamp; the clamp allows the attempt and it succeeds.
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		if errors.Is(err, ErrUnsealBackoff) {
+			t.Fatal("permanent backoff lockout on backward clock step")
+		}
+		t.Fatalf("Unseal failed: %v", err)
+	}
+	if b.failedAttempts != 0 {
+		t.Fatalf("expected failedAttempts=0 after successful unseal, got %d", b.failedAttempts)
+	}
+}
+
 func TestBarrier_BackoffDelay(t *testing.T) {
 	b := NewBarrier(DefaultBarrierConfig(1))
 
@@ -1208,7 +1249,7 @@ func TestBarrier_SetSealedRootKeyValid(t *testing.T) {
 
 	// SetSealedRootKey with valid fields should succeed.
 	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       1,
 		Salt:        make([]byte, 32),
 		Ciphertext:  []byte("dummy"),
@@ -1508,9 +1549,9 @@ func TestKeyDerivationError(t *testing.T) {
 
 func TestError(t *testing.T) {
 	inner := errors.New("rand failed")
-	err := &Error{Strategy: "software", Err: inner}
+	err := &Error{Strategy: "passphrase", Err: inner}
 
-	if err.Error() != "quicraft/seal: seal failed (strategy=software): rand failed" {
+	if err.Error() != "quicraft/seal: seal failed (strategy=passphrase): rand failed" {
 		t.Fatalf("unexpected error string: %s", err.Error())
 	}
 
@@ -1521,9 +1562,9 @@ func TestError(t *testing.T) {
 
 func TestUnsealError(t *testing.T) {
 	inner := errors.New("decrypt failed")
-	err := &UnsealError{Strategy: "software", Err: inner}
+	err := &UnsealError{Strategy: "passphrase", Err: inner}
 
-	if err.Error() != "quicraft/seal: unseal failed (strategy=software): decrypt failed" {
+	if err.Error() != "quicraft/seal: unseal failed (strategy=passphrase): decrypt failed" {
 		t.Fatalf("unexpected error string: %s", err.Error())
 	}
 
@@ -2945,7 +2986,7 @@ func TestSoftwareStrategy_AADPreventsCrossStrategySubstitution(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	// Seal normally (AAD = "software").
+	// Seal normally (AAD = "passphrase").
 	sealed, err := s.SealRootKey(context.Background(), rootKey, Credentials{})
 	if err != nil {
 		t.Fatalf("Seal failed: %v", err)
@@ -3006,7 +3047,7 @@ func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
 	b := NewBarrier(DefaultBarrierConfig(1))
 
 	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       0,
 		Salt:        make([]byte, 32),
 		Ciphertext:  []byte("dummy"),
@@ -3022,7 +3063,7 @@ func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
 
 	// Salt too short.
 	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       1,
 		Salt:        make([]byte, 16), // Expected 32.
 		Ciphertext:  []byte("dummy"),
@@ -3034,7 +3075,7 @@ func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
 
 	// Salt too long.
 	err = b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       1,
 		Salt:        make([]byte, 64), // Expected 32.
 		Ciphertext:  []byte("dummy"),
@@ -3046,7 +3087,7 @@ func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
 
 	// Nil salt.
 	err = b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       1,
 		Salt:        nil,
 		Ciphertext:  []byte("dummy"),
@@ -3062,7 +3103,7 @@ func TestBarrier_SetSealedRootKey_RejectsMissingCurrentEpoch(t *testing.T) {
 
 	// KnownEpochs does not contain the current epoch (3).
 	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
 		Ciphertext:  []byte("dummy"),
@@ -3077,7 +3118,7 @@ func TestBarrier_SetSealedRootKey_AcceptsValidMultiEpoch(t *testing.T) {
 	b := NewBarrier(DefaultBarrierConfig(1))
 
 	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategySoftware,
+		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
 		Ciphertext:  []byte("dummy"),
@@ -3354,10 +3395,14 @@ func TestBarrier_CustomInvocationCounter(t *testing.T) {
 	}
 }
 
-// TestBarrier_CustomInvocationCounterResetError verifies that when a custom
-// InvocationCounter returns an error from Reset during Rotate, the error
-// is propagated as a TrackerError.
-func TestBarrier_CustomInvocationCounterResetError(t *testing.T) {
+// TestBarrier_InvocationCounterResetError_CommitsNewEpoch verifies the
+// commit-first, fail-safe-reset semantics: when the injected invocation
+// counter's Reset returns an error, Rotate has ALREADY committed the new epoch
+// before resetting the trackers, so it must advance to (and return) the new
+// epoch with NO fatal error. A non-reset counter is the conservative direction
+// (the new key re-rotates sooner; it never exceeds its limit), so the barrier
+// must remain fully usable on the new epoch.
+func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	resetErr := errors.New("persistent reset failed")
 	mock := &mockInvocationCounter{enabled: true, resetErr: resetErr}
 	cfg := DefaultBarrierConfig(1)
@@ -3370,20 +3415,102 @@ func TestBarrier_CustomInvocationCounterResetError(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	_, err := b.Rotate()
-	if err == nil {
-		t.Fatal("expected error from Rotate when invocation counter Reset fails")
+	oldEpoch := b.CurrentEpoch()
+	newEpoch, err := b.Rotate()
+	if err != nil {
+		t.Fatalf("Rotate should not return a fatal error on a fail-safe tracker reset failure: %v", err)
 	}
 
-	var te *TrackerError
-	if !errors.As(err, &te) {
-		t.Fatalf("expected *TrackerError, got: %T: %v", err, err)
+	// The rotation has genuinely succeeded: the new key is active. Rotate must
+	// return the new epoch (never oldEpoch) and the barrier must have advanced.
+	if newEpoch != oldEpoch+1 {
+		t.Fatalf("Rotate returned epoch %d, want newEpoch %d", newEpoch, oldEpoch+1)
 	}
-	if te.Tracker != "invocation" || te.Op != "reset" {
-		t.Fatalf("TrackerError fields: tracker=%q, op=%q; want invocation/reset", te.Tracker, te.Op)
+	if got := b.CurrentEpoch(); got != newEpoch {
+		t.Fatalf("barrier stayed on epoch %d after Rotate, want newEpoch %d", got, newEpoch)
 	}
-	if !errors.Is(te.Err, resetErr) {
-		t.Fatalf("TrackerError.Err = %v, want %v", te.Err, resetErr)
+
+	// Reset was still attempted (it is what failed, fail-safe).
+	foundReset := false
+	for _, call := range mock.calls {
+		if call == "reset" {
+			foundReset = true
+			break
+		}
+	}
+	if !foundReset {
+		t.Fatalf("Rotate should still attempt invocation counter Reset; calls: %v", mock.calls)
+	}
+
+	// The barrier must encrypt/decrypt correctly under the new epoch.
+	ct, err := b.Encrypt(nil, []byte("after fail-safe reset"))
+	if err != nil {
+		t.Fatalf("Encrypt after Rotate with failed reset: %v", err)
+	}
+	pt, err := b.Decrypt(nil, ct)
+	if err != nil {
+		t.Fatalf("Decrypt after Rotate with failed reset: %v", err)
+	}
+	if !bytes.Equal(pt, []byte("after fail-safe reset")) {
+		t.Fatalf("plaintext mismatch after Rotate with failed reset")
+	}
+}
+
+// TestBarrier_NonceClearError_CommitsNewEpoch verifies the commit-first,
+// fail-safe-reset semantics for the nonce tracker: when the injected nonce
+// tracker's Clear fails during Rotate, the new epoch has ALREADY been committed
+// before the clear, so Rotate must advance to (and return) the new epoch with
+// NO fatal error. A non-cleared nonce set is the conservative direction (stale
+// nonces are at worst rejected as false positives; a reused nonce is never
+// accepted), so the barrier must remain fully usable on the new epoch.
+func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
+	clearErr := errors.New("persistent nonce clear failed")
+	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
+	cfg := DefaultBarrierConfig(1)
+	cfg.NonceTrackerProvider = mock
+	b := NewBarrier(cfg)
+	s := testStrategy(t)
+
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	oldEpoch := b.CurrentEpoch()
+	newEpoch, err := b.Rotate()
+	if err != nil {
+		t.Fatalf("Rotate should not return a fatal error on a fail-safe tracker clear failure: %v", err)
+	}
+
+	if newEpoch != oldEpoch+1 {
+		t.Fatalf("Rotate returned epoch %d, want newEpoch %d", newEpoch, oldEpoch+1)
+	}
+	if got := b.CurrentEpoch(); got != newEpoch {
+		t.Fatalf("barrier stayed on epoch %d after Rotate, want newEpoch %d", got, newEpoch)
+	}
+
+	// Clear was still attempted (it is what failed, fail-safe).
+	foundClear := false
+	for _, call := range mock.calls {
+		if call == "clear" {
+			foundClear = true
+			break
+		}
+	}
+	if !foundClear {
+		t.Fatalf("Rotate should still attempt nonce tracker Clear; calls: %v", mock.calls)
+	}
+
+	// The barrier must encrypt/decrypt correctly under the new epoch.
+	ct, err := b.Encrypt(nil, []byte("after failed clear"))
+	if err != nil {
+		t.Fatalf("Encrypt after Rotate with failed clear: %v", err)
+	}
+	pt, err := b.Decrypt(nil, ct)
+	if err != nil {
+		t.Fatalf("Decrypt after Rotate with failed clear: %v", err)
+	}
+	if !bytes.Equal(pt, []byte("after failed clear")) {
+		t.Fatalf("plaintext mismatch after Rotate with failed clear")
 	}
 }
 
@@ -3402,14 +3529,16 @@ func TestBarrier_CustomNonceTrackerProvider(t *testing.T) {
 }
 
 // TestBarrier_CustomNonceTrackerProviderClearError verifies that when a custom
-// NonceTrackerProvider returns an error from Clear during Rotate, the error
-// is propagated as a TrackerError.
+// NonceTrackerProvider returns an error from Clear during Rotate, the failure
+// is treated as fail-safe: Rotate does NOT surface it as a fatal TrackerError
+// (which could make a caller retry into another rotation) and instead commits
+// the new epoch and returns it with a nil error.
 func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 	clearErr := errors.New("persistent clear failed")
 	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
 	cfg := DefaultBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
-	cfg.InvocationLimit = -1 // disable invocation counter so only nonce tracker error triggers
+	cfg.InvocationLimit = -1 // disable invocation counter so only the nonce tracker is exercised
 	b := NewBarrier(cfg)
 	s := testStrategy(t)
 
@@ -3417,20 +3546,22 @@ func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	_, err := b.Rotate()
-	if err == nil {
-		t.Fatal("expected error from Rotate when nonce tracker Clear fails")
+	oldEpoch := b.CurrentEpoch()
+	newEpoch, err := b.Rotate()
+	if err != nil {
+		t.Fatalf("Rotate should not return a fatal error on a fail-safe clear failure: %v", err)
 	}
 
+	// No TrackerError must be surfaced for the fail-safe degraded state.
 	var te *TrackerError
-	if !errors.As(err, &te) {
-		t.Fatalf("expected *TrackerError, got: %T: %v", err, err)
+	if errors.As(err, &te) {
+		t.Fatalf("Rotate should not return a TrackerError for a fail-safe clear failure, got: %v", te)
 	}
-	if te.Tracker != "nonce" || te.Op != "clear" {
-		t.Fatalf("TrackerError fields: tracker=%q, op=%q; want nonce/clear", te.Tracker, te.Op)
+	if newEpoch != oldEpoch+1 {
+		t.Fatalf("Rotate returned epoch %d, want newEpoch %d", newEpoch, oldEpoch+1)
 	}
-	if !errors.Is(te.Err, clearErr) {
-		t.Fatalf("TrackerError.Err = %v, want %v", te.Err, clearErr)
+	if got := b.CurrentEpoch(); got != newEpoch {
+		t.Fatalf("barrier stayed on epoch %d after Rotate, want newEpoch %d", got, newEpoch)
 	}
 }
 

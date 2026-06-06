@@ -23,9 +23,9 @@ import (
 
 func TestUnsealError_Error_FormatsMessage(t *testing.T) {
 	inner := errors.New("decryption authentication failed")
-	err := &UnsealError{Strategy: "software", Err: inner}
+	err := &UnsealError{Strategy: "passphrase", Err: inner}
 
-	expected := "quicraft/seal: unseal failed (strategy=software): decryption authentication failed"
+	expected := "quicraft/seal: unseal failed (strategy=passphrase): decryption authentication failed"
 	if got := err.Error(); got != expected {
 		t.Fatalf("Error() mismatch:\n  got:  %q\n  want: %q", got, expected)
 	}
@@ -70,7 +70,7 @@ func TestUnsealError_Error_DifferentStrategies(t *testing.T) {
 
 func TestUnsealError_Unwrap_ReturnsInnerError(t *testing.T) {
 	inner := errors.New("wrapped error")
-	err := &UnsealError{Strategy: "software", Err: inner}
+	err := &UnsealError{Strategy: "passphrase", Err: inner}
 
 	unwrapped := err.Unwrap()
 	if unwrapped != inner {
@@ -79,7 +79,7 @@ func TestUnsealError_Unwrap_ReturnsInnerError(t *testing.T) {
 }
 
 func TestUnsealError_Unwrap_NilError(t *testing.T) {
-	err := &UnsealError{Strategy: "software", Err: nil}
+	err := &UnsealError{Strategy: "passphrase", Err: nil}
 
 	unwrapped := err.Unwrap()
 	if unwrapped != nil {
@@ -89,7 +89,7 @@ func TestUnsealError_Unwrap_NilError(t *testing.T) {
 
 func TestUnsealError_ErrorsIs_MatchesInnerError(t *testing.T) {
 	inner := ErrDecryptionFailed
-	err := &UnsealError{Strategy: "software", Err: inner}
+	err := &UnsealError{Strategy: "passphrase", Err: inner}
 
 	if !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatal("errors.Is should match the inner ErrDecryptionFailed")
@@ -99,8 +99,8 @@ func TestUnsealError_ErrorsIs_MatchesInnerError(t *testing.T) {
 func TestUnsealError_ErrorsIs_NestedWrapping(t *testing.T) {
 	// Create a chain: UnsealError -> Error -> sentinel
 	sentinel := ErrBarrierSealed
-	inner := &Error{Strategy: "software", Err: sentinel}
-	outer := &UnsealError{Strategy: "software", Err: inner}
+	inner := &Error{Strategy: "passphrase", Err: sentinel}
+	outer := &UnsealError{Strategy: "passphrase", Err: inner}
 
 	if !errors.Is(outer, ErrBarrierSealed) {
 		t.Fatal("errors.Is should traverse through nested wrapped errors")
@@ -128,7 +128,7 @@ func TestUnsealError_ErrorsAs_ExtractsUnsealError(t *testing.T) {
 
 func TestUnsealError_ErrorsAs_FromWrappedError(t *testing.T) {
 	inner := errors.New("original cause")
-	unsealErr := &UnsealError{Strategy: "software", Err: inner}
+	unsealErr := &UnsealError{Strategy: "passphrase", Err: inner}
 	// Wrap the UnsealError in another error
 	wrapped := errors.Join(errors.New("context"), unsealErr)
 
@@ -136,15 +136,15 @@ func TestUnsealError_ErrorsAs_FromWrappedError(t *testing.T) {
 	if !errors.As(wrapped, &target) {
 		t.Fatal("errors.As should extract *UnsealError from wrapped error")
 	}
-	if target.Strategy != "software" {
-		t.Fatalf("Strategy mismatch: got %q, want %q", target.Strategy, "software")
+	if target.Strategy != "passphrase" {
+		t.Fatalf("Strategy mismatch: got %q, want %q", target.Strategy, "passphrase")
 	}
 }
 
 func TestUnsealError_ErrorsAs_ExtractsNestedInnerError(t *testing.T) {
 	// Inner error is a typed error
 	innerTyped := &CipherError{Err: errors.New("cipher issue")}
-	unsealErr := &UnsealError{Strategy: "software", Err: innerTyped}
+	unsealErr := &UnsealError{Strategy: "passphrase", Err: innerTyped}
 
 	var target *CipherError
 	if !errors.As(unsealErr, &target) {
@@ -152,115 +152,6 @@ func TestUnsealError_ErrorsAs_ExtractsNestedInnerError(t *testing.T) {
 	}
 	if target.Err.Error() != "cipher issue" {
 		t.Fatalf("inner error mismatch: got %q", target.Err.Error())
-	}
-}
-
-// --- ShareStoreError Tests ---
-
-func TestShareStoreError_Error_FormatsMessage(t *testing.T) {
-	inner := errors.New("permission denied")
-	err := &ShareStoreError{Op: "save_metadata", Err: inner}
-
-	expected := "quicraft/seal: share store save_metadata failed: permission denied"
-	if got := err.Error(); got != expected {
-		t.Fatalf("Error() mismatch:\n  got:  %q\n  want: %q", got, expected)
-	}
-}
-
-func TestShareStoreError_Error_DifferentOperations(t *testing.T) {
-	tests := []struct {
-		name     string
-		op       string
-		inner    error
-		expected string
-	}{
-		{
-			name:     "get_sealed_share operation",
-			op:       "get_sealed_share",
-			inner:    errors.New("file not found"),
-			expected: "quicraft/seal: share store get_sealed_share failed: file not found",
-		},
-		{
-			name:     "save_version operation",
-			op:       "save_version",
-			inner:    errors.New("disk full"),
-			expected: "quicraft/seal: share store save_version failed: disk full",
-		},
-		{
-			name:     "delete operation",
-			op:       "delete",
-			inner:    errors.New("entry locked"),
-			expected: "quicraft/seal: share store delete failed: entry locked",
-		},
-		{
-			name:     "empty operation",
-			op:       "",
-			inner:    errors.New("unknown operation"),
-			expected: "quicraft/seal: share store  failed: unknown operation",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := &ShareStoreError{Op: tc.op, Err: tc.inner}
-			if got := err.Error(); got != tc.expected {
-				t.Fatalf("Error() mismatch:\n  got:  %q\n  want: %q", got, tc.expected)
-			}
-		})
-	}
-}
-
-func TestShareStoreError_Unwrap_ReturnsInnerError(t *testing.T) {
-	inner := errors.New("wrapped store error")
-	err := &ShareStoreError{Op: "get_metadata", Err: inner}
-
-	unwrapped := err.Unwrap()
-	if unwrapped != inner {
-		t.Fatalf("Unwrap() returned %v, want %v", unwrapped, inner)
-	}
-}
-
-func TestShareStoreError_Unwrap_NilError(t *testing.T) {
-	err := &ShareStoreError{Op: "test_op", Err: nil}
-
-	unwrapped := err.Unwrap()
-	if unwrapped != nil {
-		t.Fatalf("Unwrap() returned %v, want nil", unwrapped)
-	}
-}
-
-func TestShareStoreError_ErrorsIs_MatchesSentinel(t *testing.T) {
-	err := &ShareStoreError{Op: "get_metadata", Err: ErrShareStoreNotFound}
-
-	if !errors.Is(err, ErrShareStoreNotFound) {
-		t.Fatal("errors.Is should match ErrShareStoreNotFound sentinel")
-	}
-}
-
-func TestShareStoreError_ErrorsAs_ExtractsShareStoreError(t *testing.T) {
-	inner := errors.New("io error")
-	err := &ShareStoreError{Op: "save_sealed_share", Err: inner}
-
-	var target *ShareStoreError
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should extract *ShareStoreError from itself")
-	}
-	if target.Op != "save_sealed_share" {
-		t.Fatalf("Op mismatch: got %q, want %q", target.Op, "save_sealed_share")
-	}
-}
-
-func TestShareStoreError_ErrorsAs_FromWrappedError(t *testing.T) {
-	inner := errors.New("original cause")
-	storeErr := &ShareStoreError{Op: "get_version", Err: inner}
-	wrapped := errors.Join(errors.New("additional context"), storeErr)
-
-	var target *ShareStoreError
-	if !errors.As(wrapped, &target) {
-		t.Fatal("errors.As should extract *ShareStoreError from wrapped error")
-	}
-	if target.Op != "get_version" {
-		t.Fatalf("Op mismatch: got %q, want %q", target.Op, "get_version")
 	}
 }
 
@@ -341,9 +232,9 @@ func TestKeyDerivationError_ErrorsAs_ExtractsKeyDerivationError(t *testing.T) {
 
 func TestError_Error_FormatsMessage(t *testing.T) {
 	inner := errors.New("random generator failed")
-	err := &Error{Strategy: "software", Err: inner}
+	err := &Error{Strategy: "passphrase", Err: inner}
 
-	expected := "quicraft/seal: seal failed (strategy=software): random generator failed"
+	expected := "quicraft/seal: seal failed (strategy=passphrase): random generator failed"
 	if got := err.Error(); got != expected {
 		t.Fatalf("Error() mismatch:\n  got:  %q\n  want: %q", got, expected)
 	}
@@ -382,7 +273,7 @@ func TestError_Error_DifferentStrategies(t *testing.T) {
 
 func TestError_Unwrap_ReturnsInnerError(t *testing.T) {
 	inner := errors.New("wrapped seal error")
-	err := &Error{Strategy: "software", Err: inner}
+	err := &Error{Strategy: "passphrase", Err: inner}
 
 	unwrapped := err.Unwrap()
 	if unwrapped != inner {
@@ -391,7 +282,7 @@ func TestError_Unwrap_ReturnsInnerError(t *testing.T) {
 }
 
 func TestError_Unwrap_NilError(t *testing.T) {
-	err := &Error{Strategy: "software", Err: nil}
+	err := &Error{Strategy: "passphrase", Err: nil}
 
 	unwrapped := err.Unwrap()
 	if unwrapped != nil {
@@ -400,7 +291,7 @@ func TestError_Unwrap_NilError(t *testing.T) {
 }
 
 func TestError_ErrorsIs_MatchesInnerSentinel(t *testing.T) {
-	err := &Error{Strategy: "software", Err: ErrInvalidRootKeySize}
+	err := &Error{Strategy: "passphrase", Err: ErrInvalidRootKeySize}
 
 	if !errors.Is(err, ErrInvalidRootKeySize) {
 		t.Fatal("errors.Is should match ErrInvalidRootKeySize sentinel")
@@ -494,13 +385,7 @@ func TestSentinelErrors_AreDistinct(t *testing.T) {
 		ErrKDFInvalidPassphrase,
 		ErrKDFInvalidSalt,
 		ErrHardwareMode,
-		ErrShamirNotConfigured,
 		ErrShamirThresholdInvalid,
-		ErrShareStoreInvalidDir,
-		ErrShareStoreNotFound,
-		ErrShareStoreNilMetadata,
-		ErrShareStoreInvalidIndex,
-		ErrShareStoreNilShare,
 	}
 
 	for i := range sentinels {
@@ -677,13 +562,7 @@ func TestSentinelErrors_HaveDescriptiveMessages(t *testing.T) {
 		{ErrKDFInvalidPassphrase, "passphrase"},
 		{ErrKDFInvalidSalt, "salt too short"},
 		{ErrHardwareMode, "hardware encryptor"},
-		{ErrShamirNotConfigured, "shamir not configured"},
 		{ErrShamirThresholdInvalid, "threshold"},
-		{ErrShareStoreInvalidDir, "directory"},
-		{ErrShareStoreNotFound, "not found"},
-		{ErrShareStoreNilMetadata, "metadata"},
-		{ErrShareStoreInvalidIndex, "index"},
-		{ErrShareStoreNilShare, "share data"},
 	}
 
 	for _, tc := range tests {

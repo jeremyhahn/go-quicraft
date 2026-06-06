@@ -244,6 +244,13 @@ type HostConfig struct {
 	// unlimited.
 	MaxWALDiskSize uint64
 
+	// NoSyncWAL disables fdatasync on Raft WAL segment writes. When true,
+	// the WAL does not wait for OS-level write synchronisation. This trades
+	// durability for performance and is appropriate only for testing
+	// environments where overlay2/Docker fdatasync latency causes Raft
+	// proposal timeouts. Never use in production.
+	NoSyncWAL bool
+
 	// MaxApplyRetries is the maximum consecutive SM.Apply() failures
 	// before the circuit breaker trips. Default: 100.
 	MaxApplyRetries uint64
@@ -336,6 +343,12 @@ func (hc *HostConfig) Validate() error {
 	}
 	if hc.RTTMillisecond == 0 {
 		return newValidationError("RTTMillisecond", "must be > 0")
+	}
+	// Upper bound prevents time.Duration (int64 ns) overflow when the tick
+	// interval is computed as RTTMillisecond * time.Millisecond. 60_000 ms
+	// (1 minute) is far beyond any sane Raft RTT and leaves enormous headroom.
+	if hc.RTTMillisecond > 60_000 {
+		return newValidationError("RTTMillisecond", "must be <= 60000 (1 minute)")
 	}
 	if hc.DeploymentID == 0 && !hc.AllowZeroDeploymentID {
 		return newValidationError("DeploymentID",

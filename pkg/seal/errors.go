@@ -26,6 +26,11 @@ var (
 	// attempted while the barrier is sealed.
 	ErrBarrierSealed = errors.New("quicraft/seal: barrier is sealed")
 
+	// ErrNoRootKeyAvailable is returned by RootKey() when the barrier holds no
+	// root key material — i.e. no-encryption mode (StrategyNone), where the
+	// identity encryptor needs no key.
+	ErrNoRootKeyAvailable = errors.New("quicraft/seal: no root key in no-encryption mode")
+
 	// ErrBarrierNotInit is returned when the barrier has not been
 	// initialized with a sealing strategy.
 	ErrBarrierNotInit = errors.New("quicraft/seal: barrier not initialized")
@@ -44,6 +49,14 @@ var (
 	// ErrBarrierUnsealed is returned when Initialize or Unseal is called
 	// on a barrier that is already unsealed.
 	ErrBarrierUnsealed = errors.New("quicraft/seal: barrier already unsealed")
+
+	// ErrInvalidSealedKey is returned when a SealedRootKey argument is
+	// nil or otherwise structurally invalid.
+	ErrInvalidSealedKey = errors.New("quicraft/seal: invalid sealed root key")
+
+	// ErrStrategyMismatch is returned when a SealingStrategy is asked to
+	// unseal a SealedRootKey that was produced by a different strategy.
+	ErrStrategyMismatch = errors.New("quicraft/seal: sealed key strategy does not match unseal strategy")
 
 	// ErrInvalidRootKeySize is returned when a root key does not have
 	// the required 32-byte length.
@@ -94,10 +107,6 @@ var (
 	// hardware encryptor that manages its own key material.
 	ErrHardwareMode = errors.New("quicraft/seal: operation not supported in hardware encryptor mode")
 
-	// ErrShamirNotConfigured is returned when a Shamir operation is
-	// attempted before SetShamirSupport has been called.
-	ErrShamirNotConfigured = errors.New("quicraft/seal: shamir not configured")
-
 	// ErrShamirThresholdInvalid is returned when the Shamir threshold is
 	// less than 2 or greater than the total number of shares.
 	ErrShamirThresholdInvalid = errors.New("quicraft/seal: shamir threshold must be >= 2 and <= total shares")
@@ -105,29 +114,39 @@ var (
 	// ErrEmptyCredentials is returned when a deferred-passphrase strategy
 	// receives empty credentials at Seal/Unseal time.
 	ErrEmptyCredentials = errors.New("quicraft/seal: empty credentials for deferred-passphrase strategy")
-)
 
-// Sentinel errors for ShareStore operations.
-var (
-	// ErrShareStoreInvalidDir is returned when an empty data directory
-	// path is provided to NewFileShareStore.
-	ErrShareStoreInvalidDir = errors.New("quicraft/seal: share store data directory must not be empty")
+	// Shamir sealing-strategy errors (used by ShamirStrategy and shared with
+	// higher-layer Shamir flows such as recovery/rekey/quorum).
 
-	// ErrShareStoreNotFound is returned when a requested share, metadata
-	// entry, or version file does not exist.
-	ErrShareStoreNotFound = errors.New("quicraft/seal: share store entry not found")
+	// ErrNilSealedData is returned when sealed root-key data is nil.
+	ErrNilSealedData = errors.New("quicraft/seal: sealed data is nil")
 
-	// ErrShareStoreNilMetadata is returned when nil metadata is passed
-	// to SaveMetadata.
-	ErrShareStoreNilMetadata = errors.New("quicraft/seal: share metadata must not be nil")
+	// ErrShamirNilStorage is returned when a nil storage backend is provided.
+	ErrShamirNilStorage = errors.New("quicraft/seal: shamir storage backend must not be nil")
 
-	// ErrShareStoreInvalidIndex is returned when a share index less than
-	// 1 is used. Shamir share indices are 1-based.
-	ErrShareStoreInvalidIndex = errors.New("quicraft/seal: share index must be >= 1")
+	// ErrShamirSplitFailed is returned when splitting the root key into shares fails.
+	ErrShamirSplitFailed = errors.New("quicraft/seal: failed to split root key into shares")
 
-	// ErrShareStoreNilShare is returned when nil sealed share data is
-	// passed to SaveSealedShare.
-	ErrShareStoreNilShare = errors.New("quicraft/seal: sealed share data must not be nil")
+	// ErrShamirCombineFailed is returned when reconstructing the root key from shares fails.
+	ErrShamirCombineFailed = errors.New("quicraft/seal: failed to combine shares")
+
+	// ErrShamirSerializationFailed is returned when (de)serializing a share fails.
+	ErrShamirSerializationFailed = errors.New("quicraft/seal: shamir share (de)serialization failed")
+
+	// ErrShamirStorageFailed is returned when a share storage operation fails.
+	ErrShamirStorageFailed = errors.New("quicraft/seal: shamir storage operation failed")
+
+	// ErrShamirShareNotFound is returned when a requested share is absent.
+	ErrShamirShareNotFound = errors.New("quicraft/seal: shamir share not found")
+
+	// ErrShamirNoSharesFound is returned when no shares are present in storage.
+	ErrShamirNoSharesFound = errors.New("quicraft/seal: no shamir shares found")
+
+	// ErrShamirVerificationFailed is returned when persisted shares fail consistency checks.
+	ErrShamirVerificationFailed = errors.New("quicraft/seal: shamir share verification failed")
+
+	// ErrShamirQuorumIncomplete is returned when fewer than threshold shares are available.
+	ErrShamirQuorumIncomplete = errors.New("quicraft/seal: quorum not yet complete, need more shares")
 )
 
 // TrackerError is returned when a tracker operation (reset, clear, close)
@@ -212,23 +231,5 @@ func (e *CipherError) Error() string {
 
 // Unwrap returns the underlying error.
 func (e *CipherError) Unwrap() error {
-	return e.Err
-}
-
-// ShareStoreError is returned when a ShareStore operation fails.
-type ShareStoreError struct {
-	// Op is the operation that failed (e.g., "save_metadata", "get_sealed_share").
-	Op string
-	// Err is the underlying error.
-	Err error
-}
-
-// Error returns a human-readable description of the share store failure.
-func (e *ShareStoreError) Error() string {
-	return fmt.Sprintf("quicraft/seal: share store %s failed: %v", e.Op, e.Err)
-}
-
-// Unwrap returns the underlying error.
-func (e *ShareStoreError) Unwrap() error {
 	return e.Err
 }

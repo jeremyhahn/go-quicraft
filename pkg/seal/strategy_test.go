@@ -135,8 +135,8 @@ func TestSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	if sealed.Strategy != StrategySoftware {
-		t.Fatalf("expected strategy=%q, got %q", softwareStrategyName, sealed.Strategy)
+	if sealed.Strategy != StrategyPassphrase {
+		t.Fatalf("expected strategy=%q, got %q", passphraseStrategyName, sealed.Strategy)
 	}
 	// The Salt field is nil because the software strategy stores its
 	// KDF salt inside the ciphertext (not in the SealedRootKey.Salt
@@ -242,7 +242,7 @@ func TestSoftwareStrategy_UnsealTruncatedCiphertext(t *testing.T) {
 	defer s.Close()
 
 	sealed := &SealedRootKey{
-		Strategy:   softwareStrategyName,
+		Strategy:   passphraseStrategyName,
 		Salt:       make([]byte, kdfSaltLen),
 		Ciphertext: []byte{0x01}, // Too short to contain a nonce.
 	}
@@ -672,8 +672,8 @@ func TestSoftwareStrategy_IDAvailableHardwareBacked(t *testing.T) {
 	}
 	defer s.Close()
 
-	if s.ID() != StrategySoftware {
-		t.Fatalf("expected ID=%q, got %q", "software", s.ID())
+	if s.ID() != StrategyPassphrase {
+		t.Fatalf("expected ID=%q, got %q", StrategyPassphrase, s.ID())
 	}
 	if !s.Available() {
 		t.Fatal("expected Available() to return true")

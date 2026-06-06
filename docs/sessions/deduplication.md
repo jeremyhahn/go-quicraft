@@ -142,18 +142,35 @@ for entry in batch:
         sessions.Unregister(clientID)
 
     elif entry.IsSessionManaged():
-        result, isDup := sessions.CheckDuplicate(clientID, seriesID)
-        if !isDup:
-            // Add to user SM batch
-            smEntries = append(smEntries, entry)
+        result, isDup, err := sessions.CheckDuplicate(clientID, seriesID, index)
+        if err != nil:                 // ErrSessionNotFound / ErrResponseEvicted
+            results[i] = SESSION_EXPIRED
+            continue
+        if isDup:
+            results[i] = result        // cached, skip SM
+            continue
+        // Capacity gate BEFORE mutating the user SM.
+        if sessions.CanRecord(clientID, seriesID, respondedTo, admittedThisBatch[clientID]) != nil:
+            results[i] = SESSION_EXPIRED   // ErrResponseLimitExceeded
+            continue
+        admittedThisBatch[clientID]++
+        smEntries = append(smEntries, entry)  // add to user SM batch
         // After SM completes:
-        sessions.RecordResult(clientID, seriesID, respondedTo, result)
+        sessions.RecordResult(clientID, seriesID, respondedTo, index, result)
 
     else:  // clientID == 0, no-op session
         smEntries = append(smEntries, entry)  // No deduplication
 ```
 
 The Apply method pre-allocates buffers (`smEntryBuf`, `smResultBuf`, `indexMapBuf`) which are reused across batches via slice truncation (`[:0]`), avoiding heap allocations since Apply runs from a single apply goroutine per shard.
+
+### Response Cache Overflow Preserves At-Most-Once
+
+A new (non-duplicate) session series that cannot be cached is **rejected as `SESSION_EXPIRED` before the user state machine is mutated**. After `CheckDuplicate` reports the series is new, `Apply` calls `Manager.CanRecord` — a read-only projection of what `RecordResult` would do (advance `respondedTo`, evict acknowledged responses, then count survivors). If the response cache would still be full after eviction, `CanRecord` returns `ErrResponseLimitExceeded` and the entry is mapped to `SESSION_EXPIRED` (`sm.ResultSessionExpired`) and skipped — it never reaches `smEntries`, so the user SM never observes it.
+
+This is the correct behavior per Raft PhD Figure 6.1, step 3 (treat a missing cache record as `SESSION_EXPIRED`). Applying an over-capacity entry without being able to cache its result would break at-most-once: a later replay would find no cached response to deduplicate against and re-apply the mutation. Rejecting it up front keeps the entry from ever mutating the state machine.
+
+The gate is deterministic across replicas (it is driven by log index, seriesID, and `respondedTo` — no wall clock). It also accounts for `admittedThisBatch[clientID]`, the count of new series for the same client already admitted earlier in the current batch but not yet recorded (`RecordResult` runs only after the batched user-SM `Update`). Without that count, a single batch of new series could collectively overflow the cache.
 
 ## Session Manager
 
@@ -168,24 +185,33 @@ The session manager is per-shard and tracks all active client sessions and their
 - Returns `ErrSessionLimitExceeded` if the shard exceeds `MaxTotalSessions` (default 16,384)
 
 **CheckDuplicate:** Checks if a proposal is a duplicate.
-- If `seriesID <= respondedTo`: Returns false (client already acknowledged this)
-- If `seriesID` is in the result cache: Returns cached result and true
-- Otherwise: Returns false (proposal is new, add to SM batch)
+- Returns `ErrSessionNotFound` if the clientID is not registered (maps to `SESSION_EXPIRED`)
+- If `seriesID <= respondedTo`: Returns `ErrResponseEvicted` (client already acknowledged this and the cached response was evicted; maps to `SESSION_EXPIRED` per PhD Figure 6.1 step 3)
+- If `seriesID` is in the result cache: Returns cached result and `true`
+- Otherwise: Returns `false` with no error (proposal is new, subject to the capacity gate, then added to the SM batch)
+
+**CanRecord:** Read-only capacity check run before applying a new series.
+- Mirrors `RecordResult`'s `respondedTo` advance and eviction, but mutates nothing
+- Takes a `pending` count of same-client new series already admitted in the current batch
+- Returns `ErrResponseLimitExceeded` if the cache would still be full after eviction (so the caller rejects the entry as `SESSION_EXPIRED` before mutating the user SM)
+- Returns `ErrSessionNotFound` if clientID is not registered
 
 **RecordResult:** Stores the proposal result after SM application.
-- Evicts stale responses (where seriesID <= respondedTo) before caching
-- Returns `ErrResponseLimitExceeded` if response cache exceeds `MaxSessionsPerClient` after eviction
+- Advances `respondedTo` and evicts acknowledged responses (where seriesID <= respondedTo) before caching
+- Advances the activity marker (`lastActiveIndex`) before the limit check, so an active-but-full session is not treated as idle by deterministic expiry
+- Returns `ErrResponseLimitExceeded` if the response cache is full after eviction
 - Returns `ErrSessionNotFound` if clientID is not registered
 
 **Unregister:** Removes a session and all its cached results.
 - Called when an unregister entry is applied
 - Returns `ErrSessionNotFound` if the session does not exist
 
-**ExpireSessions:** Periodically removes idle sessions by TTL.
-- Takes parameters `(ttl, maxExpire)` to limit batch size
+**ExpireSessions:** Periodically removes sessions idle for too many log entries.
+- Takes parameters `(currentIndex, inactivityThreshold, maxExpire)`: a session is expired when it has been inactive for more than `inactivityThreshold` entries relative to `currentIndex`; `maxExpire` caps the number removed per call
+- Returns nil immediately if `maxExpire <= 0` or `inactivityThreshold == 0`
 - Returns slice of expired clientIDs
 - Uses index-based `lastActiveIndex` instead of wall-clock time for determinism
-- All replicas make identical expiry decisions at the same Raft indices
+- Collects all expired candidates, sorts them by clientID, then applies the `maxExpire` limit so every replica selects and removes the identical subset at the same Raft index regardless of map iteration order
 
 ### Error Types
 
@@ -194,7 +220,8 @@ The session manager is per-shard and tracks all active client sessions and their
 | `ErrSessionAlreadyExists` | Register a clientID that is already active |
 | `ErrSessionNotFound` | Unregister or CheckDuplicate on a non-existent clientID |
 | `ErrSessionLimitExceeded` / `ErrTooManySessions` | Shard exceeds `MaxTotalSessions` |
-| `ErrResponseLimitExceeded` | RecordResult exceeds `MaxSessionsPerClient` cached responses |
+| `ErrResponseLimitExceeded` | `CanRecord`/`RecordResult`: cache full after eviction (maps to `SESSION_EXPIRED`) |
+| `ErrResponseEvicted` | `CheckDuplicate`: seriesID already acknowledged and response evicted (maps to `SESSION_EXPIRED`) |
 | `ErrSessionExpired` | Proposal references a session that expired and was removed |
 | `SessionExpiredError` | Wraps ShardID and ClientID for diagnostic purposes |
 
