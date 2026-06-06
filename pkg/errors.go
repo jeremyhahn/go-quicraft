@@ -197,6 +197,10 @@ var (
 	// on disk does not match the expected FileSize from the message.
 	ErrSnapshotSizeMismatch = errors.New("quicraft: snapshot file size mismatch")
 
+	// ErrSnapshotCorrupt is returned when an encrypted snapshot frame has a
+	// corrupt/oversized length prefix during decryption (send/export path).
+	ErrSnapshotCorrupt = errors.New("quicraft: snapshot frame corrupt")
+
 	// ErrShardNotStopped is returned when RemoveData is called for a
 	// shard that is still loaded on this host.
 	ErrShardNotStopped = errors.New("quicraft: shard not stopped")

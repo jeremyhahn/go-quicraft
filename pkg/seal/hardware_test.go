@@ -509,14 +509,9 @@ func TestStrategyID_Constants(t *testing.T) {
 		id       StrategyID
 		expected string
 	}{
-		{"TPM2", StrategyTPM2, "tpm2"},
-		{"PKCS11", StrategyPKCS11, "pkcs11"},
-		{"AWSKMS", StrategyAWSKMS, "awskms"},
-		{"GCPKMS", StrategyGCPKMS, "gcpkms"},
-		{"AzureKV", StrategyAzureKV, "azurekv"},
-		{"Vault", StrategyVault, "vault"},
-		{"Shamir", StrategyShamir, "shamir"},
-		{"Software", StrategySoftware, "software"},
+		// go-quicraft (L1) only names the strategies it implements.
+		{"Passphrase", StrategyPassphrase, "passphrase"},
+		{"None", StrategyNone, "none"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -524,22 +519,6 @@ func TestStrategyID_Constants(t *testing.T) {
 				t.Fatalf("expected %q, got %q", tt.expected, tt.id)
 			}
 		})
-	}
-}
-
-func TestDefaultPreferenceOrder(t *testing.T) {
-	if len(DefaultPreferenceOrder) != 8 {
-		t.Fatalf("expected 8 strategies in preference order, got %d", len(DefaultPreferenceOrder))
-	}
-
-	// First should be TPM2 (hardware preferred).
-	if DefaultPreferenceOrder[0] != StrategyTPM2 {
-		t.Fatalf("expected first preference=TPM2, got %s", DefaultPreferenceOrder[0])
-	}
-
-	// Last should be Software (fallback).
-	if DefaultPreferenceOrder[len(DefaultPreferenceOrder)-1] != StrategySoftware {
-		t.Fatalf("expected last preference=Software, got %s", DefaultPreferenceOrder[len(DefaultPreferenceOrder)-1])
 	}
 }
 

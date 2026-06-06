@@ -24,12 +24,17 @@ import (
 
 // Share represents a single piece of a secret split using Shamir's Secret Sharing.
 type Share struct {
-	Index     int               `json:"index"`
-	Threshold int               `json:"threshold"`
-	Total     int               `json:"total"`
-	Value     string            `json:"value"`
-	Digest    [32]byte          `json:"digest"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	Index     int    `json:"index"`
+	Threshold int    `json:"threshold"`
+	Total     int    `json:"total"`
+	Value     string `json:"value"`
+	// Digest is the SHA-256 of the original secret, set by Split and used by
+	// Combine for integrity verification. A zero value ([32]byte{}) signals
+	// that no digest is available (e.g. shares constructed without Split); in
+	// that case Combine SKIPS integrity verification and the caller MUST verify
+	// the reconstructed secret out-of-band.
+	Digest   [32]byte          `json:"digest"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler for Share.

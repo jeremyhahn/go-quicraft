@@ -3993,3 +3993,97 @@ func TestSaveStateSuccessAppliesInMemoryUpdates(t *testing.T) {
 		t.Errorf("shard 1 snapshot: %+v", ss)
 	}
 }
+
+// TestUnmarshalAddrMapRejectsHugeCount feeds an address-map record whose
+// declared entry count is enormous (near uint32 max) but whose body is tiny.
+// Before the fix this forced make() to size a multi-GB map from the untrusted
+// count prefix, an OOM/DoS during recovery. The decoder must now reject it as
+// corruption (-1) without allocating.
+func TestUnmarshalAddrMapRejectsHugeCount(t *testing.T) {
+	// 4-byte count = 0xFFFFFFFF, then no entry bytes at all.
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, ^uint32(0))
+
+	m, ok := unmarshalAddrMap(data, 0)
+	if ok != -1 {
+		t.Fatalf("expected -1 (corruption) for count > cap, got ok=%d m=%v", ok, m)
+	}
+}
+
+// TestUnmarshalAddrMapJustOverCap verifies the boundary: a count one past the
+// cap is rejected even if (hypothetically) the body were large.
+func TestUnmarshalAddrMapJustOverCap(t *testing.T) {
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, maxMembershipMapEntries+1)
+
+	if _, ok := unmarshalAddrMap(data, 0); ok != -1 {
+		t.Fatalf("count %d should be rejected (> cap %d)", maxMembershipMapEntries+1, maxMembershipMapEntries)
+	}
+}
+
+// TestUnmarshalAddrMapAtCapTruncated verifies that a count at the cap but with
+// a body too small to contain the entries is still rejected by the existing
+// per-entry bounds check (and does not over-allocate, since boundedMapHint
+// clamps the make hint to remaining/12 == 0 here).
+func TestUnmarshalAddrMapAtCapTruncated(t *testing.T) {
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, maxMembershipMapEntries)
+
+	if _, ok := unmarshalAddrMap(data, 0); ok != -1 {
+		t.Fatalf("at-cap count with empty body must be rejected as truncated")
+	}
+}
+
+// TestUnmarshalRemovedMapRejectsHugeCount mirrors the address-map case for the
+// removed map decoder.
+func TestUnmarshalRemovedMapRejectsHugeCount(t *testing.T) {
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, ^uint32(0))
+
+	m, ok := unmarshalRemovedMap(data, 0)
+	if ok != -1 {
+		t.Fatalf("expected -1 (corruption) for count > cap, got ok=%d m=%v", ok, m)
+	}
+}
+
+// TestReplayBootstrapRejectsHugeNumAddrs crafts a bootstrap record with a valid
+// fixed header but a NumAddrs prefix near uint32 max and no address bytes. The
+// replay must reject it (return false) without attempting a giant allocation.
+func TestReplayBootstrapRejectsHugeNumAddrs(t *testing.T) {
+	data := make([]byte, bootstrapRecordBaseSize)
+	binary.LittleEndian.PutUint64(data[0:], 7)  // ShardID
+	binary.LittleEndian.PutUint64(data[8:], 9)  // ReplicaID
+	data[16] = 0                                // Join
+	binary.LittleEndian.PutUint64(data[17:], 0) // Type
+	binary.LittleEndian.PutUint32(data[25:], ^uint32(0))
+
+	s := &walShard{
+		bootstraps: make(map[nodeKey]logdb.Bootstrap),
+	}
+	if ok := s.replayBootstrap(data, 1); ok {
+		t.Fatal("expected replayBootstrap to reject huge NumAddrs as corruption")
+	}
+	if len(s.bootstraps) != 0 {
+		t.Fatalf("no bootstrap should have been recorded, got %d", len(s.bootstraps))
+	}
+}
+
+// TestBoundedMapHintClampsToBody asserts the make() hint is bounded by what the
+// remaining record can physically hold, never by the (untrusted) declared
+// count, even for counts at or below the cap.
+func TestBoundedMapHintClampsToBody(t *testing.T) {
+	// Declared count below the cap, but only 24 bytes of body => at most 2
+	// addr entries (24/12). Hint must be 2, not the declared 5000.
+	if got := boundedMapHint(5000, 24, addrMapEntryMinBytes); got != 2 {
+		t.Fatalf("boundedMapHint = %d, want 2 (clamped to body)", got)
+	}
+	// Declared count smaller than the body capacity => returns the count.
+	// 36 bytes of body holds 3 addr entries (36/12), so count 3 fits.
+	if got := boundedMapHint(3, 36, addrMapEntryMinBytes); got != 3 {
+		t.Fatalf("boundedMapHint = %d, want 3 (count fits)", got)
+	}
+	// Empty body => hint 0 regardless of count.
+	if got := boundedMapHint(1000, 0, removedMapEntryMinBytes); got != 0 {
+		t.Fatalf("boundedMapHint = %d, want 0 (empty body)", got)
+	}
+}

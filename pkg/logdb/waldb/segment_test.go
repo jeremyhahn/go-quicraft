@@ -217,6 +217,50 @@ func TestLargeRecordSpansBlocks(t *testing.T) {
 	}
 }
 
+// TestLargeBlockSizeChunkCap is the regression test for the chunk-payload cap:
+// when the block size exceeds maxRecordDataLen+recordHeaderSize, a single chunk
+// must still be capped at maxRecordDataLen (the 2-byte record length field
+// limit) rather than sized to the block. Without the cap, encodeRecord fails
+// with ErrBufferTooSmall and Write returns an error. The record must split into
+// multiple chunks within the oversized block and round-trip correctly.
+func TestLargeBlockSizeChunkCap(t *testing.T) {
+	dir := t.TempDir()
+	blockSize := 256 * 1024 // 256 KiB block, well above the 64 KiB length-field limit.
+
+	// A record larger than maxRecordDataLen so it must be chunked even though it
+	// fits within a single block.
+	dataLen := maxRecordDataLen*2 + 1234
+	data := make([]byte, dataLen)
+	for i := range data {
+		data[i] = byte((i * 7) % 251)
+	}
+
+	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 8*1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: unexpected error: %v", err)
+	}
+	if _, err := seg.Write(data); err != nil {
+		t.Fatalf("Write with oversized block: unexpected error: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: unexpected error: %v", err)
+	}
+
+	rseg := openSegmentForTest(t, dir, 1, blockSize)
+	defer rseg.Close()
+
+	records, err := rseg.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: unexpected error: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("ReadAll: got %d records, want 1", len(records))
+	}
+	if !bytes.Equal(records[0], data) {
+		t.Fatalf("ReadAll: data mismatch (len got=%d, want=%d)", len(records[0]), len(data))
+	}
+}
+
 // TestReadAllCorruptedTail simulates a crash by truncating the segment file
 // mid-record and verifies that ReadAll returns all records before the corruption.
 func TestReadAllCorruptedTail(t *testing.T) {
@@ -736,16 +780,27 @@ func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 		t.Errorf("blockOffset = %d, want %d", seg.blockOffset, cleanBlockOffset)
 	}
 
-	// Verify the block buffer is zeroed.
-	allZero := true
-	for _, b := range seg.blockBuf {
-		if b != 0 {
-			allZero = false
+	// After DiscardPending the open block must preserve its pre-batch content
+	// (bytes [0:cleanBlockOffset], i.e. record1, which the prior Sync made
+	// durable and which will be re-flushed verbatim) while everything written
+	// during the rolled-back batch (bytes at/after cleanBlockOffset) is zeroed.
+	for i := cleanBlockOffset; i < len(seg.blockBuf); i++ {
+		if seg.blockBuf[i] != 0 {
+			t.Errorf("block buffer byte %d should be zeroed after DiscardPending", i)
 			break
 		}
 	}
-	if !allZero {
-		t.Error("block buffer should be zeroed after DiscardPending")
+	if cleanBlockOffset > 0 {
+		nonZero := false
+		for i := 0; i < cleanBlockOffset; i++ {
+			if seg.blockBuf[i] != 0 {
+				nonZero = true
+				break
+			}
+		}
+		if !nonZero {
+			t.Error("pre-batch open-block content should be preserved after DiscardPending")
+		}
 	}
 
 	// Write a new record and sync, then verify only record1 + record3 exist.
@@ -877,13 +932,17 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 		t.Errorf("fileOffset = %d, want %d", seg.fileOffset, cleanFileOffset)
 	}
 
-	// Verify file size matches.
+	// Verify file size matches the pre-batch durable boundary. With the
+	// block-aligned offset model, fileOffset is the block-aligned start and
+	// the open block tail lives in blockOffset, so the durable end is
+	// cleanFileOffset + cleanBlockOffset (the truncation target).
 	fi, err := seg.f.Stat()
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if fi.Size() != cleanFileOffset {
-		t.Errorf("file size = %d, want %d", fi.Size(), cleanFileOffset)
+	wantSize := cleanFileOffset + int64(cleanBlockOffset)
+	if fi.Size() != wantSize {
+		t.Errorf("file size = %d, want %d", fi.Size(), wantSize)
 	}
 }
 

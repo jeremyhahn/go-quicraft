@@ -54,8 +54,6 @@ each with its own state machine, log, and membership. It provides:
 - `pkg/seal/` — Barrier (AEAD encryption), SealingStrategy
 - `pkg/crypto/` — AES-GCM/ChaCha20-Poly1305, hardware detection
 - `pkg/crypto/shamir/` — Shamir's Secret Sharing for key management
-- `pkg/discovery/` — Static, multicast, DNS SRV peer discovery
-- `pkg/bootstrap/` — Cluster formation orchestration
 - `pkg/batch/` — Proposal batching utilities
 - `pkg/enclave/` — Memory-protected containers (mlock)
 - `pkg/writemode/` — Write durability modes
@@ -360,52 +358,21 @@ The RSM adapter uses a `(value, supported, error)` pattern:
 - If SM does not implement: return (zero, false, nil)
 - SM errors are always propagated to the caller
 
-## Discovery and Bootstrap
+## Cluster Formation (lives in go-qrdb)
 
-### Discovery
-
-Three built-in discovery methods in `pkg/discovery/`:
-
-| Method               | Description                                     |
-|---------------------|---------------------------------------------|
-| `StaticDiscovery`   | Fixed peer list, known at deployment time   |
-| `MulticastDiscovery`| UDP multicast with HMAC-SHA256 authentication |
-| `DNSDiscovery`      | DNS SRV record lookup (`_raft._udp.domain`) |
-
-All implement `discovery.Method`. The `Manager` tries methods in order with
-configurable retry:
+go-quicraft is a Raft-primitives library and does **not** discover peers or
+orchestrate cluster formation. It exposes the primitive a cluster manager
+builds on:
 
 ```go
-mgr := discovery.NewManager(discovery.ManagerConfig{
-    Methods:       []discovery.Method{static, dns},
-    RetryInterval: time.Second,
-    MaxRetries:    10,
-})
-peers, err := mgr.Discover()
+// Caller supplies the member map (by discovery, static config, etc.).
+err := host.StartShard(members, join, createFn, cfg)
 ```
 
-### Bootstrap
-
-The `Bootstrapper` in `pkg/bootstrap/` orchestrates cluster formation:
-
-1. Discover peers via configured `discovery.Method`
-2. Add self to peer list (deduplicated)
-3. Validate quorum size
-4. Build member map (replicaID → address)
-5. Call `host.StartShard(shardID, replicaID, members, createFn, config)`
-
-```go
-bs := bootstrap.NewBootstrapper(bootstrap.Config{
-    ShardID:     100,
-    ReplicaID:   1,
-    Address:     "10.0.0.1:4001",
-    Discovery:   staticDiscovery,
-    CreateFn:    sm.NewCreateFunc(newKVStore),
-    ShardConfig: cfg,
-    MinPeers:    3,
-}, host)
-err := bs.Bootstrap()
-```
+Peer discovery (static / multicast / DNS SRV / token) and bootstrap
+orchestration (discover → quorum → `StartShard`), plus opt-in dynamic
+membership, live in **go-qrdb** (`pkg/discovery`, `pkg/cluster`) — the layer
+that owns the cluster. See go-qrdb's `docs/discovery.md`.
 
 ## At-Rest Encryption
 

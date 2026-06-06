@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package server provides the admin HTTP server for node management.
+// Package server provides the in-memory Raft proposal rate limiter used to
+// apply backpressure when a follower's in-flight log grows too large.
 package server
 
 import "sync/atomic"
@@ -173,9 +174,13 @@ func (r *InMemRateLimiter) GetTick() uint64 {
 }
 
 // Reset clears all follower states and resets the rate limit state.
-// Called on leadership transitions.
+// Called on leadership transitions. The local tracked in-memory log size
+// is also zeroed: the matching Decrease calls were made under the previous
+// term, so a stale local size must not carry over and trip the limiter (or
+// prevent it from decaying) after the node re-becomes leader.
 func (r *InMemRateLimiter) Reset() {
 	r.followerSizes = make(map[uint64]followerState)
+	r.rl.Set(0)
 	r.limited = false
 	r.tickLimited = 0
 	r.cachedLimited.Store(false)

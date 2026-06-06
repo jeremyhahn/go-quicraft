@@ -571,7 +571,10 @@ func TestApplyWorker_SequentialPerShard(t *testing.T) {
 	}
 }
 
-func TestApplyWorker_CircuitBreaker(t *testing.T) {
+// TestApplyWorker_FailFast verifies that an SM.Apply error marks the shard
+// failed on the FIRST error (fail-fast), reports a failure through the
+// listener, and does NOT advance lastApplied.
+func TestApplyWorker_FailFast(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	var wg sync.WaitGroup
@@ -590,22 +593,20 @@ func TestApplyWorker_CircuitBreaker(t *testing.T) {
 		},
 	}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 3, nil, "", listener) // maxApplyRetries=3
+	node := NewNode(nil, rsmSM, nil, cfg, 3, nil, "", listener)
 
-	// Send 3 items to trigger circuit breaker.
-	for i := range 3 {
-		node.commitPending.Store(true)
-		item := applyPool.Get().(*applyItem)
-		item.update = proto.Update{
-			ShardID:   1,
-			ReplicaID: 1,
-			CommittedEntries: []proto.Entry{
-				{Term: 1, Index: uint64(i + 1), Cmd: []byte("cmd")},
-			},
-		}
-		item.node = node
-		applyC <- item
+	// A single failing item must trip fail-fast.
+	node.commitPending.Store(true)
+	item := applyPool.Get().(*applyItem)
+	item.update = proto.Update{
+		ShardID:   1,
+		ReplicaID: 1,
+		CommittedEntries: []proto.Entry{
+			{Term: 1, Index: 1, Cmd: []byte("cmd")},
+		},
 	}
+	item.node = node
+	applyC <- item
 
 	// Start the apply worker dispatcher loop.
 	runDone := make(chan struct{})
@@ -614,9 +615,9 @@ func TestApplyWorker_CircuitBreaker(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Poll until circuit breaker trips (node.failed set).
+	// Poll until the shard is marked failed.
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for circuit breaker to trip",
+		"timed out waiting for shard to fail",
 		func() bool { return node.IsFailed() })
 
 	close(stopC)
@@ -624,18 +625,17 @@ func TestApplyWorker_CircuitBreaker(t *testing.T) {
 	wg.Wait()
 
 	if !node.IsFailed() {
-		t.Fatal("node should be in failed state after circuit breaker trips")
+		t.Fatal("node should be in failed state after fail-fast apply error")
 	}
 
-	if node.applyRetries.Load() < 3 {
-		t.Fatalf("applyRetries = %d, want >= 3", node.applyRetries.Load())
+	if failedCalled.Load() == 0 {
+		t.Fatal("expected OnShardFailed to be called")
 	}
 
-	// lastApplied must advance even on error because the commit worker
-	// already advanced processed. Not advancing would create a permanent
-	// gap in the apply pipeline.
-	if node.lastApplied.Load() != 3 {
-		t.Fatalf("lastApplied = %d, want 3 (highest index in batch)", node.lastApplied.Load())
+	// Fail-fast must NOT advance lastApplied. Advancing it while skipping
+	// the batch would diverge this state machine from its peers.
+	if node.lastApplied.Load() != 0 {
+		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", node.lastApplied.Load())
 	}
 }
 
@@ -868,7 +868,10 @@ func TestApplyWorker_SemaphoreLimitsConcurrency(t *testing.T) {
 	}
 }
 
-func TestApplyWorker_CircuitBreakerResetOnSuccess(t *testing.T) {
+// TestApplyWorker_SuccessfulAppliesAdvance verifies the happy path: a
+// sequence of successful applies advances lastApplied and never marks the
+// shard failed.
+func TestApplyWorker_SuccessfulAppliesAdvance(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	var wg sync.WaitGroup
@@ -880,7 +883,7 @@ func TestApplyWorker_CircuitBreakerResetOnSuccess(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 10, nil, "", nil) // maxApplyRetries=10
+	node := NewNode(nil, rsmSM, nil, cfg, 10, nil, "", nil)
 
 	// Start the apply worker dispatcher loop.
 	runDone := make(chan struct{})
@@ -889,9 +892,7 @@ func TestApplyWorker_CircuitBreakerResetOnSuccess(t *testing.T) {
 		close(runDone)
 	}()
 
-	// First: fail twice.
-	testSm.setApplyError(errors.New("transient"))
-	for i := range 2 {
+	for i := range 3 {
 		node.commitPending.Store(true)
 		item := applyPool.Get().(*applyItem)
 		item.update = proto.Update{
@@ -901,36 +902,66 @@ func TestApplyWorker_CircuitBreakerResetOnSuccess(t *testing.T) {
 		item.node = node
 		applyC <- item
 	}
-	// Poll until both failing items have been processed (lastApplied advances
-	// even on error so the commit pipeline doesn't stall).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for 2 failing items to process",
-		func() bool { return node.lastApplied.Load() >= 2 })
-
-	// Now succeed.
-	testSm.setApplyError(nil)
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:          1,
-		CommittedEntries: []proto.Entry{{Term: 1, Index: 3, Cmd: []byte("c")}},
-	}
-	item.node = node
-	applyC <- item
-	// Poll until the success item is processed.
-	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for success item to process",
+		"timed out waiting for all items to apply",
 		func() bool { return node.lastApplied.Load() >= 3 })
 
 	close(stopC)
 	<-runDone
 	wg.Wait()
 
-	// After the run() goroutine has fully exited, it is safe to read
-	// non-atomic node fields that are only written by the per-shard
-	// goroutine (which wg.Wait() guarantees is done).
-	if node.applyRetries.Load() != 0 {
-		t.Fatalf("applyRetries = %d, want 0 after success", node.applyRetries.Load())
+	if node.IsFailed() {
+		t.Fatal("shard should not be failed after successful applies")
+	}
+	if node.lastApplied.Load() != 3 {
+		t.Fatalf("lastApplied = %d, want 3", node.lastApplied.Load())
+	}
+}
+
+// TestApplyWorker_FailFastHaltsShard verifies that after a fail-fast apply
+// error, the shard is marked failed. A subsequent item delivered to the
+// per-shard goroutine is still drained from the channel (the goroutine
+// must not leak), but the shard remains failed.
+func TestApplyWorker_FailFastHaltsShard(t *testing.T) {
+	applyC := make(chan *applyItem, 64)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	var wg sync.WaitGroup
+	stopC := make(chan struct{})
+
+	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
+
+	testSm := newTestSM()
+	testSm.setApplyError(errors.New("permanent"))
+	rsmSM := newTestApplier(testSm)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	node := NewNode(nil, rsmSM, nil, cfg, 10, nil, "", nil)
+
+	runDone := make(chan struct{})
+	go func() {
+		aw.run()
+		close(runDone)
+	}()
+
+	node.commitPending.Store(true)
+	item := applyPool.Get().(*applyItem)
+	item.update = proto.Update{
+		ShardID:          1,
+		CommittedEntries: []proto.Entry{{Term: 1, Index: 1, Cmd: []byte("c")}},
+	}
+	item.node = node
+	applyC <- item
+
+	waitFor(t, 5*time.Second, time.Millisecond,
+		"timed out waiting for shard to fail",
+		func() bool { return node.IsFailed() })
+
+	close(stopC)
+	<-runDone
+	wg.Wait()
+
+	if node.lastApplied.Load() != 0 {
+		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", node.lastApplied.Load())
 	}
 }
 
@@ -3729,10 +3760,11 @@ func TestCommitWorker_PiggybackHappyPath(t *testing.T) {
 
 	cw.processBatch()
 
-	// Verify SaveState was called only once (initial batch persistence).
-	// The piggyback path skips SaveState - commit index is persisted lazily.
-	if got := ldb.saveCount.Load(); got != 1 {
-		t.Fatalf("expected 1 SaveState call (initial only, piggyback skips persist), got %d", got)
+	// Verify SaveState was called twice: once for the initial batch
+	// persistence and once on the piggyback path to make the advanced commit
+	// index durable before apply (crash-safety; see executePiggyback).
+	if got := ldb.saveCount.Load(); got != 2 {
+		t.Fatalf("expected 2 SaveState calls (batch + piggyback commit-index persist), got %d", got)
 	}
 
 	// Verify the apply worker received the piggyback committed entries.
@@ -3840,7 +3872,7 @@ func TestCommitWorker_PiggybackNoEntries(t *testing.T) {
 //
 // Even when LogDB would fail on subsequent calls, the piggyback path
 // succeeds because it doesn't call SaveState at all.
-func TestCommitWorker_PiggybackSkipsSaveState(t *testing.T) {
+func TestCommitWorker_PiggybackPersistFailureFailsNode(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
 	commitC := make(chan *commitItem, 16)
@@ -3866,9 +3898,10 @@ func TestCommitWorker_PiggybackSkipsSaveState(t *testing.T) {
 	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", listener)
 	node.commitPending.Store(true)
 
-	// Configure the LogDB to fail after the first successful SaveState.
-	// With the optimization, the piggyback path never calls SaveState,
-	// so this failure never occurs.
+	// Fail the SECOND SaveState. The first persists the batch; the second is
+	// the piggyback commit-index persist. Its failure must abort the
+	// piggyback (no apply forwarded), since applying before the commit index
+	// is durable is exactly the crash-safety hole this fix closes.
 	ldb.setFailAfterN(1, errors.New("disk full on piggyback"))
 
 	cw.batch = append(cw.batch[:0], update)
@@ -3876,21 +3909,17 @@ func TestCommitWorker_PiggybackSkipsSaveState(t *testing.T) {
 
 	cw.processBatch()
 
-	// Verify SaveState was called only once (initial batch persistence).
-	// The piggyback path skips SaveState - commit index is persisted lazily.
-	if got := ldb.saveCount.Load(); got != 1 {
-		t.Fatalf("expected 1 SaveState call (piggyback skips persist), got %d", got)
+	// Two SaveState attempts: batch (ok) + piggyback persist (failed).
+	if got := ldb.saveCount.Load(); got != 2 {
+		t.Fatalf("expected 2 SaveState calls (batch + failed piggyback persist), got %d", got)
 	}
 
-	// Apply item SHOULD be produced since piggyback no longer fails
-	// on SaveState errors (it doesn't call SaveState).
+	// No apply item must be produced when the commit-index persist fails.
 	select {
-	case ai := <-applyC:
-		if len(ai.update.CommittedEntries) == 0 {
-			t.Fatal("piggyback apply item should have committed entries")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item from piggyback (SaveState is skipped)")
+	case <-applyC:
+		t.Fatal("piggyback must NOT forward to apply when commit-index persist fails")
+	case <-time.After(100 * time.Millisecond):
+		// expected: nothing applied
 	}
 }
 
@@ -3955,15 +3984,16 @@ func TestCommitWorker_PiggybackMessageOrdering(t *testing.T) {
 	sendMu.Lock()
 	defer sendMu.Unlock()
 
-	// There should be exactly 1 SaveState call (initial only).
+	// There should be 2 SaveState calls: the initial batch persistence and
+	// the piggyback commit-index persist (which precedes ordered sends/apply).
 	saveStateCount := 0
 	for _, entry := range sendOrder {
 		if entry == "SaveState" {
 			saveStateCount++
 		}
 	}
-	if saveStateCount != 1 {
-		t.Fatalf("expected 1 SaveState entry (piggyback skips persist), got %d (sequence: %v)",
+	if saveStateCount != 2 {
+		t.Fatalf("expected 2 SaveState entries (batch + piggyback persist), got %d (sequence: %v)",
 			saveStateCount, sendOrder)
 	}
 
@@ -6000,8 +6030,9 @@ func TestApplyWorker_RunShardApply_AutoSnapshot(t *testing.T) {
 }
 
 // TestApplyWorker_RunShardApply_DecompressError verifies that when entry
-// decompression fails, the node's circuit breaker counter is incremented,
-// lastApplied is advanced, and the error is handled.
+// decompression fails, the shard fails fast: the node is marked failed,
+// lastApplied is NOT advanced, the SM is not invoked, and commitPending
+// is cleared.
 func TestApplyWorker_RunShardApply_DecompressError(t *testing.T) {
 	applyC := make(chan *applyItem, 16)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -6044,14 +6075,15 @@ func TestApplyWorker_RunShardApply_DecompressError(t *testing.T) {
 
 	aw.runShardApply(shardC)
 
-	// applyRetries should be incremented.
-	if node.applyRetries.Load() == 0 {
-		t.Fatal("applyRetries should be incremented on decompression error")
+	// Fail-fast: the shard must be marked failed.
+	if !node.IsFailed() {
+		t.Fatal("shard should be marked failed on decompression error")
 	}
 
-	// lastApplied should be advanced.
-	if node.lastApplied.Load() != 3 {
-		t.Errorf("lastApplied = %d, want 3", node.lastApplied.Load())
+	// lastApplied must NOT advance. Advancing while skipping the batch
+	// would diverge this state machine from its peers.
+	if node.lastApplied.Load() != 0 {
+		t.Errorf("lastApplied = %d, want 0 (fail-fast does not advance)", node.lastApplied.Load())
 	}
 
 	// SM should NOT have been called.
@@ -6063,11 +6095,17 @@ func TestApplyWorker_RunShardApply_DecompressError(t *testing.T) {
 	if node.commitPending.Load() {
 		t.Fatal("commitPending should be cleared after decompression error")
 	}
+
+	// OnProposalFailed should have been called.
+	if cb.proposalFailedCount.Load() != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
+	}
 }
 
 // TestApplyWorker_RunShardApply_ApplyError verifies that when sm.Apply
-// returns an error, the node's circuit breaker counter is incremented,
-// lastApplied is advanced, and pending proposals are failed.
+// returns an error, the shard fails fast: the node is marked failed,
+// lastApplied is NOT advanced, pending proposals are failed, and
+// commitPending is cleared.
 func TestApplyWorker_RunShardApply_ApplyError(t *testing.T) {
 	applyC := make(chan *applyItem, 16)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -6104,14 +6142,19 @@ func TestApplyWorker_RunShardApply_ApplyError(t *testing.T) {
 
 	aw.runShardApply(shardC)
 
-	// applyRetries should be incremented.
-	if node.applyRetries.Load() == 0 {
-		t.Fatal("applyRetries should be incremented on Apply error")
+	// Fail-fast: the shard must be marked failed on the first error.
+	if !node.IsFailed() {
+		t.Fatal("shard should be marked failed on Apply error")
 	}
 
-	// lastApplied should be advanced to prevent permanent gaps.
-	if node.lastApplied.Load() != 5 {
-		t.Errorf("lastApplied = %d, want 5", node.lastApplied.Load())
+	// lastApplied must NOT advance under fail-fast.
+	if node.lastApplied.Load() != 0 {
+		t.Errorf("lastApplied = %d, want 0 (fail-fast does not advance)", node.lastApplied.Load())
+	}
+
+	// Pending proposals must be failed.
+	if cb.proposalFailedCount.Load() != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
 	}
 
 	// commitPending should be cleared.
@@ -6120,9 +6163,8 @@ func TestApplyWorker_RunShardApply_ApplyError(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_RunShardApply_ApplyErrorCircuitBreaker verifies that
-// repeated Apply errors trigger the circuit breaker, marking the node
-// as permanently failed.
+// TestApplyWorker_RunShardApply_ApplyErrorCircuitBreaker verifies that a
+// single Apply error marks the node as permanently failed (fail-fast).
 func TestApplyWorker_RunShardApply_ApplyErrorCircuitBreaker(t *testing.T) {
 	applyC := make(chan *applyItem, 16)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -6139,10 +6181,6 @@ func TestApplyWorker_RunShardApply_ApplyErrorCircuitBreaker(t *testing.T) {
 	testSm.setApplyError(errors.New("persistent failure"))
 	rsmSM := newTestApplier(testSm)
 	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
-
-	// Pre-set retries to just below the threshold so one more failure
-	// triggers the circuit breaker.
-	node.applyRetries.Store(node.maxApplyRetries - 1)
 
 	item := &applyItem{
 		update: proto.Update{

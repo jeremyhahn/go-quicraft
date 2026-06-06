@@ -17,9 +17,11 @@ package quicraft
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -2939,6 +2941,83 @@ func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
 	rs.Release()
 }
 
+// TestOnApplied_TimeoutRecycleNoCrossDelivery reproduces Bug E at the Host
+// level: a proposal (request A) is registered, its caller "times out" and
+// Releases the RequestState while the pending-map entry is still present.
+// The late OnApplied for A then removes the entry and recycles the RS into
+// the pool. A new proposal (request B) draws a RequestState from the same
+// pool. Firing A's stale OnApplied again must not deliver any result into
+// B's channel.
+func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	addTestNodeState(h, 1, 1)
+	ns := testLoadNode(h, 1)
+	pool := NewRequestStatePool()
+	ns.requestPool = pool
+	cb := &hostEngineCallback{h: h}
+
+	// Request A registers exactly as proposeEntry does: acquireRef + Store +
+	// addPendingOp.
+	const keyA = uint64(1001)
+	rsA := newRequestState(pool, keyA, time.Time{})
+	rsA.acquireRef()
+	ns.pendingProposals.Store(keyA, &pendingProposal{rs: rsA})
+	h.addPendingOp()
+
+	// The caller times out and releases A while it is still registered.
+	rsA.Release()
+	if rsA.recycled.Load() {
+		t.Fatal("rsA recycled while still registered in the pending map")
+	}
+
+	// A's entry is finally applied: OnApplied removes the entry, completes
+	// (no-op since released), and the final releaseRef recycles rsA.
+	cb.OnApplied(1, []proto.Entry{{Key: keyA, Index: 5}}, []sm.Result{{Value: 7}})
+	if !rsA.recycled.Load() {
+		t.Fatal("rsA not recycled after its OnApplied removed the pending entry")
+	}
+
+	// Request B draws from the same pool. With a single recycled object this
+	// reuses rsA's storage.
+	const keyB = uint64(2002)
+	rsB := newRequestState(pool, keyB, time.Time{})
+	rsB.acquireRef()
+	ns.pendingProposals.Store(keyB, &pendingProposal{rs: rsB})
+	h.addPendingOp()
+
+	// A's stale OnApplied fires again (duplicate/late callback). A's key is
+	// gone from the map, so it must be a complete no-op — B's channel and
+	// pending entry must be untouched.
+	cb.OnApplied(1, []proto.Entry{{Key: keyA, Index: 5}}, []sm.Result{{Value: 7}})
+
+	select {
+	case got := <-rsB.ResultC():
+		t.Fatalf("request B channel received a foreign result: %+v", got)
+	default:
+	}
+	if _, ok := ns.pendingProposals.Load(keyB); !ok {
+		t.Fatal("request B pending entry was wrongly removed")
+	}
+
+	// B completes legitimately and receives its own result.
+	cb.OnApplied(1, []proto.Entry{{Key: keyB, Index: 6}}, []sm.Result{{Value: 99}})
+	select {
+	case got := <-rsB.ResultC():
+		if got.Value != 99 {
+			t.Fatalf("request B result = %d, want 99", got.Value)
+		}
+	default:
+		t.Fatal("request B did not receive its own result")
+	}
+	rsB.Release()
+}
+
 // TestClose_SecondSweepCatchesLateRegistrations verifies that proposals
 // registered after the first sweep visits a shard (but before Close
 // finishes) are still completed with ErrClosed by the second sweep.
@@ -4905,6 +4984,15 @@ func TestExportSnapshot_Success(t *testing.T) {
 		t.Fatalf("ExportSnapshot failed: %v", err)
 	}
 
+	// The export is now a self-describing artifact: header then plaintext
+	// data. Parse the header and verify the metadata and trailing data.
+	hdr, hdrErr := readSnapshotArtifactHeader(&buf)
+	if hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
+	if hdr.Index != 500 {
+		t.Errorf("artifact Index = %d, want 500", hdr.Index)
+	}
 	if !bytes.Equal(buf.Bytes(), snapshotData) {
 		t.Errorf("exported data = %q, want %q", buf.Bytes(), snapshotData)
 	}
@@ -4913,6 +5001,22 @@ func TestExportSnapshot_Success(t *testing.T) {
 // ---------------------------------------------------------------------------
 // ImportSnapshot
 // ---------------------------------------------------------------------------
+
+// buildSnapshotArtifact constructs a valid exported-snapshot artifact (header
+// + plaintext data) for use as ImportSnapshot input in tests.
+func buildSnapshotArtifact(t *testing.T, index, term, onDiskIndex uint64, memb proto.Membership, data []byte) []byte {
+	t.Helper()
+	hdr, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{
+		Index:       index,
+		Term:        term,
+		OnDiskIndex: onDiskIndex,
+		Membership:  memb,
+	})
+	if err != nil {
+		t.Fatalf("marshalSnapshotArtifactHeader failed: %v", err)
+	}
+	return append(hdr, data...)
+}
 
 func TestImportSnapshot_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -4978,22 +5082,31 @@ func TestImportSnapshot_Success(t *testing.T) {
 	}
 	defer h.Close()
 
-	// Import snapshot data. The shard is NOT running (no StartShard called).
+	// Import a snapshot artifact. The shard is NOT running (no StartShard).
 	snapshotData := []byte("imported snapshot payload for testing")
-	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(snapshotData))
+	memb := proto.Membership{Addresses: map[uint64]string{1: "127.0.0.1:5000"}}
+	artifact := buildSnapshotArtifact(t, 500, 7, 0, memb, snapshotData)
+	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact))
 	if err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
 
-	// Verify the snapshot metadata was saved in LogDB.
+	// Verify the snapshot metadata was saved in LogDB and preserves the
+	// ORIGINAL Index/Term/Membership from the artifact header.
 	db.mu.Lock()
 	snap, ok := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
 	if !ok {
 		t.Fatal("snapshot not saved in logdb")
 	}
-	if snap.Index == 0 {
-		t.Error("snapshot Index should not be zero")
+	if snap.Index != 500 {
+		t.Errorf("snapshot Index = %d, want 500 (from artifact header)", snap.Index)
+	}
+	if snap.Term != 7 {
+		t.Errorf("snapshot Term = %d, want 7 (from artifact header)", snap.Term)
+	}
+	if snap.Membership.Addresses[1] != "127.0.0.1:5000" {
+		t.Errorf("snapshot Membership not preserved: %#v", snap.Membership.Addresses)
 	}
 	if snap.Filepath == "" {
 		t.Error("snapshot Filepath should not be empty")
@@ -5023,8 +5136,8 @@ func TestImportSnapshot_VerifiesSnapshotDirStructure(t *testing.T) {
 	}
 	defer h.Close()
 
-	snapshotData := []byte("test data")
-	err = h.ImportSnapshot(context.Background(), 5, bytes.NewReader(snapshotData))
+	artifact := buildSnapshotArtifact(t, 42, 1, 0, proto.Membership{}, []byte("test data"))
+	err = h.ImportSnapshot(context.Background(), 5, bytes.NewReader(artifact))
 	if err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
@@ -5059,7 +5172,8 @@ func TestImportSnapshot_MultipleShardNodes(t *testing.T) {
 	}
 	defer h.Close()
 
-	err = h.ImportSnapshot(context.Background(), 20, bytes.NewReader([]byte("data")))
+	artifact := buildSnapshotArtifact(t, 100, 1, 0, proto.Membership{}, []byte("data"))
+	err = h.ImportSnapshot(context.Background(), 20, bytes.NewReader(artifact))
 	if err != nil {
 		t.Fatalf("ImportSnapshot for shard 20 failed: %v", err)
 	}
@@ -5136,6 +5250,195 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestExportImportSnapshot_PreservesIdentityAndMembership verifies Bug D: the
+// exported artifact carries the original snapshot Index, Term, OnDiskIndex,
+// and Membership, and ImportSnapshot persists them verbatim (using importSeq
+// only for the on-disk directory name). Before the fix, import synthesized
+// Index=importSeq, Term=1, and dropped Membership/OnDiskIndex, producing a
+// different logical snapshot.
+func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "snap-identity")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	originalData := []byte("identity-preserving snapshot payload")
+	if writeErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), originalData, 0o644); writeErr != nil {
+		t.Fatalf("WriteFile failed: %v", writeErr)
+	}
+
+	// A non-trivial source snapshot: high Index/Term, multi-category
+	// membership, and a non-zero OnDiskIndex.
+	srcMemb := logdb.Membership{
+		ConfigChangeID: 9,
+		Addresses:      map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001"},
+		Observers:      map[uint64]string{3: "127.0.0.1:5002"},
+		Witnesses:      map[uint64]string{4: "127.0.0.1:5003"},
+		Removed:        map[uint64]bool{5: true},
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{
+		Index:       4242,
+		Term:        13,
+		Membership:  srcMemb,
+		Filepath:    snapDir,
+		OnDiskIndex: 4200,
+	})
+
+	var exported bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &exported); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+
+	if stopErr := h.StopShard(1); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	db.mu.Unlock()
+
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
+		t.Fatalf("ImportSnapshot failed: %v", importErr)
+	}
+
+	db.mu.Lock()
+	got := db.snapshots[mockNodeKey{1, 1}]
+	db.mu.Unlock()
+
+	if got.Index != 4242 {
+		t.Errorf("imported Index = %d, want 4242", got.Index)
+	}
+	if got.Term != 13 {
+		t.Errorf("imported Term = %d, want 13", got.Term)
+	}
+	if got.OnDiskIndex != 4200 {
+		t.Errorf("imported OnDiskIndex = %d, want 4200", got.OnDiskIndex)
+	}
+	if got.Epoch != 0 {
+		t.Errorf("imported Epoch = %d, want 0 (plaintext)", got.Epoch)
+	}
+	if got.Membership.ConfigChangeID != 9 {
+		t.Errorf("imported Membership.ConfigChangeID = %d, want 9", got.Membership.ConfigChangeID)
+	}
+	if got.Membership.Addresses[1] != "127.0.0.1:5000" || got.Membership.Addresses[2] != "127.0.0.1:5001" {
+		t.Errorf("imported Addresses not preserved: %#v", got.Membership.Addresses)
+	}
+	if got.Membership.Observers[3] != "127.0.0.1:5002" {
+		t.Errorf("imported Observers not preserved: %#v", got.Membership.Observers)
+	}
+	if got.Membership.Witnesses[4] != "127.0.0.1:5003" {
+		t.Errorf("imported Witnesses not preserved: %#v", got.Membership.Witnesses)
+	}
+	if !got.Membership.Removed[5] {
+		t.Errorf("imported Removed not preserved: %#v", got.Membership.Removed)
+	}
+	// The on-disk directory uses importSeq (not the Raft index 4242).
+	if filepath.Base(got.Filepath) == "snapshot-00000000000000004242" {
+		t.Errorf("directory name should use importSeq, not the Raft index: %q", got.Filepath)
+	}
+}
+
+// TestExportImportSnapshot_RecoveryRoundTrip exercises the full Bug D flow:
+// a real snapshot is exported, imported, and then StartShard recovers from
+// the imported artifact. It asserts the recovered LogDB snapshot preserves
+// the original Index/Term/Membership.
+func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// Build a source snapshot whose data file is a valid RSM payload:
+	// 4-byte LE session count (0) followed by empty SM data.
+	srcDir := t.TempDir()
+	if writeErr := os.WriteFile(filepath.Join(srcDir, "snapshot.dat"), []byte{0, 0, 0, 0}, 0o644); writeErr != nil {
+		t.Fatalf("WriteFile failed: %v", writeErr)
+	}
+	srcMemb := logdb.Membership{
+		ConfigChangeID: 3,
+		Addresses:      map[uint64]string{1: "127.0.0.1:5000"},
+	}
+	if saveErr := h.logdb.SaveSnapshot(1, 1, logdb.Snapshot{
+		Index:      5,
+		Term:       4,
+		Membership: srcMemb,
+		Filepath:   srcDir,
+	}); saveErr != nil {
+		t.Fatalf("SaveSnapshot failed: %v", saveErr)
+	}
+
+	// Start the shard so ExportSnapshot can resolve the loaded node. The
+	// shard recovers from the source snapshot above.
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	// Export the snapshot artifact, then stop the source host.
+	var exported bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &exported); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+	if stopErr := h.StopShard(1); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+
+	// Import the artifact onto a SECOND, independent host (the realistic
+	// cross-host restore). h2 is bootstrapped for shard 1 / replica 1 so
+	// ImportSnapshot can resolve the replicaID, but has no prior snapshot.
+	cfg2 := testHostConfig(t)
+	h2, err := NewHost(cfg2, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost (h2) failed: %v", err)
+	}
+	defer h2.Close()
+	if bsErr := h2.logdb.SaveBootstrap(1, 1, logdb.Bootstrap{}); bsErr != nil {
+		t.Fatalf("SaveBootstrap (h2) failed: %v", bsErr)
+	}
+
+	if importErr := h2.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
+		t.Fatalf("ImportSnapshot failed: %v", importErr)
+	}
+
+	// The imported LogDB snapshot must preserve the ORIGINAL identity.
+	recovered, getErr := h2.logdb.GetSnapshot(1, 1)
+	if getErr != nil {
+		t.Fatalf("GetSnapshot failed: %v", getErr)
+	}
+	if recovered.Index != 5 {
+		t.Errorf("recovered Index = %d, want 5", recovered.Index)
+	}
+	if recovered.Term != 4 {
+		t.Errorf("recovered Term = %d, want 4", recovered.Term)
+	}
+	if recovered.Membership.ConfigChangeID != 3 {
+		t.Errorf("recovered ConfigChangeID = %d, want 3", recovered.Membership.ConfigChangeID)
+	}
+	if recovered.Membership.Addresses[1] != "127.0.0.1:5000" {
+		t.Errorf("recovered Addresses not preserved: %#v", recovered.Membership.Addresses)
+	}
+
+	// StartShard on h2 must recover from the imported snapshot without error.
+	if startErr := h2.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard recovery from imported snapshot failed: %v", startErr)
+	}
+}
+
 func TestExportSnapshot_LargeData(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -5168,8 +5471,13 @@ func TestExportSnapshot_LargeData(t *testing.T) {
 		t.Fatalf("ExportSnapshot failed: %v", exportErr)
 	}
 
+	// The artifact prepends a header; after parsing it, the remaining bytes
+	// must equal the original data length.
+	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
 	if buf.Len() != len(largeData) {
-		t.Errorf("exported len = %d, want %d", buf.Len(), len(largeData))
+		t.Errorf("exported data len = %d, want %d", buf.Len(), len(largeData))
 	}
 }
 
@@ -5209,7 +5517,8 @@ func TestImportSnapshot_SaveSnapshotError(t *testing.T) {
 	}
 	defer h.Close()
 
-	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader([]byte("data")))
+	artifact := buildSnapshotArtifact(t, 1, 1, 0, proto.Membership{}, []byte("data"))
+	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact))
 	if err == nil {
 		t.Fatal("ImportSnapshot should fail when SaveSnapshot returns error")
 	}
@@ -5351,8 +5660,10 @@ func TestImportSnapshot_CopyError(t *testing.T) {
 	if err == nil {
 		t.Fatal("ImportSnapshot should fail when reader returns error")
 	}
-	if err.Error() != "reader broken" {
-		t.Errorf("error = %v, want 'reader broken'", err)
+	// The reader error now surfaces while reading the artifact header; it is
+	// wrapped in a SnapshotArtifactError but must still unwrap to copyErr.
+	if !errors.Is(err, copyErr) {
+		t.Errorf("error = %v, want wrapped %v", err, copyErr)
 	}
 }
 
@@ -5812,48 +6123,127 @@ func TestHost_KeyRotationLoop_RotateError(t *testing.T) {
 	h.Close()
 }
 
-// TestHost_KeyRotationLoop_PurgesOldEpochs verifies that when
-// MaxRetainedEpochs is configured, the key rotation loop calls
-// PurgeEpochsBefore after each successful rotation.
-func TestHost_KeyRotationLoop_PurgesOldEpochs(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	cfg.MaxRetainedEpochs = 2
+// writeEncryptedSnapshotMeta writes a snapshot metadata file recording the
+// given epoch under a node's SnapshotDir layout so the engine's global
+// safe-purge floor scan discovers it. The node SnapshotDir is
+// <NodeHostDir>/snapshots/shard-<N>; listSnapshotDirs then descends into
+// shard-<N>/replica-<N>/snapshot-<index>.
+func writeEncryptedSnapshotMeta(t *testing.T, nodeHostDir string, shardID, replicaID, index, epoch uint64) {
+	t.Helper()
+	snapDir := filepath.Join(nodeHostDir, "snapshots",
+		fmt.Sprintf("shard-%d", shardID),
+		fmt.Sprintf("shard-%d", shardID),
+		fmt.Sprintf("replica-%d", replicaID),
+		fmt.Sprintf("snapshot-%020d", index))
+	if err := os.MkdirAll(snapDir, 0o750); err != nil {
+		t.Fatalf("mkdir snapshot dir: %v", err)
+	}
+	metaPath := filepath.Join(snapDir, "snapshot.meta")
+	var buf [48]byte
+	binary.LittleEndian.PutUint64(buf[0:], index)
+	binary.LittleEndian.PutUint64(buf[8:], 1) // term
+	binary.LittleEndian.PutUint64(buf[16:], shardID)
+	binary.LittleEndian.PutUint64(buf[24:], replicaID)
+	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
+	binary.LittleEndian.PutUint64(buf[40:], epoch)
+	if err := os.WriteFile(metaPath, buf[:], 0o600); err != nil {
+		t.Fatalf("write snapshot meta: %v", err)
+	}
+}
 
-	// Start at epoch 1. After 3+ rotations (epoch >= 4), the loop should
-	// call PurgeEpochsBefore with threshold = epoch - 2.
-	barrier := newTestHostBarrier(1)
+// TestHost_RotateBarrierKey_FailSafeNoFloor verifies the fail-safe contract:
+// when nothing encrypted is retained (no shards, memory LogDB, no snapshots)
+// the global safe floor is unknown, so rotation must NOT purge any DEK even
+// though MaxRetainedEpochs would otherwise permit it.
+func TestHost_RotateBarrierKey_FailSafeNoFloor(t *testing.T) {
+	cfg := testHostConfig(t)
+	cfg.MaxRetainedEpochs = 1
+
+	barrier := newTestHostBarrier(5) // already well above MaxRetainedEpochs
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
+	defer h.Close()
 
-	// Wait until enough rotations for purge to trigger.
-	// epoch must exceed MaxRetainedEpochs (2) for purge to fire.
-	// Epoch starts at 1, after 2 rotations epoch=3, threshold=3-2=1.
-	deadline := time.Now().Add(10 * time.Second)
-	for barrier.purgeCount.Load() < 1 && time.Now().Before(deadline) {
-		runtime.Gosched()
+	h.rotateBarrierKey()
+
+	if barrier.purgeCount.Load() != 0 {
+		t.Fatalf("expected 0 purge calls when global floor is unknown, got %d (lastPurge=%d)",
+			barrier.purgeCount.Load(), barrier.lastPurgeAt.Load())
+	}
+}
+
+// TestHost_RotateBarrierKey_ClampsToGlobalFloor verifies that rotation-driven
+// purging never exceeds the global safe floor. A started shard retains an
+// encrypted snapshot at a LOW epoch (2). With a large rotation jump and
+// MaxRetainedEpochs=1, the retention threshold would be far above 2, but the
+// clamp must hold the purge floor at 2 so the snapshot's DEK survives.
+func TestHost_RotateBarrierKey_ClampsToGlobalFloor(t *testing.T) {
+	cfg := testHostConfig(t)
+	cfg.MaxRetainedEpochs = 1
+
+	barrier := newTestHostBarrier(9) // current epoch high; threshold would be 9
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	if barrier.purgeCount.Load() < 1 {
-		t.Fatalf("expected at least 1 purge call, got %d (rotations=%d, epoch=%d)",
-			barrier.purgeCount.Load(), barrier.rotateCount.Load(), barrier.CurrentEpoch())
+	// Retain an encrypted snapshot at epoch 2 for the loaded shard.
+	writeEncryptedSnapshotMeta(t, cfg.NodeHostDir, 1, 1, 100, 2)
+
+	// Rotate: epoch 9 -> 10. Retention threshold = 10 - 1 = 9, but the global
+	// safe floor (snapshot epoch 2) must clamp the purge floor to 2.
+	h.rotateBarrierKey()
+
+	if barrier.purgeCount.Load() == 0 {
+		t.Fatalf("expected a purge call, got none")
+	}
+	if got := barrier.lastPurgeAt.Load(); got != 2 {
+		t.Fatalf("purge floor = %d, want 2 (clamped to global safe floor; "+
+			"snapshot epoch-2 DEK must be retained)", got)
+	}
+}
+
+// TestHost_RotateBarrierKey_RetentionBelowFloor verifies that when the
+// retention threshold is BELOW the global safe floor, the retention threshold
+// is used (we never purge MORE than retention allows, and the clamp only
+// lowers the floor, never raises it).
+func TestHost_RotateBarrierKey_RetentionBelowFloor(t *testing.T) {
+	cfg := testHostConfig(t)
+	cfg.MaxRetainedEpochs = 4
+
+	barrier := newTestHostBarrier(9) // threshold = 9 - 4 = 5
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	// Verify the purge threshold makes sense: epoch - MaxRetainedEpochs.
-	lastPurge := barrier.lastPurgeAt.Load()
-	currentEpoch := barrier.CurrentEpoch()
-	expectedThreshold := currentEpoch - cfg.MaxRetainedEpochs
-	// The lastPurge might be from an earlier rotation, so it should be
-	// at most the expected threshold. It must be > 0 since purge only
-	// fires when epoch > MaxRetainedEpochs.
-	if lastPurge == 0 || lastPurge > expectedThreshold {
-		t.Fatalf("lastPurge=%d, want <= %d (epoch=%d, retained=%d)",
-			lastPurge, expectedThreshold, currentEpoch, cfg.MaxRetainedEpochs)
-	}
+	// Snapshot retained at epoch 8 — above the retention threshold (5).
+	writeEncryptedSnapshotMeta(t, cfg.NodeHostDir, 1, 1, 100, 8)
 
-	h.Close()
+	// Rotate: epoch 9 -> 10. Retention threshold = 10 - 4 = 6, global floor = 8.
+	// min(6, 8) = 6, so the retention threshold governs.
+	h.rotateBarrierKey()
+
+	if barrier.purgeCount.Load() == 0 {
+		t.Fatalf("expected a purge call, got none")
+	}
+	if got := barrier.lastPurgeAt.Load(); got != 6 {
+		t.Fatalf("purge floor = %d, want 6 (retention threshold below global floor)", got)
+	}
 }
 
 // TestHost_KeyRotationLoop_NoPurgeWhenMaxRetainedZero verifies that when
@@ -6621,15 +7011,19 @@ func TestRequestRemoveNode_Success(t *testing.T) {
 
 	waitForLeader(t, h, 1)
 
+	// Removing replica 2, which is not a member, must now be rejected
+	// promptly with ErrNodeNotFound. Previously the Host delivered the
+	// invalid change and the apply error was swallowed, leaving the returned
+	// RequestState to hang until its deadline (H4).
 	ctx := context.Background()
 	rs, err := h.RequestRemoveNode(ctx, 1, 2, 0)
-	if err != nil {
-		t.Fatalf("RequestRemoveNode failed: %v", err)
+	if rs != nil {
+		rs.Release()
+		t.Fatal("expected nil RequestState for an invalid removal")
 	}
-	if rs == nil {
-		t.Fatal("expected non-nil RequestState")
+	if !errors.Is(err, raft.ErrNodeNotFound) {
+		t.Fatalf("RequestRemoveNode error = %v, want ErrNodeNotFound", err)
 	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -6818,9 +7212,12 @@ func TestSyncRequestDeleteNode_Success(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	// Replica 2 is not a member, so the delete is now rejected at propose
+	// time with ErrNodeNotFound rather than committing a no-op config change
+	// entry (H4: the Host pre-validates membership changes).
 	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
-	if err != nil {
-		t.Fatalf("SyncRequestDeleteNode failed: %v", err)
+	if !errors.Is(err, raft.ErrNodeNotFound) {
+		t.Fatalf("SyncRequestDeleteNode error = %v, want ErrNodeNotFound", err)
 	}
 }
 
@@ -8125,8 +8522,11 @@ func TestNewHost_DefaultLogger_DoesNotMutateGlobal(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestImportSnapshot_MonotonicCounter verifies that ImportSnapshot uses a
-// monotonic atomic counter instead of time.Now().UnixNano(), guaranteeing
-// unique, strictly increasing import indices across rapid sequential calls.
+// monotonic atomic counter (instead of time.Now().UnixNano()) for the
+// on-disk snapshot DIRECTORY name, guaranteeing unique directories across
+// rapid sequential calls. The Raft snapshot index now comes from the
+// artifact header, so this test asserts directory uniqueness rather than
+// index ordering.
 func TestImportSnapshot_MonotonicCounter(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -8141,33 +8541,34 @@ func TestImportSnapshot_MonotonicCounter(t *testing.T) {
 	defer h.Close()
 
 	// Import two snapshots in rapid succession. With time.Now().UnixNano()
-	// these could collide on fast hardware; with atomic counter they must
-	// be strictly ordered.
-	data1 := []byte("snapshot-1")
-	data2 := []byte("snapshot-2")
+	// the directory names could collide on fast hardware; with the atomic
+	// counter they must be distinct.
+	art1 := buildSnapshotArtifact(t, 100, 1, 0, proto.Membership{}, []byte("snapshot-1"))
+	art2 := buildSnapshotArtifact(t, 200, 1, 0, proto.Membership{}, []byte("snapshot-2"))
 
-	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(data1)); importErr != nil {
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art1)); importErr != nil {
 		t.Fatalf("first ImportSnapshot failed: %v", importErr)
 	}
 	db.mu.Lock()
 	snap1 := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
 
-	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(data2)); importErr != nil {
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art2)); importErr != nil {
 		t.Fatalf("second ImportSnapshot failed: %v", importErr)
 	}
 	db.mu.Lock()
 	snap2 := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
 
-	// Second import must have a strictly greater index.
-	if snap2.Index <= snap1.Index {
-		t.Errorf("second import index %d should be > first import index %d", snap2.Index, snap1.Index)
+	// The two imports must land in distinct on-disk directories.
+	if snap1.Filepath == snap2.Filepath {
+		t.Errorf("imports collided on directory %q", snap1.Filepath)
 	}
 
-	// Indices should be small sequential values (1, 2), not nanosecond timestamps.
-	if snap1.Index > 1000 {
-		t.Errorf("import index %d looks like a timestamp, expected small monotonic value", snap1.Index)
+	// The persisted Raft index must come from the artifact header, not the
+	// directory counter.
+	if snap1.Index != 100 || snap2.Index != 200 {
+		t.Errorf("snap indices = (%d, %d), want (100, 200) from headers", snap1.Index, snap2.Index)
 	}
 }
 
@@ -8193,7 +8594,7 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 
 	const n = 3
 	var wg sync.WaitGroup
-	indices := make([]uint64, n)
+	dirs := make([]string, n)
 	errs := make([]error, n)
 
 	for i := 0; i < n; i++ {
@@ -8201,12 +8602,13 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			shardID := uint64(idx + 1)
-			errs[idx] = h.ImportSnapshot(context.Background(), shardID, bytes.NewReader([]byte("data")))
+			artifact := buildSnapshotArtifact(t, 1, 1, 0, proto.Membership{}, []byte("data"))
+			errs[idx] = h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact))
 			if errs[idx] == nil {
 				db.mu.Lock()
 				snap := db.snapshots[mockNodeKey{shardID, shardID}]
 				db.mu.Unlock()
-				indices[idx] = snap.Index
+				dirs[idx] = snap.Filepath
 			}
 		}(i)
 	}
@@ -8218,13 +8620,15 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 		}
 	}
 
-	// All indices must be unique.
-	seen := make(map[uint64]bool)
-	for i, idx := range indices {
-		if seen[idx] {
-			t.Errorf("duplicate import index %d at position %d", idx, i)
+	// The atomic directory counter must produce a unique directory per
+	// concurrent import (the per-shard prefix differs, but the counter
+	// segment must not collide).
+	seen := make(map[string]bool)
+	for i, dir := range dirs {
+		if seen[dir] {
+			t.Errorf("duplicate import directory %q at position %d", dir, i)
 		}
-		seen[idx] = true
+		seen[dir] = true
 	}
 }
 
@@ -10642,7 +11046,11 @@ func TestRotateBarrierKey_RotateSuccessNoPurge(t *testing.T) {
 func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.MaxRetainedEpochs = 2
-	// newEpoch=5 > MaxRetainedEpochs=2, so purgeThreshold = 5-2 = 3.
+	// newEpoch=5 > MaxRetainedEpochs=2, so the retention threshold would be
+	// 5-2 = 3. But with a memory LogDB and no started shards, nothing
+	// encrypted is retained, so the GLOBAL safe-purge floor is unknown and
+	// rotation must FAIL SAFE: rotate but do not purge any DEK. Purging on
+	// uncertainty could brick a snapshot/WAL DEK. See rotateBarrierKey.
 	rb := &rotatingBarrier{rotateEpoch: 5, purgeResult: 2}
 
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(rb), WithoutTransport())
@@ -10656,9 +11064,10 @@ func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	if rb.rotateCalled.Load() != 1 {
 		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
 	}
-	wantPurgeThreshold := int64(5 - 2) // newEpoch - MaxRetainedEpochs
-	if got := rb.purgedBefore.Load(); got != wantPurgeThreshold {
-		t.Errorf("PurgeEpochsBefore(%d), want %d", got, wantPurgeThreshold)
+	// Fail-safe: PurgeEpochsBefore is never called when the global safe floor
+	// cannot be determined, so purgedBefore stays at its zero value.
+	if got := rb.purgedBefore.Load(); got != 0 {
+		t.Errorf("PurgeEpochsBefore(%d), want no purge call (fail-safe: unknown global floor)", got)
 	}
 }
 
@@ -12501,13 +12910,17 @@ func TestRequestRemoveNode_WithConfigChangeID(t *testing.T) {
 		t.Fatalf("SyncGetShardMembership failed: %v", err)
 	}
 
-	// Request removal of node 2 (phantom) using current ConfigChangeID.
+	// Request removal of node 2 (phantom) using the current ConfigChangeID.
+	// The staleness check passes (the ID matches), but pre-validation now
+	// rejects the removal of a non-member with ErrNodeNotFound instead of
+	// delivering a change whose apply would be silently swallowed (H4).
 	rs, err := h.RequestRemoveNode(ctx, 1, 2, membership.ConfigChangeID)
-	if err != nil {
-		t.Fatalf("RequestRemoveNode failed: %v", err)
-	}
 	if rs != nil {
 		rs.Release()
+		t.Fatal("expected nil RequestState for an invalid removal")
+	}
+	if !errors.Is(err, raft.ErrNodeNotFound) {
+		t.Fatalf("RequestRemoveNode error = %v, want ErrNodeNotFound", err)
 	}
 }
 
@@ -14966,10 +15379,10 @@ func TestImportSnapshot_FullPipeline(t *testing.T) {
 		t.Fatalf("StopShard failed: %v", err)
 	}
 
-	// Import a snapshot into the stopped shard.
+	// Import a snapshot artifact into the stopped shard.
 	ctx := context.Background()
-	data := []byte("imported-snapshot-data")
-	reader := bytes.NewReader(data)
+	artifact := buildSnapshotArtifact(t, 10, 1, 0, proto.Membership{}, []byte("imported-snapshot-data"))
+	reader := bytes.NewReader(artifact)
 	err = h.ImportSnapshot(ctx, 1, reader)
 	if err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
@@ -18349,6 +18762,62 @@ func TestOnReadyToRead_BadNodeStateType(t *testing.T) {
 // Coverage: HandleMessage - source address registration
 // ---------------------------------------------------------------------------
 
+// TestFailPendingRequests_NoDoubleReleaseRefUnderRace guards the refcount
+// invariant on the lock-free pendingProposals sync.Map: failPendingRequests
+// (and the sweeper) must claim an entry via LoadAndDelete before releaseRef so
+// they never double-release a proposal that a concurrent OnApplied-style
+// completion already removed. A double release drives RequestState.outstanding
+// negative and recycles it early, reopening the cross-request result-corruption
+// bug. With the LoadAndDelete guard, every registered proposal is released
+// exactly once and ends at outstanding == 0.
+func TestFailPendingRequests_NoDoubleReleaseRefUnderRace(t *testing.T) {
+	const n = 500
+	for iter := 0; iter < 20; iter++ {
+		h := newTestHost(t)
+		addTestNodeState(h, 1, 1)
+		v, _ := h.nodes.Load(uint64(1))
+		ns := v.(*nodeState)
+		pool := NewRequestStatePool()
+
+		all := make([]*RequestState, n)
+		for i := 0; i < n; i++ {
+			rs := newRequestState(pool, uint64(i), time.Time{})
+			rs.acquireRef() // registration ref
+			all[i] = rs
+			ns.pendingProposals.Store(uint64(i), &pendingProposal{rs: rs})
+			h.pendingOps.Add(1)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// G1: bulk failure (Range + LoadAndDelete-guarded releaseRef).
+		go func() {
+			defer wg.Done()
+			h.failPendingRequests(ns, ErrClosed)
+		}()
+		// G2: OnApplied-style atomic per-key completion over the same keys.
+		go func() {
+			defer wg.Done()
+			for i := 0; i < n; i++ {
+				if pv, ok := ns.pendingProposals.LoadAndDelete(uint64(i)); ok {
+					pp := pv.(*pendingProposal)
+					pp.rs.complete(RequestResult{})
+					pp.rs.releaseRef()
+					h.completePendingOp()
+				}
+			}
+		}()
+		wg.Wait()
+
+		for i, rs := range all {
+			if got := rs.outstanding.Load(); got != 0 {
+				t.Fatalf("iter %d key %d: outstanding = %d, want 0 (double-release drove it negative)", iter, i, got)
+			}
+		}
+		h.Close()
+	}
+}
+
 func TestHandleMessage_WithSourceAddress(t *testing.T) {
 	h := newTestHost(t)
 	handler := &hostMessageHandler{host: h, engine: h.engine}
@@ -18364,13 +18833,14 @@ func TestHandleMessage_WithSourceAddress(t *testing.T) {
 		t.Errorf("expected nil error, got: %v", err)
 	}
 
-	// Verify address was registered.
-	addr, resolveErr := h.registry.Resolve(1, 2)
-	if resolveErr != nil {
-		t.Errorf("expected address to be registered, got error: %v", resolveErr)
-	}
-	if addr != "10.0.0.2:5000" {
-		t.Errorf("expected address %q, got %q", "10.0.0.2:5000", addr)
+	// Shard 1 is NOT loaded on this host, so the sender (From=2) cannot be
+	// authorized as a member. Address learning is deliberately skipped for
+	// unloaded shards: an unverified in-band (replicaID, address) claim must
+	// not be allowed to seed the registry. Authoritative addresses arrive when
+	// the shard is loaded with its configured membership. (Learning for an
+	// authorized member of a loaded shard is covered in messagehandler_test.go.)
+	if _, resolveErr := h.registry.Resolve(1, 2); resolveErr == nil {
+		t.Errorf("expected no address learned for an unloaded shard, but (1,2) resolved")
 	}
 }
 
@@ -18587,19 +19057,19 @@ func TestImportSnapshot_SuccessWritesData(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	data := bytes.NewReader([]byte("snapshot-data-for-import"))
-	err := h.ImportSnapshot(ctx, 1, data)
+	artifact := buildSnapshotArtifact(t, 314, 2, 0, proto.Membership{}, []byte("snapshot-data-for-import"))
+	err := h.ImportSnapshot(ctx, 1, bytes.NewReader(artifact))
 	if err != nil {
 		t.Fatalf("ImportSnapshot: %v", err)
 	}
 
-	// Verify the snapshot was saved to logdb.
+	// Verify the snapshot was saved to logdb with the header's Index.
 	snap, err := h.logdb.GetSnapshot(1, 1)
 	if err != nil {
 		t.Fatalf("GetSnapshot after import: %v", err)
 	}
-	if snap.Index == 0 {
-		t.Error("snapshot index should be non-zero after import")
+	if snap.Index != 314 {
+		t.Errorf("snapshot index = %d, want 314 (from artifact header)", snap.Index)
 	}
 
 	// Verify the file was written.
@@ -18673,4 +19143,686 @@ func TestOnReadIndexBatched_NonexistentShard(t *testing.T) {
 	cb := &hostEngineCallback{h: h}
 	// Should not panic when shard doesn't exist.
 	cb.OnReadIndexBatched(999, 1, []uint64{2, 3})
+}
+
+// ---------------------------------------------------------------------------
+// H4: Host config-change API pre-validates against current membership.
+// ---------------------------------------------------------------------------
+
+// TestRequestAddNode_DuplicateReturnsErrorPromptly verifies that adding a
+// replica that already exists in the membership returns an error promptly
+// from the Host API instead of hanging until the request deadline. Before the
+// fix, the invalid change was delivered to the engine where membership.apply
+// swallowed the error, leaving the caller's RequestState pending.
+func TestRequestAddNode_DuplicateReturnsErrorPromptly(t *testing.T) {
+	h := newTestHost(t)
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	// Replica 1 is already a voting member; re-adding it must be rejected.
+	_, err := h.RequestAddNode(context.Background(), 1, 1, "127.0.0.1:5000", 0)
+	if err == nil {
+		t.Fatal("RequestAddNode for an existing replica should return an error")
+	}
+	if !errors.Is(err, raft.ErrNodeAlreadyExists) {
+		t.Fatalf("RequestAddNode error = %v, want ErrNodeAlreadyExists", err)
+	}
+}
+
+// TestRequestRemoveNode_LastVoterReturnsErrorPromptly verifies that removing
+// the last voting member is rejected promptly by the Host API rather than
+// hanging. This is the last-voter protection enforced at propose-time.
+func TestRequestRemoveNode_LastVoterReturnsErrorPromptly(t *testing.T) {
+	h := newTestHost(t)
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	_, err := h.RequestRemoveNode(context.Background(), 1, 1, 0)
+	if err == nil {
+		t.Fatal("RequestRemoveNode of the last voter should return an error")
+	}
+	if !errors.Is(err, raft.ErrRemoveLastFullReplica) {
+		t.Fatalf("RequestRemoveNode error = %v, want ErrRemoveLastFullReplica", err)
+	}
+}
+
+// TestRequestAddWitness_DuplicateReturnsErrorPromptly verifies that adding a
+// witness whose replica ID is already a member is rejected promptly by the
+// Host API. Like the AddNode duplicate case, this exercises the propose-time
+// validation that the Host now performs before delivering the change. (The
+// 64-voting-member cap is covered at the Peer level in
+// TestPeer_ValidateConfigChange_*, since adding 64 unreachable voters to a
+// single-node shard would break quorum and stall config-change progress.)
+func TestRequestAddWitness_DuplicateReturnsErrorPromptly(t *testing.T) {
+	h := newTestHost(t)
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	// Replica 1 is already a voting member; adding it as a witness must be
+	// rejected with ErrNodeAlreadyExists rather than hanging.
+	_, err := h.RequestAddWitness(context.Background(), 1, 1, "127.0.0.1:5000", 0)
+	if err == nil {
+		t.Fatal("RequestAddWitness for an existing member should return an error")
+	}
+	if !errors.Is(err, raft.ErrNodeAlreadyExists) {
+		t.Fatalf("RequestAddWitness error = %v, want ErrNodeAlreadyExists", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// H5: ExportSnapshot/ImportSnapshot operate on plaintext with a barrier.
+// ---------------------------------------------------------------------------
+
+// TestExportSnapshot_DecryptsWithBarrier verifies that ExportSnapshot emits
+// PLAINTEXT when a barrier is configured and the on-disk snapshot is encrypted
+// (Epoch > 0). Before the fix, ExportSnapshot copied raw ciphertext.
+func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	barrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "snap-encrypted")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	plaintext := []byte("the quick brown fox jumps over the lazy dog (encrypted at rest)")
+	dataPath := filepath.Join(snapDir, "snapshot.dat")
+	writeEncryptedSnapshotFile(t, barrier, dataPath, plaintext)
+
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 700, Filepath: snapDir, Epoch: 1})
+
+	var buf bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &buf); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+	// Strip the artifact header; the data portion must be decrypted plaintext.
+	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
+	if !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
+	}
+}
+
+// TestDecryptSnapshotFrames_MixedEpoch verifies the send/export decrypt path
+// handles a snapshot whose frames were sealed under DIFFERENT epochs (a key
+// rotation landed mid-save). Each frame must be decrypted with the epoch
+// embedded in its own header (barrier.Decrypt), not a single snapshot-wide
+// epoch. Under the old DecryptForEpoch-with-one-epoch behavior the post-rotation
+// frame failed AEAD, breaking InstallSnapshot send and ExportSnapshot for
+// rotation-spanning snapshots.
+func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
+	barrier := createTestBarrier(t)
+
+	p1 := []byte("frame-one-sealed-before-rotation")
+	c1, e1, err := barrier.EncryptWithEpoch(nil, p1)
+	if err != nil {
+		t.Fatalf("EncryptWithEpoch(1) failed: %v", err)
+	}
+	if _, rotErr := barrier.Rotate(); rotErr != nil {
+		t.Fatalf("Rotate failed: %v", rotErr)
+	}
+	p2 := []byte("frame-two-sealed-after-rotation-at-a-higher-epoch")
+	c2, e2, err := barrier.EncryptWithEpoch(nil, p2)
+	if err != nil {
+		t.Fatalf("EncryptWithEpoch(2) failed: %v", err)
+	}
+	if e1 == e2 {
+		t.Fatalf("expected distinct epochs across rotation, both = %d", e1)
+	}
+
+	var src bytes.Buffer
+	for _, c := range [][]byte{c1, c2} {
+		var lb [4]byte
+		binary.LittleEndian.PutUint32(lb[:], uint32(len(c)))
+		src.Write(lb[:])
+		src.Write(c)
+	}
+
+	var dst bytes.Buffer
+	if _, decErr := decryptSnapshotFrames(barrier, &src, &dst); decErr != nil {
+		t.Fatalf("decryptSnapshotFrames on a mixed-epoch snapshot failed: %v", decErr)
+	}
+	want := append(append([]byte{}, p1...), p2...)
+	if !bytes.Equal(dst.Bytes(), want) {
+		t.Errorf("decrypted = %q, want %q", dst.Bytes(), want)
+	}
+}
+
+// TestExportSnapshot_SealedBarrierEncryptedSnapshotErrors verifies that
+// ExportSnapshot refuses to export an encrypted snapshot (Epoch > 0) when the
+// barrier is sealed, returning ErrSnapshotEncryptedBarrierUnavailable instead
+// of silently emitting raw ciphertext. Emitting ciphertext would corrupt the
+// export -> import round-trip because ImportSnapshot stores bytes with Epoch=0.
+func TestExportSnapshot_SealedBarrierEncryptedSnapshotErrors(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	barrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "snap-sealed")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	plaintext := []byte("ciphertext must not leak when the barrier is sealed")
+	dataPath := filepath.Join(snapDir, "snapshot.dat")
+	writeEncryptedSnapshotFile(t, barrier, dataPath, plaintext)
+
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 800, Filepath: snapDir, Epoch: 1})
+
+	// Seal the barrier so it can no longer decrypt.
+	if sealErr := barrier.Seal(); sealErr != nil {
+		t.Fatalf("barrier.Seal failed: %v", sealErr)
+	}
+
+	var buf bytes.Buffer
+	exportErr := h.ExportSnapshot(context.Background(), 1, &buf)
+	if !errors.Is(exportErr, ErrSnapshotEncryptedBarrierUnavailable) {
+		t.Fatalf("ExportSnapshot error = %v, want ErrSnapshotEncryptedBarrierUnavailable", exportErr)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("ExportSnapshot wrote %d bytes; want 0 (no ciphertext leak)", buf.Len())
+	}
+	if bytes.Contains(buf.Bytes(), plaintext) {
+		t.Errorf("ExportSnapshot leaked plaintext")
+	}
+}
+
+// TestExportImportSnapshot_RoundTrip_Encrypted exercises the full
+// export -> import -> recover round trip with a barrier configured. The
+// recovered state machine must observe the original plaintext, proving that
+// export decrypts and import stores plaintext with Epoch=0 for the no-decrypt
+// recovery path.
+func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	barrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "snap-roundtrip-enc")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	originalData := []byte("encrypted round-trip snapshot payload 0987654321")
+	writeEncryptedSnapshotFile(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData)
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1500, Filepath: snapDir, Epoch: 1})
+
+	// Export must yield an artifact whose data portion is plaintext. Decode
+	// a copy so the original buffer remains intact for the import below.
+	var exported bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &exported); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+	peek := bytes.NewReader(exported.Bytes())
+	if _, hdrErr := readSnapshotArtifactHeader(peek); hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
+	remaining := make([]byte, peek.Len())
+	if _, readErr := io.ReadFull(peek, remaining); readErr != nil {
+		t.Fatalf("reading artifact data failed: %v", readErr)
+	}
+	if !bytes.Equal(remaining, originalData) {
+		t.Fatalf("exported data = %q, want plaintext %q", remaining, originalData)
+	}
+
+	// Stop and import.
+	if stopErr := h.StopShard(1); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	db.mu.Unlock()
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
+		t.Fatalf("ImportSnapshot failed: %v", importErr)
+	}
+
+	// Import must store plaintext with Epoch=0 (the no-decrypt recovery path).
+	db.mu.Lock()
+	importedSnap := db.snapshots[mockNodeKey{1, 1}]
+	db.mu.Unlock()
+	if importedSnap.Epoch != 0 {
+		t.Errorf("imported snapshot Epoch = %d, want 0 (plaintext)", importedSnap.Epoch)
+	}
+	importedData, readErr := os.ReadFile(filepath.Join(importedSnap.Filepath, "snapshot.dat"))
+	if readErr != nil {
+		t.Fatalf("ReadFile failed: %v", readErr)
+	}
+	if !bytes.Equal(importedData, originalData) {
+		t.Errorf("imported on-disk data = %q, want plaintext %q", importedData, originalData)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// H6: StartShard fails when a snapshot record exists but its data file is
+// missing/unreadable, instead of silently skipping recovery.
+// ---------------------------------------------------------------------------
+
+// TestStartShard_MissingSnapshotFileIsFatal verifies that StartShard returns a
+// fatal HostInitError when LogDB has a snapshot record whose data file cannot
+// be opened. Before the fix, recovery was silently skipped while the raft
+// processed index was set to the snapshot index, losing in-memory SM data.
+func TestStartShard_MissingSnapshotFileIsFatal(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// Record a snapshot whose Filepath points to a directory with no
+	// snapshot.dat file.
+	missingDir := filepath.Join(t.TempDir(), "no-such-snapshot")
+	if mkErr := os.MkdirAll(missingDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 42, Term: 1, Filepath: missingDir})
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	startErr := h.StartShard(members, false, testCreateFunc, scfg)
+	if startErr == nil {
+		t.Fatal("StartShard should fail when the snapshot data file is missing")
+	}
+	var hie *HostInitError
+	if !errors.As(startErr, &hie) {
+		t.Fatalf("StartShard error = %v, want *HostInitError", startErr)
+	}
+	if hie.Field != "snapshot_open" {
+		t.Errorf("HostInitError.Field = %q, want %q", hie.Field, "snapshot_open")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// On-disk state-machine restart recovery (BUG 1: no rollback, BUG 2: seeding)
+// ---------------------------------------------------------------------------
+
+// recordingOnDiskSM is a DiskStateMachine test double whose Open returns a
+// configurable durable lastApplied (modeling a database that has applied
+// entries past its last snapshot) and that records whether the framework
+// called RecoverFromSnapshot. A real on-disk SM recovers exclusively via
+// Open; RecoverFromSnapshot here would represent a destructive rollback.
+type recordingOnDiskSM struct {
+	openLastApplied uint64
+	recoverCalled   atomic.Bool
+	kv              map[string]uint64
+	// recoveredData captures the bytes passed to RecoverFromSnapshot so a
+	// test can assert the on-disk bootstrap path fed the imported snapshot.
+	recoveredData []byte
+}
+
+func (m *recordingOnDiskSM) Open(_ context.Context, _ string, _ <-chan struct{}) (uint64, error) {
+	if m.kv == nil {
+		m.kv = make(map[string]uint64)
+	}
+	return m.openLastApplied, nil
+}
+
+func (m *recordingOnDiskSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	for i := range entries {
+		m.kv["k"] = entries[i].Index
+		results[i].Value = entries[i].Index
+	}
+	return nil
+}
+
+func (m *recordingOnDiskSM) Lookup(_ context.Context, _ interface{}) (interface{}, error) {
+	return m.kv["k"], nil
+}
+func (m *recordingOnDiskSM) Sync() error                           { return nil }
+func (m *recordingOnDiskSM) PrepareSnapshot() (interface{}, error) { return nil, nil }
+func (m *recordingOnDiskSM) SaveSnapshot(_ context.Context, _ interface{}, _ io.Writer, _ <-chan struct{}) error {
+	return nil
+}
+
+func (m *recordingOnDiskSM) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
+	m.recoverCalled.Store(true)
+	if m.kv == nil {
+		m.kv = make(map[string]uint64)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.recoveredData = data
+	return nil
+}
+func (m *recordingOnDiskSM) Close(_ context.Context) error { return nil }
+
+var _ sm.DiskStateMachine = (*recordingOnDiskSM)(nil)
+
+// TestStartShard_OnDiskSM_NoSnapshotRollback verifies BUG 1: when an on-disk
+// SM's Open() reports a durable lastApplied (100) that is ahead of an existing
+// LogDB snapshot record (index 50), StartShard must NOT call RecoverFromSnapshot
+// (which would roll the database back to 50 and silently discard entries
+// 51..100). The on-disk SM recovers solely via Open(); the framework must not
+// feed it a local snapshot on restart.
+func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// A real snapshot record at an OLDER index than the SM's durable
+	// lastApplied. snapshot.dat exists so the only thing that would prevent
+	// recovery is the IsOnDisk guard, not a missing file.
+	snapDir := filepath.Join(t.TempDir(), "shard-1-snap")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	if wErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), []byte("old"), 0o644); wErr != nil {
+		t.Fatalf("WriteFile failed: %v", wErr)
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 1, Filepath: snapDir})
+
+	diskSM := &recordingOnDiskSM{openLastApplied: 100}
+	create := func(shardID, replicaID uint64) interface{} { return diskSM }
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	// BUG 1: the destructive local-snapshot recovery must be skipped.
+	if diskSM.recoverCalled.Load() {
+		t.Fatal("RecoverFromSnapshot was called on an on-disk SM (rollback/data loss)")
+	}
+
+	// The recovered index is the SM's durable lastApplied, not the snapshot.
+	ns := testLoadNode(h, 1)
+	if got := ns.lastApplied.Load(); got != 100 {
+		t.Errorf("ns.lastApplied = %d, want 100", got)
+	}
+
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("engine node not found")
+	}
+	if got := engNode.LastSnapshotIndex(); got != 100 {
+		t.Errorf("engine node lastSnapshotIndex = %d, want 100", got)
+	}
+	// Raft's processed marker must equal the recovered index so the engine
+	// does not replay the already-durable entries.
+	_, _, processed, _, _, _, drErr := h.DiagRaftState(1)
+	if drErr != nil {
+		t.Fatalf("DiagRaftState failed: %v", drErr)
+	}
+	if processed != 100 {
+		t.Errorf("raft processed = %d, want 100", processed)
+	}
+}
+
+// TestStartShard_OnDiskSM_SeedsAppliedMarker verifies BUG 2: on restart with
+// no new writes, the applied markers are seeded to the recovered index so the
+// FollowerRead gate (lastApplied >= committed) is satisfied immediately rather
+// than polling to the deadline. It also verifies that a compacted-away
+// snapshot file does NOT brick an on-disk SM that already recovered via Open().
+func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// Snapshot record points at a directory whose snapshot.dat is missing
+	// (compacted away). For an in-memory SM this would be fatal; for an
+	// on-disk SM that recovered via Open it must be ignored.
+	missingDir := filepath.Join(t.TempDir(), "compacted-away")
+	if mkErr := os.MkdirAll(missingDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 25, Term: 1, Filepath: missingDir})
+
+	diskSM := &recordingOnDiskSM{openLastApplied: 75}
+	diskSM.kv = map[string]uint64{"k": 75}
+	create := func(shardID, replicaID uint64) interface{} { return diskSM }
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	// Must not be bricked by the missing snapshot.dat.
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed (on-disk SM bricked by missing snapshot.dat): %v", startErr)
+	}
+	if diskSM.recoverCalled.Load() {
+		t.Fatal("RecoverFromSnapshot was called on an on-disk SM")
+	}
+
+	ns := testLoadNode(h, 1)
+	if got := ns.lastApplied.Load(); got != 75 {
+		t.Fatalf("ns.lastApplied = %d, want 75 (read gate would hang)", got)
+	}
+
+	// With markers seeded, a FollowerRead returns promptly under a deadline
+	// rather than polling until ctx expires. committed starts at 0 (no
+	// election driven here), and lastApplied(75) >= 0, so the fast path
+	// fires immediately.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	val, rErr := h.FollowerRead(ctx, 1, "k")
+	if rErr != nil {
+		t.Fatalf("FollowerRead failed: %v", rErr)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("FollowerRead took %v, expected prompt return", time.Since(start))
+	}
+	if got, _ := val.(uint64); got != 75 {
+		t.Errorf("FollowerRead value = %v, want 75", val)
+	}
+}
+
+// TestStartShard_FreshStart_NoSeed verifies that the normal fresh-start path
+// (no recovery, recoveredIndex == 0) does not regress: applied markers stay 0.
+func TestStartShard_FreshStart_NoSeed(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	diskSM := &recordingOnDiskSM{openLastApplied: 0}
+	create := func(shardID, replicaID uint64) interface{} { return diskSM }
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+	if diskSM.recoverCalled.Load() {
+		t.Fatal("RecoverFromSnapshot called on fresh on-disk SM")
+	}
+	ns := testLoadNode(h, 1)
+	if got := ns.lastApplied.Load(); got != 0 {
+		t.Errorf("ns.lastApplied = %d, want 0 on fresh start", got)
+	}
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("engine node not found")
+	}
+	if got := engNode.LastSnapshotIndex(); got != 0 {
+		t.Errorf("engine node lastSnapshotIndex = %d, want 0 on fresh start", got)
+	}
+}
+
+// TestStartShard_OnDiskSM_ImportBootstrap verifies the HIGH regression fix:
+// when an on-disk SM's Open() reports 0 (fresh/empty DB, e.g. after
+// ImportSnapshot wrote snapshot.dat + a LogDB snapshot record on a new host),
+// StartShard MUST call RecoverFromSnapshot exactly once to reconstruct the
+// on-disk database from the imported snapshot. The IsOnDisk gate must NOT
+// suppress recovery in this bootstrap case, otherwise the SM comes up empty
+// while raft believes a snapshot exists at ss.Index (cross-host restore data
+// loss).
+//
+// It also asserts the seeded markers: recoveredIndex is the snapshot's RAFT
+// LOG INDEX (ss.Index), which must equal raft's processed marker (initialized
+// to ss.Index by newRaftLog), ns.lastApplied, and the engine's snapshot index.
+func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// Model what ImportSnapshot leaves behind for the next StartShard: a real
+	// snapshot.dat plus a LogDB snapshot record. ss.Index (the raft log index,
+	// 80) differs from ss.OnDiskIndex (the SM's internal counter, 73) to prove
+	// the markers are seeded from Index, not OnDiskIndex.
+	snapDir := filepath.Join(t.TempDir(), "shard-1-import")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	// The rsm wrapper recovers the session header first, then delegates the
+	// remaining bytes to the user SM's RecoverFromSnapshot. Build a valid
+	// envelope: a 4-byte little-endian session count of 0 (no sessions),
+	// followed by the user payload the on-disk SM should receive verbatim.
+	imported := []byte("imported-on-disk-snapshot-payload")
+	envelope := append([]byte{0, 0, 0, 0}, imported...)
+	if wErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), envelope, 0o644); wErr != nil {
+		t.Fatalf("WriteFile failed: %v", wErr)
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{
+		Index:       80,
+		Term:        3,
+		Filepath:    snapDir,
+		OnDiskIndex: 73,
+	})
+
+	// Fresh/empty on-disk SM: Open() returns 0 (no durable state yet).
+	diskSM := &recordingOnDiskSM{openLastApplied: 0}
+	create := func(shardID, replicaID uint64) interface{} { return diskSM }
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	// The bootstrap path MUST reconstruct the on-disk DB from the import.
+	if !diskSM.recoverCalled.Load() {
+		t.Fatal("RecoverFromSnapshot was NOT called on empty on-disk SM with a local snapshot (import/bootstrap data loss)")
+	}
+	if string(diskSM.recoveredData) != string(imported) {
+		t.Errorf("RecoverFromSnapshot received %q, want %q", diskSM.recoveredData, imported)
+	}
+
+	// Markers are seeded to the snapshot's raft log INDEX (80), not OnDiskIndex.
+	ns := testLoadNode(h, 1)
+	if got := ns.lastApplied.Load(); got != 80 {
+		t.Errorf("ns.lastApplied = %d, want 80 (snapshot Index)", got)
+	}
+
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("engine node not found")
+	}
+	if got := engNode.LastSnapshotIndex(); got != 80 {
+		t.Errorf("engine node lastSnapshotIndex = %d, want 80", got)
+	}
+
+	// Raft's processed marker must equal the seeded index so the engine
+	// replays exactly the entries AFTER the imported snapshot.
+	_, _, processed, _, _, _, drErr := h.DiagRaftState(1)
+	if drErr != nil {
+		t.Fatalf("DiagRaftState failed: %v", drErr)
+	}
+	if processed != 80 {
+		t.Errorf("raft processed = %d, want 80 (must match seeded recovered index)", processed)
+	}
+}
+
+// TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal verifies that the
+// "missing snapshot.dat is fatal" guarantee is preserved for the on-disk
+// bootstrap path too: a recorded snapshot whose data file cannot be opened
+// must fail StartShard rather than silently bringing the on-disk SM up empty
+// while raft believes a snapshot exists.
+func TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// Snapshot record points at a directory with NO snapshot.dat, while the
+	// on-disk SM is fresh (Open() == 0). This is the bootstrap path with an
+	// unrecoverable data file: it must be fatal.
+	missingDir := filepath.Join(t.TempDir(), "missing-import")
+	if mkErr := os.MkdirAll(missingDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 40, Term: 2, Filepath: missingDir})
+
+	diskSM := &recordingOnDiskSM{openLastApplied: 0}
+	create := func(shardID, replicaID uint64) interface{} { return diskSM }
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	startErr := h.StartShard(members, false, create, scfg)
+	if startErr == nil {
+		t.Fatal("StartShard succeeded with a missing snapshot.dat on the on-disk bootstrap path; expected failure (would silently come up empty)")
+	}
+	var hie *HostInitError
+	if !errors.As(startErr, &hie) || hie.Field != "snapshot_open" {
+		t.Errorf("StartShard error = %v, want HostInitError{Field: snapshot_open}", startErr)
+	}
 }

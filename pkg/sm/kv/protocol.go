@@ -14,7 +14,10 @@
 
 package kv
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"errors"
+)
 
 const (
 	// OpPut stores a key-value pair.
@@ -31,7 +34,33 @@ const (
 
 	// MaxKeyLength is the maximum key length (uint16 max).
 	MaxKeyLength = 65535
+
+	// MaxValueLength bounds a single value read during snapshot recovery. A
+	// snapshot arrives from a peer over the transport; without this bound a
+	// corrupt or malicious length prefix could request an arbitrary (up to
+	// ~4 GiB) allocation, causing OOM/DoS on a follower.
+	//
+	// 64 MiB is a deliberately generous DoS ceiling, NOT the largest writable
+	// value. A KV value is always written inside a single proposal's Entry.Cmd,
+	// which the engine caps at proto.MaxEntrySize (8 MiB) at propose time and
+	// the WAL caps at maxCmdLen (also 8 MiB). So a legitimately-stored value can
+	// never exceed ~8 MiB and this recovery cap never rejects valid data — it
+	// only rejects a corrupt/oversized length prefix. Keeping it above the
+	// write-time entry limit means tightening MaxEntrySize cannot retroactively
+	// make an already-persisted snapshot unrecoverable.
+	MaxValueLength = 64 * 1024 * 1024
+
+	// maxSnapshotMapHint caps the initial map capacity derived from a snapshot's
+	// untrusted entry-count prefix, bounding pre-allocation regardless of the
+	// declared count. The map still grows beyond this if the snapshot genuinely
+	// contains more entries.
+	maxSnapshotMapHint = 1 << 20 // 1,048,576 entries
 )
+
+// errCorruptSnapshotLength reports a key/value length prefix in a snapshot
+// stream that exceeds its allowed bound, indicating corruption or a hostile
+// peer. Recovery returns this instead of attempting the oversized allocation.
+var errCorruptSnapshotLength = errors.New("kv: snapshot length prefix exceeds maximum; refusing oversized allocation")
 
 // EncodePut creates a binary Put command: [op:1][keyLen:2 LE][key][value].
 func EncodePut(key, value []byte) ([]byte, error) {

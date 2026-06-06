@@ -700,19 +700,25 @@ The compaction marker is WAL-durable so that after recovery, the compaction is r
 `Compact(shardID, replicaID)` triggers garbage collection of obsolete segment files:
 
 ```go
-func (db *DB) Compact(shardID, replicaID uint64) error {
+func (db *DB) Compact(shardID, _ uint64) error {
     shard := db.getShard(shardID)
     shard.mu.Lock()
     defer shard.mu.Unlock()
 
-    comp := newCompactor(shard.dir, shard.opts.blockSize)
+    comp := newCompactor(shard.fs, shard.dir, shard.opts.blockSize)
     liveSegments := make(map[uint64]bool)
     for _, idx := range shard.indexes {
         for segID := range idx.AllSegmentIDs() {
             liveSegments[segID] = true
         }
     }
-    _, err := comp.GarbageCollect(liveSegments, shard.activeSegmentID)
+    // Pin segments holding the latest State/Snapshot/Bootstrap records.
+    shard.addMetaSegmentsToLive(liveSegments)
+
+    deleted, err := comp.GarbageCollect(liveSegments, shard.activeSegmentID)
+    if deleted > 0 {
+        syncDirFS(shard.fs, shard.dir)  // make deletions crash-durable
+    }
     return err
 }
 ```
@@ -734,6 +740,51 @@ func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID uint6
 ```
 
 Safety invariant: The active segment (`activeSegmentID`) is never deleted, even if it contains no referenced entries. This prevents a race where in-flight writes target a deleted file.
+
+#### Pinning Meta-Record Segments
+
+The live-segment set is **not** computed from entry indexes alone. State, snapshot, and bootstrap records are never tracked by any entry index, so a segment whose entries have all been compacted away can still hold the sole durable copy of a node's hard state, snapshot metadata, or bootstrap configuration. Computing liveness only from `idx.AllSegmentIDs()` would let GC delete such a segment, losing that record.
+
+To prevent this, each `walShard` tracks, per node, the segment ID that holds the latest durable State, latest Snapshot, and Bootstrap record:
+
+```go
+type metaSegments struct {
+    state        uint64
+    snapshot     uint64
+    bootstrap    uint64
+    hasState     bool   // segment IDs are 0-based, so presence needs a flag
+    hasSnapshot  bool
+    hasBootstrap bool
+}
+
+// walShard field
+metaSegments map[nodeKey]metaSegments
+```
+
+Each record type carries an explicit presence flag rather than treating a zero ID as "none", because segment IDs are 0-based: segment 0 is a valid pin and must be distinguishable from the absence of a record.
+
+These segment IDs are recorded in two places, both following last-writer-wins semantics:
+
+- **On write-land**: `writeState`, `writeSnapshot`, and `writeBootstrap` call `setStateSegment` / `setSnapshotSegment` / `setBootstrapSegment` with the segment the record actually landed in (`s.activeSegmentID` after `writeRecord`, which accounts for any mid-write segment rotation). For batched state/snapshot writes the pin is applied at the commit point via `pendingMemUpdates.applyTo`, using the captured `landedSegID`.
+- **During recovery replay**: `replayState`, `replaySnapshot`, and `replayBootstrap` call the same setters with the replayed segment ID. Because segments replay in ascending ID order, the last replayed record wins, matching last-writer-wins at write time.
+
+Before running `GarbageCollect`, both `Compact` and `RemoveNodeData` fold these meta-segments into the live set via `addMetaSegmentsToLive`:
+
+```go
+func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
+    for _, m := range s.metaSegments {
+        if m.hasState     { liveSegments[m.state] = true }
+        if m.hasSnapshot  { liveSegments[m.snapshot] = true }
+        if m.hasBootstrap { liveSegments[m.bootstrap] = true }
+    }
+}
+```
+
+This guarantees that the segment holding a live node's latest State, Snapshot, or Bootstrap record is never garbage-collected. When a node is removed (`RemoveNodeData`) or replayed past (`replayRemoveNode`), its `metaSegments` entry is dropped, so its now-obsolete meta-segments become eligible for reclamation if no surviving node references them.
+
+#### Deletion Durability
+
+When `GarbageCollect` deletes one or more segment files, both `Compact` and `RemoveNodeData` fsync the shard directory (`syncDirFS`) afterward. Without this, a metadata-lazy filesystem (e.g., ext4 in default ordered mode) could lose the directory-entry removals on a crash and resurrect a deleted segment, replaying records that were supposed to be gone. The directory fsync is best-effort: a failure is logged but not fatal, because the next compaction retries the deletions and the in-memory index already excludes the deleted segments. `RemoveNodeData` previously already performed this fsync; `Compact` now does so as well whenever it deletes a segment.
 
 ## Recovery
 

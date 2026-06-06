@@ -15,7 +15,9 @@
 package waldb
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -26,6 +28,14 @@ import (
 // Records are written as chunks within blocks. When a record does not fit in
 // the remaining block space, it is split across multiple blocks using the
 // RecordFirst/RecordMiddle/RecordLast chunk types.
+// Block-alignment invariant: fileOffset is ALWAYS a multiple of blockSize and
+// marks the start of the current (in-progress) block. blockBuf[0:blockOffset]
+// holds that block's live content. A partial (mid-block) Sync writes the open
+// block at fileOffset via WriteAt WITHOUT advancing fileOffset, so the block
+// stays open and the next write continues filling it; only a full block
+// (padAndFlushBlock) advances fileOffset by blockSize. ReadAll relies on every
+// block beginning at a multiple of blockSize, so flushing must never move
+// fileOffset off the grid.
 type segment struct {
 	f           File
 	id          uint64
@@ -33,11 +43,16 @@ type segment struct {
 	blockSize   int
 	blockBuf    []byte // pre-allocated block buffer
 	blockOffset int    // current write position within the current block
-	fileOffset  int64  // current byte offset within the file
+	fileOffset  int64  // block-aligned start offset of the current block
 	maxFileSize int64
 	noSync      bool
 	recordSeq   atomic.Uint32
 	closed      bool
+	// stoppedAtCorruption is set by ReadAll when it halts at a corrupt/torn
+	// record (as opposed to a clean zero-filled EOF). Recovery uses it to stop
+	// replaying any HIGHER-numbered segment: a WAL is valid only as a prefix,
+	// so nothing after the first corruption may be resurrected.
+	stoppedAtCorruption bool
 }
 
 // segmentFilename returns the canonical filename for a given segment ID.
@@ -111,8 +126,16 @@ func (s *segment) Write(data []byte) (uint32, error) {
 			avail = s.blockSize
 		}
 
-		// Maximum payload that fits in the remaining block space.
+		// Maximum payload that fits in the remaining block space, capped at
+		// maxRecordDataLen — the record's length field is 2 bytes, so a single
+		// chunk can never carry more than that regardless of block size. Without
+		// this cap, a block size >= 64KiB+header would size a chunk past the
+		// length-field limit and encodeRecord would fail. bytesNeeded applies
+		// the identical cap so the two stay in sync.
 		maxPayload := avail - recordHeaderSize
+		if maxPayload > maxRecordDataLen {
+			maxPayload = maxRecordDataLen
+		}
 		if maxPayload > len(remaining) {
 			maxPayload = len(remaining)
 		}
@@ -161,6 +184,9 @@ func (s *segment) bytesNeeded(data []byte) int {
 		}
 
 		maxPayload := avail - recordHeaderSize
+		if maxPayload > maxRecordDataLen {
+			maxPayload = maxRecordDataLen
+		}
 		if maxPayload > remaining {
 			maxPayload = remaining
 		}
@@ -172,17 +198,20 @@ func (s *segment) bytesNeeded(data []byte) int {
 	return total
 }
 
-// padAndFlushBlock zero-fills the remainder of the current block and writes
-// the entire block (data + padding) to disk, then resets the block offset.
+// padAndFlushBlock zero-fills the remainder of the current block, writes the
+// entire block (data + padding) at its block-aligned start offset, then seals
+// it by advancing fileOffset by one block and resetting the block offset. This
+// is the only path that advances fileOffset, preserving block-grid alignment.
 func (s *segment) padAndFlushBlock() error {
 	// Zero-fill remaining space in the current block.
 	for i := s.blockOffset; i < s.blockSize; i++ {
 		s.blockBuf[i] = 0
 	}
 
-	// Write the complete block including previously buffered data.
-	_, err := s.f.Write(s.blockBuf[:s.blockSize])
-	if err != nil {
+	// Write the complete block at its aligned start. WriteAt does not move
+	// the file's implicit position, so repeated flushes of the same open
+	// block always target the same region.
+	if _, err := s.f.WriteAt(s.blockBuf[:s.blockSize], s.fileOffset); err != nil {
 		return err
 	}
 	s.fileOffset += int64(s.blockSize)
@@ -190,18 +219,20 @@ func (s *segment) padAndFlushBlock() error {
 	return nil
 }
 
-// flushBlock writes any pending data in the block buffer to disk.
+// flushBlock writes the in-progress block to disk at its block-aligned start
+// offset WITHOUT advancing fileOffset or resetting blockOffset: the block
+// remains open so subsequent writes continue filling it and a later flush
+// overwrites the same region with the grown content. This is what makes a
+// mid-block Sync safe — fileOffset never leaves the block grid that ReadAll
+// strides over during recovery.
 func (s *segment) flushBlock() error {
 	if s.blockOffset == 0 {
 		return nil
 	}
 
-	_, err := s.f.Write(s.blockBuf[:s.blockOffset])
-	if err != nil {
+	if _, err := s.f.WriteAt(s.blockBuf[:s.blockOffset], s.fileOffset); err != nil {
 		return err
 	}
-	s.fileOffset += int64(s.blockOffset)
-	s.blockOffset = 0
 	return nil
 }
 
@@ -249,7 +280,15 @@ func (s *segment) ReadAll() ([][]byte, error) {
 
 		n, err := s.f.ReadAt(blockBuf[:readSize], offset)
 		if err != nil && n == 0 {
-			break
+			// A clean EOF (or short read at the tail of a pre-allocated file)
+			// is the normal way to end the scan. A real I/O error (EIO,
+			// permission, etc.) must NOT be silently treated as end-of-data:
+			// combined with prefix-only validity it would masquerade as data
+			// loss and drop all higher segments. Surface it as a recovery error.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return records, &RecoveryError{SegmentID: s.id, Err: fmt.Errorf("read at offset %d: %w", offset, err)}
 		}
 
 		block := blockBuf[:n]
@@ -277,11 +316,22 @@ func (s *segment) ReadAll() ([][]byte, error) {
 
 			data, recType, consumed, err := decodeRecord(block[pos:])
 			if err != nil {
-				// Corrupted record. If we have an incomplete multi-chunk record
-				// in progress, discard it. Stop scanning this block.
-				partial = nil
-				// Try to skip to next block boundary for recovery.
-				goto nextBlock
+				s.stoppedAtCorruption = true
+				// Corrupted or torn record. A WAL is only valid as a prefix:
+				// skipping the bad record and resuming at the next block could
+				// recover entries/state that sit AFTER a gap, silently
+				// violating Raft log-matching. Stop recovery here and return
+				// the clean prefix collected so far. Any in-progress
+				// multi-chunk record (partial) is simply abandoned by the
+				// return below — no need to clear it.
+				slog.Warn("waldb: stopping WAL recovery at first corrupt record",
+					"segment_id", s.id,
+					"dir", s.dir,
+					"offset", offset+int64(pos),
+					"recovered_records", len(records),
+					"error", err,
+				)
+				return records, nil
 			}
 
 			switch recType {
@@ -316,7 +366,6 @@ func (s *segment) ReadAll() ([][]byte, error) {
 			pos += consumed
 		}
 
-	nextBlock:
 		offset += int64(s.blockSize)
 	}
 
@@ -344,8 +393,10 @@ func (s *segment) Close() error {
 	}
 
 	// Truncate the file to the actual written size to reclaim pre-allocated
-	// space beyond what was written.
-	if err := s.f.Truncate(s.fileOffset); err != nil {
+	// space beyond what was written. Size() accounts for the open block
+	// (fileOffset is only the block-aligned start; the live block tail lives
+	// in blockOffset).
+	if err := s.f.Truncate(s.Size()); err != nil {
 		if closeErr := s.f.Close(); closeErr != nil {
 			slog.Debug("waldb: file close failed after truncate error",
 				"segment_id", s.id,
@@ -372,32 +423,60 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int) er
 		return ErrClosed
 	}
 
-	// Truncate the file to discard any data written via padAndFlushBlock
-	// or flushBlock since the clean checkpoint.
-	if s.fileOffset > cleanFileOffset {
-		if err := s.f.Truncate(cleanFileOffset); err != nil {
+	// The durable boundary at batch start is the block-aligned start plus the
+	// open-block tail. Truncate exactly there: this removes any blocks the
+	// failed batch sealed beyond the checkpoint AND any batch bytes appended
+	// into the open block, while preserving the pre-batch open-block content
+	// that the previous successful Sync already made durable.
+	cleanEnd := cleanFileOffset + int64(cleanBlockOffset)
+	if s.Size() > cleanEnd {
+		if err := s.f.Truncate(cleanEnd); err != nil {
 			return &SegmentDiscardError{
 				SegmentID: s.id,
 				Err:       err,
 			}
 		}
-		// Seek the file write position back to match.
-		if _, err := s.f.Seek(cleanFileOffset, 0); err != nil {
-			return &SegmentDiscardError{
-				SegmentID: s.id,
-				Err:       err,
+		// fsync the truncation so a crash right after rollback cannot resurrect
+		// the discarded batch bytes (which would replay "rolled back" records).
+		if !s.noSync {
+			if err := s.f.Sync(); err != nil {
+				return &SegmentDiscardError{SegmentID: s.id, Err: err}
 			}
 		}
 	}
 
-	// Zero out the block buffer to prevent stale data from leaking into
-	// future writes.
-	for i := range s.blockBuf {
+	// Restore the open block's pre-batch content. If the failed batch sealed a
+	// block (padAndFlushBlock) the in-memory blockBuf was reused for a later
+	// block and no longer holds the checkpoint block, so reload the pre-batch
+	// tail from disk where the previous successful Sync left it. (After the
+	// truncate above, [cleanFileOffset : cleanEnd] is exactly that tail.)
+	if cleanBlockOffset > 0 {
+		if _, err := s.f.ReadAt(s.blockBuf[:cleanBlockOffset], cleanFileOffset); err != nil {
+			return &SegmentDiscardError{SegmentID: s.id, Err: err}
+		}
+	}
+	// Zero the rest of the block so stale bytes never leak into a future flush.
+	for i := cleanBlockOffset; i < len(s.blockBuf); i++ {
 		s.blockBuf[i] = 0
 	}
 
 	s.fileOffset = cleanFileOffset
 	s.blockOffset = cleanBlockOffset
+	return nil
+}
+
+// PreAllocate re-reserves disk space for the segment up to its configured
+// maxFileSize. Used after a rollback truncates the file to zero so subsequent
+// writes do not pay repeated file extensions. Mirrors createSegment: the
+// reservation is best-effort and only available when the file backend
+// implements FilePreAllocator.
+func (s *segment) PreAllocate() error {
+	if s.closed {
+		return ErrClosed
+	}
+	if pa, ok := s.f.(FilePreAllocator); ok {
+		return pa.PreAllocate(s.maxFileSize)
+	}
 	return nil
 }
 

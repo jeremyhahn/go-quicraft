@@ -49,29 +49,30 @@ type hostMessageHandler struct {
 // to flow through. The shard's raft state machine provides its own
 // term-based and log-based rejection for unauthorized messages once
 // the shard is loaded.
+//
+// Address learning (return path) is defended against poisoning by an
+// authenticated-but-malicious member through two layers:
+//
+//   - Authorization first: an inbound message's SourceAddress is only
+//     learned for the (shardID, From) pair AFTER the per-shard membership
+//     check passes. A sender that is not a member of a loaded shard never
+//     gets an address recorded for any replicaID in that shard. Unloaded
+//     shards do not learn addresses at all; authoritative addresses arrive
+//     when the shard is loaded with its configured/bootstrap membership.
+//   - Transport cert-binding: by the time a batch reaches this handler the
+//     transport has already cleared any SourceAddress not covered by the
+//     sender's verified TLS certificate (see handleMessageFrame), so a
+//     learned address is always one the sender's certificate authorizes.
+//
+// The mapping IS updated (overwritten) for an authorized member — this is
+// required so a node that recovers at a new address becomes reachable again,
+// including during quorum loss when there is no leader to propagate the new
+// address via a committed config change (see learnSourceAddress). The residual
+// — a member asserting another replicaID's From together with its own
+// cert-valid address — is a bounded, self-healing insider redirect (the victim
+// and committed-membership config changes re-register the authoritative
+// address); closing it fully would require replicaID-bound certificates.
 func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch) error {
-	// Auto-register sender address for return path. When a node joins
-	// a cluster via StartShard(join=true), its registry is empty — it
-	// has no knowledge of other nodes' addresses. Without address
-	// learning, the joining node cannot send responses (ReplicateResp,
-	// HeartbeatResp, VoteResp) because the transport cannot resolve the
-	// destination. By learning addresses from incoming messages, the
-	// joining node bootstraps its registry naturally from traffic.
-	//
-	// This is safe because:
-	// - The transport layer already validated mTLS and deployment ID
-	// - Registry.Register is idempotent (overwrites silently)
-	// - sync.Map.Swap is lock-free on the read path
-	if batch.SourceAddress != "" {
-		for i := range batch.Requests {
-			h.host.registry.Register(
-				batch.Requests[i].ShardID,
-				batch.Requests[i].From,
-				batch.SourceAddress,
-			)
-		}
-	}
-
 	for i := range batch.Requests {
 		msg := &batch.Requests[i]
 
@@ -89,10 +90,49 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch) error {
 			continue
 		}
 
+		// Learn the sender's address for the return path, but only for
+		// senders that ARE authorized members of a loaded shard, and only
+		// when doing so would not overwrite a differing existing mapping.
+		// Unloaded shards (node == nil) do not learn an address: the
+		// arbitrary replicaID in From cannot be verified as a real member
+		// until the shard is loaded with its configured membership.
+		if node != nil {
+			h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress)
+		}
+
 		h.engine.DeliverMessage(msg.ShardID, *msg)
 		h.engine.NotifyWork(msg.ShardID)
 	}
 	return nil
+}
+
+// learnSourceAddress records (and updates) the (shardID, replicaID) -> address
+// return-path mapping for an authorized member.
+//
+// Overwrite is REQUIRED for liveness: a node that crashes and recovers at a
+// NEW address (ephemeral ports, container reschedule) must become reachable
+// again. When recovery happens during quorum loss there is no leader to
+// propagate the new address via a committed config change, so peers can only
+// relearn it from this node's own inbound traffic — e.g. its RequestVote must
+// teach voters where to send VoteResp, or the cluster can never re-elect a
+// leader. A no-overwrite policy here strands a recovered-at-new-address node
+// and prevents quorum recovery.
+//
+// This is not an open injection vector: the caller only reaches here for a
+// sender that is an authorized member of a loaded shard (IsMember), and the
+// transport has already bound `address` to the sender's verified TLS
+// certificate (handleMessageFrame clears any SourceAddress not covered by the
+// peer cert's SANs). A member can therefore only set an address its own
+// certificate authorizes. The residual — a member asserting another
+// replicaID's From together with its own cert-valid address — is bounded by
+// mTLS membership and would require replicaID-bound certificates to close
+// fully; committed-membership config changes remain the authoritative source
+// and overwrite the registry directly.
+func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, address string) {
+	if address == "" || h.host == nil || h.host.registry == nil {
+		return
+	}
+	h.host.registry.Register(shardID, replicaID, address)
 }
 
 // HandleSnapshot processes received snapshot chunks from the transport
@@ -118,6 +158,17 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 	// handler is not fully wired.
 	if h.host == nil {
 		return nil
+	}
+
+	// Validate the chunk set BEFORE trusting chunks[0] for identity and
+	// metadata. A reordered, gapped, duplicated, truncated, or
+	// inconsistent chunk set must never be reassembled or persisted: doing
+	// so would corrupt the on-disk snapshot and inject a bad
+	// InstallSnapshot into raft. ordered holds the chunks indexed by
+	// ChunkID so reassembly is independent of arrival order.
+	ordered, err := validateSnapshotChunks(chunks)
+	if err != nil {
+		return err
 	}
 
 	first := &chunks[0]
@@ -164,10 +215,23 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 		}
 	}
 
-	// Reassemble the snapshot data from chunks.
+	// Reassemble the snapshot data from chunks in ChunkID order.
 	totalSize := uint64(0)
-	for i := range chunks {
-		totalSize += uint64(len(chunks[i].Data))
+	for i := range ordered {
+		totalSize += uint64(len(ordered[i].Data))
+	}
+
+	// If a declared total file size is present, the reassembled byte count
+	// must match it exactly. A mismatch means a chunk was truncated or the
+	// declared size was forged; either way the snapshot is unsafe to use.
+	if first.FileSize != 0 && first.FileSize != totalSize {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "validate",
+			Err: fmt.Errorf("reassembled size %d does not match declared FileSize %d",
+				totalSize, first.FileSize),
+		}
 	}
 
 	// Determine the snapshot directory. Use the host's configured snapshot
@@ -216,9 +280,9 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 		}
 	}
 
-	for i := range chunks {
-		if len(chunks[i].Data) > 0 {
-			if _, writeErr := f.Write(chunks[i].Data); writeErr != nil {
+	for i := range ordered {
+		if len(ordered[i].Data) > 0 {
+			if _, writeErr := f.Write(ordered[i].Data); writeErr != nil {
 				if closeErr := f.Close(); closeErr != nil {
 					slog.Debug("snapshot file close failed after write error",
 						"shard", shardID,
@@ -368,6 +432,87 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 
 	committed = true
 	return nil
+}
+
+// validateSnapshotChunks verifies that a received chunk set forms a
+// complete, consistent, correctly-ordered snapshot before any of it is
+// reassembled or persisted. The transport delivers chunks in arrival
+// order, which a reordering or malicious peer can perturb, so identity
+// and sequencing must be validated rather than trusted.
+//
+// The checks enforced are:
+//   - Every chunk carries the same identity and metadata as chunks[0]:
+//     ShardID, ReplicaID, From, Index, Term, Epoch, and OnDiskIndex.
+//   - Every chunk's ChunkCount is identical and equals len(chunks).
+//   - The set of ChunkIDs is exactly {0, 1, ..., N-1} with no gaps and
+//     no duplicates.
+//
+// On success it returns the chunks indexed by ChunkID (ordered[i] is the
+// chunk with ChunkID == i) so the caller reassembles data in sequence
+// order, not arrival order. On any inconsistency it returns a
+// *SnapshotReceiveError with Op == "validate" and no ordered slice.
+func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChunk, error) {
+	first := &chunks[0]
+	n := uint64(len(chunks))
+
+	validateErr := func(format string, args ...any) ([]*proto.SnapshotChunk, error) {
+		return nil, &SnapshotReceiveError{
+			ShardID:   first.ShardID,
+			ReplicaID: first.ReplicaID,
+			Op:        "validate",
+			Err:       fmt.Errorf(format, args...),
+		}
+	}
+
+	ordered := make([]*proto.SnapshotChunk, n)
+	for i := range chunks {
+		c := &chunks[i]
+
+		if c.ShardID != first.ShardID ||
+			c.ReplicaID != first.ReplicaID ||
+			c.From != first.From ||
+			c.Index != first.Index ||
+			c.Term != first.Term ||
+			c.Epoch != first.Epoch ||
+			c.OnDiskIndex != first.OnDiskIndex {
+			return validateErr(
+				"chunk %d identity mismatch with chunk 0 "+
+					"(shard %d/%d replica %d/%d from %d/%d index %d/%d term %d/%d epoch %d/%d ondisk %d/%d)",
+				c.ChunkID,
+				c.ShardID, first.ShardID,
+				c.ReplicaID, first.ReplicaID,
+				c.From, first.From,
+				c.Index, first.Index,
+				c.Term, first.Term,
+				c.Epoch, first.Epoch,
+				c.OnDiskIndex, first.OnDiskIndex,
+			)
+		}
+
+		if c.ChunkCount != n {
+			return validateErr(
+				"chunk %d declares ChunkCount %d but %d chunks were received",
+				c.ChunkID, c.ChunkCount, n)
+		}
+
+		if c.ChunkID >= n {
+			return validateErr(
+				"chunk ID %d out of range for %d chunks", c.ChunkID, n)
+		}
+		if ordered[c.ChunkID] != nil {
+			return validateErr("duplicate chunk ID %d", c.ChunkID)
+		}
+		ordered[c.ChunkID] = c
+	}
+
+	// Every slot must be filled; a nil slot means a missing ChunkID (gap).
+	for id := range ordered {
+		if ordered[id] == nil {
+			return validateErr("missing chunk ID %d of %d", id, n)
+		}
+	}
+
+	return ordered, nil
 }
 
 // snapshotRecvMetaSize is the metadata file size for received snapshots.

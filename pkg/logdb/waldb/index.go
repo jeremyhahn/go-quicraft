@@ -85,7 +85,9 @@ func (idx *index) appendLocked(e indexEntry) {
 		return idx.entries[i].Index >= e.Index
 	})
 	truncatedCount := n - pos
-	slog.Info("WAL index truncated: leader overwrote uncommitted entries",
+	// Debug, not Info: under leader churn this fires on the hot replication
+	// path for every overwritten suffix and would flood logs at Info level.
+	slog.Debug("WAL index truncated: leader overwrote uncommitted entries",
 		"truncated_from", pos,
 		"truncated_count", truncatedCount,
 		"new_index", e.Index,

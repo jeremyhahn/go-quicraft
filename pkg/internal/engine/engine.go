@@ -183,7 +183,7 @@ func NewEngine(cfg config.HostConfig, ldb logdb.LogDB, sender MessageSender, bar
 		applyWorkers[i] = newApplyWorker(i, applyCs[i], applyPool, maxApplyWorkers, &sync.WaitGroup{}, callback, snapshots, workSignal, applyStopC, metrics)
 	}
 
-	return &Engine{
+	e := &Engine{
 		cfg:           cfg,
 		logdb:         ldb,
 		sender:        sender,
@@ -203,6 +203,41 @@ func NewEngine(cfg config.HostConfig, ldb logdb.LogDB, sender MessageSender, bar
 		applyCs:       applyCs,
 		metrics:       metrics,
 	}
+
+	// Wire the snapshot pool's node enumerator so epoch purging can compute
+	// a GLOBAL safe-purge floor across every shard sharing the process-wide
+	// barrier. Without this, a single shard's purge could delete a DEK still
+	// needed by another shard's retained snapshot.
+	snapshots.nodes = e.loadedNodes
+
+	return e
+}
+
+// loadedNodes returns a snapshot of every node currently loaded in the
+// engine. Used by the snapshot pool to scan all shards' snapshot
+// directories when computing the global safe-purge floor for barrier
+// epoch DEKs.
+func (e *Engine) loadedNodes() []*Node {
+	var nodes []*Node
+	e.allNodes.Range(func(_, val any) bool {
+		if node, ok := val.(*Node); ok {
+			nodes = append(nodes, node)
+		}
+		return true
+	})
+	return nodes
+}
+
+// GlobalSafePurgeFloor returns the minimum barrier epoch still required by
+// any retained encrypted snapshot (across all shards) or any live WAL
+// record. DEKs for epochs strictly below this floor can be safely purged.
+//
+// The second return value is false when the floor cannot be determined
+// (errors scanning snapshot dirs, MinLiveEpoch failure) or when nothing
+// encrypted is retained. Callers MUST NOT purge any epoch when ok is
+// false: purging on uncertainty risks bricking encrypted data.
+func (e *Engine) GlobalSafePurgeFloor() (uint64, bool) {
+	return e.snapshots.globalSafePurgeFloor()
 }
 
 // Start launches all worker goroutines. Each worker tier is tracked by

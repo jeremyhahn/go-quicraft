@@ -357,12 +357,42 @@ func TestInMemRateLimiter_Reset(t *testing.T) {
 		t.Fatal("expected rate limited before reset")
 	}
 
-	// Reset clears follower states and the limited flag. In practice,
-	// the local size is also reset (e.g., after snapshot restore).
+	// Reset clears follower states, the limited flag, and the local size.
 	rl.Reset()
-	rl.Set(0)
 	if rl.RateLimited() {
 		t.Fatal("expected not rate limited after reset")
+	}
+}
+
+func TestInMemRateLimiter_ResetZeroesLocalSize(t *testing.T) {
+	rl := NewInMemRateLimiter(100)
+
+	// Drive the local size above the limit. The matching Decrease calls
+	// would normally fire under the same term; on a leadership transition
+	// they belong to the previous term, so the size must be cleared.
+	rl.Set(150)
+	if rl.Get() != 150 {
+		t.Fatalf("Get = %d, want 150 before reset", rl.Get())
+	}
+
+	rl.Reset()
+
+	// The tracked local size must be zeroed so backpressure accounting
+	// starts clean after the leadership transition.
+	if rl.Get() != 0 {
+		t.Fatalf("Get = %d, want 0 after reset", rl.Get())
+	}
+
+	// Advance past the debounce window and confirm a freshly reset limiter
+	// does not spuriously trip on the stale size.
+	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
+		rl.Tick()
+	}
+	if rl.RateLimited() {
+		t.Fatal("expected not rate limited after reset zeroes local size")
+	}
+	if rl.IsLimited() {
+		t.Fatal("expected IsLimited false after reset zeroes local size")
 	}
 }
 

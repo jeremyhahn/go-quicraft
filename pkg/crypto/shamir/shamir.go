@@ -65,6 +65,17 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 }
 
 // Combine reconstructs the original secret from M or more shares.
+//
+// Integrity verification: shares produced by Split carry a SHA-256 digest of
+// the original secret, and Combine verifies that the reconstructed secret
+// matches that digest, returning an IntegrityError on mismatch. As a special
+// case, when the first share's Digest is the zero value ([32]byte{}) the
+// SHA-256 integrity check is SKIPPED. This supports callers that construct
+// shares without Split (e.g. the seal adapter's ShareAccumulator, which has no
+// access to the original digest). When a zero digest disables verification the
+// caller MUST validate the reconstructed secret out-of-band (for example by
+// authenticating it against an independent commitment or by using it in an
+// authenticated decrypt that will fail on a wrong key).
 func Combine(shares []*Share) ([]byte, error) {
 	if len(shares) == 0 {
 		return nil, &CombineError{Reason: "no shares provided"}
@@ -90,15 +101,28 @@ func Combine(shares []*Share) ([]byte, error) {
 	}
 
 	shareStrings := make([]string, len(shares))
+	seen := make(map[string]struct{}, len(shares))
 	for i, share := range shares {
 		decoded, err := base64.StdEncoding.DecodeString(share.Value)
 		if err != nil {
 			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
 		}
-		shareStrings[i] = string(decoded)
+		s := string(decoded)
+		// Reject duplicate shares. Lagrange interpolation divides by
+		// (x_i - x_j); a repeated share yields a zero denominator (panic or
+		// garbage secret) in the underlying library. De-dup defensively.
+		if _, dup := seen[s]; dup {
+			return nil, &CombineError{Reason: fmt.Sprintf("duplicate share at index %d", i)}
+		}
+		seen[s] = struct{}{}
+		shareStrings[i] = s
 	}
 
-	secretHex, err := sssa.Combine(shareStrings)
+	// sssa.Combine is third-party and can panic on crafted/malformed shares
+	// (e.g. a duplicate x-coordinate producing a zero Lagrange denominator).
+	// Convert any panic into a clean error so a bad unseal ceremony cannot
+	// crash the process (availability/DoS).
+	secretHex, err := safeSSSACombine(shareStrings)
 	if err != nil {
 		return nil, &CombineError{Reason: fmt.Sprintf("sssa combine failed: %v", err)}
 	}
@@ -122,6 +146,19 @@ func Combine(shares []*Share) ([]byte, error) {
 	}
 
 	return secret, nil
+}
+
+// safeSSSACombine wraps the third-party sssa.Combine with panic recovery so a
+// malformed/crafted share set (e.g. a zero Lagrange denominator from duplicate
+// x-coordinates) returns an error instead of crashing the process.
+func safeSSSACombine(shareStrings []string) (secretHex string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			secretHex = ""
+			err = fmt.Errorf("panic in sssa.Combine (malformed shares?): %v", r)
+		}
+	}()
+	return sssa.Combine(shareStrings)
 }
 
 // VerifyShare checks if a share is valid and consistent with other shares.

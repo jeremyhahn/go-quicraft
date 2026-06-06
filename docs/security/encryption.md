@@ -162,15 +162,32 @@ func (b *Barrier) Rotate() (uint64, error) {
     defer b.mu.Unlock()
 
     newEpoch := b.epoch + 1
-    dek, aead, err := deriveEpochCipher(b.rootKey, b.salt, newEpoch)
+    dek, aead, err := b.deriveEpochCipher(rootBuf.Bytes(), b.salt, newEpoch)
     if err != nil {
         return 0, err
     }
+    oldEpoch := b.epoch
 
+    // Perform every fallible AEAD-safety-tracker reset BEFORE committing the
+    // epoch switch. If either fails, stay on the OLD epoch and return it.
+    if b.invocations != nil {
+        if err := b.invocations.Reset(); err != nil {
+            wipeBytes(dek)
+            return oldEpoch, &TrackerError{Tracker: "invocation", Op: "reset", Err: err}
+        }
+    }
+    if b.nonceTracker != nil {
+        if err := b.nonceTracker.Clear(); err != nil {
+            wipeBytes(dek)
+            return oldEpoch, &TrackerError{Tracker: "nonce", Op: "clear", Err: err}
+        }
+    }
+
+    // All fallible steps succeeded — commit the epoch switch atomically.
     b.epoch = newEpoch
-    b.currentDEK = dek
+    b.currentDEK = dekPK
     b.cipher = aead
-    b.deks[newEpoch] = dek
+    b.deks[newEpoch] = dekPK
     b.ciphers[newEpoch] = aead
     b.knownEpochs[newEpoch] = struct{}{}
     return newEpoch, nil
@@ -178,6 +195,17 @@ func (b *Barrier) Rotate() (uint64, error) {
 ```
 
 The write lock blocks concurrent `Encrypt`/`Decrypt` calls during rotation. Since rotation is fast (~1-2ms for HKDF + map update), this pause is negligible.
+
+**Rotation atomicity.** The new DEK/cipher are derived into locals, and the
+fallible invocation-counter `Reset()` and nonce-tracker `Clear()` are performed,
+*before* the barrier mutates any epoch state. With the in-memory trackers these
+resets always succeed, but an injected persistent or hardware-backed tracker may
+fail. If it does, `Rotate` wipes the freshly derived DEK, leaves the barrier on
+the **old** epoch with its existing (non-reset) counter, and returns the old
+epoch alongside a `TrackerError`. It never leaves the barrier half-rotated and
+never returns epoch 0 — the invocation-limit safety margin is preserved and the
+caller can retry. Rotation is rejected with `ErrBarrierSealed` unless the barrier
+is unsealed, and with `ErrHardwareMode` in hardware mode.
 
 `Rotate()` updates `b.sealed.Epoch` and rebuilds `b.sealed.KnownEpochs` from the full `b.knownEpochs` map. On restart, `SetSealedRootKey` restores the known epochs and `Unseal()` re-derives DEKs for all of them.
 
@@ -229,6 +257,22 @@ The `atomic.Bool` pre-filter avoids `RLock` contention when the barrier is seale
 The barrier generates nonces for AES-GCM using `crypto/rand.Reader`. Each `Encrypt` call reads 12 bytes of cryptographic randomness for the nonce.
 
 If `crypto/rand.Read` fails (entropy exhaustion), encryption returns an error rather than falling back to a weaker source. This fail-closed behavior prevents encrypting with a predictable nonce.
+
+### Nonce-Reuse Detection
+
+**Source:** `pkg/seal/aead_tracking.go`
+
+When nonce tracking is enabled, every generated nonce is recorded by
+`InMemoryNonceTracker` and a repeat returns `ErrNonceReuse` (nonce reuse is
+catastrophic for AEAD ciphers). The tracker keys on the **full nonce verbatim**
+— the entire byte slice, of whatever length, is used as the `sync.Map` string
+key. There is **no truncation to a 12-byte prefix**, so the 24-byte
+XChaCha20-Poly1305 nonces that share a common 12-byte prefix are tracked
+exactly and are never falsely rejected as reuse, while genuine reuse of an
+identical nonce is always detected. `Clear()` (called by `Rotate`) swaps in a
+fresh map via an atomic pointer swap, avoiding a TOCTOU race with concurrent
+`CheckAndRecordNonce` calls. Memory grows linearly with encrypt operations
+per epoch, so plan key rotation to bound it.
 
 ### Methods
 
@@ -610,6 +654,13 @@ Constructors:
 
 ### Hardware-Backed Strategies
 
+> **Layer boundary.** go-quicraft (L1) ships **only** the `None` and `Software`(passphrase)
+> strategies and names only their `StrategyID`s (`none`, `passphrase`) plus the `StrategyID`
+> *type*. The hardware/cloud strategies below are **illustrative** — their concrete
+> implementations and `StrategyID`s (`tpm2`/`pkcs11`/`awskms`/`gcpkms`/`azurekv`/`vault`) live in
+> **go-xkms**, and `shamir` in **go-qrdb**, injected via the `SealingStrategy` interface. There is
+> no built-in strategy catalog or preference-order default in L1; selection is always explicit.
+
 The `SealingStrategy` interface supports arbitrary backends without touching the core:
 
 ```go
@@ -628,15 +679,36 @@ type CloudKMSStrategy struct { /* client, key ARN */ }
 
 Custom `SealingStrategy` implementations can be provided by external modules (e.g., PKCS#11, TPM 2.0, cloud KMS). The core QuicRaft module has zero dependency on any external key management system.
 
-## Shamir's Secret Sharing
+## Shamir's Secret Sharing — primitive + interfaces only
 
-**Source:** `pkg/crypto/shamir/`
+**Source:** `pkg/crypto/shamir/` (GF(256) math), `pkg/seal/shamir.go` (interfaces)
 
-For scenarios requiring multiple key holders to reconstruct the barrier:
+The consensus engine is **Layer 1**: it owns only the low-level Shamir primitive and
+the seam interfaces, never the custody machinery.
 
-- Split master key into N shares, reconstruct from K shares (K-of-N threshold)
-- Used for sealing/unsealing the barrier with multiple key holders
-- Compatible with any `SealingStrategy`
+- `pkg/crypto/shamir/` — the pure GF(256) `Split`/`Combine` primitive (K-of-N threshold).
+- `pkg/seal/shamir.go` — the `ShareSplitter` / `ShareAccumulator` interfaces plus the
+  `ShamirConfig` / `ShamirInitResult` / `QuorumProgress` value types that a host application
+  injects an implementation for.
+
+**`Combine` integrity check is opt-out via a zero digest.** Shares produced by
+`Split` carry a SHA-256 digest of the original secret, and `Combine` verifies the
+reconstructed secret against it, returning an `IntegrityError` on mismatch. As a
+deliberate special case, when the first share's `Digest` is the zero value
+(`[32]byte{}`) the SHA-256 check is **skipped**. This supports the accumulator
+path, where the seal adapter's `ShareAccumulator` constructs shares without
+`Split` and therefore has no access to the original digest. When a zero digest
+disables verification, the **caller MUST validate the reconstructed secret
+out-of-band** — e.g. by authenticating it against an independent commitment or
+by using it in an authenticated decrypt that fails on a wrong key. (The
+accumulator/custody machinery that drives this path lives in go-qrdb, not here.)
+
+The **Shamir sealing strategy** (splitting the root key), **share custody**, the
+**M-of-N quorum/unseal orchestration**, and the **Security-Officer CSR challenge-response
+ceremony** are NOT part of the consensus engine. They are a database-server / custody
+concern and live in **go-qrdb** (`pkg/seal` strategies + `pkg/ceremony`). The consensus
+engine never persists Shamir shares. See the coordination repo's
+`docs/05-seal-barrier-architecture.md` / `docs/09-identity-barrier-unification-plan.md`.
 
 ## Enclave Integration
 

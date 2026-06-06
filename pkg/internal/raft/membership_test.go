@@ -1348,3 +1348,60 @@ func TestMembership_Validate_RemoveLastFullReplicaWithWitnesses(t *testing.T) {
 		t.Fatalf("expected ErrRemoveLastFullReplica from validate, got %v", err)
 	}
 }
+
+// TestMembership_VotingCapEnforced is the regression test for the voting cap:
+// adding a voting member (full replica or witness) past maxVotingMembers must be
+// rejected at PROPOSE/VALIDATE time (validateAddNode/validateAddWitness) so the
+// over-cap change never enters the log — preventing the later leader-side
+// invariant panic when the ReadIndex ackBits word overflows.
+//
+// Critically, the apply-path handlers (handleAddNode/handleAddWitness) must NOT
+// re-check the cap: apply() runs on already-committed entries (replication,
+// post-truncation rebuildMembershipFromLog), and rejecting a committed change
+// would cause replicas to diverge from the agreed membership — a Raft safety
+// violation. The validate gate is the single enforcement point.
+func TestMembership_VotingCapEnforced(t *testing.T) {
+	m := newMembership(proto.Membership{
+		Addresses: map[uint64]string{},
+		Observers: map[uint64]string{},
+		Witnesses: map[uint64]string{},
+		Removed:   map[uint64]bool{},
+	})
+	// Fill exactly to the cap with full voting members.
+	for i := uint64(1); i <= maxVotingMembers; i++ {
+		cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: i, Address: "addr"}
+		if err := handleAddNode(m, cc); err != nil {
+			t.Fatalf("add voter %d: unexpected error %v", i, err)
+		}
+	}
+	if m.numVotingMembers() != maxVotingMembers {
+		t.Fatalf("voting members = %d, want %d", m.numVotingMembers(), maxVotingMembers)
+	}
+
+	// The 65th voter must be rejected at validate (propose) time.
+	over := proto.ConfigChange{Type: proto.AddNode, ReplicaID: maxVotingMembers + 1, Address: "addr"}
+	if err := validateAddNode(m, over); !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("validateAddNode over cap = %v, want ErrTooManyVotingMembers", err)
+	}
+	// The apply-path handler must accept it: a committed change is always
+	// applied so replicas converge. (Rejecting here would diverge membership.)
+	if err := handleAddNode(m, over); err != nil {
+		t.Fatalf("handleAddNode over cap = %v, want nil (committed changes always apply)", err)
+	}
+
+	// A witness (also a voting member) must likewise be rejected at validate time,
+	// but accepted by the apply-path handler.
+	w := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: maxVotingMembers + 2, Address: "addr"}
+	if err := validateAddWitness(m, w); !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("validateAddWitness over cap = %v, want ErrTooManyVotingMembers", err)
+	}
+	if err := handleAddWitness(m, w); err != nil {
+		t.Fatalf("handleAddWitness over cap = %v, want nil (committed changes always apply)", err)
+	}
+
+	// Observers do not count toward the voting cap and must still be allowed.
+	obs := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: maxVotingMembers + 3, Address: "addr"}
+	if err := handleAddNonVoting(m, obs); err != nil {
+		t.Fatalf("handleAddNonVoting at voting cap: unexpected error %v", err)
+	}
+}

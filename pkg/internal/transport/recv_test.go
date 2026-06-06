@@ -2907,3 +2907,172 @@ func TestHandleConnection_SemaphoreExhaustion(t *testing.T) {
 // is evicted by another goroutine between the stream read and the
 // connection liveness check. The stream is no longer in the shard,
 // so getStream falls through to the slow path.
+
+// ---------------------------------------------------------------------------
+// SourceAddress / certificate binding (recv.go handleMessageFrame, Bug A)
+// ---------------------------------------------------------------------------
+
+// buildBatchPayload marshals a MessageBatch with the given source address into
+// a frame payload for handleMessageFrame.
+func buildBatchPayload(t *testing.T, deploymentID uint64, source string) []byte {
+	t.Helper()
+	mb := proto.MessageBatch{
+		BinVer:        proto.WireVersion,
+		DeploymentID:  deploymentID,
+		SourceAddress: source,
+		Requests: []proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+		},
+	}
+	payload := make([]byte, mb.Size())
+	n, err := mb.MarshalTo(payload)
+	if err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+	return payload[:n]
+}
+
+// TestHandleMessageFrame_SpoofedSourceAddressCleared verifies that a batch
+// whose claimed SourceAddress is not covered by the inbound connection's
+// verified peer certificate has SourceAddress cleared before the batch reaches
+// the handler. mTLS still authenticates the messages themselves, so they are
+// delivered — only the (unauthenticated, in-band) address hint is dropped so it
+// cannot poison the registry or epoch-based eviction.
+func TestHandleMessageFrame_SpoofedSourceAddressCleared(t *testing.T) {
+	t1, t2, handler1, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	// An authenticated inbound connection: t1's view of t2 carries t2's
+	// verified leaf certificate, which covers 127.0.0.1/localhost but NOT
+	// 10.99.99.99.
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	spoofed := "10.99.99.99:1234"
+	payload := buildBatchPayload(t, 42, spoofed)
+	if err := t1.handleMessageFrame(conn, bytes.NewReader(payload), uint32(len(payload)), FlagNone); err != nil {
+		t.Fatalf("handleMessageFrame returned error: %v", err)
+	}
+
+	handler1.waitBatch(t, 5*time.Second)
+	batches := handler1.getBatches()
+	if len(batches) != 1 {
+		t.Fatalf("expected 1 delivered batch, got %d", len(batches))
+	}
+	if batches[0].SourceAddress != "" {
+		t.Fatalf("expected spoofed SourceAddress to be cleared, got %q", batches[0].SourceAddress)
+	}
+}
+
+// TestHandleMessageFrame_AuthorizedSourceAddressPreserved verifies that a batch
+// whose claimed SourceAddress IS covered by the inbound connection's verified
+// peer certificate passes through unchanged.
+func TestHandleMessageFrame_AuthorizedSourceAddressPreserved(t *testing.T) {
+	t1, t2, handler1, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	// The test certificate covers 127.0.0.1, so a 127.0.0.1 SourceAddress is
+	// authorized and must survive.
+	authorized := "127.0.0.1:7777"
+	payload := buildBatchPayload(t, 42, authorized)
+	if err := t1.handleMessageFrame(conn, bytes.NewReader(payload), uint32(len(payload)), FlagNone); err != nil {
+		t.Fatalf("handleMessageFrame returned error: %v", err)
+	}
+
+	handler1.waitBatch(t, 5*time.Second)
+	batches := handler1.getBatches()
+	if len(batches) != 1 {
+		t.Fatalf("expected 1 delivered batch, got %d", len(batches))
+	}
+	if batches[0].SourceAddress != authorized {
+		t.Fatalf("expected authorized SourceAddress %q preserved, got %q", authorized, batches[0].SourceAddress)
+	}
+}
+
+// TestInboundAuthorizedForCached_VerifiesOncePerConn verifies that the
+// per-connection SourceAddress authorization cache reuses its decision rather
+// than re-running the cert check on every batch. After the first call the
+// entry is populated; a second call for the same (conn, address) returns the
+// cached decision, and a different address re-verifies.
+func TestInboundAuthorizedForCached_VerifiesOncePerConn(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	// No cache entry yet.
+	if _, ok := t1.srcAddrAuth.Load(conn); ok {
+		t.Fatal("expected no cache entry before first call")
+	}
+
+	if !t1.inboundAuthorizedForCached(conn, "127.0.0.1:1") {
+		t.Fatal("expected 127.0.0.1 to be authorized by test cert")
+	}
+
+	v, ok := t1.srcAddrAuth.Load(conn)
+	if !ok {
+		t.Fatal("expected cache entry after first call")
+	}
+	entry := v.(*srcAddrAuthEntry)
+	entry.mu.Lock()
+	if !entry.valid || entry.addr != "127.0.0.1:1" || !entry.authorized {
+		t.Fatalf("unexpected cache entry: valid=%v addr=%q authorized=%v",
+			entry.valid, entry.addr, entry.authorized)
+	}
+	entry.mu.Unlock()
+
+	// Second call for the same address must reuse the cached decision. We
+	// poison the cached authorized flag to a sentinel and confirm the cache
+	// path returns it without re-verifying against the cert.
+	entry.mu.Lock()
+	entry.authorized = false
+	entry.mu.Unlock()
+	if t1.inboundAuthorizedForCached(conn, "127.0.0.1:1") {
+		t.Fatal("expected cached (poisoned) decision to be reused, not re-verified")
+	}
+
+	// A different claimed address re-verifies: an unauthorized address yields
+	// false and updates the cached address.
+	if t1.inboundAuthorizedForCached(conn, "10.99.99.99:1") {
+		t.Fatal("expected 10.99.99.99 to be unauthorized")
+	}
+	entry.mu.Lock()
+	if entry.addr != "10.99.99.99:1" || entry.authorized {
+		t.Fatalf("expected re-verification for new address, got addr=%q authorized=%v",
+			entry.addr, entry.authorized)
+	}
+	entry.mu.Unlock()
+}
+
+// TestForgetInboundConnAuth_RemovesCacheEntry verifies that the per-connection
+// authorization cache entry is dropped when forgetInboundConnAuth is called
+// (wired into handleConnection's defer on inbound-connection teardown).
+func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	t1.inboundAuthorizedForCached(conn, "127.0.0.1:1")
+	if _, ok := t1.srcAddrAuth.Load(conn); !ok {
+		t.Fatal("expected cache entry to exist")
+	}
+
+	t1.forgetInboundConnAuth(conn)
+	if _, ok := t1.srcAddrAuth.Load(conn); ok {
+		t.Fatal("expected cache entry removed after forgetInboundConnAuth")
+	}
+}

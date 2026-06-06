@@ -14,7 +14,11 @@
 
 package config
 
-import "time"
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"time"
+)
 
 // Default values for TransportConfig fields.
 const (
@@ -29,6 +33,16 @@ const (
 	DefaultSendBatchMaxSize          int    = 64 * 1024       // 64 KB
 	DefaultUDPRecvBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical rmem_max)
 	DefaultUDPSendBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical wmem_max)
+
+	// MinMaxSnapshotReceiveRate is the smallest accepted non-zero value for
+	// MaxSnapshotReceiveRate. Rates below this floor are rejected by Validate
+	// because the receiver applies rate limiting by sleeping proportional to
+	// chunk size: an absurdly low rate (e.g. a few bytes per second) would
+	// compute a multi-day per-chunk sleep that holds the snapshot concurrency
+	// semaphore and memory budget for the entire duration, stalling
+	// availability. 64 KB/s is the slowest rate that keeps per-chunk sleeps
+	// bounded to a sane range for typical multi-megabyte chunks.
+	MinMaxSnapshotReceiveRate int64 = 64 * 1024 // 64 KB/s
 )
 
 // MTLSConfig holds the PEM-encoded certificate material for mutual TLS
@@ -236,6 +250,14 @@ func (tc *TransportConfig) Validate() error {
 		return newValidationError("TransportConfig.MaxSnapshotReceiveRate",
 			"must be >= 0")
 	}
+	// A non-zero rate below the floor would make the receiver's
+	// proportional-sleep rate limiter compute multi-day per-chunk sleeps,
+	// holding the snapshot semaphore and memory budget and stalling
+	// availability. Zero is accepted (SetDefaults supplies the default).
+	if tc.MaxSnapshotReceiveRate > 0 && tc.MaxSnapshotReceiveRate < MinMaxSnapshotReceiveRate {
+		return newValidationError("TransportConfig.MaxSnapshotReceiveRate",
+			"must be 0 (use default) or >= 64 KB/s")
+	}
 	if tc.MaxConcurrentSnapshotReceives < 1 {
 		return newValidationError("TransportConfig.MaxConcurrentSnapshotReceives",
 			"must be >= 1")
@@ -264,8 +286,31 @@ func (tc *TransportConfig) Validate() error {
 	// connections require mTLS; there is no insecure fallback. When
 	// TransportDisabled is true (set by WithoutTransport()), this
 	// validation is skipped.
-	if !tc.TransportDisabled && tc.MTLSConfig == nil {
-		return &MTLSConfigRequiredError{}
+	if !tc.TransportDisabled {
+		if tc.MTLSConfig == nil {
+			return &MTLSConfigRequiredError{}
+		}
+		// mTLS is mandatory (no insecure fallback), so empty/invalid cert
+		// material must be rejected at the config boundary rather than
+		// surfacing as an opaque handshake error at runtime.
+		mtls := tc.MTLSConfig
+		if len(mtls.CACert) == 0 {
+			return newValidationError("TransportConfig.MTLSConfig.CACert", "must be a non-empty PEM CA certificate")
+		}
+		if len(mtls.Cert) == 0 {
+			return newValidationError("TransportConfig.MTLSConfig.Cert", "must be a non-empty PEM certificate")
+		}
+		if len(mtls.Key) == 0 {
+			return newValidationError("TransportConfig.MTLSConfig.Key", "must be a non-empty PEM private key")
+		}
+		// Trial-parse so a malformed keypair or CA is caught here.
+		if _, err := tls.X509KeyPair(mtls.Cert, mtls.Key); err != nil {
+			return newValidationError("TransportConfig.MTLSConfig", "Cert/Key are not a valid PEM keypair: "+err.Error())
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(mtls.CACert) {
+			return newValidationError("TransportConfig.MTLSConfig.CACert", "no valid PEM certificate found")
+		}
 	}
 	return nil
 }

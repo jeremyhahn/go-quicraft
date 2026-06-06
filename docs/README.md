@@ -50,7 +50,7 @@ New to QuicRaft? Start here:
 | Document | Description |
 |----------|-------------|
 | [Session Deduplication](sessions/deduplication.md) | At-most-once delivery, client sessions, snapshot integration |
-| [Bootstrap & Discovery](discovery/bootstrap.md) | Static, multicast, DNS SRV discovery, cluster formation |
+| [Discovery & Bootstrap (moved to go-qrdb)](discovery/bootstrap.md) | Peer discovery and cluster formation now live in go-qrdb's `pkg/discovery`/`pkg/cluster`; quicraft is Raft-primitives-only |
 
 ## Operations
 

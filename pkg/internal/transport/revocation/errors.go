@@ -37,6 +37,12 @@ var (
 
 	// ErrInvalidCRL is returned when a CRL file cannot be parsed.
 	ErrInvalidCRL = errors.New("revocation: invalid CRL file")
+
+	// ErrOCSPNegativeCached is the underlying cause wrapped in an
+	// OCSPUnavailableError when a recent responder failure is served from the
+	// short-TTL negative cache instead of being re-queried. It distinguishes a
+	// cached failure from a fresh transport error for diagnostics.
+	ErrOCSPNegativeCached = errors.New("revocation: OCSP responder recently unavailable (negative-cached)")
 )
 
 // CertificateRevokedError is the typed error for revoked certificates.
