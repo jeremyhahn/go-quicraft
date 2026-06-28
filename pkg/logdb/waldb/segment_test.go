@@ -52,7 +52,7 @@ func openSegmentForTest(t *testing.T, dir string, id uint64, blockSize int) *seg
 // a file on disk, and can be closed without error.
 func TestCreateAndCloseSegment(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 32*1024, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 32*1024, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestCreateAndCloseSegment(t *testing.T) {
 // TestCloseAlreadyClosed verifies that closing a segment twice returns ErrClosed.
 func TestCloseAlreadyClosed(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 32*1024, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 32*1024, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCloseAlreadyClosed(t *testing.T) {
 func TestWriteAndReadAllRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 1024
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestWriteAndReadAllRoundTrip(t *testing.T) {
 func TestMultipleWritesReadAll(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 1024
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestLargeRecordSpansBlocks(t *testing.T) {
 		data[i] = byte(i % 251)
 	}
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestLargeBlockSizeChunkCap(t *testing.T) {
 		data[i] = byte((i * 7) % 251)
 	}
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 8*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 8*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestReadAllCorruptedTail(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 256
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestSegmentFilenameUnique(t *testing.T) {
 func TestSegmentSizeTracking(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 1024
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestWriteToFullSegment(t *testing.T) {
 	// Very small max file size so we fill it quickly.
 	maxFileSize := int64(blockSize * 2)
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, maxFileSize)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, maxFileSize)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestWriteToFullSegment(t *testing.T) {
 // TestWriteToClosedSegment verifies that Write returns ErrClosed on a closed segment.
 func TestWriteToClosedSegment(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestWriteToClosedSegment(t *testing.T) {
 // TestSyncClosedSegment verifies that Sync returns ErrClosed on a closed segment.
 func TestSyncClosedSegment(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestSyncClosedSegment(t *testing.T) {
 // TestReadAllClosedSegment verifies that ReadAll returns ErrClosed on a closed segment.
 func TestReadAllClosedSegment(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestReadAllClosedSegment(t *testing.T) {
 // TestSyncNoSync verifies that Sync is a no-op when noSync is set.
 func TestSyncNoSync(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestSyncNoSync(t *testing.T) {
 // TestSyncAfterWrite verifies that Sync completes without error after a write.
 func TestSyncAfterWrite(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -512,7 +512,7 @@ func TestSyncAfterWrite(t *testing.T) {
 // TestSegmentID verifies the ID getter returns the correct segment ID.
 func TestSegmentID(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 42, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 42, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestSegmentID(t *testing.T) {
 // TestSegmentIDZero verifies that ID 0 is a valid segment ID.
 func TestSegmentIDZero(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 0, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 0, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -544,7 +544,7 @@ func TestMultipleRecordsAcrossBlocks(t *testing.T) {
 	blockSize := 64 // Small blocks.
 	maxPayload := blockSize - recordHeaderSize
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestMultipleRecordsAcrossBlocks(t *testing.T) {
 func TestReadAllEmptySegment(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 1024
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -610,7 +610,7 @@ func TestReadAllEmptySegment(t *testing.T) {
 // monotonically increasing sequence numbers.
 func TestSequenceNumberIncrement(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -632,14 +632,14 @@ func TestSequenceNumberIncrement(t *testing.T) {
 func TestSequenceNumberIncrementAfterClose(t *testing.T) {
 	dir := t.TempDir()
 
-	seg1, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg1, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment[1]: unexpected error: %v", err)
 	}
 	seq1, _ := seg1.Write([]byte("seg1"))
 	seg1.Close()
 
-	seg2, err := createSegment(defaultFS(), dir, 2, 1024, 1024*1024)
+	seg2, _, err := createSegment(defaultFS(), dir, 2, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment[2]: unexpected error: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestLargeRecordExactBlockBoundary(t *testing.T) {
 	blockSize := 128
 	maxPayload := blockSize - recordHeaderSize
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: unexpected error: %v", err)
 	}
@@ -712,7 +712,7 @@ func BenchmarkSegmentWrite(b *testing.B) {
 	blockSize := 4096
 	maxFileSize := int64(1024 * 1024 * 1024) // 1GB to avoid segment full.
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, maxFileSize)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, maxFileSize)
 	if err != nil {
 		b.Fatalf("createSegment: %v", err)
 	}
@@ -739,7 +739,7 @@ func BenchmarkSegmentWrite(b *testing.B) {
 func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 4096
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -836,7 +836,7 @@ func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 // ErrClosed when called on a closed segment.
 func TestDiscardPendingOnClosedSegment(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -856,7 +856,7 @@ func TestDiscardPendingOnClosedSegment(t *testing.T) {
 func TestDiscardPendingNoTruncateNeeded(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 4096
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -893,7 +893,7 @@ func TestDiscardPendingNoTruncateNeeded(t *testing.T) {
 func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 512
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -952,7 +952,7 @@ func BenchmarkSegmentSync(b *testing.B) {
 	dir := b.TempDir()
 	blockSize := 4096
 
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024*1024)
 	if err != nil {
 		b.Fatalf("createSegment: %v", err)
 	}

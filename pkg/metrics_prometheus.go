@@ -119,6 +119,10 @@ type PrometheusMetricsCollector struct {
 	snapshotsBytesSentVec *prometheus.HistogramVec
 	snapshotsReceivedVec  *prometheus.CounterVec
 	snapshotsBytesRecvVec *prometheus.HistogramVec
+
+	// Security drop counters (alertable, low-frequency).
+	unauthorizedMessagesVec  *prometheus.CounterVec
+	unauthorizedSnapshotsVec *prometheus.CounterVec
 }
 
 // NewPrometheusMetricsCollector creates a PrometheusMetricsCollector with all
@@ -312,6 +316,30 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 			Help:      "Snapshot bytes received per transfer.",
 			Buckets:   snapshotBytesBuckets,
 		}, []string{"shard_id"}),
+
+		// Security metrics. Low-frequency by design (every increment is a
+		// rejected injection attempt or a misconfiguration), so plain
+		// WithLabelValues lookups are fine — no per-shard pre-binding.
+		// Keyed by shard_id ONLY. The dropped "from" replica id is, by
+		// definition, a value that is NOT a current member and is carried
+		// unauthenticated in the inbound message, so an attacker can emit
+		// arbitrarily many distinct values. Using it as a label would create
+		// unbounded, never-reclaimed Prometheus child series — a persistent
+		// memory/TSDB-cardinality DoS. The "from" is still available in the
+		// drop log line for forensics.
+		unauthorizedMessagesVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "quicraft",
+			Subsystem: "security",
+			Name:      "unauthorized_messages_dropped_total",
+			Help:      "Inbound Raft messages dropped for failing shard-membership authorization.",
+		}, []string{"shard_id"}),
+
+		unauthorizedSnapshotsVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "quicraft",
+			Subsystem: "security",
+			Name:      "unauthorized_snapshots_dropped_total",
+			Help:      "Inbound snapshots dropped for failing authorization or TLS identity binding.",
+		}, []string{"shard_id"}),
 	}
 
 	// Register all collectors with the custom registry.
@@ -342,6 +370,9 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 		c.snapshotsBytesSentVec,
 		c.snapshotsReceivedVec,
 		c.snapshotsBytesRecvVec,
+		// Security
+		c.unauthorizedMessagesVec,
+		c.unauthorizedSnapshotsVec,
 	)
 
 	return c
@@ -377,10 +408,29 @@ func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 	c.shardMetrics.Store(shardID, sm)
 }
 
-// UnregisterShard removes the pre-bound metrics for the given shardID.
-// Call this when a shard stops to allow garbage collection of the metrics.
+// UnregisterShard removes the pre-bound metrics for the given shardID. Call this
+// when a shard stops. It deletes both the local cache entry AND the underlying
+// per-shard Prometheus child series: dropping only the cache (as before) left
+// every per-shard series registered forever, so a host that starts and stops
+// shards over time (tenant churn, rebalancing) accumulated unbounded series —
+// a memory/TSDB-cardinality leak.
 func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
 	c.shardMetrics.Delete(shardID)
+
+	sid := strconv.FormatUint(shardID, 10)
+	c.proposalLatencyVec.DeleteLabelValues(sid)
+	c.commitLatencyVec.DeleteLabelValues(sid)
+	c.applyLatencyVec.DeleteLabelValues(sid)
+	c.readIndexLatencyVec.DeleteLabelValues(sid)
+	c.proposalDroppedVec.DeleteLabelValues(sid)
+	c.proposalBatchSizeVec.DeleteLabelValues(sid)
+	c.electionsVec.DeleteLabelValues(sid)
+	c.snapshotsVec.DeleteLabelValues(sid)
+	c.piggybackCommitsVec.DeleteLabelValues(sid)
+	c.snapshotsSentVec.DeleteLabelValues(sid)
+	c.snapshotsBytesSentVec.DeleteLabelValues(sid)
+	c.snapshotsReceivedVec.DeleteLabelValues(sid)
+	c.snapshotsBytesRecvVec.DeleteLabelValues(sid)
 }
 
 // getShard returns the pre-bound metrics for shardID, or nil if not registered.
@@ -576,6 +626,21 @@ func (c *PrometheusMetricsCollector) IncSnapshotsReceived(shardID uint64, bytes 
 	shard := strconv.FormatUint(shardID, 10)
 	c.snapshotsReceivedVec.WithLabelValues(shard).Inc()
 	c.snapshotsBytesRecvVec.WithLabelValues(shard).Observe(float64(bytes))
+}
+
+// IncUnauthorizedMessageDropped counts an inbound Raft message dropped for
+// failing shard-membership authorization. The from replica id is intentionally
+// NOT used as a metric label (unbounded attacker-controlled cardinality); it is
+// retained in the parameter list for the interface and logged by the caller.
+func (c *PrometheusMetricsCollector) IncUnauthorizedMessageDropped(shardID, _ uint64) {
+	c.unauthorizedMessagesVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
+}
+
+// IncUnauthorizedSnapshotDropped counts an inbound snapshot dropped for
+// failing authorization or TLS identity binding. The from replica id is
+// intentionally NOT used as a metric label (see IncUnauthorizedMessageDropped).
+func (c *PrometheusMetricsCollector) IncUnauthorizedSnapshotDropped(shardID, _ uint64) {
+	c.unauthorizedSnapshotsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
 }
 
 // ---------------------------------------------------------------------------

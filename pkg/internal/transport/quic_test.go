@@ -63,7 +63,7 @@ func newTestHandler() *testHandler {
 	}
 }
 
-func (h *testHandler) HandleMessage(batch proto.MessageBatch) error {
+func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ func(string) bool) error {
 	if h.handleErr != nil {
 		return h.handleErr
 	}
@@ -78,7 +78,7 @@ func (h *testHandler) HandleMessage(batch proto.MessageBatch) error {
 	return nil
 }
 
-func (h *testHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error {
+func (h *testHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ func(string) bool) error {
 	if h.snapshotErr != nil {
 		return h.snapshotErr
 	}

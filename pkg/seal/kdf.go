@@ -35,7 +35,67 @@ const (
 
 	// minKDFSaltLen is the minimum salt length accepted by DeriveKey.
 	minKDFSaltLen = 16
+
+	// Production floors for KDF work factors. The sealed root key protects
+	// all data at rest and is a high-value OFFLINE attack target, so a
+	// caller-supplied near-trivial cost (Time=1, Memory=1KiB, Iterations=1)
+	// must be rejected rather than silently producing a near-free wrapping
+	// key. These floors are conservative lower bounds (well below the
+	// defaults); the test-only escape hatch AllowWeakKDFParams bypasses
+	// them for fast unit tests.
+	minArgon2Time      = 2
+	minArgon2MemoryKiB = 32 * 1024 // 32 MiB
+	minArgon2Threads   = 1
+	minKDFKeyLen       = 16
+	minPBKDF2Iter      = 100_000
 )
+
+// allowWeakKDFParams, when true, bypasses the production KDF work-factor
+// floors enforced by DeriveKey. It exists ONLY so unit tests can derive
+// keys with trivially cheap parameters; production code must never set
+// it. Guarded by AllowWeakKDFParams.
+var allowWeakKDFParams bool
+
+// AllowWeakKDFParams enables (test-only) bypass of the production KDF
+// work-factor floors and returns a function that restores the previous
+// setting. Never call this from production code.
+func AllowWeakKDFParams() func() {
+	prev := allowWeakKDFParams
+	allowWeakKDFParams = true
+	return func() { allowWeakKDFParams = prev }
+}
+
+// validateKDFParams enforces the production work-factor floors for the
+// selected KDF version. Returns ErrKDFWeakParams when a parameter is
+// below its floor, unless the test-only bypass is active.
+func validateKDFParams(version KDFVersion, params KDFParams) error {
+	if allowWeakKDFParams {
+		return nil
+	}
+	if kdfParamsBelowFloor(version, params) {
+		return ErrKDFWeakParams
+	}
+	return nil
+}
+
+// kdfParamsBelowFloor reports whether the parameters fall below the
+// production work-factor floor for the version, independent of the
+// test-only bypass. Exposed (unexported) so the floor can be unit-tested
+// without flipping the package-wide bypass.
+func kdfParamsBelowFloor(version KDFVersion, params KDFParams) bool {
+	if params.KeyLen < minKDFKeyLen {
+		return true
+	}
+	switch version {
+	case KDFArgon2id:
+		return params.Time < minArgon2Time ||
+			params.Memory < minArgon2MemoryKiB ||
+			params.Threads < minArgon2Threads
+	case KDFPbkdf2SHA256:
+		return params.Iterations < minPBKDF2Iter
+	}
+	return false
+}
 
 // KDFParams holds the parameters for both supported key derivation algorithms.
 // Only the fields relevant to the selected KDFVersion are used during derivation.
@@ -114,6 +174,10 @@ func DeriveKey(passphrase, salt []byte, version KDFVersion, params KDFParams) ([
 	deriver, ok := kdfDispatchers[version]
 	if !ok {
 		return nil, ErrKDFUnsupportedVersion
+	}
+
+	if err := validateKDFParams(version, params); err != nil {
+		return nil, err
 	}
 
 	return deriver(passphrase, salt, params)

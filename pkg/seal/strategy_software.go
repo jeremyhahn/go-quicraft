@@ -203,7 +203,7 @@ func (s *SoftwareStrategy) sealRootKeyDeferred(_ context.Context, rootKey []byte
 	if len(creds.Secret) == 0 {
 		return nil, ErrEmptyCredentials
 	}
-	inner, err := newSoftwareStrategy([]byte(creds.Secret), s.kdfVersion, s.kdfParams)
+	inner, err := newSoftwareStrategy(creds.Secret, s.kdfVersion, s.kdfParams)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +299,7 @@ func (s *SoftwareStrategy) unsealRootKeyDeferred(_ context.Context, sealed *Seal
 	if len(creds.Secret) == 0 {
 		return nil, ErrEmptyCredentials
 	}
-	inner, err := newSoftwareStrategy([]byte(creds.Secret), s.kdfVersion, s.kdfParams)
+	inner, err := newSoftwareStrategy(creds.Secret, s.kdfVersion, s.kdfParams)
 	if err != nil {
 		return nil, err
 	}

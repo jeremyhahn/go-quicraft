@@ -270,13 +270,15 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 				}
 			}()
 
-			// If snapshot recovery is in progress, skip applying entries
-			// to avoid concurrent state machine access between the
-			// recovery goroutine and this apply goroutine. Since
-			// lastApplied is NOT advanced, the step worker will
-			// re-deliver these entries on the next cycle after
-			// recovery completes and the recovering flag is cleared.
-			if node.IsRecovering() {
+			// If a snapshot recovery OR a snapshot-save capture is in
+			// progress, skip applying entries to avoid concurrent state
+			// machine access between the snapshot-pool goroutine and this
+			// apply goroutine. Recovery replaces SM state; the save capture
+			// reads shared in-memory state (the session manager, which is not
+			// safe for concurrent use, and a regular in-memory SM). Since
+			// lastApplied is NOT advanced, the step worker will re-deliver
+			// these entries on the next cycle after the gate clears.
+			if node.IsRecovering() || node.IsSaving() {
 				return
 			}
 
@@ -341,9 +343,14 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			if w.callback != nil {
 				w.callback.OnApplied(node.shardID, entries, results[:len(entries)])
 			}
-			// Update lastApplied to the highest index in the batch.
-			lastIdx := entries[len(entries)-1].Index
+			// Update lastApplied (and its term) to the highest index in the
+			// batch. The term is stored together with the index so the snapshot
+			// pool can read a consistent (index, term) pair for the snapshot
+			// point while applies are quiesced.
+			lastEntry := &entries[len(entries)-1]
+			lastIdx := lastEntry.Index
 			node.lastApplied.Store(lastIdx)
+			node.lastAppliedTerm.Store(lastEntry.Term)
 
 			// Auto-snapshot trigger: if SnapshotEntries is configured and
 			// enough entries have been applied since the last snapshot,

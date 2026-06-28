@@ -19,15 +19,20 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// protoEntryToLogDB converts a proto.Entry to a logdb.Entry. Only the
-// fields required for persistence are copied; session-specific fields
-// (Key, ClientID, SeriesID, RespondedTo) are not stored in LogDB.
+// protoEntryToLogDB converts a proto.Entry to a logdb.Entry. All fields
+// are copied, including the session fields (Key, ClientID, SeriesID,
+// RespondedTo): they must survive the WAL round-trip or session dedup
+// (at-most-once delivery) silently breaks across crash recovery.
 func protoEntryToLogDB(e *proto.Entry) logdb.Entry {
 	return logdb.Entry{
-		Index: e.Index,
-		Term:  e.Term,
-		Type:  e.Type,
-		Cmd:   e.Cmd,
+		Index:       e.Index,
+		Term:        e.Term,
+		Type:        e.Type,
+		Key:         e.Key,
+		ClientID:    e.ClientID,
+		SeriesID:    e.SeriesID,
+		RespondedTo: e.RespondedTo,
+		Cmd:         e.Cmd,
 	}
 }
 

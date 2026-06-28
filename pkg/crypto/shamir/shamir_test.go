@@ -17,6 +17,7 @@ package shamir
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,7 +222,7 @@ func TestCombine_MismatchedThreshold(t *testing.T) {
 		{Index: 3, Threshold: 3, Total: 5, Value: "dGVzdA=="},
 	}
 
-	_, err := Combine(shares)
+	_, err := CombineUnverified(shares)
 	if err == nil {
 		t.Fatal("expected error for mismatched threshold, got nil")
 	}
@@ -242,7 +243,7 @@ func TestCombine_MismatchedTotal(t *testing.T) {
 		{Index: 3, Threshold: 3, Total: 5, Value: "dGVzdA=="},
 	}
 
-	_, err := Combine(shares)
+	_, err := CombineUnverified(shares)
 	if err == nil {
 		t.Fatal("expected error for mismatched total, got nil")
 	}
@@ -467,16 +468,19 @@ func TestShare_String(t *testing.T) {
 	}
 }
 
-func TestShare_String_ShortValue(t *testing.T) {
+func TestShare_String_RedactsValue(t *testing.T) {
 	share := &Share{
 		Index:     1,
 		Threshold: 3,
 		Total:     5,
-		Value:     "abc",
+		Value:     "supersecretsharevalue",
 	}
 	s := share.String()
-	if !strings.Contains(s, "abc") {
-		t.Errorf("String() %q does not contain short value 'abc'", s)
+	if strings.Contains(s, "supersecret") {
+		t.Errorf("String() %q leaks share value material", s)
+	}
+	if !strings.Contains(s, "[redacted]") {
+		t.Errorf("String() %q does not mark the value as redacted", s)
 	}
 }
 
@@ -717,21 +721,14 @@ func TestErrors_Format(t *testing.T) {
 	}
 }
 
-func TestCombine_DigestVerification(t *testing.T) {
-	secret := []byte("digest verification test secret")
+func TestCombine_ReconstructsSecret(t *testing.T) {
+	secret := []byte("reconstruction test secret")
 	shares, err := Split(secret, 3, 5)
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	// All shares should carry the same digest.
-	for i := 1; i < len(shares); i++ {
-		if shares[i].Digest != shares[0].Digest {
-			t.Fatalf("share %d digest differs from share 0", i)
-		}
-	}
-
-	// Combine with correct shares should succeed.
+	// A threshold subset reconstructs the original.
 	reconstructed, err := Combine([]*Share{shares[0], shares[2], shares[4]})
 	if err != nil {
 		t.Fatalf("Combine failed: %v", err)
@@ -741,52 +738,54 @@ func TestCombine_DigestVerification(t *testing.T) {
 	}
 }
 
-func TestCombine_TamperedShareFailsDigest(t *testing.T) {
-	secret := []byte("tamper test secret")
+// TestCombine_TamperedShareYieldsGarbageNotError documents the M4 contract:
+// shares carry NO secret digest (it would be an offline oracle), so a tampered
+// share is NOT self-detected — Combine returns garbage, not an error. The caller
+// must authenticate the reconstructed secret out-of-band.
+func TestCombine_TamperedShareYieldsGarbageNotError(t *testing.T) {
+	secret := []byte("tamper test secret of sufficient length")
 	shares, err := Split(secret, 3, 5)
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	// Tamper with one share's digest to simulate a forged share set.
-	shares[0].Digest[0] ^= 0xFF
-
-	_, err = Combine([]*Share{shares[0], shares[1], shares[2]})
-	if err == nil {
-		t.Fatal("expected error for tampered share digest, got nil")
+	// Tamper with one share's reconstructed value.
+	raw, err := shares[0].Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
 	}
-	var intErr *IntegrityError
-	if !errors.As(err, &intErr) {
-		t.Fatalf("expected *IntegrityError, got %T: %v", err, err)
+	raw[len(raw)-1] ^= 0xFF
+	shares[0].Value = base64.StdEncoding.EncodeToString(raw)
+
+	got, err := Combine([]*Share{shares[0], shares[1], shares[2]})
+	if err != nil {
+		t.Fatalf("Combine must not error on a tampered share (no self-verification): %v", err)
+	}
+	if bytes.Equal(got, secret) {
+		t.Fatal("tampered share unexpectedly reconstructed the original secret")
 	}
 }
 
-func TestCombine_ForgedLowThresholdFails(t *testing.T) {
-	secret := []byte("forged threshold test")
+// TestCombine_ForgedLowThreshold documents that forging a lower threshold on
+// shares is not self-detected (no digest): it yields garbage that the caller
+// must reject via out-of-band authentication. A SILENT correct reconstruction
+// of the real secret from a forged sub-threshold set would be a failure.
+func TestCombine_ForgedLowThreshold(t *testing.T) {
+	secret := []byte("forged threshold test secret")
 	shares, err := Split(secret, 4, 7)
 	if err != nil {
 		t.Fatalf("Split failed: %v", err)
 	}
 
-	// Forge a lower threshold on all shares. With only 2 shares and
-	// the real threshold being 4, reconstruction should produce wrong
-	// data and fail digest verification.
 	forged := []*Share{shares[0], shares[1]}
 	for _, s := range forged {
 		s.Threshold = 2
 		s.Total = 3
 	}
 
-	_, err = Combine(forged)
-	if err == nil {
-		t.Fatal("expected error for forged threshold, got nil")
-	}
-	// The error should be either IntegrityError (digest mismatch) or
-	// CombineError (sssa combine failure with wrong share count).
-	var intErr *IntegrityError
-	var combErr *CombineError
-	if !errors.As(err, &intErr) && !errors.As(err, &combErr) {
-		t.Fatalf("expected *IntegrityError or *CombineError, got %T: %v", err, err)
+	got, err := Combine(forged)
+	if err == nil && bytes.Equal(got, secret) {
+		t.Fatal("forged low-threshold combine unexpectedly reconstructed the original secret")
 	}
 }
 

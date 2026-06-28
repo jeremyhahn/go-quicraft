@@ -66,6 +66,15 @@ var (
 	// provided to the software sealing strategy.
 	ErrInvalidPassphrase = errors.New("quicraft/seal: passphrase must not be empty")
 
+	// ErrNoneStrategyEncryptedData is returned when the no-encryption
+	// strategy is asked to decrypt data carrying a non-zero epoch prefix,
+	// which indicates the data was written by a real sealing strategy. A
+	// barrier was misconfigured to None after running encrypted; decoding
+	// would yield garbage (no AEAD tag exists to fail on), so this fails
+	// closed.
+	ErrNoneStrategyEncryptedData = errors.New(
+		"quicraft/seal: none strategy cannot decrypt data with a non-zero epoch (data was encrypted by a real strategy)")
+
 	// ErrCiphertextTooShort is returned when a ciphertext is too short
 	// to contain the required epoch, nonce, and authentication tag.
 	ErrCiphertextTooShort = errors.New("quicraft/seal: ciphertext too short")
@@ -101,6 +110,12 @@ var (
 	// ErrKDFInvalidSalt is returned when DeriveKey receives a nil or
 	// too-short salt (minimum 16 bytes).
 	ErrKDFInvalidSalt = errors.New("quicraft/seal: KDF salt too short (minimum 16 bytes)")
+
+	// ErrKDFWeakParams is returned when DeriveKey receives work-factor
+	// parameters below the production floor (e.g. Argon2 Time=1,
+	// Memory=1KiB, or PBKDF2 Iterations=1). The sealed root key is an
+	// offline attack target, so a near-free wrapping key is rejected.
+	ErrKDFWeakParams = errors.New("quicraft/seal: KDF parameters below the production work-factor floor")
 
 	// ErrHardwareMode is returned when an operation (e.g., Rotate,
 	// PurgeEpochsBefore) is not supported because the barrier is using a

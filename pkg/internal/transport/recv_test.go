@@ -27,6 +27,95 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
+// waitForBatchCount polls until the handler has received at least want batches
+// or the timeout elapses, failing the test otherwise.
+func waitForBatchCount(t *testing.T, h *testHandler, want int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if h.batchCount.Load() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d batches; got %d (an idle data stream was abandoned while its connection stayed alive?)",
+		want, h.batchCount.Load())
+}
+
+// TestDataStreamSurvivesIdleOnLiveConnection is the regression test for the
+// post-idle replication stall in the consensus transport. A data/replication
+// stream that sits idle longer than StreamReadIdleTimeout must NOT be abandoned
+// by the receiver while its QUIC connection is still alive: the sender reuses
+// its cached stream across bursts, so abandoning it on the receive side
+// silently drops every subsequent message and hangs Raft proposals forever
+// (writes succeeded only while the cluster was kept warm). The receiver must
+// keep an idle-but-live stream open and deliver a message sent after the idle
+// gap on that same stream.
+func TestDataStreamSurvivesIdleOnLiveConnection(t *testing.T) {
+	handler1 := newTestHandler()
+	handler2 := newTestHandler()
+	reg1 := registry.NewRegistry()
+	reg2 := registry.NewRegistry()
+	mtls := testMTLSConfig(t)
+
+	// A short idle timeout so the idle window is crossed in well under a
+	// second. The QUIC connection stays alive throughout (MaxIdleTimeout 30s),
+	// so this exercises the idle-stream-on-live-connection path specifically.
+	newCfg := func() Config {
+		return Config{
+			ListenAddress:         "127.0.0.1:0",
+			DeploymentID:          7,
+			MTLSConfig:            mtls,
+			StreamReadIdleTimeout: 300 * time.Millisecond,
+		}
+	}
+
+	t1, err := NewQUICTransport(newCfg(), handler1, reg1)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(1): %v", err)
+	}
+	if err := t1.Start(); err != nil {
+		t.Fatalf("t1.Start: %v", err)
+	}
+	defer t1.Stop()
+
+	t2, err := NewQUICTransport(newCfg(), handler2, reg2)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(2): %v", err)
+	}
+	if err := t2.Start(); err != nil {
+		t.Fatalf("t2.Start: %v", err)
+	}
+	defer t2.Stop()
+
+	reg1.Register(1, 2, t2.Addr().String())
+	reg2.Register(1, 1, t1.Addr().String())
+
+	dataMsg := func() []proto.Message {
+		return []proto.Message{{
+			Type:    proto.Replicate,
+			ShardID: 1,
+			From:    1,
+			To:      2,
+			Term:    5,
+			Commit:  10,
+		}}
+	}
+
+	// First send opens the reused data stream and is delivered.
+	t1.Send(dataMsg())
+	waitForBatchCount(t, handler2, 1, 5*time.Second)
+
+	// Idle well past StreamReadIdleTimeout (300ms) but far under the QUIC
+	// connection idle timeout (30s): the connection stays alive; the data
+	// stream goes idle and (before the fix) was abandoned by the receiver.
+	time.Sleep(900 * time.Millisecond)
+
+	// Second send reuses the SAME cached data stream. It must be delivered.
+	t1.Send(dataMsg())
+	waitForBatchCount(t, handler2, 2, 5*time.Second)
+}
+
 // TestAcceptLoopHandlesMultipleConnections verifies that the accept loop
 // processes connections from multiple senders.
 func TestAcceptLoopHandlesMultipleConnections(t *testing.T) {
@@ -212,7 +301,7 @@ func TestSnapshotReceiverConcurrencyLimit(t *testing.T) {
 
 	// A second receive attempt should be dropped (default case).
 	stopC := make(chan struct{})
-	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, stopC)
+	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, nil, stopC)
 
 	// Release semaphore.
 	<-sr.sem
@@ -1138,7 +1227,7 @@ func TestProcessSnapshotHeader_HeaderTooSmall(t *testing.T) {
 
 	// Pass a header length smaller than SnapshotHeaderSize.
 	r := bytes.NewReader([]byte{1, 2, 3})
-	tr.processSnapshotHeader(r, 1) // Should return early, no panic.
+	tr.processSnapshotHeader(nil, r, 1) // Should return early, no panic.
 }
 
 // TestProcessSnapshotHeader_ReadHeaderError verifies that an EOF during
@@ -1162,7 +1251,7 @@ func TestProcessSnapshotHeader_ReadHeaderError(t *testing.T) {
 
 	// Provide too little data for the header.
 	r := bytes.NewReader(make([]byte, 10))
-	tr.processSnapshotHeader(r, SnapshotHeaderSize) // Should handle EOF gracefully.
+	tr.processSnapshotHeader(nil, r, SnapshotHeaderSize) // Should handle EOF gracefully.
 }
 
 // TestProcessSnapshotHeader_ExtraHeaderBytes verifies that processSnapshotHeader
@@ -1202,7 +1291,7 @@ func TestProcessSnapshotHeader_ExtraHeaderBytes(t *testing.T) {
 	r := bytes.NewReader(data)
 	// This exercises the discard-extra-bytes path. Since the reader is
 	// not a *quic.Stream, the snapshot will be logged and dropped.
-	tr.processSnapshotHeader(r, extraLen)
+	tr.processSnapshotHeader(nil, r, extraLen)
 }
 
 // TestProcessSnapshotHeader_NonQUICReader verifies that a non-QUIC reader
@@ -1237,7 +1326,7 @@ func TestProcessSnapshotHeader_NonQUICReader(t *testing.T) {
 
 	r := bytes.NewReader(hdrBuf[:])
 	// Non-QUIC reader: exercises the fallback warning path.
-	tr.processSnapshotHeader(r, SnapshotHeaderSize)
+	tr.processSnapshotHeader(nil, r, SnapshotHeaderSize)
 
 	// Handler should NOT have received any snapshot.
 	snaps := handler.getSnapshots()
@@ -2712,7 +2801,7 @@ func TestProcessSnapshotHeader_ValidWithExtraBytes(t *testing.T) {
 	reader := bytes.NewReader(data)
 
 	// headerLen includes the extra bytes.
-	tr.processSnapshotHeader(reader, uint32(len(data)))
+	tr.processSnapshotHeader(nil, reader, uint32(len(data)))
 }
 
 // ---------------------------------------------------------------------------

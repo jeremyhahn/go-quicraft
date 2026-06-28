@@ -222,7 +222,7 @@ func TestInMemory_Term_SnapshotIndex(t *testing.T) {
 func TestInMemory_Term_AppliedToCache(t *testing.T) {
 	im := newInMemory(4)
 	im.appliedTo = 6
-	im.appliedToTerm = 5
+	im.appliedToTerm.Store(5)
 
 	term, ok := im.term(6)
 	if !ok {
@@ -371,8 +371,8 @@ func TestInMemory_Restore_ResetsEverything(t *testing.T) {
 	if im.appliedTo != 20 {
 		t.Fatalf("expected appliedTo 20, got %d", im.appliedTo)
 	}
-	if im.appliedToTerm != 5 {
-		t.Fatalf("expected appliedToTerm 5, got %d", im.appliedToTerm)
+	if im.appliedToTerm.Load() != 5 {
+		t.Fatalf("expected appliedToTerm 5, got %d", im.appliedToTerm.Load())
 	}
 }
 

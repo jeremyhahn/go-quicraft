@@ -16,6 +16,7 @@
 package transport
 
 import (
+	"crypto/tls"
 	"errors"
 	"time"
 
@@ -42,6 +43,7 @@ const (
 	defaultMaxSnapshotReceiveRate  = 256 * 1024 * 1024 // 256 MB/s
 	defaultMaxConcurrentSnapRecv   = 4
 	defaultMaxSnapshotRecvMemory   = 1024 * 1024 * 1024 // 1 GB
+	defaultMaxMessageRecvMemory    = 256 * 1024 * 1024  // 256 MB
 	defaultSendBatchMaxSize        = 64 * 1024          // 64 KB
 	defaultMaxIncomingConnections  = 256
 	defaultMaxConnectionsPerIP     = 16
@@ -49,6 +51,19 @@ const (
 	defaultMaxStreamsPerConnection = 256
 	defaultUDPRecvBufSize          = 7 * 1024 * 1024 // 7 MB
 	defaultUDPSendBufSize          = 7 * 1024 * 1024 // 7 MB
+
+	// defaultStreamReadIdleTimeout bounds how long an inbound stream read
+	// waits at a clean frame boundary before re-checking the connection's
+	// liveness. It is NOT a stream lifetime: an idle stream on a live
+	// connection is kept open across re-checks (replication streams sit idle
+	// between bursts while heartbeats keep the connection alive). Only a dead
+	// connection or a half-delivered frame stall ends a stream.
+	defaultStreamReadIdleTimeout = 30 * time.Second
+
+	// frameReadActiveTimeout bounds completing a frame once it has begun
+	// arriving. A frame that starts but does not finish within this window is
+	// a genuine stall (dead/slow peer), so the stream is dropped.
+	frameReadActiveTimeout = 30 * time.Second
 
 	// snapshotStreamHeadroom is the number of streams reserved on top of a
 	// peer's outbound ordered-stream pool (StreamPoolSize) when sizing the
@@ -79,6 +94,9 @@ var (
 	// ErrInvalidMaxSnapshotReceiveMemory is returned when MaxSnapshotReceiveMemory <= 0.
 	ErrInvalidMaxSnapshotReceiveMemory = errors.New("transport: max snapshot receive memory must be > 0")
 
+	// ErrInvalidMaxMessageReceiveMemory is returned when MaxMessageReceiveMemory <= 0.
+	ErrInvalidMaxMessageReceiveMemory = errors.New("transport: max message receive memory must be > 0")
+
 	// ErrInvalidSendBatchMaxSize is returned when SendBatchMaxSize <= 0.
 	ErrInvalidSendBatchMaxSize = errors.New("transport: send batch max size must be > 0")
 
@@ -97,7 +115,8 @@ var (
 )
 
 // MTLSConfig holds the certificate material for mutual TLS authentication.
-// All three fields must be provided together.
+// CACert is always required. The node leaf comes from either the PEM Cert/Key
+// pair or a pre-built Certificate (whichever is provided).
 type MTLSConfig struct {
 	// CACert is the PEM-encoded CA certificate used to verify peer certificates.
 	CACert []byte
@@ -105,6 +124,11 @@ type MTLSConfig struct {
 	Cert []byte
 	// Key is the PEM-encoded private key for this node.
 	Key []byte
+	// Certificate, when non-nil, supplies a pre-built TLS certificate in place
+	// of the PEM Cert/Key pair. Its PrivateKey may be a hardware-backed
+	// crypto.Signer (TPM/HSM-resident key that never leaves the device). When
+	// set, Cert/Key are ignored.
+	Certificate *tls.Certificate
 }
 
 // Config holds all configuration for a QUICTransport instance.
@@ -160,6 +184,16 @@ type Config struct {
 	// snapshot receive buffers. Default: 1 GB.
 	MaxSnapshotReceiveMemory int64
 
+	// MaxMessageReceiveMemory is the total bytes budget for concurrent inbound
+	// message-frame payload buffers, across all connections and streams. Each
+	// frame is bounded to MaxFrameSize, but the buffer is allocated before the
+	// body is read, so without an aggregate budget an authenticated peer can
+	// open many streams that each declare the max length and withhold the body,
+	// pinning MaxFrameSize per stream and exhausting host memory (OOM DoS). A
+	// reservation against this budget is taken before allocation and released
+	// once the frame is dispatched. Default: 256 MB.
+	MaxMessageReceiveMemory int64
+
 	// SendBatchMaxSize is the maximum byte size of a single send batch.
 	// Default: 64 KB.
 	SendBatchMaxSize int
@@ -179,6 +213,15 @@ type Config struct {
 	// MaxStreamsPerConnection is the maximum number of concurrent
 	// stream-processing goroutines per inbound QUIC connection.
 	// Prevents resource exhaustion from peers opening excessive streams.
+	//
+	// Note: an idle stream on a live connection is deliberately kept open
+	// (see StreamReadIdleTimeout), so each accepted stream pins one
+	// goroutine and one slot of this budget until its connection closes.
+	// The worst-case goroutine count from authenticated peers is therefore
+	// MaxIncomingConnections * MaxStreamsPerConnection (256*256 = 65536 at
+	// the defaults). Reaping idle streams instead would reintroduce the
+	// post-idle replication stall: senders cache and reuse streams across
+	// idle gaps, so an abandoned-but-cached stream black-holes traffic.
 	// Default: 256.
 	MaxStreamsPerConnection int
 
@@ -195,6 +238,13 @@ type Config struct {
 	// DisableCompression disables Snappy compression on the wire.
 	// When true, all messages are sent uncompressed regardless of size.
 	DisableCompression bool
+
+	// StreamReadIdleTimeout bounds how long an inbound stream read waits at a
+	// clean frame boundary before re-checking connection liveness. An idle
+	// stream on a LIVE connection is kept open (not abandoned), so a
+	// replication stream that sits idle between bursts is not torn down while
+	// the leader still holds and reuses it. Default: 30s.
+	StreamReadIdleTimeout time.Duration
 
 	// RevocationConfig holds optional certificate revocation checking
 	// configuration. When non-nil, a revocation.Checker is created and
@@ -229,6 +279,9 @@ func (c *Config) SetDefaults() {
 	if c.MaxSnapshotReceiveMemory == 0 {
 		c.MaxSnapshotReceiveMemory = defaultMaxSnapshotRecvMemory
 	}
+	if c.MaxMessageReceiveMemory == 0 {
+		c.MaxMessageReceiveMemory = defaultMaxMessageRecvMemory
+	}
 	if c.SendBatchMaxSize == 0 {
 		c.SendBatchMaxSize = defaultSendBatchMaxSize
 	}
@@ -249,6 +302,9 @@ func (c *Config) SetDefaults() {
 	}
 	if c.UDPSendBufSize == 0 {
 		c.UDPSendBufSize = defaultUDPSendBufSize
+	}
+	if c.StreamReadIdleTimeout == 0 {
+		c.StreamReadIdleTimeout = defaultStreamReadIdleTimeout
 	}
 }
 
@@ -272,6 +328,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxSnapshotReceiveMemory <= 0 {
 		return ErrInvalidMaxSnapshotReceiveMemory
+	}
+	if c.MaxMessageReceiveMemory <= 0 {
+		return ErrInvalidMaxMessageReceiveMemory
 	}
 	if c.SendBatchMaxSize <= 0 {
 		return ErrInvalidSendBatchMaxSize
@@ -297,7 +356,13 @@ func (c *Config) Validate() error {
 	if c.MTLSConfig == nil {
 		return ErrMTLSConfigRequired
 	}
-	if len(c.MTLSConfig.CACert) == 0 || len(c.MTLSConfig.Cert) == 0 || len(c.MTLSConfig.Key) == 0 {
+	// CACert is always required; the node leaf comes from either a pre-built
+	// Certificate or the PEM Cert/Key pair.
+	if len(c.MTLSConfig.CACert) == 0 {
+		return ErrIncompleteMTLSConfig
+	}
+	if c.MTLSConfig.Certificate == nil &&
+		(len(c.MTLSConfig.Cert) == 0 || len(c.MTLSConfig.Key) == 0) {
 		return ErrIncompleteMTLSConfig
 	}
 	return nil

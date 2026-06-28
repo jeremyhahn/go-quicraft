@@ -214,6 +214,24 @@ func TestMean(t *testing.T) {
 	}
 }
 
+func TestSumEmpty(t *testing.T) {
+	rec := NewLatencyRecorder(10)
+	if rec.Sum() != 0 {
+		t.Fatal("expected 0 for Sum on empty recorder")
+	}
+}
+
+func TestSum(t *testing.T) {
+	rec := NewLatencyRecorder(10)
+	rec.Record(10 * time.Millisecond)
+	rec.Record(20 * time.Millisecond)
+	rec.Record(30 * time.Millisecond)
+
+	if rec.Sum() != 60*time.Millisecond {
+		t.Fatalf("expected sum=60ms, got %v", rec.Sum())
+	}
+}
+
 func TestStatsEmpty(t *testing.T) {
 	rec := NewLatencyRecorder(10)
 	stats := rec.Stats()

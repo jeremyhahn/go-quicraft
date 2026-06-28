@@ -30,8 +30,20 @@ import (
 // hostMessageHandler routes inbound Raft messages from the transport
 // layer to the engine for processing. It implements the
 // transport.MessageHandler interface.
+// engineDeliverer is the narrow engine surface the host message handler depends
+// on. Depending on this interface rather than the concrete *engine.Engine keeps
+// the inbound message/snapshot routing unit-testable with a capturing fake
+// (e.g. to assert the at-rest epoch threaded into a delivered InstallSnapshot).
+// *engine.Engine satisfies it.
+type engineDeliverer interface {
+	DeliverMessage(shardID uint64, msg proto.Message) bool
+	NotifyWork(shardID uint64)
+	GetNode(shardID uint64) *engine.Node
+	RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error
+}
+
 type hostMessageHandler struct {
-	engine *engine.Engine
+	engine engineDeliverer
 	host   *Host
 }
 
@@ -72,7 +84,12 @@ type hostMessageHandler struct {
 // cert-valid address — is a bounded, self-healing insider redirect (the victim
 // and committed-membership config changes re-register the authoritative
 // address); closing it fully would require replicaID-bound certificates.
-func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch) error {
+func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAuthorized func(address string) bool) error {
+	// A nil callback is treated as unauthorized: never learn an address that
+	// cannot be bound to the sender's certificate.
+	if senderAuthorized == nil {
+		senderAuthorized = func(string) bool { return false }
+	}
 	for i := range batch.Requests {
 		msg := &batch.Requests[i]
 
@@ -87,16 +104,23 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch) error {
 				"from", msg.From,
 				"type", proto.MessageTypeName(msg.Type),
 			)
+			if h.host != nil && h.host.metrics != nil {
+				h.host.metrics.IncUnauthorizedMessageDropped(msg.ShardID, msg.From)
+			}
 			continue
 		}
 
 		// Learn the sender's address for the return path, but only for
-		// senders that ARE authorized members of a loaded shard, and only
-		// when doing so would not overwrite a differing existing mapping.
-		// Unloaded shards (node == nil) do not learn an address: the
-		// arbitrary replicaID in From cannot be verified as a real member
-		// until the shard is loaded with its configured membership.
-		if node != nil {
+		// senders that ARE authorized members of a loaded shard, AND only
+		// when the SourceAddress is bound to the sender's verified certificate.
+		// Binding it here at the handler — rather than trusting the transport
+		// to have cleared a non-cert-valid SourceAddress — makes the handler
+		// the authoritative enforcement point, so a transport regression cannot
+		// let a peer teach the registry an address its cert does not cover.
+		// Unloaded shards (node == nil) do not learn an address: the arbitrary
+		// replicaID in From cannot be verified as a real member until the shard
+		// is loaded with its configured membership.
+		if node != nil && batch.SourceAddress != "" && senderAuthorized(batch.SourceAddress) {
 			h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress)
 		}
 
@@ -149,7 +173,7 @@ func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, addre
 // chunks for a snapshot have been received and validated.
 //
 //nolint:gocyclo // snapshot receive handles validation, directory creation, assembly, and cleanup
-func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error {
+func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, senderAuthorized func(address string) bool) error {
 	if len(chunks) == 0 {
 		return nil
 	}
@@ -178,6 +202,60 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 	snapshotIndex := first.Index
 	snapshotTerm := first.Term
 
+	// Per-shard authorization, fail closed. All chunk fields (including
+	// From) travel in-band and are NOT bound to the sender's mTLS identity
+	// by the transport framing, so three independent checks are required
+	// before anything is buffered or persisted:
+	//
+	//  1. The target shard must be loaded locally. Without a loaded node
+	//     there is no membership to authorize against; persisting the
+	//     snapshot anyway would let any authenticated peer poison the
+	//     LogDB state consumed by a later StartShard.
+	//  2. The claimed sender must be a member of the shard (snapshots are
+	//     only ever sent by the leader, which is always a member).
+	//  3. The claimed From identity must be bound to the verified TLS
+	//     certificate of the connection the snapshot arrived on: the
+	//     registered address for (shardID, From) must be covered by the
+	//     peer certificate (same mechanism as the SourceAddress binding
+	//     in the message path). This stops an authenticated-but-
+	//     compromised node from forging another replica's identity.
+	reject := func(reason string) error {
+		slog.Warn("rejected unauthorized snapshot",
+			"shard", shardID,
+			"from", fromReplicaID,
+			"index", snapshotIndex,
+			"reason", reason,
+		)
+		if h.host.metrics != nil {
+			h.host.metrics.IncUnauthorizedSnapshotDropped(shardID, fromReplicaID)
+		}
+		return &UnauthorizedMessageError{
+			ShardID: shardID,
+			From:    fromReplicaID,
+			MsgType: proto.InstallSnapshot,
+		}
+	}
+	if h.engine == nil {
+		return reject("no engine")
+	}
+	node := h.engine.GetNode(shardID)
+	if node == nil {
+		return reject("shard not loaded")
+	}
+	if !node.IsMember(fromReplicaID) {
+		return reject("sender not a shard member")
+	}
+	if h.host.registry == nil {
+		return reject("no registry to resolve sender address")
+	}
+	senderAddr, err := h.host.registry.Resolve(shardID, fromReplicaID)
+	if err != nil || senderAddr == "" {
+		return reject("sender address unknown")
+	}
+	if senderAuthorized == nil || !senderAuthorized(senderAddr) {
+		return reject("sender identity not covered by peer certificate")
+	}
+
 	// Dedup: skip if LogDB already has a snapshot at this index or later.
 	// Without this check, a duplicate snapshot delivery can overwrite the
 	// on-disk snapshot file while an async recovery is reading it, then
@@ -192,26 +270,6 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 				"received_index", snapshotIndex,
 			)
 			return nil
-		}
-	}
-
-	// Per-shard authorization: verify the snapshot sender is a member of
-	// the target shard. Snapshots are only sent by the leader, which must
-	// be a member. A compromised node could attempt to send a crafted
-	// snapshot to corrupt a shard it does not belong to.
-	if h.engine != nil {
-		node := h.engine.GetNode(shardID)
-		if node != nil && !node.IsMember(fromReplicaID) {
-			slog.Warn("rejected unauthorized snapshot",
-				"shard", shardID,
-				"from", fromReplicaID,
-				"index", snapshotIndex,
-			)
-			return &UnauthorizedMessageError{
-				ShardID: shardID,
-				From:    fromReplicaID,
-				MsgType: proto.InstallSnapshot,
-			}
 		}
 	}
 
@@ -234,14 +292,14 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 		}
 	}
 
-	// Determine the snapshot directory. Use the host's configured snapshot
-	// directory structure: <NodeHostDir>/snapshots/shard-<N>/replica-<N>/snapshot-<index>
-	snapshotDir := filepath.Join(
-		h.host.cfg.NodeHostDir, "snapshots",
-		fmt.Sprintf("shard-%d", shardID),
-		fmt.Sprintf("replica-%d", replicaID),
-		fmt.Sprintf("snapshot-%020d", snapshotIndex),
-	)
+	// Determine the snapshot directory via the engine node, so a received
+	// snapshot lands in the SAME location the snapshot pool uses for saving,
+	// garbage collection, and DEK-purge-floor scans. Using a hardcoded
+	// <NodeHostDir>/snapshots/... path here instead would, for a per-shard
+	// DataDir (which roots SnapshotDir() off the DataDir), write received
+	// snapshots where GC and key-rotation purge never look — leaking them and
+	// letting a purge remove a DEK the snapshot still needs.
+	snapshotDir := node.SnapshotSaveDir(snapshotIndex)
 
 	if err := os.MkdirAll(snapshotDir, 0o750); err != nil {
 		return &SnapshotReceiveError{
@@ -320,12 +378,47 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 			"error", closeErr)
 	}
 
+	// Re-encrypt the received snapshot under THIS node's own barrier so it is
+	// encrypted at rest with the RECEIVER's per-node key. The sender decrypts an
+	// encrypted snapshot to plaintext before streaming (doSendSnapshot sets
+	// Epoch=0), so the bytes just written are plaintext; re-encrypting here closes
+	// the follower-side at-rest gap WITHOUT any shared cross-node key — the
+	// receiver records and later recovers under its own epoch. A nil/sealed
+	// barrier is a no-op (snapshot stays plaintext, recvEpoch=0).
+	recvEpoch, encErr := reencryptReceivedSnapshot(dataPath, h.host.barrierForShard(shardID))
+	if encErr != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "reencrypt",
+			Err:       encErr,
+		}
+	}
+
 	// Write snapshot metadata file.
 	if err := writeReceivedSnapshotMetadata(snapshotDir, snapshotIndex, snapshotTerm, shardID, replicaID); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
 			Op:        "metadata",
+			Err:       err,
+		}
+	}
+
+	// Make the directory entries durable BEFORE recording the snapshot in
+	// LogDB: the data and metadata files are fsynced, but the entries
+	// created by MkdirAll and the file creates are not durable until each
+	// directory in the chain is fsynced. Otherwise a crash could leave
+	// LogDB's durably-recorded snapshot pointing at a directory that no
+	// longer exists.
+	// Sync the directory chain up to the node's snapshot base (matching the
+	// snapshot pool's save path). The base — NOT NodeHostDir — is the correct
+	// root: for a DataDir shard NodeHostDir is not even an ancestor of snapshotDir.
+	if err := engine.SyncDirChain(snapshotDir, node.SnapshotDir()); err != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "sync_dir",
 			Err:       err,
 		}
 	}
@@ -348,7 +441,10 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 			Membership:  membership,
 			Filepath:    snapshotDir,
 			OnDiskIndex: first.OnDiskIndex,
-			Epoch:       first.Epoch,
+			// Record the RECEIVER's at-rest epoch (from re-encryption above), not
+			// the wire epoch (first.Epoch is 0 — the sender streamed plaintext).
+			// recoverSnapshot decrypts under this node's barrier at this epoch.
+			Epoch: recvEpoch,
 		}
 		if saveErr := h.host.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil {
 			return &SnapshotReceiveError{
@@ -377,7 +473,14 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error 
 			Filepath:   filepath.Join(snapshotDir, "snapshot.dat"),
 			FileSize:   totalSize,
 			Membership: first.Membership,
-			Epoch:      first.Epoch,
+			// Deliver the RECEIVER's at-rest epoch (from reencryptReceivedSnapshot
+			// above, persisted to LogDB), NOT the wire epoch (first.Epoch is 0 —
+			// the sender streamed plaintext). Peer.Commit applies this snapshot to
+			// the LogReader; using first.Epoch would make the in-memory raft layer
+			// advertise the encrypted on-disk snapshot as plaintext until restart,
+			// so if this node became leader doSendSnapshot would skip decryption
+			// and stream ciphertext that followers cannot recover.
+			Epoch: recvEpoch,
 		},
 	}
 	delivered := h.engine.DeliverMessage(shardID, installMsg)

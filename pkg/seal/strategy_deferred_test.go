@@ -31,7 +31,7 @@ func TestDeferredSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: "my-deferred-passphrase"}
+	creds := Credentials{Secret: []byte("my-deferred-passphrase")}
 
 	sealed, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestDeferredSoftwareStrategy_UnsealEmptyCreds(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: "seal-passphrase"}
+	creds := Credentials{Secret: []byte("seal-passphrase")}
 	sealed, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {
 		t.Fatalf("SealRootKey failed: %v", err)
@@ -101,13 +101,13 @@ func TestDeferredSoftwareStrategy_WrongCreds(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	sealCreds := Credentials{Secret: "correct-passphrase"}
+	sealCreds := Credentials{Secret: []byte("correct-passphrase")}
 	sealed, err := s.SealRootKey(context.Background(), rootKey, sealCreds)
 	if err != nil {
 		t.Fatalf("SealRootKey failed: %v", err)
 	}
 
-	wrongCreds := Credentials{Secret: "wrong-passphrase"}
+	wrongCreds := Credentials{Secret: []byte("wrong-passphrase")}
 	_, err = s.UnsealRootKey(context.Background(), sealed, wrongCreds)
 	if err == nil {
 		t.Fatal("expected error for wrong credentials, got nil")
@@ -157,7 +157,7 @@ func TestDeferredSoftwareStrategy_InvalidRootKeySize(t *testing.T) {
 	s := NewDeferredSoftwareStrategy()
 	defer s.Close()
 
-	creds := Credentials{Secret: "some-passphrase"}
+	creds := Credentials{Secret: []byte("some-passphrase")}
 
 	// Too short.
 	_, err := s.SealRootKey(context.Background(), []byte("short"), creds)
@@ -176,7 +176,7 @@ func TestDeferredSoftwareStrategy_UnsealNilSealed(t *testing.T) {
 	s := NewDeferredSoftwareStrategy()
 	defer s.Close()
 
-	creds := Credentials{Secret: "some-passphrase"}
+	creds := Credentials{Secret: []byte("some-passphrase")}
 	_, err := s.UnsealRootKey(context.Background(), nil, creds)
 	if err == nil {
 		t.Fatal("expected error for nil sealed, got nil")
@@ -196,7 +196,7 @@ func TestDeferredSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: "deferred-multi-seal"}
+	creds := Credentials{Secret: []byte("deferred-multi-seal")}
 
 	sealed1, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {

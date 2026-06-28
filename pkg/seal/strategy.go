@@ -51,8 +51,15 @@ const (
 // field is interpreted differently by each strategy: the software strategy treats
 // it as an Argon2id passphrase, TPM2 may use it as an authorization value, and
 // cloud KMS strategies typically ignore it (relying on ambient credentials).
+//
+// Secret is a []byte rather than a string so callers can wipe it after use
+// (e.g. with crypto/subtle-style zeroing) — a Go string is immutable and
+// cannot be erased, leaving secret material resident in memory until GC.
+// The seal layer treats the passphrase as wipeable from this boundary
+// inward; callers that obtain the secret as a string should convert with
+// []byte(s) and wipe the copy when done.
 type Credentials struct {
-	Secret string // #nosec G117 -- this IS a secret field by design
+	Secret []byte // #nosec G117 -- this IS a secret field by design
 }
 
 // SealingStrategy defines the interface for wrapping and unwrapping the root key.

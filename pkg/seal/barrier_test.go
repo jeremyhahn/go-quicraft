@@ -374,6 +374,38 @@ func TestBarrier_EncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBarrier_DecryptTamperedAlgIDDoesNotPanic is the H1 regression test. The
+// algID header byte is unauthenticated and does not select the cipher (the
+// active AEAD is fixed by the epoch DEK). A tampered algID whose nonce-size
+// class differs from the active 12-byte cipher (0x05 = XChaCha20, 24-byte) or
+// that is invalid would, without the guard, slice a wrong-length nonce and
+// PANIC inside aead.Open, crashing the host on corrupt WAL/snapshot input.
+// Decrypt must instead fail closed with ErrDecryptionFailed.
+func TestBarrier_DecryptTamperedAlgIDDoesNotPanic(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	defer s.Close()
+
+	ciphertext, err := b.Encrypt(nil, []byte("sensitive payload that must not crash on tamper"))
+	if err != nil {
+		t.Fatalf("Encrypt failed: %v", err)
+	}
+
+	for _, algID := range []byte{0x00, 0x05, 0x06, 0x7f, 0xff} {
+		tampered := append([]byte(nil), ciphertext...)
+		tampered[epochSize] = algID // algID lives at offset epochSize
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Decrypt panicked on tampered algID=0x%02x (must fail closed): %v", algID, r)
+				}
+			}()
+			if _, derr := b.Decrypt(nil, tampered); !errors.Is(derr, ErrDecryptionFailed) {
+				t.Fatalf("Decrypt(algID=0x%02x) = %v, want ErrDecryptionFailed", algID, derr)
+			}
+		}()
+	}
+}
+
 func TestBarrier_EncryptDecryptWithPreallocatedDst(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -4008,5 +4040,122 @@ func TestBarrier_DecryptDuringConcurrentSeal(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// --- Invocation budget across restarts (NIST SP 800-38D) ---
+
+// TestBarrier_UnsealSeedsInvocationCounterAfterRestart verifies that an
+// unseal on a fresh process (default in-memory counter, count unknown)
+// pessimistically seeds the AEAD invocation counter to the rotation
+// threshold, so ShouldRotateKey fires immediately and the epoch is
+// rotated to a DEK with a known-zero count. Without this, a frequently
+// restarted node could encrypt unbounded volumes under one epoch DEK
+// with the in-memory counter resetting to zero on every boot.
+func TestBarrier_UnsealSeedsInvocationCounterAfterRestart(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+
+	// Encrypt something so the WAL-equivalent state is non-empty.
+	if _, err := b.Encrypt(nil, []byte("data")); err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	sealed := b.SealedRootKeyData()
+
+	// Simulate a process restart: a brand-new barrier restored from the
+	// persisted sealed root key, with a fresh in-memory counter.
+	b2 := NewBarrier(DefaultBarrierConfig(1))
+	if err := b2.SetSealedRootKey(sealed); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	if err := b2.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+
+	ic := b2.InvocationCounter()
+	if ic == nil || !ic.IsEnabled() {
+		t.Fatal("invocation counter must be enabled by default")
+	}
+	if ic.Count() == 0 {
+		t.Fatal("counter must be pessimistically seeded after restart-unseal")
+	}
+	if !b2.ShouldRotateKey() {
+		t.Fatal("ShouldRotateKey must fire immediately after restart-unseal")
+	}
+
+	// Encryption still works in the threshold→limit headroom window.
+	if _, err := b2.Encrypt(nil, []byte("more data")); err != nil {
+		t.Fatalf("Encrypt within headroom: %v", err)
+	}
+
+	// Rotation resets the budget for the fresh epoch.
+	if _, err := b2.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if b2.ShouldRotateKey() {
+		t.Fatal("budget must be reset after rotation")
+	}
+}
+
+// TestBarrier_InProcessSealUnsealKeepsAccurateCount verifies that a
+// seal/unseal cycle within one process does NOT clobber an accurate
+// non-zero in-memory count with the pessimistic seed.
+func TestBarrier_InProcessSealUnsealKeepsAccurateCount(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	for i := 0; i < 5; i++ {
+		if _, err := b.Encrypt(nil, []byte("data")); err != nil {
+			t.Fatalf("Encrypt: %v", err)
+		}
+	}
+	countBefore := b.InvocationCounter().Count()
+	if countBefore != 5 {
+		t.Fatalf("count = %d, want 5", countBefore)
+	}
+
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+
+	if got := b.InvocationCounter().Count(); got != countBefore {
+		t.Fatalf("in-process unseal changed accurate count: %d -> %d", countBefore, got)
+	}
+	if b.ShouldRotateKey() {
+		t.Fatal("in-process unseal must not force rotation")
+	}
+}
+
+// TestBarrier_UnsealTrustsInjectedCounter verifies that an embedder-
+// injected InvocationCounter (which owns persistence per the documented
+// contract) is never overridden by the pessimistic seed.
+func TestBarrier_UnsealTrustsInjectedCounter(t *testing.T) {
+	custom := NewInvocationCounter(true, 0, 0)
+	custom.Seed(0) // embedder restored "0 invocations" from durable state
+
+	cfg := DefaultBarrierConfig(1)
+	cfg.InvocationCounter = custom
+	b := NewBarrier(cfg)
+	s := testStrategy(t)
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	sealed := b.SealedRootKeyData()
+
+	cfg2 := DefaultBarrierConfig(1)
+	custom2 := NewInvocationCounter(true, 0, 0)
+	cfg2.InvocationCounter = custom2
+	b2 := NewBarrier(cfg2)
+	if err := b2.SetSealedRootKey(sealed); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	if err := b2.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if got := custom2.Count(); got != 0 {
+		t.Fatalf("injected counter was overridden: count = %d, want 0", got)
+	}
+	if b2.ShouldRotateKey() {
+		t.Fatal("injected counter must be trusted; no forced rotation")
 	}
 }

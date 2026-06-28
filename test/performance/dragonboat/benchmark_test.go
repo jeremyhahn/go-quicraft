@@ -101,7 +101,7 @@ func BenchmarkElectionTime_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatElection(b, rec)
 
-	suite.AddResult(perfresult.ScenarioElectionWAL, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElectionWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ func BenchmarkElectionTime_3N_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatElectionCluster(b, 3, rec)
 
-	suite.AddResult(perfresult.ScenarioElection3NWAL, rec.Count(), b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElection3NWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +209,7 @@ func BenchmarkElectionTime_5N_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatElectionCluster(b, 5, rec)
 
-	suite.AddResult(perfresult.ScenarioElection5NWAL, rec.Count(), b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElection5NWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------

@@ -32,6 +32,13 @@ type smWrapper interface {
 	NALookupInto(key, dst []byte) ([]byte, bool, error) // returns (result, supported, error)
 	GetHash() (uint64, bool, error)                     // returns (hash, supported, error)
 	SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
+	// saveSnapshotGated writes the user SM snapshot and invokes afterCapture
+	// (when non-nil) exactly once after the point-in-time is captured and
+	// before the potentially-long streaming begins. For regular in-memory SMs
+	// the whole save is the capture, so afterCapture fires at the end; for
+	// concurrent/on-disk SMs it fires after PrepareSnapshot, so the caller can
+	// release the apply gate while the immutable snapshot streams.
+	saveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
 	RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
 	Close(ctx context.Context) error
 	Type() SMType
@@ -124,7 +131,21 @@ func (w *regularSMWrapper) GetHash() (uint64, bool, error) {
 
 // SaveSnapshot delegates to the wrapped StateMachine.
 func (w *regularSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, stopper <-chan struct{}) error {
-	return w.sm.SaveSnapshot(ctx, wr, stopper)
+	return w.saveSnapshotGated(ctx, wr, stopper, nil)
+}
+
+// saveSnapshotGated writes the regular SM snapshot. A regular SM has no
+// point-in-time prepare and is not safe against a concurrent Update, so its
+// whole (in-memory) save is the consistent capture: afterCapture fires only
+// after the save completes successfully.
+func (w *regularSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
+	if err := w.sm.SaveSnapshot(ctx, wr, stopper); err != nil {
+		return err
+	}
+	if afterCapture != nil {
+		afterCapture()
+	}
+	return nil
 }
 
 // RecoverFromSnapshot delegates to the wrapped StateMachine.
@@ -184,9 +205,20 @@ func (w *concurrentSMWrapper) GetHash() (uint64, bool, error) {
 
 // SaveSnapshot calls PrepareSnapshot then SaveSnapshot on the wrapped SM.
 func (w *concurrentSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, stopper <-chan struct{}) error {
+	return w.saveSnapshotGated(ctx, wr, stopper, nil)
+}
+
+// saveSnapshotGated captures the concurrent SM's point-in-time via
+// PrepareSnapshot (which must not race Update, so it runs under the caller's
+// apply gate), fires afterCapture to release the gate, then streams the
+// immutable snapshot concurrently with resumed applies.
+func (w *concurrentSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	snapCtx, err := w.sm.PrepareSnapshot()
 	if err != nil {
 		return err
+	}
+	if afterCapture != nil {
+		afterCapture()
 	}
 	return w.sm.SaveSnapshot(ctx, snapCtx, wr, stopper)
 }
@@ -248,12 +280,24 @@ func (w *onDiskSMWrapper) GetHash() (uint64, bool, error) {
 
 // SaveSnapshot syncs, prepares, and saves the on-disk state machine.
 func (w *onDiskSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, stopper <-chan struct{}) error {
+	return w.saveSnapshotGated(ctx, wr, stopper, nil)
+}
+
+// saveSnapshotGated syncs and captures the on-disk SM's point-in-time via
+// PrepareSnapshot (both run under the caller's apply gate), fires afterCapture
+// to release the gate, then streams the immutable snapshot concurrently with
+// resumed applies — so a large on-disk snapshot does not pause this shard's
+// applies for the duration of the stream.
+func (w *onDiskSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	if err := w.sm.Sync(); err != nil {
 		return err
 	}
 	snapCtx, err := w.sm.PrepareSnapshot()
 	if err != nil {
 		return err
+	}
+	if afterCapture != nil {
+		afterCapture()
 	}
 	return w.sm.SaveSnapshot(ctx, snapCtx, wr, stopper)
 }

@@ -18,6 +18,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -119,6 +120,14 @@ func TestTransportConfig_SetDefaults(t *testing.T) {
 		if tc.SendBatchMaxSize != DefaultSendBatchMaxSize {
 			t.Errorf("SendBatchMaxSize = %d, want %d", tc.SendBatchMaxSize, DefaultSendBatchMaxSize)
 		}
+		if tc.MaxStreamsPerConnection != DefaultMaxStreamsPerConnection {
+			t.Errorf("MaxStreamsPerConnection = %d, want %d",
+				tc.MaxStreamsPerConnection, DefaultMaxStreamsPerConnection)
+		}
+		if tc.StreamReadIdleTimeout != DefaultStreamReadIdleTimeout {
+			t.Errorf("StreamReadIdleTimeout = %v, want %v",
+				tc.StreamReadIdleTimeout, DefaultStreamReadIdleTimeout)
+		}
 		if tc.Enable0RTT {
 			t.Error("Enable0RTT should default to false")
 		}
@@ -135,6 +144,8 @@ func TestTransportConfig_SetDefaults(t *testing.T) {
 			MaxConnectionsPerIP:           32,
 			MaxIncomingConnections:        512,
 			SendBatchMaxSize:              128 * 1024,
+			MaxStreamsPerConnection:       512,
+			StreamReadIdleTimeout:         time.Minute,
 		}
 		tc.SetDefaults()
 
@@ -169,6 +180,36 @@ func TestTransportConfig_SetDefaults(t *testing.T) {
 		if tc.SendBatchMaxSize != 128*1024 {
 			t.Errorf("SendBatchMaxSize = %d, want %d", tc.SendBatchMaxSize, 128*1024)
 		}
+		if tc.MaxStreamsPerConnection != 512 {
+			t.Errorf("MaxStreamsPerConnection = %d, want 512", tc.MaxStreamsPerConnection)
+		}
+		if tc.StreamReadIdleTimeout != time.Minute {
+			t.Errorf("StreamReadIdleTimeout = %v, want %v", tc.StreamReadIdleTimeout, time.Minute)
+		}
+	})
+}
+
+func TestTransportConfig_Validate_MaxStreamsPerConnection(t *testing.T) {
+	tc := validTransportConfig()
+	tc.MaxStreamsPerConnection = 0
+	err := tc.Validate()
+	assertTransportValidationError(t, err, "TransportConfig.MaxStreamsPerConnection")
+}
+
+func TestTransportConfig_Validate_StreamReadIdleTimeout(t *testing.T) {
+	t.Run("negative rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.StreamReadIdleTimeout = -time.Second
+		err := tc.Validate()
+		assertTransportValidationError(t, err, "TransportConfig.StreamReadIdleTimeout")
+	})
+
+	t.Run("zero accepted (uses default)", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.StreamReadIdleTimeout = 0
+		if err := tc.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil", err)
+		}
 	})
 }
 
@@ -188,6 +229,19 @@ func TestTransportConfig_Validate_Valid(t *testing.T) {
 		}
 	})
 
+	t.Run("valid with pre-built Certificate (no PEM Cert/Key)", func(t *testing.T) {
+		ca, cert, key := testMTLSMaterial()
+		prebuilt, err := tls.X509KeyPair(cert, key)
+		if err != nil {
+			t.Fatalf("X509KeyPair: %v", err)
+		}
+		var tc TransportConfig
+		tc.SetDefaults()
+		tc.MTLSConfig = &MTLSConfig{CACert: ca, Certificate: &prebuilt}
+		if err := tc.Validate(); err != nil {
+			t.Errorf("Validate() with pre-built certificate = %v, want nil", err)
+		}
+	})
 }
 
 func TestTransportConfig_Validate_StreamPoolSize(t *testing.T) {
@@ -540,4 +594,67 @@ func TestTransportConfig_Validate_RejectsEmptyMTLS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateRevocationConfig verifies RevocationConfig validation:
+// unknown mode strings are rejected (a typo must not silently select the
+// default), and modes that consult a source require that source.
+func TestValidateRevocationConfig(t *testing.T) {
+	base := func() TransportConfig {
+		tc := TransportConfig{TransportDisabled: true}
+		tc.SetDefaults()
+		return tc
+	}
+
+	t.Run("invalid mode strings rejected", func(t *testing.T) {
+		for _, mode := range []string{"CRL", "strict", "Any", "ocsp+crl"} {
+			tc := base()
+			tc.RevocationConfig = &RevocationConfig{Mode: mode, CRLPaths: []string{"/x"}, OCSPResponderURL: "http://r"}
+			if err := tc.Validate(); err == nil {
+				t.Fatalf("mode %q must be rejected", mode)
+			}
+		}
+	})
+
+	t.Run("valid modes accepted", func(t *testing.T) {
+		for _, mode := range []string{"", "crl", "ocsp", "both", "any"} {
+			tc := base()
+			tc.RevocationConfig = &RevocationConfig{
+				Mode:             mode,
+				CRLPaths:         []string{"/etc/crl.pem"},
+				OCSPResponderURL: "http://ocsp.example",
+			}
+			if err := tc.Validate(); err != nil {
+				t.Fatalf("mode %q rejected: %v", mode, err)
+			}
+		}
+	})
+
+	t.Run("crl mode requires CRLPaths", func(t *testing.T) {
+		tc := base()
+		tc.RevocationConfig = &RevocationConfig{Mode: "crl"}
+		if err := tc.Validate(); err == nil {
+			t.Fatal("crl mode without CRLPaths must be rejected")
+		}
+	})
+
+	t.Run("ocsp mode requires responder URL", func(t *testing.T) {
+		tc := base()
+		tc.RevocationConfig = &RevocationConfig{Mode: "ocsp"}
+		if err := tc.Validate(); err == nil {
+			t.Fatal("ocsp mode without OCSPResponderURL must be rejected")
+		}
+	})
+
+	t.Run("both mode requires both sources", func(t *testing.T) {
+		tc := base()
+		tc.RevocationConfig = &RevocationConfig{Mode: "both", CRLPaths: []string{"/x"}}
+		if err := tc.Validate(); err == nil {
+			t.Fatal("both mode without OCSPResponderURL must be rejected")
+		}
+		tc.RevocationConfig = &RevocationConfig{Mode: "both", OCSPResponderURL: "http://r"}
+		if err := tc.Validate(); err == nil {
+			t.Fatal("both mode without CRLPaths must be rejected")
+		}
+	})
 }

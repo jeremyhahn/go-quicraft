@@ -46,9 +46,22 @@ func (r *RateLimiter) Enabled() bool {
 	return r.maxSize > 0
 }
 
-// Increase atomically adds sz to the tracked size.
+// Increase atomically adds sz to the tracked size, saturating at the
+// uint64 maximum instead of wrapping. A wrap would reset the tracked
+// size to a tiny value and silently disable backpressure exactly when
+// the in-memory log is largest. Saturation keeps the limiter tripped.
 func (r *RateLimiter) Increase(sz uint64) {
-	r.size.Add(sz)
+	for {
+		current := r.size.Load()
+		next := current + sz
+		if next < current {
+			// Overflow: clamp to the maximum so RateLimited stays true.
+			next = ^uint64(0)
+		}
+		if r.size.CompareAndSwap(current, next) {
+			return
+		}
+	}
 }
 
 // Decrease atomically subtracts sz from the tracked size. If the

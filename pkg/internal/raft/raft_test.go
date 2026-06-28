@@ -743,10 +743,11 @@ func TestRaft_Election_HigherTermCausesStepDown(t *testing.T) {
 	electLeader(r)
 
 	// Receive a message from a higher term.
+	higherTerm := r.term + 1
 	err := r.step(proto.Message{
 		Type: proto.Heartbeat,
 		From: 2,
-		Term: r.term + 1,
+		Term: higherTerm,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -754,8 +755,9 @@ func TestRaft_Election_HigherTermCausesStepDown(t *testing.T) {
 	if r.state != follower {
 		t.Fatalf("expected step down to follower, got %s", r.state)
 	}
-	if r.term != r.term {
-		// r.term was already updated by step().
+	// step() must adopt the higher message term.
+	if r.term != higherTerm {
+		t.Fatalf("expected term to advance to %d after higher-term step, got %d", higherTerm, r.term)
 	}
 }
 

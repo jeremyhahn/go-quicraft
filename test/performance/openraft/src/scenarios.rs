@@ -118,8 +118,18 @@ async fn boot_single_node_wal() -> BenchRaft {
     raft
 }
 
+/// Build a KV Put command whose total wire size is exactly `size` bytes,
+/// byte-for-byte matching the encoding proposed by the QuicRaft, Dragonboat,
+/// and etcd benchmarks: `[op:1][keyLen:2 BE][key][value]`.
 fn payload(size: usize) -> Vec<u8> {
-    vec![0u8; size]
+    let key: &[u8] = b"bench-key";
+    let val_len = size.saturating_sub(3 + key.len());
+    let mut cmd = Vec::with_capacity(3 + key.len() + val_len);
+    cmd.push(0x01u8); // opPut
+    cmd.extend_from_slice(&(key.len() as u16).to_be_bytes());
+    cmd.extend_from_slice(key);
+    cmd.extend_from_slice(&vec![0u8; val_len]);
+    cmd
 }
 
 // ── build_result ─────────────────────────────────────────────────────────────
@@ -154,7 +164,10 @@ pub async fn bench_election(duration: Duration) -> ScenarioResult {
         let _ = raft.shutdown().await;
     }
 
-    build_result(recorder.count(), wall.elapsed().as_nanos() as u64, recorder)
+    // Duration = sum of recorded election latencies so ops/sec excludes
+    // per-iteration setup/teardown (matches the Go engines).
+    let measured_ns = recorder.sum().as_nanos() as u64;
+    build_result(recorder.count(), measured_ns, recorder)
 }
 
 pub async fn bench_propose_sequential(duration: Duration, payload_size: usize) -> ScenarioResult {
@@ -257,7 +270,10 @@ pub async fn bench_election_wal(duration: Duration) -> ScenarioResult {
         let _ = raft.shutdown().await;
     }
 
-    build_result(recorder.count(), wall.elapsed().as_nanos() as u64, recorder)
+    // Duration = sum of recorded election latencies so ops/sec excludes
+    // per-iteration setup/teardown (matches the Go engines).
+    let measured_ns = recorder.sum().as_nanos() as u64;
+    build_result(recorder.count(), measured_ns, recorder)
 }
 
 pub async fn bench_propose_sequential_wal(duration: Duration, payload_size: usize) -> ScenarioResult {
@@ -359,7 +375,10 @@ pub async fn bench_election_cluster(duration: Duration, num_nodes: usize) -> Sce
         cluster.shutdown().await;
     }
 
-    build_result(recorder.count(), wall.elapsed().as_nanos() as u64, recorder)
+    // Duration = sum of recorded election latencies so ops/sec excludes
+    // per-iteration setup/teardown (matches the Go engines).
+    let measured_ns = recorder.sum().as_nanos() as u64;
+    build_result(recorder.count(), measured_ns, recorder)
 }
 
 pub async fn bench_propose_sequential_cluster(

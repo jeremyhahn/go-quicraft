@@ -41,12 +41,34 @@ const (
 	// ModeOCSP checks only OCSP responders.
 	ModeOCSP Mode = "ocsp"
 
-	// ModeBoth requires both CRL and OCSP to confirm revocation.
+	// ModeBoth consults both CRL and OCSP; a certificate reported revoked
+	// by EITHER source is treated as revoked. (Requiring both sources to
+	// agree would let a CRL-revoked certificate with a stale OCSP "good"
+	// pass — the weakest possible composition.)
 	ModeBoth Mode = "both"
 
 	// ModeAny passes if either CRL or OCSP confirms revocation (default).
 	ModeAny Mode = "any"
 )
+
+// ValidModes lists the recognized revocation mode strings (plus the empty
+// string, which selects the default). Configuration validation uses this
+// to reject typos that would otherwise silently select the default mode.
+var ValidModes = []Mode{ModeCRL, ModeOCSP, ModeBoth, ModeAny}
+
+// IsValidMode reports whether m is a recognized revocation mode. The
+// empty string is valid and selects the default (ModeAny).
+func IsValidMode(m Mode) bool {
+	if m == "" {
+		return true
+	}
+	for _, v := range ValidModes {
+		if m == v {
+			return true
+		}
+	}
+	return false
+}
 
 // Default configuration values.
 const (
@@ -157,10 +179,18 @@ type ocspCacheEntry struct {
 // handshake path (IsRevoked) uses read locks and atomic cache lookups
 // to minimize contention with the background CRL reload goroutine.
 type Checker struct {
-	// mu protects revokedSet and crlHashes.
+	// mu protects revokedSet, crlHashes, and crlCurrent.
 	mu         sync.RWMutex
 	revokedSet map[string]struct{} // serial hex -> revoked
 	crlHashes  map[string][32]byte // path -> SHA-256 content hash
+	// crlCurrent is true while revokedSet reflects a fully-successful
+	// load of every configured CRL file. It is false before the first
+	// successful load and after any failed reload (unreadable or
+	// unparseable file). While false, the previous set keeps serving
+	// revocations (a stale "revoked" is still trustworthy) but a
+	// not-found result cannot be trusted as "not revoked"; under
+	// EnforceRevocation that surfaces as ErrCRLStale.
+	crlCurrent bool
 
 	// ocspMu protects ocspCache.
 	ocspMu    sync.RWMutex
@@ -234,9 +264,17 @@ func (c *Checker) reloadLoop() {
 }
 
 // ReloadCRLs reads all configured CRL files, parses them, and rebuilds
-// the revoked serial set. Only re-parses files whose SHA-256 content hash
-// has changed since the last reload. This method is exported to support
-// manual refresh (e.g., from an admin API or signal handler).
+// the revoked serial set. This method is exported to support manual
+// refresh (e.g., from an admin API or signal handler).
+//
+// The reload is all-or-nothing: on ANY per-file failure (read or parse)
+// the previous revoked set and hashes are kept and an error is returned.
+// Replacing the full set with a partial one would silently un-revoke
+// every certificate listed in the unreadable file — a transiently
+// missing file, permission change, or NFS blip must never widen access.
+// A failed reload also marks the set as stale (see crlCurrent), which
+// EnforceRevocation surfaces as a handshake failure until a reload
+// succeeds.
 func (c *Checker) ReloadCRLs() error {
 	if len(c.cfg.CRLPaths) == 0 {
 		return nil
@@ -248,8 +286,10 @@ func (c *Checker) ReloadCRLs() error {
 	for _, path := range c.cfg.CRLPaths {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			slog.Warn("CRL file read failed", "path", path, "error", err)
-			continue
+			slog.Warn("CRL file read failed; keeping previous revocation set",
+				"path", path, "error", err)
+			c.markCRLStale()
+			return &CRLReadError{Path: path, Err: err}
 		}
 
 		hash := sha256.Sum256(data)
@@ -258,6 +298,7 @@ func (c *Checker) ReloadCRLs() error {
 		// Parse PEM-encoded CRL and extract revoked serial numbers.
 		serials, parseErr := parseCRLSerials(data)
 		if parseErr != nil {
+			c.markCRLStale()
 			return &CRLParseError{Path: path, Err: parseErr}
 		}
 		for _, serial := range serials {
@@ -276,9 +317,18 @@ func (c *Checker) ReloadCRLs() error {
 	c.mu.Lock()
 	c.revokedSet = newSet
 	c.crlHashes = newHashes
+	c.crlCurrent = true
 	c.mu.Unlock()
 
 	return nil
+}
+
+// markCRLStale records that the revoked set no longer reflects a
+// fully-successful load of every configured CRL file.
+func (c *Checker) markCRLStale() {
+	c.mu.Lock()
+	c.crlCurrent = false
+	c.mu.Unlock()
 }
 
 // parseCRLSerials extracts revoked serial number hex strings from PEM-
@@ -335,50 +385,105 @@ func (c *Checker) RevokedCount() int {
 
 // IsRevoked checks whether the given certificate has been revoked.
 // Returns (true, nil) if revoked, (false, nil) if not revoked or status
-// unknown in soft-fail mode, or (false, error) if the check failed and
-// EnforceRevocation is true.
+// unknown in soft-fail mode, or (false, error) if the status could not
+// be established and EnforceRevocation is true.
+//
+// A "revoked" verdict from ANY consulted source always wins, in every
+// mode. "Unknown" (stale CRL, unreachable OCSP responder) is governed by
+// EnforceRevocation: fail closed when enforcing, accept when soft-fail.
 func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
 
 	switch c.cfg.Mode {
 	case ModeCRL:
-		return c.checkCRL(serial), nil
+		revoked, crlErr := c.checkCRLStatus(serial)
+		if revoked {
+			return true, nil
+		}
+		if c.cfg.EnforceRevocation && crlErr != nil {
+			return false, crlErr
+		}
+		return false, nil
 
 	case ModeOCSP:
 		return c.checkOCSP(cert)
 
 	case ModeBoth:
-		crlRevoked := c.checkCRL(serial)
-		// Use checkOCSPRaw to distinguish "OCSP says good" from
-		// "OCSP unavailable". When OCSP is unavailable, fall back
-		// to the CRL result (soft-fail) or reject (enforcement).
-		ocspRevoked, err := c.checkOCSPRaw(cert)
-		if err != nil {
-			if c.cfg.EnforceRevocation {
-				return false, err
-			}
-			// Soft-fail: OCSP unavailable, use CRL result only.
-			return crlRevoked, nil
+		// Revoked-by-either wins. (Requiring agreement of both sources
+		// would let a CRL-revoked certificate slide through on a stale
+		// OCSP "good".)
+		crlRevoked, crlErr := c.checkCRLStatus(serial)
+		if crlRevoked {
+			return true, nil
 		}
-		return crlRevoked && ocspRevoked, nil
+		ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
+		if ocspErr == nil && ocspRevoked {
+			return true, nil
+		}
+		// Neither source reported revoked. Unknown status from either
+		// source is per EnforceRevocation.
+		if c.cfg.EnforceRevocation {
+			if crlErr != nil {
+				return false, crlErr
+			}
+			if ocspErr != nil {
+				return false, ocspErr
+			}
+		}
+		return false, nil
 
 	default: // ModeAny
-		if c.checkCRL(serial) {
+		crlRevoked, crlErr := c.checkCRLStatus(serial)
+		if crlRevoked {
 			return true, nil
 		}
 		if c.cfg.OCSPResponderURL != "" {
-			return c.checkOCSP(cert)
+			ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
+			if ocspErr == nil && ocspRevoked {
+				return true, nil
+			}
+			if c.cfg.EnforceRevocation {
+				// Unknown from either source fails closed: a revocation
+				// could be hiding behind the stale CRL or the
+				// unreachable responder.
+				if ocspErr != nil {
+					return false, ocspErr
+				}
+				if crlErr != nil {
+					return false, crlErr
+				}
+			}
+			return false, nil
+		}
+		if c.cfg.EnforceRevocation && crlErr != nil {
+			return false, crlErr
 		}
 		return false, nil
 	}
 }
 
-// checkCRL tests whether the serial is in the revoked set.
-func (c *Checker) checkCRL(serial string) bool {
+// checkCRLStatus tests whether the serial is in the revoked set. The
+// second return value is non-nil when a not-found result cannot be
+// trusted as "not revoked": CRL paths are configured but no fresh,
+// fully-successful load is in effect (initial load pending, or the most
+// recent reload failed). A found (revoked) result is always trustworthy,
+// even from a stale set. Enforcement policy is applied by the caller.
+func (c *Checker) checkCRLStatus(serial string) (bool, error) {
 	c.mu.RLock()
 	_, revoked := c.revokedSet[serial]
+	current := c.crlCurrent
 	c.mu.RUnlock()
-	return revoked
+	if revoked {
+		// Found in the set: revoked, whether the set came from CRL files
+		// or a programmatic AddRevokedSerial, and even when stale.
+		return true, nil
+	}
+	// Staleness only applies when CRL files are configured; a checker
+	// used purely programmatically (no paths) has nothing to go stale.
+	if len(c.cfg.CRLPaths) > 0 && !current {
+		return false, ErrCRLStale
+	}
+	return false, nil
 }
 
 // checkOCSP queries the OCSP responder for the certificate's revocation

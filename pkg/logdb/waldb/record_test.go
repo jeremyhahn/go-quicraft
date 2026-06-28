@@ -170,7 +170,6 @@ func TestAllRecordTypes(t *testing.T) {
 		{"First", RecordFirst},
 		{"Middle", RecordMiddle},
 		{"Last", RecordLast},
-		{"Epoch", RecordEpoch},
 	}
 
 	for _, tc := range types {

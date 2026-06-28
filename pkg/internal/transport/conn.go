@@ -159,6 +159,19 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 	defer t.wg.Done()
 
+	// Recover from panics so a fault in quic-go's OpenStreamSync or the stream
+	// pool ops (e.g. on an unexpected connection state) cannot crash the whole
+	// process — matching every other transport background goroutine.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("preOpenHeartbeatStream panic recovered",
+				"target", target,
+				"panic", fmt.Sprint(r),
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+
 	if t.stopped.Load() {
 		return
 	}

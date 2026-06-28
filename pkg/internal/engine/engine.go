@@ -228,6 +228,19 @@ func (e *Engine) loadedNodes() []*Node {
 	return nodes
 }
 
+// SetShardBarriers installs a per-shard barrier resolver on the snapshot
+// pool, enabling per-tenant WAL/snapshot encryption where each Raft shard can
+// be sealed under its OWN barrier. It is purely additive: when never called
+// (the default), the snapshot pool uses the single process-wide barrier passed
+// to NewEngine and behaves byte-for-byte as before. A nil return from fn for a
+// given shard falls back to that process-wide barrier.
+//
+// Must be called during Host construction, before Start() launches the
+// snapshot workers, so the resolver is visible to every snapshot operation.
+func (e *Engine) SetShardBarriers(fn func(shardID uint64) SnapshotBarrier) {
+	e.snapshots.shardBarriers = fn
+}
+
 // GlobalSafePurgeFloor returns the minimum barrier epoch still required by
 // any retained encrypted snapshot (across all shards) or any live WAL
 // record. DEKs for epochs strictly below this floor can be safely purged.
@@ -705,19 +718,18 @@ type SnapshotRequestOption struct {
 // a snapshot is already in-flight for the shard, or a
 // SnapshotPoolBusyError if the request channel is full.
 //
-// The appliedToTerm is captured under raftMu to prevent a data race
-// with the step worker, which writes inMemory.appliedToTerm during
-// Peer.Commit(). The snapshot pool worker receives the captured value
-// in the request instead of reading it from the Peer directly.
+// appliedToTerm is carried in the request only as a fallback term source; the
+// snapshot pool records the term from the engine's apply-tracked
+// (lastApplied, lastAppliedTerm) pair captured while applies are quiesced. The
+// read of Peer.AppliedToTerm() is race-free because inMemory.appliedToTerm is
+// atomic (the step worker's lock-free restore() writes it).
 //
 // The opt parameter carries per-request snapshot options. A zero-value
 // SnapshotRequestOption uses shard-level defaults.
 func (e *Engine) RequestSnapshot(shardID, replicaID uint64, node *Node, opt SnapshotRequestOption) error {
 	var term uint64
 	if peer := node.Peer(); peer != nil {
-		node.raftMu.Lock()
 		term = peer.AppliedToTerm()
-		node.raftMu.Unlock()
 	}
 	return e.snapshots.requestSnapshot(snapshotRequest{
 		shardID:            shardID,

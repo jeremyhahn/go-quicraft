@@ -16,6 +16,7 @@ package config
 
 import (
 	"log/slog"
+	"path/filepath"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -185,6 +186,19 @@ type Config struct {
 	// time.Now on supported platforms). Per Raft PhD thesis Section 6.4.
 	// Default: false (use heartbeat-based ReadIndex).
 	LeaseRead bool
+
+	// DataDir is the directory where this shard's on-disk state-machine data
+	// is stored. When empty (the default), the on-disk state machine's data
+	// is placed under the host NodeHostDir, preserving the historical layout.
+	// When non-empty, this shard's on-disk state-machine data (the persistent
+	// store the application opens in its DiskStateMachine.Open) is rooted under
+	// DataDir instead, restoring dragonboat's "the on-disk state machine owns
+	// its storage location" behavior so a per-tenant shard can live on the
+	// tenant's own volume. It must be an absolute path when set.
+	//
+	// The Raft log/WAL is unaffected and always remains in the shared,
+	// host-wide LogDB regardless of this value.
+	DataDir string
 }
 
 // SetDefaults fills zero-valued fields with their documented defaults.
@@ -259,7 +273,25 @@ func (c *Config) Validate() error {
 	if err := c.validateLeaseRead(); err != nil {
 		return err
 	}
+	if err := c.validateDataDir(); err != nil {
+		return err
+	}
 	c.warnDisabledSafetyFlags()
+	return nil
+}
+
+// validateDataDir checks the optional per-shard on-disk state-machine data
+// directory. An empty DataDir is valid and selects the default location under
+// the host NodeHostDir. When set it must be an absolute path so the on-disk
+// state machine's storage location is unambiguous and independent of the
+// process working directory.
+func (c *Config) validateDataDir() error {
+	if c.DataDir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(c.DataDir) {
+		return newValidationError("DataDir", "must be an absolute path when set")
+	}
 	return nil
 }
 
@@ -283,8 +315,16 @@ func (c *Config) validateTiming() error {
 	if c.ElectionRTT < 5 {
 		return newValidationError("ElectionRTT", "must be >= 5 (10 recommended)")
 	}
-	if c.ElectionRTT <= c.HeartbeatRTT {
-		return newValidationError("ElectionRTT", "must be > HeartbeatRTT")
+	// Require a comfortable margin between the election timeout and the
+	// heartbeat interval. Raft needs the election timeout to span several
+	// heartbeat intervals so a healthy leader's heartbeats reliably reset
+	// follower election timers; a ratio barely above 1 (e.g. Heartbeat=4,
+	// Election=5) passes "Election > Heartbeat" yet causes spurious elections
+	// and leadership churn under normal latency jitter. Enforce at least 2x
+	// (10x recommended: HeartbeatRTT=1, ElectionRTT=10).
+	if c.ElectionRTT < 2*c.HeartbeatRTT {
+		return newValidationError("ElectionRTT",
+			"must be >= 2*HeartbeatRTT (10*HeartbeatRTT recommended)")
 	}
 	return nil
 }

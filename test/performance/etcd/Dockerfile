@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build the benchmark test binary
 # ---------------------------------------------------------------------------
-FROM golang:1.26.3 AS builder
+FROM golang:1.26.4 AS builder
 
 WORKDIR /src
 
@@ -25,7 +25,9 @@ WORKDIR /src/test/performance/etcd
 
 # Download dependencies and build the test binary with the benchmark
 # build tag. The -c flag compiles the test binary without running it.
-RUN go mod tidy && \
+# go mod download (not tidy) so the committed go.mod/go.sum are used
+# verbatim and builds stay reproducible.
+RUN go mod download && \
     go test -c -tags=benchmark -o /bench-etcd .
 
 # ---------------------------------------------------------------------------
@@ -39,11 +41,7 @@ RUN apt-get update && \
 
 COPY --from=builder /bench-etcd /usr/local/bin/bench-etcd
 
-# Run all benchmarks with 5s duration per benchmark, memory stats,
-# and a single iteration count baseline.
-ENTRYPOINT ["/usr/local/bin/bench-etcd", \
-    "-test.bench=.", \
-    "-test.benchtime=5s", \
-    "-test.benchmem", \
-    "-test.count=1", \
-    "-test.v"]
+# ENTRYPOINT is the binary only; CMD holds the default flags so the
+# orchestrator can override benchtime/timeout via `docker run <image> <flags>`.
+ENTRYPOINT ["/usr/local/bin/bench-etcd"]
+CMD ["-test.bench=.", "-test.run=^$", "-test.benchtime=5s", "-test.timeout=600s", "-test.v"]

@@ -479,21 +479,34 @@ This design means the state machine always sees plaintext data during `RecoverFr
 
 ### Snapshot Transport Between Nodes
 
-Snapshots are **NOT encrypted at the application layer during transport**. The flow:
+Snapshots are **NOT encrypted at the application layer during transport**. The flow for a single-barrier setup is:
 
 ```
 Leader:
   1. State machine writes plaintext snapshot to disk
   2. Barrier encrypts chunks to at-rest storage (local)
-  3. Leader reads snapshot, sends chunks via QUIC (mTLS encrypted in transit)
+  3. Leader reads snapshot, calls reencryptReceivedSnapshot to decrypt (plaintext)
+  4. Sends plaintext chunks via QUIC (mTLS encrypted in transit)
 
 Follower:
   1. Receives plaintext chunks over QUIC (mTLS decrypted by QUIC)
-  2. Writes to local storage
-  3. Barrier encrypts at-rest with follower's own DEK
+  2. Writes to local disk storage
+  3. reencryptReceivedSnapshot encrypts at-rest with follower's own barrier
+  4. Stores epoch from re-encryption in LogDB snapshot metadata
 ```
 
-Each node has its **own independent barrier**. A leader's at-rest encrypted snapshot is decrypted for transport, sent over mTLS-protected QUIC, and the follower re-encrypts with its own key material. Nodes cannot decrypt each other's at-rest data.
+For a **per-shard barrier setup**, the per-shard receiver routing is:
+
+```
+Follower:
+  1. Receives plaintext chunks over QUIC for target shard
+  2. Writes to local disk storage
+  3. Calls reencryptReceivedSnapshot(dataPath, host.barrierForShard(shardID))
+  4. Re-encrypts under the RECEIVER's shard-specific barrier
+  5. Stores epoch from re-encryption in LogDB snapshot metadata
+```
+
+Each node has its **own independent barrier (or set of per-shard barriers)**. A leader's at-rest encrypted snapshot is decrypted for transport, sent over mTLS-protected QUIC, and the follower re-encrypts with its own key material. Nodes cannot decrypt each other's at-rest data.
 
 ## Epoch Lifecycle and Key Retention
 
@@ -720,15 +733,36 @@ Secure enclave integration for hardware-backed key protection on supported platf
 
 **Source:** `pkg/host.go`
 
-```go
-// Minimal interface to avoid circular imports
-type Barrier interface {
-    IsSealed() bool
-    Seal() error
-}
+The Host can be configured with barriers for at-rest encryption in two modes:
 
+### Single Per-Node Barrier
+
+For deployments where all Raft shards on a host share a single encryption key:
+
+```go
 func WithBarrier(b Barrier) HostOption
 ```
+
+This is the default and backward-compatible mode. When set, `WithBarrier` installs a single barrier that encrypts every shard's snapshots and WAL records.
+
+### Per-Shard Barriers
+
+For multi-tenant or per-shard key isolation, each shard can use its own barrier:
+
+```go
+func WithShardBarriers(fn func(shardID uint64) Barrier) HostOption
+```
+
+The resolver function maps each `shardID` to a distinct `Barrier`. Returning `nil` for a shard falls back to the host-wide barrier configured via `WithBarrier`. This option is purely additive and backward-compatible:
+
+- When `WithShardBarriers` is NOT used, the host behaves exactly as before
+- When `WithShardBarriers` IS used:
+  - Snapshot encrypt/decrypt, snapshot transport (epoch protection), and DEK purge all dispatch per-shard
+  - Purging one tenant's barrier can never remove epochs still live under another tenant's barrier
+  - The caller owns per-shard key rotation; the host-wide key-rotation loop only rotates the `WithBarrier` barrier
+  - When combined with a multiplexing LogDB (`logdb.PerBarrierEpochAwareLogDB`), each shard can carry its own deduplicated WAL
+
+All barriers must be initialized and unsealed before use.
 
 ### Usage
 
@@ -736,17 +770,22 @@ func WithBarrier(b Barrier) HostOption
 // No encryption (default):
 host, _ := quicraft.NewHost(cfg)
 
-// Software-sealed:
+// Single host-wide barrier, software-sealed:
 strategy, _ := seal.NewSoftwareStrategy([]byte("passphrase"))
 barrier := seal.NewBarrier()
 barrier.Initialize(strategy)
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 
-// HSM-sealed (custom strategy):
-strategy := myHSMStrategy(hsmConfig) // implements seal.SealingStrategy
-barrier := seal.NewBarrier()
-barrier.Initialize(strategy)
-host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
+// Per-shard barriers (multi-tenant):
+barrierMap := make(map[uint64]Barrier)
+barrierMap[1] = tenantABarrier
+barrierMap[2] = tenantBBarrier
+host, _ := quicraft.NewHost(cfg, quicraft.WithShardBarriers(func(shardID uint64) Barrier {
+    if b, ok := barrierMap[shardID]; ok {
+        return b
+    }
+    return nil // fall back to WithBarrier, if set
+}))
 ```
 
 ### Lifecycle

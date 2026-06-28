@@ -33,6 +33,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 )
 
@@ -58,13 +59,10 @@ const (
 	// latency can delay the first election round.
 	quicraftClusterElectionWait = 60 * time.Second
 
-	// warmupMaxRetries is the maximum number of retry attempts for each
-	// warmup proposal during cluster setup. Transient errors (e.g. QUIC
-	// stream not yet established) are retried with backoff.
-	warmupMaxRetries = 3
-
-	// warmupRetryBackoff is the delay between warmup proposal retries.
-	warmupRetryBackoff = 500 * time.Millisecond
+	// commitLatencyWarmup is the number of unmeasured proposals run before
+	// the commit-latency measurement loop, so the first timed proposal does
+	// not include one-time pipeline initialization. Shared across all engines.
+	commitLatencyWarmup = 100
 )
 
 // benchMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf certificate
@@ -242,7 +240,6 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 			TransportConfig: config.TransportConfig{
 				MTLSConfig:         mtls,
 				DisableCompression: true,
-				Enable0RTT:         true,
 			},
 		}
 
@@ -328,24 +325,18 @@ func waitForClusterLeader(hosts []*quicraft.Host, shardID uint64, timeout time.D
 	}
 }
 
-// warmupPropose attempts a single SyncPropose with retry logic. It retries
-// up to warmupMaxRetries times with warmupRetryBackoff between attempts.
-// Returns an error only if all retries are exhausted.
+// warmupPropose attempts a single SyncPropose with the shared warmup retry
+// budget (benchutil.WarmupAttempts attempts, benchutil.WarmupBackoff between
+// attempts). Returns an error only if all attempts are exhausted.
 func warmupPropose(ctx context.Context, h *quicraft.Host, shardID uint64, cmd []byte, label string) error {
-	var lastErr error
-	for attempt := 0; attempt <= warmupMaxRetries; attempt++ {
-		if attempt > 0 {
-			retryTimer := time.NewTimer(warmupRetryBackoff)
-			<-retryTimer.C
-			retryTimer.Stop()
-		}
-		if _, err := h.SyncPropose(ctx, shardID, cmd); err != nil {
-			lastErr = err
-			continue
-		}
-		return nil
+	err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+		_, perr := h.SyncPropose(ctx, shardID, cmd)
+		return perr
+	})
+	if err != nil {
+		return fmt.Errorf("warmup %s failed after %d attempts: %w", label, benchutil.WarmupAttempts, err)
 	}
-	return fmt.Errorf("warmup %s failed after %d retries: %w", label, warmupMaxRetries+1, lastErr)
+	return nil
 }
 
 // verifyClusterReady performs post-election readiness verification by
@@ -430,7 +421,6 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 			TransportConfig: config.TransportConfig{
 				MTLSConfig:         mtls,
 				DisableCompression: true,
-				Enable0RTT:         true,
 			},
 		}
 
@@ -497,8 +487,7 @@ func BenchQuicRaftProposeCluster(b *testing.B, cluster *BenchCluster, rec *perfr
 
 	leader := cluster.Leader()
 	key := []byte("bench-key")
-	value := []byte("bench-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -533,7 +522,6 @@ func BenchQuicRaftConcurrentProposeFixedCluster(b *testing.B, cluster *BenchClus
 	b.Helper()
 
 	leader := cluster.Leader()
-	value := []byte("bench-value-0123456789abcdef")
 	opsPerGoroutine := b.N / numGoroutines
 	if opsPerGoroutine < 1 {
 		opsPerGoroutine = 1
@@ -552,7 +540,7 @@ func BenchQuicRaftConcurrentProposeFixedCluster(b *testing.B, cluster *BenchClus
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 			key := []byte(fmt.Sprintf("key-%d", id))
-			cmd := encodeKVCmd(key, value)
+			cmd := makeKVCmd(key)
 
 			for j := 0; j < opsPerGoroutine; j++ {
 				proposeCtx, proposeCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -582,11 +570,25 @@ func BenchQuicRaftCommitLatencyCluster(b *testing.B, cluster *BenchCluster, rec 
 
 	leader := cluster.Leader()
 	key := []byte("commit-key")
-	value := []byte("commit-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+
+	// Warm up the pipeline (same count and retry budget as all engines)
+	// before measuring. Transient errors are retried so a single startup
+	// flake cannot discard the whole suite.
+	for w := 0; w < commitLatencyWarmup; w++ {
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			warmCtx, warmCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer warmCancel()
+			_, perr := leader.SyncPropose(warmCtx, quicraftShardID, cmd)
+			return perr
+		})
+		if err != nil {
+			b.Fatalf("warmup propose failed: %v", err)
+		}
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -619,8 +621,7 @@ func BenchQuicRaftSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *perf
 
 	// Seed data.
 	key := []byte("read-key")
-	value := []byte("read-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if _, err := leader.SyncPropose(seedCtx, quicraftShardID, cmd); err != nil {
 		seedCancel()
@@ -662,8 +663,7 @@ func BenchQuicRaftStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *per
 
 	// Seed data.
 	key := []byte("stale-key")
-	value := []byte("stale-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if _, err := leader.SyncPropose(seedCtx, quicraftShardID, cmd); err != nil {
 		seedCancel()
@@ -713,7 +713,6 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		TransportConfig: config.TransportConfig{
 			MTLSConfig:         benchMTLSConfig(b),
 			DisableCompression: true,
-			Enable0RTT:         true,
 		},
 	}
 
@@ -773,7 +772,6 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		TransportConfig: config.TransportConfig{
 			MTLSConfig:         benchMTLSConfig(b),
 			DisableCompression: true,
-			Enable0RTT:         true,
 		},
 	}
 
@@ -837,8 +835,7 @@ func BenchQuicRaftPropose(b *testing.B, h *quicraft.Host, rec *perfresult.Latenc
 
 	ctx := context.Background()
 	key := []byte("bench-key")
-	value := []byte("bench-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -855,41 +852,12 @@ func BenchQuicRaftPropose(b *testing.B, h *quicraft.Host, rec *perfresult.Latenc
 	}
 }
 
-// BenchQuicRaftConcurrentPropose benchmarks concurrent SyncPropose throughput.
-func BenchQuicRaftConcurrentPropose(b *testing.B, h *quicraft.Host, numGoroutines int, rec *perfresult.LatencyRecorder) {
-	b.Helper()
-
-	value := []byte("bench-value-0123456789abcdef")
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	var ops atomic.Int64
-	b.RunParallel(func(pb *testing.PB) {
-		ctx := context.Background()
-		seq := ops.Add(1)
-		key := []byte(fmt.Sprintf("key-%d", seq))
-		cmd := encodeKVCmd(key, value)
-		b.SetBytes(int64(len(cmd)))
-
-		for pb.Next() {
-			start := time.Now()
-			_, err := h.SyncPropose(ctx, quicraftShardID, cmd)
-			elapsed := time.Since(start)
-			if err != nil {
-				continue
-			}
-			rec.Record(elapsed)
-		}
-	})
-}
-
 // BenchQuicRaftConcurrentProposeFixed benchmarks concurrent proposals with
-// a fixed number of goroutines rather than using b.RunParallel.
+// a fixed number of goroutines rather than using b.RunParallel, so the
+// concurrency level is identical across all benchmarked engines.
 func BenchQuicRaftConcurrentProposeFixed(b *testing.B, h *quicraft.Host, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	value := []byte("bench-value-0123456789abcdef")
 	opsPerGoroutine := b.N / numGoroutines
 	if opsPerGoroutine < 1 {
 		opsPerGoroutine = 1
@@ -906,7 +874,7 @@ func BenchQuicRaftConcurrentProposeFixed(b *testing.B, h *quicraft.Host, numGoro
 			defer wg.Done()
 			ctx := context.Background()
 			key := []byte(fmt.Sprintf("key-%d", id))
-			cmd := encodeKVCmd(key, value)
+			cmd := makeKVCmd(key)
 
 			for j := 0; j < opsPerGoroutine; j++ {
 				start := time.Now()
@@ -931,8 +899,7 @@ func BenchQuicRaftSyncRead(b *testing.B, h *quicraft.Host, rec *perfresult.Laten
 
 	// Seed data.
 	key := []byte("read-key")
-	value := []byte("read-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	if _, err := h.SyncPropose(ctx, quicraftShardID, cmd); err != nil {
 		b.Fatalf("seed propose failed: %v", err)
 	}
@@ -959,8 +926,7 @@ func BenchQuicRaftStaleRead(b *testing.B, h *quicraft.Host, rec *perfresult.Late
 
 	// Seed data.
 	key := []byte("stale-key")
-	value := []byte("stale-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	if _, err := h.SyncPropose(ctx, quicraftShardID, cmd); err != nil {
 		b.Fatalf("seed propose failed: %v", err)
 	}
@@ -1000,7 +966,6 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		TransportConfig: config.TransportConfig{
 			MTLSConfig:         benchMTLSConfig(b),
 			DisableCompression: true,
-			Enable0RTT:         true,
 		},
 	}
 
@@ -1069,7 +1034,6 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 		TransportConfig: config.TransportConfig{
 			MTLSConfig:         benchMTLSConfig(b),
 			DisableCompression: true,
-			Enable0RTT:         true,
 		},
 	}
 
@@ -1123,8 +1087,15 @@ func BenchQuicRaftCommitLatency(b *testing.B, h *quicraft.Host, rec *perfresult.
 	b.Helper()
 	ctx := context.Background()
 	key := []byte("commit-key")
-	value := []byte("commit-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
+
+	// Warm up the pipeline so the first measured proposal excludes one-time
+	// initialization, matching the other engines' commit-latency benchmarks.
+	for w := 0; w < commitLatencyWarmup; w++ {
+		if err := warmupPropose(ctx, h, quicraftShardID, cmd, "commit latency"); err != nil {
+			b.Fatalf("warmup propose failed: %v", err)
+		}
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -1178,7 +1149,6 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 			TransportConfig: config.TransportConfig{
 				MTLSConfig:         mtls,
 				DisableCompression: true,
-				Enable0RTT:         true,
 			},
 		}
 

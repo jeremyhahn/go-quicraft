@@ -121,15 +121,23 @@ func (s *Session) PrepareForPropose() {
 // ProposalCompleted advances the series ID after a proposal is applied.
 // Called by the caller after Result() returns for a normal proposal.
 //
-// Uses a CAS loop to atomically claim the current seriesID, store it
-// as respondedTo, and increment seriesID. Without this, concurrent
-// callers could both read the same seriesID, both store the same
-// respondedTo value, and double-increment seriesID (skipping a value).
+// Uses a CAS loop to atomically claim the current seriesID and increment
+// it. respondedTo is then advanced MONOTONICALLY to the claimed value:
+// a plain Store would let a goroutine that won an earlier CAS but ran its
+// store later regress respondedTo below a higher completion's value,
+// breaking the respondedTo == seriesID-1 invariant under concurrent
+// completions. The monotonic advance mirrors SetRespondedTo and keeps
+// respondedTo pinned to the highest completed series.
 func (s *Session) ProposalCompleted() {
 	for {
 		current := s.seriesID.Load()
 		if s.seriesID.CompareAndSwap(current, current+1) {
-			s.respondedTo.Store(current)
+			for {
+				r := s.respondedTo.Load()
+				if current <= r || s.respondedTo.CompareAndSwap(r, current) {
+					break
+				}
+			}
 			return
 		}
 	}

@@ -38,6 +38,20 @@ pub struct BenchResponse {
     pub applied_index: u64,
 }
 
+/// Parse the KV wire format shared by all benchmark engines:
+/// `[op:1][keyLen:2 BE][key:keyLen][value:remaining]`. Returns the key and
+/// value slices, or `None` if the buffer is malformed.
+fn parse_kv(cmd: &[u8]) -> Option<(&[u8], &[u8])> {
+    if cmd.len() < 3 {
+        return None;
+    }
+    let key_len = u16::from_be_bytes([cmd[1], cmd[2]]) as usize;
+    if cmd.len() < 3 + key_len {
+        return None;
+    }
+    Some((&cmd[3..3 + key_len], &cmd[3 + key_len..]))
+}
+
 // ── shared inner state ────────────────────────────────────────────────────────
 
 /// All mutable state wrapped in a single `Mutex` so it can be shared between
@@ -56,17 +70,26 @@ struct InnerState {
     // ── state machine ────────────────────────────────────────────────────────
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
+    /// Applied key-value pairs. Mirrors the map maintained by the QuicRaft,
+    /// Dragonboat, and etcd benchmark state machines so apply does equivalent
+    /// per-entry work across all engines.
+    kv: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     /// The most recent snapshot, if any.
     snapshot: Option<StoredSnapshot>,
     /// Monotonically increasing counter used as the snapshot id.
     snapshot_seq: u64,
 }
 
-/// The data we serialise into a snapshot blob.
+/// The data we serialise into a snapshot blob. The applied KV state is
+/// included so snapshot build/install does equivalent work to the other
+/// engines' full-state snapshots and a restored node does not silently
+/// lose its state machine contents. The map is flattened into pairs
+/// because serde_json requires string map keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotState {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
+    kv: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// An in-memory snapshot blob with its metadata.
@@ -219,6 +242,11 @@ impl RaftSnapshotBuilder<C> for MemSnapshotBuilder {
         let state = SnapshotState {
             last_applied: inner.last_applied,
             last_membership: inner.last_membership.clone(),
+            kv: inner
+                .kv
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         };
         let data = serde_json::to_vec(&state).expect("snapshot serialisation is infallible");
 
@@ -265,7 +293,13 @@ impl RaftStateMachine<C> for MemStateMachine {
 
             match entry.payload {
                 EntryPayload::Blank => {}
-                EntryPayload::Normal(_req) => {}
+                EntryPayload::Normal(req) => {
+                    // Parse the KV command, copy the value, and insert it,
+                    // matching the apply work done by the other engines.
+                    if let Some((key, value)) = parse_kv(&req.payload) {
+                        inner.kv.insert(key.to_vec(), value.to_vec());
+                    }
+                }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership =
                         StoredMembership::new(Some(entry.log_id), mem);
@@ -300,6 +334,7 @@ impl RaftStateMachine<C> for MemStateMachine {
         let mut inner = self.inner.lock().unwrap();
         inner.last_applied = state.last_applied;
         inner.last_membership = state.last_membership;
+        inner.kv = state.kv.into_iter().collect();
         inner.snapshot = Some(StoredSnapshot {
             meta: meta.clone(),
             data: bytes,

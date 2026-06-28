@@ -44,8 +44,13 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: validation failed for %s: %s", e.Field, e.Reason)
 }
 
-// IntegrityError is returned when the reconstructed secret's SHA-256 digest
-// does not match the digest stored in the shares.
+// IntegrityError was returned when a reconstructed secret's SHA-256 digest did
+// not match a digest stored in the shares.
+//
+// Deprecated: shares no longer carry a secret digest (it was an offline
+// brute-force oracle — see Share), so Combine performs no self-verification and
+// NEVER returns this error. Integrity must be established out-of-band by the
+// caller. The type is retained only for API/SDK compatibility.
 type IntegrityError struct{}
 
 func (e *IntegrityError) Error() string {

@@ -371,6 +371,12 @@ func (e *WorkerPanicError) Error() string {
 // receive accumulates more chunk data than the configured memory budget.
 var ErrSnapshotMemoryBudgetExceeded = errors.New("transport: snapshot memory budget exceeded")
 
+// ErrMessageRecvMemoryBudgetExceeded is returned when an inbound message frame
+// would push total in-flight message-receive memory past MaxMessageReceiveMemory.
+// The offending stream is dropped; this bounds an OOM DoS where a peer opens many
+// streams that each declare a large frame length and withhold the body.
+var ErrMessageRecvMemoryBudgetExceeded = errors.New("transport: message receive memory budget exceeded")
+
 // SnapshotMemoryBudgetExceededError is returned when the accumulated chunk
 // data for a single snapshot receive exceeds the configured memory budget.
 // This prevents a malicious or misconfigured peer from causing unbounded

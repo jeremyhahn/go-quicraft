@@ -150,6 +150,21 @@ func (r *LatencyRecorder) Max() time.Duration {
 	return r.samples[len(r.samples)-1]
 }
 
+// Sum returns the total of all recorded observations. Election benchmarks
+// pass this as the scenario duration so reported ops/sec reflects only the
+// measured operation time, excluding per-iteration setup/teardown (which
+// differs across engines and would otherwise skew throughput comparisons).
+func (r *LatencyRecorder) Sum() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var total time.Duration
+	for _, d := range r.samples {
+		total += d
+	}
+	return total
+}
+
 // Mean returns the arithmetic mean of all observations.
 // Returns 0 when no observations have been recorded.
 func (r *LatencyRecorder) Mean() time.Duration {

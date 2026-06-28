@@ -34,6 +34,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -249,30 +250,39 @@ func (w *walWriter) close() error {
 	return w.f.Close()
 }
 
-// benchStateMachineEtcd is a minimal state machine that tracks the last
-// applied index and processes committed entries to ensure equivalent CPU
-// work on the benchmark hot path.
+// benchStateMachineEtcd is a key-value state machine that performs the same
+// per-entry work as the QuicRaft and Dragonboat benchmark state machines:
+// it parses the KV command, copies the value, and inserts it into a
+// map[string][]byte. This keeps the apply hot path apples-to-apples across
+// all benchmarked engines.
 type benchStateMachineEtcd struct {
 	mu      sync.Mutex
-	state   map[uint64]uint64
+	data    map[string][]byte
 	applied uint64
 }
 
 // newBenchStateMachineEtcd creates a state machine with a pre-allocated
-// map for storing applied entry results.
+// map for storing applied key-value pairs.
 func newBenchStateMachineEtcd() *benchStateMachineEtcd {
 	return &benchStateMachineEtcd{
-		state: make(map[uint64]uint64, 4096),
+		data: make(map[string][]byte, 1024),
 	}
 }
 
-// apply processes committed entries through the state machine, storing
-// the payload length keyed by entry index.
+// apply processes committed entries through the state machine. For each
+// normal entry it parses the KV command, copies the value, and stores it
+// keyed by the command key, matching the work done by the other engines'
+// state machines.
 func (sm *benchStateMachineEtcd) apply(entries []raftpb.Entry) {
 	sm.mu.Lock()
 	for _, entry := range entries {
 		if entry.Type == raftpb.EntryNormal && len(entry.Data) > 0 {
-			sm.state[entry.Index] = uint64(len(entry.Data))
+			_, key, value := parseKVCmd(entry.Data)
+			if key != nil {
+				owned := make([]byte, len(value))
+				copy(owned, value)
+				sm.data[string(key)] = owned
+			}
 			sm.applied = entry.Index
 		}
 	}
@@ -570,10 +580,12 @@ func (tn *etcdRaftTestNode) waitForApplied(target int64, timeout time.Duration) 
 func benchEtcdRaftPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 
@@ -608,10 +620,12 @@ func benchEtcdRaftPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, r
 func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 
@@ -700,14 +714,16 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 
 		walDir := b.TempDir()
 
-		start := time.Now()
-
-		// Initialize TLS transport to match QuicRaft's QUIC/mTLS
-		// initialization overhead (cert generation + listener binding).
+		// Initialize TLS transport outside the timed region. QuicRaft and
+		// Dragonboat create their transport infrastructure (cert generation,
+		// listener binding) outside their election timers, so etcd must too to
+		// keep the election-time measurement apples-to-apples.
 		ts, tlsErr := setupTLSTransport()
 		if tlsErr != nil {
 			b.Fatalf("setupTLSTransport failed: %v", tlsErr)
 		}
+
+		start := time.Now()
 
 		node := raft.StartNode(cfg, peers)
 
@@ -720,7 +736,6 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 
 		// Start event loop that processes ConfChange entries and persists
 		// to WAL.
-		confTracker := newConfChangeTracker()
 		stopCh := make(chan struct{})
 		var loopDone sync.WaitGroup
 		loopDone.Add(1)
@@ -750,7 +765,6 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 							if unmarshalErr := cc.Unmarshal(entry.Data); unmarshalErr == nil {
 								node.ApplyConfChange(cc)
 							}
-							confTracker.signal()
 						}
 					}
 					node.Advance()
@@ -826,21 +840,27 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 
-	// Warm up: prime the pipeline and WAL file.
+	// Warm up: prime the pipeline and WAL file. The same retry budget as
+	// all engines tolerates transient startup errors.
 	tn.totalApplied.Store(0)
-	for w := 0; w < 10; w++ {
-		if err := tn.node.Propose(ctx, payload); err != nil {
+	for w := 0; w < commitLatencyWarmup; w++ {
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			return tn.node.Propose(ctx, payload)
+		})
+		if err != nil {
 			b.Fatalf("warmup propose failed: %v", err)
 		}
 	}
-	if !tn.waitForApplied(10, 10*time.Second) {
+	if !tn.waitForApplied(commitLatencyWarmup, 10*time.Second) {
 		b.Fatalf("warmup applies did not complete")
 	}
 
@@ -900,10 +920,12 @@ func benchEtcdRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 func benchEtcdRaftProposeCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 	leader, findErr := cluster.CurrentLeaderNode()
@@ -953,10 +975,12 @@ func benchEtcdRaftProposeCluster(b *testing.B, cluster *EtcdCluster, payloadSize
 func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 
@@ -1005,7 +1029,16 @@ func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, p
 						errCount.Add(1)
 						continue
 					}
-					leaderRef.CompareAndSwap(currentLeader, newLeader)
+					// Transfer the applied count to the new leader before
+					// publishing it (matching the sequential variant): every
+					// node applies all committed entries, so a follower's
+					// counter includes pre-reset history and is LARGER than
+					// the old leader's. Without the transfer, waitForApplied
+					// on the new leader returns immediately and records
+					// near-zero latencies for the rest of the run.
+					if leaderRef.CompareAndSwap(currentLeader, newLeader) {
+						newLeader.totalApplied.Store(currentLeader.totalApplied.Load())
+					}
 					currentLeader = leaderRef.Load()
 					// Retry on new leader.
 					if retryErr := currentLeader.node.Propose(ctx, payload); retryErr != nil {
@@ -1038,10 +1071,12 @@ func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, p
 func benchEtcdRaftCommitLatencyCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i % 256)
-	}
+	// Build a KV command whose total wire size matches proposalBytes (128B),
+	// identical to the commands proposed by the other engines. payloadSize is
+	// retained in the signature for call-site symmetry; the shared
+	// proposalBytes constant governs the actual entry size.
+	_ = payloadSize
+	payload := makeKVCmd([]byte("bench-key"))
 
 	ctx := context.Background()
 	leader, findErr := cluster.CurrentLeaderNode()
@@ -1049,14 +1084,18 @@ func benchEtcdRaftCommitLatencyCluster(b *testing.B, cluster *EtcdCluster, paylo
 		b.Fatalf("no leader at benchmark start: %v", findErr)
 	}
 
-	// Warm up: prime the pipeline and TLS connections.
+	// Warm up: prime the pipeline and TLS connections. The same retry
+	// budget as all engines tolerates transient startup errors.
 	leader.totalApplied.Store(0)
-	for w := 0; w < 10; w++ {
-		if err := leader.node.Propose(ctx, payload); err != nil {
+	for w := 0; w < commitLatencyWarmup; w++ {
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			return leader.node.Propose(ctx, payload)
+		})
+		if err != nil {
 			b.Fatalf("cluster warmup propose failed: %v", err)
 		}
 	}
-	if !leader.waitForApplied(10, 10*time.Second) {
+	if !leader.waitForApplied(commitLatencyWarmup, 10*time.Second) {
 		b.Fatalf("cluster warmup applies did not complete")
 	}
 
@@ -1203,19 +1242,19 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 
 		peers := []raft.Peer{{ID: 1}}
 
-		start := time.Now()
-
-		// Initialize TLS transport to match QuicRaft's QUIC/mTLS
-		// initialization overhead (cert generation + listener binding).
+		// Initialize TLS transport outside the timed region (see WAL election
+		// benchmark) so the measurement excludes one-time cert generation and
+		// listener binding, matching QuicRaft and Dragonboat.
 		ts, tlsErr := setupTLSTransport()
 		if tlsErr != nil {
 			b.Fatalf("setupTLSTransport (memory) failed: %v", tlsErr)
 		}
 
+		start := time.Now()
+
 		node := raft.StartNode(cfg, peers)
 
 		// Start event loop without WAL persistence (memory mode).
-		confTracker := newConfChangeTracker()
 		stopCh := make(chan struct{})
 		var loopDone sync.WaitGroup
 		loopDone.Add(1)
@@ -1237,7 +1276,6 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 							if unmarshalErr := cc.Unmarshal(entry.Data); unmarshalErr == nil {
 								node.ApplyConfChange(cc)
 							}
-							confTracker.signal()
 						}
 					}
 					node.Advance()

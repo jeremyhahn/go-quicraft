@@ -212,13 +212,13 @@ func TestCRLReload(t *testing.T) {
 	leaf200 := ca.issueLeaf(t, 200)
 	leaf300 := ca.issueLeaf(t, 300)
 
-	if !checker.checkCRL(leaf100.SerialNumber.Text(16)) {
+	if !crlRevoked(checker, leaf100.SerialNumber.Text(16)) {
 		t.Fatal("serial 100 should be revoked")
 	}
-	if !checker.checkCRL(leaf200.SerialNumber.Text(16)) {
+	if !crlRevoked(checker, leaf200.SerialNumber.Text(16)) {
 		t.Fatal("serial 200 should be revoked")
 	}
-	if checker.checkCRL(leaf300.SerialNumber.Text(16)) {
+	if crlRevoked(checker, leaf300.SerialNumber.Text(16)) {
 		t.Fatal("serial 300 should NOT be revoked")
 	}
 }
@@ -230,13 +230,72 @@ func TestCRLReloadMissingFile(t *testing.T) {
 		CRLPaths: []string{"/nonexistent/crl.pem"},
 	}, nil)
 
-	// Should not return error for missing files (just logged).
+	// An unreadable CRL must FAIL the reload: silently continuing with a
+	// partial set would un-revoke every certificate in the missing file.
+	err := checker.ReloadCRLs()
+	if err == nil {
+		t.Fatal("ReloadCRLs must fail for an unreadable CRL file")
+	}
+	var readErr *CRLReadError
+	if !errors.As(err, &readErr) {
+		t.Fatalf("expected *CRLReadError, got %T: %v", err, err)
+	}
+	if readErr.Path != "/nonexistent/crl.pem" {
+		t.Fatalf("CRLReadError.Path = %q", readErr.Path)
+	}
+}
+
+// TestCRLReloadReadFailureKeepsPreviousSet verifies that a failed reload
+// preserves the previously loaded revocations (a transiently unreadable
+// CRL must not un-revoke certificates) and that enforcement mode fails
+// closed (ErrCRLStale) for unknown serials until a reload succeeds.
+func TestCRLReloadReadFailureKeepsPreviousSet(t *testing.T) {
+	ca := newTestCA(t)
+	dir := t.TempDir()
+	revokedLeaf := ca.issueLeaf(t, 77)
+	unknownLeaf := ca.issueLeaf(t, 78)
+
+	crlData := ca.createCRL(t, 77)
+	crlPath := writeCRLFile(t, dir, "crl.pem", crlData)
+
+	checker := NewChecker(Config{
+		CRLPaths:          []string{crlPath},
+		Mode:              ModeCRL,
+		EnforceRevocation: true,
+	}, nil)
 	if err := checker.ReloadCRLs(); err != nil {
-		t.Fatalf("ReloadCRLs should not fail for missing file: %v", err)
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+	if revoked, err := checker.IsRevoked(revokedLeaf); err != nil || !revoked {
+		t.Fatalf("baseline: revoked=%v err=%v, want true/nil", revoked, err)
 	}
 
-	if checker.RevokedCount() != 0 {
-		t.Fatalf("revoked count should be 0 for missing file, got %d", checker.RevokedCount())
+	// Delete the CRL file and reload: the reload must fail, the previous
+	// set must keep serving the revocation, and unknown serials must fail
+	// closed under enforcement.
+	if err := os.Remove(crlPath); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := checker.ReloadCRLs(); err == nil {
+		t.Fatal("ReloadCRLs must fail after CRL file deletion")
+	}
+
+	if revoked, err := checker.IsRevoked(revokedLeaf); err != nil || !revoked {
+		t.Fatalf("after failed reload: revoked=%v err=%v, want true/nil (previous set must be kept)", revoked, err)
+	}
+	if _, err := checker.IsRevoked(unknownLeaf); !errors.Is(err, ErrCRLStale) {
+		t.Fatalf("unknown serial with stale CRL under enforcement: err=%v, want ErrCRLStale", err)
+	}
+
+	// Restore the file: reload succeeds and unknown serials pass again.
+	if werr := os.WriteFile(crlPath, crlData, 0o600); werr != nil {
+		t.Fatalf("WriteFile: %v", werr)
+	}
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs after restore: %v", err)
+	}
+	if revoked, err := checker.IsRevoked(unknownLeaf); err != nil || revoked {
+		t.Fatalf("after restore: revoked=%v err=%v, want false/nil", revoked, err)
 	}
 }
 
@@ -298,7 +357,7 @@ func TestCRLHotReload(t *testing.T) {
 	}
 
 	leaf200 := ca.issueLeaf(t, 200)
-	if !checker.checkCRL(leaf200.SerialNumber.Text(16)) {
+	if !crlRevoked(checker, leaf200.SerialNumber.Text(16)) {
 		t.Fatal("serial 200 should be revoked after hot-reload")
 	}
 }
@@ -448,12 +507,12 @@ func TestRemoveRevokedSerial(t *testing.T) {
 	serial := leaf.SerialNumber.Text(16)
 
 	checker.AddRevokedSerial(serial)
-	if !checker.checkCRL(serial) {
+	if !crlRevoked(checker, serial) {
 		t.Fatal("serial should be revoked after add")
 	}
 
 	checker.RemoveRevokedSerial(serial)
-	if checker.checkCRL(serial) {
+	if crlRevoked(checker, serial) {
 		t.Fatal("serial should not be revoked after remove")
 	}
 }
@@ -990,9 +1049,9 @@ func TestModeBothRequiresBothSources(t *testing.T) {
 	}
 }
 
-// TestModeBothCRLOnlyNotRevoked verifies that when only CRL reports
+// TestModeBothCRLOnlyRevokedWins verifies that when only CRL reports
 // revoked but OCSP says good, ModeBoth returns not revoked.
-func TestModeBothCRLOnlyNotRevoked(t *testing.T) {
+func TestModeBothCRLOnlyRevokedWins(t *testing.T) {
 	ca := newTestCA(t)
 	dir := t.TempDir()
 	leaf := ca.issueLeaf(t, 44)
@@ -1019,8 +1078,8 @@ func TestModeBothCRLOnlyNotRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IsRevoked error: %v", err)
 	}
-	if revoked {
-		t.Fatal("only CRL confirms revoked, ModeBoth should return not revoked")
+	if !revoked {
+		t.Fatal("CRL says revoked: ModeBoth must treat revoked-by-either as revoked")
 	}
 }
 
@@ -1061,6 +1120,8 @@ func TestModeBothOCSPUnavailableEnforced(t *testing.T) {
 	dir := t.TempDir()
 	leaf := ca.issueLeaf(t, 66)
 
+	unknownLeaf := ca.issueLeaf(t, 67)
+
 	crlData := ca.createCRL(t, 66)
 	crlPath := writeCRLFile(t, dir, "crl.pem", crlData)
 
@@ -1075,7 +1136,15 @@ func TestModeBothOCSPUnavailableEnforced(t *testing.T) {
 		t.Fatalf("ReloadCRLs: %v", err)
 	}
 
-	_, err := checker.IsRevoked(leaf)
+	// The CRL-revoked cert is revoked regardless of OCSP availability.
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil || !revoked {
+		t.Fatalf("CRL-revoked cert: revoked=%v err=%v, want true/nil", revoked, err)
+	}
+
+	// An unknown cert fails closed: its status cannot be established
+	// while the OCSP responder is unreachable.
+	_, err = checker.IsRevoked(unknownLeaf)
 	if err == nil {
 		t.Fatal("expected error with enforcement and unreachable OCSP")
 	}
@@ -1363,4 +1432,11 @@ func TestRevokedCount(t *testing.T) {
 	if checker.RevokedCount() != 1 {
 		t.Fatalf("after remove: want 1, got %d", checker.RevokedCount())
 	}
+}
+
+// crlRevoked reports whether serial is in the checker's revoked set,
+// ignoring CRL staleness (test convenience wrapper).
+func crlRevoked(c *Checker, serial string) bool {
+	revoked, _ := c.checkCRLStatus(serial)
+	return revoked
 }

@@ -308,6 +308,60 @@ func TestBuildMTLSTLSNilCheckerNoCallback(t *testing.T) {
 	}
 }
 
+// TestBuildMTLSTLSWithPrebuiltCertificate verifies the signer seam: when an
+// MTLSConfig supplies a pre-built tls.Certificate (e.g. one whose PrivateKey is
+// a hardware-backed crypto.Signer for a TPM/HSM-resident key) and no PEM
+// Cert/Key, buildMTLSTLS uses it directly on both server and client configs.
+func TestBuildMTLSTLSWithPrebuiltCertificate(t *testing.T) {
+	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
+
+	prebuilt, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+
+	// CACert is supplied; Cert/Key are intentionally omitted — the leaf comes
+	// from the pre-built Certificate.
+	pair, err := buildMTLSTLS(&MTLSConfig{
+		CACert:      caCertPEM,
+		Certificate: &prebuilt,
+	}, nil)
+	if err != nil {
+		t.Fatalf("buildMTLSTLS with prebuilt certificate: %v", err)
+	}
+	if len(pair.server.Certificates) != 1 || len(pair.client.Certificates) != 1 {
+		t.Fatal("expected the prebuilt certificate on both server and client configs")
+	}
+	if len(pair.server.Certificates[0].Certificate) == 0 ||
+		string(pair.server.Certificates[0].Certificate[0]) != string(prebuilt.Certificate[0]) {
+		t.Error("server config did not use the prebuilt certificate")
+	}
+}
+
+// TestConfigValidateAcceptsPrebuiltCertificate verifies the internal Config
+// validation accepts an MTLSConfig that carries a pre-built Certificate (and a
+// CACert) with no PEM Cert/Key, and still rejects one missing both.
+func TestConfigValidateAcceptsPrebuiltCertificate(t *testing.T) {
+	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
+	prebuilt, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+
+	cfg := Config{ListenAddress: ":0", MTLSConfig: &MTLSConfig{CACert: caCertPEM, Certificate: &prebuilt}}
+	cfg.SetDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate with prebuilt certificate: %v", err)
+	}
+
+	// Neither a Certificate nor a PEM keypair: must fail.
+	bad := Config{ListenAddress: ":0", MTLSConfig: &MTLSConfig{CACert: caCertPEM}}
+	bad.SetDefaults()
+	if err := bad.Validate(); !errors.Is(err, ErrIncompleteMTLSConfig) {
+		t.Fatalf("Validate without leaf material = %v, want ErrIncompleteMTLSConfig", err)
+	}
+}
+
 // TestBuildMTLSTLSWithCheckerInstallsCallback verifies that a revocation
 // checker causes VerifyConnection to be set on both configs.
 func TestBuildMTLSTLSWithCheckerInstallsCallback(t *testing.T) {
@@ -434,15 +488,17 @@ func TestVerifyConnectionEmptyPeerCerts(t *testing.T) {
 		t.Fatalf("buildMTLSTLS failed: %v", err)
 	}
 
-	// Empty PeerCertificates should not cause a panic.
+	// Empty PeerCertificates must FAIL CLOSED: a connection presenting no
+	// certificate cannot be revocation-checked and must be rejected
+	// rather than silently accepted (a latent fail-open).
 	cs := tls.ConnectionState{PeerCertificates: nil}
-	if cbErr := pair.server.VerifyConnection(cs); cbErr != nil {
-		t.Fatalf("nil PeerCertificates should pass: %v", cbErr)
+	if cbErr := pair.server.VerifyConnection(cs); !errors.Is(cbErr, ErrNoPeerCertificate) {
+		t.Fatalf("nil PeerCertificates: got %v, want ErrNoPeerCertificate", cbErr)
 	}
 
 	cs = tls.ConnectionState{PeerCertificates: []*x509.Certificate{}}
-	if cbErr := pair.server.VerifyConnection(cs); cbErr != nil {
-		t.Fatalf("empty PeerCertificates should pass: %v", cbErr)
+	if cbErr := pair.server.VerifyConnection(cs); !errors.Is(cbErr, ErrNoPeerCertificate) {
+		t.Fatalf("empty PeerCertificates: got %v, want ErrNoPeerCertificate", cbErr)
 	}
 }
 

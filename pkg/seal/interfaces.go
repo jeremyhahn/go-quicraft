@@ -30,6 +30,19 @@ type StorageBackend interface {
 	List(ctx context.Context, prefix string) ([]string, error)
 	Exists(ctx context.Context, key string) (bool, error)
 	Scan(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
+
+	// PutIfAbsent atomically stores data under key only if key does not
+	// already exist. It returns stored=true when this call created the key,
+	// and stored=false (with a nil error) when the key already existed — in
+	// that case the store is unchanged. A non-nil error means the outcome is
+	// unknown and the caller must not assume either way.
+	//
+	// Atomicity is provided per consistency domain: single-process backends
+	// serialize the check-then-write internally (e.g., with a mutex), while
+	// distributed backends must use their native compare-and-set primitive
+	// (e.g., a Raft transaction) so the guarantee holds across nodes.
+	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
+
 	Close() error
 }
 

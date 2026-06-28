@@ -27,6 +27,12 @@ var (
 	// file size.
 	ErrSegmentFull = errors.New("waldb: segment full")
 
+	// ErrRecordTooLarge is returned when a single record's framed size exceeds
+	// the segment size limit, so it can never fit in any segment. Unlike
+	// ErrSegmentFull this is permanent: rotating to a fresh segment will not
+	// help, and the caller must split the record into smaller writes.
+	ErrRecordTooLarge = errors.New("waldb: record exceeds maximum segment size")
+
 	// ErrClosed is returned when an operation is attempted on a closed segment.
 	ErrClosed = errors.New("waldb: segment closed")
 
@@ -54,6 +60,15 @@ var (
 	// ErrDiskFull is returned when the WAL directory has reached or
 	// exceeded the configured maximum disk usage threshold.
 	ErrDiskFull = errors.New("waldb: disk full")
+
+	// ErrDBPoisoned is returned by every write operation after an fsync
+	// failure has fail-stopped the database. Once fdatasync fails, the
+	// kernel may mark dirty pages clean without persisting them
+	// (fsyncgate), so retrying writes has undefined durability semantics
+	// and ghost records could surface at recovery. The only safe path is
+	// a process restart followed by WAL crash recovery.
+	ErrDBPoisoned = errors.New(
+		"waldb: database poisoned after fsync failure; restart required for crash recovery")
 )
 
 // WALWriteError represents a compound failure during WAL write with recovery

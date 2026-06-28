@@ -183,6 +183,25 @@ See individual comparison documents for detailed analysis:
 | `sync_read_3n_wal_leaseread` | 3N WAL | Linearizable read with LeaseRead, 3-node cluster (QuicRaft only) |
 | `sync_read_5n_wal_leaseread` | 5N WAL | Linearizable read with LeaseRead, 5-node cluster (QuicRaft only) |
 
+## Fairness Notes
+
+All engines propose byte-for-byte identical 128-byte KV commands, run the
+same 100-proposal warmup with the same retry budget before commit-latency
+measurement, apply entries through equivalent map-backed state machines, and
+persist with write+fsync WAL parity. Known asymmetries that cannot be fully
+normalized:
+
+- **etcd/raft completion detection.** Raw etcd/raft has no per-proposal
+  acknowledgement API, so its benchmarks reserve a sequence number before
+  proposing and wait until the node's *total* applied count reaches that
+  number. Under concurrency, another goroutine's proposal can satisfy the
+  wait, which may slightly under-report etcd per-operation latency relative
+  to QuicRaft/Dragonboat `SyncPropose`, which both wait for *their own*
+  proposal to apply.
+- **OpenRaft transport.** OpenRaft scenarios run with a no-op network (it is
+  benchmarked as a library, not a server), so multi-node OpenRaft numbers
+  exclude real transport cost; Go engines use real TLS/QUIC sockets.
+
 ## Architecture
 
 ```

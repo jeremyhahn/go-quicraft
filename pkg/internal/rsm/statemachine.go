@@ -586,8 +586,24 @@ func (s *StateMachine) GetHash() (uint64, bool, error) {
 
 // SaveSnapshot saves both the user SM state and session state to the
 // writer. Format: [session data][SM data]. The stopper channel signals
-// cancellation.
+// cancellation. The caller is responsible for ensuring no concurrent Apply
+// runs for the duration of this call (the engine quiesces applies via the
+// node saving gate); use SaveSnapshotGated to release that gate early once the
+// point-in-time is captured.
 func (s *StateMachine) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
+	return s.SaveSnapshotGated(ctx, w, stopper, nil)
+}
+
+// SaveSnapshotGated saves session + user SM state and invokes afterCapture
+// exactly once, after the consistent point-in-time is captured (session state
+// marshaled and, for concurrent/on-disk SMs, PrepareSnapshot completed) and
+// before the user SM snapshot streams. This lets the engine hold the apply gate
+// only across the capture — which reads the session manager (never safe for
+// concurrent use) and, for a regular SM, its in-memory state — and release it
+// so applies resume while an on-disk/concurrent snapshot streams its immutable
+// context. afterCapture may be nil (equivalent to SaveSnapshot). If the save
+// errors before the capture completes, afterCapture is not called.
+func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	// Check for cancellation before starting.
 	select {
 	case <-stopper:
@@ -595,13 +611,15 @@ func (s *StateMachine) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-
 	default:
 	}
 
-	// Save session state first.
+	// Save session state first. The session manager is not safe for concurrent
+	// use, so this MarshalTo must run with applies quiesced (the caller's gate).
 	if err := s.sessions.MarshalTo(w); err != nil {
 		return err
 	}
 
-	// Save user SM state.
-	return s.sm.SaveSnapshot(ctx, w, stopper)
+	// Save user SM state, releasing the gate via afterCapture once the user SM
+	// point-in-time is captured.
+	return s.sm.saveSnapshotGated(ctx, w, stopper, afterCapture)
 }
 
 // RecoverFromSnapshot restores both session state and user SM state

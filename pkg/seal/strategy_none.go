@@ -119,9 +119,21 @@ func (noneEncrypter) Encrypt(plaintext []byte) ([]byte, error) {
 }
 
 // Decrypt strips the epoch prefix and returns a fresh copy of the payload.
+//
+// A non-zero epoch prefix means the data was written by a REAL sealing
+// strategy (the epoch is a live DEK epoch), not by NoneStrategy. Decoding
+// it as plaintext would silently return ciphertext-as-plaintext garbage —
+// there is no AEAD tag in None mode to fail on. This happens when a
+// barrier is misconfigured to None after previously running encrypted, so
+// fail loudly instead of corrupting reads.
 func (noneEncrypter) Decrypt(ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < noneEpochHeaderSize {
 		return nil, ErrCiphertextTooShort
+	}
+	for _, b := range ciphertext[:noneEpochHeaderSize] {
+		if b != 0 {
+			return nil, ErrNoneStrategyEncryptedData
+		}
 	}
 	payload := ciphertext[noneEpochHeaderSize:]
 	out := make([]byte, len(payload))

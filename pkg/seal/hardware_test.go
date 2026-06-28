@@ -616,14 +616,14 @@ func TestSealedRootKeyData_NilNonceAndPayload(t *testing.T) {
 
 func TestCredentials_ZeroValue(t *testing.T) {
 	c := Credentials{}
-	if c.Secret != "" {
+	if len(c.Secret) != 0 {
 		t.Fatalf("expected empty secret, got %q", c.Secret)
 	}
 }
 
 func TestCredentials_WithSecret(t *testing.T) {
-	c := Credentials{Secret: "my-secret"}
-	if c.Secret != "my-secret" {
+	c := Credentials{Secret: []byte("my-secret")}
+	if string(c.Secret) != "my-secret" {
 		t.Fatalf("expected 'my-secret', got %q", c.Secret)
 	}
 }

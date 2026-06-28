@@ -23,18 +23,21 @@ import (
 )
 
 // Share represents a single piece of a secret split using Shamir's Secret Sharing.
+//
+// NOTE: shares carry NO digest of the secret. An earlier design embedded
+// sha256(secret) in every share for a self-check, but that is an offline
+// brute-force ORACLE — a single shareholder (or anyone who sees one persisted
+// share) can confirm guessed secrets without ever reaching the threshold,
+// defeating Shamir's information-theoretic secrecy for low-entropy secrets.
+// Integrity is therefore the caller's responsibility and MUST be established
+// out-of-band — e.g. by using the reconstructed secret in an authenticated
+// decrypt that fails on a wrong key (see Combine / CombineUnverified).
 type Share struct {
-	Index     int    `json:"index"`
-	Threshold int    `json:"threshold"`
-	Total     int    `json:"total"`
-	Value     string `json:"value"`
-	// Digest is the SHA-256 of the original secret, set by Split and used by
-	// Combine for integrity verification. A zero value ([32]byte{}) signals
-	// that no digest is available (e.g. shares constructed without Split); in
-	// that case Combine SKIPS integrity verification and the caller MUST verify
-	// the reconstructed secret out-of-band.
-	Digest   [32]byte          `json:"digest"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Index     int               `json:"index"`
+	Threshold int               `json:"threshold"`
+	Total     int               `json:"total"`
+	Value     string            `json:"value"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler for Share.
@@ -55,11 +58,13 @@ func (s *Share) Bytes() ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s.Value)
 }
 
-// String returns a string representation of the share.
+// String returns a string representation of the share. The share value
+// is NEVER included: shares are root-key custody material, and String is
+// exactly what reaches logs and %v/%s formatting, so even a prefix would
+// leak share bytes.
 func (s *Share) String() string {
-	truncLen := min(len(s.Value), 16)
-	return fmt.Sprintf("Share{Index: %d, Threshold: %d/%d, Value: %s...}",
-		s.Index, s.Threshold, s.Total, s.Value[:truncLen])
+	return fmt.Sprintf("Share{Index: %d, Threshold: %d/%d, Value: [redacted]}",
+		s.Index, s.Threshold, s.Total)
 }
 
 // Validate checks if the share has valid parameters.

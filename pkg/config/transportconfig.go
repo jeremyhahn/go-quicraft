@@ -27,12 +27,15 @@ const (
 	DefaultMaxSnapshotReceiveRate    int64  = 256 * 1024 * 1024 // 256 MB/s
 	DefaultMaxConcurrentSnapshotRecv int    = 4
 	DefaultMaxSnapshotReceiveMemory  int64  = 1024 * 1024 * 1024 // 1 GB
+	DefaultMaxMessageReceiveMemory   int64  = 256 * 1024 * 1024  // 256 MB
 	DefaultMaxDecompressedSize       uint32 = 16 * 1024 * 1024   // 16 MB (transport.MaxFrameSize)
 	DefaultMaxConnectionsPerIP       int    = 16
 	DefaultMaxIncomingConnections    int    = 256
 	DefaultSendBatchMaxSize          int    = 64 * 1024       // 64 KB
 	DefaultUDPRecvBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical rmem_max)
 	DefaultUDPSendBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical wmem_max)
+	DefaultMaxStreamsPerConnection   int    = 256
+	DefaultStreamReadIdleTimeout            = 30 * time.Second
 
 	// MinMaxSnapshotReceiveRate is the smallest accepted non-zero value for
 	// MaxSnapshotReceiveRate. Rates below this floor are rejected by Validate
@@ -57,6 +60,13 @@ type MTLSConfig struct {
 
 	// Key is the PEM-encoded private key for this node.
 	Key []byte
+
+	// Certificate, when non-nil, supplies a pre-built TLS certificate in place
+	// of the PEM Cert/Key pair. Its PrivateKey may be a hardware-backed
+	// crypto.Signer for a TPM/HSM-resident key that never leaves the device,
+	// which cannot be expressed as PEM Key bytes. When set, Cert/Key may be
+	// empty; CACert is still required for peer verification.
+	Certificate *tls.Certificate
 }
 
 // RevocationConfig holds certificate revocation checking configuration.
@@ -90,14 +100,23 @@ type RevocationConfig struct {
 	// Mode determines the revocation checking strategy:
 	//   "crl"  - CRL files only
 	//   "ocsp" - OCSP responder only
-	//   "both" - requires both CRL and OCSP to confirm revocation
+	//   "both" - consults both sources; revoked by EITHER is revoked
 	//   "any"  - either CRL or OCSP confirms revocation (default)
+	// Any other value is rejected by Validate; a typo must not silently
+	// select the default strategy.
 	Mode string
 
-	// EnforceRevocation rejects peers when revocation status is unknown
-	// (OCSP unreachable, no CRL configured). Default: false (soft-fail
-	// allows connections when revocation status cannot be determined).
-	EnforceRevocation bool
+	// AllowSoftFail, when true, admits a peer whose revocation status cannot be
+	// determined (OCSP responder unreachable, CRL stale/unreadable, or no
+	// revocation source configured). The default (false) FAILS CLOSED: for an
+	// intra-cluster mTLS control where the operator owns the CA and responder,
+	// revocation is the only mechanism to evict a compromised-but-unexpired
+	// certificate, so an unknown status must reject rather than admit — an
+	// attacker who got a node revoked could otherwise keep connecting by making
+	// the responder appear unreachable. Set this only when the availability
+	// tradeoff is understood. A definitive "revoked" verdict always rejects
+	// regardless of this flag.
+	AllowSoftFail bool
 
 	// OnCertRevoked is called when a certificate is found to be revoked
 	// during a TLS handshake. The serial number is passed as a lowercase
@@ -138,6 +157,12 @@ type TransportConfig struct {
 	// snapshot receives across all connections. Default: 1 GB.
 	MaxSnapshotReceiveMemory int64
 
+	// MaxMessageReceiveMemory is the total bytes allowed for in-flight inbound
+	// message-frame payload buffers across all connections and streams. It
+	// bounds an OOM DoS where a peer opens many streams that each declare a
+	// large frame length and withhold the body. Default: 256 MB.
+	MaxMessageReceiveMemory int64
+
 	// MaxDecompressedSize is the maximum allowed size after Snappy
 	// decompression. Default: 16 MB (MaxFrameSize).
 	MaxDecompressedSize uint32
@@ -149,6 +174,24 @@ type TransportConfig struct {
 	// MaxIncomingConnections is the total number of concurrent inbound
 	// QUIC connections. Default: 256.
 	MaxIncomingConnections int
+
+	// MaxStreamsPerConnection is the maximum number of concurrent
+	// stream-processing goroutines per inbound QUIC connection. Since an
+	// idle stream on a live connection is kept open (see
+	// StreamReadIdleTimeout), each accepted stream holds one goroutine and
+	// one slot of this budget until its connection closes; the worst-case
+	// goroutine count is MaxIncomingConnections * MaxStreamsPerConnection.
+	// Default: 256.
+	MaxStreamsPerConnection int
+
+	// StreamReadIdleTimeout bounds how long an inbound stream read waits
+	// at a clean frame boundary before re-checking its connection's
+	// liveness. It is NOT a stream lifetime: an idle stream on a live
+	// connection is kept open across re-checks (replication streams sit
+	// idle between bursts while heartbeats keep the connection alive).
+	// Only a dead connection or a half-delivered frame stall ends a
+	// stream. Default: 30s.
+	StreamReadIdleTimeout time.Duration
 
 	// SendBatchMaxSize is the maximum send buffer size in bytes before a
 	// flush is triggered. Default: 64 KB.
@@ -215,6 +258,9 @@ func (tc *TransportConfig) SetDefaults() {
 	if tc.MaxSnapshotReceiveMemory == 0 {
 		tc.MaxSnapshotReceiveMemory = DefaultMaxSnapshotReceiveMemory
 	}
+	if tc.MaxMessageReceiveMemory == 0 {
+		tc.MaxMessageReceiveMemory = DefaultMaxMessageReceiveMemory
+	}
 	if tc.MaxDecompressedSize == 0 {
 		tc.MaxDecompressedSize = DefaultMaxDecompressedSize
 	}
@@ -232,6 +278,12 @@ func (tc *TransportConfig) SetDefaults() {
 	}
 	if tc.UDPSendBufSize == 0 {
 		tc.UDPSendBufSize = DefaultUDPSendBufSize
+	}
+	if tc.MaxStreamsPerConnection == 0 {
+		tc.MaxStreamsPerConnection = DefaultMaxStreamsPerConnection
+	}
+	if tc.StreamReadIdleTimeout == 0 {
+		tc.StreamReadIdleTimeout = DefaultStreamReadIdleTimeout
 	}
 }
 
@@ -266,6 +318,10 @@ func (tc *TransportConfig) Validate() error {
 		return newValidationError("TransportConfig.MaxSnapshotReceiveMemory",
 			"must be >= 0")
 	}
+	if tc.MaxMessageReceiveMemory < 0 {
+		return newValidationError("TransportConfig.MaxMessageReceiveMemory",
+			"must be >= 0")
+	}
 	if tc.MaxDecompressedSize == 0 {
 		return newValidationError("TransportConfig.MaxDecompressedSize",
 			"must be > 0")
@@ -282,6 +338,14 @@ func (tc *TransportConfig) Validate() error {
 		return newValidationError("TransportConfig.SendBatchMaxSize",
 			"must be >= 1")
 	}
+	if tc.MaxStreamsPerConnection < 1 {
+		return newValidationError("TransportConfig.MaxStreamsPerConnection",
+			"must be >= 1")
+	}
+	if tc.StreamReadIdleTimeout < 0 {
+		return newValidationError("TransportConfig.StreamReadIdleTimeout",
+			"must be >= 0 (0 uses the default)")
+	}
 	// When transport is enabled, MTLSConfig must be provided. All QUIC
 	// connections require mTLS; there is no insecure fallback. When
 	// TransportDisabled is true (set by WithoutTransport()), this
@@ -297,19 +361,62 @@ func (tc *TransportConfig) Validate() error {
 		if len(mtls.CACert) == 0 {
 			return newValidationError("TransportConfig.MTLSConfig.CACert", "must be a non-empty PEM CA certificate")
 		}
-		if len(mtls.Cert) == 0 {
-			return newValidationError("TransportConfig.MTLSConfig.Cert", "must be a non-empty PEM certificate")
-		}
-		if len(mtls.Key) == 0 {
-			return newValidationError("TransportConfig.MTLSConfig.Key", "must be a non-empty PEM private key")
-		}
-		// Trial-parse so a malformed keypair or CA is caught here.
-		if _, err := tls.X509KeyPair(mtls.Cert, mtls.Key); err != nil {
-			return newValidationError("TransportConfig.MTLSConfig", "Cert/Key are not a valid PEM keypair: "+err.Error())
-		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(mtls.CACert) {
 			return newValidationError("TransportConfig.MTLSConfig.CACert", "no valid PEM certificate found")
+		}
+		// The node leaf comes from EITHER a pre-built Certificate (e.g. a
+		// hardware-signer-backed key) OR the PEM Cert/Key pair. Reject only when
+		// neither is usable.
+		if mtls.Certificate != nil {
+			if len(mtls.Certificate.Certificate) == 0 {
+				return newValidationError("TransportConfig.MTLSConfig.Certificate", "must contain at least one certificate")
+			}
+		} else {
+			if len(mtls.Cert) == 0 {
+				return newValidationError("TransportConfig.MTLSConfig.Cert", "must be a non-empty PEM certificate (or set Certificate)")
+			}
+			if len(mtls.Key) == 0 {
+				return newValidationError("TransportConfig.MTLSConfig.Key", "must be a non-empty PEM private key (or set Certificate)")
+			}
+			// Trial-parse so a malformed keypair is caught here.
+			if _, err := tls.X509KeyPair(mtls.Cert, mtls.Key); err != nil {
+				return newValidationError("TransportConfig.MTLSConfig", "Cert/Key are not a valid PEM keypair: "+err.Error())
+			}
+		}
+	}
+	if rc := tc.RevocationConfig; rc != nil {
+		// Reject unknown mode strings: a typo ("CRL", "strict") would
+		// otherwise silently select the default strategy.
+		switch rc.Mode {
+		case "", "crl", "ocsp", "both", "any":
+		default:
+			return newValidationError("TransportConfig.RevocationConfig.Mode",
+				`must be one of "crl", "ocsp", "both", "any" (or empty for the default)`)
+		}
+		// A mode that consults a source requires that source to be
+		// configured; otherwise the checker can never produce a verdict.
+		usesCRL := rc.Mode == "crl" || rc.Mode == "both"
+		usesOCSP := rc.Mode == "ocsp" || rc.Mode == "both"
+		if usesCRL && len(rc.CRLPaths) == 0 {
+			return newValidationError("TransportConfig.RevocationConfig.CRLPaths",
+				`must be non-empty when Mode is "crl" or "both"`)
+		}
+		if usesOCSP && rc.OCSPResponderURL == "" {
+			return newValidationError("TransportConfig.RevocationConfig.OCSPResponderURL",
+				`must be non-empty when Mode is "ocsp" or "both"`)
+		}
+		if rc.OCSPCacheSeconds < 0 {
+			return newValidationError("TransportConfig.RevocationConfig.OCSPCacheSeconds",
+				"must be >= 0 (0 uses the default)")
+		}
+		if rc.OCSPTimeoutSeconds < 0 {
+			return newValidationError("TransportConfig.RevocationConfig.OCSPTimeoutSeconds",
+				"must be >= 0 (0 uses the default)")
+		}
+		if rc.CheckInterval < 0 {
+			return newValidationError("TransportConfig.RevocationConfig.CheckInterval",
+				"must be >= 0 (0 uses the default)")
 		}
 	}
 	return nil

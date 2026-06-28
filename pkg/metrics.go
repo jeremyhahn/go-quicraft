@@ -98,9 +98,24 @@ type TransportMetrics interface {
 	IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
 }
 
+// SecurityMetrics covers security-relevant drop counters. These events
+// indicate either a misconfigured cluster or an active injection attempt
+// by an authenticated-but-compromised peer; they are counted (not just
+// logged) so operators can alert on them.
+type SecurityMetrics interface {
+	// IncUnauthorizedMessageDropped counts inbound Raft messages dropped
+	// because the sender failed shard-membership authorization.
+	IncUnauthorizedMessageDropped(shardID, from uint64)
+
+	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped
+	// because the sender failed authorization or TLS identity binding.
+	IncUnauthorizedSnapshotDropped(shardID, from uint64)
+}
+
 // MetricsCollector is the full metrics interface passed to WithMetrics.
-// It composes RaftMetrics, LogDBMetrics, and TransportMetrics. Internally,
-// QuicRaft passes only the relevant sub-interface to each component.
+// It composes RaftMetrics, LogDBMetrics, TransportMetrics, and
+// SecurityMetrics. Internally, QuicRaft passes only the relevant
+// sub-interface to each component.
 //
 // For best performance, implementations should pre-bind metrics per shard
 // during RegisterShard and use cached metric references in the hot-path
@@ -109,6 +124,7 @@ type MetricsCollector interface {
 	RaftMetrics
 	LogDBMetrics
 	TransportMetrics
+	SecurityMetrics
 
 	// RegisterShard is called when a shard is started on this host.
 	// Implementations should pre-bind any per-shard metrics here to
@@ -190,6 +206,14 @@ func (NoOpMetricsCollector) IncSnapshotsSent(uint64, int64, time.Duration) {}
 
 // IncSnapshotsReceived is a no-op.
 func (NoOpMetricsCollector) IncSnapshotsReceived(uint64, int64, time.Duration) {}
+
+// SecurityMetrics no-ops.
+
+// IncUnauthorizedMessageDropped is a no-op.
+func (NoOpMetricsCollector) IncUnauthorizedMessageDropped(uint64, uint64) {}
+
+// IncUnauthorizedSnapshotDropped is a no-op.
+func (NoOpMetricsCollector) IncUnauthorizedSnapshotDropped(uint64, uint64) {}
 
 // RegisterShard is a no-op.
 func (NoOpMetricsCollector) RegisterShard(uint64) {}

@@ -43,6 +43,14 @@ var (
 	// short-TTL negative cache instead of being re-queried. It distinguishes a
 	// cached failure from a fresh transport error for diagnostics.
 	ErrOCSPNegativeCached = errors.New("revocation: OCSP responder recently unavailable (negative-cached)")
+
+	// ErrCRLStale is returned (under EnforceRevocation) when a
+	// certificate's revocation status cannot be established because no
+	// fresh CRL is loaded: either the initial load has not succeeded yet,
+	// or the most recent reload failed (unreadable or unparseable file).
+	// Treating a stale CRL as "nothing revoked" would silently un-revoke
+	// every certificate, so enforcement mode fails closed instead.
+	ErrCRLStale = errors.New("revocation: no fresh CRL loaded; revocation status unknown")
 )
 
 // CertificateRevokedError is the typed error for revoked certificates.
@@ -102,6 +110,24 @@ func (e *CRLParseError) Is(target error) bool {
 
 // Unwrap returns the underlying error for errors.Is/As chain traversal.
 func (e *CRLParseError) Unwrap() error {
+	return e.Err
+}
+
+// CRLReadError is the typed error for CRL files that exist in the
+// configuration but could not be read from disk. It includes the file
+// path and the underlying I/O error.
+type CRLReadError struct {
+	Path string
+	Err  error
+}
+
+// Error returns a human-readable description of the CRL read failure.
+func (e *CRLReadError) Error() string {
+	return fmt.Sprintf("revocation: failed to read CRL %s: %v", e.Path, e.Err)
+}
+
+// Unwrap returns the underlying error for errors.Is/As chain traversal.
+func (e *CRLReadError) Unwrap() error {
 	return e.Err
 }
 

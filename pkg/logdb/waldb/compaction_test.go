@@ -31,7 +31,7 @@ func TestGarbageCollectRemovesObsoleteSegments(t *testing.T) {
 
 	// Create segment files.
 	for _, id := range []uint64{1, 2, 3, 4, 5} {
-		seg, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
+		seg, _, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
 		if err != nil {
 			t.Fatalf("createSegment(%d): %v", id, err)
 		}
@@ -73,7 +73,7 @@ func TestGarbageCollectNeverDeletesActiveSegment(t *testing.T) {
 
 	// Create segments 1-3.
 	for _, id := range []uint64{1, 2, 3} {
-		seg, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
+		seg, _, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
 		if err != nil {
 			t.Fatalf("createSegment(%d): %v", id, err)
 		}
@@ -106,7 +106,7 @@ func TestGarbageCollectNoSegmentsToDelete(t *testing.T) {
 	dir := t.TempDir()
 
 	for _, id := range []uint64{1, 2, 3} {
-		seg, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
+		seg, _, err := createSegment(defaultFS(), dir, id, 1024, 1024*1024)
 		if err != nil {
 			t.Fatalf("createSegment(%d): %v", id, err)
 		}
@@ -159,7 +159,7 @@ func TestGarbageCollectIgnoresNonSegmentFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	// Create a segment and a non-segment file.
-	seg, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}

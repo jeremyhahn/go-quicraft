@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 	"github.com/lni/dragonboat/v4"
 	dbconfig "github.com/lni/dragonboat/v4/config"
@@ -60,6 +61,11 @@ const (
 
 	// dbElectionWait is the maximum time to wait for leader election.
 	dbElectionWait = 10 * time.Second
+
+	// commitLatencyWarmup is the number of unmeasured proposals run before
+	// the commit-latency measurement loop, so the first timed proposal does
+	// not include one-time pipeline initialization. Shared across all engines.
+	commitLatencyWarmup = 100
 )
 
 // SetupDragonboatHost creates a single-node Dragonboat NodeHost with one
@@ -148,13 +154,16 @@ func waitForDragonboatLeader(nh *dragonboat.NodeHost, shardID uint64, timeout ti
 func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// The outer context must comfortably exceed the longest benchtime: it
+	// parents every per-op context, so an outer deadline shorter than the
+	// measured loop (e.g. 30s at BENCHTIME=30s) expires mid-run and fails
+	// every remaining proposal. Matches the cluster variants.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	session := nh.GetNoOPSession(dbShardID)
 	key := []byte("bench-key")
-	value := []byte("bench-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -173,39 +182,6 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 	}
 }
 
-// BenchDragonboatConcurrentPropose benchmarks concurrent SyncPropose throughput.
-func BenchDragonboatConcurrentPropose(b *testing.B, nh *dragonboat.NodeHost, numGoroutines int, rec *perfresult.LatencyRecorder) {
-	b.Helper()
-
-	value := []byte("bench-value-0123456789abcdef")
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	var ops atomic.Int64
-	b.RunParallel(func(pb *testing.PB) {
-		ctx := context.Background()
-		session := nh.GetNoOPSession(dbShardID)
-		seq := ops.Add(1)
-		key := []byte(fmt.Sprintf("key-%d", seq))
-		cmd := encodeKVCmd(key, value)
-		b.SetBytes(int64(len(cmd)))
-
-		for pb.Next() {
-			start := time.Now()
-			proposeCtx, proposeCancel := context.WithTimeout(ctx, 5*time.Second)
-			_, err := nh.SyncPropose(proposeCtx, session, cmd)
-			proposeCancel()
-			elapsed := time.Since(start)
-			if err != nil {
-				b.Errorf("SyncPropose failed: %v", err)
-				return
-			}
-			rec.Record(elapsed)
-		}
-	})
-}
-
 // BenchDragonboatSyncRead benchmarks linearizable read throughput.
 func BenchDragonboatSyncRead(b *testing.B, nh *dragonboat.NodeHost, rec *perfresult.LatencyRecorder) {
 	b.Helper()
@@ -215,8 +191,7 @@ func BenchDragonboatSyncRead(b *testing.B, nh *dragonboat.NodeHost, rec *perfres
 	// Seed data.
 	session := nh.GetNoOPSession(dbShardID)
 	key := []byte("read-key")
-	value := []byte("read-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(ctx, 5*time.Second)
 	if _, err := nh.SyncPropose(seedCtx, session, cmd); err != nil {
 		seedCancel()
@@ -249,8 +224,7 @@ func BenchDragonboatStaleRead(b *testing.B, nh *dragonboat.NodeHost, rec *perfre
 	// Seed data.
 	session := nh.GetNoOPSession(dbShardID)
 	key := []byte("stale-key")
-	value := []byte("stale-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(ctx, 5*time.Second)
 	if _, err := nh.SyncPropose(seedCtx, session, cmd); err != nil {
 		seedCancel()
@@ -276,13 +250,29 @@ func BenchDragonboatStaleRead(b *testing.B, nh *dragonboat.NodeHost, rec *perfre
 func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 10-minute outer context for the same reason as BenchDragonboatPropose:
+	// it must outlive the measured loop at the longest benchtime.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	session := nh.GetNoOPSession(dbShardID)
 	key := []byte("commit-key")
-	value := []byte("commit-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
+
+	// Warm up the pipeline (same count and retry budget as all engines)
+	// before measuring. Transient errors ("shard not ready") are retried
+	// so a single startup flake cannot discard the whole suite.
+	for w := 0; w < commitLatencyWarmup; w++ {
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			warmCtx, warmCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer warmCancel()
+			_, perr := nh.SyncPropose(warmCtx, session, cmd)
+			return perr
+		})
+		if err != nil {
+			b.Fatalf("warmup propose failed: %v", err)
+		}
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -394,7 +384,6 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	value := []byte("bench-value-0123456789abcdef")
 	opsPerGoroutine := b.N / numGoroutines
 	if opsPerGoroutine < 1 {
 		opsPerGoroutine = 1
@@ -413,7 +402,7 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 			ctx := context.Background()
 			session := nh.GetNoOPSession(dbShardID)
 			key := []byte(fmt.Sprintf("key-%d", id))
-			cmd := encodeKVCmd(key, value)
+			cmd := makeKVCmd(key)
 
 			for j := 0; j < opsPerGoroutine; j++ {
 				start := time.Now()
@@ -729,8 +718,7 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 	leader := cluster.Leader()
 	session := leader.GetNoOPSession(dbShardID)
 	key := []byte("bench-key")
-	value := []byte("bench-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -761,7 +749,6 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 	b.Helper()
 
 	leader := cluster.Leader()
-	value := []byte("bench-value-0123456789abcdef")
 	opsPerGoroutine := b.N / numGoroutines
 	if opsPerGoroutine < 1 {
 		opsPerGoroutine = 1
@@ -780,7 +767,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 			ctx := context.Background()
 			session := leader.GetNoOPSession(dbShardID)
 			key := []byte(fmt.Sprintf("key-%d", id))
-			cmd := encodeKVCmd(key, value)
+			cmd := makeKVCmd(key)
 
 			for j := 0; j < opsPerGoroutine; j++ {
 				start := time.Now()
@@ -815,8 +802,22 @@ func BenchDragonboatCommitLatencyCluster(b *testing.B, cluster *BenchCluster, re
 	leader := cluster.Leader()
 	session := leader.GetNoOPSession(dbShardID)
 	key := []byte("commit-key")
-	value := []byte("commit-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
+
+	// Warm up the pipeline (same count and retry budget as all engines)
+	// before measuring. Transient errors ("shard not ready") are retried
+	// so a single startup flake cannot discard the whole suite.
+	for w := 0; w < commitLatencyWarmup; w++ {
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			warmCtx, warmCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer warmCancel()
+			_, perr := leader.SyncPropose(warmCtx, session, cmd)
+			return perr
+		})
+		if err != nil {
+			b.Fatalf("warmup propose failed: %v", err)
+		}
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -851,8 +852,7 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 	// Seed data.
 	session := leader.GetNoOPSession(dbShardID)
 	key := []byte("read-key")
-	value := []byte("read-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(ctx, 10*time.Second)
 	if _, err := leader.SyncPropose(seedCtx, session, cmd); err != nil {
 		seedCancel()
@@ -893,8 +893,7 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 	// Seed data.
 	session := leader.GetNoOPSession(dbShardID)
 	key := []byte("stale-key")
-	value := []byte("stale-value-0123456789abcdef")
-	cmd := encodeKVCmd(key, value)
+	cmd := makeKVCmd(key)
 	seedCtx, seedCancel := context.WithTimeout(ctx, 10*time.Second)
 	if _, err := leader.SyncPropose(seedCtx, session, cmd); err != nil {
 		seedCancel()

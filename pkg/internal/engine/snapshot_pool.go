@@ -124,9 +124,20 @@ type snapshotResult struct {
 // the need for reflect.Select. Per-shard dedup via sync.Map ensures
 // only one snapshot per shard is in-flight at a time.
 type snapshotPool struct {
-	workers    int
-	logdb      logdb.LogDB
-	barrier    SnapshotBarrier
+	workers int
+	logdb   logdb.LogDB
+	barrier SnapshotBarrier
+
+	// shardBarriers, when non-nil, routes each Raft shard to its OWN at-rest
+	// barrier (per-tenant WAL/snapshot encryption). It is wired by the Host
+	// via WithShardBarriers and is purely ADDITIVE: when nil (the default),
+	// every shard uses the single process-wide barrier above and the pool
+	// behaves byte-for-byte as before. When set, snapshot encrypt/decrypt and
+	// DEK purging dispatch per shard so that purging one barrier's DEKs can
+	// never affect epochs still live under another barrier. A nil return from
+	// the function for a given shard falls back to the process-wide barrier.
+	shardBarriers func(shardID uint64) SnapshotBarrier
+
 	callback   Callback
 	requestC   chan snapshotRequest
 	completedC chan snapshotResult
@@ -191,6 +202,22 @@ func newSnapshotPool(workers int, ldb logdb.LogDB, barrier SnapshotBarrier, call
 		stopC:      stopC,
 		metrics:    metrics,
 	}
+}
+
+// barrierForShard returns the barrier that encrypts the given shard's
+// snapshots and WAL records. When per-shard barriers are not configured
+// (shardBarriers == nil) it returns the single process-wide barrier, which
+// preserves the original single-barrier behavior exactly. When per-shard
+// barriers ARE configured but the mapping returns nil for this shard, the
+// shard falls back to the process-wide barrier so an unmapped shard is never
+// left unencrypted by accident.
+func (p *snapshotPool) barrierForShard(shardID uint64) SnapshotBarrier {
+	if p.shardBarriers != nil {
+		if b := p.shardBarriers(shardID); b != nil {
+			return b
+		}
+	}
+	return p.barrier
 }
 
 // start launches the pool's worker goroutines. Each goroutine is tracked
@@ -381,10 +408,42 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
-	// Get the snapshot index from the SM's lastApplied.
+	// Cheap early-out: nothing applied yet means nothing to snapshot.
+	if snapshotter.LastApplied() == 0 {
+		return 0, nil
+	}
+
+	// Quiesce applies for this node so the consistent-capture phase of the
+	// snapshot (session-manager marshal + user-SM PrepareSnapshot, or a regular
+	// SM's whole in-memory save) cannot race a concurrent SM.Apply — a race
+	// that otherwise produces a fatal "concurrent map iteration and map write"
+	// on the session manager and crashes the whole host process. The gate is
+	// released via the afterCapture callback as soon as the point-in-time is
+	// captured, so an on-disk/concurrent SM streams its snapshot WITHOUT pausing
+	// applies. The deferred release is a backstop covering every error path.
+	node.SetSaving(true)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { node.SetSaving(false) }) }
+	defer release()
+	if !node.WaitForApplyDrain(node.StopC()) {
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       ErrStopped,
+		}
+	}
+
+	// With applies drained, lastApplied and its term are stable: capture a
+	// CONSISTENT (index, term) for the snapshot point. The SM state that
+	// SaveSnapshot captures reflects exactly this index (no apply can advance it
+	// while the gate holds), so recording it — rather than a stale dispatch-time
+	// index — prevents an under-recorded index (which would re-apply
+	// already-snapshotted entries on recovery and double-apply) and a mismatched
+	// term (which would corrupt raft log matching on InstallSnapshot).
 	snapshotIndex := snapshotter.LastApplied()
 	if snapshotIndex == 0 {
-		return 0, nil // nothing to snapshot
+		return 0, nil
 	}
 
 	// Create snapshot directory using the standard naming convention:
@@ -422,7 +481,17 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		snappyW = snappy.NewBufferedWriter(f)
 		w = snappyW
 	}
-	if err := snapshotter.SaveSnapshot(ctx, w, node.stopC); err != nil {
+	// Use the gated save when available (rsm.StateMachine) so the apply gate is
+	// released right after the point-in-time capture; otherwise fall back to a
+	// full-save gating (release happens via the deferred backstop after the
+	// save returns).
+	var saveErr error
+	if gs, ok := snapshotter.(gatedSnapshotter); ok {
+		saveErr = gs.SaveSnapshotGated(ctx, w, node.stopC, release)
+	} else {
+		saveErr = snapshotter.SaveSnapshot(ctx, w, node.stopC)
+	}
+	if err := saveErr; err != nil {
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Debug("snapshot: file close failed after save error",
 				"shard_id", req.shardID,
@@ -545,15 +614,16 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// RegisterInFlightEpoch pins the epoch live at save start so a concurrent
 	// purge cannot remove it mid-save; the deregister runs after encryption.
 	var epoch uint64
-	if p.barrier != nil && !p.barrier.IsSealed() {
-		inFlightEpoch := p.barrier.CurrentEpoch()
-		p.barrier.RegisterInFlightEpoch(inFlightEpoch)
+	barrier := p.barrierForShard(req.shardID)
+	if barrier != nil && !barrier.IsSealed() {
+		inFlightEpoch := barrier.CurrentEpoch()
+		barrier.RegisterInFlightEpoch(inFlightEpoch)
 		// Hold the pin until saveSnapshot returns — past the metadata-file and
 		// LogDB snapshot-record writes below — so a concurrent purge cannot
 		// remove this epoch's DEK in the window before the snapshot's recorded
 		// epoch becomes durable and visible to the snapshot-floor scan.
-		defer p.barrier.DeregisterInFlightEpoch(inFlightEpoch)
-		minEpoch, encryptErr := p.encryptSnapshotFile(dataPath)
+		defer barrier.DeregisterInFlightEpoch(inFlightEpoch)
+		minEpoch, encryptErr := p.encryptSnapshotFile(dataPath, barrier)
 		if encryptErr != nil {
 			return 0, &SnapshotError{
 				ShardID:   req.shardID,
@@ -565,15 +635,38 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		epoch = minEpoch
 	}
 
-	// Use the term captured at request creation time. The caller captures
-	// Peer.AppliedToTerm() before sending the request to the pool, either
-	// under raftMu (Host-initiated) or while commitPending prevents step
-	// worker writes (auto-triggered by apply worker). Reading it here
-	// from the Peer would race with the step worker's inMemory mutations.
-	term := req.appliedToTerm
+	// Term of the entry at snapshotIndex, captured CONSISTENTLY with the index
+	// from the engine's apply-tracked (lastApplied, lastAppliedTerm) pair while
+	// applies are quiesced — so the recorded (index, term) always matches the
+	// captured SM state and never races the step worker's lock-free
+	// inMemory.appliedToTerm writes. The req.appliedToTerm fallback covers only
+	// the rare forced snapshot taken after recovery before any apply has run
+	// (lastAppliedTerm seeded to 0 with no snapshot term available).
+	term := node.lastAppliedTerm.Load()
+	if term == 0 {
+		term = req.appliedToTerm
+	}
 
 	// Write snapshot metadata file (includes epoch for encrypted snapshots).
 	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch); err != nil {
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       err,
+		}
+	}
+
+	// Make the directory entries durable BEFORE recording the snapshot in
+	// LogDB. The data and metadata files are fsynced above, but the
+	// directory entries created by MkdirAll, the file creates, and the
+	// encrypt-in-place rename are not durable until each directory in the
+	// chain is fsynced. Without this, a crash could leave LogDB's
+	// durably-recorded snapshot pointing at a directory that no longer
+	// exists — a multi-node cluster re-streams from the leader, but a
+	// single-node deployment would lose the snapshot and the compacted
+	// entries it covers.
+	if err := SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
 		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
@@ -771,8 +864,9 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// loop would leak disk in the snapshot directory.
 	sweepStaleDecryptTmp(snapshotDir)
 
-	if logdbSnap.Epoch > 0 && p.barrier != nil && !p.barrier.IsSealed() {
-		plainPath, decryptErr := p.decryptSnapshotToSibling(dataPath, logdbSnap.Epoch)
+	barrier := p.barrierForShard(req.shardID)
+	if logdbSnap.Epoch > 0 && barrier != nil && !barrier.IsSealed() {
+		plainPath, decryptErr := p.decryptSnapshotToSibling(dataPath, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
 			return &SnapshotError{
 				ShardID:   req.shardID,
@@ -836,8 +930,11 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}
 
-	// Update node tracking fields to reflect recovered state.
+	// Update node tracking fields to reflect recovered state. lastAppliedTerm is
+	// seeded from the snapshot's term so a snapshot taken after recovery but
+	// before the next apply records a consistent (index, term).
 	node.lastApplied.Store(logdbSnap.Index)
+	node.lastAppliedTerm.Store(logdbSnap.Term)
 	node.lastSnapshotIndex.Store(logdbSnap.Index)
 
 	return nil
@@ -861,7 +958,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 // Atomic write: output goes to a temporary file in the same directory,
 // synced to disk, then renamed over the original. If any step fails the
 // temp file is removed and the original is preserved intact.
-func (p *snapshotPool) encryptSnapshotFile(path string) (uint64, error) {
+func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier) (uint64, error) {
 	// Open the plaintext file for streaming reads. Only one chunk
 	// (snapshotEncryptChunkSize = 64KB) is held in memory at a time,
 	// avoiding OOM on large snapshot files.
@@ -915,7 +1012,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string) (uint64, error) {
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
 		if n > 0 {
-			encrypted, frameEpoch, encErr := p.barrier.EncryptWithEpoch(nil, chunkBuf[:n])
+			encrypted, frameEpoch, encErr := barrier.EncryptWithEpoch(nil, chunkBuf[:n])
 			if encErr != nil {
 				return 0, &SnapshotEncryptError{Op: "encrypt", Err: encErr}
 			}
@@ -955,6 +1052,12 @@ func (p *snapshotPool) encryptSnapshotFile(path string) (uint64, error) {
 		return 0, &SnapshotEncryptError{Op: "rename", Err: err}
 	}
 	committed = true
+	// Fsync the directory so the rename itself is durable; without it a
+	// crash can roll the directory entry back to the (deleted) plaintext
+	// temp name even though the encrypted bytes were fsynced.
+	if err := SyncDir(dir); err != nil {
+		return 0, &SnapshotEncryptError{Op: "sync_dir", Err: err}
+	}
 	return minEpoch, nil
 }
 
@@ -976,7 +1079,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string) (uint64, error) {
 // embedded in its own ciphertext header (via barrier.Decrypt), not with this
 // value. It is retained only for log context. The caller uses the recorded
 // epoch solely to decide whether decryption is needed at all (Epoch>0).
-func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64) (string, error) {
+func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barrier SnapshotBarrier) (string, error) {
 	srcFile, err := os.Open(path)
 	if err != nil {
 		return "", &SnapshotEncryptError{Op: "read", Err: err}
@@ -1054,7 +1157,7 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64) (stri
 		// epoch parameter is advisory only (it gates whether decryption is
 		// attempted at all, and pins the DEK-purge floor at the minimum frame
 		// epoch so no frame's DEK is purged while the snapshot is retained).
-		plaintext, decErr := p.barrier.Decrypt(nil, frame)
+		plaintext, decErr := barrier.Decrypt(nil, frame)
 		if decErr != nil {
 			return "", &SnapshotEncryptError{Op: "decrypt", Err: decErr}
 		}
@@ -1108,9 +1211,15 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 			return 0, false
 		}
 		for _, d := range dirs {
-			epoch := readSnapshotEpoch(d.path)
+			epoch, ok := readSnapshotEpoch(d.path)
+			if !ok {
+				// Unreadable/corrupt snapshot metadata: the epoch is unknown,
+				// so we cannot prove which DEKs are still referenced. Fail safe
+				// rather than dropping this snapshot from the floor (over-purge).
+				return 0, false
+			}
 			if epoch == 0 {
-				continue // unencrypted snapshot, contributes no floor
+				continue // unencrypted (or GC'd) snapshot, contributes no floor
 			}
 			if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
 				snapshotMinEpoch = epoch
@@ -1146,47 +1255,190 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 	return floor, true
 }
 
-// purgeOldEpochs purges barrier DEKs for epochs strictly below the GLOBAL
-// safe-purge floor — the minimum epoch still needed by ANY shard's retained
-// encrypted snapshot or any live WAL record. This is called after log
-// compaction and snapshot garbage collection to reclaim old key material.
+// perBarrierSafePurgeFloor computes the minimum barrier epoch still required by
+// the records encrypted under a SINGLE target barrier. It is the per-tenant
+// analogue of globalSafePurgeFloor and is the minimum over:
 //
-// The barrier is shared across all shards in the host, so the floor MUST be
-// global. Computing the floor from only the calling shard's snapshots would
-// let one shard purge a DEK another shard's retained snapshot still needs,
-// permanently bricking that encrypted snapshot. The barrier's in-flight
-// epoch protection inside PurgeEpochsBefore remains as the last line of
-// defense. The shardID/replicaID parameters are retained only for log
-// context; the scan itself is global.
+//	(a) the retained encrypted-snapshot epoch of every loaded shard whose
+//	    barrier is THIS barrier (barrierForShard(shardID) == target), and
+//	(b) the WAL min-live epoch restricted to THIS barrier's records, obtained
+//	    via PerBarrierEpochAwareLogDB.MinLiveEpochForBarrier(target).
+//
+// This is the core of Invariant 1 (per-barrier purge floor) and Invariant 3
+// (per-shard isolation): barrier A's floor never counts barrier B's epochs, so
+// purging A can neither over-retain (A keeps only what A needs) nor under-retain
+// (A never purges an epoch some A-encrypted snapshot or WAL record still needs).
+//
+// The second return value follows the same fail-safe contract as
+// globalSafePurgeFloor: false on a nil node enumerator, any snapshot-dir scan
+// error, a WAL query error, an unsupported (non-per-barrier) LogDB, or when
+// nothing encrypted is retained for this barrier. Callers MUST NOT purge when
+// ok is false.
+func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64, bool) {
+	if p.nodes == nil || target == nil {
+		return 0, false
+	}
+
+	// Snapshot the currently-loaded shards mapped to the target barrier, indexed
+	// by shard ID so the completeness guard below can check membership.
+	loadedForTarget := make(map[uint64]*Node)
+	for _, node := range p.nodes() {
+		if p.barrierForShard(node.ShardID()) != target {
+			continue // belongs to a different barrier; do not let it lower/raise this floor
+		}
+		loadedForTarget[node.ShardID()] = node
+	}
+
+	// Completeness guard (MED-2): when the LogDB can enumerate the COMPLETE,
+	// fixed set of shards mapped to this barrier (a dedicated per-tenant
+	// barrier), every such shard MUST be currently loaded so its retained
+	// snapshots are visible to the scan below. A mapped shard that is
+	// transiently absent (e.g. mid-restart) would silently drop its
+	// possibly-older snapshot epochs from the floor, over-purging the SHARED
+	// barrier's DEKs and stranding the data those snapshots still need. When the
+	// shard set is not enumerable (known == false: a shared/system barrier whose
+	// membership is open-ended, or a barrier this LogDB does not own) the guard
+	// is skipped and the scan falls back to the loaded shards — matching the
+	// global single-barrier behavior; an unowned barrier is independently caught
+	// by the WAL known-check below.
+	if enum, ok := p.logdb.(logdb.BarrierShardEnumerator); ok {
+		if wantShards, known := enum.ShardsForBarrier(target); known {
+			for _, sid := range wantShards {
+				if _, present := loadedForTarget[sid]; !present {
+					return 0, false // a mapped shard is not loaded: fail safe
+				}
+			}
+		}
+	}
+
+	// (a) Snapshot floor restricted to shards mapped to the target barrier.
+	var snapshotMinEpoch uint64
+	for _, node := range loadedForTarget {
+		dirs, err := listSnapshotDirs(node.SnapshotDir(), node.ShardID(), node.ReplicaID())
+		if err != nil {
+			return 0, false // fail safe: cannot enumerate this barrier's snapshots
+		}
+		for _, d := range dirs {
+			epoch, ok := readSnapshotEpoch(d.path)
+			if !ok {
+				// Unreadable/corrupt snapshot metadata: epoch unknown, fail safe
+				// rather than dropping it from the floor (over-purge).
+				return 0, false
+			}
+			if epoch == 0 {
+				continue // unencrypted (or GC'd) snapshot, contributes no floor
+			}
+			if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
+				snapshotMinEpoch = epoch
+			}
+		}
+	}
+
+	// (b) WAL floor restricted to the target barrier's records. When a LogDB
+	// is present it MUST support per-barrier epoch queries; a plain
+	// EpochAwareLogDB only exposes a cross-barrier minimum, which would be
+	// unsafe to attribute to a single barrier, so we fail safe. A nil LogDB
+	// (memory mode) has no WAL records and contributes 0.
+	var walMinEpoch uint64
+	if p.logdb != nil {
+		perBarrierDB, ok := p.logdb.(logdb.PerBarrierEpochAwareLogDB)
+		if !ok {
+			return 0, false // cannot determine this barrier's WAL floor: fail safe
+		}
+		epoch, known, walErr := perBarrierDB.MinLiveEpochForBarrier(target)
+		if walErr != nil {
+			slog.Warn("per-barrier epoch purge skipped: WAL epoch query failed",
+				"error", walErr,
+			)
+			return 0, false
+		}
+		if !known {
+			// The LogDB does not own / cannot attribute this barrier. This is
+			// the UNSAFE case a bare epoch==0 used to mask: we cannot prove no
+			// live WAL record needs an old DEK, so we must not purge.
+			return 0, false
+		}
+		// known == true with epoch == 0 is a true non-constraint: the barrier is
+		// owned but has zero live encrypted WAL records, so the WAL imposes no
+		// floor (the snapshot floor below still applies).
+		walMinEpoch = epoch
+	}
+
+	floor := snapshotMinEpoch
+	if walMinEpoch > 0 && (floor == 0 || walMinEpoch < floor) {
+		floor = walMinEpoch
+	}
+	if floor == 0 {
+		return 0, false // nothing encrypted retained for this barrier
+	}
+	return floor, true
+}
+
+// purgeOldEpochs purges barrier DEKs for epochs strictly below the safe-purge
+// floor. It is called after log compaction and snapshot garbage collection to
+// reclaim old key material.
+//
+// Single-barrier mode (shardBarriers == nil): the process-wide barrier encrypts
+// every shard, so the floor MUST be the GLOBAL minimum across all shards'
+// retained snapshots and the cross-shard WAL floor. Computing it from only the
+// calling shard would let one shard purge a DEK another shard's retained
+// snapshot still needs. This path is byte-for-byte identical to the original.
+//
+// Per-shard-barrier mode (shardBarriers != nil): the floor and the purge are
+// dispatched to the SINGLE barrier mapped to shardID, using a per-barrier floor.
+// Purging barrier A then only ever removes A's DEKs and only below A's own live
+// epoch, so it can never affect epochs still live under barrier B.
+//
+// The barrier's in-flight epoch protection inside PurgeEpochsBefore remains the
+// last line of defense in both modes.
 func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
-	if p.barrier == nil || p.barrier.IsSealed() {
+	if p.shardBarriers == nil {
+		// Original global single-barrier path, unchanged.
+		if p.barrier == nil || p.barrier.IsSealed() {
+			return
+		}
+		purgeFloor, ok := p.globalSafePurgeFloor()
+		if !ok {
+			return // fail safe: floor unknown or nothing encrypted retained
+		}
+		p.applyPurge(p.barrier, purgeFloor, shardID, replicaID)
 		return
 	}
 
-	purgeFloor, ok := p.globalSafePurgeFloor()
-	if !ok {
-		return // fail safe: floor unknown or nothing encrypted retained
+	// Per-shard-barrier path: dispatch to the shard's own barrier.
+	barrier := p.barrierForShard(shardID)
+	if barrier == nil || barrier.IsSealed() {
+		return
 	}
+	purgeFloor, ok := p.perBarrierSafePurgeFloor(barrier)
+	if !ok {
+		return // fail safe: floor unknown or nothing encrypted retained for this barrier
+	}
+	p.applyPurge(barrier, purgeFloor, shardID, replicaID)
+}
 
-	// Only purge if the floor is above epoch 1 (epoch 1 is the initial
-	// epoch and has no predecessor to purge).
-	if purgeFloor > 1 {
-		purged, purgeErr := p.barrier.PurgeEpochsBefore(purgeFloor)
-		if purgeErr != nil {
-			slog.Warn("epoch purge failed",
-				"shard_id", shardID,
-				"replica_id", replicaID,
-				"purge_floor", purgeFloor,
-				"error", purgeErr,
-			)
-		} else if purged > 0 {
-			slog.Info("snapshot epoch purge completed",
-				"shard_id", shardID,
-				"replica_id", replicaID,
-				"purged", purged,
-				"purge_floor", purgeFloor,
-			)
-		}
+// applyPurge invokes PurgeEpochsBefore on the given barrier when the floor is
+// above the initial epoch. Epoch 1 has no predecessor to purge. Shared by the
+// global and per-barrier purge paths so both log and guard identically.
+func (p *snapshotPool) applyPurge(barrier SnapshotBarrier, purgeFloor, shardID, replicaID uint64) {
+	if purgeFloor <= 1 {
+		return
+	}
+	purged, purgeErr := barrier.PurgeEpochsBefore(purgeFloor)
+	if purgeErr != nil {
+		slog.Warn("epoch purge failed",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"purge_floor", purgeFloor,
+			"error", purgeErr,
+		)
+	} else if purged > 0 {
+		slog.Info("snapshot epoch purge completed",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"purged", purged,
+			"purge_floor", purgeFloor,
+		)
 	}
 }
 
@@ -1232,16 +1484,37 @@ func sweepStaleDecryptTmp(dir string) {
 	}
 }
 
-// readSnapshotEpoch reads the epoch field from a snapshot metadata file.
-// Returns 0 if the metadata cannot be read or is in the old 40-byte
-// format (without epoch).
-func readSnapshotEpoch(dir string) uint64 {
+// readSnapshotEpoch reads the epoch field from a snapshot metadata file. The
+// ok return value distinguishes a trustworthy answer from one that must be
+// treated fail-safe by the purge-floor callers:
+//
+//   - (epoch, true)  — the metadata was read and parsed. epoch == 0 is the
+//     legacy/plaintext case (an unencrypted snapshot that imposes no floor);
+//     epoch > 0 pins the floor at that snapshot's encryption epoch.
+//   - (0, true)      — the metadata file does not exist (the snapshot was
+//     garbage-collected between directory enumeration and this read). This is
+//     a benign skip: the snapshot is gone and imposes no floor.
+//   - (0, false)     — the metadata could not be read (a real I/O error, not
+//     os.IsNotExist) or is too short to contain the epoch field (truncated or
+//     corrupt). The epoch is UNKNOWN, so the caller must fail safe (not purge)
+//     rather than silently dropping this snapshot from the floor, which would
+//     over-purge a DEK the snapshot may still need.
+func readSnapshotEpoch(dir string) (epoch uint64, ok bool) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	data, err := os.ReadFile(metaPath)
-	if err != nil || len(data) < snapshotMetaSize {
-		return 0
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Snapshot GC'd between enumeration and read: benign, no floor.
+			return 0, true
+		}
+		// Real read error: epoch indeterminate, fail safe.
+		return 0, false
 	}
-	return binary.LittleEndian.Uint64(data[40:])
+	if len(data) < snapshotMetaSize {
+		// Truncated/corrupt metadata: cannot read the epoch field, fail safe.
+		return 0, false
+	}
+	return binary.LittleEndian.Uint64(data[40:]), true
 }
 
 // setCallback replaces the engine callback. Used by Engine.SetCallback
@@ -1475,6 +1748,15 @@ func exportSnapshotToPath(saveDir, exportPath string) error {
 				"path", dstMetaPath,
 				"error", writeErr,
 			)
+		}
+	}
+
+	// Fsync the export directory so the exported files' directory entries
+	// survive a crash.
+	if err := SyncDir(exportPath); err != nil {
+		return &SnapshotExportError{
+			ExportPath: exportPath,
+			Err:        err,
 		}
 	}
 

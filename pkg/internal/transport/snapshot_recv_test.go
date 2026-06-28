@@ -150,7 +150,7 @@ func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
 	close(stopC)
 
 	// Should return immediately since stopC is closed.
-	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, stopC)
+	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, nil, stopC)
 }
 
 // TestSnapshotReceiverAvailableMemoryReturnsToFull verifies that after
@@ -280,7 +280,7 @@ func TestSnapshotReceiver_SetEpochTracker(t *testing.T) {
 		Epoch:      42,
 		ChunkCount: 0,
 	}
-	sr.receiveSnapshot(nil, hdr, stopC)
+	sr.receiveSnapshot(nil, hdr, nil, stopC)
 
 	// After receiveSnapshot returns, the epoch should have been
 	// registered and then deregistered via defer.
@@ -311,7 +311,7 @@ func TestSnapshotReceiver_EpochTracker_ZeroEpochSkipsTracking(t *testing.T) {
 		Epoch:      0, // plaintext, no encryption epoch
 		ChunkCount: 0,
 	}
-	sr.receiveSnapshot(nil, hdr, stopC)
+	sr.receiveSnapshot(nil, hdr, nil, stopC)
 
 	if tracker.totalReg.Load() != 0 {
 		t.Fatalf("expected 0 registrations for zero-epoch snapshot, got %d", tracker.totalReg.Load())
@@ -338,7 +338,7 @@ func TestSnapshotReceiver_EpochTracker_NilTrackerNoPanic(t *testing.T) {
 	}
 
 	// Should not panic.
-	sr.receiveSnapshot(nil, hdr, stopC)
+	sr.receiveSnapshot(nil, hdr, nil, stopC)
 }
 
 // TestSnapshotReceiver_EpochTracker_ConcurrencyLimitSkipsTracking verifies
@@ -366,7 +366,7 @@ func TestSnapshotReceiver_EpochTracker_ConcurrencyLimitSkipsTracking(t *testing.
 	}
 
 	// Should return immediately without registering epoch.
-	sr.receiveSnapshot(nil, hdr, stopC)
+	sr.receiveSnapshot(nil, hdr, nil, stopC)
 
 	if tracker.totalReg.Load() != 0 {
 		t.Fatalf("expected 0 registrations when at concurrency limit, got %d", tracker.totalReg.Load())
@@ -374,6 +374,100 @@ func TestSnapshotReceiver_EpochTracker_ConcurrencyLimitSkipsTracking(t *testing.
 
 	// Drain the semaphore.
 	<-sr.sem
+}
+
+// TestSnapshotReceiver_ShardEpochTrackers_RoutesByShard verifies that with a
+// per-shard epoch tracker resolver, each received snapshot pins its in-flight
+// epoch on the barrier mapped to its shardID (per-tenant isolation), and never
+// on another shard's tracker.
+func TestSnapshotReceiver_ShardEpochTrackers_RoutesByShard(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)
+
+	trackerA := newTestEpochTracker()
+	trackerB := newTestEpochTracker()
+	sr.SetShardEpochTrackers(func(shardID uint64) EpochTracker {
+		switch shardID {
+		case 1:
+			return trackerA
+		case 2:
+			return trackerB
+		}
+		return nil
+	})
+
+	stopC := make(chan struct{})
+
+	// Shard 1, epoch 7 -> trackerA only.
+	sr.receiveSnapshot(nil, &SnapshotHeader{ShardID: 1, ReplicaID: 1, Epoch: 7}, nil, stopC)
+	if trackerA.registeredCount(7) != 1 {
+		t.Fatalf("trackerA registeredCount(7) = %d, want 1", trackerA.registeredCount(7))
+	}
+	if trackerB.totalReg.Load() != 0 {
+		t.Fatalf("trackerB registered for a shard-1 snapshot: %d, want 0", trackerB.totalReg.Load())
+	}
+
+	// Shard 2, epoch 4 -> trackerB only.
+	sr.receiveSnapshot(nil, &SnapshotHeader{ShardID: 2, ReplicaID: 1, Epoch: 4}, nil, stopC)
+	if trackerB.registeredCount(4) != 1 {
+		t.Fatalf("trackerB registeredCount(4) = %d, want 1", trackerB.registeredCount(4))
+	}
+	if trackerA.registeredCount(4) != 0 {
+		t.Fatalf("trackerA registered for a shard-2 snapshot: %d, want 0", trackerA.registeredCount(4))
+	}
+}
+
+// TestSnapshotReceiver_ShardEpochTrackers_FallbackToSingle verifies that when
+// the per-shard resolver returns nil for a shard, the single host-wide tracker
+// is used (preserving the host-wide-default + per-shard-override semantics).
+func TestSnapshotReceiver_ShardEpochTrackers_FallbackToSingle(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)
+
+	single := newTestEpochTracker()
+	perShard := newTestEpochTracker()
+	sr.SetEpochTracker(single)
+	sr.SetShardEpochTrackers(func(shardID uint64) EpochTracker {
+		if shardID == 1 {
+			return perShard
+		}
+		return nil // shard 2 falls back to the single tracker
+	})
+
+	stopC := make(chan struct{})
+	sr.receiveSnapshot(nil, &SnapshotHeader{ShardID: 2, ReplicaID: 1, Epoch: 9}, nil, stopC)
+
+	if single.registeredCount(9) != 1 {
+		t.Fatalf("single tracker registeredCount(9) = %d, want 1 (fallback)", single.registeredCount(9))
+	}
+	if perShard.totalReg.Load() != 0 {
+		t.Fatalf("per-shard tracker registered for an unmapped shard: %d, want 0", perShard.totalReg.Load())
+	}
+}
+
+// TestQUICTransport_SetShardEpochTrackers verifies the transport delegates the
+// per-shard resolver to its snapshot receiver.
+func TestQUICTransport_SetShardEpochTrackers(t *testing.T) {
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	cfg := Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+	}
+	tr, err := NewQUICTransport(cfg, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+
+	tracker := newTestEpochTracker()
+	tr.SetShardEpochTrackers(func(uint64) EpochTracker { return tracker })
+	if tr.snapshotRecv.epochTrackerForShard == nil {
+		t.Fatal("epochTrackerForShard should be set after SetShardEpochTrackers")
+	}
+	if got := tr.snapshotRecv.trackerForShard(42); got != tracker {
+		t.Fatal("trackerForShard did not return the configured per-shard tracker")
+	}
 }
 
 // TestQUICTransport_SetEpochTracker verifies that the QUICTransport
@@ -968,7 +1062,7 @@ func TestReceiveChunks_ValidateChunkFailure(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// Handler should NOT have received any snapshot.
 	snaps := handler.getSnapshots()
@@ -1017,7 +1111,7 @@ func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 		ChunkCount: 3,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// May or may not have received some chunks depending on per-chunk
 	// vs accumulated budget, but the test exercises the budget exceeded path.
@@ -1060,7 +1154,7 @@ func TestReceiveChunks_LargeChunkCountInitCapCapped(t *testing.T) {
 		ChunkCount: 2000, // > maxInitialChunkCap (1024)
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// Should still receive the one chunk even though ChunkCount was large.
 	// (The loop exits after EOF since only 1 chunk was provided.)
@@ -1112,7 +1206,7 @@ func TestReceiveChunks_WithEventListener(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	select {
 	case info := <-received:
@@ -1166,7 +1260,7 @@ func TestReceiveChunks_WithMetrics(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) == 0 {
@@ -1200,7 +1294,7 @@ func TestReceiveSnapshot_TrackerShutdownRejects(t *testing.T) {
 	}
 
 	// receiveSnapshot should return immediately without processing.
-	sr.receiveSnapshot(nil, hdr, make(chan struct{}))
+	sr.receiveSnapshot(nil, hdr, nil, make(chan struct{}))
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 0 {
@@ -1245,7 +1339,7 @@ func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 }
 
 // TestReceiveChunks_TruncatedTransferNotCommitted verifies that a snapshot
@@ -1295,7 +1389,7 @@ func TestReceiveChunks_TruncatedTransferNotCommitted(t *testing.T) {
 		ChunkCount: 4,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 0 {
 		t.Fatalf("expected 0 snapshots committed for truncated transfer, got %d", len(snaps))
@@ -1354,7 +1448,7 @@ func TestReceiveChunks_CompleteTransferCommitted(t *testing.T) {
 		ChunkCount: 3,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 1 || len(snaps[0]) != 3 {
 		t.Fatalf("expected 1 committed snapshot of 3 chunks, got %d deliveries", len(snaps))
@@ -1371,7 +1465,7 @@ func TestReceiveChunks_ZeroChunkCountCommitsNothing(t *testing.T) {
 	reader := &testChunkReader{data: nil}
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 0}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	if handler.snapshotCount.Load() != 0 {
 		t.Fatalf("expected no HandleSnapshot for ChunkCount=0, got %d", handler.snapshotCount.Load())
@@ -1384,7 +1478,7 @@ type errorSnapshotHandler struct {
 	testHandler
 }
 
-func (h *errorSnapshotHandler) HandleSnapshot(chunks []proto.SnapshotChunk) error {
+func (h *errorSnapshotHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ func(string) bool) error {
 	return errors.New("snapshot handler error")
 }
 
@@ -1431,7 +1525,7 @@ func TestReceiveChunks_MemoryBudgetExceededPerReceive(t *testing.T) {
 		ChunkCount: 10,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// The receive should have been aborted before all chunks were processed.
 	// Since maxMemory is 400 and each chunk is ~50 bytes, the receive should
@@ -1490,7 +1584,7 @@ func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 	stopC := make(chan struct{})
 	// We need a real *quic.Stream for receiveSnapshot, but we can test
 	// the tracker rejection path by checking that no snapshots arrive.
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// The chunks were processed because receiveChunks doesn't check tracker.
 	// The tracker check is in receiveSnapshot which requires *quic.Stream.
@@ -1533,7 +1627,7 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	snapshots := handler.getSnapshots()
 	if len(snapshots) != 1 {
@@ -1612,7 +1706,7 @@ func TestReceiveChunks_StopSignalDuringIteration(t *testing.T) {
 	// Close stopC immediately so the loop exits on the first iteration.
 	stopC := make(chan struct{})
 	close(stopC)
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// No snapshots should have been delivered.
 	snapshots := handler.getSnapshots()
@@ -1657,7 +1751,7 @@ func TestReceiveChunks_ChunkValidationFailsDeploymentID(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// No snapshots should be delivered.
 	snapshots := handler.getSnapshots()
@@ -1747,7 +1841,7 @@ func TestReceiveChunks_TotalBytesExceedsMaxMemory(t *testing.T) {
 		Index:      10,
 		ChunkCount: 5,
 	}
-	sr.receiveChunks(reader, hdr, stopC)
+	sr.receiveChunks(reader, hdr, nil, stopC)
 
 	// Memory budget should be fully restored after receiveChunks returns.
 	available := sr.AvailableMemory()
@@ -1784,7 +1878,7 @@ func TestReceiveSnapshot_ConcurrencyLimitDrop(t *testing.T) {
 	// (default case in select).
 	done := make(chan struct{})
 	go func() {
-		sr.receiveSnapshot(nil, hdr, stopC)
+		sr.receiveSnapshot(nil, hdr, nil, stopC)
 		close(done)
 	}()
 

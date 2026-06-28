@@ -47,6 +47,21 @@ type Snapshotter interface {
 	LastApplied() uint64
 }
 
+// gatedSnapshotter is an optional upgrade of Snapshotter. When the concrete
+// snapshotter implements it (the rsm.StateMachine does), the snapshot pool uses
+// it to release the apply gate as soon as the consistent point-in-time has been
+// captured — session state marshaled and, for concurrent/on-disk SMs,
+// PrepareSnapshot completed — so the (potentially long) streaming of an on-disk
+// SM's snapshot runs without pausing applies. afterCapture is invoked exactly
+// once after capture and before streaming; for regular in-memory SMs the whole
+// save is the capture, so it fires at the end. If the save errors before the
+// capture completes, afterCapture is not called and the caller's deferred
+// release handles the gate. Snapshotters that do not implement this are gated
+// for the full save (correct, just without early release).
+type gatedSnapshotter interface {
+	SaveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
+}
+
 // defaultProposalQueueSize is the maximum number of proposal entries
 // buffered in the MPSC proposal queue before backpressure is applied.
 const defaultProposalQueueSize = 256
@@ -104,6 +119,18 @@ type Node struct {
 	// per-node so contention is limited to a single shard. Critical
 	// sections are sub-microsecond (Tick ~100ns, Commit ~200ns).
 	raftMu sync.Mutex
+
+	// diagEnabled gates publication of the diagnostic snapshot. The raft
+	// state (Peer.r) is owned by the step worker and the commit worker
+	// (under raftMu); reading it from an external goroutine races. So the
+	// diagnostic accessors do NOT touch the Peer directly: they read
+	// diagSnap, a snapshot the step worker publishes under raftMu during
+	// tick(). Publication only happens once a diagnostic has been
+	// requested (diagEnabled set true by the first DiagRaftState/
+	// DiagRemotes call), so steady-state cost is a single atomic load per
+	// tick.
+	diagEnabled atomic.Bool
+	diagSnap    atomic.Pointer[diagSnapshot]
 
 	// peer is the Raft protocol peer. Owned by exactly one worker at a
 	// time, enforced by the commitPending flag and channel pipeline.
@@ -187,6 +214,17 @@ type Node struct {
 		_ [120]byte // pad to 128 bytes total (atomic.Uint64 = 8 bytes)
 	}
 
+	// lastAppliedTerm is the Raft term of the entry at lastApplied. It is
+	// written together with lastApplied by the apply worker (and seeded on
+	// recovery), so the snapshot pool can read a CONSISTENT (index, term) pair
+	// for the snapshot point while applies are quiesced by the saving gate.
+	// Recording a term that does not match lastApplied would corrupt raft log
+	// matching on InstallSnapshot; recording an index below the captured SM
+	// state would cause entries to be re-applied on recovery. Reading it here
+	// (instead of peer.AppliedToTerm under raftMu) also removes the data race
+	// with the step worker's lock-free inMemory.appliedToTerm writes.
+	lastAppliedTerm atomic.Uint64
+
 	// committedIndex tracks the highest log index known to be committed
 	// in the Raft log. Written exclusively by the step worker after
 	// each GetUpdate call and atomically visible to user goroutines
@@ -195,15 +233,13 @@ type Node struct {
 	// result reflects all entries committed at the time of the read.
 	committedIndex atomic.Uint64
 
-	// applyRetries tracks consecutive SM.Apply failures for the circuit
-	// breaker. Reset to 0 on successful apply. Atomic because the
-	// snapshot pool goroutine may read adjacent fields on this struct,
-	// and non-atomic access across goroutines is undefined under the
-	// Go memory model.
-	applyRetries atomic.Uint64
-
-	// maxApplyRetries is the threshold for the circuit breaker. When
-	// applyRetries >= maxApplyRetries, the shard transitions to failed.
+	// maxApplyRetries is carried from config.Config.MaxApplyRetries and is
+	// RESERVED for a future apply-retry circuit breaker; it is not yet consulted.
+	// The current policy is FAIL-FAST: failApply marks the shard failed on the
+	// FIRST SM.Apply (or decompression) error and does NOT advance lastApplied —
+	// a deterministic apply failure cannot be made to succeed by retrying, and
+	// advancing past a failed entry would diverge this state machine from its
+	// peers, breaking Raft state-machine safety.
 	maxApplyRetries uint64
 
 	// failed indicates whether the circuit breaker has tripped. When
@@ -243,16 +279,33 @@ type Node struct {
 	// call, corrupting state machine state.
 	recovering atomic.Bool
 
+	// saving is set to true while the snapshot pool captures a consistent
+	// point-in-time for SaveSnapshot, and cleared once the capture completes
+	// (the gate is released before the potentially-long streaming of an
+	// on-disk/concurrent SM's snapshot, which reads an immutable prepared
+	// context and is safe to run alongside applies). While true, the apply
+	// worker skips entry application for this node — exactly like recovering —
+	// so the snapshot read of shared in-memory state (the session manager,
+	// which is not safe for concurrent use, and a regular in-memory SM) cannot
+	// race a concurrent SM.Apply. Without this guard, SaveSnapshot's
+	// sessions.MarshalTo iterates the session map while Apply writes it,
+	// producing a fatal "concurrent map iteration and map write" that bypasses
+	// recover() and crashes the whole host. saving and recovering are mutually
+	// exclusive per node (both are gated by the snapshotting flag), so at most
+	// one is set at a time.
+	saving atomic.Bool
+
 	// applyInFlight counts apply closures that are currently executing (or
-	// about to check the recovering gate) for this node. It is incremented at
-	// the very top of the per-item apply closure — BEFORE the recovering
-	// check — and decremented when the closure returns. Snapshot recovery uses
-	// it as a drain barrier: after setting recovering=true, the snapshot
-	// worker waits for applyInFlight to reach 0 before touching the state
-	// machine, guaranteeing no apply is mid-`SM.Apply` when RecoverFromSnapshot
-	// replaces SM state. The increment-then-check / set-then-wait ordering is
-	// a standard lock-free quiesce: any apply that passed the gate must have
-	// incremented first, so the drain observes it.
+	// about to check the recovering/saving gate) for this node. It is
+	// incremented at the very top of the per-item apply closure — BEFORE the
+	// gate check — and decremented when the closure returns. Snapshot recovery
+	// AND snapshot save use it as a drain barrier: after setting the gate, the
+	// snapshot worker waits for applyInFlight to reach 0 before touching the
+	// state machine, guaranteeing no apply is mid-`SM.Apply` when
+	// RecoverFromSnapshot replaces SM state or SaveSnapshot reads it. The
+	// increment-then-check / set-then-wait ordering is a standard lock-free
+	// quiesce: any apply that passed the gate must have incremented first, so
+	// the drain observes it.
 	applyInFlight atomic.Int64
 
 	// stopC is closed when the node is unloaded from the engine.
@@ -406,20 +459,34 @@ func (n *Node) SnapshotDir() string {
 	return n.snapshotDir
 }
 
+// SnapshotSaveDir returns the on-disk directory for the snapshot at index:
+// <SnapshotDir()>/shard-<N>/replica-<N>/snapshot-<index>. This is the SAME
+// construction the snapshot pool uses for saving, garbage collection, and
+// DEK-purge-floor scans, so an inbound-snapshot receiver that writes here stays
+// consistent with — and visible to — those paths, including when a per-shard
+// DataDir roots SnapshotDir() off the shared NodeHostDir (otherwise received
+// snapshots land where GC/purge never look: they leak, and key rotation can
+// purge a DEK such a snapshot still needs).
+func (n *Node) SnapshotSaveDir(index uint64) string {
+	return snapshotSaveDir(n.snapshotDir, n.shardID, n.replicaID, index)
+}
+
 // LastSnapshotIndex returns the log index of the last completed snapshot.
 func (n *Node) LastSnapshotIndex() uint64 {
 	return n.lastSnapshotIndex.Load()
 }
 
 // SeedLastApplied initializes the node's applied markers to a recovered
-// index on restart, before the node is loaded into the engine pipeline.
-// Both lastApplied and lastSnapshotIndex are set so that follower and
-// linearizable reads can be served immediately after recovery without
-// waiting for a subsequent write to advance the applied marker. This must
-// be called before LoadNode and must match the raft peer's processed
-// marker. For a fresh start (idx == 0) this is a harmless no-op.
-func (n *Node) SeedLastApplied(idx uint64) {
+// (index, term) on restart, before the node is loaded into the engine pipeline.
+// lastApplied, lastAppliedTerm, and lastSnapshotIndex are set so that follower
+// and linearizable reads can be served immediately after recovery without
+// waiting for a subsequent write to advance the applied marker, and so the
+// first snapshot taken after recovery (before any apply) records the correct
+// term. This must be called before LoadNode and must match the raft peer's
+// processed marker. For a fresh start (idx == 0) this is a harmless no-op.
+func (n *Node) SeedLastApplied(idx, term uint64) {
 	n.lastApplied.Store(idx)
+	n.lastAppliedTerm.Store(term)
 	n.lastSnapshotIndex.Store(idx)
 }
 
@@ -480,12 +547,27 @@ func (n *Node) SetRecovering(v bool) {
 	n.recovering.Store(v)
 }
 
+// IsSaving returns true while the snapshot pool is capturing a consistent
+// point-in-time for SaveSnapshot. While saving, the apply worker skips entry
+// application for this node so the snapshot read of shared in-memory state
+// (session manager, regular SM) cannot race a concurrent SM.Apply.
+func (n *Node) IsSaving() bool {
+	return n.saving.Load()
+}
+
+// SetSaving sets the saving flag. Called by the snapshot pool around the
+// consistent-capture phase of SaveSnapshot.
+func (n *Node) SetSaving(v bool) {
+	n.saving.Store(v)
+}
+
 // WaitForApplyDrain blocks until no apply closure is in flight for this node,
-// or until stopC is closed. It MUST be called only after SetRecovering(true):
-// the recovering gate stops new applies from accessing the state machine, and
-// this drains the at-most-one apply that may have passed the gate before the
-// flag was set. Together they guarantee RecoverFromSnapshot has exclusive
-// access to the state machine. Returns false if it stopped early due to stopC.
+// or until stopC is closed. It MUST be called only after SetRecovering(true)
+// or SetSaving(true): the gate stops new applies from accessing the state
+// machine, and this drains the at-most-one apply that may have passed the gate
+// before the flag was set. Together they guarantee RecoverFromSnapshot (or the
+// consistent-capture phase of SaveSnapshot) has exclusive access to the state
+// machine. Returns false if it stopped early due to stopC.
 func (n *Node) WaitForApplyDrain(stopC <-chan struct{}) bool {
 	for n.applyInFlight.Load() > 0 {
 		select {
@@ -528,20 +610,70 @@ func (n *Node) DiagState() (commitPending bool, proposalQLen int, inboxLen int, 
 	return n.commitPending.Load(), n.proposalQ.Len(), n.inboxQ.Len(), n.readIndexQ.Len()
 }
 
-// DiagRaftState returns diagnostic raft state for debugging.
+// diagSnapshot is a point-in-time copy of the Peer's diagnostic state,
+// published by the step worker under raftMu and read lock-free by the
+// external diagnostic accessors.
+type diagSnapshot struct {
+	term      uint64
+	committed uint64
+	processed uint64
+	lastIdx   uint64
+	msgs      int
+	state     string
+	remotes   string
+}
+
+// publishDiagLocked captures the Peer's diagnostic state into diagSnap.
+// The CALLER MUST HOLD n.raftMu (the step worker holds it during tick()),
+// which excludes the commit worker and — because publication runs on the
+// step worker goroutine — is sequential with Handle/GetUpdate. This is
+// the only race-free point to read Peer.r from. It is a no-op until a
+// diagnostic accessor has enabled publication, so it adds only one atomic
+// load to the tick path in the common (no-debugger) case.
+func (n *Node) publishDiagLocked() {
+	if n.peer == nil || !n.diagEnabled.Load() {
+		return
+	}
+	term, committed, processed, lastIdx, msgs, state := n.peer.DiagRaftState()
+	remotes := n.peer.DiagRemotes()
+	n.diagSnap.Store(&diagSnapshot{
+		term:      term,
+		committed: committed,
+		processed: processed,
+		lastIdx:   lastIdx,
+		msgs:      msgs,
+		state:     state,
+		remotes:   remotes,
+	})
+}
+
+// DiagRaftState returns diagnostic raft state for debugging. It reads the
+// snapshot last published by the step worker rather than touching the
+// Peer directly (which would race with the step/commit workers). The
+// first call enables publication; until the next tick publishes, it
+// reports a warming-up placeholder.
 func (n *Node) DiagRaftState() (term, committed, processed, lastIdx uint64, msgs int, state string) {
 	if n.peer == nil {
 		return 0, 0, 0, 0, 0, "nil"
 	}
-	return n.peer.DiagRaftState()
+	n.diagEnabled.Store(true)
+	if snap := n.diagSnap.Load(); snap != nil {
+		return snap.term, snap.committed, snap.processed, snap.lastIdx, snap.msgs, snap.state
+	}
+	return 0, 0, 0, 0, 0, "(diagnostics warming up)"
 }
 
 // DiagRemotes returns diagnostic remote state for debugging commit stalls.
+// Like DiagRaftState, it reads the step worker's published snapshot.
 func (n *Node) DiagRemotes() string {
 	if n.peer == nil {
 		return "nil"
 	}
-	return n.peer.DiagRemotes()
+	n.diagEnabled.Store(true)
+	if snap := n.diagSnap.Load(); snap != nil {
+		return snap.remotes
+	}
+	return "(diagnostics warming up)"
 }
 
 // Stop signals the node to stop. Called when unloading from the engine.

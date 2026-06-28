@@ -284,7 +284,9 @@ type HostConfig struct {
 	TransportConfig TransportConfig
 
 	// KeyRotationInterval is the interval at which the barrier epoch is
-	// rotated. When 0 (the default), automatic key rotation is disabled.
+	// rotated on a schedule. When 0 (the default), scheduled rotation is
+	// disabled; invocation-threshold rotation (NIST SP 800-38D AEAD
+	// budget enforcement) still runs whenever a barrier is configured.
 	// A recommended production value is 24 hours. Requires a barrier to
 	// be configured via WithBarrier; ignored otherwise.
 	KeyRotationInterval time.Duration

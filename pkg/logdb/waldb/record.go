@@ -36,8 +36,6 @@ const (
 	RecordMiddle byte = 3
 	// RecordLast indicates the last chunk of a multi-chunk record.
 	RecordLast byte = 4
-	// RecordEpoch marks a key rotation epoch boundary (always plaintext).
-	RecordEpoch byte = 5
 )
 
 // recordHeaderSize is the fixed overhead per chunk:
@@ -136,6 +134,11 @@ func decodeRecord(buf []byte) (data []byte, recordType byte, n int, err error) {
 }
 
 // isValidRecordType returns true if the given byte is a recognized chunk type.
+// The accepted range is intentionally tight (RecordFull..RecordLast): a chunk
+// type outside it is treated as corruption, which stops recovery at the bad
+// record (a WAL is valid only as a prefix). Widening the set to include a
+// never-written type would make a random/forged header byte more likely to
+// pass the pre-CRC type check.
 func isValidRecordType(t byte) bool {
-	return t >= RecordFull && t <= RecordEpoch
+	return t >= RecordFull && t <= RecordLast
 }

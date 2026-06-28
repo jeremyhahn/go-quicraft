@@ -673,6 +673,15 @@ func TestNode_DiagRaftState_WithPeer(t *testing.T) {
 	cfg.SetDefaults()
 	n := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 
+	// DiagRaftState reads an eventually-consistent snapshot published by
+	// the step worker under raftMu (reading Peer.r from a foreign
+	// goroutine would race). With no step worker in this unit test,
+	// publish one snapshot the same way tick() does.
+	n.diagEnabled.Store(true)
+	n.raftMu.Lock()
+	n.publishDiagLocked()
+	n.raftMu.Unlock()
+
 	term, _, _, _, _, state := n.DiagRaftState()
 	// A fresh single-node peer starts in follower state at term 0.
 	if term != 0 {
@@ -707,6 +716,13 @@ func TestNode_DiagRemotes_WithNonLeaderPeer(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	n := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+
+	// Publish a snapshot as the step worker would (no step worker runs in
+	// this unit test); see TestNode_DiagRaftState_WithPeer.
+	n.diagEnabled.Store(true)
+	n.raftMu.Lock()
+	n.publishDiagLocked()
+	n.raftMu.Unlock()
 
 	// A fresh peer is a follower, so DiagRemotes should return "not leader".
 	result := n.DiagRemotes()

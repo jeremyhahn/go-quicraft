@@ -30,6 +30,10 @@ import (
 // strategy using minimal Argon2 parameters for fast test execution.
 func newTestBarrier(t *testing.T) *seal.Barrier {
 	t.Helper()
+	// Tests use cheap KDF params; permit them for the whole test binary.
+	// The restorer is intentionally discarded (no restore) to avoid a
+	// data race on the global flag across parallel tests.
+	_ = seal.AllowWeakKDFParams()
 	strategy, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("test-passphrase"), 1, 64*1024, 1,
 	)
@@ -872,6 +876,7 @@ func TestWALDecryptErrorType(t *testing.T) {
 // for testing decryption with wrong keys.
 func newTestBarrierWithPassphrase(t *testing.T, passphrase string) *seal.Barrier {
 	t.Helper()
+	_ = seal.AllowWeakKDFParams()
 	strategy, err := seal.NewSoftwareStrategyWithParams(
 		[]byte(passphrase), 1, 64*1024, 1,
 	)

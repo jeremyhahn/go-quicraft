@@ -84,7 +84,7 @@ func FuzzRecordRoundTrip(f *testing.F) {
 			t.Skip("payload exceeds max record data length")
 		}
 
-		types := []byte{RecordFull, RecordFirst, RecordMiddle, RecordLast, RecordEpoch}
+		types := []byte{RecordFull, RecordFirst, RecordMiddle, RecordLast}
 		for _, rt := range types {
 			buf := make([]byte, recordHeaderSize+len(payload))
 
@@ -140,8 +140,6 @@ func FuzzRecordDecodeCrash(f *testing.F) {
 	f.Add(buildValidRecord(RecordFirst, []byte("first chunk")))
 	// Seed: valid RecordLast with payload.
 	f.Add(buildValidRecord(RecordLast, []byte("last chunk")))
-	// Seed: valid RecordEpoch with payload.
-	f.Add(buildValidRecord(RecordEpoch, []byte("epoch marker")))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must never panic. Errors are expected and acceptable.
@@ -189,7 +187,8 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		}
 
 		// Build the entry payload: [payloadType:1][ShardID:8][ReplicaID:8]
-		// [Index:8][Term:8][Type:8][CmdLen:4][Cmd:N]
+		// [Index:8][Term:8][Type:8][Key:8][ClientID:8][SeriesID:8]
+		// [RespondedTo:8][CmdLen:4][Cmd:N]
 		payloadSize := 1 + entryRecordHeaderSize + len(cmd)
 		payload := make([]byte, payloadSize)
 		payload[0] = payloadTypeEntries
@@ -198,8 +197,12 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		binary.LittleEndian.PutUint64(payload[17:], raftIndex)
 		binary.LittleEndian.PutUint64(payload[25:], term)
 		binary.LittleEndian.PutUint64(payload[33:], entryType)
-		binary.LittleEndian.PutUint32(payload[41:], uint32(len(cmd)))
-		copy(payload[45:], cmd)
+		binary.LittleEndian.PutUint64(payload[41:], raftIndex+1) // Key
+		binary.LittleEndian.PutUint64(payload[49:], shardID+1)   // ClientID
+		binary.LittleEndian.PutUint64(payload[57:], term+1)      // SeriesID
+		binary.LittleEndian.PutUint64(payload[65:], term)        // RespondedTo
+		binary.LittleEndian.PutUint32(payload[73:], uint32(len(cmd)))
+		copy(payload[77:], cmd)
 
 		// Encode as a WAL record.
 		buf := make([]byte, recordHeaderSize+payloadSize)
@@ -234,7 +237,24 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		gotIndex := binary.LittleEndian.Uint64(data[16:])
 		gotTerm := binary.LittleEndian.Uint64(data[24:])
 		gotType := binary.LittleEndian.Uint64(data[32:])
-		gotCmdLen := binary.LittleEndian.Uint32(data[40:])
+		gotKey := binary.LittleEndian.Uint64(data[40:])
+		gotClientID := binary.LittleEndian.Uint64(data[48:])
+		gotSeriesID := binary.LittleEndian.Uint64(data[56:])
+		gotRespondedTo := binary.LittleEndian.Uint64(data[64:])
+		gotCmdLen := binary.LittleEndian.Uint32(data[72:])
+
+		if gotKey != raftIndex+1 {
+			t.Fatalf("key: got %d, want %d", gotKey, raftIndex+1)
+		}
+		if gotClientID != shardID+1 {
+			t.Fatalf("clientID: got %d, want %d", gotClientID, shardID+1)
+		}
+		if gotSeriesID != term+1 {
+			t.Fatalf("seriesID: got %d, want %d", gotSeriesID, term+1)
+		}
+		if gotRespondedTo != term {
+			t.Fatalf("respondedTo: got %d, want %d", gotRespondedTo, term)
+		}
 
 		if gotShardID != shardID {
 			t.Fatalf("shardID: got %d, want %d", gotShardID, shardID)

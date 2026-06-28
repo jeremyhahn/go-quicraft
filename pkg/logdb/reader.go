@@ -588,10 +588,14 @@ func logdbEntriesToProtoReuse(buf []proto.Entry, entries []Entry) []proto.Entry 
 	}
 	for i := range entries {
 		buf[i] = proto.Entry{
-			Term:  entries[i].Term,
-			Index: entries[i].Index,
-			Type:  entries[i].Type,
-			Cmd:   entries[i].Cmd,
+			Term:        entries[i].Term,
+			Index:       entries[i].Index,
+			Type:        entries[i].Type,
+			Key:         entries[i].Key,
+			ClientID:    entries[i].ClientID,
+			SeriesID:    entries[i].SeriesID,
+			RespondedTo: entries[i].RespondedTo,
+			Cmd:         entries[i].Cmd,
 		}
 	}
 	return buf

@@ -67,6 +67,14 @@ impl LatencyRecorder {
         self.percentile(1.0)
     }
 
+    /// Returns the total of all recorded samples. Election scenarios pass
+    /// this as the scenario duration so reported ops/sec reflects only the
+    /// measured operation time, excluding per-iteration setup/teardown
+    /// (matching the Go engines' election benchmarks).
+    pub fn sum(&self) -> Duration {
+        self.samples.iter().sum()
+    }
+
     pub fn mean(&self) -> Duration {
         if self.samples.is_empty() {
             return Duration::ZERO;

@@ -52,9 +52,10 @@ type mockLogDB struct {
 	mu              sync.Mutex
 	closed          bool
 	closeErr        error
-	listNodeInfoErr error
-	saveSnapshotErr error
-	states          map[mockNodeKey]logdb.Update
+	listNodeInfoErr  error
+	saveSnapshotErr  error
+	saveBootstrapErr error
+	states           map[mockNodeKey]logdb.Update
 	snapshots       map[mockNodeKey]logdb.Snapshot
 	bootstraps      map[mockNodeKey]logdb.Bootstrap
 	nodeInfos       []logdb.NodeInfo
@@ -131,6 +132,9 @@ func (m *mockLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 func (m *mockLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.saveBootstrapErr != nil {
+		return m.saveBootstrapErr
+	}
 	m.bootstraps[mockNodeKey{shardID, replicaID}] = bootstrap
 	return nil
 }
@@ -1578,14 +1582,43 @@ func TestRequestLeaderTransfer_AsLeader(t *testing.T) {
 	}
 	defer h.Close()
 
-	members := map[uint64]string{1: "127.0.0.1:5000"}
+	members := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001"}
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 1, 1)
 
+	// A voting-member target is accepted.
 	err = h.RequestLeaderTransfer(context.Background(), 1, 2)
 	if err != nil {
-		t.Fatalf("RequestLeaderTransfer failed: %v", err)
+		t.Fatalf("RequestLeaderTransfer to voting member failed: %v", err)
+	}
+}
+
+func TestRequestLeaderTransfer_InvalidTargets(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001"}
+	scfg := testShardConfig(1, 1)
+	h.StartShard(members, false, testCreateFunc, scfg)
+	h.updateNodeLeader(1, 1, 1)
+
+	// A non-member target must be rejected synchronously, not reported
+	// as success while the raft layer drops it asynchronously.
+	err = h.RequestLeaderTransfer(context.Background(), 1, 999)
+	if !errors.Is(err, ErrReplicaNotFound) {
+		t.Fatalf("RequestLeaderTransfer(999) = %v, want ErrReplicaNotFound", err)
+	}
+
+	// A zero target is invalid.
+	var invalidErr *InvalidMemberError
+	err = h.RequestLeaderTransfer(context.Background(), 1, 0)
+	if !errors.As(err, &invalidErr) {
+		t.Fatalf("RequestLeaderTransfer(0) = %v, want InvalidMemberError", err)
 	}
 }
 
@@ -5941,25 +5974,31 @@ var _ Barrier = (*testHostBarrier)(nil)
 
 func TestHost_KeyRotationLoop_Disabled(t *testing.T) {
 	cfg := testHostConfig(t)
-	// KeyRotationInterval = 0 (default) = disabled.
+	// KeyRotationInterval = 0 disables SCHEDULED rotation, but the
+	// invocation-threshold check still runs whenever a barrier is
+	// configured (it enforces the NIST AEAD budget). The mock barrier's
+	// ShouldRotateKey returns false, so no rotation fires.
 	barrier := newTestHostBarrier(1)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	defer h.Close()
 
-	// keyRotDone should already be closed since rotation is disabled.
-	select {
-	case <-h.keyRotDone:
-		// Expected: goroutine was never started, channel is closed.
-	default:
-		t.Fatal("expected keyRotDone to be closed when rotation is disabled")
-	}
-
-	// No rotations should have occurred.
+	// No scheduled rotations should have occurred with interval=0.
 	if barrier.rotateCount.Load() != 0 {
 		t.Fatalf("expected 0 rotations, got %d", barrier.rotateCount.Load())
+	}
+
+	// The rotation loop is running (for threshold checks); it exits and
+	// closes keyRotDone on Close.
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	select {
+	case <-h.keyRotDone:
+		// Expected: loop exited on Close.
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected keyRotDone to close after Close")
 	}
 }
 
@@ -13206,7 +13245,7 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 				OCSPResponderURL:  "http://ocsp.example.com",
 				OCSPCacheSeconds:  600,
 				CheckInterval:     30 * time.Second,
-				EnforceRevocation: true,
+				AllowSoftFail:     true,
 			},
 		},
 	}
@@ -13226,8 +13265,36 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 	if tc.RevocationConfig.OCSPCacheSeconds != 600 {
 		t.Fatalf("OCSPCacheSeconds: got %d, want 600", tc.RevocationConfig.OCSPCacheSeconds)
 	}
+	// Public AllowSoftFail=true maps to internal EnforceRevocation=false.
+	if tc.RevocationConfig.EnforceRevocation {
+		t.Fatal("EnforceRevocation: got true, want false (AllowSoftFail=true opts into soft-fail)")
+	}
+}
+
+// TestBuildTransportConfig_RevocationFailsClosedByDefault is the M3 regression
+// test: a RevocationConfig that does not opt into soft-fail must map to
+// EnforceRevocation=true (fail closed), so an unreachable OCSP responder or
+// stale CRL rejects a peer rather than admitting it.
+func TestBuildTransportConfig_RevocationFailsClosedByDefault(t *testing.T) {
+	hc := config.HostConfig{
+		ListenAddress: ":4001",
+		DeploymentID:  1,
+		TransportConfig: config.TransportConfig{
+			RevocationConfig: &config.RevocationConfig{
+				CRLPaths: []string{"/path/to/crl.pem"},
+				Mode:     "crl",
+				// AllowSoftFail intentionally left unset (default).
+			},
+		},
+	}
+	hc.SetDefaults()
+
+	tc := buildTransportConfig(hc)
+	if tc.RevocationConfig == nil {
+		t.Fatal("expected non-nil RevocationConfig")
+	}
 	if !tc.RevocationConfig.EnforceRevocation {
-		t.Fatal("EnforceRevocation: got false, want true")
+		t.Fatal("revocation must fail CLOSED by default (EnforceRevocation=true) when AllowSoftFail is unset")
 	}
 }
 
@@ -18600,7 +18667,7 @@ func TestLoadOrGenerateHostID_OverrideID(t *testing.T) {
 
 func TestHandleSnapshot_EmptyChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot(nil)
+	err := handler.HandleSnapshot(nil, nil)
 	if err != nil {
 		t.Errorf("expected nil error for empty chunks, got: %v", err)
 	}
@@ -18608,7 +18675,7 @@ func TestHandleSnapshot_EmptyChunks(t *testing.T) {
 
 func TestHandleSnapshot_NilHost(t *testing.T) {
 	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}})
+	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}}, nil)
 	if err != nil {
 		t.Errorf("expected nil error for nil host, got: %v", err)
 	}
@@ -18622,7 +18689,7 @@ func TestHandleMessage_EmptyBatch(t *testing.T) {
 	h := newTestHost(t)
 	handler := &hostMessageHandler{host: h, engine: h.engine}
 
-	err := handler.HandleMessage(proto.MessageBatch{})
+	err := handler.HandleMessage(proto.MessageBatch{}, authorizeAllSenders)
 	if err != nil {
 		t.Errorf("expected nil error for empty batch, got: %v", err)
 	}
@@ -18828,7 +18895,7 @@ func TestHandleMessage_WithSourceAddress(t *testing.T) {
 			{ShardID: 1, From: 2, Type: proto.Heartbeat},
 		},
 	}
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Errorf("expected nil error, got: %v", err)
 	}
@@ -19596,12 +19663,31 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	}
 	// Raft's processed marker must equal the recovered index so the engine
 	// does not replay the already-durable entries.
-	_, _, processed, _, _, _, drErr := h.DiagRaftState(1)
-	if drErr != nil {
-		t.Fatalf("DiagRaftState failed: %v", drErr)
+	waitDiagProcessed(t, h, 1, 100)
+}
+
+// waitDiagProcessed polls DiagRaftState until the raft processed marker
+// reaches want, then asserts it. DiagRaftState is an eventually-consistent
+// snapshot published by the step worker under raftMu (reading Peer.r from
+// the caller's goroutine would race), so a direct read can briefly observe
+// the warming-up placeholder.
+func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var processed uint64
+	for {
+		_, _, p, _, _, _, drErr := h.DiagRaftState(shardID)
+		if drErr != nil {
+			t.Fatalf("DiagRaftState failed: %v", drErr)
+		}
+		processed = p
+		if processed == want || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if processed != 100 {
-		t.Errorf("raft processed = %d, want 100", processed)
+	if processed != want {
+		t.Errorf("raft processed = %d, want %d", processed, want)
 	}
 }
 
@@ -19780,13 +19866,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 
 	// Raft's processed marker must equal the seeded index so the engine
 	// replays exactly the entries AFTER the imported snapshot.
-	_, _, processed, _, _, _, drErr := h.DiagRaftState(1)
-	if drErr != nil {
-		t.Fatalf("DiagRaftState failed: %v", drErr)
-	}
-	if processed != 80 {
-		t.Errorf("raft processed = %d, want 80 (must match seeded recovered index)", processed)
-	}
+	waitDiagProcessed(t, h, 1, 80)
 }
 
 // TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal verifies that the
@@ -19824,5 +19904,244 @@ func TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal(t *testing.T) {
 	var hie *HostInitError
 	if !errors.As(startErr, &hie) || hie.Field != "snapshot_open" {
 		t.Errorf("StartShard error = %v, want HostInitError{Field: snapshot_open}", startErr)
+	}
+}
+
+// TestStartShardRejectedWhileDraining verifies StartShard fails closed
+// once the host is draining: a graceful shutdown is in progress, so new
+// shards must not be opened.
+func TestStartShardRejectedWhileDraining(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if err := h.Drain(); err != nil {
+		t.Fatalf("Drain failed: %v", err)
+	}
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); !errors.Is(err, ErrClosed) {
+		t.Fatalf("StartShard while draining = %v, want ErrClosed", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard on-disk state-machine data directory (config.Config.DataDir)
+// ---------------------------------------------------------------------------
+
+// fileBackedOnDiskSM is a DiskStateMachine test double that persists its state
+// to a "state.bin" file in the directory the framework hands to Open. It is
+// used to prove that the shard's on-disk data physically lands at the expected
+// location and survives a stop/start restart cycle. The file holds two
+// little-endian uint64 values: lastApplied followed by the accumulated value.
+type fileBackedOnDiskSM struct {
+	mu          sync.Mutex
+	openDir     string
+	value       uint64
+	lastApplied uint64
+}
+
+func (m *fileBackedOnDiskSM) statePath() string {
+	return filepath.Join(m.openDir, "state.bin")
+}
+
+func (m *fileBackedOnDiskSM) Open(_ context.Context, dir string, _ <-chan struct{}) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.openDir = dir
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return 0, err
+	}
+	data, err := os.ReadFile(m.statePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(data) != 16 {
+		return 0, fmt.Errorf("corrupt state file: %d bytes", len(data))
+	}
+	m.lastApplied = binary.LittleEndian.Uint64(data[0:8])
+	m.value = binary.LittleEndian.Uint64(data[8:16])
+	return m.lastApplied, nil
+}
+
+func (m *fileBackedOnDiskSM) persistLocked() error {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], m.lastApplied)
+	binary.LittleEndian.PutUint64(buf[8:16], m.value)
+	return os.WriteFile(m.statePath(), buf[:], 0o600)
+}
+
+func (m *fileBackedOnDiskSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range entries {
+		m.value++
+		m.lastApplied = entries[i].Index
+		results[i].Value = m.value
+	}
+	return m.persistLocked()
+}
+
+func (m *fileBackedOnDiskSM) Lookup(_ context.Context, _ interface{}) (interface{}, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.value, nil
+}
+
+func (m *fileBackedOnDiskSM) Sync() error                           { return nil }
+func (m *fileBackedOnDiskSM) PrepareSnapshot() (interface{}, error) { return nil, nil }
+
+func (m *fileBackedOnDiskSM) SaveSnapshot(_ context.Context, _ interface{}, w io.Writer, _ <-chan struct{}) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], m.value)
+	_, err := w.Write(buf[:])
+	return err
+}
+
+func (m *fileBackedOnDiskSM) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(data) >= 8 {
+		m.value = binary.LittleEndian.Uint64(data[0:8])
+	}
+	return m.persistLocked()
+}
+
+func (m *fileBackedOnDiskSM) Close(_ context.Context) error { return nil }
+
+var _ sm.DiskStateMachine = (*fileBackedOnDiskSM)(nil)
+
+// TestStartShard_OnDiskSM_DataDir_RootsUnderDataDir proves requirement (a):
+// when cfg.DataDir is set, the on-disk state machine's Open receives a data
+// directory rooted under cfg.DataDir (not under NodeHostDir), writes/reads work
+// against that store, the data physically lands there, and a stop/start restart
+// recovers the persisted state from the same DataDir-rooted location.
+func TestStartShard_OnDiskSM_DataDir_RootsUnderDataDir(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	dataDir := t.TempDir()
+	const shardID uint64 = 7
+
+	// The factory hands out a fresh SM per call so a restart exercises a clean
+	// Open() that must recover from disk. The latest instance is captured.
+	var mu sync.Mutex
+	var current *fileBackedOnDiskSM
+	create := func(_, _ uint64) interface{} {
+		sm := &fileBackedOnDiskSM{}
+		mu.Lock()
+		current = sm
+		mu.Unlock()
+		return sm
+	}
+
+	scfg := testShardConfig(shardID, 1)
+	scfg.DataDir = dataDir
+	if vErr := scfg.Validate(); vErr != nil {
+		t.Fatalf("config with DataDir failed validation: %v", vErr)
+	}
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+	waitForLeader(t, h, shardID)
+
+	wantDir := filepath.Join(dataDir, fmt.Sprintf("shard-%d", shardID))
+	mu.Lock()
+	firstSM := current
+	mu.Unlock()
+	if got := firstSM.openDir; got != wantDir {
+		t.Fatalf("on-disk SM Open dir = %q, want %q (under cfg.DataDir)", got, wantDir)
+	}
+
+	// Writes/reads work against the DataDir-rooted store.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	const writes = 3
+	for i := 0; i < writes; i++ {
+		if _, pErr := h.SyncPropose(ctx, shardID, []byte("x")); pErr != nil {
+			t.Fatalf("SyncPropose %d failed: %v", i, pErr)
+		}
+	}
+	val, rErr := h.SyncRead(ctx, shardID, nil)
+	if rErr != nil {
+		t.Fatalf("SyncRead failed: %v", rErr)
+	}
+	if got, _ := val.(uint64); got != writes {
+		t.Fatalf("read value = %v, want %d", val, writes)
+	}
+
+	// The persistent data physically landed under cfg.DataDir.
+	if _, statErr := os.Stat(filepath.Join(wantDir, "state.bin")); statErr != nil {
+		t.Fatalf("expected on-disk SM state under %q: %v", wantDir, statErr)
+	}
+
+	// Restart round-trip: stop and restart the shard. The fresh SM must
+	// recover the persisted value from the same DataDir-rooted location.
+	if stopErr := h.StopShard(shardID); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard (restart) failed: %v", startErr)
+	}
+	mu.Lock()
+	secondSM := current
+	mu.Unlock()
+	if secondSM == firstSM {
+		t.Fatal("restart did not create a fresh state machine")
+	}
+	if got := secondSM.openDir; got != wantDir {
+		t.Fatalf("restart on-disk SM Open dir = %q, want %q", got, wantDir)
+	}
+	if got := secondSM.value; got != writes {
+		t.Fatalf("restart recovered value = %d, want %d (data lost / wrong dir)", got, writes)
+	}
+}
+
+// TestStartShard_OnDiskSM_NoDataDir_DefaultLayout is the regression guard for
+// requirement (b): when cfg.DataDir is empty (the default), the on-disk state
+// machine's Open dir is the historical NodeHostDir-derived path, byte-for-byte
+// identical to the pre-change behavior.
+func TestStartShard_OnDiskSM_NoDataDir_DefaultLayout(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	const shardID uint64 = 9
+	diskSM := &fileBackedOnDiskSM{}
+	create := func(_, _ uint64) interface{} { return diskSM }
+
+	scfg := testShardConfig(shardID, 1)
+	// DataDir intentionally left empty.
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	wantDir := filepath.Join(cfg.NodeHostDir, "snapshots", fmt.Sprintf("shard-%d", shardID))
+	if got := diskSM.openDir; got != wantDir {
+		t.Fatalf("on-disk SM Open dir = %q, want %q (default NodeHostDir layout)", got, wantDir)
 	}
 }

@@ -163,7 +163,7 @@ func BenchmarkElection_WAL(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftElection(b, rec)
 
-	suite.AddResult(perfresult.ScenarioElectionWAL, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElectionWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ func BenchmarkElection_Memory(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftElectionMemory(b, rec)
 
-	suite.AddResult(perfresult.ScenarioElectionMemory, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElectionMemory, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ func BenchmarkElection_3N_WAL(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftElectionCluster(b, 3, rec)
 
-	suite.AddResult(perfresult.ScenarioElection3NWAL, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElection3NWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +224,7 @@ func BenchmarkElection_5N_WAL(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftElectionCluster(b, 5, rec)
 
-	suite.AddResult(perfresult.ScenarioElection5NWAL, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioElection5NWAL, rec.Count(), rec.Sum(), rec)
 }
 
 // ---------------------------------------------------------------------------

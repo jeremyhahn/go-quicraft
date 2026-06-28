@@ -30,6 +30,12 @@ var (
 	// ErrInvalidCertKeyPair is returned when the certificate and key PEM pair
 	// cannot be parsed.
 	ErrInvalidCertKeyPair = errors.New("transport: invalid certificate/key pair")
+
+	// ErrNoPeerCertificate is returned by the revocation VerifyConnection
+	// callback when a connection presents no peer certificate. mTLS makes
+	// this unreachable, but the callback fails closed rather than
+	// accepting an unauthenticated connection.
+	ErrNoPeerCertificate = errors.New("transport: connection presented no peer certificate")
 )
 
 // tlsALPN is the QUIC ALPN identifier for go-quicraft transport.
@@ -49,9 +55,18 @@ type tlsPair struct {
 // installed on both server and client configs to reject revoked peer
 // certificates during the TLS handshake.
 func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, error) {
-	cert, err := tls.X509KeyPair(mtls.Cert, mtls.Key)
-	if err != nil {
-		return nil, ErrInvalidCertKeyPair
+	// The node leaf comes from a pre-built Certificate when supplied (e.g. a
+	// hardware-signer-backed key that cannot be exported to PEM), otherwise
+	// from the PEM Cert/Key pair.
+	var cert tls.Certificate
+	if mtls.Certificate != nil {
+		cert = *mtls.Certificate
+	} else {
+		var err error
+		cert, err = tls.X509KeyPair(mtls.Cert, mtls.Key)
+		if err != nil {
+			return nil, ErrInvalidCertKeyPair
+		}
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(mtls.CACert) {
@@ -78,8 +93,15 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			// On fresh handshakes PeerCertificates contains the verified chain;
 			// on resumed sessions it still contains the peer's certificates from
 			// the original handshake, so leaf checking works on both paths.
+			//
+			// Fail CLOSED on an empty peer-certificate set. With mTLS
+			// (RequireAndVerifyClientCert + RootCAs on both ends) this is
+			// unreachable, but returning nil here would mean "no cert ⇒
+			// accept", a latent fail-open if the TLS config ever changed.
+			// A connection with no presented certificate cannot be
+			// revocation-checked and must be rejected.
 			if len(cs.PeerCertificates) == 0 {
-				return nil
+				return ErrNoPeerCertificate
 			}
 			leaf := cs.PeerCertificates[0]
 			revoked, checkErr := checker.IsRevoked(leaf)

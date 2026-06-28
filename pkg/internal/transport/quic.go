@@ -164,6 +164,14 @@ type QUICTransport struct {
 
 	snapshotRecv *snapshotReceiver
 
+	// msgRecvBudget is the remaining aggregate memory budget (bytes) for inbound
+	// message-frame payload buffers across all connections/streams. A frame
+	// reserves its declared length here BEFORE allocating its receive buffer and
+	// releases it once dispatched, bounding total in-flight message memory to
+	// MaxMessageReceiveMemory. Mirrors snapshotReceiver.memoryBudget for the
+	// regular message path, which otherwise has no aggregate cap (OOM DoS).
+	msgRecvBudget atomic.Int64
+
 	stopC           chan struct{}
 	stopped         atomic.Bool
 	shutdownCtx     context.Context
@@ -371,6 +379,7 @@ func NewQUICTransport(
 		handler,
 	)
 	t.snapshotRecv.SetSnapshotTracker(&t.snapshotTracker)
+	t.msgRecvBudget.Store(cfg.MaxMessageReceiveMemory)
 
 	t.eventListener = cfg.EventListener
 	t.metrics = cfg.Metrics
@@ -469,6 +478,17 @@ func (t *QUICTransport) SetEpochTracker(tracker EpochTracker) {
 	t.snapshotRecv.SetEpochTracker(tracker)
 }
 
+// SetShardEpochTrackers configures a per-shard epoch tracker resolver on the
+// snapshot receiver, used when each Raft shard is sealed under its OWN barrier
+// (per-tenant WAL/snapshot encryption). When set, a received snapshot pins its
+// in-flight epoch on the barrier mapped to the snapshot's shardID instead of a
+// single host-wide tracker. This is additive: SetEpochTracker continues to work
+// for the single-barrier case, and a non-nil per-shard resolver takes
+// precedence. Must be called before Start.
+func (t *QUICTransport) SetShardEpochTrackers(fn func(shardID uint64) EpochTracker) {
+	t.snapshotRecv.SetShardEpochTrackers(fn)
+}
+
 // Stop gracefully shuts down the transport. It signals all per-target
 // sender goroutines to exit via stopC, waits for them to drain, stops
 // the accept loop, waits for in-flight snapshot transfers, closes all
@@ -486,14 +506,17 @@ func (t *QUICTransport) Stop() error {
 		t.revocationChecker.Stop()
 	}
 
-	// Acquire and release sendQueuesMu to synchronize with any
-	// in-progress getOrCreateSendQueue call. This creates a happens-
-	// before edge: any wg.Add(1) that was in progress (inside the
-	// write lock with stopped=false) must complete before we proceed.
-	// After this point, all future getOrCreateSendQueue calls see
-	// stopped=true and return nil without calling wg.Add(1).
+	// Acquire sendQueuesMu to synchronize with any in-progress
+	// getOrCreateSendQueue call. This creates a happens-before edge: any
+	// wg.Add(1) that was in progress (inside the write lock with
+	// stopped=false) must complete before we proceed. After this point,
+	// all future getOrCreateSendQueue calls see stopped=true and return
+	// nil without calling wg.Add(1). The read of t.stopped under the lock
+	// is the observable work that makes the barrier explicit (and not an
+	// empty critical section).
 	t.sendQueuesMu.Lock()
-	t.sendQueuesMu.Unlock() //nolint:staticcheck // intentional lock barrier for happens-before edge
+	_ = t.stopped.Load()
+	t.sendQueuesMu.Unlock()
 
 	// Set the snapshot shutdown flag and wait for all in-flight
 	// snapshot sends and receives to complete before tearing down

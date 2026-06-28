@@ -729,3 +729,28 @@ func assertValidationError(t *testing.T, err error, expectedField string) {
 		t.Errorf("error field = %q, want %q", ve.Field, expectedField)
 	}
 }
+
+func TestConfig_Validate_DataDir(t *testing.T) {
+	t.Run("empty is valid (default)", func(t *testing.T) {
+		c := validConfig()
+		c.DataDir = ""
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() with empty DataDir = %v, want nil", err)
+		}
+	})
+
+	t.Run("absolute path is valid", func(t *testing.T) {
+		c := validConfig()
+		c.DataDir = "/var/lib/qrdb/tenant-7"
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() with absolute DataDir = %v, want nil", err)
+		}
+	})
+
+	t.Run("relative path is rejected", func(t *testing.T) {
+		c := validConfig()
+		c.DataDir = "relative/path"
+		err := c.Validate()
+		assertValidationError(t, err, "DataDir")
+	})
+}

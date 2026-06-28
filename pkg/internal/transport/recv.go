@@ -16,6 +16,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,6 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
@@ -65,18 +65,21 @@ var batchPool = sync.Pool{
 }
 
 // ipConnTracker tracks the number of active connections per source IP.
-// It uses a mutex-protected map with atomic counts for efficient concurrent
-// access from the accept loop and connection handler goroutines.
+// All check-and-update operations run under a single mutex so the count
+// for an IP can never be observed or mutated through a stale entry: a
+// CAS-outside-the-lock scheme allows an increment to land on a counter
+// that release has already pruned from the map, undercounting the IP and
+// letting it exceed the limit.
 type ipConnTracker struct {
 	mu     sync.Mutex
-	counts map[string]*atomic.Int32
+	counts map[string]int
 	limit  int
 }
 
 // newIPConnTracker creates a tracker with the given per-IP connection limit.
 func newIPConnTracker(limit int) *ipConnTracker {
 	return &ipConnTracker{
-		counts: make(map[string]*atomic.Int32),
+		counts: make(map[string]int),
 		limit:  limit,
 	}
 }
@@ -86,22 +89,12 @@ func newIPConnTracker(limit int) *ipConnTracker {
 // false is returned, the count is not incremented.
 func (tr *ipConnTracker) tryAcquire(ip string) bool {
 	tr.mu.Lock()
-	counter, ok := tr.counts[ip]
-	if !ok {
-		counter = &atomic.Int32{}
-		tr.counts[ip] = counter
+	defer tr.mu.Unlock()
+	if tr.counts[ip] >= tr.limit {
+		return false
 	}
-	tr.mu.Unlock()
-
-	for {
-		cur := counter.Load()
-		if int(cur) >= tr.limit {
-			return false
-		}
-		if counter.CompareAndSwap(cur, cur+1) {
-			return true
-		}
-	}
+	tr.counts[ip]++
+	return true
 }
 
 // release decrements the count for the given IP. The caller must have
@@ -110,16 +103,16 @@ func (tr *ipConnTracker) tryAcquire(ip string) bool {
 // unbounded growth from transient connections.
 func (tr *ipConnTracker) release(ip string) {
 	tr.mu.Lock()
-	counter, ok := tr.counts[ip]
+	defer tr.mu.Unlock()
+	count, ok := tr.counts[ip]
 	if !ok {
-		tr.mu.Unlock()
 		return
 	}
-	newVal := counter.Add(-1)
-	if newVal <= 0 {
+	if count <= 1 {
 		delete(tr.counts, ip)
+		return
 	}
-	tr.mu.Unlock()
+	tr.counts[ip] = count - 1
 }
 
 // extractIP extracts the IP address from a net.Addr, stripping the port.
@@ -348,18 +341,34 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		}
 	}()
 
+	idleTimeout := t.cfg.StreamReadIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultStreamReadIdleTimeout
+	}
+
 	for {
 		if t.stopped.Load() {
 			return
 		}
 
-		// Set a read deadline to avoid hanging on dead streams.
-		if err := stream.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		// Read the next frame header. A clean idle gap on a LIVE connection is
+		// NOT a failure: replication streams sit idle between bursts while the
+		// connection is kept alive by heartbeats. Abandoning such a stream here
+		// would leave the leader writing into a stream this receiver no longer
+		// drains — the post-idle replication stall. readFrameHeaderResilient
+		// returns errStreamIdle in that case so we keep the stream open.
+		length, flags, err := t.readFrameHeaderResilient(inboundConn, stream, idleTimeout, frameReadActiveTimeout)
+		if err != nil {
+			if errors.Is(err, errStreamIdle) {
+				continue
+			}
 			return
 		}
 
-		length, flags, err := ReadFrameHeader(stream)
-		if err != nil {
+		// A frame has begun arriving: complete its body (and any back-to-back
+		// frame on a hot stream) under the active deadline so a half-delivered
+		// frame cannot stall the receiver indefinitely.
+		if derr := stream.SetReadDeadline(time.Now().Add(frameReadActiveTimeout)); derr != nil {
 			return
 		}
 
@@ -377,7 +386,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 				return
 			}
 			defer func() { <-snapSem }()
-			t.handleSnapshotStream(stream, length)
+			t.handleSnapshotStream(inboundConn, stream, length)
 			return
 		}
 
@@ -385,6 +394,65 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			return
 		}
 	}
+}
+
+// errStreamIdle signals that an inbound stream's read deadline elapsed at a
+// clean frame boundary (zero bytes buffered) while its QUIC connection is still
+// alive. The stream is idle, not dead, so handleStream keeps it open and waits
+// for the next frame rather than abandoning it. Abandoning an idle-but-live
+// replication stream is the root cause of the post-idle replication stall: the
+// leader keeps writing into its cached stream (the connection stays alive via
+// heartbeats), but the follower has stopped draining it, so proposals never
+// commit and never self-heal.
+var errStreamIdle = errors.New("transport: stream idle on live connection")
+
+// isTimeoutErr reports whether err is an i/o deadline-exceeded (read/write
+// timeout), including the timeout error quic-go surfaces from a stream whose
+// read/write deadline elapsed.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// readFrameHeaderResilient reads one frame header, distinguishing a benign idle
+// gap from a real failure. The header is first awaited under idleTimeout: if
+// the deadline fires before ANY byte of the next frame arrives and the
+// connection is still alive, it returns errStreamIdle so the caller keeps the
+// (idle) stream open. Once a frame has begun arriving, the remaining header
+// bytes are read under activeTimeout, so a half-delivered frame cannot stall
+// the receiver forever. Any other error (dead connection, malformed header,
+// reset stream) is returned as-is for the caller to terminate the stream.
+func (t *QUICTransport) readFrameHeaderResilient(conn *quic.Conn, stream *quic.Stream, idleTimeout, activeTimeout time.Duration) (length uint32, flags FrameFlags, err error) {
+	var header [FrameHeaderSize]byte
+
+	if derr := stream.SetReadDeadline(time.Now().Add(idleTimeout)); derr != nil {
+		return 0, FlagNone, derr
+	}
+	n, rerr := io.ReadFull(stream, header[:])
+	if rerr != nil {
+		switch {
+		case n == 0 && isTimeoutErr(rerr) && conn.Context().Err() == nil:
+			// Clean idle boundary on a live connection — not a failure.
+			return 0, FlagNone, errStreamIdle
+		case n > 0 && n < len(header):
+			// A frame started but its header did not complete within
+			// idleTimeout. Finish it under the active deadline; a stall now is
+			// a genuine slow/dead peer.
+			if derr := stream.SetReadDeadline(time.Now().Add(activeTimeout)); derr != nil {
+				return 0, FlagNone, derr
+			}
+			if _, rerr2 := io.ReadFull(stream, header[n:]); rerr2 != nil {
+				return 0, FlagNone, rerr2
+			}
+		default:
+			return 0, FlagNone, rerr
+		}
+	}
+
+	if verr := ValidateFrameHeader(header[:]); verr != nil {
+		return 0, FlagNone, verr
+	}
+	return binary.BigEndian.Uint32(header[4:8]), FrameFlags(header[3]), nil
 }
 
 // handoffToSnapSem transfers a stream's budget from the data-stream semaphore
@@ -401,13 +469,21 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 // leaked.
 func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inboundConn *quic.Conn) bool {
 	<-streamSem
+	// Check shutdown explicitly before trying the snapshot budget: in a
+	// combined select with a default case, a closed stopC/connection context
+	// only wins by random choice against an available snapSem slot, so a
+	// snapshot could still be accepted during shutdown.
+	if inboundConn.Context().Err() != nil {
+		return false
+	}
+	select {
+	case <-t.stopC:
+		return false
+	default:
+	}
 	select {
 	case snapSem <- struct{}{}:
 		return true
-	case <-inboundConn.Context().Done():
-		return false
-	case <-t.stopC:
-		return false
 	default:
 		slog.Warn("snapshot stream dropped: per-connection snapshot limit reached",
 			"remote", inboundConn.RemoteAddr().String(),
@@ -427,6 +503,23 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	if length == 0 {
 		return nil
 	}
+
+	// Reserve the frame's declared length against the aggregate message-receive
+	// budget BEFORE allocating the buffer. The buffer is allocated before the
+	// body is read (io.ReadFull below), so without an aggregate cap an
+	// authenticated peer could open up to MaxStreamsPerConnection streams that
+	// each declare MaxFrameSize and withhold the body, pinning that memory until
+	// the read deadline and OOM-ing the host. The reservation is released once
+	// the frame has been fully processed (defer), mirroring the snapshot
+	// receiver's memory budget.
+	if !t.reserveMsgRecvBudget(int64(length)) {
+		slog.Warn("message frame dropped: receive memory budget exhausted",
+			"remote", inboundConn.RemoteAddr().String(),
+			"length", length,
+		)
+		return ErrMessageRecvMemoryBudgetExceeded
+	}
+	defer t.releaseMsgRecvBudget(int64(length))
 
 	var recvStart time.Time
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -638,7 +731,13 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		}
 	}
 
-	handleErr := t.handler.HandleMessage(*batch)
+	// Bind the in-band batch SourceAddress to the connection's verified
+	// certificate (same hook the snapshot path uses), so the handler only
+	// learns a return-path address the sender's cert actually covers.
+	senderAuthorized := func(address string) bool {
+		return t.inboundAuthorizedForCached(inboundConn, address)
+	}
+	handleErr := t.handler.HandleMessage(*batch, senderAuthorized)
 	if !recvStart.IsZero() && len(batch.Requests) > 0 {
 		slog.Debug("message batch received",
 			"source", batch.SourceAddress,
@@ -656,15 +755,18 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 
 // handleSnapshotStream processes a snapshot stream. The snapshot header
 // was already received as the first frame's payload. Subsequent frames
-// are snapshot chunks.
-func (t *QUICTransport) handleSnapshotStream(stream io.Reader, headerLen uint32) {
-	t.processSnapshotHeader(stream, headerLen)
+// are snapshot chunks. inboundConn is the connection the stream arrived
+// on; its verified peer certificate is the authority used to bind the
+// in-band sender identity (chunk.From) before any snapshot state is
+// persisted.
+func (t *QUICTransport) handleSnapshotStream(inboundConn *quic.Conn, stream io.Reader, headerLen uint32) {
+	t.processSnapshotHeader(inboundConn, stream, headerLen)
 }
 
 // processSnapshotHeader reads and validates the snapshot header from the
 // stream, then delegates to the snapshot receiver for chunk processing.
 // Separated from handleSnapshotStream to accept io.Reader for testability.
-func (t *QUICTransport) processSnapshotHeader(r io.Reader, headerLen uint32) {
+func (t *QUICTransport) processSnapshotHeader(inboundConn *quic.Conn, r io.Reader, headerLen uint32) {
 	// Read the snapshot header payload.
 	if headerLen < SnapshotHeaderSize {
 		return
@@ -691,14 +793,50 @@ func (t *QUICTransport) processSnapshotHeader(r io.Reader, headerLen uint32) {
 		return
 	}
 
-	// For actual QUIC streams, delegate to the snapshot receiver.
-	// For testing with io.Reader, this path exercises header validation.
+	// Reject snapshots delivered over a 0-RTT (early-data) connection.
+	// 0-RTT data is replayable per RFC 9001 §8: an attacker who captured
+	// a snapshot flight could replay it to re-inject stale state. The
+	// snapshot path persists to disk and feeds InstallSnapshot into raft,
+	// so unlike idempotent Raft RPCs it must not run on replayable early
+	// data. (0-RTT is default-off; this is defense-in-depth when enabled.)
+	if inboundConn != nil && inboundConn.ConnectionState().Used0RTT {
+		slog.Warn("rejecting snapshot received over 0-RTT (replayable early data)",
+			"shard", hdr.ShardID, "replica", hdr.ReplicaID, "index", hdr.Index)
+		return
+	}
+
+	// For actual QUIC streams, delegate to the snapshot receiver. The
+	// authorization closure binds the snapshot's in-band sender identity
+	// to the inbound connection's verified peer certificate — the same
+	// mechanism used for MessageBatch.SourceAddress. A nil inboundConn
+	// yields "unauthorized" for every address (fail closed).
 	if qStream, ok := r.(*quic.Stream); ok {
-		t.snapshotRecv.receiveSnapshot(qStream, &hdr, t.stopC)
+		senderAuthorized := func(address string) bool {
+			return t.inboundAuthorizedForCached(inboundConn, address)
+		}
+		t.snapshotRecv.receiveSnapshot(qStream, &hdr, senderAuthorized, t.stopC)
 	} else {
 		slog.Warn("snapshot header received on non-QUIC stream, snapshot dropped",
 			"reader_type", fmt.Sprintf("%T", r))
 	}
+}
+
+// reserveMsgRecvBudget atomically reserves n bytes against the aggregate
+// message-receive memory budget. It returns true on success; on failure it
+// reserves nothing (restoring the budget) and returns false. Callers MUST pair
+// a successful reservation with releaseMsgRecvBudget(n).
+func (t *QUICTransport) reserveMsgRecvBudget(n int64) bool {
+	if t.msgRecvBudget.Add(-n) < 0 {
+		t.msgRecvBudget.Add(n)
+		return false
+	}
+	return true
+}
+
+// releaseMsgRecvBudget returns n previously-reserved bytes to the aggregate
+// message-receive memory budget.
+func (t *QUICTransport) releaseMsgRecvBudget(n int64) {
+	t.msgRecvBudget.Add(n)
 }
 
 // getRecvBuf gets a buffer from the pool, ensuring it has at least minCap capacity.

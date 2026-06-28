@@ -180,11 +180,11 @@ func BenchmarkCommitLatency_EtcdRaft_Memory(b *testing.B) {
 func BenchmarkElectionTime_EtcdRaft(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 
-	start := time.Now()
 	benchEtcdRaftElection(b, rec)
-	dur := time.Since(start)
 
-	suite.AddResult(perfresult.ScenarioElectionWAL, b.N, dur, rec)
+	// Duration = sum of recorded election latencies so ops/sec excludes
+	// per-iteration setup/teardown, which differs across engines.
+	suite.AddResult(perfresult.ScenarioElectionWAL, rec.Count(), rec.Sum(), rec)
 
 	b.ReportMetric(float64(rec.P50().Microseconds()), "p50-us")
 	b.ReportMetric(float64(rec.P99().Microseconds()), "p99-us")
@@ -200,11 +200,11 @@ func BenchmarkElectionTime_EtcdRaft(b *testing.B) {
 func BenchmarkElectionTime_EtcdRaft_Memory(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 
-	start := time.Now()
 	benchEtcdRaftElectionMemory(b, rec)
-	dur := time.Since(start)
 
-	suite.AddResult(perfresult.ScenarioElectionMemory, b.N, dur, rec)
+	// Duration = sum of recorded election latencies so ops/sec excludes
+	// per-iteration setup/teardown, which differs across engines.
+	suite.AddResult(perfresult.ScenarioElectionMemory, rec.Count(), rec.Sum(), rec)
 
 	b.ReportMetric(float64(rec.P50().Microseconds()), "p50-us")
 	b.ReportMetric(float64(rec.P99().Microseconds()), "p99-us")
@@ -219,11 +219,11 @@ func BenchmarkElectionTime_EtcdRaft_Memory(b *testing.B) {
 func BenchmarkElectionTime_3N_EtcdRaft(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 
-	start := time.Now()
 	benchEtcdRaftElectionCluster(b, 3, rec)
-	dur := time.Since(start)
 
-	suite.AddResult(perfresult.ScenarioElection3NWAL, b.N, dur, rec)
+	// Duration = sum of recorded election latencies so ops/sec excludes
+	// per-iteration setup/teardown, which differs across engines.
+	suite.AddResult(perfresult.ScenarioElection3NWAL, rec.Count(), rec.Sum(), rec)
 
 	b.ReportMetric(float64(rec.P50().Microseconds()), "p50-us")
 	b.ReportMetric(float64(rec.P99().Microseconds()), "p99-us")
@@ -299,11 +299,11 @@ func BenchmarkCommitLatency_3N_EtcdRaft(b *testing.B) {
 func BenchmarkElectionTime_5N_EtcdRaft(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 
-	start := time.Now()
 	benchEtcdRaftElectionCluster(b, 5, rec)
-	dur := time.Since(start)
 
-	suite.AddResult(perfresult.ScenarioElection5NWAL, b.N, dur, rec)
+	// Duration = sum of recorded election latencies so ops/sec excludes
+	// per-iteration setup/teardown, which differs across engines.
+	suite.AddResult(perfresult.ScenarioElection5NWAL, rec.Count(), rec.Sum(), rec)
 
 	b.ReportMetric(float64(rec.P50().Microseconds()), "p50-us")
 	b.ReportMetric(float64(rec.P99().Microseconds()), "p99-us")

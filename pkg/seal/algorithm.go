@@ -58,6 +58,12 @@ var (
 	// ErrUnsupportedAlgorithm is returned when an unrecognised algorithm
 	// identifier is encountered.
 	ErrUnsupportedAlgorithm = errors.New("quicraft/seal: unsupported symmetric algorithm")
+
+	// ErrAlgorithmNotFIPSApproved is returned when FIPS 140 mode is in
+	// effect and the configured algorithm (ChaCha20-Poly1305 or
+	// XChaCha20-Poly1305) is not FIPS-approved.
+	ErrAlgorithmNotFIPSApproved = errors.New(
+		"quicraft/seal: algorithm is not FIPS-approved; FIPS 140 mode requires AES-GCM")
 )
 
 // algorithmParams holds the static parameters for a SymmetricAlgorithm.
@@ -187,7 +193,16 @@ func HasAESNI() bool {
 // use AES-256-GCM on CPUs with AES-NI, and fall back to ChaCha20-Poly1305 on
 // CPUs without hardware AES acceleration where ChaCha20 is constant-time and
 // significantly faster.
+//
+// Under FIPS 140 mode the data-path cipher MUST be FIPS-approved:
+// AES-256-GCM is returned unconditionally, even on CPUs without AES-NI.
+// ChaCha20-Poly1305 is not an approved algorithm, and a "FIPS"
+// deployment silently selecting it on non-AES-NI hardware would violate
+// the deployment's compliance claim.
 func SelectOptimalAlgorithm(isHardwareBacked bool) SymmetricAlgorithm {
+	if FIPSEnabled() {
+		return AlgAES256GCM
+	}
 	if isHardwareBacked || HasAESNI() {
 		return AlgAES256GCM
 	}

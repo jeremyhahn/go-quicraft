@@ -15,6 +15,7 @@
 package seal
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -112,5 +113,54 @@ func TestFIPSEnabled_NonEmptyArbitraryValue(t *testing.T) {
 	os.Setenv(envGOFIPS140, "true")
 	if !FIPSEnabled() {
 		t.Fatal("expected FIPSEnabled() to return true for any non-empty GOFIPS140 value")
+	}
+}
+
+// TestFIPSEnabledOffValue verifies GOFIPS140=off is honored as DISABLED
+// (the old detection treated any non-empty value, including "off", as
+// FIPS mode).
+func TestFIPSEnabledOffValue(t *testing.T) {
+	t.Setenv("GOFIPS140", "off")
+	if FIPSEnabled() {
+		t.Fatal("GOFIPS140=off must not enable FIPS mode")
+	}
+}
+
+// TestFIPSConstrainsDataPathCipher verifies that FIPS mode forces
+// AES-256-GCM from SelectOptimalAlgorithm regardless of AES-NI, and that
+// BarrierConfig.validate rejects the non-approved ChaCha20 family.
+func TestFIPSConstrainsDataPathCipher(t *testing.T) {
+	t.Setenv("GOFIPS140", "latest")
+
+	if alg := SelectOptimalAlgorithm(false); alg != AlgAES256GCM {
+		t.Fatalf("SelectOptimalAlgorithm under FIPS = %v, want AES-256-GCM", alg)
+	}
+	if alg := SelectOptimalAlgorithm(true); alg != AlgAES256GCM {
+		t.Fatalf("SelectOptimalAlgorithm(hardware) under FIPS = %v, want AES-256-GCM", alg)
+	}
+
+	for _, alg := range []SymmetricAlgorithm{AlgChaCha20Poly1305, AlgXChaCha20Poly1305} {
+		cfg := BarrierConfig{Algorithm: alg, DeploymentID: 1}
+		if err := cfg.validate(); !errors.Is(err, ErrAlgorithmNotFIPSApproved) {
+			t.Fatalf("validate(%v) under FIPS = %v, want ErrAlgorithmNotFIPSApproved", alg, err)
+		}
+	}
+
+	// AES variants remain valid.
+	for _, alg := range []SymmetricAlgorithm{AlgAES128GCM, AlgAES192GCM, AlgAES256GCM} {
+		cfg := BarrierConfig{Algorithm: alg, DeploymentID: 1}
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("validate(%v) under FIPS = %v, want nil", alg, err)
+		}
+	}
+}
+
+// TestNonFIPSAllowsChaCha verifies ChaCha20 remains selectable outside
+// FIPS mode.
+func TestNonFIPSAllowsChaCha(t *testing.T) {
+	t.Setenv("GOFIPS140", "")
+	cfg := BarrierConfig{Algorithm: AlgChaCha20Poly1305, DeploymentID: 1}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate(ChaCha20) outside FIPS = %v, want nil", err)
 	}
 }

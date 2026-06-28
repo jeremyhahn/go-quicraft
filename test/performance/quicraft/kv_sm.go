@@ -36,6 +36,23 @@ const (
 	opGet byte = 0x02
 )
 
+// proposalBytes is the total wire size of every proposed KV command. It is
+// fixed at 128 bytes and shared by all benchmarked engines (QuicRaft,
+// Dragonboat, etcd, OpenRaft) so each Raft log entry carries an identical
+// payload, keeping the comparison apples-to-apples.
+const proposalBytes = 128
+
+// makeKVCmd builds a Put command whose total wire size is exactly
+// proposalBytes by padding the value to fill the space remaining after the
+// 3-byte header and the key.
+func makeKVCmd(key []byte) []byte {
+	valLen := proposalBytes - 3 - len(key)
+	if valLen < 0 {
+		valLen = 0
+	}
+	return encodeKVCmd(key, make([]byte, valLen))
+}
+
 // encodeKVCmd builds the wire-format command for a Put operation.
 func encodeKVCmd(key, value []byte) []byte {
 	keyLen := len(key)

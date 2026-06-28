@@ -103,3 +103,73 @@ type EpochAwareLogDB interface {
 	// Returns 0 with a nil error when no barrier is configured.
 	MinLiveEpoch() (uint64, error)
 }
+
+// PerBarrierEpochAwareLogDB is an optional interface for LogDB
+// implementations that route different Raft shards to different at-rest
+// barriers (per-tenant WAL encryption). It exposes the minimum live WAL
+// epoch restricted to the records encrypted under a SINGLE barrier, so the
+// snapshot pool can compute an independent DEK-purge floor per barrier:
+// purging barrier B's old DEKs must use min(B's snapshots, B's WAL records)
+// and must never be lowered or raised by another barrier's records.
+//
+// The barrier argument is an opaque, comparable handle (the same concrete
+// *seal.Barrier the caller installed). Implementations compare it by
+// identity to select the matching records. A single-barrier LogDB satisfies
+// this by returning its global MinLiveEpoch when the handle matches its own
+// barrier and 0 otherwise; a multiplexing LogDB delegates to the underlying
+// store that owns the barrier.
+//
+// Implementations that do not support per-barrier routing need not implement
+// this interface. Callers should use a type assertion to check for support
+// and fall back to EpochAwareLogDB / fail-safe behavior otherwise.
+type PerBarrierEpochAwareLogDB interface {
+	// MinLiveEpochForBarrier returns the minimum barrier encryption epoch
+	// across all live WAL records encrypted under the given barrier handle.
+	//
+	// The three return values form a fail-safe contract that callers MUST
+	// honor before purging any DEK:
+	//
+	//   - known == false: this LogDB does NOT own / cannot attribute the
+	//     barrier (it stores no records under it, or cannot prove which of its
+	//     records belong to it). The epoch is meaningless and callers MUST NOT
+	//     purge. This is the critical distinction from a true non-constraint:
+	//     an "unknown barrier" is indistinguishable from "zero live records"
+	//     in a two-value signature, and treating it as the latter over-purges.
+	//   - known == true, epoch == 0: this LogDB owns the barrier and it has
+	//     zero live encrypted records (all plaintext, empty, or fully
+	//     compacted). This is a true non-constraint — the WAL imposes no purge
+	//     floor, though other floors (e.g. retained snapshots) still apply.
+	//   - known == true, epoch > 0: this LogDB owns the barrier and its oldest
+	//     live encrypted record is at epoch. DEKs strictly below it must not be
+	//     purged.
+	//
+	// The returned error is non-nil only when the value cannot be determined
+	// (e.g. the store is closed); callers MUST treat any error as fail-safe
+	// (do not purge), exactly like known == false.
+	MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)
+}
+
+// BarrierShardEnumerator is an optional interface a per-barrier LogDB may
+// implement to report the COMPLETE, stable set of Raft shards whose records are
+// encrypted under a given barrier. The snapshot pool uses it to verify that its
+// per-barrier retained-snapshot scan covers every shard mapped to the barrier:
+// a shard that maps to the barrier but is not currently loaded in the engine
+// cannot have its retained snapshots scanned, so its (possibly older) snapshot
+// epochs would be silently dropped from the purge floor — over-purging the
+// SHARED barrier's DEKs and losing the data those snapshots still need to
+// decrypt. When a mapped shard is absent the pool fails safe (no purge).
+//
+// known is true ONLY when the barrier's shard set is a fixed, fully enumerable
+// set (e.g. a registered dedicated per-tenant barrier). It is false for a
+// barrier whose shard membership is open-ended (such as a shared/system barrier
+// that is the fallback for every non-dedicated shard) and for any barrier the
+// implementation does not own; in those cases the caller falls back to scanning
+// the currently-loaded shards, matching the global single-barrier behavior.
+//
+// Implementations that cannot enumerate shards per barrier need not implement
+// this interface; callers use a type assertion to check for support.
+type BarrierShardEnumerator interface {
+	// ShardsForBarrier returns the complete set of shard IDs whose records are
+	// encrypted under barrier, and whether that set is fully enumerable (known).
+	ShardsForBarrier(barrier any) (shards []uint64, known bool)
+}

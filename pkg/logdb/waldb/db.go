@@ -57,9 +57,11 @@ type metaSegments struct {
 	state        uint64
 	snapshot     uint64
 	bootstrap    uint64
+	compact      uint64
 	hasState     bool
 	hasSnapshot  bool
 	hasBootstrap bool
+	hasCompact   bool
 }
 
 // WALBarrier is the encryption interface used by WAL segments. It mirrors
@@ -191,6 +193,36 @@ type DB struct {
 	diskMon *DiskMonitor
 	metrics LogDBMetrics
 	closed  atomic.Bool
+	// poisoned fail-stops the DB after an fsync failure. A failed
+	// fdatasync leaves written-but-unsynced bytes whose durability the
+	// kernel no longer guarantees (it may mark dirty pages clean without
+	// writing them), so every subsequent write is refused with
+	// ErrDBPoisoned and the process must restart into WAL crash recovery.
+	poisoned atomic.Bool
+}
+
+// poison marks the DB fail-stopped after an fsync failure. Idempotent;
+// the first call logs the cause at Error level.
+func (db *DB) poison(cause error) {
+	if db.poisoned.CompareAndSwap(false, true) {
+		slog.Error("waldb: fsync failure — poisoning database (fail-stop); "+
+			"all further writes will be refused, restart required",
+			"dir", db.dir,
+			"error", cause,
+		)
+	}
+}
+
+// writeGate returns the error that must abort a write operation: ErrClosed
+// when the DB is closed, ErrDBPoisoned after a fail-stop.
+func (db *DB) writeGate() error {
+	if db.closed.Load() {
+		return logdb.ErrClosed
+	}
+	if db.poisoned.Load() {
+		return ErrDBPoisoned
+	}
+	return nil
 }
 
 // walShard is a single WAL directory shard. Each shard manages its own
@@ -207,6 +239,16 @@ type walShard struct {
 	activeSegment   *segment
 	activeSegmentID uint64
 	nextSegmentID   uint64
+
+	// poison fail-stops the owning DB after an fsync failure on this
+	// shard (see DB.poison). Nil when the shard is used standalone in
+	// tests.
+	poison func(error)
+
+	// diskMon is the owning DB's disk-usage monitor, used to force a
+	// usage check when a segment pre-allocation fails. Nil when no
+	// monitor is configured.
+	diskMon *DiskMonitor
 
 	// Per-node entry indexes for range queries and compaction tracking.
 	indexes map[nodeKey]*index
@@ -244,13 +286,14 @@ type walShard struct {
 	segmentEpochs map[uint64]uint64
 
 	// metaSegments tracks, per node, the segment ID that holds the latest
-	// durable State, Snapshot, and Bootstrap record. Unlike entries, these
-	// record types are never tracked by any entry index, so without this
-	// pin a segment whose entries have all been compacted away could be
-	// garbage-collected even though it still holds the sole durable copy of
-	// a node's State/Snapshot/Bootstrap. Compact and RemoveNodeData fold
-	// these IDs into their live-segment set before running GC. A zero ID
-	// means no such record has landed for that node. Last write wins.
+	// durable State, Snapshot, Bootstrap, and Compaction-marker record. Unlike
+	// entries, these record types are never tracked by any entry index, so
+	// without this pin a segment whose entries have all been compacted away
+	// could be garbage-collected even though it still holds the sole durable
+	// copy of a node's State/Snapshot/Bootstrap/Compact marker. Compact and
+	// RemoveNodeData fold these IDs into their live-segment set before running
+	// GC. A zero ID means no such record has landed for that node. Last write
+	// wins.
 	metaSegments map[nodeKey]metaSegments
 
 	// committedSegmentHWM is the highest segment ID whose batch has fully
@@ -305,6 +348,22 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		db.diskMon = NewDiskMonitor(dir, o.diskMonMaxBytes, o.diskMonOpts...)
 	}
 
+	// Create the WAL root directory and make its OWN directory entry durable
+	// (fsync the root's parent) before any shard subdirectory is created. POSIX
+	// durability requires fsyncing the parent of a newly created directory;
+	// without this the root dirent could be lost on a crash after a shard's
+	// first write reported success. Shard subdirectories are created lazily in
+	// ensureActiveSegment, which then only needs to fsync this root (their
+	// parent). Idempotent for an existing WAL.
+	if !o.noSync {
+		if err := o.fs.MkdirAll(dir, 0o700); err != nil {
+			return nil, &DBOpenError{Dir: dir, Err: err}
+		}
+		if err := syncDirFS(o.fs, filepath.Dir(dir)); err != nil {
+			return nil, &DBOpenError{Dir: dir, Err: err}
+		}
+	}
+
 	for i := 0; i < DefaultShardCount; i++ {
 		shardDir := filepath.Join(dir, shardDirName(i))
 		shard, err := openWALShard(shardDir, o, o.barrier, o.metrics)
@@ -321,6 +380,8 @@ func Open(dir string, opts ...Option) (*DB, error) {
 			}
 			return nil, err
 		}
+		shard.poison = db.poison
+		shard.diskMon = db.diskMon
 		db.shards[i] = shard
 	}
 
@@ -518,8 +579,13 @@ func (s *walShard) replaySegment(segID uint64) error {
 		}
 
 		// Errors during individual record replay are non-fatal (skip
-		// corrupted records) but are logged for observability.
-		skipped, reason := s.replayRecord(replayData, segID)
+		// corrupted records) but are logged for observability. A non-nil
+		// error means the WAL cannot be replayed safely (e.g. legacy
+		// on-disk format) and recovery must fail loudly.
+		skipped, reason, rerr := s.replayRecord(replayData, segID)
+		if rerr != nil {
+			return &RecoveryError{SegmentID: segID, Err: rerr}
+		}
 		if reason != "" {
 			slog.Warn("waldb: skipped record during WAL replay",
 				"segment_id", segID,
@@ -557,20 +623,40 @@ var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
-	payloadTypeEntries    byte = 0x01
+	// payloadTypeEntriesV1 is the legacy entry format (44-byte header,
+	// no session fields). It is never written anymore; encountering it
+	// during replay is a fatal recovery error (see replayRecord) because
+	// replaying it would zero the session fields and silently break
+	// at-most-once delivery. The byte value stays reserved so a V1 WAL
+	// is detected explicitly instead of being misparsed.
+	payloadTypeEntriesV1  byte = 0x01
 	payloadTypeState      byte = 0x02
 	payloadTypeSnapshot   byte = 0x03
 	payloadTypeBootstrap  byte = 0x04
 	payloadTypeCompact    byte = 0x05
 	payloadTypeRemoveNode byte = 0x06
+	// payloadTypeEntries is the current entry format (76-byte header
+	// including the four session fields).
+	payloadTypeEntries byte = 0x07
 )
+
+// ErrLegacyEntryFormat is returned when recovery encounters a WAL entry
+// record written in the pre-session-field (V1) format. Such a WAL cannot
+// be replayed safely: V1 records lack the Key/ClientID/SeriesID/
+// RespondedTo fields, so replaying them would disable session dedup for
+// every recovered entry. The node must be restored from a snapshot or
+// re-synced from its peers.
+var ErrLegacyEntryFormat = errors.New(
+	"waldb: WAL contains legacy (pre-session-field) entry records; " +
+		"restore from snapshot or re-sync this node from its peers")
 
 // replayRecord decodes a raw WAL record and updates the in-memory state.
 // Returns the number of individual entries/records skipped due to
-// malformed data, and the reason for any top-level skip.
-func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason string) {
+// malformed data, and the reason for any top-level skip. A non-nil error
+// is fatal to recovery (the WAL cannot be replayed safely at all).
+func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason string, err error) {
 	if len(rec) < 1 {
-		return 1, "empty record"
+		return 1, "empty record", nil
 	}
 
 	payloadType := rec[0]
@@ -579,35 +665,40 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 	switch payloadType {
 	case payloadTypeEntries:
 		skipped = s.replayEntries(data, segID)
+	case payloadTypeEntriesV1:
+		// Gate the legacy on-disk format hard: misparsing a V1 record with
+		// the V2 layout would garble indices and zero session fields.
+		return 0, "", ErrLegacyEntryFormat
 	case payloadTypeState:
 		if !s.replayState(data, segID) {
-			return 1, "truncated state record"
+			return 1, "truncated state record", nil
 		}
 	case payloadTypeSnapshot:
 		if !s.replaySnapshot(data, segID) {
-			return 1, "truncated snapshot record"
+			return 1, "truncated snapshot record", nil
 		}
 	case payloadTypeBootstrap:
 		if !s.replayBootstrap(data, segID) {
-			return 1, "truncated bootstrap record"
+			return 1, "truncated bootstrap record", nil
 		}
 	case payloadTypeCompact:
-		if !s.replayCompaction(data) {
-			return 1, "truncated compaction record"
+		if !s.replayCompaction(data, segID) {
+			return 1, "truncated compaction record", nil
 		}
 	case payloadTypeRemoveNode:
 		if !s.replayRemoveNode(data) {
-			return 1, "truncated remove-node record"
+			return 1, "truncated remove-node record", nil
 		}
 	default:
-		return 1, "unknown payload type"
+		return 1, "unknown payload type", nil
 	}
-	return skipped, ""
+	return skipped, "", nil
 }
 
-// Entry encoding layout:
-// [ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8][CmdLen:4][Cmd:N]
-const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 4 // 44 bytes
+// Entry encoding layout (payloadTypeEntries, format V2):
+// [ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8]
+// [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][CmdLen:4][Cmd:N]
+const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 76 bytes
 
 // maxCmdLen is the maximum allowed command length for a single WAL entry
 // during replay. This matches proto.MaxEntrySize (8 MB) and prevents
@@ -635,7 +726,11 @@ func (s *walShard) replayEntries(data []byte, segID uint64) (skipped int) {
 		raftIndex := binary.LittleEndian.Uint64(data[pos+16:])
 		term := binary.LittleEndian.Uint64(data[pos+24:])
 		entryType := binary.LittleEndian.Uint64(data[pos+32:])
-		cmdLen := binary.LittleEndian.Uint32(data[pos+40:])
+		entryKey := binary.LittleEndian.Uint64(data[pos+40:])
+		clientID := binary.LittleEndian.Uint64(data[pos+48:])
+		seriesID := binary.LittleEndian.Uint64(data[pos+56:])
+		respondedTo := binary.LittleEndian.Uint64(data[pos+64:])
+		cmdLen := binary.LittleEndian.Uint32(data[pos+72:])
 
 		// Validate cmdLen against the maximum allowed entry size to
 		// prevent corrupted length prefixes from causing unbounded
@@ -669,7 +764,7 @@ func (s *walShard) replayEntries(data []byte, segID uint64) (skipped int) {
 		var cmd []byte
 		if cmdLen > 0 {
 			cmd = make([]byte, cmdLen)
-			copy(cmd, data[pos+44:pos+44+int(cmdLen)])
+			copy(cmd, data[pos+entryRecordHeaderSize:pos+entryRecordHeaderSize+int(cmdLen)])
 		}
 
 		key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
@@ -691,10 +786,14 @@ func (s *walShard) replayEntries(data []byte, segID uint64) (skipped int) {
 			s.entries[key] = nodeEntries
 		}
 		nodeEntries[raftIndex] = logdb.Entry{
-			Index: raftIndex,
-			Term:  term,
-			Type:  entryType,
-			Cmd:   cmd,
+			Index:       raftIndex,
+			Term:        term,
+			Type:        entryType,
+			Key:         entryKey,
+			ClientID:    clientID,
+			SeriesID:    seriesID,
+			RespondedTo: respondedTo,
+			Cmd:         cmd,
 		}
 
 		pos += totalSize
@@ -1012,7 +1111,7 @@ const compactionRecordSize = 8 + 8 + 8 // 24 bytes
 
 // replayCompaction applies a compaction marker from WAL replay. Returns
 // false if the record is truncated and was skipped.
-func (s *walShard) replayCompaction(data []byte) bool {
+func (s *walShard) replayCompaction(data []byte, segID uint64) bool {
 	if len(data) < compactionRecordSize {
 		return false
 	}
@@ -1022,6 +1121,9 @@ func (s *walShard) replayCompaction(data []byte) bool {
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 	s.compactedTo[key] = compactedTo
+	// Re-pin the marker's segment on recovery (last write wins), so a post-
+	// recovery GC cannot reclaim it and reset compactedTo to 0 again.
+	s.setCompactSegment(key, segID)
 
 	// Remove compacted entries from the index.
 	if idx, ok := s.indexes[key]; ok {
@@ -1070,17 +1172,38 @@ func (s *walShard) ensureActiveSegment() error {
 		return nil
 	}
 
-	// Lazily create shard directory on first write.
+	// Lazily create shard directory on first write, then fsync its PARENT (the
+	// WAL root) so the shard directory's own entry is durable. The segment
+	// file's dirent inside this shard directory is made durable by the
+	// syncDirFS(s.dir) below; without also persisting the shard directory entry
+	// itself, a crash on a filesystem without a global metadata journal could
+	// lose the whole shard directory (and every Raft group hashing to it) even
+	// though SaveState fsynced the segment and returned success.
 	if err := s.fs.MkdirAll(s.dir, 0700); err != nil {
 		return &DBOpenError{Dir: s.dir, Err: err}
 	}
+	if !s.opts.noSync {
+		if err := syncDirFS(s.fs, filepath.Dir(s.dir)); err != nil {
+			return &DBOpenError{Dir: s.dir, Err: err}
+		}
+	}
 
 	segID := s.nextSegmentID
-	seg, err := createSegment(s.fs, s.dir, segID, s.opts.blockSize, s.opts.maxFileSize)
+	seg, preallocFailed, err := createSegment(s.fs, s.dir, segID, s.opts.blockSize, s.opts.maxFileSize)
 	if err != nil {
 		return &SegmentCreateError{SegmentID: segID, Err: err}
 	}
 	seg.noSync = s.opts.noSync
+
+	// A failed pre-allocation means the ENOSPC backstop is gone; force an
+	// immediate disk-usage check so the DiskMonitor can trip ErrDiskFull
+	// before writes start landing on a near-full filesystem.
+	if preallocFailed && s.diskMon != nil {
+		if checkErr := s.diskMon.ForceCheck(); checkErr != nil {
+			slog.Warn("waldb: disk check after fallocate failure reports pressure",
+				"dir", s.dir, "error", checkErr)
+		}
+	}
 
 	// Fsync the parent directory to make the new segment's directory entry
 	// durable. Without this, a crash on Linux ext4 could lose the new file's
@@ -1120,6 +1243,9 @@ func (s *walShard) rotateSegment() error {
 		// ensures the old segment's data survives a crash.
 		if !s.opts.noSync {
 			if err := s.activeSegment.Sync(); err != nil {
+				if s.poison != nil {
+					s.poison(err)
+				}
 				return err
 			}
 		}
@@ -1203,6 +1329,11 @@ func (s *walShard) writeRecord(data []byte) error {
 		if s.metrics != nil {
 			s.metrics.ObserveFsyncLatency(time.Since(fsyncStart))
 		}
+		if syncErr != nil && s.poison != nil {
+			// The record was written but its durability cannot be
+			// established. Fail-stop: see DB.poison.
+			s.poison(syncErr)
+		}
 		return syncErr
 	}
 	return nil
@@ -1211,6 +1342,12 @@ func (s *walShard) writeRecord(data []byte) error {
 // syncSegment flushes the active segment to stable storage. This is the
 // "sync phase" of a batched write, called after all records have been
 // buffered with batchMode enabled. The caller must hold s.mu.
+//
+// A sync failure here poisons the owning DB (fail-stop): the batch's
+// records were already written to the segment, and after a failed
+// fdatasync neither their durability nor the durability of any rollback
+// truncation can be established (fsyncgate). Rolling back is therefore
+// insufficient; the only safe continuation is crash recovery.
 func (s *walShard) syncSegment() error {
 	if s.opts.noSync || s.activeSegment == nil {
 		return nil
@@ -1219,6 +1356,9 @@ func (s *walShard) syncSegment() error {
 	syncErr := s.activeSegment.Sync()
 	if s.metrics != nil {
 		s.metrics.ObserveFsyncLatency(time.Since(fsyncStart))
+	}
+	if syncErr != nil && s.poison != nil {
+		s.poison(syncErr)
 	}
 	return syncErr
 }
@@ -1322,8 +1462,8 @@ func (db *DB) Name() string {
 // This is the same design trade-off made by dragonboat and most WAL
 // implementations.
 func (db *DB) SaveState(updates []logdb.Update) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	if len(updates) == 0 {
@@ -1338,42 +1478,64 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 
 	writeStart := time.Now()
 
-	// Phase 1: Write all records to their shards WITHOUT fsyncing.
-	// Use a stack-allocated array to track dirty shards, avoiding
-	// map allocation on the hot path.
+	// Stack-allocated per-shard bookkeeping, avoiding map allocation on the
+	// hot path. dirtyShards/dirtyCount track shards that took a successful
+	// write (fsync + commit targets); checkpoints capture each touched shard's
+	// pre-batch segment state for rollback; pending stages in-memory updates
+	// applied only after all WAL writes and sync succeed.
 	var dirtyShards [DefaultShardCount]*walShard
+	var checkpoints [DefaultShardCount]shardCheckpoint
+	var pending [DefaultShardCount]pendingMemUpdates
 	dirtyCount := 0
 
-	// Track pre-batch segment state for each shard so we can roll back
-	// on partial failure. Stack-allocated to avoid heap allocation.
-	var checkpoints [DefaultShardCount]shardCheckpoint
+	// Lock every WAL shard this batch touches for the ENTIRE batch lifecycle:
+	// checkpoint capture -> record write -> fsync -> in-memory commit (or
+	// rollback). Holding each shard's lock across the whole lifecycle makes the
+	// batch atomic per WAL segment. Previously SaveState released shard.mu
+	// between its durable write and its rollback, so a concurrent same-shard
+	// SaveState (two Raft shards that hash to one WAL shard are served by
+	// different commit workers whenever NumWorkers does not divide
+	// DefaultShardCount) could write, fsync, and COMMIT a record past this
+	// batch's checkpoint; a later partial-failure rollback then truncated the
+	// shared segment back to this batch's offset and silently erased the other
+	// batch's already-acknowledged committed records. Locks are acquired in
+	// ascending shard-index order so two batches with overlapping shard sets
+	// share a canonical lock order and cannot deadlock; single-shard lockers
+	// (Compact, SaveSnapshot, reads) hold at most one lock and cannot close a
+	// cycle.
+	var touched [DefaultShardCount]bool
+	for i := range updates {
+		touched[uint16(updates[i].ShardID%DefaultShardCount)] = true
+	}
+	for idx := 0; idx < DefaultShardCount; idx++ {
+		if touched[idx] {
+			db.shards[idx].mu.Lock()
+		}
+	}
+	defer func() {
+		for idx := DefaultShardCount - 1; idx >= 0; idx-- {
+			if touched[idx] {
+				db.shards[idx].mu.Unlock()
+			}
+		}
+	}()
 
-	// Accumulate in-memory updates per shard. Applied only after all
-	// WAL writes and sync succeed, preventing phantom reads on failure.
-	var pending [DefaultShardCount]pendingMemUpdates
-
+	// Phase 1: Write all records to their shards WITHOUT fsyncing. All touched
+	// shard locks are already held.
 	for i := range updates {
 		u := &updates[i]
 		shardIdx := uint16(u.ShardID % DefaultShardCount)
 		shard := db.shards[shardIdx]
 
-		shard.mu.Lock()
-
-		// Capture the segment checkpoint before first write to this shard.
-		// For non-lazy shards with an existing active segment, capture now.
+		// Capture the segment checkpoint before the first write to this shard.
+		// For non-lazy shards with an existing active segment, capture now;
+		// lazy shards capture inside saveUpdate after ensureActiveSegment.
 		// Flush the open block first so rollbackShard->DiscardPending can
 		// reliably reload the pre-batch tail from disk (see
 		// captureCheckpointAfterEnsure for the invariant).
 		if !checkpoints[shardIdx].valid && shard.activeSegment != nil {
 			if err := shard.activeSegment.flushBlock(); err != nil {
-				shard.mu.Unlock()
-				// Roll back any previously dirtied shards, mirroring the
-				// saveUpdate failure path below.
-				discardErrors := discardDirtyShards(&dirtyShards, &checkpoints, shard, shardIdx)
-				if len(discardErrors) > 0 {
-					return &BatchWriteError{WriteErr: err, DiscardErrors: discardErrors}
-				}
-				return err
+				return db.rollbackBatch(&checkpoints, err)
 			}
 			checkpoints[shardIdx] = shardCheckpoint{
 				fileOffset:  shard.activeSegment.fileOffset,
@@ -1388,21 +1550,8 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		err := shard.saveUpdate(u, &pending[shardIdx], &checkpoints[shardIdx])
 		shard.batchMode = false
 		if err != nil {
-			shard.mu.Unlock()
-
-			// Discard buffered data from all previously dirtied shards
-			// to prevent ghost records on the next successful SaveState.
-			discardErrors := discardDirtyShards(&dirtyShards, &checkpoints, shard, shardIdx)
-
-			if len(discardErrors) > 0 {
-				return &BatchWriteError{
-					WriteErr:      err,
-					DiscardErrors: discardErrors,
-				}
-			}
-			return err
+			return db.rollbackBatch(&checkpoints, err)
 		}
-		shard.mu.Unlock()
 
 		if dirtyShards[shardIdx] == nil {
 			dirtyShards[shardIdx] = shard
@@ -1410,22 +1559,25 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		}
 	}
 
-	// Phase 2: Sync all dirty shards to stable storage.
-	if err := syncDirtyShards(&dirtyShards, dirtyCount); err != nil {
-		return err
+	// Phase 2: Sync all dirty shards to stable storage. A failure here has
+	// already poisoned the DB (see syncSegment): the batch's records are
+	// written but not provably durable, and a rollback truncation could not be
+	// proven durable either after a failed fsync. Surface the fail-stop to the
+	// caller alongside the underlying cause.
+	if err := syncDirtyShardsLocked(&dirtyShards, dirtyCount); err != nil {
+		db.poison(err)
+		return errors.Join(ErrDBPoisoned, err)
 	}
 
-	// Phase 3: Apply in-memory updates now that all WAL data is durable.
-	// This is the commit point — reads will see these changes only after
-	// the data is safely persisted.
+	// Phase 3: Apply in-memory updates now that all WAL data is durable. This
+	// is the commit point — reads see these changes only after the data is
+	// safely persisted. The shard locks are still held, so this commit is
+	// atomic with the durable write relative to any concurrent same-shard
+	// batch.
 	for i := range dirtyShards {
-		if dirtyShards[i] == nil {
-			continue
+		if dirtyShards[i] != nil {
+			pending[i].applyTo(dirtyShards[i])
 		}
-		s := dirtyShards[i]
-		s.mu.Lock()
-		pending[i].applyTo(s)
-		s.mu.Unlock()
 	}
 
 	if db.metrics != nil {
@@ -1540,36 +1692,29 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 	}
 }
 
-// discardDirtyShards rolls back buffered WAL data for all previously dirtied
-// shards and the failing shard. This prevents ghost records from persisting
-// on the next successful SaveState. The caller must NOT hold any shard locks.
-func discardDirtyShards(
-	dirtyShards *[DefaultShardCount]*walShard,
-	checkpoints *[DefaultShardCount]shardCheckpoint,
-	failingShard *walShard,
-	failingIdx uint16,
-) []error {
+// rollbackBatch rolls back every shard that captured a checkpoint in the
+// current SaveState batch, discarding this batch's buffered/written records so
+// no ghost records survive on the next successful SaveState. A valid checkpoint
+// is captured before the first write to each shard, so iterating checkpoints
+// covers both the already-written shards and the shard whose write just failed.
+// The caller MUST hold every touched shard's mu (the SaveState batch holds them
+// for its whole lifecycle), so rollbackShard is invoked directly without
+// re-locking. writeErr is the originating Phase 1 failure; if rollback itself
+// fails, both the write error and the discard errors are surfaced.
+func (db *DB) rollbackBatch(checkpoints *[DefaultShardCount]shardCheckpoint, writeErr error) error {
 	var discardErrors []error
-	for j := range dirtyShards {
-		if dirtyShards[j] == nil || !checkpoints[j].valid {
+	for j := range checkpoints {
+		if !checkpoints[j].valid {
 			continue
 		}
-		ds := dirtyShards[j]
-		ds.mu.Lock()
-		if dErr := rollbackShard(ds, &checkpoints[j]); dErr != nil {
+		if dErr := rollbackShard(db.shards[j], &checkpoints[j]); dErr != nil {
 			discardErrors = append(discardErrors, dErr)
 		}
-		ds.mu.Unlock()
 	}
-	// Also discard the failing shard if it had a checkpoint.
-	if checkpoints[failingIdx].valid {
-		failingShard.mu.Lock()
-		if dErr := rollbackShard(failingShard, &checkpoints[failingIdx]); dErr != nil {
-			discardErrors = append(discardErrors, dErr)
-		}
-		failingShard.mu.Unlock()
+	if len(discardErrors) > 0 {
+		return &BatchWriteError{WriteErr: writeErr, DiscardErrors: discardErrors}
 	}
-	return discardErrors
+	return writeErr
 }
 
 // rollbackShard rolls a shard's WAL back to the state captured in cp. The
@@ -1660,30 +1805,32 @@ func truncateClosedSegment(ds *walShard, segID uint64, size int64) error {
 	return f.Close()
 }
 
-// syncDirtyShards fsyncs all dirty shard segments to stable storage.
-// When a single shard is dirty, the sync is performed inline to avoid
-// goroutine overhead. Multiple dirty shards are synced in parallel.
-func syncDirtyShards(dirtyShards *[DefaultShardCount]*walShard, dirtyCount int) error {
+// syncDirtyShardsLocked fsyncs every dirty shard's active segment to stable
+// storage. The caller MUST already hold every dirty shard's mu (the SaveState
+// batch holds all touched shard locks for its whole lifecycle), so this never
+// re-acquires them — doing so would deadlock. When a single shard is dirty the
+// sync is inline to avoid goroutine overhead. For multi-shard batches the
+// fdatasyncs run concurrently to bound batch latency; each goroutine touches a
+// distinct shard whose lock the caller holds (excluding all other accessors),
+// and the go statement establishes happens-before from the Phase 1 writes, so
+// the concurrent syncSegment calls are race-free.
+func syncDirtyShardsLocked(dirtyShards *[DefaultShardCount]*walShard, dirtyCount int) error {
 	if dirtyCount == 1 {
 		// Fast path: single shard, avoid goroutine overhead.
 		for i := range dirtyShards {
 			if dirtyShards[i] != nil {
-				dirtyShards[i].mu.Lock()
-				err := dirtyShards[i].syncSegment()
-				dirtyShards[i].mu.Unlock()
-				return err
+				return dirtyShards[i].syncSegment()
 			}
 		}
-	} else if dirtyCount > 1 {
+		return nil
+	}
+	if dirtyCount > 1 {
 		// Parallel sync across shards — each fdatasync runs concurrently.
 		errCh := make(chan error, dirtyCount)
 		for i := range dirtyShards {
 			if dirtyShards[i] != nil {
 				go func(s *walShard) {
-					s.mu.Lock()
-					err := s.syncSegment()
-					s.mu.Unlock()
-					errCh <- err
+					errCh <- s.syncSegment()
 				}(dirtyShards[i])
 			}
 		}
@@ -1693,9 +1840,7 @@ func syncDirtyShards(dirtyShards *[DefaultShardCount]*walShard, dirtyCount int) 
 				firstErr = err
 			}
 		}
-		if firstErr != nil {
-			return firstErr
-		}
+		return firstErr
 	}
 	return nil
 }
@@ -1797,8 +1942,12 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 		binary.LittleEndian.PutUint64(buf[pos+16:], e.Index)
 		binary.LittleEndian.PutUint64(buf[pos+24:], e.Term)
 		binary.LittleEndian.PutUint64(buf[pos+32:], e.Type)
-		binary.LittleEndian.PutUint32(buf[pos+40:], uint32(len(e.Cmd)))
-		copy(buf[pos+44:], e.Cmd)
+		binary.LittleEndian.PutUint64(buf[pos+40:], e.Key)
+		binary.LittleEndian.PutUint64(buf[pos+48:], e.ClientID)
+		binary.LittleEndian.PutUint64(buf[pos+56:], e.SeriesID)
+		binary.LittleEndian.PutUint64(buf[pos+64:], e.RespondedTo)
+		binary.LittleEndian.PutUint32(buf[pos+72:], uint32(len(e.Cmd)))
+		copy(buf[pos+entryRecordHeaderSize:], e.Cmd)
 
 		entrySize := entryRecordHeaderSize + len(e.Cmd)
 
@@ -1815,10 +1964,14 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 			copy(cmdCopy, e.Cmd)
 		}
 		stagedEntries = append(stagedEntries, logdb.Entry{
-			Index: e.Index,
-			Term:  e.Term,
-			Type:  e.Type,
-			Cmd:   cmdCopy,
+			Index:       e.Index,
+			Term:        e.Term,
+			Type:        e.Type,
+			Key:         e.Key,
+			ClientID:    e.ClientID,
+			SeriesID:    e.SeriesID,
+			RespondedTo: e.RespondedTo,
+			Cmd:         cmdCopy,
 		})
 
 		pos += entrySize
@@ -2116,8 +2269,8 @@ func (db *DB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) {
 // RemoveEntriesTo removes log entries up to and including the given index
 // for the specified node.
 func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	shard := db.getShard(shardID)
@@ -2135,6 +2288,15 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	if err := shard.writeRecord(buf[:1+compactionRecordSize]); err != nil {
 		return err
 	}
+
+	// Pin the segment the compaction marker landed in against garbage
+	// collection, and advance the commit high-water mark — mirroring
+	// writeBootstrap. Without the pin, GC could reclaim the marker's segment
+	// once its entries are compacted away, and compactedTo would reset to 0 on
+	// recovery. The write is durable here (non-batch writeRecord fdatasyncs
+	// inline).
+	shard.setCompactSegment(key, shard.activeSegmentID)
+	shard.advanceCommittedHWM(shard.activeSegmentID)
 
 	// Update in-memory compaction marker.
 	shard.compactedTo[key] = index
@@ -2159,8 +2321,8 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 // Compact triggers compaction for the given node. For the WAL implementation,
 // this triggers garbage collection of obsolete segment files.
 func (db *DB) Compact(shardID, _ uint64) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	compactStart := time.Now()
@@ -2217,8 +2379,8 @@ func (db *DB) Compact(shardID, _ uint64) error {
 // ErrSnapshotOutOfDate if the snapshot index is less than or equal to
 // the currently stored snapshot index (stale snapshot rejection).
 func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	shard := db.getShard(shardID)
@@ -2281,8 +2443,8 @@ func (db *DB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
 // After clearing in-memory state, segment garbage collection is triggered
 // to reclaim disk space from segments that no longer contain live data.
 func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	shard := db.getShard(shardID)
@@ -2392,8 +2554,8 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 
 // SaveBootstrap persists bootstrap information for a node.
 func (db *DB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	shard := db.getShard(shardID)
@@ -2441,8 +2603,8 @@ func (db *DB) Close() error {
 
 // SaveEntries persists entries for a single node (convenience method).
 func (db *DB) SaveEntries(shardID, replicaID uint64, entries []logdb.Entry) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	return db.SaveState([]logdb.Update{{
@@ -2502,8 +2664,8 @@ func (db *DB) GetEntries(shardID, replicaID, low, high, maxSize uint64) ([]logdb
 // SaveNodeState persists the hard state for a single node (convenience
 // method).
 func (db *DB) SaveNodeState(shardID, replicaID uint64, state logdb.State) error {
-	if db.closed.Load() {
-		return logdb.ErrClosed
+	if err := db.writeGate(); err != nil {
+		return err
 	}
 
 	return db.SaveState([]logdb.Update{{
@@ -2550,8 +2712,55 @@ func (db *DB) MinLiveEpoch() (uint64, error) {
 	return globalMin, nil
 }
 
-// Compile-time interface check for EpochAwareLogDB.
+// MinLiveEpochForBarrier returns the minimum barrier encryption epoch across
+// all live WAL records in this DB, but only when the given barrier handle is
+// the SAME barrier this DB was opened with. A waldb.DB encrypts every record
+// it stores with exactly one barrier (db.barrier), so it can answer the
+// per-barrier query precisely by identity: when the requested barrier matches,
+// the global MinLiveEpoch is exactly the min-epoch-for-that-barrier; when it
+// does not match (or no barrier is configured), this DB holds no records under
+// that barrier and the floor contribution is 0.
+//
+// This is the single-barrier-per-store building block. A multiplexing LogDB
+// that fans shards across several dedicated WALs (one barrier each) implements
+// PerBarrierEpochAwareLogDB by delegating to whichever underlying DB owns the
+// requested barrier; each such DB answers via this method.
+//
+// The barrier argument is compared by interface identity. Both db.barrier and
+// the argument box the same concrete *seal.Barrier pointer, so boxing to any
+// normalizes them to (concrete type, value) and == is an exact pointer match
+// regardless of the static interface type the caller holds (SnapshotBarrier,
+// Barrier, WALBarrier).
+//
+// The return values follow the fail-safe contract of
+// logdb.PerBarrierEpochAwareLogDB: this DB returns known == true only when the
+// requested barrier is its OWN barrier (identity match), in which case the
+// epoch is its global MinLiveEpoch (possibly 0 = a true non-constraint). For
+// any other barrier — or when this DB has no barrier — it returns known ==
+// false so the caller fails safe instead of mistaking "not my barrier" for
+// "zero live records".
+func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error) {
+	if db.closed.Load() {
+		return 0, false, logdb.ErrClosed
+	}
+	if db.barrier == nil || barrier == nil {
+		return 0, false, nil
+	}
+	if any(db.barrier) != barrier {
+		// This DB's records are not encrypted under the requested barrier:
+		// known == false (NOT a zero-epoch non-constraint).
+		return 0, false, nil
+	}
+	min, mErr := db.MinLiveEpoch()
+	if mErr != nil {
+		return 0, false, mErr
+	}
+	return min, true, nil
+}
+
+// Compile-time interface checks.
 var _ logdb.EpochAwareLogDB = (*DB)(nil)
+var _ logdb.PerBarrierEpochAwareLogDB = (*DB)(nil)
 
 // setStateSegment records segID as the segment holding the latest durable
 // State record for key. Last write wins. Caller must hold s.mu.
@@ -2589,8 +2798,26 @@ func (s *walShard) setBootstrapSegment(key nodeKey, segID uint64) {
 	s.metaSegments[key] = m
 }
 
-// clearMetaSegmentPins removes any State/Snapshot/Bootstrap pin that points at
-// segID, resetting both the field and its presence flag. Used when a segment is
+// setCompactSegment records segID as the segment holding the latest durable
+// compaction marker for key. A compaction marker is not tracked by any entry
+// index, so without this pin a (rotated, non-active) segment whose entries have
+// all been compacted away could be garbage-collected, discarding the marker —
+// on recovery compactedTo would then reset to 0 and GetEntries/IterateEntries
+// would return empty instead of ErrCompacted for compacted indices. Last write
+// wins. Caller must hold s.mu.
+func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
+	if s.metaSegments == nil {
+		s.metaSegments = make(map[nodeKey]metaSegments)
+	}
+	m := s.metaSegments[key]
+	m.compact = segID
+	m.hasCompact = true
+	s.metaSegments[key] = m
+}
+
+// clearMetaSegmentPins removes any State/Snapshot/Bootstrap/Compact pin that
+// points at segID, resetting both the field and its presence flag. Used when a
+// segment is
 // discarded (truncation-recovery cleanup) so no phantom pin to a non-existent
 // segment lingers in metaSegments. An entry whose pins all become absent is
 // removed from the map. Caller must hold s.mu.
@@ -2608,7 +2835,11 @@ func (s *walShard) clearMetaSegmentPins(segID uint64) {
 			m.bootstrap = 0
 			m.hasBootstrap = false
 		}
-		if !m.hasState && !m.hasSnapshot && !m.hasBootstrap {
+		if m.hasCompact && m.compact == segID {
+			m.compact = 0
+			m.hasCompact = false
+		}
+		if !m.hasState && !m.hasSnapshot && !m.hasBootstrap && !m.hasCompact {
 			delete(s.metaSegments, key)
 		} else {
 			s.metaSegments[key] = m
@@ -2626,8 +2857,8 @@ func (s *walShard) advanceCommittedHWM(segID uint64) {
 	}
 }
 
-// addMetaSegmentsToLive folds every tracked State/Snapshot/Bootstrap segment
-// ID for all live nodes into liveSegments. These record types are never
+// addMetaSegmentsToLive folds every tracked State/Snapshot/Bootstrap/Compact
+// segment ID for all live nodes into liveSegments. These record types are never
 // tracked by an entry index, so they must be pinned explicitly before garbage
 // collection or the sole durable copy of a node's State/Snapshot/Bootstrap
 // could be deleted. Caller must hold s.mu.
@@ -2641,6 +2872,9 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 		}
 		if m.hasBootstrap {
 			liveSegments[m.bootstrap] = true
+		}
+		if m.hasCompact {
+			liveSegments[m.compact] = true
 		}
 	}
 }

@@ -21,8 +21,26 @@ import "github.com/jeremyhahn/go-quicraft/pkg/proto"
 // from the transport layer.
 type MessageHandler interface {
 	// HandleMessage processes an inbound batch of Raft messages.
-	HandleMessage(batch proto.MessageBatch) error
+	//
+	// senderAuthorized reports whether the verified TLS certificate of the
+	// connection the batch arrived on authorizes the given network address.
+	// The handler MUST use it to bind the in-band batch SourceAddress to the
+	// sending peer's certificate before learning it as a (shard, replica)
+	// return-path address: SourceAddress is not authenticated by mTLS, so
+	// without this binding a peer could teach the registry an address its
+	// certificate does not cover and hijack another replica's return path. A
+	// nil senderAuthorized must be treated as unauthorized.
+	HandleMessage(batch proto.MessageBatch, senderAuthorized func(address string) bool) error
 
 	// HandleSnapshot processes inbound snapshot chunks.
-	HandleSnapshot(chunks []proto.SnapshotChunk) error
+	//
+	// senderAuthorized reports whether the verified TLS certificate of the
+	// connection the snapshot arrived on authorizes the given network
+	// address. The handler MUST use it to bind the in-band chunk.From
+	// replica identity (via its registered address) to the sending peer's
+	// certificate before persisting anything: chunk fields are NOT
+	// authenticated by mTLS, so without this binding any authenticated
+	// peer could forge another replica's identity and inject snapshot
+	// state. A nil senderAuthorized must be treated as unauthorized.
+	HandleSnapshot(chunks []proto.SnapshotChunk, senderAuthorized func(address string) bool) error
 }

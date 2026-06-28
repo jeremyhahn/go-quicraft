@@ -19,6 +19,12 @@ package logdb
 // clean boundary between the serialization format and storage format.
 
 // Entry represents a single Raft log entry.
+//
+// The session fields (Key, ClientID, SeriesID, RespondedTo) MUST be
+// persisted: at-most-once delivery depends on them surviving crash
+// recovery. ClientID=0 means "not session-managed", so dropping these
+// fields on the WAL round-trip would silently disable session dedup for
+// every entry replayed after a restart.
 type Entry struct {
 	// Index is the log position of this entry.
 	Index uint64
@@ -26,6 +32,14 @@ type Entry struct {
 	Term uint64
 	// Type identifies the entry type (normal, config change, etc.).
 	Type uint64
+	// Key is the caller-assigned completion key for this proposal.
+	Key uint64
+	// ClientID identifies the client session that proposed this entry.
+	ClientID uint64
+	// SeriesID is the per-session sequence number used for dedup.
+	SeriesID uint64
+	// RespondedTo is the highest responded-to series for this client.
+	RespondedTo uint64
 	// Cmd is the serialized command payload.
 	Cmd []byte
 }

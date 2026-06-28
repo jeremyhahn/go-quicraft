@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -503,8 +504,59 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	b.lastFailedAt = time.Time{}
 	b.persistBackoffState()
 
+	// Enforce the NIST SP 800-38D invocation budget ACROSS process
+	// lifetimes. The default in-memory counter does not survive restarts,
+	// so after an unseal the number of AEAD invocations already performed
+	// under the current epoch is unknown — and with random 96-bit nonces
+	// the 2^32 budget per DEK is a hard nonce-collision safety bound, not
+	// advisory. Unless the embedder owns seeding (injected counter) or
+	// has already seeded this one, seed the counter pessimistically to
+	// the rotation threshold so ShouldRotate fires immediately and the
+	// epoch is rotated to a fresh DEK with a known-zero count. The
+	// headroom between threshold and hard limit (default 5% ≈ 2×10^8
+	// invocations) covers encryption traffic until rotation completes.
+	b.seedInvocationsAfterUnseal()
+
 	slog.Info("barrier unsealed", "epoch", b.epoch, "algorithm", b.config.Algorithm.String())
 	return nil
+}
+
+// seedInvocationsAfterUnseal pessimistically seeds the AEAD invocation
+// counter after an unseal when the true per-epoch count is unknown. See
+// the call site in Unseal for the rationale. The caller must hold b.mu.
+func (b *Barrier) seedInvocationsAfterUnseal() {
+	if b.invocations == nil || !b.invocations.IsEnabled() {
+		return
+	}
+	if b.config.InvocationCounter != nil {
+		// The embedder injected its own counter and owns persistence and
+		// seeding (the documented contract of
+		// BarrierConfig.InvocationCounter). Trust its state.
+		return
+	}
+	if b.invocations.Count() > 0 {
+		// Already seeded — e.g. a seal/unseal cycle within one process,
+		// where the in-memory count is still accurate, or an explicit
+		// Seed() by the embedder before Unseal.
+		return
+	}
+	limit := b.invocations.Limit()
+	if limit <= 0 {
+		return
+	}
+	// Ceil so the seeded usage is AT the threshold (a floor would land
+	// fractionally below it and ShouldRotate would not fire).
+	seed := int64(math.Ceil(float64(limit) * b.invocations.GetRotationThreshold() / 100.0))
+	if seed <= 0 || seed >= limit {
+		seed = limit - 1
+	}
+	b.invocations.Seed(seed)
+	slog.Warn("AEAD invocation count for current epoch unknown after restart; "+
+		"seeded counter to rotation threshold to force prompt key rotation",
+		"epoch", b.epoch,
+		"seeded_count", seed,
+		"limit", limit,
+	)
 }
 
 // seal zeroes the root key and all DEKs from memory, transitioning the
@@ -521,11 +573,34 @@ func (b *Barrier) seal() error {
 		return ErrBarrierSealed
 	}
 
-	// Clear enclave references (memory protection handled by memguard).
+	// Actively zero all live key enclaves before dropping the references.
+	// Relying on GC/memguard finalizers would leave DEK and root-key
+	// material resident in memory for an unbounded window after seal —
+	// exactly the window an attacker who compromises the host post-seal
+	// would target. Clear is idempotent and safe on a nil-enclave key.
+	if b.rootKey != nil {
+		b.rootKey.Clear()
+	}
+	if b.currentDEK != nil {
+		b.currentDEK.Clear()
+	}
+	for epoch, dek := range b.deks {
+		if dek != nil {
+			dek.Clear()
+		}
+		delete(b.deks, epoch)
+	}
+
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
 	b.deks = make(map[uint64]*enclave.ProtectedKey)
+	// Caveat: each cipher.AEAD below holds a COPY of its DEK inside its internal
+	// key schedule (AES expanded key / ChaCha key). Go's stdlib and x/crypto
+	// AEADs expose no key-wipe API, so dropping these references cannot zero
+	// that copy — it lingers in freed heap until GC reclaims it. The enclave
+	// DEKs above ARE actively zeroed; this AEAD-resident copy is a known stdlib
+	// limitation (GC-bounded) and is the only key material not wiped here.
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.hwEncryptor = nil
 	b.state = barrierSealed
@@ -771,7 +846,16 @@ func (b *Barrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte,
 // match the epoch used during encryption for authentication to succeed.
 func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg SymmetricAlgorithm) ([]byte, error) {
 	nonceSize := alg.NonceSize()
-	if nonceSize == 0 {
+	// alg comes from the UNAUTHENTICATED algID header byte and never selects the
+	// cipher (the active AEAD is fixed by the authenticated epoch DEK). A tampered
+	// or corrupted algID that names a different nonce-size class (e.g. 24-byte
+	// XChaCha20 against a 12-byte AES-GCM cipher) would slice a wrong-length nonce
+	// and PANIC inside aead.Open — both crypto/cipher GCM and chacha20poly1305
+	// panic on a wrong nonce length. The pre-Open length gate below uses this same
+	// nonceSize, so it cannot catch the mismatch. Reject any algID whose nonce
+	// length disagrees with the active cipher, failing closed with the generic
+	// error rather than crashing the process on corrupt WAL/snapshot input.
+	if nonceSize == 0 || nonceSize != aead.NonceSize() {
 		return nil, ErrDecryptionFailed
 	}
 
@@ -958,6 +1042,12 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 		}
 		if b.inFlightEpochs[epoch] > 0 {
 			continue
+		}
+		// Actively zero the purged DEK's enclave rather than letting the
+		// GC/finalizer eventually reclaim it: a purged epoch's key must
+		// not linger in memory.
+		if dek := b.deks[epoch]; dek != nil {
+			dek.Clear()
 		}
 		delete(b.deks, epoch)
 		delete(b.ciphers, epoch)

@@ -1199,7 +1199,11 @@ func TestPrometheusMetricsCollector_UnregisterShard_NeverRegistered(t *testing.T
 func TestPrometheusMetricsCollector_RegisterUnregisterCycle(t *testing.T) {
 	c := NewPrometheusMetricsCollector()
 
-	// Full lifecycle: register, use, unregister, re-register.
+	// Full lifecycle: register, use, unregister, re-register. UnregisterShard
+	// DELETES the per-shard series (bounding Prometheus cardinality under shard
+	// churn), so the counter resets across the cycle: after re-register and one
+	// IncSnapshot it reads 1, not the cumulative 2. A counter reset on shard
+	// unload is correct and handled downstream by rate()/increase().
 	c.RegisterShard(10)
 	c.IncSnapshot(10)
 	c.UnregisterShard(10)
@@ -1207,8 +1211,8 @@ func TestPrometheusMetricsCollector_RegisterUnregisterCycle(t *testing.T) {
 	c.IncSnapshot(10)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_snapshots_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "10"}) != 2 {
-		t.Error("expected 2 snapshots across register/unregister cycle")
+	if got := counterValue(t, mf, map[string]string{"shard_id": "10"}); got != 1 {
+		t.Errorf("snapshots after unregister/re-register = %v, want 1 (series reset on unregister)", got)
 	}
 }
 
@@ -1320,7 +1324,6 @@ func TestSampledMetricsCollector_PassThroughMethods(t *testing.T) {
 	s.IncSnapshot(1)
 	s.ObserveProposalLatency(1, time.Millisecond)
 	s.RegisterShard(1)
-	s.UnregisterShard(1)
 
 	mf := gatherMetric(t, inner.Registry, "quicraft_raft_elections_total")
 	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 1 {
@@ -1331,6 +1334,10 @@ func TestSampledMetricsCollector_PassThroughMethods(t *testing.T) {
 	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 1 {
 		t.Error("IncSnapshot should pass through")
 	}
+
+	// UnregisterShard also passes through; it deletes the per-shard series, so
+	// it runs after the assertions above.
+	s.UnregisterShard(1)
 }
 
 func TestSampledMetricsCollector_ConcurrentSampling(t *testing.T) {
@@ -1394,5 +1401,73 @@ func BenchmarkSampledMetricsCollector_IncMessagesSent(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		s.IncMessagesSent(1, 2, 3)
+	}
+}
+
+// shardSeriesExists reports whether a per-shard series with the given shard_id
+// label is present in the named metric family (false if the family or series is
+// absent — e.g. after the child series has been deleted).
+func shardSeriesExists(t *testing.T, reg *prometheus.Registry, name, shardID string) bool {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "shard_id" && l.GetValue() == shardID {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality is the M8
+// regression test: the security drop counter must not key on the attacker
+// controlled "from" replica id, or it accumulates unbounded child series.
+func TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	const shard = uint64(7)
+	for from := uint64(1); from <= 500; from++ {
+		c.IncUnauthorizedMessageDropped(shard, from)
+		c.IncUnauthorizedSnapshotDropped(shard, from)
+	}
+
+	for _, name := range []string{
+		"quicraft_security_unauthorized_messages_dropped_total",
+		"quicraft_security_unauthorized_snapshots_dropped_total",
+	} {
+		mf := gatherMetric(t, c.Registry, name)
+		if got := len(mf.GetMetric()); got != 1 {
+			t.Fatalf("%s has %d series, want 1 (the attacker-controlled 'from' must not be a label)", name, got)
+		}
+		if v := counterValue(t, mf, map[string]string{"shard_id": "7"}); v != 500 {
+			t.Fatalf("%s shard 7 counter = %v, want 500", name, v)
+		}
+	}
+}
+
+// TestPrometheus_UnregisterShard_DeletesSeries is the M9 regression test:
+// UnregisterShard must delete the underlying per-shard Prometheus child series,
+// not just the local cache entry, so shard churn does not leak series forever.
+func TestPrometheus_UnregisterShard_DeletesSeries(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	const shard = uint64(42)
+	const name = "quicraft_raft_elections_total"
+
+	c.RegisterShard(shard)
+	if !shardSeriesExists(t, c.Registry, name, "42") {
+		t.Fatal("per-shard series should exist after RegisterShard")
+	}
+
+	c.UnregisterShard(shard)
+	if shardSeriesExists(t, c.Registry, name, "42") {
+		t.Fatal("per-shard series must be deleted after UnregisterShard (cardinality leak)")
 	}
 }

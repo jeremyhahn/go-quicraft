@@ -64,22 +64,29 @@ func segmentFilename(id uint64) string {
 // createSegment creates a new WAL segment file. The file is
 // pre-allocated to maxFileSize using fallocate (Linux) or ftruncate (other
 // platforms) to avoid filesystem metadata updates on each append.
-func createSegment(fs FS, dir string, id uint64, blockSize int, maxFileSize int64) (*segment, error) {
+//
+// preallocFailed reports whether the best-effort PreAllocate failed. A
+// fallocate failure is non-fatal (writes proceed and fail later if the
+// disk is truly full), but it defeats the ENOSPC-avoidance design, so the
+// caller surfaces it at Warn level and forces a disk-usage check.
+func createSegment(fs FS, dir string, id uint64, blockSize int, maxFileSize int64) (seg *segment, preallocFailed bool, err error) {
 	name := filepath.Join(dir, segmentFilename(id))
 	f, err := fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Pre-allocate disk space. Errors are non-fatal; writes will fail with
 	// a clear error if disk is truly full.
 	if pa, ok := f.(FilePreAllocator); ok {
-		if err := pa.PreAllocate(maxFileSize); err != nil {
-			slog.Debug("waldb: fallocate failed during segment creation",
+		if perr := pa.PreAllocate(maxFileSize); perr != nil {
+			preallocFailed = true
+			slog.Warn("waldb: fallocate failed during segment creation; "+
+				"ENOSPC pre-reservation defeated, disk may be near full",
 				"segment_id", id,
 				"dir", dir,
 				"max_file_size", maxFileSize,
-				"error", err,
+				"error", perr,
 			)
 		}
 	}
@@ -93,7 +100,7 @@ func createSegment(fs FS, dir string, id uint64, blockSize int, maxFileSize int6
 		blockOffset: 0,
 		fileOffset:  0,
 		maxFileSize: maxFileSize,
-	}, nil
+	}, preallocFailed, nil
 }
 
 // Write writes a complete logical record to the segment. Large records are
@@ -107,6 +114,15 @@ func (s *segment) Write(data []byte) (uint32, error) {
 	// Calculate the total bytes this record will consume (headers + data).
 	// Account for unflushed data in the block buffer (blockOffset).
 	needed := s.bytesNeeded(data)
+	// A record whose framed size (data + per-block headers + padding) exceeds
+	// the segment size limit can NEVER fit, even in a fresh segment. Return a
+	// distinct permanent error instead of ErrSegmentFull so the caller does not
+	// rotate to a new segment and retry forever (which would exhaust the
+	// SaveState retry budget and fail the node); the error tells the caller the
+	// record itself must be split.
+	if int64(needed) > s.maxFileSize {
+		return 0, ErrRecordTooLarge
+	}
 	logicalSize := s.fileOffset + int64(s.blockOffset) + int64(needed)
 	if logicalSize > s.maxFileSize {
 		return 0, ErrSegmentFull
@@ -272,6 +288,19 @@ func (s *segment) ReadAll() ([][]byte, error) {
 	offset := int64(0)
 	blockBuf := make([]byte, s.blockSize)
 
+	// holeOffset remembers the file offset of the first zero region that
+	// can only legitimately occur at the segment's tail: a wholly-zero
+	// block, or a zero run longer than the maximum legal intra-block
+	// padding (padAndFlushBlock pads at most recordHeaderSize bytes; only
+	// the FINAL open block may have a longer zero tail). If any later
+	// block contains data, that zero region was a write hole — a crash
+	// lost block N while block N+1 reached the medium (fdatasync does not
+	// order inter-block writes). Records after the hole must NOT be
+	// resurrected: a WAL is valid only as a prefix, and replaying
+	// post-hole entries would create a Raft log gap violating Log
+	// Matching.
+	holeOffset := int64(-1)
+
 	for offset < fileSize {
 		readSize := int64(s.blockSize)
 		if offset+readSize > fileSize {
@@ -305,6 +334,15 @@ func (s *segment) ReadAll() ([][]byte, error) {
 					}
 				}
 				if allZero {
+					// A wholly-zero block, or a zero tail longer than the
+					// largest legal block padding, is only valid as the
+					// final region of the segment. Remember it; if data
+					// follows in a later block this was a hole.
+					if pos == 0 || len(block)-pos > recordHeaderSize {
+						if holeOffset < 0 {
+							holeOffset = offset + int64(pos)
+						}
+					}
 					break // End of records in this block.
 				}
 			}
@@ -312,6 +350,22 @@ func (s *segment) ReadAll() ([][]byte, error) {
 			// Not enough room for a header means we are in zero padding.
 			if len(block)-pos < recordHeaderSize {
 				break
+			}
+
+			// Data after a zero hole: stop recovery at the hole. Everything
+			// from the hole onward (including this data) is untrusted; only
+			// the clean prefix before the hole is returned, and recovery
+			// must not replay any higher-numbered segment either.
+			if holeOffset >= 0 {
+				s.stoppedAtCorruption = true
+				slog.Warn("waldb: stopping WAL recovery at zero-filled hole",
+					"segment_id", s.id,
+					"dir", s.dir,
+					"hole_offset", holeOffset,
+					"data_offset", offset+int64(pos),
+					"recovered_records", len(records),
+				)
+				return records, nil
 			}
 
 			data, recType, consumed, err := decodeRecord(block[pos:])
@@ -335,7 +389,7 @@ func (s *segment) ReadAll() ([][]byte, error) {
 			}
 
 			switch recType {
-			case RecordFull, RecordEpoch:
+			case RecordFull:
 				// Complete record in a single chunk.
 				rec := make([]byte, len(data))
 				copy(rec, data)

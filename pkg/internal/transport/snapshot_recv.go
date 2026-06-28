@@ -107,6 +107,12 @@ type snapshotReceiver struct {
 	// purge during snapshot receive. Nil when encryption is disabled.
 	epochTracker EpochTracker
 
+	// epochTrackerForShard, when non-nil, resolves the in-flight epoch
+	// tracker per shard, used when each Raft shard is sealed under its own
+	// barrier. It takes precedence over epochTracker. Nil for the
+	// single-barrier case, preserving the original behavior.
+	epochTrackerForShard func(shardID uint64) EpochTracker
+
 	// snapshotTracker tracks in-flight snapshot receives so Stop() can
 	// atomically reject new operations and wait for existing ones to
 	// complete before closing connections. Nil when not set.
@@ -144,7 +150,7 @@ func newSnapshotReceiver(
 // snapshot header's Term field, which carries the barrier epoch when
 // encryption is enabled. When the epoch is 0 (no encryption), in-flight
 // tracking is skipped.
-func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHeader, stopC <-chan struct{}) {
+func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHeader, senderAuthorized func(address string) bool, stopC <-chan struct{}) {
 	// Atomically register this receive operation. TryAdd returns false
 	// if Stop() has already initiated shutdown, preventing the race
 	// between WaitGroup.Add(1) and WaitGroup.Wait().
@@ -169,13 +175,15 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	// Register in-flight epoch protection if an epoch tracker is available
 	// and the snapshot has a non-zero epoch (barrier-encrypted snapshot).
 	// This prevents PurgeEpochsBefore from removing the DEK while the
-	// snapshot transfer is in progress.
-	if sr.epochTracker != nil && hdr.Epoch > 0 {
-		sr.epochTracker.RegisterInFlightEpoch(hdr.Epoch)
-		defer sr.epochTracker.DeregisterInFlightEpoch(hdr.Epoch)
+	// snapshot transfer is in progress. With per-shard barriers the tracker
+	// is routed by the snapshot's shardID so the epoch is pinned on the
+	// correct tenant barrier; otherwise the single host-wide tracker is used.
+	if tracker := sr.trackerForShard(hdr.ShardID); tracker != nil && hdr.Epoch > 0 {
+		tracker.RegisterInFlightEpoch(hdr.Epoch)
+		defer tracker.DeregisterInFlightEpoch(hdr.Epoch)
 	}
 
-	sr.receiveChunks(stream, hdr, stopC)
+	sr.receiveChunks(stream, hdr, senderAuthorized, stopC)
 }
 
 // rateLimitChunkSleep computes the per-chunk rate-limit sleep for a chunk of
@@ -193,7 +201,7 @@ func rateLimitChunkSleep(length uint32, bytesPerSec int64) time.Duration {
 
 // receiveChunks reads snapshot chunks from the stream, enforces the memory
 // budget, applies rate limiting, and dispatches chunks to the handler.
-func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
+func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, senderAuthorized func(address string) bool, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
 	recvStart := time.Now()
 	// Cap initial allocation to prevent a malicious header from causing an
 	// oversized pre-allocation. The slice grows dynamically beyond this cap.
@@ -232,8 +240,10 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	for i := uint64(0); i < hdr.ChunkCount; i++ {
 		select {
 		case <-stopC:
+			// Stop requested: mark truncated and exit the loop. (A bare
+			// break here would only break the select, not the for loop,
+			// so set the flag and break the loop explicitly.)
 			truncated = true
-			break
 		default:
 		}
 		if truncated {
@@ -356,7 +366,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 
 	if len(chunks) > 0 {
-		if err := sr.handler.HandleSnapshot(chunks); err != nil {
+		if err := sr.handler.HandleSnapshot(chunks, senderAuthorized); err != nil {
 			slog.Warn("snapshot handler failed",
 				"shard", hdr.ShardID,
 				"replica", hdr.ReplicaID,
@@ -390,6 +400,27 @@ func (sr *snapshotReceiver) SetEpochTracker(tracker EpochTracker) {
 	sr.epochTracker = tracker
 }
 
+// SetShardEpochTrackers sets a per-shard epoch tracker resolver. When non-nil
+// it takes precedence over the single epochTracker, routing in-flight epoch
+// protection to the barrier that owns the snapshot's shard. Must be called
+// before any snapshot receives begin.
+func (sr *snapshotReceiver) SetShardEpochTrackers(fn func(shardID uint64) EpochTracker) {
+	sr.epochTrackerForShard = fn
+}
+
+// trackerForShard resolves the in-flight epoch tracker for a shard. A per-shard
+// resolver takes precedence (falling through to the single tracker only when it
+// returns nil); otherwise the single host-wide tracker is returned. Returns nil
+// when no tracker is configured, in which case in-flight protection is skipped.
+func (sr *snapshotReceiver) trackerForShard(shardID uint64) EpochTracker {
+	if sr.epochTrackerForShard != nil {
+		if t := sr.epochTrackerForShard(shardID); t != nil {
+			return t
+		}
+	}
+	return sr.epochTracker
+}
+
 // SetSnapshotTracker sets the shutdown tracker used to track in-flight
 // snapshot receives. This allows Stop() to atomically reject new
 // operations and wait for existing ones to complete before tearing down
@@ -409,8 +440,20 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk) error {
 		}
 	}
 	if chunk.Filepath != "" {
+		// chunk.Filepath is INFORMATIONAL and attacker-controllable: the sender
+		// sets it to the snapshot's on-disk directory (an ABSOLUTE path), and
+		// the receiver ignores it when writing — the on-disk location is built
+		// solely from shard/replica/snapshot-index. So absolute paths are
+		// legitimate here and must NOT be rejected. We still reject relative
+		// ".." traversal (which a clean legitimate path never contains) as
+		// defense-in-depth. SECURITY INVARIANT: any future code that turns this
+		// field into a write path MUST sanitize it (extract the base name, or
+		// filepath.Join onto a fixed base then verify the result stays within
+		// that base) — never use it directly.
 		cleaned := filepath.Clean(chunk.Filepath)
-		if strings.Contains(cleaned, "..") {
+		if cleaned == ".." ||
+			strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) ||
+			strings.Contains(cleaned, string(filepath.Separator)+".."+string(filepath.Separator)) {
 			return &ChunkFilepathTraversalError{
 				ShardID:  chunk.ShardID,
 				Filepath: chunk.Filepath,

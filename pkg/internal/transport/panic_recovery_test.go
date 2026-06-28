@@ -530,10 +530,10 @@ func TestSendQueueWorkerExitsCleanlyOnStopSignal(t *testing.T) {
 // is called. Used to verify panic recovery on the receive path.
 type panicOnHandleHandler struct{}
 
-func (h *panicOnHandleHandler) HandleMessage(_ proto.MessageBatch) error {
+func (h *panicOnHandleHandler) HandleMessage(_ proto.MessageBatch, _ func(string) bool) error {
 	panic("intentional panic in HandleMessage")
 }
 
-func (h *panicOnHandleHandler) HandleSnapshot(_ []proto.SnapshotChunk) error {
+func (h *panicOnHandleHandler) HandleSnapshot(_ []proto.SnapshotChunk, _ func(string) bool) error {
 	panic("intentional panic in HandleSnapshot")
 }

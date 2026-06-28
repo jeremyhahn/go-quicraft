@@ -287,11 +287,13 @@ Each logical WAL record begins with a 1-byte payload type that identifies its co
 
 ```go
 const (
-    payloadTypeEntries   byte = 0x01
-    payloadTypeState     byte = 0x02
-    payloadTypeSnapshot  byte = 0x03
-    payloadTypeBootstrap byte = 0x04
-    payloadTypeCompact   byte = 0x05
+    payloadTypeEntriesV1  byte = 0x01 // legacy entry format (44-byte header); rejected on replay
+    payloadTypeState      byte = 0x02
+    payloadTypeSnapshot   byte = 0x03
+    payloadTypeBootstrap  byte = 0x04
+    payloadTypeCompact    byte = 0x05
+    payloadTypeRemoveNode byte = 0x06
+    payloadTypeEntries    byte = 0x07 // current entry format (76-byte header, session fields)
 )
 ```
 
@@ -300,11 +302,16 @@ const (
 **Entry batch** (`payloadTypeEntries`, repeating):
 
 ```
-[PayloadType:1][ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8][CmdLen:4][Cmd:N]...
-                |<------- 44 bytes per entry header -------->|
+[PayloadType:1][ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8]
+               [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][CmdLen:4][Cmd:N]...
+                |<------------------ 76 bytes per entry header ------------------>|
 ```
 
-`entryRecordHeaderSize = 44` bytes per entry (8+8+8+8+8+4).
+`entryRecordHeaderSize = 76` bytes per entry (8×9 + 4). The four session
+fields (`Key`, `ClientID`, `SeriesID`, `RespondedTo`) are persisted so
+at-most-once delivery survives crash recovery; the legacy 44-byte format
+(`payloadTypeEntriesV1`) is gated and fails recovery with
+`ErrLegacyEntryFormat` rather than being misparsed.
 
 **Hard state** (`payloadTypeState`):
 
@@ -612,6 +619,55 @@ type WALBarrier interface {
 ```
 
 When a `WALBarrier` is configured via `WithBarrier()`, records are encrypted before writing and decrypted during recovery. The barrier must be initialized and unsealed before any WAL operations. Encrypted records embed an 8-byte epoch prefix in the ciphertext to enable epoch extraction without decryption, supporting key rotation without re-encrypting the entire WAL.
+
+## WAL Re-encryption Primitive
+
+**Source:** `pkg/logdb/waldb/reencrypt.go`
+
+The `Reencrypt` function performs logical re-encryption of an entire WAL from one barrier to another:
+
+```go
+func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier) (int, error)
+```
+
+This primitive enables zero-downtime key migration for scenarios like enabling encryption on a previously-unencrypted WAL or rotating a WAL's encryption key.
+
+### How It Works
+
+`Reencrypt` performs a logical copy through the public LogDB surface:
+
+1. Open source LogDB at `srcDir` with `srcBarrier` (decryption)
+2. Open destination LogDB at `dstDir` with `dstBarrier` (encryption)
+3. For each node (shard/replica pair):
+   - Copy bootstrap record (if present)
+   - Copy latest snapshot metadata (membership, index, term)
+   - Copy hard state and all live log entries
+
+Because the source LogDB decrypts each record under `srcBarrier` and the destination encrypts under `dstBarrier`, the result is byte-for-byte identical at the Raft level while the at-rest encryption changes.
+
+### Barrier Flexibility
+
+Either barrier may be `nil` for a plaintext side:
+
+- `srcBarrier = nil, dstBarrier = *Barrier`: encrypt a plaintext WAL (e.g., none→keyed migration)
+- `srcBarrier = *Barrier, dstBarrier = nil`: decrypt an encrypted WAL
+- Both non-nil: re-encrypt with a different key
+
+### Error Handling
+
+`Reencrypt` wraps errors in `ReencryptError` with an operation name to identify the failure point (open-source, open-dest, list-nodes, get-bootstrap, get-snapshot, get-state, iterate-entries, save-*). This allows operators to see exactly where a migration stopped.
+
+A node with no snapshot is tolerated (young shards whose log fits in the live range). `logdb.ErrNoSnapshot` is not a failure — the migration proceeds with hard state and entries alone.
+
+### Durability and Safety
+
+- `dstDir` must be empty; the caller verifies the result and performs the atomic directory swap, so a partial run never touches the source
+- All written records are durably fsynced before the function returns
+- The result is safe for atomic `rename(srcDir, dstDir_backup); rename(dstDir_new, dstDir)` on success
+
+### Memory Bounds
+
+Entry iteration uses bounded batches (`reencryptBatchBytes = 64 MiB`) to keep peak memory flat regardless of WAL size, making re-encryption safe for large logs.
 
 ## Post-Save Flow
 

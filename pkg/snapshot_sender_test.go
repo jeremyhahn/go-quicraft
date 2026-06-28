@@ -599,7 +599,7 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 		},
 	}
 
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg)
+	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestDecryptSnapshotForSend_FileNotFound(t *testing.T) {
 		},
 	}
 
-	_, _, err := ts.decryptSnapshotForSend(msg)
+	_, _, err := ts.decryptSnapshotForSend(msg, ts.barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -677,7 +677,7 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 		logger:  slog.Default(),
 	}
 
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg)
+	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}
@@ -714,6 +714,7 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 // Argon2id parameters for testing.
 func createTestBarrier(t *testing.T) *seal.Barrier {
 	t.Helper()
+	_ = seal.AllowWeakKDFParams()
 	b := seal.NewBarrier(seal.DefaultBarrierConfig(1))
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("test-snapshot-sender"), 1, 64*1024, 1)
@@ -871,7 +872,7 @@ func TestDecryptSnapshotForSend_FileCloseOnError(t *testing.T) {
 	}
 
 	// This should fail during decryption but clean up all resources.
-	_, _, err = ts.decryptSnapshotForSend(msg)
+	_, _, err = ts.decryptSnapshotForSend(msg, ts.barrier)
 	if err == nil {
 		t.Fatal("expected decryption error, got nil")
 	}
@@ -928,7 +929,7 @@ func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
 	}
 
 	// Manually run the decryption step (which doSendSnapshot does internally).
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg)
+	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}

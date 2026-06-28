@@ -14,16 +14,31 @@
 
 package seal
 
-import "os"
+import (
+	"crypto/fips140"
+	"os"
+)
 
 const (
 	// envGOFIPS140 is the environment variable that controls FIPS 140 mode.
 	envGOFIPS140 = "GOFIPS140"
 )
 
-// FIPSEnabled returns true when the GOFIPS140 environment variable is set
-// to a non-empty value. When enabled, FIPS-compliant algorithms (PBKDF2-SHA256)
-// are used instead of Argon2id for key derivation.
+// FIPSEnabled reports whether FIPS 140 mode is in effect. Detection is
+// keyed primarily off the Go runtime's FIPS 140-3 module state
+// (crypto/fips140.Enabled), with the GOFIPS140 environment variable as a
+// fallback for deployments that signal FIPS intent via the environment;
+// the explicit value "off" is honored as disabled rather than being
+// misread as enabled.
+//
+// When enabled, FIPS mode constrains BOTH the KDF (PBKDF2-SHA256 instead
+// of Argon2id, see kdf.go) and the data-path cipher: SelectOptimalAlgorithm
+// returns AES-256-GCM unconditionally, and BarrierConfig.validate rejects
+// the ChaCha20/XChaCha20 algorithms, which are not FIPS-approved.
 func FIPSEnabled() bool {
-	return os.Getenv(envGOFIPS140) != ""
+	if fips140.Enabled() {
+		return true
+	}
+	v := os.Getenv(envGOFIPS140)
+	return v != "" && v != "off"
 }

@@ -17,9 +17,9 @@ package quicraft
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -56,7 +56,7 @@ func TestHostMessageHandler_HandleMessage_DeliversToEngine(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestHostMessageHandler_HandleMessage_EmptyBatch(t *testing.T) {
 		Requests: []proto.Message{},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error for empty batch: %v", err)
 	}
@@ -113,7 +113,11 @@ func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters
 	if err != nil {
 		t.Fatalf("NewPeer failed: %v", err)
 	}
-	return engine.NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	// Give the node a real snapshot base (mirrors production, where host.go
+	// roots it at NodeHostDir/snapshots/shard-N). The inbound-snapshot receiver
+	// now derives its on-disk path from node.SnapshotSaveDir, so tests assert
+	// against that rather than a hardcoded NodeHostDir path.
+	return engine.NewNode(peer, nil, lr, cfg, 100, nil, t.TempDir(), nil)
 }
 
 // TestHostMessageHandler_HandleMessage_AuthorizedMember verifies that
@@ -152,7 +156,7 @@ func TestHostMessageHandler_HandleMessage_AuthorizedMember(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
@@ -196,7 +200,7 @@ func TestHostMessageHandler_HandleMessage_UnauthorizedMember(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
@@ -233,7 +237,7 @@ func TestHostMessageHandler_HandleMessage_UnloadedShardAllowed(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
@@ -279,7 +283,7 @@ func TestHostMessageHandler_HandleMessage_MixedAuthorization(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleMessage(batch)
+	err := handler.HandleMessage(batch, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
@@ -316,8 +320,9 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 	defer eng.UnloadNode(1)
 
 	h := &Host{
-		cfg:   cfg,
-		logdb: ldb,
+		cfg:      cfg,
+		logdb:    ldb,
+		registry: registry.NewRegistry(),
 	}
 
 	handler := &hostMessageHandler{
@@ -339,7 +344,7 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error for unauthorized snapshot sender")
 	}
@@ -356,10 +361,137 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 	}
 }
 
+// authorizeAllSenders is a senderAuthorized callback that authorizes any
+// address. Used by tests that exercise behavior past the TLS identity
+// binding check.
+func authorizeAllSenders(string) bool { return true }
+
+// authorizeSnapshotPath wires everything HandleSnapshot's fail-closed
+// authorization needs to admit a test sender: it loads an engine node for
+// shardID whose membership contains both the local replica and the
+// sender, and registers the sender's address in the host registry.
+func authorizeSnapshotPath(t *testing.T, eng *engine.Engine, h *Host, shardID, localReplicaID, fromReplicaID uint64) {
+	t.Helper()
+	const fromAddr = "127.0.0.1:6002"
+	voters := map[uint64]string{
+		localReplicaID: "127.0.0.1:6001",
+		fromReplicaID:  fromAddr,
+	}
+	node := newEngineNodeWithMembership(t, shardID, localReplicaID, voters)
+	eng.LoadNode(node)
+	t.Cleanup(func() { eng.UnloadNode(shardID) })
+	if h.registry == nil {
+		h.registry = registry.NewRegistry()
+	}
+	h.registry.Register(shardID, fromReplicaID, fromAddr)
+}
+
+// TestHostMessageHandler_HandleSnapshot_ShardNotLoaded verifies that a
+// snapshot for a shard that is not loaded locally is rejected (fail
+// closed): without a loaded node there is no membership to authorize the
+// sender against, and persisting the snapshot would poison a later
+// StartShard.
+func TestHostMessageHandler_HandleSnapshot_ShardNotLoaded(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	ldb := memdb.New()
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 42, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
+	}
+
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
+	var authErr *UnauthorizedMessageError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected UnauthorizedMessageError for unloaded shard, got %T: %v", err, err)
+	}
+
+	// Nothing must have been persisted.
+	if _, gerr := ldb.GetSnapshot(42, 1); gerr == nil {
+		t.Fatal("snapshot must not be persisted for an unloaded shard")
+	}
+}
+
+// TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound verifies
+// that a snapshot whose claimed From identity is not covered by the
+// sending connection's verified TLS certificate is rejected, even when
+// From is a legitimate member of the shard.
+func TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	ldb := memdb.New()
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1: "127.0.0.1:5001",
+		2: "127.0.0.1:5002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
+	reg := registry.NewRegistry()
+	reg.Register(1, 2, "127.0.0.1:5002")
+	h := &Host{cfg: cfg, logdb: ldb, registry: reg}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	chunks := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
+	}
+
+	// Certificate does not cover the claimed sender's address.
+	denyAll := func(string) bool { return false }
+	err := handler.HandleSnapshot(chunks, denyAll)
+	var authErr *UnauthorizedMessageError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected UnauthorizedMessageError for unbound identity, got %T: %v", err, err)
+	}
+
+	// A nil senderAuthorized callback must also be treated as unauthorized.
+	err = handler.HandleSnapshot(chunks, nil)
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected UnauthorizedMessageError for nil callback, got %T: %v", err, err)
+	}
+
+	// An unknown sender address (not in the registry) must be rejected too.
+	chunksFromUnregistered := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 1, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
+	}
+	err = handler.HandleSnapshot(chunksFromUnregistered, authorizeAllSenders)
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected UnauthorizedMessageError for unknown sender address, got %T: %v", err, err)
+	}
+}
+
 func TestHostMessageHandler_HandleSnapshot_NilChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
 
-	err := handler.HandleSnapshot(nil)
+	err := handler.HandleSnapshot(nil, nil)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
 	}
@@ -368,7 +500,7 @@ func TestHostMessageHandler_HandleSnapshot_NilChunks(t *testing.T) {
 func TestHostMessageHandler_HandleSnapshot_EmptyChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
 
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{})
+	err := handler.HandleSnapshot([]proto.SnapshotChunk{}, nil)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
 	}
@@ -382,7 +514,7 @@ func TestHostMessageHandler_HandleSnapshot_NilHost(t *testing.T) {
 		{ShardID: 1, ReplicaID: 1, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot with nil host returned unexpected error: %v", err)
 	}
@@ -419,6 +551,7 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 1, 2, 1)
 
 	// Simulate snapshot data spread across 3 chunks.
 	snapshotData := []byte("snapshot-data-chunk1" +
@@ -473,18 +606,13 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned error: %v", err)
 	}
 
 	// Verify the snapshot data file was written correctly.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-1",
-		"replica-2",
-		"snapshot-00000000000000000500",
-	)
+	snapshotDir := handler.engine.GetNode(1).SnapshotSaveDir(500)
 
 	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
 	data, readErr := os.ReadFile(dataPath)
@@ -546,8 +674,15 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 		t.Errorf("LogDB membership Addresses len = %d, want 2",
 			len(snap.Membership.Addresses))
 	}
-	if snap.Epoch != 5 {
-		t.Errorf("LogDB snapshot epoch = %d, want 5", snap.Epoch)
+	// Per-node snapshot encryption: the receiver records its OWN at-rest epoch
+	// from re-encrypting the (plaintext) received snapshot under its own barrier,
+	// NOT the wire epoch. This handler has no barrier, so the snapshot stays
+	// plaintext at rest and the recorded epoch is 0 — the chunks' wire Epoch (5)
+	// is intentionally not trusted (in production the sender streams plaintext
+	// with Epoch=0 via decrypt-for-send; the receiver is authoritative for its
+	// own at-rest epoch).
+	if snap.Epoch != 0 {
+		t.Errorf("LogDB snapshot epoch = %d, want 0 (no receiver barrier => plaintext at rest)", snap.Epoch)
 	}
 }
 
@@ -580,6 +715,7 @@ func TestHostMessageHandler_HandleSnapshot_SingleChunk(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 3, 1, 2)
 
 	payload := []byte("complete-snapshot-in-one-chunk")
 	chunks := []proto.SnapshotChunk{
@@ -595,18 +731,13 @@ func TestHostMessageHandler_HandleSnapshot_SingleChunk(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned error: %v", err)
 	}
 
 	// Verify data file.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-3",
-		"replica-1",
-		"snapshot-00000000000000001000",
-	)
+	snapshotDir := handler.engine.GetNode(3).SnapshotSaveDir(1000)
 	data, readErr := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
 	if readErr != nil {
 		t.Fatalf("failed to read snapshot data: %v", readErr)
@@ -645,6 +776,7 @@ func TestHostMessageHandler_HandleSnapshot_EmptyChunkData(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 5, 1, 3)
 
 	// Empty data chunk (witness snapshot or metadata-only).
 	chunks := []proto.SnapshotChunk{
@@ -660,18 +792,13 @@ func TestHostMessageHandler_HandleSnapshot_EmptyChunkData(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned error for empty data chunk: %v", err)
 	}
 
 	// The data file should exist but be empty.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-5",
-		"replica-1",
-		"snapshot-00000000000000000200",
-	)
+	snapshotDir := handler.engine.GetNode(5).SnapshotSaveDir(200)
 	data, readErr := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
 	if readErr != nil {
 		t.Fatalf("failed to read snapshot data: %v", readErr)
@@ -710,6 +837,7 @@ func TestHostMessageHandler_HandleSnapshot_NilLogDB(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 1, 1, 2)
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -724,18 +852,13 @@ func TestHostMessageHandler_HandleSnapshot_NilLogDB(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned error with nil logdb: %v", err)
 	}
 
 	// Verify data was still written to disk.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-1",
-		"replica-1",
-		"snapshot-00000000000000000100",
-	)
+	snapshotDir := handler.engine.GetNode(1).SnapshotSaveDir(100)
 	data, readErr := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
 	if readErr != nil {
 		t.Fatalf("failed to read snapshot data: %v", readErr)
@@ -1001,15 +1124,11 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 10, 1, 2)
 
 	// Pre-create the snapshot directory and put a read-only file where
 	// snapshot.dat would go so that os.Create fails after MkdirAll.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-10",
-		"replica-1",
-		"snapshot-00000000000000000777",
-	)
+	snapshotDir := handler.engine.GetNode(10).SnapshotSaveDir(777)
 	if err := os.MkdirAll(snapshotDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
@@ -1032,7 +1151,7 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error from HandleSnapshot, got nil")
 	}
@@ -1077,6 +1196,7 @@ func TestHostMessageHandler_HandleSnapshot_NoCleanupOnSuccess(t *testing.T) {
 		engine: eng,
 		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 20, 1, 2)
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -1091,18 +1211,13 @@ func TestHostMessageHandler_HandleSnapshot_NoCleanupOnSuccess(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned error: %v", err)
 	}
 
 	// The snapshot directory should still exist.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-20",
-		"replica-1",
-		"snapshot-00000000000000000888",
-	)
+	snapshotDir := handler.engine.GetNode(20).SnapshotSaveDir(888)
 	if _, statErr := os.Stat(snapshotDir); os.IsNotExist(statErr) {
 		t.Fatal("snapshot directory should exist after successful receive")
 	}
@@ -1189,7 +1304,7 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 		},
 	}
 
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
@@ -1200,6 +1315,60 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	}
 	if addr != "10.0.0.5:9000" {
 		t.Errorf("Resolve(1, 10) = %q, want %q", addr, "10.0.0.5:9000")
+	}
+}
+
+// TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned is the M2
+// regression test: when the batch SourceAddress is NOT bound to the sender's
+// certificate (senderAuthorized returns false, or is nil), the handler must not
+// learn it into the return-path registry — otherwise a peer could teach the
+// registry an address its certificate does not cover and hijack another
+// replica's return path.
+func TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned(t *testing.T) {
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	eng := engine.NewEngine(cfg, nil, &noopSender{}, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
+		1:  "127.0.0.1:5001",
+		10: "127.0.0.1:5010",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(1)
+
+	reg := registry.NewRegistry()
+	handler := &hostMessageHandler{engine: eng, host: &Host{cfg: cfg, registry: reg}}
+
+	batch := proto.MessageBatch{
+		SourceAddress: "10.0.0.5:9000", // an address the sender's cert does not cover
+		Requests:      []proto.Message{{ShardID: 1, From: 10, To: 1, Type: proto.Heartbeat}},
+	}
+
+	// Cert does not authorize the address: it must NOT be learned.
+	denyAll := func(string) bool { return false }
+	if err := handler.HandleMessage(batch, denyAll); err != nil {
+		t.Fatalf("HandleMessage error: %v", err)
+	}
+	if addr, err := reg.Resolve(1, 10); err == nil {
+		t.Fatalf("source address %q was learned despite the sender being unauthorized for it (registry poisoning)", addr)
+	}
+
+	// A nil callback must be treated as unauthorized too.
+	if err := handler.HandleMessage(batch, nil); err != nil {
+		t.Fatalf("HandleMessage(nil authorizer) error: %v", err)
+	}
+	if addr, err := reg.Resolve(1, 10); err == nil {
+		t.Fatalf("source address %q was learned with a nil authorizer", addr)
 	}
 }
 
@@ -1236,7 +1405,7 @@ func TestHostMessageHandler_HandleMessage_NoLearnForUnloadedShard(t *testing.T) 
 			{ShardID: 7, From: 3, To: 1, Type: proto.Replicate},
 		},
 	}
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
@@ -1282,7 +1451,7 @@ func TestHostMessageHandler_HandleMessage_NoLearnForNonMember(t *testing.T) {
 			{ShardID: 1, From: 999, To: 1, Type: proto.Heartbeat},
 		},
 	}
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
@@ -1340,7 +1509,7 @@ func TestHostMessageHandler_HandleMessage_UpdatesAddressForRecovery(t *testing.T
 			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
 		},
 	}
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
@@ -1389,11 +1558,11 @@ func TestHostMessageHandler_HandleMessage_SameAddressNoChange(t *testing.T) {
 		},
 	}
 	// First message learns the address.
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 	// Second identical message is a no-op (no overwrite, no warning needed).
-	if err := handler.HandleMessage(batch); err != nil {
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage returned unexpected error: %v", err)
 	}
 
@@ -1413,13 +1582,6 @@ func TestHostMessageHandler_HandleMessage_SameAddressNoChange(t *testing.T) {
 func TestHostMessageHandler_HandleSnapshot_MkdirError(t *testing.T) {
 	nodeHostDir := t.TempDir()
 
-	// Create a regular file where the snapshot directory tree would need
-	// to be created, so os.MkdirAll fails.
-	blockingFile := filepath.Join(nodeHostDir, "snapshots")
-	if err := os.WriteFile(blockingFile, []byte("blocker"), 0o600); err != nil {
-		t.Fatalf("failed to create blocking file: %v", err)
-	}
-
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
 		NodeHostDir:           nodeHostDir,
@@ -1430,9 +1592,24 @@ func TestHostMessageHandler_HandleSnapshot_MkdirError(t *testing.T) {
 	}
 	cfg.SetDefaults()
 
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
 	h := &Host{cfg: cfg}
 
-	handler := &hostMessageHandler{host: h}
+	handler := &hostMessageHandler{engine: eng, host: h}
+	authorizeSnapshotPath(t, eng, h, 1, 2, 3)
+
+	// Create a regular file where the receiver must MkdirAll its snapshot tree
+	// (node.SnapshotSaveDir = <base>/shard-1/replica-2/snapshot-...), so MkdirAll
+	// fails. The base comes from the loaded node, which the receiver now uses.
+	node := eng.GetNode(1)
+	blockingFile := filepath.Join(node.SnapshotDir(), "shard-1")
+	if err := os.WriteFile(blockingFile, []byte("blocker"), 0o600); err != nil {
+		t.Fatalf("failed to create blocking file: %v", err)
+	}
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -1447,7 +1624,7 @@ func TestHostMessageHandler_HandleSnapshot_MkdirError(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error from HandleSnapshot, got nil")
 	}
@@ -1477,17 +1654,18 @@ func TestHostMessageHandler_HandleSnapshot_MetadataWriteError(t *testing.T) {
 	}
 	cfg.SetDefaults()
 
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
 	h := &Host{cfg: cfg}
-	handler := &hostMessageHandler{host: h}
+	handler := &hostMessageHandler{engine: eng, host: h}
+	authorizeSnapshotPath(t, eng, h, 7, 4, 1)
 
 	// Pre-create the snapshot directory and place a directory where
 	// snapshot.meta would be created, so os.Create fails.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-7",
-		"replica-4",
-		"snapshot-00000000000000000300",
-	)
+	snapshotDir := handler.engine.GetNode(7).SnapshotSaveDir(300)
 	metaBlocker := filepath.Join(snapshotDir, "snapshot.meta")
 	if err := os.MkdirAll(metaBlocker, 0o750); err != nil {
 		t.Fatalf("failed to create blocking dir: %v", err)
@@ -1506,7 +1684,7 @@ func TestHostMessageHandler_HandleSnapshot_MetadataWriteError(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error from HandleSnapshot, got nil")
 	}
@@ -1553,12 +1731,18 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 		saveErr: saveErr,
 	}
 
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
 	h := &Host{
 		cfg:   cfg,
 		logdb: failDB,
 	}
 
-	handler := &hostMessageHandler{host: h}
+	handler := &hostMessageHandler{engine: eng, host: h}
+	authorizeSnapshotPath(t, eng, h, 5, 3, 1)
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -1579,7 +1763,7 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error from HandleSnapshot, got nil")
 	}
@@ -1596,12 +1780,7 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	}
 
 	// Snapshot directory should be cleaned up after the error.
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		"shard-5",
-		"replica-3",
-		"snapshot-00000000000000000200",
-	)
+	snapshotDir := handler.engine.GetNode(5).SnapshotSaveDir(200)
 	if _, statErr := os.Stat(snapshotDir); !os.IsNotExist(statErr) {
 		t.Fatal("snapshot directory should have been removed after logdb save error")
 	}
@@ -1629,13 +1808,20 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSkipped(t *testing.T) {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
 
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
 	h := &Host{
 		cfg:   cfg,
 		logdb: ldb,
 	}
 	handler := &hostMessageHandler{
-		host: h,
+		engine: eng,
+		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 1, 1, 2)
 
 	// Try to deliver a snapshot at index 50 (older than existing 100).
 	chunks := []proto.SnapshotChunk{
@@ -1650,7 +1836,7 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSkipped(t *testing.T) {
 			Data:       []byte("old-snapshot"),
 		},
 	}
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot should return nil for dedup, got: %v", err)
 	}
@@ -1675,13 +1861,20 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSameIndex(t *testing.T) {
 		t.Fatalf("SaveSnapshot failed: %v", err)
 	}
 
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
 	h := &Host{
 		cfg:   cfg,
 		logdb: ldb,
 	}
 	handler := &hostMessageHandler{
-		host: h,
+		engine: eng,
+		host:   h,
 	}
+	authorizeSnapshotPath(t, eng, h, 1, 1, 2)
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -1695,15 +1888,16 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSameIndex(t *testing.T) {
 			Data:       []byte("dup-snapshot"),
 		},
 	}
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err != nil {
 		t.Fatalf("HandleSnapshot should return nil for same-index dedup, got: %v", err)
 	}
 }
 
 // TestHostMessageHandler_HandleSnapshot_NoEngineDelivery verifies that
-// HandleSnapshot succeeds even when the engine node is nil (shard not
-// loaded in engine). This path exercises the code where delivered=false.
+// HandleSnapshot REJECTS a snapshot when the engine node is nil (shard
+// not loaded in engine): authorization fails closed because there is no
+// membership to validate the sender against.
 func TestHostMessageHandler_HandleSnapshot_NoEngineDelivery(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -1744,10 +1938,16 @@ func TestHostMessageHandler_HandleSnapshot_NoEngineDelivery(t *testing.T) {
 			Data:       []byte("snapshot-data"),
 		},
 	}
-	err := handler.HandleSnapshot(chunks)
-	if err != nil {
-		t.Fatalf("HandleSnapshot should succeed (write to disk + logdb), got: %v", err)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
+	var authErr *UnauthorizedMessageError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("expected UnauthorizedMessageError for unloaded shard, got %T: %v", err, err)
 	}
+	// Nothing must have been persisted to LogDB or disk.
+	if _, gerr := ldb.GetSnapshot(99, 1); gerr == nil {
+		t.Fatal("snapshot must not be persisted for an unloaded shard")
+	}
+	assertNoSnapshotDir(t, handler, 99, 1, 10)
 }
 
 // newSnapshotHandler builds a handler with a real engine + memdb LogDB and a
@@ -1771,7 +1971,12 @@ func newSnapshotHandler(t *testing.T) (*hostMessageHandler, string) {
 	eng.Start()
 	t.Cleanup(eng.Stop)
 
-	h := &Host{cfg: cfg, logdb: ldb}
+	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
+	// Authorize the chunk identities the validation tests use (shard 1 and
+	// shard 4, local replica 1, sender replica 2) so failures exercised by
+	// those tests occur past the fail-closed authorization gate.
+	authorizeSnapshotPath(t, eng, h, 1, 1, 2)
+	authorizeSnapshotPath(t, eng, h, 4, 1, 2)
 	return &hostMessageHandler{engine: eng, host: h}, nodeHostDir
 }
 
@@ -1794,7 +1999,7 @@ func assertValidateError(t *testing.T, err error) {
 // TestHandleSnapshot_RejectsGap verifies a chunk set with a missing ChunkID
 // (gap) is rejected without persisting anything.
 func TestHandleSnapshot_RejectsGap(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	// ChunkCount 3 but only ChunkIDs 0 and 2 present (1 is missing).
 	chunks := []proto.SnapshotChunk{
@@ -1803,15 +2008,15 @@ func TestHandleSnapshot_RejectsGap(t *testing.T) {
 	}
 	// Note: len(chunks)=2 != ChunkCount=3, so this also trips the count check;
 	// either way it must be a validate error.
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsMissingMiddleChunk verifies a chunk set whose
 // count is correct but contains a duplicate filling another slot (so a
 // middle ChunkID is absent) is rejected as a gap.
 func TestHandleSnapshot_RejectsMissingMiddleChunk(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	// Three chunks, ChunkIDs {0, 2, 2}: ID 1 is missing, ID 2 duplicated.
 	chunks := []proto.SnapshotChunk{
@@ -1819,77 +2024,77 @@ func TestHandleSnapshot_RejectsMissingMiddleChunk(t *testing.T) {
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c2")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsDuplicate verifies a chunk set with a duplicate
 // ChunkID is rejected.
 func TestHandleSnapshot_RejectsDuplicate(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	chunks := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a-dup")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsWrongCount verifies a chunk set whose declared
 // ChunkCount disagrees with the number of chunks received is rejected.
 func TestHandleSnapshot_RejectsWrongCount(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	// Two chunks received, but each declares ChunkCount 5.
 	chunks := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 5, Data: []byte("a")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 5, Data: []byte("b")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsInconsistentCount verifies that chunks declaring
 // different ChunkCount values are rejected.
 func TestHandleSnapshot_RejectsInconsistentCount(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	chunks := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 3, Data: []byte("b")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsIdentityMismatch verifies that a chunk whose
 // identity/metadata (here Term) differs from chunk 0 is rejected. This is
 // the core BUG C fix: chunks[0] is no longer blindly trusted for the set.
 func TestHandleSnapshot_RejectsIdentityMismatch(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	chunks := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("a")},
 		// Term 6 differs from chunk 0's Term 5.
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 6, ChunkID: 1, ChunkCount: 2, Data: []byte("b")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsEpochMismatch verifies that a chunk whose Epoch
 // differs from chunk 0 is rejected (the production sender stamps the same
 // Epoch on every chunk).
 func TestHandleSnapshot_RejectsEpochMismatch(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	chunks := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Epoch: 3, Data: []byte("a")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, Epoch: 9, Data: []byte("b")},
 	}
-	assertValidateError(t, handler.HandleSnapshot(chunks))
-	assertNoSnapshotDir(t, nodeHostDir, 1, 1, 100)
+	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
+	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsFileSizeMismatch verifies that when the declared
@@ -1903,7 +2108,7 @@ func TestHandleSnapshot_RejectsFileSizeMismatch(t *testing.T) {
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, FileSize: 100, Data: []byte("abc")},
 		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, FileSize: 100, Data: []byte("def")},
 	}
-	err := handler.HandleSnapshot(chunks)
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected FileSize mismatch error, got nil")
 	}
@@ -1920,7 +2125,7 @@ func TestHandleSnapshot_RejectsFileSizeMismatch(t *testing.T) {
 // arrival order != ChunkID order are reassembled in ChunkID order, so the
 // on-disk snapshot is byte-correct regardless of delivery ordering.
 func TestHandleSnapshot_ReassemblesOutOfOrder(t *testing.T) {
-	handler, nodeHostDir := newSnapshotHandler(t)
+	handler, _ := newSnapshotHandler(t)
 
 	// Arrival order: 2, 0, 1. Correct assembly must be "AAABBBCCC".
 	chunks := []proto.SnapshotChunk{
@@ -1928,14 +2133,11 @@ func TestHandleSnapshot_ReassemblesOutOfOrder(t *testing.T) {
 		{ShardID: 4, ReplicaID: 1, From: 2, Index: 700, Term: 9, ChunkID: 0, ChunkCount: 3, Data: []byte("AAA")},
 		{ShardID: 4, ReplicaID: 1, From: 2, Index: 700, Term: 9, ChunkID: 1, ChunkCount: 3, Data: []byte("BBB")},
 	}
-	if err := handler.HandleSnapshot(chunks); err != nil {
+	if err := handler.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleSnapshot returned error: %v", err)
 	}
 
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots", "shard-4", "replica-1",
-		"snapshot-00000000000000000700",
-	)
+	snapshotDir := handler.engine.GetNode(4).SnapshotSaveDir(700)
 	data, err := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
 	if err != nil {
 		t.Fatalf("failed to read reassembled snapshot: %v", err)
@@ -1948,15 +2150,68 @@ func TestHandleSnapshot_ReassemblesOutOfOrder(t *testing.T) {
 
 // assertNoSnapshotDir fails the test if a snapshot directory exists for the
 // given identity, confirming an invalid chunk set persisted nothing.
-func assertNoSnapshotDir(t *testing.T, nodeHostDir string, shardID, replicaID, index uint64) {
+func assertNoSnapshotDir(t *testing.T, handler *hostMessageHandler, shardID, replicaID, index uint64) {
 	t.Helper()
-	snapshotDir := filepath.Join(
-		nodeHostDir, "snapshots",
-		fmt.Sprintf("shard-%d", shardID),
-		fmt.Sprintf("replica-%d", replicaID),
-		fmt.Sprintf("snapshot-%020d", index),
-	)
+	node := handler.engine.GetNode(shardID)
+	if node == nil {
+		return // shard not loaded: the receiver rejects early and persists nothing
+	}
+	snapshotDir := node.SnapshotSaveDir(index)
 	if _, err := os.Stat(snapshotDir); !os.IsNotExist(err) {
 		t.Fatalf("expected no snapshot directory for invalid chunk set, but %q exists", snapshotDir)
+	}
+}
+
+// TestHandleSnapshot_LandsUnderNodeSnapshotDir is the CX3 regression test: an
+// inbound snapshot must be written under the engine node's SnapshotDir() — the
+// root that snapshot GC and the DEK-purge floor scan — NOT under a hardcoded
+// NodeHostDir/snapshots path. For a per-shard DataDir (which roots SnapshotDir()
+// off the DataDir, distinct from NodeHostDir), the old hardcoded path was
+// invisible to GC/purge: received snapshots leaked and a key rotation could
+// purge a DEK they still needed.
+func TestHandleSnapshot_LandsUnderNodeSnapshotDir(t *testing.T) {
+	nodeHostDir := t.TempDir()
+	cfg := config.HostConfig{
+		WALDir:        t.TempDir(),
+		NodeHostDir:   nodeHostDir,
+		RaftAddress:   "127.0.0.1:5000",
+		ListenAddress: "127.0.0.1:5000",
+		DeploymentID:  1,
+	}
+	cfg.SetDefaults()
+
+	ldb := memdb.New()
+	eng := engine.NewEngine(cfg, ldb, &noopSender{}, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	const shardID, localReplica, fromReplica, index = uint64(8), uint64(1), uint64(2), uint64(555)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplica, fromReplica)
+
+	chunks := []proto.SnapshotChunk{{
+		ShardID: shardID, ReplicaID: localReplica, From: fromReplica,
+		Index: index, Term: 3, ChunkID: 0, ChunkCount: 1, Data: []byte("snapshot-payload"),
+	}}
+	if err := handler.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleSnapshot: %v", err)
+	}
+
+	node := eng.GetNode(shardID)
+	gotDir := node.SnapshotSaveDir(index)
+	if _, err := os.Stat(filepath.Join(gotDir, "snapshot.dat")); err != nil {
+		t.Fatalf("snapshot not written under node.SnapshotSaveDir(%d): %v", index, err)
+	}
+	// The snapshot MUST be under the GC/DEK-purge scan root (node.SnapshotDir()).
+	if !strings.HasPrefix(gotDir, node.SnapshotDir()+string(filepath.Separator)) {
+		t.Fatalf("snapshot dir %q is not under node.SnapshotDir() %q — GC/purge would miss it",
+			gotDir, node.SnapshotDir())
+	}
+	// The node's snapshot base is distinct from the hardcoded NodeHostDir path
+	// (this models a DataDir shard), and the snapshot is NOT under that path.
+	hardcoded := filepath.Join(nodeHostDir, "snapshots")
+	if strings.HasPrefix(gotDir, hardcoded+string(filepath.Separator)) {
+		t.Fatalf("snapshot dir %q landed under the hardcoded NodeHostDir path (CX3 regression)", gotDir)
 	}
 }

@@ -201,3 +201,27 @@ func TestNoneStrategy_UnsealRootKey_StrategyMismatchRejected(t *testing.T) {
 		t.Fatalf("UnsealRootKey(wrong strategy) err = %v, want ErrStrategyMismatch", err)
 	}
 }
+
+// TestNoneEncrypterRejectsEncryptedData verifies the no-encryption
+// decrypter fails closed on data carrying a non-zero epoch prefix
+// (written by a real strategy) instead of returning garbage plaintext.
+func TestNoneEncrypterRejectsEncryptedData(t *testing.T) {
+	enc := noneEncrypter{}
+
+	// Round-trip of None-written data (zero epoch) succeeds.
+	ct, err := enc.Encrypt([]byte("plain"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	if _, err := enc.Decrypt(ct); err != nil {
+		t.Fatalf("Decrypt(none-written): %v", err)
+	}
+
+	// Data with a non-zero epoch prefix is rejected.
+	encrypted := make([]byte, noneEpochHeaderSize+4)
+	encrypted[7] = 0x01 // epoch 1, big-endian
+	copy(encrypted[noneEpochHeaderSize:], []byte("data"))
+	if _, err := enc.Decrypt(encrypted); !errors.Is(err, ErrNoneStrategyEncryptedData) {
+		t.Fatalf("Decrypt(epoch>0) = %v, want ErrNoneStrategyEncryptedData", err)
+	}
+}

@@ -48,10 +48,17 @@ func newSnapshotTestSnapshotter(lastApplied uint64) *snapshotTestSnapshotter {
 	return s
 }
 
-func (s *snapshotTestSnapshotter) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct{}) error {
+func (s *snapshotTestSnapshotter) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
+	return s.SaveSnapshotGated(ctx, w, stopper, nil)
+}
+
+func (s *snapshotTestSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writer, _ <-chan struct{}, afterCapture func()) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], s.state.Load())
 	_, err := w.Write(buf[:])
+	if err == nil && afterCapture != nil {
+		afterCapture()
+	}
 	return err
 }
 
@@ -1458,7 +1465,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, err := p.encryptSnapshotFile(dataPath); err != nil {
+	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1469,7 +1476,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Decrypt to a sibling temp file; the source dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 3)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 3, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -1514,7 +1521,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
 		t.Fatalf("write test data failed: %v", err)
 	}
-	if _, err := p.encryptSnapshotFile(dataPath); err != nil {
+	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1528,7 +1535,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	}
 
 	// First decryption: must produce a distinct sibling containing the plaintext.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 7)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 7, barrier)
 	if err != nil {
 		t.Fatalf("first decrypt failed: %v", err)
 	}
@@ -1562,7 +1569,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	// Retry-safety: a second decrypt of the same (still encrypted) source must
 	// also succeed. Under the old in-place behavior the source would now be
 	// plaintext, so this second decrypt would fail.
-	plainPath2, err := p.decryptSnapshotToSibling(dataPath, 7)
+	plainPath2, err := p.decryptSnapshotToSibling(dataPath, 7, barrier)
 	if err != nil {
 		t.Fatalf("second (retry) decrypt failed: %v", err)
 	}
@@ -1649,7 +1656,7 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 
 	// Decrypt using the MINIMUM recorded epoch (5). Per-frame embedded-epoch
 	// decryption must recover both frames despite frame 2 being at epoch 6.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5, barrier)
 	if err != nil {
 		t.Fatalf("mixed-epoch decrypt failed (per-frame epoch not honored): %v", err)
 	}
@@ -1689,7 +1696,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 		t.Fatalf("write plaintext failed: %v", err)
 	}
 
-	minEpoch, err := p.encryptSnapshotFile(dataPath)
+	minEpoch, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
@@ -1703,7 +1710,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 	}
 
 	// The mixed-epoch file must round-trip using only the recorded min epoch.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, minEpoch)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, minEpoch, barrier)
 	if err != nil {
 		t.Fatalf("decrypt of mixed-epoch file failed: %v", err)
 	}
@@ -1739,7 +1746,7 @@ func TestSnapshotPool_EncryptFile_AtomicPreservesOriginalOnFailure(t *testing.T)
 	}
 
 	// Encrypt should fail on the second chunk.
-	_, err := p.encryptSnapshotFile(dataPath)
+	_, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail on second chunk")
 	}
@@ -1806,7 +1813,7 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 
 	// Decrypt should fail on the corrupt second frame and return an empty
 	// path (decryptSnapshotToSibling never mutates the source).
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err == nil {
 		t.Fatal("expected decrypt to fail on corrupt frame")
 	}
@@ -1849,7 +1856,7 @@ func TestSnapshotPool_EncryptFile_AtomicTempCleanup(t *testing.T) {
 	}
 
 	// Encrypt should fail because barrier is sealed.
-	_, err := p.encryptSnapshotFile(dataPath)
+	_, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail with sealed barrier")
 	}
@@ -1878,7 +1885,7 @@ func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
 		t.Fatalf("write corrupt file failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for corrupt frame")
 	}
@@ -1944,37 +1951,40 @@ func TestSnapshotPool_EpochInMetadata(t *testing.T) {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
 
-	// Read and verify epoch.
-	epoch := readSnapshotEpoch(tmpDir)
-	if epoch != 7 {
-		t.Fatalf("readSnapshotEpoch = %d, want 7", epoch)
+	// Read and verify epoch (ok=true: metadata parsed cleanly).
+	epoch, ok := readSnapshotEpoch(tmpDir)
+	if !ok || epoch != 7 {
+		t.Fatalf("readSnapshotEpoch = (%d, %v), want (7, true)", epoch, ok)
 	}
 }
 
-func TestSnapshotPool_ReadSnapshotEpoch_OldFormat(t *testing.T) {
+func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Write a 40-byte (old format) metadata file without epoch.
+	// Write a 40-byte file that is shorter than snapshotMetaSize (48): the
+	// epoch field cannot be read. Under the MED-1 fail-safe contract this is
+	// treated as corrupt/indeterminate (ok=false), NOT a zero-epoch
+	// non-constraint — so the purge-floor callers refuse to purge rather than
+	// dropping this snapshot from the floor.
 	metaPath := filepath.Join(tmpDir, snapshotMetadataFile)
-	var buf [40]byte                            // old 5-field format
+	var buf [40]byte
 	binary.LittleEndian.PutUint64(buf[0:], 100) // Index
 	binary.LittleEndian.PutUint64(buf[8:], 5)   // Term
 	if err := os.WriteFile(metaPath, buf[:], 0o644); err != nil {
-		t.Fatalf("write old-format metadata failed: %v", err)
+		t.Fatalf("write short metadata failed: %v", err)
 	}
 
-	// Should return 0 since the old format doesn't have the epoch field.
-	epoch := readSnapshotEpoch(tmpDir)
-	if epoch != 0 {
-		t.Fatalf("readSnapshotEpoch for old format = %d, want 0", epoch)
+	if epoch, ok := readSnapshotEpoch(tmpDir); ok {
+		t.Fatalf("readSnapshotEpoch for short file = (%d, true), want fail-safe (0, false)", epoch)
 	}
 }
 
 func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	epoch := readSnapshotEpoch(tmpDir)
-	if epoch != 0 {
-		t.Fatalf("readSnapshotEpoch for missing file = %d, want 0", epoch)
+	// A missing metadata file (snapshot GC'd) is a benign skip: (0, true).
+	epoch, ok := readSnapshotEpoch(tmpDir)
+	if !ok || epoch != 0 {
+		t.Fatalf("readSnapshotEpoch for missing file = (%d, %v), want (0, true)", epoch, ok)
 	}
 }
 
@@ -2588,7 +2598,7 @@ func TestSnapshotPool_DecryptFile_EmptyFile(t *testing.T) {
 	}
 
 	// Decrypting an empty source should succeed and yield an empty sibling.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt empty file failed: %v", err)
 	}
@@ -2885,7 +2895,7 @@ func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, err := p.encryptSnapshotFile(dataPath); err != nil {
+	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -2900,7 +2910,7 @@ func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
 
 	// Decrypt to a sibling and verify round-trip integrity. The source
 	// dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -2941,10 +2951,10 @@ func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, err := p.encryptSnapshotFile(dataPath); err != nil {
+	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -2976,10 +2986,10 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, err := p.encryptSnapshotFile(dataPath); err != nil {
+	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 2)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 2, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3006,7 +3016,7 @@ func TestSnapshotPool_EncryptFile_MissingFile(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	_, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat")
+	_, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -3027,7 +3037,7 @@ func TestSnapshotPool_DecryptFile_MissingFile(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	plainPath, err := p.decryptSnapshotToSibling("/nonexistent/path/snapshot.dat", 1)
+	plainPath, err := p.decryptSnapshotToSibling("/nonexistent/path/snapshot.dat", 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -3058,7 +3068,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameHeader(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame header")
 	}
@@ -3092,7 +3102,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameData(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame data")
 	}

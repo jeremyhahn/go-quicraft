@@ -15,6 +15,8 @@
 package raft
 
 import (
+	"sync/atomic"
+
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/invariant"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -63,8 +65,12 @@ type inMemory struct {
 	savedTo uint64
 	// appliedTo tracks the highest index that has been applied.
 	appliedTo uint64
-	// appliedToTerm tracks the term of the entry at appliedTo.
-	appliedToTerm uint64
+	// appliedToTerm tracks the term of the entry at appliedTo. It is atomic
+	// because restore() (driven by the step worker handling InstallSnapshot)
+	// writes it WITHOUT raftMu, while readers such as Peer.AppliedToTerm() may
+	// run on another goroutine (e.g. a Host-initiated RequestSnapshot holding
+	// only raftMu). A plain field would be a data race.
+	appliedToTerm atomic.Uint64
 	// wastedPrefix tracks the number of entries truncated from the front
 	// of the backing array without compaction. This avoids pathological
 	// reallocation on every single appliedLogTo call by deferring
@@ -170,8 +176,8 @@ func (im *inMemory) firstIndex() uint64 {
 // term and true if found, 0 and false otherwise.
 func (im *inMemory) term(index uint64) (uint64, bool) {
 	// Check the applied-to cache first.
-	if index > 0 && index == im.appliedTo && im.appliedToTerm > 0 {
-		return im.appliedToTerm, true
+	if at := im.appliedToTerm.Load(); index > 0 && index == im.appliedTo && at > 0 {
+		return at, true
 	}
 	// Check if index is before our in-memory range.
 	if index < im.markerIndex {
@@ -260,7 +266,7 @@ func (im *inMemory) appliedLogTo(index uint64) {
 	invariant.Assert(entry.Index == index, "appliedLogTo: entry index mismatch")
 
 	im.appliedTo = entry.Index
-	im.appliedToTerm = entry.Term
+	im.appliedToTerm.Store(entry.Term)
 
 	// Decrease rate limiter sizes for applied entries.
 	if im.rl != nil {
@@ -288,7 +294,7 @@ func (im *inMemory) restore(ss proto.Snapshot) {
 	im.snapshot = &ss
 	im.markerIndex = ss.Index + 1
 	im.appliedTo = ss.Index
-	im.appliedToTerm = ss.Term
+	im.appliedToTerm.Store(ss.Term)
 	im.shrunk = false
 	im.wastedPrefix = 0
 	im.entries = nil

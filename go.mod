@@ -3,7 +3,6 @@ module github.com/jeremyhahn/go-quicraft
 go 1.26.4
 
 require (
-	github.com/SSSaaS/sssa-golang v0.0.0-20170502204618-d37d7782d752
 	github.com/anishathalye/porcupine v1.1.0
 	github.com/awnumar/memguard v0.23.0
 	github.com/cespare/xxhash/v2 v2.3.0

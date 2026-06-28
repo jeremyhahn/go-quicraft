@@ -78,8 +78,9 @@ func (e *ApplyError) Unwrap() error {
 	return e.Err
 }
 
-// CircuitBreakerError is returned when the apply circuit breaker trips
-// for a shard after MaxApplyRetries consecutive failures.
+// CircuitBreakerError is returned when the apply circuit breaker trips for a
+// shard. The current policy is fail-fast: the breaker trips on the FIRST
+// SM.Apply error (MaxApplyRetries is reserved, not yet consulted).
 type CircuitBreakerError struct {
 	ShardID          uint64
 	ReplicaID        uint64

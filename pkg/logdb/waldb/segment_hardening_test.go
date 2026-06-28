@@ -43,7 +43,7 @@ func reopenReadOnly(t *testing.T, dir string, id uint64, blockSize int) [][]byte
 func TestSegment_MidBlockSyncRecovery(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 32 * 1024
-	seg, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestSegment_MidBlockSyncRecovery(t *testing.T) {
 func TestSegment_MidBlockSyncRecoveryWithoutClose(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 4 * 1024
-	seg, err := createSegment(defaultFS(), dir, 2, blockSize, 8*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 2, blockSize, 8*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestSegment_MidBlockSyncRecoveryWithoutClose(t *testing.T) {
 func TestSegment_StopsAtFirstCorruption(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 4 * 1024
-	seg, err := createSegment(defaultFS(), dir, 3, blockSize, 8*1024*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 3, blockSize, 8*1024*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -186,5 +186,127 @@ func TestSegment_StopsAtFirstCorruption(t *testing.T) {
 		if !bytes.Equal(got[i], clean[i]) {
 			t.Fatalf("prefix record %d diverged from original; recovered a non-prefix", i)
 		}
+	}
+}
+
+// TestSegment_StopsAtZeroFilledHole verifies that a wholly-zero block
+// followed by valid data (a write hole: block N lost in a crash while
+// block N+1 reached the medium) terminates recovery at the hole instead
+// of resurrecting post-hole records, and marks the segment as stopped at
+// corruption so higher-numbered segments are not replayed either.
+func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
+	dir := t.TempDir()
+	const blockSize = 4 * 1024
+	seg, _, err := createSegment(defaultFS(), dir, 4, blockSize, 8*1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	// Fill several full blocks with records sized so block boundaries are
+	// crossed predictably.
+	const n = 120
+	for i := 0; i < n; i++ {
+		if _, err := seg.Write(bytes.Repeat([]byte{byte(i + 1)}, 200)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	clean := reopenReadOnly(t, dir, 4, blockSize)
+	if len(clean) != n {
+		t.Fatalf("baseline: wrote %d, recovered %d", n, len(clean))
+	}
+
+	// Zero out the ENTIRE second block, simulating a lost write whose
+	// following blocks made it to the medium.
+	rw, err := defaultFS().OpenFile(dir+"/"+segmentFilename(4), 2 /*O_RDWR*/, 0600)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	if _, err := rw.WriteAt(make([]byte, blockSize), int64(blockSize)); err != nil {
+		t.Fatalf("hole write: %v", err)
+	}
+	_ = rw.Sync()
+	_ = rw.Close()
+
+	f, err := defaultFS().Open(dir + "/" + segmentFilename(4))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	rs := &segment{f: f, id: 4, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
+	got, err := rs.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	// Recovery must stop at the hole: only block 0's records survive.
+	if len(got) >= n {
+		t.Fatalf("expected recovery to stop at the hole, got all %d records", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("expected a non-empty clean prefix before the hole")
+	}
+	for i := range got {
+		if !bytes.Equal(got[i], clean[i]) {
+			t.Fatalf("prefix record %d diverged from original", i)
+		}
+	}
+	if !rs.stoppedAtCorruption {
+		t.Fatal("stoppedAtCorruption must be set so higher segments are not replayed")
+	}
+}
+
+// TestSegment_ZeroTailIsNotAHole verifies the normal layouts are still
+// recovered in full: intra-block zero padding (<= header size) before the
+// next block's data, and a zero tail at the true end of the segment.
+func TestSegment_ZeroTailIsNotAHole(t *testing.T) {
+	dir := t.TempDir()
+	const blockSize = 4 * 1024
+	seg, _, err := createSegment(defaultFS(), dir, 5, blockSize, 8*1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	// Record sizes chosen so blocks end with < recordHeaderSize+1 free
+	// bytes from time to time, exercising padAndFlushBlock padding, and
+	// the final block has a long preallocated zero tail (no Close).
+	var want [][]byte
+	for i := 0; i < 300; i++ {
+		p := bytes.Repeat([]byte{byte(i%250 + 1)}, 90+i%17)
+		if _, err := seg.Write(p); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		cp := make([]byte, len(p))
+		copy(cp, p)
+		want = append(want, cp)
+	}
+	if err := seg.Sync(); err != nil { // durable, but no Close (crash)
+		t.Fatalf("Sync: %v", err)
+	}
+
+	f, err := defaultFS().Open(dir + "/" + segmentFilename(5))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	rs := &segment{f: f, id: 5, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
+	got, err := rs.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recovery loss: wrote %d, recovered %d", len(want), len(got))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("record %d mismatch", i)
+		}
+	}
+	if rs.stoppedAtCorruption {
+		t.Fatal("clean segment must not be flagged as corrupt")
 	}
 }

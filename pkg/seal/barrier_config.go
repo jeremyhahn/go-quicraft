@@ -25,13 +25,24 @@ type BarrierConfig struct {
 	DeploymentID uint64
 
 	// NonceTracking enables per-nonce reuse detection. Default: true.
-	// Disable only if you need to trade memory for extreme throughput and
-	// can guarantee nonce uniqueness through other means.
+	//
+	// MEMORY: the in-memory tracker retains EVERY unique nonce for the life of
+	// the epoch, so its memory grows LINEARLY with the number of encrypt
+	// operations. It is therefore inconsistent with riding the default
+	// InvocationLimit of 2^32 to its end (that would retain ~4x10^9 nonces, well
+	// over 100 GB). When tracking is on, you MUST rotate the epoch far earlier
+	// than the invocation limit (the random 96-bit nonce + invocation cap alone
+	// already bound reuse probability per NIST SP 800-38D); the tracker is
+	// belt-and-suspenders detection for that pre-rotation window, NOT a license
+	// to approach the invocation limit. Disable it (and rely on the
+	// random-nonce + invocation-cap argument) for extreme-throughput, long-epoch
+	// deployments where per-epoch memory must stay flat.
 	NonceTracking bool
 
 	// InvocationLimit is the max encrypt operations per key epoch.
 	// Default: 2^32 (NIST SP 800-38D for random 96-bit nonces).
-	// Set to 0 for default; -1 to disable.
+	// Set to 0 for default; -1 to disable. See NonceTracking: with tracking on,
+	// the epoch must rotate well before this limit or the tracker exhausts memory.
 	InvocationLimit int64
 
 	// RotationThreshold is the percentage of InvocationLimit at which
@@ -40,6 +51,14 @@ type BarrierConfig struct {
 
 	// InvocationCounter allows injection of a custom counter.
 	// Nil = default InMemoryInvocationCounter.
+	//
+	// Contract: an injected counter OWNS the persistence of per-epoch
+	// invocation counts across process restarts (Seed it from durable
+	// state before Unseal). When nil, the barrier cannot know how many
+	// AEAD invocations the current epoch has already performed after a
+	// restart, so Unseal pessimistically seeds the default counter to
+	// the rotation threshold — forcing a prompt key rotation — to keep
+	// the NIST SP 800-38D 2^32 budget sound across process lifetimes.
 	InvocationCounter InvocationCounter
 
 	// NonceTrackerProvider allows injection of a custom nonce tracker.
@@ -65,6 +84,14 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 func (c *BarrierConfig) validate() error {
 	if !c.Algorithm.Valid() {
 		return ErrUnsupportedAlgorithm
+	}
+	// FIPS 140 mode constrains the data-path cipher: the ChaCha20 family
+	// is not FIPS-approved and must be rejected at configuration time
+	// rather than silently encrypting a "FIPS" deployment's data with a
+	// non-approved cipher.
+	if FIPSEnabled() &&
+		(c.Algorithm == AlgChaCha20Poly1305 || c.Algorithm == AlgXChaCha20Poly1305) {
+		return ErrAlgorithmNotFIPSApproved
 	}
 	return nil
 }

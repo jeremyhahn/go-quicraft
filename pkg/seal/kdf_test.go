@@ -358,3 +358,46 @@ func TestDeriveKey_Argon2id_CustomKeyLen(t *testing.T) {
 		t.Fatalf("expected 64-byte key, got %d bytes", len(key))
 	}
 }
+
+// TestKDFParamsBelowFloor verifies the production KDF work-factor floor
+// catches the pathological near-free parameter sets the reviewer flagged
+// (Argon2 Time=1/Memory=1KiB, PBKDF2 Iterations=1, tiny KeyLen) while
+// accepting the defaults. It checks the pure predicate directly so it is
+// independent of the package-wide test bypass.
+func TestKDFParamsBelowFloor(t *testing.T) {
+	cases := []struct {
+		name    string
+		version KDFVersion
+		params  KDFParams
+		weak    bool
+	}{
+		{"argon2 default", KDFArgon2id, DefaultKDFParams(), false},
+		{"argon2 trivial memory", KDFArgon2id, KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 32}, true},
+		{"argon2 trivial time", KDFArgon2id, KDFParams{Time: 1, Memory: 128 * 1024, Threads: 1, KeyLen: 32}, true},
+		{"argon2 tiny key", KDFArgon2id, KDFParams{Time: 4, Memory: 128 * 1024, Threads: 4, KeyLen: 8}, true},
+		{"pbkdf2 default", KDFPbkdf2SHA256, DefaultFIPSKDFParams(), false},
+		{"pbkdf2 trivial iters", KDFPbkdf2SHA256, KDFParams{Iterations: 1, KeyLen: 32}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := kdfParamsBelowFloor(tc.version, tc.params); got != tc.weak {
+				t.Fatalf("kdfParamsBelowFloor = %v, want %v", got, tc.weak)
+			}
+		})
+	}
+}
+
+// TestDeriveKeyRejectsWeakParams verifies DeriveKey returns
+// ErrKDFWeakParams for below-floor parameters when the bypass is off.
+func TestDeriveKeyRejectsWeakParams(t *testing.T) {
+	prev := allowWeakKDFParams
+	allowWeakKDFParams = false
+	defer func() { allowWeakKDFParams = prev }()
+
+	salt := make([]byte, 32)
+	_, err := DeriveKey([]byte("passphrase"), salt, KDFArgon2id,
+		KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 32})
+	if !errors.Is(err, ErrKDFWeakParams) {
+		t.Fatalf("DeriveKey(weak) = %v, want ErrKDFWeakParams", err)
+	}
+}

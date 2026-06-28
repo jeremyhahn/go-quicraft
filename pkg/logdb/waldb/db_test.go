@@ -2443,7 +2443,7 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(buf[16:], 1)               // raftIndex
 		binary.LittleEndian.PutUint64(buf[24:], 1)               // term
 		binary.LittleEndian.PutUint64(buf[32:], 0)               // entryType
-		binary.LittleEndian.PutUint32(buf[40:], oversizedCmdLen) // cmdLen
+		binary.LittleEndian.PutUint32(buf[72:], oversizedCmdLen) // cmdLen
 
 		skipped := s.replayEntries(buf, 0)
 		if skipped != 1 {
@@ -2481,8 +2481,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(totalBuf[16:], 10)                    // raftIndex
 		binary.LittleEndian.PutUint64(totalBuf[24:], 1)                     // term
 		binary.LittleEndian.PutUint64(totalBuf[32:], 0)                     // entryType
-		binary.LittleEndian.PutUint32(totalBuf[40:], uint32(len(validCmd))) // cmdLen
-		copy(totalBuf[44:], validCmd)                                       // cmd
+		binary.LittleEndian.PutUint32(totalBuf[72:], uint32(len(validCmd))) // cmdLen
+		copy(totalBuf[76:], validCmd)                                       // cmd
 		// Oversized entry at position validEntrySize.
 		pos := validEntrySize
 		binary.LittleEndian.PutUint64(totalBuf[pos:], 1)                  // shardID
@@ -2490,7 +2490,7 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(totalBuf[pos+16:], 11)              // raftIndex
 		binary.LittleEndian.PutUint64(totalBuf[pos+24:], 1)               // term
 		binary.LittleEndian.PutUint64(totalBuf[pos+32:], 0)               // entryType
-		binary.LittleEndian.PutUint32(totalBuf[pos+40:], oversizedCmdLen) // cmdLen
+		binary.LittleEndian.PutUint32(totalBuf[pos+72:], oversizedCmdLen) // cmdLen
 
 		skipped := s.replayEntries(totalBuf, 0)
 		if skipped != 1 {
@@ -2545,8 +2545,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(buf[16:], 1)      // raftIndex
 		binary.LittleEndian.PutUint64(buf[24:], 5)      // term
 		binary.LittleEndian.PutUint64(buf[32:], 0)      // entryType
-		binary.LittleEndian.PutUint32(buf[40:], cmdLen) // cmdLen
-		copy(buf[44:], cmd)
+		binary.LittleEndian.PutUint32(buf[72:], cmdLen) // cmdLen
+		copy(buf[76:], cmd)
 
 		skipped := s.replayEntries(buf, 0)
 		if skipped != 0 {
@@ -2574,7 +2574,10 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 		knownSegments: make(map[uint64]bool),
 	}
 
-	skipped, reason := s.replayRecord(nil, 0)
+	skipped, reason, err := s.replayRecord(nil, 0)
+	if err != nil {
+		t.Fatalf("replayRecord(nil) err=%v, want nil", err)
+	}
 	if skipped != 1 {
 		t.Fatalf("replayRecord(nil) skipped=%d, want 1", skipped)
 	}
@@ -2582,7 +2585,10 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 		t.Fatalf("replayRecord(nil) reason=%q, want %q", reason, "empty record")
 	}
 
-	skipped, reason = s.replayRecord([]byte{}, 0)
+	skipped, reason, err = s.replayRecord([]byte{}, 0)
+	if err != nil {
+		t.Fatalf("replayRecord([]) err=%v, want nil", err)
+	}
 	if skipped != 1 {
 		t.Fatalf("replayRecord([]) skipped=%d, want 1", skipped)
 	}
@@ -2605,7 +2611,10 @@ func TestReplayRecordSkipsUnknownPayloadType(t *testing.T) {
 	}
 
 	// 0xFF is not a valid payload type.
-	skipped, reason := s.replayRecord([]byte{0xFF}, 0)
+	skipped, reason, err := s.replayRecord([]byte{0xFF}, 0)
+	if err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	}
 	if skipped != 1 {
 		t.Fatalf("skipped=%d, want 1", skipped)
 	}
@@ -2629,7 +2638,10 @@ func TestReplayRecordSkipsTruncatedState(t *testing.T) {
 
 	// State payload type + insufficient data.
 	rec := []byte{payloadTypeState, 0x00}
-	skipped, reason := s.replayRecord(rec, 0)
+	skipped, reason, err := s.replayRecord(rec, 0)
+	if err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	}
 	if skipped != 1 {
 		t.Fatalf("skipped=%d, want 1", skipped)
 	}
@@ -2659,7 +2671,10 @@ func TestReplayRecordValidStateSetsNoSkip(t *testing.T) {
 	binary.LittleEndian.PutUint64(rec[25:], 2) // vote
 	binary.LittleEndian.PutUint64(rec[33:], 3) // commit
 
-	skipped, reason := s.replayRecord(rec, 0)
+	skipped, reason, err := s.replayRecord(rec, 0)
+	if err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	}
 	if skipped != 0 {
 		t.Fatalf("skipped=%d, want 0", skipped)
 	}
@@ -2690,7 +2705,7 @@ func TestMaxCmdLenConstant(t *testing.T) {
 // have 0600 permissions (owner read/write only), regardless of umask.
 func TestSegmentFilePermissions(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -2711,7 +2726,7 @@ func TestSegmentFilePermissions(t *testing.T) {
 // retain 0600 permissions.
 func TestSegmentFilePermissionsAfterReopen(t *testing.T) {
 	dir := t.TempDir()
-	seg, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
+	seg, _, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
 	if err != nil {
 		t.Fatalf("createSegment: %v", err)
 	}
@@ -2759,7 +2774,7 @@ func TestReplayEntriesCmdLenBoundaryOverflow(t *testing.T) {
 	binary.LittleEndian.PutUint64(buf[16:], 1)          // raftIndex
 	binary.LittleEndian.PutUint64(buf[24:], 1)          // term
 	binary.LittleEndian.PutUint64(buf[32:], 0)          // entryType
-	binary.LittleEndian.PutUint32(buf[40:], 0xFFFFFFFF) // cmdLen = MaxUint32
+	binary.LittleEndian.PutUint32(buf[72:], 0xFFFFFFFF) // cmdLen = MaxUint32
 
 	skipped := s.replayEntries(buf, 0)
 	if skipped != 1 {

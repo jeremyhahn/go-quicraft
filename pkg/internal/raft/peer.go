@@ -1160,7 +1160,7 @@ func (p *Peer) RateLimiter() *server.InMemRateLimiter {
 // Used by the snapshot pool to record the correct term in snapshot metadata
 // without risking a stale 0 from a compacted LogReader.
 func (p *Peer) AppliedToTerm() uint64 {
-	return p.r.log.inmem.appliedToTerm
+	return p.r.log.inmem.appliedToTerm.Load()
 }
 
 // CommittedIndex returns the current committed log index from the Raft log.

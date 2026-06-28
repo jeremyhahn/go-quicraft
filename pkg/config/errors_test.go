@@ -79,8 +79,8 @@ func TestNewValidationError(t *testing.T) {
 
 	t.Run("error satisfies error interface", func(t *testing.T) {
 		var err error = newValidationError("test", "msg")
-		if err == nil {
-			t.Fatal("error should not be nil")
+		if err.Error() == "" {
+			t.Fatal("error should produce a non-empty message")
 		}
 	})
 }
