@@ -7,7 +7,7 @@
 # Usage (via Makefile):
 #   make perf-compare-dragonboat
 
-FROM golang:1.26.3 AS builder
+FROM golang:1.26.5 AS builder
 
 WORKDIR /build
 
