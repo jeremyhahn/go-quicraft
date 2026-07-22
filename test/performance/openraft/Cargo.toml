@@ -15,6 +15,6 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
-bincode = "1"
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+bincode = "3"
 tempfile = "3"
