@@ -928,11 +928,24 @@ func TestWriteHealthMetrics_NoOp(t *testing.T) {
 // RequestCompaction
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_RequestCompaction_InvalidShard(t *testing.T) {
+// TestNodeHost_RequestCompaction_UnloadedShard verifies the dragonboat
+// contract for a shard this NodeHost does not have loaded: it is assumed to
+// have been retired via RemoveData, so compaction reclaims what it can and
+// reports success rather than failing. This keeps the canonical
+// StopShard -> RemoveData -> RequestCompaction reclamation sequence working.
+func TestNodeHost_RequestCompaction_UnloadedShard(t *testing.T) {
 	nh := newTestNodeHost(t)
-	_, err := nh.RequestCompaction(999, 999)
-	if err == nil {
-		t.Error("expected error for non-existent shard, got nil")
+	state, err := nh.RequestCompaction(999, 999)
+	if err != nil {
+		t.Fatalf("expected success for an unloaded shard, got: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected a non-nil SysOpState")
+	}
+	select {
+	case <-state.ResultC():
+	default:
+		t.Error("expected the SysOpState to be already completed")
 	}
 }
 

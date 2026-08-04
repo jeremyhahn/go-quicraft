@@ -1306,12 +1306,14 @@ func (nh *NodeHost) RequestDeleteReplica(shardID, replicaID uint64, configChange
 // pair. Returns a SysOpState that completes immediately since quicraft's
 // RequestCompaction is synchronous.
 //
-// INCOMPATIBILITY: dragonboat also handles a shard that is not loaded
-// ("assume this is a node that has already been removed via RemoveData")
-// by compacting its LogDB entries to MaxUint64. Quicraft exposes no
-// public API for compacting an unloaded shard, so this adapter returns
-// ErrShardNotFound for that case and post-RemoveData disk reclamation
-// must be done through the LogDB directly.
+// A shard that is not loaded is treated as already retired via RemoveData
+// and reclaims what it can, matching dragonboat's behavior for that case.
+// Quicraft deliberately does NOT compact such a shard to MaxUint64 the way
+// dragonboat does: it cannot distinguish a removed replica from a merely
+// stopped one, and a stopped replica's log is live data it needs on
+// restart. Segment GC honors the existing compaction markers instead, so
+// the canonical StopShard -> RemoveData -> RequestCompaction sequence
+// succeeds without risking a healthy replica's log.
 func (nh *NodeHost) RequestCompaction(shardID, replicaID uint64) (*SysOpState, error) {
 	err := nh.host.RequestCompaction(shardID, replicaID)
 	if err != nil {

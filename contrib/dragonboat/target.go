@@ -19,13 +19,6 @@
 //
 // # Known incompatibilities
 //
-// Empty proposals are rejected. Dragonboat's proposalShard.propose accepts
-// a zero-length command and proposes it as a normal ApplicationEntry, so a
-// zero-length proposal is a usable commit barrier. Quicraft's Host.Propose
-// rejects len(cmd)==0 with ErrInvalidOperation, and the adapter cannot
-// override that check. Applications that use empty proposals as barriers
-// must switch to a one-byte sentinel command before migrating.
-//
 // Client sessions expose a different shape. Dragonboat's client.Session
 // exports ShardID, ClientID, SeriesID and RespondedTo as struct FIELDS.
 // This adapter's client.Session exports only ShardID as a field; ClientID,

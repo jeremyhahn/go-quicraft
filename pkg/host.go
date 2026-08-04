@@ -2790,13 +2790,14 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 		return nil, err
 	}
 
-	// Reject an empty command. An empty proposal carries no state change
-	// yet still consumes a full quorum round (a committed log entry); it
-	// is almost always a caller bug. (dragonboat rejects empty proposals
-	// the same way.)
-	if len(cmd) == 0 {
-		return nil, ErrInvalidOperation
-	}
+	// An empty command is legal and is proposed normally, matching
+	// dragonboat (proposalShard.propose types a zero-length cmd as a plain
+	// application entry). It commits and advances lastApplied, but the
+	// apply path skips empty-Cmd non-session entries before they reach the
+	// user state machine — the same treatment the leader's election no-op
+	// gets. That makes it a commit barrier: the way to force a
+	// current-term committed entry after an election (PhD 6.4 ReadIndex
+	// warmup) without inventing a throwaway payload.
 
 	// Witnesses vote but don't store log data; they cannot propose.
 	if ns.cfg.IsWitness {
@@ -5517,7 +5518,21 @@ func (h *Host) RequestCompaction(shardID, replicaID uint64) error {
 
 	v, exists := h.nodes.Load(shardID)
 	if !exists {
-		return ErrShardNotFound
+		// Not loaded here: assume the replica was already retired via
+		// RemoveData (which writes the tombstone and runs segment GC), and
+		// reclaim whatever is still reclaimable. Returning success keeps the
+		// canonical StopShard -> RemoveData -> RequestCompaction sequence
+		// working instead of failing on a step whose work already happened.
+		//
+		// Deliberately NOT dragonboat's CompactEntriesTo(MaxUint64): this
+		// host cannot distinguish "removed" from "merely stopped", and a
+		// stopped replica's log is still live data it needs on restart —
+		// compacting it to MaxUint64 would destroy a healthy replica.
+		// RemoveEntriesTo is also unsafe post-RemoveData: it would re-create
+		// the compactedTo and metaSegments entries that RemoveNodeData just
+		// deleted, pinning a segment for a node that no longer exists.
+		// Segment GC alone honors the existing markers and cannot lose data.
+		return h.logdb.Compact(shardID, replicaID)
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {

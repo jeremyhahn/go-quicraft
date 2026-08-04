@@ -9534,12 +9534,52 @@ func TestRequestCompaction_ClosedHost(t *testing.T) {
 	}
 }
 
-func TestRequestCompaction_ShardNotFound(t *testing.T) {
+// TestRequestCompaction_UnloadedShardSucceeds verifies the retired-replica
+// contract: compaction on a shard this host does not have loaded is treated
+// as "already retired via RemoveData" and reclaims what it can, rather than
+// failing. This keeps the canonical StopShard -> RemoveData ->
+// RequestCompaction sequence working (dragonboat behaves the same way).
+func TestRequestCompaction_UnloadedShardSucceeds(t *testing.T) {
 	h := newTestHost(t)
 
-	err := h.RequestCompaction(999, 1)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Fatalf("RequestCompaction not found: got %v, want ErrShardNotFound", err)
+	if err := h.RequestCompaction(999, 1); err != nil {
+		t.Fatalf("RequestCompaction on an unloaded shard: unexpected error: %v", err)
+	}
+}
+
+// TestRequestCompaction_UnloadedShardPreservesEntries verifies that the
+// unloaded path does NOT compact to MaxUint64. This host cannot distinguish a
+// removed replica from a merely stopped one, and a stopped replica's log is
+// live data it needs on restart, so segment GC must honor the existing
+// compaction markers rather than discarding the log.
+func TestRequestCompaction_UnloadedShardPreservesEntries(t *testing.T) {
+	h := newTestHost(t)
+
+	// Persist entries for a shard that is not loaded on this host.
+	const shardID, replicaID = 77, 1
+	entries := []logdb.Entry{
+		{Index: 1, Term: 1, Cmd: []byte("a")},
+		{Index: 2, Term: 1, Cmd: []byte("b")},
+	}
+	if err := h.logdb.SaveState([]logdb.Update{{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Entries:   entries,
+	}}); err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+
+	if err := h.RequestCompaction(shardID, replicaID); err != nil {
+		t.Fatalf("RequestCompaction: unexpected error: %v", err)
+	}
+
+	first, count, err := h.logdb.EntryRange(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("EntryRange failed: %v", err)
+	}
+	if first != 1 || count != 2 {
+		t.Fatalf("entries were discarded: got first=%d count=%d, want first=1 count=2",
+			first, count)
 	}
 }
 
@@ -11815,6 +11855,59 @@ func TestSyncPropose_Success(t *testing.T) {
 	// The mock state machine returns entry.Index as Value.
 	if result.Value == 0 {
 		t.Fatal("expected non-zero result Value from SyncPropose")
+	}
+}
+
+// TestSyncPropose_EmptyCommandIsCommitBarrier verifies that a zero-length
+// command is proposed normally rather than rejected, matching dragonboat
+// (proposalShard.propose types an empty cmd as a plain application entry).
+// It commits and advances the applied index, but the apply path skips
+// empty-Cmd non-session entries before they reach the user state machine —
+// the same treatment the leader's election no-op gets. That makes it the
+// supported way to force a current-term committed entry after an election
+// (PhD 6.4 ReadIndex warmup) without inventing a throwaway payload.
+func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	appliedIndex := func() uint64 {
+		v, ok := h.nodes.Load(uint64(1))
+		if !ok {
+			t.Fatal("shard 1 not loaded")
+		}
+		return v.(*nodeState).lastApplied.Load()
+	}
+	appliedBefore := appliedIndex()
+
+	if _, err := h.SyncPropose(ctx, 1, nil); err != nil {
+		t.Fatalf("empty proposal must be accepted, got: %v", err)
+	}
+
+	// The barrier committed: the applied index moved even though the user
+	// state machine never saw the entry.
+	appliedAfter := appliedIndex()
+	if appliedAfter <= appliedBefore {
+		t.Fatalf("empty proposal did not commit: applied %d -> %d",
+			appliedBefore, appliedAfter)
+	}
+
+	// A subsequent non-empty proposal still works normally.
+	if _, err := h.SyncPropose(ctx, 1, []byte("after-barrier")); err != nil {
+		t.Fatalf("proposal after barrier failed: %v", err)
 	}
 }
 
