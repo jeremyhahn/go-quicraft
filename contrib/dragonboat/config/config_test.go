@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	qcConfig "github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
 func TestConfig_ToQuicraft_DefaultValues(t *testing.T) {
@@ -129,6 +131,22 @@ func TestConfig_ToQuicraft_AllFieldsMapped(t *testing.T) {
 	}
 }
 
+// TestConfig_ToQuicraft_WitnessPolicyDisabled pins the adapter-critical
+// witness-policy mapping: dragonboat has no witness membership policy, so
+// the adapter must disable quicraft's RequireFullReplicaMajority default
+// (nil => true) to preserve dragonboat's unrestricted witness-add
+// semantics. Dropping this mapping would silently re-enable the policy
+// and break previously-legal witness adds for adapter users.
+func TestConfig_ToQuicraft_WitnessPolicyDisabled(t *testing.T) {
+	qc := Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10, HeartbeatRTT: 1}.ToQuicraft()
+	if qc.Witness.RequireFullReplicaMajority == nil || *qc.Witness.RequireFullReplicaMajority {
+		t.Fatal("ToQuicraft must set Witness.RequireFullReplicaMajority to false for dragonboat parity")
+	}
+	if qc.Witness.GetRequireFullReplicaMajority() {
+		t.Fatal("effective RequireFullReplicaMajority must be false")
+	}
+}
+
 func TestConfig_ToQuicraft_IsNonVotingMapsToObserver(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -158,7 +176,10 @@ func TestConfig_ToQuicraft_IsNonVotingMapsToObserver(t *testing.T) {
 	}
 }
 
-func TestConfig_ToQuicraft_DisableAutoCompactionsSetsSnapshotEntriesToZero(t *testing.T) {
+func TestConfig_ToQuicraft_DisableAutoCompactionsPreservesSnapshots(t *testing.T) {
+	// Dragonboat's DisableAutoCompactions only disables reclamation of
+	// applied log entries; it must never disable snapshotting. The shim
+	// approximates it with maximum retention (SnapshotEntries-1).
 	c := Config{
 		ShardID:                1,
 		ReplicaID:              1,
@@ -167,8 +188,15 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsSetsSnapshotEntriesToZero(t *te
 	}
 
 	qc := c.ToQuicraft()
-	if qc.SnapshotEntries != 0 {
-		t.Errorf("SnapshotEntries: got %d, want 0 when DisableAutoCompactions=true", qc.SnapshotEntries)
+	if qc.SnapshotEntries != 10000 {
+		t.Errorf("SnapshotEntries: got %d, want 10000 (snapshots must never be disabled)", qc.SnapshotEntries)
+	}
+	if qc.CompactionOverhead != 9999 {
+		t.Errorf("CompactionOverhead: got %d, want 9999 (SnapshotEntries-1)", qc.CompactionOverhead)
+	}
+	qc.SetDefaults()
+	if err := qc.Validate(); err != nil {
+		t.Errorf("quicraft Validate failed after SetDefaults: %v", err)
 	}
 }
 
@@ -183,6 +211,95 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsFalsePreservesSnapshotEntries(t
 	qc := c.ToQuicraft()
 	if qc.SnapshotEntries != 10000 {
 		t.Errorf("SnapshotEntries: got %d, want 10000", qc.SnapshotEntries)
+	}
+}
+
+func TestConfig_ToQuicraft_UnsetCompactionOverheadSmallSnapshotEntries(t *testing.T) {
+	// A valid dragonboat config with SnapshotEntries <= quicraft's
+	// DefaultCompactionOverhead and CompactionOverhead unset must convert
+	// to a quicraft config that survives SetDefaults + Validate: the shim
+	// picks an explicit CompactionOverhead strictly below SnapshotEntries.
+	c := Config{
+		ShardID:         1,
+		ReplicaID:       1,
+		ElectionRTT:     10,
+		HeartbeatRTT:    1,
+		SnapshotEntries: 1000,
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("shim Validate failed: %v", err)
+	}
+
+	qc := c.ToQuicraft()
+	if qc.SnapshotEntries != 1000 {
+		t.Errorf("SnapshotEntries: got %d, want 1000", qc.SnapshotEntries)
+	}
+	if qc.CompactionOverhead != 999 {
+		t.Errorf("CompactionOverhead: got %d, want 999 (SnapshotEntries-1)", qc.CompactionOverhead)
+	}
+	qc.SetDefaults()
+	if err := qc.Validate(); err != nil {
+		t.Errorf("quicraft Validate failed after SetDefaults: %v", err)
+	}
+}
+
+func TestConfig_ToQuicraft_UnsetCompactionOverheadLargeSnapshotEntries(t *testing.T) {
+	// When SnapshotEntries exceeds quicraft's default overhead, the
+	// conversion uses quicraft's DefaultCompactionOverhead unchanged.
+	c := Config{
+		ShardID:         1,
+		ReplicaID:       1,
+		ElectionRTT:     10,
+		HeartbeatRTT:    1,
+		SnapshotEntries: 100000,
+	}
+
+	qc := c.ToQuicraft()
+	if qc.CompactionOverhead != qcConfig.DefaultCompactionOverhead {
+		t.Errorf("CompactionOverhead: got %d, want %d", qc.CompactionOverhead, qcConfig.DefaultCompactionOverhead)
+	}
+	qc.SetDefaults()
+	if err := qc.Validate(); err != nil {
+		t.Errorf("quicraft Validate failed after SetDefaults: %v", err)
+	}
+}
+
+func TestConfig_ToQuicraft_BothSetPassThrough(t *testing.T) {
+	// Explicit user-set values pass through unchanged when compaction is
+	// not disabled.
+	c := Config{
+		ShardID:            1,
+		ReplicaID:          1,
+		SnapshotEntries:    10000,
+		CompactionOverhead: 1234,
+	}
+
+	qc := c.ToQuicraft()
+	if qc.CompactionOverhead != 1234 {
+		t.Errorf("CompactionOverhead: got %d, want 1234", qc.CompactionOverhead)
+	}
+}
+
+func TestConfig_Validate_SnapshotEntriesOne(t *testing.T) {
+	// Dragonboat accepts SnapshotEntries == 1, so the shim must too.
+	// Quicraft requires SnapshotEntries > CompactionOverhead >= 1, so the
+	// conversion clamps to the minimum legal pair instead of rejecting.
+	c := Config{
+		ShardID:         1,
+		ReplicaID:       1,
+		ElectionRTT:     10,
+		HeartbeatRTT:    1,
+		SnapshotEntries: 1,
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	qc := c.ToQuicraft()
+	if qc.SnapshotEntries != 2 {
+		t.Errorf("SnapshotEntries: got %d, want 2", qc.SnapshotEntries)
+	}
+	if qc.CompactionOverhead != 1 {
+		t.Errorf("CompactionOverhead: got %d, want 1", qc.CompactionOverhead)
 	}
 }
 
@@ -283,6 +400,9 @@ func TestConfig_Validate_IsObserverAndIsWitnessMutuallyExclusive(t *testing.T) {
 }
 
 func TestConfig_Validate_SnapshotEntriesLessThanCompactionOverhead(t *testing.T) {
+	// Dragonboat accepts SnapshotEntries <= CompactionOverhead (a real
+	// tuning choice), so Validate must accept it and ToQuicraft must clamp
+	// the retention below quicraft's SnapshotEntries bound.
 	c := Config{
 		ShardID:            1,
 		ReplicaID:          1,
@@ -291,16 +411,15 @@ func TestConfig_Validate_SnapshotEntriesLessThanCompactionOverhead(t *testing.T)
 		SnapshotEntries:    100,
 		CompactionOverhead: 200,
 	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error when SnapshotEntries <= CompactionOverhead")
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
+	qc := c.ToQuicraft()
+	if qc.SnapshotEntries != 100 {
+		t.Errorf("SnapshotEntries: got %d, want 100", qc.SnapshotEntries)
 	}
-	if ve.Field != "SnapshotEntries" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "SnapshotEntries")
+	if qc.CompactionOverhead != 99 {
+		t.Errorf("CompactionOverhead: got %d, want 99", qc.CompactionOverhead)
 	}
 }
 
@@ -904,7 +1023,6 @@ func TestIsValidAddress_Valid(t *testing.T) {
 		"localhost:8080",
 		"0.0.0.0:9090",
 		"192.168.1.1:63001",
-		"[::1]:8080",
 	}
 	for _, addr := range tests {
 		if !IsValidAddress(addr) {
@@ -914,16 +1032,20 @@ func TestIsValidAddress_Valid(t *testing.T) {
 }
 
 func TestIsValidAddress_Invalid(t *testing.T) {
+	// Dragonboat requires a non-empty host and a numeric port in
+	// [1, 65535], and rejects IPv6 literals outright.
 	tests := []string{
 		"",
 		"localhost",
 		":8080",
+		"host:0",
+		"host:99999",
+		"host:abc",
+		"host:-1",
+		"[::1]:8080",
+		"localhost:8080:9090",
 	}
 	for _, addr := range tests {
-		if addr == ":8080" {
-			// ":8080" is actually valid per net.SplitHostPort (empty host).
-			continue
-		}
 		if IsValidAddress(addr) {
 			t.Errorf("IsValidAddress(%q) = true, want false", addr)
 		}
@@ -1077,10 +1199,12 @@ func TestGossipConfig_IsEmpty_SeedOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// NodeHostConfig: Validate with valid gossip propagates nil
+// NodeHostConfig: Validate rejects any non-empty gossip configuration.
+// Quicraft does not support gossip; silently dropping the configuration
+// would change cluster behavior, so Validate fails loudly instead.
 // ---------------------------------------------------------------------------
 
-func TestNodeHostConfig_Validate_ValidGossip(t *testing.T) {
+func TestNodeHostConfig_Validate_NonEmptyGossipRejected(t *testing.T) {
 	c := NodeHostConfig{
 		WALDir:         "/tmp/wal",
 		NodeHostDir:    "/tmp/nodehost",
@@ -1092,8 +1216,16 @@ func TestNodeHostConfig_Validate_ValidGossip(t *testing.T) {
 			Seed:        []string{"10.0.0.1:7946"},
 		},
 	}
-	if err := c.Validate(); err != nil {
-		t.Errorf("valid config with gossip should not error: %v", err)
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("non-empty gossip config must be rejected: quicraft does not support gossip")
+	}
+	var vErr *ValidationError
+	if !errors.As(err, &vErr) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+	if vErr.Field != "Gossip" {
+		t.Errorf("ValidationError.Field = %q, want %q", vErr.Field, "Gossip")
 	}
 }
 

@@ -1405,3 +1405,186 @@ func TestMembership_VotingCapEnforced(t *testing.T) {
 		t.Fatalf("handleAddNonVoting at voting cap: unexpected error %v", err)
 	}
 }
+
+// --- Replicated witness policy (C1) ---
+
+// membershipWith builds a membership with the given full-replica and witness
+// counts and the given replicated policy for validator testing.
+func membershipWith(fullReplicas, witnesses int, maxWitnesses uint64, requireFullReplicaMajority bool) *membership {
+	addr := map[uint64]string{}
+	for i := 1; i <= fullReplicas; i++ {
+		addr[uint64(i)] = "addr"
+	}
+	wit := map[uint64]string{}
+	for i := 0; i < witnesses; i++ {
+		wit[uint64(100+i)] = "waddr"
+	}
+	return newMembership(proto.Membership{
+		Addresses:                  addr,
+		Witnesses:                  wit,
+		MaxWitnesses:               maxWitnesses,
+		RequireFullReplicaMajority: requireFullReplicaMajority,
+	})
+}
+
+// TestMembership_WitnessPolicy_RequireFullReplicaMajority verifies that the
+// default RequireFullReplicaMajority policy rejects a witness add that would
+// leave the full replicas unable to form a quorum on their own, while allowing
+// adds that preserve the full-replica majority.
+func TestMembership_WitnessPolicy_RequireFullReplicaMajority(t *testing.T) {
+	add := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 9, Address: "w"}
+
+	// 3 full + 1 witness -> after add 3 full + 2 witness = 5 voting, quorum 3,
+	// full 3 >= 3: ALLOWED.
+	if err := validateAddWitness(membershipWith(3, 1, 0, true), add); err != nil {
+		t.Fatalf("3 full + 2nd witness should be allowed, got %v", err)
+	}
+	// 3 full + 2 witness -> after add = 6 voting, quorum 4, full 3 < 4: REJECT.
+	if err := validateAddWitness(membershipWith(3, 2, 0, true), add); !errors.Is(err, ErrBreaksFullReplicaMajority) {
+		t.Fatalf("3 full + 3rd witness should break full-replica majority, got %v", err)
+	}
+	// 2 full + 1 witness -> after add = 4 voting, quorum 3, full 2 < 3: REJECT.
+	if err := validateAddWitness(membershipWith(2, 1, 0, true), add); !errors.Is(err, ErrBreaksFullReplicaMajority) {
+		t.Fatalf("2 full + 2nd witness should break full-replica majority, got %v", err)
+	}
+	// 2 full + 0 witness -> after add = 3 voting, quorum 2, full 2 >= 2: ALLOWED
+	// (a valid tiebreaker config where full replicas still form a quorum).
+	if err := validateAddWitness(membershipWith(2, 0, 0, true), add); err != nil {
+		t.Fatalf("2 full + 1st witness should be allowed, got %v", err)
+	}
+}
+
+// TestMembership_WitnessPolicy_AllowWhenDisabled verifies that disabling
+// RequireFullReplicaMajority permits witness-as-tiebreaker deployments that the
+// default policy would reject (the quorums stay unified, so data is still safe).
+func TestMembership_WitnessPolicy_AllowWhenDisabled(t *testing.T) {
+	add := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 9, Address: "w"}
+	if err := validateAddWitness(membershipWith(2, 1, 0, false), add); err != nil {
+		t.Fatalf("witness add should be allowed when RequireFullReplicaMajority is off, got %v", err)
+	}
+}
+
+// TestMembership_WitnessPolicy_MaxWitnesses verifies the MaxWitnesses cap.
+func TestMembership_WitnessPolicy_MaxWitnesses(t *testing.T) {
+	add := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 9, Address: "w"}
+
+	// Cap of 2: adding a 2nd witness (1 existing) is allowed.
+	if err := validateAddWitness(membershipWith(3, 1, 2, false), add); err != nil {
+		t.Fatalf("2nd witness under cap 2 should be allowed, got %v", err)
+	}
+	// Cap of 2: adding a 3rd witness (2 existing) is rejected.
+	if err := validateAddWitness(membershipWith(3, 2, 2, false), add); !errors.Is(err, ErrTooManyWitnesses) {
+		t.Fatalf("3rd witness over cap 2 should be rejected, got %v", err)
+	}
+	// Cap of 0 means unbounded.
+	if err := validateAddWitness(membershipWith(5, 4, 0, false), add); err != nil {
+		t.Fatalf("unbounded cap should allow witness add, got %v", err)
+	}
+}
+
+// TestMembership_WitnessPolicy_RemoveNodePreservesFullReplicaMajority verifies
+// that RequireFullReplicaMajority also gates full-replica removal: removing a
+// full replica must not leave the remaining full replicas unable to form a
+// quorum over the voting set. Without this check, a remove could silently
+// produce exactly the witness-heavy membership the policy rejects on add.
+func TestMembership_WitnessPolicy_RemoveNodePreservesFullReplicaMajority(t *testing.T) {
+	// 3 full + 2 witness (full 3 >= quorum 3): removing full replica 3 would
+	// leave 2 full + 2 witness = 4 voting, quorum 3, full 2 < 3: REJECT.
+	rmFull := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 3}
+	if err := validateRemoveNode(membershipWith(3, 2, 0, true), rmFull); !errors.Is(err, ErrBreaksFullReplicaMajority) {
+		t.Fatalf("removing full replica from 3F+2W should break full-replica majority, got %v", err)
+	}
+	// Same removal is allowed when the policy is disabled.
+	if err := validateRemoveNode(membershipWith(3, 2, 0, false), rmFull); err != nil {
+		t.Fatalf("removal should be allowed with policy off, got %v", err)
+	}
+	// 4 full + 1 witness: removing a full replica leaves 3 full + 1 witness =
+	// 4 voting, quorum 3, full 3 >= 3: ALLOWED.
+	if err := validateRemoveNode(membershipWith(4, 1, 0, true), rmFull); err != nil {
+		t.Fatalf("removal preserving full-replica majority should be allowed, got %v", err)
+	}
+	// Removing a WITNESS only improves the ratio: 3 full + 2 witness minus
+	// witness 100 -> ALLOWED even under the policy.
+	rmWitness := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 100}
+	if err := validateRemoveNode(membershipWith(3, 2, 0, true), rmWitness); err != nil {
+		t.Fatalf("removing a witness should always be allowed by the policy, got %v", err)
+	}
+	// No witnesses present: policy imposes nothing on full-replica removal.
+	if err := validateRemoveNode(membershipWith(3, 0, 0, true), rmFull); err != nil {
+		t.Fatalf("removal with no witnesses should be allowed, got %v", err)
+	}
+}
+
+// TestMembership_UpdateWitnessPolicy_ApplyAndValidate verifies the
+// UpdateWitnessPolicy config change: apply replaces the replicated policy
+// unconditionally (deterministic replay), while validate rejects a new
+// policy the CURRENT membership does not satisfy.
+func TestMembership_UpdateWitnessPolicy_ApplyAndValidate(t *testing.T) {
+	// Apply: policy fields replaced, configChangeID advanced.
+	m := membershipWith(3, 1, 0, false)
+	cc := proto.ConfigChange{
+		Type:                       proto.UpdateWitnessPolicy,
+		MaxWitnesses:               2,
+		RequireFullReplicaMajority: true,
+	}
+	if err := m.validate(cc); err != nil {
+		t.Fatalf("consistent policy update should validate, got %v", err)
+	}
+	if err := m.apply(cc, 42); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if m.maxWitnesses != 2 || !m.requireFullReplicaMajority {
+		t.Fatalf("policy not applied: max=%d rfrm=%v", m.maxWitnesses, m.requireFullReplicaMajority)
+	}
+	if m.configChangeID != 42 {
+		t.Fatalf("expected configChangeID 42, got %d", m.configChangeID)
+	}
+	// The new policy now governs subsequent changes: a 3rd witness would
+	// exceed... cap 2 with 1 existing allows one more, then majority rule
+	// kicks in for 3F+2W -> 3rd witness (6 voting, quorum 4 > full 3).
+	add := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 9, Address: "w"}
+	if err := m.validate(add); err != nil {
+		t.Fatalf("2nd witness should be allowed under new policy, got %v", err)
+	}
+
+	// Validate: tightening the cap below the current witness count is
+	// rejected — reshape first, then tighten.
+	m2 := membershipWith(3, 2, 0, false)
+	if err := m2.validate(proto.ConfigChange{
+		Type:         proto.UpdateWitnessPolicy,
+		MaxWitnesses: 1,
+	}); !errors.Is(err, ErrTooManyWitnesses) {
+		t.Fatalf("cap below current witness count must be rejected, got %v", err)
+	}
+	// Validate: enabling RequireFullReplicaMajority on a membership that
+	// violates it is rejected (2 full + 2 witness: quorum 3 > full 2).
+	m3 := membershipWith(2, 2, 0, false)
+	if err := m3.validate(proto.ConfigChange{
+		Type:                       proto.UpdateWitnessPolicy,
+		RequireFullReplicaMajority: true,
+	}); !errors.Is(err, ErrBreaksFullReplicaMajority) {
+		t.Fatalf("enabling RFRM on violating membership must be rejected, got %v", err)
+	}
+	// Apply is unconditional even for a policy the membership violates
+	// (committed replay must never diverge).
+	if err := m3.apply(proto.ConfigChange{
+		Type:                       proto.UpdateWitnessPolicy,
+		RequireFullReplicaMajority: true,
+	}, 50); err != nil {
+		t.Fatalf("apply must be unconditional, got %v", err)
+	}
+	if !m3.requireFullReplicaMajority {
+		t.Fatal("policy not applied on replay path")
+	}
+}
+
+// TestMembership_PolicySurvivesSnapshotRoundTrip verifies the policy flows
+// through snapshot() -> toProto() -> newMembership().
+func TestMembership_PolicySurvivesSnapshotRoundTrip(t *testing.T) {
+	m := membershipWith(3, 1, 5, true)
+	restored := newMembership(m.snapshot().toProto())
+	if restored.maxWitnesses != 5 || !restored.requireFullReplicaMajority {
+		t.Fatalf("policy lost in round trip: max=%d rfrm=%v",
+			restored.maxWitnesses, restored.requireFullReplicaMajority)
+	}
+}

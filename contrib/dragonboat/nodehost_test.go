@@ -76,10 +76,12 @@ func newTestNodeHost(t *testing.T) *NodeHost {
 	t.Helper()
 	dir := t.TempDir()
 	nhConfig := dbConfig.NodeHostConfig{
-		DeploymentID:   1,
-		WALDir:         filepath.Join(dir, "wal"),
-		NodeHostDir:    filepath.Join(dir, "data"),
-		RaftAddress:    "localhost:0",
+		DeploymentID: 1,
+		WALDir:       filepath.Join(dir, "wal"),
+		NodeHostDir:  filepath.Join(dir, "data"),
+		// A real port: dragonboat's address validator rejects port 0,
+		// and initial-member targets are validated at Start*Replica.
+		RaftAddress:    "localhost:63001",
 		ListenAddress:  "localhost:0",
 		RTTMillisecond: 1,
 	}
@@ -122,11 +124,30 @@ func startTestShard(t *testing.T, nh *NodeHost, shardID, replicaID uint64) {
 	for {
 		leaderID, _, valid, leaderErr := nh.GetLeaderID(shardID)
 		if leaderErr == nil && valid && leaderID == replicaID {
-			return
+			break
 		}
 		select {
 		case <-deadline.C:
 			t.Fatalf("leader not elected for shard %d within 5s", shardID)
+			return
+		case <-ticker.C:
+		}
+	}
+
+	// A linearizable read is only servable once the post-election ReadIndex
+	// warmup has completed (PhD 6.4), so wait for that too. Returning at
+	// leader election alone makes every SyncRead/SyncGetShardMembership in
+	// the suite race the warmup and intermittently see ErrShardNotReady.
+	for {
+		readCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, readErr := nh.SyncGetShardMembership(readCtx, shardID)
+		cancel()
+		if readErr == nil {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("shard %d not readable within 5s: %v", shardID, readErr)
 			return
 		case <-ticker.C:
 		}
@@ -679,8 +700,8 @@ func TestFromQuicraftShardInfo(t *testing.T) {
 	if !si.IsLeader {
 		t.Error("expected IsLeader=true")
 	}
-	if si.Pending != 3 {
-		t.Errorf("expected Pending=3, got %d", si.Pending)
+	if si.PendingProposals != 3 {
+		t.Errorf("expected PendingProposals=3, got %d", si.PendingProposals)
 	}
 	if len(si.Nodes) != 2 {
 		t.Errorf("expected 2 nodes, got %d", len(si.Nodes))
@@ -706,6 +727,34 @@ func TestFromQuicraftShardInfo_EmptyNodes(t *testing.T) {
 	}
 }
 
+func TestToDragonboatStateMachineType(t *testing.T) {
+	// Quicraft numbers state machine types Regular=0, Concurrent=1,
+	// OnDisk=2 (pkg/proto); dragonboat numbers them Regular=1,
+	// Concurrent=2, OnDisk=3 (statemachine.Type). The conversion must
+	// translate, not copy.
+	tests := []struct {
+		name     string
+		quicraft uint64
+		want     uint64
+	}{
+		{"Regular", 0, 1},
+		{"Concurrent", 1, 2},
+		{"OnDisk", 2, 3},
+		{"Unknown", 99, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toDragonboatStateMachineType(tc.quicraft); got != tc.want {
+				t.Errorf("toDragonboatStateMachineType(%d) = %d, want %d", tc.quicraft, got, tc.want)
+			}
+			si := fromQuicraftShardInfo(quicraft.ShardInfo{StateMachineType: tc.quicraft})
+			if si.StateMachineType != tc.want {
+				t.Errorf("fromQuicraftShardInfo StateMachineType = %d, want %d", si.StateMachineType, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodeToError(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -713,9 +762,9 @@ func TestCodeToError(t *testing.T) {
 		expected error
 	}{
 		{"Timeout", RequestTimeout, ErrTimeout},
-		{"Terminated", RequestTerminated, ErrClosed},
+		{"Terminated", RequestTerminated, ErrShardClosed},
 		{"Rejected", RequestRejected, ErrRejected},
-		{"Dropped", RequestDropped, ErrSystemBusy},
+		{"Dropped", RequestDropped, ErrShardNotReady},
 		{"Aborted", RequestAborted, ErrAborted},
 	}
 
@@ -1046,11 +1095,12 @@ func TestFromQuicraftShardInfo_AllFields(t *testing.T) {
 	if !si.IsWitness {
 		t.Error("expected IsWitness=true")
 	}
-	if si.StateMachineType != 2 {
-		t.Errorf("StateMachineType = %d, want 2", si.StateMachineType)
+	// Quicraft OnDisk (2) must be translated to dragonboat OnDisk (3).
+	if si.StateMachineType != 3 {
+		t.Errorf("StateMachineType = %d, want 3 (dragonboat OnDisk)", si.StateMachineType)
 	}
-	if si.Pending != 7 {
-		t.Errorf("Pending = %d, want 7", si.Pending)
+	if si.PendingProposals != 7 {
+		t.Errorf("PendingProposals = %d, want 7", si.PendingProposals)
 	}
 	if len(si.Nodes) != 3 {
 		t.Errorf("Nodes length = %d, want 3", len(si.Nodes))
@@ -1282,14 +1332,16 @@ func TestNodeHost_SyncRequestAddWitness_InvalidShard(t *testing.T) {
 
 func TestNodeHost_ReadLocalNode_NilResultC(t *testing.T) {
 	nh := newTestNodeHost(t)
-	// RequestState with nil inner produces nil ResultC.
+	// A RequestState with no delivered completion must be rejected:
+	// serving the query without a resolved ReadIndex would violate
+	// linearizability.
 	rs := &RequestState{}
 	_, err := nh.ReadLocalNode(rs, nil)
 	if err == nil {
-		t.Error("expected error for nil ResultC")
+		t.Error("expected error for unresolved RequestState")
 	}
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("expected ErrShardNotFound, got %v", err)
+	if !errors.Is(err, ErrInvalidOperation) {
+		t.Errorf("expected ErrInvalidOperation, got %v", err)
 	}
 }
 
@@ -1358,10 +1410,12 @@ func TestNodeHost_MultipleShardsIndependent(t *testing.T) {
 func TestNodeHost_Close_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 	nhConfig := dbConfig.NodeHostConfig{
-		DeploymentID:   1,
-		WALDir:         filepath.Join(dir, "wal"),
-		NodeHostDir:    filepath.Join(dir, "data"),
-		RaftAddress:    "localhost:0",
+		DeploymentID: 1,
+		WALDir:       filepath.Join(dir, "wal"),
+		NodeHostDir:  filepath.Join(dir, "data"),
+		// A real port: dragonboat's address validator rejects port 0,
+		// and initial-member targets are validated at Start*Replica.
+		RaftAddress:    "localhost:63001",
 		ListenAddress:  "localhost:0",
 		RTTMillisecond: 1,
 	}
@@ -1941,6 +1995,11 @@ func TestNodeHost_ProposeSession_Success(t *testing.T) {
 		t.Fatalf("SyncGetSession: %v", err)
 	}
 
+	// Dragonboat requires the caller to prepare the session for a
+	// session operation; a live in-use session is rejected with
+	// ErrInvalidSession (see TestNodeHost_ProposeSession_LiveSessionRejected).
+	session.PrepareForUnregister()
+
 	rs, err := nh.ProposeSession(session, 5*time.Second)
 	if err != nil {
 		t.Fatalf("ProposeSession: %v", err)
@@ -2101,12 +2160,17 @@ func TestNodeHost_ReadIndex_And_ReadLocalNode(t *testing.T) {
 		t.Fatalf("SyncPropose: %v", err)
 	}
 
-	// ReadIndex to get a resolved RequestState.
+	// ReadIndex, then wait for completion on ResultC — the dragonboat
+	// contract requires observing RequestCompleted before ReadLocalNode.
 	rs, err := nh.ReadIndex(shardID, 5*time.Second)
 	if err != nil {
 		t.Fatalf("ReadIndex: %v", err)
 	}
 	defer rs.Release()
+	s := <-rs.ResultC()
+	if !s.Completed() {
+		t.Fatalf("ReadIndex did not complete: code=%v", s.code)
+	}
 
 	// ReadLocalNode should query the local state machine.
 	result, err := nh.ReadLocalNode(rs, nil)
@@ -2125,18 +2189,19 @@ func TestNodeHost_ReadIndex_And_ReadLocalNode(t *testing.T) {
 func TestNodeHost_ReadLocalNode_ClosedChannel(t *testing.T) {
 	nh := newTestNodeHost(t)
 
-	// Create a RequestState with a closed CompletedC channel.
-	// When resolved is nil, ResultC() returns CompletedC directly.
+	// A RequestState whose channel was closed without ever delivering a
+	// completion is an abandoned request: no completion was latched, so
+	// ReadLocalNode must refuse to serve the query.
 	ch := make(chan RequestResult)
 	close(ch)
 	rs := &RequestState{CompletedC: ch}
 
 	_, err := nh.ReadLocalNode(rs, nil)
 	if err == nil {
-		t.Error("expected error for closed channel")
+		t.Error("expected error for abandoned request")
 	}
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("expected ErrClosed, got %v", err)
+	if !errors.Is(err, ErrInvalidOperation) {
+		t.Errorf("expected ErrInvalidOperation, got %v", err)
 	}
 }
 
@@ -2537,10 +2602,12 @@ func TestWriteHealthMetrics_NonNilWriter(t *testing.T) {
 func TestNodeHost_NewNodeHostWithOptions_Success(t *testing.T) {
 	dir := t.TempDir()
 	nhConfig := dbConfig.NodeHostConfig{
-		DeploymentID:   1,
-		WALDir:         filepath.Join(dir, "wal"),
-		NodeHostDir:    filepath.Join(dir, "data"),
-		RaftAddress:    "localhost:0",
+		DeploymentID: 1,
+		WALDir:       filepath.Join(dir, "wal"),
+		NodeHostDir:  filepath.Join(dir, "data"),
+		// A real port: dragonboat's address validator rejects port 0,
+		// and initial-member targets are validated at Start*Replica.
+		RaftAddress:    "localhost:63001",
 		ListenAddress:  "localhost:0",
 		RTTMillisecond: 1,
 	}
@@ -2669,19 +2736,18 @@ func TestNodeHost_RequestDeleteReplica_Success(t *testing.T) {
 	replicaID := uint64(1)
 	startTestShard(t, nh, shardID, replicaID)
 
-	// Use async RequestDeleteReplica with configChangeIndex=0
-	// on the sole replica. The request should be accepted (returns
-	// a RequestState) even if the operation ultimately fails because
-	// the node removes itself and loses quorum.
+	// Deleting the sole full replica is invalid: the Host membership API
+	// pre-validates config changes and rejects it synchronously with
+	// ErrRemoveLastFullReplica instead of returning a RequestState that
+	// would hang until deadline (a documented divergence from upstream
+	// dragonboat; see the RequestDeleteReplica doc comment).
 	rs, err := nh.RequestDeleteReplica(shardID, replicaID, 0, 5*time.Second)
-	if err != nil {
-		t.Fatalf("RequestDeleteReplica: %v", err)
+	if err == nil {
+		rs.Release()
+		t.Fatal("expected synchronous rejection when deleting the last full replica")
 	}
-	defer rs.Release()
-
-	// Verify we got a valid RequestState with a result channel.
-	if rs.ResultC() == nil {
-		t.Fatal("ResultC should not be nil")
+	if !errors.Is(err, quicraft.ErrRemoveLastFullReplica) {
+		t.Fatalf("expected ErrRemoveLastFullReplica, got %v", err)
 	}
 }
 
@@ -2991,7 +3057,36 @@ func TestNodeHost_QueryRaftLog_EntryTypeField(t *testing.T) {
 // ReadLocalNode linearizability: blocks until resolved
 // ---------------------------------------------------------------------------
 
-func TestReadLocalNode_BlocksUntilResolved(t *testing.T) {
+func TestReadLocalNode_UnresolvedFailsFast(t *testing.T) {
+	nh := newTestNodeHost(t)
+	shardID := uint64(1)
+	replicaID := uint64(1)
+	startTestShard(t, nh, shardID, replicaID)
+
+	// ReadLocalNode must never block waiting for the ReadIndex: per the
+	// dragonboat contract the caller drains ResultC first, so a second
+	// receive inside ReadLocalNode would deadlock the canonical caller
+	// pattern. An unresolved RequestState is rejected immediately.
+	ch := make(chan RequestResult, 1)
+	rs := &RequestState{CompletedC: ch, shardID: shardID}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := nh.ReadLocalNode(rs, nil)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidOperation) {
+			t.Fatalf("expected ErrInvalidOperation for unresolved ReadIndex, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadLocalNode blocked on an unresolved RequestState")
+	}
+}
+
+func TestReadLocalNode_AfterCompletionServesQuery(t *testing.T) {
 	nh := newTestNodeHost(t)
 	shardID := uint64(1)
 	replicaID := uint64(1)
@@ -3002,44 +3097,25 @@ func TestReadLocalNode_BlocksUntilResolved(t *testing.T) {
 
 	// Write data so the state machine has something to return.
 	session := nh.GetNoOPSession(shardID)
-	payload := []byte("blocks-until-resolved")
-	_, err := nh.SyncPropose(ctx, session, payload)
-	if err != nil {
+	payload := []byte("read-after-completion")
+	if _, err := nh.SyncPropose(ctx, session, payload); err != nil {
 		t.Fatalf("SyncPropose: %v", err)
 	}
 
-	// Create a delayed-resolution channel to prove ReadLocalNode blocks.
-	// When resolved is nil, ResultC() returns CompletedC directly.
-	ch := make(chan RequestResult, 1)
-	rs := &RequestState{CompletedC: ch, shardID: shardID}
-
-	done := make(chan struct{})
-	var result interface{}
-	var readErr error
-	go func() {
-		defer close(done)
-		result, readErr = nh.ReadLocalNode(rs, nil)
-	}()
-
-	// Verify ReadLocalNode has not returned yet (it should be blocking).
-	select {
-	case <-done:
-		t.Fatal("ReadLocalNode returned before ResultC was resolved")
-	case <-time.After(50 * time.Millisecond):
-		// Expected: still blocking.
+	// Canonical dragonboat caller pattern: ReadIndex, drain ResultC,
+	// observe completion, then ReadLocalNode. This must not deadlock and
+	// must serve the linearizable query.
+	rs, err := nh.ReadIndex(shardID, 5*time.Second)
+	if err != nil {
+		t.Fatalf("ReadIndex: %v", err)
+	}
+	defer rs.Release()
+	s := <-rs.ResultC()
+	if !s.Completed() {
+		t.Fatalf("ReadIndex did not complete: code=%v", s.code)
 	}
 
-	// Now resolve the ReadIndex.
-	ch <- RequestResult{code: RequestCompleted}
-
-	// Wait for ReadLocalNode to complete.
-	select {
-	case <-done:
-		// Expected.
-	case <-time.After(5 * time.Second):
-		t.Fatal("ReadLocalNode did not return after ResultC was resolved")
-	}
-
+	result, readErr := nh.ReadLocalNode(rs, nil)
 	if readErr != nil {
 		t.Fatalf("ReadLocalNode returned error: %v", readErr)
 	}
@@ -3070,8 +3146,8 @@ func TestReadLocalNode_ReturnsErrorOnFailedReadIndex(t *testing.T) {
 		{
 			name:        "Terminated",
 			code:        RequestTerminated,
-			expectedErr: ErrClosed,
-			description: "terminated ReadIndex must propagate ErrClosed",
+			expectedErr: ErrShardClosed,
+			description: "terminated ReadIndex must propagate ErrShardClosed",
 		},
 		{
 			name:        "Rejected",
@@ -3082,8 +3158,8 @@ func TestReadLocalNode_ReturnsErrorOnFailedReadIndex(t *testing.T) {
 		{
 			name:        "Dropped",
 			code:        RequestDropped,
-			expectedErr: ErrSystemBusy,
-			description: "dropped ReadIndex must propagate ErrSystemBusy",
+			expectedErr: ErrShardNotReady,
+			description: "dropped ReadIndex must propagate ErrShardNotReady",
 		},
 		{
 			name:        "Aborted",
@@ -3095,9 +3171,7 @@ func TestReadLocalNode_ReturnsErrorOnFailedReadIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ch := make(chan RequestResult, 1)
-			ch <- RequestResult{code: tt.code}
-			rs := &RequestState{CompletedC: ch}
+			rs := newResolvedRequestState(RequestResult{code: tt.code})
 
 			_, err := nh.ReadLocalNode(rs, nil)
 			if err == nil {
@@ -3117,9 +3191,10 @@ func TestReadLocalNode_ReturnsErrorOnFailedReadIndex(t *testing.T) {
 func TestNodeHost_QueryTimeout_Default(t *testing.T) {
 	nh := newTestNodeHost(t)
 
-	expected := 5 * time.Second
-	if nh.QueryTimeout() != expected {
-		t.Errorf("expected default queryTimeout %v, got %v", expected, nh.QueryTimeout())
+	// Dragonboat's ReadLocalNode calls sm.Lookup with no deadline, so the
+	// adapter must impose none by default.
+	if nh.QueryTimeout() != 0 {
+		t.Errorf("expected default queryTimeout 0 (no deadline), got %v", nh.QueryTimeout())
 	}
 }
 
@@ -3133,16 +3208,17 @@ func TestNodeHost_SetQueryTimeout(t *testing.T) {
 		t.Errorf("expected queryTimeout %v after SetQueryTimeout, got %v", custom, nh.QueryTimeout())
 	}
 
-	// Verify zero is ignored (keeps previous value).
+	// Zero restores the dragonboat default of no deadline.
 	nh.SetQueryTimeout(0)
-	if nh.QueryTimeout() != custom {
-		t.Errorf("expected queryTimeout %v after SetQueryTimeout(0), got %v", custom, nh.QueryTimeout())
+	if nh.QueryTimeout() != 0 {
+		t.Errorf("expected queryTimeout 0 after SetQueryTimeout(0), got %v", nh.QueryTimeout())
 	}
 
-	// Verify negative is ignored (keeps previous value).
+	// Negative is clamped to the same no-deadline default.
+	nh.SetQueryTimeout(custom)
 	nh.SetQueryTimeout(-1 * time.Second)
-	if nh.QueryTimeout() != custom {
-		t.Errorf("expected queryTimeout %v after SetQueryTimeout(-1s), got %v", custom, nh.QueryTimeout())
+	if nh.QueryTimeout() != 0 {
+		t.Errorf("expected queryTimeout 0 after SetQueryTimeout(-1s), got %v", nh.QueryTimeout())
 	}
 
 	// Verify a smaller positive value is accepted.
@@ -3155,6 +3231,9 @@ func TestNodeHost_SetQueryTimeout(t *testing.T) {
 
 func TestNodeHost_QueryTimeout_ConcurrentAccess(t *testing.T) {
 	nh := newTestNodeHost(t)
+	// The default is 0 (no deadline); seed a positive value so readers can
+	// assert that they never observe a torn write.
+	nh.SetQueryTimeout(time.Millisecond)
 
 	const goroutines = 100
 	const iterations = 1000

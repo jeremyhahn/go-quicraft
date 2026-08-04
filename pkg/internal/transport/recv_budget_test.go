@@ -15,9 +15,14 @@
 package transport
 
 import (
+	"bytes"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // TestMsgRecvBudget_ReserveReleaseBounds is the H2 regression test for the
@@ -98,5 +103,103 @@ func TestMsgRecvBudget_ConcurrentNeverOverCommits(t *testing.T) {
 	done.Wait()
 	if got := tr.msgRecvBudget.Load(); got != slots*each {
 		t.Fatalf("budget after all releases = %d, want %d (leak)", got, slots*each)
+	}
+}
+
+// TestMsgRecvBudget_CompressedDeltaCharged is the H9 regression test for the
+// compressed receive path: the aggregate budget must be charged with the
+// DECLARED DECOMPRESSED length, not just the compressed frame length. Snappy
+// achieves >1000:1 ratios, so charging only the compressed length would let a
+// peer pin MaxDecompressedSize per in-flight frame while the budget barely
+// moves. A frame whose declared decompressed size exceeds the remaining budget
+// must be rejected, and the budget must return to its baseline afterward.
+func TestMsgRecvBudget_CompressedDeltaCharged(t *testing.T) {
+	const budget = 4096
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	cfg := Config{
+		ListenAddress:           ":0",
+		DeploymentID:            42,
+		MaxMessageReceiveMemory: budget,
+		MTLSConfig:              testMTLSConfig(t),
+	}
+	tr, err := NewQUICTransport(cfg, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	// 64KB of zeros compresses to a few dozen bytes: the compressed frame
+	// length fits comfortably within the budget while the declared
+	// decompressed size exceeds the whole budget many times over.
+	raw := make([]byte, 64*1024)
+	compressed := snappyEncode(nil, raw)
+	if int64(len(compressed)) >= budget {
+		t.Fatalf("test setup: compressed length %d must be below budget %d", len(compressed), budget)
+	}
+
+	err = tr.handleMessageFrame(nil, bytes.NewReader(compressed), uint32(len(compressed)), FlagCompressed)
+	if !errors.Is(err, ErrMessageRecvMemoryBudgetExceeded) {
+		t.Fatalf("expected ErrMessageRecvMemoryBudgetExceeded for oversized declared length, got %v", err)
+	}
+	if got := tr.msgRecvBudget.Load(); got != budget {
+		t.Fatalf("budget after rejected compressed frame = %d, want %d (reserve/release imbalance)", got, budget)
+	}
+}
+
+// TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess verifies the success path
+// of the H9 fix: a compressed frame whose declared decompressed size fits the
+// budget is processed normally, and both the compressed-length reservation and
+// the decompression delta are released afterward, restoring the baseline.
+func TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess(t *testing.T) {
+	const budget = 64 * 1024
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	cfg := Config{
+		ListenAddress:           ":0",
+		DeploymentID:            42,
+		MaxMessageReceiveMemory: budget,
+		MTLSConfig:              testMTLSConfig(t),
+	}
+	tr, err := NewQUICTransport(cfg, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	// A batch with a highly compressible 8KB command: declared decompressed
+	// length exceeds the compressed length (positive delta) but fits the
+	// budget, so the frame must be accepted.
+	mb := proto.MessageBatch{
+		BinVer:       proto.WireVersion,
+		DeploymentID: 42,
+		Requests: []proto.Message{
+			{
+				Type:    proto.Replicate,
+				ShardID: 1,
+				From:    2,
+				To:      1,
+				Term:    5,
+				Entries: []proto.Entry{{Index: 1, Term: 5, Cmd: make([]byte, 8*1024)}},
+			},
+		},
+	}
+	rawBuf := make([]byte, mb.Size())
+	n, err := mb.MarshalTo(rawBuf)
+	if err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+	compressed := snappyEncode(nil, rawBuf[:n])
+	if len(compressed) >= n {
+		t.Fatalf("test setup: compressed length %d must be below declared length %d", len(compressed), n)
+	}
+
+	err = tr.handleMessageFrame(nil, bytes.NewReader(compressed), uint32(len(compressed)), FlagCompressed)
+	if err != nil {
+		t.Fatalf("expected in-budget compressed frame to succeed, got %v", err)
+	}
+	if got := handler.batchCount.Load(); got != 1 {
+		t.Fatalf("handler received %d batches, want 1", got)
+	}
+	if got := tr.msgRecvBudget.Load(); got != budget {
+		t.Fatalf("budget after successful compressed frame = %d, want %d (reserve/release imbalance)", got, budget)
 	}
 }

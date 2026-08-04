@@ -243,9 +243,13 @@ integration-test-e2e:
 
 # Internal targets: executed inside the devcontainer. Not intended for host use.
 
+# -p 1 serializes package execution: each integration package spins up
+# multi-node QUIC clusters with -race, and running all four concurrently
+# in the container starves CPU enough that snapshot catch-up tests
+# (30s waits) flake. Every package is stable standalone.
 .PHONY: _integration-test
 _integration-test:
-	$(GOTEST) -tags=integration -timeout=300s $(INT_TEST_DIR)/...
+	$(GOTEST) -tags=integration -timeout=300s -p 1 $(INT_TEST_DIR)/...
 
 .PHONY: _integration-test-raft
 _integration-test-raft:

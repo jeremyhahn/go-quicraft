@@ -16,6 +16,7 @@ package transport
 
 import (
 	"encoding/binary"
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"io"
 )
 
@@ -53,7 +54,31 @@ const (
 	// maxPoolBufSize is the maximum buffer size returned to sync.Pool.
 	// Buffers larger than this are left for GC to prevent pool pollution.
 	maxPoolBufSize = 256 * 1024
+
+	// batchFramingReserve is headroom reserved inside a frame for the
+	// MessageBatch header (BinVer, DeploymentID, SourceEpoch, SourceAddress,
+	// request count) and the per-message framing that sits on top of the raw
+	// entry payload bytes a replication batch is sized against.
+	batchFramingReserve = 64 * 1024
 )
+
+// MaxReplicationPayloadBytes is the largest raw entry payload a single
+// replication batch may carry and still fit in one transport frame.
+//
+// MarshalFrame rejects anything above MaxFrameSize with ErrPayloadTooLarge,
+// and a rejected batch is DROPPED: raft does not advance the follower's next
+// index, so it rebuilds the identical oversized batch on every replicate
+// cycle and the follower can never catch up (no backoff, no batch-size
+// reduction, and no snapshot fallback because the entries are still present).
+// Configuration that sizes replication batches — raft's maxReplicationPayload,
+// i.e. Config.MaxApplyEntrySize — MUST be clamped to this bound.
+const MaxReplicationPayloadBytes = int(MaxFrameSize) - FrameHeaderSize - batchFramingReserve
+
+// config.MaxReplicationPayloadBytes duplicates this value because this package
+// imports pkg/config (so config cannot import back). This assertion fails the
+// build if the two ever drift: config uses it to reject a MaxApplyEntrySize
+// that would make raft build replication batches this transport cannot frame.
+const _ = uint64(MaxReplicationPayloadBytes) - config.MaxReplicationPayloadBytes
 
 // FrameFlags is a bitfield encoding frame-level options in a single byte.
 type FrameFlags byte

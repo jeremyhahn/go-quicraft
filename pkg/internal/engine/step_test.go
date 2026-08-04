@@ -1010,13 +1010,26 @@ func TestStepWorker_FlushReadIndex_UnconditionalCall(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	// Drain initial election update.
+	// Drain initial election update. Persisting the term-opening no-op
+	// via Peer.Commit fires the persistence-edge commit re-evaluation,
+	// which commits it on this single-node shard — so one follow-up
+	// update (the committed no-op) is expected and must be drained too.
 	ws.Notify(1)
 	sw.processReady()
 	select {
 	case item := <-commitC:
 		if err := peer.Commit(item.update); err != nil {
 			t.Fatalf("initial commit failed: %v", err)
+		}
+		node.commitPending.Store(false)
+	default:
+	}
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case item := <-commitC:
+		if err := peer.Commit(item.update); err != nil {
+			t.Fatalf("no-op commit failed: %v", err)
 		}
 		node.commitPending.Store(false)
 	default:
@@ -2977,8 +2990,10 @@ func TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered(t *testing.T) 
 
 // TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll verifies
 // that when the inbox contains ONLY InstallSnapshot messages during
-// commitPending, all are deferred and processCommitPendingInbox returns
-// early without acquiring raftMu.
+// commitPending, they are deferred and processCommitPendingInbox returns
+// early without acquiring raftMu. Only the highest-index snapshot is kept:
+// older ones are strictly superseded, and retaining every leader
+// retransmission would grow the buffer without bound.
 func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -3016,14 +3031,18 @@ func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T
 	ws.Notify(1)
 	sw.processReady()
 
-	// Both InstallSnapshot messages should be buffered in deferredSnapshots.
+	// Both InstallSnapshot messages leave the inbox; the buffer retains only
+	// the highest-index one.
 	remaining := node.DrainInbox(nil)
 	if len(remaining) != 0 {
 		t.Fatalf("expected 0 messages in inbox (InstallSnapshot buffered), got %d", len(remaining))
 	}
 	deferred := sw.deferredSnapshots[1]
-	if len(deferred) != 2 {
-		t.Fatalf("expected 2 deferred snapshots, got %d", len(deferred))
+	if len(deferred) != 1 {
+		t.Fatalf("expected 1 deferred snapshot (superseded), got %d", len(deferred))
+	}
+	if deferred[0].Snapshot.Index != 75 {
+		t.Fatalf("deferred snapshot index = %d, want 75 (highest)", deferred[0].Snapshot.Index)
 	}
 	for _, msg := range deferred {
 		if msg.Type != proto.InstallSnapshot {
@@ -4199,6 +4218,19 @@ func TestExecutePiggyback_WithFreeOrderMessages(t *testing.T) {
 	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 	node.commitPending.Store(true)
 
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. tryCommit counts the leader's own match at its durable
+	// index, so the single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
+
 	piggyback := proto.Update{
 		ShardID:   1,
 		ReplicaID: 1,
@@ -4478,5 +4510,48 @@ func TestStepWorker_CommitPendingInbox_DeferredSnapshotReinjected(t *testing.T) 
 	deferred := sw.deferredSnapshots[1]
 	if len(deferred) != 0 {
 		t.Fatalf("deferred snapshots should be empty after re-injection, got %d", len(deferred))
+	}
+}
+
+// TestCommitMemoryMode_CommitError_FailsShard verifies that the memory-mode
+// inline commit path treats a Peer.Commit error as terminal: Commit has
+// already advanced the processed marker, so the committed entries can never
+// be re-offered and the shard must go offline rather than keep serving a
+// state machine that is missing them.
+func TestCommitMemoryMode_CommitError_FailsShard(t *testing.T) {
+	sender := newSequenceSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 16)
+	applyC := make(chan *applyItem, 16)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+	sw.memoryMode = true
+	sw.applyC = applyC
+	sw.applyPool = applyPool
+
+	peer, lr, update := newCommitFailurePeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	if stopped := sw.commitMemoryMode(node, update); stopped {
+		t.Fatal("commitMemoryMode should not report stopped")
+	}
+
+	if !node.IsFailed() {
+		t.Fatal("node must be marked failed after a Peer.Commit error")
+	}
+	if node.commitPending.Load() {
+		t.Fatal("commitPending must be cleared after a Peer.Commit error")
+	}
+	if len(applyC) != 0 {
+		t.Fatalf("no apply item may be forwarded after a Commit error, got %d", len(applyC))
+	}
+	if cb.proposalFailedCount.Load() != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
 	}
 }

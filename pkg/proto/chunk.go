@@ -65,7 +65,10 @@ type SnapshotChunk struct {
 	// saved. Zero indicates no encryption (plaintext snapshot). The
 	// receiver uses this to decrypt barrier-encrypted snapshot data.
 	Epoch uint64
-	// Data is the chunk payload.
+	// Data is the chunk payload. After UnmarshalFrom, Data aliases the
+	// source buffer (zero-copy), like Entry.Cmd. The caller must copy if
+	// the data needs to outlive the buffer — on the receive path the
+	// buffer is pooled and is returned before the handler runs.
 	Data []byte
 }
 
@@ -153,7 +156,7 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	sc.ChunkSize = getUint64(buf[56:])
 	sc.FileSize = getUint64(buf[64:])
 	offset := 72
-	fp, n, err := getString(buf[offset:], MaxFilepathLen)
+	fp, n, err := getString(buf[offset:], MaxFilepathLen, ErrFilepathTooLong)
 	if err != nil {
 		return 0, err
 	}
@@ -190,10 +193,19 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	sc.DeploymentID = getUint64(buf[offset:])
 	offset += 8
 	sc.BinVer = getUint64(buf[offset:])
+	// Exact-equality gate, mirroring MessageBatch.UnmarshalFrom. A chunk
+	// from any other binary — newer or older — encodes the embedded
+	// Membership differently, so it is rejected outright instead of being
+	// misparsed. BinVer is a required field: senders stamp WireVersion,
+	// and an unstamped chunk (BinVer 0) is indistinguishable from a v1
+	// sender's chunk.
+	if sc.BinVer != WireVersion {
+		return 0, ErrUnsupportedVersion
+	}
 	offset += 8
 	sc.Epoch = getUint64(buf[offset:])
 	offset += 8
-	data, n, err := getBytes(buf[offset:], MaxSnapshotChunkDataLen)
+	data, n, err := getBytes(buf[offset:], MaxSnapshotChunkDataLen, ErrChunkDataTooLong)
 	if err != nil {
 		return 0, err
 	}

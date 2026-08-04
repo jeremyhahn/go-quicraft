@@ -17,9 +17,7 @@ package transport
 import (
 	"context"
 	"crypto/rand"
-	"crypto/x509"
 	"encoding/binary"
-	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net"
@@ -220,19 +218,48 @@ type QUICTransport struct {
 	// and reused. Entries are removed when the inbound connection's handler
 	// returns (handleConnection). Keyed by *quic.Conn, value *srcAddrAuthEntry.
 	srcAddrAuth sync.Map
+
+	// connMsgBudget holds the per-inbound-connection message-receive
+	// reservation, keyed by *quic.Conn with value *atomic.Int64. The global
+	// msgRecvBudget alone lets one peer occupy the entire budget and force
+	// every other peer's frames into the exhaustion path; this sub-budget caps
+	// any single connection at maxConnMsgRecv. Entries are removed with the
+	// auth cache when the connection's handler returns.
+	connMsgBudget sync.Map
+
+	// maxConnMsgRecv is the per-inbound-connection ceiling on in-flight
+	// message-frame memory, derived from MaxMessageReceiveMemory.
+	maxConnMsgRecv int64
 }
 
-// srcAddrAuthEntry caches the SourceAddress authorization decision for a single
-// inbound connection. addr is the last claimed SourceAddress that was verified
-// against the connection's peer certificate; authorized records whether that
-// address is covered by the certificate. A connection advertises a stable
-// address, so a single-entry cache suffices for the common case while still
-// re-verifying if the claimed address ever changes.
-type srcAddrAuthEntry struct {
-	mu         sync.Mutex
+// srcAddrAuthSlots is the number of distinct claimed SourceAddresses cached
+// per inbound connection. A legitimate peer advertises exactly one, but a
+// single slot is defeated by a peer alternating two claimed addresses, which
+// forces a full ConnectionState()+VerifyHostname on every batch while holding
+// the entry mutex and so serializes that connection's receive path.
+const srcAddrAuthSlots = 4
+
+// srcAddrAuthMaxDistinct bounds how many distinct claimed SourceAddresses one
+// connection may have verified against its certificate. Past this bound the
+// negative result is assumed without re-verifying: a peer cycling addresses is
+// abusive, and failing closed only clears the (unauthenticated) SourceAddress.
+const srcAddrAuthMaxDistinct = 16
+
+// srcAddrAuthSlot is one cached (claimed address, decision) pair.
+type srcAddrAuthSlot struct {
 	addr       string
 	authorized bool
 	valid      bool
+}
+
+// srcAddrAuthEntry caches SourceAddress authorization decisions for a single
+// inbound connection. Slots are filled round-robin and scanned linearly;
+// distinct counts how many addresses have been verified for this connection.
+type srcAddrAuthEntry struct {
+	mu       sync.Mutex
+	slots    [srcAddrAuthSlots]srcAddrAuthSlot
+	next     int
+	distinct int
 }
 
 // newBootEpoch returns a per-process boot epoch used to detect peer restarts
@@ -270,25 +297,25 @@ func NewQUICTransport(
 
 	// Create the revocation checker when configured. The checker is
 	// passed to buildMTLSTLS to wire VerifyPeerCertificate on both
-	// server and client TLS configs. The issuer certificate is extracted
-	// from the CA PEM for OCSP request construction. Parse errors are
-	// fatal: a nil issuer would silently disable OCSP checks at runtime.
+	// server and client TLS configs. The WHOLE CA bundle is parsed and
+	// handed to the checker, which selects the actual issuer per leaf and
+	// per CRL: TLS verifies against every block in the bundle
+	// (AppendCertsFromPEM), so wiring revocation to only the first block
+	// would build OCSP requests naming the wrong issuer and reject every
+	// intermediate-signed CRL. Parse errors are fatal: a missing issuer
+	// would silently disable OCSP checks at runtime.
 	var checker *revocation.Checker
 	if cfg.RevocationConfig != nil {
-		block, _ := pem.Decode(cfg.MTLSConfig.CACert)
-		if block == nil {
-			return nil, &CACertificateParseError{
-				Reason: "PEM decode returned nil block",
-			}
+		revCfg := *cfg.RevocationConfig
+		revCfg.SetDefaults()
+		if err := revCfg.Validate(); err != nil {
+			return nil, err
 		}
-		issuerCert, parseErr := x509.ParseCertificate(block.Bytes)
+		issuers, parseErr := parseCACertificates(cfg.MTLSConfig.CACert)
 		if parseErr != nil {
-			return nil, &CACertificateParseError{
-				Reason: "x509.ParseCertificate failed",
-				Err:    parseErr,
-			}
+			return nil, parseErr
 		}
-		checker = revocation.NewChecker(*cfg.RevocationConfig, issuerCert)
+		checker = revocation.NewChecker(revCfg, issuers...)
 	}
 
 	pair, err := buildMTLSTLS(cfg.MTLSConfig, checker)
@@ -365,6 +392,15 @@ func NewQUICTransport(
 				return &buf
 			},
 		},
+		// Without a New function the encode pool could never bootstrap:
+		// Put was gated on a successful Get, so every compressed send
+		// heap-allocated its destination buffer on the hot path.
+		snappyEncPool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, 0, maxPoolBufSize)
+				return &buf
+			},
+		},
 	}
 
 	for i := range t.streamShards {
@@ -380,6 +416,13 @@ func NewQUICTransport(
 	)
 	t.snapshotRecv.SetSnapshotTracker(&t.snapshotTracker)
 	t.msgRecvBudget.Store(cfg.MaxMessageReceiveMemory)
+	// Cap any single connection at a quarter of the aggregate budget, but
+	// never below one maximum-size frame plus its decompression delta, so a
+	// legitimate peer's largest legal frame always fits.
+	t.maxConnMsgRecv = cfg.MaxMessageReceiveMemory / 4
+	if minPerConn := int64(cfg.MaxDecompressedSize) + int64(MaxFrameSize); t.maxConnMsgRecv < minPerConn {
+		t.maxConnMsgRecv = minPerConn
+	}
 
 	t.eventListener = cfg.EventListener
 	t.metrics = cfg.Metrics
@@ -590,9 +633,10 @@ func (t *QUICTransport) Addr() net.Addr {
 // stream write with 5s deadline), preventing heartbeat starvation and
 // cascading multi-node stalls.
 //
-// Each message is deep-copied (including entries and their Cmd payloads)
-// before enqueueing into the per-target channel. The caller may reuse or
-// modify the msgs slice and its contents after Send returns.
+// Each message is deep-copied (entries and their Cmd payloads, and the
+// snapshot metadata's membership maps and checksum) before enqueueing into
+// the per-target channel. The caller may reuse or modify the msgs slice and
+// its contents after Send returns.
 func (t *QUICTransport) Send(msgs []proto.Message) {
 	if t.stopped.Load() {
 		return
@@ -600,6 +644,12 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 	if len(msgs) == 0 {
 		return
 	}
+
+	// Hoisted once per Send: the drop sites below fire on every message to an
+	// unresolved target during membership churn, and the variadic slog form
+	// builds and boxes its []any at the call site regardless of whether Debug
+	// is enabled.
+	debugOn := debugEnabled()
 
 	for i := range msgs {
 		msg := msgs[i] // copy the message value (shallow)
@@ -620,14 +670,76 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 			}
 			msg.Entries = entries
 		}
+		// Snapshot is copied by VALUE with the message, but proto.Snapshot
+		// embeds Membership's four maps and a Checksum slice, all still
+		// aliasing the caller's structures. Membership.MarshalTo ranges over
+		// those maps on the async send path, so an in-place mutation by the
+		// caller would be an unrecoverable "concurrent map iteration and map
+		// write" fatal error that the worker's recover cannot catch. Deep-copy
+		// them so the documented reuse contract actually holds.
+		if !msg.Snapshot.IsEmpty() {
+			copySnapshotRefs(&msg.Snapshot)
+		}
 		addr, err := t.reg.Resolve(msg.ShardID, msg.To)
 		if err != nil {
+			// Debug level: unresolved targets recur for every message to a
+			// removed/not-yet-registered replica, so this can be high-frequency.
+			if debugOn {
+				slog.Debug("transport: dropping message: target address unresolved",
+					"shard", msg.ShardID,
+					"to", msg.To,
+					"msg_type", proto.MessageTypeName(msg.Type),
+					"error", err,
+				)
+			}
 			continue
 		}
-		if !t.enqueueToTarget(addr, msg) {
+		if !t.enqueueToTarget(addr, msg, debugOn) {
 			return // transport stopped
 		}
 	}
+}
+
+// debugEnabled reports whether the default logger would emit a Debug record.
+// The variadic slog.Debug form builds its []any and boxes every value at the
+// call site before the handler's Enabled check runs, so high-frequency drop
+// paths must gate on this instead of calling slog.Debug unconditionally.
+func debugEnabled() bool {
+	return slog.Default().Enabled(context.Background(), slog.LevelDebug)
+}
+
+// copySnapshotRefs replaces every reference-typed field reachable from a
+// snapshot's metadata with an owned copy, so the transport's asynchronous
+// marshal never races a caller mutating the original.
+func copySnapshotRefs(s *proto.Snapshot) {
+	if len(s.Checksum) > 0 {
+		checksum := make([]byte, len(s.Checksum))
+		copy(checksum, s.Checksum)
+		s.Checksum = checksum
+	}
+	s.Membership.Addresses = copyAddrMap(s.Membership.Addresses)
+	s.Membership.Observers = copyAddrMap(s.Membership.Observers)
+	s.Membership.Witnesses = copyAddrMap(s.Membership.Witnesses)
+	if s.Membership.Removed != nil {
+		removed := make(map[uint64]bool, len(s.Membership.Removed))
+		for k, v := range s.Membership.Removed {
+			removed[k] = v
+		}
+		s.Membership.Removed = removed
+	}
+}
+
+// copyAddrMap returns an owned copy of a replica-ID-to-address map, or nil
+// when the source is nil (preserving the distinction the wire format keeps).
+func copyAddrMap(src map[uint64]string) map[uint64]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[uint64]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // enqueueToTarget resolves the per-target send queue and enqueues msg on the
@@ -641,7 +753,7 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 // The retry is bounded to a single attempt because the freshly created queue
 // returned by getOrCreateSendQueue cannot have been pruned yet (its worker has
 // not run its idle timer), so a second orphaning is impossible.
-func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message) bool {
+func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn bool) bool {
 	for attempt := 0; attempt < 2; attempt++ {
 		sq := t.getOrCreateSendQueue(addr)
 		if sq == nil {
@@ -654,6 +766,15 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message) bool {
 			select {
 			case sq.hbCh <- msg:
 			default:
+				// Debug level: heartbeat backpressure can be high-frequency
+				// under load; Raft retransmits on the next tick.
+				if debugOn {
+					slog.Debug("heartbeat queue backpressure",
+						"target", addr,
+						"shard", msg.ShardID,
+						"msg_type", proto.MessageTypeName(msg.Type),
+					)
+				}
 				return true // queue full; Raft retransmits
 			}
 		} else {
@@ -664,12 +785,14 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message) bool {
 			case sq.ch <- msg:
 			default:
 				// Log backpressure event when send queue is full.
-				slog.Debug("send queue backpressure",
-					"target", addr,
-					"shard", msg.ShardID,
-					"msg_type", proto.MessageTypeName(msg.Type),
-					"queue_cap", defaultSendQueueLen,
-				)
+				if debugOn {
+					slog.Debug("send queue backpressure",
+						"target", addr,
+						"shard", msg.ShardID,
+						"msg_type", proto.MessageTypeName(msg.Type),
+						"queue_cap", defaultSendQueueLen,
+					)
+				}
 				return true
 			}
 		}
@@ -906,8 +1029,9 @@ func (t *QUICTransport) sendToTarget(target string, batch []proto.Message) {
 // sendBatch marshals a message batch and writes it as a framed payload to
 // the appropriate stream for the target. Errors are logged and dropped.
 func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolint:gocognit // metrics instrumentation adds branches
+	debugOn := debugEnabled()
 	var sendStart time.Time
-	if t.metrics != nil || slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+	if t.metrics != nil || debugOn {
 		sendStart = time.Now()
 	}
 	mb := proto.MessageBatch{
@@ -925,6 +1049,13 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	payloadBuf := buf[FrameHeaderSize:]
 	n, err := mb.MarshalTo(payloadBuf)
 	if err != nil {
+		// A marshal failure indicates an internal sizing bug; surface it
+		// loudly rather than dropping the batch silently.
+		slog.Error("transport: dropping batch that failed to marshal",
+			"target", target,
+			"batch_size", len(msgs),
+			"error", err,
+		)
 		t.putBuf(bufPtr)
 		return
 	}
@@ -949,17 +1080,13 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	var snappyBufPtr *[]byte // original pool pointer; returned in Put to avoid local-variable aliasing
 	if !isHeartbeat && !t.cfg.DisableCompression {
 		maxEnc := snappy.MaxEncodedLen(len(payload))
-		if v := t.snappyEncPool.Get(); v != nil {
-			snappyBufPtr = v.(*[]byte)
-			if cap(*snappyBufPtr) >= maxEnc {
-				snappyBuf = (*snappyBufPtr)[:cap(*snappyBufPtr)]
-			} else {
-				snappyBuf = make([]byte, maxEnc)
-				snappyBufPtr = nil // capacity too small; discard the pooled pointer
-			}
-		} else {
-			snappyBuf = make([]byte, maxEnc)
+		snappyBufPtr = t.snappyEncPool.Get().(*[]byte)
+		if cap(*snappyBufPtr) < maxEnc {
+			// Grow through the pooled pointer so the buffer is still returned
+			// (subject to the maxPoolBufSize cap) instead of being discarded.
+			*snappyBufPtr = make([]byte, 0, maxEnc)
 		}
+		snappyBuf = (*snappyBufPtr)[:cap(*snappyBufPtr)]
 		compressed := snappy.Encode(snappyBuf, payload)
 		if len(compressed) < len(payload) {
 			payload = compressed
@@ -967,10 +1094,15 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 		}
 	}
 
-	// Ensure the buffer is large enough for the compressed frame.
+	// Ensure the buffer is large enough for the compressed frame. The pooled
+	// buffer must NOT be returned before MarshalFrame runs: payload may alias
+	// it (uncompressed sends marshal straight into it), so pooling it first
+	// would let a concurrent Get hand that backing array to another sender
+	// while it is still being copied from.
 	totalSize := FrameHeaderSize + len(payload)
-	if cap(buf) < totalSize {
-		t.putBuf(bufPtr)
+	grewBuf := cap(buf) < totalSize
+	oldBufPtr := bufPtr
+	if grewBuf {
 		newBuf := make([]byte, totalSize)
 		bufPtr = &newBuf
 		buf = newBuf
@@ -979,6 +1111,9 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	}
 
 	_, err = MarshalFrame(buf, payload, flags)
+	if grewBuf {
+		t.putBuf(oldBufPtr)
+	}
 
 	// Return the Snappy encode buffer now that the payload has been
 	// copied into the frame buffer. The compressed slice aliases
@@ -990,23 +1125,31 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	// only be heap-allocated due to the Pool.Put interface{} box.
 	if snappyBufPtr != nil {
 		*snappyBufPtr = snappyBuf[:0] // reset length but keep capacity
-		t.snappyEncPool.Put(snappyBufPtr)
+		// Apply the standard pool cap: an encode buffer sized for a large
+		// payload must not be retained per P as unaccounted memory.
+		if cap(*snappyBufPtr) <= maxPoolBufSize {
+			t.snappyEncPool.Put(snappyBufPtr)
+		}
 		snappyBufPtr = nil //nolint:ineffassign,wastedassign // defensive nil to prevent use-after-pool-return
 	}
 	snappyBuf = nil //nolint:wastedassign // defensive nil to prevent use-after-pool-return
 
 	if err != nil {
 		// A MarshalFrame failure here is almost always ErrPayloadTooLarge: the
-		// serialized batch exceeds MaxFrameSize (e.g. a Replicate batch bounded
-		// by maxReplicationPayload that is larger than the 16MB frame cap).
-		// Surface it loudly — a silent drop would stall replication to a
-		// lagging follower with no diagnostic. (NOTE: the underlying limit
-		// mismatch — maxReplicationPayload/MaxBatchSize vs MaxFrameSize/
-		// MaxDecompressedSize — should be reconciled in config.)
-		slog.Error("transport: dropping batch that failed to marshal into a frame",
+		// serialized batch exceeds MaxFrameSize because raft sized it against
+		// maxReplicationPayload (Config.MaxApplyEntrySize), which is larger
+		// than the frame cap. The batch is dropped and raft does not advance
+		// the follower's next index, so it rebuilds the SAME oversized batch
+		// every cycle: the follower can never catch up and quorum silently
+		// degrades. This is a configuration defect, not a transient failure —
+		// clamp MaxApplyEntrySize to MaxReplicationPayloadBytes.
+		slog.Error("transport: dropping batch that failed to marshal into a frame; a lagging follower cannot catch up until MaxApplyEntrySize is clamped",
 			"target", target,
+			"shard", shardID,
+			"batch_size", len(msgs),
 			"payload_bytes", len(payload),
 			"max_frame_size", MaxFrameSize,
+			"max_replication_payload_bytes", MaxReplicationPayloadBytes,
 			"error", err,
 		)
 		t.putBuf(bufPtr)
@@ -1017,6 +1160,15 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 
 	stream, err := t.getStream(target, shardID, isHeartbeat)
 	if err != nil {
+		// Debug level: repeats for every batch while a peer is unreachable;
+		// Raft retransmits once the peer returns.
+		if debugOn {
+			slog.Debug("transport: dropping batch: stream unavailable",
+				"target", target,
+				"batch_size", len(msgs),
+				"error", err,
+			)
+		}
 		t.putBuf(bufPtr)
 		return
 	}
@@ -1037,6 +1189,15 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 		// fresh. Without this, other cached streams on the same dead
 		// connection would each hang for the full write deadline before
 		// failing, compounding latency on every message type.
+		// Debug level: a dead peer fails every in-flight batch until eviction
+		// completes; Raft retransmits the dropped messages.
+		if debugOn {
+			slog.Debug("transport: dropping batch: stream write failed",
+				"target", target,
+				"batch_size", len(msgs),
+				"error", err,
+			)
+		}
 		t.removeAndCloseConnection(target, "stream write failure")
 		t.evictStreamsForTarget(target)
 		return
@@ -1170,7 +1331,22 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	// if the receiver is slow or the network stalls. Without this, a
 	// stalled WriteFrame holds the snapshotTracker slot forever, making
 	// Stop() -> ShutdownAndWait() block indefinitely.
+	// Arm the shutdown watcher so a chunk write blocked on a stalled receiver
+	// cannot hold Stop() for the full 30s per-chunk deadline. It is disarmed
+	// explicitly once the last chunk is written (see below) so a concurrent
+	// Stop cannot reset a stream that already carried the whole snapshot; the
+	// defer is the backstop for the error returns inside the loop.
+	releaseWriteWatch := t.cancelSnapshotWriteOnStop(stream)
+	defer releaseWriteWatch()
+
 	for i := range chunks {
+		// Abort between chunks as soon as shutdown begins; the watcher above
+		// handles a write already in flight.
+		select {
+		case <-t.stopC:
+			return ErrStreamClosed
+		default:
+		}
 		// Copy the chunk by value so stamping DeploymentID does not mutate
 		// the caller's backing array. SendSnapshotStreaming already operates
 		// on a by-value copy via its emit callback.
@@ -1195,6 +1371,11 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		}
 	}
 
+	// Every chunk is on the wire: disarm the shutdown watcher before any
+	// success bookkeeping so a concurrent Stop cannot reset a completed
+	// transfer while this call reports it as sent.
+	releaseWriteWatch()
+
 	// Calculate total snapshot bytes sent.
 	var snapBytes int64
 	for i := range chunks {
@@ -1217,6 +1398,48 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	}
 
 	return nil
+}
+
+// cancelSnapshotWriteOnStop arms a watcher that resets the snapshot stream's
+// write side when the transport begins shutting down mid-transfer. Each chunk
+// write may block for up to snapshotChunkWriteDeadline (30s); without the
+// watcher, Stop()'s ShutdownAndWait stalls behind every in-flight chunk write.
+// CancelWrite unblocks a blocked Write immediately, failing the transfer with
+// a stream error that the per-chunk error handling already surfaces. The
+// returned release func must be called (deferred) when the transfer finishes.
+//
+// The release func is idempotent and disarms the watcher under a mutex, which
+// closes the success race: without it, a close(stopC) landing between the last
+// successful chunk write and the release call lets the watcher RESET a stream
+// that already carried the whole snapshot, discarding the peer's
+// buffered-but-unread data while the sender reports success (OnSnapshotSent,
+// IncSnapshotsSent). Callers therefore release explicitly once the final chunk
+// is written, before any success bookkeeping, and defer the same func as a
+// backstop for the error paths.
+func (t *QUICTransport) cancelSnapshotWriteOnStop(stream *quic.Stream) func() {
+	done := make(chan struct{})
+	var mu sync.Mutex
+	released := false
+	go func() {
+		select {
+		case <-t.stopC:
+			mu.Lock()
+			defer mu.Unlock()
+			if !released {
+				stream.CancelWrite(QUICStreamErrShutdown)
+			}
+		case <-done:
+		}
+	}()
+	return func() {
+		mu.Lock()
+		alreadyReleased := released
+		released = true
+		mu.Unlock()
+		if !alreadyReleased {
+			close(done)
+		}
+	}
 }
 
 // SnapshotChunkProducer is a function that streams snapshot chunks to an
@@ -1314,9 +1537,23 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	// Stream chunks from the producer. Each chunk is serialized and
 	// written to the wire immediately, then its data buffer can be GC'd
 	// before the next chunk is read from disk.
+	// Arm the shutdown watcher so a chunk write blocked on a stalled receiver
+	// cannot hold Stop() for the full 30s per-chunk deadline. It is disarmed
+	// explicitly once the producer finishes so a concurrent Stop cannot reset
+	// a stream that already carried the whole snapshot.
+	releaseWriteWatch := t.cancelSnapshotWriteOnStop(stream)
+	defer releaseWriteWatch()
+
 	var chunkIdx uint64
 	var snapBytes int64
 	emitErr := produce(func(chunk proto.SnapshotChunk) error {
+		// Abort between chunks as soon as shutdown begins; the watcher above
+		// handles a write already in flight.
+		select {
+		case <-t.stopC:
+			return ErrStreamClosed
+		default:
+		}
 		chunk.DeploymentID = t.cfg.DeploymentID
 		chunkSz := chunk.Size()
 		chunkBuf := make([]byte, chunkSz)
@@ -1342,6 +1579,10 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	if emitErr != nil {
 		return emitErr
 	}
+
+	// Every chunk is on the wire: disarm the shutdown watcher before any
+	// success bookkeeping (see SendSnapshot).
+	releaseWriteWatch()
 
 	// Mark send as successful before firing completion events.
 	sendOK = true

@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
@@ -45,6 +46,63 @@ type engineDeliverer interface {
 type hostMessageHandler struct {
 	engine engineDeliverer
 	host   *Host
+
+	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
+	// same (shard, replica, index). The snapshot directory is deterministic
+	// per index and the dedup guard only consults LogDB — which is written
+	// LAST — so without this claim two concurrent receives of the same index
+	// would both O_TRUNC and interleave writes into the same snapshot.dat,
+	// and the loser's cleanup would RemoveAll a directory the winner may
+	// already have recorded in LogDB. Keys are claimed with LoadOrStore at
+	// entry and released at exit; the duplicate takes the same early-return
+	// path as the LogDB dedup.
+	inflightSnapshotRecv sync.Map
+}
+
+// snapshotRecvKey identifies one in-flight snapshot receive by target
+// replica and snapshot index.
+type snapshotRecvKey struct {
+	shardID   uint64
+	replicaID uint64
+	index     uint64
+}
+
+// snapshotCtrlDeliverer is the minimal engine surface needed to deliver
+// one-shot snapshot control messages with retry.
+type snapshotCtrlDeliverer interface {
+	DeliverMessage(shardID uint64, msg proto.Message) bool
+	NotifyWork(shardID uint64)
+}
+
+const (
+	// snapshotCtrlDeliverAttempts bounds delivery retries for one-shot
+	// snapshot control messages.
+	snapshotCtrlDeliverAttempts = 5
+	// snapshotCtrlDeliverBackoff is the pause between delivery retries.
+	snapshotCtrlDeliverBackoff = 100 * time.Millisecond
+)
+
+// deliverSnapshotControl delivers a one-shot snapshot control message
+// (SnapshotStatus, or a re-delivered InstallSnapshot) to the shard inbox,
+// retrying briefly when the inbox is transiently full. Unlike regular raft
+// traffic, these messages have no protocol-level retransmission: dropping a
+// status leaves the leader's remote paused in snapshot state with no ack
+// countdown armed, and dropping an install leaves the follower's raft log
+// behind a snapshot it already persisted. Callers run on snapshot/transport
+// goroutines, never on a step worker, so the bounded sleep is safe. Returns
+// false when delivery still failed after all attempts (shard unloaded, or a
+// persistently saturated inbox).
+func deliverSnapshotControl(eng snapshotCtrlDeliverer, shardID uint64, msg proto.Message) bool {
+	for attempt := 0; ; attempt++ {
+		if eng.DeliverMessage(shardID, msg) {
+			eng.NotifyWork(shardID)
+			return true
+		}
+		if attempt >= snapshotCtrlDeliverAttempts-1 {
+			return false
+		}
+		time.Sleep(snapshotCtrlDeliverBackoff)
+	}
 }
 
 // HandleMessage delivers each message in the batch to the engine's
@@ -102,6 +160,27 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 			slog.Warn("rejected unauthorized message",
 				"shard", msg.ShardID,
 				"from", msg.From,
+				"type", proto.MessageTypeName(msg.Type),
+			)
+			if h.host != nil && h.host.metrics != nil {
+				h.host.metrics.IncUnauthorizedMessageDropped(msg.ShardID, msg.From)
+			}
+			continue
+		}
+
+		// Destination check: a message addressed to a different replica of
+		// this shard must be dropped, not stepped into the local raft state.
+		// Neither engine.DeliverMessage nor raft.step compares msg.To against
+		// the local replica ID, so misrouted or stale traffic (e.g. a
+		// replica ID reused after removal, or a transport-level routing
+		// error) would otherwise be processed as if it were addressed here.
+		// To == 0 is allowed: broadcast/local control messages leave it unset.
+		if node != nil && msg.To != 0 && msg.To != node.ReplicaID() {
+			slog.Warn("rejected misrouted message",
+				"shard", msg.ShardID,
+				"from", msg.From,
+				"to", msg.To,
+				"local_replica", node.ReplicaID(),
 				"type", proto.MessageTypeName(msg.Type),
 			)
 			if h.host != nil && h.host.metrics != nil {
@@ -242,6 +321,18 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	if node == nil {
 		return reject("shard not loaded")
 	}
+	// Destination check, mirroring the msg.To check in HandleMessage. The
+	// target ReplicaID travels in-band and is otherwise trusted verbatim,
+	// yet everything downstream keys off it: a foreign value splits the
+	// snapshotRecvKey so the inflight serialization guard is bypassed while
+	// snapshotDir still uses the LOCAL replica ID (two concurrent receives
+	// O_TRUNC and interleave into the same snapshot.dat), defeats the
+	// LogDB dedup lookup, writes a durable LogDB record under a replica ID
+	// this host does not own, and reaches raft through DeliverMessage,
+	// which performs no destination check of its own.
+	if replicaID != node.ReplicaID() {
+		return reject("snapshot addressed to a different replica")
+	}
 	if !node.IsMember(fromReplicaID) {
 		return reject("sender not a shard member")
 	}
@@ -256,19 +347,84 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		return reject("sender identity not covered by peer certificate")
 	}
 
-	// Dedup: skip if LogDB already has a snapshot at this index or later.
-	// Without this check, a duplicate snapshot delivery can overwrite the
-	// on-disk snapshot file while an async recovery is reading it, then
-	// delete the directory on the "out of date" error path.
+	// Serialize concurrent receives of the same snapshot. snapshotDir is
+	// deterministic per index and the LogDB dedup below only sees COMPLETED
+	// receives (LogDB is written last), so two concurrent deliveries of the
+	// same index would otherwise both O_TRUNC and interleave writes into the
+	// same snapshot.dat, and the loser's !committed cleanup would RemoveAll a
+	// directory the winner may already have recorded in LogDB. The duplicate
+	// takes the same early-return path as the dedup: drop it and rely on the
+	// leader's ack-timeout re-send, which lands after the winner finishes and
+	// is then answered from LogDB by the dedup branch.
+	recvKey := snapshotRecvKey{shardID: shardID, replicaID: replicaID, index: snapshotIndex}
+	if _, inflight := h.inflightSnapshotRecv.LoadOrStore(recvKey, struct{}{}); inflight {
+		slog.Debug("concurrent receive of same snapshot in flight, dropping duplicate",
+			"shard", shardID,
+			"replica", replicaID,
+			"index", snapshotIndex,
+		)
+		return nil
+	}
+	defer h.inflightSnapshotRecv.Delete(recvKey)
+
+	// Dedup: skip persistence if LogDB already has a snapshot at this index
+	// or later. Without this check, a duplicate snapshot delivery can
+	// overwrite the on-disk snapshot file while an async recovery is reading
+	// it, then delete the directory on the "out of date" error path.
+	//
+	// Persistence is skipped, but the InstallSnapshot raft message is
+	// RE-DELIVERED from the persisted snapshot: the original delivery is
+	// best-effort and can be dropped on a full inbox, in which case the
+	// follower's raft log stays behind a snapshot it durably holds. The
+	// leader's retransmitted snapshot lands here — swallowing it would
+	// neuter retransmission and livelock the catch-up (the leader re-streams,
+	// this dedup discards, forever). handleSnapshot is idempotent, so a
+	// duplicate install for an already-applied snapshot just re-sends the
+	// ReplicateResp ack the leader is waiting for.
 	if h.host.logdb != nil {
 		existing, err := h.host.logdb.GetSnapshot(shardID, replicaID)
 		if err == nil && existing.Index >= snapshotIndex {
-			slog.Debug("snapshot already applied, skipping duplicate",
+			slog.Debug("snapshot already persisted, re-delivering install without re-writing",
 				"shard", shardID,
 				"replica", replicaID,
 				"existing_index", existing.Index,
 				"received_index", snapshotIndex,
 			)
+			installMsg := proto.Message{
+				Type:    proto.InstallSnapshot,
+				ShardID: shardID,
+				From:    fromReplicaID,
+				To:      replicaID,
+				Snapshot: proto.Snapshot{
+					ShardID:    shardID,
+					ReplicaID:  replicaID,
+					Index:      existing.Index,
+					Term:       existing.Term,
+					Filepath:   existing.Filepath,
+					FileSize:   existing.FileSize,
+					Membership: logdbMembershipToProto(existing.Membership),
+					Epoch:      existing.Epoch,
+				},
+			}
+			if !deliverSnapshotControl(h.engine, shardID, installMsg) {
+				slog.Warn("failed to re-deliver InstallSnapshot for persisted snapshot",
+					"shard", shardID,
+					"replica", replicaID,
+					"index", existing.Index,
+				)
+			}
+			// Re-arm state-machine recovery when the persisted snapshot
+			// is ahead of the applied state. This makes the leader's
+			// ack-timeout re-send self-healing for the case where the
+			// original delivery persisted and installed the snapshot but
+			// recovery could not be queued: without this, the dedup path
+			// would swallow every retransmission and the state machine
+			// would stay behind the snapshot forever.
+			if existing.Index > node.LastApplied() {
+				if err := h.requestRecoveryWithRetry(shardID, replicaID, node); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 	}
@@ -425,15 +581,19 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 
 	// Save snapshot metadata to LogDB so the node can recover from it.
 	if h.host.logdb != nil {
-		membership := logdb.Membership{}
-		if len(first.Membership.Addresses) > 0 || first.Membership.ConfigChangeID > 0 {
-			membership = logdb.Membership{
-				ConfigChangeID: first.Membership.ConfigChangeID,
-				Addresses:      copyMapUint64String(first.Membership.Addresses),
-				Observers:      copyMapUint64String(first.Membership.Observers),
-				Witnesses:      copyMapUint64String(first.Membership.Witnesses),
-				Removed:        copyMapUint64Bool(first.Membership.Removed),
-			}
+		// Carry the full membership unconditionally, including the
+		// replicated witness policy: gating on Addresses/ConfigChangeID
+		// would discard a policy-only membership, and dropping the policy
+		// fields would persist this snapshot with a zeroed witness quorum
+		// that disagrees with every peer after a restart.
+		membership := logdb.Membership{
+			ConfigChangeID:             first.Membership.ConfigChangeID,
+			MaxWitnesses:               first.Membership.MaxWitnesses,
+			RequireFullReplicaMajority: first.Membership.RequireFullReplicaMajority,
+			Addresses:                  copyMapUint64String(first.Membership.Addresses),
+			Observers:                  copyMapUint64String(first.Membership.Observers),
+			Witnesses:                  copyMapUint64String(first.Membership.Witnesses),
+			Removed:                    copyMapUint64Bool(first.Membership.Removed),
 		}
 		logdbSnap := logdb.Snapshot{
 			Index:       snapshotIndex,
@@ -455,6 +615,13 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 			}
 		}
 	}
+
+	// The snapshot file is fsynced and the LogDB record is written, so the
+	// on-disk artifacts must survive from here on regardless of what happens
+	// to the raft install or the state-machine recovery below: LogDB now
+	// points at this directory, and the dedup branch above answers the
+	// leader's re-send from it.
+	committed = true
 
 	// Deliver the InstallSnapshot to the local raft layer so it updates
 	// its log state (committed index, applied index, membership). Without
@@ -483,46 +650,40 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 			Epoch: recvEpoch,
 		},
 	}
-	delivered := h.engine.DeliverMessage(shardID, installMsg)
-	if delivered {
-		h.engine.NotifyWork(shardID)
+	if !deliverSnapshotControl(h.engine, shardID, installMsg) {
+		// Fatal for this transfer. Without the install, raft never advances
+		// its committed index to the snapshot index, so queuing state-machine
+		// recovery would only produce a SnapshotRecoveryBehindError and the
+		// node markers would stay behind. Reporting success here would stop
+		// the leader from re-sending, leaving the follower permanently
+		// unrecovered; report failure instead so the leader retries and the
+		// dedup branch above re-delivers the install from LogDB.
+		slog.Error("failed to deliver InstallSnapshot to raft",
+			"shard", shardID,
+			"replica", replicaID,
+			"index", snapshotIndex,
+		)
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "deliver_install",
+			Err:       ErrSystemBusy,
+		}
 	}
 
-	// Deliver a SnapshotReceived message to the local raft peer so
-	// it rebuilds its remote tracking maps from the snapshot's
-	// membership. Without this, the raft layer may have stale remote
-	// state after restoring from the snapshot.
-	recvMsg := proto.Message{
-		Type:    proto.SnapshotReceived,
-		ShardID: shardID,
-		From:    fromReplicaID,
-		To:      replicaID,
-		Snapshot: proto.Snapshot{
-			ShardID:    shardID,
-			ReplicaID:  replicaID,
-			Index:      snapshotIndex,
-			Term:       snapshotTerm,
-			Membership: first.Membership,
-		},
-	}
-	if h.engine.DeliverMessage(shardID, recvMsg) {
-		h.engine.NotifyWork(shardID)
-	}
-
-	// Trigger snapshot recovery on the engine node. The engine's
-	// snapshot pool handles the actual SM.RecoverFromSnapshot call.
+	// Trigger snapshot recovery on the engine node. The engine's snapshot
+	// pool handles the actual SM.RecoverFromSnapshot call. This must not
+	// be best-effort: raft now treats every entry at or below the snapshot
+	// index as applied, so if recovery is never queued the state machine
+	// silently misses the snapshot contents and diverges from its peers.
+	// A concurrent auto-save briefly holds the snapshotting slot, so retry
+	// until the slot frees; if the retry budget is exhausted, report the
+	// transfer failed so the leader re-sends and the dedup branch above
+	// re-arms recovery from the persisted snapshot.
 	engNode := h.engine.GetNode(shardID)
 	if engNode != nil {
-		started := engNode.TryStartSnapshot()
-		if started {
-			if err := h.engine.RequestSnapshotRecovery(shardID, replicaID, engNode); err != nil {
-				engNode.ClearSnapshotting()
-				slog.Warn("snapshot recovery request failed",
-					"shard", shardID,
-					"replica", replicaID,
-					"error", err,
-				)
-			}
+		if err := h.requestRecoveryWithRetry(shardID, replicaID, engNode); err != nil {
+			return err
 		}
 	}
 
@@ -533,8 +694,43 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// the LEADER (on the sender host) to transition the remote out of
 	// snapshot state.
 
-	committed = true
 	return nil
+}
+
+// requestRecoveryWithRetry queues state-machine recovery for a persisted,
+// raft-installed snapshot, retrying while a concurrent snapshot save
+// holds the node's snapshotting slot or the snapshot pool is briefly
+// full. Recovery is mandatory once InstallSnapshot has been delivered
+// (see HandleSnapshot); a request that cannot be queued within the retry
+// budget is a snapshot receive failure, not a warning.
+func (h *hostMessageHandler) requestRecoveryWithRetry(shardID, replicaID uint64, engNode *engine.Node) error {
+	const (
+		attempts = 100
+		backoff  = 50 * time.Millisecond
+	)
+	for i := 0; i < attempts; i++ {
+		if engNode.TryStartSnapshot() {
+			err := h.engine.RequestSnapshotRecovery(shardID, replicaID, engNode)
+			if err == nil {
+				return nil
+			}
+			// Pool briefly full: release the slot and retry.
+			engNode.ClearSnapshotting()
+			slog.Warn("snapshot recovery request failed, retrying",
+				"shard", shardID,
+				"replica", replicaID,
+				"attempt", i+1,
+				"error", err,
+			)
+		}
+		time.Sleep(backoff)
+	}
+	return &SnapshotReceiveError{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Op:        "recover",
+		Err:       ErrSnapshotInProgress,
+	}
 }
 
 // validateSnapshotChunks verifies that a received chunk set forms a

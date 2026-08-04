@@ -16,7 +16,7 @@ package proto
 
 // Entry is the fundamental unit of replication in the Raft log. It contains
 // 8 fixed fields and one variable-length command payload. The wire format
-// uses a 64-byte fixed header followed by the command data:
+// uses a 60-byte fixed header (entryHeaderSize) followed by the command data:
 //
 //	[Term:8][Index:8][Type:8][Key:8][ClientID:8][SeriesID:8][RespondedTo:8][CmdLen:4][Cmd:N]
 //

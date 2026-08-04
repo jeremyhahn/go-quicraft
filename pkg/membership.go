@@ -39,6 +39,15 @@ type Membership struct {
 	// Removed tracks replicaIDs that have been removed from the cluster.
 	// The struct{} value type avoids memory waste for large removed sets.
 	Removed map[uint64]struct{}
+
+	// MaxWitnesses is the shard's replicated witness cap (0 = no explicit
+	// cap). Changed via Host.RequestUpdateWitnessPolicy.
+	MaxWitnesses uint64
+
+	// RequireFullReplicaMajority is the shard's replicated
+	// full-replica-majority witness policy. Changed via
+	// Host.RequestUpdateWitnessPolicy.
+	RequireFullReplicaMajority bool
 }
 
 // ConfigChangeIndex returns the ConfigChangeID. This alias exists for

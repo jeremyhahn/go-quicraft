@@ -18,6 +18,13 @@
 // dragonboat implement the familiar IStateMachine, IConcurrentStateMachine,
 // or IOnDiskStateMachine interfaces and use the Wrap*CreateFunc helpers to
 // produce a quicraft sm.CreateFunc.
+//
+// MIGRATION NOTE: quicraft passes an initial snapshot directory to an
+// on-disk state machine's Open. Dragonboat's IOnDiskStateMachine.Open
+// takes only a stop channel, so the adapter discards that directory: an
+// on-disk state machine keeps managing its own storage paths exactly as
+// it did on dragonboat, and does not receive quicraft's managed
+// directory.
 package statemachine
 
 import "log/slog"
@@ -65,15 +72,28 @@ type ISnapshotFileCollection interface {
 	AddFile(fileID uint64, path string, metadata []byte)
 }
 
-// snapshotFileCollection is a no-op implementation of ISnapshotFileCollection.
-// QuicRaft does not support external snapshot files, so this adapter
-// silently discards any files added through the dragonboat API.
-type snapshotFileCollection struct{}
+// snapshotFileCollection records external files added through the
+// dragonboat ISnapshotFileCollection API. QuicRaft does not support
+// external snapshot files: the SaveSnapshot adapters inspect the
+// collection after the user state machine returns and FAIL the snapshot
+// with ErrSnapshotFilesNotSupported when any file was added. Discarding
+// the files instead would produce a snapshot that recovers without its
+// external data — permanent, silent data loss.
+type snapshotFileCollection struct {
+	files []SnapshotFile
+}
 
-// AddFile logs a warning and discards the file. QuicRaft does not support
-// external snapshot files; callers are warned so silent data loss is avoided.
+// AddFile records the external file so the surrounding SaveSnapshot
+// adapter can fail the snapshot. QuicRaft does not support external
+// snapshot files; the warning makes the subsequent snapshot failure
+// attributable.
 func (s *snapshotFileCollection) AddFile(fileID uint64, path string, metadata []byte) {
-	slog.Warn("dragonboat: external snapshot files are not supported by quicraft, file discarded",
+	s.files = append(s.files, SnapshotFile{
+		FileID:   fileID,
+		Filepath: path,
+		Metadata: metadata,
+	})
+	slog.Warn("dragonboat: external snapshot files are not supported by quicraft, snapshot will fail",
 		"fileID", fileID,
 		"path", path,
 		"metadataLen", len(metadata),

@@ -550,6 +550,11 @@ func TestPaper_LeaderCommitsEntry(t *testing.T) {
 	proposedIdx := r.log.lastIndex()
 	r.drainMessages()
 
+	// Persist the leader's log: tryCommit counts the leader's own match
+	// at its durable index, so the single follower ack below completes
+	// the quorum.
+	persistLog(r)
+
 	commitBefore := r.log.committed
 
 	// Acknowledge from one peer (quorum = 2 for 3-node cluster).
@@ -595,6 +600,9 @@ func TestPaper_LeaderCommitsPrecedingEntries(t *testing.T) {
 	}
 	lastIdx := r.log.lastIndex()
 	r.drainMessages()
+
+	// Persist the leader's log so its own durable match covers lastIdx.
+	persistLog(r)
 
 	// Acknowledge the last entry from peer 2. This should commit all
 	// entries through lastIdx (the quorum replication point).
@@ -989,6 +997,11 @@ func TestPaper_LeaderOnlyCommitsCurrentTermEntries(t *testing.T) {
 		t.Fatal("expected to become leader")
 	}
 	r.drainMessages()
+
+	// Persist the leader's log so the negative check below is decided
+	// purely by the Section 5.4.2 term rule, not by missing local
+	// durability.
+	persistLog(r)
 
 	// The no-op entry from becomeLeader is at index 3, term 4.
 	// Entry at index 2 (term 2) is still uncommitted.

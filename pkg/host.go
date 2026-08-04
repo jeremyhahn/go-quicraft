@@ -346,7 +346,7 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 				// Notify the raft layer that the snapshot was rejected so
 				// the leader transitions the remote out of snapshot state.
 				// Without this, the follower is permanently stuck.
-				s.safeNotifySnapshotRejected(msg.ShardID, msg.From, msg.To)
+				s.safeNotifySnapshotRejected(msg.ShardID, msg.From, msg.To, msg.Hint)
 			}
 		}()
 		s.doSendSnapshot(msg)
@@ -357,7 +357,7 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 // notification, recovering from any secondary panic (e.g., if the engine
 // is already torn down). This prevents a double-panic in the deferred
 // recovery handler of SendSnapshot from crashing the process.
-func (s *transportSender) safeNotifySnapshotRejected(shardID, from, to uint64) {
+func (s *transportSender) safeNotifySnapshotRejected(shardID, from, to, transferSeq uint64) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic in snapshot rejection notification",
@@ -368,7 +368,7 @@ func (s *transportSender) safeNotifySnapshotRejected(shardID, from, to uint64) {
 			)
 		}
 	}()
-	s.notifySnapshotStatus(shardID, from, to, true)
+	s.notifySnapshotStatus(shardID, from, to, transferSeq, true)
 }
 
 // Wait blocks until all in-flight snapshot sends complete. Called by
@@ -424,7 +424,7 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 				"epoch", msg.Snapshot.Epoch,
 				"barrier_nil", sendBarrier == nil,
 			)
-			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, true)
+			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
 			return
 		}
 		decryptedPath, decryptedSize, err := s.decryptSnapshotForSend(msg, sendBarrier)
@@ -435,7 +435,7 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 				"epoch", msg.Snapshot.Epoch,
 				"error", err,
 			)
-			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, true)
+			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
 			return
 		}
 		// Register temp file cleanup immediately after successful creation.
@@ -487,11 +487,11 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 			"to", msg.To,
 			"error", err,
 		)
-		s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, true)
+		s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
 		return
 	}
 
-	s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, false)
+	s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, false)
 }
 
 // decryptSnapshotForSend decrypts an encrypted snapshot file to a
@@ -725,23 +725,31 @@ func decryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 // sender's raft inbox to inform the leader of the transfer outcome.
 // The From field is set to the target replica (the follower that
 // received or rejected the snapshot) so the leader's raft layer
-// can look up the correct remote entry.
-func (s *transportSender) notifySnapshotStatus(shardID, localReplicaID, targetReplicaID uint64, rejected bool) {
+// can look up the correct remote entry. Hint echoes the transfer
+// sequence the leader stamped on the InstallSnapshot (raft
+// snapshotSeq), so handleSnapshotStatus can discard a stale status
+// from a superseded transfer attempt — even one re-sending the same
+// snapshot index — instead of arming the ack countdown (or forcing a
+// backoff) for a newer in-flight one. Delivery is retried briefly:
+// this is a one-shot message with no protocol-level retransmission,
+// and losing it leaves the remote paused with no countdown armed.
+func (s *transportSender) notifySnapshotStatus(shardID, localReplicaID, targetReplicaID, transferSeq uint64, rejected bool) {
 	statusMsg := proto.Message{
 		Type:    proto.SnapshotStatus,
 		ShardID: shardID,
 		From:    targetReplicaID,
 		To:      localReplicaID,
+		Hint:    transferSeq,
 		Reject:  rejected,
 	}
-	if !s.engine.DeliverMessage(shardID, statusMsg) {
+	if !deliverSnapshotControl(s.engine, shardID, statusMsg) {
 		s.logger.Warn("failed to deliver SnapshotStatus",
 			"shard", shardID,
 			"target", targetReplicaID,
+			"transfer_seq", transferSeq,
 			"rejected", rejected,
 		)
 	}
-	s.engine.NotifyWork(shardID)
 }
 
 // forEachSnapshotChunk reads the snapshot data file referenced by the
@@ -966,6 +974,22 @@ type nodeState struct {
 type pendingProposal struct {
 	rs       *RequestState
 	deadline time.Time
+
+	// onFailure runs exactly once, at the completion site that claims this
+	// entry with an error (OnProposalFailed, failPendingRequests, the
+	// deadline sweep). It is NOT run on the applied path: an applied entry
+	// committed, so any speculative side effect it owns is now legitimate.
+	// Used by requestConfigChange to undo its speculative address
+	// pre-registration for an entry that was appended but never committed
+	// (leader deposed, log truncated). Nil for ordinary proposals.
+	onFailure func()
+}
+
+// failed runs the entry's failure hook. Safe when no hook is set.
+func (pp *pendingProposal) failed() {
+	if pp.onFailure != nil {
+		pp.onFailure()
+	}
 }
 
 // hostEngineCallback implements engine.Callback by routing
@@ -1213,6 +1237,22 @@ func (c *hostEngineCallback) OnReadIndexBatched(shardID uint64, batchKey uint64,
 	ns.pendingReadsMu.Lock()
 	batchPR, ok := ns.pendingReads[batchKey]
 	if !ok {
+		// The batch key was already removed (expired by the sweep or failed
+		// by a close/leadership sweep) before the aliases could attach.
+		// Alias reads are reachable ONLY through the batch entry — the raft
+		// confirmation arrives keyed by batchKey — so without it they could
+		// never complete. Fail them now instead of leaving deadline-less
+		// callers blocked forever.
+		for _, aliasKey := range aliasKeys {
+			aliasPR, aliasOK := ns.pendingReads[aliasKey]
+			if !aliasOK {
+				continue
+			}
+			aliasPR.rs.complete(RequestResult{Err: ErrTimeout})
+			delete(ns.pendingReads, aliasKey)
+			aliasPR.rs.releaseRef()
+			c.h.completePendingOp()
+		}
 		ns.pendingReadsMu.Unlock()
 		return
 	}
@@ -1539,7 +1579,33 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 					})
 				continue
 			}
+			// Unlike the completion paths, OnCommitted must leave the map
+			// entry in place for the later OnApplied, so it cannot claim
+			// via LoadAndDelete. A bare commitNotify after Load would race
+			// the claiming paths (OnApplied/OnProposalFailed/
+			// failPendingRequests/sweep): they can remove, complete, and
+			// releaseRef between the Load and the notify, recycle the
+			// RequestState into a brand-new request, and the stale notify
+			// would then win the fresh request's committedDone CAS and
+			// push a bogus WAL-durable notification into it. Instead, pin
+			// the RS with tryAcquireRef (safe against recycling — it never
+			// increments from zero), then re-verify the map still holds
+			// the SAME pendingProposal. Keys are host-wide monotonic and
+			// never reused, so a matching re-Load proves the entry — and
+			// therefore the map's own reference — was held continuously
+			// across the acquire, i.e. the pinned RS is still this
+			// request's. If the verify fails the request was claimed (or
+			// the count belonged to a recycled successor); drop the
+			// balanced reference and skip.
+			if !pp.rs.tryAcquireRef() {
+				continue
+			}
+			if v2, still := ns.pendingProposals.Load(entry.Key); !still || v2 != v {
+				pp.rs.releaseRef()
+				continue
+			}
 			pp.rs.commitNotify(RequestResult{Value: 0})
+			pp.rs.releaseRef()
 		}
 	}
 }
@@ -1582,6 +1648,7 @@ func (c *hostEngineCallback) OnProposalFailed(shardID uint64, entries []proto.En
 					})
 				continue
 			}
+			pp.failed()
 			pp.rs.complete(RequestResult{Err: apiErr})
 			pp.rs.releaseRef()
 			c.h.completePendingOp()
@@ -1698,6 +1765,12 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	if options.disableTransport {
 		cfg.TransportConfig.TransportDisabled = true
 	}
+	// TransportDisabled is an exported field, so a caller can set it directly
+	// without going through WithoutTransport. Config validation then skips
+	// the MTLSConfig requirement, so transport creation must honour the same
+	// flag: otherwise the field would silently do nothing but disable the
+	// mTLS check, which is exactly backwards.
+	transportDisabled := options.disableTransport || cfg.TransportConfig.TransportDisabled
 
 	cfg.SetDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -1764,7 +1837,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	var tr *transport.QUICTransport
 	var msgHandler *hostMessageHandler
 
-	if !options.disableTransport {
+	if !transportDisabled {
 		trCfg := buildTransportConfig(cfg)
 		// Wire transport metrics when a MetricsCollector is provided. The
 		// transport's internal TransportMetrics interface matches the
@@ -2060,10 +2133,58 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// AppendEntries will update the joining node's term and make it a
 	// follower. The membership is later updated to the full cluster config
 	// when a snapshot is applied (handleSnapshot).
-	if !join || len(nodesCopy) > 0 {
+	//
+	// CRITICAL: only seed when recovery restored NOTHING. Membership is
+	// replicated state; the recovered snapshot is authoritative and must
+	// never be overwritten by the caller's bootstrap map. Config changes
+	// at or below the snapshot index are compacted out of the log, and an
+	// on-disk state machine's processed marker is seeded to its own
+	// lastApplied (see SetProcessedIndex below), so commit-time replay
+	// cannot reconstruct them. Overwriting here would drop witnesses,
+	// observers and Removed tombstones and silently revert the REPLICATED
+	// witness policy to this node's local config — a restarted replica
+	// would then compute quorum over a smaller voting set than its peers
+	// and two leaders could be elected in the same term.
+	_, recovered := lr.NodeState()
+	nothingRecovered := recovered.ConfigChangeID == 0 &&
+		len(recovered.Addresses) == 0 &&
+		len(recovered.Observers) == 0 &&
+		len(recovered.Witnesses) == 0
+	if nothingRecovered && (!join || len(nodesCopy) > 0) {
+		// Seed the replicated witness policy from this node's config. This
+		// is the ONLY point where config.WitnessConfig enters the shard:
+		// from here on the policy lives in replicated membership state
+		// (snapshot + log) and changes only via UpdateWitnessPolicy config
+		// changes, so every replica enforces the same policy regardless of
+		// local configuration.
 		lr.SetMembership(proto.Membership{
-			Addresses: nodesCopy,
+			Addresses:                  nodesCopy,
+			MaxWitnesses:               uint64(max(0, cfg.Witness.MaxWitnesses)),
+			RequireFullReplicaMajority: cfg.Witness.GetRequireFullReplicaMajority(),
 		})
+	}
+
+	// Address routing must follow the EFFECTIVE membership, not the
+	// bootstrap map: after a restart the recovered membership may contain
+	// observers and witnesses the caller never listed, and the transport
+	// cannot resolve a replica it has no address for.
+	effectiveNodes := nodesCopy
+	if !nothingRecovered {
+		_, m := lr.NodeState()
+		effectiveNodes = make(map[uint64]string,
+			len(m.Addresses)+len(m.Observers)+len(m.Witnesses))
+		for _, group := range []map[uint64]string{m.Addresses, m.Observers, m.Witnesses} {
+			for id, addr := range group {
+				effectiveNodes[id] = addr
+			}
+		}
+		// A member recorded without an address (possible for entries that
+		// predate address tracking) falls back to the caller's map.
+		for id, addr := range nodesCopy {
+			if _, ok := effectiveNodes[id]; !ok {
+				effectiveNodes[id] = addr
+			}
+		}
 	}
 
 	// Create the Raft peer. NewPeer validates the config and
@@ -2241,7 +2362,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		cfg:              cfg,
 		createFn:         create,
 		smType:           stateMachine.SMType().TypeCode(),
-		nodes:            nodesCopy,
+		nodes:            effectiveNodes,
 		requestPool:      NewRequestStatePool(),
 		rsm:              stateMachine,
 		openStopper:      openStopper,
@@ -2277,6 +2398,12 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			Type:      ns.smType,
 		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
+			// Mark the nodeState stopped BEFORE removing it from h.nodes
+			// (matching StopShard/Close ordering): a reader that resolved ns
+			// just before the Delete must fail its stopped check rather than
+			// call into the state machine the deferred rollback is about to
+			// close.
+			ns.stopped.Store(true)
 			h.nodes.Delete(cfg.ShardID)
 			h.activeNodes.Add(-1)
 			return ErrLogDBWrite
@@ -2312,7 +2439,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 
 	// Register all members in the registry for address resolution.
-	for replicaID, addr := range nodesCopy {
+	for replicaID, addr := range effectiveNodes {
 		h.registry.Register(cfg.ShardID, replicaID, addr)
 	}
 
@@ -2839,7 +2966,7 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 
 	// Create request state with deadline from context.
 	deadline, _ := ctx.Deadline()
-	rs := newRequestState(ns.requestPool, proposalKey, deadline)
+	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
 
 	// Track this operation for drain notification.
 	h.addPendingOp()
@@ -2862,9 +2989,13 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	if h.closed.Load() || ns.stopped.Load() {
 		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
 			rs.releaseRef()
-			rs.Release()
 			h.completePendingOp()
 		}
+		// The caller's own reference is dropped whether or not the claim
+		// won: a sweep that beat us to the entry drops only ITS reference,
+		// so leaving Release() inside the claim would strand the object
+		// outside the pool.
+		rs.Release()
 		return nil, ErrClosed
 	}
 
@@ -2874,11 +3005,21 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// single-owner invariant on the Peer. Using the dedicated proposal
 	// queue avoids channel serialization under high concurrent load.
 	if !engNode.DeliverProposal([]proto.Entry{entry}) {
-		// Queue full — remove the RS and let the caller retry.
-		ns.pendingProposals.Delete(proposalKey)
-		rs.releaseRef()
+		// Queue full — remove the RS and let the caller retry. The entry
+		// must be CLAIMED with LoadAndDelete: the sweep and
+		// failPendingRequests also remove entries with claims, and an
+		// unconditional Delete pairing with a sweep that already completed
+		// this key would double releaseRef (driving outstanding negative —
+		// the RS is permanently lost from the pool) and double
+		// completePendingOp (undercounting pendingOps so Drain can close
+		// early). Only the claimant rolls back the map reference;
+		// rs.Release() is the caller's own reference and is dropped
+		// unconditionally.
+		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
 		rs.Release()
-		h.completePendingOp()
 		if h.metrics != nil {
 			h.metrics.IncProposalDropped(shardID)
 		}
@@ -2935,7 +3076,7 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	readKey := h.readKeySeq.Add(1)
 
 	deadline, _ := ctx.Deadline()
-	rs := newRequestState(ns.requestPool, readKey, deadline)
+	rs := newRequestState(ns.requestPool, readKey, deadline, h.metrics != nil)
 
 	// Track this operation for drain notification.
 	h.addPendingOp()
@@ -2951,18 +3092,57 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	ns.pendingReads[readKey] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
 
+	// Close-vs-ReadIndex TOCTOU guard: the host may have begun closing (and
+	// run its pending-request sweeps) between the top-of-ReadIndex closed
+	// check and the store above, which would orphan the RS in a deleted
+	// nodeState's map — a deadline-less caller would then block on
+	// rs.Result() forever. Re-check after registering and roll back if
+	// shutting down. The delete-under-mutex claim makes the rollback
+	// exactly-once relative to a concurrent Close sweep (mirrors
+	// proposeEntry's LoadAndDelete pattern).
+	if h.closed.Load() || ns.stopped.Load() {
+		ns.pendingReadsMu.Lock()
+		_, present := ns.pendingReads[readKey]
+		if present {
+			delete(ns.pendingReads, readKey)
+		}
+		ns.pendingReadsMu.Unlock()
+		if present {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
+		// The caller's own reference is dropped whether or not the claim
+		// won; a sweep that beat us drops only its own.
+		rs.Release()
+		return nil, ErrClosed
+	}
+
 	// Deliver the ReadIndex key to the MPSC ReadIndex queue. The step
 	// worker drains all accumulated keys and submits a single batched
 	// ReadIndex operation, coalescing N concurrent callers into 1
 	// heartbeat quorum round. This is the primary performance
 	// optimization for multi-node ReadIndex workloads.
 	if !engNode.DeliverReadIndex(readKey) {
+		// Claim the entry before rolling back. failPendingRequests and
+		// sweepPendingReads remove entries under the same mutex; an
+		// unconditional delete here could pair with a concurrent completion
+		// that already removed and released this entry, double-counting
+		// releaseRef (driving outstanding negative, so tryRecycle's
+		// outstanding==0 check never holds again and the object leaks out of
+		// the pool) and completePendingOp (undercounting pendingOps so Drain
+		// can close drainC with work still in flight). rs.Release() is the
+		// caller's own reference and is dropped unconditionally.
 		ns.pendingReadsMu.Lock()
-		delete(ns.pendingReads, readKey)
+		_, claimed := ns.pendingReads[readKey]
+		if claimed {
+			delete(ns.pendingReads, readKey)
+		}
 		ns.pendingReadsMu.Unlock()
-		rs.releaseRef()
+		if claimed {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
 		rs.Release()
-		h.completePendingOp()
 		if el := h.cfg.EventListener; el != nil && el.OnReadIndexDropped != nil {
 			el.OnReadIndexDropped(config.EventShardInfo{
 				ShardID:   shardID,
@@ -3084,14 +3264,32 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		return ns.rsm.Lookup(ctx, query)
 	}
 
-	// Slow path: poll until lastApplied catches up or context expires.
-	ticker := time.NewTicker(time.Millisecond)
+	// Slow path: poll until lastApplied catches up, the shard or host shuts
+	// down, or the context expires. Shutdown must terminate the loop on its
+	// own: a caller passing a deadline-less context on a partitioned follower
+	// would otherwise spin at 1000Hz forever and Host.Close could not
+	// interrupt it. The interval backs off after the initial burst so a long
+	// catch-up costs a handful of wakeups per second instead of a thousand.
+	const (
+		followerReadPollInterval = time.Millisecond
+		followerReadFastPolls    = 50
+		followerReadSlowInterval = 20 * time.Millisecond
+	)
+	ticker := time.NewTicker(followerReadPollInterval)
 	defer ticker.Stop()
+	polls := 0
 	for {
 		select {
 		case <-ticker.C:
 			if ns.lastApplied.Load() >= committed {
 				return ns.rsm.Lookup(ctx, query)
+			}
+			if ns.stopped.Load() || h.closed.Load() {
+				return nil, ErrClosed
+			}
+			polls++
+			if polls == followerReadFastPolls {
+				ticker.Reset(followerReadSlowInterval)
 			}
 		case <-ctx.Done():
 			return nil, mapContextError(ctx.Err())
@@ -3362,11 +3560,13 @@ func (h *Host) getMembershipFromPeer(shardID uint64) (*Membership, error) {
 // All maps are copied to prevent aliasing.
 func protoMembershipToPublic(pm *proto.Membership) *Membership {
 	m := &Membership{
-		ConfigChangeID: pm.ConfigChangeID,
-		Nodes:          make(map[uint64]string, len(pm.Addresses)),
-		Observers:      make(map[uint64]string, len(pm.Observers)),
-		Witnesses:      make(map[uint64]string, len(pm.Witnesses)),
-		Removed:        make(map[uint64]struct{}, len(pm.Removed)),
+		ConfigChangeID:             pm.ConfigChangeID,
+		MaxWitnesses:               pm.MaxWitnesses,
+		RequireFullReplicaMajority: pm.RequireFullReplicaMajority,
+		Nodes:                      make(map[uint64]string, len(pm.Addresses)),
+		Observers:                  make(map[uint64]string, len(pm.Observers)),
+		Witnesses:                  make(map[uint64]string, len(pm.Witnesses)),
+		Removed:                    make(map[uint64]struct{}, len(pm.Removed)),
 	}
 	for k, v := range pm.Addresses {
 		m.Nodes[k] = v
@@ -3568,7 +3768,7 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	snapshotKey := h.snapshotKeySeq.Add(1)
 
 	deadline, _ := ctx.Deadline()
-	rs := newRequestState(ns.requestPool, snapshotKey, deadline)
+	rs := newRequestState(ns.requestPool, snapshotKey, deadline, h.metrics != nil)
 
 	// Track this operation for drain notification.
 	h.addPendingOp()
@@ -3581,6 +3781,32 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	ns.pendingSnapshots[snapshotKey] = rs
 	ns.pendingSnapshotsMu.Unlock()
 
+	// Close-vs-RequestSnapshot TOCTOU guard: the host may have begun closing
+	// (and run its pending-request sweeps) between the top-of-method closed
+	// check and the store above, which would orphan the RS in a deleted
+	// nodeState's map — a deadline-less caller would then block on
+	// rs.Result() forever. Re-check after registering and roll back if
+	// shutting down. The delete-under-mutex claim makes the rollback
+	// exactly-once relative to a concurrent Close sweep (mirrors
+	// proposeEntry's LoadAndDelete pattern).
+	if h.closed.Load() || ns.stopped.Load() {
+		ns.pendingSnapshotsMu.Lock()
+		_, present := ns.pendingSnapshots[snapshotKey]
+		if present {
+			delete(ns.pendingSnapshots, snapshotKey)
+		}
+		ns.pendingSnapshotsMu.Unlock()
+		if present {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
+		// The caller's own reference is dropped whether or not the claim
+		// won; a sweep that beat us drops only its own.
+		rs.Release()
+		engNode.ClearSnapshotting()
+		return nil, ErrClosed
+	}
+
 	// Build engine-level option from the public SnapshotOption.
 	engineOpt := engine.SnapshotRequestOption{
 		ExportPath:         opt.ExportPath,
@@ -3591,14 +3817,29 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 
 	// Submit the snapshot request to the engine's snapshot pool.
 	if submitErr := h.engine.RequestSnapshot(shardID, ns.replicaID, engNode, engineOpt); submitErr != nil {
-		// Snapshot pool rejected (duplicate or full) -- clean up.
+		// Snapshot pool rejected (duplicate or full) -- clean up. Claim the
+		// entry first: OnSnapshotCompleted drains the ENTIRE pendingSnapshots
+		// map on any completion for this shard, so a concurrent completion
+		// may already have completed, removed and released this entry between
+		// the Store above and this rollback. An unconditional
+		// releaseRef/completePendingOp would then double-count — outstanding
+		// goes negative so tryRecycle's outstanding==0 check never holds and
+		// the object is permanently lost from the pool, and pendingOps is
+		// undercounted so Drain can close drainC with work in flight.
+		// rs.Release() is the caller's own reference and is dropped
+		// unconditionally.
 		engNode.ClearSnapshotting()
 		ns.pendingSnapshotsMu.Lock()
-		delete(ns.pendingSnapshots, snapshotKey)
+		_, claimed := ns.pendingSnapshots[snapshotKey]
+		if claimed {
+			delete(ns.pendingSnapshots, snapshotKey)
+		}
 		ns.pendingSnapshotsMu.Unlock()
-		rs.releaseRef()
+		if claimed {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
 		rs.Release()
-		h.completePendingOp()
 		return nil, ErrSnapshotInProgress
 	}
 
@@ -3772,6 +4013,11 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // Epoch=0 (the no-decrypt recovery path), making export -> import a lossless
 // round-trip across hosts with independent barrier keys.
 //
+// The decrypting barrier is resolved per shard via barrierForShard — the
+// same resolver the snapshot receive/recover paths use — so a snapshot
+// encrypted under a WithShardBarriers per-shard key exports correctly and
+// is never fed to the (wrong) host-wide barrier.
+//
 // When the snapshot is encrypted (Epoch > 0) but the barrier cannot decrypt
 // it (no barrier is configured or the barrier is sealed), ExportSnapshot
 // returns ErrSnapshotEncryptedBarrierUnavailable rather than silently
@@ -3817,18 +4063,24 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		}
 	}()
 
+	// Resolve the at-rest barrier for THIS shard. With WithShardBarriers the
+	// snapshot was encrypted under the per-shard key, so the host-wide
+	// barrier is the wrong (or absent) key for it; barrierForShard mirrors
+	// the receive/recover paths.
+	barrier := h.barrierForShard(shardID)
+
 	// Refuse early if the snapshot is encrypted but cannot be decrypted, so
 	// we never emit a (partial) artifact header for an unrecoverable export.
-	if logdbSnap.Epoch > 0 && (h.barrier == nil || h.barrier.IsSealed()) {
+	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return ErrSnapshotEncryptedBarrierUnavailable
 	}
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
 
-	// Write the self-describing artifact header carrying the original
-	// snapshot identity (Index/Term/OnDiskIndex/Membership) before any data.
-	// ImportSnapshot parses this to persist the SAME logical snapshot.
+	// Build the self-describing artifact header carrying the original
+	// snapshot identity (Index/Term/OnDiskIndex/Membership). ImportSnapshot
+	// parses this to persist the SAME logical snapshot.
 	headerBytes, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{
 		Index:       logdbSnap.Index,
 		Term:        logdbSnap.Term,
@@ -3838,34 +4090,86 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(headerBytes); err != nil {
-		return err
-	}
 
 	// When the snapshot was encrypted at rest (Epoch > 0) it must be
 	// decrypted to plaintext before writing. Without this the writer would
 	// receive raw ciphertext that a later ImportSnapshot stores with
 	// Epoch=0, feeding undecryptable bytes into RecoverFromSnapshot.
+	//
+	// The header is held back until the first frame decrypts successfully
+	// (deferredHeaderWriter): a wrong or rotated key fails AEAD on the very
+	// first frame, and emitting the header eagerly would leave the caller
+	// holding a truncated header-only artifact for a failed export.
 	if logdbSnap.Epoch > 0 {
-		if _, err = decryptSnapshotFrames(h.barrier, f, w); err != nil {
+		// Pin the recorded snapshot epoch live for the duration of the read
+		// so a concurrent keyRotationLoop -> PurgeEpochsBefore cannot remove
+		// its DEK mid-stream and fail AEAD partway through a multi-GB export
+		// (GlobalSafePurgeFloor does not account for an in-progress export).
+		// This mirrors decryptSnapshotForSend: frames embed their own epoch,
+		// and the recorded epoch is the minimum across them, so pinning it
+		// protects the oldest DEK any frame may reference.
+		barrier.RegisterInFlightEpoch(logdbSnap.Epoch)
+		defer barrier.DeregisterInFlightEpoch(logdbSnap.Epoch)
+
+		hw := &deferredHeaderWriter{w: w, header: headerBytes}
+		if _, err = decryptSnapshotFrames(barrier, f, hw); err != nil {
 			return err
 		}
-		return nil
+		// A frameless (empty-data) stream never triggered a write; the
+		// header alone is still a complete, importable artifact.
+		return hw.flushHeader()
 	}
 
 	// Epoch == 0: the on-disk snapshot is already plaintext, so a raw copy
 	// is correct. copyWithContext performs periodic cancellation checks.
+	if _, err = w.Write(headerBytes); err != nil {
+		return err
+	}
 	if err = copyWithContext(ctx, w, f); err != nil {
 		return err
 	}
 	return nil
 }
 
+// deferredHeaderWriter withholds a header from the underlying writer until
+// the first payload write arrives, so producers that can fail before
+// yielding any payload (AEAD decryption with a wrong key) fail before ANY
+// byte reaches the destination instead of after a dangling header.
+// flushHeader must be called after a successful payload-less production to
+// emit the header for empty streams.
+type deferredHeaderWriter struct {
+	w      io.Writer
+	header []byte // pending header; nil once written
+}
+
+// Write emits the pending header (once) before the first payload bytes.
+func (d *deferredHeaderWriter) Write(p []byte) (int, error) {
+	if err := d.flushHeader(); err != nil {
+		return 0, err
+	}
+	return d.w.Write(p)
+}
+
+// flushHeader writes the header if it has not been written yet. Idempotent.
+func (d *deferredHeaderWriter) flushHeader() error {
+	if d.header == nil {
+		return nil
+	}
+	header := d.header
+	d.header = nil
+	_, err := d.w.Write(header)
+	return err
+}
+
 // protoMembershipToLogDB converts a proto.Membership to a logdb.Membership.
 // Both types have identical field layouts; all maps are deep-copied to
 // prevent aliasing between the decoded header and LogDB storage.
 func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
-	result := logdb.Membership{ConfigChangeID: m.ConfigChangeID}
+	result := logdb.Membership{
+		ConfigChangeID:             m.ConfigChangeID,
+		MaxWitnesses:               m.MaxWitnesses,
+		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
+	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))
 		for k, v := range m.Addresses {
@@ -3907,10 +4211,17 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 // used as the Raft snapshot index (which comes from the artifact header).
 func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 	if h.closed.Load() {
 		return ErrClosed
+	}
+
+	// The import writes a full snapshot artifact to disk; starting one while
+	// the WAL disk monitor reports the volume full would only deepen the
+	// exhaustion and leave a truncated artifact behind.
+	if h.diskFull != nil && h.diskFull.Load() {
+		return ErrDiskFull
 	}
 
 	// Verify shard is NOT running.
@@ -3955,7 +4266,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 
 	// Check context before performing I/O.
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 
 	snapDir := filepath.Join(h.cfg.NodeHostDir, "snapshots",
@@ -3973,12 +4284,34 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 	if createErr != nil {
 		return createErr
 	}
-	if _, copyErr := io.Copy(f, r); copyErr != nil {
+	// Bound the copy by the maximum snapshot size. An unbounded io.Copy lets
+	// any artifact — a malformed stream, or one produced by a host with a
+	// larger limit — fill the volume before anything notices. The reader is
+	// given one byte past the maximum so an artifact exactly at the limit
+	// still imports while an oversized one is detected.
+	//
+	// The shard is stopped by definition here, so its per-shard
+	// Config.MaxSnapshotSize is not available; the package default is the
+	// applicable ceiling.
+	maxSize := config.DefaultMaxSnapshotSize
+	written, copyErr := io.Copy(f, io.LimitReader(r, int64(maxSize)+1))
+	if copyErr == nil && uint64(written) > maxSize {
+		copyErr = &SnapshotTooLargeError{ShardID: shardID, MaxSize: maxSize}
+	}
+	if copyErr != nil {
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Debug("snapshot import file close failed after copy error",
 				"shard", shardID,
 				"path", dataPath,
 				"error", closeErr)
+		}
+		// Do not leave a partial (possibly multi-gigabyte) artifact behind
+		// for an import that will never be recorded in LogDB.
+		if rmErr := os.RemoveAll(snapDir); rmErr != nil {
+			slog.Debug("snapshot import directory cleanup failed",
+				"shard", shardID,
+				"dir", snapDir,
+				"error", rmErr)
 		}
 		return copyErr
 	}
@@ -4000,7 +4333,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 
 	// Check context before committing to LogDB.
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 
 	// Determine the data file size for recovery's InstallSnapshot path.
@@ -4414,6 +4747,7 @@ func (h *Host) failPendingRequests(ns *nodeState, err error) {
 				})
 			return true // skip malformed entry
 		}
+		pp.failed()
 		pp.rs.complete(RequestResult{Err: err})
 		pp.rs.releaseRef()
 		h.completePendingOp()
@@ -4535,7 +4869,17 @@ func (h *Host) rotateBarrierKey() {
 	}
 	newEpoch, err := h.barrier.Rotate()
 	if err != nil {
-		h.logger.Error("key rotation failed", "error", err)
+		// Rotate fails closed when the barrier has no state persister: a
+		// rotation that is not persisted would leave every record written
+		// under the new epoch undecryptable after a restart. The condition is
+		// a permanent misconfiguration, not a transient failure, so the
+		// operator has to be told exactly what is broken and what it costs.
+		// It is NOT fatal to the host: reads and writes continue under the
+		// current epoch until the AEAD invocation limit is reached.
+		h.logger.Error("at-rest key rotation is DISABLED: the barrier rejected the rotation; "+
+			"configure a barrier state persister to enable it, otherwise the current epoch key "+
+			"is never replaced and writes will eventually fail at the AEAD invocation limit",
+			"error", err)
 		return
 	}
 	h.logger.Info("key rotation completed", "epoch", newEpoch)
@@ -4705,6 +5049,7 @@ func (h *Host) sweepPendingProposals(ns *nodeState, now time.Time) {
 		if _, removed := ns.pendingProposals.LoadAndDelete(key); !removed {
 			return true
 		}
+		pp.failed()
 		pp.rs.complete(RequestResult{Err: ErrTimeout})
 		pp.rs.releaseRef()
 		h.completePendingOp()
@@ -4713,6 +5058,16 @@ func (h *Host) sweepPendingProposals(ns *nodeState, now time.Time) {
 }
 
 // sweepPendingReads expires read requests whose deadline has passed.
+//
+// When an expired entry is a batch key with coalesced aliases, its
+// UNCONFIRMED aliases are expired with it: an unconfirmed alias is
+// reachable ONLY through the batch key's pendingRead (OnReadyToRead
+// looks up the batch key and walks pr.aliases), so once the batch entry
+// is removed a deadline-less alias could never complete and its
+// RequestState would never return to the pool. Confirmed aliases are
+// left in place — confirmation (which happens for the batch key and all
+// aliases atomically under pendingReadsMu) makes each alias
+// independently completable by the OnApplied read scan.
 func (h *Host) sweepPendingReads(ns *nodeState, now time.Time) {
 	ns.pendingReadsMu.Lock()
 	for key, pr := range ns.pendingReads {
@@ -4724,6 +5079,16 @@ func (h *Host) sweepPendingReads(ns *nodeState, now time.Time) {
 		delete(ns.pendingReads, key)
 		pr.rs.releaseRef()
 		h.completePendingOp()
+		for _, aliasKey := range pr.aliases {
+			aliasPR, ok := ns.pendingReads[aliasKey]
+			if !ok || aliasPR.confirmed {
+				continue
+			}
+			aliasPR.rs.complete(RequestResult{Err: ErrTimeout})
+			delete(ns.pendingReads, aliasKey)
+			aliasPR.rs.releaseRef()
+			h.completePendingOp()
+		}
 	}
 	ns.pendingReadsMu.Unlock()
 }
@@ -4838,14 +5203,23 @@ func (h *Host) HealthCheck() *HealthStatus {
 // SyncGetShardMembership().ConfigChangeID to ensure ordered config
 // changes. Pass 0 to skip the ordering check.
 func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.requestConfigChange(ctx, shardID, replicaID, addr, proto.AddNode, configChangeIndex)
+	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
+		ConfigChangeID: configChangeIndex,
+		Type:           proto.AddNode,
+		ReplicaID:      replicaID,
+		Address:        addr,
+	})
 }
 
 // RequestRemoveNode requests removing a replica from a shard via Raft
 // config change. The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID.
 func (h *Host) RequestRemoveNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) (*RequestState, error) {
-	return h.requestConfigChange(ctx, shardID, replicaID, "", proto.RemoveNode, configChangeIndex)
+	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
+		ConfigChangeID: configChangeIndex,
+		Type:           proto.RemoveNode,
+		ReplicaID:      replicaID,
+	})
 }
 
 // SyncRequestAddNode adds a replica to the shard's membership and blocks
@@ -4955,7 +5329,12 @@ func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uin
 // The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID.
 func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.requestConfigChange(ctx, shardID, replicaID, addr, proto.AddNonVoting, configChangeIndex)
+	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
+		ConfigChangeID: configChangeIndex,
+		Type:           proto.AddNonVoting,
+		ReplicaID:      replicaID,
+		Address:        addr,
+	})
 }
 
 // RequestAddWitness requests adding a voting witness to a shard.
@@ -4963,7 +5342,61 @@ func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64
 // The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID.
 func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.requestConfigChange(ctx, shardID, replicaID, addr, proto.AddWitness, configChangeIndex)
+	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
+		ConfigChangeID: configChangeIndex,
+		Type:           proto.AddWitness,
+		ReplicaID:      replicaID,
+		Address:        addr,
+	})
+}
+
+// RequestUpdateWitnessPolicy proposes replacing the shard's replicated
+// witness policy (config.WitnessConfig semantics: MaxWitnesses caps the
+// witness count, RequireFullReplicaMajority keeps the full replicas able
+// to form a quorum on their own). The change goes through Raft like any
+// membership change, so every replica adopts the new policy atomically at
+// the same log position. The new policy must be satisfied by the current
+// membership: tightening a policy the shard already violates is rejected
+// with ErrTooManyWitnesses or ErrBreaksFullReplicaMajority — reshape the
+// membership first, then tighten. configChangeIndex carries the usual
+// staleness guard (0 to skip).
+func (h *Host) RequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) (*RequestState, error) {
+	if policy.MaxWitnesses < 0 {
+		return nil, &HostInitError{
+			Field: "witness_policy",
+			Err:   fmt.Errorf("MaxWitnesses must be >= 0, got %d", policy.MaxWitnesses),
+		}
+	}
+	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
+		ConfigChangeID:             configChangeIndex,
+		Type:                       proto.UpdateWitnessPolicy,
+		MaxWitnesses:               uint64(policy.MaxWitnesses),
+		RequireFullReplicaMajority: policy.GetRequireFullReplicaMajority(),
+	})
+}
+
+// SyncRequestUpdateWitnessPolicy proposes a witness-policy change and
+// blocks until it commits or the context is canceled. See
+// RequestUpdateWitnessPolicy.
+func (h *Host) SyncRequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) error {
+	rs, err := h.RequestUpdateWitnessPolicy(ctx, shardID, policy, configChangeIndex)
+	if err != nil {
+		return err
+	}
+	defer rs.Release()
+
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			return result.Err
+		}
+		return nil
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			return ErrTimeout
+		}
+		return ErrCanceled
+	}
 }
 
 // SyncRequestSnapshot requests a snapshot of the shard with the
@@ -5155,7 +5588,7 @@ type LogRange struct {
 // firstIndex >= lastIndex or maxSize is zero.
 func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint64, lastIndex uint64, maxSize uint64) ([]proto.Entry, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, mapContextError(err)
 	}
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -5236,7 +5669,8 @@ func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
 // requestConfigChange is the shared implementation for all membership
 // operations. It serializes the ConfigChange, wraps it in an
 // EntryConfigChange entry, and delivers it via the engine inbox.
-func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint64, addr string, changeType uint64, configChangeIndex uint64) (*RequestState, error) {
+func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto.ConfigChange) (*RequestState, error) {
+	configChangeIndex := cc.ConfigChangeID
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -5285,17 +5719,9 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint6
 		return nil, ErrShardNotReady
 	}
 
-	// Serialize the config change into a binary payload.
-	cc := proto.ConfigChange{
-		ConfigChangeID: configChangeIndex,
-		Type:           changeType,
-		ReplicaID:      replicaID,
-		Address:        addr,
-	}
-
 	// Pre-validate the config change against the current membership before
 	// delivering it to the engine. The Host proposal path reaches
-	// membership.apply directly (DeliverProposal -> processConfigChanges),
+	// membership.apply on commit (Peer.Commit -> processConfigChanges),
 	// which deliberately does NOT re-check the voting-member cap so that
 	// committed changes always replay. Without this pre-check an invalid
 	// change (cap exceeded, duplicate add, last-voter removal) would either
@@ -5308,25 +5734,54 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint6
 	}
 
 	// Pre-register the address in the transport registry for Add operations.
-	// Per Raft PhD thesis 4.1, config changes take effect on log append. When
-	// the raft layer appends the config change entry, it immediately adds the
-	// remote and calls sendAppend/broadcastAppend. The transport must be able
-	// to resolve the new node's address at that point, not later when the
-	// entry is applied. Without this, the first Replicate messages are silently
-	// dropped (registry miss), causing the new node to never receive entries
-	// when no subsequent proposals create new log entries to trigger resends.
-	preRegistered := addr != "" && (changeType == proto.AddNode || changeType == proto.AddNonVoting || changeType == proto.AddWitness)
+	// Config changes take effect on commit, and the leader adds the new
+	// remote (syncRaftRemotes in Peer.Commit) and starts replicating to it
+	// the moment the entry commits. The transport must be able to resolve
+	// the new node's address at that point, not later when the entry is
+	// applied to the state machine. Without this, the first Replicate
+	// messages are silently dropped (registry miss), causing the new node
+	// to never receive entries when no subsequent proposals create new log
+	// entries to trigger resends.
+	//
+	// Register overwrites (Swap), so the prior mapping is captured first:
+	// AddNode on an EXISTING observer (observer -> voter promotion) targets a
+	// replicaID that already has a live registry entry, and an unconditional
+	// Remove on rollback would delete the address of a replica that is still
+	// a member and still being replicated to. A follower/observer never
+	// initiates traffic, so learnSourceAddress cannot heal the deletion and
+	// the replica would fall behind until the next committed config change,
+	// snapshot recovery, or host restart.
+	preRegistered := cc.Address != "" && (cc.Type == proto.AddNode || cc.Type == proto.AddNonVoting || cc.Type == proto.AddWitness)
+	var priorAddr string
+	var hadPrior bool
 	if preRegistered {
-		h.registry.Register(shardID, replicaID, addr)
+		if addr, resolveErr := h.registry.Resolve(shardID, cc.ReplicaID); resolveErr == nil && addr != "" {
+			priorAddr, hadPrior = addr, true
+		}
+		h.registry.Register(shardID, cc.ReplicaID, cc.Address)
 	}
 	// Roll back the speculative registration if the proposal never reaches
-	// the log. Leaving a stale (replicaID -> addr) mapping for a config
-	// change that was never proposed could misdirect later traffic to a
-	// node that was never actually added.
+	// the log or never commits. Leaving a stale (replicaID -> addr) mapping
+	// for a config change that was never applied could misdirect later
+	// traffic to a node that was never actually added. The rollback restores
+	// the prior mapping when there was one rather than deleting it.
+	//
+	// The rollback is skipped when the current mapping is no longer the
+	// address this call speculatively wrote: a later config change (or an
+	// apply-path registration) has since claimed the entry and must win over
+	// a late rollback from this superseded attempt.
 	rollbackPreRegister := func() {
-		if preRegistered {
-			h.registry.Remove(shardID, replicaID)
+		if !preRegistered {
+			return
 		}
+		if cur, resolveErr := h.registry.Resolve(shardID, cc.ReplicaID); resolveErr != nil || cur != cc.Address {
+			return
+		}
+		if hadPrior {
+			h.registry.Register(shardID, cc.ReplicaID, priorAddr)
+			return
+		}
+		h.registry.Remove(shardID, cc.ReplicaID)
 	}
 
 	buf := make([]byte, cc.Size())
@@ -5338,7 +5793,7 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint6
 	proposalKey := h.proposalKeySeq.Add(1)
 
 	deadline, _ := ctx.Deadline()
-	rs := newRequestState(ns.requestPool, proposalKey, deadline)
+	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
 
 	// Track this operation for drain notification.
 	h.addPendingOp()
@@ -5347,7 +5802,33 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint6
 	// fires before the map entry exists. acquireRef pins the RS until
 	// this map entry is removed.
 	rs.acquireRef()
-	ns.pendingProposals.Store(proposalKey, &pendingProposal{rs: rs, deadline: deadline})
+	ns.pendingProposals.Store(proposalKey, &pendingProposal{
+		rs:       rs,
+		deadline: deadline,
+		// An appended-but-never-committed config change (leader deposed,
+		// log truncated) must not leave a registry entry behind for a
+		// replica that never became a member.
+		onFailure: rollbackPreRegister,
+	})
+
+	// Close-vs-configchange TOCTOU guard: the host may have begun closing
+	// (and run its pending-request sweeps) between the top-of-method closed
+	// check and the Store above, which would orphan the RS in a deleted
+	// nodeState's map — a deadline-less caller would then block on
+	// rs.Result() forever. Re-check after registering and roll back if
+	// shutting down. LoadAndDelete makes the rollback exactly-once relative
+	// to a concurrent Close sweep (mirrors proposeEntry).
+	if h.closed.Load() || ns.stopped.Load() {
+		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
+		// The caller's own reference is dropped whether or not the claim
+		// won; a sweep that beat us drops only its own.
+		rs.Release()
+		rollbackPreRegister()
+		return nil, ErrClosed
+	}
 
 	entry := proto.Entry{
 		Type: proto.EntryConfigChange,
@@ -5355,10 +5836,18 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID, replicaID uint6
 		Cmd:  buf,
 	}
 	if !engNode.DeliverProposal([]proto.Entry{entry}) {
-		ns.pendingProposals.Delete(proposalKey)
-		rs.releaseRef()
+		// Queue full — claim the entry before rolling back. The sweep and
+		// failPendingRequests remove entries with LoadAndDelete-style
+		// claims; an unconditional Delete here could pair with a sweep that
+		// already completed the entry, double-counting releaseRef (driving
+		// outstanding negative) and completePendingOp. Only the claimant
+		// rolls back; rs.Release() is the caller's own reference and is
+		// dropped unconditionally.
+		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
+			rs.releaseRef()
+			h.completePendingOp()
+		}
 		rs.Release()
-		h.completePendingOp()
 		rollbackPreRegister()
 		return nil, ErrSystemBusy
 	}
@@ -5404,10 +5893,13 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		return true
 	})
 
+	leaderID := ns.leaderID.Load()
+	lastApplied := ns.lastApplied.Load()
+
 	return &ShardInfo{
 		ShardID:              ns.shardID,
 		ReplicaID:            ns.replicaID,
-		LeaderID:             ns.leaderID.Load(),
+		LeaderID:             leaderID,
 		Term:                 ns.term.Load(),
 		IsLeader:             ns.isLeader.Load(),
 		IsObserver:           ns.cfg.IsObserver,
@@ -5416,10 +5908,53 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		StateMachineTypeName: proto.StateMachineTypeName(ns.smType),
 		Pending:              pending,
 		Nodes:                nodesCopy,
-		Health:               ShardHealth(ns.health.Load()),
-		LastApplied:          ns.lastApplied.Load(),
+		Health:               h.shardHealth(ns, leaderID, lastApplied),
+		LastApplied:          lastApplied,
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
 	}
+}
+
+// shardLaggingThreshold is the number of committed-but-unapplied entries at
+// which a loaded, led shard is reported as ShardLagging. It is deliberately
+// generous: a healthy shard under load carries a small apply backlog, so the
+// threshold only trips when the state machine is falling meaningfully behind.
+const shardLaggingThreshold uint64 = 1000
+
+// shardHealth derives the reported health of a loaded shard. ns.health only
+// records the coarse lifecycle state (healthy once started, unloaded once
+// stopped); the failure, no-leader, and lagging conditions are live and are
+// derived here from the engine node so that a wedged shard is not reported
+// as healthy. Only a stored ShardHealthy is refined — ShardUnloaded is a
+// terminal lifecycle state and must not be overridden.
+func (h *Host) shardHealth(ns *nodeState, leaderID, lastApplied uint64) ShardHealth {
+	stored := ShardHealth(ns.health.Load())
+	if stored != ShardHealthy {
+		return stored
+	}
+
+	engNode := h.engine.GetNode(ns.shardID)
+	if engNode == nil {
+		// No engine node to derive live state from; report the stored value.
+		return stored
+	}
+	// The engine trips node.failed on a Peer.Commit error or an apply gap
+	// (the apply circuit breaker). The shard is wedged at that point: every
+	// proposal times out, so HealthCheck must report degraded rather than ok.
+	if engNode.IsFailed() {
+		return ShardError
+	}
+	if leaderID == 0 {
+		return ShardNoLeader
+	}
+	// Witnesses do not store log data and never apply, so a committed-vs-
+	// applied comparison is meaningless for them.
+	if !ns.cfg.IsWitness {
+		if committed := engNode.CommittedIndex(); committed > lastApplied &&
+			committed-lastApplied >= shardLaggingThreshold {
+			return ShardLagging
+		}
+	}
+	return ShardHealthy
 }
 
 // buildNotLeaderError creates a NotLeaderError with leader info from the
@@ -5641,7 +6176,9 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 // in-memory raft state.
 func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 	result := proto.Membership{
-		ConfigChangeID: m.ConfigChangeID,
+		ConfigChangeID:             m.ConfigChangeID,
+		MaxWitnesses:               m.MaxWitnesses,
+		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

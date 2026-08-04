@@ -353,6 +353,17 @@ func (l *raftLog) tryAppend(prevLogIndex, prevLogTerm uint64, ents []proto.Entry
 	if !l.matchTerm(prevLogIndex, prevLogTerm) {
 		return 0, false, false, nil
 	}
+	// Reject non-contiguous batches before any log mutation: the offset
+	// arithmetic below and inMemory.merge both assume ents[i].Index ==
+	// prevLogIndex+1+i. A gapped batch (buggy or corrupted sender) would
+	// otherwise corrupt the in-memory log; persistence-time gap detection
+	// only fires after the damage is done. Returning an error drops the
+	// message without a response, so a healthy leader simply retries.
+	for i := range ents {
+		if ents[i].Index != prevLogIndex+1+uint64(i) {
+			return 0, false, false, ErrGappedEntryBatch
+		}
+	}
 	// Find the first conflicting entry.
 	conflictIdx, cerr := l.getConflictIndex(ents)
 	if cerr != nil {

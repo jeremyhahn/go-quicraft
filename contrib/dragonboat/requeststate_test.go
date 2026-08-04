@@ -94,12 +94,27 @@ func TestRequestResult_GetResult_NilData(t *testing.T) {
 }
 
 func TestRequestResult_RequestOutOfRange(t *testing.T) {
+	// Dragonboat signals an out-of-range log query with a dedicated result
+	// code carrying the available range, not with an error value.
 	r := RequestResult{
-		inner: quicraft.RequestResult{Err: quicraft.ErrInvalidRange},
-		code:  RequestAborted,
+		code:     RequestOutOfRange,
+		logRange: LogRange{FirstIndex: 4, LastIndex: 9},
 	}
 	if !r.RequestOutOfRange() {
 		t.Error("expected RequestOutOfRange() to be true")
+	}
+	entries, lr := r.RaftLogs()
+	if entries != nil {
+		t.Errorf("expected nil entries, got %v", entries)
+	}
+	if lr.FirstIndex != 4 || lr.LastIndex != 9 {
+		t.Errorf("LogRange = %+v, want {4 9}", lr)
+	}
+}
+
+func TestRequestResultCode_OutOfRangeString(t *testing.T) {
+	if got := RequestOutOfRange.String(); got != "RequestOutOfRange" {
+		t.Errorf("RequestOutOfRange.String() = %q", got)
 	}
 }
 
@@ -114,12 +129,27 @@ func TestRequestResult_RequestOutOfRange_False(t *testing.T) {
 }
 
 func TestRequestResult_SnapshotIndex(t *testing.T) {
+	// Quicraft carries the snapshot index in the result's Value field.
 	r := RequestResult{
-		snapshotIndex: 42,
-		code:          RequestCompleted,
+		inner: quicraft.RequestResult{Value: 42},
+		code:  RequestCompleted,
 	}
 	if r.SnapshotIndex() != 42 {
 		t.Errorf("SnapshotIndex() = %d, want 42", r.SnapshotIndex())
+	}
+}
+
+func TestRequestResult_SnapshotIndex_FromTranslateResult(t *testing.T) {
+	// A completed snapshot request delivered through translateResult must
+	// surface the quicraft result Value as the snapshot index, matching
+	// dragonboat's behavior of returning the request result's value.
+	qr := quicraft.RequestResult{Value: 7788}
+	r := translateResult(qr)
+	if !r.Completed() {
+		t.Fatal("expected Completed() to be true for nil error")
+	}
+	if r.SnapshotIndex() != 7788 {
+		t.Errorf("SnapshotIndex() = %d, want 7788", r.SnapshotIndex())
 	}
 }
 
@@ -137,8 +167,9 @@ func TestRequestResult_RaftLogs_WithEntries(t *testing.T) {
 		{Index: 7, Term: 2, Cmd: []byte("c")},
 	}
 	r := RequestResult{
-		code:    RequestCompleted,
-		entries: entries,
+		code:     RequestCompleted,
+		entries:  entries,
+		logRange: LogRange{FirstIndex: 5, LastIndex: 8},
 	}
 	gotEntries, lr := r.RaftLogs()
 	if len(gotEntries) != 3 {
@@ -201,7 +232,14 @@ func TestTranslateResultCode(t *testing.T) {
 		{name: "closed", err: quicraft.ErrClosed, want: RequestTerminated},
 		{name: "stopped", err: quicraft.ErrStopped, want: RequestTerminated},
 		{name: "canceled", err: quicraft.ErrCanceled, want: RequestAborted},
-		{name: "unknown", err: quicraft.ErrNotLeader, want: RequestAborted},
+		{name: "session_expired", err: quicraft.ErrSessionExpired, want: RequestRejected},
+		{name: "session_not_found", err: quicraft.ErrSessionNotFound, want: RequestRejected},
+		{name: "session_already_exists", err: quicraft.ErrSessionAlreadyExists, want: RequestRejected},
+		{name: "not_leader", err: quicraft.ErrNotLeader, want: RequestDropped},
+		{name: "readindex_not_ready", err: quicraft.ErrReadIndexNotReady, want: RequestDropped},
+		{name: "shard_not_ready", err: quicraft.ErrShardNotReady, want: RequestDropped},
+		{name: "disk_full", err: quicraft.ErrDiskFull, want: RequestDropped},
+		{name: "unknown", err: errors.New("no mapping"), want: RequestAborted},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -248,7 +286,7 @@ func TestRequestState_Release_NilInner(t *testing.T) {
 func TestRequestState_Release_WithInner(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 	// Should not panic.
 	rs.Release()
 }
@@ -319,7 +357,7 @@ func TestRequestState_AppliedC_Resolved(t *testing.T) {
 func TestRequestState_ShardID(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestStateForShard(inner, 42)
+	rs := WrapRequestStateForShard(inner, 42, false)
 	if rs.ShardID() != 42 {
 		t.Errorf("ShardID() = %d, want 42", rs.ShardID())
 	}
@@ -484,22 +522,22 @@ func TestResult_TypeAlias(t *testing.T) {
 
 func TestRequestResult_SnapshotIndex_NonSnapshotResult(t *testing.T) {
 	// In dragonboat, accessing SnapshotIndex on a regular (non-snapshot)
-	// result panics. Our adapter returns 0 for non-snapshot results,
-	// which is a safe and compatible behavior.
+	// result panics, so its value there is undefined. Our adapter returns
+	// the raw result value in all cases, which for a snapshot request is
+	// the snapshot index.
 	r := RequestResult{
 		inner: quicraft.RequestResult{Value: 42, Data: []byte("data")},
 		code:  RequestCompleted,
-		// snapshotIndex not set (zero value).
 	}
-	if r.SnapshotIndex() != 0 {
-		t.Errorf("SnapshotIndex() = %d, want 0 for non-snapshot result", r.SnapshotIndex())
+	if r.SnapshotIndex() != 42 {
+		t.Errorf("SnapshotIndex() = %d, want raw result value 42", r.SnapshotIndex())
 	}
 }
 
 func TestRequestResult_SnapshotIndex_WithSnapshotResult(t *testing.T) {
 	r := RequestResult{
-		code:          RequestCompleted,
-		snapshotIndex: 12345,
+		code:  RequestCompleted,
+		inner: quicraft.RequestResult{Value: 12345},
 	}
 	if r.SnapshotIndex() != 12345 {
 		t.Errorf("SnapshotIndex() = %d, want 12345", r.SnapshotIndex())
@@ -595,7 +633,7 @@ func TestRequestState_ResolvedC_MultipleAppliedCCalls(t *testing.T) {
 func TestRequestState_ShardID_ZeroDefault(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 	if rs.ShardID() != 0 {
 		t.Errorf("ShardID() = %d, want 0 for non-shard wrapper", rs.ShardID())
 	}
@@ -644,7 +682,11 @@ func TestTranslateResult_Aborted(t *testing.T) {
 
 func TestRequestResult_RaftLogs_SingleEntry(t *testing.T) {
 	entries := []Entry{{Index: 10, Cmd: []byte("single")}}
-	r := RequestResult{code: RequestCompleted, entries: entries}
+	r := RequestResult{
+		code:     RequestCompleted,
+		entries:  entries,
+		logRange: LogRange{FirstIndex: 10, LastIndex: 11},
+	}
 	gotEntries, lr := r.RaftLogs()
 	if len(gotEntries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(gotEntries))
@@ -715,7 +757,7 @@ func TestWrapSysOpState_Release(t *testing.T) {
 func TestRequestState_AppliedC_NonResolved(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 
 	// AppliedC should return the CompletedC channel (adapted from inner).
 	ch := rs.AppliedC()
@@ -728,7 +770,7 @@ func TestRequestState_AppliedC_NonResolved(t *testing.T) {
 func TestRequestState_ResultC_NonResolved(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 
 	ch := rs.ResultC()
 	if ch == nil {
@@ -748,7 +790,7 @@ func TestWrapRequestStateWithCancel_CancelOnRelease(t *testing.T) {
 	canceled := false
 	cancel := func() { canceled = true }
 
-	rs := WrapRequestStateWithCancel(inner, cancel)
+	rs := WrapRequestStateWithCancel(inner, cancel, false)
 	if canceled {
 		t.Error("cancel should not be called before Release")
 	}
@@ -764,7 +806,7 @@ func TestWrapRequestStateWithCancel_NilCancel(t *testing.T) {
 	inner := pool.Get().(*quicraft.RequestState)
 
 	// Passing nil cancel should not panic on Release.
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 	rs.Release()
 }
 
@@ -775,7 +817,7 @@ func TestWrapRequestStateForShardWithCancel_ShardID(t *testing.T) {
 	canceled := false
 	cancel := func() { canceled = true }
 
-	rs := WrapRequestStateForShardWithCancel(inner, 99, cancel)
+	rs := WrapRequestStateForShardWithCancel(inner, 99, cancel, false)
 	if rs.ShardID() != 99 {
 		t.Errorf("ShardID() = %d, want 99", rs.ShardID())
 	}
@@ -793,7 +835,7 @@ func TestWrapRequestStateForShardWithCancel_CancelNotCalledPrematurely(t *testin
 	canceled := false
 	cancel := func() { canceled = true }
 
-	rs := WrapRequestStateForShardWithCancel(inner, 42, cancel)
+	rs := WrapRequestStateForShardWithCancel(inner, 42, cancel, false)
 
 	// Access channels before release -- cancel should not fire.
 	ch := rs.ResultC()
@@ -817,7 +859,7 @@ func TestWrapRequestStateWithCancel_DoubleRelease(t *testing.T) {
 	callCount := 0
 	cancel := func() { callCount++ }
 
-	rs := WrapRequestStateWithCancel(inner, cancel)
+	rs := WrapRequestStateWithCancel(inner, cancel, false)
 	rs.Release()
 	// Second release should call cancel again (cancel funcs are idempotent).
 	// This verifies no panic on double release.
@@ -846,7 +888,7 @@ func TestRequestState_ReleaseBeforeResult_NoGoroutineLeak(t *testing.T) {
 	for i := range states {
 		pool := quicraft.NewRequestStatePool()
 		inner := pool.Get().(*quicraft.RequestState)
-		states[i] = WrapRequestState(inner)
+		states[i] = WrapRequestState(inner, false)
 	}
 
 	// Release all before any result is delivered.
@@ -926,7 +968,7 @@ func TestRequestState_ResultArrivesThenRelease(t *testing.T) {
 func TestRequestState_DoubleRelease_NoPanic(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner)
+	rs := WrapRequestState(inner, false)
 
 	// Double release should not panic (doneOnce protects close).
 	rs.Release()
@@ -1016,8 +1058,9 @@ func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) 
 	for i := range states {
 		pool := quicraft.NewRequestStatePool()
 		inner := pool.Get().(*quicraft.RequestState)
-		states[i] = WrapRequestState(inner)
-		// Verify committedC is non-nil (inner has a committedC channel).
+		states[i] = WrapRequestState(inner, true)
+		// Touch CommittedC so the bridge goroutine is actually created;
+		// it is spawned lazily on first use.
 		if states[i].CommittedC() == nil {
 			t.Fatalf("expected non-nil CommittedC for state %d", i)
 		}
@@ -1097,7 +1140,17 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 	}
 	rs := newResolvedRequestState(result)
 
-	// Read from ResultC first.
+	// ResultC, AppliedC and CompletedC must all be the SAME channel, each
+	// call returning the same instance. Handing out a fresh pre-loaded
+	// channel per call makes the idiomatic dragonboat receive loop spin
+	// forever on the same value.
+	if rs.ResultC() != rs.AppliedC() || rs.ResultC() != rs.CompletedC {
+		t.Fatal("resolved RequestState must hand out one shared channel")
+	}
+	if rs.ResultC() != rs.ResultC() {
+		t.Fatal("ResultC must return the same channel on every call")
+	}
+
 	select {
 	case r := <-rs.ResultC():
 		if r.GetResult().Value != 88 {
@@ -1107,24 +1160,11 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 		t.Fatal("timed out reading from ResultC")
 	}
 
-	// Read from AppliedC second -- must not block.
+	// The single buffered value is now consumed, matching a real request.
 	select {
-	case r := <-rs.AppliedC():
-		if r.GetResult().Value != 88 {
-			t.Errorf("AppliedC Value = %d, want 88", r.GetResult().Value)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from AppliedC after ResultC was consumed")
-	}
-
-	// Read from CompletedC third -- must not block.
-	select {
-	case r := <-rs.CompletedC:
-		if r.GetResult().Value != 88 {
-			t.Errorf("CompletedC Value = %d, want 88", r.GetResult().Value)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from CompletedC after ResultC and AppliedC were consumed")
+	case <-rs.AppliedC():
+		t.Fatal("resolved RequestState delivered a second value")
+	default:
 	}
 }
 
@@ -1135,17 +1175,13 @@ func TestResolvedRequestState_MultipleReads_DataPreserved(t *testing.T) {
 	}
 	rs := newResolvedRequestState(result)
 
-	// Drain CompletedC.
-	<-rs.CompletedC
-
-	// AppliedC should still deliver the full result.
 	select {
-	case r := <-rs.AppliedC():
+	case r := <-rs.CompletedC:
 		if string(r.GetResult().Data) != "preserved" {
 			t.Errorf("Data = %q, want %q", string(r.GetResult().Data), "preserved")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out reading from AppliedC")
+		t.Fatal("timed out reading from CompletedC")
 	}
 }
 

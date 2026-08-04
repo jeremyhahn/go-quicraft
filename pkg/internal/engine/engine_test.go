@@ -1396,3 +1396,73 @@ func TestEngine_SetCallback_AfterStart_Panics(t *testing.T) {
 
 	e.SetCallback(newTestCallback())
 }
+
+// TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies the
+// commit-worker panic recovery contract:
+//
+//   - commitC is drained BEFORE commitPending is cleared. The step worker is
+//     still running; once commitPending is false it reuses the very
+//     *commitItem still queued in commitC, so clearing first could enqueue
+//     the same pointer twice (double Peer.Commit, double apply, double
+//     release of the same pooled entry slice).
+//   - the batch buffers are cleared, so the restarted worker cannot send this
+//     batch's ordered messages after an unrelated later batch's fsync.
+func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+
+	cfg := newTestHostConfig()
+	cfg.NumWorkers = 1
+	ldb := newTestLogDB()
+
+	e := NewEngine(cfg, ldb, newTestSender(), nil, nil, nil)
+	cw := e.CommitWorker(0)
+	cw.retryHookForTest = func(_ int) { panic("injected commit worker panic") }
+	ldb.setSaveError(errors.New("disk error"))
+
+	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
+	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node.commitPending.Store(true)
+	e.LoadNode(node)
+
+	// A queued item that must be drained by the recovery.
+	stale := NewNode(nil, nil, nil, config.Config{ShardID: 3, ReplicaID: 1}, 100, nil, "", nil)
+	stale.commitPending.Store(true)
+	e.LoadNode(stale)
+	cw.commitC <- &commitItem{update: proto.Update{ShardID: 3, ReplicaID: 1}, node: stale}
+
+	// The item that panics, carrying an ordered message that must never be
+	// sent by a later batch.
+	cw.commitC <- &commitItem{
+		update:      proto.Update{ShardID: 1, ReplicaID: 1, State: proto.State{Term: 1}},
+		node:        node,
+		orderedMsgs: []proto.Message{{Type: proto.RequestVoteResp, ShardID: 1, From: 1, To: 2}},
+	}
+
+	if !e.runCommitWorkerOnce(cw) {
+		t.Fatal("expected runCommitWorkerOnce to report a panic")
+	}
+
+	if len(cw.commitC) != 0 {
+		t.Fatalf("commitC must be drained by the recovery, %d items left", len(cw.commitC))
+	}
+	if len(cw.orderedMsgsBuf) != 0 {
+		t.Fatalf("orderedMsgsBuf must be cleared by the recovery, got %d shards", len(cw.orderedMsgsBuf))
+	}
+	if len(cw.commitTimes) != 0 {
+		t.Fatalf("commitTimes must be cleared by the recovery, got %d entries", len(cw.commitTimes))
+	}
+	for i := range cw.batch {
+		if cw.batch[i].ShardID != 0 || len(cw.batch[i].CommittedEntries) != 0 {
+			t.Fatalf("batch slot %d not cleared: %+v", i, cw.batch[i])
+		}
+	}
+	for i := range cw.batchNodes {
+		if cw.batchNodes[i] != nil {
+			t.Fatalf("batchNodes slot %d not cleared", i)
+		}
+	}
+	if node.commitPending.Load() || stale.commitPending.Load() {
+		t.Fatal("commitPending must be cleared on every node owned by the worker")
+	}
+}

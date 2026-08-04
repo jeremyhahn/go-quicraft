@@ -19,7 +19,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"io"
+	"sync/atomic"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
@@ -61,7 +63,12 @@ const (
 // strategy for each operation. This mode is useful when the passphrase is
 // not known until seal/unseal time (e.g., derived from user credentials).
 type SoftwareStrategy struct {
-	passphrase *enclave.ProtectedKey
+	// passphrase is an atomic.Pointer so that Close (which drops the
+	// reference) cannot race the Seal/Unseal paths that read it. Those paths
+	// load the pointer ONCE into a local and operate on the local; a Close
+	// that lands mid-operation therefore cannot turn a validated non-nil
+	// reference into a nil dereference.
+	passphrase atomic.Pointer[enclave.ProtectedKey]
 	kdfVersion KDFVersion
 	kdfParams  KDFParams
 
@@ -149,12 +156,13 @@ func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams
 	}
 	p := make([]byte, len(passphrase))
 	copy(p, passphrase)
-	return &SoftwareStrategy{
-		passphrase: enclave.NewProtectedKey(p),
+	s := &SoftwareStrategy{
 		kdfVersion: version,
 		kdfParams:  params,
 		randReader: rand.Reader,
-	}, nil
+	}
+	s.passphrase.Store(enclave.NewProtectedKey(p))
+	return s, nil
 }
 
 // ID returns the strategy identifier StrategyPassphrase.
@@ -213,6 +221,14 @@ func (s *SoftwareStrategy) sealRootKeyDeferred(_ context.Context, rootKey []byte
 
 // sealRootKeyBound performs the seal operation using the bound passphrase.
 func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, error) {
+	// Close() drops the passphrase enclave; calling Open on the nil
+	// *ProtectedKey would panic, so a closed (or never-bound) strategy
+	// fails with a typed error instead. The pointer is loaded ONCE so a
+	// concurrent Close cannot invalidate it after this check.
+	passphrase := s.passphrase.Load()
+	if passphrase == nil {
+		return nil, &Error{Strategy: passphraseStrategyName, Err: ErrStrategyClosed}
+	}
 	if len(rootKey) != 32 {
 		return nil, ErrInvalidRootKeySize
 	}
@@ -224,9 +240,9 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	}
 
 	// Open passphrase enclave for KDF derivation.
-	ppBuf, err := s.passphrase.Open()
+	ppBuf, err := passphrase.Open()
 	if err != nil {
-		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
+		return nil, &Error{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
 	}
 
 	// Derive wrapping key from passphrase using the configured KDF.
@@ -309,8 +325,27 @@ func (s *SoftwareStrategy) unsealRootKeyDeferred(_ context.Context, sealed *Seal
 
 // unsealRootKeyBound performs the unseal operation using the bound passphrase.
 func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, error) {
+	// Close() drops the passphrase enclave; calling Open on the nil
+	// *ProtectedKey would panic, so a closed (or never-bound) strategy
+	// fails with a typed error instead. The pointer is loaded ONCE so a
+	// concurrent Close cannot invalidate it after this check.
+	passphrase := s.passphrase.Load()
+	if passphrase == nil {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyClosed}
+	}
 	if sealed == nil {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
+	}
+
+	// Reject a sealed blob that claims a different strategy. The Strategy
+	// field is plaintext and NOT covered by the AEAD AAD (which is the
+	// constant strategy name), so without this check an attacker who flips
+	// the field to "none" still gets a successful decrypt here while
+	// steering Barrier.Unseal down its no-encryption branch — a downgrade
+	// that leaves the barrier "unsealed" with no cipher. Empty is accepted
+	// for sealed data written before the field was populated.
+	if sealed.Strategy != "" && sealed.Strategy != StrategyPassphrase {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyMismatch}
 	}
 
 	// Minimum ciphertext: kdfSalt(32) + nonce(12) + tag(16) = 60 bytes.
@@ -329,9 +364,9 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	rest := sealed.Ciphertext[kdfSaltLen:]
 
 	// Open passphrase enclave for KDF derivation.
-	ppBuf, err := s.passphrase.Open()
+	ppBuf, err := passphrase.Open()
 	if err != nil {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
 	}
 
 	// Derive the wrapping key from passphrase + KDF salt.
@@ -416,14 +451,26 @@ func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersio
 	}
 }
 
+// closedIfEnclaveGone maps the enclave-nil error to ErrStrategyClosed. Close
+// clears the enclave INSIDE the ProtectedKey, so a Close that lands after a
+// seal/unseal loaded the reference surfaces as ErrEnclaveNil from Open; that
+// is the same condition as "used after Close" and must report the same error.
+func closedIfEnclaveGone(err error) error {
+	if errors.Is(err, enclave.ErrEnclaveNil) {
+		return ErrStrategyClosed
+	}
+	return err
+}
+
 // Close releases strategy-held resources by clearing the passphrase enclave
 // reference, allowing memguard's finalizer to securely wipe the key material.
-// This method is idempotent. For deferred strategies (where passphrase is nil),
-// Close is a no-op.
+// This method is idempotent and safe to call concurrently with Seal/Unseal:
+// an operation that already loaded the reference completes against it, and any
+// operation that starts afterwards fails with ErrStrategyClosed. For deferred
+// strategies (where the passphrase is bound per call), Close is a no-op.
 func (s *SoftwareStrategy) Close() error {
-	if s.passphrase != nil {
-		s.passphrase.Clear()
-		s.passphrase = nil
+	if passphrase := s.passphrase.Swap(nil); passphrase != nil {
+		passphrase.Clear()
 	}
 	return nil
 }

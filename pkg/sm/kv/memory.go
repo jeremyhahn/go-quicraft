@@ -62,6 +62,11 @@ func handleDelete(m *MemoryStore, cmd Command) sm.Result {
 type MemoryStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte
+
+	// cmds is a scratch slice reused across Update calls for the decode
+	// pass, avoiding a per-batch allocation. Guarded by mu; entries alias
+	// Entry.Cmd only for the duration of a single Update call.
+	cmds []Command
 }
 
 // NewMemoryStore creates a new MemoryStore.
@@ -70,21 +75,52 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // Update applies committed entries to the in-memory store.
+//
+// The entries are committed Raft log entries: they MUST be applied
+// deterministically on every replica, so a payload that fails to decode
+// produces the reserved sm.ResultInvalidCommand result for that entry
+// rather than an Update error (the engine treats an Update error as
+// terminal for the shard). All entries are decoded before any mutation,
+// so no error return can occur after the first write and the
+// all-or-nothing contract of sm.StateMachine.Update holds.
 func (m *MemoryStore) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Pass 1: decode every command before mutating anything. An
+	// undecodable payload is marked with the zero Command (Op 0 is not a
+	// valid opcode) and its reserved per-entry result is written now.
+	if cap(m.cmds) < len(entries) {
+		m.cmds = make([]Command, len(entries))
+	}
+	cmds := m.cmds[:len(entries)]
 	for i, e := range entries {
 		cmd, err := DecodeCommand(e.Cmd)
 		if err != nil {
-			return err
+			cmds[i] = Command{}
+			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
+			continue
 		}
-		handler, ok := opHandlers[cmd.Op]
-		if !ok {
-			return &InvalidCommandError{Reason: "unknown op"}
+		if _, ok := opHandlers[cmd.Op]; !ok {
+			// Unreachable while DecodeCommand validates the opcode
+			// range; kept so a future opcode gap stays deterministic.
+			cmds[i] = Command{}
+			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
+			continue
 		}
-		results[i] = handler(m, cmd)
+		cmds[i] = cmd
 	}
+
+	// Pass 2: apply. Handlers cannot fail, so the batch applies fully.
+	for i := range cmds {
+		if cmds[i].Op == 0 {
+			continue
+		}
+		results[i] = opHandlers[cmds[i].Op](m, cmds[i])
+	}
+	// Drop aliases into Entry.Cmd buffers, which the engine may recycle
+	// after Update returns (Config.ZeroCopyEntryCmd).
+	clear(cmds)
 	return nil
 }
 
@@ -155,6 +191,8 @@ func (m *MemoryStore) BytesLookupInto(key, dst []byte) ([]byte, error) {
 }
 
 // GetHash computes a deterministic xxhash64 hash of all key-value pairs.
+// Each key and value is hashed via hashLenPrefixed so pair boundaries are
+// unambiguous.
 func (m *MemoryStore) GetHash() (uint64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -166,14 +204,37 @@ func (m *MemoryStore) GetHash() (uint64, error) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if _, err := h.WriteString(k); err != nil {
-			return 0, &HashWriteError{Err: err}
-		}
-		if _, err := h.Write(m.data[k]); err != nil {
-			return 0, &HashWriteError{Err: err}
+		if err := hashLenPrefixed(h, k, m.data[k]); err != nil {
+			return 0, err
 		}
 	}
 	return h.Sum64(), nil
+}
+
+// hashLenPrefixed writes one key-value pair into h with a fixed-width
+// uint64 little-endian length prefix before the key and before the value.
+// Without the prefixes the concatenated stream is ambiguous —
+// {"user":"1"} and {"use":"r1"} would hash identically, so genuine
+// divergence could go undetected by the very API that exists to detect it.
+// Shared by MemoryStore.GetHash and ConcurrentStore.GetHash so both stores
+// produce the same hash for the same logical contents.
+func hashLenPrefixed(h *xxhash.Digest, key string, val []byte) error {
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(key)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	if _, err := h.WriteString(key); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(val)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	if _, err := h.Write(val); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	return nil
 }
 
 // SaveSnapshot serializes all key-value pairs to the writer.

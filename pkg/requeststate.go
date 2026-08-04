@@ -97,7 +97,9 @@ type RequestState struct {
 	deadlineNano atomic.Int64
 
 	// createdAt records when the request was submitted, for measuring
-	// end-to-end proposal latency. Zero when metrics are disabled.
+	// end-to-end proposal latency. Zero when the request was created with
+	// trackLatency false (no metrics collector configured), in which case
+	// no latency is observed for it.
 	createdAt time.Time
 
 	// completedC delivers the full apply result exactly once.
@@ -155,8 +157,10 @@ func NewRequestStatePool() *sync.Pool {
 }
 
 // newRequestState obtains a RequestState from the pool and initializes it
-// for a new request.
-func newRequestState(pool *sync.Pool, key uint64, deadline time.Time) *RequestState {
+// for a new request. trackLatency stamps createdAt for the end-to-end
+// latency histograms; it must be false when no metrics collector is
+// configured so the clock read is kept off the proposal hot path entirely.
+func newRequestState(pool *sync.Pool, key uint64, deadline time.Time, trackLatency bool) *RequestState {
 	rs := pool.Get().(*RequestState)
 	rs.key = key
 	if deadline.IsZero() {
@@ -164,7 +168,11 @@ func newRequestState(pool *sync.Pool, key uint64, deadline time.Time) *RequestSt
 	} else {
 		rs.deadlineNano.Store(deadline.UnixNano())
 	}
-	rs.createdAt = time.Now()
+	if trackLatency {
+		rs.createdAt = time.Now()
+	} else {
+		rs.createdAt = time.Time{}
+	}
 	rs.pool = pool
 	rs.released.Store(false)
 	rs.recycled.Store(false)
@@ -290,6 +298,34 @@ func (rs *RequestState) acquireRef() {
 func (rs *RequestState) releaseRef() {
 	if rs.outstanding.Add(-1) == 0 {
 		rs.tryRecycle()
+	}
+}
+
+// tryAcquireRef acquires an additional reference only while at least one
+// other reference is outstanding, returning false otherwise. Unlike
+// acquireRef (which is only safe at registration time, before the object
+// is published to a pending map), tryAcquireRef is safe on an object that
+// may be racing recycling: it never increments from zero, and a nonzero
+// count means a pending-map reference still pins the object, so it cannot
+// reach tryRecycle's pool.Put — or newRequestState's counter reset — while
+// the new reference is held. An unconditional Add(1) here could instead
+// land on an object already recycled into the pool; if newRequestState
+// then reset the counter to zero before the paired releaseRef ran, the
+// counts would unbalance and the object could be recycled while still
+// registered. A successful tryAcquireRef must be paired with releaseRef.
+// Callers that need the reference to belong to a specific request must
+// re-verify their pending-map entry after acquiring (see OnCommitted):
+// the count may belong to a recycled successor, in which case the
+// verify fails and the balanced acquire/release pair is harmless.
+func (rs *RequestState) tryAcquireRef() bool {
+	for {
+		n := rs.outstanding.Load()
+		if n <= 0 {
+			return false
+		}
+		if rs.outstanding.CompareAndSwap(n, n+1) {
+			return true
+		}
 	}
 }
 

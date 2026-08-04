@@ -127,10 +127,17 @@ func WithRegistry(reg prometheus.Registerer) Option {
 }
 
 // aggregatorMetrics holds all Prometheus metrics for the aggregator.
+//
+// Cardinality policy: the library targets 10K+ shards, so the per-shard
+// "shard" label is carried ONLY by the batchesTotal counter (2 series per
+// shard, needed for per-shard flush/failure attribution). The batchSize and
+// flushDuration histograms are deliberately unlabeled aggregates — with
+// their 11/14 buckets a shard label would multiply into hundreds of
+// thousands of time series from this component alone.
 type aggregatorMetrics struct {
 	batchesTotal     *prometheus.CounterVec
-	batchSize        *prometheus.HistogramVec
-	flushDuration    *prometheus.HistogramVec
+	batchSize        prometheus.Histogram
+	flushDuration    prometheus.Histogram
 	queueDepth       prometheus.Gauge
 	flushReasonTotal *prometheus.CounterVec
 }
@@ -140,8 +147,17 @@ type aggregatorMetrics struct {
 // the per-proposal Raft consensus overhead across many operations,
 // significantly improving write throughput.
 //
+// Delivery semantics: AT-LEAST-ONCE. The aggregator proposes a raw encoded
+// batch with no client session, so it has no at-most-once path. A flush that
+// fails with FlushError.Indeterminate set (proposer timeout or cancellation)
+// may nonetheless commit and apply; retrying such a batch applies every
+// command in it a second time. Callers needing exactly-once semantics must
+// make their commands idempotent or propose through a session instead.
+//
 // Thread safety: Submit may be called concurrently from multiple
-// goroutines. The aggregator manages its own background flush loop.
+// goroutines. The aggregator manages its own background flush loop, which
+// flushes each shard's batch concurrently so one slow shard cannot stall
+// the others.
 type Aggregator struct {
 	cfg      Config
 	proposer Proposer
@@ -214,6 +230,11 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 //   - QueueFullError if the queue is at capacity
 //   - context.Canceled or context.DeadlineExceeded if ctx is done
 //   - FlushError if the batch flush fails
+//
+// A returned FlushError wraps the proposer's error (use errors.Is/errors.As
+// to inspect it) and sets Indeterminate when the outcome is unknown rather
+// than a definite rejection. Retrying an indeterminate submission can apply
+// the batch twice; see the Aggregator doc comment.
 func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) error {
 	if a.closed.Load() {
 		return &ClosedError{}
@@ -378,9 +399,25 @@ func (a *Aggregator) flush(reason string) {
 		shardBatches[p.shardID] = append(shardBatches[p.shardID], p)
 	}
 
-	for shardID, shardProposals := range shardBatches {
-		a.flushShard(shardID, shardProposals)
+	// Flush every shard concurrently. Flushing them in sequence on the single
+	// flushLoop goroutine lets one slow or leaderless shard block every other
+	// shard's flush for the full proposal timeout, backing the queue up to
+	// QueueSize and producing QueueFullError for unrelated shards.
+	if len(shardBatches) == 1 {
+		for shardID, shardProposals := range shardBatches {
+			a.flushShard(shardID, shardProposals)
+		}
+		return
 	}
+	var wg sync.WaitGroup
+	wg.Add(len(shardBatches))
+	for shardID, shardProposals := range shardBatches {
+		go func() {
+			defer wg.Done()
+			a.flushShard(shardID, shardProposals)
+		}()
+	}
+	wg.Wait()
 }
 
 // flushShard encodes and submits a batch of proposals for a single shard,
@@ -389,7 +426,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	shardLabel := strconv.FormatUint(shardID, 10)
 	batchLen := len(proposals)
 
-	a.metrics.batchSize.WithLabelValues(shardLabel).Observe(float64(batchLen))
+	a.metrics.batchSize.Observe(float64(batchLen))
 	a.metrics.batchesTotal.WithLabelValues(shardLabel, "attempted").Inc()
 
 	// Encode all proposal data as a length-prefixed batch.
@@ -409,16 +446,25 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	err := a.proposer.SyncPropose(ctx, shardID, encoded)
 	elapsed := time.Since(start)
 
-	a.metrics.flushDuration.WithLabelValues(shardLabel).Observe(elapsed.Seconds())
+	a.metrics.flushDuration.Observe(elapsed.Seconds())
 
 	if err != nil {
+		// A timeout or cancellation does NOT mean the proposal was rejected:
+		// the entry may already be replicated and will apply. Reporting it as
+		// a definite failure would tell the caller a committed write failed,
+		// and a blind retry would duplicate the whole batch. Flag the outcome
+		// as indeterminate so the caller can distinguish the two.
+		indeterminate := errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) ||
+			ctx.Err() != nil
 		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
 		a.logger.Warn("batch flush failed",
 			slog.Uint64("shard_id", shardID),
 			slog.Int("batch_size", batchLen),
+			slog.Bool("indeterminate", indeterminate),
 			slog.String("error", err.Error()),
 		)
-		flushErr := &FlushError{ShardID: shardID, Err: err}
+		flushErr := &FlushError{ShardID: shardID, Err: err, Indeterminate: indeterminate}
 		for _, p := range proposals {
 			p.resultCh <- flushErr
 		}
@@ -456,21 +502,25 @@ func (a *Aggregator) initMetrics() {
 				Help:      "Total number of batch flush operations by shard and status.",
 			}, []string{"shard", "status"}),
 
-			batchSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			// Aggregate (no shard label) by design — see the
+			// aggregatorMetrics cardinality policy.
+			batchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 				Namespace: "quicraft",
 				Subsystem: "batch",
 				Name:      "batch_size",
-				Help:      "Number of proposals in each flushed batch.",
+				Help:      "Number of proposals in each flushed batch (all shards).",
 				Buckets:   []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
-			}, []string{"shard"}),
+			}),
 
-			flushDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			// Aggregate (no shard label) by design — see the
+			// aggregatorMetrics cardinality policy.
+			flushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
 				Namespace: "quicraft",
 				Subsystem: "batch",
 				Name:      "flush_duration_seconds",
-				Help:      "Duration of batch flush operations (proposer SyncPropose call).",
+				Help:      "Duration of batch flush operations (proposer SyncPropose call, all shards).",
 				Buckets:   []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
-			}, []string{"shard"}),
+			}),
 
 			queueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 				Namespace: "quicraft",

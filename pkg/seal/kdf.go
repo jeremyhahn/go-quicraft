@@ -16,6 +16,8 @@ package seal
 
 import (
 	"crypto/sha256"
+	"sync/atomic"
+	"testing"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/pbkdf2"
@@ -52,24 +54,33 @@ const (
 
 // allowWeakKDFParams, when true, bypasses the production KDF work-factor
 // floors enforced by DeriveKey. It exists ONLY so unit tests can derive
-// keys with trivially cheap parameters; production code must never set
-// it. Guarded by AllowWeakKDFParams.
-var allowWeakKDFParams bool
+// keys with trivially cheap parameters; production code must never set it.
+// It is an atomic.Bool because DeriveKey reads it from every concurrent
+// seal/unseal while a test may flip it. Guarded by AllowWeakKDFParams.
+var allowWeakKDFParams atomic.Bool
 
-// AllowWeakKDFParams enables (test-only) bypass of the production KDF
+// AllowWeakKDFParams enables the test-only bypass of the production KDF
 // work-factor floors and returns a function that restores the previous
-// setting. Never call this from production code.
+// setting.
+//
+// It PANICS outside a test binary. The bypass reduces the sealed-root-key
+// wrapping KDF to a near-free cost, so an importer (or a dependency's init)
+// must not be able to weaken a production deployment by calling it. The
+// function stays exported only because the floors must also be bypassable
+// from the test binaries of other packages that drive a real barrier.
 func AllowWeakKDFParams() func() {
-	prev := allowWeakKDFParams
-	allowWeakKDFParams = true
-	return func() { allowWeakKDFParams = prev }
+	if !testing.Testing() {
+		panic("seal.AllowWeakKDFParams: test-only KDF bypass called outside a test binary")
+	}
+	prev := allowWeakKDFParams.Swap(true)
+	return func() { allowWeakKDFParams.Store(prev) }
 }
 
 // validateKDFParams enforces the production work-factor floors for the
 // selected KDF version. Returns ErrKDFWeakParams when a parameter is
 // below its floor, unless the test-only bypass is active.
 func validateKDFParams(version KDFVersion, params KDFParams) error {
-	if allowWeakKDFParams {
+	if allowWeakKDFParams.Load() {
 		return nil
 	}
 	if kdfParamsBelowFloor(version, params) {

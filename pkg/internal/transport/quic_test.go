@@ -17,6 +17,8 @@ package transport
 import (
 	"bytes"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -520,6 +522,7 @@ func TestSendSnapshotRoundTrip(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -531,6 +534,7 @@ func TestSendSnapshotRoundTrip(t *testing.T) {
 			Data:       []byte("chunk-0000"),
 		},
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -614,7 +618,7 @@ func TestSendSnapshotAfterStop(t *testing.T) {
 	tr.Stop()
 
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 1, ChunkCount: 1},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 1, ChunkCount: 1},
 	}
 	err = tr.SendSnapshot(chunks)
 	if !errors.Is(err, ErrStreamClosed) {
@@ -810,6 +814,7 @@ func TestQUICTransport_Stop_WaitsForSnapshots(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -913,7 +918,7 @@ func TestNewQUICTransportRevocationMalformedCAPEM(t *testing.T) {
 	if !errors.As(err, &parseErr) {
 		t.Fatalf("expected *CACertificateParseError, got %T", err)
 	}
-	if parseErr.Reason != "PEM decode returned nil block" {
+	if parseErr.Reason != "PEM decode yielded no CERTIFICATE block" {
 		t.Fatalf("unexpected reason: %s", parseErr.Reason)
 	}
 	if parseErr.Err != nil {
@@ -2058,7 +2063,7 @@ func TestSendSnapshot_StoppedTransport(t *testing.T) {
 	tr.Stop()
 
 	err = tr.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, Index: 100, ChunkCount: 1},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 100, ChunkCount: 1},
 	})
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("expected ErrStreamClosed, got %v", err)
@@ -2086,7 +2091,7 @@ func TestSendSnapshot_UnresolvableTarget(t *testing.T) {
 	defer tr.Stop()
 
 	err = tr.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 99, ReplicaID: 99, Index: 1, ChunkCount: 1},
+		{BinVer: proto.WireVersion, ShardID: 99, ReplicaID: 99, Index: 1, ChunkCount: 1},
 	})
 	if err == nil {
 		t.Fatal("expected error for unresolvable target")
@@ -2178,7 +2183,7 @@ func TestSendSnapshotStreaming_ConnectionFailure(t *testing.T) {
 
 	meta := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 1, ChunkCount: 1}
 	err = tr.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
-		return emit(proto.SnapshotChunk{ShardID: 1, ReplicaID: 2, Data: []byte("test")})
+		return emit(proto.SnapshotChunk{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Data: []byte("test")})
 	})
 	if err == nil {
 		t.Fatal("expected error for unreachable target")
@@ -2432,6 +2437,7 @@ func TestSendSnapshotStreaming_RoundTrip(t *testing.T) {
 	err := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 3; i++ {
 			chunk := proto.SnapshotChunk{
+				BinVer:     proto.WireVersion,
 				ShardID:    1,
 				ReplicaID:  2,
 				Index:      200,
@@ -2526,6 +2532,7 @@ func TestSendSnapshotStreaming_WithEventListener(t *testing.T) {
 
 	err = t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		return emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      300,
@@ -2601,6 +2608,7 @@ func TestSendSnapshotStreaming_WithMetrics(t *testing.T) {
 	err = t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 2; i++ {
 			if emitErr := emit(proto.SnapshotChunk{
+				BinVer:     proto.WireVersion,
 				ShardID:    1,
 				ReplicaID:  2,
 				Index:      400,
@@ -2640,6 +2648,7 @@ func TestSendSnapshotStreaming_ProducerError(t *testing.T) {
 	err := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		// Emit one chunk successfully, then fail.
 		if emitErr := emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      500,
@@ -2764,7 +2773,7 @@ func TestSendSnapshot_WithEventListener(t *testing.T) {
 	reg1.Register(1, 2, t2.Addr().String())
 
 	err = t1.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("event-data")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("event-data")},
 	})
 	if err != nil {
 		t.Fatalf("SendSnapshot failed: %v", err)
@@ -2827,8 +2836,8 @@ func TestSendSnapshot_WithMetrics(t *testing.T) {
 	reg1.Register(1, 2, t2.Addr().String())
 
 	err = t1.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("data1")},
-		{ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, Data: []byte("data2")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, Data: []byte("data1")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, Data: []byte("data2")},
 	})
 	if err != nil {
 		t.Fatalf("SendSnapshot failed: %v", err)
@@ -3237,6 +3246,7 @@ func TestSendSnapshotStreaming_ProducerErrorWithEventListener(t *testing.T) {
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		// Emit one chunk successfully, then fail.
 		if emitErr := emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      500,
@@ -3335,6 +3345,7 @@ func TestSendSnapshot_WithEventListeners(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -3443,6 +3454,7 @@ func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		return emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      500,
@@ -3544,6 +3556,7 @@ func TestSendSnapshot_AbortedEventOnConnectionError(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -3555,6 +3568,7 @@ func TestSendSnapshot_AbortedEventOnConnectionError(t *testing.T) {
 			Data:       []byte("hello"),
 		},
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -3900,7 +3914,7 @@ func TestSendSnapshot_OpenStreamSyncError(t *testing.T) {
 
 	// SendSnapshot should fail at OpenStreamSync or getConnection.
 	err = t1.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
 			ChunkID: 0, ChunkCount: 1, ChunkSize: 5,
 			Data: []byte("hello")},
 	})
@@ -3972,6 +3986,7 @@ func TestSendSnapshotStreaming_OpenStreamSyncError(t *testing.T) {
 		SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 1, Term: 1, ChunkCount: 1},
 		func(emit func(proto.SnapshotChunk) error) error {
 			return emit(proto.SnapshotChunk{
+				BinVer:  proto.WireVersion,
 				ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
 				ChunkID: 0, ChunkCount: 1, ChunkSize: 5,
 				Data: []byte("hello"),
@@ -4044,7 +4059,7 @@ func TestSendSnapshot_WriteDeadlineError(t *testing.T) {
 	}()
 
 	err = t1.SendSnapshot([]proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
 			ChunkID: 0, ChunkCount: 1, ChunkSize: 5,
 			Data: []byte("hello")},
 	})
@@ -4125,6 +4140,7 @@ func TestSendSnapshot_AbortedWithEventListenerOnWriteError(t *testing.T) {
 	chunks := make([]proto.SnapshotChunk, 5)
 	for i := range chunks {
 		chunks[i] = proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -4213,6 +4229,7 @@ func TestSendSnapshotStreaming_AbortedEventOnWriteError(t *testing.T) {
 		func(emit func(proto.SnapshotChunk) error) error {
 			for i := 0; i < 5; i++ {
 				if emitErr := emit(proto.SnapshotChunk{
+					BinVer:     proto.WireVersion,
 					ShardID:    1,
 					ReplicaID:  2,
 					From:       1,
@@ -4435,6 +4452,7 @@ func TestSendSnapshot_ChunkWriteErrorTriggersAbort(t *testing.T) {
 	largeData := bytes.Repeat([]byte("snapshot-data"), 1000)
 	for i := range chunks {
 		chunks[i] = proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -4538,6 +4556,7 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 100; i++ {
 			if err := emit(proto.SnapshotChunk{
+				BinVer:     proto.WireVersion,
 				ShardID:    1,
 				ReplicaID:  2,
 				Index:      10,
@@ -4612,6 +4631,7 @@ func TestSendSnapshot_SuccessWithMetrics(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -4702,6 +4722,7 @@ func TestSendSnapshotStreaming_SuccessWithMetrics(t *testing.T) {
 
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		return emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -4786,6 +4807,7 @@ func TestSendSnapshot_OpenStreamSyncErrorViaShutdownCancel(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -4866,6 +4888,7 @@ func TestSendSnapshotStreaming_OpenStreamSyncErrorViaShutdown(t *testing.T) {
 
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		return emit(proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -5116,6 +5139,7 @@ func TestSendSnapshot_ChunkLoopWriteFailure(t *testing.T) {
 	chunks := make([]proto.SnapshotChunk, 500)
 	for i := range chunks {
 		chunks[i] = proto.SnapshotChunk{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			Index:      10,
@@ -5228,6 +5252,7 @@ func TestSendSnapshotStreaming_ChunkWriteFailure(t *testing.T) {
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 500; i++ {
 			if emitErr := emit(proto.SnapshotChunk{
+				BinVer:     proto.WireVersion,
 				ShardID:    1,
 				ReplicaID:  2,
 				Index:      10,
@@ -5243,5 +5268,169 @@ func TestSendSnapshotStreaming_ChunkWriteFailure(t *testing.T) {
 	})
 	if sendErr == nil {
 		t.Log("SendSnapshotStreaming succeeded (connection survived)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// snappyEncPool bootstrap + cap (quic.go NewQUICTransport / sendBatch)
+// ---------------------------------------------------------------------------
+
+// TestSnappyEncPool_Bootstraps verifies that the Snappy encode pool has a
+// New function so it can bootstrap: without one, Put was gated on a
+// successful Get and every compressed send heap-allocated on the hot path.
+func TestSnappyEncPool_Bootstraps(t *testing.T) {
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	tr, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+	}, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	v := tr.snappyEncPool.Get()
+	if v == nil {
+		t.Fatal("snappyEncPool.Get returned nil: pool has no New function")
+	}
+	ptr, ok := v.(*[]byte)
+	if !ok {
+		t.Fatalf("snappyEncPool holds %T, want *[]byte", v)
+	}
+	if cap(*ptr) == 0 {
+		t.Fatal("snappyEncPool New returned a zero-capacity buffer")
+	}
+	tr.snappyEncPool.Put(ptr)
+
+	// The per-P private pool slot returns the most recently Put pointer,
+	// proving Put/Get now round-trip.
+	if got := tr.snappyEncPool.Get(); got != v {
+		t.Fatal("snappyEncPool did not round-trip the returned buffer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Send drop observability (quic.go Send)
+// ---------------------------------------------------------------------------
+
+// TestSend_UnresolvedTargetLogsDrop verifies that a message dropped because
+// its target address cannot be resolved emits a structured log record
+// instead of vanishing silently.
+func TestSend_UnresolvedTargetLogsDrop(t *testing.T) {
+	handler := newTestHandler()
+	tr, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+	}, handler, registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	// Replica 99 is not registered, so Resolve fails and the message drops.
+	tr.Send([]proto.Message{
+		{Type: proto.Replicate, ShardID: 1, From: 1, To: 99, Term: 1},
+	})
+
+	if !strings.Contains(logBuf.String(), "target address unresolved") {
+		t.Fatalf("expected drop log for unresolved target, got: %s", logBuf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SendSnapshot shutdown responsiveness (quic.go cancelSnapshotWriteOnStop)
+// ---------------------------------------------------------------------------
+
+// TestSendSnapshot_StopUnblocksStalledChunkWrite verifies that Stop() is not
+// held hostage by an in-flight snapshot send whose chunk writes are blocked
+// on a slow receiver. The receiver rate-limits snapshot chunks (capped 5s
+// sleep per chunk), so the sender fills its QUIC flow-control window and
+// blocks in Write; without the shutdown watcher, Stop() would wait for the
+// entire transfer (30s write deadline per chunk).
+func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
+	handler1 := newTestHandler()
+	handler2 := newTestHandler()
+	reg1 := registry.NewRegistry()
+	reg2 := registry.NewRegistry()
+	mtls := testMTLSConfig(t)
+
+	t1, err := NewQUICTransport(Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+	}, handler1, reg1)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(1) failed: %v", err)
+	}
+	if err := t1.Start(); err != nil {
+		t.Fatalf("t1.Start failed: %v", err)
+	}
+
+	// 1 B/s receive rate: every chunk hits the capped 5s rate-limit sleep,
+	// during which the receiver does not drain the stream.
+	t2, err := NewQUICTransport(Config{
+		ListenAddress:          "127.0.0.1:0",
+		DeploymentID:           42,
+		MTLSConfig:             mtls,
+		MaxSnapshotReceiveRate: 1,
+	}, handler2, reg2)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(2) failed: %v", err)
+	}
+	if err := t2.Start(); err != nil {
+		t.Fatalf("t2.Start failed: %v", err)
+	}
+	defer t2.Stop()
+
+	reg1.Register(1, 2, t2.Addr().String())
+
+	// 32 x 1MB chunks: far more than the 8MB stream receive window, so the
+	// sender's Write blocks once the window fills.
+	const chunkCount = 32
+	data := bytes.Repeat([]byte("x"), 1<<20)
+	chunks := make([]proto.SnapshotChunk, chunkCount)
+	for i := range chunks {
+		chunks[i] = proto.SnapshotChunk{
+			BinVer:       proto.WireVersion,
+			ShardID:      1,
+			ReplicaID:    2,
+			From:         1,
+			Index:        10,
+			Term:         1,
+			ChunkID:      uint64(i),
+			ChunkCount:   chunkCount,
+			ChunkSize:    uint64(len(data)),
+			Data:         data,
+			DeploymentID: 42,
+		}
+	}
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- t1.SendSnapshot(chunks) }()
+
+	// Let the send fill the flow-control window and block.
+	time.Sleep(2 * time.Second)
+
+	stopStart := time.Now()
+	if err := t1.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if elapsed := time.Since(stopStart); elapsed > 15*time.Second {
+		t.Fatalf("Stop blocked %v behind a stalled snapshot send", elapsed)
+	}
+
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatal("SendSnapshot should fail when the transport stops mid-transfer")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SendSnapshot did not return after Stop")
 	}
 }

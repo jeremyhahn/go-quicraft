@@ -17,8 +17,10 @@ package quicraft
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -267,4 +269,148 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return b
+}
+
+// pinRecordingBarrier wraps a real Barrier and records every in-flight epoch
+// registration so tests can assert the L12 pinning contract.
+type pinRecordingBarrier struct {
+	Barrier
+	mu           sync.Mutex
+	registered   []uint64
+	deregistered []uint64
+}
+
+func (p *pinRecordingBarrier) RegisterInFlightEpoch(epoch uint64) {
+	p.mu.Lock()
+	p.registered = append(p.registered, epoch)
+	p.mu.Unlock()
+	p.Barrier.RegisterInFlightEpoch(epoch)
+}
+
+func (p *pinRecordingBarrier) DeregisterInFlightEpoch(epoch uint64) {
+	p.mu.Lock()
+	p.deregistered = append(p.deregistered, epoch)
+	p.mu.Unlock()
+	p.Barrier.DeregisterInFlightEpoch(epoch)
+}
+
+// TestReencryptSnapshotFile_PinsSourceEpochs is the L12 regression test for
+// the missing RegisterInFlightEpoch: while the source is decrypted, every
+// epoch its frames reference must be pinned on the source barrier so a
+// concurrent PurgeEpochsBefore cannot remove a DEK mid-migration — and the
+// pins must be released when the migration finishes.
+func TestReencryptSnapshotFile_PinsSourceEpochs(t *testing.T) {
+	barA := createTestBarrier(t)
+	barB := createTestBarrier(t)
+	plain := snapshotPlaintext()
+
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "snapshot.dat")
+	writeEncryptedSnapshotFile(t, barA, srcPath, plain)
+
+	rec := &pinRecordingBarrier{Barrier: barA}
+	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
+	if _, err := ReencryptSnapshotFile(srcPath, dstPath, rec, barB); err != nil {
+		t.Fatalf("ReencryptSnapshotFile: %v", err)
+	}
+
+	rec.mu.Lock()
+	registered := append([]uint64(nil), rec.registered...)
+	deregistered := append([]uint64(nil), rec.deregistered...)
+	rec.mu.Unlock()
+
+	if len(registered) == 0 {
+		t.Fatal("source epochs were never pinned — a concurrent purge could remove a DEK mid-migration")
+	}
+	wantEpoch := barA.CurrentEpoch()
+	found := false
+	for _, e := range registered {
+		if e == wantEpoch {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pinned epochs %v do not include the source frame epoch %d", registered, wantEpoch)
+	}
+	if len(deregistered) != len(registered) {
+		t.Fatalf("pins leaked: registered %v but deregistered %v", registered, deregistered)
+	}
+}
+
+// TestSnapshotFrameEpochs_ScansHeadersWithoutDecrypting verifies the frame
+// epoch scanner returns the distinct epochs embedded in the frames' seal
+// ciphertext headers, in first-seen order, without needing a barrier.
+func TestSnapshotFrameEpochs_ScansHeadersWithoutDecrypting(t *testing.T) {
+	// Real frames produced by a live barrier scan to that barrier's epoch.
+	bar := createTestBarrier(t)
+	var enc bytes.Buffer
+	if _, err := encryptSnapshotFrames(bar, bytes.NewReader(snapshotPlaintext()), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	epochs, err := snapshotFrameEpochs(bytes.NewReader(enc.Bytes()))
+	if err != nil {
+		t.Fatalf("snapshotFrameEpochs: %v", err)
+	}
+	if len(epochs) != 1 || epochs[0] != bar.CurrentEpoch() {
+		t.Fatalf("epochs = %v, want [%d]", epochs, bar.CurrentEpoch())
+	}
+
+	// Synthetic multi-epoch frames: the scanner reads only the length
+	// prefix and the 8-byte big-endian epoch header, so garbage ciphertext
+	// bodies are fine.
+	var synth bytes.Buffer
+	writeFrame := func(epoch uint64, bodyLen int) {
+		frame := make([]byte, 8+bodyLen)
+		binary.BigEndian.PutUint64(frame[:8], epoch)
+		var lenBuf [4]byte
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(frame)))
+		synth.Write(lenBuf[:])
+		synth.Write(frame)
+	}
+	writeFrame(3, 40)
+	writeFrame(4, 40)
+	writeFrame(3, 40) // duplicate epoch: reported once
+	epochs, err = snapshotFrameEpochs(bytes.NewReader(synth.Bytes()))
+	if err != nil {
+		t.Fatalf("snapshotFrameEpochs synthetic: %v", err)
+	}
+	if len(epochs) != 2 || epochs[0] != 3 || epochs[1] != 4 {
+		t.Fatalf("epochs = %v, want [3 4]", epochs)
+	}
+
+	// Final frame truncated inside its epoch header: best-effort — the
+	// epochs collected from the complete frames are returned with the error.
+	truncated := append([]byte(nil), synth.Bytes()...)
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], 48)
+	truncated = append(truncated, lenBuf[:]...)
+	truncated = append(truncated, 0xAA, 0xBB, 0xCC) // 3 of the declared 48 bytes
+	epochs, err = snapshotFrameEpochs(bytes.NewReader(truncated))
+	if err == nil {
+		t.Fatal("expected error for frame truncated inside its epoch header")
+	}
+	if len(epochs) != 2 {
+		t.Fatalf("best-effort epochs = %v, want the 2 complete frames' epochs", epochs)
+	}
+}
+
+// TestReencryptSnapshotFile_CreatesNestedDestination exercises the L12
+// durability path: a destination several directories deep that does not
+// exist yet must be created, populated, and dir-synced (SyncDirChain up to
+// the deepest pre-existing ancestor) without error.
+func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
+	bar := createTestBarrier(t)
+	plain := snapshotPlaintext()
+	dir := t.TempDir()
+
+	srcPath := filepath.Join(dir, "snapshot.dat")
+	writeEncryptedSnapshotFile(t, bar, srcPath, plain)
+
+	dstPath := filepath.Join(dir, "a", "b", "c", "snapshot.dat")
+	if _, err := ReencryptSnapshotFile(srcPath, dstPath, bar, nil); err != nil {
+		t.Fatalf("ReencryptSnapshotFile into nested destination: %v", err)
+	}
+	if got := mustRead(t, dstPath); !bytes.Equal(got, plain) {
+		t.Fatal("nested destination content mismatch")
+	}
 }

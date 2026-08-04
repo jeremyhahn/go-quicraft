@@ -223,7 +223,10 @@ func TestIntegration_DB_ProposeSession(t *testing.T) {
 	t.Logf("session registered: ClientID=%d", session.ClientID())
 
 	// Use ProposeSession (async) to close the session. In the adapter,
-	// ProposeSession delegates to CloseSession.
+	// ProposeSession delegates to CloseSession. Per dragonboat semantics
+	// the caller must prepare the session for the unregister operation
+	// first; a live in-use session is rejected with ErrInvalidSession.
+	session.PrepareForUnregister()
 	rs, propErr := leaderHost.ProposeSession(session, defaultTimeout)
 	if propErr != nil {
 		t.Fatalf("ProposeSession failed: %v", propErr)

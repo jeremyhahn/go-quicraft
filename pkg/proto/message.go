@@ -151,6 +151,12 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	if entryCount > maxMessagesPerBatch {
 		return 0, ErrTooManyMessages
 	}
+	// entryHeaderSize is the minimum encoding of one Entry (empty Cmd), so
+	// a count the remaining buffer cannot possibly hold is rejected before
+	// the slice is allocated rather than after a partial parse.
+	if uint64(entryCount)*entryHeaderSize > uint64(len(buf)-offset) {
+		return 0, ErrBufferTooSmall
+	}
 	if entryCount > 0 {
 		if cap(m.Entries) >= int(entryCount) {
 			m.Entries = m.Entries[:entryCount]

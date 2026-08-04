@@ -16,8 +16,24 @@ package proto
 
 import (
 	"encoding/binary"
+	"math"
 	"sort"
 )
+
+// mapEntryMinBytes is the smallest possible wire size of a map[uint64]string
+// entry: [key:8][valueLen:4] with a zero-length value.
+const mapEntryMinBytes = 8 + 4
+
+// boolMapEntryBytes is the exact wire size of a map[uint64]bool entry:
+// [key:8][value:8].
+const boolMapEntryBytes = 8 + 8
+
+// maxMapSizeHint bounds the capacity hint passed to make(map...) when the
+// entry count comes off the wire. The count is bounded by
+// maxMembershipEntries and cross-checked against the remaining buffer, but
+// a hint is honoured before a single entry is parsed, so it is clamped
+// independently: memberships are small, and a larger map grows on demand.
+const maxMapSizeHint = 64
 
 // putUint64 writes a uint64 value to buf in little-endian byte order.
 // buf must be at least 8 bytes.
@@ -71,13 +87,21 @@ func putBytes(buf []byte, data []byte) int {
 // getBytes reads a length-prefixed byte slice from buf: [len:4][data:N].
 // Returns the data slice (aliased into buf for zero-copy), total bytes
 // consumed, and any error. Returns nil data for zero-length payloads.
-func getBytes(buf []byte, maxLen uint32) ([]byte, int, error) {
+// errOverLimit is returned when the length prefix exceeds maxLen, so each
+// call site reports its own sentinel (ErrChecksumTooLong, ErrMetadataTooLong,
+// ErrChunkDataTooLong, ...) and errors.Is matching works per field.
+func getBytes(buf []byte, maxLen uint32, errOverLimit error) ([]byte, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
 	}
 	dataLen := binary.LittleEndian.Uint32(buf)
 	if maxLen > 0 && dataLen > maxLen {
-		return nil, 0, ErrEntrySizeLimitExceeded
+		return nil, 0, errOverLimit
+	}
+	// int is 32-bit on 32-bit platforms, where 4+int(dataLen) wraps negative
+	// and turns the bounds check below into a slice panic.
+	if dataLen > math.MaxInt32 {
+		return nil, 0, ErrBufferTooSmall
 	}
 	total := 4 + int(dataLen)
 	if len(buf) < total {
@@ -99,14 +123,23 @@ func putString(buf []byte, s string) int {
 
 // getString reads a length-prefixed string from buf: [len:4][data:N].
 // Returns the string, total bytes consumed, and any error. String data
-// is copied from buf (strings are immutable in Go).
-func getString(buf []byte, maxLen int) (string, int, error) {
+// is copied from buf (strings are immutable in Go). errOverLimit is
+// returned when the length prefix exceeds maxLen, so each call site
+// reports its own sentinel (ErrAddressTooLong, ErrFilepathTooLong, ...)
+// and errors.Is matching works per field.
+func getString(buf []byte, maxLen int, errOverLimit error) (string, int, error) {
 	if len(buf) < 4 {
 		return "", 0, ErrBufferTooSmall
 	}
 	strLen := binary.LittleEndian.Uint32(buf)
+	// Checked before int(strLen): on a 32-bit platform int(strLen) is
+	// negative for strLen > MaxInt32, which would pass the maxLen check and
+	// then panic on the slice below.
+	if strLen > math.MaxInt32 {
+		return "", 0, ErrBufferTooSmall
+	}
 	if maxLen > 0 && int(strLen) > maxLen {
-		return "", 0, ErrAddressTooLong
+		return "", 0, errOverLimit
 	}
 	total := 4 + int(strLen)
 	if len(buf) < total {
@@ -165,7 +198,9 @@ func putMap(buf []byte, m map[uint64]string) int {
 
 // getMap reads a map[uint64]string from buf:
 // [count:4] then for each entry: [key:8][valueLen:4][value:N].
-// Returns the map, total bytes consumed, and any error.
+// Returns the map, total bytes consumed, and any error. The count is
+// cross-checked against the remaining buffer before allocating, so a short
+// buffer with a large count cannot drive an oversized allocation.
 func getMap(buf []byte) (map[uint64]string, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
@@ -175,7 +210,10 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 		return nil, 0, ErrTooManyMembershipEntries
 	}
 	offset := 4
-	m := make(map[uint64]string, count)
+	if uint64(count)*mapEntryMinBytes > uint64(len(buf)-offset) {
+		return nil, 0, ErrBufferTooSmall
+	}
+	m := make(map[uint64]string, min(count, maxMapSizeHint))
 	for i := uint32(0); i < count; i++ {
 		if len(buf) < offset+8+4 {
 			return nil, 0, ErrBufferTooSmall
@@ -189,6 +227,11 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 		}
 		if len(buf) < offset+int(valLen) {
 			return nil, 0, ErrBufferTooSmall
+		}
+		// putMap emits each key once, sorted ascending. A repeat is a
+		// non-canonical encoding this decoder never produces.
+		if _, dup := m[key]; dup {
+			return nil, 0, ErrDuplicateMapKey
 		}
 		m[key] = string(buf[offset : offset+int(valLen)])
 		offset += int(valLen)
@@ -219,7 +262,9 @@ func putBoolMap(buf []byte, m map[uint64]bool) int {
 
 // getBoolMap reads a map[uint64]bool from buf:
 // [count:4] then for each entry: [key:8][value:8].
-// Returns the map, total bytes consumed, and any error.
+// Returns the map, total bytes consumed, and any error. The count is
+// cross-checked against the remaining buffer before allocating, so a short
+// buffer with a large count cannot drive an oversized allocation.
 func getBoolMap(buf []byte) (map[uint64]bool, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
@@ -229,13 +274,21 @@ func getBoolMap(buf []byte) (map[uint64]bool, int, error) {
 		return nil, 0, ErrTooManyMembershipEntries
 	}
 	offset := 4
-	m := make(map[uint64]bool, count)
+	if uint64(count)*boolMapEntryBytes > uint64(len(buf)-offset) {
+		return nil, 0, ErrBufferTooSmall
+	}
+	m := make(map[uint64]bool, min(count, maxMapSizeHint))
 	for i := uint32(0); i < count; i++ {
 		if len(buf) < offset+16 {
 			return nil, 0, ErrBufferTooSmall
 		}
 		key := binary.LittleEndian.Uint64(buf[offset:])
 		offset += 8
+		// putBoolMap emits each key once, sorted ascending. A repeat is a
+		// non-canonical encoding this decoder never produces.
+		if _, dup := m[key]; dup {
+			return nil, 0, ErrDuplicateMapKey
+		}
 		m[key] = getBool(buf[offset:])
 		offset += 8
 	}

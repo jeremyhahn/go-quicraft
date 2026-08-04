@@ -272,14 +272,21 @@ func (s *segment) Sync() error {
 // primary recovery path. Records are returned in write order. Scanning stops
 // at the first zero-filled or corrupted block (normal EOF for pre-allocated
 // files).
-func (s *segment) ReadAll() ([][]byte, error) {
+//
+// The second return value is the clean-prefix end: the file offset of the
+// first hole or corrupt chunk when scanning stopped early (stoppedAtCorruption
+// is then set), otherwise the full file size. Recovery truncates the segment
+// there so the corrupt tail is repaired on disk instead of re-triggering
+// prefix truncation — and the destruction of every later segment — on every
+// subsequent restart.
+func (s *segment) ReadAll() ([][]byte, int64, error) {
 	if s.closed {
-		return nil, ErrClosed
+		return nil, 0, ErrClosed
 	}
 
 	fi, err := s.f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	fileSize := fi.Size()
 
@@ -317,7 +324,7 @@ func (s *segment) ReadAll() ([][]byte, error) {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
-			return records, &RecoveryError{SegmentID: s.id, Err: fmt.Errorf("read at offset %d: %w", offset, err)}
+			return records, offset, &RecoveryError{SegmentID: s.id, Err: fmt.Errorf("read at offset %d: %w", offset, err)}
 		}
 
 		block := blockBuf[:n]
@@ -365,7 +372,7 @@ func (s *segment) ReadAll() ([][]byte, error) {
 					"data_offset", offset+int64(pos),
 					"recovered_records", len(records),
 				)
-				return records, nil
+				return records, holeOffset, nil
 			}
 
 			data, recType, consumed, err := decodeRecord(block[pos:])
@@ -385,7 +392,7 @@ func (s *segment) ReadAll() ([][]byte, error) {
 					"recovered_records", len(records),
 					"error", err,
 				)
-				return records, nil
+				return records, offset + int64(pos), nil
 			}
 
 			switch recType {
@@ -423,7 +430,7 @@ func (s *segment) ReadAll() ([][]byte, error) {
 		offset += int64(s.blockSize)
 	}
 
-	return records, nil
+	return records, fileSize, nil
 }
 
 // Close flushes any pending block data and closes the underlying file.

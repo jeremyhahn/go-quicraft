@@ -81,7 +81,9 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	}
 	defer nh.Close()
 
-	// Configure with an extremely small MaxInMemLogSize (1 byte).
+	// Configure with the smallest MaxInMemLogSize dragonboat accepts
+	// (EntryNonCmdFieldsSize+1 == 129 bytes); anything below that is
+	// rejected by Config.Validate on both dragonboat and this adapter.
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbConfig.Config{
@@ -90,7 +92,7 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 		ElectionRTT:     10,
 		HeartbeatRTT:    1,
 		CheckQuorum:     true,
-		MaxInMemLogSize: 1, // 1 byte -- extremely aggressive
+		MaxInMemLogSize: 129, // smallest legal value -- extremely aggressive
 	}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
@@ -103,7 +105,7 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	})
 
 	// Fire async proposals rapidly to build backpressure. With
-	// MaxInMemLogSize=1, the in-memory log should exceed the threshold
+	// MaxInMemLogSize=129, the in-memory log should exceed the threshold
 	// after a single entry, causing subsequent proposals to be rejected
 	// with ErrSystemBusy.
 	session := dbClient.NewNoOPSession(1, nil)

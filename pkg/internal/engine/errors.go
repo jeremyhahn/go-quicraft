@@ -39,6 +39,13 @@ var (
 	// ErrSnapshotTooLarge is returned when a snapshot data file exceeds
 	// the configured Config.MaxSnapshotSize limit.
 	ErrSnapshotTooLarge = errors.New("engine: snapshot exceeds MaxSnapshotSize")
+
+	// ErrApplyGap is returned when a committed batch does not start at
+	// lastApplied+1. The missing range can never be re-offered (Raft's
+	// processed marker already advanced past it), so the shard is failed
+	// instead of applying a batch that would leave a hole in the state
+	// machine.
+	ErrApplyGap = errors.New("engine: committed entry gap detected before apply")
 )
 
 // SaveStateError is returned when a LogDB SaveState operation fails after
@@ -170,6 +177,26 @@ func (e *CommitError) Error() string {
 // Unwrap returns the underlying error.
 func (e *CommitError) Unwrap() error {
 	return e.Err
+}
+
+// SnapshotRecoveryBehindError is returned when a state machine recovery is
+// requested for a snapshot index the Raft log has not committed. Advancing
+// the node's apply markers to that index would make the next Update carry a
+// LastApplied greater than the raft log's committed/processed markers, which
+// the commit path asserts against. It signals a failed snapshot receive: the
+// InstallSnapshot was never installed into the Raft log.
+type SnapshotRecoveryBehindError struct {
+	ShardID       uint64
+	ReplicaID     uint64
+	SnapshotIndex uint64
+	Committed     uint64
+}
+
+// Error returns a human-readable description of the recovery mismatch.
+func (e *SnapshotRecoveryBehindError) Error() string {
+	return fmt.Sprintf(
+		"engine: snapshot recovery for shard %d replica %d at index %d is ahead of committed index %d",
+		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.Committed)
 }
 
 // SnapshotExportError is returned when exporting a snapshot to the

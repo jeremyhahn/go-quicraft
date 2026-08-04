@@ -33,11 +33,23 @@ import (
 // out-of-band — e.g. by using the reconstructed secret in an authenticated
 // decrypt that fails on a wrong key (see Combine / CombineUnverified).
 type Share struct {
-	Index     int               `json:"index"`
-	Threshold int               `json:"threshold"`
-	Total     int               `json:"total"`
-	Value     string            `json:"value"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	// Index is the share's 1-based position, equal to the x-coordinate
+	// embedded in Value.
+	Index int `json:"index"`
+	// Threshold is the M of the M-of-N scheme. It is UNAUTHENTICATED
+	// caller-supplied metadata, not a property Combine can verify: Combine
+	// takes the threshold from shares[0].Threshold, so relabelling two
+	// shares of a real 5-of-9 split as Threshold:2 makes Combine return
+	// garbage rather than an error. Callers must obtain the true threshold
+	// from a trusted source and authenticate the reconstructed secret
+	// out-of-band.
+	Threshold int `json:"threshold"`
+	// Total is the N of the M-of-N scheme. Unauthenticated, like Threshold.
+	Total int `json:"total"`
+	// Value is the base64 encoding of [version:1][x:1][y...].
+	Value string `json:"value"`
+	// Metadata is caller-defined and carries no cryptographic meaning.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler for Share.

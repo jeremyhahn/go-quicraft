@@ -36,10 +36,21 @@ func testStrategy(t *testing.T) *SoftwareStrategy {
 	return s
 }
 
+// testBarrierConfig returns DefaultBarrierConfig with a no-op StatePersister
+// attached. Rotate and a purging PurgeEpochsBefore fail closed with
+// ErrNoStatePersister without one, so every test barrier that mutates
+// persisted state needs it. Tests that assert on the persisted blob install
+// their own recording persister instead.
+func testBarrierConfig(deploymentID uint64) BarrierConfig {
+	cfg := DefaultBarrierConfig(deploymentID)
+	cfg.StatePersister = func(*SealedRootKey) error { return nil }
+	return cfg
+}
+
 // testInitializedBarrier returns a barrier that has been initialized and is unsealed.
 func testInitializedBarrier(t *testing.T) (*Barrier, *SoftwareStrategy) {
 	t.Helper()
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := NewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
@@ -1333,12 +1344,12 @@ func TestDeriveDEK_DifferentEpochs(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	dek1, err := deriveDEK(rootKey, salt, 1, 1, 32)
+	dek1, err := deriveDEK(rootKey, salt, 1, 1, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK epoch 1 failed: %v", err)
 	}
 
-	dek2, err := deriveDEK(rootKey, salt, 1, 2, 32)
+	dek2, err := deriveDEK(rootKey, salt, 1, 2, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK epoch 2 failed: %v", err)
 	}
@@ -1359,12 +1370,12 @@ func TestDeriveDEK_Deterministic(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	dek1, err := deriveDEK(rootKey, salt, 1, 42, 32)
+	dek1, err := deriveDEK(rootKey, salt, 1, 42, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK failed: %v", err)
 	}
 
-	dek2, err := deriveDEK(rootKey, salt, 1, 42, 32)
+	dek2, err := deriveDEK(rootKey, salt, 1, 42, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK failed: %v", err)
 	}
@@ -1389,12 +1400,12 @@ func TestDeriveDEK_DifferentSalts(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	dek1, err := deriveDEK(rootKey, salt1, 1, 1, 32)
+	dek1, err := deriveDEK(rootKey, salt1, 1, 1, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK salt1 failed: %v", err)
 	}
 
-	dek2, err := deriveDEK(rootKey, salt2, 1, 1, 32)
+	dek2, err := deriveDEK(rootKey, salt2, 1, 1, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK salt2 failed: %v", err)
 	}
@@ -1422,12 +1433,12 @@ func TestHKDFDeploymentIDBinding(t *testing.T) {
 
 	const epoch uint64 = 1
 
-	dek1, err := deriveDEK(rootKey, salt, 100, epoch, 32)
+	dek1, err := deriveDEK(rootKey, salt, 100, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK deploymentID=100 failed: %v", err)
 	}
 
-	dek2, err := deriveDEK(rootKey, salt, 200, epoch, 32)
+	dek2, err := deriveDEK(rootKey, salt, 200, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK deploymentID=200 failed: %v", err)
 	}
@@ -1460,12 +1471,12 @@ func TestHKDFDeploymentIDConsistency(t *testing.T) {
 	const deploymentID uint64 = 42
 	const epoch uint64 = 7
 
-	dek1, err := deriveDEK(rootKey, salt, deploymentID, epoch, 32)
+	dek1, err := deriveDEK(rootKey, salt, deploymentID, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK call 1 failed: %v", err)
 	}
 
-	dek2, err := deriveDEK(rootKey, salt, deploymentID, epoch, 32)
+	dek2, err := deriveDEK(rootKey, salt, deploymentID, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK call 2 failed: %v", err)
 	}
@@ -1491,7 +1502,7 @@ func TestHKDFZeroDeploymentID(t *testing.T) {
 	const epoch uint64 = 1
 
 	// Zero deployment ID should work and produce a valid DEK.
-	dekZero1, err := deriveDEK(rootKey, salt, 0, epoch, 32)
+	dekZero1, err := deriveDEK(rootKey, salt, 0, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK deploymentID=0 failed: %v", err)
 	}
@@ -1500,7 +1511,7 @@ func TestHKDFZeroDeploymentID(t *testing.T) {
 	}
 
 	// Zero deployment ID should be deterministic.
-	dekZero2, err := deriveDEK(rootKey, salt, 0, epoch, 32)
+	dekZero2, err := deriveDEK(rootKey, salt, 0, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK deploymentID=0 (second call) failed: %v", err)
 	}
@@ -1509,7 +1520,7 @@ func TestHKDFZeroDeploymentID(t *testing.T) {
 	}
 
 	// Zero deployment ID should differ from non-zero.
-	dekNonZero, err := deriveDEK(rootKey, salt, 1, epoch, 32)
+	dekNonZero, err := deriveDEK(rootKey, salt, 1, epoch, AlgAES256GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK deploymentID=1 failed: %v", err)
 	}
@@ -2373,7 +2384,7 @@ func TestBarrier_MultipleSealUnsealCycles(t *testing.T) {
 // --- Rotate + Seal/Unseal + DecryptForEpoch cross-epoch ---
 
 func TestBarrier_RotateSealUnsealDecryptForEpoch(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := NewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2662,7 +2673,7 @@ func TestBarrier_RotateUpdatesSealedEpoch_WhenSealed(t *testing.T) {
 
 func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
 	// Phase 1: Initialize, rotate twice (epochs 1, 2, 3), encrypt data at each epoch.
-	b1 := NewBarrier(DefaultBarrierConfig(1))
+	b1 := NewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -3437,7 +3448,7 @@ func TestBarrier_CustomInvocationCounter(t *testing.T) {
 func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	resetErr := errors.New("persistent reset failed")
 	mock := &mockInvocationCounter{enabled: true, resetErr: resetErr}
-	cfg := DefaultBarrierConfig(1)
+	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mock
 	cfg.NonceTracking = false
 	b := NewBarrier(cfg)
@@ -3498,7 +3509,7 @@ func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
 	clearErr := errors.New("persistent nonce clear failed")
 	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
-	cfg := DefaultBarrierConfig(1)
+	cfg := testBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
 	b := NewBarrier(cfg)
 	s := testStrategy(t)
@@ -3568,7 +3579,7 @@ func TestBarrier_CustomNonceTrackerProvider(t *testing.T) {
 func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 	clearErr := errors.New("persistent clear failed")
 	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
-	cfg := DefaultBarrierConfig(1)
+	cfg := testBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
 	cfg.InvocationLimit = -1 // disable invocation counter so only the nonce tracker is exercised
 	b := NewBarrier(cfg)
@@ -3689,7 +3700,7 @@ func TestBarrier_RotateResetsBothTrackers(t *testing.T) {
 	t.Parallel()
 	mockIC := &mockInvocationCounter{enabled: true}
 	mockNT := &mockNonceTracker{enabled: true}
-	cfg := DefaultBarrierConfig(1)
+	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
 	b := NewBarrier(cfg)
@@ -3739,7 +3750,7 @@ func TestBarrier_RotateResetsBothTrackers_VerifyEncryptAfterRotate(t *testing.T)
 	t.Parallel()
 	mockIC := &mockInvocationCounter{enabled: true}
 	mockNT := &mockNonceTracker{enabled: true}
-	cfg := DefaultBarrierConfig(1)
+	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
 	b := NewBarrier(cfg)
@@ -4063,7 +4074,7 @@ func TestBarrier_UnsealSeedsInvocationCounterAfterRestart(t *testing.T) {
 
 	// Simulate a process restart: a brand-new barrier restored from the
 	// persisted sealed root key, with a fresh in-memory counter.
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := NewBarrier(testBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}

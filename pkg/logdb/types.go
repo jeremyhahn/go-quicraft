@@ -59,6 +59,12 @@ type Membership struct {
 	// ConfigChangeID is the log index of the configuration change
 	// that produced this membership.
 	ConfigChangeID uint64
+	// MaxWitnesses is the shard's replicated witness cap (0 = no
+	// explicit cap). Part of the replicated membership state.
+	MaxWitnesses uint64
+	// RequireFullReplicaMajority is the shard's replicated
+	// full-replica-majority witness policy.
+	RequireFullReplicaMajority bool
 	// Addresses maps replica IDs to their network addresses for
 	// full voting members.
 	Addresses map[uint64]string

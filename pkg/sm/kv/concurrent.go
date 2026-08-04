@@ -41,6 +41,22 @@ type bucket struct {
 // during writes. Bucket selection is via xxhash64 of the key.
 type ConcurrentStore struct {
 	buckets [numBuckets]bucket
+
+	// ops is a scratch slice reused across Update calls for the decode
+	// pass, avoiding a per-batch allocation. Update is serialized on the
+	// apply worker, so no lock guards it; entries alias Entry.Cmd only for
+	// the duration of a single Update call.
+	ops []decodedOp
+}
+
+// decodedOp is a pre-validated command staged during the first pass of
+// Update, paired with its target bucket. valid is false for entries whose
+// payload failed to decode; those receive the reserved
+// sm.ResultInvalidCommand result and are skipped during the apply pass.
+type decodedOp struct {
+	cmd    Command
+	bucket uint32
+	valid  bool
 }
 
 // NewConcurrentStore creates a new ConcurrentStore.
@@ -57,17 +73,65 @@ func bucketIndex(key []byte) uint32 {
 	return uint32(xxhash.Sum64(key) % numBuckets)
 }
 
-// Update applies committed entries. Acquires write locks per affected bucket.
+// Update applies committed entries.
+//
+// The entries are committed Raft log entries: they MUST be applied
+// deterministically on every replica, so a payload that fails to decode
+// produces the reserved sm.ResultInvalidCommand result for that entry
+// rather than an Update error (the engine treats an Update error as
+// terminal for the shard).
+//
+// All entries are decoded before any mutation, and the write locks of every
+// affected bucket are held together for the whole apply pass, so the batch
+// is all-or-nothing AND concurrent Lookups never observe a partially
+// applied batch. Buckets are locked in ascending index order -- the same
+// order used by Lookup(ListQuery) and PrepareSnapshot -- so lock
+// acquisition cannot deadlock.
 func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	// Pass 1: decode every command before touching any bucket. An
+	// undecodable payload is marked invalid and its reserved per-entry
+	// result is written now.
+	if cap(cs.ops) < len(entries) {
+		cs.ops = make([]decodedOp, len(entries))
+	}
+	ops := cs.ops[:len(entries)]
+	var affected [numBuckets]bool
 	for i, e := range entries {
 		cmd, err := DecodeCommand(e.Cmd)
 		if err != nil {
-			return err
+			ops[i] = decodedOp{}
+			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
+			continue
+		}
+		switch cmd.Op {
+		case OpPut, OpGet, OpDelete:
+		default:
+			// Unreachable while DecodeCommand validates the opcode
+			// range; kept so a future opcode gap stays deterministic.
+			ops[i] = decodedOp{}
+			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
+			continue
 		}
 		idx := bucketIndex(cmd.Key)
-		b := &cs.buckets[idx]
+		ops[i] = decodedOp{cmd: cmd, bucket: idx, valid: true}
+		if cmd.Op != OpGet {
+			affected[idx] = true
+		}
+	}
 
-		b.mu.Lock()
+	// Pass 2: apply under all affected bucket locks at once. No error
+	// return can occur past this point, so the batch applies fully.
+	for i := range cs.buckets {
+		if affected[i] {
+			cs.buckets[i].mu.Lock()
+		}
+	}
+	for i := range ops {
+		if !ops[i].valid {
+			continue
+		}
+		cmd := &ops[i].cmd
+		b := &cs.buckets[ops[i].bucket]
 		switch cmd.Op {
 		case OpPut:
 			val := make([]byte, len(cmd.Value))
@@ -78,13 +142,18 @@ func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results
 			delete(b.data, string(cmd.Key))
 			results[i] = sm.Result{Value: 1}
 		case OpGet:
+			// Get in Update is a no-op (reads go through Lookup).
 			results[i] = sm.Result{Value: 0}
-		default:
-			b.mu.Unlock()
-			return &InvalidCommandError{Reason: "unknown op"}
 		}
-		b.mu.Unlock()
 	}
+	for i := range cs.buckets {
+		if affected[i] {
+			cs.buckets[i].mu.Unlock()
+		}
+	}
+	// Drop aliases into Entry.Cmd buffers, which the engine may recycle
+	// after Update returns (Config.ZeroCopyEntryCmd).
+	clear(ops)
 	return nil
 }
 
@@ -173,35 +242,44 @@ func (cs *ConcurrentStore) BytesLookupInto(key, dst []byte) ([]byte, error) {
 }
 
 // GetHash computes a deterministic xxhash64 hash of all key-value pairs
-// across all buckets. Acquires read locks on all buckets.
+// across all buckets. The read locks of EVERY bucket are held together for
+// the whole computation so the hash reflects a state that actually existed
+// atomically — releasing and re-acquiring per key would let a concurrent
+// Update interleave, producing a hash of a state no replica ever held and
+// raising false divergence alarms. Buckets are locked in ascending index
+// order, matching Lookup(ListQuery)/PrepareSnapshot/Update, so lock
+// acquisition cannot deadlock. Each key and value is hashed via
+// hashLenPrefixed so pair boundaries are unambiguous.
 func (cs *ConcurrentStore) GetHash() (uint64, error) {
-	h := xxhash.New()
-
-	// Collect all keys from all buckets.
-	var allKeys []string
 	for i := range cs.buckets {
-		b := &cs.buckets[i]
-		b.mu.RLock()
-		for k := range b.data {
-			allKeys = append(allKeys, k)
+		cs.buckets[i].mu.RLock()
+	}
+	defer func() {
+		for i := range cs.buckets {
+			cs.buckets[i].mu.RUnlock()
 		}
-		b.mu.RUnlock()
+	}()
+
+	// Collect keys and values together under the held locks.
+	total := 0
+	for i := range cs.buckets {
+		total += len(cs.buckets[i].data)
+	}
+	allKeys := make([]string, 0, total)
+	pairs := make(map[string][]byte, total)
+	for i := range cs.buckets {
+		for k, v := range cs.buckets[i].data {
+			allKeys = append(allKeys, k)
+			pairs[k] = v
+		}
 	}
 	sort.Strings(allKeys)
 
+	h := xxhash.New()
 	for _, k := range allKeys {
-		idx := bucketIndex([]byte(k))
-		b := &cs.buckets[idx]
-		b.mu.RLock()
-		if _, err := h.WriteString(k); err != nil {
-			b.mu.RUnlock()
-			return 0, &HashWriteError{Err: err}
+		if err := hashLenPrefixed(h, k, pairs[k]); err != nil {
+			return 0, err
 		}
-		if _, err := h.Write(b.data[k]); err != nil {
-			b.mu.RUnlock()
-			return 0, &HashWriteError{Err: err}
-		}
-		b.mu.RUnlock()
 	}
 	return h.Sum64(), nil
 }
@@ -263,74 +341,72 @@ func (cs *ConcurrentStore) SaveSnapshot(_ context.Context, snapshotCtx interface
 }
 
 // RecoverFromSnapshot restores state from the reader, replacing all data.
+//
+// The entire stream is read and validated into local staging maps BEFORE
+// any live bucket is touched: a truncated or corrupt stream must return an
+// error while leaving the existing state fully intact. Only after a clean
+// full parse are the bucket write locks taken and the staged maps swapped
+// in atomically (mirrors MemoryStore.RecoverFromSnapshot).
 func (cs *ConcurrentStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 		return err
 	}
 
-	// Lock all buckets for the full restore.
-	for i := range cs.buckets {
-		cs.buckets[i].mu.Lock()
-		cs.buckets[i].data = make(map[string][]byte)
+	// count is an untrusted length prefix from a peer snapshot. Cap the
+	// per-bucket capacity hint so a hostile count cannot force a huge
+	// preallocation; the maps grow organically past the hint if needed.
+	hint := int(count)
+	if hint > maxSnapshotMapHint {
+		hint = maxSnapshotMapHint
+	}
+	var staged [numBuckets]map[string][]byte
+	for i := range staged {
+		staged[i] = make(map[string][]byte, hint/numBuckets)
 	}
 
 	for i := uint32(0); i < count; i++ {
 		select {
 		case <-stopper:
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return context.Canceled
 		default:
 		}
 
 		var keyLen uint32
 		if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return err
 		}
 		if keyLen > MaxKeyLength {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return errCorruptSnapshotLength
 		}
 		key := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, key); err != nil {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return err
 		}
 
 		var valLen uint32
 		if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return err
 		}
 		if valLen > MaxValueLength {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return errCorruptSnapshotLength
 		}
 		val := make([]byte, valLen)
 		if _, err := io.ReadFull(r, val); err != nil {
-			for j := range cs.buckets {
-				cs.buckets[j].mu.Unlock()
-			}
 			return err
 		}
 
-		idx := bucketIndex(key)
-		cs.buckets[idx].data[string(key)] = val
+		staged[bucketIndex(key)][string(key)] = val
 	}
 
+	// Full stream parsed cleanly; install the staged maps atomically.
+	// Ascending lock order matches Lookup(ListQuery)/PrepareSnapshot/Update.
+	for i := range cs.buckets {
+		cs.buckets[i].mu.Lock()
+	}
+	for i := range cs.buckets {
+		cs.buckets[i].data = staged[i]
+	}
 	for i := range cs.buckets {
 		cs.buckets[i].mu.Unlock()
 	}

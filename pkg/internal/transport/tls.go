@@ -17,6 +17,7 @@ package transport
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
@@ -47,6 +48,55 @@ const tlsALPN = "quicraft"
 type tlsPair struct {
 	server *tls.Config
 	client *tls.Config
+}
+
+// parseCACertificates parses every CERTIFICATE block in a PEM CA bundle and
+// returns the candidates that can act as an issuing CA. The full bundle is
+// required because TLS verification consumes all of it
+// (pool.AppendCertsFromPEM), so revocation checking must be able to select
+// the same issuer the peer's leaf was actually signed by — in a root +
+// issuing-intermediate PKI that is never the bundle's first block.
+//
+// It fails fast when the bundle contains no block that could issue a
+// certificate: with no usable issuer, OCSP requests would name the wrong CA
+// (a permanent silent no-op under soft-fail, a total handshake outage under
+// EnforceRevocation) and every CRL signature check would fail.
+func parseCACertificates(caPEM []byte) ([]*x509.Certificate, error) {
+	var issuers []*x509.Certificate
+	rest := caPEM
+	blocks := 0
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		blocks++
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, &CACertificateParseError{
+				Reason: "x509.ParseCertificate failed",
+				Err:    err,
+			}
+		}
+		if cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign != 0 {
+			issuers = append(issuers, cert)
+		}
+	}
+	if blocks == 0 {
+		return nil, &CACertificateParseError{
+			Reason: "PEM decode yielded no CERTIFICATE block",
+		}
+	}
+	if len(issuers) == 0 {
+		return nil, &CACertificateParseError{
+			Reason: "CA bundle contains no certificate able to act as an issuer",
+		}
+	}
+	return issuers, nil
 }
 
 // buildMTLSTLS builds a TLS pair from provided mTLS certificate material.

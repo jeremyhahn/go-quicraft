@@ -445,8 +445,8 @@ func TestTransportSender_NotifySnapshotStatus(t *testing.T) {
 
 	// Without a loaded node, the status message will be dropped silently
 	// (DeliverMessage returns false for unknown shards). This should not panic.
-	ts.notifySnapshotStatus(1, 1, 2, true)
-	ts.notifySnapshotStatus(1, 1, 2, false)
+	ts.notifySnapshotStatus(1, 1, 2, 10, true)
+	ts.notifySnapshotStatus(1, 1, 2, 10, false)
 }
 
 // TestTransportSender_NotifySnapshotStatus_Rejected verifies that a rejected
@@ -478,7 +478,7 @@ func TestTransportSender_NotifySnapshotStatus_Rejected(t *testing.T) {
 	}
 
 	// Send rejected status - should be delivered to the node's inbox.
-	ts.notifySnapshotStatus(1, 1, 2, true)
+	ts.notifySnapshotStatus(1, 1, 2, 10, true)
 
 	// Drain the inbox and verify the SnapshotStatus message.
 	var buf []proto.Message
@@ -531,7 +531,7 @@ func TestTransportSender_NotifySnapshotStatus_Accepted(t *testing.T) {
 	}
 
 	// Send accepted status.
-	ts.notifySnapshotStatus(1, 1, 2, false)
+	ts.notifySnapshotStatus(1, 1, 2, 10, false)
 
 	var buf []proto.Message
 	buf = node.DrainInbox(buf)
@@ -711,11 +711,16 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 }
 
 // createTestBarrier creates a real seal.Barrier initialized with fast
-// Argon2id parameters for testing.
+// Argon2id parameters for testing. A no-op StatePersister is wired in
+// because Rotate and PurgeEpochsBefore fail closed with ErrNoStatePersister
+// without one: an unpersisted rotation would lose the new epoch key on
+// restart, so the barrier refuses it.
 func createTestBarrier(t *testing.T) *seal.Barrier {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
-	b := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	cfg := seal.DefaultBarrierConfig(1)
+	cfg.StatePersister = func(*seal.SealedRootKey) error { return nil }
+	b := seal.NewBarrier(cfg)
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("test-snapshot-sender"), 1, 64*1024, 1)
 	if err != nil {

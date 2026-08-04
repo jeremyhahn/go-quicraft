@@ -32,16 +32,28 @@ func numVotingMembers(remotes map[uint64]*remote, witnesses map[uint64]*remote) 
 	return len(remotes) + len(witnesses) + 1 // +1 for self
 }
 
-// electionQuorum returns the number of votes needed to win an election.
-// Both remotes and witnesses vote in elections.
-func electionQuorum(remotes map[uint64]*remote, witnesses map[uint64]*remote) int {
-	return numVotingMembers(remotes, witnesses)/2 + 1
+// quorumOf returns the majority threshold over a voting set of n members.
+// This is the single definition of the majority rule; quorum() and the
+// membership validators (validateAddWitness, validateRemoveNode) all derive
+// from it so the admission checks and the runtime quorum can never diverge.
+func quorumOf(n int) int {
+	return n/2 + 1
 }
 
-// commitQuorum returns the number of data-bearing nodes needed to commit
-// an entry. Only remotes and the leader count; witnesses do not store
-// log entries and are excluded.
-func commitQuorum(remotes map[uint64]*remote) int {
-	replicatingMembers := len(remotes) + 1 // remotes + leader
-	return replicatingMembers/2 + 1
+// quorum returns the number of voting members needed for a quorum over the
+// full voting set (remotes + witnesses + self). This is the SINGLE quorum
+// used for BOTH elections and commit advancement.
+//
+// Using one unified quorum is a Raft safety requirement: witnesses vote in
+// elections, so they MUST also be counted toward the commit quorum, or the
+// two quorums are taken over different member sets and need not intersect
+// in any node holding a committed entry — violating Leader Completeness.
+// Witness metadata (Index/Term, no Cmd) is sufficient to gate commit and
+// to enforce the up-to-date election check. The resulting durability
+// trade-off (a commit may rest on {leader + witnesses} with its payload on
+// one node, unrecoverable if that node suffers permanent storage loss) and
+// the WitnessConfig membership-shape bounds are documented canonically in
+// docs/raft/protocol.md Section 6. Matches the dragonboat reference.
+func quorum(remotes map[uint64]*remote, witnesses map[uint64]*remote) int {
+	return quorumOf(numVotingMembers(remotes, witnesses))
 }

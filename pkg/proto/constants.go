@@ -25,9 +25,23 @@ package proto
 import "fmt"
 
 // WireVersion is the current binary wire format version. It is written as
-// the first 8 bytes of on-disk structures. Receivers validate that the
-// version does not exceed WireVersion before unmarshaling.
-const WireVersion uint64 = 1
+// the first 8 bytes of on-disk structures. Receivers validate the version
+// before unmarshaling; a mismatch is reported as ErrUnsupportedVersion.
+//
+// Version history:
+//
+//	v1: original layout (Membership base 8 bytes, ConfigChange fixed 36 bytes).
+//	v2: replicated witness policy — Membership gained MaxWitnesses and
+//	    RequireFullReplicaMajority (base 8 -> 24 bytes) and ConfigChange
+//	    gained the same fields (fixed 36 -> 52 bytes). The v1 layouts carry
+//	    no per-type version byte and cannot be decoded by v2.
+//	v3: Membership gained a leading version byte (base 24 -> 25 bytes), so a
+//	    legacy section is rejected in band instead of being misparsed. The
+//	    embedding types (Snapshot, SnapshotChunk) grow by the same byte.
+//	    Bumped because v2 and v3 encode Membership differently while both
+//	    would otherwise stamp BinVer 2, which is the exact ambiguity the
+//	    version byte removes.
+const WireVersion uint64 = 3
 
 // MaxEntrySize is the maximum byte length of an Entry.Cmd payload.
 // Enforced during UnmarshalFrom to prevent memory exhaustion from
@@ -128,11 +142,15 @@ const (
 	RemoveNode   uint64 = 1
 	AddNonVoting uint64 = 2
 	AddWitness   uint64 = 3
+	// UpdateWitnessPolicy replaces the shard's replicated witness policy
+	// (MaxWitnesses, RequireFullReplicaMajority). Carries no target
+	// replica; the policy fields on ConfigChange hold the new values.
+	UpdateWitnessPolicy uint64 = 4
 )
 
 // maxConfigChangeType is the upper bound for valid ConfigChange.Type values.
 // Used in UnmarshalFrom validation instead of referencing AddWitness directly.
-const maxConfigChangeType = AddWitness
+const maxConfigChangeType = UpdateWitnessPolicy
 
 // maxStateMachineType is the upper bound for valid Snapshot.Type values.
 // Used in UnmarshalFrom validation to reject unknown state machine types.
@@ -181,10 +199,11 @@ func MessageTypeName(t uint64) string {
 
 // configChangeTypeNames maps config change type constants to human-readable names.
 var configChangeTypeNames = map[uint64]string{
-	AddNode:      "AddNode",
-	RemoveNode:   "RemoveNode",
-	AddNonVoting: "AddNonVoting",
-	AddWitness:   "AddWitness",
+	AddNode:             "AddNode",
+	RemoveNode:          "RemoveNode",
+	AddNonVoting:        "AddNonVoting",
+	AddWitness:          "AddWitness",
+	UpdateWitnessPolicy: "UpdateWitnessPolicy",
 }
 
 // ConfigChangeTypeName returns the human-readable name for a config change type constant.

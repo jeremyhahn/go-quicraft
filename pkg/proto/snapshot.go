@@ -36,7 +36,11 @@ type Snapshot struct {
 	Filepath string
 	// FileSize is the size of the snapshot data file in bytes.
 	FileSize uint64
-	// Checksum is the integrity checksum of the snapshot data.
+	// Checksum is the integrity checksum of the snapshot data. After
+	// UnmarshalFrom, Checksum aliases the source buffer (zero-copy), like
+	// Entry.Cmd. The caller must copy if the data needs to outlive the
+	// buffer — on the receive path the buffer is pooled and is returned
+	// before the handler runs.
 	Checksum []byte
 	// Type identifies the state machine type.
 	Type uint64
@@ -119,7 +123,7 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	offset += n
 	var fp string
-	fp, n, err = getString(buf[offset:], MaxFilepathLen)
+	fp, n, err = getString(buf[offset:], MaxFilepathLen, ErrFilepathTooLong)
 	if err != nil {
 		return 0, err
 	}
@@ -132,7 +136,7 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	s.FileSize = getUint64(buf[offset:])
 	offset += 8
 	var cksum []byte
-	cksum, n, err = getBytes(buf[offset:], MaxChecksumLen)
+	cksum, n, err = getBytes(buf[offset:], MaxChecksumLen, ErrChecksumTooLong)
 	if err != nil {
 		return 0, err
 	}

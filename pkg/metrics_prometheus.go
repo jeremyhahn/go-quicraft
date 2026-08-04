@@ -87,6 +87,14 @@ type PrometheusMetricsCollector struct {
 	// Pre-bound metrics per shard for O(1) hot-path access.
 	shardMetrics sync.Map // map[uint64]*shardMetrics
 
+	// unregisteredShards tombstones every shard whose child series
+	// UnregisterShard deleted, so a residual in-flight sample cannot
+	// re-create them through the fallback path. It holds only shard IDs that
+	// have been registered and then unregistered — exactly the set that used
+	// to leak a full set of Prometheus child series each — so it replaces
+	// per-shard histogram series with a single map key.
+	unregisteredShards sync.Map // map[uint64]struct{}
+
 	// Raft metric vectors (for registration and pre-binding).
 	proposalLatencyVec   *prometheus.HistogramVec
 	commitLatencyVec     *prometheus.HistogramVec
@@ -389,6 +397,11 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 	sid := strconv.FormatUint(shardID, 10)
 
+	// Lift the tombstone before the series are re-bound so a sample racing
+	// this registration falls back to WithLabelValues on the same child
+	// series RegisterShard is about to bind, rather than being dropped.
+	c.unregisteredShards.Delete(shardID)
+
 	sm := &shardMetrics{
 		proposalLatency:    c.proposalLatencyVec.WithLabelValues(sid),
 		commitLatency:      c.commitLatencyVec.WithLabelValues(sid),
@@ -414,7 +427,14 @@ func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 // every per-shard series registered forever, so a host that starts and stops
 // shards over time (tenant churn, rebalancing) accumulated unbounded series —
 // a memory/TSDB-cardinality leak.
+//
+// The shard is tombstoned first: once the pre-bound cache entry is gone, a
+// hot-path sample still in flight on the engine apply goroutine (an OnApplied
+// racing StopShard) would otherwise take the fallback and RE-CREATE the very
+// child series this method deletes, reinstating the leak permanently. The
+// tombstone makes those residual samples drop instead.
 func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
+	c.unregisteredShards.Store(shardID, struct{}{})
 	c.shardMetrics.Delete(shardID)
 
 	sid := strconv.FormatUint(shardID, 10)
@@ -441,6 +461,16 @@ func (c *PrometheusMetricsCollector) getShard(shardID uint64) *shardMetrics {
 	return nil
 }
 
+// fallbackAllowed reports whether a sample for a shard with no pre-bound
+// metrics may create its child series through WithLabelValues. It is false
+// only for shards UnregisterShard has torn down; a shard that was simply
+// never registered still records, so an embedder that does not call
+// RegisterShard is not silently unmetered.
+func (c *PrometheusMetricsCollector) fallbackAllowed(shardID uint64) bool {
+	_, tombstoned := c.unregisteredShards.Load(shardID)
+	return !tombstoned
+}
+
 // ---------------------------------------------------------------------------
 // RaftMetrics
 // ---------------------------------------------------------------------------
@@ -450,6 +480,9 @@ func (c *PrometheusMetricsCollector) getShard(shardID uint64) *shardMetrics {
 func (c *PrometheusMetricsCollector) ObserveProposalLatency(shardID uint64, d time.Duration) {
 	if sm := c.getShard(shardID); sm != nil {
 		sm.proposalLatency.Observe(d.Seconds())
+		return
+	}
+	if !c.fallbackAllowed(shardID) {
 		return
 	}
 	// Fallback for unregistered shards (slow path).
@@ -462,6 +495,9 @@ func (c *PrometheusMetricsCollector) ObserveCommitLatency(shardID uint64, d time
 		sm.commitLatency.Observe(d.Seconds())
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	c.commitLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
 }
 
@@ -469,6 +505,9 @@ func (c *PrometheusMetricsCollector) ObserveCommitLatency(shardID uint64, d time
 func (c *PrometheusMetricsCollector) ObserveApplyLatency(shardID uint64, d time.Duration) {
 	if sm := c.getShard(shardID); sm != nil {
 		sm.applyLatency.Observe(d.Seconds())
+		return
+	}
+	if !c.fallbackAllowed(shardID) {
 		return
 	}
 	c.applyLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
@@ -481,6 +520,9 @@ func (c *PrometheusMetricsCollector) ObserveReadIndexLatency(shardID uint64, d t
 		sm.readIndexLatency.Observe(d.Seconds())
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	c.readIndexLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
 }
 
@@ -491,6 +533,9 @@ func (c *PrometheusMetricsCollector) IncProposalDropped(shardID uint64) {
 		sm.proposalDropped.Inc()
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	c.proposalDroppedVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
 }
 
@@ -499,6 +544,9 @@ func (c *PrometheusMetricsCollector) IncProposalDropped(shardID uint64) {
 func (c *PrometheusMetricsCollector) ObserveProposalBatchSize(shardID uint64, size int) {
 	if sm := c.getShard(shardID); sm != nil {
 		sm.proposalBatchSize.Observe(float64(size))
+		return
+	}
+	if !c.fallbackAllowed(shardID) {
 		return
 	}
 	c.proposalBatchSizeVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(float64(size))
@@ -516,6 +564,9 @@ func (c *PrometheusMetricsCollector) IncElection(shardID uint64) {
 		sm.elections.Inc()
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	c.electionsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
 }
 
@@ -525,6 +576,9 @@ func (c *PrometheusMetricsCollector) IncSnapshot(shardID uint64) {
 		sm.snapshots.Inc()
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	c.snapshotsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
 }
 
@@ -532,6 +586,9 @@ func (c *PrometheusMetricsCollector) IncSnapshot(shardID uint64) {
 func (c *PrometheusMetricsCollector) IncPiggybackCommit(shardID uint64) {
 	if sm := c.getShard(shardID); sm != nil {
 		sm.piggybackCommits.Inc()
+		return
+	}
+	if !c.fallbackAllowed(shardID) {
 		return
 	}
 	c.piggybackCommitsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
@@ -610,6 +667,9 @@ func (c *PrometheusMetricsCollector) IncSnapshotsSent(shardID uint64, bytes int6
 		sm.snapshotsBytesSent.Observe(float64(bytes))
 		return
 	}
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
 	shard := strconv.FormatUint(shardID, 10)
 	c.snapshotsSentVec.WithLabelValues(shard).Inc()
 	c.snapshotsBytesSentVec.WithLabelValues(shard).Observe(float64(bytes))
@@ -621,6 +681,9 @@ func (c *PrometheusMetricsCollector) IncSnapshotsReceived(shardID uint64, bytes 
 	if sm := c.getShard(shardID); sm != nil {
 		sm.snapshotsReceived.Inc()
 		sm.snapshotsBytesRecv.Observe(float64(bytes))
+		return
+	}
+	if !c.fallbackAllowed(shardID) {
 		return
 	}
 	shard := strconv.FormatUint(shardID, 10)
@@ -648,9 +711,15 @@ func (c *PrometheusMetricsCollector) IncUnauthorizedSnapshotDropped(shardID, _ u
 // ---------------------------------------------------------------------------
 
 // SampledMetricsCollector wraps a MetricsCollector and samples expensive
-// metrics to reduce overhead in ultra-high-throughput scenarios.
-// Hot-path metrics (commit latency, apply latency, message counts) are
-// sampled at the configured rate. Less frequent metrics (elections,
+// HISTOGRAM observations (commit latency, apply latency) to reduce overhead
+// in ultra-high-throughput scenarios. Sampling a histogram thins its
+// resolution but keeps its distribution representative.
+//
+// COUNTERS are never sampled: a sampled prometheus.Counter.Inc() would make
+// every *_total series under-report by SampleRate, so every rate()/increase()
+// built on it would be off by orders of magnitude. Message send/receive
+// counts therefore forward every call to the wrapped collector (a counter
+// increment is a cheap atomic add). Less frequent metrics (elections,
 // snapshots) are always recorded.
 type SampledMetricsCollector struct {
 	MetricsCollector
@@ -659,8 +728,13 @@ type SampledMetricsCollector struct {
 	// record 1 in 100 observations. Default: 100.
 	SampleRate uint64
 
-	// counter tracks observations for sampling decisions.
-	counter atomic.Uint64
+	// Each sampled metric owns its counter. A single shared counter makes
+	// the sampling decision depend on the INTERLEAVING of the metrics: with
+	// an even SampleRate and a strictly alternating call pattern, every
+	// multiple of SampleRate lands on the same metric, which is then sampled
+	// always while the other is sampled never.
+	commitCounter atomic.Uint64
+	applyCounter  atomic.Uint64
 }
 
 // NewSampledMetricsCollector wraps an existing collector with sampling.
@@ -675,34 +749,34 @@ func NewSampledMetricsCollector(inner MetricsCollector, sampleRate uint64) *Samp
 	}
 }
 
-func (s *SampledMetricsCollector) shouldSample() bool {
-	return s.counter.Add(1)%s.SampleRate == 0
+// shouldSample advances the given metric's own counter and reports whether
+// this observation is the one in SampleRate that gets recorded.
+func (s *SampledMetricsCollector) shouldSample(counter *atomic.Uint64) bool {
+	return counter.Add(1)%s.SampleRate == 0
 }
 
 // ObserveCommitLatency samples commit latency observations.
 func (s *SampledMetricsCollector) ObserveCommitLatency(shardID uint64, d time.Duration) {
-	if s.shouldSample() {
+	if s.shouldSample(&s.commitCounter) {
 		s.MetricsCollector.ObserveCommitLatency(shardID, d)
 	}
 }
 
 // ObserveApplyLatency samples apply latency observations.
 func (s *SampledMetricsCollector) ObserveApplyLatency(shardID uint64, d time.Duration) {
-	if s.shouldSample() {
+	if s.shouldSample(&s.applyCounter) {
 		s.MetricsCollector.ObserveApplyLatency(shardID, d)
 	}
 }
 
-// IncMessagesSent samples message send counts.
+// IncMessagesSent forwards EVERY send to the wrapped collector. Counters
+// must be exact; see the SampledMetricsCollector doc comment.
 func (s *SampledMetricsCollector) IncMessagesSent(shardID, to uint64, msgType uint64) {
-	if s.shouldSample() {
-		s.MetricsCollector.IncMessagesSent(shardID, to, msgType)
-	}
+	s.MetricsCollector.IncMessagesSent(shardID, to, msgType)
 }
 
-// IncMessagesReceived samples message receive counts.
+// IncMessagesReceived forwards EVERY receive to the wrapped collector.
+// Counters must be exact; see the SampledMetricsCollector doc comment.
 func (s *SampledMetricsCollector) IncMessagesReceived(shardID, from uint64, msgType uint64) {
-	if s.shouldSample() {
-		s.MetricsCollector.IncMessagesReceived(shardID, from, msgType)
-	}
+	s.MetricsCollector.IncMessagesReceived(shardID, from, msgType)
 }

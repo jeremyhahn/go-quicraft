@@ -17,6 +17,7 @@ package transport
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -100,6 +101,31 @@ const (
 
 	// QUICErrIPLimitReached indicates the per-IP connection limit was reached.
 	QUICErrIPLimitReached quic.ApplicationErrorCode = 0x3
+
+	// QUICErrDuplicateDial indicates a freshly dialed connection lost a
+	// dial race: another dial to the same target already populated the
+	// connection cache, so the loser is closed instead of leaking alive
+	// on keep-alives outside the cache's bookkeeping.
+	QUICErrDuplicateDial quic.ApplicationErrorCode = 0x4
+)
+
+// Stream-level QUIC error codes, sent in STOP_SENDING / RESET_STREAM frames
+// via Stream.CancelRead / Stream.CancelWrite. These are distinct from the
+// connection-level quic.ApplicationErrorCode values above.
+const (
+	// QUICStreamErrReceiverGone is sent via CancelRead when the receiver
+	// abandons an inbound stream (frame error, budget exhaustion, snapshot
+	// drop, shutdown). The STOP_SENDING it triggers makes the peer's next
+	// Write on the stream fail fast and releases the stream's flow-control
+	// credit, instead of letting the peer silently black-hole data into a
+	// stream nobody drains.
+	QUICStreamErrReceiverGone quic.StreamErrorCode = 0x1
+
+	// QUICStreamErrShutdown is sent via CancelWrite when the transport is
+	// stopping while a snapshot chunk write is in flight. The RESET_STREAM
+	// unblocks a Write that would otherwise hold Stop() hostage for up to
+	// snapshotChunkWriteDeadline per chunk.
+	QUICStreamErrShutdown quic.StreamErrorCode = 0x2
 )
 
 // FrameDecompressError wraps an underlying Snappy decode failure that
@@ -135,6 +161,14 @@ var (
 	// ErrChunkFilepathTraversal is returned when a snapshot chunk's Filepath
 	// contains path traversal sequences.
 	ErrChunkFilepathTraversal = errors.New("transport: snapshot chunk filepath contains path traversal")
+
+	// ErrChunkHeaderMismatch is returned when a snapshot chunk's identity
+	// fields (ShardID, Index, or Epoch) do not match the stream header that
+	// was used for epoch pinning and resource accounting. Accepting such a
+	// chunk could persist snapshot data under a barrier epoch that was
+	// never pinned, letting a concurrent epoch purge strand an
+	// undecryptable snapshot.
+	ErrChunkHeaderMismatch = errors.New("transport: snapshot chunk does not match stream header")
 )
 
 // ChunkFilepathTooLongError is returned when a deserialized snapshot chunk
@@ -214,6 +248,33 @@ func (e *ChunkFilepathTraversalError) Error() string {
 // Is reports whether target matches the sentinel ErrChunkFilepathTraversal.
 func (e *ChunkFilepathTraversalError) Is(target error) bool {
 	return target == ErrChunkFilepathTraversal
+}
+
+// ChunkHeaderMismatchError is returned when a deserialized snapshot chunk's
+// ShardID, Index, or Epoch differs from the stream's snapshot header. The
+// header is the authority for epoch pinning, so every chunk must match it
+// before any chunk data is retained.
+type ChunkHeaderMismatchError struct {
+	// Field names the mismatching chunk field ("shard_id", "index", "epoch").
+	Field string
+	// ChunkID identifies the offending chunk within the transfer.
+	ChunkID uint64
+	// HeaderValue is the value declared in the stream header.
+	HeaderValue uint64
+	// ChunkValue is the conflicting value carried by the chunk.
+	ChunkValue uint64
+}
+
+// Error returns a human-readable description of the header mismatch.
+func (e *ChunkHeaderMismatchError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot chunk %d field %s does not match stream header (header %d, chunk %d)",
+		e.ChunkID, e.Field, e.HeaderValue, e.ChunkValue)
+}
+
+// Is reports whether target matches the sentinel ErrChunkHeaderMismatch.
+func (e *ChunkHeaderMismatchError) Is(target error) bool {
+	return target == ErrChunkHeaderMismatch
 }
 
 // ErrEmptyDialHost is returned when a dial target has an empty host portion.
@@ -397,4 +458,128 @@ func (e *SnapshotMemoryBudgetExceededError) Error() string {
 // Is reports whether target matches the sentinel ErrSnapshotMemoryBudgetExceeded.
 func (e *SnapshotMemoryBudgetExceededError) Is(target error) bool {
 	return target == ErrSnapshotMemoryBudgetExceeded
+}
+
+// Sentinels for inbound snapshot liveness and admission failures.
+var (
+	// ErrSnapshotTransferTimeout is returned when a single inbound snapshot
+	// transfer exceeds maxSnapshotTransferDuration.
+	ErrSnapshotTransferTimeout = errors.New("transport: snapshot transfer exceeded maximum duration")
+
+	// ErrSnapshotProgressStalled is returned when an inbound snapshot
+	// transfer falls below the minimum sustained throughput. Without it the
+	// per-frame read deadline is reset every iteration, so a peer trickling
+	// bytes can hold a concurrency slot indefinitely.
+	ErrSnapshotProgressStalled = errors.New("transport: snapshot transfer below minimum throughput")
+
+	// ErrSnapshotZeroLengthFrameFlood is returned when an inbound snapshot
+	// stream emits more consecutive zero-length chunk frames than any
+	// legitimate sender produces (which is none).
+	ErrSnapshotZeroLengthFrameFlood = errors.New("transport: snapshot zero-length chunk frame flood")
+
+	// ErrSnapshotHeaderLength is returned when a snapshot stream declares a
+	// header length outside the accepted range.
+	ErrSnapshotHeaderLength = errors.New("transport: snapshot header length out of range")
+
+	// ErrSnapshotChunkCount is returned when a snapshot header declares more
+	// chunks than the configured maximum.
+	ErrSnapshotChunkCount = errors.New("transport: snapshot chunk count exceeds maximum")
+)
+
+// SnapshotTransferTimeoutError reports an inbound snapshot transfer aborted
+// for exceeding the whole-transfer duration ceiling.
+type SnapshotTransferTimeoutError struct {
+	Elapsed       time.Duration
+	Limit         time.Duration
+	ReceivedBytes int64
+}
+
+// Error returns a human-readable description of the transfer timeout.
+func (e *SnapshotTransferTimeoutError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot transfer exceeded maximum duration (%s elapsed, limit %s, %d bytes received)",
+		e.Elapsed, e.Limit, e.ReceivedBytes)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotTransferTimeout.
+func (e *SnapshotTransferTimeoutError) Is(target error) bool {
+	return target == ErrSnapshotTransferTimeout
+}
+
+// SnapshotProgressStalledError reports an inbound snapshot transfer aborted
+// for sustaining less than the minimum average throughput.
+type SnapshotProgressStalledError struct {
+	Elapsed        time.Duration
+	ReceivedBytes  int64
+	MinBytesPerSec int64
+}
+
+// Error returns a human-readable description of the stalled transfer.
+func (e *SnapshotProgressStalledError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot transfer below minimum throughput (%d bytes in %s, floor %d B/s)",
+		e.ReceivedBytes, e.Elapsed, e.MinBytesPerSec)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotProgressStalled.
+func (e *SnapshotProgressStalledError) Is(target error) bool {
+	return target == ErrSnapshotProgressStalled
+}
+
+// SnapshotZeroLengthFrameFloodError reports an inbound snapshot stream that
+// emitted a run of zero-length chunk frames.
+type SnapshotZeroLengthFrameFloodError struct {
+	Count int
+	Max   int
+}
+
+// Error returns a human-readable description of the zero-length frame flood.
+func (e *SnapshotZeroLengthFrameFloodError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot stream sent %d consecutive zero-length chunk frames (max %d)",
+		e.Count, e.Max)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotZeroLengthFrameFlood.
+func (e *SnapshotZeroLengthFrameFloodError) Is(target error) bool {
+	return target == ErrSnapshotZeroLengthFrameFlood
+}
+
+// SnapshotHeaderLengthError reports a snapshot stream whose declared header
+// length falls outside [SnapshotHeaderSize, maxSnapshotHeaderWireLen].
+type SnapshotHeaderLengthError struct {
+	Declared uint32
+	Min      uint32
+	Max      uint32
+}
+
+// Error returns a human-readable description of the header length violation.
+func (e *SnapshotHeaderLengthError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot header length %d out of range [%d, %d]",
+		e.Declared, e.Min, e.Max)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotHeaderLength.
+func (e *SnapshotHeaderLengthError) Is(target error) bool {
+	return target == ErrSnapshotHeaderLength
+}
+
+// SnapshotChunkCountError reports a snapshot header declaring more chunks
+// than the receiver accepts.
+type SnapshotChunkCountError struct {
+	Declared uint64
+	Max      uint64
+}
+
+// Error returns a human-readable description of the chunk count violation.
+func (e *SnapshotChunkCountError) Error() string {
+	return fmt.Sprintf(
+		"transport: snapshot header declares %d chunks (max %d)",
+		e.Declared, e.Max)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotChunkCount.
+func (e *SnapshotChunkCountError) Is(target error) bool {
+	return target == ErrSnapshotChunkCount
 }

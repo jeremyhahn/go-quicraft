@@ -352,6 +352,11 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		im.shrunk = false
 		im.wastedPrefix = 0
 		if offset > uint64(len(im.entries)) {
+			// Only legal when there are no buffered entries (post
+			// snapshot restore); with a non-empty buffer this would
+			// silently create a hole in the log.
+			invariant.Assert(len(im.entries) == 0,
+				"gapped merge past in-memory tail")
 			// After snapshot restore, entries may be nil while
 			// markerIndex has advanced. No prefix to preserve;
 			// adopt the new entries and advance markerIndex.

@@ -4412,3 +4412,54 @@ func TestHandleRequest_CompletedCFull_DropsResult(t *testing.T) {
 	close(stopC)
 	wg.Wait()
 }
+
+// panicOnCompletedCallback panics inside OnSnapshotCompleted, standing in for
+// a user EventListener that panics after the snapshot itself has finished.
+type panicOnCompletedCallback struct {
+	*testCallback
+	rejected atomic.Int64
+}
+
+func (c *panicOnCompletedCallback) OnSnapshotCompleted(_ uint64, _ uint64, _ error) {
+	panic("listener boom")
+}
+
+func (c *panicOnCompletedCallback) OnSnapshotRejected(_, _ uint64) {
+	c.rejected.Add(1)
+}
+
+// TestHandleRequest_PanicRecovery_PostCompletionCallback verifies that panic
+// containment extends past handleSnapshot to the completion notification.
+// OnSnapshotCompleted reaches user EventListener code through the host; an
+// unrecovered panic there would abort the whole host process from a pool
+// worker goroutine, taking every unrelated shard down with it.
+func TestHandleRequest_PanicRecovery_PostCompletionCallback(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cb := &panicOnCompletedCallback{testCallback: newTestCallback()}
+	pool := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	// No snapshotter: saveSnapshot returns an error, so handleSnapshot
+	// completes and the panic can only come from the completion callback.
+	node := NewNode(nil, nil, nil, cfg, 100, nil, t.TempDir(), nil)
+	node.snapshotting.Store(true)
+	pool.inFlight.Store(uint64(1), struct{}{})
+
+	// Must not panic out of handleRequest.
+	pool.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: true})
+
+	if node.snapshotting.Load() {
+		t.Fatal("snapshotting must be cleared after a post-completion panic")
+	}
+	if _, ok := pool.inFlight.Load(uint64(1)); ok {
+		t.Fatal("in-flight must be cleared after a post-completion panic")
+	}
+	if cb.rejected.Load() != 0 {
+		t.Fatal("OnSnapshotRejected must not fire for a snapshot that completed")
+	}
+}

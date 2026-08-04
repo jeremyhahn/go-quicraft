@@ -16,15 +16,21 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/quic-go/quic-go"
 )
 
 // waitForBatchCount polls until the handler has received at least want batches
@@ -301,7 +307,7 @@ func TestSnapshotReceiverConcurrencyLimit(t *testing.T) {
 
 	// A second receive attempt should be dropped (default case).
 	stopC := make(chan struct{})
-	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, nil, stopC)
+	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, "", nil, stopC)
 
 	// Release semaphore.
 	<-sr.sem
@@ -3113,38 +3119,106 @@ func TestInboundAuthorizedForCached_VerifiesOncePerConn(t *testing.T) {
 		t.Fatal("expected cache entry after first call")
 	}
 	entry := v.(*srcAddrAuthEntry)
-	entry.mu.Lock()
-	if !entry.valid || entry.addr != "127.0.0.1:1" || !entry.authorized {
-		t.Fatalf("unexpected cache entry: valid=%v addr=%q authorized=%v",
-			entry.valid, entry.addr, entry.authorized)
+	if got, ok := lookupAuthSlot(entry, "127.0.0.1:1"); !ok || !got {
+		t.Fatalf("unexpected cache slot for 127.0.0.1:1: authorized=%v cached=%v", got, ok)
 	}
-	entry.mu.Unlock()
 
 	// Second call for the same address must reuse the cached decision. We
 	// poison the cached authorized flag to a sentinel and confirm the cache
 	// path returns it without re-verifying against the cert.
-	entry.mu.Lock()
-	entry.authorized = false
-	entry.mu.Unlock()
+	poisonAuthSlot(entry, "127.0.0.1:1", false)
 	if t1.inboundAuthorizedForCached(conn, "127.0.0.1:1") {
 		t.Fatal("expected cached (poisoned) decision to be reused, not re-verified")
 	}
 
-	// A different claimed address re-verifies: an unauthorized address yields
-	// false and updates the cached address.
+	// A different claimed address re-verifies into its own slot: an
+	// unauthorized address yields false, and the first address stays cached
+	// (the multi-slot cache is what stops a peer alternating two claimed
+	// addresses from forcing a cert check on every batch).
 	if t1.inboundAuthorizedForCached(conn, "10.99.99.99:1") {
 		t.Fatal("expected 10.99.99.99 to be unauthorized")
 	}
-	entry.mu.Lock()
-	if entry.addr != "10.99.99.99:1" || entry.authorized {
-		t.Fatalf("expected re-verification for new address, got addr=%q authorized=%v",
-			entry.addr, entry.authorized)
+	if got, ok := lookupAuthSlot(entry, "10.99.99.99:1"); !ok || got {
+		t.Fatalf("expected cached unauthorized slot for 10.99.99.99:1, authorized=%v cached=%v", got, ok)
 	}
-	entry.mu.Unlock()
+	if _, ok := lookupAuthSlot(entry, "127.0.0.1:1"); !ok {
+		t.Fatal("expected the first address to remain cached alongside the second")
+	}
+}
+
+// lookupAuthSlot returns the cached decision for addr and whether a slot for
+// it exists.
+func lookupAuthSlot(entry *srcAddrAuthEntry, addr string) (bool, bool) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	for i := range entry.slots {
+		if entry.slots[i].valid && entry.slots[i].addr == addr {
+			return entry.slots[i].authorized, true
+		}
+	}
+	return false, false
+}
+
+// poisonAuthSlot overwrites the cached decision for addr so a subsequent
+// lookup that returns it proves the cache was consulted.
+func poisonAuthSlot(entry *srcAddrAuthEntry, addr string, authorized bool) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	for i := range entry.slots {
+		if entry.slots[i].valid && entry.slots[i].addr == addr {
+			entry.slots[i].authorized = authorized
+		}
+	}
+}
+
+// TestInboundAuthorizedForCached_CachesMultipleAddresses is the M-cache
+// regression test: a peer alternating two claimed SourceAddresses must not
+// evict either decision, and a connection that cycles more than
+// srcAddrAuthMaxDistinct addresses stops re-verifying and fails closed.
+func TestInboundAuthorizedForCached_CachesMultipleAddresses(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	// Two alternating claimed addresses both stay cached.
+	t1.inboundAuthorizedForCached(conn, "127.0.0.1:1")
+	t1.inboundAuthorizedForCached(conn, "127.0.0.1:2")
+	v, ok := t1.srcAddrAuth.Load(conn)
+	if !ok {
+		t.Fatal("expected cache entry")
+	}
+	entry := v.(*srcAddrAuthEntry)
+	for _, addr := range []string{"127.0.0.1:1", "127.0.0.1:2"} {
+		if _, cached := lookupAuthSlot(entry, addr); !cached {
+			t.Fatalf("expected %s to remain cached in a multi-slot cache", addr)
+		}
+	}
+
+	// Poisoning both proves neither address re-verifies against the cert.
+	poisonAuthSlot(entry, "127.0.0.1:1", false)
+	poisonAuthSlot(entry, "127.0.0.1:2", false)
+	for _, addr := range []string{"127.0.0.1:1", "127.0.0.1:2"} {
+		if t1.inboundAuthorizedForCached(conn, addr) {
+			t.Fatalf("expected poisoned cache decision reused for %s", addr)
+		}
+	}
+
+	// Past srcAddrAuthMaxDistinct distinct claims the connection stops paying
+	// for certificate checks and fails closed on anything not already cached.
+	for i := 0; i < srcAddrAuthMaxDistinct+2; i++ {
+		t1.inboundAuthorizedForCached(conn, fmt.Sprintf("127.0.0.1:%d", 1000+i))
+	}
+	if t1.inboundAuthorizedForCached(conn, "127.0.0.1:9999") {
+		t.Fatal("expected fail-closed after exceeding srcAddrAuthMaxDistinct distinct claims")
+	}
 }
 
 // TestForgetInboundConnAuth_RemovesCacheEntry verifies that the per-connection
-// authorization cache entry is dropped when forgetInboundConnAuth is called
+// authorization cache entry is dropped when forgetInboundConnState is called
 // (wired into handleConnection's defer on inbound-connection teardown).
 func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
@@ -3160,8 +3234,339 @@ func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 		t.Fatal("expected cache entry to exist")
 	}
 
-	t1.forgetInboundConnAuth(conn)
+	t1.forgetInboundConnState(conn)
 	if _, ok := t1.srcAddrAuth.Load(conn); ok {
-		t.Fatal("expected cache entry removed after forgetInboundConnAuth")
+		t.Fatal("expected cache entry removed after forgetInboundConnState")
+	}
+}
+
+// TestHandleStream_ErrorExitCancelsRead is the H10 regression test: when
+// handleStream abandons a stream on a non-idle error (here, an invalid frame
+// header), it must CancelRead in addition to Close. In quic-go, Close only
+// closes the SEND direction, so without CancelRead the receive direction stays
+// open: the peer keeps writing into a stream nobody drains (silently
+// black-holing up to the stream receive window) and the abandoned stream
+// permanently holds one of the peer's stream credits. CancelRead sends
+// STOP_SENDING, so the peer's next Write on the stream fails fast with the
+// receiver-gone stream error code.
+func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+
+	// Invalid magic bytes: the receiver's ValidateFrameHeader fails and
+	// handleStream exits through a non-errStreamIdle error path.
+	if _, err := stream.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00}); err != nil {
+		t.Fatalf("initial write failed: %v", err)
+	}
+
+	// The receiver's CancelRead arrives as STOP_SENDING: subsequent writes
+	// must start failing with a quic.StreamError carrying
+	// QUICStreamErrReceiverGone. Without the fix, every write below succeeds
+	// silently (we send far less than the stream receive window) and the
+	// deadline elapses.
+	junk := make([]byte, 1024)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := stream.Write(junk); err != nil {
+			var streamErr *quic.StreamError
+			if !errors.As(err, &streamErr) {
+				t.Fatalf("expected quic.StreamError from write after CancelRead, got %T: %v", err, err)
+			}
+			if streamErr.ErrorCode != QUICStreamErrReceiverGone {
+				t.Fatalf("stream error code = %d, want %d (QUICStreamErrReceiverGone)",
+					streamErr.ErrorCode, QUICStreamErrReceiverGone)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("stream writes kept succeeding: receive direction was never cancelled")
+}
+
+// ---------------------------------------------------------------------------
+// processSnapshotHeader oversized declared header length (recv.go)
+// ---------------------------------------------------------------------------
+
+// countingReader wraps a byte source and records how many bytes were read.
+type countingReader struct {
+	data []byte
+	pos  int
+	read int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	r.read += n
+	return n, nil
+}
+
+// TestProcessSnapshotHeader_OversizedHeaderLenRejected verifies that a
+// declared snapshot header length beyond maxSnapshotHeaderWireLen is
+// rejected BEFORE any bytes are read: the declared length is
+// attacker-controlled and sits outside every receive budget, so it must
+// never drive an allocation or a long discard.
+func TestProcessSnapshotHeader_OversizedHeaderLenRejected(t *testing.T) {
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	tr, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+	}, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	r := &countingReader{data: make([]byte, SnapshotHeaderSize)}
+	tr.processSnapshotHeader(nil, r, maxSnapshotHeaderWireLen+1)
+	if r.read != 0 {
+		t.Fatalf("oversized header length must be rejected before reading, read %d bytes", r.read)
+	}
+
+	// A bounded header length (with forward-compat slack) must still be
+	// consumed via the discard path.
+	hdr := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkCount: 1}
+	var hdrBuf [SnapshotHeaderSize]byte
+	if _, err := hdr.MarshalTo(hdrBuf[:]); err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+	extraLen := uint32(SnapshotHeaderSize + 32)
+	data := make([]byte, extraLen)
+	copy(data, hdrBuf[:])
+	r2 := &countingReader{data: data}
+	tr.processSnapshotHeader(nil, r2, extraLen)
+	if r2.read != int(extraLen) {
+		t.Fatalf("bounded header must be fully consumed, read %d of %d bytes", r2.read, extraLen)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// snappyDecPool oversized-buffer cap (recv.go putSnappyDecBuf)
+// ---------------------------------------------------------------------------
+
+// TestPutSnappyDecBuf_OversizedNotPooled verifies that Snappy decode buffers
+// grown past maxPoolBufSize are NOT returned to snappyDecPool — the same cap
+// every other buffer pool in the package applies. Without it, up to
+// MaxDecompressedSize per P could be retained unaccounted.
+func TestPutSnappyDecBuf_OversizedNotPooled(t *testing.T) {
+	oversized := make([]byte, 0, maxPoolBufSize+1)
+	oversizedPtr := &oversized
+	putSnappyDecBuf(oversizedPtr)
+
+	// The per-P private pool slot returns the most recently Put pointer, so
+	// with the cap missing this Get would hand the oversized buffer back.
+	got := snappyDecPool.Get().(*[]byte)
+	if got == oversizedPtr {
+		t.Fatal("oversized snappy decode buffer was returned to the pool")
+	}
+	if cap(*got) > maxPoolBufSize {
+		t.Fatalf("pooled snappy decode buffer cap %d exceeds maxPoolBufSize %d", cap(*got), maxPoolBufSize)
+	}
+	putSnappyDecBuf(got)
+
+	// A buffer at or below the cap is pooled, with its length reset.
+	normal := make([]byte, 100, 1024)
+	normalPtr := &normal
+	putSnappyDecBuf(normalPtr)
+	if len(*normalPtr) != 0 {
+		t.Fatalf("pooled buffer length must be reset, got %d", len(*normalPtr))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M5: header-stage snapshot rejections must be observable
+// ---------------------------------------------------------------------------
+
+// newRejectionCountingTransport builds a transport whose OnSnapshotRejected
+// listener increments the returned counter.
+func newRejectionCountingTransport(t *testing.T, rejected *atomic.Int64) *QUICTransport {
+	t.Helper()
+	cfg := Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+		EventListener: &config.EventListener{
+			OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
+		},
+	}
+	tr, err := NewQUICTransport(cfg, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+	return tr
+}
+
+// TestProcessSnapshotHeaderRejectionsAreReported is the M5 regression test:
+// every header-stage drop must fire OnSnapshotRejected and a structured
+// warning. These paths previously returned silently, so an operator saw
+// nothing while the sender waited out its ack timeout.
+func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
+	validHdr := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 3, ChunkCount: 1}
+	var validBuf [SnapshotHeaderSize]byte
+	if _, err := validHdr.MarshalTo(validBuf[:]); err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+
+	oversizedHdr := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 3,
+		ChunkCount: defaultMaxSnapshotChunkCount + 1}
+	var oversizedBuf [SnapshotHeaderSize]byte
+	if _, err := oversizedHdr.MarshalTo(oversizedBuf[:]); err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		headerLen uint32
+		body      []byte
+	}{
+		{
+			name:      "declared length below minimum",
+			headerLen: SnapshotHeaderSize - 1,
+		},
+		{
+			name:      "declared length above bound",
+			headerLen: maxSnapshotHeaderWireLen + 1,
+		},
+		{
+			name:      "header read truncated",
+			headerLen: SnapshotHeaderSize,
+			body:      validBuf[:SnapshotHeaderSize-4],
+		},
+		{
+			name:      "forward-compat discard truncated",
+			headerLen: SnapshotHeaderSize + 16,
+			body:      validBuf[:],
+		},
+		{
+			name:      "chunk count exceeds bound",
+			headerLen: SnapshotHeaderSize,
+			body:      oversizedBuf[:],
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var rejected atomic.Int64
+			tr := newRejectionCountingTransport(t, &rejected)
+			tr.processSnapshotHeader(nil, bytes.NewReader(tc.body), tc.headerLen)
+			if rejected.Load() != 1 {
+				t.Fatalf("OnSnapshotRejected fired %d times, want 1", rejected.Load())
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M8: receive-budget exhaustion is retryable, not a stream teardown
+// ---------------------------------------------------------------------------
+
+// TestHandleMessageFrameDrainsBodyOnBudgetExhaustion is the M8 regression
+// test. Budget exhaustion used to be fatal to the stream, so one peer filling
+// the aggregate budget tore down every OTHER peer's replication stream and
+// cascaded into cluster-wide connection churn. The fix requires the frame body
+// to be consumed so the stream is left at a clean frame boundary and the
+// caller can simply continue.
+func TestHandleMessageFrameDrainsBodyOnBudgetExhaustion(t *testing.T) {
+	tr, err := NewQUICTransport(Config{
+		ListenAddress:           "127.0.0.1:0",
+		DeploymentID:            42,
+		MaxMessageReceiveMemory: 1024,
+		MTLSConfig:              testMTLSConfig(t),
+	}, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	body := make([]byte, 4096) // larger than the whole budget
+	marker := []byte("NEXT-FRAME-HEADER")
+	stream := bytes.NewReader(append(append([]byte{}, body...), marker...))
+
+	err = tr.handleMessageFrame(nil, stream, uint32(len(body)), FlagNone)
+	if !errors.Is(err, ErrMessageRecvMemoryBudgetExceeded) {
+		t.Fatalf("expected ErrMessageRecvMemoryBudgetExceeded, got %v", err)
+	}
+
+	remaining, readErr := io.ReadAll(stream)
+	if readErr != nil {
+		t.Fatalf("reading the stream remainder failed: %v", readErr)
+	}
+	if string(remaining) != string(marker) {
+		t.Fatalf("stream left at %q, want the next frame at %q (body was not drained)",
+			remaining, marker)
+	}
+	if got := tr.msgRecvBudget.Load(); got != 1024 {
+		t.Fatalf("budget after a rejected frame = %d, want 1024 (reserve/release imbalance)", got)
+	}
+}
+
+// TestBudgetExhaustionIsNotAProtocolViolation verifies the classification the
+// retry depends on: a transient budget rejection must not be treated as a
+// peer-protocol fault (which terminates the stream and logs a violation),
+// while genuine protocol faults still are.
+func TestBudgetExhaustionIsNotAProtocolViolation(t *testing.T) {
+	if isProtocolViolation(ErrMessageRecvMemoryBudgetExceeded) {
+		t.Fatal("budget exhaustion must not be classified as a protocol violation")
+	}
+	for _, err := range []error{
+		ErrInvalidMagic,
+		ErrUnsupportedVersion,
+		ErrFrameTooLarge,
+		ErrPeerIdentityMismatch,
+		proto.ErrTooManyMessages,
+	} {
+		if !isProtocolViolation(err) {
+			t.Fatalf("%v must be classified as a protocol violation", err)
+		}
+	}
+}
+
+// TestPerConnectionMsgRecvBudgetBoundsOnePeer verifies the M8 partitioning:
+// a single connection cannot reserve the whole aggregate budget, so one peer's
+// burst cannot push every other peer into the exhaustion path.
+func TestPerConnectionMsgRecvBudgetBoundsOnePeer(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String())
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	if t1.maxConnMsgRecv <= 0 {
+		t.Fatal("expected a positive per-connection receive ceiling")
+	}
+	if !t1.reserveConnMsgRecvBudget(conn, t1.maxConnMsgRecv) {
+		t.Fatal("a reservation up to the per-connection ceiling should succeed")
+	}
+	if t1.reserveConnMsgRecvBudget(conn, 1) {
+		t.Fatal("a reservation past the per-connection ceiling must be refused")
+	}
+	t1.releaseConnMsgRecvBudget(conn, t1.maxConnMsgRecv)
+	if !t1.reserveConnMsgRecvBudget(conn, t1.maxConnMsgRecv) {
+		t.Fatal("released capacity should be reusable")
+	}
+	t1.releaseConnMsgRecvBudget(conn, t1.maxConnMsgRecv)
+
+	// The per-connection accounting is dropped with the rest of the
+	// connection state so the map cannot grow across connection churn.
+	t1.forgetInboundConnState(conn)
+	if _, ok := t1.connMsgBudget.Load(conn); ok {
+		t.Fatal("expected the per-connection budget entry to be removed")
 	}
 }

@@ -1175,17 +1175,68 @@ func TestPrometheusMetricsCollector_RegisterShard_MultipleTimes(t *testing.T) {
 	}
 }
 
+// TestPrometheusMetricsCollector_UnregisterShard is the ML8 regression test:
+// a sample that arrives AFTER UnregisterShard (an OnApplied still in flight
+// on the engine apply goroutine when StopShard runs) must be dropped, not
+// re-create the child series the unregister just deleted. Re-creating it
+// would resurrect the series permanently and reinstate the cardinality leak
+// UnregisterShard exists to close.
 func TestPrometheusMetricsCollector_UnregisterShard(t *testing.T) {
 	c := NewPrometheusMetricsCollector()
 	c.RegisterShard(99)
+	c.ObserveProposalLatency(99, time.Millisecond)
+	if !shardSeriesExists(t, c.Registry, "quicraft_raft_proposal_latency_seconds", "99") {
+		t.Fatal("series should exist while the shard is registered")
+	}
+
 	c.UnregisterShard(99)
 
-	// After unregister, metrics should still work (fall back to slow path).
+	// Residual in-flight samples across every per-shard hot-path method.
 	c.ObserveProposalLatency(99, time.Millisecond)
+	c.ObserveCommitLatency(99, time.Millisecond)
+	c.ObserveApplyLatency(99, time.Millisecond)
+	c.ObserveReadIndexLatency(99, time.Millisecond)
+	c.IncProposalDropped(99)
+	c.ObserveProposalBatchSize(99, 4)
+	c.IncElection(99)
+	c.IncSnapshot(99)
+	c.IncPiggybackCommit(99)
+	c.IncSnapshotsSent(99, 1024, time.Millisecond)
+	c.IncSnapshotsReceived(99, 1024, time.Millisecond)
+
+	for _, name := range []string{
+		"quicraft_raft_proposal_latency_seconds",
+		"quicraft_raft_commit_latency_seconds",
+		"quicraft_raft_apply_latency_seconds",
+		"quicraft_raft_read_index_latency_seconds",
+		"quicraft_raft_proposals_dropped_total",
+		"quicraft_raft_proposal_batch_size",
+		"quicraft_raft_elections_total",
+		"quicraft_raft_snapshots_total",
+		"quicraft_raft_piggyback_commits_total",
+		"quicraft_transport_snapshots_sent_total",
+		"quicraft_transport_snapshots_sent_bytes",
+		"quicraft_transport_snapshots_received_total",
+		"quicraft_transport_snapshots_received_bytes",
+	} {
+		if shardSeriesExists(t, c.Registry, name, "99") {
+			t.Errorf("%s: series resurrected by a post-unregister sample", name)
+		}
+	}
+}
+
+// TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords pins the
+// other half of the ML8 fix: only shards torn down by UnregisterShard are
+// tombstoned. An embedder that never calls RegisterShard must still be
+// metered through the fallback rather than silently unmetered.
+func TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+
+	c.ObserveProposalLatency(7, time.Millisecond)
+
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
-	labels := map[string]string{"shard_id": "99"}
-	if histogramCount(t, mf, labels) != 1 {
-		t.Error("expected 1 observation after unregister")
+	if got := histogramCount(t, mf, map[string]string{"shard_id": "7"}); got != 1 {
+		t.Errorf("observations for a never-registered shard = %d, want 1", got)
 	}
 }
 
@@ -1283,35 +1334,68 @@ func TestSampledMetricsCollector_ObserveApplyLatency_Sampling(t *testing.T) {
 	}
 }
 
-func TestSampledMetricsCollector_IncMessagesSent_Sampling(t *testing.T) {
+// TestSampledMetricsCollector_IncMessagesSent_Unsampled is the L11
+// regression test: counters must record EVERY increment. Sampling a
+// prometheus.Counter.Inc() makes *_total under-report by SampleRate, so
+// every rate()/increase() built on it is off by orders of magnitude.
+func TestSampledMetricsCollector_IncMessagesSent_Unsampled(t *testing.T) {
 	inner := NewPrometheusMetricsCollector()
-	s := NewSampledMetricsCollector(inner, 20) // 1 in 20
+	s := NewSampledMetricsCollector(inner, 20)
 
-	// Record 100 messages; only 5 should be recorded.
+	// Record 100 messages; ALL 100 must be recorded (counters are exact).
 	for range 100 {
 		s.IncMessagesSent(1, 2, 3)
 	}
 
 	mf := gatherMetric(t, inner.Registry, "quicraft_transport_messages_sent_total")
 	val := counterValue(t, mf, nil)
-	if val != 5 {
-		t.Errorf("expected 5 sampled messages sent, got %f", val)
+	if val != 100 {
+		t.Errorf("expected 100 messages sent (counters must not be sampled), got %f", val)
 	}
 }
 
-func TestSampledMetricsCollector_IncMessagesReceived_Sampling(t *testing.T) {
+// TestSampledMetricsCollector_IncMessagesReceived_Unsampled is the L11
+// regression test for the receive counter; see IncMessagesSent_Unsampled.
+func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
 	inner := NewPrometheusMetricsCollector()
-	s := NewSampledMetricsCollector(inner, 25) // 1 in 25
+	s := NewSampledMetricsCollector(inner, 25)
 
-	// Record 100 messages; only 4 should be recorded.
+	// Record 100 messages; ALL 100 must be recorded (counters are exact).
 	for range 100 {
 		s.IncMessagesReceived(1, 2, 3)
 	}
 
 	mf := gatherMetric(t, inner.Registry, "quicraft_transport_messages_received_total")
 	val := counterValue(t, mf, nil)
-	if val != 4 {
-		t.Errorf("expected 4 sampled messages received, got %f", val)
+	if val != 100 {
+		t.Errorf("expected 100 messages received (counters must not be sampled), got %f", val)
+	}
+}
+
+// TestSampledMetricsCollector_InterleavedSamplingIndependent is the L11
+// regression test for the per-metric sampling counters. With a single
+// counter shared across metrics, a strictly alternating commit/apply call
+// pattern at an even SampleRate lands every even count on one metric —
+// it gets sampled ALWAYS while the other is sampled NEVER. Dedicated
+// counters guarantee each metric records 1 in SampleRate of its own
+// observations regardless of interleaving.
+func TestSampledMetricsCollector_InterleavedSamplingIndependent(t *testing.T) {
+	inner := NewPrometheusMetricsCollector()
+	s := NewSampledMetricsCollector(inner, 2) // 1 in 2
+
+	for range 10 {
+		s.ObserveCommitLatency(1, time.Millisecond)
+		s.ObserveApplyLatency(1, time.Millisecond)
+	}
+
+	mf := gatherMetric(t, inner.Registry, "quicraft_raft_commit_latency_seconds")
+	commitCount := histogramCount(t, mf, map[string]string{"shard_id": "1"})
+	mf = gatherMetric(t, inner.Registry, "quicraft_raft_apply_latency_seconds")
+	applyCount := histogramCount(t, mf, map[string]string{"shard_id": "1"})
+
+	if commitCount != 5 || applyCount != 5 {
+		t.Errorf("interleaved sampling: commit = %d, apply = %d, want 5 and 5 "+
+			"(a shared counter would give 0 and 10)", commitCount, applyCount)
 	}
 }
 
@@ -1364,10 +1448,17 @@ func TestSampledMetricsCollector_ConcurrentSampling(t *testing.T) {
 
 	wg.Wait()
 
-	// Primary goal: verify concurrent access does not panic.
-	// The test passes if we reach this point without a panic/race.
-	// Sampling count verification is secondary since the shared counter
-	// leads to non-deterministic distribution across metric types.
+	// Verify concurrent access does not panic/race, and that the message
+	// counters — which are never sampled — recorded every increment.
+	const wantMessages = float64(goroutines * iterations)
+	mf := gatherMetric(t, inner.Registry, "quicraft_transport_messages_sent_total")
+	if val := counterValue(t, mf, nil); val != wantMessages {
+		t.Errorf("messages sent = %f, want %f (counters must not be sampled)", val, wantMessages)
+	}
+	mf = gatherMetric(t, inner.Registry, "quicraft_transport_messages_received_total")
+	if val := counterValue(t, mf, nil); val != wantMessages {
+		t.Errorf("messages received = %f, want %f (counters must not be sampled)", val, wantMessages)
+	}
 }
 
 func TestSampledMetricsCollector_SampleRateOne(t *testing.T) {

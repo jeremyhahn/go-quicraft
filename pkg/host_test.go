@@ -49,16 +49,16 @@ import (
 
 // mockLogDB is a minimal in-memory LogDB for testing Host operations.
 type mockLogDB struct {
-	mu              sync.Mutex
-	closed          bool
-	closeErr        error
+	mu               sync.Mutex
+	closed           bool
+	closeErr         error
 	listNodeInfoErr  error
 	saveSnapshotErr  error
 	saveBootstrapErr error
 	states           map[mockNodeKey]logdb.Update
-	snapshots       map[mockNodeKey]logdb.Snapshot
-	bootstraps      map[mockNodeKey]logdb.Bootstrap
-	nodeInfos       []logdb.NodeInfo
+	snapshots        map[mockNodeKey]logdb.Snapshot
+	bootstraps       map[mockNodeKey]logdb.Bootstrap
+	nodeInfos        []logdb.NodeInfo
 }
 
 type mockNodeKey struct {
@@ -365,6 +365,17 @@ func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 		if engNode != nil && engNode.Peer() != nil && engNode.Peer().IsLeader() {
 			// Sync the host's cached leader state.
 			h.updateNodeLeader(shardID, engNode.Peer().LeaderID(), 0)
+			// The leader's no-op commits asynchronously on the
+			// persistence edge, and ReadIndex serves only after an entry
+			// from the current term is committed (PhD 6.4). Wait for the
+			// first apply so Sync* calls immediately after this helper
+			// don't race ErrReadIndexNotReady.
+			if v, ok := h.nodes.Load(shardID); ok {
+				if ns, nsOK := v.(*nodeState); nsOK && ns.lastApplied.Load() == 0 {
+					runtime.Gosched()
+					continue
+				}
+			}
 			return
 		}
 		runtime.Gosched()
@@ -2846,17 +2857,17 @@ func TestFailPendingRequests_CompletesAllPendingWithError(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// Register pending proposals, reads, and snapshots.
-	rsProposal := newRequestState(pool, 10, time.Time{})
+	rsProposal := newRequestState(pool, 10, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(10), &pendingProposal{rs: rsProposal})
 	h.addPendingOp()
 
-	rsRead := newRequestState(pool, 20, time.Time{})
+	rsRead := newRequestState(pool, 20, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[20] = &pendingRead{rs: rsRead}
 	ns.pendingReadsMu.Unlock()
 	h.addPendingOp()
 
-	rsSnapshot := newRequestState(pool, 30, time.Time{})
+	rsSnapshot := newRequestState(pool, 30, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[30] = rsSnapshot
 	ns.pendingSnapshotsMu.Unlock()
@@ -2951,7 +2962,7 @@ func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// Register one proposal.
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -2998,7 +3009,7 @@ func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 	// Request A registers exactly as proposeEntry does: acquireRef + Store +
 	// addPendingOp.
 	const keyA = uint64(1001)
-	rsA := newRequestState(pool, keyA, time.Time{})
+	rsA := newRequestState(pool, keyA, time.Time{}, true)
 	rsA.acquireRef()
 	ns.pendingProposals.Store(keyA, &pendingProposal{rs: rsA})
 	h.addPendingOp()
@@ -3019,7 +3030,7 @@ func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 	// Request B draws from the same pool. With a single recycled object this
 	// reuses rsA's storage.
 	const keyB = uint64(2002)
-	rsB := newRequestState(pool, keyB, time.Time{})
+	rsB := newRequestState(pool, keyB, time.Time{}, true)
 	rsB.acquireRef()
 	ns.pendingProposals.Store(keyB, &pendingProposal{rs: rsB})
 	h.addPendingOp()
@@ -3091,7 +3102,7 @@ func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 	// At this point, the nodeState has been swept and removed from
 	// the map. Simulate a late-arriving proposal that was registered
 	// during the first sweep window.
-	lateRS := newRequestState(pool, 99, time.Time{})
+	lateRS := newRequestState(pool, 99, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(99), &pendingProposal{rs: lateRS})
 
 	// The second sweep in Close() would catch this. Since Close
@@ -3143,7 +3154,7 @@ func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 		i := i
 		go func() {
 			<-startC
-			rs := newRequestState(pool, uint64(i+1000), time.Time{})
+			rs := newRequestState(pool, uint64(i+1000), time.Time{}, true)
 			states[i] = rs
 			ns.pendingProposals.Store(uint64(i+1000), &pendingProposal{rs: rs})
 			h.addPendingOp()
@@ -3490,7 +3501,7 @@ func TestHostEngineCallback_OnApplied_SessionExpired(t *testing.T) {
 
 	// Manually insert a pending proposal with a known key.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 	h.pendingOps.Add(1)
 
@@ -3549,8 +3560,8 @@ func TestHostEngineCallback_OnApplied_SessionExpired_MixedBatch(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// Insert two pending proposals.
-	rsNormal := newRequestState(pool, 100, time.Time{})
-	rsExpired := newRequestState(pool, 200, time.Time{})
+	rsNormal := newRequestState(pool, 100, time.Time{}, true)
+	rsExpired := newRequestState(pool, 200, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(100), &pendingProposal{rs: rsNormal})
 	ns.pendingProposals.Store(uint64(200), &pendingProposal{rs: rsExpired})
 	h.pendingOps.Add(2)
@@ -3654,7 +3665,7 @@ func TestHostEngineCallback_OnLeaderUpdated_FailsPendingOnLeadershipLoss(t *test
 
 	// Manually register a pending proposal.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
 	// First establish this node as leader so the loss is detected.
@@ -3705,7 +3716,7 @@ func TestHostEngineCallback_OnLeaderUpdated_KeepsPendingOnSelfLeader(t *testing.
 
 	// Register a pending proposal.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
 	// Simulate leader update where we ARE the leader (replica 1).
@@ -3794,7 +3805,7 @@ func TestStopShard_FailsPendingProposals(t *testing.T) {
 
 	// Manually register a pending proposal.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
 	// Stop the shard. This should fail pending proposals.
@@ -3886,7 +3897,7 @@ func TestOnReadyToRead_CompletesReadWhenApplied(t *testing.T) {
 
 	// Manually register a pending read with key 100.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 100, time.Time{})
+	rs := newRequestState(pool, 100, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[100] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -3932,7 +3943,7 @@ func TestOnReadyToRead_WaitsForApplyThenCompletes(t *testing.T) {
 
 	// Manually register a pending read with key 200.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 200, time.Time{})
+	rs := newRequestState(pool, 200, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[200] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -4049,10 +4060,10 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 
 	// Create pending reads for batchKey (300) and aliases (301, 302, 303).
 	pool := NewRequestStatePool()
-	rsBatch := newRequestState(pool, 300, time.Time{})
-	rsAlias1 := newRequestState(pool, 301, time.Time{})
-	rsAlias2 := newRequestState(pool, 302, time.Time{})
-	rsAlias3 := newRequestState(pool, 303, time.Time{})
+	rsBatch := newRequestState(pool, 300, time.Time{}, true)
+	rsAlias1 := newRequestState(pool, 301, time.Time{}, true)
+	rsAlias2 := newRequestState(pool, 302, time.Time{}, true)
+	rsAlias3 := newRequestState(pool, 303, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[300] = &pendingRead{rs: rsBatch}
@@ -4098,10 +4109,11 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 // TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration verifies that
 // if OnReadyToRead fires for a batchKey that has no aliases (because
 // OnReadIndexBatched was never called or the batchKey was deleted),
-// only the batchKey is completed. The alias keys remain as unresolved
-// pendingRead entries. This documents the old buggy ordering behavior
-// where aliases could be orphaned, demonstrating why OnReadIndexBatched
-// must be called BEFORE Handle(ReadIndex).
+// only the batchKey is completed. A subsequent OnReadIndexBatched for the
+// already-removed batch key must then FAIL the alias reads (M14): aliases
+// are reachable only through the batch entry, so leaving them pending
+// would block deadline-less callers forever. This defensive path backs up
+// the fixed ordering (OnReadIndexBatched before Handle(ReadIndex)).
 func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
@@ -4119,9 +4131,9 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 
 	// Create pending reads for batchKey and aliases.
 	pool := NewRequestStatePool()
-	rsBatch := newRequestState(pool, 400, time.Time{})
-	rsAlias1 := newRequestState(pool, 401, time.Time{})
-	rsAlias2 := newRequestState(pool, 402, time.Time{})
+	rsBatch := newRequestState(pool, 400, time.Time{}, true)
+	rsAlias1 := newRequestState(pool, 401, time.Time{}, true)
+	rsAlias2 := newRequestState(pool, 402, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[400] = &pendingRead{rs: rsBatch}
@@ -4145,23 +4157,28 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 		t.Errorf("batchKey result.Value = %d, want 10", result.Value)
 	}
 
-	// Now call OnReadIndexBatched. The batchKey is already gone,
-	// so this is a no-op -- aliases are NOT attached.
+	// Now call OnReadIndexBatched. The batchKey is already gone, so the
+	// aliases can never be confirmed — they must be failed and removed
+	// rather than left to orphan (M14 fix).
 	cb.OnReadIndexBatched(1, 400, []uint64{401, 402})
 
-	// Aliases should still be pending (orphaned in the old design).
 	ns.pendingReadsMu.Lock()
 	_, has401 := ns.pendingReads[401]
 	_, has402 := ns.pendingReads[402]
 	ns.pendingReadsMu.Unlock()
-
-	if !has401 || !has402 {
-		t.Error("aliases should still be in pendingReads (orphaned)")
+	if has401 || has402 {
+		t.Error("aliases attached to a removed batch key must be failed and removed, not orphaned")
 	}
-
-	// Clean up: complete orphaned aliases manually (simulating timeout).
-	rsAlias1.complete(RequestResult{})
-	rsAlias2.complete(RequestResult{})
+	for i, rs := range []*RequestState{rsAlias1, rsAlias2} {
+		select {
+		case aliasResult := <-rs.ResultC():
+			if !errors.Is(aliasResult.Err, ErrTimeout) {
+				t.Errorf("alias %d result.Err = %v, want ErrTimeout", i, aliasResult.Err)
+			}
+		default:
+			t.Errorf("alias %d was not completed", i)
+		}
+	}
 
 	rsBatch.Release()
 	rsAlias1.Release()
@@ -4184,8 +4201,8 @@ func TestOnLeaderUpdated_FailsPendingReads(t *testing.T) {
 
 	// Register two pending reads to verify all are failed.
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 300, time.Time{})
-	rs2 := newRequestState(pool, 301, time.Time{})
+	rs1 := newRequestState(pool, 300, time.Time{}, true)
+	rs2 := newRequestState(pool, 301, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[300] = &pendingRead{rs: rs1}
 	ns.pendingReads[301] = &pendingRead{rs: rs2, readIndex: 5, confirmed: true}
@@ -4247,7 +4264,7 @@ func TestOnLeaderUpdated_KeepsPendingReadsOnSelfLeader(t *testing.T) {
 
 	// Register a pending read.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 400, time.Time{})
+	rs := newRequestState(pool, 400, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[400] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -4284,7 +4301,7 @@ func TestStopShard_FailsPendingReads(t *testing.T) {
 
 	// Register a pending read.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 500, time.Time{})
+	rs := newRequestState(pool, 500, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[500] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -4318,8 +4335,8 @@ func TestOnApplied_CompletesConfirmedReadOnlyWhenCaughtUp(t *testing.T) {
 
 	// Register two pending reads: one confirmed at readIndex 5, one at readIndex 20.
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 600, time.Time{})
-	rs2 := newRequestState(pool, 601, time.Time{})
+	rs1 := newRequestState(pool, 600, time.Time{}, true)
+	rs2 := newRequestState(pool, 601, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[600] = &pendingRead{rs: rs1, readIndex: 5, confirmed: true}
 	ns.pendingReads[601] = &pendingRead{rs: rs2, readIndex: 20, confirmed: true}
@@ -4379,7 +4396,7 @@ func TestOnApplied_IgnoresUnconfirmedReads(t *testing.T) {
 
 	// Register an unconfirmed pending read (confirmed=false, readIndex=0).
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 700, time.Time{})
+	rs := newRequestState(pool, 700, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[700] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -4431,7 +4448,7 @@ func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[42] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -4480,7 +4497,7 @@ func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 43, time.Time{})
+	rs := newRequestState(pool, 43, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[43] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -4681,9 +4698,9 @@ func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 50, time.Time{})
-	rs2 := newRequestState(pool, 51, time.Time{})
-	rs3 := newRequestState(pool, 52, time.Time{})
+	rs1 := newRequestState(pool, 50, time.Time{}, true)
+	rs2 := newRequestState(pool, 51, time.Time{}, true)
+	rs3 := newRequestState(pool, 52, time.Time{}, true)
 
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[50] = rs1
@@ -4778,7 +4795,7 @@ func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 60, time.Time{})
+	rs := newRequestState(pool, 60, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[60] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -4820,7 +4837,7 @@ func TestOnLeaderUpdated_FailsPendingSnapshots(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 70, time.Time{})
+	rs := newRequestState(pool, 70, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[70] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -6504,7 +6521,7 @@ func TestHost_Drain_WaitsForInFlight(t *testing.T) {
 	// event-driven drain implementation.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	h.addPendingOp()
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
@@ -6559,7 +6576,7 @@ func TestHost_Drain_Timeout(t *testing.T) {
 	// Must also increment the pendingOps counter.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 99, time.Time{})
+	rs := newRequestState(pool, 99, time.Time{}, true)
 	h.addPendingOp()
 	ns.pendingProposals.Store(uint64(99), &pendingProposal{rs: rs})
 
@@ -6658,7 +6675,7 @@ func TestHost_Drain_WaitsForPendingReads(t *testing.T) {
 	// Inject a pending read.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 77, time.Time{})
+	rs := newRequestState(pool, 77, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[77] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -6703,7 +6720,7 @@ func TestHost_Drain_WaitsForPendingSnapshots(t *testing.T) {
 	// Inject a pending snapshot.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 88, time.Time{})
+	rs := newRequestState(pool, 88, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[88] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -7355,6 +7372,10 @@ func TestRequestAddWitness_Success(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	// This test exercises the witness-add API mechanics on a single-replica
+	// shard; the default RequireFullReplicaMajority policy would reject
+	// {1 full + 1 witness} (full 1 < quorum 2), so disable it explicitly.
+	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
@@ -8002,7 +8023,7 @@ func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
 	for i := uint64(1); i <= 5; i++ {
-		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{})})
+		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{}, true)})
 	}
 
 	info, err = h.GetShardInfo(1)
@@ -8069,7 +8090,7 @@ func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
 	for i := uint64(10); i <= 12; i++ {
-		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{})})
+		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{}, true)})
 	}
 
 	nhInfo := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: true})
@@ -8169,8 +8190,8 @@ func TestHost_Close_CompletesPendingProposals(t *testing.T) {
 	// Inject pending proposals that callers are waiting on.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 100, time.Time{})
-	rs2 := newRequestState(pool, 101, time.Time{})
+	rs1 := newRequestState(pool, 100, time.Time{}, true)
+	rs2 := newRequestState(pool, 101, time.Time{}, true)
 
 	ns.pendingProposals.Store(uint64(100), &pendingProposal{rs: rs1})
 	ns.pendingProposals.Store(uint64(101), &pendingProposal{rs: rs2})
@@ -8209,7 +8230,7 @@ func TestHost_Close_CompletesPendingReads(t *testing.T) {
 	// Inject pending reads.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 200, time.Time{})
+	rs := newRequestState(pool, 200, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[200] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -8241,7 +8262,7 @@ func TestHost_Close_CompletesPendingSnapshots(t *testing.T) {
 	// Inject pending snapshot requests.
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 300, time.Time{})
+	rs := newRequestState(pool, 300, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[300] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -8279,14 +8300,14 @@ func TestHost_Close_UnblocksConcurrentWaiters(t *testing.T) {
 	requestStates := make([]*RequestState, 0, numProposals+numReads)
 
 	for i := uint64(0); i < numProposals; i++ {
-		rs := newRequestState(pool, 400+i, time.Time{})
+		rs := newRequestState(pool, 400+i, time.Time{}, true)
 		ns.pendingProposals.Store(400+i, &pendingProposal{rs: rs})
 		requestStates = append(requestStates, rs)
 	}
 
 	ns.pendingReadsMu.Lock()
 	for i := uint64(0); i < numReads; i++ {
-		rs := newRequestState(pool, 500+i, time.Time{})
+		rs := newRequestState(pool, 500+i, time.Time{}, true)
 		ns.pendingReads[500+i] = &pendingRead{rs: rs}
 		requestStates = append(requestStates, rs)
 	}
@@ -8821,8 +8842,10 @@ func TestImportSnapshot_CanceledContext(t *testing.T) {
 	if err == nil {
 		t.Fatal("ImportSnapshot should fail with canceled context")
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("error = %v, want context.Canceled", err)
+	// ImportSnapshot funnels context errors through mapContextError like every
+	// other Host method, so callers matching on the package sentinel see it.
+	if !errors.Is(err, ErrCanceled) {
+		t.Errorf("error = %v, want ErrCanceled", err)
 	}
 }
 
@@ -8848,8 +8871,8 @@ func TestImportSnapshot_DeadlineExceeded(t *testing.T) {
 	if err == nil {
 		t.Fatal("ImportSnapshot should fail with expired deadline")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	if !errors.Is(err, ErrTimeout) {
+		t.Errorf("error = %v, want ErrTimeout", err)
 	}
 }
 
@@ -9044,7 +9067,7 @@ func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 
 	// Register a pending snapshot so OnSnapshotCompleted has something to complete.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 50, time.Time{})
+	rs := newRequestState(pool, 50, time.Time{}, true)
 	h.addPendingOp()
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[50] = rs
@@ -9091,7 +9114,7 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 
 	// Register a pending snapshot.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 60, time.Time{})
+	rs := newRequestState(pool, 60, time.Time{}, true)
 	h.addPendingOp()
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[60] = rs
@@ -9984,7 +10007,7 @@ func TestSafeNotifySnapshotRejected_NilEngine(t *testing.T) {
 	}
 
 	// This must not panic the test.
-	ts.safeNotifySnapshotRejected(1, 1, 2)
+	ts.safeNotifySnapshotRejected(1, 1, 2, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -10078,7 +10101,7 @@ func TestSweepExpiredPending_ExpiresProposalWithPassedDeadline(t *testing.T) {
 
 	// Create a proposal with a deadline in the past.
 	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 10, deadline)
+	rs := newRequestState(pool, 10, deadline, true)
 	ns.pendingProposals.Store(uint64(10), &pendingProposal{rs: rs, deadline: deadline})
 	h.addPendingOp()
 
@@ -10112,7 +10135,7 @@ func TestSweepExpiredPending_DoesNotExpireActiveProposal(t *testing.T) {
 
 	// Create a proposal with a deadline in the future.
 	deadline := time.Now().Add(10 * time.Minute)
-	rs := newRequestState(pool, 20, deadline)
+	rs := newRequestState(pool, 20, deadline, true)
 	ns.pendingProposals.Store(uint64(20), &pendingProposal{rs: rs, deadline: deadline})
 	h.addPendingOp()
 
@@ -10145,7 +10168,7 @@ func TestSweepExpiredPending_SkipsZeroDeadline(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// Create a proposal with zero deadline (no timeout).
-	rs := newRequestState(pool, 30, time.Time{})
+	rs := newRequestState(pool, 30, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(30), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -10177,7 +10200,7 @@ func TestSweepExpiredPending_ExpiresRead(t *testing.T) {
 
 	// Create a read with a deadline in the past.
 	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 40, deadline)
+	rs := newRequestState(pool, 40, deadline, true)
 	pr := &pendingRead{rs: rs}
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[40] = pr
@@ -10215,7 +10238,7 @@ func TestSweepExpiredPending_ExpiresSnapshot(t *testing.T) {
 
 	// Create a snapshot with a deadline in the past.
 	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 50, deadline)
+	rs := newRequestState(pool, 50, deadline, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[50] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -10252,7 +10275,7 @@ func TestSweepExpiredPending_SkipsStoppedNode(t *testing.T) {
 
 	// Create a proposal with an expired deadline.
 	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 60, deadline)
+	rs := newRequestState(pool, 60, deadline, true)
 	ns.pendingProposals.Store(uint64(60), &pendingProposal{rs: rs, deadline: deadline})
 	h.addPendingOp()
 
@@ -10289,13 +10312,13 @@ func TestSweepExpiredPending_MixedExpiredAndActive(t *testing.T) {
 
 	// Expired proposal.
 	expiredDeadline := time.Now().Add(-1 * time.Second)
-	expired := newRequestState(pool, 70, expiredDeadline)
+	expired := newRequestState(pool, 70, expiredDeadline, true)
 	ns.pendingProposals.Store(uint64(70), &pendingProposal{rs: expired, deadline: expiredDeadline})
 	h.addPendingOp()
 
 	// Active proposal.
 	activeDeadline := time.Now().Add(10 * time.Minute)
-	active := newRequestState(pool, 71, activeDeadline)
+	active := newRequestState(pool, 71, activeDeadline, true)
 	ns.pendingProposals.Store(uint64(71), &pendingProposal{rs: active, deadline: activeDeadline})
 	h.addPendingOp()
 
@@ -10341,13 +10364,13 @@ func TestSweepExpiredPending_MultipleShards(t *testing.T) {
 
 	// Expired proposal on shard 1.
 	deadline1 := time.Now().Add(-1 * time.Second)
-	rs1 := newRequestState(pool, 80, deadline1)
+	rs1 := newRequestState(pool, 80, deadline1, true)
 	ns1.pendingProposals.Store(uint64(80), &pendingProposal{rs: rs1, deadline: deadline1})
 	h.addPendingOp()
 
 	// Expired proposal on shard 2.
 	deadline2 := time.Now().Add(-1 * time.Second)
-	rs2 := newRequestState(pool, 81, deadline2)
+	rs2 := newRequestState(pool, 81, deadline2, true)
 	ns2.pendingProposals.Store(uint64(81), &pendingProposal{rs: rs2, deadline: deadline2})
 	h.addPendingOp()
 
@@ -10376,7 +10399,7 @@ func TestSweepExpiredPending_ConcurrentWithCompletion(t *testing.T) {
 
 	// Create an expired proposal.
 	expDeadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 90, expDeadline)
+	rs := newRequestState(pool, 90, expDeadline, true)
 	ns.pendingProposals.Store(uint64(90), &pendingProposal{rs: rs, deadline: expDeadline})
 	h.addPendingOp()
 
@@ -10427,12 +10450,12 @@ func TestOnLeaderUpdated_FollowerLeaderChangeFailsForwardedProposals(t *testing.
 	ns.isLeader.Store(false)
 
 	// Register a pending proposal (simulating a forwarded proposal).
-	rs := newRequestState(pool, 100, time.Time{})
+	rs := newRequestState(pool, 100, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(100), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
 	// Register a pending read.
-	rsRead := newRequestState(pool, 101, time.Time{})
+	rsRead := newRequestState(pool, 101, time.Time{}, true)
 	pr := &pendingRead{rs: rsRead}
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[101] = pr
@@ -10483,7 +10506,7 @@ func TestOnLeaderUpdated_FollowerSameLeaderReelectedDoesNotFail(t *testing.T) {
 	ns.isLeader.Store(false)
 
 	// Register a pending proposal.
-	rs := newRequestState(pool, 200, time.Time{})
+	rs := newRequestState(pool, 200, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(200), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -10515,7 +10538,7 @@ func TestOnLeaderUpdated_FollowerNoPreviousLeaderDoesNotFail(t *testing.T) {
 	ns.isLeader.Store(false)
 
 	// Register a pending proposal.
-	rs := newRequestState(pool, 300, time.Time{})
+	rs := newRequestState(pool, 300, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(300), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -10548,7 +10571,7 @@ func TestOnLeaderUpdated_LeaderLostStillWorks(t *testing.T) {
 	ns.isLeader.Store(true)
 
 	// Register a pending proposal.
-	rs := newRequestState(pool, 400, time.Time{})
+	rs := newRequestState(pool, 400, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(400), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -10803,9 +10826,12 @@ func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 
 	ns := testLoadNode(h, 1)
 
-	// Insert a pending proposal with known key.
+	// Insert a pending proposal with known key. Real registration always
+	// holds a map reference (acquireRef before Store); OnCommitted relies
+	// on that reference to pin the RequestState while it notifies.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 77, time.Time{})
+	rs := newRequestState(pool, 77, time.Time{}, true)
+	rs.acquireRef()
 	ns.pendingProposals.Store(uint64(77), &pendingProposal{rs: rs})
 
 	cb := &hostEngineCallback{h: h}
@@ -10823,7 +10849,132 @@ func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 
 	// Clean up.
 	rs.complete(RequestResult{Value: 1})
+	ns.pendingProposals.Delete(uint64(77))
+	rs.releaseRef()
 	rs.Release()
+}
+
+// TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal verifies the
+// recycle guard: a pendingProposal whose RequestState holds NO outstanding
+// reference is one that a claiming path (OnApplied/OnProposalFailed/
+// failPendingRequests/sweep) has already released — its object may already
+// be recycled into a new request. OnCommitted must skip it rather than
+// deliver a notification it holds no reference for.
+func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	h.StartShard(members, false, testCreateFunc, scfg)
+	waitForLeader(t, h, 1)
+
+	ns := testLoadNode(h, 1)
+
+	// Simulate the hazard window: the map still holds the entry, but the
+	// RequestState's reference count has already dropped to zero (as it
+	// would mid-race once a claiming path ran releaseRef).
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 88, time.Time{}, true)
+	ns.pendingProposals.Store(uint64(88), &pendingProposal{rs: rs})
+
+	cb := &hostEngineCallback{h: h}
+	cb.OnCommitted(1, []proto.Entry{{Index: 10, Key: 88}})
+
+	select {
+	case <-rs.CommittedC():
+		t.Fatal("OnCommitted notified a RequestState with no outstanding reference")
+	default:
+		// Correct: skipped.
+	}
+
+	ns.pendingProposals.Delete(uint64(88))
+	rs.complete(RequestResult{Value: 1})
+	rs.Release()
+}
+
+// TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress hammers
+// OnCommitted against concurrent fail-and-recycle of the same proposal.
+// Before the tryAcquireRef+re-verify guard, OnCommitted could load the
+// pendingProposal, lose the race to a claiming path (LoadAndDelete +
+// complete + releaseRef + caller Release -> pool recycle), and then push a
+// stale WAL-durable notification into the recycled object after it had been
+// handed to a brand-new request. The successor request registered here must
+// never observe a committedC notification. Run under -race.
+func TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	h.StartShard(members, false, testCreateFunc, scfg)
+	waitForLeader(t, h, 1)
+
+	ns := testLoadNode(h, 1)
+	cb := &hostEngineCallback{h: h}
+	pool := NewRequestStatePool()
+
+	const iterations = 5000
+	for i := 0; i < iterations; i++ {
+		// Register a proposal exactly like the real path: ref then Store.
+		key := uint64(1_000_000 + 2*i)
+		rs := newRequestState(pool, key, time.Time{}, true)
+		rs.acquireRef()
+		ns.pendingProposals.Store(key, &pendingProposal{rs: rs})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Commit worker delivering the WAL-durable notification.
+		go func() {
+			defer wg.Done()
+			cb.OnCommitted(1, []proto.Entry{{Index: uint64(i + 1), Key: key}})
+		}()
+		// Claiming path (as in failPendingRequests/sweep): remove,
+		// complete, drop the map reference.
+		go func() {
+			defer wg.Done()
+			if v, removed := ns.pendingProposals.LoadAndDelete(key); removed {
+				pp := v.(*pendingProposal)
+				pp.rs.complete(RequestResult{Err: ErrAborted})
+				pp.rs.releaseRef()
+			}
+		}()
+		// Caller gives up concurrently, allowing recycle.
+		rs.Release()
+
+		// Recycle into a successor request immediately so a stale
+		// commitNotify from the still-running OnCommitted would land on
+		// a live foreign request. Registered but never committed, its
+		// committedC must stay empty.
+		successorKey := key + 1
+		successor := newRequestState(pool, successorKey, time.Time{}, true)
+		successor.acquireRef()
+		ns.pendingProposals.Store(successorKey, &pendingProposal{rs: successor})
+
+		wg.Wait()
+
+		select {
+		case <-successor.committedC:
+			t.Fatalf("iteration %d: stale commitNotify leaked into a recycled successor request", i)
+		default:
+		}
+		if successor.committedDone.Load() {
+			t.Fatalf("iteration %d: stale commitNotify consumed the successor's committedDone", i)
+		}
+
+		ns.pendingProposals.Delete(successorKey)
+		successor.complete(RequestResult{Value: 1})
+		successor.releaseRef()
+		successor.Release()
+	}
 }
 
 func TestHostEngineCallback_OnCommitted_SkipsZeroKey(t *testing.T) {
@@ -10843,7 +10994,7 @@ func TestHostEngineCallback_OnCommitted_SkipsZeroKey(t *testing.T) {
 
 	// Insert a pending proposal.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 55, time.Time{})
+	rs := newRequestState(pool, 55, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(55), &pendingProposal{rs: rs})
 
 	cb := &hostEngineCallback{h: h}
@@ -13175,6 +13326,10 @@ func TestSyncRequestAddWitness_Success(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	// This test exercises the witness-add API mechanics on a single-replica
+	// shard; the default RequireFullReplicaMajority policy would reject
+	// {1 full + 1 witness} (full 1 < quorum 2), so disable it explicitly.
+	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
@@ -13193,6 +13348,96 @@ func TestSyncRequestAddWitness_Success(t *testing.T) {
 	err = h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", membership.ConfigChangeID)
 	if err != nil {
 		t.Fatalf("SyncRequestAddWitness failed: %v", err)
+	}
+}
+
+// TestSyncRequestUpdateWitnessPolicy_EndToEnd verifies the runtime
+// witness-policy update: the policy is committed through Raft, exposed on
+// the membership view, and immediately governs subsequent witness adds.
+func TestSyncRequestUpdateWitnessPolicy_EndToEnd(t *testing.T) {
+	h := newTestHost(t)
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Bootstrap seeded the default policy (RequireFullReplicaMajority on).
+	m, err := h.SyncGetShardMembership(ctx, 1)
+	if err != nil {
+		t.Fatalf("SyncGetShardMembership: %v", err)
+	}
+	if !m.RequireFullReplicaMajority {
+		t.Fatal("bootstrap must seed RequireFullReplicaMajority=true by default")
+	}
+
+	// Under the default policy a witness add on this single-replica shard
+	// is rejected (1 full < quorum 2).
+	if err := h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", 0); !errors.Is(err, raft.ErrBreaksFullReplicaMajority) {
+		t.Fatalf("expected ErrBreaksFullReplicaMajority before policy change, got %v", err)
+	}
+
+	// Commit a policy change disabling the majority rule.
+	if err := h.SyncRequestUpdateWitnessPolicy(ctx, 1, config.WitnessConfig{
+		RequireFullReplicaMajority: config.BoolPtr(false),
+	}, 0); err != nil {
+		t.Fatalf("SyncRequestUpdateWitnessPolicy: %v", err)
+	}
+
+	// The new policy is visible on the membership view...
+	m, err = h.SyncGetShardMembership(ctx, 1)
+	if err != nil {
+		t.Fatalf("SyncGetShardMembership after update: %v", err)
+	}
+	if m.RequireFullReplicaMajority {
+		t.Fatal("policy update not reflected in membership view")
+	}
+	// ...and the same witness add now succeeds.
+	if err := h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", 0); err != nil {
+		t.Fatalf("witness add should succeed after policy change, got %v", err)
+	}
+
+	// Tightening the policy while the membership violates it is rejected:
+	// {1 full + 1 witness} cannot satisfy RequireFullReplicaMajority.
+	err = h.SyncRequestUpdateWitnessPolicy(ctx, 1, config.WitnessConfig{
+		RequireFullReplicaMajority: config.BoolPtr(true),
+	}, 0)
+	if !errors.Is(err, raft.ErrBreaksFullReplicaMajority) {
+		t.Fatalf("expected rejection tightening policy on violating membership, got %v", err)
+	}
+}
+
+// TestSyncRequestAddWitness_DefaultPolicyRejects verifies end-to-end that the
+// default RequireFullReplicaMajority policy rejects a witness add that would
+// leave the full replicas unable to form a quorum: on a single-replica shard,
+// {1 full + 1 witness} has quorum 2 > 1 full replica.
+func TestSyncRequestAddWitness_DefaultPolicyRejects(t *testing.T) {
+	h := newTestHost(t)
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	membership, err := h.SyncGetShardMembership(ctx, 1)
+	if err != nil {
+		t.Fatalf("SyncGetShardMembership failed: %v", err)
+	}
+
+	err = h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", membership.ConfigChangeID)
+	if !errors.Is(err, raft.ErrBreaksFullReplicaMajority) {
+		t.Fatalf("expected ErrBreaksFullReplicaMajority under default policy, got %v", err)
 	}
 }
 
@@ -13241,11 +13486,11 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 		DeploymentID:  1,
 		TransportConfig: config.TransportConfig{
 			RevocationConfig: &config.RevocationConfig{
-				CRLPaths:          []string{"/path/to/crl.pem"},
-				OCSPResponderURL:  "http://ocsp.example.com",
-				OCSPCacheSeconds:  600,
-				CheckInterval:     30 * time.Second,
-				AllowSoftFail:     true,
+				CRLPaths:         []string{"/path/to/crl.pem"},
+				OCSPResponderURL: "http://ocsp.example.com",
+				OCSPCacheSeconds: 600,
+				CheckInterval:    30 * time.Second,
+				AllowSoftFail:    true,
 			},
 		},
 	}
@@ -14166,7 +14411,7 @@ func TestDiagPipelineState_WithPendingProposals(t *testing.T) {
 	v, _ := h.nodes.Load(uint64(1))
 	ns := v.(*nodeState)
 	fakeDeadline := time.Now().Add(time.Hour)
-	fakeRS := newRequestState(ns.requestPool, 999, fakeDeadline)
+	fakeRS := newRequestState(ns.requestPool, 999, fakeDeadline, true)
 	ns.pendingProposals.Store(uint64(999), &pendingProposal{rs: fakeRS, deadline: fakeDeadline})
 	defer func() {
 		ns.pendingProposals.Delete(uint64(999))
@@ -16670,7 +16915,7 @@ func TestHostEngineCallback_OnProposalFailed_CompletesWithError(t *testing.T) {
 
 	ns := testLoadNode(h, 1)
 	pool := ns.requestPool
-	rs := newRequestState(pool, 42, time.Now().Add(time.Minute))
+	rs := newRequestState(pool, 42, time.Now().Add(time.Minute), true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs, deadline: time.Now().Add(time.Minute)})
 	h.addPendingOp()
 
@@ -16710,7 +16955,7 @@ func TestHostEngineCallback_OnReadIndexFailed_CompletesReads(t *testing.T) {
 
 	ns := testLoadNode(h, 1)
 	pool := ns.requestPool
-	rs := newRequestState(pool, 100, time.Now().Add(time.Minute))
+	rs := newRequestState(pool, 100, time.Now().Add(time.Minute), true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[100] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -17222,8 +17467,8 @@ func TestOnReadyToRead_AliasCompletionWithSufficientApply(t *testing.T) {
 	batchKey := uint64(10)
 	aliasKey := uint64(11)
 
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{})
-	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{})
+	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
+	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS, aliases: []uint64{aliasKey}}
@@ -17266,8 +17511,8 @@ func TestOnReadyToRead_AliasConfirmedButNotCaughtUp(t *testing.T) {
 	batchKey := uint64(20)
 	aliasKey := uint64(21)
 
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{})
-	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{})
+	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
+	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS, aliases: []uint64{aliasKey}}
@@ -17310,7 +17555,7 @@ func TestOnReadIndexBatched_AppendMultipleAliases(t *testing.T) {
 	ns.requestPool = NewRequestStatePool()
 
 	batchKey := uint64(10)
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{})
+	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS}
@@ -17544,7 +17789,7 @@ func TestOnApplied_ProposalLatencyMetrics(t *testing.T) {
 	ns.requestPool = NewRequestStatePool()
 
 	proposalKey := uint64(100)
-	rs := newRequestState(ns.requestPool, proposalKey, time.Time{})
+	rs := newRequestState(ns.requestPool, proposalKey, time.Time{}, true)
 	ns.pendingProposals.Store(proposalKey, &pendingProposal{rs: rs, deadline: time.Time{}})
 	h.addPendingOp()
 
@@ -17577,7 +17822,7 @@ func TestOnReadyToRead_ReadIndexLatencyMetrics(t *testing.T) {
 	ns.lastApplied.Store(100)
 
 	readKey := uint64(200)
-	rs := newRequestState(ns.requestPool, readKey, time.Time{})
+	rs := newRequestState(ns.requestPool, readKey, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[readKey] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
@@ -17611,8 +17856,8 @@ func TestOnReadyToRead_AliasCompletionWithMetrics(t *testing.T) {
 	batchKey := uint64(300)
 	aliasKey := uint64(301)
 
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{})
-	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{})
+	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
+	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{}, true)
 
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS, aliases: []uint64{aliasKey}}
@@ -18217,11 +18462,11 @@ func TestOnLeaderUpdated_LostLeadership(t *testing.T) {
 
 	// Insert a pending proposal that should be completed on leadership loss.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
 	// Insert a pending read.
-	rsRead := newRequestState(pool, 43, time.Time{})
+	rsRead := newRequestState(pool, 43, time.Time{}, true)
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[43] = &pendingRead{rs: rsRead}
 	ns.pendingReadsMu.Unlock()
@@ -18346,7 +18591,7 @@ func TestFailPendingRequests_FailsSnapshots(t *testing.T) {
 	ns.requestPool = NewRequestStatePool()
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 55, time.Time{})
+	rs := newRequestState(pool, 55, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[55] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -18413,7 +18658,7 @@ func TestOnLeaderUpdated_FollowerDetectsLeaderChange(t *testing.T) {
 
 	// Insert a pending proposal that would be forwarded to leader.
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 42, time.Time{})
+	rs := newRequestState(pool, 42, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(42), &pendingProposal{rs: rs})
 
 	h.addPendingOp()
@@ -18726,7 +18971,7 @@ func TestOnApplied_SessionExpiredResult(t *testing.T) {
 	ns.requestPool = NewRequestStatePool()
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 66, time.Time{})
+	rs := newRequestState(pool, 66, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(66), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -18752,7 +18997,7 @@ func TestOnApplied_NormalResultCompletes(t *testing.T) {
 	ns.requestPool = NewRequestStatePool()
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 77, time.Time{})
+	rs := newRequestState(pool, 77, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(77), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
@@ -18848,7 +19093,7 @@ func TestFailPendingRequests_NoDoubleReleaseRefUnderRace(t *testing.T) {
 
 		all := make([]*RequestState, n)
 		for i := 0; i < n; i++ {
-			rs := newRequestState(pool, uint64(i), time.Time{})
+			rs := newRequestState(pool, uint64(i), time.Time{}, true)
 			rs.acquireRef() // registration ref
 			all[i] = rs
 			ns.pendingProposals.Store(uint64(i), &pendingProposal{rs: rs})
@@ -19044,7 +19289,7 @@ func TestSweepPendingReads_SkipsNonExpired(t *testing.T) {
 
 	// Create a read with a future deadline — should NOT be expired.
 	futureDeadline := time.Now().Add(10 * time.Minute)
-	rs := newRequestState(pool, 80, futureDeadline)
+	rs := newRequestState(pool, 80, futureDeadline, true)
 	pr := &pendingRead{rs: rs}
 	ns.pendingReadsMu.Lock()
 	ns.pendingReads[80] = pr
@@ -19075,7 +19320,7 @@ func TestSweepPendingSnapshots_SkipsNonExpired(t *testing.T) {
 
 	// Create a snapshot with a future deadline — should NOT be expired.
 	futureDeadline := time.Now().Add(10 * time.Minute)
-	rs := newRequestState(pool, 90, futureDeadline)
+	rs := newRequestState(pool, 90, futureDeadline, true)
 	ns.pendingSnapshotsMu.Lock()
 	ns.pendingSnapshots[90] = rs
 	ns.pendingSnapshotsMu.Unlock()
@@ -19431,6 +19676,185 @@ func TestExportSnapshot_SealedBarrierEncryptedSnapshotErrors(t *testing.T) {
 	}
 	if bytes.Contains(buf.Bytes(), plaintext) {
 		t.Errorf("ExportSnapshot leaked plaintext")
+	}
+}
+
+// exportShardSnapshotSetup writes an encrypted snapshot.dat for shard 1 under
+// the given barrier and records it in the mock LogDB with Epoch 1.
+func exportShardSnapshotSetup(t *testing.T, db *mockLogDB, b Barrier, plaintext []byte) {
+	t.Helper()
+	snapDir := filepath.Join(t.TempDir(), "snap-shard")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	writeEncryptedSnapshotFile(t, b, filepath.Join(snapDir, "snapshot.dat"), plaintext)
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: 1})
+}
+
+// TestExportSnapshot_PerShardBarrier_Decrypts verifies ExportSnapshot resolves
+// the decrypting barrier per shard (barrierForShard). With ONLY per-shard
+// barriers configured (no host-wide barrier), an encrypted snapshot must
+// still export as plaintext. Before the fix, ExportSnapshot consulted only
+// h.barrier and returned ErrSnapshotEncryptedBarrierUnavailable even though
+// the shard's own barrier was unsealed.
+func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	shardBarrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(),
+		WithShardBarriers(func(shardID uint64) Barrier {
+			if shardID == 1 {
+				return shardBarrier
+			}
+			return nil
+		}))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	plaintext := []byte("per-shard barrier snapshot exports as plaintext")
+	exportShardSnapshotSetup(t, db, shardBarrier, plaintext)
+
+	var buf bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &buf); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
+	if !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
+	}
+}
+
+// TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier verifies that
+// when BOTH a host-wide barrier and a per-shard barrier are configured, the
+// shard's snapshot is decrypted with the per-shard barrier it was encrypted
+// under. Before the fix, ExportSnapshot decrypted with the host-wide barrier
+// (the wrong key), failed AEAD after already writing the artifact header,
+// and left the caller with a truncated header-only artifact.
+func TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	hostBarrier := createTestBarrier(t)
+	shardBarrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(),
+		WithBarrier(hostBarrier),
+		WithShardBarriers(func(shardID uint64) Barrier {
+			if shardID == 1 {
+				return shardBarrier
+			}
+			return nil
+		}))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	plaintext := []byte("encrypted under the SHARD barrier, not the host barrier")
+	exportShardSnapshotSetup(t, db, shardBarrier, plaintext)
+
+	var buf bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &buf); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
+		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
+	}
+	if !bytes.Equal(buf.Bytes(), plaintext) {
+		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
+	}
+}
+
+// TestExportSnapshot_SealedShardBarrierErrors verifies the sealed-check also
+// uses the per-shard barrier: when the shard's barrier is sealed, export must
+// refuse with ErrSnapshotEncryptedBarrierUnavailable even though an unsealed
+// host-wide barrier exists (which holds the WRONG key for this shard).
+func TestExportSnapshot_SealedShardBarrierErrors(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	hostBarrier := createTestBarrier(t)
+	shardBarrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(),
+		WithBarrier(hostBarrier),
+		WithShardBarriers(func(shardID uint64) Barrier {
+			if shardID == 1 {
+				return shardBarrier
+			}
+			return nil
+		}))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	plaintext := []byte("sealed shard barrier must refuse export")
+	exportShardSnapshotSetup(t, db, shardBarrier, plaintext)
+
+	if sealErr := shardBarrier.Seal(); sealErr != nil {
+		t.Fatalf("shardBarrier.Seal failed: %v", sealErr)
+	}
+
+	var buf bytes.Buffer
+	exportErr := h.ExportSnapshot(context.Background(), 1, &buf)
+	if !errors.Is(exportErr, ErrSnapshotEncryptedBarrierUnavailable) {
+		t.Fatalf("ExportSnapshot error = %v, want ErrSnapshotEncryptedBarrierUnavailable", exportErr)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("ExportSnapshot wrote %d bytes; want 0", buf.Len())
+	}
+}
+
+// TestExportSnapshot_DecryptFailureWritesNothing verifies the artifact header
+// is withheld until the first frame decrypts: when AEAD fails (the snapshot
+// was encrypted under a different key than the export barrier), the caller's
+// writer must receive ZERO bytes — not a truncated header-only artifact.
+func TestExportSnapshot_DecryptFailureWritesNothing(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	exportBarrier := createTestBarrier(t)
+	foreignBarrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(exportBarrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	plaintext := []byte("frames sealed under a key the export barrier does not hold")
+	exportShardSnapshotSetup(t, db, foreignBarrier, plaintext)
+
+	var buf bytes.Buffer
+	exportErr := h.ExportSnapshot(context.Background(), 1, &buf)
+	if exportErr == nil {
+		t.Fatal("ExportSnapshot succeeded with a mismatched barrier key")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("ExportSnapshot wrote %d bytes after decrypt failure; want 0 (no truncated artifact)", buf.Len())
 	}
 }
 

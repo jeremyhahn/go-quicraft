@@ -114,7 +114,7 @@ func TestWriteAndReadAllRoundTrip(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestMultipleWritesReadAll(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestLargeRecordSpansBlocks(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestLargeBlockSizeChunkCap(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestReadAllCorruptedTail(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -464,7 +464,7 @@ func TestReadAllClosedSegment(t *testing.T) {
 		t.Fatalf("Close: unexpected error: %v", err)
 	}
 
-	_, err = seg.ReadAll()
+	_, _, err = seg.ReadAll()
 	if err != ErrClosed {
 		t.Fatalf("ReadAll: error = %v, want %v", err, ErrClosed)
 	}
@@ -567,7 +567,7 @@ func TestMultipleRecordsAcrossBlocks(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -597,7 +597,7 @@ func TestReadAllEmptySegment(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -687,7 +687,7 @@ func TestLargeRecordExactBlockBoundary(t *testing.T) {
 	rseg := openSegmentForTest(t, dir, 1, blockSize)
 	defer rseg.Close()
 
-	records, err := rseg.ReadAll()
+	records, _, err := rseg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: unexpected error: %v", err)
 	}
@@ -816,7 +816,7 @@ func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 	readSeg := openSegmentForTest(t, dir, 1, blockSize)
 	defer readSeg.Close()
 
-	records, err := readSeg.ReadAll()
+	records, _, err := readSeg.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}

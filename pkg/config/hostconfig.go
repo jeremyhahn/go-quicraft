@@ -388,5 +388,16 @@ func (hc *HostConfig) Validate() error {
 			"key_rotation_interval", hc.KeyRotationInterval,
 		)
 	}
+	hc.warnDisabledSafetyFlags()
 	return nil
+}
+
+// warnDisabledSafetyFlags emits warnings for host settings that trade a
+// durability or safety guarantee for performance. They are not rejected —
+// benchmarking and containerised test environments legitimately need them —
+// but a config copied into production must leave a trace in the logs.
+func (hc *HostConfig) warnDisabledSafetyFlags() {
+	if hc.NoSyncWAL {
+		slog.Warn("NoSyncWAL enabled: Raft WAL writes are not fsynced, committed entries can be lost on power loss or OS crash (testing only)")
+	}
 }

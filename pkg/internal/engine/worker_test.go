@@ -1519,12 +1519,25 @@ func TestStepWorker_ProcessReady_NoUpdate(t *testing.T) {
 	ws.Notify(1)
 	sw.processReady()
 
-	// Drain any initial commit item.
+	// Drain any initial commit item. Persisting the term-opening no-op
+	// via Peer.Commit fires the persistence-edge commit re-evaluation,
+	// which commits it on this single-node shard — so one follow-up
+	// update (the committed no-op) is expected and must be drained too.
 	select {
 	case item := <-commitC:
 		// Commit the update to clear the peer's pending state.
 		if err := peer.Commit(item.update); err != nil {
 			t.Fatalf("unexpected Commit error: %v", err)
+		}
+		node.commitPending.Store(false)
+	default:
+	}
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case item := <-commitC:
+		if err := peer.Commit(item.update); err != nil {
+			t.Fatalf("unexpected Commit error on no-op follow-up: %v", err)
 		}
 		node.commitPending.Store(false)
 	default:
@@ -1616,8 +1629,22 @@ func TestCommitWorker_ProcessBatch_SuccessPath(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. tryCommit counts the leader's own match at its durable
+	// index, so the single-node commit index only advances at the
+	// persistence edge inside Peer.Commit. The next GetUpdate then
+	// carries the no-op as a committed entry, keeping processBatch on
+	// the normal apply-forward path (single batch SaveState).
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (initial) failed: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit (initial) failed: %v", err)
+	}
+
 	// Propose to generate a real update.
-	_, err := peer.Propose([]proto.Entry{{Cmd: []byte("commit-test")}})
+	_, err = peer.Propose([]proto.Entry{{Cmd: []byte("commit-test")}})
 	if err != nil {
 		t.Fatalf("propose failed: %v", err)
 	}
@@ -2243,8 +2270,12 @@ func TestCommitWorker_SkipApplyWhenNoCommittedEntries(t *testing.T) {
 	tickPeerToLeader(peer)
 
 	// Drain the initial leader state so committed == processed.
-	// This ensures GetPiggybackUpdate returns no entries.
-	if peer.HasUpdate(0) {
+	// This ensures GetPiggybackUpdate returns no entries. Persisting
+	// the term-opening no-op fires the persistence-edge commit
+	// re-evaluation, which produces a follow-up update carrying the
+	// committed no-op — the loop drains that too so the processed
+	// marker catches up with the commit index.
+	for peer.HasUpdate(0) {
 		initUpdate, err := peer.GetUpdate(true, 0)
 		if err != nil {
 			t.Fatalf("GetUpdate (initial) failed: %v", err)
@@ -2312,7 +2343,19 @@ func TestCommitWorker_NoSkipApplyWhenCommittedEntriesPresent(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	_, err := peer.Propose([]proto.Entry{{Cmd: []byte("apply-test")}})
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. The single-node commit index only advances at the
+	// persistence edge inside Peer.Commit, so the next GetUpdate
+	// carries the no-op as a committed entry.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (initial) failed: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit (initial) failed: %v", err)
+	}
+
+	_, err = peer.Propose([]proto.Entry{{Cmd: []byte("apply-test")}})
 	if err != nil {
 		t.Fatalf("propose failed: %v", err)
 	}
@@ -2322,7 +2365,8 @@ func TestCommitWorker_NoSkipApplyWhenCommittedEntriesPresent(t *testing.T) {
 		t.Fatalf("GetUpdate failed: %v", err)
 	}
 
-	// Verify update has committed entries (single-node = immediate commit).
+	// The persistence-edge commit of the no-op makes this update carry
+	// committed entries alongside the freshly proposed EntriesToSave.
 	if len(update.CommittedEntries) == 0 {
 		t.Fatal("expected committed entries in single-node update")
 	}
@@ -2760,7 +2804,20 @@ func TestCommitWorker_SendsOrderedMessagesAfterSaveState(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	_, err := peer.Propose([]proto.Entry{{Cmd: []byte("ordered-msg-test")}})
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle so the commit index advances at the persistence edge. The
+	// next GetUpdate then carries committed entries, keeping
+	// processBatch on the normal path with a single batch SaveState
+	// (no piggyback persist, no extra piggyback messages).
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (initial) failed: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit (initial) failed: %v", err)
+	}
+
+	_, err = peer.Propose([]proto.Entry{{Cmd: []byte("ordered-msg-test")}})
 	if err != nil {
 		t.Fatalf("propose failed: %v", err)
 	}
@@ -3503,8 +3560,20 @@ func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 
 	tickPeerToLeader(oldPeer)
 
+	// Persist the old incarnation's term-opening no-op through a real
+	// GetUpdate/Commit cycle. The commit index only advances at the
+	// persistence edge inside Peer.Commit, so this makes the next
+	// GetUpdate carry the no-op as a committed entry.
+	oldInitial, err := oldPeer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (initial) on old peer failed: %v", err)
+	}
+	if err := oldPeer.Commit(oldInitial); err != nil {
+		t.Fatalf("Commit (initial) on old peer failed: %v", err)
+	}
+
 	// Propose to generate committed entries on the old incarnation.
-	_, err := oldPeer.Propose([]proto.Entry{{Cmd: []byte("old-incarnation")}})
+	_, err = oldPeer.Propose([]proto.Entry{{Cmd: []byte("old-incarnation")}})
 	if err != nil {
 		t.Fatalf("propose on old peer failed: %v", err)
 	}
@@ -3670,13 +3739,18 @@ done2:
 //
 // The flow:
 //  1. Create single-node peer, tick to leader (immediate self-election).
-//  2. Drain initial state (leader no-op entry).
-//  3. Propose a new entry. In a single-node cluster, commit advances
-//     immediately, but processed only advances in Commit().
+//  2. Drain initial state (leader no-op entry). Persisting the no-op
+//     inside Peer.Commit fires the persistence-edge commit
+//     re-evaluation, committing it — but processed stays behind because
+//     only Commit of an update carrying committed entries advances it.
+//  3. Propose a new entry.
 //  4. Call GetUpdate to extract the update. Clear CommittedEntries from
 //     the returned update so processBatch enters the piggyback branch.
-//  5. The peer's internal state now has committed > processed because
-//     GetUpdate does not advance processed (only Commit does).
+//  5. When processBatch persists the update, the persistence edge
+//     inside Peer.Commit commits the proposed entry as well, so
+//     GetPiggybackUpdate reports committed entries through the
+//     proposal's index — the last EntriesToSave index is the expected
+//     piggyback tip.
 func setupPiggybackPeer(t *testing.T, shardID, replicaID uint64) (
 	*raft.Peer, *logdb.LogReader, proto.Update, uint64,
 ) {
@@ -3708,10 +3782,13 @@ func setupPiggybackPeer(t *testing.T, shardID, replicaID uint64) (
 		t.Fatalf("GetUpdate failed: %v", err)
 	}
 
-	if len(update.CommittedEntries) == 0 {
-		t.Fatal("expected committed entries from single-node GetUpdate")
+	if len(update.EntriesToSave) == 0 {
+		t.Fatal("expected the proposed entry in EntriesToSave")
 	}
-	piggybackIndex := update.CommittedEntries[len(update.CommittedEntries)-1].Index
+	// The persistence edge inside processBatch's Peer.Commit commits
+	// through the durable tip, so the piggyback covers everything up to
+	// and including the proposed entry.
+	piggybackIndex := update.EntriesToSave[len(update.EntriesToSave)-1].Index
 
 	// Clear CommittedEntries to simulate the 3N first-cycle scenario.
 	// processBatch sees no committed entries, enters the piggyback branch,
@@ -3814,8 +3891,12 @@ func TestCommitWorker_PiggybackNoEntries(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	tickPeerToLeader(peer)
 
-	// Drain ALL initial state so committed == processed.
-	if peer.HasUpdate(0) {
+	// Drain ALL initial state so committed == processed. Persisting the
+	// term-opening no-op fires the persistence-edge commit
+	// re-evaluation, which produces a follow-up update carrying the
+	// committed no-op — the loop drains that too so the processed
+	// marker catches up with the commit index.
+	for peer.HasUpdate(0) {
 		initUpdate, err := peer.GetUpdate(true, 0)
 		if err != nil {
 			t.Fatalf("GetUpdate (initial) failed: %v", err)
@@ -4181,7 +4262,7 @@ func TestCommitWorker_DrainUnloadReload_ProcessesUnloads(t *testing.T) {
 
 	// Verify all shards are in the unloaded set.
 	for _, id := range []uint64{10, 20, 30} {
-		if _, ok := cw.unloaded[id]; !ok {
+		if !cw.unloaded.has(id) {
 			t.Fatalf("shard %d should be in unloaded set", id)
 		}
 	}
@@ -4199,8 +4280,8 @@ func TestCommitWorker_DrainUnloadReload_ProcessesReloads(t *testing.T) {
 	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
 
 	// Pre-populate unloaded set.
-	cw.unloaded[10] = struct{}{}
-	cw.unloaded[20] = struct{}{}
+	cw.unloaded.add(10)
+	cw.unloaded.add(20)
 
 	// Enqueue reload requests.
 	cw.reloadC <- 10
@@ -4209,10 +4290,10 @@ func TestCommitWorker_DrainUnloadReload_ProcessesReloads(t *testing.T) {
 	cw.drainUnloadReload()
 
 	// Verify shards are removed from the unloaded set.
-	if _, ok := cw.unloaded[10]; ok {
+	if cw.unloaded.has(10) {
 		t.Fatal("shard 10 should be removed from unloaded set after reload")
 	}
-	if _, ok := cw.unloaded[20]; ok {
+	if cw.unloaded.has(20) {
 		t.Fatal("shard 20 should be removed from unloaded set after reload")
 	}
 }
@@ -4236,10 +4317,10 @@ func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T
 	cw.drainUnloadReload()
 
 	// Both should be in the unloaded set.
-	if _, ok := cw.unloaded[10]; !ok {
+	if !cw.unloaded.has(10) {
 		t.Fatal("shard 10 should be in unloaded set after first drain")
 	}
-	if _, ok := cw.unloaded[20]; !ok {
+	if !cw.unloaded.has(20) {
 		t.Fatal("shard 20 should be in unloaded set after first drain")
 	}
 
@@ -4249,10 +4330,10 @@ func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T
 	cw.drainUnloadReload()
 
 	// Shard 10 should be removed; shard 20 should remain.
-	if _, ok := cw.unloaded[10]; ok {
+	if cw.unloaded.has(10) {
 		t.Fatal("shard 10 should be removed from unloaded set after reload")
 	}
-	if _, ok := cw.unloaded[20]; !ok {
+	if !cw.unloaded.has(20) {
 		t.Fatal("shard 20 should still be in unloaded set")
 	}
 }
@@ -4299,7 +4380,7 @@ func TestApplyWorker_Dispatch_SkipsUnloadedShard(t *testing.T) {
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
 
 	// Mark shard 42 as unloaded.
-	aw.unloaded[42] = struct{}{}
+	aw.unloaded.add(42)
 
 	cfg := config.Config{ShardID: 42, ReplicaID: 1}
 	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
@@ -4398,6 +4479,19 @@ func TestExecutePiggyback_WithOnCommittedCallback(t *testing.T) {
 	node.commitPending.Store(true)
 	node.SetNotifyCommit(true)
 
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. tryCommit counts the leader's own match at its durable
+	// index, so the single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
+
 	piggyback := proto.Update{
 		ShardID:   1,
 		ReplicaID: 1,
@@ -4446,6 +4540,18 @@ func TestExecutePiggyback_NoMessages(t *testing.T) {
 	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 	node.commitPending.Store(true)
 
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. The single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
+
 	piggyback := proto.Update{
 		ShardID:   1,
 		ReplicaID: 1,
@@ -4489,6 +4595,18 @@ func TestExecutePiggyback_OnlyOrderedMessages(t *testing.T) {
 	cfg.SetDefaults()
 	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 	node.commitPending.Store(true)
+
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. The single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
 
 	piggyback := proto.Update{
 		ShardID:   1,
@@ -4898,7 +5016,7 @@ func TestCommitWorker_ProcessBatch_SkipsUnloadedShard(t *testing.T) {
 	cw.noRetryDelay = true
 
 	// Mark shard 1 as unloaded.
-	cw.unloaded[1] = struct{}{}
+	cw.unloaded.add(1)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
@@ -5246,6 +5364,18 @@ func TestExecutePiggyback_ApplyCFull_BlockingSend(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. The single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
+
 	// Fill applyC to capacity so the first non-blocking send fails.
 	applyC <- &applyItem{}
 
@@ -5300,6 +5430,18 @@ func TestExecutePiggyback_ApplyCFull_StopC(t *testing.T) {
 	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 
 	tickPeerToLeader(peer)
+
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. The single-node commit index only advances at the
+	// persistence edge inside Peer.Commit — the manufactured piggyback
+	// below claims entry 1 is committed, which must be true by then.
+	initial, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if err := peer.Commit(initial); err != nil {
+		t.Fatalf("Commit(initial): %v", err)
+	}
 
 	piggyback := proto.Update{
 		ShardID:   1,
@@ -5955,16 +6097,47 @@ func TestApplyWorker_RunShardApply_RecoveringSkipsApply(t *testing.T) {
 	shardC <- item
 	close(shardC)
 
-	aw.runShardApply(shardC)
+	// The apply goroutine parks the batch while the recovery gate is
+	// set: raft's processed marker has already advanced past these
+	// entries, so dropping them would silently diverge the state
+	// machine. Run it in a goroutine so the parked state can be
+	// observed before completing the recovery.
+	done := make(chan struct{})
+	go func() {
+		aw.runShardApply(shardC)
+		close(done)
+	}()
 
-	// Entries should NOT be applied because recovering is true.
+	// While recovering, the batch stays parked: the SM is untouched and
+	// commitPending remains set.
+	time.Sleep(20 * time.Millisecond)
 	if testSm.applyCount.Load() != 0 {
 		t.Fatal("state machine should not be applied during recovery")
 	}
+	if !node.commitPending.Load() {
+		t.Fatal("commitPending should stay set while the batch waits on the recovery gate")
+	}
 
-	// commitPending should still be cleared.
+	// Complete the recovery at snapshot index 1: the recovered snapshot
+	// covers the queued entry, so the parked batch resumes and filters
+	// it as snapshot-covered without applying.
+	node.lastApplied.Store(1)
+	node.SetRecovering(false)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the parked batch to resume after recovery")
+	}
+
+	// The snapshot-covered entry must not reach the state machine.
+	if testSm.applyCount.Load() != 0 {
+		t.Fatal("snapshot-covered entries must not be applied after recovery")
+	}
+
+	// commitPending is cleared once the batch resumes and is filtered.
 	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared even during recovery skip")
+		t.Fatal("commitPending should be cleared after the parked batch resumes")
 	}
 }
 
@@ -6473,7 +6646,7 @@ func TestCommitWorker_Run_ReloadInMainLoop(t *testing.T) {
 	cw.noRetryDelay = true
 
 	// Pre-mark shard 5 as unloaded.
-	cw.unloaded[5] = struct{}{}
+	cw.unloaded.add(5)
 
 	// Start the worker loop in background.
 	var wg sync.WaitGroup
@@ -6495,7 +6668,7 @@ func TestCommitWorker_Run_ReloadInMainLoop(t *testing.T) {
 	wg.Wait()
 
 	// Shard 5 should no longer be in the unloaded set.
-	if _, stillUnloaded := cw.unloaded[5]; stillUnloaded {
+	if cw.unloaded.has(5) {
 		t.Fatal("shard 5 should have been removed from unloaded set after reload")
 	}
 }
@@ -6614,7 +6787,126 @@ func TestCommitWorker_Run_UnloadInMainLoop(t *testing.T) {
 	close(stopC)
 	wg.Wait()
 
-	if _, unloaded := cw.unloaded[7]; !unloaded {
+	if !cw.unloaded.has(7) {
 		t.Fatal("shard 7 should be in unloaded set after unload request")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Peer.Commit failure handling (state-machine safety)
+// ---------------------------------------------------------------------------
+
+// newCommitFailurePeer returns a single-node leader peer that has completed
+// one election cycle, plus an Update carrying real committed entries whose
+// EntriesToSave start far past the LogReader's tracked range. Peer.Commit
+// advances the processed marker past the committed entries FIRST and only then
+// fails in logReader.Append, so those committed entries can never be re-offered
+// by entriesToApply — the shard must be failed rather than allowed to continue.
+func newCommitFailurePeer(t *testing.T, shardID, replicaID uint64) (*raft.Peer, *logdb.LogReader, proto.Update) {
+	t.Helper()
+	peer, lr := newTestPeer(t, shardID, replicaID)
+	tickPeerToLeader(peer)
+
+	// Election cycle: commits the leader's empty entry so the log has a
+	// committed index the next update can carry.
+	election, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("election GetUpdate failed: %v", err)
+	}
+	if err := peer.Commit(election); err != nil {
+		t.Fatalf("election Commit failed: %v", err)
+	}
+	if _, err := peer.Propose([]proto.Entry{{Cmd: []byte("commit-failure")}}); err != nil {
+		t.Fatalf("propose failed: %v", err)
+	}
+	u, err := peer.GetUpdate(true, election.LastApplied)
+	if err != nil {
+		t.Fatalf("GetUpdate failed: %v", err)
+	}
+	if len(u.CommittedEntries) == 0 {
+		t.Fatal("expected committed entries in the update")
+	}
+	// Force logReader.Append to fail with a log gap.
+	u.EntriesToSave = []proto.Entry{{Index: 500, Term: 1}}
+	return peer, lr, u
+}
+
+// TestCommitWorker_PeerCommitError_FailsShard verifies that a Peer.Commit
+// error takes the shard OFFLINE instead of letting it keep running. Commit
+// has already advanced the processed marker, so the batch is gone: a shard
+// that continued would ack the leader and serve reads from a state machine
+// permanently missing those committed entries.
+func TestCommitWorker_PeerCommitError_FailsShard(t *testing.T) {
+	commitC := make(chan *commitItem, 4)
+	applyC := make(chan *applyItem, 4)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+
+	cw := newCommitWorker(0, nil, newTestSender(), commitC, applyC, applyPool,
+		NewWorkSignal(1), cb, stopC, nil)
+
+	peer, lr, u := newCommitFailurePeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+
+	node.commitPending.Store(true)
+	cw.batch = append(cw.batch[:0], u)
+	cw.batchNodes = append(cw.batchNodes[:0], node)
+	cw.processBatch()
+
+	if !node.IsFailed() {
+		t.Fatal("node must be marked failed after a Peer.Commit error")
+	}
+	if node.commitPending.Load() {
+		t.Fatal("commitPending must be cleared after a Peer.Commit error")
+	}
+	if len(applyC) != 0 {
+		t.Fatalf("no apply item may be forwarded after a Commit error, got %d", len(applyC))
+	}
+	failed := cb.getProposalFailedCalls()
+	if len(failed) != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", len(failed))
+	}
+	var commitErr *CommitError
+	if !errors.As(failed[0].err, &commitErr) {
+		t.Fatalf("expected CommitError, got %T: %v", failed[0].err, failed[0].err)
+	}
+}
+
+// TestExecutePiggyback_CommitError_FailsShard verifies the piggyback path
+// applies the same fail-fast rule as the batch path.
+func TestExecutePiggyback_CommitError_FailsShard(t *testing.T) {
+	commitC := make(chan *commitItem, 4)
+	applyC := make(chan *applyItem, 4)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+
+	cw := newCommitWorker(0, nil, newTestSender(), commitC, applyC, applyPool,
+		NewWorkSignal(1), cb, stopC, nil)
+
+	peer, lr, u := newCommitFailurePeer(t, 2, 1)
+	cfg := config.Config{ShardID: 2, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+
+	node.commitPending.Store(true)
+	if cont := cw.executePiggyback(node, u); !cont {
+		t.Fatal("executePiggyback should report continue (per-node error, not shutdown)")
+	}
+
+	if !node.IsFailed() {
+		t.Fatal("node must be marked failed after a piggyback Peer.Commit error")
+	}
+	if node.commitPending.Load() {
+		t.Fatal("commitPending must be cleared after a piggyback Commit error")
+	}
+	if len(applyC) != 0 {
+		t.Fatalf("no apply item may be forwarded after a Commit error, got %d", len(applyC))
+	}
+	if cb.proposalFailedCount.Load() != 1 {
+		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
 	}
 }

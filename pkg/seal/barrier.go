@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,9 +55,13 @@ const (
 	// hkdfInfoPrefix is the fixed prefix for HKDF info strings.
 	hkdfInfoPrefix = "quicraft/barrier/v1/"
 
-	// hkdfInfoLen is the total length of the HKDF info:
+	// hkdfInfoLenV1 is the length of the v1 HKDF info:
 	// 20 bytes prefix + 8 bytes deploymentID + 8 bytes epoch.
-	hkdfInfoLen = 36
+	hkdfInfoLenV1 = 36
+
+	// hkdfInfoLenV2 is the length of the v2 HKDF info: v1 plus the
+	// algorithm identifier and the DEK length.
+	hkdfInfoLenV2 = 38
 
 	// bruteForceThreshold is the number of consecutive failed Unseal
 	// attempts before exponential backoff activates.
@@ -70,6 +75,30 @@ const (
 
 	// bruteForceErrorThreshold is the number of failures that triggers ERROR-level logging.
 	bruteForceErrorThreshold = 20
+)
+
+// HKDFVersion identifies the layout of the HKDF info string used to derive
+// epoch DEKs. It is persisted in SealedRootKey so that data derived under an
+// older layout keeps deriving under that layout after an upgrade.
+type HKDFVersion uint8
+
+const (
+	// HKDFV1 is the original info layout: [prefix:20][deploymentID:8][epoch:8].
+	// It has no algorithm/key-size domain separation: because HKDF is a
+	// stream, the 16-byte AES-128 DEK for a given (deployment, epoch) is the
+	// first half of that pair's 32-byte AES-256 DEK. HKDFV1 is the fallback
+	// for sealed blobs persisted before the version field existed and must
+	// stay derivable; new deployments use HKDFV2.
+	HKDFV1 HKDFVersion = 1
+
+	// HKDFV2 appends [algID:1][keyLen:1] to the v1 info, so a change of
+	// BarrierConfig.Algorithm yields unrelated keys instead of related ones
+	// and the unauthenticated algID header byte cannot select a key that is
+	// a prefix of another.
+	HKDFV2 HKDFVersion = 2
+
+	// currentHKDFVersion is stamped into every newly initialized barrier.
+	currentHKDFVersion = HKDFV2
 )
 
 // barrierState represents the lifecycle state of a Barrier.
@@ -124,6 +153,11 @@ type Barrier struct {
 	state   barrierState
 	rootKey *enclave.ProtectedKey // 32 bytes, encrypted at rest in memory via memguard enclave
 	salt    []byte                // 32 bytes, generated at Initialize, used for HKDF
+
+	// hkdfVersion is the DEK-derivation info layout in force. Set to
+	// currentHKDFVersion for a fresh barrier and overwritten from the
+	// persisted SealedRootKey by SetSealedRootKey.
+	hkdfVersion HKDFVersion
 
 	epoch      uint64                           // current key rotation epoch
 	currentDEK *enclave.ProtectedKey            // derived via HKDF from rootKey + epoch, encrypted at rest
@@ -213,6 +247,7 @@ func NewBarrier(config BarrierConfig) *Barrier {
 	return &Barrier{
 		config:         config,
 		state:          barrierUninitialized,
+		hkdfVersion:    currentHKDFVersion,
 		deks:           make(map[uint64]*enclave.ProtectedKey),
 		ciphers:        make(map[uint64]cipher.AEAD),
 		knownEpochs:    make(map[uint64]struct{}),
@@ -296,6 +331,9 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	sealed.Epoch = initialEpoch
 	sealed.Salt = salt
 	sealed.KnownEpochs = []uint64{initialEpoch}
+	// Record the DEK-derivation layout so a future version can still derive
+	// this deployment's keys after the layout changes again.
+	sealed.HKDFVersion = b.hkdfVersion
 
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
@@ -409,19 +447,32 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// the persisted brute-force backoff would lock the node out of its own
 	// plaintext data. The identity encryptor ignores key material, so no root
 	// key is stored.
-	if b.sealed != nil && b.sealed.Strategy == StrategyNone {
+	//
+	// The branch is gated on the CONSTRUCTED strategy, never on
+	// b.sealed.Strategy: that field is plaintext and unauthenticated (the
+	// AEAD AAD is a constant), so flipping it to "none" on disk would
+	// otherwise steer a passphrase deployment into this branch and leave the
+	// barrier "unsealed" with no cipher at all.
+	if strategy.ID() == StrategyNone {
 		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
 		if hwErr != nil {
 			wipeBytes(rootKey)
 			return hwErr
 		}
 		wipeBytes(rootKey)
+		// A nil encryptor here would leave state=unsealed with cipher==nil
+		// and hwEncryptor==nil, and the first Encrypt would nil-dereference.
+		if hwEnc == nil {
+			return ErrNoBarrierEncryptor
+		}
 		b.hwEncryptor = hwEnc
 		// Mirror Initialize's epoch assignment so CurrentEpoch() is symmetric
 		// across Initialize and restart-via-Unseal. The value is cosmetic in
 		// None mode (the identity encrypter ignores the epoch), but keeping it
 		// consistent avoids surprising any consumer that reads CurrentEpoch().
-		b.epoch = b.sealed.Epoch
+		if b.sealed != nil {
+			b.epoch = b.sealed.Epoch
+		}
 		b.state = barrierUnsealed
 		b.unsealed.Store(true)
 		b.failedAttempts = 0
@@ -467,10 +518,18 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	}
 
 	// Re-derive DEKs for all known epochs (survives seal/unseal cycles).
+	// The current epoch is skipped: its DEK/cipher were already derived
+	// above and are installed below. Deriving it again here would wrap a
+	// second ProtectedKey enclave that the newDEKs[b.epoch] assignment
+	// silently overwrites, leaving an unwiped duplicate of the current
+	// epoch's DEK behind on every unseal.
 	newDEKs := make(map[uint64]*enclave.ProtectedKey)
 	newCiphers := make(map[uint64]cipher.AEAD)
 	var plainDEKs [][]byte // track for cleanup on error
 	for epoch := range b.knownEpochs {
+		if epoch == b.epoch {
+			continue
+		}
 		d, a, derr := b.deriveEpochCipher(rootKey, b.salt, epoch)
 		if derr != nil {
 			wipeBytes(rootKey)
@@ -488,7 +547,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// Wrap current epoch DEK in enclave (wipes dek).
 	dekPK := enclave.NewProtectedKey(dek)
 
-	// Also ensure the current epoch is in the maps.
+	// Install the current epoch (skipped by the loop above; this also
+	// covers the case where b.epoch is not in knownEpochs).
 	newDEKs[b.epoch] = dekPK
 	newCiphers[b.epoch] = aead
 
@@ -573,11 +633,17 @@ func (b *Barrier) seal() error {
 		return ErrBarrierSealed
 	}
 
-	// Actively zero all live key enclaves before dropping the references.
-	// Relying on GC/memguard finalizers would leave DEK and root-key
-	// material resident in memory for an unbounded window after seal —
-	// exactly the window an attacker who compromises the host post-seal
-	// would target. Clear is idempotent and safe on a nil-enclave key.
+	// Drop every live key enclave before dropping the map/field references.
+	//
+	// Precisely what this buys: enclave.ProtectedKey.Clear() releases the
+	// enclave reference so the key can no longer be OPENED — it does NOT zero
+	// the enclave's ciphertext, because memguard.Enclave exposes no API to do
+	// so (see enclave.ProtectedKey.Clear). After seal(), the encrypted DEK
+	// bytes and memguard's session coffer key therefore remain resident until
+	// the GC reclaims them; what is gone is the barrier's ability to decrypt
+	// them, and the plaintext key material (which lives only inside a
+	// short-lived LockedBuffer that Open's callers Destroy). Clear is
+	// idempotent and safe on an already-cleared key.
 	if b.rootKey != nil {
 		b.rootKey.Clear()
 	}
@@ -628,6 +694,10 @@ func (b *Barrier) Seal() error {
 // is nil or too small, a new buffer is allocated. The dst parameter is ignored
 // in hardware mode.
 //
+// dst MUST NOT overlap plaintext except exactly (crypto/cipher's in-place
+// requirement): the AEAD seals directly into dst, and an inexact overlap
+// PANICS inside crypto/cipher. Pass nil when in doubt.
+//
 // The method uses a two-phase fast path:
 //  1. Atomic check of b.unsealed (no contention).
 //  2. RLock for the cipher operation (prevents TOCTOU with Seal).
@@ -655,6 +725,8 @@ func (b *Barrier) Encrypt(dst, plaintext []byte) ([]byte, error) {
 // EncryptWithEpoch encrypts plaintext and returns both the ciphertext and the
 // epoch used for encryption. This is used by WAL headers to record which epoch
 // was used for each segment.
+//
+// dst MUST NOT overlap plaintext except exactly; see Encrypt.
 //
 // In hardware mode, the epoch is returned but the ciphertext format is
 // determined by the hardware strategy.
@@ -766,6 +838,10 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 //
 // In hardware mode, decryption is delegated to the hardware-backed encryptor.
 //
+// dst MUST NOT overlap ciphertext except exactly (crypto/cipher's in-place
+// requirement): the AEAD opens directly into dst, and an inexact overlap
+// PANICS inside crypto/cipher. Pass nil when in doubt.
+//
 // Returns a single generic ErrDecryptionFailed for ALL failure modes (unknown
 // epoch, authentication failure, corrupted ciphertext, unsupported algorithm)
 // to prevent error-type oracle attacks.
@@ -806,6 +882,8 @@ func (b *Barrier) Decrypt(dst, ciphertext []byte) ([]byte, error) {
 //
 // In hardware mode, the epoch parameter is ignored and decryption is delegated
 // to the hardware-backed encryptor.
+//
+// dst MUST NOT overlap ciphertext except exactly; see Decrypt.
 //
 // Returns ErrDecryptionFailed for all failure modes to prevent error-type oracles.
 func (b *Barrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error) {
@@ -896,15 +974,28 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 // Rotate must only be called while the barrier is unsealed. It acquires the
 // exclusive write lock for the entire duration.
 //
-// Ordering — commit-first, then fail-safe tracker reset:
+// PERSIST-THEN-ACTIVATE: a rotated epoch that is not durably recorded is a
+// data-loss bug, not an inconvenience. The write path stamps the new epoch
+// into WAL segments and snapshots immediately, while the read path
+// (DecryptForEpoch) fails closed on an epoch the restored blob does not name.
+// Rotate therefore requires BarrierConfig.StatePersister: it hands the NEW
+// sealed state to the persister and only installs the new key once the
+// persister reports the state durable. With no persister configured Rotate
+// fails closed with ErrNoStatePersister and changes nothing.
 //
-//  1. Derive the new DEK and AEAD cipher (the only genuinely fallible step). On
-//     a derivation error nothing has changed; Rotate returns 0 (old epoch still
-//     active) and zeroes the partial DEK.
-//  2. Commit the epoch switch. All of these mutations are in-memory and
+// Ordering — derive, persist, commit, then fail-safe tracker reset:
+//
+//  1. Derive the new DEK and AEAD cipher. On a derivation error nothing has
+//     changed; Rotate returns 0 (old epoch still active) and zeroes the
+//     partial DEK.
+//  2. Persist the new sealed state (new Epoch + KnownEpochs). On a persist
+//     error nothing is committed: no DEK installed, no knownEpochs mutation,
+//     no tracker reset. The old epoch stays fully active and usable, and the
+//     error is returned as *StatePersistError.
+//  3. Commit the epoch switch. All of these mutations are in-memory and
 //     infallible, performed under the already-held b.mu write lock, so the new
 //     epoch becomes active atomically with respect to every other locked path.
-//  3. Reset the AEAD safety trackers (invocations.Reset, nonceTracker.Clear).
+//  4. Reset the AEAD safety trackers (invocations.Reset, nonceTracker.Clear).
 //     These run AFTER the commit and must NOT revert the epoch on failure.
 //
 // The reason resets run last — and never trigger a rollback — is that the
@@ -945,11 +1036,18 @@ func (b *Barrier) Rotate() (uint64, error) {
 		return 0, ErrHardwareMode
 	}
 
+	if b.sealed == nil {
+		return 0, ErrNilSealedData
+	}
+	persist := b.config.StatePersister
+	if persist == nil {
+		return 0, ErrNoStatePersister
+	}
+
 	oldEpoch := b.epoch
 	newEpoch := b.epoch + 1
 
-	// Step 1: derive the new DEK and cipher. This is the only fallible step that
-	// must leave the barrier unchanged on failure. Open the root key enclave
+	// Step 1: derive the new DEK and cipher. Open the root key enclave
 	// temporarily for HKDF derivation.
 	rootBuf, err := b.rootKey.Open()
 	if err != nil {
@@ -965,7 +1063,21 @@ func (b *Barrier) Rotate() (uint64, error) {
 		return 0, err
 	}
 
-	// Step 2: commit the epoch switch. Wrap the DEK in an enclave (wipes dek)
+	// Step 2: persist the new sealed state BEFORE any of it becomes active.
+	// The candidate is a private deep copy, so a failed persist leaves the
+	// live state byte-for-byte unchanged; the persister gets its own copy it
+	// may retain. It runs with b.mu held and must not re-enter the barrier.
+	candidate := cloneSealedRootKey(b.sealed)
+	candidate.Epoch = newEpoch
+	candidate.KnownEpochs = sortedEpochsWith(b.knownEpochs, newEpoch)
+	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
+		wipeBytes(dek)
+		slog.Error("key rotation aborted: sealed state not persisted; previous epoch remains active",
+			"from_epoch", oldEpoch, "to_epoch", newEpoch, "error", perr)
+		return 0, &StatePersistError{Op: "rotate", Epoch: newEpoch, Err: perr}
+	}
+
+	// Step 3: commit the epoch switch. Wrap the DEK in an enclave (wipes dek)
 	// then perform the in-memory, infallible state mutations under the held write
 	// lock. After this point the NEW key is active and the rotation has
 	// succeeded; the trackers below are reset against the new epoch.
@@ -978,16 +1090,11 @@ func (b *Barrier) Rotate() (uint64, error) {
 	b.ciphers[newEpoch] = aead
 	b.knownEpochs[newEpoch] = struct{}{}
 
-	// Update persisted sealed state so SealedRootKeyData() returns
-	// the current epoch and all known epochs for re-derivation on restart.
-	b.sealed.Epoch = newEpoch
-	epochs := make([]uint64, 0, len(b.knownEpochs))
-	for ep := range b.knownEpochs {
-		epochs = append(epochs, ep)
-	}
-	b.sealed.KnownEpochs = epochs
+	// Adopt the state that was just persisted, so SealedRootKeyData() and the
+	// durable blob agree exactly.
+	b.sealed = candidate
 
-	// Step 3: reset the AEAD safety trackers for the new epoch. These run AFTER
+	// Step 4: reset the AEAD safety trackers for the new epoch. These run AFTER
 	// the commit and never revert it. A failure here is fail-safe (see the doc
 	// comment): a non-reset counter only forces an earlier re-rotation; a
 	// non-cleared nonce set only yields conservative false-positive rejections.
@@ -1015,6 +1122,18 @@ func (b *Barrier) Rotate() (uint64, error) {
 // (registered via RegisterInFlightEpoch) are skipped. Returns the number
 // of epochs actually purged.
 //
+// A purge shrinks KnownEpochs, which is persisted state: if the reduced set
+// were not written durably, a restart would resurrect the purged epochs and
+// re-derive the DEKs the purge floor retired. PurgeEpochsBefore therefore
+// persists the reduced state through BarrierConfig.StatePersister BEFORE
+// dropping any key, and fails closed with ErrNoStatePersister when there is
+// something to purge and no persister is configured. A purge that would drop
+// nothing needs no persister and returns (0, nil).
+//
+// Crash safety of the persist-then-drop order: if the process dies after the
+// persist, the restored blob simply omits the epochs the purge had already
+// decided to retire — exactly the intended outcome.
+//
 // PurgeEpochsBefore is not supported in hardware mode (returns ErrHardwareMode).
 func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	b.mu.Lock()
@@ -1035,7 +1154,9 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	b.inFlightMu.Lock()
 	defer b.inFlightMu.Unlock()
 
-	purged := 0
+	// Select the purgeable epochs first; nothing is mutated until the reduced
+	// state is durable.
+	var purgeable []uint64
 	for epoch := range b.deks {
 		if epoch >= minEpoch || epoch == b.epoch {
 			continue
@@ -1043,6 +1164,33 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 		if b.inFlightEpochs[epoch] > 0 {
 			continue
 		}
+		purgeable = append(purgeable, epoch)
+	}
+	if len(purgeable) == 0 {
+		return 0, nil
+	}
+
+	if b.sealed == nil {
+		return 0, ErrNilSealedData
+	}
+	persist := b.config.StatePersister
+	if persist == nil {
+		return 0, ErrNoStatePersister
+	}
+
+	retire := make(map[uint64]struct{}, len(purgeable))
+	for _, epoch := range purgeable {
+		retire[epoch] = struct{}{}
+	}
+	candidate := cloneSealedRootKey(b.sealed)
+	candidate.KnownEpochs = sortedEpochsWithout(b.knownEpochs, retire)
+	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
+		slog.Error("epoch purge aborted: reduced sealed state not persisted; DEKs retained",
+			"min_epoch", minEpoch, "error", perr)
+		return 0, &StatePersistError{Op: "purge", Epoch: b.epoch, Err: perr}
+	}
+
+	for _, epoch := range purgeable {
 		// Actively zero the purged DEK's enclave rather than letting the
 		// GC/finalizer eventually reclaim it: a purged epoch's key must
 		// not linger in memory.
@@ -1052,11 +1200,39 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 		delete(b.deks, epoch)
 		delete(b.ciphers, epoch)
 		delete(b.knownEpochs, epoch)
-		purged++
 		slog.Info("old DEK purged", "epoch", epoch)
 	}
+	b.sealed = candidate
 
-	return purged, nil
+	return len(purgeable), nil
+}
+
+// sortedEpochsWith returns the epoch set plus add as an ascending slice.
+// The order is deterministic so that persisted blobs are reproducible.
+func sortedEpochsWith(set map[uint64]struct{}, add uint64) []uint64 {
+	epochs := make([]uint64, 0, len(set)+1)
+	for ep := range set {
+		epochs = append(epochs, ep)
+	}
+	if _, ok := set[add]; !ok {
+		epochs = append(epochs, add)
+	}
+	slices.Sort(epochs)
+	return epochs
+}
+
+// sortedEpochsWithout returns the epoch set minus drop as an ascending slice.
+// The order is deterministic so that persisted blobs are reproducible.
+func sortedEpochsWithout(set map[uint64]struct{}, drop map[uint64]struct{}) []uint64 {
+	epochs := make([]uint64, 0, len(set))
+	for ep := range set {
+		if _, dropped := drop[ep]; dropped {
+			continue
+		}
+		epochs = append(epochs, ep)
+	}
+	slices.Sort(epochs)
+	return epochs
 }
 
 // RegisterInFlightEpoch increments the in-flight reference count for an epoch.
@@ -1137,40 +1313,47 @@ func (b *Barrier) CurrentEpoch() uint64 {
 func (b *Barrier) SealedRootKeyData() *SealedRootKey {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if b.sealed == nil {
+	return cloneSealedRootKey(b.sealed)
+}
+
+// cloneSealedRootKey returns a deep copy of a sealed root key, so that a
+// caller (or a StatePersister) can retain and mutate it without aliasing the
+// barrier's own state. Returns nil for a nil input.
+func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
+	if src == nil {
 		return nil
 	}
-	// Return a defensive copy.
 	cp := &SealedRootKey{
-		Strategy:           b.sealed.Strategy,
-		Version:            b.sealed.Version,
-		Epoch:              b.sealed.Epoch,
-		FailedAttempts:     b.sealed.FailedAttempts,
-		LastFailedUnixNano: b.sealed.LastFailedUnixNano,
-		KDFVersion:         b.sealed.KDFVersion,
-		ShamirThreshold:    b.sealed.ShamirThreshold,
-		ShamirTotal:        b.sealed.ShamirTotal,
-		CreatedAt:          b.sealed.CreatedAt,
+		Strategy:           src.Strategy,
+		Version:            src.Version,
+		Epoch:              src.Epoch,
+		FailedAttempts:     src.FailedAttempts,
+		LastFailedUnixNano: src.LastFailedUnixNano,
+		KDFVersion:         src.KDFVersion,
+		HKDFVersion:        src.HKDFVersion,
+		ShamirThreshold:    src.ShamirThreshold,
+		ShamirTotal:        src.ShamirTotal,
+		CreatedAt:          src.CreatedAt,
 	}
-	cp.Salt = make([]byte, len(b.sealed.Salt))
-	copy(cp.Salt, b.sealed.Salt)
-	cp.Ciphertext = make([]byte, len(b.sealed.Ciphertext))
-	copy(cp.Ciphertext, b.sealed.Ciphertext)
-	if b.sealed.Metadata != nil {
-		cp.Metadata = make([]byte, len(b.sealed.Metadata))
-		copy(cp.Metadata, b.sealed.Metadata)
+	cp.Salt = make([]byte, len(src.Salt))
+	copy(cp.Salt, src.Salt)
+	cp.Ciphertext = make([]byte, len(src.Ciphertext))
+	copy(cp.Ciphertext, src.Ciphertext)
+	if src.Metadata != nil {
+		cp.Metadata = make([]byte, len(src.Metadata))
+		copy(cp.Metadata, src.Metadata)
 	}
-	if len(b.sealed.KnownEpochs) > 0 {
-		cp.KnownEpochs = make([]uint64, len(b.sealed.KnownEpochs))
-		copy(cp.KnownEpochs, b.sealed.KnownEpochs)
+	if len(src.KnownEpochs) > 0 {
+		cp.KnownEpochs = make([]uint64, len(src.KnownEpochs))
+		copy(cp.KnownEpochs, src.KnownEpochs)
 	}
-	if b.sealed.Nonce != nil {
-		cp.Nonce = make([]byte, len(b.sealed.Nonce))
-		copy(cp.Nonce, b.sealed.Nonce)
+	if src.Nonce != nil {
+		cp.Nonce = make([]byte, len(src.Nonce))
+		copy(cp.Nonce, src.Nonce)
 	}
-	if b.sealed.HardwarePayload != nil {
-		cp.HardwarePayload = make([]byte, len(b.sealed.HardwarePayload))
-		copy(cp.HardwarePayload, b.sealed.HardwarePayload)
+	if src.HardwarePayload != nil {
+		cp.HardwarePayload = make([]byte, len(src.HardwarePayload))
+		copy(cp.HardwarePayload, src.HardwarePayload)
 	}
 	return cp
 }
@@ -1218,9 +1401,23 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return ErrInvalidSealedEpochs
 	}
 
+	// Reject a DEK-derivation layout this build does not implement rather
+	// than failing later with an opaque decryption error.
+	if sealed.HKDFVersion > currentHKDFVersion {
+		return ErrUnsupportedHKDFVersion
+	}
+
 	b.sealed = sealed
 	b.salt = sealed.Salt
 	b.epoch = sealed.Epoch
+
+	// A blob persisted before the version field existed carries 0 and must
+	// keep deriving with the v1 info layout.
+	if sealed.HKDFVersion == 0 {
+		b.hkdfVersion = HKDFV1
+	} else {
+		b.hkdfVersion = sealed.HKDFVersion
+	}
 
 	// Restore known epochs from persisted data so Unseal can re-derive
 	// DEKs for all historical epochs.
@@ -1281,17 +1478,41 @@ func (b *Barrier) backoffDelay() time.Duration {
 // ensure that two clusters sharing the same root key derive completely different
 // DEKs, preventing cross-cluster ciphertext portability.
 //
-// The keySize parameter determines the output length and is derived from the
-// configured algorithm (e.g. 16 for AES-128-GCM, 32 for AES-256-GCM).
+// The output length is the algorithm's key size (e.g. 16 for AES-128-GCM,
+// 32 for AES-256-GCM).
 //
-// Info layout: [prefix:20][deploymentID:8][epoch:8] = 36 bytes.
-func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64, keySize int) ([]byte, error) {
-	var info [hkdfInfoLen]byte
+// Info layout by version:
+//
+//	v1: [prefix:20][deploymentID:8][epoch:8]            = 36 bytes
+//	v2: [prefix:20][deploymentID:8][epoch:8][alg:1][len:1] = 38 bytes
+//
+// v2 adds algorithm/key-length domain separation; see HKDFV2. The version
+// comes from the persisted SealedRootKey so existing data keeps deriving
+// under the layout it was written with.
+func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64, alg SymmetricAlgorithm, version HKDFVersion) ([]byte, error) {
+	keySize := alg.KeySize()
+	if keySize == 0 {
+		return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedAlgorithm}
+	}
+
+	var info [hkdfInfoLenV2]byte
 	copy(info[:20], hkdfInfoPrefix)
 	binary.BigEndian.PutUint64(info[20:], deploymentID)
 	binary.BigEndian.PutUint64(info[28:], epoch)
 
-	hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:])
+	infoLen := hkdfInfoLenV1
+	switch version {
+	case 0, HKDFV1:
+		// Legacy layout; nothing to append.
+	case HKDFV2:
+		info[36] = byte(alg)
+		info[37] = byte(keySize)
+		infoLen = hkdfInfoLenV2
+	default:
+		return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedHKDFVersion}
+	}
+
+	hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:infoLen])
 	dek := make([]byte, keySize)
 	if _, err := io.ReadFull(hkdfReader, dek); err != nil {
 		return nil, &KeyDerivationError{Epoch: epoch, Err: err}
@@ -1306,7 +1527,7 @@ func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64, keySize int) ([
 // duplication across Initialize, Unseal, and Rotate.
 func (b *Barrier) deriveEpochCipher(rootKey, salt []byte, epoch uint64) ([]byte, cipher.AEAD, error) {
 	alg := b.config.Algorithm
-	dek, err := deriveDEK(rootKey, salt, b.config.DeploymentID, epoch, alg.KeySize())
+	dek, err := deriveDEK(rootKey, salt, b.config.DeploymentID, epoch, alg, b.hkdfVersion)
 	if err != nil {
 		return nil, nil, err
 	}

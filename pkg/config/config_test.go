@@ -17,6 +17,8 @@ package config
 import (
 	"errors"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // validConfig returns a Config with all required fields populated and
@@ -165,6 +167,23 @@ func TestConfig_Validate_ReplicaID(t *testing.T) {
 	})
 }
 
+func TestConfig_Validate_WitnessMaxWitnesses(t *testing.T) {
+	t.Run("negative MaxWitnesses", func(t *testing.T) {
+		c := validConfig()
+		c.Witness.MaxWitnesses = -1
+		err := c.Validate()
+		assertValidationError(t, err, "Witness.MaxWitnesses")
+	})
+
+	t.Run("zero MaxWitnesses is valid", func(t *testing.T) {
+		c := validConfig()
+		c.Witness.MaxWitnesses = 0
+		if err := c.Validate(); err != nil {
+			t.Errorf("zero MaxWitnesses should be valid, got %v", err)
+		}
+	})
+}
+
 func TestConfig_Validate_HeartbeatRTT(t *testing.T) {
 	t.Run("zero HeartbeatRTT", func(t *testing.T) {
 		c := validConfig()
@@ -280,6 +299,36 @@ func TestConfig_Validate_MaxEntrySize(t *testing.T) {
 		c.MaxEntrySize = 1
 		if err := c.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("at protocol maximum", func(t *testing.T) {
+		c := validConfig()
+		c.MaxEntrySize = uint64(proto.MaxEntrySize)
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+
+	// MaxEntrySize is the decompression ceiling on the apply path, so a
+	// value above the protocol maximum would let a compressed entry expand
+	// past anything the deserializer will accept.
+	t.Run("above protocol maximum", func(t *testing.T) {
+		c := validConfig()
+		c.MaxEntrySize = uint64(proto.MaxEntrySize) + 1
+		err := c.Validate()
+		if err == nil {
+			t.Fatal("expected error for MaxEntrySize > proto.MaxEntrySize, got nil")
+		}
+		var exceeded *MaxEntrySizeExceededError
+		if !errors.As(err, &exceeded) {
+			t.Fatalf("expected *MaxEntrySizeExceededError, got %T: %v", err, err)
+		}
+		if exceeded.Configured != uint64(proto.MaxEntrySize)+1 {
+			t.Errorf("Configured = %d, want %d", exceeded.Configured, uint64(proto.MaxEntrySize)+1)
+		}
+		if exceeded.ProtocolMaximum != uint64(proto.MaxEntrySize) {
+			t.Errorf("ProtocolMaximum = %d, want %d", exceeded.ProtocolMaximum, uint64(proto.MaxEntrySize))
 		}
 	})
 }
@@ -454,6 +503,29 @@ func TestConfig_GetCheckQuorum(t *testing.T) {
 		c := Config{CheckQuorum: BoolPtr(true)}
 		if !c.GetCheckQuorum() {
 			t.Error("GetCheckQuorum should return true when explicitly set")
+		}
+	})
+}
+
+func TestWitnessConfig_GetRequireFullReplicaMajority(t *testing.T) {
+	t.Run("nil returns true", func(t *testing.T) {
+		w := WitnessConfig{}
+		if !w.GetRequireFullReplicaMajority() {
+			t.Error("GetRequireFullReplicaMajority should return true for nil")
+		}
+	})
+
+	t.Run("explicit false returns false", func(t *testing.T) {
+		w := WitnessConfig{RequireFullReplicaMajority: BoolPtr(false)}
+		if w.GetRequireFullReplicaMajority() {
+			t.Error("GetRequireFullReplicaMajority should return false when explicitly set")
+		}
+	})
+
+	t.Run("explicit true returns true", func(t *testing.T) {
+		w := WitnessConfig{RequireFullReplicaMajority: BoolPtr(true)}
+		if !w.GetRequireFullReplicaMajority() {
+			t.Error("GetRequireFullReplicaMajority should return true when explicitly set")
 		}
 	})
 }

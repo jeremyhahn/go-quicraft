@@ -37,8 +37,12 @@ type MessageSender interface {
 	//
 	// On completion (success or failure), the implementation must
 	// deliver a SnapshotStatus message back to the sender's raft
-	// layer via the engine so the leader can transition the remote
-	// out of the snapshot state.
+	// layer via the engine, carrying the snapshot index in Hint so
+	// the status can be matched to its transfer. The status drives
+	// the leader's snapshot ack/retry wait; see the raft package's
+	// remote.snapshotDone for the full protocol. Delivery should be
+	// retried on transient failure — the message is one-shot, and
+	// losing it leaves the peer paused without a countdown armed.
 	//
 	// SendSnapshot is called from the step worker goroutine. The
 	// implementation must not block; it should launch the transfer

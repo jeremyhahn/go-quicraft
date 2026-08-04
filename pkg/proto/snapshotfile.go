@@ -25,7 +25,11 @@ type SnapshotFile struct {
 	FileSize uint64
 	// FileID is the unique identifier for this file within the snapshot.
 	FileID uint64
-	// Metadata is application-defined metadata for this file.
+	// Metadata is application-defined metadata for this file. After
+	// UnmarshalFrom, Metadata aliases the source buffer (zero-copy), like
+	// Entry.Cmd. The caller must copy if the data needs to outlive the
+	// buffer — on the receive path the buffer is pooled and is returned
+	// before the handler runs.
 	Metadata []byte
 }
 
@@ -52,7 +56,7 @@ func (sf *SnapshotFile) MarshalTo(buf []byte) (int, error) {
 
 // UnmarshalFrom reads the snapshot file from buf and returns bytes consumed.
 func (sf *SnapshotFile) UnmarshalFrom(buf []byte) (int, error) {
-	fp, n, err := getString(buf, MaxFilepathLen)
+	fp, n, err := getString(buf, MaxFilepathLen, ErrFilepathTooLong)
 	if err != nil {
 		return 0, err
 	}
@@ -65,7 +69,7 @@ func (sf *SnapshotFile) UnmarshalFrom(buf []byte) (int, error) {
 	offset += 8
 	sf.FileID = getUint64(buf[offset:])
 	offset += 8
-	md, n, err := getBytes(buf[offset:], MaxMetadataLen)
+	md, n, err := getBytes(buf[offset:], MaxMetadataLen, ErrMetadataTooLong)
 	if err != nil {
 		return 0, err
 	}

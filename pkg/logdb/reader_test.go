@@ -1931,6 +1931,11 @@ func TestLogReaderCompactLogDBErrorPropagation(t *testing.T) {
 	}
 }
 
+// TestLogReaderTermWhenLogDBReturnsEmpty is the M5 regression: an empty
+// LogDB result for an in-range index must surface as ErrUnavailable, never
+// as term 0 — Raft's "no term" sentinel — which would make followers reject
+// appends forever (as prevLogTerm) or grant votes to shorter logs (as the
+// local last-log term).
 func TestLogReaderTermWhenLogDBReturnsEmpty(t *testing.T) {
 	db := newMemLogDB()
 	const shardID, replicaID uint64 = 1, 1
@@ -1943,12 +1948,36 @@ func TestLogReaderTermWhenLogDBReturnsEmpty(t *testing.T) {
 	// Term(3) will call getRangeLocked which calls IterateEntries,
 	// which returns an empty slice (no entries in LogDB).
 	term, err := lr.Term(3)
-	if err != nil {
-		t.Fatalf("Term(3) returned error: %v", err)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Term(3) = (%d, %v), want ErrUnavailable for missing entries", term, err)
 	}
-	// Empty result from LogDB after conversion returns zero term.
 	if term != 0 {
-		t.Errorf("Term(3) = %d, want 0 for missing entries", term)
+		t.Errorf("Term(3) = %d, want 0 alongside the error", term)
+	}
+}
+
+// wrongIndexLogDB wraps memLogDB but returns an entry whose Index does not
+// match the requested range start, simulating a buggy or gapped backend.
+type wrongIndexLogDB struct {
+	*memLogDB
+}
+
+func (w *wrongIndexLogDB) IterateEntries(
+	ents []Entry, size uint64,
+	shardID, replicaID, low, high, maxSize uint64,
+) ([]Entry, uint64, error) {
+	return append(ents, Entry{Index: low + 1, Term: 7}), size, nil
+}
+
+// TestLogReaderTermRejectsMismatchedIndex verifies the defensive guard in
+// termLocked: a backend result whose index does not match the request must
+// surface as ErrUnavailable, never as another entry's term.
+func TestLogReaderTermRejectsMismatchedIndex(t *testing.T) {
+	lr := NewLogReader(1, 1, &wrongIndexLogDB{newMemLogDB()})
+	mustSetRange(t, lr, 1, 5)
+
+	if _, err := lr.Term(3); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Term(3) = %v, want ErrUnavailable for mismatched entry index", err)
 	}
 }
 
@@ -3333,5 +3362,213 @@ func TestLogReaderSnapshotIsSafeForConcurrentRead(t *testing.T) {
 	}
 	for i := 0; i < 10; i++ {
 		<-done
+	}
+}
+
+// TestLogReaderTermCacheInvalidatedOnTruncatingAppend covers the follower
+// conflict-truncation path: entries 1..10 at term 5 are replaced from index 6
+// onward by entries 6..8 at term 6. Before the termBuf trimFrom fix, the ring
+// still held the superseded (7,5)/(8,5)/(9,5)/(10,5) pairs and termLocked —
+// which consults termBuf ahead of the range check — served them, corrupting
+// matchTerm, the conflict hint, and (via Compact) markerTerm.
+func TestLogReaderTermCacheInvalidatedOnTruncatingAppend(t *testing.T) {
+	lr := NewLogReader(1, 1, nil)
+
+	first := make([]proto.Entry, 0, 10)
+	for i := uint64(1); i <= 10; i++ {
+		first = append(first, proto.Entry{Index: i, Term: 5})
+	}
+	mustAppend(t, lr, first)
+
+	second := []proto.Entry{
+		{Index: 6, Term: 6},
+		{Index: 7, Term: 6},
+		{Index: 8, Term: 6},
+	}
+	mustAppend(t, lr, second)
+
+	lo, hi := lr.IndexRange()
+	if lo != 1 || hi != 8 {
+		t.Fatalf("IndexRange() = (%d, %d), want (1, 8)", lo, hi)
+	}
+
+	for idx := uint64(1); idx <= 5; idx++ {
+		term, err := lr.Term(idx)
+		if err != nil {
+			t.Fatalf("Term(%d): unexpected error %v", idx, err)
+		}
+		if term != 5 {
+			t.Errorf("Term(%d) = %d, want 5", idx, term)
+		}
+	}
+	for idx := uint64(6); idx <= 8; idx++ {
+		term, err := lr.Term(idx)
+		if err != nil {
+			t.Fatalf("Term(%d): unexpected error %v", idx, err)
+		}
+		if term != 6 {
+			t.Errorf("Term(%d) = %d, want 6 (truncated entry must not serve the stale term)", idx, term)
+		}
+	}
+	for _, idx := range []uint64{9, 10} {
+		term, err := lr.Term(idx)
+		if !errors.Is(err, ErrUnavailable) {
+			t.Errorf("Term(%d) = (%d, %v), want ErrUnavailable (entry no longer exists)", idx, term, err)
+		}
+	}
+}
+
+// TestLogReaderCompactAfterTruncatingAppendUsesNewTerm pins the downstream
+// consequence of the stale term cache: Compact reads termLocked(index) to set
+// markerTerm, which is later served as prevLogTerm and as the last-log term for
+// isUpToDate. A stale term there is an Election Safety hazard.
+func TestLogReaderCompactAfterTruncatingAppendUsesNewTerm(t *testing.T) {
+	lr := NewLogReader(1, 1, nil)
+
+	first := make([]proto.Entry, 0, 10)
+	for i := uint64(1); i <= 10; i++ {
+		first = append(first, proto.Entry{Index: i, Term: 5})
+	}
+	mustAppend(t, lr, first)
+	mustAppend(t, lr, []proto.Entry{
+		{Index: 6, Term: 6},
+		{Index: 7, Term: 6},
+		{Index: 8, Term: 6},
+	})
+
+	if err := lr.Compact(7); err != nil {
+		t.Fatalf("Compact(7): %v", err)
+	}
+	term, err := lr.Term(7)
+	if err != nil {
+		t.Fatalf("Term(7) after Compact: %v", err)
+	}
+	if term != 6 {
+		t.Errorf("markerTerm after Compact(7) = %d, want 6", term)
+	}
+	if lo, hi := lr.IndexRange(); lo != 8 || hi != 8 {
+		t.Errorf("IndexRange() after Compact(7) = (%d, %d), want (8, 8)", lo, hi)
+	}
+}
+
+// TestLogReaderTruncatingAppendPurgesEntryCache verifies the entry cache is
+// truncated alongside the term cache so GetRange cannot serve a superseded
+// entry body for a re-written index.
+func TestLogReaderTruncatingAppendPurgesEntryCache(t *testing.T) {
+	lr := NewLogReader(1, 1, nil)
+
+	mustAppend(t, lr, []proto.Entry{
+		{Index: 1, Term: 5, Cmd: []byte("old1")},
+		{Index: 2, Term: 5, Cmd: []byte("old2")},
+		{Index: 3, Term: 5, Cmd: []byte("old3")},
+	})
+	mustAppend(t, lr, []proto.Entry{
+		{Index: 2, Term: 6, Cmd: []byte("new2")},
+	})
+
+	ents, err := lr.GetRange(1, 3, 0)
+	if err != nil {
+		t.Fatalf("GetRange(1, 3): %v", err)
+	}
+	if len(ents) != 2 {
+		t.Fatalf("GetRange(1, 3) returned %d entries, want 2", len(ents))
+	}
+	if string(ents[1].Cmd) != "new2" || ents[1].Term != 6 {
+		t.Errorf("entry 2 = %q term %d, want %q term 6", ents[1].Cmd, ents[1].Term, "new2")
+	}
+	if _, err := lr.GetRange(3, 4, 0); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("GetRange(3, 4) error = %v, want ErrUnavailable", err)
+	}
+	if _, ok := lr.entryCache[3]; ok {
+		t.Error("entryCache still holds the truncated entry at index 3")
+	}
+}
+
+// TestTermRingBufferTrimFrom exercises trimFrom directly across the
+// below-range, mid-range, above-range and empty-buffer cases.
+func TestTermRingBufferTrimFrom(t *testing.T) {
+	r := newTermRingBuffer(16)
+	for i := uint64(1); i <= 8; i++ {
+		r.append(i, i*10)
+	}
+
+	r.trimFrom(20) // Above range: no-op.
+	if r.len() != 8 {
+		t.Fatalf("len after trimFrom(20) = %d, want 8", r.len())
+	}
+
+	r.trimFrom(5)
+	if r.len() != 4 {
+		t.Fatalf("len after trimFrom(5) = %d, want 4", r.len())
+	}
+	if _, ok := r.lookup(5); ok {
+		t.Error("lookup(5) succeeded after trimFrom(5)")
+	}
+	if term, ok := r.lookup(4); !ok || term != 40 {
+		t.Errorf("lookup(4) = (%d, %v), want (40, true)", term, ok)
+	}
+
+	r.trimFrom(1) // Below range: removes everything.
+	if r.len() != 0 {
+		t.Fatalf("len after trimFrom(1) = %d, want 0", r.len())
+	}
+	r.trimFrom(1) // Empty buffer: no-op, must not panic.
+}
+
+// TestTermRingBufferAppendRepairsNonMonotonicIndex asserts that appending an
+// index at or below the tail repairs the ring (drops the superseded suffix)
+// instead of corrupting the monotonic order that lookup binary-searches.
+func TestTermRingBufferAppendRepairsNonMonotonicIndex(t *testing.T) {
+	r := newTermRingBuffer(16)
+	for i := uint64(1); i <= 10; i++ {
+		r.append(i, 5)
+	}
+
+	r.append(6, 6)
+	if r.len() != 6 {
+		t.Fatalf("len after repairing append(6) = %d, want 6", r.len())
+	}
+	if term, ok := r.lookup(6); !ok || term != 6 {
+		t.Errorf("lookup(6) = (%d, %v), want (6, true)", term, ok)
+	}
+	for _, idx := range []uint64{7, 8, 9, 10} {
+		if term, ok := r.lookup(idx); ok {
+			t.Errorf("lookup(%d) = (%d, true), want miss after repair", idx, term)
+		}
+	}
+
+	// Re-appending the same index repeatedly must stay stable.
+	r.append(6, 7)
+	if r.len() != 6 {
+		t.Fatalf("len after second append(6) = %d, want 6", r.len())
+	}
+	if term, ok := r.lookup(6); !ok || term != 7 {
+		t.Errorf("lookup(6) = (%d, %v), want (7, true)", term, ok)
+	}
+}
+
+// TestTermRingBufferAppendRepairAfterWraparound exercises the repairing
+// append on a wrapped ring, where head is non-zero.
+func TestTermRingBufferAppendRepairAfterWraparound(t *testing.T) {
+	r := newTermRingBuffer(4)
+	for i := uint64(1); i <= 6; i++ {
+		r.append(i, 5) // Wraps; retains 3..6.
+	}
+	if r.head == 0 {
+		t.Fatalf("expected a wrapped ring, head = 0")
+	}
+
+	r.append(5, 9)
+	if r.len() != 3 {
+		t.Fatalf("len after repairing append(5) = %d, want 3", r.len())
+	}
+	if term, ok := r.lookup(5); !ok || term != 9 {
+		t.Errorf("lookup(5) = (%d, %v), want (9, true)", term, ok)
+	}
+	if _, ok := r.lookup(6); ok {
+		t.Error("lookup(6) succeeded after repairing append(5)")
+	}
+	if term, ok := r.lookup(3); !ok || term != 5 {
+		t.Errorf("lookup(3) = (%d, %v), want (5, true)", term, ok)
 	}
 }

@@ -15,6 +15,7 @@
 package dragonboat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -87,7 +88,10 @@ func TestSentinelMappingsMatchQuicraft(t *testing.T) {
 		// quicraft errors. They are tested via translateError instead.
 		{"ErrInvalidOperation", ErrInvalidOperation, quicraft.ErrInvalidOperation},
 		{"ErrInvalidRange", ErrInvalidRange, quicraft.ErrInvalidRange},
-		{"ErrReplicaRemoved", ErrReplicaRemoved, quicraft.ErrReplicaNotFound},
+		// ErrReplicaRemoved is a distinct sentinel (permanent removal
+		// guard) and intentionally does NOT alias quicraft's
+		// ErrReplicaNotFound; the alias is ErrReplicaNotFound.
+		{"ErrReplicaNotFound", ErrReplicaNotFound, quicraft.ErrReplicaNotFound},
 	}
 
 	for _, tt := range tests {
@@ -187,8 +191,8 @@ func TestTranslateError_MapsQuicraftToDragonboat(t *testing.T) {
 		{"InvalidConfig", quicraft.ErrInvalidConfig, ErrInvalidShardSettings},
 		{"InvalidOperation", quicraft.ErrInvalidOperation, ErrInvalidOperation},
 		{"InvalidRange", quicraft.ErrInvalidRange, ErrInvalidRange},
-		{"ReplicaNotFound", quicraft.ErrReplicaNotFound, ErrReplicaRemoved},
-		{"NotLeader", quicraft.ErrNotLeader, ErrNotLeader},
+		{"ReplicaNotFound", quicraft.ErrReplicaNotFound, ErrReplicaNotFound},
+		{"NotLeader", quicraft.ErrNotLeader, ErrShardNotReady},
 		{"StaleConfigChange", quicraft.ErrStaleConfigChange, ErrStaleConfigChange},
 		{"SnapshotNotFound", quicraft.ErrSnapshotNotFound, ErrSnapshotNotFound},
 		{"SnapshotInProgress", quicraft.ErrSnapshotInProgress, ErrSnapshotInProgress},
@@ -199,7 +203,7 @@ func TestTranslateError_MapsQuicraftToDragonboat(t *testing.T) {
 		{"ShardFailed", quicraft.ErrShardFailed, ErrShardClosed},
 		{"Busy", quicraft.ErrBusy, ErrSystemBusy},
 		{"Draining", quicraft.ErrDraining, ErrSystemBusy},
-		{"Dropped", quicraft.ErrDropped, ErrSystemBusy},
+		{"Dropped", quicraft.ErrDropped, ErrShardNotReady},
 		{"Stopped", quicraft.ErrStopped, ErrShardClosed},
 		{"SessionLimitExceeded", quicraft.ErrSessionLimitExceeded, ErrSystemBusy},
 		{"LogDBWrite", quicraft.ErrLogDBWrite, ErrSystemBusy},
@@ -241,11 +245,48 @@ func TestTranslateError_WrappedQuicraftErrors(t *testing.T) {
 	}
 }
 
-func TestTranslateError_UnknownErrorPassedThrough(t *testing.T) {
+func TestTranslateError_UnknownErrorWrappedInAdapterError(t *testing.T) {
 	unknown := errors.New("unknown error")
 	result := translateError(unknown)
-	if result != unknown {
-		t.Errorf("expected unknown error to pass through unchanged, got %v", result)
+
+	var ae *AdapterError
+	if !errors.As(result, &ae) {
+		t.Fatalf("expected *AdapterError, got %T (%v)", result, result)
+	}
+	if !errors.Is(result, unknown) {
+		t.Error("AdapterError must keep the original error reachable via errors.Is")
+	}
+}
+
+func TestTranslateError_AdapterSentinelNotReWrapped(t *testing.T) {
+	for _, sentinel := range []error{ErrInvalidTarget, ErrDeadlineNotSet, ErrLogDBNotCreatedOrClosed} {
+		if got := translateError(sentinel); got != sentinel {
+			t.Errorf("translateError(%v) = %v, want the sentinel unchanged", sentinel, got)
+		}
+	}
+}
+
+func TestTranslateError_InvalidMemberErrorMapsToInvalidTarget(t *testing.T) {
+	err := &quicraft.InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"}
+	if got := translateError(err); !errors.Is(got, ErrInvalidTarget) {
+		t.Errorf("translateError(InvalidMemberError) = %v, want ErrInvalidTarget", got)
+	}
+}
+
+func TestTranslateError_ContextErrors(t *testing.T) {
+	if got := translateError(context.DeadlineExceeded); !errors.Is(got, ErrTimeout) {
+		t.Errorf("translateError(DeadlineExceeded) = %v, want ErrTimeout", got)
+	}
+	if got := translateError(context.Canceled); !errors.Is(got, ErrCanceled) {
+		t.Errorf("translateError(Canceled) = %v, want ErrCanceled", got)
+	}
+}
+
+func TestIsTempError_NotLeaderIsTemporary(t *testing.T) {
+	// A raw quicraft not-leader error reaching a migrated retry loop must
+	// not be treated as fatal: an election is a routine, temporary state.
+	if !IsTempError(ErrNotLeader) {
+		t.Error("IsTempError(ErrNotLeader) = false, want true")
 	}
 }
 
@@ -437,7 +478,7 @@ func TestTranslateError_PackageLevelMappings(t *testing.T) {
 		t.Fatal("errorMappings package-level variable must not be nil")
 	}
 
-	const expectedCount = 37
+	const expectedCount = 39
 	if len(errorMappings) != expectedCount {
 		t.Errorf("errorMappings has %d entries, want %d", len(errorMappings), expectedCount)
 	}

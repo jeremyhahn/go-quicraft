@@ -61,6 +61,60 @@ var (
 	// exceeded the configured maximum disk usage threshold.
 	ErrDiskFull = errors.New("waldb: disk full")
 
+	// ErrCmdTooLarge is returned when a single entry's Cmd exceeds maxCmdLen.
+	// The write path enforces it so the WAL never contains an entry that
+	// recovery would reject, keeping the two sides of the format symmetric;
+	// during replay it is fatal (wrapped in RecoveryError) because a stored
+	// oversized length can only be corruption.
+	ErrCmdTooLarge = errors.New("waldb: entry Cmd exceeds maximum entry size")
+
+	// ErrTruncatedEntryRecord is returned when WAL replay finds an entry
+	// batch record that ends mid-entry. The batch was written as a single
+	// CRC-protected record, so a mid-record decode failure is corruption
+	// that CRC did not explain; skipping the remainder would leave a hole
+	// in the replayed log that reads would serve as a silently shortened
+	// range (Log Matching violation), so recovery fails instead.
+	ErrTruncatedEntryRecord = errors.New("waldb: entry batch record truncated mid-entry")
+
+	// ErrTruncatedStateRecord is returned when WAL replay finds a hard-state
+	// record whose length does not match the fixed on-disk layout. It is
+	// fatal: skipping the record lets an OLDER state record win
+	// last-writer-wins replay, regressing Term/Vote so the node can vote
+	// twice in one term (Election Safety violation).
+	ErrTruncatedStateRecord = errors.New("waldb: state record malformed")
+
+	// ErrTruncatedSnapshotRecord is returned when WAL replay cannot parse a
+	// snapshot record: a short header, a filepath length past the record end,
+	// a missing or malformed membership section, or trailing bytes. It is
+	// fatal because a skipped snapshot record boots the node with empty
+	// membership and no snapshot metadata.
+	ErrTruncatedSnapshotRecord = errors.New("waldb: snapshot record malformed")
+
+	// ErrTruncatedBootstrapRecord is returned when WAL replay cannot parse a
+	// bootstrap record. Fatal: the record already passed its chunk CRC, so a
+	// parse failure is corruption or a format skew.
+	ErrTruncatedBootstrapRecord = errors.New("waldb: bootstrap record malformed")
+
+	// ErrTruncatedCompactionRecord is returned when WAL replay finds a
+	// compaction marker whose length does not match the fixed on-disk layout.
+	// Fatal: a lost marker resets compactedTo to 0, so reads below the true
+	// floor return empty instead of ErrCompacted.
+	ErrTruncatedCompactionRecord = errors.New("waldb: compaction record malformed")
+
+	// ErrTruncatedRemoveNodeRecord is returned when WAL replay finds a
+	// remove-node tombstone whose length does not match the fixed on-disk
+	// layout. Fatal: a skipped tombstone resurrects a removed replica.
+	ErrTruncatedRemoveNodeRecord = errors.New("waldb: remove-node record malformed")
+
+	// ErrUnknownPayloadType is returned when WAL replay finds a record whose
+	// payload type byte is not written by this package. Payload types are
+	// CRC-protected, so an unknown type is corruption or a configuration
+	// skew — most importantly a KEYED WAL opened with barrier==nil, where
+	// every ciphertext record's leading epoch byte decodes as type 0x00.
+	// Skipping such records booted the node as an empty replica with no
+	// memory of prior votes, so replay fails-stop instead.
+	ErrUnknownPayloadType = errors.New("waldb: unknown WAL record payload type")
+
 	// ErrDBPoisoned is returned by every write operation after an fsync
 	// failure has fail-stopped the database. Once fdatasync fails, the
 	// kernel may mark dirty pages clean without persisting them
@@ -189,9 +243,15 @@ func (e *BatchWriteError) Error() string {
 	return msg
 }
 
-// Unwrap returns the original write error.
-func (e *BatchWriteError) Unwrap() error {
-	return e.WriteErr
+// Unwrap returns the original write error followed by every rollback
+// failure, so errors.Is/errors.As traverse the full chain — in particular,
+// a rollback that fail-stopped the DB surfaces ErrDBPoisoned to callers of
+// SaveState via one of the DiscardErrors.
+func (e *BatchWriteError) Unwrap() []error {
+	errs := make([]error, 0, 1+len(e.DiscardErrors))
+	errs = append(errs, e.WriteErr)
+	errs = append(errs, e.DiscardErrors...)
+	return errs
 }
 
 // DiskUsageError is returned when the platform disk usage query fails.

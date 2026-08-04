@@ -2657,10 +2657,19 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	// outbound cached so the second call compares against it.
 	t1.evictStaleOutboundOnRecv(t2Addr, 1, outbound)
 
+	// Drop the cache entry (without forgetting the peer epoch) so
+	// dialConnection produces a DISTINCT second connection: its dial-race
+	// re-check would otherwise reuse the cached live outbound.
+	t1.connMu.Lock()
+	delete(t1.conns, t2Addr)
+	t1.connMu.Unlock()
 	conn2, dialErr := t1.dialConnection(t2Addr)
 	if dialErr != nil {
 		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
 		return
+	}
+	if conn2 == outbound {
+		t.Fatal("expected a distinct second connection after cache removal")
 	}
 	t1.connMu.Lock()
 	t1.conns[t2Addr] = outbound
@@ -3676,3 +3685,51 @@ func TestDialConnection_ShutdownContextCanceled(t *testing.T) {
 // TestReceiveSnapshot_ConcurrencyLimitDrop verifies that when the
 // concurrency semaphore is full, additional snapshot receives are
 // silently dropped.
+
+// ---------------------------------------------------------------------------
+// dialConnection dial-race re-check (conn.go)
+// ---------------------------------------------------------------------------
+
+// TestDialConnection_ReusesCachedWinner verifies the dial-race fix: a dial
+// that completes after another dial already populated the connection cache
+// (singleflight only coalesces OVERLAPPING dials) must close its own
+// connection and return the cached winner instead of overwriting it — the
+// overwritten connection would otherwise stay alive on keep-alives forever,
+// with its pre-opened streams diverging from the pool's bookkeeping.
+func TestDialConnection_ReusesCachedWinner(t *testing.T) {
+	t1, t2, _, _, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	t2Addr := t2.Addr().String()
+
+	winner, err := t1.getConnection(t2Addr)
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	// A direct dial simulates the loser of the race: the cache already
+	// holds a live connection when its insert runs.
+	got, err := t1.dialConnection(t2Addr)
+	if err != nil {
+		t.Fatalf("dialConnection failed: %v", err)
+	}
+	if got != winner {
+		t.Fatal("losing dial must return the cached winner, not its own connection")
+	}
+	if n := t1.ConnectionCount(); n != 1 {
+		t.Fatalf("expected exactly 1 cached connection, got %d", n)
+	}
+
+	// The winner must still be alive and cached.
+	t1.connMu.RLock()
+	cached := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
+	if cached != winner {
+		t.Fatal("cache no longer holds the winning connection")
+	}
+	select {
+	case <-winner.Context().Done():
+		t.Fatal("winning connection was closed by the losing dial")
+	default:
+	}
+}

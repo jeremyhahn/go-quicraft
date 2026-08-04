@@ -75,7 +75,8 @@ func TestOpenEmptyDir(t *testing.T) {
 	}
 }
 
-// TestDoubleClose verifies closing a DB twice returns ErrClosed.
+// TestDoubleClose verifies Close is idempotent: a redundant second call (the
+// common `defer db.Close()` plus an explicit Close) must not surface an error.
 func TestDoubleClose(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true))
@@ -85,8 +86,8 @@ func TestDoubleClose(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
-	if err := db.Close(); err != logdb.ErrClosed {
-		t.Fatalf("second Close: got %v, want %v", err, logdb.ErrClosed)
+	if err := db.Close(); err != nil {
+		t.Fatalf("second Close: got %v, want nil (Close is idempotent)", err)
 	}
 }
 
@@ -204,7 +205,8 @@ func TestSaveAndGetEntriesWithCmd(t *testing.T) {
 }
 
 // TestGetEntriesNonExistentNode verifies GetEntries returns empty for
-// a node that has never been written to.
+// a node that has never been written to (lookup semantics: absence is not
+// an error, unlike the IterateEntries interface contract).
 func TestGetEntriesNonExistentNode(t *testing.T) {
 	db := openTestDB(t)
 
@@ -1440,8 +1442,8 @@ func TestIterateEntriesNonExistentNode(t *testing.T) {
 	db := openTestDB(t)
 
 	got, size, err := db.IterateEntries(nil, 0, 99, 99, 1, 10, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries: %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("IterateEntries: got %v, want ErrUnavailable", err)
 	}
 	if got != nil {
 		t.Fatalf("IterateEntries: got %d entries, want nil", len(got))
@@ -1902,7 +1904,9 @@ func TestSegmentRotationRecovery(t *testing.T) {
 // makeMembership creates a populated logdb.Membership for testing.
 func makeMembership() logdb.Membership {
 	return logdb.Membership{
-		ConfigChangeID: 42,
+		ConfigChangeID:             42,
+		MaxWitnesses:               7,
+		RequireFullReplicaMajority: true,
 		Addresses: map[uint64]string{
 			1: "10.0.0.1:9001",
 			2: "10.0.0.2:9001",
@@ -2002,6 +2006,12 @@ func TestSnapshotMembershipPersistence(t *testing.T) {
 	// Verify all membership fields roundtrip.
 	if got.Membership.ConfigChangeID != 42 {
 		t.Fatalf("ConfigChangeID=%d, want 42", got.Membership.ConfigChangeID)
+	}
+	if got.Membership.MaxWitnesses != 7 {
+		t.Fatalf("MaxWitnesses=%d, want 7", got.Membership.MaxWitnesses)
+	}
+	if !got.Membership.RequireFullReplicaMajority {
+		t.Fatal("RequireFullReplicaMajority not persisted")
 	}
 	if len(got.Membership.Addresses) != 3 {
 		t.Fatalf("Addresses: got %d, want 3", len(got.Membership.Addresses))
@@ -2366,9 +2376,13 @@ func TestMembershipSizeHelper(t *testing.T) {
 		ConfigChangeID: 42,
 		// All nil maps.
 	}
-	// ConfigChangeID(8) + 4 addr maps * 4 bytes each = 8 + 16 = 24.
-	if got := membershipSize(m); got != 24 {
-		t.Fatalf("membershipSize(empty)=%d, want 24", got)
+	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1) +
+	// 4 map count headers * 4 bytes each = 18 + 16 = 34.
+	if got := membershipSize(m); got != 34 {
+		t.Fatalf("membershipSize(empty)=%d, want 34", got)
+	}
+	if got := membershipSize(m); got != minMembershipSize {
+		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize=%d", got, minMembershipSize)
 	}
 }
 
@@ -2420,11 +2434,12 @@ func TestUnmarshalRemovedMapTruncated(t *testing.T) {
 
 // --- WAL replay bounds and skip logging tests ---
 
-// TestReplayEntriesCmdLenExceedsMax verifies that replayEntries skips
-// entries with a cmdLen exceeding the maxCmdLen constant. Valid entries
-// before the oversized one must still be applied.
+// TestReplayEntriesCmdLenExceedsMax verifies that replayEntries aborts
+// recovery with ErrCmdTooLarge when an entry's cmdLen exceeds maxCmdLen:
+// the batch record's CRC already passed, so an oversized length is
+// corruption and a soft skip would leave a silent hole in the log.
 func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
-	t.Run("single oversized entry is skipped", func(t *testing.T) {
+	t.Run("single oversized entry is fatal", func(t *testing.T) {
 		s := &walShard{
 			indexes:       make(map[nodeKey]*index),
 			entries:       make(map[nodeKey]map[uint64]logdb.Entry),
@@ -2445,9 +2460,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(buf[32:], 0)               // entryType
 		binary.LittleEndian.PutUint32(buf[72:], oversizedCmdLen) // cmdLen
 
-		skipped := s.replayEntries(buf, 0)
-		if skipped != 1 {
-			t.Fatalf("replayEntries skipped=%d, want 1", skipped)
+		if err := s.replayEntries(buf, 0); !errors.Is(err, ErrCmdTooLarge) {
+			t.Fatalf("replayEntries = %v, want ErrCmdTooLarge", err)
 		}
 
 		// No entries should have been stored.
@@ -2457,7 +2471,7 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		}
 	})
 
-	t.Run("valid entries before oversized entry are applied", func(t *testing.T) {
+	t.Run("oversized entry after valid entries is still fatal", func(t *testing.T) {
 		s := &walShard{
 			indexes:       make(map[nodeKey]*index),
 			entries:       make(map[nodeKey]map[uint64]logdb.Entry),
@@ -2492,27 +2506,15 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(totalBuf[pos+32:], 0)               // entryType
 		binary.LittleEndian.PutUint32(totalBuf[pos+72:], oversizedCmdLen) // cmdLen
 
-		skipped := s.replayEntries(totalBuf, 0)
-		if skipped != 1 {
-			t.Fatalf("replayEntries skipped=%d, want 1", skipped)
+		if err := s.replayEntries(totalBuf, 0); !errors.Is(err, ErrCmdTooLarge) {
+			t.Fatalf("replayEntries = %v, want ErrCmdTooLarge", err)
 		}
 
-		// The valid entry must be present.
+		// The oversized entry must not be present. (The valid entry
+		// decoded before the abort may be present, but the caller fails
+		// the whole recovery, so the shard's state is discarded.)
 		key := nodeKey{ShardID: 1, ReplicaID: 1}
-		nodeEntries := s.entries[key]
-		if nodeEntries == nil {
-			t.Fatal("expected entries map for node, got nil")
-		}
-		e, ok := nodeEntries[10]
-		if !ok {
-			t.Fatal("expected entry at index 10")
-		}
-		if string(e.Cmd) != "abc" {
-			t.Fatalf("entry cmd = %q, want %q", e.Cmd, "abc")
-		}
-
-		// The oversized entry must not be present.
-		if _, ok := nodeEntries[11]; ok {
+		if _, ok := s.entries[key][11]; ok {
 			t.Fatal("oversized entry at index 11 should not be present")
 		}
 	})
@@ -2548,9 +2550,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint32(buf[72:], cmdLen) // cmdLen
 		copy(buf[76:], cmd)
 
-		skipped := s.replayEntries(buf, 0)
-		if skipped != 0 {
-			t.Fatalf("replayEntries skipped=%d, want 0 for valid entry", skipped)
+		if err := s.replayEntries(buf, 0); err != nil {
+			t.Fatalf("replayEntries = %v, want nil for valid entry", err)
 		}
 
 		key := nodeKey{ShardID: 1, ReplicaID: 1}
@@ -2597,9 +2598,13 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 	}
 }
 
-// TestReplayRecordSkipsUnknownPayloadType verifies replayRecord reports
-// a skip for unrecognized payload type bytes.
-func TestReplayRecordSkipsUnknownPayloadType(t *testing.T) {
+// TestReplayRecordRejectsUnknownPayloadType verifies an unrecognized payload
+// type byte is fatal. Payload types are written only by this package and are
+// CRC-protected, so an unknown one is corruption or a config skew — most often
+// a keyed WAL opened with barrier==nil, where every ciphertext record's leading
+// epoch byte decodes as type 0x00. Skipping them booted the node as an empty
+// replica with no memory of prior votes.
+func TestReplayRecordRejectsUnknownPayloadType(t *testing.T) {
 	s := &walShard{
 		indexes:       make(map[nodeKey]*index),
 		entries:       make(map[nodeKey]map[uint64]logdb.Entry),
@@ -2611,21 +2616,20 @@ func TestReplayRecordSkipsUnknownPayloadType(t *testing.T) {
 	}
 
 	// 0xFF is not a valid payload type.
-	skipped, reason, err := s.replayRecord([]byte{0xFF}, 0)
-	if err != nil {
-		t.Fatalf("err=%v, want nil", err)
+	if _, _, err := s.replayRecord([]byte{0xFF}, 0); !errors.Is(err, ErrUnknownPayloadType) {
+		t.Fatalf("err=%v, want ErrUnknownPayloadType", err)
 	}
-	if skipped != 1 {
-		t.Fatalf("skipped=%d, want 1", skipped)
-	}
-	if reason != "unknown payload type" {
-		t.Fatalf("reason=%q, want %q", reason, "unknown payload type")
+
+	// 0x00 is the byte a keyed record decodes to when no barrier is set.
+	if _, _, err := s.replayRecord([]byte{0x00, 0x01, 0x02}, 0); !errors.Is(err, ErrUnknownPayloadType) {
+		t.Fatalf("err=%v for type 0x00, want ErrUnknownPayloadType", err)
 	}
 }
 
-// TestReplayRecordSkipsTruncatedState verifies replayRecord reports a
-// skip for a state record that is too short.
-func TestReplayRecordSkipsTruncatedState(t *testing.T) {
+// TestReplayRecordRejectsTruncatedState verifies a short state record is
+// fatal. Skipping it would let an OLDER state record win last-writer-wins
+// replay, regressing Term/Vote and allowing a double vote in one term.
+func TestReplayRecordRejectsTruncatedState(t *testing.T) {
 	s := &walShard{
 		indexes:       make(map[nodeKey]*index),
 		entries:       make(map[nodeKey]map[uint64]logdb.Entry),
@@ -2638,15 +2642,11 @@ func TestReplayRecordSkipsTruncatedState(t *testing.T) {
 
 	// State payload type + insufficient data.
 	rec := []byte{payloadTypeState, 0x00}
-	skipped, reason, err := s.replayRecord(rec, 0)
-	if err != nil {
-		t.Fatalf("err=%v, want nil", err)
+	if _, _, err := s.replayRecord(rec, 0); !errors.Is(err, ErrTruncatedStateRecord) {
+		t.Fatalf("err=%v, want ErrTruncatedStateRecord", err)
 	}
-	if skipped != 1 {
-		t.Fatalf("skipped=%d, want 1", skipped)
-	}
-	if reason != "truncated state record" {
-		t.Fatalf("reason=%q, want %q", reason, "truncated state record")
+	if len(s.states) != 0 {
+		t.Fatalf("truncated state record was stored: %v", s.states)
 	}
 }
 
@@ -2776,9 +2776,8 @@ func TestReplayEntriesCmdLenBoundaryOverflow(t *testing.T) {
 	binary.LittleEndian.PutUint64(buf[32:], 0)          // entryType
 	binary.LittleEndian.PutUint32(buf[72:], 0xFFFFFFFF) // cmdLen = MaxUint32
 
-	skipped := s.replayEntries(buf, 0)
-	if skipped != 1 {
-		t.Fatalf("replayEntries skipped=%d, want 1 for MaxUint32 cmdLen", skipped)
+	if err := s.replayEntries(buf, 0); !errors.Is(err, ErrCmdTooLarge) {
+		t.Fatalf("replayEntries = %v, want ErrCmdTooLarge for MaxUint32 cmdLen", err)
 	}
 }
 
@@ -4063,7 +4062,7 @@ func TestUnmarshalRemovedMapRejectsHugeCount(t *testing.T) {
 
 // TestReplayBootstrapRejectsHugeNumAddrs crafts a bootstrap record with a valid
 // fixed header but a NumAddrs prefix near uint32 max and no address bytes. The
-// replay must reject it (return false) without attempting a giant allocation.
+// replay must reject it as corruption without attempting a giant allocation.
 func TestReplayBootstrapRejectsHugeNumAddrs(t *testing.T) {
 	data := make([]byte, bootstrapRecordBaseSize)
 	binary.LittleEndian.PutUint64(data[0:], 7)  // ShardID
@@ -4075,8 +4074,8 @@ func TestReplayBootstrapRejectsHugeNumAddrs(t *testing.T) {
 	s := &walShard{
 		bootstraps: make(map[nodeKey]logdb.Bootstrap),
 	}
-	if ok := s.replayBootstrap(data, 1); ok {
-		t.Fatal("expected replayBootstrap to reject huge NumAddrs as corruption")
+	if err := s.replayBootstrap(data, 1); !errors.Is(err, ErrTruncatedBootstrapRecord) {
+		t.Fatalf("replayBootstrap error = %v, want ErrTruncatedBootstrapRecord", err)
 	}
 	if len(s.bootstraps) != 0 {
 		t.Fatalf("no bootstrap should have been recorded, got %d", len(s.bootstraps))

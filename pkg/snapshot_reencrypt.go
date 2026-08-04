@@ -4,23 +4,76 @@
 package quicraft
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
+
+// snapshotFrameEpochs scans the framed snapshot ciphertext at src and returns
+// the distinct epochs embedded in the frames' headers, in first-seen order,
+// without decrypting anything. Each frame is [4-byte LE length][seal
+// ciphertext], and the seal wire format places the epoch as a big-endian
+// uint64 in the ciphertext's first 8 bytes explicitly so it can be identified
+// without decryption (see seal.Barrier encryptLocked).
+//
+// The scan is best-effort: on a malformed or truncated frame it returns the
+// epochs collected so far together with the error. Callers that only need the
+// epochs for in-flight pinning should pin what was found and proceed — the
+// authoritative frame validation (and the caller-visible error) belongs to
+// decryptSnapshotFrames.
+func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
+	var frameLenBuf [4]byte
+	var epochBuf [8]byte
+	seen := make(map[uint64]struct{})
+	var epochs []uint64
+	for {
+		if _, err := io.ReadFull(src, frameLenBuf[:]); err != nil {
+			if err == io.EOF {
+				return epochs, nil
+			}
+			return epochs, err
+		}
+		frameLen := binary.LittleEndian.Uint32(frameLenBuf[:])
+		if frameLen > maxSnapshotFrameLen || frameLen < uint32(len(epochBuf)) {
+			return epochs, ErrSnapshotCorrupt
+		}
+		if _, err := io.ReadFull(src, epochBuf[:]); err != nil {
+			return epochs, err
+		}
+		epoch := binary.BigEndian.Uint64(epochBuf[:])
+		if _, ok := seen[epoch]; !ok {
+			seen[epoch] = struct{}{}
+			epochs = append(epochs, epoch)
+		}
+		if _, err := src.Seek(int64(frameLen)-int64(len(epochBuf)), io.SeekCurrent); err != nil {
+			return epochs, err
+		}
+	}
+}
 
 // ReencryptSnapshotFile re-encrypts the snapshot data file at srcPath into
 // dstPath: every frame is decrypted under srcBarrier and re-encrypted under
 // dstBarrier, streamed through an in-memory pipe so a large snapshot never
 // loads fully into memory and its plaintext never lands on disk. The write is
 // atomic and crash-safe — output goes to a temporary file in dstPath's
-// directory, is fsynced, then renamed over dstPath; on any failure the temp
-// file is removed and srcPath/dstPath are left untouched.
+// directory, is fsynced, then renamed over dstPath, and the destination
+// directory chain (every directory the initial MkdirAll may have created,
+// plus the rename's directory entry) is fsynced before success is reported;
+// on any failure before the rename the temp file is removed and
+// srcPath/dstPath are left untouched.
 //
 // It returns the destination's MINIMUM at-rest epoch across the written frames,
 // which the host records as the migrated snapshot's Epoch so the DEK-purge
 // floor protects every frame. The epoch is 0 for an empty source or a plaintext
 // destination.
+//
+// While the source is decrypted, every epoch referenced by its frames is
+// pinned on srcBarrier via RegisterInFlightEpoch so a concurrent
+// PurgeEpochsBefore cannot remove a DEK mid-migration (the same protection
+// decryptSnapshotForSend takes around its decrypt).
 //
 // A nil or sealed barrier denotes a PLAINTEXT side: a nil/sealed srcBarrier
 // treats the source bytes as plaintext (no decryption); a nil/sealed dstBarrier
@@ -36,7 +89,22 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 	}
 	defer func() { _ = src.Close() }()
 
+	// Record the deepest pre-existing ancestor of the destination directory
+	// BEFORE MkdirAll: the post-rename fsync chain must cover every directory
+	// MkdirAll creates, or a crash could lose the new directories' entries
+	// even though the renamed file's data was fsynced.
 	dstDir := filepath.Dir(dstPath)
+	syncRoot := dstDir
+	for {
+		if _, statErr := os.Stat(syncRoot); statErr == nil {
+			break
+		}
+		parent := filepath.Dir(syncRoot)
+		if parent == syncRoot {
+			break
+		}
+		syncRoot = parent
+	}
 	if err := os.MkdirAll(dstDir, 0o750); err != nil {
 		return 0, err
 	}
@@ -55,6 +123,25 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 
 	srcLive := srcBarrier != nil && !srcBarrier.IsSealed()
 	dstLive := dstBarrier != nil && !dstBarrier.IsSealed()
+
+	// Pin every epoch the source frames reference so a concurrent
+	// PurgeEpochsBefore cannot remove a DEK mid-migration. The scan is
+	// best-effort: on a malformed source it pins what it found and lets the
+	// decrypt below surface the authoritative error.
+	if srcLive {
+		srcEpochs, _ := snapshotFrameEpochs(src)
+		for _, e := range srcEpochs {
+			srcBarrier.RegisterInFlightEpoch(e)
+		}
+		defer func() {
+			for _, e := range srcEpochs {
+				srcBarrier.DeregisterInFlightEpoch(e)
+			}
+		}()
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
+	}
 
 	var epoch uint64
 	switch {
@@ -91,6 +178,13 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 		return 0, err
 	}
 	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return 0, err
+	}
+	// Make the rename (and any directories MkdirAll created) durable before
+	// reporting success: without the directory fsync a crash could leave the
+	// caller's durably-recorded migration pointing at a directory entry that
+	// no longer exists (same hazard HandleSnapshot closes with SyncDirChain).
+	if err := engine.SyncDirChain(dstDir, syncRoot); err != nil {
 		return 0, err
 	}
 	committed = true

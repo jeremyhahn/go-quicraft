@@ -32,6 +32,31 @@ func mustCommit(t *testing.T, p *Peer, update proto.Update) {
 	}
 }
 
+// runUpdateCycles drives the GetUpdate→Commit contract until the peer
+// reports no pending update, mirroring the engine's step/commit worker
+// loop. Commit fires the persistence-edge commit re-evaluation, so a
+// proposal takes one cycle to persist its entries and a second cycle to
+// surface them as committed entries. Returns every committed entry
+// observed across the cycles so callers can assert on what reached the
+// apply stage.
+func runUpdateCycles(t *testing.T, p *Peer) []proto.Entry {
+	t.Helper()
+	var committed []proto.Entry
+	for range 10 {
+		if !p.HasUpdate(0) {
+			return committed
+		}
+		update, err := p.GetUpdate(true, 0)
+		if err != nil {
+			t.Fatalf("failed to get update: %v", err)
+		}
+		committed = append(committed, update.CommittedEntries...)
+		mustCommit(t, p, update)
+	}
+	t.Fatal("peer did not settle within 10 update cycles")
+	return nil
+}
+
 // testConfig returns a valid Config for testing.
 func testConfig() config.Config {
 	cfg := config.Config{
@@ -111,14 +136,10 @@ func newTestLeaderPeer(t *testing.T) *Peer {
 	electSingleNodeLeader(t, p)
 
 	// Drain the no-op entry and election messages from the initial
-	// leader election so tests start with a clean state.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("failed to get update: %v", err)
-		}
-		mustCommit(t, p, update)
-	}
+	// leader election so tests start with a clean state. The first
+	// Commit persists the no-op, which commits it at the persistence
+	// edge; further cycles apply it and settle the peer.
+	runUpdateCycles(t, p)
 	return p
 }
 
@@ -165,14 +186,10 @@ func newTestMultiNodeLeaderPeer(t *testing.T) *Peer {
 		LogIndex: p.r.log.lastIndex(),
 	})
 
-	// Drain initial state.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("failed to get update: %v", err)
-		}
-		mustCommit(t, p, update)
-	}
+	// Drain initial state. Commit persists the no-op, completing the
+	// durable quorum with the follower ack above; further cycles apply
+	// the no-op and settle the peer.
+	runUpdateCycles(t, p)
 	return p
 }
 
@@ -727,8 +744,10 @@ func TestPeer_Propose_SingleNodeAutoCommits(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// In a single-node cluster, the leader's tryCommit should
-	// auto-commit the entry since quorum == 1.
+	// In a single-node cluster, quorum == 1 and the leader's own match
+	// is its durable index, so the entry commits at the persistence
+	// edge: Commit acknowledges local durability and re-runs tryCommit.
+	runUpdateCycles(t, p)
 	if p.r.log.committed != p.r.log.lastIndex() {
 		t.Fatalf("expected committed == lastIndex (%d), got committed=%d",
 			p.r.log.lastIndex(), p.r.log.committed)
@@ -750,9 +769,11 @@ func TestPeer_ProposeConfigChange_Success(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Membership should be updated immediately (Raft Section 4.1).
+	// Membership takes effect at commit time; drive the update cycles so
+	// the single-node leader persists and commits the entry.
+	runUpdateCycles(t, p)
 	if !p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to be voter after config change")
+		t.Fatal("expected replica 4 to be voter after config change committed")
 	}
 }
 
@@ -1612,9 +1633,13 @@ func TestPeer_GetMembership_ReflectsMutations(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// Membership takes effect at commit time; drive the update cycles so
+	// the single-node leader persists and commits the entry.
+	runUpdateCycles(t, p)
+
 	result := p.GetMembership()
 	if _, ok := result.Addresses[4]; !ok {
-		t.Fatal("expected replica 4 in membership after config change")
+		t.Fatal("expected replica 4 in membership after config change committed")
 	}
 }
 
@@ -1743,10 +1768,29 @@ func TestPeer_FullLifecycle_ProposeGetUpdateCommit(t *testing.T) {
 		t.Fatalf("expected term %d, got %d", leaderTerm, update.State.Term)
 	}
 
-	// Step 4: Commit acknowledges persistence.
+	// Step 4: Commit acknowledges persistence. This is the persistence
+	// edge: the leader's own match advances to its durable index, which
+	// completes the single-node quorum and commits the entries.
 	mustCommit(t, p, update)
 
-	// Step 5: After commit, HasUpdate should be false (no new changes).
+	// Step 5: The persistence-edge commit produces committed entries to
+	// apply, so HasUpdate must report a pending update.
+	if !p.HasUpdate(0) {
+		t.Fatal("expected HasUpdate to be true after the persistence-edge commit")
+	}
+
+	// Step 6: The follow-up update carries the proposed entries as
+	// committed entries.
+	update, err = p.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(update.CommittedEntries) < 2 {
+		t.Fatalf("expected at least 2 committed entries, got %d", len(update.CommittedEntries))
+	}
+	mustCommit(t, p, update)
+
+	// Step 7: With the entries persisted and applied, no update remains.
 	if p.HasUpdate(0) {
 		t.Fatal("expected HasUpdate to be false after commit")
 	}
@@ -1809,13 +1853,7 @@ func TestPeer_FullLifecycle_ElectAndPropose(t *testing.T) {
 	electSingleNodeLeader(t, p)
 
 	// Drain election state.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("failed to get update: %v", err)
-		}
-		mustCommit(t, p, update)
-	}
+	runUpdateCycles(t, p)
 
 	// Now propose.
 	entries := []proto.Entry{{Cmd: []byte("hello")}}
@@ -1829,14 +1867,12 @@ func TestPeer_FullLifecycle_ElectAndPropose(t *testing.T) {
 		t.Fatal("expected HasUpdate to be true after propose")
 	}
 
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	// A single-node proposal commits at the persistence edge: the first
+	// cycle persists the entry, the second surfaces it as committed.
+	committed := runUpdateCycles(t, p)
 
-	// Verify the proposed entry is in the committed entries (single-node auto-commits).
 	var foundCmd bool
-	for _, e := range update.CommittedEntries {
+	for _, e := range committed {
 		if string(e.Cmd) == "hello" {
 			foundCmd = true
 		}
@@ -1844,8 +1880,6 @@ func TestPeer_FullLifecycle_ElectAndPropose(t *testing.T) {
 	if !foundCmd {
 		t.Fatal("expected proposed entry in committed entries")
 	}
-
-	mustCommit(t, p, update)
 }
 
 // --- Leader heartbeat production ---
@@ -2126,9 +2160,9 @@ func TestPeer_ProposeConfigChange_AllowsAfterCommit(t *testing.T) {
 		t.Fatalf("first config change should succeed: %v", err)
 	}
 
-	// After adding node 4, the cluster now has 4 voters (1, 2, 3, 4).
-	// Quorum is ceil((4+1)/2) = 3, so we need acks from 2 followers
-	// plus the leader's own match. Send acks from node 2 and node 3.
+	// Membership takes effect at commit time, so the AddNode(4) entry
+	// commits under the OLD config {1,2,3} (quorum 2). One follower ack
+	// plus the leader's durable match suffices; ack both for good measure.
 	lastIdx := p.r.log.lastIndex()
 	p.Handle(proto.Message{
 		Type:     proto.ReplicateResp,
@@ -2143,18 +2177,18 @@ func TestPeer_ProposeConfigChange_AllowsAfterCommit(t *testing.T) {
 		LogIndex: lastIdx,
 	})
 
-	// Get the update and commit it, which clears pendingConfigChange.
+	// Run the update cycles: the first persists the config change entry
+	// (whose durable leader match completes the quorum with the two acks
+	// above), and a follow-up cycle surfaces it as committed, which
+	// clears pendingConfigChange.
 	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate to be true after config change commit")
+		t.Fatal("expected HasUpdate to be true after config change acks")
 	}
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("failed to get update: %v", err)
-	}
+	committed := runUpdateCycles(t, p)
 
-	// Verify the config change entry is in committed entries.
+	// Verify the config change entry reached the committed entries.
 	var foundCC bool
-	for _, e := range update.CommittedEntries {
+	for _, e := range committed {
 		if e.Type&proto.EntryTypeMask == proto.EntryConfigChange {
 			foundCC = true
 		}
@@ -2162,8 +2196,6 @@ func TestPeer_ProposeConfigChange_AllowsAfterCommit(t *testing.T) {
 	if !foundCC {
 		t.Fatal("expected config change entry in committed entries")
 	}
-
-	mustCommit(t, p, update)
 
 	// pendingConfigChange should now be cleared.
 	if p.r.pendingConfigChange {
@@ -2181,14 +2213,27 @@ func TestPeer_ProposeConfigChange_AllowsAfterCommit(t *testing.T) {
 		t.Fatalf("second config change after commit should succeed: %v", err)
 	}
 
+	// Commit the second change: membership {1,2,3,4} has quorum 3, so the
+	// leader's durable match plus acks from replicas 2 and 3 suffice.
+	lastIdx2 := p.r.log.lastIndex()
+	for _, from := range []uint64{2, 3} {
+		p.Handle(proto.Message{
+			Type:     proto.ReplicateResp,
+			From:     from,
+			Term:     p.r.term,
+			LogIndex: lastIdx2,
+		})
+	}
+	runUpdateCycles(t, p)
+
 	if !p.membership.isVoter(5) {
-		t.Fatal("expected replica 5 to be voter after second config change")
+		t.Fatal("expected replica 5 to be voter after second config change committed")
 	}
 }
 
-// --- Fix 6: Follower config change application via Peer.Handle ---
+// --- Follower config change application (commit-time) ---
 
-func TestPeer_Handle_FollowerAppliesConfigChangeOnAppend(t *testing.T) {
+func TestPeer_Handle_FollowerAppliesConfigChangeOnCommit(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
@@ -2212,8 +2257,9 @@ func TestPeer_Handle_FollowerAppliesConfigChangeOnAppend(t *testing.T) {
 	}
 
 	// Send a Replicate message from the leader containing the config
-	// change entry. Per Raft PhD thesis 4.1, config changes take effect
-	// on log append (not commit).
+	// change entry with the leader's commit index covering it. Config
+	// changes take effect at COMMIT time, applied via the update cycle
+	// (Peer.Commit -> processConfigChanges).
 	msg := proto.Message{
 		Type:     proto.Replicate,
 		From:     2,
@@ -2222,7 +2268,7 @@ func TestPeer_Handle_FollowerAppliesConfigChangeOnAppend(t *testing.T) {
 		Term:     1,
 		LogIndex: 1, // prevLogIndex
 		LogTerm:  1, // prevLogTerm
-		Commit:   0,
+		Commit:   2,
 		Entries: []proto.Entry{
 			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: buf},
 		},
@@ -2232,11 +2278,18 @@ func TestPeer_Handle_FollowerAppliesConfigChangeOnAppend(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// Not yet applied: membership mutates only when the committed entry
+	// flows through Peer.Commit.
+	if _, ok := p.GetMembership().Addresses[4]; ok {
+		t.Fatal("membership must not change before the update cycle commits the entry")
+	}
+	runUpdateCycles(t, p)
+
 	// Verify the peer's membership reflects the new node.
 	membership := p.GetMembership()
 	addr, ok := membership.Addresses[4]
 	if !ok {
-		t.Fatal("expected replica 4 to be in membership after follower applies config change")
+		t.Fatal("expected replica 4 to be in membership after follower commits config change")
 	}
 	if addr != "addr4" {
 		t.Fatalf("expected address addr4, got %s", addr)
@@ -2333,7 +2386,7 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 		Term:     1,
 		LogIndex: 1,
 		LogTerm:  1,
-		Commit:   0,
+		Commit:   2,
 		Entries: []proto.Entry{
 			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: buf},
 		},
@@ -2342,10 +2395,11 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	runUpdateCycles(t, p)
 
 	// Verify that the membership's internal state includes node 4 as a voter.
 	if !p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to be a voter in membership after config change")
+		t.Fatal("expected replica 4 to be a voter in membership after config change committed")
 	}
 
 	// Also test adding an observer via a second Replicate.
@@ -2368,7 +2422,7 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 		Term:     1,
 		LogIndex: 2,
 		LogTerm:  1,
-		Commit:   0,
+		Commit:   3,
 		Entries: []proto.Entry{
 			{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: bufObs},
 		},
@@ -2377,9 +2431,10 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	runUpdateCycles(t, p)
 
 	if !p.membership.isObserver(5) {
-		t.Fatal("expected replica 5 to be an observer after config change")
+		t.Fatal("expected replica 5 to be an observer after config change committed")
 	}
 }
 
@@ -2402,11 +2457,10 @@ func TestPeer_LeaderStepsDown_WhenRemovedFromConfig(t *testing.T) {
 		t.Fatalf("self-removal config change should succeed: %v", err)
 	}
 
-	// At this point, membership has been updated immediately (Section 4.1)
-	// but the entry is not yet committed. The leader should still be
-	// functioning until commit.
-	if p.membership.isMember(p.replicaID) {
-		t.Fatal("expected leader to be removed from membership after proposal")
+	// Membership takes effect at commit time: the leader is still a
+	// member (and still functioning) until the removal entry commits.
+	if !p.membership.isMember(p.replicaID) {
+		t.Fatal("expected leader to remain in membership until the removal commits")
 	}
 
 	// Simulate follower acknowledgement to commit the entry.
@@ -2418,19 +2472,19 @@ func TestPeer_LeaderStepsDown_WhenRemovedFromConfig(t *testing.T) {
 		LogIndex: lastIdx,
 	})
 
-	// Get the update and commit it. Commit() calls checkLeaderSelfRemoval
-	// which should step the leader down since it is no longer in membership.
+	// Run the update cycles: the first persists the config change entry
+	// (its durable leader match completes the quorum with the ack above),
+	// and a follow-up cycle surfaces it as committed. The Commit that
+	// carries the committed config change calls checkLeaderSelfRemoval,
+	// which steps the leader down since it is no longer in membership.
 	if !p.HasUpdate(0) {
 		t.Fatal("expected HasUpdate to be true")
 	}
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("failed to get update: %v", err)
-	}
+	committed := runUpdateCycles(t, p)
 
-	// Verify the config change is in the committed entries.
+	// Verify the config change reached the committed entries.
 	var foundCC bool
-	for _, e := range update.CommittedEntries {
+	for _, e := range committed {
 		if e.Type&proto.EntryTypeMask == proto.EntryConfigChange {
 			foundCC = true
 		}
@@ -2438,8 +2492,6 @@ func TestPeer_LeaderStepsDown_WhenRemovedFromConfig(t *testing.T) {
 	if !foundCC {
 		t.Fatal("expected config change entry in committed entries")
 	}
-
-	mustCommit(t, p, update)
 
 	// After commit, the leader must have stepped down.
 	if p.IsLeader() {
@@ -2469,12 +2521,14 @@ func TestPeer_LeaderContinues_WhenOtherNodeRemoved(t *testing.T) {
 		t.Fatalf("remove-other config change should succeed: %v", err)
 	}
 
-	// Verify node 3 is removed from membership immediately.
-	if p.membership.isMember(3) {
-		t.Fatal("expected node 3 to be removed from membership")
+	// Membership takes effect at commit time: node 3 is still a member
+	// until the removal entry commits.
+	if !p.membership.isMember(3) {
+		t.Fatal("expected node 3 to remain in membership until the removal commits")
 	}
 
-	// Simulate follower acknowledgement to commit the entry.
+	// Simulate follower acknowledgement and drive the update cycles so
+	// the entry persists, commits, and the membership change applies.
 	lastIdx := p.r.log.lastIndex()
 	p.Handle(proto.Message{
 		Type:     proto.ReplicateResp,
@@ -2482,16 +2536,15 @@ func TestPeer_LeaderContinues_WhenOtherNodeRemoved(t *testing.T) {
 		Term:     p.r.term,
 		LogIndex: lastIdx,
 	})
-
-	// Get update and commit.
 	if !p.HasUpdate(0) {
 		t.Fatal("expected HasUpdate to be true")
 	}
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("failed to get update: %v", err)
+	runUpdateCycles(t, p)
+
+	// Node 3 is removed once the entry committed.
+	if p.membership.isMember(3) {
+		t.Fatal("expected node 3 to be removed after the removal committed")
 	}
-	mustCommit(t, p, update)
 
 	// Leader must remain leader since it was not the removed node.
 	if !p.IsLeader() {
@@ -2991,9 +3044,19 @@ func TestPeer_IsMember_RemovedNotMember(t *testing.T) {
 		t.Fatalf("ProposeConfigChange failed: %v", err)
 	}
 
-	// After removal, replica 2 should not be a member.
+	// Membership takes effect at commit time: ack from replica 3 and
+	// drive the update cycles so the removal commits.
+	p.Handle(proto.Message{
+		Type:     proto.ReplicateResp,
+		From:     3,
+		Term:     p.r.term,
+		LogIndex: p.r.log.lastIndex(),
+	})
+	runUpdateCycles(t, p)
+
+	// After the removal commits, replica 2 should not be a member.
 	if p.IsMember(2) {
-		t.Error("expected replica 2 to NOT be a member after removal")
+		t.Error("expected replica 2 to NOT be a member after removal committed")
 	}
 }
 
@@ -3073,7 +3136,9 @@ func TestPeer_IsMember_ConcurrentReadDuringConfigChange(t *testing.T) {
 		buf := make([]byte, cc.Size())
 		_, _ = cc.MarshalTo(buf)
 		entries := []proto.Entry{{
-			Index: p.r.log.lastIndex() + 1,
+			// Distinct, increasing index per change: membership.apply
+			// skips logIndex <= configChangeID as replay.
+			Index: p.r.log.lastIndex() + 1 + (i - 10),
 			Term:  p.r.term,
 			Type:  proto.EntryConfigChange,
 			Cmd:   buf,
@@ -3231,11 +3296,66 @@ func TestPeer_AppliedToTerm_ZeroBeforeAnyApply(t *testing.T) {
 // M5: handleSnapshot retains membership when entries are retained
 // ---------------------------------------------------------------------------
 
+// TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership verifies the
+// commit-time-membership requirement that a matching-log snapshot whose
+// membership is strictly newer IS adopted. The matching branch advances the
+// processed marker to the snapshot index, so config changes below it are
+// never emitted as CommittedEntries and never reach processConfigChanges —
+// without adoption this replica would compute quorum over a stale voting set.
+func TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	initialMs := proto.Membership{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+	}
+	p := newTestPeer(t, cfg, proto.State{}, initialMs)
+	p.r.becomeFollower(2, 2)
+
+	for i := uint64(1); i <= 12; i++ {
+		p.r.log.inmem.merge([]proto.Entry{{Index: i, Term: 2}})
+	}
+
+	// Snapshot at index 10 matches the log, and its membership carries a
+	// witness added by a config change at index 8 (ConfigChangeID 8 > 0).
+	snap := proto.Snapshot{
+		Index: 10,
+		Term:  2,
+		Membership: proto.Membership{
+			ConfigChangeID: 8,
+			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+			Witnesses:      map[uint64]string{4: "addr4"},
+		},
+	}
+	if err := p.Handle(proto.Message{
+		Type:     proto.InstallSnapshot,
+		From:     2,
+		To:       1,
+		ShardID:  1,
+		Term:     2,
+		Snapshot: snap,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !p.membership.isWitness(4) {
+		t.Fatal("expected witness 4 from the strictly newer snapshot membership")
+	}
+	if p.membership.configChangeID != 8 {
+		t.Fatalf("expected configChangeID 8, got %d", p.membership.configChangeID)
+	}
+	// Remote tracking must follow the adopted membership.
+	if _, ok := p.r.witnesses[4]; !ok {
+		t.Fatal("expected raft witness remote for replica 4 after adoption")
+	}
+}
+
 func TestPeer_Handle_InstallSnapshot_MatchRetainsMembership(t *testing.T) {
-	// When a snapshot matches (same index+term in the log), the follower
-	// retains entries beyond the snapshot point. Config changes in those
-	// retained entries are newer than the snapshot's membership, so the
-	// peer's membership must NOT be overwritten.
+	// When a snapshot matches (same index+term in the log) and its
+	// membership is NOT strictly newer (equal ConfigChangeID here), the
+	// local membership wins: an equal ID means the same configuration, and
+	// a locally-higher ID means config changes were already applied above
+	// the snapshot index. A strictly newer snapshot IS adopted — see
+	// TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership.
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
 	initialMs := proto.Membership{
@@ -3431,8 +3551,10 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 		t.Fatal("replica 5 should be a member after first apply")
 	}
 
-	// Apply the same config change again at the same index.
-	// membership.apply will reject it as duplicate/stale.
+	// Apply the same config change again at a higher index. The replay
+	// guard (logIndex <= configChangeID) no longer applies, so the
+	// duplicate-add handler error is surfaced and logged.
+	entries[0].Index = 3
 	buf.Reset()
 	p.processConfigChanges(entries)
 
@@ -3512,7 +3634,13 @@ func marshalConfigChange(t *testing.T, cc proto.ConfigChange) []byte {
 // 4.1: "a log entry for a configuration change can be removed (if
 // leadership changes); in this case, a server must be prepared to fall
 // back to the previous configuration in its log."
-func TestPeer_Handle_ConfigChangeRollbackOnTruncation(t *testing.T) {
+// TestPeer_Handle_UncommittedConfigChangeNotApplied verifies commit-time
+// membership semantics on a follower: a config change entry that is
+// appended but not committed never mutates membership or remote tracking,
+// so log truncation that overwrites it requires no rollback. When a
+// replacement config change commits, membership reflects only the
+// replacement.
+func TestPeer_Handle_UncommittedConfigChangeNotApplied(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
@@ -3522,8 +3650,7 @@ func TestPeer_Handle_ConfigChangeRollbackOnTruncation(t *testing.T) {
 		{Index: 1, Term: 1},
 	})
 
-	// Step 1: Follower receives a config change entry from leader L1
-	// at index 2, term 1, adding node 4.
+	// Follower receives AddNode(4) at index 2 from leader L1, NOT committed.
 	addNode4 := marshalConfigChange(t, proto.ConfigChange{
 		Type:      proto.AddNode,
 		ReplicaID: 4,
@@ -3546,17 +3673,25 @@ func TestPeer_Handle_ConfigChangeRollbackOnTruncation(t *testing.T) {
 		t.Fatalf("unexpected error on first Replicate: %v", err)
 	}
 
-	// Verify node 4 is now in membership.
-	if !p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to be a voter after config change")
+	// Uncommitted: membership and remote tracking must be untouched.
+	if p.membership.isVoter(4) {
+		t.Fatal("uncommitted config change must not mutate membership")
 	}
-	if !p.IsMember(4) {
-		t.Fatal("expected IsMember(4) to be true after config change")
+	if p.IsMember(4) {
+		t.Fatal("expected IsMember(4) to be false while the change is uncommitted")
+	}
+	if _, ok := p.r.remotes[4]; ok {
+		t.Fatal("uncommitted config change must not create a remote")
 	}
 
-	// Step 2: New leader L2 (term 2) wins election and sends a Replicate
-	// with a DIFFERENT entry at index 2 (a normal application entry, not
-	// a config change). This creates a conflict at index 2.
+	// New leader L2 (term 2) overwrites index 2 with AddNode(6) and
+	// commits it. The truncated AddNode(4) was never applied, so no
+	// rollback is involved.
+	addNode6 := marshalConfigChange(t, proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: 6,
+		Address:   "addr6",
+	})
 	msg2 := proto.Message{
 		Type:     proto.Replicate,
 		From:     3,
@@ -3565,166 +3700,36 @@ func TestPeer_Handle_ConfigChangeRollbackOnTruncation(t *testing.T) {
 		Term:     2,
 		LogIndex: 1,
 		LogTerm:  1,
-		Commit:   0,
+		Commit:   2,
 		Entries: []proto.Entry{
-			{Index: 2, Term: 2, Type: proto.EntryNormal, Cmd: []byte("data")},
+			{Index: 2, Term: 2, Type: proto.EntryConfigChange, Cmd: addNode6},
 		},
 	}
 	if err := p.Handle(msg2); err != nil {
 		t.Fatalf("unexpected error on conflicting Replicate: %v", err)
 	}
+	runUpdateCycles(t, p)
 
-	// Verify node 4 is NO LONGER in membership (config change was rolled back).
+	// Only the committed replacement is applied.
 	if p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to NOT be a voter after log truncation rolled back config change")
+		t.Fatal("truncated config change must not be in membership")
 	}
-	if p.IsMember(4) {
-		t.Fatal("expected IsMember(4) to be false after config change rollback")
+	if !p.membership.isVoter(6) {
+		t.Fatal("expected committed replacement AddNode(6) to be applied")
 	}
-
-	// Verify the original three-node membership is restored.
+	if _, ok := p.r.remotes[6]; !ok {
+		t.Fatal("expected remote for replica 6 after its addition committed")
+	}
 	m := p.GetMembership()
-	if len(m.Addresses) != 3 {
-		t.Fatalf("expected 3 voters after rollback, got %d", len(m.Addresses))
-	}
-	for _, id := range []uint64{1, 2, 3} {
-		if _, ok := m.Addresses[id]; !ok {
-			t.Fatalf("expected replica %d in membership after rollback", id)
-		}
+	if len(m.Addresses) != 4 {
+		t.Fatalf("expected 4 voters (1,2,3,6), got %d", len(m.Addresses))
 	}
 }
 
-// TestPeer_Handle_ConfigChangeRollbackClearsRemotes verifies that when a
-// config change is rolled back due to log truncation, the raft remote
-// tracking maps (r.remotes) are also cleaned up.
-func TestPeer_Handle_ConfigChangeRollbackClearsRemotes(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Seed log.
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	// Follower receives config change adding node 4.
-	addNode4 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	})
-	msg1 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode4},
-		},
-	}
-	if err := p.Handle(msg1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Verify remote for node 4 was added.
-	if _, ok := p.r.remotes[4]; !ok {
-		t.Fatal("expected remote for replica 4 after config change")
-	}
-
-	// New leader overwrites index 2.
-	msg2 := proto.Message{
-		Type:     proto.Replicate,
-		From:     3,
-		To:       1,
-		ShardID:  1,
-		Term:     2,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 2, Type: proto.EntryNormal},
-		},
-	}
-	if err := p.Handle(msg2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Remote for node 4 must be removed.
-	if _, ok := p.r.remotes[4]; ok {
-		t.Fatal("expected remote for replica 4 to be removed after config change rollback")
-	}
-}
-
-// TestPeer_Handle_NoRollbackWithoutTruncation verifies that normal
-// Replicate messages that do not cause log truncation do NOT trigger
-// a membership rebuild.
-func TestPeer_Handle_NoRollbackWithoutTruncation(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Seed log.
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	// Follower receives config change adding node 4.
-	addNode4 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	})
-	msg1 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode4},
-		},
-	}
-	if err := p.Handle(msg1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Send a contiguous (non-conflicting) Replicate with more entries.
-	// This should NOT trigger a membership rebuild.
-	msg2 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 2,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 3, Term: 1, Type: proto.EntryNormal, Cmd: []byte("data")},
-		},
-	}
-	if err := p.Handle(msg2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Node 4 should still be in membership (no rollback).
-	if !p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to remain a voter after non-conflicting append")
-	}
-}
-
-// TestPeer_Handle_ConfigChangeRollbackPreservesCommitted verifies that
-// committed config changes survive the rollback. When a config change
-// is committed before truncation occurs, it must persist in the rebuilt
-// membership.
-func TestPeer_Handle_ConfigChangeRollbackPreservesCommitted(t *testing.T) {
+// TestPeer_Handle_CommittedConfigChangeSurvivesTruncation verifies that a
+// COMMITTED config change is applied to membership and survives later log
+// conflicts, while an uncommitted one in the same batch is never applied.
+func TestPeer_Handle_CommittedConfigChangeSurvivesTruncation(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
@@ -3734,8 +3739,8 @@ func TestPeer_Handle_ConfigChangeRollbackPreservesCommitted(t *testing.T) {
 		{Index: 1, Term: 1},
 	})
 
-	// Follower receives two config changes: AddNode(4) at index 2 and
-	// AddNode(5) at index 3, both committed.
+	// Follower receives AddNode(4) at index 2 (committed) and AddNode(5)
+	// at index 3 (uncommitted).
 	addNode4 := marshalConfigChange(t, proto.ConfigChange{
 		Type:      proto.AddNode,
 		ReplicaID: 4,
@@ -3754,7 +3759,7 @@ func TestPeer_Handle_ConfigChangeRollbackPreservesCommitted(t *testing.T) {
 		Term:     1,
 		LogIndex: 1,
 		LogTerm:  1,
-		Commit:   2, // commit up to index 2 (AddNode(4) is committed)
+		Commit:   2, // commit up to index 2 (AddNode(4) only)
 		Entries: []proto.Entry{
 			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode4},
 			{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode5},
@@ -3763,14 +3768,18 @@ func TestPeer_Handle_ConfigChangeRollbackPreservesCommitted(t *testing.T) {
 	if err := p.Handle(msg1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	runUpdateCycles(t, p)
 
-	// Both nodes 4 and 5 should be in membership.
-	if !p.membership.isVoter(4) || !p.membership.isVoter(5) {
-		t.Fatal("expected both replicas 4 and 5 to be voters")
+	// Committed AddNode(4) applied; uncommitted AddNode(5) not applied.
+	if !p.membership.isVoter(4) {
+		t.Fatal("expected committed AddNode(4) to be applied")
+	}
+	if p.membership.isVoter(5) {
+		t.Fatal("uncommitted AddNode(5) must not be applied")
 	}
 
-	// New leader overwrites index 3 (AddNode(5) was uncommitted).
-	// AddNode(4) at index 2 was committed, so it must survive.
+	// New leader overwrites uncommitted index 3 with a normal entry.
+	// The committed AddNode(4) must survive.
 	msg2 := proto.Message{
 		Type:     proto.Replicate,
 		From:     3,
@@ -3787,193 +3796,17 @@ func TestPeer_Handle_ConfigChangeRollbackPreservesCommitted(t *testing.T) {
 	if err := p.Handle(msg2); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	runUpdateCycles(t, p)
 
-	// Node 4 (committed) must still be in membership.
 	if !p.membership.isVoter(4) {
-		t.Fatal("expected committed config change (AddNode(4)) to survive rollback")
-	}
-
-	// Node 5 (uncommitted, truncated) must NOT be in membership.
-	if p.membership.isVoter(5) {
-		t.Fatal("expected uncommitted config change (AddNode(5)) to be rolled back")
-	}
-
-	m := p.GetMembership()
-	if len(m.Addresses) != 4 {
-		t.Fatalf("expected 4 voters (1,2,3,4) after partial rollback, got %d", len(m.Addresses))
-	}
-}
-
-// TestPeer_Handle_ConfigChangeRollbackMultipleRounds verifies that
-// the rollback mechanism works correctly across multiple rounds of
-// config change + truncation.
-func TestPeer_Handle_ConfigChangeRollbackMultipleRounds(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Seed log.
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	// Round 1: AddNode(4) at index 2, term 1.
-	addNode4 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	})
-	msg1 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode4},
-		},
-	}
-	if err := p.Handle(msg1); err != nil {
-		t.Fatalf("round 1 append: %v", err)
-	}
-	if !p.membership.isVoter(4) {
-		t.Fatal("round 1: expected replica 4 in membership")
-	}
-
-	// Round 1 truncation: new leader overwrites with AddNode(5).
-	addNode5 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 5,
-		Address:   "addr5",
-	})
-	msg2 := proto.Message{
-		Type:     proto.Replicate,
-		From:     3,
-		To:       1,
-		ShardID:  1,
-		Term:     2,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 2, Type: proto.EntryConfigChange, Cmd: addNode5},
-		},
-	}
-	if err := p.Handle(msg2); err != nil {
-		t.Fatalf("round 1 truncation: %v", err)
-	}
-
-	// After round 1 truncation: node 4 gone, node 5 present.
-	if p.membership.isVoter(4) {
-		t.Fatal("round 1 rollback: expected replica 4 removed")
-	}
-	if !p.membership.isVoter(5) {
-		t.Fatal("round 1 rollback: expected replica 5 added from new entry")
-	}
-
-	// Round 2 truncation: another leader overwrites with a normal entry.
-	msg3 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     3,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 3, Type: proto.EntryNormal},
-		},
-	}
-	if err := p.Handle(msg3); err != nil {
-		t.Fatalf("round 2 truncation: %v", err)
-	}
-
-	// After round 2: both 4 and 5 should be gone, back to original 3 nodes.
-	if p.membership.isVoter(4) {
-		t.Fatal("round 2 rollback: expected replica 4 removed")
+		t.Fatal("expected committed AddNode(4) to survive truncation of later entries")
 	}
 	if p.membership.isVoter(5) {
-		t.Fatal("round 2 rollback: expected replica 5 removed")
-	}
-	m := p.GetMembership()
-	if len(m.Addresses) != 3 {
-		t.Fatalf("expected 3 voters after double rollback, got %d", len(m.Addresses))
-	}
-}
-
-// TestPeer_Handle_TruncationReplacesConfigChangeWithConfigChange verifies
-// that when a truncated config change is replaced by a different config
-// change, the membership reflects only the replacement.
-func TestPeer_Handle_TruncationReplacesConfigChangeWithConfigChange(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Seed log.
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	// First config change: AddNode(4).
-	addNode4 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	})
-	msg1 := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: addNode4},
-		},
-	}
-	if err := p.Handle(msg1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Replacement: AddNode(6) instead of AddNode(4).
-	addNode6 := marshalConfigChange(t, proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 6,
-		Address:   "addr6",
-	})
-	msg2 := proto.Message{
-		Type:     proto.Replicate,
-		From:     3,
-		To:       1,
-		ShardID:  1,
-		Term:     2,
-		LogIndex: 1,
-		LogTerm:  1,
-		Commit:   0,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 2, Type: proto.EntryConfigChange, Cmd: addNode6},
-		},
-	}
-	if err := p.Handle(msg2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Node 4 rolled back, node 6 applied.
-	if p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to be rolled back")
-	}
-	if !p.membership.isVoter(6) {
-		t.Fatal("expected replica 6 to be in membership from replacement entry")
+		t.Fatal("truncated AddNode(5) must not be in membership")
 	}
 	m := p.GetMembership()
 	if len(m.Addresses) != 4 {
-		t.Fatalf("expected 4 voters (1,2,3,6), got %d", len(m.Addresses))
+		t.Fatalf("expected 4 voters (1,2,3,4), got %d", len(m.Addresses))
 	}
 }
 
@@ -5137,6 +4970,16 @@ func TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer(t *testing.T) {
 		t.Fatalf("config change should succeed after transfer timeout: %v", err)
 	}
 
+	// Membership takes effect at commit time: ack the appended entry
+	// from a follower and drive the update cycles so it commits.
+	p.Handle(proto.Message{
+		Type:     proto.ReplicateResp,
+		From:     2,
+		Term:     p.r.term,
+		LogIndex: p.r.log.lastIndex(),
+	})
+	runUpdateCycles(t, p)
+
 	// Verify the config change was applied.
 	if !p.membership.isVoter(4) {
 		t.Fatal("expected replica 4 to be a voter after successful config change")
@@ -5171,7 +5014,7 @@ func TestPeer_SyncRaftRemotes_ClearsTransferTargetOnRemoval(t *testing.T) {
 	p.membership.apply(proto.ConfigChange{
 		Type:      proto.RemoveNode,
 		ReplicaID: 2,
-	}, 0)
+	}, p.r.log.lastIndex()+1)
 	p.syncRaftRemotes()
 
 	// Transfer state must be cleared.
@@ -5187,6 +5030,59 @@ func TestPeer_SyncRaftRemotes_ClearsTransferTargetOnRemoval(t *testing.T) {
 	// Remote for node 2 must be removed.
 	if _, ok := p.r.remotes[2]; ok {
 		t.Fatal("expected remote for node 2 to be removed")
+	}
+}
+
+// TestPeer_SyncRaftRemotes_PreservesRemoteOnObserverPromotion verifies that
+// promoting an observer to voter moves its existing remote struct into the
+// voter set instead of creating a fresh one. The observer's remote carries
+// live replication progress — possibly a snapshot transfer or its ack wait —
+// and recreating it at next=lastIndex+1 would immediately probe a
+// still-restoring node into a redundant full snapshot re-send.
+func TestPeer_SyncRaftRemotes_PreservesRemoteOnObserverPromotion(t *testing.T) {
+	p := newTestMultiNodeLeaderPeer(t)
+
+	// Add node 9 as an observer and put its remote mid-snapshot-wait.
+	if err := p.membership.apply(proto.ConfigChange{
+		Type:      proto.AddNonVoting,
+		ReplicaID: 9,
+		Address:   "addr9",
+	}, p.r.log.lastIndex()+1); err != nil {
+		t.Fatalf("add observer: %v", err)
+	}
+	p.syncRaftRemotes()
+	obs, ok := p.r.observers[9]
+	if !ok {
+		t.Fatal("expected observer remote for node 9")
+	}
+	obs.match = 7
+	obs.becomeSnapshot(40, 3)
+	obs.snapshotDone(5)
+
+	// Promote observer 9 to voter.
+	if err := p.membership.apply(proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: 9,
+		Address:   "addr9",
+	}, p.r.log.lastIndex()+2); err != nil {
+		t.Fatalf("promote observer: %v", err)
+	}
+	p.syncRaftRemotes()
+
+	promoted, ok := p.r.remotes[9]
+	if !ok {
+		t.Fatal("expected voter remote for node 9 after promotion")
+	}
+	if _, still := p.r.observers[9]; still {
+		t.Fatal("observer entry must be removed after promotion")
+	}
+	if promoted != obs {
+		t.Fatal("promotion must preserve the existing remote struct, not recreate it")
+	}
+	if promoted.state != remoteSnapshot || promoted.snapshotIndex != 40 ||
+		promoted.snapshotSeq != 3 || promoted.snapshotWaitTicks != 5 || promoted.match != 7 {
+		t.Fatalf("promotion must preserve replication state, got %s seq=%d wait=%d match=%d",
+			promoted, promoted.snapshotSeq, promoted.snapshotWaitTicks, promoted.match)
 	}
 }
 
@@ -5209,7 +5105,7 @@ func TestPeer_SyncRaftRemotes_ProposalsSucceedAfterTransferTargetRemoved(t *test
 	p.membership.apply(proto.ConfigChange{
 		Type:      proto.RemoveNode,
 		ReplicaID: 3,
-	}, 0)
+	}, p.r.log.lastIndex()+1)
 	p.syncRaftRemotes()
 
 	// Transfer state must be cleared, allowing proposals.

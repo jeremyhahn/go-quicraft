@@ -176,11 +176,33 @@ func TestConfigChangeSize(t *testing.T) {
 	}
 }
 
+// TestConfigChangeUpdateWitnessPolicyRoundTrip verifies the policy fields
+// survive marshal/unmarshal for the UpdateWitnessPolicy change type.
+func TestConfigChangeUpdateWitnessPolicyRoundTrip(t *testing.T) {
+	cc := ConfigChange{
+		ConfigChangeID:             9,
+		Type:                       UpdateWitnessPolicy,
+		MaxWitnesses:               3,
+		RequireFullReplicaMajority: true,
+	}
+	buf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	var cc2 ConfigChange
+	if _, err := cc2.UnmarshalFrom(buf); err != nil {
+		t.Fatalf("UnmarshalFrom: %v", err)
+	}
+	if cc2 != cc {
+		t.Fatalf("round trip mismatch: got %+v, want %+v", cc2, cc)
+	}
+}
+
 func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
-	t.Run("type beyond AddWitness is rejected", func(t *testing.T) {
+	t.Run("type beyond UpdateWitnessPolicy is rejected", func(t *testing.T) {
 		cc := ConfigChange{
 			ConfigChangeID: 1,
-			Type:           AddWitness + 1, // 4, one beyond the last valid type
+			Type:           UpdateWitnessPolicy + 1, // one beyond the last valid type
 			ReplicaID:      1,
 			Address:        "addr:5000",
 			Initialize:     false,

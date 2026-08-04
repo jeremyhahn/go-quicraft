@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,32 @@ const (
 // minimum rate, so this ceiling is a defense-in-depth backstop.
 const maxRateLimitChunkSleep = 5 * time.Second
 
+// Whole-transfer liveness bounds for an inbound snapshot. The per-frame read
+// deadline is reset on every iteration, so on its own it bounds nothing: a
+// peer that emits one frame header just inside each deadline holds its
+// concurrency slot indefinitely. These bound the transfer as a whole.
+const (
+	// maxSnapshotTransferDuration is the absolute ceiling on one inbound
+	// transfer, regardless of progress.
+	maxSnapshotTransferDuration = time.Hour
+
+	// snapshotProgressGracePeriod is how long a transfer may run before the
+	// throughput floor is enforced, absorbing a slow start (stream setup,
+	// sender disk reads) without failing a legitimate transfer.
+	snapshotProgressGracePeriod = 60 * time.Second
+
+	// minSnapshotReceiveBytesPerSec is the average throughput a transfer must
+	// sustain past the grace period. Far below any real link, it exists only to
+	// evict a peer trickling bytes to occupy a concurrency slot.
+	minSnapshotReceiveBytesPerSec = 1024
+
+	// maxConsecutiveZeroLengthFrames bounds zero-length chunk frames in a row.
+	// A legitimate sender emits none — SendSnapshot and SendSnapshotStreaming
+	// always write a non-empty chunk — so any run of them is a peer burning
+	// the declared ChunkCount to hold its slot.
+	maxConsecutiveZeroLengthFrames = 8
+)
+
 // chunkReader abstracts the stream operations needed for receiving snapshot
 // chunks: setting a read deadline and reading bytes. This enables testing
 // with mock streams.
@@ -82,8 +109,30 @@ type EpochTracker interface {
 // snapshotReceiver manages concurrent snapshot receive operations with
 // concurrency limits, memory budgets, and rate limiting.
 type snapshotReceiver struct {
-	// sem is a counting semaphore limiting concurrent snapshot receives.
+	// sem is a counting semaphore limiting concurrent snapshot receives
+	// host-wide, across every peer.
 	sem chan struct{}
+
+	// peerMu protects peerSlots.
+	peerMu sync.Mutex
+
+	// peerSlots counts in-flight receives per remote address. Without it the
+	// host-global sem is holdable in full by one peer, after which every
+	// legitimate snapshot to a recovering follower is dropped and the shard
+	// cannot restore quorum.
+	peerSlots map[string]int
+
+	// maxPerPeer is the ceiling on concurrent receives from a single remote
+	// address: ceil(maxConcurrent/2), so no peer can occupy the whole budget.
+	maxPerPeer int
+
+	// maxTransferDuration, progressGracePeriod, and minBytesPerSec are the
+	// whole-transfer liveness bounds, seeded from the package constants.
+	// Fields rather than direct constant references so tests can exercise the
+	// bounds without waiting out production-scale timeouts.
+	maxTransferDuration time.Duration
+	progressGracePeriod time.Duration
+	minBytesPerSec      int64
 
 	// memoryBudget tracks the remaining memory budget in bytes. Atomic
 	// operations provide lock-free updates.
@@ -133,15 +182,80 @@ func newSnapshotReceiver(
 	deploymentID uint64,
 	handler MessageHandler,
 ) *snapshotReceiver {
+	maxPerPeer := (maxConcurrent + 1) / 2
+	if maxPerPeer < 1 {
+		maxPerPeer = 1
+	}
 	sr := &snapshotReceiver{
-		sem:          make(chan struct{}, maxConcurrent),
-		maxMemory:    maxMemory,
-		bytesPerSec:  bytesPerSec,
-		deploymentID: deploymentID,
-		handler:      handler,
+		sem:                 make(chan struct{}, maxConcurrent),
+		peerSlots:           make(map[string]int),
+		maxPerPeer:          maxPerPeer,
+		maxTransferDuration: maxSnapshotTransferDuration,
+		progressGracePeriod: snapshotProgressGracePeriod,
+		minBytesPerSec:      minSnapshotReceiveBytesPerSec,
+		maxMemory:           maxMemory,
+		bytesPerSec:         bytesPerSec,
+		deploymentID:        deploymentID,
+		handler:             handler,
 	}
 	sr.memoryBudget.Store(maxMemory)
 	return sr
+}
+
+// acquirePeerSlot reserves one of a peer's concurrent-receive slots. An empty
+// peer address (unit-test paths with no connection) is not accounted.
+func (sr *snapshotReceiver) acquirePeerSlot(peer string) bool {
+	if peer == "" {
+		return true
+	}
+	sr.peerMu.Lock()
+	defer sr.peerMu.Unlock()
+	if sr.peerSlots[peer] >= sr.maxPerPeer {
+		return false
+	}
+	sr.peerSlots[peer]++
+	return true
+}
+
+// releasePeerSlot returns a peer's concurrent-receive slot, pruning the map
+// entry at zero so it does not grow across peer churn.
+func (sr *snapshotReceiver) releasePeerSlot(peer string) {
+	if peer == "" {
+		return
+	}
+	sr.peerMu.Lock()
+	defer sr.peerMu.Unlock()
+	n, ok := sr.peerSlots[peer]
+	if !ok {
+		return
+	}
+	if n <= 1 {
+		delete(sr.peerSlots, peer)
+		return
+	}
+	sr.peerSlots[peer] = n - 1
+}
+
+// cancelSnapshotReadOnStop arms a watcher that resets the read side of an
+// inbound snapshot stream when the transport begins shutting down. receiveChunks
+// only observes stopC at loop boundaries and during the rate-limit sleep; while
+// it is blocked in ReadFrameHeader or io.ReadFull nothing else cancels it, so
+// Stop()'s ShutdownAndWait would stall behind the 30s per-frame deadline. This
+// mirrors cancelSnapshotWriteOnStop on the send side. The returned release func
+// must be called when the transfer ends.
+func cancelSnapshotReadOnStop(stream *quic.Stream, stopC <-chan struct{}) func() {
+	if stream == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-stopC:
+			stream.CancelRead(QUICStreamErrShutdown)
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
 
 // receiveSnapshot processes a snapshot stream. It enforces the concurrency
@@ -150,27 +264,47 @@ func newSnapshotReceiver(
 // snapshot header's Term field, which carries the barrier epoch when
 // encryption is enabled. When the epoch is 0 (no encryption), in-flight
 // tracking is skipped.
-func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHeader, senderAuthorized func(address string) bool, stopC <-chan struct{}) {
+func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHeader, peer string, senderAuthorized func(address string) bool, stopC <-chan struct{}) {
 	// Atomically register this receive operation. TryAdd returns false
 	// if Stop() has already initiated shutdown, preventing the race
 	// between WaitGroup.Add(1) and WaitGroup.Wait().
 	if sr.snapshotTracker != nil {
 		if !sr.snapshotTracker.TryAdd() {
+			sr.rejectSnapshotStream("transport shutting down", hdr, nil)
 			return
 		}
 		defer sr.snapshotTracker.Done()
 	}
 
-	// Try to acquire concurrency semaphore.
+	select {
+	case <-stopC:
+		sr.rejectSnapshotStream("transport shutting down", hdr, nil)
+		return
+	default:
+	}
+
+	// Per-peer fairness first: the host-global semaphore alone lets one peer
+	// hold every slot, silently starving snapshot delivery to every other
+	// recovering follower.
+	if !sr.acquirePeerSlot(peer) {
+		sr.rejectSnapshotStream("per-peer snapshot concurrency limit reached", hdr, nil)
+		return
+	}
+	defer sr.releasePeerSlot(peer)
+
+	// Try to acquire the host-global concurrency semaphore.
 	select {
 	case sr.sem <- struct{}{}:
 		defer func() { <-sr.sem }()
-	case <-stopC:
-		return
 	default:
 		// At concurrency limit, drop the snapshot.
+		sr.rejectSnapshotStream("global snapshot concurrency limit reached", hdr, nil)
 		return
 	}
+
+	// Reset the stream's read side on shutdown so a transfer blocked in a
+	// frame read cannot hold Stop() for the full per-frame deadline.
+	defer cancelSnapshotReadOnStop(stream, stopC)()
 
 	// Register in-flight epoch protection if an epoch tracker is available
 	// and the snapshot has a non-zero epoch (barrier-encrypted snapshot).
@@ -237,7 +371,35 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	// usable for recovery and would corrupt state.
 	truncated := false
 
+	// zeroFrames counts consecutive zero-length chunk frames, which no
+	// legitimate sender produces.
+	zeroFrames := 0
+
 	for i := uint64(0); i < hdr.ChunkCount; i++ {
+		// Bound the transfer as a whole. The per-frame deadline below is reset
+		// on every iteration, so without these a peer can trickle one frame
+		// header per deadline and hold its concurrency slot for years.
+		elapsed := time.Since(recvStart)
+		if sr.maxTransferDuration > 0 && elapsed > sr.maxTransferDuration {
+			sr.rejectSnapshot(hdr, "transfer exceeded maximum duration", totalBytes,
+				&SnapshotTransferTimeoutError{
+					Elapsed:       elapsed,
+					Limit:         sr.maxTransferDuration,
+					ReceivedBytes: totalBytes,
+				})
+			return
+		}
+		if sr.minBytesPerSec > 0 && elapsed > sr.progressGracePeriod &&
+			totalBytes < int64(elapsed/time.Second)*sr.minBytesPerSec {
+			sr.rejectSnapshot(hdr, "transfer below minimum throughput", totalBytes,
+				&SnapshotProgressStalledError{
+					Elapsed:        elapsed,
+					ReceivedBytes:  totalBytes,
+					MinBytesPerSec: sr.minBytesPerSec,
+				})
+			return
+		}
+
 		select {
 		case <-stopC:
 			// Stop requested: mark truncated and exit the loop. (A bare
@@ -261,12 +423,23 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 				truncated = true
 				break
 			}
+			sr.rejectSnapshot(hdr, "chunk frame read failed", totalBytes, err)
 			return
 		}
 
 		if length == 0 {
+			zeroFrames++
+			if zeroFrames > maxConsecutiveZeroLengthFrames {
+				sr.rejectSnapshot(hdr, "zero-length chunk frame flood", totalBytes,
+					&SnapshotZeroLengthFrameFloodError{
+						Count: zeroFrames,
+						Max:   maxConsecutiveZeroLengthFrames,
+					})
+				return
+			}
 			continue
 		}
+		zeroFrames = 0
 
 		// Check memory budget before allocating.
 		remaining := sr.memoryBudget.Add(-int64(length))
@@ -274,6 +447,11 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			// Over budget, restore and reject. This chunk was never
 			// added to totalBytes so it must be restored inline.
 			sr.memoryBudget.Add(int64(length))
+			sr.rejectSnapshot(hdr, "receive memory budget exhausted", totalBytes+int64(length),
+				&SnapshotMemoryBudgetExceededError{
+					Accumulated: totalBytes + int64(length),
+					Budget:      sr.maxMemory,
+				})
 			return
 		}
 
@@ -282,6 +460,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			// Read failed. This chunk was deducted from budget but
 			// not yet added to totalBytes, so restore it inline.
 			sr.memoryBudget.Add(int64(length))
+			sr.rejectSnapshot(hdr, "chunk body read failed", totalBytes, err)
 			return
 		}
 
@@ -290,19 +469,16 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			// Unmarshal failed. Same as above: restore inline since
 			// this chunk is not yet tracked in totalBytes.
 			sr.memoryBudget.Add(int64(length))
+			sr.rejectSnapshot(hdr, "chunk unmarshal failed", totalBytes, err)
 			return
 		}
 
-		// Validate chunk fields to prevent oversized allocations
+		// Validate chunk fields (including consistency with the stream
+		// header used for epoch pinning) to prevent oversized allocations
 		// and cross-cluster data corruption.
-		if err := sr.validateChunk(&chunk); err != nil {
+		if err := sr.validateChunk(&chunk, hdr); err != nil {
 			sr.memoryBudget.Add(int64(length))
-			slog.Warn("snapshot chunk validation failed",
-				"shard", hdr.ShardID,
-				"replica", hdr.ReplicaID,
-				"chunkID", chunk.ChunkID,
-				"error", err,
-			)
+			sr.rejectSnapshot(hdr, "chunk validation failed", totalBytes, err)
 			return
 		}
 
@@ -314,12 +490,11 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		// against global overcommit, but this check ensures a single
 		// receive does not consume the entire budget.
 		if totalBytes > sr.maxMemory {
-			slog.Warn("snapshot receive exceeded memory budget",
-				"shard", hdr.ShardID,
-				"replica", hdr.ReplicaID,
-				"accumulated_bytes", totalBytes,
-				"budget_bytes", sr.maxMemory,
-			)
+			sr.rejectSnapshot(hdr, "per-receive memory budget exceeded", totalBytes,
+				&SnapshotMemoryBudgetExceededError{
+					Accumulated: totalBytes,
+					Budget:      sr.maxMemory,
+				})
 			return
 		}
 
@@ -332,11 +507,17 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 				rateLimitTimer.Reset(chunkDuration)
 				select {
 				case <-stopC:
+					// Shutdown during the rate-limit sleep: flow into the
+					// truncated-transfer path below so the discard is logged
+					// and reported like every other incomplete transfer.
 					rateLimitTimer.Stop()
-					return
+					truncated = true
 				case <-rateLimitTimer.C:
 				}
 			}
+		}
+		if truncated {
+			break
 		}
 	}
 
@@ -345,9 +526,12 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	// shutdown) leaves fewer chunks than hdr.ChunkCount; committing it would
 	// persist a partial snapshot as the latest snapshot, which recovery would
 	// then load as if whole — data corruption. Treat it as a failed receive:
-	// log, fire the rejection listener, and do NOT call HandleSnapshot. An
-	// hdr.ChunkCount of 0 also falls here and persists nothing.
-	if truncated || uint64(len(chunks)) != hdr.ChunkCount {
+	// log, fire the rejection listener, and do NOT call HandleSnapshot.
+	//
+	// hdr.ChunkCount == 0 is named explicitly: the count comparison alone
+	// (0 != 0) is false, so an empty transfer would otherwise fall through to
+	// a silent return with no log and no listener callback.
+	if truncated || hdr.ChunkCount == 0 || uint64(len(chunks)) != hdr.ChunkCount {
 		slog.Warn("snapshot receive incomplete, discarding partial transfer",
 			"shard", hdr.ShardID,
 			"replica", hdr.ReplicaID,
@@ -392,6 +576,58 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 }
 
+// rejectSnapshot records a discarded inbound snapshot transfer: a structured
+// warning with the transfer's identity and size, plus the OnSnapshotRejected
+// listener — the same failure signal the truncated-transfer path fires — so a
+// dropped receive is observable instead of silently timing out the sender's
+// ack wait.
+func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason string, receivedBytes int64, err error) {
+	slog.Warn("snapshot receive rejected, discarding transfer",
+		"reason", reason,
+		"shard", hdr.ShardID,
+		"replica", hdr.ReplicaID,
+		"index", hdr.Index,
+		"received_bytes", receivedBytes,
+		"expected_chunks", hdr.ChunkCount,
+		"error", err,
+	)
+	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
+		sr.listener.OnSnapshotRejected(config.SnapshotInfo{
+			ShardID:   hdr.ShardID,
+			ReplicaID: hdr.ReplicaID,
+			Index:     hdr.Index,
+		})
+	}
+}
+
+// rejectSnapshotStream records a snapshot transfer discarded before any chunk
+// was read: an admission failure (shutdown, global or per-peer concurrency
+// limit) or a header-stage failure, where the transfer's identity may not be
+// known yet. It fires the same OnSnapshotRejected listener and structured
+// warning as rejectSnapshot so every discarded transfer is observable through
+// one signal, rather than some paths returning silently and leaving the sender
+// to time out its ack wait. hdr may be nil when the header never parsed.
+func (sr *snapshotReceiver) rejectSnapshotStream(reason string, hdr *SnapshotHeader, err error) {
+	var info config.SnapshotInfo
+	if hdr != nil {
+		info = config.SnapshotInfo{
+			ShardID:   hdr.ShardID,
+			ReplicaID: hdr.ReplicaID,
+			Index:     hdr.Index,
+		}
+	}
+	slog.Warn("snapshot stream rejected, discarding transfer",
+		"reason", reason,
+		"shard", info.ShardID,
+		"replica", info.ReplicaID,
+		"index", info.Index,
+		"error", err,
+	)
+	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
+		sr.listener.OnSnapshotRejected(info)
+	}
+}
+
 // SetEpochTracker sets the epoch tracker for in-flight epoch protection.
 // Must be called before any snapshot receives begin. When set, the receiver
 // will register/deregister epochs for all encrypted snapshot transfers to
@@ -429,9 +665,13 @@ func (sr *snapshotReceiver) SetSnapshotTracker(tracker *shutdownTracker) {
 	sr.snapshotTracker = tracker
 }
 
-// validateChunk checks bounds on deserialized snapshot chunk fields and
-// verifies the DeploymentID matches this receiver's configured deployment.
-func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk) error {
+// validateChunk checks bounds on deserialized snapshot chunk fields,
+// verifies the DeploymentID matches this receiver's configured deployment,
+// and binds the chunk to the stream header (hdr) that was used for epoch
+// pinning: a chunk whose ShardID, Index, or Epoch diverges from the header
+// could otherwise persist under a barrier epoch that was never pinned,
+// letting a concurrent epoch purge strand an undecryptable snapshot.
+func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *SnapshotHeader) error {
 	if len(chunk.Filepath) > maxSnapshotFilepathLen {
 		return &ChunkFilepathTooLongError{
 			ShardID: chunk.ShardID,
@@ -472,6 +712,32 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk) error {
 			ShardID:  chunk.ShardID,
 			Expected: sr.deploymentID,
 			Got:      chunk.DeploymentID,
+		}
+	}
+	if hdr != nil {
+		if chunk.ShardID != hdr.ShardID {
+			return &ChunkHeaderMismatchError{
+				Field:       "shard_id",
+				ChunkID:     chunk.ChunkID,
+				HeaderValue: hdr.ShardID,
+				ChunkValue:  chunk.ShardID,
+			}
+		}
+		if chunk.Index != hdr.Index {
+			return &ChunkHeaderMismatchError{
+				Field:       "index",
+				ChunkID:     chunk.ChunkID,
+				HeaderValue: hdr.Index,
+				ChunkValue:  chunk.Index,
+			}
+		}
+		if chunk.Epoch != hdr.Epoch {
+			return &ChunkHeaderMismatchError{
+				Field:       "epoch",
+				ChunkID:     chunk.ChunkID,
+				HeaderValue: hdr.Epoch,
+				ChunkValue:  chunk.Epoch,
+			}
 		}
 	}
 	return nil

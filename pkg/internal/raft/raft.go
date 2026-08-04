@@ -83,12 +83,13 @@ const noLeader uint64 = 0
 // noNode indicates no specific node.
 const noNode uint64 = 0
 
-// maxConfigChangeScanSize is the maximum total byte size of entries loaded
-// when scanning for uncommitted config change entries. This prevents an
-// unbounded log read from causing OOM when the uncommitted tail is very
-// large. 64 MiB is generous enough to cover any practical config change
-// scan while bounding memory usage.
-const maxConfigChangeScanSize uint64 = 64 * 1024 * 1024
+// configChangeScanChunkEntries bounds how many entry INDICES are read per
+// chunk when scanning the uncommitted tail for config changes. Chunking by
+// index rather than by byte size keeps peak memory bounded while still
+// covering the entire range: a byte bound would stop early and could miss a
+// config change, breaking the one-uncommitted-change invariant that
+// commit-time membership depends on.
+const configChangeScanChunkEntries uint64 = 1024
 
 // readIndexStatus tracks a pending read index request. Heartbeat acks
 // are tracked with a uint64 bitfield instead of a map for zero-allocation
@@ -138,6 +139,26 @@ type raft struct {
 	remotes   map[uint64]*remote
 	observers map[uint64]*remote
 	witnesses map[uint64]*remote
+
+	// snapshotSeq is a monotonically increasing identifier for snapshot
+	// transfer attempts started by this raft instance. Stamped on each
+	// InstallSnapshot handed to the transport (msg.Hint) and echoed back
+	// in the SnapshotStatus report, so a status can be matched to the
+	// exact attempt it describes (see remote.snapshotSeq).
+	snapshotSeq uint64
+
+	// maxWitnesses and requireFullReplicaMajority mirror the shard's
+	// REPLICATED witness policy (proto.Membership) for the leader-side
+	// propose-time policy check (validateConfigChangePolicy). Seeded from
+	// the membership at newRaft and re-synced by the peer after every
+	// config-change apply and snapshot restore. Enforced only before log
+	// append on the leader — never on the deterministic apply/replay
+	// path — so a forwarded config change that no node pre-validated
+	// (the follower forward path bypasses the Host API's
+	// ValidateConfigChange) still cannot commit a policy-violating
+	// membership.
+	maxWitnesses               uint64
+	requireFullReplicaMajority bool
 
 	// Messages to send. Double-buffered: msgs accumulates outbound
 	// messages, msgsBuf holds the alternate buffer for swap in
@@ -235,16 +256,6 @@ type raft struct {
 	// onCampaign is called when an election starts. Set by Peer. Nil-safe.
 	onCampaign func(shardID, replicaID, term uint64)
 
-	// logTruncated is set by handleAppend when tryAppend detects a
-	// conflict and truncates log entries. This signals to Peer that
-	// membership may need rebuilding from the committed base, since
-	// truncated entries may have contained config changes that were
-	// already applied to the membership. Per PhD thesis 4.1: "a log
-	// entry for a configuration change can be removed (if leadership
-	// changes); in this case, a server must be prepared to fall back
-	// to the previous configuration in its log."
-	logTruncated bool
-
 	// Function pointers set on role transition for zero-branch dispatch.
 	stepFunc func(r *raft, msg proto.Message) error
 	tickFunc func(r *raft)
@@ -287,9 +298,15 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 
 	// Initialize remotes from membership.
 	r.initRemotes(membership)
+	// Seed the replicated witness-policy mirror from the recovered (or
+	// bootstrap-seeded) membership; kept in sync by the peer thereafter.
+	r.maxWitnesses = membership.MaxWitnesses
+	r.requireFullReplicaMajority = membership.RequireFullReplicaMajority
 
-	// Pre-allocate matched buffer and double-buffered msgs slices.
-	r.matched = make([]uint64, 0, len(r.remotes)+1)
+	// Pre-allocate matched buffer and double-buffered msgs slices. The buffer
+	// holds self + every remote + every witness (witnesses are counted toward
+	// the unified commit quorum in tryCommit).
+	r.matched = make([]uint64, 0, len(r.remotes)+len(r.witnesses)+1)
 	msgCap := len(r.remotes) + len(r.observers) + len(r.witnesses)
 	r.msgs = make([]proto.Message, 0, msgCap)
 	r.msgsBuf = make([]proto.Message, 0, msgCap)
@@ -499,7 +516,40 @@ func (r *raft) becomeLeader() {
 
 // step handles a Raft message. Common term-based logic is handled first,
 // then delegation to the role-specific step function.
+// dropHighTermVote reports whether a higher-term RequestVote should be
+// dropped under the CheckQuorum rule: the node has a known leader and has
+// heard from it within the last election timeout. Transfer-hinted votes
+// (Hint == From) are never dropped.
+func (r *raft) dropHighTermVote(msg proto.Message) bool {
+	if msg.Type != proto.RequestVote || !r.checkQuorum || msg.Term <= r.term {
+		return false
+	}
+	if msg.Hint == msg.From {
+		return false
+	}
+	return r.leaderID != noLeader && r.electionTick < r.electionTimeout
+}
+
 func (r *raft) step(msg proto.Message) error {
+	// CheckQuorum guard (Raft paper §6 last paragraph, thesis p.42): drop
+	// a higher-term RequestVote while this node heard from a live,
+	// quorum-backed leader within the last election timeout. Without
+	// this, a network-partitioned node that kept incrementing its term
+	// disrupts a stable cluster the moment it rejoins — the higher term
+	// forces the leader to step down even though the partitioned node
+	// cannot win. Leadership-transfer votes (Hint == From) are exempt.
+	// PreVote is unaffected: it never advances terms. Mirrors
+	// dragonboat's dropRequestVoteFromHighTermNode.
+	if r.dropHighTermVote(msg) {
+		slog.Debug("dropped higher-term RequestVote, leader lease active",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"msg_term", msg.Term,
+			"term", r.term)
+		return nil
+	}
+
 	// Handle term-based transitions first.
 	if msg.Term > 0 {
 		if msg.Term > r.term {
@@ -586,8 +636,6 @@ func stepFollower(r *raft, msg proto.Message) error {
 		return r.handleFollowerReadIndex(msg)
 	case proto.ReadIndexResp:
 		return r.handleReadIndexResp(msg)
-	case proto.SnapshotReceived:
-		return r.handleSnapshotReceived(msg)
 	case proto.Propose:
 		if r.leaderID == noLeader {
 			return &NotLeaderError{LeaderID: 0}
@@ -631,8 +679,6 @@ func stepCandidate(r *raft, msg proto.Message) error {
 	case proto.InstallSnapshot:
 		r.becomeFollower(msg.Term, msg.From)
 		return r.handleSnapshot(msg)
-	case proto.SnapshotReceived:
-		return r.handleSnapshotReceived(msg)
 	case proto.Propose:
 		return &NotLeaderError{LeaderID: 0}
 	default:
@@ -655,8 +701,6 @@ func stepLeader(r *raft, msg proto.Message) error {
 		return r.handleLeaderTransfer(msg)
 	case proto.SnapshotStatus:
 		return r.handleSnapshotStatus(msg)
-	case proto.SnapshotReceived:
-		return r.handleSnapshotReceived(msg)
 	case proto.Unreachable:
 		return r.handleUnreachable(msg)
 	case proto.RateLimit:
@@ -724,6 +768,14 @@ func tickCandidate(r *raft) {
 // tickLeader advances the leader tick. Sends heartbeats and checks
 // quorum connectivity.
 func tickLeader(r *raft) {
+	// Snapshot ack/retry countdowns must advance even while quiesced:
+	// a lagging follower's catch-up runs entirely on response messages,
+	// none of which reset the quiesce idle counter, so a snapshot cycle
+	// can start and finish under quiesce. Skipping this behind the
+	// quiesce early-return would freeze an armed countdown and strand
+	// the follower paused in snapshot state until the next proposal.
+	r.tickSnapshotWaits()
+
 	if r.quiesce.active {
 		// During quiesce, only send liveness probes.
 		if r.quiesce.tickLiveness() {
@@ -824,24 +876,48 @@ func tickLeader(r *raft) {
 // During this window, the cluster is transitioning between membership
 // configurations, and starting an election could violate the overlap
 // guarantee required for safe membership changes.
+// The whole uncommitted range must be scanned, in bounded chunks. Membership
+// now takes effect at COMMIT time, and the sole safety argument for that is
+// "at most one config change is ever uncommitted" — enforced by the propose
+// gate plus this re-arm. A byte-bounded scan that stopped early would miss a
+// config change beyond the bound and let a second one be proposed, which is
+// the classic two-simultaneous-configurations unsafety. Every failure to
+// prove absence therefore fails CLOSED (returns true, blocking new config
+// change proposals) rather than open.
 func (r *raft) hasConfigChangeToApply() bool {
 	if r.log.committed >= r.log.lastIndex() {
 		return false
 	}
-	// Scan entries from committed+1 to lastIndex for config changes.
-	// Use a bounded maxSize to prevent loading an unbounded log tail
-	// into memory. Config changes are rare and block further config
-	// changes, so they appear near the start of the uncommitted range.
-	entries, err := r.log.entries(r.log.committed+1, r.log.lastIndex()+1, maxConfigChangeScanSize)
-	if err != nil {
-		// If we cannot read entries (compacted), be conservative and
-		// allow the election. The log is already behind.
-		return false
-	}
-	for i := range entries {
-		if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
+	lastIdx := r.log.lastIndex()
+	for low := r.log.committed + 1; low <= lastIdx; {
+		high := low + configChangeScanChunkEntries
+		if high > lastIdx+1 {
+			high = lastIdx + 1
+		}
+		// maxSize 0 means "no byte limit" for this index-bounded chunk, so
+		// the scan cannot silently stop short of `high`.
+		entries, err := r.log.entries(low, high, 0)
+		if err != nil {
+			// Cannot prove absence — assume a config change is pending.
+			slog.Warn("config change scan failed, assuming a pending change",
+				"shard", r.shardID,
+				"replica", r.replicaID,
+				"low", low,
+				"high", high,
+				"error", err,
+			)
 			return true
 		}
+		if len(entries) == 0 {
+			// No progress possible; treat as unprovable rather than absent.
+			return true
+		}
+		for i := range entries {
+			if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
+				return true
+			}
+		}
+		low = entries[len(entries)-1].Index + 1
 	}
 	return false
 }
@@ -889,7 +965,7 @@ func (r *raft) startElection() {
 // campaign sends vote requests to all voting members. The message
 // template is created once and only the To field is mutated per peer.
 // send() copies the struct by value when appending, so reuse is safe.
-func (r *raft) campaign(msgType uint64) {
+func (r *raft) campaign(msgType uint64, transfer bool) {
 	term := r.term
 	if msgType == proto.RequestPreVote {
 		// For PreVote, use term+1 as the prospective term without
@@ -902,6 +978,14 @@ func (r *raft) campaign(msgType uint64) {
 		Term:     term,
 		LogTerm:  r.log.lastTerm(),
 		LogIndex: r.log.lastIndex(),
+	}
+	// Mark a leadership-transfer election by setting Hint to the
+	// candidate's own ID (Hint == From on receipt). Recipients exempt
+	// such votes from the CheckQuorum higher-term-vote guard, which
+	// would otherwise drop them while the old leader's lease is fresh
+	// (Raft thesis p.42).
+	if transfer {
+		msg.Hint = r.replicaID
 	}
 
 	for id := range r.remotes {
@@ -922,12 +1006,19 @@ func (r *raft) campaign(msgType uint64) {
 
 // broadcastPreVote sends RequestPreVote to all voting members.
 func (r *raft) broadcastPreVote() {
-	r.campaign(proto.RequestPreVote)
+	r.campaign(proto.RequestPreVote, false)
 }
 
 // broadcastVote sends RequestVote to all voting members.
 func (r *raft) broadcastVote() {
-	r.campaign(proto.RequestVote)
+	r.campaign(proto.RequestVote, false)
+}
+
+// broadcastTransferVote sends RequestVote to all voting members with the
+// leadership-transfer hint set, exempting the votes from recipients'
+// CheckQuorum higher-term-vote guard.
+func (r *raft) broadcastTransferVote() {
+	r.campaign(proto.RequestVote, true)
 }
 
 // handleVoteRequest processes a RequestVote or RequestPreVote message.
@@ -1022,7 +1113,7 @@ func (r *raft) handleVoteResp(msg proto.Message) error {
 // election is decided. Returns true if a transition occurred.
 func (r *raft) checkElectionResult() bool {
 	result := r.tallyVotes()
-	quorum := electionQuorum(r.remotes, r.witnesses)
+	q := quorum(r.remotes, r.witnesses)
 	granted := 0
 	for _, v := range r.votes {
 		if v {
@@ -1046,7 +1137,7 @@ func (r *raft) checkElectionResult() bool {
 			"won", true,
 			"term", r.term,
 			"votes_received", granted,
-			"votes_needed", quorum,
+			"votes_needed", q,
 			"duration_ticks", electionDuration,
 		)
 		r.becomeLeader()
@@ -1060,7 +1151,7 @@ func (r *raft) checkElectionResult() bool {
 			"won", false,
 			"term", r.term,
 			"votes_received", granted,
-			"votes_needed", quorum,
+			"votes_needed", q,
 			"duration_ticks", electionDuration,
 		)
 		r.becomeFollower(r.term, noLeader)
@@ -1072,7 +1163,7 @@ func (r *raft) checkElectionResult() bool {
 
 // tallyVotes counts votes and returns the result.
 func (r *raft) tallyVotes() voteResult {
-	quorum := electionQuorum(r.remotes, r.witnesses)
+	q := quorum(r.remotes, r.witnesses)
 	granted := 0
 	rejected := 0
 	totalVoters := numVotingMembers(r.remotes, r.witnesses)
@@ -1085,10 +1176,10 @@ func (r *raft) tallyVotes() voteResult {
 		}
 	}
 
-	if granted >= quorum {
+	if granted >= q {
 		return voteWon
 	}
-	if rejected > totalVoters-quorum {
+	if rejected > totalVoters-q {
 		return voteLost
 	}
 	return votePending
@@ -1124,6 +1215,16 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 		if msg.Entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
 			if r.pendingConfigChange || foundCC {
 				return ErrPendingConfigChange
+			}
+			// Leader-side witness-policy check before append. The Host
+			// API pre-validates on the node the client contacted, but a
+			// follower-forwarded Propose reaches this leader with no
+			// validation at all, and a differently-configured contact
+			// node may have validated against a laxer policy. This is
+			// the last gate before the change enters the log; the
+			// committed-replay path never re-checks (determinism).
+			if err := r.validateConfigChangePolicy(msg.Entries[i].Cmd); err != nil {
+				return err
 			}
 			foundCC = true
 		}
@@ -1163,6 +1264,92 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 	r.broadcastAppend()
 	// Leader also counts its own entries as matched.
 	r.tryCommit()
+	return nil
+}
+
+// validateConfigChangePolicy enforces this node's WitnessConfig policy
+// against a proposed config change using the leader's live peer tracking
+// (remotes/witnesses; the leader itself is always a full voting replica).
+// It mirrors the membership-level validateAddWitness/validateRemoveNode
+// policy checks but runs at the raft layer, where forwarded proposals
+// arrive without any prior validation. Only the policy rules are checked
+// here — structural rules (duplicates, unknown members, last-voter) stay
+// with the Host-side validation and the tolerant apply path. An
+// unmarshalable payload passes through with a warning, matching the
+// apply path's tolerance (processConfigChanges warns and skips it), so
+// the propose and apply layers never disagree about which entries are
+// acceptable.
+func (r *raft) validateConfigChangePolicy(cmd []byte) error {
+	var cc proto.ConfigChange
+	if _, err := cc.UnmarshalFrom(cmd); err != nil {
+		slog.Warn("config change payload unmarshal failed at propose time",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"error", err,
+		)
+		return nil
+	}
+	// The voting-member cap must be enforced HERE for every net-new voting
+	// member. This is the last gate before the entry enters the log on a
+	// follower-forwarded Propose, which bypasses the Host API's
+	// ValidateConfigChange entirely. The committed-replay path deliberately
+	// does not re-check (determinism), so a committed 65th voter would make
+	// rebuildReplicaToBit's invariant panic on every node that becomes
+	// leader — permanently killing the shard.
+	switch cc.Type {
+	case proto.AddNode, proto.AddWitness:
+		_, isRemote := r.remotes[cc.ReplicaID]
+		_, isWitness := r.witnesses[cc.ReplicaID]
+		if !isRemote && !isWitness && cc.ReplicaID != r.replicaID {
+			if len(r.remotes)+len(r.witnesses)+1 >= maxVotingMembers {
+				return ErrTooManyVotingMembers
+			}
+		}
+	}
+
+	switch cc.Type {
+	case proto.UpdateWitnessPolicy:
+		// The NEW policy must be satisfied by the current membership,
+		// mirroring validateUpdateWitnessPolicy.
+		if cc.MaxWitnesses > 0 && uint64(len(r.witnesses)) > cc.MaxWitnesses {
+			return ErrTooManyWitnesses
+		}
+		if cc.RequireFullReplicaMajority && len(r.witnesses) > 0 {
+			fullReplicas := len(r.remotes) + 1 // + self
+			if fullReplicas < quorumOf(fullReplicas+len(r.witnesses)) {
+				return ErrBreaksFullReplicaMajority
+			}
+		}
+	case proto.AddWitness:
+		if _, exists := r.witnesses[cc.ReplicaID]; exists {
+			// Re-adding an existing witness is a no-op at apply time;
+			// policy arithmetic below assumes a net-new witness.
+			return nil
+		}
+		newWitnessCount := uint64(len(r.witnesses) + 1)
+		if r.maxWitnesses > 0 && newWitnessCount > r.maxWitnesses {
+			return ErrTooManyWitnesses
+		}
+		if r.requireFullReplicaMajority {
+			fullReplicas := len(r.remotes) + 1 // + self
+			if fullReplicas < quorumOf(fullReplicas+int(newWitnessCount)) {
+				return ErrBreaksFullReplicaMajority
+			}
+		}
+	case proto.RemoveNode:
+		if !r.requireFullReplicaMajority || len(r.witnesses) == 0 {
+			return nil
+		}
+		_, isRemote := r.remotes[cc.ReplicaID]
+		if !isRemote && cc.ReplicaID != r.replicaID {
+			// Removing a witness or observer never worsens the ratio.
+			return nil
+		}
+		fullReplicas := len(r.remotes) // + self - removed member
+		if fullReplicas < quorumOf(fullReplicas+len(r.witnesses)) {
+			return ErrBreaksFullReplicaMajority
+		}
+	}
 	return nil
 }
 
@@ -1400,7 +1587,8 @@ func (r *raft) sendSnapshot(to uint64) {
 		return
 	}
 
-	rm.becomeSnapshot(ss.Index)
+	r.snapshotSeq++
+	rm.becomeSnapshot(ss.Index, r.snapshotSeq)
 
 	snap := *ss
 	// Strip snapshot file data for witnesses. They only need the
@@ -1411,9 +1599,14 @@ func (r *raft) sendSnapshot(to uint64) {
 		snap.Witness = true
 	}
 
+	// Hint carries the transfer sequence; the transport echoes it back in
+	// the SnapshotStatus report. It is transport-local and never crosses
+	// the wire to the follower (the snapshot streams as SnapshotHeader +
+	// chunks).
 	r.send(proto.Message{
 		Type:     proto.InstallSnapshot,
 		To:       to,
+		Hint:     r.snapshotSeq,
 		Snapshot: snap,
 	})
 }
@@ -1448,12 +1641,11 @@ func (r *raft) handleAppend(msg proto.Message) error {
 		return err
 	}
 	if ok {
-		// Signal to Peer that log entries were overwritten due to
-		// conflict resolution. Peer must rebuild membership from
-		// the committed base to ensure truncated config change
-		// entries are rolled back (PhD thesis 4.1).
+		// Truncation cannot remove an applied config change: membership
+		// only mutates on COMMITTED entries (Peer.Commit ->
+		// processConfigChanges) and committed entries are never
+		// truncated, so no membership rollback is needed here.
 		if truncated {
-			r.logTruncated = true
 			slog.Debug("log truncated due to conflict",
 				"shard", r.shardID,
 				"replica", r.replicaID,
@@ -1669,13 +1861,25 @@ func (r *raft) handleAppendResp(msg proto.Message) error {
 // replication. Uses a pre-allocated sort buffer.
 func (r *raft) tryCommit() bool {
 	r.matched = r.matched[:0]
-	r.matched = append(r.matched, r.log.lastIndex()) // leader's own match
+	// The leader's own match is its DURABLE index (inmem.savedTo), not
+	// lastIndex(). lastIndex() includes entries that exist only in memory
+	// and have not been fsynced by the commit worker; counting them would
+	// let a single follower ack complete a "quorum" in which the leader's
+	// contribution is not crash-safe — a power failure before the fsync
+	// then loses a committed entry. Commits blocked only on local
+	// durability are re-evaluated at the persistence edge in Peer.Commit.
+	r.matched = append(r.matched, r.log.inmem.savedTo)
 	for _, rm := range r.remotes {
 		r.matched = append(r.matched, rm.match)
 	}
+	// Witness matches (tracked via metadata-only Replicate acks) count toward
+	// the unified quorum; see util.go quorum() for the safety rationale.
+	for _, wm := range r.witnesses {
+		r.matched = append(r.matched, wm.match)
+	}
 	slices.Sort(r.matched)
-	quorum := commitQuorum(r.remotes)
-	mci := r.matched[len(r.matched)-quorum]
+	q := quorum(r.remotes, r.witnesses)
+	mci := r.matched[len(r.matched)-q]
 	oldCommit := r.log.committed
 	advanced := r.log.tryCommit(mci, r.term)
 	if advanced {
@@ -1765,7 +1969,7 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 
 	// Track heartbeat ack for both lease-based reads and ReadIndex
 	// leadership confirmation. Since witnesses vote in elections, the
-	// lease and ReadIndex quorums use electionQuorum (remotes + witnesses
+	// lease and ReadIndex quorums use the unified quorum (remotes + witnesses
 	// + self). All voting members must be tracked so their heartbeat
 	// acks count toward the leadership confirmation quorum.
 	if r.remoteLastAck != nil {
@@ -1895,7 +2099,14 @@ func (r *raft) handleSnapshot(msg proto.Message) error {
 	// Per Raft Figure 13: if existing log entry has same index and
 	// term as snapshot's last included entry, retain following entries.
 	if t, err := r.log.term(ss.Index); err == nil && t == ss.Term {
-		// Log matches at snapshot point; just advance commit.
+		// Log matches at snapshot point; advance commit AND the
+		// processed marker. The engine restores the state machine from
+		// the received snapshot (HandleSnapshot always requests SM
+		// recovery after delivering InstallSnapshot), so every entry at
+		// or below ss.Index is already represented in the recovered
+		// state. Leaving processed behind would re-emit those entries
+		// to the apply worker and double-apply them on top of the
+		// recovered state, violating state-machine safety.
 		// Do NOT rebuild remotes here: retained entries may contain
 		// config changes newer than the snapshot's membership.
 		// Overwriting would lose those changes.
@@ -1907,6 +2118,7 @@ func (r *raft) handleSnapshot(msg proto.Message) error {
 			"snapshot_term", ss.Term,
 		)
 		r.log.commitTo(ss.Index)
+		r.log.appliedTo(ss.Index)
 	} else {
 		// Log does not match; discard and restore from snapshot.
 		slog.Info("snapshot accepted, restoring from snapshot",
@@ -1938,6 +2150,9 @@ func (r *raft) handleSnapshot(msg proto.Message) error {
 // the given membership. This is called after snapshot restore to ensure
 // the raft node tracks the correct set of peers.
 func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
+	// The snapshot's membership carries the replicated witness policy.
+	r.maxWitnesses = m.MaxWitnesses
+	r.requireFullReplicaMajority = m.RequireFullReplicaMajority
 	nextIdx := r.log.lastIndex() + 1
 	r.remotes = make(map[uint64]*remote)
 	for id := range m.Addresses {
@@ -1959,34 +2174,67 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 	}
 }
 
-// handleSnapshotReceived processes a SnapshotReceived message, which is
-// delivered after the receiver successfully persists a snapshot to disk
-// and LogDB. This rebuilds the remote tracking maps from the snapshot's
-// membership so the raft layer has an accurate view of cluster peers.
-// All roles handle this message because any node may receive a snapshot
-// (e.g., a follower joining mid-cluster, or a candidate that fell behind).
-func (r *raft) handleSnapshotReceived(msg proto.Message) error {
-	if !msg.Snapshot.IsEmpty() {
-		r.rebuildRemotesFromMembership(msg.Snapshot.Membership)
-	}
-	return nil
-}
+// snapshotAckWaitMultiplier sizes the post-transfer ack wait as a multiple
+// of the election timeout. Transfer success is reported when the last chunk
+// hits the wire; the follower's ack arrives only after it reassembles the
+// chunks, persists them, and its raft layer processes the InstallSnapshot —
+// which under load can exceed a single election timeout. A premature expiry
+// costs a redundant snapshot re-stream (the receiver dedups it), so the
+// wait errs generous; a crashed follower just waits this long before the
+// leader's retry resumes.
+const snapshotAckWaitMultiplier = 3
 
-// handleSnapshotStatus processes a snapshot status report on the leader.
+// handleSnapshotStatus processes a snapshot transfer status report on the
+// leader. The status is bound to the exact transfer attempt by the
+// sequence in msg.Hint (stamped by sendSnapshot, echoed by the transport);
+// a stale report from a superseded attempt — including a re-send of the
+// SAME snapshot index — is discarded so it cannot arm the ack countdown
+// (or force a backoff) for a newer in-flight stream. Both outcomes keep
+// the peer paused in remoteSnapshot with a countdown armed (see
+// remote.snapshotDone): on success the peer exits via its own raft-level
+// ack (ReplicateResp → respondedTo) or the countdown fallback; on failure
+// the countdown is a retry backoff, preventing a persistently failing
+// transfer (unreachable peer, full receiver disk) from re-streaming full
+// snapshots back-to-back.
 func (r *raft) handleSnapshotStatus(msg proto.Message) error {
 	rm := r.getRemote(msg.From)
 	if rm == nil {
 		return nil
 	}
-	if rm.state != remoteSnapshot {
+	if rm.state != remoteSnapshot || msg.Hint != rm.snapshotSeq {
 		return nil
 	}
 	if msg.Reject {
-		rm.snapshotFailed()
+		rm.snapshotFailed(r.electionTimeout)
 	} else {
-		rm.snapshotDone()
+		rm.snapshotDone(snapshotAckWaitMultiplier * r.electionTimeout)
 	}
 	return nil
+}
+
+// tickSnapshotWaits advances the snapshot ack/retry countdown (see
+// remote.snapshotDone) for every peer category that can receive snapshots
+// (remotes, observers, witnesses). A peer whose countdown expires falls
+// back to probe so the normal retry path — including a fresh snapshot
+// send — resumes. Called once per leader tick, before any quiesce
+// early-return.
+func (r *raft) tickSnapshotWaits() {
+	expire := func(peers map[uint64]*remote) {
+		for id, rm := range peers {
+			if rm.tickSnapshotWait() {
+				slog.Warn("snapshot ack timed out, falling back to probe",
+					"shard", r.shardID,
+					"replica", r.replicaID,
+					"peer", id,
+					"snapshot_index", rm.snapshotIndex,
+				)
+				rm.becomeProbe()
+			}
+		}
+	}
+	expire(r.remotes)
+	expire(r.observers)
+	expire(r.witnesses)
 }
 
 // handleUnreachable processes an unreachable report on the leader.
@@ -2079,7 +2327,7 @@ func (r *raft) hasValidLease() bool {
 	if !r.leaseRead || r.state != leader || r.remoteLastAck == nil {
 		return false
 	}
-	quorum := electionQuorum(r.remotes, r.witnesses)
+	q := quorum(r.remotes, r.witnesses)
 	count := 1 // count self
 	leaseExpiry := r.electionTick - r.leaseTimeout
 	for _, tick := range r.remoteLastAck {
@@ -2087,7 +2335,7 @@ func (r *raft) hasValidLease() bool {
 			count++
 		}
 	}
-	return count >= quorum
+	return count >= q
 }
 
 // handleLeaderReadIndex handles a read index request on the leader.
@@ -2244,8 +2492,8 @@ func (r *raft) checkReadIndexQuorum() {
 	// members (remotes + witnesses + self). Since witnesses vote in elections,
 	// the leadership confirmation quorum must overlap with every possible
 	// election-winning coalition to prevent stale reads after leadership change.
-	// Use electionQuorum (remotes + witnesses + leader) for linearizability.
-	quorum := electionQuorum(r.remotes, r.witnesses)
+	// Use the unified quorum (remotes + witnesses + leader) for linearizability.
+	q := quorum(r.remotes, r.witnesses)
 
 	// Compact resolved entries by overwriting with unresolved ones.
 	// Self-ack is pre-set at creation time in handleLeaderReadIndex,
@@ -2254,7 +2502,7 @@ func (r *raft) checkReadIndexQuorum() {
 	resolvedCount := 0
 	for i := range r.pendingReadIndex {
 		pending := &r.pendingReadIndex[i]
-		if pending.ackCount < quorum {
+		if pending.ackCount < q {
 			r.pendingReadIndex[n] = r.pendingReadIndex[i]
 			n++
 			continue
@@ -2267,7 +2515,7 @@ func (r *raft) checkReadIndexQuorum() {
 			"index", pending.index,
 			"ctx", pending.ctx,
 			"ack_count", pending.ackCount,
-			"quorum", quorum,
+			"quorum", q,
 		)
 		if pending.from != 0 && pending.from != r.replicaID {
 			// Forwarded from a follower; send response back.
@@ -2397,9 +2645,11 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 	// the election fails, tickFollower would use the extended quiesce
 	// election timeout (30x normal).
 	r.quiesce.exit()
-	// Start an election immediately, bypassing PreVote.
+	// Start an election immediately, bypassing PreVote. The votes carry
+	// the leadership-transfer hint so peers with a fresh leader lease
+	// still grant them.
 	r.becomeCandidate()
-	r.broadcastVote()
+	r.broadcastTransferVote()
 	r.checkElectionResult()
 	return nil
 }
@@ -2545,7 +2795,7 @@ func (r *raft) hasQuorumActive() bool {
 			activeCount++
 		}
 	}
-	return activeCount >= electionQuorum(r.remotes, r.witnesses)
+	return activeCount >= quorum(r.remotes, r.witnesses)
 }
 
 // logQuorumStatus logs the current quorum health status. Called
@@ -2562,7 +2812,7 @@ func (r *raft) logQuorumStatus() {
 			activeCount++
 		}
 	}
-	quorum := electionQuorum(r.remotes, r.witnesses)
+	q := quorum(r.remotes, r.witnesses)
 	slog.Debug("quorum status",
 		"shard", r.shardID,
 		"replica", r.replicaID,
@@ -2570,7 +2820,7 @@ func (r *raft) logQuorumStatus() {
 		"commit_index", r.log.committed,
 		"last_index", r.log.lastIndex(),
 		"active_replicas", activeCount,
-		"quorum_size", quorum,
+		"quorum_size", q,
 	)
 }
 
@@ -2599,7 +2849,7 @@ func (r *raft) resetLeaseAcks() {
 
 // rebuildReplicaToBit constructs the replicaToBit mapping from the current
 // set of all voting members (remotes + witnesses + self). Both ReadIndex
-// and LeaseRead use electionQuorum (remotes + witnesses + self) because
+// and LeaseRead use the unified quorum (remotes + witnesses + self) because
 // witnesses vote in elections and the leadership confirmation quorum must
 // overlap with every possible election-winning coalition. Including
 // witnesses ensures their heartbeat acks count toward ReadIndex quorum.
@@ -2621,6 +2871,26 @@ func (r *raft) rebuildReplicaToBit() {
 	for id := range r.witnesses {
 		r.replicaToBit[id] = bit
 		bit++
+	}
+
+	// Re-base in-flight ReadIndex acks to self-only. Their ackBits were
+	// recorded under the OLD bit mapping; after a rebuild (membership
+	// change during leadership) a replica whose position moved could ack
+	// again into a fresh bit and be counted twice, letting a sub-quorum
+	// set of replicas satisfy the ReadIndex check — a stale-read hazard.
+	// Dropping recorded acks is safe: the pending heartbeat round keeps
+	// re-confirming and the entries simply take one more response each.
+	// Self is always bit 0, matching the creation-time self-ack.
+	selfMask := uint64(1) << r.replicaToBit[r.replicaID]
+	for i := range r.pendingReadIndex {
+		r.pendingReadIndex[i].ackBits = selfMask
+		r.pendingReadIndex[i].ackCount = 1
+	}
+	// Arm a fresh confirmation heartbeat round: responses to the previous
+	// round may have all arrived already (and were just discarded), and
+	// regular heartbeats carry ctx=0 which never confirms ReadIndex.
+	if len(r.pendingReadIndex) > 0 {
+		r.readIndexBroadcastPending = true
 	}
 }
 

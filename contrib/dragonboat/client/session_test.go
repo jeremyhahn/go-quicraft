@@ -386,6 +386,21 @@ func TestSession_PrepareForPropose(t *testing.T) {
 	}
 }
 
+func TestSession_PrepareForRegister(t *testing.T) {
+	s := NewSession(1, &testRNG{val: 100})
+	s.PrepareForRegister()
+	if s.SeriesID() != quicraft.SeriesIDForRegister {
+		t.Errorf("SeriesID after PrepareForRegister = %d, want %d",
+			s.SeriesID(), quicraft.SeriesIDForRegister)
+	}
+	if !s.ValidForSessionOp(1) {
+		t.Error("session prepared for register must be valid for a session op")
+	}
+	if s.ValidForProposal(1) {
+		t.Error("session prepared for register must not be valid for normal proposals")
+	}
+}
+
 func TestSession_PrepareForUnregister(t *testing.T) {
 	s := NewSession(1, &testRNG{val: 100})
 	s.PrepareForPropose()

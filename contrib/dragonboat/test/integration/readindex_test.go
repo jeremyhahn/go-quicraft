@@ -49,7 +49,21 @@ func TestIntegration_DB_ReadIndex_ReadLocalNode(t *testing.T) {
 	}
 	defer rs.Release()
 
-	// Step 2: Wait for ReadIndex to resolve via ResultC, then query locally.
+	// Step 2: Wait for ReadIndex to resolve via ResultC. Per the
+	// dragonboat contract, ReadLocalNode may only be called after the
+	// caller has observed a completed result; calling it earlier
+	// returns ErrInvalidOperation.
+	select {
+	case r := <-rs.ResultC():
+		if !r.Completed() {
+			t.Fatalf("ReadIndex did not complete: timeout=%v rejected=%v",
+				r.Timeout(), r.Rejected())
+		}
+	case <-time.After(defaultTimeout):
+		t.Fatal("timed out waiting for ReadIndex result")
+	}
+
+	// Step 3: Query the local state machine at the confirmed read index.
 	result, err := leaderHost.ReadLocalNode(rs, encodeKVGet("readindex-key"))
 	if err != nil {
 		t.Fatalf("ReadLocalNode failed: %v", err)

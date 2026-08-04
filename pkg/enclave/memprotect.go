@@ -21,6 +21,7 @@ package enclave
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/awnumar/memguard"
@@ -58,100 +59,134 @@ func (e *OpenError) Unwrap() error {
 // ProtectedBuffer wraps memguard.LockedBuffer for consistent memory protection
 // across all platforms. It provides guard pages, core dump prevention, and
 // guaranteed zeroing on destruction.
+//
+// OWNERSHIP: a ProtectedBuffer's CONTENTS are single-owner. memguard's
+// LockedBuffer is not safe for concurrent Destroy/read, so Bytes and Size must
+// not run concurrently with Destroy, and the slice returned by Bytes must not
+// outlive the buffer (Destroy zeroes and unmaps that memory).
+//
+// The locked-buffer REFERENCE is held in an atomic.Pointer, mirroring
+// ProtectedKey. That makes Destroy single-shot and idempotent under
+// concurrency — exactly one caller reaches memguard, the rest are no-ops — and
+// removes this type's own field race; it does not make the contents shareable.
 type ProtectedBuffer struct {
-	buf *memguard.LockedBuffer
+	buf atomic.Pointer[memguard.LockedBuffer]
+}
+
+// newProtectedBuffer wraps an existing locked buffer.
+func newProtectedBuffer(buf *memguard.LockedBuffer) *ProtectedBuffer {
+	p := &ProtectedBuffer{}
+	p.buf.Store(buf)
+	return p
 }
 
 // NewProtectedBuffer allocates a memory-protected buffer of the given size.
 // The buffer is locked in memory with guard pages on both sides.
 func NewProtectedBuffer(size int) *ProtectedBuffer {
-	return &ProtectedBuffer{buf: memguard.NewBuffer(size)}
+	return newProtectedBuffer(memguard.NewBuffer(size))
 }
 
 // NewProtectedBufferFromBytes creates a memory-protected buffer from existing bytes.
 // The source slice is wiped after copying into the protected buffer.
 func NewProtectedBufferFromBytes(data []byte) *ProtectedBuffer {
-	return &ProtectedBuffer{buf: memguard.NewBufferFromBytes(data)}
+	return newProtectedBuffer(memguard.NewBufferFromBytes(data))
 }
 
-// Bytes returns the underlying byte slice. The caller must NOT store this reference
-// beyond the lifetime of the ProtectedBuffer.
+// Bytes returns the underlying byte slice, or nil once the buffer has been
+// destroyed. The caller must NOT store this reference beyond the lifetime of
+// the ProtectedBuffer.
 func (p *ProtectedBuffer) Bytes() []byte {
-	if p.buf == nil {
+	buf := p.buf.Load()
+	if buf == nil {
 		return nil
 	}
-	return p.buf.Bytes()
+	return buf.Bytes()
 }
 
-// Size returns the size of the protected buffer.
+// Size returns the size of the protected buffer, or 0 once destroyed.
 func (p *ProtectedBuffer) Size() int {
-	if p.buf == nil {
+	buf := p.buf.Load()
+	if buf == nil {
 		return 0
 	}
-	return p.buf.Size()
+	return buf.Size()
 }
 
-// Destroy zeroes and releases the protected memory. Safe to call multiple times.
+// Destroy zeroes and releases the protected memory. Safe to call multiple
+// times and concurrently with Bytes/Size; only the caller that wins the swap
+// destroys the buffer.
 func (p *ProtectedBuffer) Destroy() {
-	if p.buf != nil {
-		p.buf.Destroy()
-		p.buf = nil
+	if buf := p.buf.Swap(nil); buf != nil {
+		buf.Destroy()
 	}
 }
 
 // ProtectedKey wraps memguard.Enclave for encrypting key material at rest in memory.
 // The key is only decrypted when needed and immediately re-encrypted.
+//
+// ProtectedKey is safe for concurrent use: the enclave reference is held in
+// an atomic.Pointer, so Open and Clear may race without a torn read. An
+// atomic pointer (rather than a mutex) is used because Open sits on hot
+// decrypt paths (per-frame DEK access in the seal barrier) and the only
+// shared state is the single reference — a lock would add contention for no
+// additional invariant.
 type ProtectedKey struct {
-	enclave *memguard.Enclave
+	enclave atomic.Pointer[memguard.Enclave]
 }
 
 // NewProtectedKey creates an encrypted-at-rest key from a byte slice.
 // The source slice is wiped after sealing into the enclave.
 func NewProtectedKey(key []byte) *ProtectedKey {
-	return &ProtectedKey{enclave: memguard.NewEnclave(key)}
+	p := &ProtectedKey{}
+	p.enclave.Store(memguard.NewEnclave(key))
+	return p
 }
 
 // Open decrypts the key material and returns a ProtectedBuffer.
 // The caller must call Destroy() on the returned buffer when done.
 func (p *ProtectedKey) Open() (*ProtectedBuffer, error) {
-	if p.enclave == nil {
+	enclave := p.enclave.Load()
+	if enclave == nil {
 		return nil, ErrEnclaveNil
 	}
-	buf, err := p.enclave.Open()
+	buf, err := enclave.Open()
 	if err != nil {
 		return nil, &OpenError{Err: err}
 	}
-	return &ProtectedBuffer{buf: buf}, nil
+	return newProtectedBuffer(buf), nil
 }
 
-// Clear actively zeroes the key material in the enclave by opening it
-// into a LockedBuffer and destroying it, then nils the reference. This
-// ensures the sensitive data is wiped immediately rather than relying on
-// the garbage collector and memguard's finalizer. After Clear, Open
-// returns ErrEnclaveNil. Safe to call multiple times.
+// Clear drops the enclave reference so the key can no longer be opened.
+// After Clear, Open returns ErrEnclaveNil. Safe to call multiple times and
+// concurrently with Open.
+//
+// Clear deliberately does NOT open the enclave to destroy the returned
+// buffer: memguard.Enclave has no API to zero its internal ciphertext, so an
+// open-then-destroy would only wipe the freshly DECRYPTED copy — briefly
+// re-materializing the plaintext in memory for no benefit — while leaving the
+// enclave's own ciphertext untouched either way. The ciphertext is useless
+// without memguard's session coffer key and is reclaimed by the enclave
+// finalizer once unreferenced.
 func (p *ProtectedKey) Clear() {
-	if p.enclave == nil {
-		return
-	}
-	// Open the enclave to get a LockedBuffer, then destroy it to
-	// securely zero the memory. If Open fails (e.g., enclave was
-	// already destroyed internally), we still nil the reference.
-	buf, err := p.enclave.Open()
-	if err == nil && buf != nil {
-		buf.Destroy()
-	}
-	p.enclave = nil
+	p.enclave.Store(nil)
 }
 
 // SealProtectedBuffer creates a new ProtectedKey from a ProtectedBuffer,
-// consuming the buffer. The buffer is destroyed after sealing.
+// CONSUMING the buffer: ownership transfers to the returned key and the
+// argument is left empty (Bytes returns nil, Size returns 0). Returns nil if
+// the buffer is nil or already consumed/destroyed. Only the caller that wins
+// the swap seals; a concurrent second call gets nil.
 func SealProtectedBuffer(buf *ProtectedBuffer) *ProtectedKey {
-	if buf == nil || buf.buf == nil {
+	if buf == nil {
 		return nil
 	}
-	enclave := buf.buf.Seal()
-	buf.buf = nil
-	return &ProtectedKey{enclave: enclave}
+	locked := buf.buf.Swap(nil)
+	if locked == nil {
+		return nil
+	}
+	p := &ProtectedKey{}
+	p.enclave.Store(locked.Seal())
+	return p
 }
 
 // WipeBytes securely zeroes a byte slice using memguard's wiping mechanism.

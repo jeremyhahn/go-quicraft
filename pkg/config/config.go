@@ -26,18 +26,86 @@ const (
 	DefaultElectionRTT          uint64 = 10
 	DefaultHeartbeatRTT         uint64 = 1
 	DefaultCompactionOverhead   uint64 = 5000
-	DefaultMaxInMemLogSize      uint64 = 0                // 0 = disabled
-	DefaultMaxEntrySize         uint64 = 8 * 1024 * 1024  // 8 MB
-	DefaultMaxApplyEntrySize    uint64 = 64 * 1024 * 1024 // 64 MB
+	DefaultMaxInMemLogSize      uint64 = 0               // 0 = disabled
+	DefaultMaxEntrySize         uint64 = 8 * 1024 * 1024 // 8 MB
+	DefaultMaxApplyEntrySize    uint64 = MaxReplicationPayloadBytes
 	DefaultMaxSnapshotSize      uint64 = 4 * 1024 * 1024 * 1024
 	DefaultMaxSessionsPerClient uint64 = 128
 	DefaultMaxTotalSessions     uint64 = 16384
 )
 
+// MaxReplicationPayloadBytes bounds MaxApplyEntrySize, which raft uses as the
+// size limit when chunking a replication batch. A batch larger than the
+// transport can frame is rejected at marshal time and DROPPED — and because
+// the follower's next index never advances, raft rebuilds the identical
+// oversized batch forever, so a lagging follower can never catch up and there
+// is no snapshot fallback (the entries still exist).
+//
+// The value is transport.MaxFrameSize minus frame and batch framing overhead.
+// It is duplicated here rather than imported because pkg/internal/transport
+// imports this package; transport asserts at compile time that the two agree.
+const MaxReplicationPayloadBytes uint64 = 16711672
+
 // BoolPtr returns a pointer to the given bool value. This is the standard
 // Go pattern for setting *bool config fields where nil means "use default".
 // Exported for use by contrib packages (e.g., dragonboat adapter).
 func BoolPtr(v bool) *bool { return &v }
+
+// WitnessConfig tunes witness-replica policy for a shard. Witnesses are voting
+// members that store metadata-only log entries (Index/Term, no command
+// payload): they add election fault-tolerance without a full replica's storage
+// cost. Witnesses count toward BOTH the election and commit quorums (a Raft
+// safety requirement — a split quorum could let a committed entry be
+// truncated), so an individual commit may rest on a {leader + witnesses}
+// quorum with its payload on the leader alone: committed data survives any
+// minority of crash-restart failures, but permanent storage loss of every
+// full replica holding an entry makes it unrecoverable. These knobs bound
+// membership shape to limit that exposure; they do NOT constrain which nodes
+// form any individual commit quorum. The full safety and durability analysis
+// lives in docs/raft/protocol.md Section 6.
+//
+// Lifecycle: WitnessConfig is the BOOTSTRAP SEED for the shard's
+// replicated witness policy. When a shard is created, the policy is
+// written into the replicated membership state (proto.Membership) and
+// from then on is carried by the log, snapshots, and WAL like the member
+// maps themselves — every replica enforces the identical policy
+// regardless of local configuration, and it survives restarts from the
+// replicated state, not from this struct. Change it at runtime via
+// Host.RequestUpdateWitnessPolicy / SyncRequestUpdateWitnessPolicy,
+// which commits an UpdateWitnessPolicy config change through Raft.
+// Enforcement is validate-time only (Host API pre-validation plus the
+// leader's propose gate), never on the deterministic apply path.
+type WitnessConfig struct {
+	// MaxWitnesses caps the number of witnesses in the shard. Zero means no
+	// explicit cap (witnesses are still bounded by the 64 voting-member limit);
+	// negative values are rejected by Config.Validate. A witness-add config
+	// change that would exceed the cap is rejected at validation time with
+	// ErrTooManyWitnesses.
+	MaxWitnesses int
+
+	// RequireFullReplicaMajority, when enabled, rejects any config change —
+	// witness add or full-replica removal — that would leave the full
+	// (data-bearing) replicas unable to form a quorum over the voting set.
+	// This bounds how witness-dependent commits can become and is the default
+	// (nil => true). For example, adding a third witness to {3 full +
+	// 2 witnesses} is rejected (full 3 < quorum 4), as is removing a full
+	// replica from that membership; {2 full + 1 witness} is allowed (full 2 >=
+	// quorum 2). Note this is a membership-shape bound only: even in a
+	// compliant membership a commit can rest on {leader + witnesses} when the
+	// other full replicas lag (see the durability trade-off above). Set to
+	// BoolPtr(false) to allow witness-heavy memberships that knowingly accept
+	// full witness dependence for commit.
+	RequireFullReplicaMajority *bool
+}
+
+// GetRequireFullReplicaMajority returns the effective RequireFullReplicaMajority
+// policy, defaulting to true (the safe posture) when unset.
+func (w WitnessConfig) GetRequireFullReplicaMajority() bool {
+	if w.RequireFullReplicaMajority == nil {
+		return true
+	}
+	return *w.RequireFullReplicaMajority
+}
 
 // Config is per-shard Raft configuration. It controls election timing,
 // log compaction, entry size limits, session limits, and compression.
@@ -61,6 +129,12 @@ type Config struct {
 	// in elections and quorum but does not maintain a state machine.
 	// Mutually exclusive with IsObserver.
 	IsWitness bool
+
+	// Witness seeds the shard's replicated witness policy at bootstrap.
+	// The zero value is a safe default (RequireFullReplicaMajority
+	// enabled, no explicit witness cap). After bootstrap the policy lives
+	// in replicated membership state; see WitnessConfig.
+	Witness WitnessConfig
 
 	// CheckQuorum enables the leader to step down if it cannot reach a
 	// quorum within an election timeout. Defaults to true when nil.
@@ -122,6 +196,10 @@ type Config struct {
 	// MaxEntrySize) when both are set. Set MaxProposalPayloadSize to impose
 	// a tighter user-facing limit while keeping MaxEntrySize at the
 	// transport default.
+	//
+	// MaxEntrySize is also the decompression ceiling on the apply path, so
+	// it may not exceed proto.MaxEntrySize (8 MB); Validate rejects larger
+	// values with *MaxEntrySizeExceededError.
 	//
 	// Default: 8 MB.
 	MaxEntrySize uint64
@@ -305,6 +383,9 @@ func (c *Config) validateIdentity() error {
 	if c.IsObserver && c.IsWitness {
 		return newValidationError("IsObserver", "IsObserver and IsWitness are mutually exclusive")
 	}
+	if c.Witness.MaxWitnesses < 0 {
+		return newValidationError("Witness.MaxWitnesses", "must be >= 0 (0 means no explicit cap)")
+	}
 	return nil
 }
 
@@ -345,8 +426,23 @@ func (c *Config) validateSizeLimits() error {
 	if c.MaxEntrySize == 0 {
 		return newValidationError("MaxEntrySize", "must be > 0")
 	}
+	// MaxEntrySize doubles as the decompression ceiling on the apply path,
+	// so an operator-raised value above the protocol maximum would let a
+	// small compressed entry expand to an arbitrary size in memory.
+	if c.MaxEntrySize > uint64(proto.MaxEntrySize) {
+		return &MaxEntrySizeExceededError{
+			Configured:      c.MaxEntrySize,
+			ProtocolMaximum: uint64(proto.MaxEntrySize),
+		}
+	}
 	if c.MaxApplyEntrySize == 0 {
 		return newValidationError("MaxApplyEntrySize", "must be > 0")
+	}
+	if c.MaxApplyEntrySize > MaxReplicationPayloadBytes {
+		return &MaxApplyEntrySizeExceededError{
+			Configured:   c.MaxApplyEntrySize,
+			FrameMaximum: MaxReplicationPayloadBytes,
+		}
 	}
 	return nil
 }

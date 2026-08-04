@@ -26,6 +26,6 @@ import (
 // is verified directly via kdfParamsBelowFloor in
 // TestKDFParamsBelowFloor, independent of this bypass.
 func TestMain(m *testing.M) {
-	allowWeakKDFParams = true
+	allowWeakKDFParams.Store(true)
 	os.Exit(m.Run())
 }

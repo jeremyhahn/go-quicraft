@@ -17,6 +17,7 @@ package enclave
 import (
 	"bytes"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -130,7 +131,7 @@ func TestProtectedKey_OpenSeal(t *testing.T) {
 // TestProtectedKey_OpenNilEnclave verifies that Open returns ErrEnclaveNil
 // when the enclave is nil.
 func TestProtectedKey_OpenNilEnclave(t *testing.T) {
-	pk := &ProtectedKey{enclave: nil}
+	pk := &ProtectedKey{}
 	_, err := pk.Open()
 	if !errors.Is(err, ErrEnclaveNil) {
 		t.Fatalf("expected ErrEnclaveNil, got %v", err)
@@ -140,7 +141,7 @@ func TestProtectedKey_OpenNilEnclave(t *testing.T) {
 // TestProtectedKey_OpenNilEnclaveErrorMessage verifies the error message format
 // for ErrEnclaveNil.
 func TestProtectedKey_OpenNilEnclaveErrorMessage(t *testing.T) {
-	pk := &ProtectedKey{enclave: nil}
+	pk := &ProtectedKey{}
 	_, err := pk.Open()
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -204,7 +205,7 @@ func TestSealProtectedBuffer(t *testing.T) {
 	}
 
 	// The buffer's internal reference should be nil after sealing.
-	if pb.buf != nil {
+	if pb.buf.Load() != nil {
 		t.Fatal("buffer's internal reference should be nil after SealProtectedBuffer")
 	}
 
@@ -275,7 +276,7 @@ func TestNilError_TypedError(t *testing.T) {
 	})
 
 	t.Run("errors.Is matches ErrEnclaveNil", func(t *testing.T) {
-		pk := &ProtectedKey{enclave: nil}
+		pk := &ProtectedKey{}
 		_, err := pk.Open()
 		if !errors.Is(err, ErrEnclaveNil) {
 			t.Errorf("expected errors.Is(err, ErrEnclaveNil), got %v", err)
@@ -309,18 +310,64 @@ func TestProtectedKey_MultipleOpens(t *testing.T) {
 	}
 }
 
-// TestProtectedKey_ClearZeroesKeyMaterial verifies that Clear() opens and
-// destroys the underlying enclave data rather than relying on GC.
-func TestProtectedKey_ClearZeroesKeyMaterial(t *testing.T) {
+// TestProtectedKey_ClearDropsEnclaveReference verifies that Clear() makes
+// the key unopenable. Clear deliberately does NOT open the enclave to
+// destroy a decrypted copy (that would briefly re-materialize the plaintext
+// without zeroing the enclave's own ciphertext); it only drops the
+// reference — see the L16 fix.
+func TestProtectedKey_ClearDropsEnclaveReference(t *testing.T) {
 	keyData := []byte("clear-zeroes-key-material-32!!!!") // 32 bytes
 	pk := NewProtectedKey(keyData)
 
-	// Clear should not panic and should nil the enclave.
+	// Clear should not panic and should drop the enclave reference.
 	pk.Clear()
 
 	// After Clear, Open should return ErrEnclaveNil.
 	_, err := pk.Open()
 	if !errors.Is(err, ErrEnclaveNil) {
+		t.Fatalf("expected ErrEnclaveNil after Clear, got %v", err)
+	}
+}
+
+// TestProtectedKey_ConcurrentOpenClear is the L16 regression test for the
+// unsynchronized enclave field: Clear used to write p.enclave while Open
+// read it, a data race that could tear under the race detector. With the
+// atomic.Pointer field, concurrent Open and Clear are safe: every Open
+// either succeeds against a still-live reference or fails with
+// ErrEnclaveNil, and the race detector stays quiet.
+func TestProtectedKey_ConcurrentOpenClear(t *testing.T) {
+	keyData := []byte("concurrent-open-clear-key-32!!!!") // 32 bytes
+	pk := NewProtectedKey(keyData)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 100 {
+				buf, err := pk.Open()
+				if err != nil {
+					if !errors.Is(err, ErrEnclaveNil) {
+						t.Errorf("Open error = %v, want ErrEnclaveNil or success", err)
+					}
+					return
+				}
+				buf.Destroy()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		pk.Clear()
+	}()
+	close(start)
+	wg.Wait()
+
+	if _, err := pk.Open(); !errors.Is(err, ErrEnclaveNil) {
 		t.Fatalf("expected ErrEnclaveNil after Clear, got %v", err)
 	}
 }
@@ -361,5 +408,49 @@ func TestNewProtectedKey_WipesSource(t *testing.T) {
 	}
 	if !allZero {
 		t.Fatalf("source slice was not wiped by NewProtectedKey: %x", source)
+	}
+}
+
+// TestProtectedBuffer_ConcurrentDestroy is the regression test for the plain
+// `buf` field, whose write in Destroy raced every other Destroy. The reference
+// now lives in an atomic.Pointer, so exactly one caller wins the swap and
+// reaches memguard; the losers are no-ops.
+//
+// Note the deliberate absence of concurrent Bytes/Size here: memguard's own
+// LockedBuffer is not safe for concurrent Destroy/read, so the CONTENTS stay
+// single-owner (see the ProtectedBuffer doc comment). The atomic reference
+// fixes this type's own field race only.
+func TestProtectedBuffer_ConcurrentDestroy(t *testing.T) {
+	pb := NewProtectedBuffer(32)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pb.Destroy()
+		}()
+	}
+	wg.Wait()
+
+	if pb.Size() != 0 {
+		t.Fatal("Size should be 0 after Destroy")
+	}
+	if pb.Bytes() != nil {
+		t.Fatal("Bytes should be nil after Destroy")
+	}
+}
+
+// TestSealProtectedBuffer_ConsumedBufferReturnsNil verifies the documented
+// single-consumption contract: sealing an already-consumed buffer yields nil
+// rather than a second key over the same (now unowned) memory.
+func TestSealProtectedBuffer_ConsumedBufferReturnsNil(t *testing.T) {
+	pb := NewProtectedBufferFromBytes([]byte("consume-me-once-32-bytes-long!!!"))
+
+	if pk := SealProtectedBuffer(pb); pk == nil {
+		t.Fatal("first SealProtectedBuffer returned nil")
+	}
+	if pk := SealProtectedBuffer(pb); pk != nil {
+		t.Fatal("second SealProtectedBuffer should return nil for a consumed buffer")
 	}
 }

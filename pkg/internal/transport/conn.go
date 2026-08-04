@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -124,6 +125,23 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 		t.connMu.Unlock()
 		_ = conn.CloseWithError(QUICErrShutdown, "transport stopped during dial")
 		return nil, ErrStreamClosed
+	}
+	// Re-check the cache under the lock: singleflight only coalesces
+	// OVERLAPPING dials, so a dial started after another completed (fast-path
+	// miss racing the winner's insert) reaches here with the cache already
+	// populated. Overwriting would leak the cached connection — kept alive
+	// forever by keep-alives, its pre-opened streams diverging from the
+	// stream pool's bookkeeping. Keep the live winner and close the loser.
+	if existing, ok := t.conns[target]; ok && existing != conn {
+		select {
+		case <-existing.Context().Done():
+			// Cached connection is dead; replace it with the fresh dial.
+		default:
+			t.connMu.Unlock()
+			_ = conn.CloseWithError(QUICErrDuplicateDial, "duplicate dial: reusing cached connection")
+			slog.Debug("dial race lost, reusing cached connection", "target", target)
+			return existing, nil
+		}
 	}
 	t.conns[target] = conn
 	t.connMu.Unlock()
@@ -678,9 +696,13 @@ func (t *QUICTransport) inboundAuthorizedFor(conn *quic.Conn, target string) boo
 // authorization decision is computed once per (conn, target) and reused for
 // every subsequent batch on the same connection. This keeps the hot receive
 // path (frequent heartbeats) off the expensive ConnectionState()+VerifyHostname
-// call. The cache re-verifies only if the claimed address changes for the
-// connection. Entries are dropped by forgetInboundConnAuth when the inbound
-// connection's handler returns.
+// call.
+//
+// The cache holds srcAddrAuthSlots addresses so a peer alternating claimed
+// addresses cannot force a certificate check on every batch, and stops
+// verifying entirely (failing closed) after srcAddrAuthMaxDistinct distinct
+// claims from one connection. Entries are dropped by forgetInboundConnState
+// when the inbound connection's handler returns.
 func (t *QUICTransport) inboundAuthorizedForCached(conn *quic.Conn, target string) bool {
 	if conn == nil {
 		return false
@@ -690,24 +712,66 @@ func (t *QUICTransport) inboundAuthorizedForCached(conn *quic.Conn, target strin
 	entry := v.(*srcAddrAuthEntry)
 
 	entry.mu.Lock()
-	if entry.valid && entry.addr == target {
-		authorized := entry.authorized
-		entry.mu.Unlock()
-		return authorized
+	defer entry.mu.Unlock()
+	for i := range entry.slots {
+		if entry.slots[i].valid && entry.slots[i].addr == target {
+			return entry.slots[i].authorized
+		}
+	}
+	if entry.distinct >= srcAddrAuthMaxDistinct {
+		// A peer cycling claimed addresses is abusive; assume the negative
+		// result rather than paying for another certificate check.
+		return false
 	}
 	authorized := t.inboundAuthorizedFor(conn, target)
-	entry.addr = target
-	entry.authorized = authorized
-	entry.valid = true
-	entry.mu.Unlock()
+	entry.distinct++
+	entry.slots[entry.next] = srcAddrAuthSlot{addr: target, authorized: authorized, valid: true}
+	entry.next = (entry.next + 1) % srcAddrAuthSlots
 	return authorized
 }
 
-// forgetInboundConnAuth removes the cached SourceAddress authorization decision
-// for an inbound connection. Called when the connection's handler returns so
-// the per-connection cache does not grow unbounded across connection churn.
-func (t *QUICTransport) forgetInboundConnAuth(conn *quic.Conn) {
+// forgetInboundConnState removes the per-inbound-connection caches (the
+// SourceAddress authorization decisions and the message-receive sub-budget).
+// Called when the connection's handler returns — after every stream goroutine
+// it spawned has finished — so neither map grows unbounded across connection
+// churn. Waiting for the stream goroutines is what makes the delete final: an
+// in-flight handleStream would otherwise re-insert an entry keyed by the dead
+// connection with nothing left to remove it, pinning the whole *quic.Conn.
+func (t *QUICTransport) forgetInboundConnState(conn *quic.Conn) {
 	t.srcAddrAuth.Delete(conn)
+	t.connMsgBudget.Delete(conn)
+}
+
+// reserveConnMsgRecvBudget reserves n bytes against the per-connection
+// message-receive sub-budget in addition to the aggregate budget, so a single
+// peer cannot occupy the whole of MaxMessageReceiveMemory and force every
+// other peer's frames into the exhaustion path. A nil conn (test/unit paths)
+// is not accounted. Successful reservations must be paired with
+// releaseConnMsgRecvBudget.
+func (t *QUICTransport) reserveConnMsgRecvBudget(conn *quic.Conn, n int64) bool {
+	if conn == nil || t.maxConnMsgRecv <= 0 {
+		return true
+	}
+	v, _ := t.connMsgBudget.LoadOrStore(conn, new(atomic.Int64))
+	reserved := v.(*atomic.Int64)
+	if reserved.Add(n) > t.maxConnMsgRecv {
+		reserved.Add(-n)
+		return false
+	}
+	return true
+}
+
+// releaseConnMsgRecvBudget returns n previously-reserved bytes to the
+// per-connection message-receive sub-budget.
+func (t *QUICTransport) releaseConnMsgRecvBudget(conn *quic.Conn, n int64) {
+	if conn == nil || t.maxConnMsgRecv <= 0 {
+		return
+	}
+	v, ok := t.connMsgBudget.Load(conn)
+	if !ok {
+		return
+	}
+	v.(*atomic.Int64).Add(-n)
 }
 
 // ConnectionCount returns the number of active connections in the pool.

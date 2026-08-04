@@ -16,6 +16,7 @@ package transport
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -93,6 +94,16 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 	for i := range msgs {
 		n, err := msgs[i].MarshalTo(buf[offset:])
 		if err != nil {
+			// The buffer is sized for fixed HeartbeatMessageSize records, so a
+			// marshal failure means a non-fixed-size message slipped past
+			// isHeartbeatBatch — an internal routing bug. Surface it loudly:
+			// silently dropping the whole batch would stall liveness.
+			slog.Warn("transport: dropping heartbeat batch: message failed fixed-size marshal",
+				"target", target,
+				"batch_size", msgCount,
+				"msg_type", proto.MessageTypeName(msgs[i].Type),
+				"error", err,
+			)
 			t.putBuf(bufPtr)
 			return
 		}
@@ -108,6 +119,16 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 
 	stream, err := t.getStream(target, shardID, true)
 	if err != nil {
+		// Debug level: repeats every heartbeat tick while a peer is
+		// unreachable; the next tick retries. Gated so the variadic slog form
+		// does not build and box its []any on every tick when Debug is off.
+		if debugEnabled() {
+			slog.Debug("transport: dropping heartbeat batch: stream unavailable",
+				"target", target,
+				"batch_size", msgCount,
+				"error", err,
+			)
+		}
 		t.putBuf(bufPtr)
 		return
 	}
@@ -122,17 +143,29 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 	_, err = stream.Write(buf[:frameSize])
 	t.putBuf(bufPtr)
 	if err != nil {
+		// Debug level: a dead peer fails every heartbeat until eviction
+		// completes; the next tick retries on a fresh connection.
+		if debugEnabled() {
+			slog.Debug("transport: dropping heartbeat batch: stream write failed",
+				"target", target,
+				"batch_size", msgCount,
+				"error", err,
+			)
+		}
 		t.removeAndCloseConnection(target, "heartbeat stream write failure")
 		t.evictStreamsForTarget(target)
 	}
 }
 
 // isHeartbeatBatch returns true if all messages in the batch are heartbeat
-// or heartbeat response types. This is used by Send() to route batches to
-// the heartbeat fast path.
+// or heartbeat response types carrying no entries. This is used by Send()
+// to route batches to the heartbeat fast path. The fast path marshals each
+// message into a fixed HeartbeatMessageSize slot, so a heartbeat that ever
+// carries entries must fall through to the general sendBatch path — the
+// fixed-size buffer would otherwise overflow and drop the whole batch.
 func isHeartbeatBatch(msgs []proto.Message) bool {
 	for i := range msgs {
-		if !isHeartbeatMessage(msgs[i].Type) {
+		if !isHeartbeatMessage(msgs[i].Type) || len(msgs[i].Entries) > 0 {
 			return false
 		}
 	}

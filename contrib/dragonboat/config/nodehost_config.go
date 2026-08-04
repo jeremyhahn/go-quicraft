@@ -17,6 +17,9 @@ package config
 import (
 	"net"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/jeremyhahn/go-quicraft/contrib/dragonboat/raftio"
 	qcConfig "github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -72,18 +75,24 @@ type NodeHostConfig struct {
 	EnableMetrics bool
 
 	// MaxSendQueueSize is the maximum outbound message queue size.
-	// Accepted for compatibility but mapped to transport config.
+	// NOT supported by quicraft: accepted for dragonboat API
+	// compatibility only and ignored by ToQuicraft. Quicraft sizes its
+	// transport send queues internally.
 	MaxSendQueueSize uint64
 
 	// MaxReceiveQueueSize is the maximum inbound message queue size.
-	// Accepted for compatibility but mapped to transport config.
+	// NOT supported by quicraft: accepted for dragonboat API
+	// compatibility only and ignored by ToQuicraft. Quicraft sizes its
+	// transport receive queues internally.
 	MaxReceiveQueueSize uint64
 
 	// NotifyCommit enables WAL-durable early notification.
 	NotifyCommit bool
 
-	// DefaultNodeRegistryEnabled enables the built-in node registry
-	// for automatic node discovery.
+	// DefaultNodeRegistryEnabled enables dragonboat's gossip-based
+	// default node registry. NOT supported by quicraft: accepted for
+	// dragonboat API compatibility only and ignored by ToQuicraft.
+	// Quicraft resolves peers from shard membership addresses.
 	DefaultNodeRegistryEnabled bool
 
 	// RaftEventListener receives Raft protocol event notifications.
@@ -93,9 +102,16 @@ type NodeHostConfig struct {
 	SystemEventListener raftio.ISystemEventListener
 
 	// Gossip configures the gossip protocol for node discovery.
+	// NOT supported by quicraft: gossip absence changes cluster
+	// behavior, so Validate rejects a non-empty GossipConfig rather
+	// than silently dropping it.
 	Gossip GossipConfig
 
-	// Expert holds advanced tuning parameters.
+	// Expert holds advanced tuning parameters. Engine.ExecShards and
+	// Engine.ApplyShards are mapped to quicraft worker counts by
+	// ToQuicraft; the remaining Engine fields and LogDB.Shards are NOT
+	// supported (quicraft uses a fixed internal WAL shard count) and
+	// are ignored.
 	Expert ExpertConfig
 }
 
@@ -216,10 +232,32 @@ type NodeRegistryFactory interface {
 }
 
 // IsValidAddress returns true when addr is in valid host:port format.
+// It mirrors dragonboat's validator: exactly one colon separating a
+// non-empty host from a numeric port in [1, 65535], where the host is
+// either a hostname or an IPv4 literal. IPv6 literals are rejected,
+// as they are by dragonboat.
 func IsValidAddress(addr string) bool {
-	_, _, err := net.SplitHostPort(addr)
-	return err == nil
+	in := strings.TrimSpace(addr)
+	host, port, found := strings.Cut(in, ":")
+	if !found || host == "" || port == "" || strings.Contains(port, ":") {
+		return false
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p <= 0 || p > 65535 {
+		return false
+	}
+	if hostnameRegex.MatchString(host) {
+		return true
+	}
+	return ipv4Regex.MatchString(host) && net.ParseIP(host) != nil
 }
+
+// hostnameRegex and ipv4Regex mirror the patterns dragonboat uses to
+// validate the host portion of a Raft address.
+var (
+	hostnameRegex = regexp.MustCompile(`^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`)
+	ipv4Regex     = regexp.MustCompile(`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`)
+)
 
 // GetDefaultEngineConfig returns the default EngineConfig with standard
 // worker shard counts.
@@ -334,8 +372,11 @@ func (c NodeHostConfig) Validate() error {
 			return &ValidationError{Field: "KeyFile", Message: "must not be empty when MutualTLS is true"}
 		}
 	}
-	if err := c.Gossip.Validate(); err != nil {
-		return err
+	// Gossip is not supported by quicraft. A configuration that expects
+	// gossip-based node discovery would behave differently on quicraft,
+	// so a non-empty GossipConfig is rejected instead of silently dropped.
+	if !c.Gossip.IsEmpty() {
+		return &ValidationError{Field: "Gossip", Message: "gossip is not supported by quicraft; GossipConfig must be empty"}
 	}
 	return nil
 }

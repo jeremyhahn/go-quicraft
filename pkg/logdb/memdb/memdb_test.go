@@ -368,23 +368,23 @@ func TestIterateEntriesMaxSizeLimit(t *testing.T) {
 		entries[i] = logdb.Entry{
 			Index: uint64(i + 1),
 			Term:  1,
-			Cmd:   make([]byte, 100), // Each entry = 24 + 100 = 124 bytes.
+			Cmd:   make([]byte, 100), // Each entry = 76 + 100 = 176 bytes.
 		}
 	}
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: entries},
 	})
 
-	// Request all 10 entries but limit to 250 bytes (fits ~2 entries at 124 each).
-	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, 250)
+	// Request all 10 entries but limit to 360 bytes (fits 2 entries at 176 each).
+	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, 360)
 	if err != nil {
 		t.Fatalf("IterateEntries() error: %v", err)
 	}
 	if len(got) != 2 {
-		t.Errorf("IterateEntries() with maxSize=250: got %d entries, want 2", len(got))
+		t.Errorf("IterateEntries() with maxSize=360: got %d entries, want 2", len(got))
 	}
-	if size != 248 { // 2 * 124
-		t.Errorf("IterateEntries() size = %d, want 248", size)
+	if size != 352 { // 2 * 176
+		t.Errorf("IterateEntries() size = %d, want 352", size)
 	}
 }
 
@@ -451,7 +451,7 @@ func TestIterateEntriesAccumulatesSize(t *testing.T) {
 	db := New()
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("hello")}, // 24 + 5 = 29
+			{Index: 1, Term: 1, Cmd: []byte("hello")}, // 76 + 5 = 81
 		}},
 	})
 
@@ -459,9 +459,9 @@ func TestIterateEntriesAccumulatesSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IterateEntries() error: %v", err)
 	}
-	// Initial size 100 + entry size 29 = 129
-	if size != 129 {
-		t.Errorf("IterateEntries() size = %d, want 129", size)
+	// Initial size 100 + entry size 81 = 181
+	if size != 181 {
+		t.Errorf("IterateEntries() size = %d, want 181", size)
 	}
 }
 
@@ -1277,7 +1277,7 @@ func TestIterateEntriesPartialRange(t *testing.T) {
 
 func TestEntrySizeCalculation(t *testing.T) {
 	db := New()
-	cmd := make([]byte, 76) // 24 + 76 = 100 bytes per entry.
+	cmd := make([]byte, 24) // 76 + 24 = 100 bytes per entry.
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
 			{Index: 1, Term: 1, Cmd: cmd},

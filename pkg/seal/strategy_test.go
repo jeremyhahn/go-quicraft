@@ -300,14 +300,14 @@ func TestSoftwareStrategy_CloseNilsEnclave(t *testing.T) {
 	}
 
 	// Passphrase should be accessible before Close.
-	if s.passphrase == nil {
+	if s.passphrase.Load() == nil {
 		t.Fatal("passphrase enclave should not be nil before Close")
 	}
 
 	s.Close()
 
 	// Passphrase enclave reference should be nil after Close.
-	if s.passphrase != nil {
+	if s.passphrase.Load() != nil {
 		t.Fatal("passphrase enclave should be nil after Close")
 	}
 }
@@ -321,7 +321,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	defer s.Close()
 
 	// The passphrase should be stored in a memguard enclave.
-	buf, openErr := s.passphrase.Open()
+	buf, openErr := s.passphrase.Load().Open()
 	if openErr != nil {
 		t.Fatalf("passphrase.Open() failed: %v", openErr)
 	}

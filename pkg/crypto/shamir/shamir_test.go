@@ -215,6 +215,120 @@ func TestCombine_InsufficientShares(t *testing.T) {
 	}
 }
 
+func TestCombineBytes_Success(t *testing.T) {
+	secret := []byte("Reconstruct this secret via raw byte shares")
+	threshold := 3
+	total := 5
+
+	shares, err := Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
+	}
+
+	// Use exactly threshold raw share VALUES (the bytes of Share.Value).
+	values := [][]byte{
+		[]byte(shares[0].Value),
+		[]byte(shares[2].Value),
+		[]byte(shares[4].Value),
+	}
+	reconstructed, err := CombineBytes(values, threshold)
+	if err != nil {
+		t.Fatalf("CombineBytes failed: %v", err)
+	}
+	if !bytes.Equal(secret, reconstructed) {
+		t.Errorf("reconstructed secret does not match original\noriginal:      %q\nreconstructed: %q", secret, reconstructed)
+	}
+}
+
+func TestCombineBytes_MatchesCombine(t *testing.T) {
+	secret := []byte("byte-combine and string-combine must agree")
+	threshold, total := 2, 4
+
+	shares, err := Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
+	}
+
+	viaShares, err := Combine([]*Share{shares[0], shares[3]})
+	if err != nil {
+		t.Fatalf("Combine failed: %v", err)
+	}
+	viaBytes, err := CombineBytes([][]byte{[]byte(shares[0].Value), []byte(shares[3].Value)}, threshold)
+	if err != nil {
+		t.Fatalf("CombineBytes failed: %v", err)
+	}
+	if !bytes.Equal(viaShares, viaBytes) {
+		t.Errorf("CombineBytes disagrees with Combine:\nCombine:      %q\nCombineBytes: %q", viaShares, viaBytes)
+	}
+}
+
+func TestCombineBytes_InvalidThreshold(t *testing.T) {
+	secret := []byte("threshold below 2 must be rejected")
+	shares, err := Split(secret, 2, 3)
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
+	}
+	values := [][]byte{[]byte(shares[0].Value), []byte(shares[1].Value)}
+	for _, threshold := range []int{1, 0, -1} {
+		_, err := CombineBytes(values, threshold)
+		var combineErr *CombineError
+		if !errors.As(err, &combineErr) || !strings.Contains(combineErr.Reason, "threshold must be at least 2") {
+			t.Fatalf("threshold %d: expected threshold CombineError, got %v", threshold, err)
+		}
+	}
+}
+
+func TestCombineBytes_NoShares(t *testing.T) {
+	_, err := CombineBytes(nil, 3)
+	var combineErr *CombineError
+	if !errors.As(err, &combineErr) || combineErr.Reason != "no shares provided" {
+		t.Fatalf("expected no-shares CombineError, got %v", err)
+	}
+}
+
+func TestCombineBytes_InsufficientShares(t *testing.T) {
+	secret := []byte("need more byte shares")
+	threshold, total := 4, 7
+	shares, err := Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
+	}
+	values := [][]byte{[]byte(shares[0].Value), []byte(shares[1].Value)}
+	_, err = CombineBytes(values, threshold)
+	var combineErr *CombineError
+	if !errors.As(err, &combineErr) {
+		t.Fatalf("expected *CombineError, got %T: %v", err, err)
+	}
+	expected := fmt.Sprintf("need at least %d shares, got %d", threshold, len(values))
+	if combineErr.Reason != expected {
+		t.Errorf("unexpected reason: %s (expected: %s)", combineErr.Reason, expected)
+	}
+}
+
+func TestCombineBytes_InvalidBase64(t *testing.T) {
+	_, err := CombineBytes([][]byte{[]byte("!!!not-base64!!!"), []byte("@@@@")}, 2)
+	var combineErr *CombineError
+	if !errors.As(err, &combineErr) {
+		t.Fatalf("expected *CombineError for bad base64, got %T: %v", err, err)
+	}
+}
+
+func TestCombineBytes_DuplicateXCoordinate(t *testing.T) {
+	secret := []byte("dup x-coordinate is rejected")
+	threshold, total := 2, 5
+	shares, err := Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split failed: %v", err)
+	}
+	// Same share twice → duplicate x-coordinate.
+	values := [][]byte{[]byte(shares[0].Value), []byte(shares[0].Value)}
+	_, err = CombineBytes(values, threshold)
+	var combineErr *CombineError
+	if !errors.As(err, &combineErr) || !strings.Contains(combineErr.Reason, "duplicate share") {
+		t.Fatalf("expected duplicate-share CombineError, got %v", err)
+	}
+}
+
 func TestCombine_MismatchedThreshold(t *testing.T) {
 	shares := []*Share{
 		{Index: 1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
@@ -836,4 +950,99 @@ func BenchmarkCombine(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = Combine(subset)
 	}
+}
+
+// TestSplit_CoefficientsUsedVerbatim asserts that Split uses the raw
+// crypto/rand coefficient bytes verbatim, without resampling zero top
+// coefficients. Excluding c_{t-1}=0 would let a t-1 coalition eliminate one
+// candidate secret per byte, so a zero top coefficient MUST be accepted.
+// With an all-zeros randReader every sharing polynomial degenerates to its
+// constant term, so each share's y-payload must equal the secret exactly.
+func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
+	orig := randReader
+	defer func() { randReader = orig }()
+
+	secret := []byte{0x00, 0x01, 0x7F, 0xFF}
+	threshold, total := 3, 5
+
+	// All-zero coefficients: p(x) = secret byte for every x.
+	randReader = zeroReader{}
+	shares, err := Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split with zero coefficients: %v", err)
+	}
+	for i, share := range shares {
+		raw, err := base64.StdEncoding.DecodeString(share.Value)
+		if err != nil {
+			t.Fatalf("decode share %d: %v", i, err)
+		}
+		if !bytes.Equal(raw[rawShareOverhead:], secret) {
+			t.Fatalf("share %d: zero coefficients were not used verbatim: y-payload %x, want %x",
+				i, raw[rawShareOverhead:], secret)
+		}
+	}
+	got, err := Combine(shares[:threshold])
+	if err != nil {
+		t.Fatalf("Combine: %v", err)
+	}
+	if !bytes.Equal(got, secret) {
+		t.Fatalf("round-trip with zero top coefficients: got %x, want %x", got, secret)
+	}
+
+	// Known non-zero coefficients: shares must match direct polynomial
+	// evaluation with exactly the supplied bytes.
+	coeffBytes := []byte{0x11, 0x00, 0x22, 0x00, 0x33, 0x00, 0x44, 0x00}
+	randReader = bytes.NewReader(coeffBytes)
+	shares, err = Split(secret, threshold, total)
+	if err != nil {
+		t.Fatalf("Split with fixed coefficients: %v", err)
+	}
+	for i, share := range shares {
+		raw, err := base64.StdEncoding.DecodeString(share.Value)
+		if err != nil {
+			t.Fatalf("decode share %d: %v", i, err)
+		}
+		x := raw[1]
+		for b := range secret {
+			coeffs := append([]byte{secret[b]}, coeffBytes[b*(threshold-1):(b+1)*(threshold-1)]...)
+			want := gfPolyEval(coeffs, x)
+			if raw[rawShareOverhead+b] != want {
+				t.Fatalf("share %d byte %d: got %#x, want %#x (coefficients not used verbatim)",
+					i, b, raw[rawShareOverhead+b], want)
+			}
+		}
+	}
+	got, err = Combine(shares[:threshold])
+	if err != nil {
+		t.Fatalf("Combine: %v", err)
+	}
+	if !bytes.Equal(got, secret) {
+		t.Fatalf("round-trip with fixed coefficients: got %x, want %x", got, secret)
+	}
+}
+
+// zeroReader yields an endless stream of zero bytes.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// TestWipe asserts the shared wipe helper zeroes its argument. wipe delegates
+// to enclave.WipeBytes (memguard), whose zeroing is resistant to dead-store
+// elimination; every secret-derived scratch buffer in this package — including
+// the per-share raw buffer Split builds before base64-encoding it — goes
+// through it.
+func TestWipe(t *testing.T) {
+	b := []byte{1, 2, 3, 4, 5}
+	wipe(b)
+	for i, v := range b {
+		if v != 0 {
+			t.Fatalf("b[%d] = %d after wipe, want 0", i, v)
+		}
+	}
+	wipe(nil) // must not panic
 }

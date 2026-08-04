@@ -47,8 +47,14 @@ func protoStateToLogDB(s *proto.State) logdb.State {
 
 // protoMembershipToLogDB converts a proto.Membership to a logdb.Membership.
 func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
+	// MaxWitnesses and RequireFullReplicaMajority are replicated membership
+	// state, not local config: dropping them here would persist every
+	// snapshot with a zeroed witness policy, so a restarted replica would
+	// compute a different witness quorum than its peers.
 	result := logdb.Membership{
-		ConfigChangeID: m.ConfigChangeID,
+		ConfigChangeID:             m.ConfigChangeID,
+		MaxWitnesses:               m.MaxWitnesses,
+		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

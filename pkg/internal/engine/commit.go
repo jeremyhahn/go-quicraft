@@ -116,7 +116,7 @@ type commitWorker struct {
 	// in this set, mirroring the apply worker's unloaded guard.
 	// Without this, an in-flight commitItem could call Peer.Commit
 	// on a node that has already been torn down.
-	unloaded map[uint64]struct{}
+	unloaded *unloadedSet
 
 	// unloadC receives shard IDs to add to the unloaded set.
 	unloadC chan uint64
@@ -161,7 +161,7 @@ func newCommitWorker(
 		yieldFn:            runtime.Gosched,
 		metrics:            metrics,
 		commitTimes:        make(map[uint64]time.Time),
-		unloaded:           make(map[uint64]struct{}),
+		unloaded:           newUnloadedSet(),
 		unloadC:            make(chan uint64, 64),
 		reloadC:            make(chan uint64, 64),
 	}
@@ -183,10 +183,10 @@ func (w *commitWorker) run() {
 			w.drainAndProcess()
 			return
 		case shardID := <-w.unloadC:
-			w.unloaded[shardID] = struct{}{}
+			w.unloaded.add(shardID)
 			continue
 		case shardID := <-w.reloadC:
-			delete(w.unloaded, shardID)
+			w.unloaded.remove(shardID)
 			continue
 		case item := <-w.commitC:
 			w.batch = append(w.batch[:0], item.update)
@@ -417,7 +417,7 @@ func (w *commitWorker) processBatch() {
 		// An in-flight commitItem may have been enqueued before the
 		// unload was processed. Calling Peer.Commit on a torn-down
 		// node would panic or corrupt state.
-		if _, unloaded := w.unloaded[u.ShardID]; unloaded {
+		if w.unloaded.has(u.ShardID) {
 			slog.Warn("commit skipped for unloaded shard",
 				"worker", w.workerID,
 				"shard", u.ShardID,
@@ -432,14 +432,7 @@ func (w *commitWorker) processBatch() {
 
 		if err != nil {
 			node.raftMu.Unlock()
-			slog.Warn("commit Peer.Commit failed",
-				"shard", u.ShardID, "replica", u.ReplicaID, "error", err)
-			node.commitPending.Store(false)
-			node.handleError(&CommitError{
-				ShardID:   u.ShardID,
-				ReplicaID: u.ReplicaID,
-				Err:       err,
-			})
+			failCommit(node, w.callback, u, err)
 			continue
 		}
 
@@ -496,7 +489,7 @@ func (w *commitWorker) processBatch() {
 				slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
 					"shard", ai.update.ShardID)
 				ai.update.ReleaseCommittedEntries()
-				w.applyPool.Put(ai)
+				releaseApplyItem(w.applyPool, ai)
 				w.clearBatch()
 				return
 			}
@@ -539,8 +532,45 @@ func (w *commitWorker) failBatchSaveState(saveErr error) {
 		if w.callback != nil && len(u.CommittedEntries) > 0 {
 			w.callback.OnProposalFailed(u.ShardID, u.CommittedEntries, saveStateErr)
 		}
+		// Return the pooled committed-entries slice after the callback (which
+		// must not retain them). clearBatch below only zeroes the slot, so
+		// without this every failed batch permanently removes a slice from
+		// proto's entry-slice pool and degrades the apply hot path.
+		u.ReleaseCommittedEntries()
 	}
 	w.clearBatch()
+}
+
+// failCommit handles a terminal Peer.Commit failure for one update.
+//
+// Peer.Commit advances the raft log's processed marker (and applies committed
+// config changes) BEFORE its fallible LogReader steps (ApplySnapshot, Append).
+// Once it returns an error, entriesToApply can never re-offer this batch, so
+// the state machine is permanently missing committed entries. A shard that
+// kept running would keep acking the leader and keep serving reads from that
+// divergent state machine — a state-machine-safety violation. It is therefore
+// treated exactly like a terminal SaveState failure: the node is marked failed
+// (no automatic reset; recovery is unload/reload or snapshot recovery),
+// commitPending is cleared, the error is reported, and pending proposals for
+// the batch are failed so callers see an error instead of blocking to their
+// deadline.
+func failCommit(node *Node, callback Callback, u proto.Update, err error) {
+	commitErr := &CommitError{
+		ShardID:   u.ShardID,
+		ReplicaID: u.ReplicaID,
+		Err:       err,
+	}
+	slog.Warn("commit Peer.Commit failed, shard marked failed",
+		"shard", u.ShardID, "replica", u.ReplicaID, "error", err)
+	node.failed.Store(true)
+	node.commitPending.Store(false)
+	node.handleError(commitErr)
+	if callback != nil && len(u.CommittedEntries) > 0 {
+		callback.OnProposalFailed(u.ShardID, u.CommittedEntries, commitErr)
+	}
+	// Return the pooled slice only after the callback, which must not
+	// retain the entries beyond the call.
+	u.ReleaseCommittedEntries()
 }
 
 // clearBatch clears the batch node pointers, update values, commit times,
@@ -570,9 +600,9 @@ func (w *commitWorker) drainUnloadReload() {
 	for {
 		select {
 		case shardID := <-w.unloadC:
-			w.unloaded[shardID] = struct{}{}
+			w.unloaded.add(shardID)
 		case shardID := <-w.reloadC:
-			delete(w.unloaded, shardID)
+			w.unloaded.remove(shardID)
 		default:
 			return
 		}
@@ -671,15 +701,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	node.raftMu.Unlock()
 
 	if pbCommitErr != nil {
-		slog.Warn("piggyback Peer.Commit failed",
-			"shard", piggyback.ShardID, "replica", piggyback.ReplicaID, "error", pbCommitErr)
-		piggyback.ReleaseCommittedEntries()
-		node.commitPending.Store(false)
-		node.handleError(&CommitError{
-			ShardID:   piggyback.ShardID,
-			ReplicaID: piggyback.ReplicaID,
-			Err:       pbCommitErr,
-		})
+		failCommit(node, w.callback, piggyback, pbCommitErr)
 		return true
 	}
 
@@ -712,7 +734,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 			slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
 				"shard", piggyback.ShardID)
 			ai.update.ReleaseCommittedEntries()
-			w.applyPool.Put(ai)
+			releaseApplyItem(w.applyPool, ai)
 			// Signal the caller to stop: it must NOT keep iterating the
 			// shared batch (clearBatch will run in the caller).
 			return false

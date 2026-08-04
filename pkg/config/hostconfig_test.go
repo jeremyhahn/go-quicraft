@@ -15,8 +15,11 @@
 package config
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -587,6 +590,40 @@ func TestHostConfig_MaxRetainedEpochs(t *testing.T) {
 		if hc.MaxRetainedEpochs != 10 {
 			t.Fatalf("SetDefaults overwrote MaxRetainedEpochs: expected 10, got %d",
 				hc.MaxRetainedEpochs)
+		}
+	})
+}
+
+// TestHostConfig_Validate_NoSyncWALWarns asserts that disabling WAL fsync
+// leaves a trace in the logs. NoSyncWAL is not rejected — containerised test
+// environments need it — but a config copied into production would otherwise
+// ack Raft commits that are not durable with nothing recorded.
+func TestHostConfig_Validate_NoSyncWALWarns(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	t.Run("warns when set", func(t *testing.T) {
+		buf.Reset()
+		hc := validHostConfig()
+		hc.NoSyncWAL = true
+		if err := hc.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+		if !strings.Contains(buf.String(), "NoSyncWAL") {
+			t.Fatalf("expected a NoSyncWAL warning, got %q", buf.String())
+		}
+	})
+
+	t.Run("silent when unset", func(t *testing.T) {
+		buf.Reset()
+		hc := validHostConfig()
+		if err := hc.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+		if strings.Contains(buf.String(), "NoSyncWAL") {
+			t.Fatalf("unexpected NoSyncWAL warning: %q", buf.String())
 		}
 	})
 }

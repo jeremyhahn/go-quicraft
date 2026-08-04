@@ -29,7 +29,7 @@ func reopenReadOnly(t *testing.T, dir string, id uint64, blockSize int) [][]byte
 	}
 	defer f.Close()
 	rs := &segment{f: f, id: id, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
-	recs, err := rs.ReadAll()
+	recs, _, err := rs.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
 	}
 	defer f.Close()
 	rs := &segment{f: f, id: 4, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
-	got, err := rs.ReadAll()
+	got, _, err := rs.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestSegment_ZeroTailIsNotAHole(t *testing.T) {
 	}
 	defer f.Close()
 	rs := &segment{f: f, id: 5, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
-	got, err := rs.ReadAll()
+	got, _, err := rs.ReadAll()
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}

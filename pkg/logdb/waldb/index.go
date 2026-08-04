@@ -200,6 +200,21 @@ func (idx *index) Last() (indexEntry, bool) {
 	return idx.entries[len(idx.entries)-1], true
 }
 
+// Bounds returns the first entry, last entry, and entry count under a single
+// lock acquisition, so callers deriving a range from all three see one
+// consistent snapshot instead of racing First/Last/Len against a concurrent
+// append or compaction. count == 0 means the index is empty and both entries
+// are zero-valued.
+func (idx *index) Bounds() (first, last indexEntry, count int) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	count = len(idx.entries)
+	if count == 0 {
+		return indexEntry{}, indexEntry{}, 0
+	}
+	return idx.entries[0], idx.entries[count-1], count
+}
+
 // AllSegmentIDs returns the set of all unique segment IDs referenced by
 // any entry in the index.
 func (idx *index) AllSegmentIDs() map[uint64]bool {

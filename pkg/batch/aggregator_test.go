@@ -1094,3 +1094,64 @@ func TestFlushReasonConstants(t *testing.T) {
 		t.Errorf("flushReasonClose = %q, want %q", flushReasonClose, "close")
 	}
 }
+
+// TestMetrics_HistogramsHaveNoShardLabel is the regression test for the
+// metrics cardinality policy: with 10K+ shards a per-shard label on the
+// 11/14-bucket histograms would explode into hundreds of thousands of time
+// series. The histograms must be unlabeled aggregates; only the
+// low-cardinality batchesTotal counter keeps the shard label.
+func TestMetrics_HistogramsHaveNoShardLabel(t *testing.T) {
+	mp := &mockProposer{}
+	reg := prometheus.NewRegistry()
+	agg, err := NewAggregator(mp, WithRegistry(reg))
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	defer agg.Close()
+
+	if err := agg.Submit(context.Background(), 42, []byte("cmd")); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := map[string]bool{}
+	for _, mf := range families {
+		name := mf.GetName()
+		switch name {
+		case "quicraft_batch_batch_size", "quicraft_batch_flush_duration_seconds":
+			found[name] = true
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "shard" {
+						t.Errorf("%s carries a per-shard label; histograms must be aggregate-only", name)
+					}
+				}
+			}
+		case "quicraft_batch_batches_total":
+			found[name] = true
+			hasShard := false
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "shard" {
+						hasShard = true
+					}
+				}
+			}
+			if !hasShard {
+				t.Error("quicraft_batch_batches_total lost its shard label")
+			}
+		}
+	}
+	for _, name := range []string{
+		"quicraft_batch_batch_size",
+		"quicraft_batch_flush_duration_seconds",
+		"quicraft_batch_batches_total",
+	} {
+		if !found[name] {
+			t.Errorf("metric %s not found in registry", name)
+		}
+	}
+}

@@ -1061,6 +1061,16 @@ type barrierTestCluster struct {
 	barriers []*seal.Barrier
 }
 
+// testBarrierConfig returns a seal.BarrierConfig carrying a no-op
+// StatePersister. seal.Barrier.Rotate and PurgeEpochsBefore fail closed with
+// seal.ErrNoStatePersister when the barrier cannot durably persist its sealed
+// root-key state, so every test barrier that rotates needs one.
+func testBarrierConfig(deploymentID uint64) seal.BarrierConfig {
+	cfg := seal.DefaultBarrierConfig(deploymentID)
+	cfg.StatePersister = func(*seal.SealedRootKey) error { return nil }
+	return cfg
+}
+
 // newBarrierTestCluster creates an N-node cluster where each host has
 // its own independently initialized and unsealed barrier. Uses fast
 // Argon2id parameters (time=1, memory=64KB, threads=1) for test speed.
@@ -1076,7 +1086,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 	for i := range numNodes {
 		// Create and initialize a barrier for this node.
 		_ = seal.AllowWeakKDFParams()
-		b := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+		b := seal.NewBarrier(testBarrierConfig(1))
 		s, err := seal.NewSoftwareStrategyWithParams(
 			[]byte(fmt.Sprintf("test-passphrase-%d", i)), 1, 64*1024, 1)
 		if err != nil {
@@ -1133,7 +1143,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 func newBarrierForNode(t *testing.T) *seal.Barrier {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
-	b := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	b := seal.NewBarrier(testBarrierConfig(1))
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("replacement-passphrase"), 1, 64*1024, 1)
 	if err != nil {

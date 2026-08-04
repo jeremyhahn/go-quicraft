@@ -237,7 +237,13 @@ type TransportConfig struct {
 	// TransportDisabled indicates that the transport layer is not used.
 	// When true, MTLSConfig validation is skipped because no QUIC
 	// connections will be established. This is set internally by
-	// WithoutTransport() and should not be configured directly.
+	// WithoutTransport() and must not be configured directly.
+	//
+	// Setting it directly does NOT prevent transport creation — that is
+	// gated on the WithoutTransport() host option alone — so the only
+	// effect is to skip mTLS validation here. The result fails closed: the
+	// transport is still constructed and rejects the nil MTLSConfig, but
+	// the failure surfaces at startup instead of at config validation.
 	TransportDisabled bool
 }
 

@@ -54,7 +54,7 @@ func (s *gateProbeSM) Apply(entries []proto.Entry, results []sm.Result) error {
 // applies through the apply worker while a second goroutine repeatedly runs the
 // exact gate sequence snapshotPool.saveSnapshot uses around the consistent
 // capture — SetSaving(true) -> WaitForApplyDrain -> capture window ->
-// SetSaving(false). The apply worker skips applies while saving, and the drain
+// SetSaving(false). The apply worker waits out the saving gate, and the drain
 // guarantees no apply is mid-flight when the capture begins, so no Apply may
 // execute during the capture window. A non-zero violation count means the gate
 // failed to quiesce applies — the regression that crashes the host.
@@ -102,9 +102,9 @@ func TestSavingGateQuiescesApplies(t *testing.T) {
 		}
 	}()
 
-	// Applier: feed committed entries continuously while saves run. Skipped
-	// applies (during saving) do not advance lastApplied; that is fine — the
-	// invariant under test is purely that no Apply overlaps a capture window.
+	// Applier: feed committed entries continuously while saves run. Applies
+	// that arrive during a capture window block until the gate clears; the
+	// invariant under test is that no Apply overlaps a capture window.
 	idx := uint64(0)
 	feeding := true
 	for feeding {
@@ -196,5 +196,86 @@ func TestSavingGateAndDrainConsistency(t *testing.T) {
 	if gotIdx != 7 || gotTerm != 3 {
 		t.Fatalf("post-drain snapshot point = (index=%d, term=%d), want (7, 3): "+
 			"the apply-tracked (lastApplied, lastAppliedTerm) pair is inconsistent", gotIdx, gotTerm)
+	}
+}
+
+// countingSM records every applied entry index so a test can verify that
+// no committed entry is lost across save-gate windows.
+type countingSM struct {
+	mu      sync.Mutex
+	applied []uint64
+}
+
+func (s *countingSM) Apply(entries []proto.Entry, results []sm.Result) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range entries {
+		s.applied = append(s.applied, entries[i].Index)
+		results[i] = sm.Result{}
+	}
+	return nil
+}
+
+// TestSavingGateDoesNotDropEntries verifies that a batch delivered to the
+// apply worker while a snapshot-save capture holds the gate is applied
+// after the gate clears, never discarded. Raft's processed marker has
+// already advanced past a delivered batch (Peer.Commit), so a discarded
+// batch would never be re-delivered and the state machine would silently
+// diverge from its peers.
+func TestSavingGateDoesNotDropEntries(t *testing.T) {
+	applyC := make(chan *applyItem, 256)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	var wg sync.WaitGroup
+	stopC := make(chan struct{})
+
+	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
+
+	rec := &countingSM{}
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	node := NewNode(nil, rec, nil, cfg, 10, nil, "", nil)
+
+	runDone := make(chan struct{})
+	go func() {
+		aw.run()
+		close(runDone)
+	}()
+
+	// Close the gate, deliver a batch while it is held, keep it closed
+	// long enough that a drop-style gate would have returned, then open it.
+	node.SetSaving(true)
+
+	const total = 32
+	for i := uint64(1); i <= total; i++ {
+		node.commitPending.Store(true)
+		item := applyPool.Get().(*applyItem)
+		item.update = proto.Update{
+			ShardID:          1,
+			CommittedEntries: []proto.Entry{{Term: 1, Index: i, Cmd: []byte("c")}},
+		}
+		item.node = node
+		applyC <- item
+	}
+	time.Sleep(5 * time.Millisecond)
+	node.SetSaving(false)
+
+	// Every delivered entry must eventually reach the state machine.
+	waitFor(t, 5*time.Second, time.Millisecond, "gated entries were not applied",
+		func() bool { return node.lastApplied.Load() >= total })
+
+	close(stopC)
+	<-runDone
+	wg.Wait()
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.applied) != total {
+		t.Fatalf("applied %d entries, want %d: entries delivered during a "+
+			"save-gate window were dropped", len(rec.applied), total)
+	}
+	for i, idx := range rec.applied {
+		if idx != uint64(i+1) {
+			t.Fatalf("apply order violated at position %d: got index %d, want %d",
+				i, idx, i+1)
+		}
 	}
 }

@@ -83,7 +83,14 @@ var ErrSnapshotReencryptRequired = errors.New(
 //
 // Either barrier may be nil for a plaintext side. dstDir must be empty; the
 // caller verifies the result and performs the atomic directory swap, so a
-// partial run never touches the source.
+// partial run never changes the Raft-visible content of the source.
+//
+// The source is NOT opened read-only: Open runs full crash recovery on
+// srcDir, which may repair a corrupt segment tail, discard orphaned segments
+// above it, create a new active segment and fsync the directory. That is the
+// same recovery any normal Open would perform, and it never removes records
+// that a normal Open would have replayed — but srcDir is modified on disk, so
+// the caller must not treat it as byte-for-byte immutable across a run.
 func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc) (int, error) {
 	srcOpts := []Option{}
 	if srcBarrier != nil {
@@ -169,6 +176,18 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		upd := logdb.Update{ShardID: ni.ShardID, ReplicaID: ni.ReplicaID, State: state}
 		if err := dst.SaveState([]logdb.Update{upd}); err != nil {
 			return &ReencryptError{Op: "save-state", Err: err}
+		}
+	}
+
+	// Compaction floor. Without carrying the marker, the destination's
+	// compactedTo stays 0 and a post-migration request below the true floor
+	// would fail as a log gap (or, before that guard existed, be served as
+	// a silently shifted range) instead of returning ErrCompacted.
+	if compactedTo, err := src.CompactedTo(ni.ShardID, ni.ReplicaID); err != nil {
+		return &ReencryptError{Op: "compacted-to", Err: err}
+	} else if compactedTo > 0 {
+		if err := dst.RemoveEntriesTo(ni.ShardID, ni.ReplicaID, compactedTo); err != nil {
+			return &ReencryptError{Op: "remove-entries-to", Err: err}
 		}
 	}
 

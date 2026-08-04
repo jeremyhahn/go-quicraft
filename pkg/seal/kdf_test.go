@@ -390,9 +390,8 @@ func TestKDFParamsBelowFloor(t *testing.T) {
 // TestDeriveKeyRejectsWeakParams verifies DeriveKey returns
 // ErrKDFWeakParams for below-floor parameters when the bypass is off.
 func TestDeriveKeyRejectsWeakParams(t *testing.T) {
-	prev := allowWeakKDFParams
-	allowWeakKDFParams = false
-	defer func() { allowWeakKDFParams = prev }()
+	prev := allowWeakKDFParams.Swap(false)
+	defer allowWeakKDFParams.Store(prev)
 
 	salt := make([]byte, 32)
 	_, err := DeriveKey([]byte("passphrase"), salt, KDFArgon2id,

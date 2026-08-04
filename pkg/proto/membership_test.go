@@ -125,7 +125,10 @@ func TestMembershipBufferTooSmallMarshal(t *testing.T) {
 }
 
 func TestMembershipBufferTooSmallUnmarshal(t *testing.T) {
-	buf := make([]byte, 8) // too short: needs ConfigChangeID + at least map count
+	// Correct version byte, then too short for the fixed region plus the
+	// first map count.
+	buf := make([]byte, 8)
+	buf[0] = membershipWireVersion
 	var m Membership
 	_, err := m.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrBufferTooSmall) {
@@ -150,11 +153,36 @@ func TestMembershipAddressTooLong(t *testing.T) {
 	}
 }
 
+// TestMembershipPolicyRoundTrip verifies the replicated witness-policy
+// fields survive marshal/unmarshal.
+func TestMembershipPolicyRoundTrip(t *testing.T) {
+	m := Membership{
+		ConfigChangeID:             11,
+		MaxWitnesses:               4,
+		RequireFullReplicaMajority: true,
+		Addresses:                  map[uint64]string{1: "a"},
+	}
+	buf := make([]byte, m.Size())
+	if _, err := m.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	var m2 Membership
+	if _, err := m2.UnmarshalFrom(buf); err != nil {
+		t.Fatalf("UnmarshalFrom: %v", err)
+	}
+	if m2.MaxWitnesses != 4 || !m2.RequireFullReplicaMajority || m2.ConfigChangeID != 11 {
+		t.Fatalf("round trip mismatch: %+v", m2)
+	}
+}
+
 func TestMembershipTooManyEntries(t *testing.T) {
 	// Craft a buffer with Addresses count = maxMembershipEntries + 1
-	buf := make([]byte, 8+4)
-	putUint64(buf, 0)                          // ConfigChangeID
-	putUint32(buf[8:], maxMembershipEntries+1) // Addresses count
+	buf := make([]byte, membershipFixedSize+4)
+	buf[0] = membershipWireVersion
+	putUint64(buf[1:], 0)                                        // ConfigChangeID
+	putUint64(buf[9:], 0)                                        // MaxWitnesses
+	putBool(buf[17:], false)                                     // RequireFullReplicaMajority
+	putUint32(buf[membershipFixedSize:], maxMembershipEntries+1) // Addresses count
 	var m Membership
 	_, err := m.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {

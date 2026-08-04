@@ -364,7 +364,7 @@ func FuzzSegmentReplayCrash(f *testing.F) {
 		}
 
 		// Must never panic. Records may or may not be returned.
-		records, err := seg.ReadAll()
+		records, _, err := seg.ReadAll()
 		_ = records
 		_ = err
 	})

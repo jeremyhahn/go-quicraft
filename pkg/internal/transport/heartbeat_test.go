@@ -837,3 +837,40 @@ func TestSendHeartbeatBatch_GetStreamError(t *testing.T) {
 // TestSendSnapshot_ChunkLoopWriteFailure exercises the SendSnapshot chunk
 // write error path by sending many large chunks while closing the
 // connection concurrently. The connection close races with chunk writes.
+
+// ---------------------------------------------------------------------------
+// heartbeat fast-path entry guard (heartbeat.go isHeartbeatBatch)
+// ---------------------------------------------------------------------------
+
+// TestIsHeartbeatBatch_EntriesFallThroughToNormalPath verifies that a
+// heartbeat message carrying entries is NOT routed to the fixed-size
+// heartbeat fast path: the fast path sizes its buffer for
+// HeartbeatMessageSize records, so entries would overflow the marshal and
+// silently drop the whole batch. Such a batch must fall through to the
+// general sendBatch path.
+func TestIsHeartbeatBatch_EntriesFallThroughToNormalPath(t *testing.T) {
+	plain := []proto.Message{
+		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
+		{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1, Term: 1},
+	}
+	if !isHeartbeatBatch(plain) {
+		t.Fatal("entry-free heartbeat batch must use the fast path")
+	}
+
+	withEntries := []proto.Message{
+		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1,
+			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("x")}}},
+	}
+	if isHeartbeatBatch(withEntries) {
+		t.Fatal("heartbeat carrying entries must fall through to the normal send path")
+	}
+
+	mixed := []proto.Message{
+		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
+		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 3, Term: 1,
+			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("y")}}},
+	}
+	if isHeartbeatBatch(mixed) {
+		t.Fatal("batch with any entry-carrying heartbeat must fall through to the normal send path")
+	}
+}

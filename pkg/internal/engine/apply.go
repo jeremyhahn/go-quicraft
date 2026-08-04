@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -32,7 +33,91 @@ import (
 // causing head-of-line blocking in the dispatcher. A slow shard
 // filling its buffer blocks only the dispatcher's send to that shard,
 // but with a larger buffer the window for backpressure is reduced.
+//
+// Invariant relied on by requestUnload: a shard has at most ONE applyItem in
+// flight at a time (commitPending gates the step worker from producing a
+// second update until the first has been applied), so the per-shard channel
+// can never be full and the dispatcher can never park in a per-shard send.
+// That is what keeps the unbuffered unloadC rendezvous reachable. Raising the
+// per-shard in-flight limit above this buffer size would require servicing
+// unloadC from the blocking-send select in dispatch.
 const defaultShardChanBuffer = 64
+
+// applyUnloadRequest asks the apply worker's dispatcher goroutine to tear
+// down a shard's apply resources. done is closed only after the per-shard
+// channel has been closed AND the per-shard apply goroutine (if one exists)
+// has fully exited, so the requester can treat the unload as synchronous:
+// once done is closed, no SM.Apply for the shard is or will be in flight.
+type applyUnloadRequest struct {
+	shardID uint64
+	done    chan struct{}
+}
+
+// maxUnloadedShards bounds the number of retired shard IDs the commit and
+// apply workers remember. The set exists to reject items that were already
+// in flight when a shard was unloaded; that window closes as soon as the
+// pipeline drains, so only recent unloads matter. Without a bound the set
+// would grow for the process lifetime under shard churn, since an entry is
+// removed only when the SAME shard ID is loaded again.
+const maxUnloadedShards = 1024
+
+// unloadedSet is a bounded FIFO set of unloaded shard IDs. It is owned by a
+// single worker goroutine and is not safe for concurrent use. Adding beyond
+// maxUnloadedShards retires the oldest entry.
+type unloadedSet struct {
+	m     map[uint64]struct{}
+	order []uint64
+}
+
+// newUnloadedSet creates an empty bounded set.
+func newUnloadedSet() *unloadedSet {
+	return &unloadedSet{m: make(map[uint64]struct{})}
+}
+
+// add marks a shard as unloaded, evicting the oldest entry when full.
+func (s *unloadedSet) add(shardID uint64) {
+	if _, ok := s.m[shardID]; ok {
+		return
+	}
+	if len(s.order) >= maxUnloadedShards {
+		oldest := s.order[0]
+		s.order = s.order[1:]
+		delete(s.m, oldest)
+	}
+	s.m[shardID] = struct{}{}
+	s.order = append(s.order, shardID)
+}
+
+// remove clears a shard from the set, called when it is loaded again.
+func (s *unloadedSet) remove(shardID uint64) {
+	if _, ok := s.m[shardID]; !ok {
+		return
+	}
+	delete(s.m, shardID)
+	for i := range s.order {
+		if s.order[i] == shardID {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// has reports whether the shard is currently marked unloaded.
+func (s *unloadedSet) has(shardID uint64) bool {
+	_, ok := s.m[shardID]
+	return ok
+}
+
+// releaseApplyItem clears an applyItem's references and returns it to the
+// pool. Clearing is required: a pooled item that still points at a Node keeps
+// that node's Peer, LogReader, and state machine reachable long after the
+// shard was unloaded, and a retained proto.Update keeps its entry slices
+// alive.
+func releaseApplyItem(pool *sync.Pool, item *applyItem) {
+	item.node = nil
+	item.update = proto.Update{}
+	pool.Put(item)
+}
 
 // applyWorker applies committed entries to state machines using a
 // fan-out pattern. A dispatcher goroutine reads from applyC and routes
@@ -49,14 +134,15 @@ type applyWorker struct {
 	applyPool       *sync.Pool
 	sem             chan struct{}
 	shardChans      map[uint64]chan *applyItem
-	unloaded        map[uint64]struct{} // shards that have been unloaded; dispatch skips these
+	shardExits      map[uint64]chan struct{} // per-shard goroutine exit signals, closed on runShardApply return
+	unloaded        *unloadedSet             // shards that have been unloaded; dispatch skips these
 	wg              *sync.WaitGroup
 	maxApplyWorkers int
 	callback        Callback
 	snapshotPool    *snapshotPool
 	workSignal      *WorkSignal
-	unloadC         chan uint64 // shard IDs to unload from the dispatcher goroutine
-	reloadC         chan uint64 // shard IDs to re-load (clear from unloaded set)
+	unloadC         chan applyUnloadRequest // unload requests handled by the dispatcher goroutine
+	reloadC         chan uint64             // shard IDs to re-load (clear from unloaded set)
 	stopC           chan struct{}
 
 	// metrics collects raft-level metrics. Nil when disabled.
@@ -83,16 +169,21 @@ func newApplyWorker(
 		applyPool:       applyPool,
 		sem:             make(chan struct{}, maxApplyWorkers),
 		shardChans:      make(map[uint64]chan *applyItem),
-		unloaded:        make(map[uint64]struct{}),
+		shardExits:      make(map[uint64]chan struct{}),
+		unloaded:        newUnloadedSet(),
 		wg:              wg,
 		maxApplyWorkers: maxApplyWorkers,
 		callback:        callback,
 		snapshotPool:    snapshotPool,
 		workSignal:      workSignal,
-		unloadC:         make(chan uint64, 64),
-		reloadC:         make(chan uint64, 64),
-		stopC:           stopC,
-		metrics:         metrics,
+		// unloadC is deliberately unbuffered: requestUnload must rendezvous
+		// with the dispatcher (or observe stopC) so an unload request can
+		// never be stranded in a buffer after the dispatcher has exited,
+		// which would leave the synchronous UnloadNode waiter blocked forever.
+		unloadC: make(chan applyUnloadRequest),
+		reloadC: make(chan uint64, 64),
+		stopC:   stopC,
+		metrics: metrics,
 	}
 }
 
@@ -102,29 +193,87 @@ func newApplyWorker(
 // goroutine, ensuring per-shard goroutines are cleaned up when nodes
 // are unloaded.
 func (w *applyWorker) run() {
+	// Join the per-shard goroutines on EVERY exit path taken while the
+	// engine is stopping, including a panic unwinding out of the dispatcher.
+	// Engine.Stop must never return with an SM.Apply in flight: Host.Close
+	// closes the state machines immediately afterwards.
+	defer w.shutdownIfStopping()
 	for {
 		select {
 		case <-w.stopC:
 			// Drain applyC before exiting. Committed entries must be
 			// applied to deliver results and advance lastApplied.
 			w.drain()
-			// Close all per-shard channels so their goroutines exit.
-			for shardID, ch := range w.shardChans {
-				close(ch)
-				delete(w.shardChans, shardID)
-			}
-			// Wait for all per-shard goroutines to finish their
-			// current Apply call before returning. Without this,
-			// Engine.Stop() could return while SM.Apply() is still
-			// executing, causing use-after-close on the state machine.
-			w.wg.Wait()
 			return
-		case shardID := <-w.unloadC:
-			w.removeShardChan(shardID)
+		case req := <-w.unloadC:
+			w.handleUnload(req)
 		case shardID := <-w.reloadC:
-			delete(w.unloaded, shardID)
+			w.unloaded.remove(shardID)
 		case item := <-w.applyC:
+			// Unload/reload requests are ordered ahead of any applyItem a
+			// re-loaded shard can produce (LoadNode enqueues the reload
+			// before publishing the node), but select picks uniformly at
+			// random among ready cases. Service them first so a re-loaded
+			// shard's first committed batch is not dropped as "unloaded".
+			w.drainUnloadReload()
 			w.dispatch(item)
+		}
+	}
+}
+
+// shutdownIfStopping closes every per-shard channel and waits for the
+// per-shard apply goroutines to exit, then acks unload requests that raced
+// shutdown. It is a no-op unless stopC is closed, so a panic-restart of the
+// dispatcher keeps the per-shard channels — and the committed items buffered
+// in them — intact. It is idempotent: shardChans is emptied as it goes.
+func (w *applyWorker) shutdownIfStopping() {
+	select {
+	case <-w.stopC:
+	default:
+		return
+	}
+	for shardID, ch := range w.shardChans {
+		close(ch)
+		delete(w.shardChans, shardID)
+	}
+	w.wg.Wait()
+	// All per-shard goroutines have exited, so closing done keeps the
+	// synchronous-unload contract truthful; without the ack a concurrent
+	// UnloadNode would block forever on its done channel.
+	w.ackPendingUnloads()
+}
+
+// handleUnload tears down a shard's apply resources and acks the requester
+// once the per-shard goroutine has exited. Must run on the dispatcher
+// goroutine (single-owner invariant on shardChans/shardExits).
+func (w *applyWorker) handleUnload(req applyUnloadRequest) {
+	exited := w.removeShardChan(req.shardID)
+	if exited == nil {
+		// No per-shard goroutine was ever spawned: nothing to join.
+		close(req.done)
+		return
+	}
+	// Join the per-shard goroutine from a helper so a slow SM.Apply on the
+	// unloading shard cannot head-of-line block the dispatcher (other shards
+	// keep applying).
+	go func(exited <-chan struct{}, done chan struct{}) {
+		<-exited
+		close(done)
+	}(exited, req.done)
+}
+
+// drainUnloadReload non-blocking drains pending unload and reload requests.
+// Called before dispatching so shard membership changes are always observed
+// ahead of the items they govern.
+func (w *applyWorker) drainUnloadReload() {
+	for {
+		select {
+		case req := <-w.unloadC:
+			w.handleUnload(req)
+		case shardID := <-w.reloadC:
+			w.unloaded.remove(shardID)
+		default:
+			return
 		}
 	}
 }
@@ -138,7 +287,7 @@ func (w *applyWorker) run() {
 func (w *applyWorker) dispatch(item *applyItem) {
 	shardID := item.update.ShardID
 
-	if _, unloaded := w.unloaded[shardID]; unloaded {
+	if w.unloaded.has(shardID) {
 		slog.Warn("apply dispatch skipped for unloaded shard",
 			"worker", w.workerID,
 			"shard", shardID,
@@ -149,7 +298,7 @@ func (w *applyWorker) dispatch(item *applyItem) {
 		if item.node != nil {
 			item.node.commitPending.Store(false)
 		}
-		w.applyPool.Put(item)
+		releaseApplyItem(w.applyPool, item)
 		return
 	}
 
@@ -157,8 +306,14 @@ func (w *applyWorker) dispatch(item *applyItem) {
 	if !ok {
 		ch = make(chan *applyItem, defaultShardChanBuffer)
 		w.shardChans[shardID] = ch
+		// exited is closed when the per-shard goroutine returns; the
+		// unload path joins on it so UnloadNode can guarantee no
+		// SM.Apply is in flight after the unload completes.
+		exited := make(chan struct{})
+		w.shardExits[shardID] = exited
 		w.wg.Add(1)
 		go func() {
+			defer close(exited)
 			defer w.wg.Done()
 			w.runShardApply(ch)
 		}()
@@ -194,7 +349,7 @@ func (w *applyWorker) dispatch(item *applyItem) {
 			if item.node != nil {
 				item.node.commitPending.Store(false)
 			}
-			w.applyPool.Put(item)
+			releaseApplyItem(w.applyPool, item)
 		}
 	}
 }
@@ -203,6 +358,7 @@ func (w *applyWorker) dispatch(item *applyItem) {
 // to per-shard goroutines.
 func (w *applyWorker) drain() {
 	for {
+		w.drainUnloadReload()
 		select {
 		case item := <-w.applyC:
 			w.dispatch(item)
@@ -243,7 +399,7 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 				// would wait for the next tick, adding up to one tick
 				// interval of latency to the commit/apply pipeline.
 				w.workSignal.Notify(node.shardID)
-				w.applyPool.Put(item)
+				releaseApplyItem(w.applyPool, item)
 			}()
 
 			// Recover from panics in user state machine code (Apply,
@@ -271,18 +427,75 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			}()
 
 			// If a snapshot recovery OR a snapshot-save capture is in
-			// progress, skip applying entries to avoid concurrent state
-			// machine access between the snapshot-pool goroutine and this
-			// apply goroutine. Recovery replaces SM state; the save capture
-			// reads shared in-memory state (the session manager, which is not
-			// safe for concurrent use, and a regular in-memory SM). Since
-			// lastApplied is NOT advanced, the step worker will re-deliver
-			// these entries on the next cycle after the gate clears.
-			if node.IsRecovering() || node.IsSaving() {
-				return
+			// progress, WAIT for the gate to clear rather than dropping the
+			// batch. Raft's processed marker already advanced past these
+			// entries in Peer.Commit, so a dropped batch is never
+			// re-delivered and the state machine would silently diverge.
+			// The gate exists to avoid concurrent state machine access
+			// between the snapshot-pool goroutine and this apply goroutine:
+			// recovery replaces SM state; the save capture reads shared
+			// in-memory state (the session manager, which is not safe for
+			// concurrent use, and a regular in-memory SM).
+			//
+			// The Add(-1)/recheck/Add(+1) handshake pairs with the snapshot
+			// worker's set-flag-then-drain protocol: either this apply's
+			// in-flight registration is visible to WaitForApplyDrain, or
+			// the flag is visible here and we back off, releasing the slot
+			// so the drain can complete.
+			for node.IsRecovering() || node.IsSaving() {
+				node.applyInFlight.Add(-1)
+				stopped := false
+				select {
+				case <-node.StopC():
+					stopped = true
+				default:
+					time.Sleep(50 * time.Microsecond)
+				}
+				node.applyInFlight.Add(1)
+				if stopped {
+					// Shard is stopping. The entries are durable in the
+					// WAL; restart re-derives the apply frontier from
+					// LogDB state, so abandoning them here is safe.
+					return
+				}
+			}
+
+			// A completed recovery replaced SM state with a snapshot that
+			// may already cover a prefix (or all) of this batch. Skip
+			// covered entries: they are represented in the recovered state
+			// and re-applying them would double-apply. The save gate never
+			// moves lastApplied, so this filter is a no-op for it — and in
+			// normal operation entries[0].Index == lastApplied+1.
+			la := node.lastApplied.Load()
+			if len(entries) > 0 && entries[0].Index <= la {
+				skip := 0
+				for skip < len(entries) && entries[skip].Index <= la {
+					skip++
+				}
+				entries = entries[skip:]
 			}
 
 			if len(entries) == 0 {
+				return
+			}
+
+			// The batch must continue exactly where the last one stopped.
+			// A higher first index means an earlier batch was dropped (an
+			// unloaded-shard skip, a shutdown drop, a failed Peer.Commit).
+			// The missing range can never be re-offered, so applying this
+			// batch would silently skip committed entries and keep the shard
+			// serving reads from a divergent state machine. Fail the shard
+			// instead. la == 0 is a shard that has not applied anything yet
+			// (fresh start, or an on-disk SM whose frontier is seeded
+			// elsewhere), where no continuity claim can be made.
+			if la > 0 && entries[0].Index != la+1 {
+				slog.Error("committed entry gap before apply",
+					"shard", node.shardID,
+					"replica", node.replicaID,
+					"last_applied", la,
+					"batch_first_index", entries[0].Index,
+				)
+				w.failApply(node, entries, ErrApplyGap)
 				return
 			}
 			// Grow pre-allocated results slice if needed.
@@ -295,7 +508,11 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			// machine. The maxSize limit prevents decompression bomb
 			// attacks from malicious entries in the log.
 			maxDecompressSize := int(node.cfg.MaxEntrySize)
-			if err := raft.DecompressEntries(entries, maxDecompressSize); err != nil {
+			err := checkDecompressedSize(entries, maxDecompressSize)
+			if err == nil {
+				err = raft.DecompressEntries(entries, maxDecompressSize)
+			}
+			if err != nil {
 				// Fail-fast: a decompression error means these committed
 				// entries cannot be applied. Skipping them while advancing
 				// lastApplied would silently diverge this state machine
@@ -313,7 +530,6 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			// panicking user SM.Apply (recovered above) cannot leak the
 			// slot. Leaking enough slots across distinct panicking shards
 			// would deadlock all applies.
-			var err error
 			func() {
 				w.sem <- struct{}{}
 				defer func() { <-w.sem }()
@@ -386,6 +602,32 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 	}
 }
 
+// checkDecompressedSize rejects decompression bombs BEFORE any output buffer
+// is allocated. raft.DecompressEntry enforces the limit only after
+// snappy.Decode has already allocated the declared decoded length, so a
+// crafted 4-byte header claiming gigabytes would be allocated first and
+// rejected second. snappy.DecodedLen reads that declared length from the
+// frame header without allocating. maxSize <= 0 disables the limit, matching
+// raft.DecompressEntry.
+func checkDecompressedSize(entries []proto.Entry, maxSize int) error {
+	if maxSize <= 0 {
+		return nil
+	}
+	for i := range entries {
+		if entries[i].Type&proto.EntryCompressFlag == 0 {
+			continue
+		}
+		n, err := snappy.DecodedLen(entries[i].Cmd)
+		if err != nil {
+			return &raft.DecompressError{Err: err}
+		}
+		if n > maxSize {
+			return raft.ErrDecompressionBomb
+		}
+	}
+	return nil
+}
+
 // failApply handles a terminal apply or decompression error for a shard
 // using fail-fast semantics. It fails the batch's pending proposals so
 // callers observe the error immediately, marks the shard as failed, and
@@ -408,14 +650,38 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 }
 
 // requestUnload sends a shard removal request to the dispatcher goroutine
-// via the unloadC channel. This is safe for concurrent use by the Host
-// goroutine because the actual map mutation (removeShardChan) happens in
-// the dispatcher goroutine's select loop, preserving the single-owner
+// via the unloadC channel and returns a channel that is closed once the
+// unload is COMPLETE: the per-shard channel closed and the per-shard apply
+// goroutine (if any) fully exited. This is safe for concurrent use by the
+// Host goroutine because the actual map mutation (removeShardChan) happens
+// in the dispatcher goroutine's select loop, preserving the single-owner
 // invariant on shardChans.
-func (w *applyWorker) requestUnload(shardID uint64) {
+//
+// When the engine is stopping (stopC closed), done is closed immediately:
+// Engine.Stop owns the join in that case — it waits for the apply workers,
+// which in turn wait for every per-shard goroutine, before returning.
+func (w *applyWorker) requestUnload(shardID uint64) <-chan struct{} {
+	done := make(chan struct{})
 	select {
-	case w.unloadC <- shardID:
+	case w.unloadC <- applyUnloadRequest{shardID: shardID, done: done}:
 	case <-w.stopC:
+		close(done)
+	}
+	return done
+}
+
+// ackPendingUnloads closes the done channel of every unload request still
+// pending on unloadC. Called by the dispatcher after wg.Wait() during
+// shutdown, when all per-shard goroutines have already exited, so closing
+// done keeps the synchronous-unload contract truthful.
+func (w *applyWorker) ackPendingUnloads() {
+	for {
+		select {
+		case req := <-w.unloadC:
+			close(req.done)
+		default:
+			return
+		}
 	}
 }
 
@@ -434,20 +700,25 @@ func (w *applyWorker) requestReload(shardID uint64) {
 	}
 }
 
-// removeShardChan removes and closes the per-shard channel and adds the
-// shard to the unloaded set. Must only be called from the dispatcher
-// goroutine to maintain the single-owner invariant on shardChans.
+// removeShardChan removes and closes the per-shard channel, adds the
+// shard to the unloaded set, and returns the per-shard goroutine's exit
+// channel (nil when no goroutine was ever spawned for the shard). Must
+// only be called from the dispatcher goroutine to maintain the
+// single-owner invariant on shardChans/shardExits.
 //
 // The unloaded set prevents dispatch() from re-creating a per-shard
 // channel for this shard if a stale applyItem arrives from the commit
 // worker after the unload has been processed. Without this guard, the
 // new goroutine would leak because no subsequent removeShardChan call
 // would ever close its channel.
-func (w *applyWorker) removeShardChan(shardID uint64) {
-	w.unloaded[shardID] = struct{}{}
+func (w *applyWorker) removeShardChan(shardID uint64) <-chan struct{} {
+	w.unloaded.add(shardID)
 	ch, ok := w.shardChans[shardID]
 	if ok {
 		close(ch)
 		delete(w.shardChans, shardID)
 	}
+	exited := w.shardExits[shardID]
+	delete(w.shardExits, shardID)
+	return exited
 }

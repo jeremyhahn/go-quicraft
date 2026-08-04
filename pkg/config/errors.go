@@ -72,6 +72,43 @@ func (e *MaxProposalPayloadSizeExceededError) Error() string {
 	)
 }
 
+// MaxApplyEntrySizeExceededError is returned when the configured
+// MaxApplyEntrySize exceeds what the transport can frame. Raft uses this
+// value to size replication batches, so a larger setting produces batches
+// that are dropped at marshal time and rebuilt identically forever, leaving
+// a lagging follower permanently unable to catch up.
+type MaxApplyEntrySizeExceededError struct {
+	Configured   uint64
+	FrameMaximum uint64
+}
+
+// Error returns a human-readable description.
+func (e *MaxApplyEntrySizeExceededError) Error() string {
+	return fmt.Sprintf(
+		"config: MaxApplyEntrySize %d exceeds the maximum replication payload %d "+
+			"that the transport can frame",
+		e.Configured, e.FrameMaximum,
+	)
+}
+
+// MaxEntrySizeExceededError is returned when the configured MaxEntrySize
+// exceeds the wire protocol's compile-time MaxEntrySize. MaxEntrySize is
+// also the decompression ceiling on the apply path, so a value above the
+// protocol maximum would let a compressed entry expand past what the
+// deserializer will ever accept.
+type MaxEntrySizeExceededError struct {
+	Configured      uint64
+	ProtocolMaximum uint64
+}
+
+// Error returns a formatted error message describing the violation.
+func (e *MaxEntrySizeExceededError) Error() string {
+	return fmt.Sprintf(
+		"config: MaxEntrySize %d exceeds wire protocol maximum %d",
+		e.Configured, e.ProtocolMaximum,
+	)
+}
+
 // KeyRotationIntervalTooSmallError is returned when the configured
 // KeyRotationInterval is non-zero but less than the minimum of 1 second.
 // Sub-second rotation intervals would cause excessive key churn and

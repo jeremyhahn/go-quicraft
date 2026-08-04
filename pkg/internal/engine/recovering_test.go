@@ -51,7 +51,10 @@ func TestRecovering_BlocksEntryApplication(t *testing.T) {
 	// Start the apply worker.
 	go aw.run()
 
-	// Send an item with committed entries while recovering.
+	// Send an item with committed entries while recovering. The apply
+	// worker must hold the batch until the gate clears — never touch the
+	// state machine, and never discard the batch (raft's processed marker
+	// has already advanced past it, so it would not be re-delivered).
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
 	item.update = proto.Update{
@@ -65,38 +68,43 @@ func TestRecovering_BlocksEntryApplication(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	// Wait for the apply worker to process (and skip) the item.
-	// The observable signal is commitPending being cleared by the
-	// deferred cleanup in the apply path.
+	// While recovering, the batch stays parked: the SM is untouched and
+	// commitPending remains set.
+	time.Sleep(20 * time.Millisecond)
+	if goodSM.applyCount.Load() != 0 {
+		t.Fatalf("expected 0 SM.Apply calls during recovery, got %d", goodSM.applyCount.Load())
+	}
+	if got := node.lastApplied.Load(); got != 0 {
+		t.Fatalf("expected lastApplied to remain 0 during recovery, got %d", got)
+	}
+	if !node.commitPending.Load() {
+		t.Fatal("expected commitPending to stay set while the batch waits on the recovery gate")
+	}
+
+	// Complete the recovery: the recovered snapshot covers both queued
+	// entries, so the parked batch resumes, filters them as
+	// snapshot-covered, and releases the pipeline without applying.
+	node.lastApplied.Store(6)
+	node.SetRecovering(false)
+
 	deadlineRec := time.After(5 * time.Second)
 	for node.commitPending.Load() {
 		select {
 		case <-deadlineRec:
-			t.Fatal("timed out waiting for commitPending to be cleared during recovery")
+			t.Fatal("timed out waiting for commitPending to clear after recovery completed")
 		default:
 		}
 		time.Sleep(time.Millisecond)
 	}
 
-	// lastApplied must remain at 0 because recovery blocked apply.
-	if got := node.lastApplied.Load(); got != 0 {
-		t.Fatalf("expected lastApplied to remain 0 during recovery, got %d", got)
-	}
-
-	// The SM should not have been called at all.
+	// Entries covered by the recovered snapshot must not reach the SM.
 	if goodSM.applyCount.Load() != 0 {
-		t.Fatalf("expected 0 SM.Apply calls during recovery, got %d", goodSM.applyCount.Load())
-	}
-
-	// commitPending should have been cleared by the deferred cleanup
-	// so the step worker can re-process the node.
-	if node.commitPending.Load() {
-		t.Fatal("expected commitPending to be cleared after skipped apply")
+		t.Fatalf("expected 0 SM.Apply calls for snapshot-covered entries, got %d", goodSM.applyCount.Load())
 	}
 
 	// OnApplied callback should NOT have been called.
 	if cb.appliedCount.Load() != 0 {
-		t.Fatalf("expected 0 OnApplied calls during recovery, got %d", cb.appliedCount.Load())
+		t.Fatalf("expected 0 OnApplied calls for snapshot-covered entries, got %d", cb.appliedCount.Load())
 	}
 
 	close(stopC)
@@ -169,10 +177,10 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRecovering_EntriesAppliedAfterRecovery verifies that entries
-// queued during recovery are successfully applied after the recovering
-// flag is cleared. Since lastApplied was not advanced during recovery,
-// the step worker will re-deliver the same entries on the next cycle.
+// TestRecovering_EntriesAppliedAfterRecovery verifies that a batch
+// queued during recovery is held by the apply worker and applied once
+// the recovering flag clears, with entries at or below the recovered
+// snapshot index filtered out and entries above it applied.
 func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -192,7 +200,8 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	// Start the apply worker.
 	go aw.run()
 
-	// Phase 1: recovering=true, entries should be skipped.
+	// Phase 1: recovering=true; a batch delivered now must be held, not
+	// applied and not discarded.
 	node.SetRecovering(true)
 	node.commitPending.Store(true)
 	item1 := applyPool.Get().(*applyItem)
@@ -200,45 +209,31 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 		ShardID:   1,
 		ReplicaID: 1,
 		CommittedEntries: []proto.Entry{
-			{Index: 10, Term: 1, Cmd: []byte("during-recovery")},
+			{Index: 10, Term: 1, Cmd: []byte("covered-by-snapshot")},
+			{Index: 11, Term: 1, Cmd: []byte("beyond-snapshot")},
 		},
 	}
 	item1.node = node
 	applyC <- item1
 
-	// Wait for the skipped apply to process.
-	deadline := time.After(5 * time.Second)
-	for node.commitPending.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for commitPending to clear (phase 1)")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	// Verify entries were NOT applied.
+	// The batch stays parked while recovery is in progress.
+	time.Sleep(20 * time.Millisecond)
 	if node.lastApplied.Load() != 0 {
 		t.Fatalf("expected lastApplied=0 during recovery, got %d", node.lastApplied.Load())
 	}
-
-	// Phase 2: clear recovering, re-send entries -- they should apply.
-	node.SetRecovering(false)
-	node.commitPending.Store(true)
-	item2 := applyPool.Get().(*applyItem)
-	item2.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Index: 10, Term: 1, Cmd: []byte("after-recovery")},
-			{Index: 11, Term: 1, Cmd: []byte("after-recovery-2")},
-		},
+	if goodSM.applyCount.Load() != 0 {
+		t.Fatalf("expected 0 SM.Apply calls during recovery, got %d", goodSM.applyCount.Load())
 	}
-	item2.node = node
-	applyC <- item2
+
+	// Phase 2: recovery completes at snapshot index 10 (recoverSnapshot
+	// stores the snapshot index into node.lastApplied before clearing the
+	// flag). The parked batch resumes: entry 10 is covered by the
+	// snapshot and filtered; entry 11 applies.
+	node.lastApplied.Store(10)
+	node.SetRecovering(false)
 
 	// Wait for entries to be applied.
-	deadline = time.After(5 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for node.lastApplied.Load() < 11 {
 		select {
 		case <-deadline:

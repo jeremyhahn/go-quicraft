@@ -261,11 +261,14 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// (SaveSnapshot, RecoverFromSnapshot). The deferred recovery
 	// runs before the deferred cleanup below, ensuring all flags
 	// are cleared even on panic.
-	panicked := true
+	// The recover stays armed for the WHOLE function, not just the
+	// handleSnapshot call: everything after it — SetRecovering, the work
+	// signal, metrics, and OnSnapshotCompleted — reaches user EventListener
+	// callbacks through the host. A panicking listener on a pool worker
+	// goroutine would otherwise abort the entire host process, taking every
+	// unrelated shard with it.
+	completed := false
 	defer func() {
-		if !panicked {
-			return
-		}
 		r := recover()
 		if r == nil {
 			return
@@ -275,11 +278,14 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 			"shard_id", req.shardID,
 			"replica_id", req.replicaID,
 			"save", req.save,
+			"completed", completed,
 			"panic", fmt.Sprint(r),
 			"stack", string(stack),
 		)
 		// Mirror the normal cleanup path: clear recovering flag
-		// for recovery requests and signal the step worker.
+		// for recovery requests and signal the step worker. The cleanup is
+		// idempotent, so running it again after a post-completion panic is
+		// harmless and guarantees the shard is never left wedged.
 		if !req.save {
 			req.node.SetRecovering(false)
 			if p.workSignal != nil {
@@ -291,10 +297,25 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 		p.inFlight.Delete(req.shardID)
 		// Clear snapshotting flag on the node.
 		req.node.snapshotting.Store(false)
-		// Notify via callback that the snapshot was rejected due
-		// to the panic, so the caller can retry or report.
-		if p.callback != nil {
-			p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
+		// Notify via callback that the snapshot was rejected due to the
+		// panic, so the caller can retry or report. Only when the snapshot
+		// itself did not complete: after completion OnSnapshotCompleted has
+		// already been delivered, and a second terminal callback would
+		// misreport a snapshot that exists. The nested recover keeps a
+		// panicking listener from escaping this deferred handler.
+		if !completed && p.callback != nil {
+			func() {
+				defer func() {
+					if r2 := recover(); r2 != nil {
+						slog.Error("OnSnapshotRejected callback panicked",
+							"shard_id", req.shardID,
+							"replica_id", req.replicaID,
+							"panic", fmt.Sprint(r2),
+						)
+					}
+				}()
+				p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
+			}()
 		}
 	}()
 
@@ -322,15 +343,14 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 			if p.workSignal != nil {
 				p.workSignal.Notify(req.shardID)
 			}
-			panicked = false
 			return
 		}
 	}
 	index, err := p.handleSnapshot(req)
 
-	// Mark that we completed without panicking so the deferred
-	// recovery handler becomes a no-op.
-	panicked = false
+	// Mark that the snapshot operation itself finished, so a later panic is
+	// reported as a post-completion panic rather than a rejected snapshot.
+	completed = true
 
 	// Clear the recovering flag AFTER recovery completes
 	// (success or error). Signal the work signal so the step
@@ -444,6 +464,20 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	snapshotIndex := snapshotter.LastApplied()
 	if snapshotIndex == 0 {
 		return 0, nil
+	}
+
+	// The term MUST be captured here, INSIDE the gate and together with the
+	// index. afterCapture releases the gate as soon as the point-in-time is
+	// captured, after which applies resume; a leader change during the (long)
+	// stream/flush/fsync/encrypt phases would then apply entries at term T+1
+	// and a late lastAppliedTerm read would record (index@T, term=T+1) — a
+	// Log Matching violation for any follower that installs the snapshot.
+	// The req.appliedToTerm fallback covers only the rare forced snapshot
+	// taken after recovery before any apply has run (lastAppliedTerm seeded
+	// to 0 with no snapshot term available).
+	term := node.lastAppliedTerm.Load()
+	if term == 0 {
+		term = req.appliedToTerm
 	}
 
 	// Create snapshot directory using the standard naming convention:
@@ -635,19 +669,10 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		epoch = minEpoch
 	}
 
-	// Term of the entry at snapshotIndex, captured CONSISTENTLY with the index
-	// from the engine's apply-tracked (lastApplied, lastAppliedTerm) pair while
-	// applies are quiesced — so the recorded (index, term) always matches the
-	// captured SM state and never races the step worker's lock-free
-	// inMemory.appliedToTerm writes. The req.appliedToTerm fallback covers only
-	// the rare forced snapshot taken after recovery before any apply has run
-	// (lastAppliedTerm seeded to 0 with no snapshot term available).
-	term := node.lastAppliedTerm.Load()
-	if term == 0 {
-		term = req.appliedToTerm
-	}
-
 	// Write snapshot metadata file (includes epoch for encrypted snapshots).
+	// The (snapshotIndex, term) pair was captured together under the apply
+	// gate above; do NOT re-read lastAppliedTerm here — applies may have
+	// resumed since afterCapture released the gate.
 	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch); err != nil {
 		return 0, &SnapshotError{
 			ShardID:   req.shardID,
@@ -779,6 +804,23 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 		if snapshotIndex > overhead {
 			compactIndex := snapshotIndex - overhead
+			// Advance the LogReader's compaction marker BEFORE the LogDB
+			// removal. LogReader.Compact resolves the term at compactIndex,
+			// which stops being readable once RemoveEntriesTo has run — the
+			// reverse order fails with ErrCompacted and silently leaves
+			// markerIndex stale, so raft keeps probing for entries the
+			// LogDB has already discarded.
+			if lr := node.LogReader(); lr != nil {
+				if lrErr := lr.Compact(compactIndex); lrErr != nil &&
+					!errors.Is(lrErr, logdb.ErrCompacted) {
+					slog.Warn("log reader compaction failed",
+						"shard_id", req.shardID,
+						"replica_id", req.replicaID,
+						"compact_index", compactIndex,
+						"error", lrErr,
+					)
+				}
+			}
 			if removeErr := p.logdb.RemoveEntriesTo(req.shardID, req.replicaID, compactIndex); removeErr != nil {
 				slog.Warn("log compaction remove failed",
 					"shard_id", req.shardID,
@@ -803,6 +845,20 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	p.purgeOldEpochs(node.SnapshotDir(), req.shardID, req.replicaID)
 
 	return snapshotIndex, nil
+}
+
+// peerCommittedIndex returns the Raft log's committed index, read under
+// raftMu — the lock that serializes the step worker's Tick and the commit
+// worker's Commit. The second result is false when the node has no peer
+// (there is then no raft log whose markers a recovery could get ahead of).
+func peerCommittedIndex(node *Node) (uint64, bool) {
+	peer := node.Peer()
+	if peer == nil {
+		return 0, false
+	}
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	return peer.CommittedIndex(), true
 }
 
 // recoverSnapshot recovers the state machine from the most recent
@@ -930,12 +986,41 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}
 
+	// Refuse to advance the apply markers past what the Raft log has
+	// committed. Recovery is queued unconditionally once a snapshot is
+	// persisted, including when delivering the InstallSnapshot into the Raft
+	// log failed — in which case the log never restored to this index.
+	// Advancing lastApplied anyway would make the next GetUpdate carry a
+	// LastApplied greater than the log's committed/processed markers, which
+	// commitUpdate asserts against: an invariant panic on the commit worker.
+	// Report it as a failed recovery so the caller can retry the transfer.
+	committed, hasPeer := peerCommittedIndex(node)
+	if hasPeer && committed < logdbSnap.Index {
+		return &SnapshotRecoveryBehindError{
+			ShardID:       req.shardID,
+			ReplicaID:     req.replicaID,
+			SnapshotIndex: logdbSnap.Index,
+			Committed:     committed,
+		}
+	}
+
 	// Update node tracking fields to reflect recovered state. lastAppliedTerm is
 	// seeded from the snapshot's term so a snapshot taken after recovery but
 	// before the next apply records a consistent (index, term).
 	node.lastApplied.Store(logdbSnap.Index)
 	node.lastAppliedTerm.Store(logdbSnap.Term)
 	node.lastSnapshotIndex.Store(logdbSnap.Index)
+
+	// Seed the snapshotter's OWN applied counter alongside the node markers.
+	// saveSnapshot takes its snapshot INDEX from snapshotter.LastApplied() and
+	// its TERM from node.lastAppliedTerm; the recovered state machine reflects
+	// logdbSnap.Index, so the two sources must agree here. Without this, a
+	// snapshot requested right after recovery (before the next Apply) would
+	// record the stale pre-recovery index against post-recovery state —
+	// regressing lastSnapshotIndex and double-applying on replay.
+	if setter, ok := snapshotter.(appliedSetter); ok {
+		setter.SetLastApplied(logdbSnap.Index)
+	}
 
 	return nil
 }

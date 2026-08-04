@@ -31,43 +31,35 @@ import (
 // CRITICAL: Entry Validation Tests
 // ===========================================================================
 
-// TestDragonboat_AppendRejectsIndexHole verifies that tryAppend correctly
-// identifies a conflict when entries have a gap in indices. When the log
-// has entries 1-3 and receives entries starting at index 5 (skipping 4),
-// the conflict detection should identify the gap and append from the
-// first unavailable index.
+// TestDragonboat_AppendRejectsIndexHole verifies that tryAppend rejects a
+// batch whose entries are not contiguous with the declared prevLogIndex.
+// When the log has entries 1-3 and receives entries starting at index 5
+// (skipping 4), accepting the batch would store entries under wrong
+// positions and corrupt the in-memory log; tryAppend must reject it
+// before any mutation (dragonboat panics via checkEntriesToAppend; we
+// return ErrGappedEntryBatch and drop the message so the leader retries).
 func TestDragonboat_AppendRejectsIndexHole(t *testing.T) {
 	entries := makeEntries(1, 4, 1) // indices 1,2,3 at term 1
 	l := newTestRaftLog(entries)
 	l.committed = 1
 
 	// Entries with a gap: prevLogIndex=3, term matches, but entries
-	// start at index 5 (skipping 4). tryAppend should succeed and
-	// treat index 5 as beyond the log.
+	// start at index 5 (skipping 4).
 	gappedEntries := []proto.Entry{
 		{Index: 5, Term: 1},
 		{Index: 6, Term: 1},
 	}
 
-	// prevLogIndex=3, prevLogTerm=1 matches. The entries start at 5 but
-	// getConflictIndex will find index 5 is beyond lastIndex (3), so
-	// it will report conflict at 5 and append from there.
-	// However, tryAppend uses prevLogIndex + entry offset to align entries.
-	// With prevLogIndex=3 and entries starting at index 5, offset=5-5=0,
-	// so all entries are appended starting at index 4 (conflict point).
-	lastIdx, ok, _, err := l.tryAppend(3, 1, gappedEntries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	_, ok, _, err := l.tryAppend(3, 1, gappedEntries)
+	if !errors.Is(err, ErrGappedEntryBatch) {
+		t.Fatalf("expected ErrGappedEntryBatch, got %v", err)
 	}
-	if !ok {
-		t.Fatal("expected tryAppend to succeed with matching prevLog")
+	if ok {
+		t.Fatal("gapped batch must not be reported as appended")
 	}
-	// tryAppend returns ents[len(ents)-1].Index = 6. The entries are
-	// appended starting from the first conflict point (index 4, which
-	// is beyond the log). The gap in entry indices doesn't matter
-	// because inmem.merge overwrites from the conflict point.
-	if lastIdx != 6 {
-		t.Fatalf("expected lastIndex 6, got %d", lastIdx)
+	// The log must be untouched.
+	if l.lastIndex() != 3 {
+		t.Fatalf("expected log unchanged at lastIndex 3, got %d", l.lastIndex())
 	}
 }
 
@@ -197,23 +189,27 @@ func TestDragonboat_LeaderTransferAfterSnapshot(t *testing.T) {
 	rm := r.remotes[2]
 
 	// Simulate that follower 2 needed a snapshot (was behind compaction).
-	rm.becomeSnapshot(5)
+	rm.becomeSnapshot(5, 1)
 
-	// Snapshot completes successfully.
+	// Snapshot completes successfully (Hint binds status to transfer).
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: false,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if rm.state != remoteProbe {
-		t.Fatalf("expected probe state after snapshot done, got %s", rm.state)
+	// Transfer success keeps the remote paused in snapshot state until
+	// the follower acknowledges the snapshot at the raft level.
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot state after transfer success, got %s", rm.state)
 	}
 
-	// Follower 2 catches up: acknowledge entries up to lastIndex.
+	// Follower 2 catches up: acknowledge entries up to lastIndex. This is
+	// the ack that transitions snapshot -> probe -> replicate.
 	rm.update(r.log.lastIndex())
 	rm.respondedTo()
 	r.drainMessages()
@@ -257,13 +253,16 @@ func TestDragonboat_LeaderTransferReceiveHigherTermVote(t *testing.T) {
 	}
 	r.drainMessages()
 
-	// Receive a RequestVote with a higher term from node 3.
+	// Receive a transfer-initiated RequestVote with a higher term from
+	// node 3 (Hint == From marks a leadership-transfer election, which
+	// bypasses the CheckQuorum higher-term-vote guard).
 	err = r.step(proto.Message{
 		Type:     proto.RequestVote,
 		From:     3,
 		Term:     r.term + 2,
 		LogIndex: r.log.lastIndex(),
 		LogTerm:  r.log.lastTerm(),
+		Hint:     3,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -682,7 +681,7 @@ func TestDragonboat_SnapshotAbort(t *testing.T) {
 	r.drainMessages()
 
 	rm := r.remotes[2]
-	rm.becomeSnapshot(20)
+	rm.becomeSnapshot(20, 1)
 
 	if rm.state != remoteSnapshot {
 		t.Fatalf("expected remoteSnapshot, got %s", rm.state)
@@ -691,26 +690,33 @@ func TestDragonboat_SnapshotAbort(t *testing.T) {
 		t.Fatal("expected remote paused during snapshot")
 	}
 
-	// Abort: report failure.
+	// Abort: report failure (Hint binds status to transfer).
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Remote should be in probe state, ready to retry.
+	// Failure arms a retry backoff (paused); expiry falls back to probe.
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot backoff after abort, got %s", rm.state)
+	}
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickSnapshotWaits()
+	}
 	if rm.state != remoteProbe {
-		t.Fatalf("expected remoteProbe after abort, got %s", rm.state)
+		t.Fatalf("expected remoteProbe after backoff expiry, got %s", rm.state)
 	}
 	if rm.snapshotIndex != 0 {
 		t.Fatalf("expected snapshotIndex cleared, got %d", rm.snapshotIndex)
 	}
 	if rm.isPaused() {
-		t.Fatal("expected remote unpaused after snapshot abort")
+		t.Fatal("expected remote unpaused after backoff expiry")
 	}
 	// next should be max(match+1, snapshotIndex+1) = max(1, 21) = 21
 	if rm.next != 21 {
@@ -727,17 +733,24 @@ func TestDragonboat_SnapshotFailureResetToProbe(t *testing.T) {
 
 	rm := r.remotes[3]
 	rm.match = 5
-	rm.becomeSnapshot(15)
+	rm.becomeSnapshot(15, 1)
 
-	// Report failure.
+	// Report failure (Hint binds status to transfer); backoff then expiry.
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   3,
 		Term:   r.term,
+		Hint:   1,
 		Reject: true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot backoff after failure, got %s", rm.state)
+	}
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickSnapshotWaits()
 	}
 
 	if rm.state != remoteProbe {
@@ -977,6 +990,11 @@ func TestDragonboat_VoteFromAnyState(t *testing.T) {
 			setup: func() *raft {
 				r := newTestRaftPreVoteDisabled(1)
 				electLeader(r)
+				// Disable the CheckQuorum higher-term-vote guard;
+				// this subtest exercises the plain vote-from-leader
+				// term transition. The guard itself is covered by
+				// TestDragonboat_LeaderSupersedingWithCheckQuorum.
+				r.checkQuorum = false
 				return r
 			},
 		},
@@ -1046,8 +1064,8 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 	r.drainMessages()
 
 	// Initial quorum: (4+1)/2 + 1 = 3
-	if commitQuorum(r.remotes) != 3 {
-		t.Fatalf("expected commit quorum 3 with 5 nodes, got %d", commitQuorum(r.remotes))
+	if quorum(r.remotes, r.witnesses) != 3 {
+		t.Fatalf("expected commit quorum 3 with 5 nodes, got %d", quorum(r.remotes, r.witnesses))
 	}
 
 	// Propose an entry.
@@ -1061,13 +1079,18 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 	lastIdx := r.log.lastIndex()
 	r.drainMessages()
 
+	// Persist the leader's log so its own durable match covers lastIdx;
+	// the commit below is then decided by the follower ack completing
+	// the reduced quorum.
+	persistLog(r)
+
 	// Remove nodes 4 and 5.
 	delete(r.remotes, 4)
 	delete(r.remotes, 5)
 
 	// New quorum: (2+1)/2 + 1 = 2
-	if commitQuorum(r.remotes) != 2 {
-		t.Fatalf("expected commit quorum 2 with 3 nodes, got %d", commitQuorum(r.remotes))
+	if quorum(r.remotes, r.witnesses) != 2 {
+		t.Fatalf("expected commit quorum 2 with 3 nodes, got %d", quorum(r.remotes, r.witnesses))
 	}
 
 	// Ack from peer 2 should be sufficient (self + peer 2 = quorum of 2).
@@ -1185,6 +1208,10 @@ func TestDragonboat_CannotCommitWithoutNewTermEntry(t *testing.T) {
 	dataIndex := r.log.lastIndex()
 	r.drainMessages()
 
+	// Persist the leader's log: tryCommit counts the leader's own match
+	// at its durable index, so the acks below complete the majority.
+	persistLog(r)
+
 	// Ack from peers 2 and 3 for all entries (majority = 3 with self).
 	for _, peer := range []uint64{2, 3} {
 		err = r.step(proto.Message{
@@ -1222,6 +1249,11 @@ func TestDragonboat_CannotCommitWithoutNewTermEntry(t *testing.T) {
 
 	noopTerm4 := r.log.lastIndex()
 	_ = noopIndex
+
+	// Persist the term-4 leader's log so the negative check below is
+	// decided purely by the Section 5.4.2 term rule, not by missing
+	// local durability.
+	persistLog(r)
 
 	// Before any acks for the term-4 no-op, let's check what happens
 	// if followers ack entries up to but NOT including the term-4 no-op.
@@ -1298,6 +1330,9 @@ func TestDragonboat_LeaderCycle(t *testing.T) {
 	}
 	lastIdx := r.log.lastIndex()
 	r.drainMessages()
+
+	// Persist the leader's log so its own durable match covers lastIdx.
+	persistLog(r)
 
 	// Get acks from follower 2 to commit all entries.
 	err := r.step(proto.Message{
@@ -1595,8 +1630,9 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 
 	leaderTerm := r.term
 
-	// A candidate at a higher term sends a RequestVote. The leader
-	// must step down because the message has a higher term.
+	// Phase 1: with a fresh quorum lease, a higher-term RequestVote is
+	// DROPPED (Raft paper §6 last paragraph): a partitioned node that
+	// inflated its term must not disrupt a stable leader.
 	err = r.step(proto.Message{
 		Type:     proto.RequestVote,
 		From:     2,
@@ -1605,7 +1641,27 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 		LogTerm:  r.log.lastTerm(),
 	})
 	if err != nil {
-		t.Fatalf("RequestVote: %v", err)
+		t.Fatalf("RequestVote (fresh lease): %v", err)
+	}
+	if r.state != leader {
+		t.Fatalf("leader must ignore higher-term vote under fresh lease, got %s", r.state)
+	}
+	if r.term != leaderTerm {
+		t.Fatalf("term must not advance on dropped vote, got %d", r.term)
+	}
+
+	// Phase 2: once the lease has expired (no quorum contact within the
+	// election timeout), the same vote supersedes the leader.
+	r.electionTick = r.electionTimeout
+	err = r.step(proto.Message{
+		Type:     proto.RequestVote,
+		From:     2,
+		Term:     leaderTerm + 1,
+		LogIndex: r.log.lastIndex(),
+		LogTerm:  r.log.lastTerm(),
+	})
+	if err != nil {
+		t.Fatalf("RequestVote (expired lease): %v", err)
 	}
 
 	if r.state != follower {

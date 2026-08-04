@@ -99,6 +99,18 @@ var (
 	// limit would cause bit position aliasing, breaking quorum checks.
 	ErrTooManyVotingMembers = errors.New("raft: cluster exceeds 64 voting members, ReadIndex quorum tracking requires ackBits to fit in uint64")
 
+	// ErrTooManyWitnesses is returned when adding a witness would exceed the
+	// shard's configured WitnessConfig.MaxWitnesses cap.
+	ErrTooManyWitnesses = errors.New("raft: witness count would exceed configured MaxWitnesses")
+
+	// ErrBreaksFullReplicaMajority is returned when a config change — adding
+	// a witness or removing a full replica — would leave the full
+	// (data-bearing) replicas unable to form a quorum on their own, violating
+	// WitnessConfig.RequireFullReplicaMajority. Such a membership lets commits
+	// rest on witness acks with the payload on fewer full replicas, so it is
+	// rejected unless the policy is explicitly disabled.
+	ErrBreaksFullReplicaMajority = errors.New("raft: config change would leave full replicas unable to form a quorum (set WitnessConfig.RequireFullReplicaMajority=false to allow)")
+
 	// ErrReadIndexOverloaded is returned when the pendingReadIndex
 	// queue reaches maxPendingReadIndex capacity. This occurs when
 	// heartbeat responses are lost or delayed under sustained
@@ -109,6 +121,12 @@ var (
 	// the last full (non-witness) voting replica. Witnesses cannot
 	// become leaders, so at least one full replica must remain.
 	ErrRemoveLastFullReplica = errors.New("raft: cannot remove last full replica, witnesses cannot become leader")
+
+	// ErrGappedEntryBatch is returned when a Replicate message carries an
+	// entry batch that is not contiguous with the declared prevLogIndex or
+	// contains internal index gaps. Accepting such a batch would corrupt
+	// the in-memory log long before persistence-time gap detection fires.
+	ErrGappedEntryBatch = errors.New("raft: non-contiguous entry batch in append")
 )
 
 // DecompressError wraps an underlying Snappy decode failure with context

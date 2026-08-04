@@ -29,7 +29,7 @@ import (
 // encryption.
 func newNoneBarrier(t *testing.T) *seal.Barrier {
 	t.Helper()
-	b := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	b := seal.NewBarrier(testBarrierConfig(1))
 	if err := b.Initialize(context.Background(), seal.NewNoneStrategy(), seal.Credentials{}); err != nil {
 		t.Fatalf("none barrier Initialize: %v", err)
 	}

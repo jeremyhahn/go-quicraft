@@ -26,6 +26,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
+// testBarrierConfig returns a seal.BarrierConfig carrying a no-op
+// StatePersister. Barrier.Rotate and Barrier.PurgeEpochsBefore fail closed
+// with seal.ErrNoStatePersister when the barrier cannot durably persist its
+// sealed root-key state, so every test barrier that rotates or purges needs
+// one. See TestBarrierRotateWithoutStatePersisterFailsClosed.
+func testBarrierConfig(deploymentID uint64) seal.BarrierConfig {
+	cfg := seal.DefaultBarrierConfig(deploymentID)
+	cfg.StatePersister = func(*seal.SealedRootKey) error { return nil }
+	return cfg
+}
+
 // newTestBarrier creates a real seal.Barrier initialized with a software
 // strategy using minimal Argon2 parameters for fast test execution.
 func newTestBarrier(t *testing.T) *seal.Barrier {
@@ -42,7 +53,7 @@ func newTestBarrier(t *testing.T) *seal.Barrier {
 	}
 	t.Cleanup(func() { strategy.Close() })
 
-	barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	barrier := seal.NewBarrier(testBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)
 	}
@@ -405,8 +416,13 @@ func TestEncryptedWALRecovery(t *testing.T) {
 	}
 }
 
-// TestEncryptedWALRecoveryWithoutBarrier verifies that a WAL written with
-// encryption cannot be recovered without the barrier (records are skipped).
+// TestEncryptedWALRecoveryWithoutBarrier verifies that a keyed WAL opened
+// without its barrier FAILS TO OPEN rather than recovering nothing. Barrier
+// ciphertext starts with an 8-byte big-endian epoch, so with no decrypt
+// attempted every record decodes as payload type 0x00. Skipping those records
+// booted the node with empty indexes/states/snapshots — a brand-new empty
+// replica that votes in the current term with no memory of prior votes and
+// accepts a log it has already superseded.
 func TestEncryptedWALRecoveryWithoutBarrier(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -429,35 +445,48 @@ func TestEncryptedWALRecoveryWithoutBarrier(t *testing.T) {
 	}
 	db.Close()
 
-	// Reopen WITHOUT barrier -- encrypted records should be silently
-	// skipped during recovery (no barrier means no decryption, and the
-	// raw encrypted bytes will fail to parse as valid records).
+	// Reopen WITHOUT barrier -- recovery must fail loudly.
 	db2, err := Open(dir,
 		WithNoSync(true),
 		WithBlockSize(1024),
 		WithMaxFileSize(64*1024),
-		// No WithBarrier -- records are just replayed as raw bytes.
+		// No WithBarrier -- records are replayed as raw ciphertext bytes.
+	)
+	if err == nil {
+		_ = db2.Close()
+		t.Fatal("Open of a keyed WAL without its barrier succeeded; " +
+			"the node would boot as an empty replica")
+	}
+	if !errors.Is(err, ErrUnknownPayloadType) {
+		t.Fatalf("Reopen without barrier: err=%v, want ErrUnknownPayloadType", err)
+	}
+
+	// Reopening WITH the barrier still works: the failed open must not have
+	// damaged the WAL.
+	db3, err := Open(dir,
+		WithNoSync(true),
+		WithBlockSize(1024),
+		WithMaxFileSize(64*1024),
+		WithBarrier(barrier),
 	)
 	if err != nil {
-		t.Fatalf("Reopen without barrier: %v", err)
+		t.Fatalf("Reopen with barrier: %v", err)
 	}
-	defer db2.Close()
+	defer db3.Close()
 
-	// The unencrypted replay will attempt to interpret encrypted bytes as
-	// WAL records. Since they are AES-GCM ciphertext, the payload type
-	// byte is effectively random, so most records will be silently skipped
-	// by replayRecord. No entries or state should be recovered.
-	got, err := db2.GetEntries(1, 1, 1, 6, 0)
+	got, err := db3.GetEntries(1, 1, 1, 6, 0)
 	if err != nil {
 		t.Fatalf("GetEntries: %v", err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("GetEntries: got %d entries without barrier, want 0", len(got))
+	if len(got) != 5 {
+		t.Fatalf("GetEntries: got %d entries, want 5", len(got))
 	}
-
-	_, _, err = db2.ReadState(1, 1)
-	if err != logdb.ErrNoState {
-		t.Fatalf("ReadState: got %v, want %v", err, logdb.ErrNoState)
+	st, _, err := db3.ReadState(1, 1)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if st.Term != 3 || st.Vote != 1 {
+		t.Fatalf("ReadState: got %+v, want Term 3 Vote 1", st)
 	}
 }
 
@@ -885,7 +914,7 @@ func newTestBarrierWithPassphrase(t *testing.T, passphrase string) *seal.Barrier
 	}
 	t.Cleanup(func() { strategy.Close() })
 
-	barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	barrier := seal.NewBarrier(testBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)
 	}
@@ -1188,5 +1217,57 @@ func TestMinLiveEpoch_RecoveryPreservesEpoch(t *testing.T) {
 	}
 	if epoch != 1 {
 		t.Fatalf("MinLiveEpoch after recovery = %d, want 1", epoch)
+	}
+}
+
+// TestBarrierRotateWithoutStatePersisterFailsClosed verifies that a WAL
+// barrier with no seal.StatePersister refuses to rotate. Without a
+// persister the new epoch's sealed root-key state would never reach durable
+// storage, so every record the WAL wrote under that epoch would be
+// undecryptable after a restart. The barrier must therefore fail closed and
+// keep the WAL pinned to the epoch it can still recover.
+func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
+	_ = seal.AllowWeakKDFParams()
+	strategy, err := seal.NewSoftwareStrategyWithParams(
+		[]byte("test-passphrase"), 1, 64*1024, 1,
+	)
+	if err != nil {
+		t.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+	}
+	t.Cleanup(func() { strategy.Close() })
+
+	// DefaultBarrierConfig leaves StatePersister nil.
+	barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
+		t.Fatalf("barrier.Initialize: %v", err)
+	}
+	db := openEncryptedTestDB(t, barrier)
+
+	if err := db.SaveEntries(1, 1, makeEntries(1, 5, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	if _, err := barrier.Rotate(); !errors.Is(err, seal.ErrNoStatePersister) {
+		t.Fatalf("Rotate = %v, want seal.ErrNoStatePersister", err)
+	}
+
+	// The WAL is still pinned to the only epoch the barrier can recover, and
+	// the records written under it still decrypt.
+	epoch, err := db.MinLiveEpoch()
+	if err != nil {
+		t.Fatalf("MinLiveEpoch: %v", err)
+	}
+	if epoch != 1 {
+		t.Fatalf("MinLiveEpoch = %d, want 1 (rotation must not have happened)", epoch)
+	}
+	if err := db.SaveEntries(1, 1, makeEntries(6, 5, 1)); err != nil {
+		t.Fatalf("SaveEntries after failed rotation: %v", err)
+	}
+	got, err := db.GetEntries(1, 1, 1, 11, 0)
+	if err != nil {
+		t.Fatalf("GetEntries: %v", err)
+	}
+	if len(got) != 10 {
+		t.Fatalf("GetEntries: got %d entries, want 10", len(got))
 	}
 }

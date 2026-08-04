@@ -31,7 +31,7 @@ import (
 func TestRequestState_PendingConfigChange_CreateAndVerify(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(5 * time.Second)
-	rs := newRequestState(pool, 100, deadline)
+	rs := newRequestState(pool, 100, deadline, true)
 
 	if rs.Key() != 100 {
 		t.Errorf("Key = %d, want 100", rs.Key())
@@ -67,7 +67,7 @@ func TestRequestState_PendingConfigChange_CreateAndVerify(t *testing.T) {
 // a second request can detect the busy state by checking the channel.
 func TestRequestState_PendingConfigChange_BusyWhenPending(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 1, time.Now().Add(10*time.Second))
+	rs1 := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
 
 	// rs1 is pending (no result delivered yet). A caller checking
 	// whether a config change is pending should find the channel empty.
@@ -98,7 +98,7 @@ func TestRequestState_PendingConfigChange_BusyWhenPending(t *testing.T) {
 func TestRequestState_PendingConfigChange_Timeout(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 
 	_, err := rs.Result()
 	if !errors.Is(err, ErrTimeout) {
@@ -112,7 +112,7 @@ func TestRequestState_PendingConfigChange_Timeout(t *testing.T) {
 // ResultC and Result().
 func TestRequestState_PendingConfigChange_CompletionNotification(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	expected := RequestResult{Value: 42, Data: []byte("config-applied")}
 
@@ -138,7 +138,7 @@ func TestRequestState_PendingConfigChange_CompletionNotification(t *testing.T) {
 // nil and Result return ErrReleased.
 func TestRequestState_PendingConfigChange_DropCancel(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second))
+	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
 
 	// Drop/cancel the pending request.
 	rs.Release()
@@ -161,7 +161,7 @@ func TestRequestState_PendingConfigChange_DropCancel(t *testing.T) {
 func TestRequestState_PendingReadIndex_CreateAndVerify(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(3 * time.Second)
-	rs := newRequestState(pool, 200, deadline)
+	rs := newRequestState(pool, 200, deadline, true)
 
 	if rs.Key() != 200 {
 		t.Errorf("Key = %d, want 200", rs.Key())
@@ -179,7 +179,7 @@ func TestRequestState_PendingReadIndex_CreateAndVerify(t *testing.T) {
 // a pending read index detects the busy state through channel inspection.
 func TestRequestState_PendingReadIndex_WhenPending(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second))
+	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
 
 	// Read index is pending.
 	select {
@@ -206,7 +206,7 @@ func TestRequestState_PendingReadIndex_WhenPending(t *testing.T) {
 // that a read index result carries the committed index from the leader.
 func TestRequestState_PendingReadIndex_CompletionWithCommittedIndex(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Simulate leader confirming the read index at committed=1000.
 	go func() {
@@ -228,7 +228,7 @@ func TestRequestState_PendingReadIndex_CompletionWithCommittedIndex(t *testing.T
 func TestRequestState_PendingReadIndex_Timeout(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 
 	_, err := rs.Result()
 	if !errors.Is(err, ErrTimeout) {
@@ -246,7 +246,7 @@ func TestRequestState_BatchReadIndex_Timeout(t *testing.T) {
 	const batchSize = 5
 	states := make([]*RequestState, batchSize)
 	for i := range states {
-		states[i] = newRequestState(pool, uint64(i+1), deadline)
+		states[i] = newRequestState(pool, uint64(i+1), deadline, true)
 	}
 
 	// All should timeout.
@@ -267,7 +267,7 @@ func TestRequestState_BatchReadIndex_Timeout(t *testing.T) {
 // pending snapshot request (simulating GC) correctly cleans up state.
 func TestRequestState_SnapshotGCDuringPending(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 300, time.Now().Add(30*time.Second))
+	rs := newRequestState(pool, 300, time.Now().Add(30*time.Second), true)
 
 	// Snapshot is pending. Simulate GC by releasing before completion.
 	rs.Release()
@@ -292,7 +292,7 @@ func TestRequestState_SnapshotGCDuringPending(t *testing.T) {
 // snapshot apply delivers the result correctly to the caller.
 func TestRequestState_SnapshotApplyCompletion(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Simulate snapshot apply completion.
 	go func() {
@@ -317,9 +317,9 @@ func TestRequestState_SnapshotApplyCompletion(t *testing.T) {
 func TestRequestState_SnapshotIdentityByKey(t *testing.T) {
 	pool := NewRequestStatePool()
 
-	rs1 := newRequestState(pool, 100, time.Time{})
-	rs2 := newRequestState(pool, 200, time.Time{})
-	rs3 := newRequestState(pool, 300, time.Time{})
+	rs1 := newRequestState(pool, 100, time.Time{}, true)
+	rs2 := newRequestState(pool, 200, time.Time{}, true)
+	rs3 := newRequestState(pool, 300, time.Time{}, true)
 
 	if rs1.Key() == rs2.Key() || rs2.Key() == rs3.Key() || rs1.Key() == rs3.Key() {
 		t.Error("snapshot requests should have distinct keys")
@@ -358,7 +358,7 @@ func TestRequestState_SnapshotIdentityByKey(t *testing.T) {
 // creation through completion to release, checking state at each stage.
 func TestRequestState_ReleaseAndReadyStates(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Stage 1: Active state.
 	if rs.released.Load() {
@@ -403,7 +403,7 @@ func TestRequestState_ReleaseAndReadyStates(t *testing.T) {
 // safe and idempotent, not panicking or corrupting state.
 func TestRequestState_DoubleReleaseSafety(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.complete(RequestResult{Value: 1})
 	<-rs.ResultC()
@@ -434,7 +434,7 @@ func TestRequestState_DoubleReleaseSafety(t *testing.T) {
 // double-release from multiple goroutines is safe.
 func TestRequestState_DoubleReleaseConcurrent(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 	rs.complete(RequestResult{Value: 1})
 
 	var wg sync.WaitGroup
@@ -457,7 +457,7 @@ func TestRequestState_DoubleReleaseConcurrent(t *testing.T) {
 // a request after double release is a safe no-op.
 func TestRequestState_CompleteAfterDoubleRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 	rs.Release()
@@ -478,7 +478,7 @@ func TestRequestState_CompleteAfterDoubleRelease(t *testing.T) {
 // independent results to their respective channels.
 func TestRequestState_CommitThenComplete_BothChannelsWork(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.commitNotify(RequestResult{Value: 0})
 	rs.complete(RequestResult{Value: 42, Data: []byte("applied")})
@@ -512,7 +512,7 @@ func TestRequestState_PoolRecycleFullLifecycle(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// First lifecycle.
-	rs1 := newRequestState(pool, 1, time.Now().Add(5*time.Second))
+	rs1 := newRequestState(pool, 1, time.Now().Add(5*time.Second), true)
 	rs1.commitNotify(RequestResult{Value: 0})
 	rs1.complete(RequestResult{Value: 10})
 	<-rs1.CommittedC()
@@ -520,7 +520,7 @@ func TestRequestState_PoolRecycleFullLifecycle(t *testing.T) {
 	rs1.Release()
 
 	// Second lifecycle with recycled object.
-	rs2 := newRequestState(pool, 2, time.Now().Add(5*time.Second))
+	rs2 := newRequestState(pool, 2, time.Now().Add(5*time.Second), true)
 	if rs2.Key() != 2 {
 		t.Errorf("recycled key = %d, want 2", rs2.Key())
 	}
@@ -559,7 +559,7 @@ func TestRequestState_PoolRecycleFullLifecycle(t *testing.T) {
 // with zero deadline blocks until completion (no timeout).
 func TestRequestState_ZeroDeadline_BlocksIndefinitely(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	if !rs.Deadline().IsZero() {
 		t.Fatalf("deadline should be zero, got %v", rs.Deadline())
@@ -597,7 +597,7 @@ func TestRequestState_ZeroDeadline_BlocksIndefinitely(t *testing.T) {
 // completing with an error result propagates through Result().
 func TestRequestState_CompleteWithError_PropagatesToResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	go func() {
 		rs.complete(RequestResult{Err: ErrAborted})

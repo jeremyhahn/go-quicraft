@@ -240,7 +240,7 @@ func TestSendSnapshotConnectionDialFailure(t *testing.T) {
 	reg.Register(1, 2, "127.0.0.1:1")
 
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkCount: 1, Data: []byte("data")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkCount: 1, Data: []byte("data")},
 	}
 
 	err = tr.SendSnapshot(chunks)
@@ -474,6 +474,7 @@ func TestHandleSnapshotStreamSmallHeaderLen(t *testing.T) {
 	// A normal single-chunk snapshot should work fine.
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -710,16 +711,19 @@ func TestSnapshotMultiChunkWithRateLimiting(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:  proto.WireVersion,
 			ShardID: 1, ReplicaID: 2, From: 1,
 			Index: 10, Term: 1, ChunkID: 0, ChunkCount: 3,
 			ChunkSize: 10, Data: []byte("0123456789"),
 		},
 		{
+			BinVer:  proto.WireVersion,
 			ShardID: 1, ReplicaID: 2, From: 1,
 			Index: 10, Term: 1, ChunkID: 1, ChunkCount: 3,
 			ChunkSize: 10, Data: []byte("abcdefghij"),
 		},
 		{
+			BinVer:  proto.WireVersion,
 			ShardID: 1, ReplicaID: 2, From: 1,
 			Index: 10, Term: 1, ChunkID: 2, ChunkCount: 3,
 			ChunkSize: 10, Data: []byte("klmnopqrst"),
@@ -881,6 +885,7 @@ func TestSendSnapshotWithLargePayload(t *testing.T) {
 
 	chunks := []proto.SnapshotChunk{
 		{
+			BinVer:     proto.WireVersion,
 			ShardID:    1,
 			ReplicaID:  2,
 			From:       1,
@@ -1409,13 +1414,15 @@ func TestReceiveChunksHappyPath(t *testing.T) {
 	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)
 
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
-		{ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 5, Data: []byte("world")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 5, Data: []byte("world")},
 	}
 	data := buildChunkFrames(t, chunks)
 
 	reader := &testChunkReader{data: data}
-	hdr := &SnapshotHeader{ChunkCount: 2}
+	// The header must match the chunks' ShardID/Index/Epoch: receiveChunks
+	// rejects chunks that diverge from the stream header.
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 2}
 	stopC := make(chan struct{})
 
 	sr.receiveChunks(reader, hdr, nil, stopC)
@@ -1437,8 +1444,8 @@ func TestReceiveChunksStopDuringLoop(t *testing.T) {
 
 	// Create two chunks but close stopC before processing.
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
-		{ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 5, Data: []byte("world")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 5, Data: []byte("world")},
 	}
 	data := buildChunkFrames(t, chunks)
 
@@ -1487,7 +1494,7 @@ func TestReceiveChunksReadFrameHeaderEOF(t *testing.T) {
 
 	// Create only 1 chunk but claim 2 in the header.
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 5, Data: []byte("hello")},
 	}
 	data := buildChunkFrames(t, chunks)
 
@@ -1541,6 +1548,7 @@ func TestReceiveChunksZeroLengthChunk(t *testing.T) {
 	WriteFrame(&buf, nil, FlagNone)
 	// Normal chunk.
 	chunk := proto.SnapshotChunk{
+		BinVer:  proto.WireVersion,
 		ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2,
 		ChunkSize: 4, Data: []byte("data"),
 	}
@@ -1571,7 +1579,7 @@ func TestReceiveChunksMemoryBudgetExceeded(t *testing.T) {
 
 	// Create a chunk larger than the budget.
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 1, ChunkSize: 100, Data: make([]byte, 100)},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 1, ChunkSize: 100, Data: make([]byte, 100)},
 	}
 	data := buildChunkFrames(t, chunks)
 
@@ -1655,8 +1663,8 @@ func TestReceiveChunksRateLimitWithStop(t *testing.T) {
 	sr := newSnapshotReceiver(4, 1<<30, 1, 0, handler)
 
 	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 100, Data: make([]byte, 100)},
-		{ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 100, Data: make([]byte, 100)},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 0, ChunkCount: 2, ChunkSize: 100, Data: make([]byte, 100)},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, ChunkID: 1, ChunkCount: 2, ChunkSize: 100, Data: make([]byte, 100)},
 	}
 	data := buildChunkFrames(t, chunks)
 

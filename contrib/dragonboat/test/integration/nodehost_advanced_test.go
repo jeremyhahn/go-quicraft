@@ -248,18 +248,18 @@ func TestIntegration_DB_TimeoutCanBeReturned(t *testing.T) {
 // In quicraft, after SyncGetSession the session's SeriesID is
 // SeriesIDFirstProposal (normal proposal range), not SeriesIDForRegister.
 // The adapter's ProposeSession routes based on SeriesID:
-//   - SeriesIDForRegister  -> register a new session (new client ID)
-//   - Any other value      -> close/unregister the session
+//   - SeriesIDForRegister   -> register the session (client ID preserved)
+//   - SeriesIDForUnregister -> close/unregister the session
+//   - any other value       -> rejected with ErrInvalidSession
 //
 // To simulate "register twice", we manually prepare the session for
-// registration. Since quicraft's GetNewSession always creates a new
-// client ID, ProposeSession creates a distinct session rather than
-// re-registering the same one. This is correct behavior -- the adapter
-// cannot re-register an existing client ID through the public API.
+// registration. The register path is asynchronous: the duplicate
+// registration is reported through the RequestState's ResultC as a
+// non-completed result rather than as an immediate error.
 //
 // Matches dragonboat's TestRegisterASessionTwiceWillBeReported in spirit:
-// both verify that ProposeSession on an already-registered session does
-// not produce undefined behavior.
+// both verify that ProposeSession on an already-registered session is
+// reported and does not produce undefined behavior.
 func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -288,9 +288,10 @@ func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 	// SeriesIDForRegister.
 	session.Inner().PrepareForRegister()
 
-	// ProposeSession with SeriesIDForRegister calls GetNewSession under
-	// the hood, which creates a brand-new session with a different client
-	// ID. It then overwrites the adapter session in place.
+	// The register path runs asynchronously through RegisterSession,
+	// which preserves the client ID. A duplicate registration is applied
+	// as an empty result by the state machine and surfaces here as a
+	// non-completed RequestResult.
 	rs, propErr := leaderHost.ProposeSession(session, defaultTimeout)
 	if propErr != nil {
 		// A direct error is acceptable -- some implementations may reject
@@ -302,22 +303,21 @@ func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 
 	select {
 	case result := <-rs.ResultC():
-		if result.Rejected() {
-			// Rejection is acceptable if the engine detects the duplicate.
-			t.Logf("ProposeSession for already-registered session was rejected")
+		if !result.Completed() {
+			// The duplicate registration was reported -- this is the
+			// expected outcome (dragonboat: "will be reported").
+			t.Logf("ProposeSession for already-registered session was reported: completed=%v rejected=%v aborted=%v",
+				result.Completed(), result.Rejected(), result.Aborted())
 			return
 		}
-		if !result.Completed() {
-			t.Fatalf("unexpected result state: completed=%v rejected=%v",
-				result.Completed(), result.Rejected())
-		}
 
-		// Registration succeeded -- verify it created a new session with
-		// a different client ID, not a re-registration of the original.
+		// If the engine treated the re-registration as a success, the
+		// client ID must be preserved: RegisterSession never mints a
+		// new client ID.
 		newClientID := session.ClientID()
-		t.Logf("new session clientID=%d (original=%d)", newClientID, originalClientID)
-		if newClientID == originalClientID {
-			t.Fatal("ProposeSession should have created a new session with a different client ID")
+		t.Logf("session clientID after re-register=%d (original=%d)", newClientID, originalClientID)
+		if newClientID != originalClientID {
+			t.Fatal("ProposeSession must preserve the session's client ID")
 		}
 	case <-ctx.Done():
 		t.Fatal("ProposeSession timed out waiting for result")
@@ -458,9 +458,13 @@ func TestIntegration_DB_SnapshotRecoveryAfterRestart(t *testing.T) {
 	t.Logf("follower recovered all %d entries after snapshot-based restart", len(expected))
 }
 
-// TestIntegration_DB_SnapshotIndex_ZeroOnRegularResult verifies that
-// SnapshotIndex() returns 0 on a regular (non-snapshot) request result.
-func TestIntegration_DB_SnapshotIndex_ZeroOnRegularResult(t *testing.T) {
+// TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult verifies the
+// adapter's documented SnapshotIndex() behavior: quicraft delivers the
+// snapshot index in the result's Value field, so SnapshotIndex() returns
+// the raw result value. It is only meaningful for snapshot-related
+// results; on a regular proposal it simply mirrors GetResult().Value
+// (dragonboat panics on such misuse, the adapter does not).
+func TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
 
@@ -490,13 +494,15 @@ func TestIntegration_DB_SnapshotIndex_ZeroOnRegularResult(t *testing.T) {
 			t.Fatalf("Propose did not complete: timeout=%v, rejected=%v",
 				result.Timeout(), result.Rejected())
 		}
-		if result.SnapshotIndex() != 0 {
-			t.Fatalf("SnapshotIndex() = %d, want 0 for regular proposal result",
-				result.SnapshotIndex())
-		}
 		smResult := result.GetResult()
 		if smResult.Value != uint64(len(value)) {
 			t.Fatalf("GetResult().Value = %d, want %d", smResult.Value, len(value))
+		}
+		// SnapshotIndex mirrors the raw result value on non-snapshot
+		// results (documented adapter behavior).
+		if result.SnapshotIndex() != smResult.Value {
+			t.Fatalf("SnapshotIndex() = %d, want raw result value %d",
+				result.SnapshotIndex(), smResult.Value)
 		}
 		t.Logf("regular proposal result: SnapshotIndex=0, Value=%d", smResult.Value)
 	case <-time.After(defaultTimeout):

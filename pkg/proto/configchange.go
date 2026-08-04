@@ -18,24 +18,34 @@ package proto
 // as the Cmd payload of an EntryConfigChange entry. The wire format is:
 //
 //	[ConfigChangeID:8][Type:8][ReplicaID:8][Address:len+data][Initialize:8]
+//	[MaxWitnesses:8][RequireFullReplicaMajority:8]
 type ConfigChange struct {
 	// ConfigChangeID is the log index that identifies this config change.
 	ConfigChangeID uint64
-	// Type is the change type: AddNode, RemoveNode, AddNonVoting, or AddWitness.
+	// Type is the change type: AddNode, RemoveNode, AddNonVoting,
+	// AddWitness, or UpdateWitnessPolicy.
 	Type uint64
 	// ReplicaID is the target replica for the membership change.
+	// Unused (zero) for UpdateWitnessPolicy.
 	ReplicaID uint64
 	// Address is the network address for the replica being added.
-	// Empty for RemoveNode operations.
+	// Empty for RemoveNode and UpdateWitnessPolicy operations.
 	Address string
 	// Initialize indicates whether the replica needs initial state.
 	Initialize bool
+	// MaxWitnesses is the new witness cap for UpdateWitnessPolicy
+	// changes (0 = no explicit cap). Ignored for other types.
+	MaxWitnesses uint64
+	// RequireFullReplicaMajority is the new full-replica-majority policy
+	// for UpdateWitnessPolicy changes. Ignored for other types.
+	RequireFullReplicaMajority bool
 }
 
 // configChangeFixedSize is the wire size of the fixed fields:
-// ConfigChangeID(8) + Type(8) + ReplicaID(8) + Initialize(8) = 32 bytes
+// ConfigChangeID(8) + Type(8) + ReplicaID(8) + Initialize(8) +
+// MaxWitnesses(8) + RequireFullReplicaMajority(8) = 48 bytes
 // plus the 4-byte address string length prefix.
-const configChangeFixedSize = 4*8 + 4 // 36 bytes
+const configChangeFixedSize = 6*8 + 4 // 52 bytes
 
 // Size returns the total marshaled size of the config change in bytes.
 func (cc *ConfigChange) Size() int {
@@ -57,12 +67,17 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 	offset += putString(buf[offset:], cc.Address)
 	putBool(buf[offset:], cc.Initialize)
 	offset += 8
+	putUint64(buf[offset:], cc.MaxWitnesses)
+	offset += 8
+	putBool(buf[offset:], cc.RequireFullReplicaMajority)
+	offset += 8
 	return offset, nil
 }
 
 // UnmarshalFrom reads the config change from buf and returns bytes consumed.
-// Returns ErrBufferTooSmall on truncated input or ErrAddressTooLong if
-// the address exceeds MaxAddressLength.
+// Returns ErrBufferTooSmall on truncated input, ErrAddressTooLong if the
+// address exceeds MaxAddressLength, or ErrUnsupportedVersion if the buffer
+// matches the legacy (pre-WireVersion 2) layout.
 func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < 24+4 { // 3 uint64 fields + address length prefix
 		return 0, ErrBufferTooSmall
@@ -74,7 +89,7 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	cc.ReplicaID = getUint64(buf[16:])
 	offset := 24
-	addr, n, err := getString(buf[offset:], MaxAddressLength)
+	addr, n, err := getString(buf[offset:], MaxAddressLength, ErrAddressTooLong)
 	if err != nil {
 		return 0, err
 	}
@@ -84,6 +99,21 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 		return 0, ErrBufferTooSmall
 	}
 	cc.Initialize = getBool(buf[offset:])
+	offset += 8
+	if len(buf) < offset+16 {
+		// Legacy-layout detection: the v1 ConfigChange (no witness-policy
+		// fields) ended exactly here, so a buffer that terminates at this
+		// offset is a payload written by a pre-WireVersion 2 binary, not a
+		// truncation of a v2 payload. Report it as an unsupported format
+		// rather than an opaque short-buffer error.
+		if len(buf) == offset {
+			return 0, ErrUnsupportedVersion
+		}
+		return 0, ErrBufferTooSmall
+	}
+	cc.MaxWitnesses = getUint64(buf[offset:])
+	offset += 8
+	cc.RequireFullReplicaMajority = getBool(buf[offset:])
 	offset += 8
 	return offset, nil
 }
@@ -95,4 +125,6 @@ func (cc *ConfigChange) Reset() {
 	cc.ReplicaID = 0
 	cc.Address = ""
 	cc.Initialize = false
+	cc.MaxWitnesses = 0
+	cc.RequireFullReplicaMajority = false
 }

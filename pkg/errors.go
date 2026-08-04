@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
@@ -218,6 +219,32 @@ var (
 	// ErrInvalidRange is returned when a log query specifies an invalid
 	// index range, such as firstIndex >= lastIndex.
 	ErrInvalidRange = errors.New("quicraft: invalid range")
+
+	// ErrSnapshotTooLarge is the sentinel form of SnapshotTooLargeError,
+	// returned when an imported snapshot artifact exceeds the configured
+	// MaxSnapshotSize.
+	ErrSnapshotTooLarge = errors.New("quicraft: snapshot too large")
+)
+
+// Membership validation sentinels surfaced by the membership-change API
+// (RequestAddWitness, RequestRemoveNode, and their Sync variants). These
+// alias the internal raft sentinels so external callers can match the
+// rejections with errors.Is instead of string comparison.
+var (
+	// ErrTooManyWitnesses is returned when a witness add would exceed the
+	// shard's WitnessConfig.MaxWitnesses cap.
+	ErrTooManyWitnesses = raft.ErrTooManyWitnesses
+
+	// ErrBreaksFullReplicaMajority is returned when a config change —
+	// adding a witness or removing a full replica — would leave the full
+	// replicas unable to form a quorum, violating the
+	// WitnessConfig.RequireFullReplicaMajority policy.
+	ErrBreaksFullReplicaMajority = raft.ErrBreaksFullReplicaMajority
+
+	// ErrRemoveLastFullReplica is returned when a config change would
+	// remove the shard's only full replica; witnesses cannot become
+	// leader, so the shard would be permanently headless.
+	ErrRemoveLastFullReplica = raft.ErrRemoveLastFullReplica
 )
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
@@ -264,6 +291,28 @@ func (e *EntryTooLargeError) Error() string {
 // Is reports whether target matches the sentinel ErrEntryTooLarge error.
 func (e *EntryTooLargeError) Is(target error) bool {
 	return target == ErrEntryTooLarge
+}
+
+// SnapshotTooLargeError is returned when an imported snapshot artifact
+// exceeds the configured MaxSnapshotSize. MaxSize is the configured limit;
+// the artifact is rejected as soon as the limit is exceeded, so its full
+// size is not known and is not reported.
+type SnapshotTooLargeError struct {
+	ShardID uint64
+	MaxSize uint64
+}
+
+// Error returns a human-readable description including the limit.
+func (e *SnapshotTooLargeError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: snapshot for shard %d exceeds the maximum snapshot size of %d bytes",
+		e.ShardID, e.MaxSize,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotTooLarge error.
+func (e *SnapshotTooLargeError) Is(target error) bool {
+	return target == ErrSnapshotTooLarge
 }
 
 // BusyError is returned when the in-memory log exceeds MaxInMemLogSize

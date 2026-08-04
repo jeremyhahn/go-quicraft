@@ -90,44 +90,73 @@ func (c *CachedDiskStateMachine) Open(ctx context.Context, initialDir string, st
 	return lastApplied, nil
 }
 
-// Update applies entries to the inner SM, then updates the cache.
+// Update invalidates the affected cache keys, applies entries to the inner
+// SM, then repopulates the cache.
+//
+// The invalidation MUST happen before the inner write: if the cache were
+// only repopulated afterwards, a Lookup racing with Update could return the
+// stale pre-write value from the cache while the write is already durable
+// in the inner SM. Deleting first degrades that window to a cache miss that
+// falls through to the (already or not-yet updated, but never stale-cached)
+// inner SM.
 func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, results []Result) error {
-	if err := c.inner.Update(ctx, entries, results); err != nil {
-		return err
+	// Extract once; the (key, value) pairs alias e.Cmd, which stays valid
+	// until this Update returns (the engine recycles Cmd buffers only after
+	// that, see ZeroCopyEntryCmd).
+	type kvPair struct {
+		key   string
+		value []byte
 	}
+	pairs := make([]kvPair, 0, len(entries))
 	for _, e := range entries {
 		key, value := c.extractKV(e.Cmd)
 		if key != "" {
-			// Copy the value before caching. extractKV may return a sub-slice
-			// of e.Cmd, which under ZeroCopyEntryCmd aliases an internal buffer
-			// the engine recycles after Update returns. Caching the alias would
-			// let a later write corrupt previously-cached reads. A nil value is
-			// preserved as nil (it signals a delete to the cache).
-			if value != nil {
-				cached := make([]byte, len(value))
-				copy(cached, value)
-				value = cached
-			}
-			c.cache.Put(key, value)
+			pairs = append(pairs, kvPair{key: key, value: value})
+			c.cache.Delete(key)
 		}
+	}
+
+	if err := c.inner.Update(ctx, entries, results); err != nil {
+		// The affected keys stay invalidated; subsequent lookups fall
+		// through to the inner SM, which is the source of truth.
+		return err
+	}
+
+	for _, p := range pairs {
+		value := p.value
+		// Copy the value before caching. extractKV may return a sub-slice
+		// of e.Cmd, which under ZeroCopyEntryCmd aliases an internal buffer
+		// the engine recycles after Update returns. Caching the alias would
+		// let a later write corrupt previously-cached reads. A nil value is
+		// preserved as nil (it signals a delete to the cache).
+		if value != nil {
+			cached := make([]byte, len(value))
+			copy(cached, value)
+			value = cached
+		}
+		c.cache.Put(p.key, value)
 	}
 	return nil
 }
 
 // Lookup checks the cache first, then falls back to the inner SM on miss.
+// Cache hits return an owned copy: handing out the live cache buffer would
+// let a caller that mutates or pools the returned slice corrupt the cached
+// value for every future reader.
 func (c *CachedDiskStateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
 	if key := extractQueryKey(query); key != "" {
 		if val, hit := c.cache.Get(key); hit {
-			return val, nil
+			return copyValue(val), nil
 		}
 	}
 	return c.inner.Lookup(ctx, query)
 }
 
-// BytesLookup provides the NALookup interface for zero-allocation cached reads.
+// BytesLookup provides the NALookup interface for cached reads. Cache hits
+// return an owned copy (see Lookup).
 func (c *CachedDiskStateMachine) BytesLookup(key []byte) ([]byte, error) {
 	if val, hit := c.cache.Get(string(key)); hit {
-		return val, nil
+		return copyValue(val), nil
 	}
 	if na, ok := c.inner.(NALookup); ok {
 		return na.BytesLookup(key)
@@ -191,6 +220,16 @@ func (c *CachedDiskStateMachine) CacheStats() (hits, misses uint64) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// copyValue returns an owned copy of a cached value, preserving nil.
+func copyValue(val []byte) []byte {
+	if val == nil {
+		return nil
+	}
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	return cp
+}
 
 // extractQueryKey attempts to extract a string cache key from a query value.
 // Supports string and []byte query types. Returns "" if the query type is

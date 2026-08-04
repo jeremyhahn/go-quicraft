@@ -109,7 +109,7 @@ func TestResult_PooledTimerTimeout(t *testing.T) {
 	pool := NewRequestStatePool()
 	// Use a short deadline so the pooled timer fires quickly.
 	deadline := time.Now().Add(40 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 
 	_, err := rs.Result()
 	if !errors.Is(err, ErrTimeout) {
@@ -124,7 +124,7 @@ func TestResult_PooledTimerReuse(t *testing.T) {
 	// confirm the pool handles reuse correctly with no stale ticks.
 	for i := range 5 {
 		deadline := time.Now().Add(30 * time.Millisecond)
-		rs := newRequestState(pool, uint64(i)+1, deadline)
+		rs := newRequestState(pool, uint64(i)+1, deadline, true)
 		_, err := rs.Result()
 		if !errors.Is(err, ErrTimeout) {
 			t.Errorf("iteration %d: Result error = %v, want ErrTimeout", i, err)
@@ -145,7 +145,7 @@ func BenchmarkResultPooledTimer(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		deadline := time.Now().Add(time.Hour) // far future: timer never fires
-		rs := newRequestState(pool, 1, deadline)
+		rs := newRequestState(pool, 1, deadline, true)
 		// Send a result so Result() returns via the result path, not timer.
 		rs.complete(RequestResult{Value: 1})
 		_, _ = rs.Result()
@@ -208,7 +208,7 @@ func TestNewRequestStatePool_AllocatesCommittedChannel(t *testing.T) {
 func TestNewRequestState_Initialization(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(5 * time.Second)
-	rs := newRequestState(pool, 42, deadline)
+	rs := newRequestState(pool, 42, deadline, true)
 
 	if rs.key != 42 {
 		t.Errorf("key = %d, want 42", rs.key)
@@ -229,13 +229,13 @@ func TestNewRequestState_Initialization(t *testing.T) {
 
 func TestNewRequestState_DrainsStalePreviousResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Simulate a stale result in the channel.
 	rs.completedC <- RequestResult{Value: 999}
 
 	// Re-initialize should drain the stale result.
-	rs2 := newRequestState(pool, 2, time.Time{})
+	rs2 := newRequestState(pool, 2, time.Time{}, true)
 
 	// The channel should be empty now.
 	select {
@@ -248,13 +248,13 @@ func TestNewRequestState_DrainsStalePreviousResult(t *testing.T) {
 
 func TestNewRequestState_DrainsStaleCommittedResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Simulate a stale committed notification in the channel.
 	rs.committedC <- RequestResult{Value: 888}
 
 	// Re-initialize should drain the stale committed result.
-	rs2 := newRequestState(pool, 2, time.Time{})
+	rs2 := newRequestState(pool, 2, time.Time{}, true)
 
 	// The committedC channel should be empty now.
 	select {
@@ -267,7 +267,7 @@ func TestNewRequestState_DrainsStaleCommittedResult(t *testing.T) {
 
 func TestNewRequestState_ResetsCommittedDone(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Mark as committed.
 	rs.commitNotify(RequestResult{Value: 0})
@@ -277,7 +277,7 @@ func TestNewRequestState_ResetsCommittedDone(t *testing.T) {
 
 	// Release and re-init.
 	rs.Release()
-	rs2 := newRequestState(pool, 2, time.Time{})
+	rs2 := newRequestState(pool, 2, time.Time{}, true)
 
 	// committedDone must be reset.
 	if rs2.committedDone.Load() {
@@ -291,7 +291,7 @@ func TestNewRequestState_ResetsCommittedDone(t *testing.T) {
 
 func TestResult_BlockingSuccess(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	expected := RequestResult{Value: 42, Data: []byte("hello")}
 
@@ -313,7 +313,7 @@ func TestResult_BlockingSuccess(t *testing.T) {
 
 func TestResult_BlockingWithError(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	go func() {
 		rs.complete(RequestResult{Err: ErrRejected})
@@ -328,7 +328,7 @@ func TestResult_BlockingWithError(t *testing.T) {
 func TestResult_Timeout(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 
 	_, err := rs.Result()
 	if !errors.Is(err, ErrTimeout) {
@@ -339,7 +339,7 @@ func TestResult_Timeout(t *testing.T) {
 func TestResult_AlreadyExpiredDeadline(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(-1 * time.Second) // Already past.
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 
 	_, err := rs.Result()
 	if !errors.Is(err, ErrTimeout) {
@@ -349,7 +349,7 @@ func TestResult_AlreadyExpiredDeadline(t *testing.T) {
 
 func TestResult_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 
@@ -365,7 +365,7 @@ func TestResult_AfterRelease(t *testing.T) {
 
 func TestResultC_ReturnsChannel(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	ch := rs.ResultC()
 	if ch == nil {
@@ -375,7 +375,7 @@ func TestResultC_ReturnsChannel(t *testing.T) {
 
 func TestResultC_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 
@@ -387,7 +387,7 @@ func TestResultC_AfterRelease(t *testing.T) {
 
 func TestResultC_ReceivesResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	go func() {
 		rs.complete(RequestResult{Value: 77})
@@ -410,7 +410,7 @@ func TestResultC_ReceivesResult(t *testing.T) {
 
 func TestCommittedC_ReturnsChannel(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	ch := rs.CommittedC()
 	if ch == nil {
@@ -420,7 +420,7 @@ func TestCommittedC_ReturnsChannel(t *testing.T) {
 
 func TestCommittedC_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 
@@ -432,7 +432,7 @@ func TestCommittedC_AfterRelease(t *testing.T) {
 
 func TestCommittedC_ReceivesNotification(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	go func() {
 		rs.commitNotify(RequestResult{Value: 0})
@@ -451,7 +451,7 @@ func TestCommittedC_ReceivesNotification(t *testing.T) {
 
 func TestCommittedC_IndependentFromCompletedC(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Commit notification fires first.
 	rs.commitNotify(RequestResult{Value: 0})
@@ -488,7 +488,7 @@ func TestCommittedC_IndependentFromCompletedC(t *testing.T) {
 
 func TestApplyResultC_ReturnsCompletedChannel(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	ch := rs.ApplyResultC()
 	if ch == nil {
@@ -502,7 +502,7 @@ func TestApplyResultC_ReturnsCompletedChannel(t *testing.T) {
 
 func TestApplyResultC_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 
@@ -518,7 +518,7 @@ func TestApplyResultC_AfterRelease(t *testing.T) {
 
 func TestRelease_Idempotent(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Release should not panic when called multiple times.
 	rs.Release()
@@ -532,7 +532,7 @@ func TestRelease_Idempotent(t *testing.T) {
 
 func TestRelease_ConcurrentSafety(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -551,7 +551,7 @@ func TestRelease_ConcurrentSafety(t *testing.T) {
 
 func TestRelease_DrainsUnconsumedResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.complete(RequestResult{Value: 42})
 	rs.Release()
@@ -568,7 +568,7 @@ func TestRelease_DrainsUnconsumedResult(t *testing.T) {
 
 func TestRelease_DrainsUnconsumedCommittedResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.commitNotify(RequestResult{Value: 0})
 	rs.complete(RequestResult{Value: 42})
@@ -610,7 +610,7 @@ func TestRelease_NilPoolDoesNotPanic(t *testing.T) {
 
 func TestComplete_SendsResult(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	expected := RequestResult{Value: 123, Data: []byte("data")}
 	rs.complete(expected)
@@ -630,7 +630,7 @@ func TestComplete_SendsResult(t *testing.T) {
 
 func TestComplete_AfterRelease_IsNoOp(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 	// Should not panic or block.
@@ -639,7 +639,7 @@ func TestComplete_AfterRelease_IsNoOp(t *testing.T) {
 
 func TestComplete_DoubleComplete_DoesNotBlock(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.complete(RequestResult{Value: 1})
 	// Second complete should not block (already completed).
@@ -653,7 +653,7 @@ func TestComplete_DoubleComplete_DoesNotBlock(t *testing.T) {
 
 func TestComplete_DoubleComplete_AtomicGuard(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// First complete delivers the result.
 	rs.complete(RequestResult{Value: 42})
@@ -678,7 +678,7 @@ func TestComplete_DoubleComplete_AtomicGuard(t *testing.T) {
 
 func TestComplete_ConcurrentDoubleComplete(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	var wg sync.WaitGroup
 	// Race N goroutines trying to complete the same request.
@@ -715,7 +715,7 @@ func TestComplete_ConcurrentDoubleComplete(t *testing.T) {
 
 func TestCommitNotify_SendsNotification(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.commitNotify(RequestResult{Value: 0})
 
@@ -731,7 +731,7 @@ func TestCommitNotify_SendsNotification(t *testing.T) {
 
 func TestCommitNotify_AfterRelease_IsNoOp(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.Release()
 	// Should not panic or block.
@@ -740,7 +740,7 @@ func TestCommitNotify_AfterRelease_IsNoOp(t *testing.T) {
 
 func TestCommitNotify_Idempotent(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// First call delivers.
 	rs.commitNotify(RequestResult{Value: 0})
@@ -764,7 +764,7 @@ func TestCommitNotify_Idempotent(t *testing.T) {
 
 func TestCommitNotify_ConcurrentSafety(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	var wg sync.WaitGroup
 	const n = 100
@@ -796,7 +796,7 @@ func TestCommitNotify_ConcurrentSafety(t *testing.T) {
 
 func TestCommitNotify_IndependentFromComplete(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Both commitNotify and complete should work independently.
 	rs.commitNotify(RequestResult{Value: 0})
@@ -829,7 +829,7 @@ func TestCommitNotify_IndependentFromComplete(t *testing.T) {
 
 func TestKey_ReturnsKey(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 999, time.Time{})
+	rs := newRequestState(pool, 999, time.Time{}, true)
 	if rs.Key() != 999 {
 		t.Errorf("Key = %d, want 999", rs.Key())
 	}
@@ -838,7 +838,7 @@ func TestKey_ReturnsKey(t *testing.T) {
 func TestDeadline_ReturnsDeadline(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(10 * time.Second)
-	rs := newRequestState(pool, 1, deadline)
+	rs := newRequestState(pool, 1, deadline, true)
 	if !rs.Deadline().Equal(deadline) {
 		t.Errorf("Deadline = %v, want %v", rs.Deadline(), deadline)
 	}
@@ -846,7 +846,7 @@ func TestDeadline_ReturnsDeadline(t *testing.T) {
 
 func TestDeadline_ZeroValue(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 	if !rs.Deadline().IsZero() {
 		t.Error("Deadline should be zero when not set")
 	}
@@ -859,10 +859,10 @@ func TestDeadline_ZeroValue(t *testing.T) {
 func TestPoolRecycling_ReusesObjects(t *testing.T) {
 	pool := NewRequestStatePool()
 
-	rs1 := newRequestState(pool, 1, time.Time{})
+	rs1 := newRequestState(pool, 1, time.Time{}, true)
 	rs1.Release()
 
-	rs2 := newRequestState(pool, 2, time.Time{})
+	rs2 := newRequestState(pool, 2, time.Time{}, true)
 	// The pool may or may not return the same object, but it should work correctly.
 	if rs2.key != 2 {
 		t.Errorf("key = %d, want 2", rs2.key)
@@ -886,7 +886,7 @@ func TestPoolRecycling_ReusesObjects(t *testing.T) {
 // releaseRef runs after Release.
 func TestRefcount_ReleaseBeforeReleaseRefDefersRecycle(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	// Simulate registration in a pending map.
 	rs.acquireRef()
@@ -911,7 +911,7 @@ func TestRefcount_ReleaseBeforeReleaseRefDefersRecycle(t *testing.T) {
 // Release.
 func TestRefcount_ReleaseRefBeforeReleaseDefersRecycle(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 	rs.acquireRef()
 
 	rs.releaseRef()
@@ -933,7 +933,7 @@ func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
 	pool := NewRequestStatePool()
 
 	// Request A registers and the caller releases on timeout.
-	rsA := newRequestState(pool, 100, time.Time{})
+	rsA := newRequestState(pool, 100, time.Time{}, true)
 	rsA.acquireRef()
 	rsA.Release()
 
@@ -945,7 +945,7 @@ func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
 
 	// Request B obtains a fresh RequestState from the pool. With a single
 	// object in the pool this returns the recycled rsA storage.
-	rsB := newRequestState(pool, 200, time.Time{})
+	rsB := newRequestState(pool, 200, time.Time{}, true)
 	if rsB != rsA {
 		t.Skip("pool did not hand back the recycled object; race-free path")
 	}
@@ -984,7 +984,7 @@ func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
 // are released, regardless of caller Release ordering.
 func TestRefcount_MultipleRefs(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 
 	rs.acquireRef()
 	rs.acquireRef()
@@ -1006,9 +1006,90 @@ func TestRefcount_MultipleRefs(t *testing.T) {
 // registered in a pending map recycles immediately on Release.
 func TestRefcount_NoRefRecyclesOnRelease(t *testing.T) {
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{})
+	rs := newRequestState(pool, 1, time.Time{}, true)
 	rs.Release()
 	if !rs.recycled.Load() {
 		t.Fatal("unregistered rs should recycle immediately on Release")
+	}
+}
+
+// TestTryAcquireRef_FailsAtZero verifies tryAcquireRef never increments from
+// zero: an object with no outstanding references may already be racing
+// recycling (or sitting in the pool), and pinning it would be unsafe.
+func TestTryAcquireRef_FailsAtZero(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{}, true)
+	if rs.tryAcquireRef() {
+		t.Fatal("tryAcquireRef succeeded with zero outstanding references")
+	}
+	if got := rs.outstanding.Load(); got != 0 {
+		t.Fatalf("outstanding = %d after failed tryAcquireRef, want 0", got)
+	}
+	rs.Release()
+}
+
+// TestTryAcquireRef_PinsAgainstRecycle verifies a successful tryAcquireRef
+// (taken while a map reference pins the object) keeps the object out of the
+// pool until its paired releaseRef, even when the map reference and the
+// caller both release in the meantime.
+func TestTryAcquireRef_PinsAgainstRecycle(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{}, true)
+	rs.acquireRef() // registration-time map reference
+
+	if !rs.tryAcquireRef() {
+		t.Fatal("tryAcquireRef failed while a map reference was outstanding")
+	}
+
+	// The claiming path removes the map reference and the caller releases.
+	rs.releaseRef()
+	rs.Release()
+	if rs.recycled.Load() {
+		t.Fatal("recycled while a tryAcquireRef reference was still held")
+	}
+
+	// Dropping the pinned reference performs the final recycle.
+	rs.releaseRef()
+	if !rs.recycled.Load() {
+		t.Fatal("not recycled after the last reference was released")
+	}
+}
+
+// TestTryAcquireRef_ConcurrentWithRelease races tryAcquireRef against the
+// claiming path's releaseRef and the caller's Release. Invariants checked:
+// every successful tryAcquireRef is balanced by releaseRef, the counter
+// never goes negative, and exactly one recycle happens. Run under -race.
+func TestTryAcquireRef_ConcurrentWithRelease(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		pool := &sync.Pool{New: func() interface{} {
+			return &RequestState{
+				completedC: make(chan RequestResult, 1),
+				committedC: make(chan RequestResult, 1),
+			}
+		}}
+		rs := newRequestState(pool, 1, time.Time{}, true)
+		rs.acquireRef()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if rs.tryAcquireRef() {
+				rs.releaseRef()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			rs.releaseRef() // claiming path drops the map reference
+		}()
+		rs.Release()
+		wg.Wait()
+
+		if got := rs.outstanding.Load(); got != 0 {
+			t.Fatalf("iteration %d: outstanding = %d, want 0", i, got)
+		}
+		if !rs.recycled.Load() {
+			t.Fatalf("iteration %d: object was not recycled", i)
+		}
 	}
 }

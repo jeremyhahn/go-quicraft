@@ -292,6 +292,22 @@ func (w *stepWorker) processReady() {
 			w.drainAndHandleInbox(shardID, node)
 			node.peer.FlushReadIndex()
 		}
+		// commitC backpressure guard (WAL mode only). This worker is the
+		// ONLY producer for its commitC, so a free slot observed here cannot
+		// be taken by anyone else and the enqueue below is guaranteed not to
+		// block. When the channel is full, skip the shard WITHOUT calling
+		// GetUpdate: nothing has been extracted from the peer, so nothing is
+		// lost and the shard is simply retried. Blocking on the send instead
+		// would park this goroutine while holding nodesMu.RLock, stopping
+		// tick() for EVERY shard this worker owns (missed heartbeats,
+		// spurious elections on unrelated shards) and stalling UnloadNode.
+		// Liveness: the commit/apply pipeline notifies the work signal as it
+		// clears commitPending, and processReady also re-runs on every tick.
+		// An unbuffered commitC is a test-only rendezvous configuration
+		// (NewEngine always allocates a buffer), so the guard does not apply.
+		if !w.memoryMode && cap(w.commitC) > 0 && len(w.commitC) == cap(w.commitC) {
+			continue
+		}
 		lastApplied := node.lastApplied.Load()
 		hasUpdate := node.peer != nil && node.peer.HasUpdate(lastApplied)
 		if !hasUpdate {
@@ -367,6 +383,25 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 		deferred[i] = proto.Message{}
 	}
 	w.deferredSnapshots[shardID] = kept
+}
+
+// deferSnapshot buffers an InstallSnapshot message for redelivery once
+// commitPending clears, keeping only the HIGHEST-index snapshot per shard.
+// A leader retransmits InstallSnapshot every retry interval while it waits
+// for an ack, and each message carries its own membership maps; appending
+// them all would grow the buffer without bound for as long as the shard stays
+// in commitPending. An older snapshot is strictly superseded by a newer one,
+// so keeping the latest loses nothing.
+func (w *stepWorker) deferSnapshot(shardID uint64, msg proto.Message) {
+	buf := w.deferredSnapshots[shardID]
+	if len(buf) == 0 {
+		w.deferredSnapshots[shardID] = append(buf[:0], msg)
+		return
+	}
+	if msg.Snapshot.Index >= buf[0].Snapshot.Index {
+		buf[0] = msg
+	}
+	w.deferredSnapshots[shardID] = buf[:1]
 }
 
 // drainAndHandleInbox drains transport messages (Replicate, Heartbeat,
@@ -595,11 +630,9 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 		}
 	}
 	if err := node.peer.Commit(update); err != nil {
-		node.handleError(&CommitError{
-			ShardID:   update.ShardID,
-			ReplicaID: update.ReplicaID,
-			Err:       err,
-		})
+		// Terminal: Peer.Commit already advanced the processed marker, so
+		// these committed entries can never be re-offered. See failCommit.
+		failCommit(node, w.callback, update, err)
 		return false
 	}
 	// Send ordered messages after successful Commit.
@@ -616,7 +649,7 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 		return false
 	case <-w.stopC:
 		node.commitPending.Store(false)
-		w.applyPool.Put(ai)
+		releaseApplyItem(w.applyPool, ai)
 		return true
 	}
 }
@@ -715,8 +748,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 				// burning CPU until commitPending clears. Buffering
 				// here ensures the messages are processed exactly once
 				// when commitPending transitions to false.
-				w.deferredSnapshots[shardID] = append(
-					w.deferredSnapshots[shardID], w.inboxBuf[i])
+				w.deferSnapshot(shardID, w.inboxBuf[i])
 			} else {
 				filtered = append(filtered, w.inboxBuf[i])
 			}

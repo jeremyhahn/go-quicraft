@@ -24,6 +24,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
@@ -49,6 +50,17 @@ var snappyDecPool = sync.Pool{
 		buf := make([]byte, 0, 256*1024)
 		return &buf
 	},
+}
+
+// putSnappyDecBuf returns a Snappy decode buffer to snappyDecPool, applying
+// the same maxPoolBufSize cap every other buffer pool in the package applies.
+// A decode destination can grow to MaxDecompressedSize; retaining such
+// buffers would pin up to that much unaccounted memory per P.
+func putSnappyDecBuf(bufPtr *[]byte) {
+	if cap(*bufPtr) <= maxPoolBufSize {
+		*bufPtr = (*bufPtr)[:0]
+		snappyDecPool.Put(bufPtr)
+	}
 }
 
 // batchPool recycles proto.MessageBatch structs on the receive path.
@@ -227,10 +239,22 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 // goroutines to MaxStreamsPerConnection, preventing resource exhaustion from
 // peers opening excessive streams.
 func (t *QUICTransport) handleConnection(conn *quic.Conn) {
-	// Drop the per-connection SourceAddress authorization cache entry when this
-	// inbound connection's handler returns, so the cache does not grow unbounded
-	// across connection churn.
-	defer t.forgetInboundConnAuth(conn)
+	// Drop the per-connection caches when this inbound connection's handler
+	// returns, so they do not grow unbounded across connection churn.
+	//
+	// Deferred FIRST so it runs LAST: streamWG below must be waited on before
+	// the delete. handleConnection returns as soon as AcceptStream errors,
+	// while handleStream goroutines may still be in flight; one of them calling
+	// inboundAuthorizedForCached after the delete would LoadOrStore a fresh
+	// entry for a connection nothing will ever forget again, permanently
+	// pinning the *quic.Conn and its buffers.
+	defer t.forgetInboundConnState(conn)
+
+	// streamWG tracks the per-connection stream goroutines. The transport-wide
+	// t.wg does not bound them to this connection's lifetime.
+	var streamWG sync.WaitGroup
+	defer streamWG.Wait()
+
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("panic recovered in handleConnection",
@@ -292,8 +316,10 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 		}
 
 		t.wg.Add(1)
+		streamWG.Add(1)
 		go func() {
 			defer t.wg.Done()
+			defer streamWG.Done()
 			t.handleStream(conn, stream, streamSem, snapSem)
 		}()
 	}
@@ -324,6 +350,22 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		}
 	}()
 	defer func() {
+		// stream.Close only closes the SEND direction in quic-go; the receive
+		// direction would otherwise stay open after handleStream abandons the
+		// stream. The peer's sender caches streams, so it would keep writing
+		// into a stream nobody drains: up to MaxStreamReceiveWindow of messages
+		// silently black-holed while sendBatch reports success, and the
+		// abandoned stream permanently holds one of the peer's stream credits
+		// (enough of these exhaust MaxIncomingStreams, after which ALL sends
+		// from that peer silently fail). CancelRead sends STOP_SENDING so the
+		// peer's next Write fails fast — its write-failure path evicts the
+		// connection and re-dials — and the stream credit is released.
+		//
+		// This is safe on every exit path: the deliberately-kept idle stream
+		// (errStreamIdle) never exits this function, and on the one exit whose
+		// receive direction was fully consumed (snapshot completion) CancelRead
+		// is a no-op.
+		stream.CancelRead(QUICStreamErrReceiverGone)
 		if closeErr := stream.Close(); closeErr != nil {
 			slog.Debug("transport: stream close failed after handleStream",
 				"remote", inboundConn.RemoteAddr().String(),
@@ -362,6 +404,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			if errors.Is(err, errStreamIdle) {
 				continue
 			}
+			logProtocolViolation("inbound frame header rejected", inboundConn, err)
 			return
 		}
 
@@ -391,9 +434,78 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		}
 
 		if err := t.handleMessageFrame(inboundConn, stream, length, flags); err != nil {
+			// Receive-budget exhaustion is TRANSIENT and must not tear the
+			// stream down: handleMessageFrame has already drained the frame
+			// body, so the stream sits at a clean frame boundary. Returning
+			// here would CancelRead+Close it, and the peer's cached stream
+			// would then fail its next write, evicting the whole connection —
+			// one peer filling the budget would cascade into cluster-wide
+			// connection churn for every OTHER peer sharing it.
+			if errors.Is(err, ErrMessageRecvMemoryBudgetExceeded) {
+				continue
+			}
+			logProtocolViolation("inbound message frame rejected", inboundConn, err)
 			return
 		}
 	}
+}
+
+// protocolViolationLogInterval rate-limits the protocol-violation warning so a
+// peer stuck in a teardown/re-dial loop (wrong DeploymentID, mismatched wire
+// version after a partial upgrade) produces a usable diagnostic instead of a
+// log flood.
+const protocolViolationLogInterval = 10 * time.Second
+
+// lastProtocolViolationLog is the Unix-nanosecond timestamp of the most recent
+// emitted protocol-violation warning.
+var lastProtocolViolationLog atomic.Int64
+
+// logProtocolViolation emits a rate-limited warning for a frame-level protocol
+// violation that terminates an inbound stream. These errors (bad magic,
+// unsupported wire version, oversized frame, DeploymentID mismatch, too many
+// messages in a batch) are configuration or version faults, not transient I/O:
+// without a diagnostic they present only as continuous silent stream teardown
+// and re-dial churn. Ordinary end-of-stream and I/O errors are not violations
+// and are skipped.
+func logProtocolViolation(msg string, conn *quic.Conn, err error) {
+	if err == nil || !isProtocolViolation(err) {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := lastProtocolViolationLog.Load()
+	if now-last < int64(protocolViolationLogInterval) {
+		return
+	}
+	if !lastProtocolViolationLog.CompareAndSwap(last, now) {
+		return
+	}
+	remote := "<unknown>"
+	if conn != nil {
+		remote = conn.RemoteAddr().String()
+	}
+	slog.Warn(msg,
+		"remote", remote,
+		"error", err,
+		"rate_limit", protocolViolationLogInterval,
+	)
+}
+
+// isProtocolViolation reports whether err indicates a peer that is speaking a
+// protocol this node cannot accept, as opposed to a transient transport error.
+func isProtocolViolation(err error) bool {
+	switch {
+	case errors.Is(err, ErrInvalidMagic),
+		errors.Is(err, ErrUnsupportedVersion),
+		errors.Is(err, ErrFrameTooLarge),
+		errors.Is(err, ErrBufferTooSmall),
+		errors.Is(err, ErrPeerIdentityMismatch),
+		errors.Is(err, proto.ErrTooManyMessages),
+		errors.Is(err, ErrDecompressedSizeLimitExceeded),
+		errors.Is(err, ErrDecompressionMismatch):
+		return true
+	}
+	var decompressErr *FrameDecompressError
+	return errors.As(err, &decompressErr)
 }
 
 // errStreamIdle signals that an inbound stream's read deadline elapsed at a
@@ -512,14 +624,33 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// the read deadline and OOM-ing the host. The reservation is released once
 	// the frame has been fully processed (defer), mirroring the snapshot
 	// receiver's memory budget.
+	//
+	// Exhaustion is TRANSIENT, so the frame body is drained and the stream is
+	// left at a clean boundary for the caller to continue on (see
+	// handleStream): tearing the stream down would punish every peer sharing
+	// the aggregate budget for one peer's burst.
 	if !t.reserveMsgRecvBudget(int64(length)) {
+		t.discardFrameBody(stream, length)
 		slog.Warn("message frame dropped: receive memory budget exhausted",
-			"remote", inboundConn.RemoteAddr().String(),
+			"remote", remoteAddrOf(inboundConn),
 			"length", length,
 		)
 		return ErrMessageRecvMemoryBudgetExceeded
 	}
 	defer t.releaseMsgRecvBudget(int64(length))
+
+	// The per-connection sub-budget bounds what one peer can hold of the
+	// aggregate, so a single connection cannot starve all the others.
+	if !t.reserveConnMsgRecvBudget(inboundConn, int64(length)) {
+		t.discardFrameBody(stream, length)
+		slog.Warn("message frame dropped: per-connection receive memory budget exhausted",
+			"remote", remoteAddrOf(inboundConn),
+			"length", length,
+			"per_conn_limit", t.maxConnMsgRecv,
+		)
+		return ErrMessageRecvMemoryBudgetExceeded
+	}
+	defer t.releaseConnMsgRecvBudget(inboundConn, int64(length))
 
 	var recvStart time.Time
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -552,17 +683,48 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 			t.putRecvBuf(buf)
 			return ErrDecompressedSizeLimitExceeded
 		}
+		// The reservation above covers only the COMPRESSED frame length, but the
+		// decode below allocates the declared DECOMPRESSED length. Snappy achieves
+		// >1000:1 ratios, so without charging the difference an authenticated peer
+		// could pin up to MaxDecompressedSize per in-flight frame while only the
+		// tiny compressed length counts against MaxMessageReceiveMemory, defeating
+		// the aggregate budget. Reserve the positive delta before decoding; the
+		// deferred release keeps the accounting exactly balanced on every exit
+		// path (success and error) for the remainder of this frame's processing.
+		if delta := int64(declaredLen) - int64(length); delta > 0 {
+			if !t.reserveMsgRecvBudget(delta) {
+				t.putRecvBuf(buf)
+				slog.Warn("compressed message frame dropped: receive memory budget exhausted",
+					"remote", remoteAddrOf(inboundConn),
+					"compressed_length", length,
+					"declared_decompressed_length", declaredLen,
+				)
+				return ErrMessageRecvMemoryBudgetExceeded
+			}
+			defer t.releaseMsgRecvBudget(delta)
+			if !t.reserveConnMsgRecvBudget(inboundConn, delta) {
+				t.putRecvBuf(buf)
+				slog.Warn("compressed message frame dropped: per-connection receive memory budget exhausted",
+					"remote", remoteAddrOf(inboundConn),
+					"compressed_length", length,
+					"declared_decompressed_length", declaredLen,
+					"per_conn_limit", t.maxConnMsgRecv,
+				)
+				return ErrMessageRecvMemoryBudgetExceeded
+			}
+			defer t.releaseConnMsgRecvBudget(inboundConn, delta)
+		}
 		snappyBuf = snappyDecPool.Get().(*[]byte)
 		decompressed, err := snappy.Decode(*snappyBuf, payload)
 		if err != nil {
-			snappyDecPool.Put(snappyBuf)
+			putSnappyDecBuf(snappyBuf)
 			snappyBuf = nil
 			t.putRecvBuf(buf)
 			return &FrameDecompressError{Err: err}
 		}
 		if len(decompressed) != declaredLen {
 			*snappyBuf = decompressed[:0]
-			snappyDecPool.Put(snappyBuf)
+			putSnappyDecBuf(snappyBuf)
 			snappyBuf = nil
 			t.putRecvBuf(buf)
 			return ErrDecompressionMismatch
@@ -577,10 +739,10 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 
 	// returnSnappyBuf returns the Snappy decode buffer to the pool after
 	// resetting its length to zero so the capacity is retained for reuse.
+	// Oversized buffers are dropped by putSnappyDecBuf's maxPoolBufSize cap.
 	returnSnappyBuf := func() {
 		if snappyBuf != nil {
-			*snappyBuf = (*snappyBuf)[:0]
-			snappyDecPool.Put(snappyBuf)
+			putSnappyDecBuf(snappyBuf)
 			snappyBuf = nil
 		}
 	}
@@ -642,13 +804,9 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// The decision is cached per connection, so the costly cert check runs at
 	// most once per (connection, claimed-address) rather than on every batch.
 	if batch.SourceAddress != "" && !t.inboundAuthorizedForCached(inboundConn, batch.SourceAddress) {
-		remote := "<unknown>"
-		if inboundConn != nil {
-			remote = inboundConn.RemoteAddr().String()
-		}
 		slog.Warn("clearing spoofed source address: not covered by peer certificate",
 			"claimed_source", batch.SourceAddress,
-			"remote", remote,
+			"remote", remoteAddrOf(inboundConn),
 		)
 		batch.SourceAddress = ""
 	}
@@ -672,15 +830,19 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		return proto.ErrTooManyMessages
 	}
 
-	// Entry.Cmd slices alias the receive buffer via zero-copy unmarshal.
-	// Copy them into a single bulk allocation before returning the buffer
-	// to the pool. This reduces N allocations to 1 per frame, cutting
-	// GC pressure on the receive hot path.
+	// Entry.Cmd slices AND Snapshot.Checksum alias the receive buffer via
+	// zero-copy unmarshal. Copy them into a single bulk allocation before
+	// returning the buffer to the pool: the buffer is recycled below while the
+	// step worker still reads these fields asynchronously, so any alias left
+	// behind would be read after the buffer was handed to another frame.
+	// This reduces N allocations to 1 per frame, cutting GC pressure on the
+	// receive hot path.
 	totalCmdBytes := 0
 	for i := range batch.Requests {
 		for j := range batch.Requests[i].Entries {
 			totalCmdBytes += len(batch.Requests[i].Entries[j].Cmd)
 		}
+		totalCmdBytes += len(batch.Requests[i].Snapshot.Checksum)
 	}
 	if totalCmdBytes > 0 {
 		bulk := make([]byte, totalCmdBytes)
@@ -693,6 +855,11 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 					batch.Requests[i].Entries[j].Cmd = bulk[off : off+len(cmd) : off+len(cmd)]
 					off += len(cmd)
 				}
+			}
+			if sum := batch.Requests[i].Snapshot.Checksum; len(sum) > 0 {
+				copy(bulk[off:], sum)
+				batch.Requests[i].Snapshot.Checksum = bulk[off : off+len(sum) : off+len(sum)]
+				off += len(sum)
 			}
 		}
 	}
@@ -763,33 +930,56 @@ func (t *QUICTransport) handleSnapshotStream(inboundConn *quic.Conn, stream io.R
 	t.processSnapshotHeader(inboundConn, stream, headerLen)
 }
 
+// maxSnapshotHeaderWireLen bounds the declared length of a snapshot header
+// frame. No sender produces a header larger than SnapshotHeaderSize; the
+// slack only exists for forward-compatible header growth. Without this bound
+// the declared length (up to MaxFrameSize) is attacker-controlled and sits
+// outside every receive budget, so it must never size an allocation or a
+// long discard.
+const maxSnapshotHeaderWireLen = 4096
+
 // processSnapshotHeader reads and validates the snapshot header from the
 // stream, then delegates to the snapshot receiver for chunk processing.
 // Separated from handleSnapshotStream to accept io.Reader for testability.
 func (t *QUICTransport) processSnapshotHeader(inboundConn *quic.Conn, r io.Reader, headerLen uint32) {
-	// Read the snapshot header payload.
+	// Read the snapshot header payload. Every drop below routes through
+	// rejectSnapshotStream so the OnSnapshotRejected listener and a structured
+	// warning fire uniformly: a silent return leaves the sender waiting out its
+	// ack timeout with no local record of why the transfer never landed.
 	if headerLen < SnapshotHeaderSize {
+		t.snapshotRecv.rejectSnapshotStream("declared header length below minimum", nil,
+			&SnapshotHeaderLengthError{Declared: headerLen, Min: SnapshotHeaderSize, Max: maxSnapshotHeaderWireLen})
+		return
+	}
+	if headerLen > maxSnapshotHeaderWireLen {
+		t.snapshotRecv.rejectSnapshotStream("declared header length exceeds bound", nil,
+			&SnapshotHeaderLengthError{Declared: headerLen, Min: SnapshotHeaderSize, Max: maxSnapshotHeaderWireLen})
 		return
 	}
 
 	var hdrBuf [SnapshotHeaderSize]byte
 	if _, err := io.ReadFull(r, hdrBuf[:]); err != nil {
+		t.snapshotRecv.rejectSnapshotStream("header read failed", nil, err)
 		return
 	}
-	// Discard any remaining header bytes.
+	// Discard any remaining (forward-compat) header bytes without allocating
+	// the declared size: io.Discard copies through a small internal buffer.
 	if headerLen > SnapshotHeaderSize {
-		discard := make([]byte, headerLen-SnapshotHeaderSize)
-		if _, err := io.ReadFull(r, discard); err != nil {
+		if _, err := io.CopyN(io.Discard, r, int64(headerLen-SnapshotHeaderSize)); err != nil {
+			t.snapshotRecv.rejectSnapshotStream("forward-compat header discard failed", nil, err)
 			return
 		}
 	}
 
 	var hdr SnapshotHeader
 	if _, err := hdr.UnmarshalFrom(hdrBuf[:]); err != nil {
+		t.snapshotRecv.rejectSnapshotStream("header unmarshal failed", nil, err)
 		return
 	}
 
 	if hdr.ChunkCount > defaultMaxSnapshotChunkCount {
+		t.snapshotRecv.rejectSnapshotStream("declared chunk count exceeds bound", &hdr,
+			&SnapshotChunkCountError{Declared: hdr.ChunkCount, Max: defaultMaxSnapshotChunkCount})
 		return
 	}
 
@@ -800,8 +990,7 @@ func (t *QUICTransport) processSnapshotHeader(inboundConn *quic.Conn, r io.Reade
 	// so unlike idempotent Raft RPCs it must not run on replayable early
 	// data. (0-RTT is default-off; this is defense-in-depth when enabled.)
 	if inboundConn != nil && inboundConn.ConnectionState().Used0RTT {
-		slog.Warn("rejecting snapshot received over 0-RTT (replayable early data)",
-			"shard", hdr.ShardID, "replica", hdr.ReplicaID, "index", hdr.Index)
+		t.snapshotRecv.rejectSnapshotStream("received over 0-RTT (replayable early data)", &hdr, nil)
 		return
 	}
 
@@ -814,10 +1003,33 @@ func (t *QUICTransport) processSnapshotHeader(inboundConn *quic.Conn, r io.Reade
 		senderAuthorized := func(address string) bool {
 			return t.inboundAuthorizedForCached(inboundConn, address)
 		}
-		t.snapshotRecv.receiveSnapshot(qStream, &hdr, senderAuthorized, t.stopC)
+		t.snapshotRecv.receiveSnapshot(qStream, &hdr, remoteAddrOf(inboundConn), senderAuthorized, t.stopC)
 	} else {
 		slog.Warn("snapshot header received on non-QUIC stream, snapshot dropped",
 			"reader_type", fmt.Sprintf("%T", r))
+	}
+}
+
+// remoteAddrOf returns a printable remote address for a possibly-nil
+// connection.
+func remoteAddrOf(conn *quic.Conn) string {
+	if conn == nil {
+		return "<unknown>"
+	}
+	return conn.RemoteAddr().String()
+}
+
+// discardFrameBody consumes a frame payload that will not be processed so the
+// stream is left at a clean frame boundary and can carry the next frame.
+// length is bounded by MaxFrameSize (ValidateFrameHeader) and the body has not
+// been read yet, so the discard copies through io.Discard's small internal
+// buffer without allocating the declared size.
+func (t *QUICTransport) discardFrameBody(r io.Reader, length uint32) {
+	if length == 0 {
+		return
+	}
+	if _, err := io.CopyN(io.Discard, r, int64(length)); err != nil {
+		slog.Debug("transport: discarding dropped frame body failed", "error", err)
 	}
 }
 

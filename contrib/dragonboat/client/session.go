@@ -14,6 +14,15 @@
 
 // Package client provides dragonboat-compatible client session types that
 // wrap quicraft's Session for at-most-once proposal semantics.
+//
+// MIGRATION NOTE: this is the type migrating code touches most, and its
+// shape differs from dragonboat's. Dragonboat's client.Session exposes
+// ShardID, ClientID, SeriesID and RespondedTo as struct FIELDS. Here only
+// ShardID is a field; ClientID, SeriesID and RespondedTo are METHODS,
+// because the underlying quicraft session is swapped atomically during
+// registration and cannot be read as plain fields. Code reading those
+// fields fails to compile — loudly, never silently — and must be changed
+// to method calls (s.ClientID() instead of s.ClientID).
 package client
 
 import (
@@ -156,6 +165,14 @@ func (s *Session) PrepareForPropose() {
 // ProposalCompleted advances the series ID after a proposal is applied.
 func (s *Session) ProposalCompleted() {
 	s.inner.Load().ProposalCompleted()
+}
+
+// PrepareForRegister sets the session state for a register proposal.
+// The seriesID is set to SeriesIDForRegister and respondedTo is cleared.
+// Matches dragonboat's client.Session.PrepareForRegister; callers use it
+// before NodeHost.ProposeSession to register the session through Raft.
+func (s *Session) PrepareForRegister() {
+	s.inner.Load().PrepareForRegister()
 }
 
 // PrepareForUnregister sets the session state for an unregister proposal.

@@ -467,8 +467,8 @@ func TestSafety_CommitAfterRemoveNode(t *testing.T) {
 	r.drainMessages()
 
 	// Commit quorum with 3 nodes = 2 (self + 1 peer).
-	if commitQuorum(r.remotes) != 2 {
-		t.Fatalf("expected commit quorum 2 with 3 nodes, got %d", commitQuorum(r.remotes))
+	if quorum(r.remotes, r.witnesses) != 2 {
+		t.Fatalf("expected commit quorum 2 with 3 nodes, got %d", quorum(r.remotes, r.witnesses))
 	}
 
 	// Simulate node 3 removal by removing it from remotes.
@@ -476,8 +476,8 @@ func TestSafety_CommitAfterRemoveNode(t *testing.T) {
 
 	// Now commit quorum = 2 (self + 1 peer = 2 members, quorum = 2).
 	// Actually with 2 members: quorum = (1+1)/2+1 = 2.
-	if commitQuorum(r.remotes) != 2 {
-		t.Fatalf("expected commit quorum 2 with 2 nodes, got %d", commitQuorum(r.remotes))
+	if quorum(r.remotes, r.witnesses) != 2 {
+		t.Fatalf("expected commit quorum 2 with 2 nodes, got %d", quorum(r.remotes, r.witnesses))
 	}
 
 	// Acknowledge from peer 2 should be sufficient to commit.
@@ -508,7 +508,7 @@ func TestSafety_SnapshotFailureRecovery(t *testing.T) {
 	rm := r.remotes[2]
 
 	// Put remote into snapshot state as if the leader is sending a snapshot.
-	rm.becomeSnapshot(10)
+	rm.becomeSnapshot(10, 1)
 	if rm.state != remoteSnapshot {
 		t.Fatalf("expected remoteSnapshot state, got %s", rm.state)
 	}
@@ -516,20 +516,28 @@ func TestSafety_SnapshotFailureRecovery(t *testing.T) {
 		t.Fatalf("expected snapshotIndex 10, got %d", rm.snapshotIndex)
 	}
 
-	// Report snapshot failure.
+	// Report snapshot failure (Hint binds the status to this transfer).
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: true, // failure
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Remote should transition back to probe state after failure.
+	// Failure arms a retry backoff: the remote stays paused in snapshot
+	// state and falls back to probe when the countdown expires.
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot backoff after failure, got %s", rm.state)
+	}
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickSnapshotWaits()
+	}
 	if rm.state != remoteProbe {
-		t.Fatalf("expected remoteProbe after snapshot failure, got %s", rm.state)
+		t.Fatalf("expected remoteProbe after backoff expiry, got %s", rm.state)
 	}
 	// snapshotIndex should be cleared.
 	if rm.snapshotIndex != 0 {
@@ -560,25 +568,33 @@ func TestSafety_SnapshotAbortDuringTransfer(t *testing.T) {
 	rm := r.remotes[2]
 
 	// Put remote into snapshot state.
-	rm.becomeSnapshot(15)
+	rm.becomeSnapshot(15, 1)
 	if rm.state != remoteSnapshot {
 		t.Fatal("expected remoteSnapshot state")
 	}
 
-	// Report snapshot success.
+	// Report snapshot success (Hint binds the status to this transfer).
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: false, // success
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Remote should transition to probe after successful snapshot.
+	// Transfer success keeps the remote paused in snapshot state (the
+	// follower may still be restoring); the follower's raft-level ack
+	// transitions to probe.
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot state after transfer success, got %s", rm.state)
+	}
+	rm.update(15)
+	rm.respondedTo()
 	if rm.state != remoteProbe {
-		t.Fatalf("expected remoteProbe after snapshot done, got %s", rm.state)
+		t.Fatalf("expected remoteProbe after follower ack, got %s", rm.state)
 	}
 	if rm.snapshotIndex != 0 {
 		t.Fatalf("expected snapshotIndex cleared, got %d", rm.snapshotIndex)
@@ -597,7 +613,7 @@ func TestSafety_PendingSnapshotPausesReplication(t *testing.T) {
 	rm := r.remotes[2]
 
 	// Put remote into snapshot state.
-	rm.becomeSnapshot(10)
+	rm.becomeSnapshot(10, 1)
 
 	// isPaused should return true in snapshot state.
 	if !rm.isPaused() {
@@ -881,7 +897,7 @@ func TestSafety_RemoteStateSnapshot(t *testing.T) {
 	r.drainMessages()
 
 	rm := r.remotes[2]
-	rm.becomeSnapshot(5)
+	rm.becomeSnapshot(5, 1)
 
 	if !rm.isPaused() {
 		t.Fatal("expected snapshot remote to be paused")
@@ -899,13 +915,20 @@ func TestSafety_RemoteStateSnapshot(t *testing.T) {
 		}
 	}
 
-	// After snapshot done, remote transitions to probe and is unpaused.
-	rm.snapshotDone()
+	// Transfer completion keeps the remote paused (the peer may still be
+	// restoring); the peer's own ReplicateResp ack (update + respondedTo
+	// with match >= snapshotIndex) transitions to probe and un-pauses.
+	rm.snapshotDone(r.electionTimeout)
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused remoteSnapshot after transfer success, got %s", rm.state)
+	}
+	rm.update(5)
+	rm.respondedTo()
 	if rm.state != remoteProbe {
-		t.Fatalf("expected remoteProbe after snapshotDone, got %s", rm.state)
+		t.Fatalf("expected remoteProbe after peer ack, got %s", rm.state)
 	}
 	if rm.isPaused() {
-		t.Fatal("expected remote unpaused after snapshotDone")
+		t.Fatal("expected remote unpaused after peer ack")
 	}
 }
 
@@ -927,6 +950,9 @@ func TestSafety_LogReplicationMultiScenario(t *testing.T) {
 	}
 	entryIdx := r.log.lastIndex()
 	r.drainMessages()
+
+	// Persist the leader's log so its own durable match covers entryIdx.
+	persistLog(r)
 
 	// Acknowledge from peer 2.
 	_ = r.step(proto.Message{
@@ -963,6 +989,9 @@ func TestSafety_LogReplicationMultiScenario(t *testing.T) {
 	})
 	entry2Idx := r.log.lastIndex()
 	r.drainMessages()
+
+	// Persist the leader's log so its own durable match covers entry2Idx.
+	persistLog(r)
 
 	for _, peerID := range []uint64{2, 3} {
 		_ = r.step(proto.Message{
@@ -1103,8 +1132,9 @@ func TestSafety_ReadIndexDuringLeaderTransfer(t *testing.T) {
 // ===========================================================================
 
 // TestSafety_SingleNodeCommit verifies that a single-node cluster commits
-// entries immediately without waiting for peer acknowledgment. The leader's
-// own log position is sufficient for quorum.
+// entries without any peer acknowledgment: the leader's own durable log
+// position is sufficient for quorum, so entries commit at the persistence
+// edge.
 func TestSafety_SingleNodeCommit(t *testing.T) {
 	members := map[uint64]string{1: "addr1"}
 	cfg := raftTestCfgPreVote(1, 1, false)
@@ -1124,7 +1154,8 @@ func TestSafety_SingleNodeCommit(t *testing.T) {
 			r.log.committed, noopIdx)
 	}
 
-	// Propose multiple entries; all should commit immediately.
+	// Propose multiple entries; all commit as soon as the local append
+	// is durable, without any peer acknowledgment.
 	for i := 0; i < 5; i++ {
 		err = r.step(proto.Message{
 			Type:    proto.Propose,
@@ -1134,6 +1165,7 @@ func TestSafety_SingleNodeCommit(t *testing.T) {
 			t.Fatalf("proposal %d failed: %v", i, err)
 		}
 	}
+	persistLog(r)
 
 	if r.log.committed != r.log.lastIndex() {
 		t.Fatalf("expected all entries committed in single-node, committed=%d last=%d",

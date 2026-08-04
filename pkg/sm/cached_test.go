@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1322,5 +1323,208 @@ func BenchmarkLRUGet(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := "key-" + strconv.Itoa(i%10000)
 		c.Get(key)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M12 regression tests: owned copies on the way out of the cache, and
+// invalidate-before-inner-write ordering in Update.
+// ---------------------------------------------------------------------------
+
+// kvExtract parses "key=value" commands into a cache key/value pair, so a
+// key keeps its identity across value changes (unlike simpleExtractKV).
+func kvExtract(cmd []byte) (string, []byte) {
+	i := bytes.IndexByte(cmd, '=')
+	if i <= 0 {
+		return "", nil
+	}
+	return string(cmd[:i]), cmd[i+1:]
+}
+
+// kvDiskSM is a minimal DiskStateMachine over "key=value" commands with a
+// mutex-protected map, plus optional hooks that let a test observe the
+// moment the inner write is durable and hold Update open afterwards.
+type kvDiskSM struct {
+	mu      sync.Mutex
+	state   map[string][]byte
+	applied chan struct{} // if non-nil, closed once the write is applied
+	release chan struct{} // if non-nil, Update blocks on it after applying
+}
+
+func newKVDiskSM() *kvDiskSM {
+	return &kvDiskSM{state: make(map[string][]byte)}
+}
+
+func (k *kvDiskSM) Open(_ context.Context, _ string, _ <-chan struct{}) (uint64, error) {
+	return 0, nil
+}
+
+func (k *kvDiskSM) Update(_ context.Context, entries []Entry, results []Result) error {
+	k.mu.Lock()
+	for i, e := range entries {
+		key, val := kvExtract(e.Cmd)
+		if key == "" {
+			k.mu.Unlock()
+			return errTestFatal
+		}
+		cp := make([]byte, len(val))
+		copy(cp, val)
+		k.state[key] = cp
+		results[i] = Result{Value: e.Index}
+	}
+	k.mu.Unlock()
+	if k.applied != nil {
+		close(k.applied)
+		k.applied = nil
+	}
+	if k.release != nil {
+		<-k.release
+	}
+	return nil
+}
+
+func (k *kvDiskSM) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	key, ok := query.(string)
+	if !ok {
+		return nil, errTestFatal
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	val, exists := k.state[key]
+	if !exists {
+		return nil, nil
+	}
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	return cp, nil
+}
+
+func (k *kvDiskSM) Sync() error { return nil }
+
+func (k *kvDiskSM) PrepareSnapshot() (interface{}, error) { return nil, nil }
+
+func (k *kvDiskSM) SaveSnapshot(_ context.Context, _ interface{}, _ io.Writer, _ <-chan struct{}) error {
+	return nil
+}
+
+func (k *kvDiskSM) RecoverFromSnapshot(_ context.Context, _ io.Reader, _ <-chan struct{}) error {
+	return nil
+}
+
+func (k *kvDiskSM) Close(_ context.Context) error { return nil }
+
+var _ DiskStateMachine = (*kvDiskSM)(nil)
+
+// TestCachedDiskStateMachine_LookupReturnsOwnedCopy asserts that cache hits
+// hand out owned copies: a caller that mutates (or pools) the returned
+// slice must not corrupt the cached value seen by future readers.
+func TestCachedDiskStateMachine_LookupReturnsOwnedCopy(t *testing.T) {
+	inner := newKVDiskSM()
+	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+		MaxEntries: 16,
+		ExtractKV:  kvExtract,
+	})
+	if err != nil {
+		t.Fatalf("NewCachedDiskStateMachine: %v", err)
+	}
+	ctx := context.Background()
+
+	entries := []Entry{{Index: 1, Cmd: []byte("k=value")}}
+	if err := cached.Update(ctx, entries, make([]Result, 1)); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// Lookup path.
+	got, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	buf := got.([]byte)
+	if string(buf) != "value" {
+		t.Fatalf("Lookup = %q, want %q", buf, "value")
+	}
+	for i := range buf {
+		buf[i] = 'X' // caller scribbles on the returned slice
+	}
+	got2, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup after mutation: %v", err)
+	}
+	if string(got2.([]byte)) != "value" {
+		t.Fatalf("cache corrupted by caller mutation: Lookup = %q, want %q", got2, "value")
+	}
+
+	// BytesLookup path.
+	bval, err := cached.BytesLookup([]byte("k"))
+	if err != nil {
+		t.Fatalf("BytesLookup: %v", err)
+	}
+	for i := range bval {
+		bval[i] = 'Y'
+	}
+	bval2, err := cached.BytesLookup([]byte("k"))
+	if err != nil {
+		t.Fatalf("BytesLookup after mutation: %v", err)
+	}
+	if string(bval2) != "value" {
+		t.Fatalf("cache corrupted by caller mutation: BytesLookup = %q, want %q", bval2, "value")
+	}
+}
+
+// TestCachedDiskStateMachine_UpdateInvalidatesBeforeInnerWrite asserts the
+// invalidate-then-write ordering: once the inner write is durable but the
+// cache has not yet been repopulated, a concurrent Lookup must miss and
+// fall through to the inner SM (returning the NEW value) rather than serve
+// the stale pre-write value from the cache.
+func TestCachedDiskStateMachine_UpdateInvalidatesBeforeInnerWrite(t *testing.T) {
+	inner := newKVDiskSM()
+	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+		MaxEntries: 16,
+		ExtractKV:  kvExtract,
+	})
+	if err != nil {
+		t.Fatalf("NewCachedDiskStateMachine: %v", err)
+	}
+	ctx := context.Background()
+
+	// Seed the cache with the old value.
+	if err := cached.Update(ctx, []Entry{{Index: 1, Cmd: []byte("k=old")}}, make([]Result, 1)); err != nil {
+		t.Fatalf("seed Update: %v", err)
+	}
+
+	applied := make(chan struct{})
+	release := make(chan struct{})
+	inner.applied = applied
+	inner.release = release
+
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- cached.Update(ctx, []Entry{{Index: 2, Cmd: []byte("k=new")}}, make([]Result, 1))
+	}()
+
+	// The inner write is durable; the wrapper is still inside inner.Update
+	// and has not repopulated the cache. The stale window of the original
+	// bug is exactly here.
+	<-applied
+	got, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup during write window: %v", err)
+	}
+	if string(got.([]byte)) != "new" {
+		t.Fatalf("stale read during write window: got %q, want %q (cache must be invalidated before the inner write)", got, "new")
+	}
+
+	close(release)
+	if err := <-updateDone; err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// After Update returns the cache is repopulated with the new value.
+	got, err = cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup after Update: %v", err)
+	}
+	if string(got.([]byte)) != "new" {
+		t.Fatalf("Lookup after Update = %q, want %q", got, "new")
 	}
 }

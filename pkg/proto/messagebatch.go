@@ -25,7 +25,7 @@ package proto
 // to enforce MaxBatchSize.
 type MessageBatch struct {
 	// BinVer is the wire format version. Receiver validates
-	// BinVer <= WireVersion before unmarshaling.
+	// BinVer == WireVersion before unmarshaling.
 	BinVer uint64
 	// DeploymentID identifies the deployment for cross-deployment
 	// message rejection.
@@ -44,6 +44,18 @@ type MessageBatch struct {
 // messageBatchFixedSize is the wire size of the three fixed uint64 fields
 // (BinVer, DeploymentID, SourceEpoch).
 const messageBatchFixedSize = 3 * 8 // 24 bytes
+
+// minMessageWireSize is the smallest possible encoding of a single Message:
+// the fixed fields plus the mandatory entries-count and has-snapshot
+// prefixes. Identical to HeartbeatMessageSize by construction — a heartbeat
+// (no entries, no snapshot) IS the minimal message.
+const minMessageWireSize = HeartbeatMessageSize // 100 bytes
+
+// maxRetainedRequests bounds the Requests capacity a batch keeps across
+// Reset. The transport pools batches, so without this a single crafted
+// oversized batch would pin cap * unsafe.Sizeof(Message) bytes in the pool
+// for the process lifetime.
+const maxRetainedRequests = 256
 
 // Size returns the total marshaled size of the batch in bytes.
 func (mb *MessageBatch) Size() int {
@@ -80,7 +92,7 @@ func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 }
 
 // UnmarshalFrom reads the message batch from buf and returns bytes
-// consumed. Validates BinVer against WireVersion, request count against
+// consumed. Validates BinVer == WireVersion, request count against
 // maxMessagesPerBatch, and cumulative size against MaxBatchSize.
 // Returns ErrUnsupportedVersion, ErrTooManyMessages,
 // ErrBatchSizeLimitExceeded, or ErrBufferTooSmall as appropriate.
@@ -89,13 +101,18 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 		return 0, ErrBufferTooSmall
 	}
 	mb.BinVer = getUint64(buf[0:])
-	if mb.BinVer > WireVersion {
+	// Exact-version gate: there is no version negotiation and no legacy
+	// decode path — the v1 layout (pre-witness-policy Membership inside
+	// snapshot messages) cannot be parsed by this decoder, so batches from
+	// both older AND newer binaries are rejected with a clear signal
+	// instead of being misparsed.
+	if mb.BinVer != WireVersion {
 		return 0, ErrUnsupportedVersion
 	}
 	mb.DeploymentID = getUint64(buf[8:])
 	mb.SourceEpoch = getUint64(buf[16:])
 	offset := messageBatchFixedSize
-	addr, n, err := getString(buf[offset:], MaxAddressLength)
+	addr, n, err := getString(buf[offset:], MaxAddressLength, ErrAddressTooLong)
 	if err != nil {
 		return 0, err
 	}
@@ -108,6 +125,14 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 	offset += 4
 	if reqCount > maxMessagesPerBatch {
 		return 0, ErrTooManyMessages
+	}
+	// The count alone drives the allocation below, so it must also be
+	// consistent with what is left in the buffer: a 32-byte frame claiming
+	// 10000 requests would otherwise allocate ~2.8 MB before failing. The
+	// transport's receive-memory budget charges only the frame length, so
+	// this check is the only bound on that amplification.
+	if uint64(reqCount)*minMessageWireSize > uint64(len(buf)-offset) {
+		return 0, ErrBufferTooSmall
 	}
 	if reqCount > 0 {
 		if cap(mb.Requests) >= int(reqCount) {
@@ -135,11 +160,17 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// Reset clears all fields for reuse.
+// Reset clears all fields for reuse. A Requests slice grown past
+// maxRetainedRequests is dropped rather than truncated so a pooled batch
+// cannot retain attacker-influenced capacity.
 func (mb *MessageBatch) Reset() {
 	mb.BinVer = 0
 	mb.DeploymentID = 0
 	mb.SourceEpoch = 0
 	mb.SourceAddress = ""
+	if cap(mb.Requests) > maxRetainedRequests {
+		mb.Requests = nil
+		return
+	}
 	mb.Requests = mb.Requests[:0]
 }

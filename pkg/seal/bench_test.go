@@ -180,6 +180,6 @@ func BenchmarkDeriveDEK(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = deriveDEK(rootKey, salt, 42, 1, 32)
+		_, _ = deriveDEK(rootKey, salt, 42, 1, AlgAES256GCM, HKDFV2)
 	}
 }

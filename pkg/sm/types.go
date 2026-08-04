@@ -31,6 +31,14 @@ const (
 	// on the RequestResult so the client can distinguish it from a
 	// legitimate zero-value result (Raft PhD Figure 6.1, step 3).
 	ResultSessionExpired uint64 = 1<<64 - 3 // math.MaxUint64 - 2
+
+	// ResultInvalidCommand is the reserved Result.Value set by a state
+	// machine when a committed entry's payload cannot be decoded. A
+	// committed entry MUST be applied deterministically on every replica:
+	// returning an Update error would mark the shard failed and permanently
+	// wedge it on replay, so a malformed payload instead yields this
+	// per-entry result and the store state is left unchanged for that entry.
+	ResultInvalidCommand uint64 = 1<<64 - 4 // math.MaxUint64 - 3
 )
 
 // Result is returned from state machine Update operations. The Value field

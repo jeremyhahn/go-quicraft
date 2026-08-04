@@ -55,13 +55,20 @@ var (
 	// count exceeds maxMembershipEntries during unmarshal.
 	ErrTooManyMembershipEntries = errors.New("proto: membership entry count exceeds limit")
 
+	// ErrDuplicateMapKey is returned when a membership map on the wire
+	// repeats a replica ID. The encoder writes each key exactly once in
+	// ascending order, so a repeat is a non-canonical encoding.
+	ErrDuplicateMapKey = errors.New("proto: duplicate map key")
+
 	// ErrInvalidConfigChangeType is returned when a ConfigChange.Type
 	// field does not match any known config change type constant
 	// (AddNode, RemoveNode, AddNonVoting, AddWitness).
 	ErrInvalidConfigChangeType = errors.New("proto: invalid config change type")
 
-	// ErrUnsupportedVersion is returned when the wire version in the
-	// buffer exceeds the current WireVersion.
+	// ErrUnsupportedVersion is returned when a version stamp in the buffer
+	// (MessageBatch.BinVer, SnapshotChunk.BinVer, or the Membership
+	// section's leading version byte) does not equal the current
+	// WireVersion, or when a payload matches a legacy fixed layout.
 	ErrUnsupportedVersion = errors.New("proto: unsupported wire version")
 
 	// ErrFilepathTooLong is returned when a filepath string exceeds

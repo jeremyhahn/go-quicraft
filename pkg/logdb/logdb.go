@@ -31,6 +31,14 @@ type NodeInfo struct {
 	ReplicaID uint64
 }
 
+// EntryOverheadBytes is the fixed per-entry byte overhead every LogDB
+// implementation charges against the IterateEntries maxSize budget, in
+// addition to len(Entry.Cmd). It equals the WAL V2 entry record header size
+// (waldb entryRecordHeaderSize), so size budgets computed by callers are
+// portable across implementations: the same maxSize admits the same entries
+// regardless of the backing store.
+const EntryOverheadBytes = 76
+
 // LogDB is the interface for persistent Raft log storage.
 // Implementations must be safe for concurrent use from multiple goroutines.
 type LogDB interface {
@@ -39,11 +47,36 @@ type LogDB interface {
 
 	// SaveState persists a batch of Updates atomically.
 	// Each Update contains entries and/or hard state for a single shard.
+	//
+	// Implementations must not retain or alias the caller's Entry.Cmd
+	// backing arrays: callers may reuse those buffers after SaveState
+	// returns, so the stored log must hold its own copies.
+	//
+	// When Update.Snapshot has Index > 0 and is newer than the stored
+	// snapshot for the node, the snapshot metadata (including its
+	// Membership) is persisted exactly as SaveSnapshot would persist it;
+	// stale snapshots in an Update are silently ignored.
 	SaveState(updates []Update) error
 
-	// IterateEntries returns log entries in the range [low, high) for the given node,
-	// up to maxSize bytes total. Results are appended to the entries slice.
-	// Returns the modified entries slice and the total size in bytes.
+	// IterateEntries returns log entries in the range [low, high) for the
+	// given node, up to maxSize bytes total. Results are appended to the
+	// entries slice. Returns the modified entries slice and the cumulative
+	// size in bytes (the incoming size plus each returned entry's size).
+	//
+	// Contract (identical for every implementation):
+	//   - Each entry is charged EntryOverheadBytes + len(Cmd) against
+	//     maxSize. maxSize of 0 means unlimited. At least one entry is
+	//     returned when any is available, even if it alone exceeds
+	//     maxSize; otherwise iteration stops BEFORE the entry that would
+	//     push the cumulative size past maxSize.
+	//   - low >= high returns (entries, size, nil) without touching store
+	//     state.
+	//   - low at or below the node's compaction floor returns ErrCompacted.
+	//   - An unknown node, or a range holding no entries, returns
+	//     ErrUnavailable.
+	//   - A stored range that does not begin exactly at low, or that is
+	//     missing an interior index, returns ErrLogGapDetected — a log
+	//     hole must never be served as a silently shortened result.
 	IterateEntries(entries []Entry, size uint64, shardID uint64, replicaID uint64,
 		low uint64, high uint64, maxSize uint64) ([]Entry, uint64, error)
 
@@ -54,6 +87,12 @@ type LogDB interface {
 	// entries for the given node. Returns (0, 0, nil) when no entries exist.
 	// Used during recovery to initialize the LogReader's tracked range
 	// without loading all entries into memory.
+	//
+	// The returned length is the CONTIGUOUS span lastIndex-firstIndex+1.
+	// Implementations must verify that the stored entry count matches that
+	// span and return ErrLogGapDetected on a mismatch: reporting a bare
+	// count over a holed range would make the caller compute a short
+	// lastIndex and silently hide the gap.
 	EntryRange(shardID uint64, replicaID uint64) (firstIndex uint64, length uint64, err error)
 
 	// RemoveEntriesTo removes log entries up to and including the given index

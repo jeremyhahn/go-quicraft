@@ -85,10 +85,32 @@ func newTestRaftLeaseRead(replicaID uint64) *raft {
 	return r
 }
 
-// commitNoOp commits the leader's no-op entry by sending a ReplicateResp
-// from follower 2 and draining messages. This satisfies
-// hasCommittedEntryAtCurrentTerm for ReadIndex.
+// persistLog simulates the engine's commit worker persisting every
+// appended entry and firing the persistence-edge commit re-evaluation
+// (the Peer.Commit contract). tryCommit counts the leader's own match
+// at its durable index (inmem.savedTo), so tests that drive the raft
+// struct directly must advance savedTo before commit can be observed —
+// exactly as the production pipeline does after SaveState+fsync.
+func persistLog(r *raft) {
+	last := r.log.lastIndex()
+	if last == 0 || last <= r.log.inmem.savedTo {
+		return
+	}
+	term, err := r.log.term(last)
+	if err != nil {
+		panic("persistLog: " + err.Error())
+	}
+	r.log.inmem.savedLogTo(last, term)
+	if r.state == leader && r.tryCommit() {
+		r.broadcastAppend()
+	}
+}
+
+// commitNoOp commits the leader's no-op entry by persisting the local
+// log and sending a ReplicateResp from follower 2, then draining
+// messages. This satisfies hasCommittedEntryAtCurrentTerm for ReadIndex.
 func commitNoOp(r *raft) {
+	persistLog(r)
 	if err := r.step(proto.Message{
 		Type:     proto.ReplicateResp,
 		From:     2,
@@ -221,8 +243,11 @@ func advanceHeartbeat(r *raft) {
 func electLeader(r *raft) {
 	r.becomeCandidate()
 	r.broadcastVote()
-	// Single-node cluster wins immediately with self-vote.
+	// Single-node cluster wins immediately with self-vote. Persist the
+	// term-opening no-op so the persistence-edge commit re-evaluation
+	// runs: the sole voter's durable match is the entire quorum.
 	if r.checkElectionResult() {
+		persistLog(r)
 		r.drainMessages()
 		return
 	}
@@ -259,6 +284,9 @@ func electLeader(r *raft) {
 	if r.state != leader {
 		panic("electLeader: failed to elect leader")
 	}
+	// Simulate the commit worker durably persisting the term-opening
+	// no-op so the persistence-edge commit re-evaluation can run.
+	persistLog(r)
 	// Drain messages from election.
 	r.drainMessages()
 }
@@ -2538,6 +2566,9 @@ func TestRaft_SingleNode_CommitsImmediately(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// The proposal commits once the local append is durable: the sole
+	// voter's durable match is the entire quorum.
+	persistLog(r)
 	if r.log.committed != r.log.lastIndex() {
 		t.Fatalf("expected all entries committed in single-node, committed=%d last=%d",
 			r.log.committed, r.log.lastIndex())
@@ -2559,13 +2590,13 @@ func TestRaft_Witness_CountsInElectionQuorum(t *testing.T) {
 	}
 
 	// 3 voting members: 1(self), 2(remote), 3(witness). Quorum = 2.
-	eq := electionQuorum(r.remotes, r.witnesses)
+	eq := quorum(r.remotes, r.witnesses)
 	if eq != 2 {
 		t.Fatalf("expected election quorum 2, got %d", eq)
 	}
 
-	// Commit quorum should exclude witnesses: only self + remote 2 = 2 members, quorum = 2.
-	cq := commitQuorum(r.remotes)
+	// Unified quorum counts witnesses: self + remote 2 + witness 3 = 3 voting, quorum = 2.
+	cq := quorum(r.remotes, r.witnesses)
 	if cq != 2 {
 		t.Fatalf("expected commit quorum 2, got %d", cq)
 	}
@@ -2914,26 +2945,346 @@ func TestRaft_HardState_ReflectsCommit(t *testing.T) {
 // Test: SnapshotStatus and Unreachable
 // ---------------------------------------------------------------------------
 
-func TestRaft_SnapshotStatus_Success(t *testing.T) {
+// TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe verifies the liveness
+// fallback: a successful transfer report keeps the remote paused with the
+// ack countdown armed (snapshotAckWaitMultiplier x electionTimeout); if the
+// follower never acknowledges (crashed, or the ack was lost), the per-tick
+// countdown expires and the remote falls back to probe so the retry path
+// resumes. The countdown ticks even while the shard is quiesced — the whole
+// snapshot cycle can run under quiesce because none of its messages reset
+// the quiesce idle counter.
+func TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
 	r.drainMessages()
 
-	r.remotes[2].becomeSnapshot(10)
-
-	err := r.step(proto.Message{
+	rm := r.remotes[2]
+	rm.becomeSnapshot(10, 1)
+	if err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: false,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot state after transfer success, got %s", rm.state)
+	}
+	wait := snapshotAckWaitMultiplier * r.electionTimeout
+	if rm.snapshotWaitTicks != wait {
+		t.Fatalf("expected wait countdown %d, got %d", wait, rm.snapshotWaitTicks)
+	}
 
-	if r.remotes[2].state != remoteProbe {
-		t.Fatalf("expected probe state after snapshot success, got %s",
-			r.remotes[2].state)
+	// Drive the countdown through tickLeader with quiesce ACTIVE to pin
+	// that the quiesce early-return cannot freeze it. One tick short of
+	// the timeout: still paused in snapshot state.
+	r.quiesce.active = true
+	for i := 0; i < wait-1; i++ {
+		tickLeader(r)
+	}
+	if rm.state != remoteSnapshot {
+		t.Fatalf("expected snapshot state before timeout, got %s", rm.state)
+	}
+	// Final tick expires the countdown and falls back to probe.
+	tickLeader(r)
+	if rm.state != remoteProbe {
+		t.Fatalf("expected probe state after ack timeout, got %s", rm.state)
+	}
+	// next = max(match+1, snapshotIndex+1) = 11.
+	if rm.next != 11 {
+		t.Fatalf("expected next=11 after fallback, got %d", rm.next)
+	}
+}
+
+// TestRaft_SnapshotStatus_StaleTransferIgnored verifies that a status
+// whose Hint does not match the remote's current snapshotIndex is
+// discarded: a late report from a superseded transfer must not arm the
+// countdown (or force a probe) for a newer in-flight transfer.
+func TestRaft_SnapshotStatus_StaleTransferIgnored(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	electLeader(r)
+	r.drainMessages()
+
+	rm := r.remotes[2]
+	rm.becomeSnapshot(20, 7) // current transfer attempt: seq 7
+
+	for _, reject := range []bool{false, true} {
+		if err := r.step(proto.Message{
+			Type:   proto.SnapshotStatus,
+			From:   2,
+			Term:   r.term,
+			Hint:   3, // stale: reports a superseded transfer attempt
+			Reject: reject,
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rm.state != remoteSnapshot || rm.snapshotWaitTicks != 0 {
+			t.Fatalf("stale status (reject=%v) must be ignored: state=%s waitTicks=%d",
+				reject, rm.state, rm.snapshotWaitTicks)
+		}
+	}
+}
+
+// TestRaft_SnapshotStatus_SameIndexResendDisambiguated pins the transfer
+// sequence: after an ack-timeout retry re-sends the SAME snapshot index,
+// the late status from the first attempt must be ignored, while the second
+// attempt's status is honored. The snapshot index alone cannot tell the
+// two attempts apart.
+func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	electLeader(r)
+	r.drainMessages()
+
+	rm := r.remotes[2]
+	// Attempt #1 at index 40 times out and falls back to probe...
+	rm.becomeSnapshot(40, 1)
+	rm.snapshotDone(1)
+	r.tickSnapshotWaits()
+	if rm.state != remoteProbe {
+		t.Fatalf("expected probe after attempt #1 expiry, got %s", rm.state)
+	}
+	// ...and the retry re-sends the SAME index as attempt #2.
+	rm.becomeSnapshot(40, 2)
+
+	// The late status for attempt #1 arrives: same index, stale seq.
+	if err := r.step(proto.Message{
+		Type: proto.SnapshotStatus,
+		From: 2,
+		Term: r.term,
+		Hint: 1,
+	}); err != nil {
+		t.Fatalf("stale status: %v", err)
+	}
+	if rm.snapshotWaitTicks != 0 {
+		t.Fatalf("stale same-index status must not arm the countdown, got %d", rm.snapshotWaitTicks)
+	}
+	// Attempt #2's own status is honored.
+	if err := r.step(proto.Message{
+		Type: proto.SnapshotStatus,
+		From: 2,
+		Term: r.term,
+		Hint: 2,
+	}); err != nil {
+		t.Fatalf("current status: %v", err)
+	}
+	if rm.snapshotWaitTicks != snapshotAckWaitMultiplier*r.electionTimeout {
+		t.Fatalf("current status must arm the countdown, got %d", rm.snapshotWaitTicks)
+	}
+}
+
+// TestRaft_SendSnapshot_StampsMonotonicSeq verifies sendSnapshot stamps a
+// fresh transfer sequence on the remote and on the outgoing InstallSnapshot
+// message (Hint) for every attempt.
+func TestRaft_SendSnapshot_StampsMonotonicSeq(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	electLeader(r)
+	r.drainMessages()
+	r.log.restore(proto.Snapshot{Index: 50, Term: 1})
+
+	var seqs []uint64
+	for i := 0; i < 2; i++ {
+		r.sendSnapshot(2)
+		msgs := r.drainMessages()
+		var found bool
+		for _, m := range msgs {
+			if m.Type == proto.InstallSnapshot && m.To == 2 {
+				seqs = append(seqs, m.Hint)
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("attempt %d: no InstallSnapshot emitted", i)
+		}
+		if r.remotes[2].snapshotSeq != seqs[len(seqs)-1] {
+			t.Fatalf("attempt %d: remote seq %d != message seq %d",
+				i, r.remotes[2].snapshotSeq, seqs[len(seqs)-1])
+		}
+		r.remotes[2].becomeProbe() // allow re-send
+	}
+	if seqs[1] <= seqs[0] {
+		t.Fatalf("expected monotonically increasing seqs, got %v", seqs)
+	}
+}
+
+// TestRaft_LeaderProposeEnforcesWitnessPolicy verifies the leader-side
+// propose-time policy gate: a config change violating the local
+// WitnessConfig policy is rejected before log append even though it
+// arrived with no prior validation (the follower-forward path), and the
+// pending-config-change slot is not consumed.
+func TestRaft_LeaderProposeEnforcesWitnessPolicy(t *testing.T) {
+	marshalCC := func(t *testing.T, cc proto.ConfigChange) []byte {
+		t.Helper()
+		buf := make([]byte, cc.Size())
+		if _, err := cc.MarshalTo(buf); err != nil {
+			t.Fatalf("MarshalTo: %v", err)
+		}
+		return buf
+	}
+	propose := func(r *raft, cmd []byte) error {
+		return r.step(proto.Message{
+			Type:    proto.Propose,
+			Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: cmd}},
+		})
+	}
+
+	t.Run("witness add breaking majority rejected", func(t *testing.T) {
+		// 3 full replicas + 2 witnesses: quorum 3 == full 3. A third
+		// witness makes quorum 4 > full 3.
+		r := newWitnessClusterRaft(t, 2)
+		electLeaderOnWitnessVotes(t, r, 4, 5)
+		lastBefore := r.log.lastIndex()
+		err := propose(r, marshalCC(t, proto.ConfigChange{
+			Type: proto.AddWitness, ReplicaID: 9, Address: "w",
+		}))
+		if !errors.Is(err, ErrBreaksFullReplicaMajority) {
+			t.Fatalf("expected ErrBreaksFullReplicaMajority, got %v", err)
+		}
+		if r.pendingConfigChange {
+			t.Fatal("rejected change must not consume the pending slot")
+		}
+		if r.log.lastIndex() != lastBefore {
+			t.Fatal("rejected change must not be appended")
+		}
+	})
+
+	t.Run("full replica removal breaking majority rejected", func(t *testing.T) {
+		r := newWitnessClusterRaft(t, 2)
+		electLeaderOnWitnessVotes(t, r, 4, 5)
+		err := propose(r, marshalCC(t, proto.ConfigChange{
+			Type: proto.RemoveNode, ReplicaID: 3,
+		}))
+		if !errors.Is(err, ErrBreaksFullReplicaMajority) {
+			t.Fatalf("expected ErrBreaksFullReplicaMajority, got %v", err)
+		}
+	})
+
+	t.Run("witness removal always allowed", func(t *testing.T) {
+		r := newWitnessClusterRaft(t, 2)
+		electLeaderOnWitnessVotes(t, r, 4, 5)
+		if err := propose(r, marshalCC(t, proto.ConfigChange{
+			Type: proto.RemoveNode, ReplicaID: 4,
+		})); err != nil {
+			t.Fatalf("witness removal should pass the policy gate, got %v", err)
+		}
+	})
+
+	t.Run("max witnesses cap enforced", func(t *testing.T) {
+		members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.CheckQuorum = config.BoolPtr(false)
+		logdb := newTestLogReaderWithMembership(members)
+		logdb.membership.Witnesses = map[uint64]string{4: "waddr"}
+		// Replicated policy: cap 1, majority rule off.
+		logdb.membership.MaxWitnesses = 1
+		r, err := newRaft(cfg, logdb)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		electLeader(r)
+		r.drainMessages()
+		if err := propose(r, marshalCC(t, proto.ConfigChange{
+			Type: proto.AddWitness, ReplicaID: 9, Address: "w",
+		})); !errors.Is(err, ErrTooManyWitnesses) {
+			t.Fatalf("expected ErrTooManyWitnesses, got %v", err)
+		}
+	})
+
+	t.Run("compliant change accepted", func(t *testing.T) {
+		// 4 full replicas + 1 witness stays compliant when adding a 2nd
+		// witness: 6 voting, quorum 4, full 4 >= 4.
+		members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4"}
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.CheckQuorum = config.BoolPtr(false)
+		logdb := newTestLogReaderWithMembership(members)
+		logdb.membership.Witnesses = map[uint64]string{5: "waddr"}
+		logdb.membership.RequireFullReplicaMajority = true
+		r, err := newRaft(cfg, logdb)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		r.becomeCandidate()
+		r.broadcastVote()
+		for _, id := range []uint64{2, 5} {
+			if err := r.step(proto.Message{
+				Type: proto.RequestVoteResp, From: id, Term: r.term,
+			}); err != nil {
+				t.Fatalf("vote from %d: %v", id, err)
+			}
+		}
+		if r.state != leader {
+			t.Fatalf("expected leader, got %s", r.state)
+		}
+		r.drainMessages()
+		if err := propose(r, marshalCC(t, proto.ConfigChange{
+			Type: proto.AddWitness, ReplicaID: 9, Address: "w",
+		})); err != nil {
+			t.Fatalf("compliant witness add should be accepted, got %v", err)
+		}
+		if !r.pendingConfigChange {
+			t.Fatal("accepted config change must set the pending slot")
+		}
+	})
+}
+
+// TestRaft_SnapshotStatus_NoResendWhileAwaitingAck is the regression guard
+// for the duplicate-snapshot-send loop: after a successful transfer report,
+// heartbeat responses must NOT un-pause the remote into probing a follower
+// that is still restoring — the old behavior probed immediately, drew a
+// rejection whose hint backtracked next into compacted territory, and
+// re-streamed the full snapshot 3-4x per restore.
+func TestRaft_SnapshotStatus_NoResendWhileAwaitingAck(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	electLeader(r)
+	r.drainMessages()
+
+	rm := r.remotes[2]
+	rm.becomeSnapshot(10, 1)
+	if err := r.step(proto.Message{
+		Type:   proto.SnapshotStatus,
+		From:   2,
+		Term:   r.term,
+		Hint:   1,
+		Reject: false,
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r.drainMessages()
+
+	// Heartbeat responses from the still-restoring follower arrive; the
+	// remote must stay paused and the leader must emit no Replicate or
+	// InstallSnapshot toward it.
+	for i := 0; i < 3; i++ {
+		if err := r.step(proto.Message{
+			Type: proto.HeartbeatResp,
+			From: 2,
+			Term: r.term,
+		}); err != nil {
+			t.Fatalf("HeartbeatResp: %v", err)
+		}
+	}
+	for _, m := range r.drainMessages() {
+		if m.To == 2 && (m.Type == proto.Replicate || m.Type == proto.InstallSnapshot) {
+			t.Fatalf("leader must not send %s while awaiting snapshot ack", proto.MessageTypeName(m.Type))
+		}
+	}
+	if rm.state != remoteSnapshot {
+		t.Fatalf("expected remote to stay in snapshot state, got %s", rm.state)
+	}
+
+	// The follower finishes restoring and acks at the snapshot index;
+	// normal replication resumes.
+	if err := r.step(proto.Message{
+		Type:     proto.ReplicateResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: 10,
+	}); err != nil {
+		t.Fatalf("ReplicateResp: %v", err)
+	}
+	if rm.state == remoteSnapshot {
+		t.Fatalf("expected remote to leave snapshot state after ack, got %s", rm.state)
 	}
 }
 
@@ -2942,21 +3293,33 @@ func TestRaft_SnapshotStatus_Failure(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	r.remotes[2].becomeSnapshot(10)
+	rm := r.remotes[2]
+	rm.becomeSnapshot(10, 1)
 
 	err := r.step(proto.Message{
 		Type:   proto.SnapshotStatus,
 		From:   2,
 		Term:   r.term,
+		Hint:   1,
 		Reject: true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if r.remotes[2].state != remoteProbe {
-		t.Fatalf("expected probe state after snapshot failure, got %s",
-			r.remotes[2].state)
+	// Failure arms a retry backoff of one electionTimeout (paused);
+	// expiry falls back to probe so the retry path resumes.
+	if rm.state != remoteSnapshot || !rm.isPaused() {
+		t.Fatalf("expected paused snapshot backoff after failure, got %s", rm.state)
+	}
+	if rm.snapshotWaitTicks != r.electionTimeout {
+		t.Fatalf("expected backoff %d, got %d", r.electionTimeout, rm.snapshotWaitTicks)
+	}
+	for i := 0; i < r.electionTimeout; i++ {
+		r.tickSnapshotWaits()
+	}
+	if rm.state != remoteProbe {
+		t.Fatalf("expected probe state after backoff expiry, got %s", rm.state)
 	}
 }
 
@@ -3323,6 +3686,10 @@ func TestRaft_Leader_StepsDownOnHigherTermVoteRequest(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
 	r.drainMessages()
+
+	// Expire the CheckQuorum lease: with a fresh lease the higher-term
+	// vote would be dropped (see TestDragonboat_LeaderSupersedingWithCheckQuorum).
+	r.electionTick = r.electionTimeout
 
 	err := r.step(proto.Message{
 		Type:     proto.RequestVote,
@@ -4069,6 +4436,10 @@ func TestRaft_Step_HigherTermVoteRequestSetsLeaderToNoLeader(t *testing.T) {
 	r.leaderID = 3
 	r.drainMessages()
 
+	// Expire the CheckQuorum lease so the higher-term vote is processed
+	// rather than dropped while the known leader is still fresh.
+	r.electionTick = r.electionTimeout
+
 	// A RequestVote from a higher term should clear the leader.
 	err := r.step(proto.Message{
 		Type:     proto.RequestVote,
@@ -4181,12 +4552,12 @@ func TestRaft_Witness_TimeoutNowIgnored(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: ReadIndex quorum excludes witnesses
+// Test: ReadIndex uses the unified quorum (witness acks count)
 // ---------------------------------------------------------------------------
 
 func TestRaft_Witness_ReadIndexUsesElectionQuorum(t *testing.T) {
 	// 3-node cluster: node 1 (leader), node 2 (remote), node 3 (witness).
-	// Election quorum = 2 (all 3 vote). ReadIndex uses electionQuorum
+	// Election quorum = 2 (all 3 vote). ReadIndex uses quorum
 	// because witnesses vote in elections and the leadership confirmation
 	// quorum must overlap with every possible election-winning coalition.
 	// Either remote 2 or witness 3 ack (plus self) satisfies quorum.
@@ -4261,8 +4632,8 @@ func TestRaft_Witness_ReadIndexUsesElectionQuorum(t *testing.T) {
 
 func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
 	// 4-node cluster: node 1 (leader), node 2 (remote), node 3 (remote),
-	// node 4 (witness). electionQuorum = 3 (4 voting / 2 + 1).
-	// ReadIndex uses electionQuorum because witnesses vote in elections
+	// node 4 (witness). quorum = 3 (4 voting / 2 + 1).
+	// ReadIndex uses quorum because witnesses vote in elections
 	// and the leadership confirmation quorum must overlap with every
 	// possible election-winning coalition. One remote ack (self + remote2
 	// = 2) is insufficient; need one more ack from remote3 or witness4.
@@ -4309,7 +4680,7 @@ func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
 	hbCtx := hbs[0].Hint
 	r.drainMessages()
 
-	// electionQuorum for 4 voting nodes = 3. One remote ack (self + remote2
+	// quorum for 4 voting nodes = 3. One remote ack (self + remote2
 	// = 2) is NOT sufficient.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
@@ -4321,7 +4692,7 @@ func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
 	}
 
 	if len(r.readStates) != 0 {
-		t.Fatalf("expected 0 read states (electionQuorum=3, self+remote2=2), got %d", len(r.readStates))
+		t.Fatalf("expected 0 read states (quorum=3, self+remote2=2), got %d", len(r.readStates))
 	}
 
 	// Witness ack should bring count to 3 (self + remote2 + witness4).
@@ -4335,7 +4706,7 @@ func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
 	}
 
 	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 read state (electionQuorum=3, self+remote2+witness4=3), got %d", len(r.readStates))
+		t.Fatalf("expected 1 read state (quorum=3, self+remote2+witness4=3), got %d", len(r.readStates))
 	}
 	if r.readStates[0].Key != 77 {
 		t.Fatalf("expected read state key 77, got %d", r.readStates[0].Key)
@@ -5077,6 +5448,20 @@ func TestRaft_HeartbeatResp_WitnessAcksReadIndex(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	electLeader(r)
+	r.drainMessages()
+
+	// Commit the leader's no-op at the current term. With the unified quorum
+	// (self + witness = 2), the witness must ack the no-op before ReadIndex can
+	// confirm a committed current-term entry. The witness tracks match via its
+	// metadata-only replica, so its ReplicateResp counts toward commit.
+	if err := r.step(proto.Message{
+		Type:     proto.ReplicateResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: r.log.lastIndex(),
+	}); err != nil {
+		t.Fatalf("witness no-op ack: %v", err)
+	}
 	r.drainMessages()
 	r.readStates = nil
 
@@ -7234,7 +7619,7 @@ func TestOPT8_Campaign_TemplateReuse_CorrectMessages(t *testing.T) {
 	r.becomeCandidate()
 	r.msgs = r.msgs[:0]
 
-	r.campaign(proto.RequestVote)
+	r.campaign(proto.RequestVote, false)
 
 	// Should have sent RequestVote to all peers (2 and 3).
 	voteReqs := collectMessages(r, proto.RequestVote)
@@ -7272,7 +7657,7 @@ func TestOPT8_Campaign_PreVote_UsesTermPlusOne(t *testing.T) {
 	r.msgs = r.msgs[:0]
 
 	expectedTerm := r.term + 1
-	r.campaign(proto.RequestPreVote)
+	r.campaign(proto.RequestPreVote, false)
 
 	preVoteReqs := collectMessages(r, proto.RequestPreVote)
 	if len(preVoteReqs) != 2 {
@@ -7794,7 +8179,7 @@ func TestLeaseRead_RenewalOnHeartbeatAck(t *testing.T) {
 	}
 
 	// Send ack from follower 2 only. In a 3-node cluster:
-	// commitQuorum(remotes) = (2+1)/2+1 = 2. Self(1) + follower(2) = 2 = quorum.
+	// Unified quorum = (2+1)/2+1 = 2. Self(1) + follower(2) = 2 = quorum.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
@@ -8262,7 +8647,7 @@ func TestLeaseRead_PartialAckNotQuorum(t *testing.T) {
 	}
 	r.drainMessages()
 
-	// commitQuorum for 5-node: (4+1)/2+1 = 3. Self + 1 = 2. Not quorum.
+	// Unified quorum for 5-node: (4+1)/2+1 = 3. Self + 1 = 2. Not quorum.
 	if r.hasValidLease() {
 		t.Fatal("expected no valid lease with only 1 remote ack in 5-node cluster")
 	}
@@ -9211,7 +9596,7 @@ func TestSendAppendPipeliningSnapshotState(t *testing.T) {
 
 	// Set peer 2 to Snapshot state.
 	rm := r.remotes[2]
-	rm.becomeSnapshot(5)
+	rm.becomeSnapshot(5, 1)
 
 	r.drainMessages()
 	r.sendAppend(2)
@@ -9700,7 +10085,7 @@ func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
 
 func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 	// 4-node cluster: node 1 (leader), node 2 (remote), node 3 (remote),
-	// node 4 (witness). electionQuorum = 3 (4 voting / 2 + 1).
+	// node 4 (witness). quorum = 3 (4 voting / 2 + 1).
 	// Witnesses are included in replicaToBit and their heartbeat acks
 	// count toward ReadIndex quorum because witnesses vote in elections.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
@@ -9751,7 +10136,7 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 	r.drainMessages()
 
 	// Send heartbeat ack from witness only - should NOT resolve alone
-	// because electionQuorum=3 and self(1) + witness(1) = 2 < 3.
+	// because quorum=3 and self(1) + witness(1) = 2 < 3.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 4,
@@ -9762,7 +10147,7 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 	}
 
 	if len(r.readStates) != 0 {
-		t.Fatalf("witness ack alone must not satisfy ReadIndex quorum (electionQuorum=3): got %d readStates, want 0",
+		t.Fatalf("witness ack alone must not satisfy ReadIndex quorum (quorum=3): got %d readStates, want 0",
 			len(r.readStates))
 	}
 
@@ -9787,7 +10172,7 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 	}
 
 	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 read state after reaching electionQuorum, got %d", len(r.readStates))
+		t.Fatalf("expected 1 read state after reaching quorum, got %d", len(r.readStates))
 	}
 	if r.readStates[0].Key != 55 {
 		t.Fatalf("expected read state key 55, got %d", r.readStates[0].Key)
@@ -9796,9 +10181,9 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 
 func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testing.T) {
 	// Minimal cluster: node 1 (leader), node 2 (remote), node 3 (witness).
-	// electionQuorum = 2 (3 voting / 2 + 1). Since witnesses vote in
+	// quorum = 2 (3 voting / 2 + 1). Since witnesses vote in
 	// elections, witness ack correctly satisfies ReadIndex quorum:
-	// self(1) + witness(1) = 2 = electionQuorum. This is safe because
+	// self(1) + witness(1) = 2 = quorum. This is safe because
 	// the leadership confirmation quorum overlaps with every possible
 	// election-winning coalition.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
@@ -9841,7 +10226,7 @@ func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testin
 	hbCtx := hbs[0].Hint
 	r.drainMessages()
 
-	// Witness ack alone should resolve because electionQuorum=2 and
+	// Witness ack alone should resolve because quorum=2 and
 	// self(1) + witness(1) = 2 = quorum.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
@@ -9852,7 +10237,7 @@ func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testin
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
 	if len(r.readStates) != 1 {
-		t.Fatalf("witness ack should resolve ReadIndex in 3-node cluster (electionQuorum=2): "+
+		t.Fatalf("witness ack should resolve ReadIndex in 3-node cluster (quorum=2): "+
 			"got %d readStates, want 1", len(r.readStates))
 	}
 	if r.readStates[0].Key != 33 {
@@ -9866,7 +10251,7 @@ func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testin
 
 func TestRaft_Witness_HeartbeatAckCountsForLeaseQuorum(t *testing.T) {
 	// 3-node cluster: node 1 (leader), node 2 (remote), node 3 (witness).
-	// LeaseRead enabled. electionQuorum for lease = 2 (3 voting / 2 + 1).
+	// LeaseRead enabled. quorum for lease = 2 (3 voting / 2 + 1).
 	// Since witnesses vote in elections, witness heartbeat ack counts
 	// toward lease validity. self(1) + witness(1) = 2 = quorum.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
@@ -9915,15 +10300,15 @@ func TestRaft_Witness_HeartbeatAckCountsForLeaseQuorum(t *testing.T) {
 		t.Fatal("witness node 3 should have an entry in remoteLastAck")
 	}
 
-	// Lease should be valid with self + witness = electionQuorum (2).
+	// Lease should be valid with self + witness = quorum (2).
 	if !r.hasValidLease() {
-		t.Fatal("lease should be valid with self + witness heartbeat ack (electionQuorum=2)")
+		t.Fatal("lease should be valid with self + witness heartbeat ack (quorum=2)")
 	}
 }
 
 func TestRaft_Witness_LeaseQuorumUsesElectionQuorum(t *testing.T) {
 	// 4-node cluster: node 1 (leader), node 2 (remote), node 3 (remote),
-	// node 4 (witness). electionQuorum = 3 (4 voting / 2 + 1).
+	// node 4 (witness). quorum = 3 (4 voting / 2 + 1).
 	// Both witness and remote acks count toward lease validity.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgLeaseRead(1, 1)
@@ -9951,9 +10336,9 @@ func TestRaft_Witness_LeaseQuorumUsesElectionQuorum(t *testing.T) {
 	if _, found := r.remoteLastAck[4]; !found {
 		t.Fatal("witness node 4 must be tracked in remoteLastAck")
 	}
-	// self(1) + witness(1) = 2 < electionQuorum(3).
+	// self(1) + witness(1) = 2 < quorum(3).
 	if r.hasValidLease() {
-		t.Fatal("lease must not be valid with self + witness only (need electionQuorum=3)")
+		t.Fatal("lease must not be valid with self + witness only (need quorum=3)")
 	}
 
 	// One data-bearing ack (self + witness + remote 2 = 3 = quorum).
@@ -9967,7 +10352,7 @@ func TestRaft_Witness_LeaseQuorumUsesElectionQuorum(t *testing.T) {
 	}
 
 	if !r.hasValidLease() {
-		t.Fatal("lease should be valid with self + witness + remote (electionQuorum=3)")
+		t.Fatal("lease should be valid with self + witness + remote (quorum=3)")
 	}
 }
 
@@ -11324,6 +11709,10 @@ func TestRaft_Safety_LeaderCompleteness_CommittedEntryOnNewLeader(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 	entryIdx := leaderNode.log.lastIndex()
+	// Persist the leader's log: tryCommit counts the leader's own match
+	// at its durable index, so the follower ack below completes the
+	// quorum for entryIdx.
+	persistLog(leaderNode)
 
 	// Collect Replicate to node 2 for replication.
 	appends := collectMessages(leaderNode, proto.Replicate)
@@ -11953,72 +12342,106 @@ func TestRaft_FastBacktrack_ReplicateStateFallsBackToMatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Witness-heavy cluster stalls commits when full replicas insufficient
+// Test: Witnesses count toward the unified commit quorum (C1 regression)
 // ---------------------------------------------------------------------------
 
-// TestRaft_WitnessHeavyCluster_StallsCommitsWhenFullReplicasInsufficient
-// verifies that a cluster where witnesses allow an election quorum but full
-// (data-bearing) replicas do not meet the commit quorum will stall commits.
+// TestRaft_WitnessCountsTowardCommitQuorum_Unified is the regression guard for
+// the C1 fix: witnesses vote in elections, so they MUST also be counted toward
+// the commit quorum. Using a single unified quorum for both election and commit
+// is required for Leader Completeness — if the commit quorum excluded witnesses
+// (the old behavior), a commit set (a data-node minority) and an election-
+// winning set (data minority + witnesses) could be disjoint, letting a
+// candidate that never saw a committed entry win on witness votes and truncate
+// it.
 //
 // Cluster: 3 full replicas (1,2,3) + 2 witnesses (4,5) = 5 voting members.
-//   - electionQuorum = 5/2+1 = 3
-//   - commitQuorum   = (3 data-bearing)/2+1 = 2 (remotes+leader)
+//   - quorum = 5/2+1 = 3
+//   - commit quorum  = 5/2+1 = 3 (UNIFIED — witnesses included)
 //
-// Scenario: node 1 is leader. Full replicas 2 and 3 are "dead" (never ack).
-// Witnesses 4 and 5 are alive and grant votes, so the cluster can elect a
-// leader (self + 2 witnesses = 3 = electionQuorum). However, the commit
-// quorum requires 2 data-bearing nodes to match, and only the leader (node 1)
-// is alive. Proposals cannot commit because the median match across data-
-// bearing nodes never reaches an entry at the current term.
-func TestRaft_WitnessHeavyCluster_StallsCommitsWhenFullReplicasInsufficient(t *testing.T) {
-	// 3 full replicas + 2 witnesses.
-	members := map[uint64]string{
-		1: "addr1",
-		2: "addr2",
-		3: "addr3",
-	}
+// The old (buggy) model computed commit quorum as (3 data)/2+1 = 2, which let a
+// commit land on a data-node minority {leader, 1 data}. This test asserts the
+// corrected behavior:
+//
+//	(a) the unified quorum is 3 (not 2);
+//	(b) commit does NOT advance with only a data-node minority matching;
+//	(c) a witness metadata-ack legitimately contributes to a 3-node quorum
+//	    (alongside the leader's own data and one full replica's data), so the
+//	    committed entry's data is always present on a full-replica subset.
+//
+// newWitnessClusterRaft builds the canonical witness test fixture: a raft
+// node for replica 1 in a shard of 3 full replicas {1,2,3} plus witnesses
+// {4..3+witnesses}, with PreVote and CheckQuorum disabled.
+func newWitnessClusterRaft(tb testing.TB, witnesses int) *raft {
+	tb.Helper()
+	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.CheckQuorum = config.BoolPtr(false)
 	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Witnesses = map[uint64]string{4: "addr4", 5: "addr5"}
+	w := map[uint64]string{}
+	for i := 0; i < witnesses; i++ {
+		w[uint64(4+i)] = "waddr"
+	}
+	if len(w) > 0 {
+		logdb.membership.Witnesses = w
+	}
+	// Replicated witness policy: the production bootstrap default
+	// (RequireFullReplicaMajority on, no explicit cap).
+	logdb.membership.RequireFullReplicaMajority = true
 	r, err := newRaft(cfg, logdb)
 	if err != nil {
-		t.Fatalf("newRaft: %v", err)
+		tb.Fatalf("newRaft: %v", err)
 	}
+	return r
+}
 
-	// Verify quorum arithmetic.
-	eq := electionQuorum(r.remotes, r.witnesses)
-	if eq != 3 {
-		t.Fatalf("expected electionQuorum 3, got %d", eq)
-	}
-	cq := commitQuorum(r.remotes)
-	if cq != 2 {
-		t.Fatalf("expected commitQuorum 2, got %d", cq)
-	}
-
-	// Elect node 1 as leader using witness votes (self + witness 4 + witness 5 = 3).
+// electLeaderOnWitnessVotes elects the local node using self plus the given
+// witnesses' votes only (no full-replica votes), then drains messages.
+func electLeaderOnWitnessVotes(tb testing.TB, r *raft, witnessIDs ...uint64) {
+	tb.Helper()
 	r.becomeCandidate()
 	r.broadcastVote()
-	for _, wid := range []uint64{4, 5} {
+	for _, wid := range witnessIDs {
 		if err := r.step(proto.Message{
 			Type: proto.RequestVoteResp,
 			From: wid,
 			Term: r.term,
 		}); err != nil {
-			t.Fatalf("vote from witness %d: %v", wid, err)
+			tb.Fatalf("vote from witness %d: %v", wid, err)
 		}
 	}
 	if r.state != leader {
-		t.Fatalf("expected leader after witness votes, got %s", r.state)
+		tb.Fatalf("expected leader after witness votes, got %s", r.state)
 	}
+	// Simulate the commit worker durably persisting the term-opening
+	// no-op so the persistence-edge commit re-evaluation can run.
+	persistLog(r)
 	r.drainMessages()
+}
+
+func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
+	// 3 full replicas + 2 witnesses.
+	r := newWitnessClusterRaft(t, 2)
+
+	// (a) Election and commit quorums are now the SAME unified value over the
+	// full voting set (remotes + witnesses + self).
+	eq := quorum(r.remotes, r.witnesses)
+	if eq != 3 {
+		t.Fatalf("expected quorum 3, got %d", eq)
+	}
+	cq := quorum(r.remotes, r.witnesses)
+	if cq != 3 {
+		t.Fatalf("expected unified commit quorum 3 (witnesses counted), got %d", cq)
+	}
+
+	// Elect node 1 as leader using witness votes (self + witness 4 + witness 5 = 3).
+	electLeaderOnWitnessVotes(t, r, 4, 5)
 
 	noopIdx := r.log.lastIndex()
 
 	// Propose a new entry. The leader appends it locally.
 	if err := r.step(proto.Message{
 		Type:    proto.Propose,
-		Entries: []proto.Entry{{Cmd: []byte("stalled-entry")}},
+		Entries: []proto.Entry{{Cmd: []byte("entry")}},
 	}); err != nil {
 		t.Fatalf("propose: %v", err)
 	}
@@ -12030,55 +12453,88 @@ func TestRaft_WitnessHeavyCluster_StallsCommitsWhenFullReplicasInsufficient(t *t
 			proposalIdx, noopIdx)
 	}
 
-	// No full replica acks the proposal. The leader alone has it.
-	// matched = [proposalIdx (leader), 0 (remote 2), 0 (remote 3)]
-	// sorted  = [0, 0, proposalIdx]
-	// mci     = matched[3-2] = matched[1] = 0
-	// tryCommit(0, term) -> toCommit <= committed, returns false.
-	if r.log.committed >= noopIdx {
-		t.Fatalf("committed should not advance without data-bearing acks: committed=%d, noopIdx=%d",
-			r.log.committed, noopIdx)
-	}
+	// Persist the leader's log up front so the minority check below is
+	// decided purely by quorum counting: the leader's durable match
+	// already covers proposalIdx when the acks arrive.
+	persistLog(r)
 
-	// Even a single full replica ack at the noop (not the proposal) should
-	// not advance commit to the proposal because the median match at current
-	// term stops at noop.
-	if err := r.step(proto.Message{
-		Type:     proto.ReplicateResp,
-		From:     2,
-		Term:     r.term,
-		LogIndex: noopIdx,
-	}); err != nil {
-		t.Fatalf("ReplicateResp from 2: %v", err)
-	}
-	r.drainMessages()
-
-	// Now committed should advance to noopIdx (leader + remote 2 = quorum of 2).
-	if r.log.committed < noopIdx {
-		t.Fatalf("expected committed >= noopIdx after 1 full replica ack: committed=%d, noopIdx=%d",
-			r.log.committed, noopIdx)
-	}
-
-	// But committed must NOT advance to proposalIdx because only the
-	// leader has replicated it (1 < commitQuorum of 2).
-	if r.log.committed >= proposalIdx {
-		t.Fatalf("committed must not reach proposal without majority data-bearing ack: committed=%d, proposalIdx=%d",
-			r.log.committed, proposalIdx)
-	}
-
-	// Now remote 2 acks the proposal. Commit should advance.
+	// (b) A single full-replica ack (leader + remote 2 = 2 matches) is a
+	// MINORITY (< unified quorum of 3) and must NOT advance commit. Under a
+	// split quorum this would have committed — the core of the C1 defect.
 	if err := r.step(proto.Message{
 		Type:     proto.ReplicateResp,
 		From:     2,
 		Term:     r.term,
 		LogIndex: proposalIdx,
 	}); err != nil {
-		t.Fatalf("ReplicateResp from 2 (proposal): %v", err)
+		t.Fatalf("ReplicateResp from 2: %v", err)
 	}
 	r.drainMessages()
+	if r.log.committed >= proposalIdx {
+		t.Fatalf("committed must NOT advance on a data-node minority (2 of 5): committed=%d, proposalIdx=%d",
+			r.log.committed, proposalIdx)
+	}
 
+	// (c) A witness metadata-ack brings the match count to 3 = unified quorum
+	// (leader's data + remote 2's data + witness 4's metadata). Commit advances,
+	// and the entry's DATA is present on two full replicas (leader and remote 2),
+	// so it can never be lost.
+	if err := r.step(proto.Message{
+		Type:     proto.ReplicateResp,
+		From:     4, // witness
+		Term:     r.term,
+		LogIndex: proposalIdx,
+	}); err != nil {
+		t.Fatalf("ReplicateResp from witness 4: %v", err)
+	}
+	r.drainMessages()
 	if r.log.committed < proposalIdx {
-		t.Fatalf("expected committed >= proposalIdx after majority data-bearing ack: committed=%d, proposalIdx=%d",
+		t.Fatalf("expected committed >= proposalIdx after unified quorum (leader+data+witness): committed=%d, proposalIdx=%d",
+			r.log.committed, proposalIdx)
+	}
+}
+
+// TestRaft_WitnessOnlyCommitQuorum pins the documented durability trade-off
+// of the unified quorum: a commit CAN advance on {leader + witnesses} acks
+// alone, with the entry's payload held by the leader only. Deliberate,
+// matching dragonboat; see docs/raft/protocol.md Section 6. If this behavior
+// is ever changed (e.g. commits additionally gated on a full-replica
+// majority), update this test alongside the docs.
+func TestRaft_WitnessOnlyCommitQuorum(t *testing.T) {
+	// 3 full replicas + 2 witnesses; a membership the default
+	// RequireFullReplicaMajority policy allows (full 3 >= quorum 3).
+	r := newWitnessClusterRaft(t, 2)
+	electLeaderOnWitnessVotes(t, r, 4, 5)
+
+	if err := r.step(proto.Message{
+		Type:    proto.Propose,
+		Entries: []proto.Entry{{Cmd: []byte("witness-quorum-entry")}},
+	}); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	r.drainMessages()
+	proposalIdx := r.log.lastIndex()
+	// Persist the leader's log so its own durable match covers the
+	// proposal before the witness acks arrive.
+	persistLog(r)
+
+	// Both witnesses ack the proposal via metadata-only replication; the
+	// full replicas 2 and 3 never ack. matched = {leader: N, w4: N, w5: N,
+	// r2: 0, r3: 0} → unified quorum of 3 reached → commit advances even
+	// though the payload exists only on the leader.
+	for _, wid := range []uint64{4, 5} {
+		if err := r.step(proto.Message{
+			Type:     proto.ReplicateResp,
+			From:     wid,
+			Term:     r.term,
+			LogIndex: proposalIdx,
+		}); err != nil {
+			t.Fatalf("ReplicateResp from witness %d: %v", wid, err)
+		}
+	}
+	r.drainMessages()
+	if r.log.committed < proposalIdx {
+		t.Fatalf("expected commit on {leader + 2 witnesses} unified quorum: committed=%d, proposalIdx=%d",
 			r.log.committed, proposalIdx)
 	}
 }
@@ -12225,6 +12681,11 @@ func TestRaft_Figure8_PreviousTermEntryNotCommittedDirectly(t *testing.T) {
 	if noopIdx != 3 {
 		t.Fatalf("expected lastIndex=3 after third leadership, got %d", noopIdx)
 	}
+
+	// Persist the leader's log so its own durable match covers the noop.
+	// The negative check below is then decided purely by the Figure 8
+	// term rule, not by missing local durability.
+	persistLog(r)
 
 	// S1 replicates (index 2, term 2) to S3. Now S1, S2, S3 all have idx 2.
 	// This is majority (3 out of 5) for index 2.
@@ -12716,7 +13177,7 @@ func TestH1_NewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
 	}
 
 	// Ack from the new member (replica 4) and one existing member (replica 2).
-	// In a 4-node cluster (self + 3 remotes), electionQuorum = 3.
+	// In a 4-node cluster (self + 3 remotes), quorum = 3.
 	// Self is pre-acked, so we need 2 more acks.
 	for _, from := range []uint64{2, 4} {
 		if err := r.step(proto.Message{
@@ -12740,13 +13201,13 @@ func TestH1_NewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: S1+S2 - ReadIndex/LeaseRead quorum uses electionQuorum with witnesses
+// Test: S1+S2 - ReadIndex/LeaseRead quorum uses quorum with witnesses
 // ---------------------------------------------------------------------------
 
 func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 	// 5-node cluster: node 1 (leader), nodes 2,3 (remotes), nodes 4,5 (witnesses).
-	// electionQuorum = 3 (5 voting / 2 + 1). commitQuorum would be 2 (3 data / 2 + 1).
-	// ReadIndex must use electionQuorum so the confirmation quorum overlaps
+	// Unified quorum = 3 (5 voting / 2 + 1) for both election and commit.
+	// ReadIndex must use quorum so the confirmation quorum overlaps
 	// with every possible election-winning coalition. Verify that 2 acks
 	// (self + 1 remote) is NOT sufficient, but 3 acks (self + 1 remote + 1 witness) is.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
@@ -12798,7 +13259,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 	hbCtx := hbs[0].Hint
 	r.drainMessages()
 
-	// self(1) + remote2(1) = 2 < electionQuorum(3).
+	// self(1) + remote2(1) = 2 < quorum(3).
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
@@ -12808,10 +13269,10 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 		t.Fatalf("HeartbeatResp: %v", err)
 	}
 	if len(r.readStates) != 0 {
-		t.Fatalf("expected 0 readStates (electionQuorum=3, have 2), got %d", len(r.readStates))
+		t.Fatalf("expected 0 readStates (quorum=3, have 2), got %d", len(r.readStates))
 	}
 
-	// self(1) + remote2(1) + witness4(1) = 3 = electionQuorum.
+	// self(1) + remote2(1) + witness4(1) = 3 = quorum.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 4,
@@ -12821,7 +13282,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
 	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 readState (electionQuorum=3, have 3), got %d", len(r.readStates))
+		t.Fatalf("expected 1 readState (quorum=3, have 3), got %d", len(r.readStates))
 	}
 	if r.readStates[0].Key != 42 {
 		t.Fatalf("expected read state key 42, got %d", r.readStates[0].Key)
@@ -12876,7 +13337,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 
 func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	// 5-node cluster: node 1 (leader), nodes 2,3 (remotes), nodes 4,5 (witnesses).
-	// electionQuorum = 3. LeaseRead must use electionQuorum. Verify that
+	// quorum = 3. LeaseRead must use quorum. Verify that
 	// self + 1 remote = 2 < 3 does not satisfy lease, but adding a witness does.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgLeaseRead(1, 1)
@@ -12891,7 +13352,7 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	// Only remote 2 acks. self(1) + remote2(1) = 2 < electionQuorum(3).
+	// Only remote 2 acks. self(1) + remote2(1) = 2 < quorum(3).
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
@@ -12902,7 +13363,7 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	r.drainMessages()
 
 	if r.hasValidLease() {
-		t.Fatal("lease must not be valid with self + 1 remote (electionQuorum=3)")
+		t.Fatal("lease must not be valid with self + 1 remote (quorum=3)")
 	}
 
 	// Add witness 4 ack. self(1) + remote2(1) + witness4(1) = 3 = quorum.
@@ -12916,7 +13377,7 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	r.drainMessages()
 
 	if !r.hasValidLease() {
-		t.Fatal("lease should be valid with self + remote + witness (electionQuorum=3)")
+		t.Fatal("lease should be valid with self + remote + witness (quorum=3)")
 	}
 }
 
@@ -13202,3 +13663,26 @@ func TestS4_LeaseInvalidatedOnQuiesceEntry_LeaseDisabled(t *testing.T) {
 		t.Fatal("lease must not be valid when leaseRead is disabled")
 	}
 }
+
+// benchmarkTryCommit measures the commit-advancement hot path (executed on
+// every ReplicateResp) with the given number of witnesses, covering the
+// unified-quorum change that added witness match tracking to tryCommit.
+func benchmarkTryCommit(b *testing.B, witnesses int) {
+	r := newWitnessClusterRaft(b, witnesses)
+	electLeader(r)
+	r.drainMessages()
+	last := r.log.lastIndex()
+	for _, rm := range r.remotes {
+		rm.match = last
+	}
+	for _, wm := range r.witnesses {
+		wm.match = last
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.tryCommit()
+	}
+}
+
+func BenchmarkTryCommit(b *testing.B)            { benchmarkTryCommit(b, 0) }
+func BenchmarkTryCommit_2Witnesses(b *testing.B) { benchmarkTryCommit(b, 2) }

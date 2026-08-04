@@ -603,3 +603,51 @@ func TestBuildMTLSTLS_ClientSessionCache(t *testing.T) {
 		t.Fatal("server ClientSessionCache should be nil")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H2: CA bundle parsing for revocation issuer selection
+// ---------------------------------------------------------------------------
+
+// TestParseCACertificatesReturnsWholeBundle is the H2 regression test on the
+// transport side: TLS verification consumes every block of the CA bundle
+// (pool.AppendCertsFromPEM), so revocation must receive every issuer candidate
+// too. Taking only the first PEM block wires revocation to the root in a
+// standard root-first bundle, which can never match an intermediate-issued
+// leaf.
+func TestParseCACertificatesReturnsWholeBundle(t *testing.T) {
+	rootPEM, _, _, _ := generateTestCertPair(t)
+	secondPEM, _, _, _ := generateTestCertPair(t)
+
+	bundle := append(append([]byte{}, rootPEM...), secondPEM...)
+	issuers, err := parseCACertificates(bundle)
+	if err != nil {
+		t.Fatalf("parseCACertificates failed: %v", err)
+	}
+	if len(issuers) != 2 {
+		t.Fatalf("parsed %d issuers from a two-certificate bundle, want 2", len(issuers))
+	}
+}
+
+// TestParseCACertificatesRejectsBundleWithoutIssuer verifies the fail-fast
+// path: a bundle whose blocks cannot act as an issuing CA leaves revocation
+// with no way to build an OCSP request or verify a CRL, which is a silent
+// no-op under soft-fail and a total handshake outage under enforcement.
+func TestParseCACertificatesRejectsBundleWithoutIssuer(t *testing.T) {
+	_, _, leafPEM, _ := generateTestCertPair(t)
+
+	_, err := parseCACertificates(leafPEM)
+	if err == nil {
+		t.Fatal("expected an error for a bundle containing only a leaf certificate")
+	}
+	if !errors.Is(err, ErrCACertificateParse) {
+		t.Fatalf("expected ErrCACertificateParse, got %v", err)
+	}
+}
+
+// TestParseCACertificatesRejectsEmptyPEM verifies that input with no
+// CERTIFICATE block is rejected rather than yielding an empty issuer list.
+func TestParseCACertificatesRejectsEmptyPEM(t *testing.T) {
+	if _, err := parseCACertificates([]byte("not-pem")); !errors.Is(err, ErrCACertificateParse) {
+		t.Fatalf("expected ErrCACertificateParse for non-PEM input, got %v", err)
+	}
+}

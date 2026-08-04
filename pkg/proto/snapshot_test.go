@@ -259,8 +259,8 @@ func TestSnapshotUnmarshalOversizedFilepath(t *testing.T) {
 
 	var s2 Snapshot
 	_, err = s2.UnmarshalFrom(crafted)
-	if !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("expected ErrAddressTooLong for oversized filepath, got %v", err)
+	if !errors.Is(err, ErrFilepathTooLong) {
+		t.Fatalf("expected ErrFilepathTooLong for oversized filepath, got %v", err)
 	}
 }
 

@@ -581,18 +581,19 @@ func TestKV_GetHash_LargeDataset(t *testing.T) {
 }
 
 func TestKV_InvalidCommand(t *testing.T) {
+	// A malformed payload in a COMMITTED entry must never surface as an
+	// Update error (the engine treats that as terminal for the shard).
+	// It must instead yield the reserved deterministic per-entry result.
 	for _, b := range backends() {
 		t.Run(b.name+"/short_data", func(t *testing.T) {
 			ctx := context.Background()
 			entries := []sm.Entry{{Index: 1, Cmd: []byte{0x01}}}
 			results := make([]sm.Result, 1)
-			err := b.update(ctx, entries, results)
-			if err == nil {
-				t.Fatal("expected error for short command")
+			if err := b.update(ctx, entries, results); err != nil {
+				t.Fatalf("Update = %v, want nil for malformed committed entry", err)
 			}
-			var invCmd *InvalidCommandError
-			if !errors.As(err, &invCmd) {
-				t.Errorf("expected InvalidCommandError, got %T", err)
+			if results[0].Value != sm.ResultInvalidCommand {
+				t.Errorf("results[0].Value = %d, want ResultInvalidCommand", results[0].Value)
 			}
 		})
 	}
@@ -603,13 +604,11 @@ func TestKV_InvalidCommand(t *testing.T) {
 			ctx := context.Background()
 			entries := []sm.Entry{{Index: 1, Cmd: []byte{0xFF, 0x00, 0x00}}}
 			results := make([]sm.Result, 1)
-			err := b.update(ctx, entries, results)
-			if err == nil {
-				t.Fatal("expected error for bad op")
+			if err := b.update(ctx, entries, results); err != nil {
+				t.Fatalf("Update = %v, want nil for malformed committed entry", err)
 			}
-			var invCmd *InvalidCommandError
-			if !errors.As(err, &invCmd) {
-				t.Errorf("expected InvalidCommandError, got %T", err)
+			if results[0].Value != sm.ResultInvalidCommand {
+				t.Errorf("results[0].Value = %d, want ResultInvalidCommand", results[0].Value)
 			}
 		})
 	}
@@ -1579,26 +1578,21 @@ func TestKeyTooLongError_Message(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConcurrentStore_UpdateUnknownOpAfterDecode(t *testing.T) {
-	// The ConcurrentStore.Update uses a switch with a default case
-	// for unknown ops. The decode step catches unknown ops first, but
-	// we can test the error path for an op that passes decode but not
-	// the switch. OpGet is handled, so we need a valid but unexpected op
-	// code. Since DecodeCommand validates op range, we test via the normal
-	// invalid command path.
+	// An unknown op code in a committed entry (op=0, below the OpPut
+	// range, with an otherwise valid header) must yield the reserved
+	// deterministic per-entry result, never an Update error: the engine
+	// treats an Update error as terminal for the shard.
 	cs := NewConcurrentStore()
 	ctx := context.Background()
 
-	// Feed an entry with op=0 (below OpPut range), header is valid.
 	cmd := []byte{0x00, 0x01, 0x00, 'k'}
 	entries := []sm.Entry{{Index: 1, Cmd: cmd}}
 	results := make([]sm.Result, 1)
-	err := cs.Update(ctx, entries, results)
-	if err == nil {
-		t.Fatal("expected error for unknown op code")
+	if err := cs.Update(ctx, entries, results); err != nil {
+		t.Fatalf("Update = %v, want nil for unknown op in committed entry", err)
 	}
-	var invCmd *InvalidCommandError
-	if !errors.As(err, &invCmd) {
-		t.Errorf("expected InvalidCommandError, got %T", err)
+	if results[0].Value != sm.ResultInvalidCommand {
+		t.Errorf("results[0].Value = %d, want ResultInvalidCommand", results[0].Value)
 	}
 }
 

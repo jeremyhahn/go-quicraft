@@ -14,6 +14,23 @@
 
 package seal
 
+// StatePersister durably writes the barrier's sealed root-key state to the
+// embedder's storage. The barrier owns no storage of its own: go-qrdb (or
+// whichever embedder loads the blob at boot via SetSealedRootKey) owns the
+// file/KV record and its fsync.
+//
+// Contract:
+//   - Returning nil MUST mean the blob is durable — it will be read back
+//     verbatim after a crash. The barrier activates the new epoch only after
+//     a nil return, so a premature nil re-introduces the data-loss window this
+//     hook exists to close.
+//   - The argument is a private copy; the persister may retain or mutate it.
+//   - The persister is invoked with the barrier's write lock HELD. It MUST NOT
+//     call back into the same Barrier (Encrypt, Rotate, SealedRootKeyData, …)
+//     or it will deadlock.
+//   - Returning an error aborts the operation with the previous epoch intact.
+type StatePersister func(*SealedRootKey) error
+
 // BarrierConfig configures the algorithm-agile epoch barrier.
 type BarrierConfig struct {
 	// Algorithm selects the symmetric encryption algorithm used for barrier
@@ -49,6 +66,18 @@ type BarrierConfig struct {
 	// ShouldRotate() returns true. Default: 95.0.
 	RotationThreshold float64
 
+	// StatePersister durably persists the sealed root-key state. It is
+	// REQUIRED for Rotate and for any PurgeEpochsBefore that actually purges:
+	// both change state that must survive a restart (the active epoch, the
+	// KnownEpochs set), and data written under an epoch the persisted blob
+	// does not name is undecryptable after a restart. When nil, those
+	// operations fail closed with ErrNoStatePersister and the current epoch
+	// stays active — writes continue until the hard invocation limit, at
+	// which point Encrypt itself fails closed. Initialize does NOT call the
+	// persister: the embedder persists SealedRootKeyData() directly at
+	// bootstrap.
+	StatePersister StatePersister
+
 	// InvocationCounter allows injection of a custom counter.
 	// Nil = default InMemoryInvocationCounter.
 	//
@@ -59,6 +88,14 @@ type BarrierConfig struct {
 	// restart, so Unseal pessimistically seeds the default counter to
 	// the rotation threshold — forcing a prompt key rotation — to keep
 	// the NIST SP 800-38D 2^32 budget sound across process lifetimes.
+	//
+	// CONSEQUENCE — a deployment that leaves this nil MUST both run a
+	// rotation loop AND configure StatePersister. The post-unseal seeding
+	// makes ShouldRotateKey() true almost immediately after every restart,
+	// so an embedder that never rotates burns the remaining headroom
+	// between the rotation threshold and InvocationLimit (default 5%) and
+	// then fails every Encrypt with the invocation-limit error. Inject a
+	// counter that persists its own count to avoid the forced rotation.
 	InvocationCounter InvocationCounter
 
 	// NonceTrackerProvider allows injection of a custom nonce tracker.

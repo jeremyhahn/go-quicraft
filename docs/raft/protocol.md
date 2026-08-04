@@ -207,16 +207,19 @@ the election quorum. The election is decided early when either
 `granted >= quorum` or `rejected > total - quorum`.
 
 ```go
-func electionQuorum(remotes, witnesses map[uint64]*remote) int {
-    return numVotingMembers(remotes, witnesses)/2 + 1
+func quorum(remotes, witnesses map[uint64]*remote) int {
+    return quorumOf(numVotingMembers(remotes, witnesses))
 }
+
+func quorumOf(n int) int { return n/2 + 1 }
 
 func numVotingMembers(remotes, witnesses map[uint64]*remote) int {
     return len(remotes) + len(witnesses) + 1  // +1 for self
 }
 ```
 
-Both full replicas and witnesses vote in elections.
+Both full replicas and witnesses vote in elections. This is the same
+unified `quorum` used for commit advancement (Section 6).
 
 ## 4. Log Replication
 
@@ -329,9 +332,10 @@ containing `EntryMetadata` entries that carry Index and Term but no
 Cmd payload. Config change entries are sent unmodified so witnesses
 can maintain correct membership. This allows witnesses to track log
 position for election up-to-date checks and commit index advancement
-without storing full entry data. Witnesses are excluded from
-`commitQuorum` (see Section 6) because they do not replicate full
-entries.
+without storing full entry data. Witnesses are counted in the unified
+`quorum` for both elections and commit (see Section 6); their `match` is
+tracked from these metadata-only acks even though they do not store full
+entry data.
 
 ## 5. Remote State Machine
 
@@ -347,7 +351,7 @@ with four states:
     |  |                              |
     |  +--------- becomeProbe --------+
     |
-    +-- snapshotDone / snapshotFailed
+    +-- follower ack (respondedTo) / ack-or-retry countdown expiry
     |
   [Snapshot] <--- sendSnapshot --- [Probe/Replicate]
 ```
@@ -358,8 +362,13 @@ The leader waits for the response to discover the follower's position.
 **Replicate**: Sliding window of up to `maxInflightMsgs` (256) entries
 in flight. `rm.next` is advanced optimistically on send.
 
-**Snapshot**: A snapshot is being transferred. All sends are paused.
-On completion (`snapshotDone`/`snapshotFailed`), transitions to probe.
+**Snapshot**: A snapshot is being transferred or awaiting the follower's
+raft-level acknowledgment. All sends are paused for the entire phase.
+The transfer outcome report (`SnapshotStatus`) does NOT un-pause the
+peer; it arms an ack-or-retry countdown (`snapshotWaitTicks`). The peer
+exits to probe via the follower's `ReplicateResp` ack (`respondedTo`
+with match >= snapshotIndex) or countdown expiry — see Section 7,
+"Snapshot Status and the Post-Transfer Wait".
 
 ### Inflights (inflights.go)
 
@@ -388,9 +397,12 @@ func (r *raft) tryCommit() bool {
     for _, rm := range r.remotes {
         r.matched = append(r.matched, rm.match)
     }
+    for _, wm := range r.witnesses {                  // unified quorum:
+        r.matched = append(r.matched, wm.match)       // witness metadata
+    }                                                 // acks count too
     slices.Sort(r.matched)
-    quorum := commitQuorum(r.remotes)
-    mci := r.matched[len(r.matched)-quorum]
+    q := quorum(r.remotes, r.witnesses)
+    mci := r.matched[len(r.matched)-q]
     return r.log.tryCommit(mci, r.term)
 }
 ```
@@ -400,24 +412,72 @@ index replicated to a quorum. The `log.tryCommit` call additionally
 verifies the entry at that index has the leader's current term
 (Paper 5.4.2 -- leaders only commit entries from their own term).
 
-### Commit Quorum vs Election Quorum
+### Unified Quorum (Election == Commit)
 
 ```go
-// Election quorum: remotes + witnesses + self.
-// Witnesses vote but do not store data.
-func electionQuorum(remotes, witnesses) int {
+// Single quorum over the full voting set (remotes + witnesses + self),
+// used for BOTH elections and commit advancement.
+func quorum(remotes, witnesses) int {
     return (len(remotes) + len(witnesses) + 1) / 2 + 1
-}
-
-// Commit quorum: remotes + self only.
-// Witnesses are excluded because they do not replicate entries.
-func commitQuorum(remotes) int {
-    return (len(remotes) + 1) / 2 + 1
 }
 ```
 
-This separation means witnesses increase fault tolerance for leader
-election without affecting the data replication quorum.
+Witnesses vote in elections, so they **must** also be counted toward the
+commit quorum. `tryCommit` includes each witness's `match` (tracked via the
+metadata-only Replicate acks of `sendWitnessAppend`) in the sorted match array
+alongside the full replicas and the leader's own last index.
+
+**Why a unified quorum is required (safety).** If the commit quorum excluded
+witnesses (computing it over data nodes only) while the election quorum
+included them, the two quorums would be taken over different member sets and
+need not intersect in any node holding a committed entry. A commit could then
+land on a data-node minority, and a candidate that never saw that entry could
+win election on witness votes and truncate it — violating **Leader
+Completeness** and silently losing committed data. Counting witnesses in both
+quorums restores quorum intersection. This matches the dragonboat reference,
+whose single `quorum()` spans `remotes + witnesses`.
+
+**Why witness metadata is sufficient for safety.** A witness stores each
+entry's `(Index, Term)` but not its `Cmd`. That is enough to (a) gate commit
+via its `match` index and (b) enforce the up-to-date check during elections,
+so a candidate that never saw a committed entry can never win — Leader
+Completeness holds.
+
+**Residual trade-off: durability under permanent storage loss.** A commit may
+rest on a `{leader + witnesses}` quorum with its payload on the leader alone.
+Committed data survives any minority of *crash-restart* failures: a full
+replica holding the entry is required to win any subsequent election, so the
+entry is at worst briefly unavailable until such a replica returns. But if
+every full replica holding an entry suffers *permanent* storage loss (e.g. the
+leader's disk is destroyed while the other full replicas lag), the entry is
+unrecoverable — witnesses hold no payload — and the shard stalls: no surviving
+replica can pass the witnesses' up-to-date vote check, and recovery requires
+operator intervention (snapshot import at an earlier index). This is inherent
+to the witness design and matches the dragonboat reference.
+
+`WitnessConfig.RequireFullReplicaMajority` (default true) bounds membership
+*shape*: it rejects any witness-add or full-replica-removal that would leave
+the full replicas unable to form a quorum on their own. Note this does **not**
+prevent an individual commit from resting on `{leader + witnesses}` when the
+other full replicas lag — it only bounds how witness-dependent the membership
+can become. Set it false for witness-heavy deployments that knowingly accept
+the exposure. `WitnessConfig.MaxWitnesses` caps witness fan-out. The policy is
+REPLICATED STATE: it lives in `proto.Membership` (log, snapshots, WAL)
+alongside the member maps, is seeded at shard bootstrap from
+`config.WitnessConfig`, and changes only via an `UpdateWitnessPolicy`
+config change committed through Raft
+(`Host.RequestUpdateWitnessPolicy` / `SyncRequestUpdateWitnessPolicy`).
+Every replica therefore enforces the identical policy regardless of
+local configuration, and the policy survives restarts from the
+replicated state. A policy update must be satisfied by the CURRENT
+membership (validate-time; e.g. tightening a cap below the current
+witness count is rejected) — reshape first, then tighten. Enforcement
+happens at two validate-time gates, never on the deterministic apply
+path: the Host membership API pre-validates against the membership
+snapshot, and the leader re-validates in `handleLeaderPropose` before
+log append (`validateConfigChangePolicy`, reading the raft layer's
+mirror of the replicated policy) — closing the follower-forward path,
+where a proposal reaches the leader with no prior validation.
 
 ## 7. Snapshots
 
@@ -452,11 +512,53 @@ When `sendAppend` cannot resolve `prevLogTerm` or entries (log
 compacted), it calls `sendSnapshot`:
 
 1. Get the latest snapshot from `log.snapshot()`.
-2. Transition the remote to `remoteSnapshot` state.
+2. Transition the remote to `remoteSnapshot` state (paused).
 3. Send `InstallSnapshot` message.
 
 The engine layer (`transport`) handles snapshot chunking for large
 snapshots, reassembling chunks on disk before calling `LogDB.SaveSnapshot`.
+
+### Snapshot Status and the Post-Transfer Wait
+
+The transport reports the transfer outcome to the leader's raft layer as
+a `SnapshotStatus` message. `Hint` echoes the transfer sequence the
+leader stamped on the `InstallSnapshot` (`raft.snapshotSeq`, monotonic
+per raft instance; transport-local, never on the wire to the follower).
+`handleSnapshotStatus` discards a status whose sequence does not match
+the remote's current `snapshotSeq` — a late report from a superseded
+attempt, including a re-send of the SAME snapshot index, must not
+affect a newer in-flight one. Delivery is retried
+briefly on a transiently full inbox (`deliverSnapshotControl`): the
+status is one-shot, and losing it would leave the peer paused with no
+countdown armed.
+
+Neither outcome un-pauses the peer directly. Both arm the
+`snapshotWaitTicks` countdown, decremented once per leader tick by
+`tickSnapshotWaits` (called before any quiesce early-return, since a
+snapshot cycle can run entirely under quiesce):
+
+- **Success** arms `snapshotAckWaitMultiplier` (3) election timeouts.
+  Transfer completion only means the bytes arrived; the follower may
+  still be reassembling, persisting, and processing the snapshot.
+  Probing in that window draws a rejection whose hint backtracks `next`
+  into compacted territory, re-streaming the entire snapshot
+  redundantly. The peer normally exits earlier via its own
+  `ReplicateResp{LogIndex: ss.Index}` ack (`update` + `respondedTo`
+  with match >= snapshotIndex → probe).
+- **Failure** arms one election timeout as a retry backoff, so a
+  persistently failing transfer (unreachable peer, full receiver disk)
+  cannot re-stream full snapshots back-to-back.
+
+Countdown expiry falls back to probe, resuming the normal retry path
+including a fresh snapshot send. On the receiver, a re-sent snapshot
+that is already persisted is deduplicated — persistence is skipped, but
+the `InstallSnapshot` raft message is re-delivered from LogDB
+(`HandleSnapshot` dedup branch), so a follower whose original install
+delivery was dropped still advances and acks; `handleSnapshot` is
+idempotent for already-applied snapshots.
+
+This mirrors the dragonboat reference's wait state and delayed snapshot
+ack.
 
 ### rebuildRemotesFromMembership (raft.go:1131)
 
@@ -572,12 +674,12 @@ type readIndexStatus struct {
 }
 ```
 
-**Commit quorum for ReadIndex** (`raft.go:1439`):
-`checkReadIndexQuorum` uses `commitQuorum` (remotes + leader), not
-`electionQuorum`. Witnesses are excluded from ReadIndex confirmation
-by design—they return early from `handleHeartbeatResp` before the
-ReadIndex ack path. This matches the data-bearing quorum used for commit
-calculation.
+**ReadIndex quorum**: `checkReadIndexQuorum` uses the unified `quorum`
+(remotes + witnesses + self). Witness heartbeat acks count toward ReadIndex
+confirmation — `rebuildReplicaToBit` assigns witnesses ack bits and
+`handleHeartbeatResp` records their acks. Since witnesses vote in elections,
+the confirmation quorum must span the same voting set so it overlaps with
+every possible election-winning coalition (linearizability).
 
 **Witness ReadIndex rejection** (`raft.go:1261`): Witnesses cannot serve
 ReadIndex requests; they return `ErrInvalidOperation`. Witnesses lack the
@@ -697,22 +799,24 @@ the config change entry commits (`peer.go:458`).
 This ensures safe cluster reconfigurations by preventing two overlapping
 config change entries, which could lead to two disjoint majorities.
 
-### Config Change Takes Effect on Append
+### Config Change Takes Effect on Commit
 
-Per PhD thesis 4.1, membership changes take effect immediately when the
-config change entry is appended to the log, not when it commits. This is
-implemented in two places:
+Membership changes take effect when the config change entry COMMITS, not
+when it is appended (the etcd/dragonboat model, diverging from the
+PhD thesis 4.1 append-time rule). The single application point is
+`Peer.Commit` -> `processConfigChanges`: when an update's
+`CommittedEntries` contain config changes, they are applied to the
+membership, the immutable snapshot is republished, and
+`syncRaftRemotes()` adds/removes remote trackers — identically on
+leaders and followers.
 
-1. **Leader** (`peer.go:212-226`): After `ProposeConfigChange`, the
-   membership is updated and `syncRaftRemotes()` adds/removes remote
-   trackers immediately.
-
-2. **Follower** (`peer.go:127-132`): After receiving `Replicate` with
-   config change entries (verified actually appended via `matchTerm`),
-   `processConfigChanges()` applies each to membership and syncs remotes.
-
-This early application is safe because the entry's position in the log is
-established before any node can become leader (Ongaro 4.1).
+Commit-time application is safe because at most one config change is
+ever uncommitted: `handleLeaderPropose` rejects a second change while
+one is pending, and `becomeLeader` re-arms `pendingConfigChange` from
+uncommitted inherited entries. It also avoids the append-time trap where
+a just-added (possibly not yet running) member immediately counts toward
+the quorum required to commit its own addition, stalling commit and
+stepping the leader down via CheckQuorum.
 
 ### ConfigChangeID Staleness Detection
 
@@ -722,12 +826,13 @@ to the log, the leader verifies the `ConfigChangeID` matches the current
 state; if it was already applied, the entry is skipped. This prevents
 stale config changes from being re-applied after snapshot recovery.
 
-### Config Change Rollback on Log Truncation
+### Log Truncation Needs No Membership Rollback
 
-When the log is truncated (typically during snapshot recovery), committed
-config changes may be removed. The `rebuildMembershipFromLog()` function
-rescans the log to rebuild the membership to match reality. This prevents
-a stale membership snapshot from persisting after log truncation.
+Because membership only mutates on COMMITTED entries and committed
+entries are never truncated, conflict-driven log truncation cannot
+remove an applied config change. No rollback or log-rescan machinery
+exists; an appended-but-uncommitted config change that gets truncated
+was never applied in the first place.
 
 ### Dispatch Table
 
@@ -753,9 +858,10 @@ participate in elections and commit quorum.
 **Observers (Non-Voting Learners)**: Replicate the full log but do not
 vote. Used to bring new nodes up to speed before promotion to voter.
 
-**Witnesses**: Vote in elections but do not store full log entries (only
-metadata). Increase fault tolerance for leadership without affecting data
-quorum.
+**Witnesses**: Vote in elections and count toward the unified commit quorum,
+but store only entry metadata (Index/Term, no command payload). They add
+election fault tolerance at low storage cost; see Section 6 for the
+durability trade-off of witness-backed commits.
 
 ### Leader Self-Removal (Paper Section 6)
 

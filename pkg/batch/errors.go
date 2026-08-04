@@ -89,14 +89,29 @@ func (e *NilProposerError) Is(target error) bool {
 
 // FlushError wraps a flush failure with shard context for diagnostics.
 // The ShardID identifies which shard's batch failed to flush, and the
-// underlying Err contains the proposer's error.
+// underlying Err contains the proposer's error, which Unwrap exposes so
+// callers can match the proposer's own sentinels with errors.Is.
 type FlushError struct {
 	ShardID uint64
 	Err     error
+
+	// Indeterminate reports that the outcome of the proposal is UNKNOWN
+	// rather than a definite rejection: the proposer timed out or was
+	// canceled, so the batch may already be replicated and may still apply.
+	// A caller that retries an indeterminate flush must be prepared for the
+	// batch to be applied twice — the aggregator has no session/at-most-once
+	// path (see the Aggregator doc comment).
+	Indeterminate bool
 }
 
 // Error returns a human-readable description of the flush failure.
 func (e *FlushError) Error() string {
+	if e.Indeterminate {
+		return fmt.Sprintf(
+			"quicraft/batch: flush outcome indeterminate for shard %d: %v",
+			e.ShardID, e.Err,
+		)
+	}
 	return fmt.Sprintf("quicraft/batch: flush failed for shard %d: %v", e.ShardID, e.Err)
 }
 

@@ -19,6 +19,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // This file implements Shamir's Secret Sharing over GF(2^8) (see
@@ -75,23 +77,15 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 		return nil, &SplitError{Reason: fmt.Sprintf("reading random coefficients: %v", err)}
 	}
 
-	// Ensure every sharing polynomial is exactly degree (threshold-1): the top
-	// coefficient must be non-zero, else that secret byte degenerates to a
-	// lower-degree polynomial reconstructable from fewer than `threshold` shares
-	// (happens for ~1/256 of bytes with uniform randomness). Resample any zero
-	// top coefficient. The resampling depends only on random bytes, not the
-	// secret, so it leaks nothing via timing.
-	topIdx := threshold - 2 // index of c_{t-1} within each byte's (t-1) coefficients
-	var oneByte [1]byte
-	for b := range secret {
-		off := b*(threshold-1) + topIdx
-		for randCoeffs[off] == 0 {
-			if _, err := io.ReadFull(randReader, oneByte[:]); err != nil {
-				return nil, &SplitError{Reason: fmt.Sprintf("resampling top coefficient: %v", err)}
-			}
-			randCoeffs[off] = oneByte[0]
-		}
-	}
+	// The raw crypto/rand coefficients are used verbatim, INCLUDING a zero
+	// top coefficient. Uniform i.i.d. coefficients are what make Shamir
+	// information-theoretically secure: with t-1 shares every candidate
+	// secret byte remains exactly equally likely, and an adversary cannot
+	// distinguish a polynomial whose top coefficient happens to be zero
+	// from any other. Excluding c_{t-1}=0 (as a "degenerate polynomial"
+	// defense) would instead LEAK information — a t-1 coalition could rule
+	// out the one candidate secret consistent with c_{t-1}=0, reducing
+	// per-byte entropy from 8 bits to log2(255). Do not resample.
 
 	// No secret digest is embedded in shares: storing sha256(secret) per share
 	// is an offline oracle that defeats information-theoretic secrecy for
@@ -116,6 +110,9 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 			Value:     base64.StdEncoding.EncodeToString(raw),
 			Metadata:  make(map[string]string),
 		}
+		// raw holds this share's y-values; the base64 string is the only
+		// copy that must survive.
+		wipe(raw)
 	}
 
 	// Wipe the secret-derived scratch material.
@@ -185,41 +182,73 @@ func combine(shares []*Share) ([]byte, error) {
 	ys := make([][]byte, len(shares))
 	seenX := make(map[byte]struct{}, len(shares))
 	secretLen := -1
+	// Wipe every decoded buffer on every return path, mirroring
+	// CombineBytes. The share strings themselves are immutable and cannot
+	// be wiped, but leaving additional decoded copies of share material on
+	// the heap — including on validation-error returns — needlessly widens
+	// the exposure. The reconstructed secret is a separate buffer.
+	decoded := make([][]byte, 0, len(shares))
+	defer func() {
+		for _, d := range decoded {
+			wipe(d)
+		}
+	}()
 	for i, share := range shares {
 		raw, err := base64.StdEncoding.DecodeString(share.Value)
+		// Register before the error check: DecodeString returns the bytes
+		// decoded so far alongside a corrupt-input error, and those partial
+		// bytes are share material that must be wiped too.
+		decoded = append(decoded, raw)
 		if err != nil {
 			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
 		}
-		if len(raw) < rawShareOverhead+1 {
-			return nil, &CombineError{Reason: fmt.Sprintf("share %d too short (%d bytes)", i, len(raw))}
+		x, y, err := parseRawShare(raw, i, seenX, secretLen)
+		if err != nil {
+			return nil, err
 		}
-		if raw[0] != shareFormatVersion {
-			return nil, &CombineError{Reason: fmt.Sprintf(
-				"share %d has unsupported format version %d (legacy or foreign share)", i, raw[0])}
-		}
-		x := raw[1]
-		if x == 0 {
-			return nil, &CombineError{Reason: fmt.Sprintf("share %d has zero x-coordinate", i)}
-		}
-		if _, dup := seenX[x]; dup {
-			return nil, &CombineError{Reason: fmt.Sprintf("duplicate share at index %d (x-coordinate %d)", i, x)}
-		}
-		seenX[x] = struct{}{}
-
-		y := raw[rawShareOverhead:]
-		if secretLen == -1 {
-			secretLen = len(y)
-		} else if len(y) != secretLen {
-			return nil, &CombineError{Reason: fmt.Sprintf(
-				"share %d payload length %d differs from share 0 length %d", i, len(y), secretLen)}
-		}
+		secretLen = len(y)
 		xs[i] = x
 		ys[i] = y
 	}
 
-	// Lagrange interpolation at x=0. The basis coefficients depend only
-	// on the public x-coordinates and are computed once; secret-dependent
-	// y bytes flow only through constant-time gfMul.
+	return interpolateSecret(xs, ys, secretLen), nil
+}
+
+// parseRawShare validates a decoded [version][x][y...] share payload and
+// returns its x-coordinate and y-payload. It is the single copy of the share
+// wire-format rules shared by combine and CombineBytes, so the string and
+// byte reconstruction paths can never diverge on which shares they accept.
+// seenX tracks duplicate x-coordinates across the share set; secretLen is
+// the y-payload length established by share 0, or -1 when not yet known.
+func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (byte, []byte, error) {
+	if len(raw) < rawShareOverhead+1 {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf("share %d too short (%d bytes)", i, len(raw))}
+	}
+	if raw[0] != shareFormatVersion {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf(
+			"share %d has unsupported format version %d (legacy or foreign share)", i, raw[0])}
+	}
+	x := raw[1]
+	if x == 0 {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf("share %d has zero x-coordinate", i)}
+	}
+	if _, dup := seenX[x]; dup {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf("duplicate share at index %d (x-coordinate %d)", i, x)}
+	}
+	seenX[x] = struct{}{}
+	y := raw[rawShareOverhead:]
+	if secretLen != -1 && len(y) != secretLen {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf(
+			"share %d payload length %d differs from share 0 length %d", i, len(y), secretLen)}
+	}
+	return x, y, nil
+}
+
+// interpolateSecret reconstructs the secret via GF(2^8) Lagrange interpolation
+// at x=0 from the public x-coordinates and the per-share y-payloads. The basis
+// coefficients depend only on the public x-coordinates and are computed once;
+// secret-dependent y bytes flow only through constant-time gfMul.
+func interpolateSecret(xs []byte, ys [][]byte, secretLen int) []byte {
 	basis := gfLagrangeZero(xs)
 	secret := make([]byte, secretLen)
 	for b := 0; b < secretLen; b++ {
@@ -229,14 +258,68 @@ func combine(shares []*Share) ([]byte, error) {
 		}
 		secret[b] = v
 	}
-	return secret, nil
+	return secret
 }
 
-// wipe zeroes a byte slice.
-func wipe(b []byte) {
-	for i := range b {
-		b[i] = 0
+// CombineBytes reconstructs the secret from M-or-more raw share VALUES — the
+// base64-encoded [version][x][y...] payloads that are exactly the bytes of
+// Share.Value — WITHOUT integrity verification. It exists so callers that hold
+// share material in wipeable []byte buffers (e.g. memory-locked enclaves) never
+// have to copy it into an immutable, un-wipeable Go string just to reconstruct.
+// threshold is the M of the M-of-N scheme and must be at least 2, matching
+// Split. The same out-of-band-validation caveat as CombineUnverified applies.
+// Every decoded buffer — including partially decoded or validation-rejected
+// shares — is wiped on every return path; the caller still owns (and must
+// wipe) the input buffers.
+func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
+	if threshold < 2 {
+		return nil, &CombineError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
 	}
+	if len(values) == 0 {
+		return nil, &CombineError{Reason: "no shares provided"}
+	}
+	if len(values) < threshold {
+		return nil, &CombineError{Reason: fmt.Sprintf("need at least %d shares, got %d", threshold, len(values))}
+	}
+	xs := make([]byte, len(values))
+	ys := make([][]byte, len(values))
+	// Every decode buffer is registered in decoded BEFORE any bytes are
+	// written into it, so the deferred wipe covers partially decoded and
+	// validation-rejected shares too — not just the fully accepted ys. The
+	// reconstructed secret returned to the caller is a separate buffer.
+	decoded := make([][]byte, 0, len(values))
+	defer func() {
+		for _, d := range decoded {
+			wipe(d)
+		}
+	}()
+	seenX := make(map[byte]struct{}, len(values))
+	secretLen := -1
+	for i, val := range values {
+		raw := make([]byte, base64.StdEncoding.DecodedLen(len(val)))
+		decoded = append(decoded, raw)
+		n, err := base64.StdEncoding.Decode(raw, val)
+		if err != nil {
+			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+		}
+		x, y, err := parseRawShare(raw[:n], i, seenX, secretLen)
+		if err != nil {
+			return nil, err
+		}
+		secretLen = len(y)
+		xs[i] = x
+		ys[i] = y
+	}
+	return interpolateSecret(xs, ys, secretLen), nil
+}
+
+// wipe zeroes a byte slice. It delegates to enclave.WipeBytes (memguard),
+// whose zeroing is resistant to dead-store elimination; a plain range-assign
+// loop over a slice the compiler can prove dead may be optimized away.
+// pkg/enclave depends only on the standard library and memguard, so the
+// import cannot cycle back into pkg/crypto/shamir.
+func wipe(b []byte) {
+	enclave.WipeBytes(b)
 }
 
 // VerifyShare checks if a share is valid and consistent with other shares.

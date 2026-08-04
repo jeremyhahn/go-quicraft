@@ -262,10 +262,10 @@ func FuzzMessageBatchRoundTrip(f *testing.F) {
 	f.Fuzz(func(t *testing.T, binVer, deploymentID uint64, srcAddr string,
 		msgType, from, to uint64, entryCmd []byte) {
 
-		// Clamp wire version to valid range.
-		if binVer > WireVersion {
-			binVer = binVer % (WireVersion + 1)
-		}
+		// The decoder accepts exactly the current wire version (no
+		// negotiation, no legacy decode path), so only WireVersion
+		// round-trips.
+		binVer = WireVersion
 		// Clamp message type to valid range.
 		if msgType > RateLimit {
 			msgType = msgType % (RateLimit + 1)
@@ -613,19 +613,20 @@ func FuzzConfigChangeRoundTrip(f *testing.F) {
 // round-trips preserve the config change ID and all map entries.
 func FuzzMembershipRoundTrip(f *testing.F) {
 	f.Add(uint64(1), uint64(10), "addr-10", uint64(20), "obs-20",
-		uint64(30), "wit-30", uint64(40))
+		uint64(30), "wit-30", uint64(40), uint64(0), false)
 	f.Add(uint64(0), uint64(0), "", uint64(0), "",
-		uint64(0), "", uint64(0))
+		uint64(0), "", uint64(0), uint64(0), false)
 	f.Add(uint64(math.MaxUint64), uint64(1), "a", uint64(2), "b",
-		uint64(3), "c", uint64(4))
+		uint64(3), "c", uint64(4), uint64(math.MaxUint64), true)
 	f.Add(uint64(999), uint64(100), "node-a:5000", uint64(200), "node-b:5001",
-		uint64(300), "node-c:5002", uint64(400))
+		uint64(300), "node-c:5002", uint64(400), uint64(3), true)
 
 	f.Fuzz(func(t *testing.T, ccID uint64,
 		addrKey uint64, addrVal string,
 		obsKey uint64, obsVal string,
 		witKey uint64, witVal string,
-		removedKey uint64) {
+		removedKey uint64,
+		maxWitnesses uint64, requireFullMajority bool) {
 
 		// Clamp address values to valid length.
 		if len(addrVal) > MaxAddressLength {
@@ -638,34 +639,74 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 			witVal = witVal[:MaxAddressLength]
 		}
 
-		m := Membership{
-			ConfigChangeID: ccID,
-			Addresses:      map[uint64]string{addrKey: addrVal},
-			Observers:      map[uint64]string{obsKey: obsVal},
-			Witnesses:      map[uint64]string{witKey: witVal},
-			Removed:        map[uint64]bool{removedKey: true},
+		// Exercise every map shape: nil, empty and populated, so Size(),
+		// MarshalTo and UnmarshalFrom agree for all of them.
+		shapes := []Membership{
+			{
+				ConfigChangeID:             ccID,
+				MaxWitnesses:               maxWitnesses,
+				RequireFullReplicaMajority: requireFullMajority,
+				Addresses:                  map[uint64]string{addrKey: addrVal},
+				Observers:                  map[uint64]string{obsKey: obsVal},
+				Witnesses:                  map[uint64]string{witKey: witVal},
+				Removed:                    map[uint64]bool{removedKey: true},
+			},
+			{
+				ConfigChangeID:             ccID,
+				MaxWitnesses:               maxWitnesses,
+				RequireFullReplicaMajority: requireFullMajority,
+			},
+			{
+				ConfigChangeID: ccID,
+				Addresses:      map[uint64]string{},
+				Observers:      map[uint64]string{},
+				Witnesses:      map[uint64]string{},
+				Removed:        map[uint64]bool{},
+			},
 		}
+		for i := range shapes {
+			checkMembershipRoundTrip(t, &shapes[i])
+		}
+	})
+}
 
-		buf := make([]byte, m.Size())
-		n, err := m.MarshalTo(buf)
-		if err != nil {
-			t.Fatalf("MarshalTo failed: %v", err)
-		}
-		if n != m.Size() {
-			t.Fatalf("MarshalTo wrote %d bytes, expected %d", n, m.Size())
-		}
+// checkMembershipRoundTrip asserts Size() == MarshalTo() == UnmarshalFrom()
+// and full field equality for one membership shape, and pins the version
+// byte at wire offset 0.
+func checkMembershipRoundTrip(t *testing.T, m *Membership) {
+	t.Helper()
 
-		var m2 Membership
-		n2, err := m2.UnmarshalFrom(buf)
-		if err != nil {
-			t.Fatalf("round-trip UnmarshalFrom failed: %v", err)
-		}
-		if n2 != n {
-			t.Fatalf("UnmarshalFrom consumed %d bytes, MarshalTo wrote %d", n2, n)
-		}
+	buf := make([]byte, m.Size())
+	n, err := m.MarshalTo(buf)
+	if err != nil {
+		t.Fatalf("MarshalTo failed: %v", err)
+	}
+	if n != m.Size() {
+		t.Fatalf("MarshalTo wrote %d bytes, expected %d", n, m.Size())
+	}
+	if buf[0] != membershipWireVersion {
+		t.Fatalf("wire byte 0 = %d, want version %d", buf[0], membershipWireVersion)
+	}
 
+	var m2 Membership
+	n2, err := m2.UnmarshalFrom(buf)
+	if err != nil {
+		t.Fatalf("round-trip UnmarshalFrom failed: %v", err)
+	}
+	if n2 != n {
+		t.Fatalf("UnmarshalFrom consumed %d bytes, MarshalTo wrote %d", n2, n)
+	}
+
+	{
 		if m.ConfigChangeID != m2.ConfigChangeID {
 			t.Fatalf("ConfigChangeID mismatch: %d != %d", m.ConfigChangeID, m2.ConfigChangeID)
+		}
+		if m.MaxWitnesses != m2.MaxWitnesses {
+			t.Fatalf("MaxWitnesses mismatch: %d != %d", m.MaxWitnesses, m2.MaxWitnesses)
+		}
+		if m.RequireFullReplicaMajority != m2.RequireFullReplicaMajority {
+			t.Fatalf("RequireFullReplicaMajority mismatch: %v != %v",
+				m.RequireFullReplicaMajority, m2.RequireFullReplicaMajority)
 		}
 		if len(m.Addresses) != len(m2.Addresses) {
 			t.Fatalf("Addresses length mismatch: %d != %d", len(m.Addresses), len(m2.Addresses))
@@ -699,7 +740,7 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 				t.Fatalf("Removed[%d] mismatch: %v != %v", k, v, m2.Removed[k])
 			}
 		}
-	})
+	}
 }
 
 // FuzzStateRoundTrip verifies that State marshal/unmarshal round-trips

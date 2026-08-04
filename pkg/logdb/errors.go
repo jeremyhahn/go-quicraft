@@ -47,8 +47,12 @@ var (
 	// or equal to the currently recorded snapshot.
 	ErrSnapshotOutOfDate = errors.New("logdb: snapshot out of date")
 
-	// ErrLogGapDetected is returned when SetRange detects a gap between
-	// the existing range and the new entries. This indicates a bug in
-	// the entry persistence pipeline.
+	// ErrLogGapDetected is returned when a hole in the stored log is
+	// detected: SetRange sees new entries that are not contiguous with the
+	// existing range, EntryRange finds an entry count that does not match
+	// the first..last index span, or IterateEntries finds that the stored
+	// range does not begin at the requested index. A gap indicates a bug in
+	// the entry persistence pipeline or on-disk corruption; it must never
+	// be served as a silently shortened result (Log Matching violation).
 	ErrLogGapDetected = errors.New("logdb: gap detected in log entries")
 )

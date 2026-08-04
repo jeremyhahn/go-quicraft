@@ -47,6 +47,18 @@ type Snapshotter interface {
 	LastApplied() uint64
 }
 
+// appliedSetter is an optional upgrade of Snapshotter. When the concrete
+// snapshotter implements it (the rsm.StateMachine does), the snapshot pool
+// seeds the snapshotter's own applied counter after RecoverFromSnapshot
+// installs snapshot state, keeping it consistent with the node's
+// (lastApplied, lastAppliedTerm) markers. saveSnapshot reads its snapshot
+// index from Snapshotter.LastApplied(), so the counter MUST reflect the
+// recovered index or the next snapshot would pair a stale index with
+// post-recovery state.
+type appliedSetter interface {
+	SetLastApplied(idx uint64)
+}
+
 // gatedSnapshotter is an optional upgrade of Snapshotter. When the concrete
 // snapshotter implements it (the rsm.StateMachine does), the snapshot pool uses
 // it to release the apply gate as soon as the consistent point-in-time has been
@@ -474,6 +486,12 @@ func (n *Node) SnapshotSaveDir(index uint64) string {
 // LastSnapshotIndex returns the log index of the last completed snapshot.
 func (n *Node) LastSnapshotIndex() uint64 {
 	return n.lastSnapshotIndex.Load()
+}
+
+// LastApplied returns the highest log index applied to the state machine,
+// as tracked by the apply worker (and seeded on restart/recovery).
+func (n *Node) LastApplied() uint64 {
+	return n.lastApplied.Load()
 }
 
 // SeedLastApplied initializes the node's applied markers to a recovered

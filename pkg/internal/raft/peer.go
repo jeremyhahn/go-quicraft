@@ -151,9 +151,83 @@ func (p *Peer) publishMembership() {
 // this, the engine would re-apply entries that the on-disk SM has already
 // persisted, which is wasteful for large logs.
 //
+// Skipping those entries would also skip their MEMBERSHIP effect, because
+// commit-time semantics apply config changes only from CommittedEntries
+// (Peer.Commit -> processConfigChanges). Any committed config change in the
+// skipped window therefore has to be folded in here, or this replica would
+// come up computing quorum over a stale voting set. The scan is idempotent:
+// membership.apply skips anything at or below the current configChangeID.
+//
 // Must be called before the first Tick.
 func (p *Peer) SetProcessedIndex(index uint64) {
 	p.r.log.processed = index
+	p.replayConfigChangesTo(index)
+}
+
+// replayConfigChangesTo folds committed config changes at or below index into
+// the membership. Entries already covered by the recovered snapshot membership
+// are skipped by the replay guard, so only the (snapshotIndex, index] window
+// has any effect.
+func (p *Peer) replayConfigChangesTo(index uint64) {
+	first := p.r.log.firstIndex()
+	if first > index {
+		return
+	}
+	changed := false
+	const chunk uint64 = 1024
+	for low := first; low <= index; {
+		high := low + chunk
+		if high > index+1 {
+			high = index + 1
+		}
+		entries, err := p.r.log.entries(low, high, 0)
+		if err != nil || len(entries) == 0 {
+			// Compacted or unreadable: the snapshot membership already
+			// covers everything below the compaction floor.
+			slog.Debug("config change replay stopped",
+				"shard", p.shardID,
+				"replica", p.replicaID,
+				"low", low,
+				"error", err,
+			)
+			break
+		}
+		for i := range entries {
+			if entries[i].Type&proto.EntryTypeMask != proto.EntryConfigChange {
+				continue
+			}
+			if len(entries[i].Cmd) == 0 {
+				continue
+			}
+			var cc proto.ConfigChange
+			if _, err := cc.UnmarshalFrom(entries[i].Cmd); err != nil {
+				slog.Warn("config change replay unmarshal failed",
+					"shard", p.shardID,
+					"replica", p.replicaID,
+					"entry_index", entries[i].Index,
+					"error", err,
+				)
+				continue
+			}
+			if err := p.membership.apply(cc, entries[i].Index); err != nil {
+				// Benign on the replay path (duplicate adds, removed
+				// tombstones); logged so an unexpected skip is visible.
+				slog.Warn("config change replay skipped",
+					"shard", p.shardID,
+					"replica", p.replicaID,
+					"entry_index", entries[i].Index,
+					"error", err,
+				)
+				continue
+			}
+			changed = true
+		}
+		low = entries[len(entries)-1].Index + 1
+	}
+	if changed {
+		p.publishMembership()
+		p.syncRaftRemotes()
+	}
 }
 
 // SetOnCampaign sets the callback that fires when the raft state machine
@@ -220,54 +294,49 @@ func (p *Peer) DrainFreeOrderMessages() []proto.Message {
 func (p *Peer) Handle(msg proto.Message) error {
 	err := p.r.step(msg)
 
-	// Per PhD thesis 4.1: config changes take effect on log append,
-	// not on commit. When a follower appends config change entries
-	// from the leader, update membership and remotes immediately.
-	// Guard: only apply if the entries were actually appended (not
-	// rejected due to prevLogIndex/prevLogTerm mismatch). handleAppend
-	// always returns nil, so err==nil is not sufficient.
-	if msg.Type == proto.Replicate && err == nil && len(msg.Entries) > 0 {
-		// Per PhD thesis 4.1: "a log entry for a configuration change
-		// can be removed (if leadership changes); in this case, a
-		// server must be prepared to fall back to the previous
-		// configuration in its log." When tryAppend detects a conflict
-		// and truncates entries, some of those truncated entries may
-		// have been config changes already applied to membership.
-		// Rebuild membership from the committed base before applying
-		// new config changes from the replacement entries.
-		if p.r.logTruncated {
-			p.r.logTruncated = false
-			p.rebuildMembershipFromLog()
-		}
-		lastEntry := msg.Entries[len(msg.Entries)-1]
-		if p.r.log.matchTerm(lastEntry.Index, lastEntry.Term) {
-			p.processConfigChanges(msg.Entries)
-		}
-	}
-	// When a Propose message with config change entries is delivered
-	// through the engine inbox (Host.RequestAddNode etc.), the leader's
-	// handleLeaderPropose appends the entries but does not apply the
-	// membership change. Process them here so membership takes effect
-	// immediately on the leader, matching the ProposeConfigChange path.
-	if msg.Type == proto.Propose && err == nil && p.IsLeader() && len(msg.Entries) > 0 {
-		p.processConfigChanges(msg.Entries)
-	}
+	// Config changes take effect on COMMIT, not on log append: committed
+	// EntryConfigChange entries are applied to membership in Peer.Commit
+	// via processConfigChanges, on leaders and followers alike. Because
+	// only committed entries mutate membership, log truncation on
+	// conflict can never remove an applied config change, so no
+	// membership rollback/rebuild is needed here.
 	if msg.Type == proto.InstallSnapshot && err == nil {
-		// Only overwrite membership when the log was fully replaced
-		// (non-matching case). A pending snapshot in inmem indicates
-		// that handleSnapshot called restore(), meaning the log does
-		// NOT match and all entries were discarded. When entries are
-		// retained (matching case), they may contain config changes
-		// newer than the snapshot's membership, so overwriting would
-		// lose those changes.
-		if p.r.log.pendingSnapshot() != nil {
-			p.membership = newMembership(msg.Snapshot.Membership)
+		// Adopt the snapshot's membership on BOTH branches, gated on it
+		// not being older than what we already have.
+		//
+		// The matching-log branch also advances the processed marker to
+		// the snapshot index, so config changes in (processed, ss.Index]
+		// are never emitted as CommittedEntries and never reach
+		// processConfigChanges — the ONLY place membership is applied
+		// under commit-time semantics. Skipping the adoption there would
+		// silently drop them, leaving this replica computing quorum over
+		// a smaller voting set than the rest of the cluster.
+		//
+		// Adopting is safe because an applied config change always has
+		// index <= processed <= committed < ss.Index (handleSnapshot
+		// early-rejects ss.Index <= committed), so the snapshot's
+		// membership can never be older than the local one. Config
+		// changes RETAINED above ss.Index still apply normally: the
+		// membership.apply replay guard skips anything at or below the
+		// adopted ConfigChangeID and applies the rest.
+		// A restore always adopts (the log was fully replaced). The
+		// matching branch adopts only when the snapshot is STRICTLY newer,
+		// so an equal ConfigChangeID (identical configuration) or a
+		// locally-newer one (config changes already applied above
+		// ss.Index) leaves the local membership untouched.
+		ss := msg.Snapshot
+		restored := p.r.log.pendingSnapshot() != nil
+		if restored || ss.Membership.ConfigChangeID > p.membership.configChangeID {
+			p.membership = newMembership(ss.Membership)
 			// Publish immutable snapshot for concurrent readers.
 			p.publishMembership()
+			p.syncRaftRemotes()
 			// Snapshot delivers the full cluster membership. A joining
 			// node now has complete membership knowledge and can enforce
 			// per-shard message authorization.
 			p.joining.Store(false)
+		}
+		if restored {
 			// Mark pending snapshot for HasUpdate fast-path so the
 			// engine processes the snapshot even if no other state
 			// changed.
@@ -307,9 +376,16 @@ func (p *Peer) Propose(entries []proto.Entry) (uint64, error) {
 // change is serialized as an EntryConfigChange entry and routed through
 // the raft state machine as a Propose message.
 //
-// Per Raft thesis Section 4.1: membership takes effect immediately on
-// log append, not on commit. The membership struct is updated after the
-// entry is successfully appended by the raft state machine.
+// Membership takes effect when the entry COMMITS, not when it is
+// appended (the etcd/dragonboat model, diverging from Raft thesis
+// Section 4.1 append-time semantics). The commit-time application is in
+// Peer.Commit via processConfigChanges. Applying at commit is safe
+// because at most one config change is ever uncommitted at a time:
+// handleLeaderPropose rejects a second change while one is pending, and
+// becomeLeader re-arms pendingConfigChange from uncommitted inherited
+// entries. Append-time application would let a just-added (possibly not
+// yet running) member count toward the quorum required to commit its
+// own addition, stalling commit and stepping the leader down.
 func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 	if !p.IsLeader() {
 		return &NotLeaderError{
@@ -317,7 +393,9 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 		}
 	}
 
-	// Validate the config change before proposing.
+	// Validate the config change before proposing. The replicated witness
+	// policy is part of the membership itself, so this path and the Host
+	// API path enforce identical rules.
 	err := p.membership.validate(cc)
 	if err != nil {
 		return err
@@ -344,21 +422,6 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 		return err
 	}
 
-	// Apply the config change to membership immediately (Raft Section 4.1).
-	// The entry's index was assigned by the raft state machine during
-	// handleLeaderPropose; we use the last index in the log.
-	entryIndex := p.r.log.lastIndex()
-	applyErr := p.membership.apply(cc, entryIndex)
-	if applyErr != nil {
-		return applyErr
-	}
-
-	// Publish immutable snapshot for concurrent readers.
-	p.publishMembership()
-
-	// Sync raft remotes from updated membership.
-	p.syncRaftRemotes()
-
 	p.syncLeaderID()
 	return nil
 }
@@ -372,7 +435,8 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 // This is used by the Host membership API (RequestAddNode, RequestAddWitness,
 // RequestRemoveNode, etc.), whose proposals are delivered through the engine
 // inbox and reach membership.apply directly — a path that deliberately does
-// NOT re-check the cap so that committed changes always replay deterministically.
+// NOT re-check the cap or the witness policy so that committed changes always
+// replay deterministically.
 // Pre-validating here gives the caller a prompt error instead of a hung
 // RequestState (or, for a 65th voting member, an invariant panic in
 // rebuildReplicaToBit).
@@ -384,11 +448,13 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 // commits concurrently may cause a benign false rejection, which the caller
 // resolves by re-reading the membership and retrying.
 func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
-	snap := p.membershipSnap.Load()
-	if snap == nil {
-		return newMembership(proto.Membership{}).validate(cc)
+	var m *membership
+	if snap := p.membershipSnap.Load(); snap == nil {
+		m = newMembership(proto.Membership{})
+	} else {
+		m = newMembership(snap.toProto())
 	}
-	return newMembership(snap.toProto()).validate(cc)
+	return m.validate(cc)
 }
 
 // syncRaftRemotes synchronizes the raft state machine's remote tracking
@@ -397,13 +463,22 @@ func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 func (p *Peer) syncRaftRemotes() {
 	nextIdx := p.r.log.lastIndex() + 1
 
-	// Add new remotes.
+	// Add new remotes. An observer being promoted to voter keeps its
+	// existing remote struct: it carries live replication progress
+	// (match/next) and possibly an in-flight snapshot transfer or ack
+	// wait. Recreating it at next=lastIndex+1 would immediately probe a
+	// potentially still-restoring node, drawing the compacted-hint
+	// rejection and a redundant full snapshot re-send.
 	for id := range p.membership.addresses {
 		if id == p.replicaID {
 			continue
 		}
 		if _, ok := p.r.remotes[id]; !ok {
-			p.r.remotes[id] = newRemote(nextIdx, maxInflightMsgs)
+			if promoted, wasObserver := p.r.observers[id]; wasObserver {
+				p.r.remotes[id] = promoted
+			} else {
+				p.r.remotes[id] = newRemote(nextIdx, maxInflightMsgs)
+			}
 		}
 	}
 	// Remove departed remotes.
@@ -453,6 +528,12 @@ func (p *Peer) syncRaftRemotes() {
 		}
 	}
 
+	// Mirror the replicated witness policy into the raft layer so the
+	// leader-side propose gate (validateConfigChangePolicy) enforces the
+	// same policy as the membership validators.
+	p.r.maxWitnesses = p.membership.maxWitnesses
+	p.r.requireFullReplicaMajority = p.membership.requireFullReplicaMajority
+
 	// When the node is leader, rebuild quorum and lease tracking maps
 	// so that new voting members' heartbeat acks count correctly.
 	if p.r.state == leader {
@@ -499,113 +580,10 @@ func (p *Peer) checkLeaderSelfRemoval() {
 	}
 }
 
-// rebuildMembershipFromLog rebuilds the membership from the committed base
-// (LogReader snapshot membership) plus any config change entries remaining
-// in the log. This is called when log truncation overwrites entries that
-// may have contained config changes already applied to membership.
-//
-// Per PhD thesis 4.1: "a log entry for a configuration change can be
-// removed (if leadership changes); in this case, a server must be
-// prepared to fall back to the previous configuration in its log."
-//
-// The rebuild scans from firstIndex to lastIndex, which covers both
-// LogDB-persisted entries and in-memory entries. This is safe because
-// config changes are rare; the scan cost is amortized over many normal
-// entries between config changes.
-func (p *Peer) rebuildMembershipFromLog() {
-	// Start from the committed base membership. This is the membership
-	// from the last snapshot (or bootstrap), which is guaranteed to be
-	// correct because snapshots are only taken at committed state.
-	_, baseMembership := p.logReader.NodeState()
-	p.membership = newMembership(baseMembership)
-
-	// Scan all log entries for config changes and replay them.
-	firstIdx := p.r.log.firstIndex()
-	lastIdx := p.r.log.lastIndex()
-	if firstIdx > lastIdx {
-		// Empty log after truncation; base membership is correct.
-		p.publishMembership()
-		p.syncRaftRemotes()
-		return
-	}
-
-	// Read entries in chunks to avoid loading the entire log at once.
-	// Config changes are rare, so most chunks contain zero config
-	// changes and the scan is fast.
-	const chunkSize uint64 = 1024
-	for low := firstIdx; low <= lastIdx; low += chunkSize {
-		high := low + chunkSize
-		if high > lastIdx+1 {
-			high = lastIdx + 1
-		}
-		entries, err := p.r.log.entries(low, high, 0)
-		if err != nil {
-			slog.Warn("rebuildMembershipFromLog: failed to read entries",
-				"shard_id", p.shardID,
-				"replica_id", p.replicaID,
-				"low", low,
-				"high", high,
-				"error", err,
-			)
-			// Cannot read entries; keep the base membership.
-			break
-		}
-		for i := range entries {
-			if entries[i].Type&proto.EntryTypeMask != proto.EntryConfigChange {
-				continue
-			}
-			if len(entries[i].Cmd) == 0 {
-				continue
-			}
-			var cc proto.ConfigChange
-			if _, unmarshalErr := cc.UnmarshalFrom(entries[i].Cmd); unmarshalErr != nil {
-				slog.Warn("rebuildMembershipFromLog: config change unmarshal failed",
-					"shard_id", p.shardID,
-					"replica_id", p.replicaID,
-					"entry_index", entries[i].Index,
-					"error", unmarshalErr,
-				)
-				continue
-			}
-			// Some apply errors are expected during rebuild (duplicate adds
-			// already present in the base membership, or adds of a replica
-			// that a later committed entry removes — the removed tombstone is
-			// intentional: a removed replicaID can only rejoin under a NEW id).
-			// These are benign and replay deterministically. We log at WARN
-			// rather than DEBUG so that an UNEXPECTED skip (which would mean
-			// the rebuilt membership diverges from the committed config) is
-			// visible to operators instead of silently swallowed.
-			if applyErr := p.membership.apply(cc, entries[i].Index); applyErr != nil {
-				slog.Warn("rebuildMembershipFromLog: config change apply skipped during replay",
-					"shard_id", p.shardID,
-					"replica_id", p.replicaID,
-					"entry_index", entries[i].Index,
-					"change_type", cc.Type,
-					"cc_replica_id", cc.ReplicaID,
-					"error", applyErr,
-				)
-			}
-		}
-	}
-
-	// Publish the rebuilt membership and sync raft remotes.
-	p.publishMembership()
-	p.syncRaftRemotes()
-
-	slog.Debug("membership rebuilt from log after truncation",
-		"shard_id", p.shardID,
-		"replica_id", p.replicaID,
-		"first_index", firstIdx,
-		"last_index", lastIdx,
-		"voters", len(p.membership.addresses),
-		"observers", len(p.membership.observers),
-		"witnesses", len(p.membership.witnesses),
-	)
-}
-
-// processConfigChanges scans entries for config changes and applies them
-// to the peer's membership. Per PhD thesis 4.1, config changes take effect
-// immediately on log append.
+// processConfigChanges scans COMMITTED entries for config changes and
+// applies them to the peer's membership, publishing the updated snapshot
+// and syncing raft remote tracking. Called from Peer.Commit: membership
+// takes effect at commit time (etcd/dragonboat model), not on log append.
 func (p *Peer) processConfigChanges(entries []proto.Entry) {
 	needsSync := false
 	for i := range entries {
@@ -929,19 +907,54 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 // Returns an error if the log reader detects a gap in the entry range,
 // which indicates a bug in the entry persistence pipeline.
 func (p *Peer) Commit(update proto.Update) error {
+	// Register durable state with the LogReader FIRST. These are the only
+	// fallible steps in Commit; running them before any marker advances
+	// keeps an error fully RE-DELIVERABLE — the processed marker has not
+	// moved, so entriesToApply() will offer the same batch again. If they
+	// ran after appliedTo, a failure here would strand committed entries
+	// that can never be re-emitted (the state machine would silently miss
+	// a range while the shard kept serving reads).
+	if !update.Snapshot.IsEmpty() {
+		// Without this the LogReader keeps its initial empty range and
+		// subsequent Append calls for entries after the snapshot index
+		// fail with ErrLogGapDetected.
+		if err := p.logReader.ApplySnapshot(update.Snapshot); err != nil {
+			return err
+		}
+	}
+	if len(update.EntriesToSave) > 0 {
+		// Updates the tracked range and term cache so Term() lookups still
+		// resolve for entries commitUpdate -> appliedLogTo is about to
+		// truncate from inmem; without it the leader's sendAppend cannot
+		// resolve term(prevLogIndex) for slow followers.
+		if err := p.logReader.Append(update.EntriesToSave); err != nil {
+			return err
+		}
+	}
+
 	// Advance the processed marker before commitUpdate, which asserts
-	// that LastApplied <= processed.
+	// that LastApplied <= processed. Everything from here on is
+	// infallible, so the update is guaranteed to reach the apply stage.
 	if len(update.CommittedEntries) > 0 {
 		lastProcessed := update.CommittedEntries[len(update.CommittedEntries)-1].Index
 		p.r.log.appliedTo(lastProcessed)
 
-		// Process committed config changes. The leader enforces the
-		// single-pending invariant (handleLeaderPropose rejects proposals
-		// when pendingConfigChange is true), so at most one config change
-		// is pending at any given time on the leader. However, a follower
-		// catching up via log replication can legitimately receive a batch
-		// containing multiple committed config changes that were proposed
-		// and committed across separate leader rounds. Process each one
+		// Apply committed config changes to membership and sync raft
+		// remotes. This is THE point where membership takes effect
+		// (commit-time semantics, see ProposeConfigChange): each
+		// committed entry flows through exactly one update's
+		// CommittedEntries because the processed marker advances
+		// monotonically. Must run before checkLeaderSelfRemoval below so
+		// self-removal sees the post-change membership.
+		p.processConfigChanges(update.CommittedEntries)
+
+		// The leader enforces the single-pending invariant
+		// (handleLeaderPropose rejects proposals when pendingConfigChange
+		// is true), so at most one config change is pending at any given
+		// time on the leader. However, a follower catching up via log
+		// replication can legitimately receive a batch containing
+		// multiple committed config changes that were proposed and
+		// committed across separate leader rounds. Process each one
 		// sequentially: clear pendingConfigChange and check leader self-
 		// removal for every config change entry in the batch.
 		for i := range update.CommittedEntries {
@@ -965,16 +978,9 @@ func (p *Peer) Commit(update proto.Update) error {
 		uc.StableLogTerm = last.Term
 	}
 
-	// Record stable snapshot. When a snapshot is persisted (e.g., from an
-	// InstallSnapshot received by a joining node), update the LogReader's
-	// marker to the snapshot index. Without this, the LogReader still has
-	// its initial empty range and subsequent Append calls for entries
-	// after the snapshot index will fail with ErrLogGapDetected.
+	// Record stable snapshot (registered with the LogReader above).
 	if !update.Snapshot.IsEmpty() {
 		uc.StableSnapshotTo = update.Snapshot.Index
-		if err := p.logReader.ApplySnapshot(update.Snapshot); err != nil {
-			return err
-		}
 	}
 
 	// Record the last applied index from the previous cycle. This is the
@@ -993,18 +999,21 @@ func (p *Peer) Commit(update proto.Update) error {
 		uc.ReadyToRead = uint64(len(update.ReadyToRead))
 	}
 
-	// Update the log reader's tracked range and term cache so it can
-	// serve Term() lookups for entries that are about to be truncated
-	// from inmem by commitUpdate → appliedLogTo. Without this, the
-	// leader's sendAppend would fail to resolve term(prevLogIndex) for
-	// slow followers whose next points to a truncated entry.
-	if len(update.EntriesToSave) > 0 {
-		if err := p.logReader.Append(update.EntriesToSave); err != nil {
-			return err
+	p.r.log.commitUpdate(uc)
+
+	// Persistence edge: tryCommit uses the leader's durable index
+	// (inmem.savedTo) as its own match, so a commit that was blocked only
+	// on local durability becomes possible exactly here, after savedTo
+	// advanced. Re-evaluate and, if the commit index moved, broadcast so
+	// followers learn it promptly. This mirrors etcd's async-storage-
+	// writes design (self-directed append-resp after the local append
+	// completes). The messages land in r.msgs and are drained by the
+	// commit worker's piggyback update or the next step-worker cycle.
+	if p.r.state == leader && uc.StableLogTo > 0 {
+		if p.r.tryCommit() {
+			p.r.broadcastAppend()
 		}
 	}
-
-	p.r.log.commitUpdate(uc)
 	return nil
 }
 

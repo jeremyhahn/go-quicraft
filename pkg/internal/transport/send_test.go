@@ -557,7 +557,7 @@ func TestEnqueueToTarget_PruneThenEnqueueReEnqueues(t *testing.T) {
 	tr.sendQueuesMu.Unlock()
 
 	msg := proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 7}
-	if ok := tr.enqueueToTarget(target, msg); !ok {
+	if ok := tr.enqueueToTarget(target, msg, false); !ok {
 		t.Fatal("enqueueToTarget returned false (transport stopped) unexpectedly")
 	}
 
@@ -607,7 +607,7 @@ func TestEnqueueToTarget_FreshQueueNotMarkedClosed(t *testing.T) {
 
 	const target = "127.0.0.1:9998"
 	msg := proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 3}
-	if ok := tr.enqueueToTarget(target, msg); !ok {
+	if ok := tr.enqueueToTarget(target, msg, false); !ok {
 		t.Fatal("enqueueToTarget returned false unexpectedly")
 	}
 	tr.sendQueuesMu.RLock()

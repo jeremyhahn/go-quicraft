@@ -63,7 +63,20 @@ func newTermRingBuffer(capacity int) *termRingBuffer {
 
 // append adds an (index, term) pair at the tail of the ring buffer.
 // If the buffer is full, the oldest entry (at head) is evicted.
+//
+// lookup binary-searches the buffer, so the stored indices must stay
+// strictly increasing. An index at or below the current tail would break
+// that ordering, so the superseded suffix is dropped first (trimFrom) and
+// the pair is appended over it. This repairs — rather than corrupts — the
+// ring when a caller re-appends an overwritten index.
 func (r *termRingBuffer) append(index, term uint64) {
+	if r.count > 0 {
+		bufLen := len(r.buf)
+		last := r.buf[(r.head+r.count-1)%bufLen]
+		if index <= last.index {
+			r.trimFrom(index)
+		}
+	}
 	bufLen := len(r.buf)
 	tail := (r.head + r.count) % bufLen
 	r.buf[tail] = termRingEntry{index: index, term: term}
@@ -122,6 +135,34 @@ func (r *termRingBuffer) trimTo(index uint64) {
 	// lo is the number of entries to remove.
 	r.head = (r.head + lo) % bufLen
 	r.count -= lo
+}
+
+// trimFrom removes all entries with index >= the given cutoff, dropping
+// them from the tail. Uses binary search to find the new count in O(log n).
+//
+// This is the truncation counterpart of trimTo: a follower conflict
+// truncation replaces a suffix of the log, and every cached term at or
+// above the new first index is superseded. Leaving them cached would let
+// termLocked serve a stale term for a re-written index (Log Matching
+// violation) and would bake a wrong markerTerm into Compact.
+func (r *termRingBuffer) trimFrom(index uint64) {
+	if r.count == 0 {
+		return
+	}
+	bufLen := len(r.buf)
+	// Binary search for the first entry with entry.index >= index.
+	lo, hi := 0, r.count
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		entry := r.buf[(r.head+mid)%bufLen]
+		if entry.index < index {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	// lo is the number of entries to keep.
+	r.count = lo
 }
 
 // clear resets the buffer to empty without deallocating.
@@ -310,11 +351,14 @@ func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, e
 		return result, nil
 	}
 
-	// Reuse the logdb entry buffer to avoid per-call allocation.
+	// Reuse the logdb entry buffer to avoid per-call allocation. The maxSize
+	// budget is enforced by IterateEntries itself: every LogDB backend stops
+	// BEFORE appending an entry that would exceed it, except for the first
+	// entry which is always included so a single oversized entry can still
+	// make progress. No post-trim is therefore possible or needed here.
 	ents := lr.logdbEntryBuf[:0]
-	var size uint64
 	var err error
-	ents, size, err = lr.logdb.IterateEntries(
+	ents, _, err = lr.logdb.IterateEntries(
 		ents, 0, lr.shardID, lr.replicaID, low, high, maxSize,
 	)
 	if err != nil {
@@ -325,16 +369,7 @@ func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, e
 	// Reuse the proto entry buffer to avoid per-call conversion allocation.
 	lr.protoEntryBuf = logdbEntriesToProtoReuse(lr.protoEntryBuf, ents)
 
-	result := lr.protoEntryBuf
-
-	// Apply maxSize limiting: if we exceeded maxSize and have more than
-	// one entry, trim the last entry that pushed us over the limit.
-	// A maxSize of 0 means unlimited (no size restriction).
-	if maxSize > 0 && size > maxSize && len(result) > 1 {
-		result = result[:len(result)-1]
-	}
-
-	return result, nil
+	return lr.protoEntryBuf, nil
 }
 
 // Term returns the term for the entry at the given index.
@@ -367,8 +402,13 @@ func (lr *LogReader) termLocked(index uint64) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(ents) == 0 {
-		return 0, nil
+	// Term 0 is Raft's "no term" sentinel: propagated as prevLogTerm it
+	// makes followers reject appends forever, and as the local last-log
+	// term it grants votes to shorter logs (Election Safety violation). A
+	// missing or mismatched entry must therefore surface as ErrUnavailable,
+	// never as a fabricated zero term.
+	if len(ents) == 0 || ents[0].Index != index {
+		return 0, ErrUnavailable
 	}
 	return ents[0].Term, nil
 }
@@ -411,6 +451,13 @@ func (lr *LogReader) setRangeLocked(firstIndex, length uint64) error {
 	offset := firstIndex - lr.markerIndex
 	switch {
 	case lr.length > offset:
+		// Overwrite: the existing range already covers firstIndex, so every
+		// cached term and entry at or above it is superseded. Purge them
+		// before the caller re-populates the new suffix, otherwise
+		// termLocked — which consults termBuf ahead of the range check —
+		// keeps serving the old terms for re-written indices and keeps
+		// answering for indices the truncation removed entirely.
+		lr.truncateCachesFrom(firstIndex)
 		lr.length = offset + length
 	case lr.length == offset:
 		lr.length += length
@@ -418,6 +465,19 @@ func (lr *LogReader) setRangeLocked(firstIndex, length uint64) error {
 		return ErrLogGapDetected
 	}
 	return nil
+}
+
+// truncateCachesFrom drops every cached term and entry with index >=
+// fromIndex. Caller must hold mu.Lock.
+func (lr *LogReader) truncateCachesFrom(fromIndex uint64) {
+	if lr.termBuf != nil {
+		lr.termBuf.trimFrom(fromIndex)
+	}
+	for k := range lr.entryCache {
+		if k >= fromIndex {
+			delete(lr.entryCache, k)
+		}
+	}
 }
 
 // SetState updates the cached hard state. Called by the commit worker
@@ -439,6 +499,14 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 	}
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
+	// Update the tracked range FIRST. A truncating append (follower
+	// conflict resolution) takes setRangeLocked's overwrite branch, which
+	// purges the superseded suffix from the term and entry caches; the new
+	// terms below are then written over a clean tail. Doing it the other
+	// way round would drop the terms just cached.
+	if err := lr.setRangeLocked(entries[0].Index, uint64(len(entries))); err != nil {
+		return err
+	}
 	// Cache terms for entries being registered. The ring buffer
 	// auto-evicts the oldest entries when full (O(1) per append).
 	if lr.termBuf == nil {
@@ -457,8 +525,7 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 			lr.entryCache[entries[i].Index] = entries[i]
 		}
 	}
-	// Update the tracked range.
-	return lr.setRangeLocked(entries[0].Index, uint64(len(entries)))
+	return nil
 }
 
 // NodeState returns the cached hard state and membership.

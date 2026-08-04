@@ -134,7 +134,7 @@ func TestDeferredSoftwareStrategy_Properties(t *testing.T) {
 	if s.HardwareBacked() {
 		t.Fatal("expected HardwareBacked() to return false")
 	}
-	if s.passphrase != nil {
+	if s.passphrase.Load() != nil {
 		t.Fatal("expected passphrase to be nil for deferred strategy")
 	}
 	if !s.deferPassphrase {

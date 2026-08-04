@@ -66,6 +66,12 @@ var (
 	// provided to the software sealing strategy.
 	ErrInvalidPassphrase = errors.New("quicraft/seal: passphrase must not be empty")
 
+	// ErrStrategyClosed is returned when a seal/unseal operation is
+	// attempted on a SealingStrategy whose key material has already been
+	// released by Close. Close is idempotent but not reversible; a closed
+	// strategy must be re-created, not reused.
+	ErrStrategyClosed = errors.New("quicraft/seal: sealing strategy is closed")
+
 	// ErrNoneStrategyEncryptedData is returned when the no-encryption
 	// strategy is asked to decrypt data carrying a non-zero epoch prefix,
 	// which indicates the data was written by a real sealing strategy. A
@@ -103,6 +109,10 @@ var (
 	// unknown KDFVersion value.
 	ErrKDFUnsupportedVersion = errors.New("quicraft/seal: unsupported KDF version")
 
+	// ErrUnsupportedHKDFVersion is returned when a SealedRootKey names a
+	// DEK-derivation info layout this build does not implement.
+	ErrUnsupportedHKDFVersion = errors.New("quicraft/seal: unsupported HKDF info version")
+
 	// ErrKDFInvalidPassphrase is returned when DeriveKey receives an
 	// empty passphrase.
 	ErrKDFInvalidPassphrase = errors.New("quicraft/seal: KDF passphrase must not be empty")
@@ -116,6 +126,20 @@ var (
 	// Memory=1KiB, or PBKDF2 Iterations=1). The sealed root key is an
 	// offline attack target, so a near-free wrapping key is rejected.
 	ErrKDFWeakParams = errors.New("quicraft/seal: KDF parameters below the production work-factor floor")
+
+	// ErrNoStatePersister is returned by Rotate (and by a PurgeEpochsBefore
+	// that would actually purge) when BarrierConfig.StatePersister is nil.
+	// Both operations change state that must survive a restart, and
+	// activating a new epoch that was never persisted makes every byte
+	// written under it undecryptable after the restart. Failing closed keeps
+	// the previous epoch active and fully usable.
+	ErrNoStatePersister = errors.New("quicraft/seal: no state persister configured; refusing to change unpersistable barrier state")
+
+	// ErrNoBarrierEncryptor is returned when a strategy that must supply its
+	// own encryptor (no-encryption mode, hardware mode) returns none. The
+	// barrier would otherwise report itself unsealed with no cipher and
+	// nil-dereference on the first Encrypt.
+	ErrNoBarrierEncryptor = errors.New("quicraft/seal: strategy provided no barrier encryptor")
 
 	// ErrHardwareMode is returned when an operation (e.g., Rotate,
 	// PurgeEpochsBefore) is not supported because the barrier is using a
@@ -183,6 +207,28 @@ func (e *TrackerError) Error() string {
 
 // Unwrap returns the underlying error.
 func (e *TrackerError) Unwrap() error {
+	return e.Err
+}
+
+// StatePersistError is returned when BarrierConfig.StatePersister fails to
+// durably write the sealed root-key state. The operation that triggered the
+// write (rotation, purge) is aborted with the previous epoch fully intact.
+type StatePersistError struct {
+	// Op is the aborted operation: "rotate" or "purge".
+	Op string
+	// Epoch is the epoch the aborted operation tried to persist.
+	Epoch uint64
+	// Err is the underlying persistence error.
+	Err error
+}
+
+// Error returns a human-readable description of the persistence failure.
+func (e *StatePersistError) Error() string {
+	return fmt.Sprintf("quicraft/seal: %s aborted, sealed state for epoch %d not persisted: %v", e.Op, e.Epoch, e.Err)
+}
+
+// Unwrap returns the underlying error.
+func (e *StatePersistError) Unwrap() error {
 	return e.Err
 }
 

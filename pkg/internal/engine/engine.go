@@ -304,22 +304,53 @@ func (e *Engine) Start() {
 // stepWorker[shardID % numWorkers].
 func (e *Engine) LoadNode(node *Node) {
 	workerID := int(node.shardID % uint64(len(e.stepWorkers)))
-	e.stepWorkers[workerID].loadNode(node)
 
-	// Clear the shard from the commit and apply workers' unloaded
-	// sets so that committed entries for this shard are processed
-	// normally. This is a no-op if the shard was never unloaded.
+	// Clear the shard from the commit and apply workers' unloaded sets
+	// BEFORE publishing the node to the step worker. This is a no-op if the
+	// shard was never unloaded. Ordering matters on StopShard/StartShard of
+	// the same shardID: publishing first lets the new incarnation's first
+	// update reach applyC while the shard is still marked unloaded, and the
+	// apply dispatcher would drop that batch permanently (Peer.Commit has
+	// already advanced the processed marker, so it is never re-offered).
+	// Enqueueing the reload first makes it strictly precede any applyItem the
+	// new incarnation can produce; the dispatcher consumes reload requests
+	// before dispatching (see applyWorker.run).
 	e.commitWorkers[workerID].requestReload(node.shardID)
 	e.applyWorkers[workerID].requestReload(node.shardID)
+
+	e.stepWorkers[workerID].loadNode(node)
 
 	e.allNodes.Store(node.shardID, node)
 }
 
 // UnloadNode removes a node from its worker partition and the
-// concurrent-safe allNodes map. It also signals the apply worker to
-// close the per-shard goroutine, preventing goroutine leaks.
+// concurrent-safe allNodes map. It is SYNCHRONOUS end-to-end: on return,
+// the step worker no longer owns the shard, the node is stopped (stopC
+// closed, cancelling in-flight snapshot-pool operations and releasing any
+// apply goroutine parked on the recovering/saving gate), and the shard's
+// per-shard apply goroutine has fully exited — so no SM.Apply is or will
+// be in flight. Callers (Host.StopShard) rely on this guarantee to close
+// the state machine immediately afterwards without racing an apply.
+//
+// UnloadNode must NOT be called from an engine worker goroutine: waiting
+// for the apply goroutine to exit from a callback that runs ON that
+// goroutine would self-deadlock. All production callers run on Host/user
+// goroutines, and the EventListener contract already forbids blocking
+// calls from engine-worker callbacks.
 func (e *Engine) UnloadNode(shardID uint64) {
 	workerID := int(shardID % uint64(len(e.stepWorkers)))
+
+	// Stop the node FIRST, before any worker-side unload. Closing node.stopC
+	// releases an apply goroutine blocked on the recovering/saving gate,
+	// aborts snapshot save/recover operations that select on it, and releases
+	// a step worker parked in a commitC/applyC send for this shard. Taking
+	// the step worker's nodesMu write lock first would instead make this call
+	// wait behind that parked send, and the apply-side wait below would stall
+	// behind the gated apply.
+	if node := e.GetNode(shardID); node != nil {
+		node.Stop()
+	}
+
 	e.stepWorkers[workerID].unloadNode(shardID)
 
 	// Signal the commit worker to skip Peer.Commit for this shard.
@@ -327,11 +358,20 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// torn-down node.
 	e.commitWorkers[workerID].requestUnload(shardID)
 
-	// Signal the apply worker to close the per-shard channel and
-	// goroutine. This is sent through a channel so the actual cleanup
-	// happens in the dispatcher goroutine's select loop, maintaining
-	// the single-owner invariant on shardChans.
-	e.applyWorkers[workerID].requestUnload(shardID)
+	// Unload the apply side and WAIT for completion. The request is
+	// processed by the dispatcher goroutine (preserving the single-owner
+	// invariant on shardChans); done closes only after the per-shard
+	// channel is closed AND the per-shard apply goroutine has exited. The
+	// wait is bounded by the current SM.Apply batch — deliberately no
+	// timeout, because abandoning the wait would reintroduce the
+	// apply-racing-Close use-after-close this exists to prevent. During
+	// engine shutdown the request is acked immediately and Engine.Stop
+	// owns the join instead. Before Start there is no dispatcher goroutine
+	// to rendezvous with and nothing can be in flight, so the apply-side
+	// unload is skipped entirely.
+	if e.started.Load() {
+		<-e.applyWorkers[workerID].requestUnload(shardID)
+	}
 
 	e.allNodes.Delete(shardID)
 }
@@ -542,13 +582,27 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 				"stack", string(stack),
 				"error", panicErr,
 			)
-			e.clearCommitPending(cw.workerID)
-			// Drain stale commitItems that may already be in-flight
-			// in the commitC channel. Without this, the restarted
-			// worker would process a stale item whose node already
-			// had commitPending cleared above, violating the
-			// single-owner invariant on the Peer.
+			// Drain stale commitItems already queued in commitC BEFORE
+			// clearing commitPending — the same ordering the step-worker
+			// recovery uses, and for the same reason. The step worker is
+			// still running: the instant commitPending is false it may call
+			// getCommitSlot(shardID), which returns the SAME *commitItem
+			// pointer that is still queued here, overwrite it, and enqueue it
+			// again. commitC would then hold one pointer twice, so the same
+			// batch could be committed and applied twice and its pooled
+			// committed-entries slice returned to proto's pool twice — handing
+			// one backing array to two shards.
 			e.drainCommitC(cw.commitC)
+			// The panic may have unwound out of processBatch before
+			// clearBatch ran, leaving orderedMsgsBuf holding this batch's
+			// VoteResp/HeartbeatResp and batch/commitTimes holding its
+			// updates. The restarted worker would append the NEXT batch's
+			// messages to those survivors and send them after that unrelated
+			// batch's SaveState — sending a vote grant whose HardState was
+			// never persisted (Raft PhD 10.2.1). Safe to touch here: the
+			// worker goroutine is unwinding, so nothing else owns the batch.
+			cw.clearBatch()
+			e.clearCommitPending(cw.workerID)
 		}
 	}()
 	cw.run()
@@ -565,6 +619,10 @@ func (e *Engine) drainCommitC(commitC chan *commitItem) {
 	for {
 		select {
 		case item := <-commitC:
+			// The update is discarded, so return its pooled committed-entries
+			// slice; otherwise every panic permanently drains proto's entry
+			// slice pool.
+			item.update.ReleaseCommittedEntries()
 			item.node.commitPending.Store(false)
 			// Wake the step worker so it immediately re-processes
 			// this shard. Without this notification, the step worker
@@ -648,6 +706,21 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 				"stack", string(stack),
 				"error", panicErr,
 			)
+			// Drain stale commitItems already queued in commitC BEFORE
+			// clearing commitPending and restarting. The step worker's
+			// per-shard commitItem slots (getCommitSlot) are reused with
+			// commitPending as the ownership flag: clearing the flag while
+			// an item is still queued would let the restarted worker
+			// overwrite that slot and enqueue the SAME pointer again, so
+			// the commit worker would process it twice — double
+			// Peer.Commit, double apply, and a double
+			// ReleaseCommittedEntries on the same pooled slice. Drained
+			// updates are discarded exactly as in the commit-worker
+			// recovery path (drainCommitC); the commit worker may
+			// concurrently consume from commitC, but a channel receive is
+			// exclusive, so each item is either drained here or processed
+			// normally — never both.
+			e.drainCommitC(sw.commitC)
 			sw.clearStepCommitPending()
 		}
 	}()

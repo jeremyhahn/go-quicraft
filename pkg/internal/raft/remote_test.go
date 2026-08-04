@@ -65,8 +65,9 @@ func TestRemoteString(t *testing.T) {
 	r := newRemote(11, 5)
 	r.match = 10
 	r.snapshotIndex = 50
+	r.snapshotWaitTicks = 3
 	s := r.String()
-	if s != "match:10,next:11,state:Probe,snapshot:50" {
+	if s != "match:10,next:11,state:Probe,snapshot:50,snapshotwait:3" {
 		t.Errorf("unexpected String(): %s", s)
 	}
 }
@@ -192,7 +193,7 @@ func TestBecomeSnapshotRecordsIndex(t *testing.T) {
 		r := newRemote(11, 5)
 		r.match = 10
 		r.state = st
-		r.becomeSnapshot(50)
+		r.becomeSnapshot(50, 1)
 		if r.state != remoteSnapshot {
 			t.Errorf("from %s: expected snapshot state, got %s", st, r.state)
 		}
@@ -212,7 +213,7 @@ func TestBecomeSnapshotResetsInflights(t *testing.T) {
 	r := newRemote(11, 5)
 	r.state = remoteReplicate
 	mustAdd(t, r.inflights, 12)
-	r.becomeSnapshot(50)
+	r.becomeSnapshot(50, 1)
 	if r.inflights.Count() != 0 {
 		t.Errorf("expected inflights reset, count=%d", r.inflights.Count())
 	}
@@ -585,35 +586,82 @@ func TestIsPausedInvalidStateDoesNotPanic(t *testing.T) {
 // snapshotDone
 // ---------------------------------------------------------------------------
 
-func TestSnapshotDoneTransitionsToProbe(t *testing.T) {
+// TestSnapshotDoneStaysPausedUntilAck verifies that a successful transfer
+// report does NOT un-pause the peer: it stays in remoteSnapshot with an
+// armed wait countdown until the peer acknowledges (respondedTo) or the
+// countdown expires. Probing before the peer's ack would draw a rejection
+// that backtracks into compacted territory and re-sends the snapshot.
+func TestSnapshotDoneStaysPausedUntilAck(t *testing.T) {
 	r := newRemote(5, 5)
 	r.match = 10
 	r.state = remoteSnapshot
 	r.snapshotIndex = 50
-	r.snapshotDone()
+	r.snapshotDone(3)
+	if r.state != remoteSnapshot {
+		t.Fatalf("expected snapshot state after snapshotDone, got %s", r.state)
+	}
+	if !r.isPaused() {
+		t.Fatal("expected peer to stay paused after snapshotDone")
+	}
+	// Countdown: expires exactly on the waitTicks-th tick.
+	if r.tickSnapshotWait() || r.tickSnapshotWait() {
+		t.Fatal("countdown must not expire before waitTicks ticks")
+	}
+	if !r.tickSnapshotWait() {
+		t.Fatal("countdown must expire on the final tick")
+	}
+	// Caller falls back to probe on expiry:
+	// next = max(match+1, snapshotIndex+1) = max(11, 51) = 51.
+	r.becomeProbe()
 	if r.state != remoteProbe {
 		t.Errorf("expected probe state, got %s", r.state)
 	}
-	// next = max(match+1, snapshotIndex+1) = max(11, 51) = 51
 	if r.next != 51 {
 		t.Errorf("expected next=51, got %d", r.next)
 	}
 	if r.snapshotIndex != 0 {
 		t.Errorf("expected snapshotIndex cleared, got %d", r.snapshotIndex)
 	}
+	// Expired countdown must not fire again.
+	if r.tickSnapshotWait() {
+		t.Fatal("countdown must not fire after expiry")
+	}
 }
 
-func TestSnapshotDoneWhenMatchExceedsSnapshot(t *testing.T) {
+// TestSnapshotDoneAckViaRespondedTo verifies the normal exit path: the
+// peer's ReplicateResp advances match past the snapshot index and
+// respondedTo transitions snapshot -> probe.
+func TestSnapshotDoneAckViaRespondedTo(t *testing.T) {
 	r := newRemote(5, 5)
-	r.match = 100
 	r.state = remoteSnapshot
 	r.snapshotIndex = 50
-	r.snapshotDone()
+	r.snapshotDone(10)
+	r.update(100)
+	r.respondedTo()
 	if r.state != remoteProbe {
-		t.Errorf("expected probe state, got %s", r.state)
+		t.Errorf("expected probe state after ack, got %s", r.state)
 	}
 	if r.next != 101 {
 		t.Errorf("expected next=101, got %d", r.next)
+	}
+	if r.snapshotWaitTicks != 0 {
+		t.Errorf("expected wait countdown cleared, got %d", r.snapshotWaitTicks)
+	}
+}
+
+// TestTickSnapshotWaitNotArmed verifies the countdown is inert while the
+// transfer is still in flight (snapshotDone not yet reported) and outside
+// snapshot state.
+func TestTickSnapshotWaitNotArmed(t *testing.T) {
+	r := newRemote(5, 5)
+	r.state = remoteSnapshot
+	r.snapshotIndex = 50
+	if r.tickSnapshotWait() {
+		t.Fatal("countdown must not fire while transfer is in flight")
+	}
+	r.becomeProbe()
+	if r.tickSnapshotWait() {
+		t.Fatal("countdown must not fire outside snapshot state")
 	}
 }
 
@@ -621,27 +669,34 @@ func TestSnapshotDoneWhenMatchExceedsSnapshot(t *testing.T) {
 // snapshotFailed
 // ---------------------------------------------------------------------------
 
-func TestSnapshotFailedTransitionsToProbe(t *testing.T) {
+// TestSnapshotFailedArmsRetryBackoff verifies that a failed transfer keeps
+// the peer paused with the countdown armed as a retry backoff — probing
+// immediately would re-stream the full snapshot back-to-back on persistent
+// failure. Expiry falls back to probe via the caller.
+func TestSnapshotFailedArmsRetryBackoff(t *testing.T) {
 	r := newRemote(5, 5)
 	r.match = 10
 	r.state = remoteSnapshot
 	r.snapshotIndex = 50
-	r.snapshotFailed()
+	r.snapshotFailed(2)
+	if r.state != remoteSnapshot {
+		t.Errorf("expected snapshot state (paused backoff), got %s", r.state)
+	}
+	if !r.isPaused() {
+		t.Error("expected peer to stay paused during retry backoff")
+	}
+	if r.tickSnapshotWait() {
+		t.Fatal("backoff must not expire before waitTicks ticks")
+	}
+	if !r.tickSnapshotWait() {
+		t.Fatal("backoff must expire on the final tick")
+	}
+	r.becomeProbe()
 	if r.state != remoteProbe {
-		t.Errorf("expected probe state, got %s", r.state)
+		t.Errorf("expected probe state after backoff expiry, got %s", r.state)
 	}
 	if r.snapshotIndex != 0 {
 		t.Errorf("expected snapshotIndex cleared, got %d", r.snapshotIndex)
-	}
-}
-
-func TestSnapshotFailedResetsInflights(t *testing.T) {
-	r := newRemote(5, 5)
-	r.state = remoteSnapshot
-	r.snapshotIndex = 50
-	r.snapshotFailed()
-	if r.inflights.Count() != 0 {
-		t.Errorf("expected inflights reset")
 	}
 }
 
@@ -668,7 +723,7 @@ func TestStateCycleProbeReplicateSnapshotProbe(t *testing.T) {
 	}
 
 	// replicate -> snapshot
-	r.becomeSnapshot(100)
+	r.becomeSnapshot(100, 1)
 	if r.state != remoteSnapshot {
 		t.Errorf("expected snapshot, got %s", r.state)
 	}
@@ -676,8 +731,16 @@ func TestStateCycleProbeReplicateSnapshotProbe(t *testing.T) {
 		t.Errorf("expected snapshotIndex=100, got %d", r.snapshotIndex)
 	}
 
-	// snapshot -> probe (via snapshotDone)
-	r.snapshotDone()
+	// snapshot -> (paused wait) -> probe: transfer success arms the wait
+	// countdown; expiry falls back to probe.
+	r.snapshotDone(1)
+	if r.state != remoteSnapshot {
+		t.Errorf("expected snapshot (paused wait) after snapshotDone, got %s", r.state)
+	}
+	if !r.tickSnapshotWait() {
+		t.Error("expected wait countdown to expire")
+	}
+	r.becomeProbe()
 	if r.state != remoteProbe {
 		t.Errorf("expected probe, got %s", r.state)
 	}
@@ -868,7 +931,7 @@ func TestRapidStateTransitions(t *testing.T) {
 	// Rapid transitions should not corrupt state
 	r.becomeReplicate()
 	r.becomeProbe()
-	r.becomeSnapshot(50)
+	r.becomeSnapshot(50, 1)
 	r.becomeProbe()
 	r.becomeReplicate()
 

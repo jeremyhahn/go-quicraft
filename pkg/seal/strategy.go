@@ -140,6 +140,11 @@ type SealedRootKey struct {
 	// unseal to select the correct KDF regardless of the current FIPS mode.
 	KDFVersion int `json:"kdf_version,omitempty"`
 
+	// HKDFVersion identifies the info-string layout used to derive epoch
+	// DEKs from the root key. Stamped by Initialize; a zero value means the
+	// blob predates the field and must derive with the v1 layout.
+	HKDFVersion HKDFVersion `json:"hkdf_version,omitempty"`
+
 	// Nonce is the AES-GCM nonce used during sealing, when stored separately
 	// from the ciphertext (hardware strategies may store nonce externally).
 	Nonce []byte `json:"nonce,omitempty"`

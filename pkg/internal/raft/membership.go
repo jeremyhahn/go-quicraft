@@ -25,24 +25,30 @@ type configChangeHandler func(m *membership, cc proto.ConfigChange) error
 // configChangeHandlers maps config change types to their handler functions
 // for O(1) dispatch. These handlers mutate the membership in place.
 var configChangeHandlers = map[uint64]configChangeHandler{
-	proto.AddNode:      handleAddNode,
-	proto.RemoveNode:   handleRemoveNode,
-	proto.AddNonVoting: handleAddNonVoting,
-	proto.AddWitness:   handleAddWitness,
+	proto.AddNode:             handleAddNode,
+	proto.RemoveNode:          handleRemoveNode,
+	proto.AddNonVoting:        handleAddNonVoting,
+	proto.AddWitness:          handleAddWitness,
+	proto.UpdateWitnessPolicy: handleUpdateWitnessPolicy,
 }
 
 // configChangeValidator is the function signature for read-only config change
-// validators. These check invariants without copying or mutating the membership.
+// validators. These check invariants without copying or mutating the
+// membership, including the shard's replicated witness policy (carried on
+// the membership itself). The deterministic apply path (configChangeHandlers)
+// never validates, so an already-committed change always replays — mirroring
+// how the 64-member cap is validate-only.
 type configChangeValidator func(m *membership, cc proto.ConfigChange) error
 
 // configChangeValidators maps config change types to their read-only validation
 // functions for O(1) dispatch. Each validator checks the same preconditions as
 // the corresponding handler but performs no mutations.
 var configChangeValidators = map[uint64]configChangeValidator{
-	proto.AddNode:      validateAddNode,
-	proto.RemoveNode:   validateRemoveNode,
-	proto.AddNonVoting: validateAddNonVoting,
-	proto.AddWitness:   validateAddWitness,
+	proto.AddNode:             validateAddNode,
+	proto.RemoveNode:          validateRemoveNode,
+	proto.AddNonVoting:        validateAddNonVoting,
+	proto.AddWitness:          validateAddWitness,
+	proto.UpdateWitnessPolicy: validateUpdateWitnessPolicy,
 }
 
 // membershipSnapshot is an immutable, concurrency-safe snapshot of the
@@ -51,6 +57,11 @@ var configChangeValidators = map[uint64]configChangeValidator{
 // from the transport recv goroutine (IsMember) and host query methods
 // (GetMembership). The maps are never modified after construction.
 type membershipSnapshot struct {
+	// maxWitnesses is the shard's replicated witness cap (0 = no cap).
+	maxWitnesses uint64
+	// requireFullReplicaMajority is the shard's replicated
+	// full-replica-majority witness policy.
+	requireFullReplicaMajority bool
 	// addresses maps replica IDs to network addresses for full voting members.
 	addresses map[uint64]string
 	// observers maps replica IDs to network addresses for non-voting observers.
@@ -81,11 +92,13 @@ func (s *membershipSnapshot) isMember(replicaID uint64) bool {
 // are deep-copied to prevent external mutation of the immutable snapshot.
 func (s *membershipSnapshot) toProto() proto.Membership {
 	return proto.Membership{
-		ConfigChangeID: s.configChangeID,
-		Addresses:      copyStringMap(s.addresses),
-		Observers:      copyStringMap(s.observers),
-		Witnesses:      copyStringMap(s.witnesses),
-		Removed:        copyBoolMap(s.removed),
+		ConfigChangeID:             s.configChangeID,
+		MaxWitnesses:               s.maxWitnesses,
+		RequireFullReplicaMajority: s.requireFullReplicaMajority,
+		Addresses:                  copyStringMap(s.addresses),
+		Observers:                  copyStringMap(s.observers),
+		Witnesses:                  copyStringMap(s.witnesses),
+		Removed:                    copyBoolMap(s.removed),
 	}
 }
 
@@ -109,17 +122,30 @@ type membership struct {
 	removed map[uint64]bool
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
+
+	// maxWitnesses is the shard's replicated witness cap (0 = no cap).
+	// Part of the replicated membership state: seeded at bootstrap from
+	// config.WitnessConfig, changed only via a committed
+	// UpdateWitnessPolicy config change, so every replica enforces the
+	// same policy regardless of local configuration.
+	maxWitnesses uint64
+	// requireFullReplicaMajority is the shard's replicated
+	// full-replica-majority witness policy. Same lifecycle as
+	// maxWitnesses.
+	requireFullReplicaMajority bool
 }
 
 // newMembership creates a membership from a proto.Membership. The maps are
 // deep-copied to avoid aliasing the source.
 func newMembership(m proto.Membership) *membership {
 	return &membership{
-		addresses:      copyStringMap(m.Addresses),
-		observers:      copyStringMap(m.Observers),
-		witnesses:      copyStringMap(m.Witnesses),
-		removed:        copyBoolMap(m.Removed),
-		configChangeID: m.ConfigChangeID,
+		addresses:                  copyStringMap(m.Addresses),
+		observers:                  copyStringMap(m.Observers),
+		witnesses:                  copyStringMap(m.Witnesses),
+		removed:                    copyBoolMap(m.Removed),
+		configChangeID:             m.ConfigChangeID,
+		maxWitnesses:               m.MaxWitnesses,
+		requireFullReplicaMajority: m.RequireFullReplicaMajority,
 	}
 }
 
@@ -129,11 +155,13 @@ func newMembership(m proto.Membership) *membership {
 // worker.
 func (m *membership) snapshot() *membershipSnapshot {
 	return &membershipSnapshot{
-		addresses:      copyStringMap(m.addresses),
-		observers:      copyStringMap(m.observers),
-		witnesses:      copyStringMap(m.witnesses),
-		removed:        copyBoolMap(m.removed),
-		configChangeID: m.configChangeID,
+		addresses:                  copyStringMap(m.addresses),
+		observers:                  copyStringMap(m.observers),
+		witnesses:                  copyStringMap(m.witnesses),
+		removed:                    copyBoolMap(m.removed),
+		configChangeID:             m.configChangeID,
+		maxWitnesses:               m.maxWitnesses,
+		requireFullReplicaMajority: m.requireFullReplicaMajority,
 	}
 }
 
@@ -170,10 +198,13 @@ func (m *membership) isMember(replicaID uint64) bool {
 
 // validate checks that a config change is valid before application. It
 // enforces safety rules such as preventing removal of the last voter and
-// detecting duplicate or conflicting additions. This is a read-only
-// operation that does not copy or mutate the membership.
+// detecting duplicate or conflicting additions, plus the shard's replicated
+// witness policy. This is a read-only operation that does not copy or mutate
+// the membership.
 func (m *membership) validate(cc proto.ConfigChange) error {
-	if cc.ReplicaID == 0 {
+	// UpdateWitnessPolicy targets the shard, not a replica; every other
+	// change type must name a non-zero target replica.
+	if cc.ReplicaID == 0 && cc.Type != proto.UpdateWitnessPolicy {
 		return ErrZeroReplicaID
 	}
 	validator, ok := configChangeValidators[cc.Type]
@@ -187,7 +218,17 @@ func (m *membership) validate(cc proto.ConfigChange) error {
 // change must have been validated with validate() first. This method
 // modifies the membership in place.
 func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
-	if cc.ReplicaID == 0 {
+	// Replay guard: a config change at or below configChangeID has already
+	// been applied (restart replay of committed entries on top of a
+	// snapshot-seeded membership, or a follower re-receiving entries).
+	// Re-applying would be wrong for non-idempotent changes — a replayed
+	// UpdateWitnessPolicy would revert a newer policy — and would regress
+	// configChangeID. Skipping is deterministic across replicas because
+	// configChangeID is itself replicated state.
+	if logIndex <= m.configChangeID {
+		return nil
+	}
+	if cc.ReplicaID == 0 && cc.Type != proto.UpdateWitnessPolicy {
 		return ErrZeroReplicaID
 	}
 	handler, ok := configChangeHandlers[cc.Type]
@@ -221,9 +262,10 @@ func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	}
 	// NOTE: The voting-member cap is enforced ONLY at propose/validate time
 	// (validateAddNode). It must NOT be re-checked here: apply() runs on
-	// already-committed config-change entries (replication, post-truncation
-	// rebuildMembershipFromLog), and rejecting a committed change would make
-	// replicas diverge from the agreed membership — a Raft safety violation.
+	// already-committed config-change entries (commit-time application in
+	// Peer.Commit, restart replay), and rejecting a committed change would
+	// make replicas diverge from the agreed membership — a Raft safety
+	// violation.
 	// Promote from observer if applicable.
 	if m.isObserver(cc.ReplicaID) {
 		delete(m.observers, cc.ReplicaID)
@@ -328,7 +370,9 @@ func validateAddNode(m *membership, cc proto.ConfigChange) error {
 }
 
 // validateRemoveNode checks whether removing a member would succeed without
-// mutating the membership. Returns the same errors as handleRemoveNode.
+// mutating the membership. Returns the same errors as handleRemoveNode, plus
+// the RequireFullReplicaMajority policy violation when removing a full
+// replica would leave the remaining full replicas unable to form a quorum.
 func validateRemoveNode(m *membership, cc proto.ConfigChange) error {
 	if !m.isMember(cc.ReplicaID) {
 		return ErrNodeNotFound
@@ -338,6 +382,19 @@ func validateRemoveNode(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.isWitness(cc.ReplicaID) && m.numVotingMembers() <= 1 {
 		return ErrRemoveLastVoter
+	}
+	// RequireFullReplicaMajority must also gate full-replica removal: without
+	// this check, removing a full replica from a compliant membership (e.g.
+	// {3 full + 2 witnesses}) silently produces exactly the witness-heavy
+	// shape the policy exists to reject ({2 full + 2 witnesses}). The
+	// witnesses > 0 conjunct is clarity-only: with zero witnesses the
+	// arithmetic below can never fire (the last-full-replica check above
+	// pre-empts fullReplicas == 0).
+	if m.requireFullReplicaMajority && len(m.witnesses) > 0 && m.isVoter(cc.ReplicaID) {
+		fullReplicas := len(m.addresses) - 1
+		if fullReplicas < quorumOf(fullReplicas+len(m.witnesses)) {
+			return ErrBreaksFullReplicaMajority
+		}
 	}
 	return nil
 }
@@ -359,7 +416,9 @@ func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
 }
 
 // validateAddWitness checks whether adding a witness would succeed without
-// mutating the membership. Returns the same errors as handleAddWitness.
+// mutating the membership. Returns the same errors as handleAddWitness, plus
+// the replicated witness-policy violations (validate-only — never enforced
+// on the apply path).
 func validateAddWitness(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -372,6 +431,47 @@ func validateAddWitness(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.numVotingMembers() >= maxVotingMembers {
 		return ErrTooManyVotingMembers
+	}
+	newWitnessCount := len(m.witnesses) + 1
+	if m.maxWitnesses > 0 && uint64(newWitnessCount) > m.maxWitnesses {
+		return ErrTooManyWitnesses
+	}
+	if m.requireFullReplicaMajority {
+		// After the add, the full (data-bearing) replicas alone must still be
+		// able to form a quorum over the voting set. This bounds membership
+		// shape only; it does not constrain which nodes form any individual
+		// commit quorum (see the config.WitnessConfig doc).
+		fullReplicas := len(m.addresses)
+		if fullReplicas < quorumOf(fullReplicas+newWitnessCount) {
+			return ErrBreaksFullReplicaMajority
+		}
+	}
+	return nil
+}
+
+// handleUpdateWitnessPolicy replaces the shard's replicated witness policy.
+// Like every handler it is unconditional: an already-committed policy change
+// must replay identically on every replica.
+func handleUpdateWitnessPolicy(m *membership, cc proto.ConfigChange) error {
+	m.maxWitnesses = cc.MaxWitnesses
+	m.requireFullReplicaMajority = cc.RequireFullReplicaMajority
+	return nil
+}
+
+// validateUpdateWitnessPolicy checks that the proposed policy is satisfied
+// by the CURRENT membership: a policy the shard already violates would be
+// unenforceable doctrine (every subsequent witness change would be judged
+// against a baseline the membership never met). Operators must reshape the
+// membership first, then tighten the policy.
+func validateUpdateWitnessPolicy(m *membership, cc proto.ConfigChange) error {
+	if cc.MaxWitnesses > 0 && uint64(len(m.witnesses)) > cc.MaxWitnesses {
+		return ErrTooManyWitnesses
+	}
+	if cc.RequireFullReplicaMajority && len(m.witnesses) > 0 {
+		fullReplicas := len(m.addresses)
+		if fullReplicas < quorumOf(fullReplicas+len(m.witnesses)) {
+			return ErrBreaksFullReplicaMajority
+		}
 	}
 	return nil
 }

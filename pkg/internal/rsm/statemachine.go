@@ -217,6 +217,17 @@ func (s *StateMachine) IsOnDisk() bool {
 //
 // The results slice must be pre-allocated with len(results) == len(entries).
 func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
+	// Defence in depth: the engine's synchronous UnloadNode guarantees no
+	// Apply is in flight when Close runs, but a misordered caller must get a
+	// typed error instead of running user code on a closed SM. Holding the
+	// read guard for the duration of Apply also forces Close to wait out an
+	// in-flight Apply rather than closing the SM under it.
+	s.readGuard.RLock()
+	defer s.readGuard.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+
 	// Build the filtered entry list and result mapping.
 	// We convert proto.Entry to sm.Entry for the user SM, skipping
 	// entries that are detected as duplicates by the session manager,
@@ -604,6 +615,16 @@ func (s *StateMachine) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-
 // context. afterCapture may be nil (equivalent to SaveSnapshot). If the save
 // errors before the capture completes, afterCapture is not called.
 func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error {
+	// Defence in depth: never snapshot a closed SM (see Apply). The read
+	// guard is held for the whole save, so Close blocks until the save
+	// finishes; the engine closes the node's stopC before Close runs, which
+	// aborts an in-flight save promptly via the stopper checks.
+	s.readGuard.RLock()
+	defer s.readGuard.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+
 	// Check for cancellation before starting.
 	select {
 	case <-stopper:
@@ -625,6 +646,15 @@ func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopp
 // RecoverFromSnapshot restores both session state and user SM state
 // from the reader. The stopper channel signals cancellation.
 func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error {
+	// Defence in depth: never install snapshot state into a closed SM (see
+	// Apply). The read guard is held for the whole recovery, so Close blocks
+	// until it finishes; the stopper aborts it promptly once the node stops.
+	s.readGuard.RLock()
+	defer s.readGuard.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+
 	// Check for cancellation before starting.
 	select {
 	case <-stopper:
@@ -658,6 +688,17 @@ func (s *StateMachine) Close() error {
 // Safe for concurrent access from the snapshot pool worker goroutine.
 func (s *StateMachine) LastApplied() uint64 {
 	return s.lastApplied.Load()
+}
+
+// SetLastApplied records idx as the index of the last applied entry. It is
+// called by the engine's snapshot pool after RecoverFromSnapshot installs
+// snapshot state at idx: the recovered state reflects exactly idx, and this
+// counter is the index source for the NEXT snapshot save, so the two must
+// agree or a snapshot taken before the next Apply would pair a stale index
+// with post-recovery state. The engine quiesces applies for the duration of
+// recovery, so no concurrent Apply can race this store.
+func (s *StateMachine) SetLastApplied(idx uint64) {
+	s.lastApplied.Store(idx)
 }
 
 // SMType returns the type of the underlying state machine.
