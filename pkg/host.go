@@ -4472,6 +4472,18 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		return ErrShardNotFound
 	}
 
+	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
+	// unavailable for this shard, not that the shard is plaintext. Refuse
+	// before any directory, data file, or LogDB record exists, mirroring the
+	// same precheck HandleSnapshot enforces on the receive path: an imported
+	// artifact's bytes are plaintext (ExportSnapshot decrypts before writing
+	// them), so persisting them while sealed would durably downgrade a shard
+	// whose data must be encrypted at rest. reencryptReceivedSnapshot below
+	// re-checks and covers a seal that lands mid-import.
+	if h.snapshotEncryptionSealed(shardID) {
+		return ErrSnapshotBarrierSealed
+	}
+
 	// Parse the self-describing artifact header BEFORE touching disk so a
 	// malformed/foreign stream is rejected without creating partial state.
 	// The header carries the original logical snapshot identity; the bytes
@@ -4558,12 +4570,35 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 			"error", closeErr)
 	}
 
+	// Re-encrypt the imported snapshot under THIS host's own barrier so it is
+	// encrypted at rest with the same key every other on-disk snapshot for the
+	// shard uses. The artifact's bytes are plaintext (ExportSnapshot decrypts
+	// before writing, so an import never carries ciphertext), so this is what
+	// closes the at-rest gap for a shard whose barrier is configured — the
+	// same role reencryptReceivedSnapshot plays for a network-received
+	// snapshot. A nil barrier is a no-op (snapshot stays plaintext, epoch 0);
+	// a barrier sealed after the precheck above fails closed here rather than
+	// leaving the plaintext artifact durably recorded.
+	epoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, h.barrierForShard(shardID))
+	if encErr != nil {
+		// Never recorded in LogDB, so the partial artifact must not be left
+		// behind for a later scan to trip over.
+		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
+			slog.Debug("snapshot import directory cleanup failed",
+				"shard", shardID,
+				"dir", snapDir,
+				"error", rmErr)
+		}
+		return encErr
+	}
+
 	// Make the directory entries durable BEFORE recording the snapshot in
-	// LogDB. The data file is fsynced, but the entries MkdirAll and the file
-	// create added are not durable until each directory in the chain is
-	// fsynced; without this a crash right after the import leaves LogDB
-	// pointing at a directory that no longer exists, and StartShard then
-	// fails with snapshot_open. Same invariant HandleSnapshot enforces.
+	// LogDB. The data file is fsynced (both the original write and the
+	// reencrypt rename above), but the entries MkdirAll, the file create, and
+	// the reencrypt rename added are not durable until each directory in the
+	// chain is fsynced; without this a crash right after the import leaves
+	// LogDB pointing at a directory that no longer exists, and StartShard
+	// then fails with snapshot_open. Same invariant HandleSnapshot enforces.
 	if syncErr := syncDirChain(fsys, snapDir, syncRoot); syncErr != nil {
 		return syncErr
 	}
@@ -4573,7 +4608,10 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		return mapContextError(err)
 	}
 
-	// Determine the data file size for recovery's InstallSnapshot path.
+	// Determine the data file size for recovery's InstallSnapshot path. This
+	// is measured AFTER reencryption so FileSize always means "size of the
+	// file at Filepath", matching the framed-ciphertext size when a barrier
+	// is configured rather than the plaintext size written above.
 	var fileSize uint64
 	if fi, statErr := fsys.Stat(dataPath); statErr == nil {
 		fileSize = uint64(fi.Size())
@@ -4586,9 +4624,12 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 	// floored at 1 (the minimum valid term) so the snapshot is never treated
 	// as uninitialized by the Raft engine.
 	//
-	// Epoch is left 0: imports always carry PLAINTEXT (ExportSnapshot emits
-	// decrypted bytes), so recovery must NOT attempt to decrypt. Epoch=0 is
-	// exactly the no-decrypt path StartShard -> RecoverFromSnapshot expects.
+	// Epoch records what reencryptReceivedSnapshot actually did: 0 when the
+	// shard has no barrier configured (plaintext deployment, artifact stays
+	// as imported), or the DEK epoch it was just re-encrypted under when a
+	// barrier is configured and unsealed. Recovery reads Epoch>0 as "decrypt
+	// before use", so this must reflect this host's own at-rest state, not
+	// the artifact's.
 	term := header.Term
 	if term == 0 {
 		term = 1
@@ -4600,6 +4641,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		Filepath:    snapDir,
 		FileSize:    fileSize,
 		OnDiskIndex: header.OnDiskIndex,
+		Epoch:       epoch,
 		// The artifact's own compression, NOT this host's config: the bytes
 		// were written by the exporting host and are stored verbatim.
 		Compression: header.Compression,

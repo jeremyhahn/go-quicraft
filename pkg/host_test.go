@@ -20020,19 +20020,93 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 		t.Fatalf("ImportSnapshot failed: %v", importErr)
 	}
 
-	// Import must store plaintext with Epoch=0 (the no-decrypt recovery path).
+	// The host has a configured, unsealed barrier, so ImportSnapshot must
+	// re-encrypt the plaintext artifact under it before it lands on disk
+	// (reencryptReceivedSnapshot) — the same policy saveSnapshot enforces for
+	// a locally-taken snapshot. Epoch=0 would tell recovery to skip
+	// decryption, which is only correct for a plaintext deployment.
 	db.mu.Lock()
 	importedSnap := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
-	if importedSnap.Epoch != 0 {
-		t.Errorf("imported snapshot Epoch = %d, want 0 (plaintext)", importedSnap.Epoch)
+	if importedSnap.Epoch == 0 {
+		t.Errorf("imported snapshot Epoch = 0, want >0 (encrypted under the host's barrier)")
 	}
 	importedData, readErr := os.ReadFile(filepath.Join(importedSnap.Filepath, "snapshot.dat"))
 	if readErr != nil {
 		t.Fatalf("ReadFile failed: %v", readErr)
 	}
-	if !bytes.Equal(importedData, originalData) {
-		t.Errorf("imported on-disk data = %q, want plaintext %q", importedData, originalData)
+	if bytes.Contains(importedData, originalData) {
+		t.Errorf("imported on-disk data contains plaintext %q; must be encrypted at rest", originalData)
+	}
+	var decrypted bytes.Buffer
+	if _, decErr := decryptSnapshotFrames(barrier, bytes.NewReader(importedData), &decrypted); decErr != nil {
+		t.Fatalf("decryptSnapshotFrames on imported artifact failed: %v", decErr)
+	}
+	if !bytes.Equal(decrypted.Bytes(), originalData) {
+		t.Errorf("decrypted imported data = %q, want %q", decrypted.Bytes(), originalData)
+	}
+}
+
+// TestImportSnapshot_SealedBarrierFailsClosed verifies that ImportSnapshot
+// refuses to write an imported artifact when the host's barrier is
+// configured but SEALED, rather than durably persisting it as plaintext.
+// This is the ImportSnapshot counterpart of the already-fixed saveSnapshot
+// and HandleSnapshot (reencryptReceivedSnapshot) fail-closed behavior: a
+// sealed barrier means encryption is temporarily unavailable, not that the
+// shard is a plaintext deployment.
+func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	barrier := createTestBarrier(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "snap-import-sealed")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll failed: %v", mkErr)
+	}
+	originalData := []byte("must never land on disk while the barrier is sealed")
+	writeEncryptedSnapshotFile(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData)
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1600, Filepath: snapDir, Epoch: 1})
+
+	var exported bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &exported); exportErr != nil {
+		t.Fatalf("ExportSnapshot failed: %v", exportErr)
+	}
+
+	if stopErr := h.StopShard(1); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	delete(db.snapshots, mockNodeKey{1, 1})
+	db.mu.Unlock()
+
+	// Seal the barrier so encryption is temporarily unavailable.
+	if sealErr := barrier.Seal(); sealErr != nil {
+		t.Fatalf("barrier.Seal failed: %v", sealErr)
+	}
+
+	importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes()))
+	if !errors.Is(importErr, ErrSnapshotBarrierSealed) {
+		t.Fatalf("ImportSnapshot error = %v, want ErrSnapshotBarrierSealed", importErr)
+	}
+
+	// No snapshot record and no plaintext artifact must be left behind.
+	db.mu.Lock()
+	_, recorded := db.snapshots[mockNodeKey{1, 1}]
+	db.mu.Unlock()
+	if recorded {
+		t.Errorf("ImportSnapshot recorded a snapshot in LogDB despite the sealed-barrier failure")
 	}
 }
 
