@@ -358,6 +358,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if o.maxFileSize <= 0 {
 		return nil, ErrInvalidMaxFileSize
 	}
+	// A segment must span at least two blocks, or maxRecordPayload is zero and
+	// no record can ever be written. Beyond that the geometry is the
+	// operator's to choose: a large BATCH is split across records, and a lone
+	// entry too big for any record surfaces at the write as the permanent
+	// ErrRecordTooLarge. Requiring room for a theoretical maxCmdLen entry here
+	// would reject small-segment deployments that never write one.
+	if o.maxFileSize/int64(o.blockSize) < 2 {
+		return nil, ErrSegmentTooSmallForEntry
+	}
 
 	db := &DB{
 		dir:     dir,
@@ -2388,23 +2397,78 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 		return err
 	}
 
-	// Calculate total size needed.
-	totalSize := 1 // payload type byte
-	for i := range entries {
-		totalSize += entryRecordHeaderSize + len(entries[i].Cmd)
+	// A single WAL record must fit inside one segment, so a large batch is
+	// split across several records. A record spends recordHeaderSize bytes in
+	// every block it spans and may pad the block it starts in, so the usable
+	// payload is strictly LESS than the segment size. Raft's batch cap counts
+	// neither that framing nor the 76-byte per-entry header, so without
+	// splitting a batch raft legitimately produced -- a lagging follower
+	// catching up on many small entries is the realistic case -- would fail
+	// permanently with ErrRecordTooLarge and this node could never persist it.
+	//
+	// Splitting is format-compatible: replay already handles several entry
+	// records per Update. It is also crash-safe, because these records still
+	// precede this Update's state record in log order and the WAL truncates at
+	// a prefix. A torn tail can therefore only lose state while keeping
+	// entries, never the reverse -- which would recover with a commit index
+	// past the last entry.
+	maxPayload := s.maxRecordPayload()
+
+	for start := 0; start < len(entries); {
+		// Grow the chunk while it still fits one record, always taking at
+		// least one entry so the batch cannot stall.
+		size := 1 // payload type byte
+		end := start
+		for end < len(entries) {
+			need := entryRecordHeaderSize + len(entries[end].Cmd)
+			if end > start && size+need > maxPayload {
+				break
+			}
+			size += need
+			end++
+		}
+		// A lone entry larger than one record is genuinely unpersistable;
+		// ErrRecordTooLarge is permanent so the caller does not retry forever.
+		if size > maxPayload {
+			return ErrRecordTooLarge
+		}
+		if err := s.writeEntryChunk(key, shardID, replicaID, entries[start:end], size, pending); err != nil {
+			return err
+		}
+		start = end
 	}
 
+	return nil
+}
+
+// maxRecordPayload is the largest record payload guaranteed to fit in a fresh
+// segment, accounting for the per-block header every block a record spans
+// costs and for the block the record may have to pad past to start.
+func (s *walShard) maxRecordPayload() int {
+	blocks := int(s.opts.maxFileSize / int64(s.opts.blockSize))
+	if blocks <= 1 {
+		return 0
+	}
+	return (blocks - 1) * (s.opts.blockSize - recordHeaderSize)
+}
+
+// writeEntryChunk marshals one chunk of entries into a single WAL record,
+// writes it, and stages the resulting in-memory updates. totalSize is the
+// chunk's exact marshalled size as computed by the caller.
+func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entries []logdb.Entry, totalSize int, pending *pendingMemUpdates) error {
 	buf := s.getMarshalBuf(totalSize)
 	buf[0] = payloadTypeEntries
 	pos := 1
 
 	// Collect index and entry updates to stage into pending. The SegmentID is
-	// filled in AFTER writeRecord succeeds: the single writeRecord below may
-	// hit ErrSegmentFull and rotate, landing the whole blob in a NEW segment.
-	// Capturing s.activeSegmentID before the write would point the index at
-	// the old segment, and Compact (which builds its live-segment set from
-	// index SegmentIDs) could then GC the segment that actually holds these
-	// entries — silent data loss on recovery.
+	// filled in AFTER writeRecord succeeds: the write below may hit
+	// ErrSegmentFull and rotate, landing this chunk in a NEW segment.
+	// Capturing s.activeSegmentID beforehand would point the index at the old
+	// segment, and Compact (which builds its live-segment set from index
+	// SegmentIDs) could then GC the segment that actually holds these entries
+	// -- silent data loss on recovery. With chunking, consecutive chunks of
+	// one batch can legitimately land in different segments, so each chunk
+	// must be stamped with its own.
 	stagedIdx := make([]indexEntry, 0, len(entries))
 	stagedEntries := make([]logdb.Entry, 0, len(entries))
 
@@ -2455,9 +2519,8 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 		return err
 	}
 
-	// Stamp the index entries with the segment the blob actually landed in
-	// (post-rotation if writeRecord rotated). All entries share one record, so
-	// they all live in the same, current active segment.
+	// Stamp the index entries with the segment this chunk actually landed in
+	// (post-rotation if writeRecord rotated).
 	landedSegID := s.activeSegmentID
 	for i := range stagedIdx {
 		stagedIdx[i].SegmentID = landedSegID

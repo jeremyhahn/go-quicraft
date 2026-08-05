@@ -54,6 +54,14 @@ var (
 	// ErrInvalidMaxFileSize is returned when Options.MaxFileSize is not positive.
 	ErrInvalidMaxFileSize = errors.New("waldb: max file size must be positive")
 
+	// ErrSegmentTooSmallForEntry is returned when a segment spans fewer than
+	// two blocks, leaving no usable record payload at all. A large BATCH is
+	// split across records and a lone oversized entry fails at the write with
+	// ErrRecordTooLarge, so this rejects only the geometry where nothing can
+	// ever be written.
+	ErrSegmentTooSmallForEntry = errors.New(
+		"waldb: max file size must span at least two blocks")
+
 	// ErrInvalidMaxBatchSize is returned when Options.MaxBatchSize is not positive.
 	ErrInvalidMaxBatchSize = errors.New("waldb: max batch size must be positive")
 
