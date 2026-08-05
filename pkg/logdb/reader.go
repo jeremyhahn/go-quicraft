@@ -499,6 +499,21 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 	}
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
+	// Drop any head that sits at or below the marker. setRangeLocked clamps
+	// the RANGE the same way, but the caches below are populated from this
+	// slice: caching the trimmed prefix records terms for indices the log no
+	// longer holds, and termLocked consults termBuf ahead of the range check,
+	// so those indices answer with a term instead of ErrCompacted. A leader
+	// resolving term(prevLogIndex) for a lagging follower would then get a
+	// plausible term rather than the ErrCompacted that triggers the
+	// InstallSnapshot fallback, and the follower could never catch up.
+	first := lr.firstIndex()
+	if entries[len(entries)-1].Index < first {
+		return nil
+	}
+	if entries[0].Index < first {
+		entries = entries[first-entries[0].Index:]
+	}
 	// Update the tracked range FIRST. A truncating append (follower
 	// conflict resolution) takes setRangeLocked's overwrite branch, which
 	// purges the superseded suffix from the term and entry caches; the new
