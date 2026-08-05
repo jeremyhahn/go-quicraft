@@ -34,7 +34,7 @@ import (
 // an ephemeral CA and leaf certificate signed by that CA. The certs are
 // cached per test via t.Helper() but regenerated for each test to avoid
 // cross-test contamination.
-func testMTLSConfig(t *testing.T) *MTLSConfig {
+func testMTLSConfig(t testing.TB) *MTLSConfig {
 	t.Helper()
 	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
 	return &MTLSConfig{
@@ -142,7 +142,7 @@ func (h *testHandler) waitSnapshot(t *testing.T, timeout time.Duration) {
 // transportPair creates two QUICTransport instances connected via loopback.
 // It registers each transport in the other's registry so messages can be
 // routed. Returns (sender, receiver, senderHandler, receiverHandler, cleanup).
-func transportPair(t *testing.T, deploymentID uint64) (
+func transportPair(t testing.TB, deploymentID uint64) (
 	*QUICTransport, *QUICTransport,
 	*testHandler, *testHandler,
 	func(),
@@ -151,6 +151,24 @@ func transportPair(t *testing.T, deploymentID uint64) (
 
 	handler1 := newTestHandler()
 	handler2 := newTestHandler()
+	t1, t2, cleanup := transportPairWith(t, deploymentID, handler1, handler2)
+	return t1, t2, handler1, handler2, cleanup
+}
+
+// transportPairWith is the general form of transportPair: it accepts the two
+// MessageHandler implementations and optional Config mutators applied to BOTH
+// endpoints before construction, so callers that need custom handlers or
+// non-default transport tuning (benchmarks, in particular) reuse the same
+// loopback + mTLS + registry setup instead of building their own.
+// Returns (sender, receiver, cleanup).
+func transportPairWith(
+	t testing.TB,
+	deploymentID uint64,
+	handler1, handler2 MessageHandler,
+	opts ...func(*Config),
+) (*QUICTransport, *QUICTransport, func()) {
+	t.Helper()
+
 	reg1 := registry.NewRegistry()
 	reg2 := registry.NewRegistry()
 
@@ -164,6 +182,10 @@ func transportPair(t *testing.T, deploymentID uint64) (
 		ListenAddress: "127.0.0.1:0",
 		DeploymentID:  deploymentID,
 		MTLSConfig:    mtls,
+	}
+	for _, opt := range opts {
+		opt(&cfg1)
+		opt(&cfg2)
 	}
 
 	t1, err := NewQUICTransport(cfg1, handler1, reg1)
@@ -195,7 +217,7 @@ func transportPair(t *testing.T, deploymentID uint64) (
 		t2.Stop()
 	}
 
-	return t1, t2, handler1, handler2, cleanup
+	return t1, t2, cleanup
 }
 
 // TestNewQUICTransportValidConfig verifies successful creation with valid config.

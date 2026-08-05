@@ -283,6 +283,19 @@ type Config struct {
 	// value (see connectionReceiveWindow), so the total inbound receive
 	// footprint is this budget plus MaxIncomingConnections *
 	// connectionReceiveWindow(...), not this budget alone.
+	//
+	// The derived window also sets the ceiling on replication throughput over
+	// a high-latency link, since a receive window caps a connection at
+	// window/RTT. At the defaults (256 MB over 256 connections) the derivation
+	// floors at 8 MB, which sustains roughly 134 Gbps at a 0.5 ms same-AZ RTT
+	// but caps a 10 Gbps path beyond ~6.7 ms RTT and a 1 Gbps path beyond
+	// ~67 ms. Same-datacenter and same-AZ replication has ample headroom;
+	// deployments replicating across regions on 10 GbE or faster should raise
+	// this budget (or lower MaxIncomingConnections) to widen the window.
+	// Measured on loopback by BenchmarkThroughputQUIC, which finds no
+	// throughput cost to the 8 MB floor there — loopback RTT is ~0.05 ms, so
+	// that benchmark cannot observe the bandwidth-delay-product effect this
+	// paragraph describes and does not contradict it.
 	MaxMessageReceiveMemory int64
 
 	// SendBatchMaxSize is the maximum byte size of a single send batch.

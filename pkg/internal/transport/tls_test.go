@@ -213,8 +213,9 @@ func TestBuildMTLSTLSServerALPN(t *testing.T) {
 }
 
 // generateTestCertPair creates a CA and a leaf certificate signed by it.
-// Returns (caCertPEM, caKeyPEM, leafCertPEM, leafKeyPEM).
-func generateTestCertPair(t *testing.T) ([]byte, []byte, []byte, []byte) {
+// Returns (caCertPEM, caKeyPEM, leafCertPEM, leafKeyPEM). It takes testing.TB
+// so benchmarks can build the same mTLS material as tests.
+func generateTestCertPair(t testing.TB) ([]byte, []byte, []byte, []byte) {
 	t.Helper()
 
 	// Generate CA key and cert.
