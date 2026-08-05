@@ -18,6 +18,7 @@ package quicraft
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -413,4 +414,80 @@ func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
 	if got := mustRead(t, dstPath); !bytes.Equal(got, plain) {
 		t.Fatal("nested destination content mismatch")
 	}
+}
+
+// TestReencryptSnapshotFile_SealedBarrierFailsClosed proves a CONFIGURED but
+// sealed barrier is not treated as a plaintext side.
+//
+// The previous contract said "a nil or sealed barrier denotes a PLAINTEXT
+// side". For the destination that is a silent downgrade. For the SOURCE it is
+// corruption: the source's ciphertext would be read as though it were
+// plaintext and written out recorded as plaintext, producing a destination
+// nothing can decrypt, with no error reported.
+func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
+	plain := snapshotPlaintext()
+
+	newSrc := func(t *testing.T, bar Barrier) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		srcPath := filepath.Join(dir, "src", "snapshot.dat")
+		if err := os.MkdirAll(filepath.Dir(srcPath), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		writeEncryptedSnapshotFile(t, bar, srcPath, plain)
+		return srcPath, filepath.Join(dir, "dst", "snapshot.dat")
+	}
+
+	t.Run("sealed source", func(t *testing.T) {
+		barA := createTestBarrier(t)
+		barB := createTestBarrier(t)
+		srcPath, dstPath := newSrc(t, barA)
+		if err := barA.Seal(); err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+		if _, err := ReencryptSnapshotFile(srcPath, dstPath, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed source "+
+				"must not have its ciphertext copied out as plaintext)", err)
+		}
+		if _, err := os.Stat(dstPath); !os.IsNotExist(err) {
+			t.Error("destination was written despite the sealed source")
+		}
+	})
+
+	t.Run("sealed destination", func(t *testing.T) {
+		barA := createTestBarrier(t)
+		barB := createTestBarrier(t)
+		srcPath, dstPath := newSrc(t, barA)
+		if err := barB.Seal(); err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+		if _, err := ReencryptSnapshotFile(srcPath, dstPath, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed "+
+				"destination must not durably write plaintext)", err)
+		}
+		if _, err := os.Stat(dstPath); !os.IsNotExist(err) {
+			t.Error("destination was written despite the sealed barrier")
+		}
+	})
+
+	// A NIL barrier still means "this side is plaintext by configuration",
+	// which is the behavior downstream migration callers depend on.
+	t.Run("nil destination still writes plaintext", func(t *testing.T) {
+		barA := createTestBarrier(t)
+		srcPath, dstPath := newSrc(t, barA)
+		epoch, err := ReencryptSnapshotFile(srcPath, dstPath, barA, nil)
+		if err != nil {
+			t.Fatalf("ReencryptSnapshotFile: %v", err)
+		}
+		if epoch != 0 {
+			t.Errorf("epoch = %d, want 0 for a plaintext destination", epoch)
+		}
+		got, err := os.ReadFile(dstPath)
+		if err != nil {
+			t.Fatalf("read dst: %v", err)
+		}
+		if !bytes.Equal(got, plain) {
+			t.Error("nil destination barrier did not write the plaintext through")
+		}
+	})
 }

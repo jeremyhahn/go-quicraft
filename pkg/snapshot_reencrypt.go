@@ -72,11 +72,19 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // PurgeEpochsBefore cannot remove a DEK mid-migration (the same protection
 // decryptSnapshotForSend takes around its decrypt).
 //
-// A nil or sealed barrier denotes a PLAINTEXT side: a nil/sealed srcBarrier
-// treats the source bytes as plaintext (no decryption); a nil/sealed dstBarrier
-// writes plaintext. This mirrors the barrier convention of
-// waldb.Reencrypt/SnapshotReencryptFunc, so a host can pass the same barriers it
-// passes there. It is the migration counterpart of the receive-side
+// A NIL barrier denotes a plaintext side: a nil srcBarrier treats the source
+// bytes as plaintext (no decryption); a nil dstBarrier writes plaintext.
+//
+// A non-nil but SEALED barrier is NOT a plaintext side. It means encryption is
+// configured for that side but temporarily unavailable, and it returns
+// ErrSnapshotBarrierSealed rather than falling through: reading an encrypted
+// source under a sealed barrier would copy ciphertext and record it as
+// plaintext, and a sealed destination would durably downgrade a snapshot that
+// must be encrypted at rest. This is the same nil-means-off,
+// sealed-means-fail-closed policy saveSnapshot, HandleSnapshot, and
+// ImportSnapshot enforce.
+//
+// It is the migration counterpart of the receive-side
 // reencryptReceivedSnapshot: that path encrypts just-received plaintext, this
 // path re-keys an already-sealed snapshot from one barrier to another.
 func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
@@ -87,6 +95,20 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 // filesystem. The exported entry point pins the os-backed one; tests supply a
 // fault-injecting implementation to exercise the crash-safety sequence.
 func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
+	// Refuse before opening anything. A CONFIGURED barrier that is sealed
+	// means encryption is temporarily unavailable, never that the side is
+	// plaintext. Treating a sealed srcBarrier as plaintext would read the
+	// source's CIPHERTEXT as if it were plaintext and write it out recorded
+	// as plaintext -- silent corruption, not merely a downgrade -- and a
+	// sealed dstBarrier would durably write a plaintext destination for a
+	// snapshot that must be encrypted at rest.
+	if srcBarrier != nil && srcBarrier.IsSealed() {
+		return 0, ErrSnapshotBarrierSealed
+	}
+	if dstBarrier != nil && dstBarrier.IsSealed() {
+		return 0, ErrSnapshotBarrierSealed
+	}
+
 	src, err := fsys.Open(srcPath)
 	if err != nil {
 		return 0, err
@@ -115,8 +137,8 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 		}
 	}()
 
-	srcLive := srcBarrier != nil && !srcBarrier.IsSealed()
-	dstLive := dstBarrier != nil && !dstBarrier.IsSealed()
+	srcLive := srcBarrier != nil
+	dstLive := dstBarrier != nil
 
 	// Pin every epoch the source frames reference so a concurrent
 	// PurgeEpochsBefore cannot remove a DEK mid-migration. The scan is
