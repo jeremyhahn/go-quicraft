@@ -161,6 +161,12 @@ type TransportConfig struct {
 	// message-frame payload buffers across all connections and streams. It
 	// bounds an OOM DoS where a peer opens many streams that each declare a
 	// large frame length and withhold the body. Default: 256 MB.
+	//
+	// It bounds APPLICATION frame buffers only. QUIC additionally buffers
+	// received bytes before the application reads them, up to
+	// MaxIncomingConnections * the per-connection QUIC receive window; that
+	// window is derived from this value, so the total inbound receive
+	// footprint is this budget PLUS the QUIC-level windows.
 	MaxMessageReceiveMemory int64
 
 	// MaxDecompressedSize is the maximum allowed size after Snappy
@@ -423,6 +429,18 @@ func (tc *TransportConfig) Validate() error {
 		if rc.CheckInterval < 0 {
 			return newValidationError("TransportConfig.RevocationConfig.CheckInterval",
 				"must be >= 0 (0 uses the default)")
+		}
+		// The default mode ("any") names no specific source, so the two checks
+		// above cannot catch it. Enabling revocation with the fail-closed
+		// default and nothing to consult admits EVERY revoked certificate for
+		// the process lifetime with no error, no log and no metric — the
+		// failure mode revocation exists to prevent. Soft-fail is the
+		// documented opt-out and explicitly covers "no revocation source
+		// configured", so it is left alone.
+		if !usesCRL && !usesOCSP && !rc.AllowSoftFail &&
+			len(rc.CRLPaths) == 0 && rc.OCSPResponderURL == "" {
+			return newValidationError("TransportConfig.RevocationConfig",
+				`must configure CRLPaths or OCSPResponderURL when revocation is enforced (set AllowSoftFail, or leave RevocationConfig nil, to disable revocation checking)`)
 		}
 	}
 	return nil

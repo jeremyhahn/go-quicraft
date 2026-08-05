@@ -69,8 +69,18 @@ func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ func(string) boo
 	if h.handleErr != nil {
 		return h.handleErr
 	}
+	// The transport recycles the batch — including the Message values inside
+	// it — as soon as this call returns, so the Requests slice header must not
+	// outlive the call. Copy it, as any conforming handler must; the Entries
+	// and Checksum slices inside each Message already point at an owned bulk
+	// allocation rather than the pooled receive buffer.
+	retained := batch
+	if len(batch.Requests) > 0 {
+		retained.Requests = make([]proto.Message, len(batch.Requests))
+		copy(retained.Requests, batch.Requests)
+	}
 	h.mu.Lock()
-	h.batches = append(h.batches, batch)
+	h.batches = append(h.batches, retained)
 	h.mu.Unlock()
 	h.batchCount.Add(1)
 	select {
@@ -5301,13 +5311,30 @@ func TestSnappyEncPool_Bootstraps(t *testing.T) {
 	if cap(*ptr) == 0 {
 		t.Fatal("snappyEncPool New returned a zero-capacity buffer")
 	}
-	tr.snappyEncPool.Put(ptr)
-
 	// The per-P private pool slot returns the most recently Put pointer,
-	// proving Put/Get now round-trip.
-	if got := tr.snappyEncPool.Get(); got != v {
+	// proving Put/Get now round-trip. Retried because the race detector makes
+	// sync.Pool discard a random fraction of Puts (runtime behaviour, not a
+	// property of this pool); a single attempt is a coin flip under -race,
+	// while a pool that never round-trips fails every attempt.
+	if !poolRoundTrips(func() { tr.snappyEncPool.Put(ptr) }, func() bool {
+		return tr.snappyEncPool.Get() == v
+	}) {
 		t.Fatal("snappyEncPool did not round-trip the returned buffer")
 	}
+}
+
+// poolRoundTrips reports whether put/observe round-trips within enough
+// attempts to be reliable under the race detector, which drops a random
+// fraction of sync.Pool Puts.
+func poolRoundTrips(put func(), observe func() bool) bool {
+	const attempts = 64
+	for i := 0; i < attempts; i++ {
+		put()
+		if observe() {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -5432,5 +5459,36 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("SendSnapshot did not return after Stop")
+	}
+}
+
+// TestSend_UnresolvedTargetCountsDrop verifies that a message whose target
+// replica has no registered address increments IncMessagesDropped under the
+// fixed "unresolved_target" reason rather than vanishing into a Debug log.
+func TestSend_UnresolvedTargetCountsDrop(t *testing.T) {
+	rec := &dropRecorder{}
+	tr, err := NewQUICTransport(Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+		Metrics:       rec,
+	}, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer tr.Stop()
+
+	// Nothing is registered, so Resolve fails for every target.
+	tr.Send([]proto.Message{{Type: proto.Replicate, ShardID: 5, From: 1, To: 3}})
+
+	got := rec.drops()
+	if len(got) != 1 {
+		t.Fatalf("IncMessagesDropped calls = %d, want 1", len(got))
+	}
+	if got[0].shardID != 5 || got[0].to != 3 || got[0].reason != dropReasonUnresolvedTarget {
+		t.Fatalf("drop = %+v, want shard 5 to 3 reason %q", got[0], dropReasonUnresolvedTarget)
 	}
 }

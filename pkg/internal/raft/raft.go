@@ -91,6 +91,28 @@ const noNode uint64 = 0
 // commit-time membership depends on.
 const configChangeScanChunkEntries uint64 = 1024
 
+// localControlMessages is the set of message types that are injected into
+// step() by the local process rather than received from the network: the
+// engine builds Propose and ReadIndex, the message handler builds
+// InstallSnapshot and SnapshotStatus, the host builds LeaderTransfer, and
+// Unreachable is a transport-local notification. None of them carry a term,
+// so they are the only types allowed past the Term != 0 gate in step().
+var localControlMessages = map[uint64]struct{}{
+	proto.Propose:         {},
+	proto.ReadIndex:       {},
+	proto.InstallSnapshot: {},
+	proto.SnapshotStatus:  {},
+	proto.Unreachable:     {},
+	proto.LeaderTransfer:  {},
+}
+
+// isLocalControlMessage reports whether a message type is locally injected
+// and therefore exempt from the Term != 0 requirement.
+func isLocalControlMessage(msgType uint64) bool {
+	_, ok := localControlMessages[msgType]
+	return ok
+}
+
 // readIndexStatus tracks a pending read index request. Heartbeat acks
 // are tracked with a uint64 bitfield instead of a map for zero-allocation
 // on the hot path. Replica IDs are mapped to bit positions 0..N via
@@ -216,6 +238,19 @@ type raft struct {
 	// appended but not yet committed. Per PhD thesis 4.1, only one
 	// config change may be pending at a time to prevent safety issues.
 	pendingConfigChange bool
+
+	// configChangeScanUnproven records that pendingConfigChange was armed
+	// by a scan that could not prove absence (a LogDB read error) rather
+	// than by an observed entry. The propose gate re-runs the scan in that
+	// case, so one transient read failure cannot block every membership
+	// change for the rest of the leadership term.
+	configChangeScanUnproven bool
+
+	// configChangeScanFailures counts fail-closed config change scans since
+	// process start. Reported with every fail-closed warning: a nonzero and
+	// growing value means membership changes are being blocked by storage
+	// errors, not by protocol state.
+	configChangeScanFailures uint64
 
 	// Leader transfer state.
 	transferTarget  uint64
@@ -531,6 +566,24 @@ func (r *raft) dropHighTermVote(msg proto.Message) bool {
 }
 
 func (r *raft) step(msg proto.Message) error {
+	// Term 0 is the local-injection escape hatch, not a wire value. Every
+	// message type produced by send() carries r.term, so a zero term on one
+	// of those types can only come from a peer that would thereby bypass
+	// every term comparison below: a Replicate could advance a follower's
+	// commit index over its uncommitted tail (the entries then reach the
+	// state machine and a later truncation by the real leader violates
+	// State Machine Safety), a vote response could escape the stale-term
+	// filter, and a Heartbeat could install a leader at any term.
+	if msg.Term == 0 && !isLocalControlMessage(msg.Type) {
+		slog.Warn("dropped protocol message with no term",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"type", proto.MessageTypeName(msg.Type),
+			"term", r.term)
+		return ErrZeroTermMessage
+	}
+
 	// CheckQuorum guard (Raft paper §6 last paragraph, thesis p.42): drop
 	// a higher-term RequestVote while this node heard from a live,
 	// quorum-backed leader within the last election timeout. Without
@@ -642,7 +695,7 @@ func stepFollower(r *raft, msg proto.Message) error {
 		}
 		// Client activity: exit quiesce so the election timer runs at
 		// normal speed while proposals are in flight.
-		r.quiesce.recordActivity()
+		r.recordActivity()
 		// Forward to leader.
 		msg.To = r.leaderID
 		r.send(msg)
@@ -722,7 +775,7 @@ func tickFollower(r *raft) {
 		r.electionTick++
 		if r.electionTick >= r.quiesce.quiesceElectionTimeout() {
 			r.electionTick = 0
-			r.quiesce.exit()
+			r.exitQuiesce()
 			r.startElection()
 		}
 		return
@@ -780,6 +833,32 @@ func tickLeader(r *raft) {
 		// During quiesce, only send liveness probes.
 		if r.quiesce.tickLiveness() {
 			r.broadcastHeartbeat()
+		}
+		// CheckQuorum must keep running while quiesced. Freezing
+		// electionTick here would freeze the read lease as well: acks
+		// recorded before or during quiesce never age, hasValidLease
+		// computes a negative expiry and accepts all of them, and a
+		// partitioned leader keeps answering ReadIndex from a stale
+		// committed index for the whole partition. The quiesce liveness
+		// interval is the quiesced equivalent of the election timeout,
+		// so it paces both the step-down check and the lease reset.
+		if r.checkQuorum {
+			r.electionTick++
+			if r.electionTick >= r.quiesce.livenessInterval {
+				r.electionTick = 0
+				r.logQuorumStatus()
+				if !r.hasQuorumActive() {
+					slog.Info("quiesced leader lost quorum, stepping down to follower",
+						"shard", r.shardID,
+						"replica", r.replicaID,
+						"term", r.term,
+					)
+					r.becomeFollower(r.term, noLeader)
+					return
+				}
+				r.resetRemoteActivity()
+				r.resetLeaseAcks()
+			}
 		}
 		return
 	}
@@ -856,13 +935,12 @@ func tickLeader(r *raft) {
 	// to stall indefinitely. The leader would reject proposals with
 	// ErrTransferInProgress until manually restarted.
 	if r.transferTarget == noNode && r.quiesce.tryEnter() {
-		// Invalidate the lease on quiesce entry. During quiesce,
-		// electionTick is frozen, so hasValidLease would compute
-		// leaseExpiry = frozenTick - leaseTimeout which can underflow
-		// negative, making all remoteLastAck entries appear valid.
-		// This prevents stale reads on a partitioned leader that exits
-		// quiesce and serves a ReadIndex before earning a fresh lease.
+		// Invalidate the lease on quiesce entry and restart the quiesced
+		// CheckQuorum cycle from zero so the lease must be re-earned
+		// against the liveness-probe interval rather than inheriting a
+		// partially elapsed election timeout.
 		r.resetLeaseAcks()
+		r.electionTick = 0
 		r.broadcastQuiesce()
 	}
 }
@@ -884,11 +962,35 @@ func tickLeader(r *raft) {
 // the classic two-simultaneous-configurations unsafety. Every failure to
 // prove absence therefore fails CLOSED (returns true, blocking new config
 // change proposals) rather than open.
+//
+// A fail-closed result is recorded in configChangeScanUnproven so the
+// propose gate can re-run the scan instead of latching a transient LogDB
+// read error for the rest of the leadership term.
 func (r *raft) hasConfigChangeToApply() bool {
-	if r.log.committed >= r.log.lastIndex() {
-		return false
+	found, err := r.scanUncommittedConfigChange()
+	if err != nil {
+		r.configChangeScanUnproven = true
+		r.configChangeScanFailures++
+		slog.Warn("config change scan failed, assuming a pending change",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"failures", r.configChangeScanFailures,
+			"error", err,
+		)
+		return true
 	}
+	r.configChangeScanUnproven = false
+	return found
+}
+
+// scanUncommittedConfigChange reports whether the uncommitted tail holds a
+// config change entry. A non-nil error means absence could not be proven;
+// it is never a statement that no config change exists.
+func (r *raft) scanUncommittedConfigChange() (bool, error) {
 	lastIdx := r.log.lastIndex()
+	if r.log.committed >= lastIdx {
+		return false, nil
+	}
 	for low := r.log.committed + 1; low <= lastIdx; {
 		high := low + configChangeScanChunkEntries
 		if high > lastIdx+1 {
@@ -898,28 +1000,20 @@ func (r *raft) hasConfigChangeToApply() bool {
 		// the scan cannot silently stop short of `high`.
 		entries, err := r.log.entries(low, high, 0)
 		if err != nil {
-			// Cannot prove absence — assume a config change is pending.
-			slog.Warn("config change scan failed, assuming a pending change",
-				"shard", r.shardID,
-				"replica", r.replicaID,
-				"low", low,
-				"high", high,
-				"error", err,
-			)
-			return true
+			return false, err
 		}
 		if len(entries) == 0 {
-			// No progress possible; treat as unprovable rather than absent.
-			return true
+			// No progress possible; absence is unprovable, not established.
+			return false, ErrUnavailable
 		}
 		for i := range entries {
 			if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
-				return true
+				return true, nil
 			}
 		}
 		low = entries[len(entries)-1].Index + 1
 	}
-	return false
+	return false, nil
 }
 
 // startElection starts a new election. Uses PreVote if enabled.
@@ -1098,7 +1192,20 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 }
 
 // handleVoteResp processes a RequestVoteResp or RequestPreVoteResp.
+// Responses from replicas outside the CURRENT configuration are discarded:
+// the quorum in tallyVotes is computed over the live voting set, so counting
+// a grant from a replica that was removed mid-election (or was never a
+// member) lets a candidate win with fewer configuration votes than the
+// quorum requires — two leaders in one term.
 func (r *raft) handleVoteResp(msg proto.Message) error {
+	if !r.isVotingMember(msg.From) {
+		slog.Debug("ignoring vote response from outside the configuration",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"term", r.term)
+		return nil
+	}
 	slog.Debug("vote response",
 		"shard", r.shardID,
 		"from", msg.From,
@@ -1109,17 +1216,66 @@ func (r *raft) handleVoteResp(msg proto.Message) error {
 	return nil
 }
 
+// isVotingMember reports whether id belongs to the current configuration's
+// voting set (remotes + witnesses + self).
+func (r *raft) isVotingMember(id uint64) bool {
+	if id == r.replicaID {
+		return true
+	}
+	if _, ok := r.remotes[id]; ok {
+		return true
+	}
+	_, ok := r.witnesses[id]
+	return ok
+}
+
+// purgeDepartedVotes drops vote records for replicas that left the voting
+// set. Called whenever the configuration is reshaped, because r.votes is
+// otherwise cleared only on the next campaign: a shrinking voting set
+// lowers the quorum while stale grants remain countable.
+func (r *raft) purgeDepartedVotes() {
+	for id := range r.votes {
+		if !r.isVotingMember(id) {
+			delete(r.votes, id)
+		}
+	}
+}
+
+// countVotes tallies grants and rejections over the CURRENT configuration's
+// voting set. Ranging r.votes instead would count replicas that are no
+// longer part of the configuration the quorum is computed from.
+func (r *raft) countVotes() (granted, rejected int) {
+	tally := func(id uint64) {
+		v, ok := r.votes[id]
+		switch {
+		case !ok:
+			return
+		case v:
+			granted++
+		default:
+			rejected++
+		}
+	}
+	tally(r.replicaID)
+	for id := range r.remotes {
+		if id != r.replicaID {
+			tally(id)
+		}
+	}
+	for id := range r.witnesses {
+		if id != r.replicaID {
+			tally(id)
+		}
+	}
+	return granted, rejected
+}
+
 // checkElectionResult tallies votes and transitions state if the
 // election is decided. Returns true if a transition occurred.
 func (r *raft) checkElectionResult() bool {
 	result := r.tallyVotes()
 	q := quorum(r.remotes, r.witnesses)
-	granted := 0
-	for _, v := range r.votes {
-		if v {
-			granted++
-		}
-	}
+	granted, _ := r.countVotes()
 	switch result {
 	case voteWon:
 		if r.state == preCandidate {
@@ -1161,20 +1317,14 @@ func (r *raft) checkElectionResult() bool {
 	}
 }
 
-// tallyVotes counts votes and returns the result.
+// tallyVotes counts votes over the current voting set and returns the
+// result. Both the quorum and the tally are taken over the same
+// configuration, so a mid-election membership change can never produce a
+// win on fewer votes than that configuration requires.
 func (r *raft) tallyVotes() voteResult {
 	q := quorum(r.remotes, r.witnesses)
-	granted := 0
-	rejected := 0
 	totalVoters := numVotingMembers(r.remotes, r.witnesses)
-
-	for _, v := range r.votes {
-		if v {
-			granted++
-		} else {
-			rejected++
-		}
-	}
+	granted, rejected := r.countVotes()
 
 	if granted >= q {
 		return voteWon
@@ -1202,7 +1352,15 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 		return ErrTransferInProgress
 	}
 
-	r.quiesce.recordActivity()
+	r.recordActivity()
+
+	// Re-run a scan that previously failed closed. becomeLeader arms
+	// pendingConfigChange from the inherited uncommitted tail; when that
+	// scan could not read the log, the arming was a guess, and leaving it
+	// latched rejects every membership change for the whole term.
+	if r.pendingConfigChange && r.configChangeScanUnproven {
+		r.pendingConfigChange = r.hasConfigChangeToApply()
+	}
 
 	// Per PhD thesis 4.1: reject config change if one is already pending.
 	// Validate the entire batch before mutating state. If a batch contains
@@ -1615,7 +1773,7 @@ func (r *raft) sendSnapshot(to uint64) {
 func (r *raft) handleAppend(msg proto.Message) error {
 	r.electionTick = 0
 	r.leaderID = msg.From
-	r.quiesce.recordActivity()
+	r.recordActivity()
 
 	// If the leader's prevLogIndex is behind our committed index, the
 	// entries are stale. Respond immediately with the committed index
@@ -1802,6 +1960,21 @@ func (r *raft) handleAppendResp(msg proto.Message) error {
 				r.sendAppend(msg.From)
 			}
 		}
+		return nil
+	}
+
+	// A match index beyond the leader's own log cannot be real: a follower
+	// only ever echoes an index the leader sent it. Accepting it would push
+	// rm.match past lastIndex and let tryCommit advance the commit index
+	// over entries that do not exist.
+	if msg.LogIndex > r.log.lastIndex() {
+		slog.Warn("append response reports match beyond leader log",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"reported_index", msg.LogIndex,
+			"last_index", r.log.lastIndex(),
+		)
 		return nil
 	}
 
@@ -2172,6 +2345,7 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 			r.witnesses[id] = newRemote(nextIdx, maxInflightMsgs)
 		}
 	}
+	r.purgeDepartedVotes()
 }
 
 // snapshotAckWaitMultiplier sizes the post-transfer ack wait as a multiple
@@ -2340,7 +2514,7 @@ func (r *raft) hasValidLease() bool {
 
 // handleLeaderReadIndex handles a read index request on the leader.
 func (r *raft) handleLeaderReadIndex(msg proto.Message) error {
-	r.quiesce.recordActivity()
+	r.recordActivity()
 
 	// Per PhD thesis 6.4: leader must have committed an entry in its
 	// current term before serving linearizable reads.
@@ -2571,7 +2745,7 @@ func (r *raft) handleLeaderTransfer(msg proto.Message) error {
 	// timeout logic. Without this, a quiesced leader that transfers to
 	// an unreachable target would be permanently stuck: no proposals
 	// accepted and the transfer never times out.
-	r.quiesce.exit()
+	r.exitQuiesce()
 
 	rm, ok := r.remotes[target]
 	if !ok {
@@ -2644,7 +2818,7 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 	// liveness probe interval instead of normal heartbeats, and if
 	// the election fails, tickFollower would use the extended quiesce
 	// election timeout (30x normal).
-	r.quiesce.exit()
+	r.exitQuiesce()
 	// Start an election immediately, bypassing PreVote. The votes carry
 	// the leadership-transfer hint so peers with a fresh leader lease
 	// still grant them.
@@ -2831,6 +3005,31 @@ func (r *raft) resetRemoteActivity() {
 	}
 	for _, wm := range r.witnesses {
 		wm.setNotActive()
+	}
+}
+
+// recordActivity notes client or protocol activity and leaves quiesce.
+// Leaving quiesce invalidates the read lease: the acks that earned it were
+// recorded against a clock paced by the liveness-probe interval, which
+// says nothing about the followers' election timers once normal ticking
+// resumes.
+func (r *raft) recordActivity() {
+	if r.quiesce.active {
+		r.exitQuiesce()
+		return
+	}
+	r.quiesce.recordActivity()
+}
+
+// exitQuiesce leaves quiesce mode and invalidates the read lease. Every
+// quiesce exit path must go through here so no lease survives the clock
+// change.
+func (r *raft) exitQuiesce() {
+	wasActive := r.quiesce.active
+	r.quiesce.exit()
+	if wasActive {
+		r.resetLeaseAcks()
+		r.electionTick = 0
 	}
 }
 

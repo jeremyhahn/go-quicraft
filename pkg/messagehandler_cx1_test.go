@@ -40,6 +40,20 @@ func (c *capturingEngineDeliverer) DeliverMessage(shardID uint64, msg proto.Mess
 	return c.engineDeliverer.DeliverMessage(shardID, msg)
 }
 
+// firstInstallSnapshot returns the first InstallSnapshot message delivered to
+// the raft layer, which is the message that seeds the LogReader's snapshot
+// record and therefore what this node would stream as leader.
+func (c *capturingEngineDeliverer) firstInstallSnapshot() (proto.Message, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.delivered {
+		if m.Type == proto.InstallSnapshot {
+			return m, true
+		}
+	}
+	return proto.Message{}, false
+}
+
 func (c *capturingEngineDeliverer) installSnapshotEpoch() (uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

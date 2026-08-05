@@ -24,6 +24,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
+// mustHandle is a test helper that steps a message and fails on error.
+func mustHandle(t *testing.T, p *Peer, msg proto.Message) {
+	t.Helper()
+	if err := p.Handle(msg); err != nil {
+		t.Fatalf("unexpected error from Handle(%s): %v",
+			proto.MessageTypeName(msg.Type), err)
+	}
+}
+
 // mustCommit is a test helper that calls Commit and fails on error.
 func mustCommit(t *testing.T, p *Peer, update proto.Update) {
 	t.Helper()
@@ -2863,103 +2872,6 @@ func BenchmarkPeerHasUpdate(b *testing.B) {
 	}
 }
 
-// --- DrainReadState tests ---
-
-// TestPeer_DrainReadState_ExtractsReadStatesAndMessages verifies that
-// DrainReadState extracts readStates and outbound messages from the
-// raft state machine without touching entries, hard state, or snapshots.
-func TestPeer_DrainReadState_ExtractsReadStatesAndMessages(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	// Issue a ReadIndex. For a single-node cluster, this resolves
-	// immediately and populates readStates.
-	err := p.ReadIndex(77)
-	if err != nil {
-		t.Fatalf("ReadIndex failed: %v", err)
-	}
-
-	// DrainReadState should extract the readStates.
-	readStates, msgs := p.DrainReadState()
-
-	if len(readStates) != 1 {
-		t.Fatalf("expected 1 readState, got %d", len(readStates))
-	}
-	if readStates[0].Key != 77 {
-		t.Errorf("readState key = %d, want 77", readStates[0].Key)
-	}
-
-	// No outbound messages expected for single-node ReadIndex.
-	// (ReadIndex resolves locally without heartbeat broadcast.)
-	_ = msgs
-
-	// After drain, readStates should be empty in the raft struct.
-	// A second drain should return nil.
-	readStates2, _ := p.DrainReadState()
-	if len(readStates2) != 0 {
-		t.Fatalf("second DrainReadState should return empty, got %d", len(readStates2))
-	}
-}
-
-// TestPeer_DrainReadState_EmptyWhenNoPendingState verifies that
-// DrainReadState returns nil when there are no pending readStates
-// or outbound messages.
-func TestPeer_DrainReadState_EmptyWhenNoPendingState(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	// Drain any residual state from leader election.
-	_, _ = p.DrainReadState()
-	_ = p.r.drainMessages()
-
-	// Now drain again - should return empty.
-	readStates, msgs := p.DrainReadState()
-
-	if len(readStates) != 0 {
-		t.Fatalf("expected 0 readStates, got %d", len(readStates))
-	}
-	if len(msgs) != 0 {
-		t.Fatalf("expected 0 messages, got %d", len(msgs))
-	}
-}
-
-// TestPeer_DrainReadState_PreservesEntryState verifies that DrainReadState
-// does NOT consume entries to save or modify prevState. This is critical
-// for the commitPending fast path where entries must remain available for
-// the next full GetUpdate cycle after commitPending clears.
-func TestPeer_DrainReadState_PreservesEntryState(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	// Propose an entry to create entries to save.
-	_, err := p.Propose([]proto.Entry{{Cmd: []byte("test")}})
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-
-	// Verify there are entries to save.
-	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate=true after Propose")
-	}
-
-	// Issue a ReadIndex as well.
-	err = p.ReadIndex(88)
-	if err != nil {
-		t.Fatalf("ReadIndex failed: %v", err)
-	}
-
-	// DrainReadState should extract readStates and messages but leave
-	// entries to save intact.
-	readStates, _ := p.DrainReadState()
-
-	if len(readStates) != 1 {
-		t.Fatalf("expected 1 readState, got %d", len(readStates))
-	}
-
-	// HasUpdate should still be true because entries to save are preserved.
-	// Note: messages were drained by DrainReadState, but entriesToSave remain.
-	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate=true after DrainReadState (entries still pending)")
-	}
-}
-
 // --- IsMember ---
 
 func TestPeer_IsMember_Voter(t *testing.T) {
@@ -3996,7 +3908,9 @@ func TestPeer_GetPiggybackUpdate_DoesNotTouchSnapshot(t *testing.T) {
 
 func TestPeer_SetProcessedIndex_SetsLogProcessedMarker(t *testing.T) {
 	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+	// The marker is clamped to the recovered commit index, so the recovered
+	// hard state must actually cover the index under test.
+	p := newTestPeer(t, cfg, proto.State{Commit: 100}, singleNodeMembership())
 
 	// Initial processed should be 0.
 	if p.r.log.processed != 0 {
@@ -4013,7 +3927,7 @@ func TestPeer_SetProcessedIndex_SetsLogProcessedMarker(t *testing.T) {
 
 func TestPeer_SetProcessedIndex_ZeroValue(t *testing.T) {
 	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+	p := newTestPeer(t, cfg, proto.State{Commit: 50}, singleNodeMembership())
 
 	// Set to a non-zero value first.
 	p.SetProcessedIndex(50)
@@ -4031,10 +3945,10 @@ func TestPeer_SetProcessedIndex_ZeroValue(t *testing.T) {
 
 func TestPeer_SetProcessedIndex_LargeValue(t *testing.T) {
 	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
-
-	// Set to a large value to simulate on-disk state machine recovery.
 	largeIndex := uint64(1 << 40)
+	p := newTestPeer(t, cfg, proto.State{Commit: largeIndex}, singleNodeMembership())
+
+	// A large value simulates on-disk state machine recovery.
 	p.SetProcessedIndex(largeIndex)
 
 	if p.r.log.processed != largeIndex {
@@ -5124,7 +5038,7 @@ func TestPeer_SyncRaftRemotes_ProposalsSucceedAfterTransferTargetRemoved(t *test
 // R12-1: syncRaftRemotes includes witnesses in remoteLastAck
 // ---------------------------------------------------------------------------
 
-func TestPeer_SyncRaftRemotes_IncludesWitnessesInRemoteLastAck(t *testing.T) {
+func TestPeer_SyncRaftRemotes_TracksWitnessLeaseAcks(t *testing.T) {
 	// Create a 2-voter + 1-witness cluster with lease reads enabled.
 	cfg := testConfigWithID(1, 1)
 	cfg.PreVote = config.BoolPtr(false)
@@ -5146,12 +5060,12 @@ func TestPeer_SyncRaftRemotes_IncludesWitnessesInRemoteLastAck(t *testing.T) {
 	}
 
 	// Grant votes from remote and witness to become leader.
-	p.Handle(proto.Message{
+	mustHandle(t, p, proto.Message{
 		Type: proto.RequestVoteResp,
 		From: 2,
 		Term: p.r.term,
 	})
-	p.Handle(proto.Message{
+	mustHandle(t, p, proto.Message{
 		Type: proto.RequestVoteResp,
 		From: 3,
 		Term: p.r.term,
@@ -5166,28 +5080,36 @@ func TestPeer_SyncRaftRemotes_IncludesWitnessesInRemoteLastAck(t *testing.T) {
 		t.Fatal("expected remoteLastAck to be initialized for lease reads")
 	}
 
-	// becomeLeader starts with an empty remoteLastAck map. Entries are
-	// added lazily via handleHeartbeatResp or syncRaftRemotes. Call
-	// syncRaftRemotes to simulate a config change that adds witnesses.
-	p.syncRaftRemotes()
-
-	// After syncRaftRemotes, witness 3 must have an entry.
-	if _, ok := p.r.remoteLastAck[3]; !ok {
-		t.Fatal("expected witness 3 to have an entry in remoteLastAck after syncRaftRemotes")
+	// A witness ack counts toward the lease exactly like a voter ack:
+	// witnesses vote in elections, so they belong to the same quorum.
+	for _, from := range []uint64{2, 3} {
+		mustHandle(t, p, proto.Message{
+			Type: proto.HeartbeatResp,
+			From: from,
+			Term: p.r.term,
+		})
+		if _, ok := p.r.remoteLastAck[from]; !ok {
+			t.Fatalf("expected replica %d in remoteLastAck after its heartbeat ack", from)
+		}
 	}
 
-	// Remote 2 must also have an entry.
-	if _, ok := p.r.remoteLastAck[2]; !ok {
-		t.Fatal("expected remote 2 to have an entry in remoteLastAck after syncRaftRemotes")
-	}
-
-	// Add a new witness via membership and sync again.
+	// A witness added during leadership must NOT be seeded with an ack
+	// tick: an entry at tick 0 is indistinguishable from a real ack and
+	// would let a member that never responded contribute to the lease.
 	p.membership.witnesses[4] = "addr4"
 	p.syncRaftRemotes()
+	if _, ok := p.r.remoteLastAck[4]; ok {
+		t.Fatal("newly added witness 4 was seeded with an ack tick")
+	}
 
-	// The new witness should have been added to remoteLastAck.
+	// It enters the map on its first real ack.
+	mustHandle(t, p, proto.Message{
+		Type: proto.HeartbeatResp,
+		From: 4,
+		Term: p.r.term,
+	})
 	if _, ok := p.r.remoteLastAck[4]; !ok {
-		t.Fatal("expected new witness 4 to have an entry in remoteLastAck after syncRaftRemotes")
+		t.Fatal("expected witness 4 in remoteLastAck after its first ack")
 	}
 
 	// Remove witness 4 from membership and the raft witnesses map, then sync.

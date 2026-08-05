@@ -8,7 +8,7 @@ At-rest encryption in QuicRaft is built on a **per-node Barrier** that manages A
 - `pkg/crypto/shamir/` — Shamir's Secret Sharing for key management
 - `pkg/enclave/` — Secure enclave integration
 
-**Source:** `pkg/seal/barrier.go`, `pkg/seal/strategy.go`, `pkg/seal/errors.go`
+**Source:** `pkg/seal/barrier.go`, `pkg/seal/barrier_config.go`, `pkg/seal/strategy.go`, `pkg/seal/errors.go`
 
 ## Overview
 
@@ -37,8 +37,10 @@ The system separates two concerns:
 
 | Layer | Responsibility | Configurable |
 |-------|----------------|--------------|
-| **Barrier** | Derives DEKs via HKDF-SHA256, encrypts/decrypts data with AEAD, manages epoch rotation, auto-detects optimal algorithm | Algorithm selection via `BarrierConfig` |
+| **Barrier** | Derives DEKs via HKDF-SHA256, encrypts/decrypts data with AEAD, manages epoch rotation, auto-detects optimal algorithm | Algorithm, deployment ID, AEAD safety trackers, and the `StatePersister` via `BarrierConfig` |
 | **SealingStrategy** | Protects the root key at rest (wrapping/unwrapping) | Yes—any backend (software, HSM, TPM2, cloud KMS) |
+
+**The embedder owns durable storage.** The barrier holds sealed state in memory and hands it to a caller-supplied `StatePersister` when that state changes; it never writes a file. Custody of the sealed blob belongs to the host application (go-qrdb), per the Layer-1 boundary.
 
 **Per-node encryption, NOT clustered DEK.** Each node independently manages its own barrier and root key. QUIC provides in-transit encryption via mTLS; the barrier encrypts data at-rest. Nodes cannot decrypt each other's at-rest data.
 
@@ -83,13 +85,13 @@ type Barrier struct {
     unsealed atomic.Bool  // fast-path check
 
     state    barrierState
-    rootKey  *memguard.Enclave      // 32 bytes, encrypted at-rest in memory
+    rootKey  *enclave.ProtectedKey  // 32 bytes, encrypted at-rest in memory
     salt     []byte                 // 32 bytes, used for HKDF
 
     epoch      uint64
-    currentDEK *memguard.LockedBuffer // derived via HKDF
+    currentDEK *enclave.ProtectedKey  // derived via HKDF
     cipher     cipher.AEAD             // current epoch's AEAD cipher
-    deks       map[uint64]*memguard.LockedBuffer // epoch → DEK for reading old data
+    deks       map[uint64]*enclave.ProtectedKey // epoch → DEK for reading old data
     ciphers    map[uint64]cipher.AEAD
 
     knownEpochs    map[uint64]struct{}  // all epochs ever used
@@ -101,7 +103,13 @@ type Barrier struct {
 }
 ```
 
-The root key is stored in a `memguard.Enclave` (encrypted at-rest in process memory). DEKs are stored in `memguard.LockedBuffer` instances (mlock'd, guard pages, canary values). On `Seal()`, all key material is zeroed.
+Key material is held in `enclave.ProtectedKey` (`pkg/enclave`), which wraps a
+memguard enclave: the plaintext key exists only inside a guarded, mlock'd
+buffer for the duration of a single operation and is encrypted at rest in
+process memory the rest of the time. `Seal()` drops every key reference via
+`ProtectedKey.Clear()`; note that `Clear()` releases the reference rather than
+zeroing the enclave's own ciphertext, so residual encrypted material remains
+until garbage collection.
 
 ### Lifecycle Transitions
 
@@ -119,16 +127,30 @@ Uninitialized ──Initialize()──> Unsealed ──Seal()──> Sealed
 
 ## Key Derivation
 
-Each epoch produces a cryptographically independent DEK using HKDF-SHA256:
+Each epoch produces a cryptographically independent DEK using HKDF-SHA256. The DEK length is the configured algorithm's key size (16 for AES-128-GCM, 24 for AES-192-GCM, 32 for AES-256-GCM and both ChaCha20 variants).
 
 ```go
-func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64) ([]byte, error) {
-    var info [36]byte
+func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64, alg SymmetricAlgorithm, version HKDFVersion) ([]byte, error) {
+    keySize := alg.KeySize()
+
+    var info [38]byte
     copy(info[:20], "quicraft/barrier/v1/")              // domain separation
     binary.BigEndian.PutUint64(info[20:], deploymentID)  // deployment isolation
     binary.BigEndian.PutUint64(info[28:], epoch)         // epoch
-    hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:])
-    dek := make([]byte, 32) // AES-256
+
+    infoLen := 36
+    switch version {
+    case 0, HKDFV1:                                      // legacy layout
+    case HKDFV2:
+        info[36] = byte(alg)                             // algorithm separation
+        info[37] = byte(keySize)                         // key-size separation
+        infoLen = 38
+    default:
+        return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedHKDFVersion}
+    }
+
+    hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:infoLen])
+    dek := make([]byte, keySize)
     _, err := io.ReadFull(hkdfReader, dek)
     return dek, err
 }
@@ -136,10 +158,33 @@ func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64) ([]byte, error)
 
 **Key properties:**
 
-- **Deterministic:** Same root key + salt + deploymentID + epoch always produces the same DEK. DEKs can be re-derived on demand after `Unseal()`.
+- **Deterministic:** Same root key + salt + deploymentID + epoch + algorithm always produces the same DEK. DEKs can be re-derived on demand after `Unseal()`.
 - **Independent:** Each epoch's info string differs, so DEKs are cryptographically independent.
 - **Deployment isolation:** The `deploymentID` ensures different deployments produce entirely different DEKs.
+- **Algorithm isolation (v2):** The algorithm identifier and key length are bound into the info string.
 - **Salt purpose:** 32-byte random salt provides additional node-level separation.
+
+### HKDF Info Versioning
+
+The info layout is versioned by `SealedRootKey.HKDFVersion` (type `HKDFVersion uint8`), persisted with the sealed root key so data keeps deriving under the layout it was written with.
+
+| Version | Info length | Layout |
+|---------|-------------|--------|
+| `HKDFV1` = 1 | 36 bytes | `[prefix:20 \| deploymentID:8 \| epoch:8]` |
+| `HKDFV2` = 2 | 38 bytes | `[prefix:20 \| deploymentID:8 \| epoch:8 \| algID:1 \| keyLen:1]` |
+
+- `prefix` is the 20 ASCII bytes `quicraft/barrier/v1/` — a fixed string, unrelated to `HKDFVersion`.
+- `deploymentID` and `epoch` are big-endian `uint64`.
+- `algID` is the `SymmetricAlgorithm` byte (`0x01` AES-128-GCM, `0x02` AES-192-GCM, `0x03` AES-256-GCM, `0x04` ChaCha20-Poly1305, `0x05` XChaCha20-Poly1305); `keyLen` is the DEK length in bytes.
+
+**Why v2.** HKDF is a stream: under v1 the 16-byte AES-128 DEK for a given (deployment, epoch) is the first 16 bytes of that pair's 32-byte AES-256 DEK, and ChaCha20-Poly1305 and AES-256-GCM share a key outright. The unauthenticated `algID` header byte could therefore select a key that is a prefix of another. v2's `[algID][keyLen]` suffix makes a change of `BarrierConfig.Algorithm` yield unrelated keys.
+
+**Version handling:**
+
+- `Initialize` stamps `currentHKDFVersion` (= `HKDFV2`) into the sealed blob. New deployments are always v2.
+- `SetSealedRootKey` treats `HKDFVersion == 0` — a blob persisted before the field existed — as `HKDFV1`, so pre-upgrade data stays derivable.
+- `SetSealedRootKey` rejects any version above `currentHKDFVersion` with `ErrUnsupportedHKDFVersion` rather than failing later with an opaque decryption error; `deriveDEK` rejects the same with a `KeyDerivationError` wrapping it.
+- The version applies to every epoch of a barrier. There is no per-epoch layout mixing and no in-place upgrade of an existing v1 blob.
 
 ## Epoch-Based Key Rotation
 
@@ -149,7 +194,7 @@ Epoch rotation changes encryption keys without re-encrypting existing data and w
 
 1. **Single root key** — generated once at `Initialize()`, never changes
 2. **Epoch counter** — starts at 1, incremented on each `Rotate()` call
-3. **DEK per epoch** — derived deterministically: `DEK(epoch) = HKDF(rootKey, salt, "quicraft/barrier/v1/" + deploymentID + epoch)`
+3. **DEK per epoch** — derived deterministically: `DEK(epoch) = HKDF(rootKey, salt, "quicraft/barrier/v1/" + deploymentID + epoch [+ algID + keyLen])`
 4. **New writes use current epoch** — `Encrypt()` always uses the current DEK
 5. **Old reads use historical DEKs** — `Decrypt()` reads the epoch from the ciphertext header, looks up the corresponding DEK
 6. **No re-encryption** — old data stays encrypted with its original epoch's DEK until compaction deletes it
@@ -161,63 +206,97 @@ func (b *Barrier) Rotate() (uint64, error) {
     b.mu.Lock()
     defer b.mu.Unlock()
 
+    persist := b.config.StatePersister
+    if persist == nil {
+        return 0, ErrNoStatePersister
+    }
+
     newEpoch := b.epoch + 1
+
+    // 1. Derive. Nothing has changed yet on error.
     dek, aead, err := b.deriveEpochCipher(rootBuf.Bytes(), b.salt, newEpoch)
     if err != nil {
+        wipeBytes(dek)
         return 0, err
     }
-    oldEpoch := b.epoch
 
-    // Perform every fallible AEAD-safety-tracker reset BEFORE committing the
-    // epoch switch. If either fails, stay on the OLD epoch and return it.
-    if b.invocations != nil {
-        if err := b.invocations.Reset(); err != nil {
-            wipeBytes(dek)
-            return oldEpoch, &TrackerError{Tracker: "invocation", Op: "reset", Err: err}
-        }
-    }
-    if b.nonceTracker != nil {
-        if err := b.nonceTracker.Clear(); err != nil {
-            wipeBytes(dek)
-            return oldEpoch, &TrackerError{Tracker: "nonce", Op: "clear", Err: err}
-        }
+    // 2. Persist the new epoch + KnownEpochs BEFORE activating them. On error
+    //    nothing is committed and the OLD epoch stays fully active.
+    candidate := cloneSealedRootKey(b.sealed)
+    candidate.Epoch = newEpoch
+    candidate.KnownEpochs = sortedEpochsWith(b.knownEpochs, newEpoch)
+    if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
+        wipeBytes(dek)
+        return 0, &StatePersistError{Op: "rotate", Epoch: newEpoch, Err: perr}
     }
 
-    // All fallible steps succeeded — commit the epoch switch atomically.
+    // 3. Commit — in-memory, infallible, under the held write lock.
     b.epoch = newEpoch
     b.currentDEK = dekPK
     b.cipher = aead
     b.deks[newEpoch] = dekPK
     b.ciphers[newEpoch] = aead
     b.knownEpochs[newEpoch] = struct{}{}
+    b.sealed = candidate
+
+    // 4. Reset the AEAD safety trackers for the new key. Failures here are
+    //    fail-safe: logged, never reverting the commit.
+    ...
     return newEpoch, nil
 }
 ```
 
 The write lock blocks concurrent `Encrypt`/`Decrypt` calls during rotation. Since rotation is fast (~1-2ms for HKDF + map update), this pause is negligible.
 
-**Rotation atomicity.** The new DEK/cipher are derived into locals, and the
-fallible invocation-counter `Reset()` and nonce-tracker `Clear()` are performed,
-*before* the barrier mutates any epoch state. With the in-memory trackers these
-resets always succeed, but an injected persistent or hardware-backed tracker may
-fail. If it does, `Rotate` wipes the freshly derived DEK, leaves the barrier on
-the **old** epoch with its existing (non-reset) counter, and returns the old
-epoch alongside a `TrackerError`. It never leaves the barrier half-rotated and
-never returns epoch 0 — the invocation-limit safety margin is preserved and the
-caller can retry. Rotation is rejected with `ErrBarrierSealed` unless the barrier
-is unsealed, and with `ErrHardwareMode` in hardware mode.
+**Persist-then-activate.** A rotated epoch that is not durably recorded is a data-loss bug: the write path stamps the new epoch into WAL segments and snapshots immediately, while the read path fails closed on an epoch the restored blob does not name — so every byte written after an unpersisted rotation is permanently undecryptable once the process restarts. `Rotate` therefore hands the new sealed state (`Epoch` + `KnownEpochs`) to `BarrierConfig.StatePersister` and installs the new key **only** after the persister returns nil. A persister error aborts the rotation: no DEK installed, no `knownEpochs` mutation, no tracker reset, no change to `b.sealed`; the old epoch remains fully active and usable, and `Rotate` returns `(0, *StatePersistError{Op: "rotate"})`. With no persister configured, `Rotate` returns `ErrNoStatePersister` and changes nothing.
 
-`Rotate()` updates `b.sealed.Epoch` and rebuilds `b.sealed.KnownEpochs` from the full `b.knownEpochs` map. On restart, `SetSealedRootKey` restores the known epochs and `Unseal()` re-derives DEKs for all of them.
+**Tracker resets are fail-safe and run last.** The invocation-counter `Reset()` and nonce-tracker `Clear()` happen *after* the epoch commit and never revert it; a failure is logged at `slog.Warn` and `Rotate` still returns `(newEpoch, nil)`. The trackers are shared in-place state with no rollback API — resetting before the commit could hand a still-active old key a freshly zeroed invocation counter, i.e. a second 2^32 budget beyond its AEAD safety limit. After the commit, both failure modes are safe: a non-reset counter only makes the new key re-rotate sooner, and a non-cleared nonce set only yields conservative false-positive reuse rejections. Returning an error alongside a committed epoch is deliberately avoided so a caller cannot retry into a second rotation.
+
+Rotation is rejected with `ErrBarrierSealed` unless the barrier is unsealed, and with `ErrHardwareMode` in hardware mode.
+
+On restart, `SetSealedRootKey` restores the persisted known epochs and `Unseal()` re-derives DEKs for all of them.
+
+### Durable State: StatePersister
+
+**Source:** `pkg/seal/barrier_config.go`
+
+```go
+type StatePersister func(*SealedRootKey) error
+```
+
+The barrier owns no storage. Per the Layer-1 boundary, `pkg/seal` is the encryptor only — the **embedder** (go-qrdb, or whichever component loads the blob at boot via `SetSealedRootKey`) owns the file/KV record holding the sealed root key and its fsync. `StatePersister` is the seam: the barrier hands over the state it needs made durable and waits for confirmation.
+
+**Contract:**
+
+- Returning nil MUST mean the blob is durable — readable back verbatim after a crash. The barrier activates the new epoch on a nil return, so a premature nil re-opens the data-loss window the hook exists to close.
+- The argument is a private deep copy; the persister may retain or mutate it.
+- The persister runs **with the barrier's write lock held**. It MUST NOT call back into the same `Barrier` (`Encrypt`, `Rotate`, `SealedRootKeyData`, …) — doing so deadlocks.
+- Returning an error aborts the operation with the previous epoch intact.
+
+**Required for:** `Rotate`, and any `PurgeEpochsBefore` that would actually drop an epoch. Both change state that must survive a restart. `Initialize` does **not** call the persister — the embedder persists `SealedRootKeyData()` directly at bootstrap.
+
+**Consequence of leaving it nil.** At-rest key rotation is disabled: `Rotate` fails closed with `ErrNoStatePersister` on every call. Encryption continues under the current epoch, but only until the AEAD invocation limit. The default `InvocationLimit` is `DefaultInvocationLimit` = 2^32 (NIST SP 800-38D for random 96-bit nonces); `Encrypt` increments the counter on every call and returns `ErrInvocationLimitExceeded` once the limit would be exceeded, failing every subsequent encrypt until the key is rotated. That end is reached quickly after any restart: with the default in-memory counter, `Unseal` cannot know how many invocations the current epoch already performed before the restart, so it pessimistically seeds the counter to the rotation threshold (default 95%), leaving only the ~5% headroom (≈2×10^8 invocations) before the hard limit. A deployment that leaves `StatePersister` nil therefore burns that headroom and then stops accepting writes.
 
 ### Ciphertext Format
 
-Every encrypted output carries its epoch:
+Every encrypted output carries its epoch and algorithm:
 
 ```
-[Epoch:8 | Nonce:12 | EncryptedData | Tag:16]
+[Epoch:8 (big-endian) | AlgID:1 | Nonce:N | EncryptedData | Tag:16]
 ```
 
-The 8-byte epoch prefix is **unencrypted** — it tells the decryptor which DEK to use.
+The epoch prefix and algorithm ID are **unencrypted**: the epoch selects the
+DEK and the algorithm ID gives the nonce length, both of which must be known
+before any key material is touched. `Nonce:N` is the AEAD's own nonce size —
+12 bytes for the AES-GCM algorithms, 24 for XChaCha20-Poly1305 — so the header
+is not a fixed width. `decryptLocked` validates the declared nonce size
+against the selected AEAD before slicing, so a tampered algorithm ID cannot
+cause an out-of-range read.
+
+Note the deliberate endianness split: the epoch is written **big-endian** in
+this header (for readability when inspecting raw ciphertext) but
+**little-endian** in the AAD below. The two encodings serve different purposes
+and are not interchangeable.
 
 ### Epoch AAD Binding
 
@@ -538,28 +617,50 @@ barrier.PurgeEpochsBefore(minEpoch)  // removes DEKs for epochs < minEpoch
 **Source:** `pkg/seal/barrier.go`
 
 ```go
-func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) error {
+func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
     b.mu.Lock()
     defer b.mu.Unlock()
-
     b.inFlightMu.Lock()
     defer b.inFlightMu.Unlock()
 
-    for epoch, dek := range b.deks {
+    // Select first; nothing is mutated until the reduced state is durable.
+    var purgeable []uint64
+    for epoch := range b.deks {
         if epoch >= minEpoch || epoch == b.epoch { continue } // keep
-        if b.inFlightEpochs[epoch] > 0 { continue }          // in-flight
-        zeroBytes(dek)     // explicit zeroing
+        if b.inFlightEpochs[epoch] > 0 { continue }           // in-flight
+        purgeable = append(purgeable, epoch)
+    }
+    if len(purgeable) == 0 {
+        return 0, nil // nothing to persist, no persister needed
+    }
+
+    persist := b.config.StatePersister
+    if persist == nil {
+        return 0, ErrNoStatePersister
+    }
+    candidate := cloneSealedRootKey(b.sealed)
+    candidate.KnownEpochs = sortedEpochsWithout(b.knownEpochs, setOf(purgeable))
+    if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
+        return 0, &StatePersistError{Op: "purge", Epoch: b.epoch, Err: perr}
+    }
+
+    for _, epoch := range purgeable {
+        b.deks[epoch].Clear()  // explicit zeroing
         delete(b.deks, epoch)
         delete(b.ciphers, epoch)
         delete(b.knownEpochs, epoch)
     }
-    return nil
+    b.sealed = candidate
+    return len(purgeable), nil
 }
 ```
 
 **Safety invariants:**
 - Current epoch is **never** purged
 - In-flight epochs (refcount > 0) are **never** purged
+- The reduced `KnownEpochs` is **persisted before any key is dropped**
+
+**Persist-then-drop.** A purge shrinks `KnownEpochs`, which is persisted state: were the reduced set not written durably, a restart would resurrect the purged epochs and re-derive the DEKs the purge floor retired. `PurgeEpochsBefore` therefore persists through `StatePersister` before dropping anything, and fails closed with `ErrNoStatePersister` when there is something to purge and no persister is configured. A purge that would drop nothing needs no persister and returns `(0, nil)`. A persister error aborts the purge — every DEK stays usable — and returns `(0, *StatePersistError{Op: "purge"})`. Crash safety follows from the order: dying after the persist leaves a blob that simply omits the epochs the purge had already decided to retire.
 
 ### In-Flight Epoch Protection
 
@@ -605,12 +706,13 @@ type SealingStrategy interface {
 }
 
 type SealedRootKey struct {
-    Strategy    string    // "software", "pkcs11", "tpm2", "cloudkms"
-    Epoch       uint64    // key rotation epoch at time of sealing
-    Salt        []byte    // 32-byte HKDF salt
-    Ciphertext  []byte    // encrypted root key
-    Metadata    []byte    // strategy-specific (key ID, KMS ARN, etc.)
-    KnownEpochs []uint64  // all epoch numbers for DEK re-derivation
+    Strategy    string       // "software", "pkcs11", "tpm2", "cloudkms"
+    Epoch       uint64       // key rotation epoch at time of sealing
+    Salt        []byte       // 32-byte HKDF salt
+    Ciphertext  []byte       // encrypted root key
+    Metadata    []byte       // strategy-specific (key ID, KMS ARN, etc.)
+    KnownEpochs []uint64     // all epoch numbers for DEK re-derivation
+    HKDFVersion HKDFVersion  // DEK info layout; 0 = pre-versioning, derives as v1
 }
 ```
 
@@ -622,12 +724,11 @@ The `KnownEpochs` field on `SealedRootKey` is the mechanism that preserves epoch
 
 **Persistence flow:**
 
-1. `Initialize()` sets `sealed.KnownEpochs = []uint64{1}` (the initial epoch).
-2. Each `Rotate()` rebuilds `sealed.KnownEpochs` from the full `b.knownEpochs` map.
-3. The caller persists the `SealedRootKey` to stable storage.
-4. On restart, the caller loads the persisted `SealedRootKey` and calls `SetSealedRootKey()`.
-5. `SetSealedRootKey()` validates the sealed data (epoch > 0, salt length, KnownEpochs contains current epoch), restores the in-memory `knownEpochs` map.
-6. `Unseal()` iterates `b.knownEpochs` and re-derives a DEK + cipher for every historical epoch.
+1. `Initialize()` sets `sealed.KnownEpochs = []uint64{1}` (the initial epoch). The embedder persists `SealedRootKeyData()` itself — `Initialize` does not invoke `StatePersister`.
+2. Each `Rotate()` rebuilds `sealed.KnownEpochs` (ascending, so persisted blobs are reproducible) and pushes the new state through `StatePersister` *before* activating the new epoch; each purging `PurgeEpochsBefore()` pushes the reduced set through it *before* dropping a key.
+3. On restart, the caller loads the persisted `SealedRootKey` and calls `SetSealedRootKey()`.
+4. `SetSealedRootKey()` validates the sealed data (epoch > 0, salt length, KnownEpochs contains current epoch, `HKDFVersion` not newer than this build), restores the in-memory `knownEpochs` map.
+5. `Unseal()` iterates `b.knownEpochs` and re-derives a DEK + cipher for every historical epoch.
 
 This ensures that after a restart with multiple prior rotations, every historical DEK is available for decrypting old WAL segments and snapshots.
 
@@ -772,8 +873,11 @@ host, _ := quicraft.NewHost(cfg)
 
 // Single host-wide barrier, software-sealed:
 strategy, _ := seal.NewSoftwareStrategy([]byte("passphrase"))
-barrier := seal.NewBarrier()
-barrier.Initialize(strategy)
+bcfg := seal.DefaultBarrierConfig(deploymentID)
+bcfg.StatePersister = saveSealedBlob // REQUIRED for Rotate / PurgeEpochsBefore
+barrier := seal.NewBarrier(bcfg)
+barrier.Initialize(ctx, strategy, seal.Credentials{})
+saveSealedBlob(barrier.SealedRootKeyData()) // bootstrap blob: persisted by the embedder
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 
 // Per-shard barriers (multi-tenant):
@@ -792,10 +896,11 @@ host, _ := quicraft.NewHost(cfg, quicraft.WithShardBarriers(func(shardID uint64)
 
 1. `NewHost()` receives barrier via `WithBarrier` option
 2. Host checks initialization state (first boot check)
-3. If not initialized: `barrier.Initialize(strategy)` generates root key
-4. `barrier.Unseal(strategy)` decrypts root key and derives DEKs
-5. Barrier passed to WAL and snapshot writers
-6. On `Host.Close()`: pipeline drained, `barrier.Seal()` zeros all keys
+3. If not initialized: `barrier.Initialize(ctx, strategy, creds)` generates root key; the embedder persists `SealedRootKeyData()`
+4. Otherwise: embedder loads the persisted blob and calls `barrier.SetSealedRootKey()`
+5. `barrier.Unseal(ctx, strategy, creds)` decrypts root key and derives DEKs for every known epoch
+6. Barrier passed to WAL and snapshot writers
+7. On `Host.Close()`: pipeline drained, `barrier.Seal()` zeros all keys
 
 ### Shutdown Sequence
 
@@ -846,8 +951,8 @@ The barrier uses [memguard](https://github.com/awnuber/memguard) for hardware-as
 
 ### Key Material Allocation
 
-- **Root key** (`memguard.Enclave`): Encrypted at-rest in process memory. Decrypted into a temporary `LockedBuffer` only when needed (e.g., DEK derivation), then immediately re-sealed.
-- **DEKs** (`memguard.LockedBuffer`): Each epoch's DEK lives in its own locked, guard-paged buffer. On `Seal()` or `PurgeEpochsBefore()`, buffers are destroyed via `LockedBuffer.Destroy()`.
+- **Root key** (`enclave.ProtectedKey`, wrapping a `memguard.Enclave`): Encrypted at-rest in process memory. Opened into a temporary guarded buffer only when needed (e.g. DEK derivation), then immediately released.
+- **DEKs** (`enclave.ProtectedKey` each): Every epoch's DEK is individually protected. `Seal()` and `PurgeEpochsBefore()` drop them via `ProtectedKey.Clear()`, which releases the reference — it does not zero the enclave's own ciphertext, which persists until garbage collection.
 - **Passphrase** (`SoftwareStrategy`): Stored in a `LockedBuffer`, destroyed on `Close()`.
 
 ### Zeroing
@@ -883,12 +988,16 @@ func zeroBytes(b []byte) {
 | `ErrUnsealBackoff` | Brute-force backoff active |
 | `ErrPurgeCurrentEpoch` | Attempted to purge active epoch |
 | `ErrEpochInFlight` | Attempted to purge epoch with in-flight references |
+| `ErrNoStatePersister` | `Rotate` (or a purging `PurgeEpochsBefore`) with no `BarrierConfig.StatePersister` |
+| `ErrUnsupportedHKDFVersion` | Sealed blob names a DEK-derivation info layout this build does not implement |
+| `ErrInvocationLimitExceeded` | AEAD invocation limit reached for the epoch; rotation required |
 
 ### Typed Errors (with Unwrap)
 
 | Error | Fields |
 |-------|--------|
 | `KeyDerivationError` | Epoch, Err |
+| `StatePersistError` | Op ("rotate"/"purge"), Epoch, Err |
 | `Error` | Strategy, Err |
 | `UnsealError` | Strategy, Err |
 | `CipherError` | Err |
@@ -936,7 +1045,9 @@ slog.Info("barrier initialized", "epoch", epoch)
 slog.Info("barrier unsealed", "epoch", epoch)
 slog.Info("barrier sealed")
 slog.Error("barrier unseal failed", "err", err)
-slog.Info("key rotated", "from_epoch", oldEpoch, "to_epoch", newEpoch)
+slog.Info("key rotated", "from_epoch", oldEpoch, "to_epoch", newEpoch, "algorithm", alg)
+slog.Error("key rotation aborted: sealed state not persisted; previous epoch remains active", ...)
+slog.Error("epoch purge aborted: reduced sealed state not persisted; DEKs retained", ...)
 slog.Warn("decryption failed", "err", err)  // intentionally omits epoch
 slog.Info("old DEK purged", "epoch", epoch)
 ```

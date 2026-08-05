@@ -109,10 +109,21 @@ func newRaftLog(logdb LogReader) *raftLog {
 		processed = firstIdx - 1
 	}
 
+	// A snapshot's index is COMMITTED by construction — a snapshot is only
+	// ever taken over committed state — so it is a lower bound on committed
+	// regardless of what HardState survived. Without this, restoring from a
+	// snapshot with a lost or lagging HardState.Commit comes up with
+	// processed > committed, which violates commitUpdate's assertion on the
+	// very first commit and takes the commit worker down.
+	committed := state.Commit
+	if ss.Index > committed {
+		committed = ss.Index
+	}
+
 	l := &raftLog{
 		logdb:     logdb,
 		inmem:     newInMemory(inmemStart),
-		committed: state.Commit,
+		committed: committed,
 		processed: processed,
 	}
 	return l

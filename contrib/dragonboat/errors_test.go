@@ -478,7 +478,7 @@ func TestTranslateError_PackageLevelMappings(t *testing.T) {
 		t.Fatal("errorMappings package-level variable must not be nil")
 	}
 
-	const expectedCount = 39
+	const expectedCount = 40
 	if len(errorMappings) != expectedCount {
 		t.Errorf("errorMappings has %d entries, want %d", len(errorMappings), expectedCount)
 	}

@@ -45,14 +45,22 @@ func SyncDir(dir string) error {
 // synced. When stopAt is empty or leaf is not under stopAt, only leaf is
 // synced.
 func SyncDirChain(leaf, stopAt string) error {
+	return SyncDirChainWith(SyncDir, leaf, stopAt)
+}
+
+// SyncDirChainWith performs SyncDirChain's walk, fsyncing each directory with
+// the supplied function instead of SyncDir. It exists so a caller that routes
+// its file I/O through its own filesystem abstraction syncs directories
+// through that same abstraction; the walk itself must not be duplicated.
+func SyncDirChainWith(syncDir func(string) error, leaf, stopAt string) error {
 	leaf = filepath.Clean(leaf)
 	stopAt = filepath.Clean(stopAt)
 	sep := string(filepath.Separator)
 	if stopAt == "" || !strings.HasPrefix(leaf+sep, stopAt+sep) {
-		return SyncDir(leaf)
+		return syncDir(leaf)
 	}
 	for dir := leaf; ; dir = filepath.Dir(dir) {
-		if err := SyncDir(dir); err != nil {
+		if err := syncDir(dir); err != nil {
 			return err
 		}
 		if dir == stopAt {

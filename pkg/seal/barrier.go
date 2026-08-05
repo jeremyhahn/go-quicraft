@@ -230,6 +230,21 @@ func NewBarrier(config BarrierConfig) *Barrier {
 		ic = NewInvocationCounter(true, config.InvocationLimit, config.RotationThreshold)
 	}
 
+	// Nonce tracking retains every nonce until Clear, and Clear is reached only
+	// through a successful Rotate — which fails closed with ErrNoStatePersister
+	// when no persister is configured. With no injected InvocationCounter
+	// either, nothing else can release the tracked set, so this combination
+	// provably cannot rotate and the tracker grows for the process lifetime.
+	// Reported rather than rejected: it is what DefaultBarrierConfig produces,
+	// and NewBarrier's only rejection mechanism is a panic. The tracker itself
+	// fails safe at DefaultMaxTrackedNonces.
+	if config.NonceTracking && config.InvocationCounter == nil && config.StatePersister == nil {
+		slog.Warn("quicraft/seal: barrier configured with nonce tracking but no StatePersister and no InvocationCounter; the epoch cannot rotate, so tracked nonces are never released",
+			"deployment_id", config.DeploymentID,
+			"remedy", "configure StatePersister (and a rotation loop), inject an InvocationCounter, or disable NonceTracking",
+		)
+	}
+
 	var nt NonceTrackerProvider
 	if config.NonceTrackerProvider != nil {
 		nt = config.NonceTrackerProvider

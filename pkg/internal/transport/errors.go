@@ -438,6 +438,36 @@ var ErrSnapshotMemoryBudgetExceeded = errors.New("transport: snapshot memory bud
 // streams that each declare a large frame length and withhold the body.
 var ErrMessageRecvMemoryBudgetExceeded = errors.New("transport: message receive memory budget exceeded")
 
+// ErrFrameDrainIncomplete is returned when a dropped frame's body could not be
+// fully discarded. Unlike the budget error it is NOT retryable: the stream is
+// desynchronised mid-frame, so the next "header" would be parsed out of
+// undelivered payload. The caller must tear the stream down.
+var ErrFrameDrainIncomplete = errors.New("transport: frame body drain incomplete; stream desynchronised")
+
+// FrameDrainError carries the declared length and drained byte count of a
+// frame body that could not be fully discarded.
+type FrameDrainError struct {
+	Declared uint32
+	Drained  int64
+	Err      error
+}
+
+// Error returns a human-readable description of the incomplete drain.
+func (e *FrameDrainError) Error() string {
+	return fmt.Sprintf("transport: drained %d of %d frame body bytes; stream desynchronised: %v",
+		e.Drained, e.Declared, e.Err)
+}
+
+// Is reports whether target matches the sentinel ErrFrameDrainIncomplete.
+func (e *FrameDrainError) Is(target error) bool {
+	return target == ErrFrameDrainIncomplete
+}
+
+// Unwrap returns the underlying I/O error for errors.Is/As chain traversal.
+func (e *FrameDrainError) Unwrap() error {
+	return e.Err
+}
+
 // SnapshotMemoryBudgetExceededError is returned when the accumulated chunk
 // data for a single snapshot receive exceeds the configured memory budget.
 // This prevents a malicious or misconfigured peer from causing unbounded

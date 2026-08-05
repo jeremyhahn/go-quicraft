@@ -579,21 +579,89 @@ func assertTransportValidationError(t *testing.T, err error, expectedField strin
 // an enabled transport with present-but-empty mTLS material must fail at
 // config validation, not at handshake time.
 func TestTransportConfig_Validate_RejectsEmptyMTLS(t *testing.T) {
-	cases := map[string]*MTLSConfig{
-		"all empty":   {},
-		"empty cert":  {CACert: []byte("x"), Key: []byte("y")},
-		"bad keypair": {CACert: []byte("x"), Cert: []byte("notpem"), Key: []byte("notpem")},
+	ca, cert, key := testMTLSMaterial()
+
+	// Each case must reach the branch it names: a placeholder CACert would
+	// short-circuit at the CA pool check and leave the leaf-material branches
+	// untested.
+	cases := map[string]struct {
+		mtls  *MTLSConfig
+		field string
+	}{
+		"all empty": {
+			mtls:  &MTLSConfig{},
+			field: "TransportConfig.MTLSConfig.CACert",
+		},
+		"CACert not PEM": {
+			mtls:  &MTLSConfig{CACert: []byte("not-a-pem-block"), Cert: cert, Key: key},
+			field: "TransportConfig.MTLSConfig.CACert",
+		},
+		"empty cert": {
+			mtls:  &MTLSConfig{CACert: ca, Key: key},
+			field: "TransportConfig.MTLSConfig.Cert",
+		},
+		"empty key": {
+			mtls:  &MTLSConfig{CACert: ca, Cert: cert},
+			field: "TransportConfig.MTLSConfig.Key",
+		},
+		"bad keypair": {
+			mtls:  &MTLSConfig{CACert: ca, Cert: []byte("notpem"), Key: []byte("notpem")},
+			field: "TransportConfig.MTLSConfig",
+		},
+		"prebuilt certificate with no chain": {
+			mtls:  &MTLSConfig{CACert: ca, Certificate: &tls.Certificate{}},
+			field: "TransportConfig.MTLSConfig.Certificate",
+		},
 	}
-	for name, mtls := range cases {
+	for name, tt := range cases {
 		t.Run(name, func(t *testing.T) {
 			var tc TransportConfig
 			tc.SetDefaults()
-			tc.MTLSConfig = mtls
-			if err := tc.Validate(); err == nil {
+			tc.MTLSConfig = tt.mtls
+			err := tc.Validate()
+			if err == nil {
 				t.Fatal("expected validation error for empty/invalid mTLS material, got nil")
 			}
+			assertValidationError(t, err, tt.field)
 		})
 	}
+}
+
+// TestTransportConfig_Validate_AcceptsPrebuiltCertificate verifies the
+// hardware-signer path: a pre-built tls.Certificate satisfies the leaf
+// requirement without any PEM Cert/Key pair.
+func TestTransportConfig_Validate_AcceptsPrebuiltCertificate(t *testing.T) {
+	ca, cert, key := testMTLSMaterial()
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		t.Fatalf("build keypair: %v", err)
+	}
+
+	var tc TransportConfig
+	tc.SetDefaults()
+	tc.MTLSConfig = &MTLSConfig{CACert: ca, Certificate: &pair}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a pre-built certificate", err)
+	}
+}
+
+// TestTransportConfig_Validate_MaxMessageReceiveMemory covers the receive
+// memory budget bound; a negative budget would make the accounting semaphore
+// meaningless.
+func TestTransportConfig_Validate_MaxMessageReceiveMemory(t *testing.T) {
+	t.Run("negative rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxMessageReceiveMemory = -1
+		assertValidationError(t, tc.Validate(), "TransportConfig.MaxMessageReceiveMemory")
+	})
+
+	t.Run("zero accepted", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxMessageReceiveMemory = 0
+		if err := tc.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil (0 means unlimited)", err)
+		}
+	})
 }
 
 // TestValidateRevocationConfig verifies RevocationConfig validation:
@@ -655,6 +723,24 @@ func TestValidateRevocationConfig(t *testing.T) {
 		tc.RevocationConfig = &RevocationConfig{Mode: "both", OCSPResponderURL: "http://r"}
 		if err := tc.Validate(); err == nil {
 			t.Fatal("both mode without CRLPaths must be rejected")
+		}
+	})
+
+	// Negative durations/counts would otherwise reach the checker, where a
+	// negative CheckInterval panics time.NewTicker and a negative cache TTL
+	// expires every entry on insert.
+	t.Run("negative tunables rejected", func(t *testing.T) {
+		negatives := map[string]func(*RevocationConfig){
+			"TransportConfig.RevocationConfig.OCSPCacheSeconds":   func(rc *RevocationConfig) { rc.OCSPCacheSeconds = -1 },
+			"TransportConfig.RevocationConfig.OCSPTimeoutSeconds": func(rc *RevocationConfig) { rc.OCSPTimeoutSeconds = -1 },
+			"TransportConfig.RevocationConfig.CheckInterval":      func(rc *RevocationConfig) { rc.CheckInterval = -time.Second },
+		}
+		for field, apply := range negatives {
+			tc := base()
+			rc := &RevocationConfig{Mode: "any"}
+			apply(rc)
+			tc.RevocationConfig = rc
+			assertValidationError(t, tc.Validate(), field)
 		}
 	})
 }

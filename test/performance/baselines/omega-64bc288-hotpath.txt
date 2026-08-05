@@ -1,0 +1,371 @@
+# quicraft benchmark run
+# generated:     2026-08-04T19:32:33Z
+# mode:          baseline
+# run-host:      omega  (PERF_HOST=jhahn@198.51.100.90)
+# cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+# cpu-count:     20
+# governor:      powersave
+# loadavg:       0.57 0.63 0.35  (at start of run)
+# build-host:    vm-host-1
+# go-version:    go version go1.26.5 linux/amd64
+# current-ref:   64bc2882844a4109c698b99ef022ef9219a391ef  [clean (pinned to HEAD (64bc288))]
+# packages:      ./pkg/internal/raft/ ./pkg/internal/engine/
+# bench-filter:  .
+# rounds:        10 (interleaved)
+# iterations:    200000x (fixed)
+# command:       BASELINE_REF='HEAD' PERF_HOST='jhahn@198.51.100.90' BENCH_PKGS='./pkg/internal/raft/ ./pkg/internal/engine/' BENCH_FILTER='.' BENCH_ROUNDS='10' BENCH_ITERS='200000x' make bench-baseline
+#
+# Raw samples follow in Go benchmark format. Diff a future run against
+# this file with:
+#   benchstat test/performance/baselines/omega-64bc288-hotpath.txt build/bench-compare/<run>/current.txt
+#
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4231 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3225 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     12959 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      2987 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1226 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2691 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        46.57 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       288.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       279.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        28.86 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       244.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        13.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      2981 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       225.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       266.0 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       320.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12121 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       325.9 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       108.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       341.8 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        47.69 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3335 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       279.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       125.5 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4306 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3243 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     13080 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      2903 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1343 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.733 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2901 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        19.67 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       182.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       264.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        28.82 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       257.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        14.84 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3284 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       256.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       238.8 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       315.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     11998 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       277.9 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       107.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       330.6 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        51.31 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3395 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       253.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       124.5 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4265 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3186 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     12763 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3453 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1263 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.659 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2501 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        21.20 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       274.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       423.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	         9.096 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       276.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        13.68 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3323 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       240.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       261.7 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       284.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12229 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       244.7 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       108.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       332.0 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        48.87 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3345 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       366.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       120.2 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4255 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3261 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     13041 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3413 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1223 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.062 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2756 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        50.84 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       302.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       260.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        29.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       310.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        13.56 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3235 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       243.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       268.8 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       359.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     11963 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       248.5 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       106.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       315.5 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        49.33 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3333 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       248.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       126.4 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4285 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3232 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     13020 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3200 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1371 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.835 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2685 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        47.02 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       270.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       184.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        29.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       259.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	         4.290 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      2604 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       203.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       249.3 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       303.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12094 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       223.7 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	        80.26 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       302.2 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        50.92 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3337 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       273.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       127.7 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4214 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3229 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     13018 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3007 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1200 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.446 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2955 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        14.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       258.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       273.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	         8.804 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       322.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        13.65 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      2563 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       242.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       298.1 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       371.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12152 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       299.7 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	        98.05 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       332.3 ns/op	       6 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        50.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3379 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       126.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       123.1 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4240 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3239 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     12830 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3014 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1203 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.926 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      3241 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        47.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       239.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       235.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        31.17 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       271.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        14.55 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      2715 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       236.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       262.9 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       458.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     11955 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       236.2 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       112.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       316.4 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        48.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3288 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       207.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       131.9 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4205 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3218 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     13061 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3031 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1221 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.048 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2366 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        16.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       265.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       276.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	        29.29 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       247.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        14.29 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3210 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       136.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       163.5 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       316.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12107 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       282.6 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	        78.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       331.3 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        50.12 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3301 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       276.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       129.2 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4246 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3130 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     12927 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      2985 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1222 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         8.896 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2647 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        50.21 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       282.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       184.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	         8.857 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       182.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        13.74 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3061 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       126.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       295.7 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       417.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12058 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       107.1 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	        78.67 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       308.3 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        50.66 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3325 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       131.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       126.8 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/raft
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkCompressEntry-20                   	  200000	      4245 ns/op	    5376 B/op	       2 allocs/op
+BenchmarkDecompressEntry-20                 	  200000	      3185 ns/op	    2448 B/op	       2 allocs/op
+BenchmarkCompressDecompress_RoundTrip-20    	  200000	     12975 ns/op	   15104 B/op	       3 allocs/op
+BenchmarkInMemoryMerge-20                   	  200000	      3200 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkInMemoryMergeApply-20              	  200000	      1255 ns/op	     896 B/op	       1 allocs/op
+BenchmarkInMemoryGetEntries-20              	  200000	         7.578 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogAppend-20                   	  200000	      2470 ns/op	    4125 B/op	       0 allocs/op
+BenchmarkRaftLogEntries-20                  	  200000	        49.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogFirstIndexOfTerm-20         	  200000	       328.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogLastIndexOfTerm-20          	  200000	       267.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRaftLogTerm-20                     	  200000	         9.270 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerTick-20                        	  200000	       271.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerHasUpdate-20                   	  200000	        14.60 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPeerGetUpdate-20                   	  200000	      3398 ns/op	    2323 B/op	       5 allocs/op
+BenchmarkTryCommit-20                       	  200000	       209.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTryCommit_2Witnesses-20            	  200000	       257.4 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/internal/engine
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkProtoUpdatesToLogDBReuse_SmallBatch-20    	  200000	       321.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProtoUpdatesToLogDBReuse_LargeBatch-20    	  200000	     12106 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_Set-20                           	  200000	       319.4 ns/op	      47 B/op	       0 allocs/op
+BenchmarkReadyMap_SetAndSwap-20                    	  200000	       109.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_ConcurrentSet-20                 	  200000	       341.7 ns/op	       3 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapEmpty-20                     	  200000	        48.96 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyMap_SwapWithData-20                  	  200000	      3343 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_Notify-20                      	  200000	       201.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkWorkSignal_NotifyContended-20             	  200000	       121.0 ns/op	       0 B/op	       0 allocs/op
+PASS

@@ -22,10 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
@@ -369,18 +371,20 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		db.diskMon = NewDiskMonitor(dir, o.diskMonMaxBytes, o.diskMonOpts...)
 	}
 
-	// Create the WAL root directory and make its OWN directory entry durable
-	// (fsync the root's parent) before any shard subdirectory is created. POSIX
-	// durability requires fsyncing the parent of a newly created directory;
-	// without this the root dirent could be lost on a crash after a shard's
-	// first write reported success. Shard subdirectories are created lazily in
-	// ensureActiveSegment, which then only needs to fsync this root (their
-	// parent). Idempotent for an existing WAL.
+	// Create the WAL root directory and make the directory entry of EVERY
+	// level MkdirAll created durable. POSIX durability requires fsyncing the
+	// parent of each newly created directory, and MkdirAll may create several
+	// levels: fsyncing only the root's immediate parent leaves the
+	// intermediate dirents un-durable, so a crash after an acked SaveState can
+	// take the whole tree with it (the node then boots with no term and no
+	// vote). The deepest PRE-EXISTING ancestor is recorded first so the sync
+	// walk covers exactly the created chain. Idempotent for an existing WAL.
 	if !o.noSync {
+		existing := deepestExistingDir(o.fs, dir)
 		if err := o.fs.MkdirAll(dir, 0o700); err != nil {
 			return nil, &DBOpenError{Dir: dir, Err: err}
 		}
-		if err := syncDirFS(o.fs, filepath.Dir(dir)); err != nil {
+		if err := syncDirChainFS(o.fs, dir, existing); err != nil {
 			return nil, &DBOpenError{Dir: dir, Err: err}
 		}
 	}
@@ -432,7 +436,12 @@ func openWALShard(dir string, opts dbOptions, barrier WALBarrier, metrics LogDBM
 		// marshalBuf is nil -- allocated lazily in getMarshalBuf.
 	}
 
-	// If the directory exists, recover any existing data.
+	// If the directory exists, recover any existing data. ONLY ErrNotExist may
+	// be read as absence: EACCES, EIO, ENOTDIR, ELOOP or a stale handle leave
+	// the directory (and its segments) in place, so treating them as absence
+	// would skip recovery, leave nextSegmentID at 0, and let the first write
+	// recreate 000000.log with O_TRUNC — erasing the node's term, vote and
+	// entries. Fail the open instead.
 	if _, err := s.fs.Stat(dir); err == nil {
 		if err := s.recover(); err != nil {
 			return nil, err
@@ -444,6 +453,8 @@ func openWALShard(dir string, opts dbOptions, barrier WALBarrier, metrics LogDBM
 				return nil, err
 			}
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, &DBOpenError{Dir: dir, Err: err}
 	}
 	// If directory doesn't exist, shard is lazy -- directory and segment
 	// will be created on first write via ensureActiveSegment.
@@ -779,11 +790,18 @@ const (
 	// ConfigChangeID, so parsing it with the V3 layout would consume that
 	// field's low byte as a version byte and shift every subsequent read.
 	payloadTypeSnapshotV2 byte = 0x08
-	// payloadTypeSnapshot is the current snapshot format, whose membership
-	// section begins with membershipSectionVersion. The distinct payload
+	// payloadTypeSnapshotV3 is the membership-version-byte snapshot format,
+	// whose fixed region ends at FilePathLen with no Compression field. It
+	// is never written anymore and is fatal on replay: its FilePathLen sits
+	// where the V4 layout reads Compression, so parsing it with the current
+	// layout would read the path length as a compression type and then slice
+	// the record at the wrong offset.
+	payloadTypeSnapshotV3 byte = 0x09
+	// payloadTypeSnapshot is the current snapshot format, which adds the
+	// artifact Compression field to the fixed region. The distinct payload
 	// type is the record-level version discriminator, matching the
 	// payloadTypeEntriesV1/payloadTypeEntries precedent.
-	payloadTypeSnapshot byte = 0x09
+	payloadTypeSnapshot byte = 0x0a
 )
 
 // ErrLegacyEntryFormat is returned when recovery encounters a WAL entry
@@ -817,6 +835,24 @@ var ErrLegacySnapshotFormat = errors.New(
 var ErrLegacySnapshotFormatV2 = errors.New(
 	"waldb: WAL contains legacy (pre-membership-version-byte) snapshot " +
 		"records; restore from snapshot or re-sync this node from its peers")
+
+// ErrLegacySnapshotFormatV3 is returned when recovery encounters a WAL
+// snapshot record written in the pre-compression (V3) layout. Its fixed
+// region has no Compression field, so parsing it with the current layout
+// would consume FilePathLen as the compression type and slice the filepath
+// at the wrong offset. Recovering the snapshot's compression by guessing is
+// exactly the failure this field exists to prevent, so the record is
+// rejected outright.
+var ErrLegacySnapshotFormatV3 = errors.New(
+	"waldb: WAL contains legacy (pre-compression-field) snapshot records; " +
+		"restore from snapshot or re-sync this node from its peers")
+
+// ErrUnsupportedSnapshotCompression is returned when a snapshot record
+// declares a compression algorithm this binary cannot decompress. Recovering
+// the artifact would hand the state machine bytes in an unknown encoding, so
+// replay fails instead.
+var ErrUnsupportedSnapshotCompression = errors.New(
+	"waldb: snapshot record declares an unsupported compression algorithm")
 
 // ErrUnsupportedMembershipVersion is returned when a current-format
 // snapshot record carries a membership section whose version byte is not
@@ -874,6 +910,11 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 		// Same gate for the witness-policy layout that predates the
 		// membership version byte.
 		return 0, "", ErrLegacySnapshotFormatV2
+	case payloadTypeSnapshotV3:
+		// Same gate for the layout that predates the artifact Compression
+		// field: its fixed region is two bytes shorter, so every offset from
+		// FilePathLen onward would be misread.
+		return 0, "", ErrLegacySnapshotFormatV3
 	case payloadTypeBootstrap:
 		if rerr := s.replayBootstrap(data, segID); rerr != nil {
 			return 0, "", rerr
@@ -1039,13 +1080,13 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 
 // Snapshot encoding layout:
 // [ShardID:8][ReplicaID:8][Index:8][Term:8][FileSize:8][OnDiskIndex:8]
-// [Epoch:8][FilePathLen:4][FilePath:N]
+// [Epoch:8][Compression:2][FilePathLen:4][FilePath:N]
 // [MembershipVersion:1][ConfigChangeID:8][MaxWitnesses:8][PolicyFlags:1]
 // [NumAddresses:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumObservers:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumWitnesses:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumRemoved:4]{ [ReplicaID:8] }...
-const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 60 bytes
+const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
 // membershipSectionVersion is the layout revision of the membership section
 // of a snapshot record, written as its first byte and required to match
@@ -1124,6 +1165,19 @@ func marshalRemovedMap(buf []byte, pos int, m map[uint64]bool) int {
 // chunk CRC32 only detects accidental corruption; the encrypted path is
 // additionally AEAD-authenticated.
 const maxMembershipMapEntries = 10000
+
+// checkMembershipSize rejects a membership whose any map exceeds
+// maxMembershipMapEntries, the cap replay treats as corruption. Keeping the
+// write side symmetric with replay is the same rule ErrCmdTooLarge follows.
+func checkMembershipSize(m logdb.Membership) error {
+	if len(m.Addresses) > maxMembershipMapEntries ||
+		len(m.Observers) > maxMembershipMapEntries ||
+		len(m.Witnesses) > maxMembershipMapEntries ||
+		len(m.Removed) > maxMembershipMapEntries {
+		return ErrMembershipTooLarge
+	}
+	return nil
+}
 
 // addrMapEntryMinBytes is the minimum on-disk size of one address-map
 // entry: [ReplicaID:8][AddrLen:4]. The address bytes are additional.
@@ -1219,7 +1273,17 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	fileSize := binary.LittleEndian.Uint64(data[32:])
 	onDiskIndex := binary.LittleEndian.Uint64(data[40:])
 	epoch := binary.LittleEndian.Uint64(data[48:])
-	fpLen := binary.LittleEndian.Uint32(data[56:])
+	compression := config.CompressionType(binary.LittleEndian.Uint16(data[56:]))
+	fpLen := binary.LittleEndian.Uint32(data[58:])
+
+	// A compression algorithm this binary cannot build a reader for makes the
+	// artifact unrecoverable; accepting the record would defer the failure to
+	// RecoverFromSnapshot, where it looks like state machine corruption.
+	if !compression.IsValid() {
+		slog.Error("waldb: snapshot record declares unsupported compression during replay",
+			"segment_id", segID, "compression", uint16(compression))
+		return ErrUnsupportedSnapshotCompression
+	}
 
 	// Bound-check in uint64: on 32-bit platforms int(fpLen) sign-truncates
 	// for fpLen >= 2^31 and 60+fpLen wraps in uint32, so an int-domain
@@ -1302,6 +1366,7 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 		FileSize:    fileSize,
 		OnDiskIndex: onDiskIndex,
 		Epoch:       epoch,
+		Compression: compression,
 		Membership:  membership,
 	}
 	// Pin the segment so post-recovery compaction does not delete the sole
@@ -1389,6 +1454,15 @@ func (s *walShard) replayCompaction(data []byte, segID uint64) error {
 	compactedTo := binary.LittleEndian.Uint64(data[16:])
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
+	// The floor is monotonic during replay too: a WAL written by an older
+	// build (or replayed out of segment order) may hold a lower marker after a
+	// higher one, and adopting it would resurrect a hole below entries that
+	// are already gone. Skipping the marker also keeps the HIGHER marker's
+	// segment pinned, so a post-recovery GC cannot reclaim the only record of
+	// the real floor.
+	if cur, ok := s.compactedTo[key]; ok && compactedTo <= cur {
+		return nil
+	}
 	s.compactedTo[key] = compactedTo
 	// Re-pin the marker's segment on recovery (last write wins), so a post-
 	// recovery GC cannot reclaim it and reset compactedTo to 0 again.
@@ -1721,6 +1795,47 @@ func syncDirFS(filesystem FS, dir string) error {
 	return nil
 }
 
+// deepestExistingDir returns the deepest ancestor of dir (dir itself when it
+// already exists) that is present on filesystem. Only ErrNotExist is read as
+// absence; any other Stat error stops the walk at that level, which is the
+// conservative choice because the following sync walk then covers MORE
+// directories, never fewer.
+func deepestExistingDir(filesystem FS, dir string) string {
+	for p := filepath.Clean(dir); ; {
+		if _, err := filesystem.Stat(p); err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return p
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return p
+		}
+		p = parent
+	}
+}
+
+// syncDirChainFS fsyncs leaf and every ancestor up to and including stopAt, so
+// each directory MkdirAll created below stopAt has its own dirent made durable
+// by a sync of its parent. It is the FS-abstracted equivalent of the shared
+// engine.SyncDirChainWith walk (pkg/internal/engine/fsync.go); the walk is
+// duplicated rather than imported because waldb is the storage layer and must
+// not depend on the consensus engine package.
+func syncDirChainFS(filesystem FS, leaf, stopAt string) error {
+	leaf = filepath.Clean(leaf)
+	stopAt = filepath.Clean(stopAt)
+	sep := string(filepath.Separator)
+	if stopAt == "" || !strings.HasPrefix(leaf+sep, stopAt+sep) {
+		return syncDirFS(filesystem, leaf)
+	}
+	for dir := leaf; ; dir = filepath.Dir(dir) {
+		if err := syncDirFS(filesystem, dir); err != nil {
+			return err
+		}
+		if dir == stopAt {
+			return nil
+		}
+	}
+}
+
 // getShard returns the WAL shard for the given Raft shardID.
 func (db *DB) getShard(shardID uint64) *walShard {
 	return db.shards[shardID%DefaultShardCount]
@@ -2043,7 +2158,11 @@ func (db *DB) rollbackBatch(checkpoints *[DefaultShardCount]shardCheckpoint, wri
 // segments created entirely from batch data, and (3) empty the current active
 // segment. This guarantees recovery replays only the pre-batch prefix.
 func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
-	if ds.activeSegment == nil {
+	// Nothing was written against a known position, so there is nothing to
+	// undo. An absent active segment is NOT such a case: rotateSegment drops
+	// the handle when the post-Sync Close fails, and that Sync already made
+	// this batch's records durable in the checkpoint segment.
+	if ds.activeSegment == nil && !cp.valid {
 		return nil
 	}
 	// Every rollback failure is a DURABILITY failure: the truncation that
@@ -2064,7 +2183,7 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 	}()
 
 	// No rotation: the active segment is the checkpoint segment.
-	if cp.seg == nil || ds.activeSegment == cp.seg {
+	if ds.activeSegment != nil && (cp.seg == nil || ds.activeSegment == cp.seg) {
 		return ds.activeSegment.DiscardPending(cp.fileOffset, cp.blockOffset)
 	}
 
@@ -2085,22 +2204,27 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		delete(ds.segmentEpochs, id)
 	}
 
-	// Empty the current active segment (all its content is batch data). It
-	// remains the active segment: a zero-length / all-zero file replays to
-	// nothing, so recovery is correct. Two tolerated side effects: (1) its ID
-	// is now non-contiguous with the checkpoint segment because the
-	// intermediates were deleted — recovery sorts segment IDs, so a gap is
-	// fine; (2) DiscardPending truncated it to 0, dropping the fallocate
-	// reservation, so we re-preallocate below to avoid re-extending on the
-	// next write.
-	if err := ds.activeSegment.DiscardPending(0, 0); err != nil {
-		return err
-	}
-	if err := ds.activeSegment.PreAllocate(); err != nil {
-		// Non-fatal: a failed re-reservation only costs a later file
-		// extension; correctness is unaffected.
-		slog.Debug("waldb: re-preallocate after rollback failed",
-			"dir", ds.dir, "segment_id", ds.activeSegmentID, "error", err)
+	// Empty the current segment (all its content is batch data). It remains
+	// the active segment: a zero-length / all-zero file replays to nothing, so
+	// recovery is correct. Two tolerated side effects: (1) its ID is now
+	// non-contiguous with the checkpoint segment because the intermediates
+	// were deleted — recovery sorts segment IDs, so a gap is fine; (2) the
+	// truncation to 0 drops the fallocate reservation, which DiscardPending
+	// re-takes.
+	//
+	// When the rotation's Close failed, rotateSegment dropped the handle and
+	// left activeSegment nil while activeSegmentID still names the segment on
+	// disk; truncate that closed file to zero instead, so its already-fsynced
+	// batch records cannot replay.
+	switch {
+	case ds.activeSegment != nil:
+		if err := ds.activeSegment.DiscardPending(0, 0); err != nil {
+			return err
+		}
+	case ds.activeSegmentID != cp.segID:
+		if err := truncateClosedSegment(ds, ds.activeSegmentID, 0); err != nil {
+			return err
+		}
 	}
 
 	// Make the segment-file deletions/truncation durable. Without a directory
@@ -2205,8 +2329,11 @@ func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *s
 		}
 	}
 
-	// Write snapshot if non-empty and not stale.
-	if u.Snapshot.Index != 0 || u.Snapshot.Term != 0 {
+	// Write the snapshot if present and not stale. Presence is keyed on
+	// Index > 0 alone, matching memdb: a zero-index snapshot is no snapshot,
+	// and writing one made GetSnapshot report a snapshot at index 0 and pinned
+	// its segment against garbage collection permanently.
+	if u.Snapshot.Index > 0 {
 		// Check against both persisted snapshots and any pending snapshot
 		// updates in this batch to avoid writing stale data.
 		stale := false
@@ -2346,6 +2473,38 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 	return nil
 }
 
+// captureShardCheckpoint prepares a standalone (non-batch) record write for
+// rollback: it creates the active segment if the shard is still lazy, then
+// captures the segment position the write starts from. Paired with
+// DB.rollbackStandalone it gives SaveSnapshot/RemoveEntriesTo/RemoveNodeData
+// the same "a failed write leaves nothing durable" guarantee SaveState has.
+// The caller must hold s.mu.
+func captureShardCheckpoint(s *walShard, cp *shardCheckpoint) error {
+	if err := s.ensureActiveSegment(); err != nil {
+		return err
+	}
+	return captureCheckpointAfterEnsure(s, cp)
+}
+
+// rollbackStandalone discards a failed standalone record write, returning the
+// original write error (wrapped in a BatchWriteError when the rollback itself
+// failed, so ErrDBPoisoned still reaches the caller). The caller must hold the
+// shard's mu.
+//
+// A poisoned DB is left alone: after a failed fdatasync neither the record nor
+// a rollback truncation can be proven durable (fsyncgate), so crash recovery —
+// not truncation — is the only sound continuation, exactly as in SaveState's
+// sync phase.
+func (db *DB) rollbackStandalone(s *walShard, cp *shardCheckpoint, writeErr error) error {
+	if !cp.valid || db.poisoned.Load() {
+		return writeErr
+	}
+	if dErr := rollbackShard(s, cp); dErr != nil {
+		return &BatchWriteError{WriteErr: writeErr, DiscardErrors: []error{dErr}}
+	}
+	return writeErr
+}
+
 // captureCheckpointAfterEnsure captures a checkpoint for a shard that
 // just had its active segment created by ensureActiveSegment. This
 // handles lazy shards that had no segment at batch start. The checkpoint
@@ -2407,6 +2566,13 @@ func (s *walShard) writeState(key nodeKey, shardID, replicaID uint64, state logd
 // including Epoch and full Membership state.
 // The in-memory snapshot update is staged in pending for deferred application.
 func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logdb.Snapshot, pending *pendingMemUpdates, cp *shardCheckpoint) error {
+	// Enforce the same map-size cap replay enforces, BEFORE any segment is
+	// touched: replay rejects an oversized map as corruption and fails the
+	// whole recovery, so a record accepted here would be durable, acked and
+	// unreadable — the node could never start again.
+	if err := checkMembershipSize(ss.Membership); err != nil {
+		return err
+	}
 	if err := s.ensureActiveSegment(); err != nil {
 		return err
 	}
@@ -2424,8 +2590,9 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	binary.LittleEndian.PutUint64(buf[33:], ss.FileSize)
 	binary.LittleEndian.PutUint64(buf[41:], ss.OnDiskIndex)
 	binary.LittleEndian.PutUint64(buf[49:], ss.Epoch)
-	binary.LittleEndian.PutUint32(buf[57:], uint32(len(ss.Filepath)))
-	copy(buf[61:], ss.Filepath)
+	binary.LittleEndian.PutUint16(buf[57:], uint16(ss.Compression))
+	binary.LittleEndian.PutUint32(buf[59:], uint32(len(ss.Filepath)))
+	copy(buf[63:], ss.Filepath)
 
 	pos := 1 + snapshotRecordBaseSize + len(ss.Filepath)
 
@@ -2472,6 +2639,11 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	// Guard against accidental batch-mode usage. See invariant above.
 	if s.batchMode {
 		return &WriteBootstrapBatchModeError{}
+	}
+	// Symmetric with replayBootstrap, which rejects an oversized address count
+	// as corruption: see checkMembershipSize.
+	if len(bs.Addresses) > maxMembershipMapEntries {
+		return ErrMembershipTooLarge
 	}
 	// Calculate total size.
 	totalSize := 1 + bootstrapRecordBaseSize
@@ -2688,6 +2860,26 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	// The compaction floor is monotonic. Entries below an earlier, HIGHER
+	// floor are already deleted, so a lower floor can never be honoured: reads
+	// between the two floors would see a hard log hole (ErrLogGapDetected)
+	// instead of ErrCompacted and raft would never fall back to
+	// InstallSnapshot. The call is dropped before it reaches the WAL because
+	// persisting the lower marker also re-pins garbage collection to it,
+	// letting the higher marker's segment be reclaimed — the regression would
+	// then survive restart. Callers can lower the floor legitimately only by
+	// removing the node.
+	if cur, ok := shard.compactedTo[key]; ok && index <= cur {
+		return nil
+	}
+
+	// Capture the pre-write segment position so a failed write leaves nothing
+	// durable behind, matching SaveState's checkpoint/rollback discipline.
+	var cp shardCheckpoint
+	if err := captureShardCheckpoint(shard, &cp); err != nil {
+		return err
+	}
+
 	// Write compaction marker to WAL for durability across restarts.
 	buf := shard.getMarshalBuf(1 + compactionRecordSize)
 	buf[0] = payloadTypeCompact
@@ -2695,7 +2887,7 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	binary.LittleEndian.PutUint64(buf[9:], replicaID)
 	binary.LittleEndian.PutUint64(buf[17:], index)
 	if err := shard.writeRecord(buf[:1+compactionRecordSize]); err != nil {
-		return err
+		return db.rollbackStandalone(shard, &cp, err)
 	}
 
 	// Pin the segment the compaction marker landed in against garbage
@@ -2820,26 +3012,16 @@ func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) e
 		return logdb.ErrSnapshotOutOfDate
 	}
 
-	// Standalone snapshot write — apply in-memory update immediately
-	// since there is no batch to fail.
+	// Standalone snapshot write — apply the in-memory update immediately since
+	// there is no batch to fail, but roll the segment back on a write failure
+	// so no partial or complete record stays durable after an error return.
 	var p pendingMemUpdates
 	var cp shardCheckpoint
-	if shard.activeSegment != nil {
-		// Flush the open block so a later DiscardPending can reload the
-		// pre-batch tail from disk (see captureCheckpointAfterEnsure).
-		if err := shard.activeSegment.flushBlock(); err != nil {
-			return err
-		}
-		cp = shardCheckpoint{
-			fileOffset:  shard.activeSegment.fileOffset,
-			blockOffset: shard.activeSegment.blockOffset,
-			seg:         shard.activeSegment,
-			segID:       shard.activeSegmentID,
-			valid:       true,
-		}
+	if err := captureShardCheckpoint(shard, &cp); err != nil {
+		return err
 	}
 	if err := shard.writeSnapshot(key, shardID, replicaID, snapshot, &p, &cp); err != nil {
-		return err
+		return db.rollbackStandalone(shard, &cp, err)
 	}
 	p.applyTo(shard)
 	return nil
@@ -2879,13 +3061,21 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	// Capture the pre-write segment position: a tombstone left durable after an
+	// error return would erase the node on the next restart even though the
+	// caller was told the removal failed.
+	var cp shardCheckpoint
+	if err := captureShardCheckpoint(shard, &cp); err != nil {
+		return err
+	}
+
 	// Write the remove-node record to the WAL for durability.
 	buf := shard.getMarshalBuf(1 + removeNodeRecordSize)
 	buf[0] = payloadTypeRemoveNode
 	binary.LittleEndian.PutUint64(buf[1:], shardID)
 	binary.LittleEndian.PutUint64(buf[9:], replicaID)
 	if err := shard.writeRecord(buf[:1+removeNodeRecordSize]); err != nil {
-		return err
+		return db.rollbackStandalone(shard, &cp, err)
 	}
 	// The tombstone landed in the (post-rotation) active segment; capture the
 	// ID before any further writes could rotate again. The record is durable

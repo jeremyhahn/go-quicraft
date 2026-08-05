@@ -19,6 +19,7 @@ package rsm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -261,6 +262,20 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// user-SM Update populates results for the first occurrences.
 	var mirrors map[int]int
 
+	// sessionLifecycleAt maps a clientID to the entry index of the most
+	// recent session lifecycle transition (successful Register or Unregister)
+	// in this batch. RecordResult runs only after the batched user-SM Update,
+	// so an entry admitted earlier in the batch may reach it after the session
+	// it was admitted against is gone — replaced or removed by a later entry
+	// in the SAME batch. An entry whose clientID has a transition at a HIGHER
+	// entry index than its own must not record a response: for a closed
+	// session the cache is moot, and for a re-registered clientID caching into
+	// the replacement session would deduplicate a future proposal of that
+	// series which the replacement session never applied. The absent-key zero
+	// value is a valid "no transition" marker: index 0 can only ever precede
+	// the entries it would invalidate. nil until the first transition.
+	var sessionLifecycleAt map[uint64]int
+
 	for i := range entries {
 		entry := &entries[i]
 
@@ -292,9 +307,14 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 		// the clientID as the result Value. Skip user SM.
 		if entry.IsNewSessionRequest() {
 			if err := s.sessions.Register(entry.ClientID, entry.Index); err != nil {
-				// Already registered is not fatal — return empty result.
+				// Already registered or over the session limit is not fatal —
+				// return an empty result and leave the session table untouched.
 				results[i] = sm.Result{}
 			} else {
+				if sessionLifecycleAt == nil {
+					sessionLifecycleAt = make(map[uint64]int)
+				}
+				sessionLifecycleAt[entry.ClientID] = i
 				results[i] = sm.Result{Value: entry.ClientID}
 			}
 			continue
@@ -309,6 +329,10 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 				// translates this to ErrSessionExpired → ErrRejected.
 				results[i] = sm.Result{Value: sm.ResultSessionExpired}
 			} else {
+				if sessionLifecycleAt == nil {
+					sessionLifecycleAt = make(map[uint64]int)
+				}
+				sessionLifecycleAt[entry.ClientID] = i
 				results[i] = sm.Result{Value: entry.ClientID}
 			}
 			continue
@@ -429,6 +453,14 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 			entry := &entries[origIdx]
 
 			if entry.IsSessionManaged() {
+				// The session this entry was admitted against was closed or
+				// replaced by a later entry in this same batch. The entry was
+				// legally applied (it precedes the transition in the log), so
+				// its result stands, but it must not be cached: see
+				// sessionLifecycleAt.
+				if sessionLifecycleAt[entry.ClientID] > origIdx {
+					continue
+				}
 				cached := smResults[j]
 				// In zero-copy mode, the user SM received Cmd as a direct
 				// alias into the engine's pooled CommittedEntries buffer
@@ -451,7 +483,27 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 					entry.Index,
 					cached,
 				); err != nil {
-					return err
+					// A missing session is a property of the committed log, not
+					// an infrastructure failure: returning it would fail the
+					// shard deterministically on every replica. The
+					// sessionLifecycleAt check above already covers every
+					// in-batch removal path; this is defence in depth against
+					// any future path that drops a session mid-batch. The
+					// response cache of a session that no longer exists is
+					// moot, so dropping the record is safe and deterministic.
+					// Any other error is an invariant violation (the CanRecord
+					// gate makes ErrResponseLimitExceeded unreachable here) and
+					// stays fatal.
+					if !errors.Is(err, session.ErrSessionNotFound) {
+						return err
+					}
+					slog.Warn("rsm: session removed within apply batch, response not cached",
+						"shardID", s.shardID,
+						"replicaID", s.replicaID,
+						"clientID", entry.ClientID,
+						"seriesID", entry.SeriesID,
+						"index", entry.Index,
+					)
 				}
 			}
 		}

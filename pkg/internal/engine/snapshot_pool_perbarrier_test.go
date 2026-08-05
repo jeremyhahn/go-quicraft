@@ -238,7 +238,7 @@ func writeShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, index,
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
-	if err := writeSnapshotMetadata(dir, index, 1, shardID, replicaID, epoch); err != nil {
+	if err := writeSnapshotMetadata(dir, index, 1, shardID, replicaID, epoch, config.NoCompression); err != nil {
 		t.Fatalf("write metadata failed: %v", err)
 	}
 }
@@ -478,12 +478,14 @@ func TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe(t *testing.T) {
 	wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1))
 
 	// Create a snapshot directory whose metadata file is truncated (corrupt):
-	// shorter than snapshotMetaSize so the epoch field cannot be read.
+	// it ends inside the epoch field, so the epoch cannot be read. The bound
+	// is the epoch field's own end, not snapshotMetaSize — fields appended
+	// after epoch must not turn a readable epoch into a fail-safe.
 	dir := snapshotSaveDir(baseDir, 1, 1, 100)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	corrupt := make([]byte, snapshotMetaSize-1)
+	corrupt := make([]byte, snapshotMetaEpochOffset+8-1)
 	if err := os.WriteFile(filepath.Join(dir, snapshotMetadataFile), corrupt, 0o600); err != nil {
 		t.Fatalf("write corrupt meta: %v", err)
 	}

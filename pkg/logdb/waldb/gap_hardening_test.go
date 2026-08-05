@@ -588,14 +588,15 @@ func TestRotateSegmentClearsSegmentOnCloseFailure(t *testing.T) {
 // TestReplaySnapshotHugeFpLenDoesNotPanic verifies a corrupt fpLen near
 // MaxUint32 is rejected as a truncated record without a slice panic. The
 // uint64-domain guard protects 32-bit platforms, where int(fpLen)
-// sign-truncates and 60+fpLen wraps in uint32 arithmetic.
+// sign-truncates and snapshotRecordBaseSize+fpLen wraps in uint32 arithmetic.
 func TestReplaySnapshotHugeFpLenDoesNotPanic(t *testing.T) {
 	s := newBareShard()
 	data := make([]byte, snapshotRecordBaseSize)
 	binary.LittleEndian.PutUint64(data[0:], 1)           // shardID
 	binary.LittleEndian.PutUint64(data[8:], 1)           // replicaID
 	binary.LittleEndian.PutUint64(data[16:], 5)          // index
-	binary.LittleEndian.PutUint32(data[56:], 0xFFFFFFFF) // fpLen
+	binary.LittleEndian.PutUint16(data[56:], 0)          // compression: none
+	binary.LittleEndian.PutUint32(data[58:], 0xFFFFFFFF) // fpLen
 
 	if err := s.replaySnapshot(data, 0); !errors.Is(err, ErrTruncatedSnapshotRecord) {
 		t.Fatalf("replaySnapshot error = %v, want ErrTruncatedSnapshotRecord", err)

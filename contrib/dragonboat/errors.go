@@ -246,6 +246,9 @@ var errorMappings = []errorMapping{
 	{quicraft.ErrInvalidOperation, ErrInvalidOperation},
 	{quicraft.ErrInvalidRange, ErrInvalidRange},
 	{quicraft.ErrReplicaNotFound, ErrReplicaNotFound},
+	// Dragonboat rejects an invalid leader-transfer or membership target
+	// with ErrInvalidTarget.
+	{quicraft.ErrInvalidMember, ErrInvalidTarget},
 	// Dragonboat has no not-leader error: its propose/read/config-change
 	// entry points accept the request and let it resolve as Dropped().
 	// ErrShardNotReady is the documented equivalent ("unknown leader is the
@@ -288,14 +291,6 @@ var errorMappings = []errorMapping{
 func translateError(err error) error {
 	if err == nil {
 		return nil
-	}
-
-	// InvalidMemberError has no Is method, so it cannot be matched through
-	// the errors.Is table. Dragonboat rejects an invalid leader-transfer or
-	// membership target with ErrInvalidTarget.
-	var invalidMember *quicraft.InvalidMemberError
-	if errors.As(err, &invalidMember) {
-		return ErrInvalidTarget
 	}
 
 	for _, m := range errorMappings {

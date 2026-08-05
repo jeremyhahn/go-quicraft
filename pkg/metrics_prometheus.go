@@ -128,6 +128,14 @@ type PrometheusMetricsCollector struct {
 	snapshotsReceivedVec  *prometheus.CounterVec
 	snapshotsBytesRecvVec *prometheus.HistogramVec
 
+	// Transport drop counters. Error-path events, so they are not pre-bound
+	// per shard: the reason label would multiply every shard's pre-bound set
+	// by the reason cardinality for series that are idle in a healthy
+	// cluster. They still honor the tombstone and are deleted by
+	// UnregisterShard like every other per-shard series.
+	snapshotsRejectedVec *prometheus.CounterVec
+	messagesDroppedVec   *prometheus.CounterVec
+
 	// Security drop counters (alertable, low-frequency).
 	unauthorizedMessagesVec  *prometheus.CounterVec
 	unauthorizedSnapshotsVec *prometheus.CounterVec
@@ -325,6 +333,26 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 			Buckets:   snapshotBytesBuckets,
 		}, []string{"shard_id"}),
 
+		// Transport drop counters. The reason label is a closed set fixed by
+		// the transport (see TransportMetrics), so its cardinality is bounded.
+		// The dropped message's target replica id is deliberately NOT a label:
+		// it would multiply the series count by the shard's membership size
+		// for no diagnostic gain the reason does not already carry, and it is
+		// available in the drop log line.
+		snapshotsRejectedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "quicraft",
+			Subsystem: "transport",
+			Name:      "snapshots_rejected_total",
+			Help:      "Inbound snapshot transfers discarded per shard and reason.",
+		}, []string{"shard_id", "reason"}),
+
+		messagesDroppedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "quicraft",
+			Subsystem: "transport",
+			Name:      "messages_dropped_total",
+			Help:      "Raft messages discarded by the transport per shard and reason.",
+		}, []string{"shard_id", "reason"}),
+
 		// Security metrics. Low-frequency by design (every increment is a
 		// rejected injection attempt or a misconfiguration), so plain
 		// WithLabelValues lookups are fine — no per-shard pre-binding.
@@ -378,6 +406,8 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 		c.snapshotsBytesSentVec,
 		c.snapshotsReceivedVec,
 		c.snapshotsBytesRecvVec,
+		c.snapshotsRejectedVec,
+		c.messagesDroppedVec,
 		// Security
 		c.unauthorizedMessagesVec,
 		c.unauthorizedSnapshotsVec,
@@ -451,6 +481,11 @@ func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
 	c.snapshotsBytesSentVec.DeleteLabelValues(sid)
 	c.snapshotsReceivedVec.DeleteLabelValues(sid)
 	c.snapshotsBytesRecvVec.DeleteLabelValues(sid)
+	// Drop counters carry a reason label, so every reason's child series for
+	// this shard must go; DeleteLabelValues can only address one full label
+	// set at a time.
+	c.snapshotsRejectedVec.DeletePartialMatch(prometheus.Labels{"shard_id": sid})
+	c.messagesDroppedVec.DeletePartialMatch(prometheus.Labels{"shard_id": sid})
 }
 
 // getShard returns the pre-bound metrics for shardID, or nil if not registered.
@@ -689,6 +724,28 @@ func (c *PrometheusMetricsCollector) IncSnapshotsReceived(shardID uint64, bytes 
 	shard := strconv.FormatUint(shardID, 10)
 	c.snapshotsReceivedVec.WithLabelValues(shard).Inc()
 	c.snapshotsBytesRecvVec.WithLabelValues(shard).Observe(float64(bytes))
+}
+
+// IncSnapshotsRejected counts an inbound snapshot transfer discarded before it
+// reached the state machine, bucketed by the transport's fixed reason set.
+// Rejections are an error path, so the series is looked up rather than
+// pre-bound; it still respects the shard tombstone so a sample racing
+// UnregisterShard cannot re-create a deleted series.
+func (c *PrometheusMetricsCollector) IncSnapshotsRejected(shardID uint64, reason string) {
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
+	c.snapshotsRejectedVec.WithLabelValues(strconv.FormatUint(shardID, 10), reason).Inc()
+}
+
+// IncMessagesDropped counts a Raft message the transport discarded instead of
+// delivering, bucketed by the transport's fixed reason set. The target replica
+// id is intentionally NOT a metric label (see the vector's registration).
+func (c *PrometheusMetricsCollector) IncMessagesDropped(shardID, _ uint64, reason string) {
+	if !c.fallbackAllowed(shardID) {
+		return
+	}
+	c.messagesDroppedVec.WithLabelValues(strconv.FormatUint(shardID, 10), reason).Inc()
 }
 
 // IncUnauthorizedMessageDropped counts an inbound Raft message dropped for

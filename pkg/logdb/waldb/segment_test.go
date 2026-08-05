@@ -932,17 +932,24 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 		t.Errorf("fileOffset = %d, want %d", seg.fileOffset, cleanFileOffset)
 	}
 
-	// Verify file size matches the pre-batch durable boundary. With the
+	// The logical write position is the pre-batch durable boundary. With the
 	// block-aligned offset model, fileOffset is the block-aligned start and
 	// the open block tail lives in blockOffset, so the durable end is
-	// cleanFileOffset + cleanBlockOffset (the truncation target).
+	// cleanFileOffset + cleanBlockOffset (the truncation target). The FILE is
+	// larger than that: DiscardPending re-takes the fallocate reservation the
+	// truncation dropped, so writes after a rollback do not pay a file
+	// extension. (This test previously asserted the truncated size, pinning
+	// the lost reservation.)
+	wantEnd := cleanFileOffset + int64(cleanBlockOffset)
+	if seg.Size() != wantEnd {
+		t.Errorf("logical size = %d, want %d", seg.Size(), wantEnd)
+	}
 	fi, err := seg.f.Stat()
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	wantSize := cleanFileOffset + int64(cleanBlockOffset)
-	if fi.Size() != wantSize {
-		t.Errorf("file size = %d, want %d", fi.Size(), wantSize)
+	if fi.Size() < wantEnd {
+		t.Errorf("file size = %d, want at least %d", fi.Size(), wantEnd)
 	}
 }
 

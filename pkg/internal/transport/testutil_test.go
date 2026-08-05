@@ -15,6 +15,7 @@
 package transport
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -70,4 +71,45 @@ func waitForChan(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg st
 	case <-timer.C:
 		t.Fatal(msg)
 	}
+}
+
+// dropRecorder implements the transport Metrics interface, recording only the
+// two drop counters so tests can assert the reason bucket a call site emits.
+type dropRecorder struct {
+	noopTransportMetrics
+	mu               sync.Mutex
+	snapshotsRejects []dropSample
+	messageDrops     []dropSample
+}
+
+// dropSample is one recorded drop: the shard, the target replica (0 for
+// snapshot rejections), and the reason label.
+type dropSample struct {
+	shardID uint64
+	to      uint64
+	reason  string
+}
+
+func (d *dropRecorder) IncSnapshotsRejected(shardID uint64, reason string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.snapshotsRejects = append(d.snapshotsRejects, dropSample{shardID: shardID, reason: reason})
+}
+
+func (d *dropRecorder) IncMessagesDropped(shardID, to uint64, reason string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.messageDrops = append(d.messageDrops, dropSample{shardID: shardID, to: to, reason: reason})
+}
+
+func (d *dropRecorder) rejects() []dropSample {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]dropSample(nil), d.snapshotsRejects...)
+}
+
+func (d *dropRecorder) drops() []dropSample {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]dropSample(nil), d.messageDrops...)
 }

@@ -19,6 +19,14 @@ import "github.com/jeremyhahn/go-quicraft/pkg/proto"
 // MessageHandler defines the interface for handling inbound Raft messages
 // and snapshots. The engine implements this interface to receive messages
 // from the transport layer.
+//
+// The senderAuthorized closure passed to both methods is valid only for the
+// duration of the call. It captures the inbound *quic.Conn, so a handler that
+// stores it (or hands it to a goroutine outliving the call) pins that
+// connection and its buffers for as long as the reference lives — including
+// after the peer has gone — and later consults a certificate that is no longer
+// the peer's. Call it synchronously; copy the boolean result, never the
+// closure.
 type MessageHandler interface {
 	// HandleMessage processes an inbound batch of Raft messages.
 	//

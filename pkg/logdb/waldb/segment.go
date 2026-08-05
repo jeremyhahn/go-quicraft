@@ -504,6 +504,15 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int) er
 				return &SegmentDiscardError{SegmentID: s.id, Err: err}
 			}
 		}
+		// The truncation dropped the segment's fallocate reservation, so
+		// re-take it: without this every write after a rollback pays a file
+		// extension and the ENOSPC pre-reservation the design relies on is
+		// gone. Best-effort, exactly as in createSegment — a failed
+		// reservation costs performance, never correctness.
+		if err := s.PreAllocate(); err != nil {
+			slog.Debug("waldb: re-preallocate after discard failed",
+				"segment_id", s.id, "dir", s.dir, "error", err)
+		}
 	}
 
 	// Restore the open block's pre-batch content. If the failed batch sealed a

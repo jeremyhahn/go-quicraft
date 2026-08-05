@@ -236,3 +236,84 @@ func TestSessionExpiryEntriesTooSmallError_Error(t *testing.T) {
 		}
 	})
 }
+
+func TestMaxEntrySizeExceededError_Error(t *testing.T) {
+	err := &MaxEntrySizeExceededError{
+		Configured:      16 * 1024 * 1024,
+		ProtocolMaximum: 8 * 1024 * 1024,
+	}
+	msg := err.Error()
+	for _, want := range []string{"MaxEntrySize", "16777216", "8388608"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("Error() = %q, missing %q", msg, want)
+		}
+	}
+
+	var typed *MaxEntrySizeExceededError
+	if !errors.As(error(err), &typed) {
+		t.Fatal("errors.As should match *MaxEntrySizeExceededError")
+	}
+}
+
+func TestMaxApplyEntrySizeExceededError_Error(t *testing.T) {
+	err := &MaxApplyEntrySizeExceededError{
+		Configured:   MaxReplicationPayloadBytes + 1,
+		FrameMaximum: MaxReplicationPayloadBytes,
+	}
+	msg := err.Error()
+	for _, want := range []string{"MaxApplyEntrySize", "16711673", "16711672", "frame"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("Error() = %q, missing %q", msg, want)
+		}
+	}
+
+	var typed *MaxApplyEntrySizeExceededError
+	if !errors.As(error(err), &typed) {
+		t.Fatal("errors.As should match *MaxApplyEntrySizeExceededError")
+	}
+	if typed.FrameMaximum != MaxReplicationPayloadBytes {
+		t.Errorf("FrameMaximum = %d, want %d", typed.FrameMaximum, MaxReplicationPayloadBytes)
+	}
+}
+
+// TestMTLSConfigRequiredError verifies both the message and the sentinel
+// matching that callers use to distinguish "mTLS material missing" from any
+// other validation failure. mTLS is mandatory; there is no insecure fallback.
+func TestMTLSConfigRequiredError(t *testing.T) {
+	err := &MTLSConfigRequiredError{}
+	if !strings.Contains(err.Error(), "MTLSConfig is required") {
+		t.Fatalf("Error() = %q, missing the requirement statement", err.Error())
+	}
+	if !errors.Is(err, ErrMTLSConfigRequired) {
+		t.Fatal("errors.Is should match ErrMTLSConfigRequired")
+	}
+	if errors.Is(err, ErrLeaseReadRequiresCheckQuorum) {
+		t.Fatal("errors.Is must not match an unrelated sentinel")
+	}
+
+	// The sentinel must match the error Validate actually returns.
+	var tc TransportConfig
+	tc.SetDefaults()
+	tc.MTLSConfig = nil
+	if verr := tc.Validate(); !errors.Is(verr, ErrMTLSConfigRequired) {
+		t.Fatalf("Validate() = %v, want ErrMTLSConfigRequired", verr)
+	}
+}
+
+// TestLeaseReadRequiresCheckQuorumError verifies the message and sentinel for
+// the lease-read safety precondition (Raft PhD thesis 6.4): without CheckQuorum
+// a partitioned leader serves stale reads indefinitely.
+func TestLeaseReadRequiresCheckQuorumError(t *testing.T) {
+	err := &LeaseReadRequiresCheckQuorumError{}
+	for _, want := range []string{"LeaseRead requires CheckQuorum", "stale reads"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Error() = %q, missing %q", err.Error(), want)
+		}
+	}
+	if !errors.Is(err, ErrLeaseReadRequiresCheckQuorum) {
+		t.Fatal("errors.Is should match ErrLeaseReadRequiresCheckQuorum")
+	}
+	if errors.Is(err, ErrMTLSConfigRequired) {
+		t.Fatal("errors.Is must not match an unrelated sentinel")
+	}
+}

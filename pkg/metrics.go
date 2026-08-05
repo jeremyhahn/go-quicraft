@@ -96,6 +96,23 @@ type TransportMetrics interface {
 	// IncSnapshotsReceived records a snapshot received for the given shard,
 	// including the byte count and duration of the transfer.
 	IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
+
+	// IncSnapshotsRejected counts an inbound snapshot transfer discarded
+	// before it reached the state machine. reason comes from a closed set
+	// defined by the transport: "shutdown", "concurrency_limit",
+	// "memory_budget", "liveness", "malformed", "io_error", "policy".
+	// Implementations must treat it as a metric label and must not derive
+	// new label values from it. shardID is 0 when the transfer was rejected
+	// before its header parsed.
+	IncSnapshotsRejected(shardID uint64, reason string)
+
+	// IncMessagesDropped counts a Raft message the transport discarded
+	// instead of delivering. reason comes from a closed set defined by the
+	// transport: "unresolved_target", "queue_full", "stream_unavailable",
+	// "write_failed", "marshal_failed", "protocol_violation". shardID and to
+	// are both 0 for "protocol_violation", where the frame is discarded
+	// before its messages are parsed.
+	IncMessagesDropped(shardID, to uint64, reason string)
 }
 
 // SecurityMetrics covers security-relevant drop counters. These events
@@ -206,6 +223,12 @@ func (NoOpMetricsCollector) IncSnapshotsSent(uint64, int64, time.Duration) {}
 
 // IncSnapshotsReceived is a no-op.
 func (NoOpMetricsCollector) IncSnapshotsReceived(uint64, int64, time.Duration) {}
+
+// IncSnapshotsRejected is a no-op.
+func (NoOpMetricsCollector) IncSnapshotsRejected(uint64, string) {}
+
+// IncMessagesDropped is a no-op.
+func (NoOpMetricsCollector) IncMessagesDropped(uint64, uint64, string) {}
 
 // SecurityMetrics no-ops.
 

@@ -467,7 +467,12 @@ func TestParseSegmentFilename(t *testing.T) {
 		{"zero padded", "000042.log", 42, true},
 		{"zero", "000000.log", 0, true},
 		{"large id", "999999.log", 999999, true},
-		{"no padding", "1.log", 1, true},
+		// Only the canonical %06d form is a segment: a shorter or
+		// over-padded digit string is a foreign file that would alias a real
+		// segment ID (this case previously parsed as segment 1).
+		{"no padding", "1.log", 0, false},
+		{"over padded", "0000001.log", 0, false},
+		{"overflows uint64", "99999999999999999999.log", 0, false},
 		{"not a log file", "000001.idx", 0, false},
 		{"no extension", "000001", 0, false},
 		{"empty name", "", 0, false},

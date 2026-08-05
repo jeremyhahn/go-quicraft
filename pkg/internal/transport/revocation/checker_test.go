@@ -214,13 +214,13 @@ func TestCRLReload(t *testing.T) {
 	leaf200 := ca.issueLeaf(t, 200)
 	leaf300 := ca.issueLeaf(t, 300)
 
-	if !crlRevoked(checker, leaf100.SerialNumber.Text(16)) {
+	if !crlRevokedFor(checker, leaf100) {
 		t.Fatal("serial 100 should be revoked")
 	}
-	if !crlRevoked(checker, leaf200.SerialNumber.Text(16)) {
+	if !crlRevokedFor(checker, leaf200) {
 		t.Fatal("serial 200 should be revoked")
 	}
-	if crlRevoked(checker, leaf300.SerialNumber.Text(16)) {
+	if crlRevokedFor(checker, leaf300) {
 		t.Fatal("serial 300 should NOT be revoked")
 	}
 }
@@ -359,7 +359,7 @@ func TestCRLHotReload(t *testing.T) {
 	}
 
 	leaf200 := ca.issueLeaf(t, 200)
-	if !crlRevoked(checker, leaf200.SerialNumber.Text(16)) {
+	if !crlRevokedFor(checker, leaf200) {
 		t.Fatal("serial 200 should be revoked after hot-reload")
 	}
 }
@@ -914,7 +914,6 @@ func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
 func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 5151)
-	serialHex := leaf.SerialNumber.Text(16)
 
 	// A responder that always fails, so any actual query is treated as
 	// "unavailable" and drives the negative-cache write path.
@@ -932,9 +931,10 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 	}, ca.cert)
 
 	// Seed an unexpired definitive "revoked" verdict, as if the responder had
-	// answered moments earlier.
+	// answered moments earlier. The cache is keyed by (issuer, serial).
+	cacheKey := ocspKey(checker, leaf)
 	checker.ocspMu.Lock()
-	checker.ocspCache[serialHex] = &ocspCacheEntry{
+	checker.ocspCache[cacheKey] = &ocspCacheEntry{
 		revoked:   true,
 		expiresAt: time.Now().Add(300 * time.Second),
 	}
@@ -943,19 +943,19 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 	// Drive the failing query path directly. queryOCSP fails (responder down),
 	// so checkOCSPRaw reaches the negative-cache write. The guard must refuse
 	// to overwrite the unexpired definitive entry.
-	if _, _, err := checker.queryOCSP(leaf); err == nil {
+	if _, _, err := checker.queryOCSP(leaf, ca.cert); err == nil {
 		t.Fatal("responder is down; queryOCSP should fail")
 	}
 	// Reproduce the negative-write that checkOCSPRaw performs on query failure,
 	// which is guarded against clobbering a definitive entry.
 	checker.ocspMu.Lock()
-	if existing, ok := checker.ocspCache[serialHex]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
-		checker.ocspCache[serialHex] = &ocspCacheEntry{
+	if existing, ok := checker.ocspCache[cacheKey]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
+		checker.ocspCache[cacheKey] = &ocspCacheEntry{
 			unavailable: true,
 			expiresAt:   time.Now().Add(ocspUnavailableTTL),
 		}
 	}
-	after := checker.ocspCache[serialHex]
+	after := checker.ocspCache[cacheKey]
 	checker.ocspMu.Unlock()
 	if after == nil || after.unavailable || !after.revoked {
 		t.Fatalf("definitive revoked entry must survive responder outage, got %+v", after)
@@ -974,7 +974,7 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 	// Conversely, an EXPIRED definitive entry is stale and may be replaced by a
 	// negative entry on query failure (correct: the verdict is no longer valid).
 	checker.ocspMu.Lock()
-	checker.ocspCache[serialHex].expiresAt = time.Now().Add(-time.Second)
+	checker.ocspCache[cacheKey].expiresAt = time.Now().Add(-time.Second)
 	checker.ocspMu.Unlock()
 	revoked, err = checker.IsRevoked(leaf)
 	if err != nil {
@@ -984,7 +984,7 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 		t.Fatal("expired entry + down responder is unknown, not revoked, in soft-fail")
 	}
 	checker.ocspMu.Lock()
-	stale := checker.ocspCache[serialHex]
+	stale := checker.ocspCache[cacheKey]
 	checker.ocspMu.Unlock()
 	if stale == nil || !stale.unavailable {
 		t.Fatalf("expired definitive entry should be replaced by a negative entry, got %+v", stale)
@@ -1439,8 +1439,24 @@ func TestRevokedCount(t *testing.T) {
 // crlRevoked reports whether serial is in the checker's revoked set,
 // ignoring CRL staleness (test convenience wrapper).
 func crlRevoked(c *Checker, serial string) bool {
-	revoked, _ := c.checkCRLStatus(serial)
+	revoked, _ := c.checkCRLStatus(anyIssuerScope, serial)
 	return revoked
+}
+
+// crlRevokedFor reports whether leaf is in the checker's revoked set under the
+// scope of the CA that issued it, ignoring CRL staleness. CRL-published
+// revocations are keyed per issuer, so a lookup for a CA-issued leaf must
+// name that CA.
+func crlRevokedFor(c *Checker, leaf *x509.Certificate) bool {
+	revoked, _ := c.checkCRLStatus(c.scopeFor(leaf), leaf.SerialNumber.Text(16))
+	return revoked
+}
+
+// ocspKey returns the issuer-scoped OCSP cache key the checker uses for leaf,
+// so tests that seed or inspect the cache address the same entry the
+// production path does.
+func ocspKey(c *Checker, leaf *x509.Certificate) string {
+	return scopedSerial(c.scopeFor(leaf), leaf.SerialNumber.Text(16))
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,7 +2008,6 @@ func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
 func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 701)
-	serialHex := leaf.SerialNumber.Text(16)
 
 	var queries atomic.Int64
 	server := newUnknownOCSPServer(t, ca, &queries)
@@ -2011,7 +2026,7 @@ func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 	}
 
 	checker.ocspMu.RLock()
-	entry, cached := checker.ocspCache[serialHex]
+	entry, cached := checker.ocspCache[ocspKey(checker, leaf)]
 	checker.ocspMu.RUnlock()
 	if cached && !entry.unavailable {
 		t.Fatal("unknown status must not be cached as a definitive verdict")
@@ -2144,7 +2159,6 @@ func TestReloadCRLsRejectsPostDatedCRL(t *testing.T) {
 func TestOCSPCacheTTLBoundedByNextUpdate(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 900)
-	serialHex := leaf.SerialNumber.Text(16)
 	nextUpdate := time.Now().Add(30 * time.Second)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2174,7 +2188,7 @@ func TestOCSPCacheTTLBoundedByNextUpdate(t *testing.T) {
 		t.Fatalf("IsRevoked error: %v", err)
 	}
 	checker.ocspMu.RLock()
-	entry, cached := checker.ocspCache[serialHex]
+	entry, cached := checker.ocspCache[ocspKey(checker, leaf)]
 	checker.ocspMu.RUnlock()
 	if !cached {
 		t.Fatal("expected a cached definitive verdict")
@@ -2274,5 +2288,450 @@ func TestConfigValidateAcceptsSatisfiableModes(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("case %d: Validate() = %v, want nil", i, err)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mode validation helper
+// ---------------------------------------------------------------------------
+
+// TestIsValidMode covers the recognized mode set including the empty string,
+// which selects the default. Config.Validate depends on this to reject typos
+// that would otherwise silently fall through to the default mode.
+func TestIsValidMode(t *testing.T) {
+	for _, m := range []Mode{"", ModeCRL, ModeOCSP, ModeBoth, ModeAny} {
+		if !IsValidMode(m) {
+			t.Fatalf("IsValidMode(%q) = false, want true", m)
+		}
+	}
+	for _, m := range []Mode{"CRL", "strict", "ocsp ", "none"} {
+		if IsValidMode(m) {
+			t.Fatalf("IsValidMode(%q) = true, want false", m)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issuer selection fallbacks
+// ---------------------------------------------------------------------------
+
+// issueLeafWithAKI issues a leaf signed by signer but stamped with an explicit
+// AuthorityKeyId. The parent copy has its SubjectKeyId cleared so that
+// x509.CreateCertificate honors the template's AuthorityKeyId instead of
+// deriving it from the signing certificate.
+func issueLeafWithAKI(t *testing.T, signer *testCA, serial int64, aki []byte) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	parent := *signer.cert
+	parent.SubjectKeyId = nil
+	tmpl := &x509.Certificate{
+		SerialNumber:   big.NewInt(serial),
+		Subject:        pkix.Name{CommonName: fmt.Sprintf("aki-leaf-%d", serial)},
+		NotBefore:      time.Now().Add(-1 * time.Minute),
+		NotAfter:       time.Now().Add(1 * time.Hour),
+		KeyUsage:       x509.KeyUsageDigitalSignature,
+		AuthorityKeyId: aki,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, &parent, &key.PublicKey, signer.key)
+	if err != nil {
+		t.Fatalf("create leaf cert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse leaf cert: %v", err)
+	}
+	return leaf
+}
+
+// TestIssuerForAuthorityKeyIdFallback covers the second selection stage: when
+// no candidate's key verifies the leaf signature, the leaf's AuthorityKeyId is
+// matched against candidate SubjectKeyIds. This keeps issuer selection working
+// for signature algorithms this build cannot verify; a wrongly selected issuer
+// still fails closed downstream because ocsp.ParseResponseForCert verifies the
+// response against it.
+func TestIssuerForAuthorityKeyIdFallback(t *testing.T) {
+	trusted := newTestCA(t)
+	rogue := newTestCA(t)
+	if len(trusted.cert.SubjectKeyId) == 0 {
+		t.Fatal("setup: trusted CA has no SubjectKeyId to match against")
+	}
+
+	leaf := issueLeafWithAKI(t, rogue, 1100, trusted.cert.SubjectKeyId)
+	if leaf.CheckSignatureFrom(trusted.cert) == nil {
+		t.Fatal("setup: leaf must not verify against the trusted CA")
+	}
+
+	checker := NewChecker(Config{}, trusted.cert)
+	got := checker.issuerFor(leaf)
+	if got == nil {
+		t.Fatal("AuthorityKeyId fallback did not select an issuer")
+	}
+	if !got.Equal(trusted.cert) {
+		t.Fatalf("issuerFor selected %v, want the AuthorityKeyId match", got.Subject)
+	}
+}
+
+// TestIssuerForNoUsableIssuer verifies the fail-closed default: a bundle
+// holding no issuer for the leaf (neither by signature nor AuthorityKeyId)
+// yields nil, which callers turn into ErrNoIssuerCertificate.
+func TestIssuerForNoUsableIssuer(t *testing.T) {
+	trusted := newTestCA(t)
+	rogue := newTestCA(t)
+	leaf := issueLeafWithAKI(t, rogue, 1101, []byte{0xde, 0xad, 0xbe, 0xef})
+
+	checker := NewChecker(Config{}, trusted.cert)
+	if got := checker.issuerFor(leaf); got != nil {
+		t.Fatalf("issuerFor = %v, want nil for a foreign leaf", got.Subject)
+	}
+
+	// The same condition surfaces as a typed error through the OCSP path: no
+	// issuer means no request can be built and no verdict can be scoped.
+	checker.cfg.OCSPResponderURL = "http://ocsp.invalid"
+	if _, err := checker.checkOCSPRaw(leaf); !errors.Is(err, ErrNoIssuerCertificate) {
+		t.Fatalf("checkOCSPRaw error = %v, want ErrNoIssuerCertificate", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Start / reloadLoop failure paths
+// ---------------------------------------------------------------------------
+
+// TestStartWithUnreadableCRLFailsClosed verifies that a failing initial load
+// in Start does not panic and leaves the set stale, so EnforceRevocation
+// rejects peers instead of treating "no CRL loaded" as "nothing revoked".
+func TestStartWithUnreadableCRLFailsClosed(t *testing.T) {
+	ca := newTestCA(t)
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+
+	checker := NewChecker(Config{
+		CRLPaths:          []string{missing},
+		CheckInterval:     time.Hour,
+		Mode:              ModeCRL,
+		EnforceRevocation: true,
+	}, ca.cert)
+	checker.Start()
+	defer checker.Stop()
+
+	leaf := ca.issueLeaf(t, 1200)
+	if _, err := checker.IsRevoked(leaf); !errors.Is(err, ErrCRLStale) {
+		t.Fatalf("IsRevoked error = %v, want ErrCRLStale after a failed initial load", err)
+	}
+}
+
+// TestReloadLoopMarksStaleOnCorruptedFile verifies the periodic reload's
+// failure branch: a CRL replaced with unparseable content while the checker is
+// running must take the set stale within one interval, so a fail-closed
+// deployment stops trusting "not in the set" as "not revoked".
+func TestReloadLoopMarksStaleOnCorruptedFile(t *testing.T) {
+	ca := newTestCA(t)
+	dir := t.TempDir()
+	path := writeCRLFile(t, dir, "corrupt.crl.pem", ca.createCRL(t, 1300))
+
+	checker := NewChecker(Config{
+		CRLPaths:          []string{path},
+		CheckInterval:     10 * time.Millisecond,
+		Mode:              ModeCRL,
+		EnforceRevocation: true,
+	}, ca.cert)
+	checker.Start()
+	defer checker.Stop()
+
+	require.Eventually(t, func() bool {
+		return checker.RevokedCount() == 1
+	}, 5*time.Second, 5*time.Millisecond, "initial background load")
+
+	// Replace the CRL with a PEM block that is not a parseable CRL.
+	writeCRLFile(t, dir, "corrupt.crl.pem",
+		pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: []byte("not-a-crl")}))
+
+	unlisted := ca.issueLeaf(t, 1301)
+	require.Eventually(t, func() bool {
+		_, err := checker.IsRevoked(unlisted)
+		return errors.Is(err, ErrCRLStale)
+	}, 5*time.Second, 5*time.Millisecond, "reload loop must mark the set stale")
+
+	// The previously loaded revocation survives the failed reload.
+	revoked, _ := checker.IsRevoked(ca.issueLeaf(t, 1300))
+	if !revoked {
+		t.Fatal("a stale set must keep serving known revocations")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ModeBoth composition
+// ---------------------------------------------------------------------------
+
+// TestModeBothOCSPOnlyRevokedWins covers the OCSP half of revoked-by-either:
+// a fresh CRL that does not list the serial must not override an OCSP
+// "revoked" verdict.
+func TestModeBothOCSPOnlyRevokedWins(t *testing.T) {
+	ca := newTestCA(t)
+	dir := t.TempDir()
+	leaf := ca.issueLeaf(t, 1400)
+	serialHex := leaf.SerialNumber.Text(16)
+
+	// CRL is fresh and valid but lists an unrelated serial.
+	crlPath := writeCRLFile(t, dir, "other.crl.pem", ca.createCRL(t, 1499))
+	server := newMockOCSPServer(t, ca, map[string]bool{serialHex: true})
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		CRLPaths:           []string{crlPath},
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+		Mode:               ModeBoth,
+		EnforceRevocation:  true,
+	}, ca.cert)
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("IsRevoked error: %v", err)
+	}
+	if !revoked {
+		t.Fatal("OCSP reports revoked: ModeBoth must treat revoked-by-either as revoked")
+	}
+}
+
+// TestModeBothBothSourcesCleanPasses verifies the accept path: a fresh CRL and
+// an OCSP "good" produce no error even under enforcement.
+func TestModeBothBothSourcesCleanPasses(t *testing.T) {
+	ca := newTestCA(t)
+	dir := t.TempDir()
+	leaf := ca.issueLeaf(t, 1401)
+
+	crlPath := writeCRLFile(t, dir, "clean.crl.pem", ca.createCRL(t, 1499))
+	server := newMockOCSPServer(t, ca, map[string]bool{})
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		CRLPaths:           []string{crlPath},
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+		Mode:               ModeBoth,
+		EnforceRevocation:  true,
+	}, ca.cert)
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("clean sources must not error under enforcement: %v", err)
+	}
+	if revoked {
+		t.Fatal("neither source reports revoked")
+	}
+}
+
+// TestModeBothStaleCRLFailsClosed verifies that in ModeBoth an unusable CRL
+// fails closed under enforcement even when OCSP answers "good": the revocation
+// could be published in the CRL this checker cannot read.
+func TestModeBothStaleCRLFailsClosed(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1402)
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+
+	server := newMockOCSPServer(t, ca, map[string]bool{})
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		CRLPaths:           []string{missing},
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+		Mode:               ModeBoth,
+		EnforceRevocation:  true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("no source reported revoked")
+	}
+	if !errors.Is(err, ErrCRLStale) {
+		t.Fatalf("IsRevoked error = %v, want ErrCRLStale", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ModeAny with an OCSP responder configured
+// ---------------------------------------------------------------------------
+
+// TestModeAnyOCSPRevokedWins verifies that the default mode consults the OCSP
+// responder when one is configured and honors a "revoked" verdict.
+func TestModeAnyOCSPRevokedWins(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1500)
+	serialHex := leaf.SerialNumber.Text(16)
+
+	server := newMockOCSPServer(t, ca, map[string]bool{serialHex: true})
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeAny,
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("IsRevoked error: %v", err)
+	}
+	if !revoked {
+		t.Fatal("ModeAny must honor an OCSP revoked verdict")
+	}
+}
+
+// TestModeAnyOCSPUnavailableEnforcedFailsClosed verifies that an unreachable
+// responder rejects the peer under enforcement in the default mode.
+func TestModeAnyOCSPUnavailableEnforcedFailsClosed(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1501)
+
+	checker := NewChecker(Config{
+		Mode:               ModeAny,
+		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
+		OCSPTimeoutSeconds: 1,
+		EnforceRevocation:  true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("unavailable status must not be reported as revoked")
+	}
+	if !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("IsRevoked error = %v, want ErrOCSPUnavailable", err)
+	}
+}
+
+// TestModeAnyOCSPUnavailableSoftFailAllows verifies the soft-fail counterpart:
+// with enforcement off, an unreachable responder admits the peer.
+func TestModeAnyOCSPUnavailableSoftFailAllows(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1502)
+
+	checker := NewChecker(Config{
+		Mode:               ModeAny,
+		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
+		OCSPTimeoutSeconds: 1,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("soft-fail must not surface an error: %v", err)
+	}
+	if revoked {
+		t.Fatal("unavailable status must not be reported as revoked")
+	}
+}
+
+// TestModeAnyStaleCRLFailsClosedDespiteGoodOCSP verifies that in ModeAny a
+// reachable responder answering "good" does not paper over an unusable CRL
+// under enforcement: the revocation may be published only in the CRL.
+func TestModeAnyStaleCRLFailsClosedDespiteGoodOCSP(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1503)
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+
+	server := newMockOCSPServer(t, ca, map[string]bool{})
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeAny,
+		CRLPaths:           []string{missing},
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+		EnforceRevocation:  true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("no source reported revoked")
+	}
+	if !errors.Is(err, ErrCRLStale) {
+		t.Fatalf("IsRevoked error = %v, want ErrCRLStale", err)
+	}
+}
+
+// TestModeAnyStaleCRLWithoutOCSPFailsClosed covers the no-responder branch of
+// ModeAny: with only CRL files configured, an unusable CRL fails closed.
+func TestModeAnyStaleCRLWithoutOCSPFailsClosed(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1504)
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+
+	checker := NewChecker(Config{
+		Mode:              ModeAny,
+		CRLPaths:          []string{missing},
+		EnforceRevocation: true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("no source reported revoked")
+	}
+	if !errors.Is(err, ErrCRLStale) {
+		t.Fatalf("IsRevoked error = %v, want ErrCRLStale", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// queryOCSP transport failure paths
+// ---------------------------------------------------------------------------
+
+// TestQueryOCSPMalformedResponderURL verifies that a responder URL the HTTP
+// client cannot build a request from is treated as status-unavailable (fail
+// closed under enforcement) rather than as "not revoked".
+func TestQueryOCSPMalformedResponderURL(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1600)
+
+	checker := NewChecker(Config{
+		Mode:               ModeOCSP,
+		OCSPResponderURL:   "http://ocsp.example\n/bad",
+		OCSPTimeoutSeconds: 1,
+		EnforceRevocation:  true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("a malformed responder URL must not yield a revoked verdict")
+	}
+	if !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("IsRevoked error = %v, want ErrOCSPUnavailable", err)
+	}
+}
+
+// TestQueryOCSPTruncatedResponseBody verifies that a responder which declares
+// more body than it sends (a truncated or hostile response) is treated as
+// status-unavailable, never as "good".
+func TestQueryOCSPTruncatedResponseBody(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 1601)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ocsp-response")
+		w.Header().Set("Content-Length", "4096")
+		_, _ = w.Write([]byte("trunc"))
+	}))
+	defer server.Close()
+
+	checker := NewChecker(Config{
+		Mode:               ModeOCSP,
+		OCSPResponderURL:   server.URL,
+		OCSPTimeoutSeconds: 5,
+		EnforceRevocation:  true,
+	}, ca.cert)
+
+	revoked, err := checker.IsRevoked(leaf)
+	if revoked {
+		t.Fatal("a truncated response must not yield a revoked verdict")
+	}
+	if !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("IsRevoked error = %v, want ErrOCSPUnavailable", err)
 	}
 }

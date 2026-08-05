@@ -34,7 +34,77 @@ type Metrics interface {
 	IncMessagesReceived(shardID, from uint64, msgType uint64)
 	IncSnapshotsSent(shardID uint64, bytes int64, d time.Duration)
 	IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
+	IncSnapshotsRejected(shardID uint64, reason string)
+	IncMessagesDropped(shardID, to uint64, reason string)
 }
+
+// snapshotRejectReason is the bucket recorded as the reason label of
+// IncSnapshotsRejected. The set is closed: every value is a package constant
+// below, because the label feeds Prometheus and a per-transfer string would
+// create unbounded child series. The free-form detail that accompanies a
+// rejection is logged only.
+type snapshotRejectReason string
+
+// Snapshot rejection reasons.
+const (
+	// snapshotRejectShutdown covers transfers refused because the transport
+	// is stopping.
+	snapshotRejectShutdown snapshotRejectReason = "shutdown"
+
+	// snapshotRejectConcurrency covers the host-global and per-peer
+	// concurrent-receive limits.
+	snapshotRejectConcurrency snapshotRejectReason = "concurrency_limit"
+
+	// snapshotRejectMemory covers the aggregate and per-receive snapshot
+	// memory budgets.
+	snapshotRejectMemory snapshotRejectReason = "memory_budget"
+
+	// snapshotRejectLiveness covers the whole-transfer duration ceiling, the
+	// throughput floor, and the zero-length chunk flood — a peer occupying a
+	// concurrency slot without making progress.
+	snapshotRejectLiveness snapshotRejectReason = "liveness"
+
+	// snapshotRejectMalformed covers header and chunk records that fail
+	// bounds, unmarshal, or validation checks.
+	snapshotRejectMalformed snapshotRejectReason = "malformed"
+
+	// snapshotRejectIO covers stream read failures during the header or
+	// chunk stages.
+	snapshotRejectIO snapshotRejectReason = "io_error"
+
+	// snapshotRejectPolicy covers transfers refused by a security policy
+	// rather than by a defect, currently only arrival over 0-RTT.
+	snapshotRejectPolicy snapshotRejectReason = "policy"
+)
+
+// Message-drop reasons recorded as the reason label of IncMessagesDropped.
+// Closed set, for the same cardinality reason as snapshotRejectReason.
+const (
+	// dropReasonUnresolvedTarget is a message whose target replica has no
+	// registered address (membership churn).
+	dropReasonUnresolvedTarget = "unresolved_target"
+
+	// dropReasonQueueFull is a message shed by a full per-target send or
+	// heartbeat queue.
+	dropReasonQueueFull = "queue_full"
+
+	// dropReasonStreamUnavailable is a batch dropped because no stream to
+	// the target could be obtained.
+	dropReasonStreamUnavailable = "stream_unavailable"
+
+	// dropReasonWriteFailed is a batch dropped on a stream write or write
+	// deadline failure.
+	dropReasonWriteFailed = "write_failed"
+
+	// dropReasonMarshalFailed is a batch dropped because it could not be
+	// serialized (an internal sizing defect or an oversized replication
+	// payload).
+	dropReasonMarshalFailed = "marshal_failed"
+
+	// dropReasonProtocolViolation is an inbound frame discarded before its
+	// messages could be parsed, so neither shard nor target is known.
+	dropReasonProtocolViolation = "protocol_violation"
+)
 
 // Default configuration values for QUICTransport.
 const (
@@ -64,6 +134,20 @@ const (
 	// arriving. A frame that starts but does not finish within this window is
 	// a genuine stall (dead/slow peer), so the stream is dropped.
 	frameReadActiveTimeout = 30 * time.Second
+
+	// QUIC flow-control window sizes. These bound memory quic-go buffers
+	// BEFORE the application reads a frame, which is separate from (and
+	// additional to) MaxMessageReceiveMemory.
+	//
+	// initialStreamReceiveWindow is the starting per-stream window;
+	// maxStreamReceiveWindow is the ceiling autotuning may raise it to.
+	initialStreamReceiveWindow = 2 << 20 // 2 MB
+	maxStreamReceiveWindow     = 8 << 20 // 8 MB
+
+	// maxConnectionReceiveWindowCeiling caps the per-connection window that
+	// connectionReceiveWindow derives, so a large MaxMessageReceiveMemory does
+	// not translate into an unbounded per-connection buffer.
+	maxConnectionReceiveWindowCeiling = 32 << 20 // 32 MB
 
 	// snapshotStreamHeadroom is the number of streams reserved on top of a
 	// peer's outbound ordered-stream pool (StreamPoolSize) when sizing the
@@ -192,6 +276,13 @@ type Config struct {
 	// pinning MaxFrameSize per stream and exhausting host memory (OOM DoS). A
 	// reservation against this budget is taken before allocation and released
 	// once the frame is dispatched. Default: 256 MB.
+	//
+	// It bounds APPLICATION frame buffers only. QUIC also buffers received
+	// bytes before the application reads them, up to MaxIncomingConnections *
+	// the per-connection receive window; that window is derived from this
+	// value (see connectionReceiveWindow), so the total inbound receive
+	// footprint is this budget plus MaxIncomingConnections *
+	// connectionReceiveWindow(...), not this budget alone.
 	MaxMessageReceiveMemory int64
 
 	// SendBatchMaxSize is the maximum byte size of a single send batch.
@@ -260,6 +351,32 @@ type Config struct {
 	// Metrics collects transport-level metrics (send latency, message
 	// counts, snapshot transfers). Nil when metrics are disabled.
 	Metrics Metrics
+}
+
+// connectionReceiveWindow derives the QUIC per-connection receive window from
+// the application's message-receive budget. quic-go buffers received bytes
+// before the application ever sees them, so a window fixed independently of
+// the budget multiplies by MaxIncomingConnections into memory the budget does
+// not cover (32 MB * 256 connections = 8 GB against a 256 MB budget).
+//
+// The result is floored at maxStreamReceiveWindow — a connection window below
+// the per-stream window makes that stream window unreachable and throttles
+// replication — and capped at maxConnectionReceiveWindowCeiling. The floor
+// means the QUIC-level footprint is not strictly inside the budget for small
+// budgets; it is bounded and stated on MaxMessageReceiveMemory rather than
+// silently unbounded.
+func connectionReceiveWindow(maxMessageRecvMemory int64, maxIncomingConns int) uint64 {
+	if maxIncomingConns < 1 || maxMessageRecvMemory <= 0 {
+		return maxStreamReceiveWindow
+	}
+	window := uint64(maxMessageRecvMemory) / uint64(maxIncomingConns)
+	if window < maxStreamReceiveWindow {
+		return maxStreamReceiveWindow
+	}
+	if window > maxConnectionReceiveWindowCeiling {
+		return maxConnectionReceiveWindowCeiling
+	}
+	return window
 }
 
 // SetDefaults fills zero-valued fields with production defaults.

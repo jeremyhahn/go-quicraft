@@ -108,28 +108,47 @@ func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID, maxC
 	return deleted, nil
 }
 
-// parseSegmentFilename extracts the segment ID from a filename matching
-// the format "%06d.log". Returns the ID and true on success, or 0 and
-// false if the filename does not match.
+// segmentFilenameDigits is the canonical zero-padded width of a segment
+// filename's numeric part, as produced by segmentFilename ("%06d.log").
+const segmentFilenameDigits = 6
+
+// maxSegmentID is the largest representable segment ID.
+const maxSegmentID = ^uint64(0)
+
+// parseSegmentFilename extracts the segment ID from a filename in the exact
+// form segmentFilename produces: six digits, or more than six digits with no
+// leading zero. Returns the ID and true on success.
+//
+// Only the canonical form is accepted. A non-canonical digit string
+// ("0000001.log", "00000000000000000001.log") is a foreign file that would
+// otherwise alias a real segment ID — recovery would adopt it, or GC would
+// delete it believing an unrelated segment was reclaimed — and an
+// arbitrary-length string silently wrapped on uint64 overflow.
 func parseSegmentFilename(name string) (uint64, bool) {
-	if len(name) < 5 {
-		return 0, false
-	}
 	// Must end with ".log".
-	if name[len(name)-4:] != ".log" {
+	if len(name) <= 4 || name[len(name)-4:] != ".log" {
 		return 0, false
 	}
 	numStr := name[:len(name)-4]
-	if len(numStr) == 0 {
+	if len(numStr) < segmentFilenameDigits {
+		return 0, false
+	}
+	if len(numStr) > segmentFilenameDigits && numStr[0] == '0' {
 		return 0, false
 	}
 
 	var id uint64
-	for _, ch := range numStr {
+	for i := 0; i < len(numStr); i++ {
+		ch := numStr[i]
 		if ch < '0' || ch > '9' {
 			return 0, false
 		}
-		id = id*10 + uint64(ch-'0')
+		d := uint64(ch - '0')
+		// Reject rather than wrap: a wrapped ID names a different segment.
+		if id > (maxSegmentID-d)/10 {
+			return 0, false
+		}
+		id = id*10 + d
 	}
 	return id, true
 }

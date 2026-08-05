@@ -328,6 +328,8 @@ Source: `pkg/internal/transport/conn.go`
 
 For current benchmark results, pairwise comparisons (vs Dragonboat v4, etcd/raft, OpenRaft), and per-scenario breakdowns, see the performance documentation directory.
 
+Changes to the hot paths described above must be benchmarked before merge. See [Benchmark Regression Testing](benchmarking.md) for `make bench-compare`, the stored baselines under `test/performance/baselines/`, and why a single `make bench-<pkg>` run cannot answer the question.
+
 ## Allocation Budget Summary
 
 The 0 allocs/op target applies to the uncompressed, steady-state hot path with warm pools. With compression enabled, the realistic budget is 1-3 allocs/op.

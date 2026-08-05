@@ -166,8 +166,15 @@ type snapshotPool struct {
 const (
 	snapshotDataFile     = "snapshot.dat"
 	snapshotMetadataFile = "snapshot.meta"
-	snapshotMetaSize     = 6 * 8 // 6 uint64 fields (Index, Term, ShardID, ReplicaID, CreatedAt, Epoch)
-	maxSnapshotsRetained = 3     // keep last 3 snapshots
+	// snapshotMetaSize covers 7 uint64 fields: Index, Term, ShardID,
+	// ReplicaID, CreatedAt, Epoch, Compression.
+	snapshotMetaSize = 7 * 8
+	// snapshotMetaEpochOffset is the byte offset of the Epoch field. Readers
+	// that need only Epoch bound-check against this offset rather than the
+	// whole record, so a metadata file written before a later field was
+	// appended still yields a trustworthy epoch for the DEK purge floor.
+	snapshotMetaEpochOffset = 5 * 8
+	maxSnapshotsRetained    = 3 // keep last 3 snapshots
 
 	// snapshotEncryptChunkSize is the chunk size for streaming encryption
 	// of snapshot data. 64 KB balances between per-chunk overhead and
@@ -330,7 +337,17 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// two would race and corrupt SM/session state. The increment-then-check
 	// (apply) / set-then-drain (here) ordering guarantees any in-flight
 	// apply is observed by the drain.
+	var blocked error
 	if !req.save {
+		// The recovering gate stops the step worker from processing this node
+		// AT ALL — including draining its inbox — so the InstallSnapshot that
+		// advances the raft log to the snapshot index cannot be installed
+		// while the gate is up. Wait for the log to reach the snapshot index
+		// BEFORE raising the gate, otherwise the recovery would exclude the
+		// very message that makes it admissible.
+		blocked = p.awaitRecoverableLog(req)
+	}
+	if !req.save && blocked == nil {
 		req.node.SetRecovering(true)
 		// If the drain aborts because the node is stopping, do NOT touch the
 		// state machine: an apply may still be in flight (engine Stop closes
@@ -346,7 +363,11 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 			return
 		}
 	}
-	index, err := p.handleSnapshot(req)
+	var index uint64
+	err := blocked
+	if err == nil {
+		index, err = p.handleSnapshot(req)
+	}
 
 	// Mark that the snapshot operation itself finished, so a later panic is
 	// reported as a post-completion panic rather than a rejected snapshot.
@@ -410,6 +431,22 @@ func (p *snapshotPool) handleSnapshot(req snapshotRequest) (uint64, error) {
 	return 0, err
 }
 
+// discardSaveDir removes a snapshot save directory that will never be
+// recorded in LogDB. It is used on the failure paths that run while the data
+// file still holds plaintext, or holds an artifact that must not be retained;
+// a removal failure is logged and otherwise ignored because the caller is
+// already returning an error.
+func discardSaveDir(saveDir string, req snapshotRequest) {
+	if err := os.RemoveAll(saveDir); err != nil {
+		slog.Debug("snapshot: discard of save directory failed",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"path", saveDir,
+			"error", err,
+		)
+	}
+}
+
 // saveSnapshot saves the state machine state to a snapshot directory,
 // writes metadata, persists snapshot info to LogDB, garbage collects
 // old snapshots, and compacts the log. Returns the snapshot index on
@@ -431,6 +468,22 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// Cheap early-out: nothing applied yet means nothing to snapshot.
 	if snapshotter.LastApplied() == 0 {
 		return 0, nil
+	}
+
+	// A CONFIGURED barrier that is SEALED means encryption is temporarily
+	// unavailable — not that this shard is a plaintext deployment. Fail here,
+	// before any directory, data file, metadata file or LogDB record exists,
+	// so a host sealed during incident response cannot durably write its next
+	// snapshot as plaintext at rest. A nil barrier is the distinct
+	// "encryption disabled" state and proceeds unencrypted as configured.
+	barrier := p.barrierForShard(req.shardID)
+	if barrier != nil && barrier.IsSealed() {
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       ErrSnapshotBarrierSealed,
+		}
 	}
 
 	// Quiesce applies for this node so the consistent-capture phase of the
@@ -508,10 +561,17 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// Save SM state to the data file. When Snappy compression is
 	// configured, wrap the file writer with a Snappy buffered writer
 	// for transparent streaming compression.
+	// The compression decision is recorded with the artifact (metadata file,
+	// LogDB record, export header) so every reader derives its chain from the
+	// artifact rather than from its own — per-shard, mutable, per-host —
+	// config. Reading it back from config is how a follower with a different
+	// setting, or an operator flipping it across a restart, silently feeds
+	// compressed bytes to the state machine.
+	compression := node.cfg.SnapshotCompressionType
 	ctx := context.Background()
 	var w io.Writer = f
 	var snappyW *snappy.Writer
-	if node.cfg.SnapshotCompressionType == config.Snappy {
+	if compression == config.Snappy {
 		snappyW = snappy.NewBufferedWriter(f)
 		w = snappyW
 	}
@@ -611,15 +671,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"error", closeErr,
 				)
 			}
-			// Clean up the oversized snapshot directory.
-			if removeErr := os.RemoveAll(saveDir); removeErr != nil {
-				slog.Debug("snapshot: remove oversized directory failed",
-					"shard_id", req.shardID,
-					"replica_id", req.replicaID,
-					"path", saveDir,
-					"error", removeErr,
-				)
-			}
+			discardSaveDir(saveDir, req)
 			return 0, &SnapshotTooLargeError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
@@ -647,9 +699,24 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// purges a DEK any retained frame still needs. As defense-in-depth,
 	// RegisterInFlightEpoch pins the epoch live at save start so a concurrent
 	// purge cannot remove it mid-save; the deregister runs after encryption.
+	//
+	// The data file on disk is PLAINTEXT until encryptSnapshotFile replaces
+	// it, so every failure from here to the end of the encrypt discards the
+	// whole save directory: leaving it behind would strand exactly the
+	// plaintext artifact this branch exists to prevent.
 	var epoch uint64
-	barrier := p.barrierForShard(req.shardID)
-	if barrier != nil && !barrier.IsSealed() {
+	if barrier != nil {
+		// Re-check: an operator seal (EmergencySeal) can land between the
+		// entry check and here, after the plaintext data file was written.
+		if barrier.IsSealed() {
+			discardSaveDir(saveDir, req)
+			return 0, &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      true,
+				Err:       ErrSnapshotBarrierSealed,
+			}
+		}
 		inFlightEpoch := barrier.CurrentEpoch()
 		barrier.RegisterInFlightEpoch(inFlightEpoch)
 		// Hold the pin until saveSnapshot returns — past the metadata-file and
@@ -659,6 +726,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		defer barrier.DeregisterInFlightEpoch(inFlightEpoch)
 		minEpoch, encryptErr := p.encryptSnapshotFile(dataPath, barrier)
 		if encryptErr != nil {
+			discardSaveDir(saveDir, req)
 			return 0, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
@@ -673,7 +741,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// The (snapshotIndex, term) pair was captured together under the apply
 	// gate above; do NOT re-read lastAppliedTerm here — applies may have
 	// resumed since afterCapture released the gate.
-	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch); err != nil {
+	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression); err != nil {
 		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
@@ -700,6 +768,14 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
+	// Measure the artifact AFTER encryption so FileSize always means "size of
+	// the file at Filepath". A record whose FileSize is 0 while Filepath is
+	// set makes this replica stream an empty snapshot once it becomes leader.
+	var fileSize uint64
+	if fi, statErr := os.Stat(dataPath); statErr == nil {
+		fileSize = uint64(fi.Size())
+	}
+
 	// Persist snapshot metadata to LogDB, including the current cluster
 	// membership. Without membership, ReadState on restart returns empty
 	// membership which breaks quorum calculation.
@@ -710,11 +786,13 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			membership = protoMembershipToLogDB(&m)
 		}
 		logdbSnap := logdb.Snapshot{
-			Index:      snapshotIndex,
-			Term:       term,
-			Membership: membership,
-			Filepath:   saveDir,
-			Epoch:      epoch,
+			Index:       snapshotIndex,
+			Term:        term,
+			Membership:  membership,
+			Filepath:    saveDir,
+			FileSize:    fileSize,
+			Epoch:       epoch,
+			Compression: compression,
 		}
 		if err := p.logdb.SaveSnapshot(req.shardID, req.replicaID, logdbSnap); err != nil {
 			return 0, &SnapshotError{
@@ -736,17 +814,12 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		if peer := node.Peer(); peer != nil {
 			m = peer.GetMembership()
 		}
-		snapDataPath := filepath.Join(saveDir, snapshotDataFile)
-		var fileSize uint64
-		if fi, statErr := os.Stat(snapDataPath); statErr == nil {
-			fileSize = uint64(fi.Size())
-		}
 		if err := lr.CreateSnapshot(proto.Snapshot{
 			ShardID:    req.shardID,
 			ReplicaID:  req.replicaID,
 			Index:      snapshotIndex,
 			Term:       term,
-			Filepath:   snapDataPath,
+			Filepath:   dataPath,
 			FileSize:   fileSize,
 			Membership: m,
 			Epoch:      epoch,
@@ -847,18 +920,126 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	return snapshotIndex, nil
 }
 
-// peerCommittedIndex returns the Raft log's committed index, read under
-// raftMu — the lock that serializes the step worker's Tick and the commit
-// worker's Commit. The second result is false when the node has no peer
+// peerLogMarkers returns the Raft log's committed and processed markers, read
+// under raftMu — the lock that serializes the step worker's Tick and the
+// commit worker's Commit. The third result is false when the node has no peer
 // (there is then no raft log whose markers a recovery could get ahead of).
-func peerCommittedIndex(node *Node) (uint64, bool) {
+//
+// BOTH markers are needed. committed alone is not sufficient: with
+// processed < index <= committed, seeding lastApplied to the snapshot index
+// makes the next Update carry a LastApplied above the log's processed marker,
+// which commitUpdate asserts against. DiagRaftState is the only accessor the
+// raft package exposes for processed, and it is safe here for the same reason
+// CommittedIndex is: the read happens under raftMu.
+func peerLogMarkers(node *Node) (committed, processed uint64, ok bool) {
 	peer := node.Peer()
 	if peer == nil {
-		return 0, false
+		return 0, 0, false
 	}
 	node.raftMu.Lock()
 	defer node.raftMu.Unlock()
-	return peer.CommittedIndex(), true
+	_, committed, processed, _, _, _ = peer.DiagRaftState()
+	return committed, processed, true
+}
+
+// recoveryBlockedByLog reports why a state machine recovery for snapIndex must
+// not proceed, or nil when it may. Both bounds are evaluated against markers
+// that only the raft log and the apply pipeline own, so this MUST run before
+// the recovering gate is raised and before RecoverFromSnapshot touches the
+// state machine:
+//
+//   - Lower bound: the snapshot must be strictly ahead of the apply frontier.
+//     Recovering behind it rolls the state machine backwards and regresses
+//     lastApplied, which fails the shard with ErrApplyGap on the next batch.
+//   - Upper bound: the raft log must already hold the snapshot, i.e. the
+//     InstallSnapshot must have been installed by the step worker. Until then
+//     the recovery is merely early, not wrong — the error says so.
+func recoveryBlockedByLog(req snapshotRequest, snapIndex uint64) error {
+	if applied := req.node.LastApplied(); snapIndex <= applied {
+		return &SnapshotRecoveryStaleError{
+			ShardID:       req.shardID,
+			ReplicaID:     req.replicaID,
+			SnapshotIndex: snapIndex,
+			LastApplied:   applied,
+		}
+	}
+	committed, processed, hasPeer := peerLogMarkers(req.node)
+	if hasPeer && (committed < snapIndex || processed < snapIndex) {
+		return &SnapshotRecoveryBehindError{
+			ShardID:       req.shardID,
+			ReplicaID:     req.replicaID,
+			SnapshotIndex: snapIndex,
+			Committed:     committed,
+			Processed:     processed,
+		}
+	}
+	return nil
+}
+
+// Bounds on how long a recovery request waits for the step worker to install
+// the snapshot into the raft log. The install is a single inbox message the
+// step worker picks up on the next work signal, so the common wait is a
+// scheduling delay; the budget only has to outlast a loaded machine.
+const (
+	recoveryLogWaitInterval = 5 * time.Millisecond
+	recoveryLogWaitBudget   = 5 * time.Second
+)
+
+// awaitRecoverableLog blocks until a recovery request's log bounds are
+// satisfiable, WITHOUT raising the recovering gate, and returns nil once they
+// are. A permanent refusal (the snapshot is behind the apply frontier) is
+// returned immediately. A transient one — the raft log has not installed the
+// snapshot yet — is retried until the budget is exhausted, then returned so
+// the transfer fails loudly instead of leaving the state machine silently
+// behind a snapshot raft already accounts for.
+func (p *snapshotPool) awaitRecoverableLog(req snapshotRequest) error {
+	snapIndex := p.pendingRecoveryIndex(req)
+	if snapIndex == 0 {
+		return nil // nothing to recover; recoverSnapshot reports any read error
+	}
+	deadline := time.Now().Add(recoveryLogWaitBudget)
+	timer := time.NewTimer(recoveryLogWaitInterval)
+	defer timer.Stop()
+	for {
+		err := recoveryBlockedByLog(req, snapIndex)
+		var behind *SnapshotRecoveryBehindError
+		if !errors.As(err, &behind) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			slog.Error("snapshot recovery abandoned: raft log never installed the snapshot",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"snapshot_index", snapIndex,
+				"committed", behind.Committed,
+				"processed", behind.Processed,
+			)
+			return err
+		}
+		select {
+		case <-req.node.StopC():
+			return err
+		case <-p.stopC:
+			return err
+		case <-timer.C:
+			timer.Reset(recoveryLogWaitInterval)
+		}
+	}
+}
+
+// pendingRecoveryIndex returns the index of the snapshot a recovery request
+// would restore, or 0 when there is nothing to recover. It reads only LogDB,
+// so handleRequest can evaluate the recovery bounds BEFORE raising the
+// recovering gate.
+func (p *snapshotPool) pendingRecoveryIndex(req snapshotRequest) uint64 {
+	if p.logdb == nil || req.node.Snapshotter() == nil {
+		return 0
+	}
+	logdbSnap, err := p.logdb.GetSnapshot(req.shardID, req.replicaID)
+	if err != nil {
+		return 0 // recoverSnapshot reports the read failure
+	}
+	return logdbSnap.Index
 }
 
 // recoverSnapshot recovers the state machine from the most recent
@@ -885,6 +1066,13 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	}
 	if logdbSnap.Index == 0 {
 		return nil // no snapshot to recover
+	}
+
+	// Evaluate both apply-frontier bounds BEFORE the snapshotter is touched.
+	// Running RecoverFromSnapshot first and checking afterwards leaves the
+	// state machine replaced by a snapshot whose markers were then refused.
+	if err := recoveryBlockedByLog(req, logdbSnap.Index); err != nil {
+		return err
 	}
 
 	// Determine snapshot directory. Prefer the filepath stored in LogDB
@@ -920,8 +1108,21 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// loop would leak disk in the snapshot directory.
 	sweepStaleDecryptTmp(snapshotDir)
 
+	// An encrypted artifact with no usable barrier fails CLOSED, matching
+	// Host.StartShard on the identical predicate. Falling through would hand
+	// the raw ciphertext to RecoverFromSnapshot; the leader must re-send
+	// instead. Reachable whenever the barrier is sealed or torn down between
+	// the snapshot receive and the (asynchronous, retried) recovery.
 	barrier := p.barrierForShard(req.shardID)
-	if logdbSnap.Epoch > 0 && barrier != nil && !barrier.IsSealed() {
+	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
+		return &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       ErrSnapshotEncryptedBarrierUnavailable,
+		}
+	}
+	if logdbSnap.Epoch > 0 {
 		plainPath, decryptErr := p.decryptSnapshotToSibling(dataPath, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
 			return &SnapshotError{
@@ -969,13 +1170,19 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}()
 
-	// Recover SM state from the snapshot data. When Snappy compression
-	// is configured, wrap the file reader with a Snappy reader for
-	// transparent streaming decompression.
+	// Recover SM state from the snapshot data. The reader chain mirrors the
+	// chain the ARTIFACT was written through, taken from the snapshot record
+	// — not from node.cfg, which may have been changed since the save, or may
+	// never have matched the leader that streamed this snapshot.
 	ctx := context.Background()
-	var r io.Reader = f
-	if node.cfg.SnapshotCompressionType == config.Snappy {
-		r = snappy.NewReader(f)
+	r, readerErr := DecompressingSnapshotReader(f, logdbSnap.Compression)
+	if readerErr != nil {
+		return &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       readerErr,
+		}
 	}
 	if err := snapshotter.RecoverFromSnapshot(ctx, r, node.stopC); err != nil {
 		return &SnapshotError{
@@ -983,24 +1190,6 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 			ReplicaID: req.replicaID,
 			Save:      false,
 			Err:       err,
-		}
-	}
-
-	// Refuse to advance the apply markers past what the Raft log has
-	// committed. Recovery is queued unconditionally once a snapshot is
-	// persisted, including when delivering the InstallSnapshot into the Raft
-	// log failed — in which case the log never restored to this index.
-	// Advancing lastApplied anyway would make the next GetUpdate carry a
-	// LastApplied greater than the log's committed/processed markers, which
-	// commitUpdate asserts against: an invariant panic on the commit worker.
-	// Report it as a failed recovery so the caller can retry the transfer.
-	committed, hasPeer := peerCommittedIndex(node)
-	if hasPeer && committed < logdbSnap.Index {
-		return &SnapshotRecoveryBehindError{
-			ShardID:       req.shardID,
-			ReplicaID:     req.replicaID,
-			SnapshotIndex: logdbSnap.Index,
-			Committed:     committed,
 		}
 	}
 
@@ -1595,11 +1784,11 @@ func readSnapshotEpoch(dir string) (epoch uint64, ok bool) {
 		// Real read error: epoch indeterminate, fail safe.
 		return 0, false
 	}
-	if len(data) < snapshotMetaSize {
+	if len(data) < snapshotMetaEpochOffset+8 {
 		// Truncated/corrupt metadata: cannot read the epoch field, fail safe.
 		return 0, false
 	}
-	return binary.LittleEndian.Uint64(data[40:]), true
+	return binary.LittleEndian.Uint64(data[snapshotMetaEpochOffset:]), true
 }
 
 // setCallback replaces the engine callback. Used by Engine.SetCallback
@@ -1664,11 +1853,34 @@ func snapshotBaseDir(baseDir string, shardID, replicaID uint64) string {
 	)
 }
 
-// writeSnapshotMetadata writes a 48-byte binary metadata file to the
-// snapshot directory. The format is:
-// Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | CreatedAt(8) | Epoch(8).
-// Epoch is 0 for unencrypted snapshots.
-func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64) error {
+// DecompressingSnapshotReader wraps r in the decompressor matching the
+// compression an artifact was WRITTEN through. It is the single decision
+// point shared by both recovery paths (snapshotPool.recoverSnapshot and
+// Host.StartShard), so neither can derive the chain from its own config.
+//
+// An algorithm this binary cannot decompress is rejected with
+// ErrUnsupportedSnapshotCompression rather than read as plain bytes: guessing
+// hands the state machine an unknown encoding and corrupts it silently.
+func DecompressingSnapshotReader(r io.Reader, c config.CompressionType) (io.Reader, error) {
+	switch c {
+	case config.NoCompression:
+		return r, nil
+	case config.Snappy:
+		return snappy.NewReader(r), nil
+	default:
+		return nil, ErrUnsupportedSnapshotCompression
+	}
+}
+
+// writeSnapshotMetadata writes the binary metadata file to the snapshot
+// directory. The format is:
+// Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | CreatedAt(8) | Epoch(8) |
+// Compression(8).
+// Epoch is 0 for unencrypted snapshots; Compression is 0 (NoCompression)
+// for uncompressed ones. Both describe the artifact next to it, so a
+// directory that outlives its LogDB record still says how to read itself.
+func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64,
+	compression config.CompressionType) error {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1692,6 +1904,7 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	binary.LittleEndian.PutUint64(buf[24:], replicaID)
 	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
 	binary.LittleEndian.PutUint64(buf[40:], epoch)
+	binary.LittleEndian.PutUint64(buf[48:], uint64(compression))
 
 	if _, err := f.Write(buf[:]); err != nil {
 		return err

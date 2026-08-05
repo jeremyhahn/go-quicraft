@@ -1008,7 +1008,7 @@ func TestNoopSender_SendSnapshot_DoesNotPanic(t *testing.T) {
 func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	dir := t.TempDir()
 
-	err := writeReceivedSnapshotMetadata(dir, 42, 7, 10, 3)
+	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, dir, 42, 7, 10, 3)
 	if err != nil {
 		t.Fatalf("writeReceivedSnapshotMetadata returned error: %v", err)
 	}
@@ -1057,7 +1057,7 @@ func TestWriteReceivedSnapshotMetadata_InvalidDir(t *testing.T) {
 
 	// Try to write metadata into a directory path where a file exists.
 	invalidDir := filepath.Join(filePath, "subdir")
-	err := writeReceivedSnapshotMetadata(invalidDir, 1, 1, 1, 1)
+	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, invalidDir, 1, 1, 1, 1)
 	if err == nil {
 		t.Fatal("expected error for invalid directory, got nil")
 	}
@@ -1786,6 +1786,27 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	}
 }
 
+// seedPersistedSnapshot writes a snapshot.dat holding data into a fresh
+// directory and records the matching LogDB snapshot record, modelling a
+// snapshot this replica already durably holds. The dedup branch re-delivers
+// the install FROM this artifact, so it must actually exist on disk.
+func seedPersistedSnapshot(t *testing.T, ldb logdb.LogDB, shardID, replicaID, index, term uint64, data []byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.dat"), data, 0o600); err != nil {
+		t.Fatalf("write snapshot.dat: %v", err)
+	}
+	if err := ldb.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
+		Index:    index,
+		Term:     term,
+		Filepath: dir,
+		FileSize: uint64(len(data)),
+	}); err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+	return dir
+}
+
 // TestHostMessageHandler_HandleSnapshot_DuplicateSkipped verifies that
 // a snapshot already present in LogDB at the same or higher index is
 // silently skipped (dedup logic).
@@ -1803,10 +1824,9 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSkipped(t *testing.T) {
 
 	ldb := memdb.New()
 
-	// Pre-save a snapshot at index 100.
-	if err := ldb.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Term: 5}); err != nil {
-		t.Fatalf("SaveSnapshot failed: %v", err)
-	}
+	// Pre-save a snapshot at index 100, artifact included: the dedup branch
+	// re-delivers the install from the persisted snapshot file.
+	seedPersistedSnapshot(t, ldb, 1, 1, 100, 5, []byte("persisted-snapshot"))
 
 	sender := &noopSender{}
 	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
@@ -1857,9 +1877,7 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSameIndex(t *testing.T) {
 	cfg.SetDefaults()
 
 	ldb := memdb.New()
-	if err := ldb.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Term: 5}); err != nil {
-		t.Fatalf("SaveSnapshot failed: %v", err)
-	}
+	seedPersistedSnapshot(t, ldb, 1, 1, 100, 5, []byte("persisted-snapshot"))
 
 	sender := &noopSender{}
 	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)

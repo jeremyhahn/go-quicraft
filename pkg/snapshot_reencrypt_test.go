@@ -99,7 +99,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	if err := os.WriteFile(recvPath, mustRead(t, wirePath), 0o600); err != nil {
 		t.Fatalf("write received plaintext: %v", err)
 	}
-	recvEpoch, err := reencryptReceivedSnapshot(recvPath, nodeB)
+	recvEpoch, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, nodeB)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestReceiveSnapshot_NilBarrierLeavesPlaintext(t *testing.T) {
 	if err := os.WriteFile(path, plain, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	epoch, err := reencryptReceivedSnapshot(path, nil)
+	epoch, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, nil)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot(nil): %v", err)
 	}

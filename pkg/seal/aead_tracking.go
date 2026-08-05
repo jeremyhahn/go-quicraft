@@ -16,6 +16,7 @@ package seal
 
 import (
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 )
@@ -39,6 +40,16 @@ const (
 	// sync.Map key (a string) so that nonces of any length are tracked
 	// exactly, with no truncation and therefore no false positives.
 	NonceSize = 12
+
+	// DefaultMaxTrackedNonces bounds InMemoryNonceTracker. Entries are
+	// released only by Clear, which only a successful Rotate calls, so a
+	// deployment that cannot rotate (no StatePersister) would otherwise grow
+	// the tracker toward the 2^32 invocation limit — roughly 170 GB — and
+	// exhaust memory long before that limit could fail closed. This ceiling is
+	// far above any legitimate pre-rotation working set (~4M nonces, on the
+	// order of 160 MB) and exists so the failure is a loud, bounded
+	// degradation instead of an OOM.
+	DefaultMaxTrackedNonces int64 = 4 << 20
 )
 
 // AEAD safety sentinel errors.
@@ -234,19 +245,48 @@ func (ic *InMemoryInvocationCounter) Close() error {
 //
 // Thread-safe: reads use sync.Map's lock-free fast path; writes use
 // sync.Map's internal sharding. The enabled flag is protected by atomic operations.
+// Memory is bounded by maxTracked: past that ceiling the tracker logs an error
+// and disables itself rather than growing without limit, since Clear is reached
+// only through a successful key rotation. Clear re-arms a tracker that
+// auto-disabled, because the new epoch starts with no history to retain.
 type InMemoryNonceTracker struct {
 	enabled atomic.Bool
 	nonces  atomic.Pointer[sync.Map]
 	count   atomic.Int64
+
+	// maxTracked is the ceiling on tracked nonces. Zero or negative disables
+	// the ceiling.
+	maxTracked atomic.Int64
+
+	// overflowed records that the ceiling was reached and tracking was
+	// auto-disabled, so the error is logged once per epoch and Clear knows to
+	// re-arm.
+	overflowed atomic.Bool
 }
 
-// NewNonceTracker creates an InMemoryNonceTracker. Pass enabled=false to disable
-// tracking (all operations become no-ops returning nil / zero values).
+// NewNonceTracker creates an InMemoryNonceTracker bounded at
+// DefaultMaxTrackedNonces. Pass enabled=false to disable tracking (all
+// operations become no-ops returning nil / zero values).
 func NewNonceTracker(enabled bool) *InMemoryNonceTracker {
 	nt := &InMemoryNonceTracker{}
 	nt.enabled.Store(enabled)
 	nt.nonces.Store(&sync.Map{})
+	nt.maxTracked.Store(DefaultMaxTrackedNonces)
 	return nt
+}
+
+// SetMaxTrackedNonces sets the ceiling on tracked nonces. A value <= 0 removes
+// the ceiling, which is only safe when the epoch is guaranteed to rotate (and
+// therefore Clear the tracker) well before memory becomes a concern.
+//
+// Thread-safe.
+func (nt *InMemoryNonceTracker) SetMaxTrackedNonces(max int64) {
+	nt.maxTracked.Store(max)
+}
+
+// MaxTrackedNonces returns the current ceiling on tracked nonces.
+func (nt *InMemoryNonceTracker) MaxTrackedNonces() int64 {
+	return nt.maxTracked.Load()
 }
 
 // nonceKey converts a nonce byte slice to a string key for use in sync.Map.
@@ -272,13 +312,40 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 	}
 
 	key := nonceKey(nonce)
+	nonces := nt.nonces.Load()
 
-	if _, loaded := nt.nonces.Load().LoadOrStore(key, struct{}{}); loaded {
+	// The reuse check runs FIRST so a repeat of an already-recorded nonce is
+	// still caught at the ceiling: it costs no additional memory.
+	if _, loaded := nonces.LoadOrStore(key, struct{}{}); loaded {
 		return ErrNonceReuse
 	}
 
-	nt.count.Add(1)
+	// This nonce is new. Admitting it past the ceiling is what would grow the
+	// tracker without limit, so the entry that crosses the ceiling is rolled
+	// back and tracking is disabled instead.
+	n := nt.count.Add(1)
+	if max := nt.maxTracked.Load(); max > 0 && n > max {
+		nonces.Delete(key)
+		nt.count.Add(-1)
+		nt.disableOnOverflow(max)
+	}
 	return nil
+}
+
+// disableOnOverflow turns tracking off once the ceiling is reached and reports
+// it once, at error level: continuing to grow would exhaust memory, and
+// silently dropping nonces would leave a tracker that reports "no reuse"
+// without checking. Rotating the epoch (Clear) re-arms it.
+func (nt *InMemoryNonceTracker) disableOnOverflow(max int64) {
+	if !nt.overflowed.CompareAndSwap(false, true) {
+		return
+	}
+	nt.enabled.Store(false)
+	slog.Error("quicraft/seal: nonce tracker ceiling reached; nonce-reuse detection DISABLED for this epoch",
+		"tracked", nt.count.Load(),
+		"max_tracked", max,
+		"remedy", "rotate the epoch (requires a StatePersister), raise SetMaxTrackedNonces, or disable NonceTracking",
+	)
 }
 
 // Contains reports whether nonce has been previously recorded without modifying
@@ -321,6 +388,12 @@ func (nt *InMemoryNonceTracker) Count() int {
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Clear() error {
+	// A tracker that auto-disabled on overflow is re-armed here: the epoch has
+	// changed, so there is no history left to retain and detection can resume
+	// from empty. A tracker disabled explicitly via SetEnabled stays disabled.
+	if nt.overflowed.CompareAndSwap(true, false) {
+		nt.enabled.Store(true)
+	}
 	if !nt.enabled.Load() {
 		return nil
 	}

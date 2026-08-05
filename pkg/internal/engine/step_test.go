@@ -747,9 +747,13 @@ func newMultiNodeLeaderTestPeer(t *testing.T, shardID, replicaID uint64) (*raft.
 	// Drain election messages.
 	_ = peer.DrainMessages()
 
-	// Grant votes.
-	_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 2})
-	_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 3})
+	// Grant votes. Network-originated message types must carry the term:
+	// raft rejects a zero term on them, because Term==0 is reserved for
+	// locally-injected control messages and would otherwise let a peer
+	// bypass every term check.
+	campaignTerm, _, _, _, _, _ := peer.DiagRaftState()
+	_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 2, Term: campaignTerm})
+	_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 3, Term: campaignTerm})
 
 	if !peer.IsLeader() {
 		t.Fatal("peer must be leader")
@@ -759,12 +763,12 @@ func newMultiNodeLeaderTestPeer(t *testing.T, shardID, replicaID uint64) (*raft.
 	_ = peer.DrainMessages()
 
 	// Ack the no-op entry from followers to commit it.
-	_, _, _, lastIdx, _, _ := peer.DiagRaftState()
+	leaderTerm, _, _, lastIdx, _, _ := peer.DiagRaftState()
 	_ = peer.Handle(proto.Message{
-		Type: proto.ReplicateResp, From: 2, LogIndex: lastIdx,
+		Type: proto.ReplicateResp, From: 2, LogIndex: lastIdx, Term: leaderTerm,
 	})
 	_ = peer.Handle(proto.Message{
-		Type: proto.ReplicateResp, From: 3, LogIndex: lastIdx,
+		Type: proto.ReplicateResp, From: 3, LogIndex: lastIdx, Term: leaderTerm,
 	})
 
 	// Drain commit-advance messages.
@@ -838,14 +842,18 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 	// Deliver HeartbeatResp from both followers while commitPending=true.
 	// These carry the ReadIndex ctx and should satisfy quorum when
 	// processed by processCommitPendingInbox.
+	// HeartbeatResp is network-originated, so it must carry the term.
+	hbTerm, _, _, _, _, _ := node.Peer().DiagRaftState()
 	node.Deliver(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
+		Term: hbTerm,
 		Hint: 100, // ctx high enough to cover all pending ReadIndex
 	})
 	node.Deliver(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 3,
+		Term: hbTerm,
 		Hint: 100,
 	})
 
@@ -2872,10 +2880,16 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 	node.commitPending.Store(true)
 	initialReadyCount := cb.readyCount.Load()
 
+	// Stamp the leader's current term: raft rejects network messages that
+	// arrive with Term 0, so an unstamped HeartbeatResp never reaches the
+	// ReadIndex quorum logic this test is exercising.
+	curTerm, _, _, _, _, _ := peer.DiagRaftState()
+
 	// HeartbeatResp from both followers to satisfy ReadIndex quorum.
 	node.Deliver(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
+		Term: curTerm,
 		Hint: 200,
 	})
 	node.Deliver(proto.Message{
@@ -2883,6 +2897,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 		From:    2,
 		To:      1,
 		ShardID: 1,
+		Term:    curTerm,
 		Snapshot: proto.Snapshot{
 			Index: 500,
 			Term:  10,
@@ -2891,6 +2906,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 	node.Deliver(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 3,
+		Term: curTerm,
 		Hint: 200,
 	})
 

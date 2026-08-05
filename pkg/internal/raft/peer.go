@@ -159,15 +159,37 @@ func (p *Peer) publishMembership() {
 // membership.apply skips anything at or below the current configChangeID.
 //
 // Must be called before the first Tick.
-func (p *Peer) SetProcessedIndex(index uint64) {
+// SetProcessedIndex returns the index actually applied after clamping, so the
+// caller can seed ITS OWN markers from the same value. The engine's lastApplied
+// and raft's processed must not diverge: a later Update carrying an unclamped
+// LastApplied would trip commitUpdate's assertion and kill the commit worker.
+func (p *Peer) SetProcessedIndex(index uint64) uint64 {
+	// The state machine marker is durable, but it is not authority over
+	// what COMMITTED. An on-disk SM whose lastApplied outruns the recovered
+	// HardState.Commit (a lost state fsync — the engine acknowledges that
+	// hazard) would otherwise fold the uncommitted tail's config changes
+	// into the membership permanently, leaving this replica computing
+	// quorum over a voting set no other replica shares, and would push
+	// l.processed above l.committed so the first Commit trips
+	// commitUpdate's LastApplied assertions on every restart.
+	if index > p.r.log.committed {
+		slog.Warn("state machine applied index exceeds recovered commit index, clamping",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"sm_applied", index,
+			"committed", p.r.log.committed,
+		)
+		index = p.r.log.committed
+	}
 	p.r.log.processed = index
 	p.replayConfigChangesTo(index)
+	return index
 }
 
 // replayConfigChangesTo folds committed config changes at or below index into
 // the membership. Entries already covered by the recovered snapshot membership
 // are skipped by the replay guard, so only the (snapshotIndex, index] window
-// has any effect.
+// has any effect. index must not exceed p.r.log.committed; callers clamp it.
 func (p *Peer) replayConfigChangesTo(index uint64) {
 	first := p.r.log.firstIndex()
 	if first > index {
@@ -292,6 +314,21 @@ func (p *Peer) DrainFreeOrderMessages() []proto.Message {
 // transitions, vote requests/responses, append entries, heartbeats,
 // snapshots, read index, leader transfer, quiesce, and more.
 func (p *Peer) Handle(msg proto.Message) error {
+	// A joining node must not campaign. Tick() suppresses its election
+	// timer for this reason; TimeoutNow is the other campaign entry point
+	// and goes straight to the raft layer. A joining node that caught up by
+	// pure log replay (the leader never compacted, so no snapshot ever
+	// arrived) holds only itself in its membership, so it would win with a
+	// quorum of one and acknowledge writes the real cluster later discards.
+	if msg.Type == proto.TimeoutNow && p.joining.Load() {
+		slog.Warn("ignoring TimeoutNow on a joining node with incomplete membership",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"from", msg.From,
+		)
+		return ErrJoiningNodeCannotCampaign
+	}
+
 	err := p.r.step(msg)
 
 	// Config changes take effect on COMMIT, not on log append: committed
@@ -324,9 +361,17 @@ func (p *Peer) Handle(msg proto.Message) error {
 		// so an equal ConfigChangeID (identical configuration) or a
 		// locally-newer one (config changes already applied above
 		// ss.Index) leaves the local membership untouched.
+		//
+		// A JOINING node always adopts. Its membership is incomplete by
+		// construction (the bootstrap confState is not in the log), and it
+		// has usually already applied its own AddNode — so the local
+		// ConfigChangeID EQUALS the snapshot's and the strictly-newer test
+		// rejects the only message that can repair it, leaving joining set
+		// forever and per-shard authorization bypassed for the shard.
 		ss := msg.Snapshot
 		restored := p.r.log.pendingSnapshot() != nil
-		if restored || ss.Membership.ConfigChangeID > p.membership.configChangeID {
+		joining := p.joining.Load()
+		if restored || joining || ss.Membership.ConfigChangeID > p.membership.configChangeID {
 			p.membership = newMembership(ss.Membership)
 			// Publish immutable snapshot for concurrent readers.
 			p.publishMembership()
@@ -355,9 +400,16 @@ func (p *Peer) Handle(msg proto.Message) error {
 // On success, returns the last log index assigned to the proposed entries.
 // The caller can use this index to track the proposal through the
 // commit/apply pipeline. On failure, returns 0 and the error.
+//
+// Only a leader can assign indices. A follower forwards the proposal and
+// r.log.lastIndex() would then describe replicated entries the caller never
+// proposed, so this returns NotLeaderError instead of a fabricated index.
 func (p *Peer) Propose(entries []proto.Entry) (uint64, error) {
 	if len(entries) == 0 {
 		return 0, nil
+	}
+	if !p.IsLeader() {
+		return 0, &NotLeaderError{LeaderID: p.leaderID.Load()}
 	}
 	msg := proto.Message{
 		Type:    proto.Propose,
@@ -492,6 +544,13 @@ func (p *Peer) syncRaftRemotes() {
 			if p.r.transferTarget == id {
 				p.r.transferTarget = noNode
 				p.r.transferElapsed = 0
+				// Restore the lease tracking handleLeaderTransfer cleared,
+				// mirroring tickLeader's transfer-timeout path. Without it
+				// every ReadIndex degrades to a full heartbeat round-trip
+				// for the rest of the term.
+				if p.r.leaseRead && p.r.remoteLastAck == nil {
+					p.r.remoteLastAck = make(map[uint64]int)
+				}
 			}
 		}
 	}
@@ -534,6 +593,11 @@ func (p *Peer) syncRaftRemotes() {
 	p.r.maxWitnesses = p.membership.maxWitnesses
 	p.r.requireFullReplicaMajority = p.membership.requireFullReplicaMajority
 
+	// Drop vote records for replicas that just left. The election quorum is
+	// computed over the voting set this call just reshaped; a stale grant
+	// from a departed replica would be tallied against the smaller quorum.
+	p.r.purgeDepartedVotes()
+
 	// When the node is leader, rebuild quorum and lease tracking maps
 	// so that new voting members' heartbeat acks count correctly.
 	if p.r.state == leader {
@@ -542,24 +606,18 @@ func (p *Peer) syncRaftRemotes() {
 	}
 }
 
-// syncLeaseAcks ensures remoteLastAck tracks exactly the current set of
-// voting members (remotes + witnesses). New members are added with a zero
-// ack tick; departed members are removed. Without this, members added
-// during leadership would be silently ignored in lease and ReadIndex
-// quorum checks.
+// syncLeaseAcks drops remoteLastAck entries for replicas that left the
+// voting set (remotes + witnesses).
+//
+// Newly added members are deliberately NOT seeded: absence from the map
+// already means "never acked", and handleHeartbeatResp creates the key on
+// the first real ack. A seeded tick of 0 is indistinguishable from an ack
+// recorded at tick 0, and hasValidLease computes a negative expiry early in
+// each checkQuorum cycle, so the seed would let a member that is not even
+// running contribute to the read lease.
 func (p *Peer) syncLeaseAcks() {
 	if p.r.remoteLastAck == nil {
 		return
-	}
-	for id := range p.r.remotes {
-		if _, ok := p.r.remoteLastAck[id]; !ok {
-			p.r.remoteLastAck[id] = 0
-		}
-	}
-	for id := range p.r.witnesses {
-		if _, ok := p.r.remoteLastAck[id]; !ok {
-			p.r.remoteLastAck[id] = 0
-		}
 	}
 	for id := range p.r.remoteLastAck {
 		_, inRemotes := p.r.remotes[id]
@@ -670,30 +728,6 @@ func (p *Peer) ReadIndex(key uint64) error {
 // Must be called after processing all inbox messages and before GetUpdate.
 func (p *Peer) FlushReadIndex() {
 	p.r.flushReadIndex()
-}
-
-// DrainReadState extracts pending readStates and outbound messages from
-// the raft state machine without performing a full GetUpdate cycle. This
-// is designed for the commitPending fast path in the step worker: when a
-// commit/apply pipeline is in-flight, the step worker can still process
-// incoming HeartbeatResp messages that satisfy ReadIndex quorum, extract
-// the resulting readStates, and deliver OnReadyToRead callbacks without
-// waiting for the commit pipeline to complete.
-//
-// Unlike GetUpdate, this method does NOT touch entries, hard state,
-// snapshots, or prevState. It only drains messages and readStates,
-// which are independent of the commit/apply pipeline state.
-//
-// The caller must hold raftMu (or otherwise ensure exclusive access).
-//
-// Returns the drained readStates and messages. Either or both may be nil.
-func (p *Peer) DrainReadState() (readStates []proto.ReadyToRead, msgs []proto.Message) {
-	if len(p.r.readStates) > 0 {
-		readStates = p.r.readStates
-		p.r.readStates = nil
-	}
-	msgs = p.r.drainMessages()
-	return readStates, msgs
 }
 
 // DrainReadStatesOnly extracts pending readStates without draining

@@ -234,6 +234,23 @@ func TestHostConfig_Validate_RTTMillisecond(t *testing.T) {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
+
+	t.Run("at upper bound", func(t *testing.T) {
+		hc := validHostConfig()
+		hc.RTTMillisecond = 60_000
+		if err := hc.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil at the 60000ms bound", err)
+		}
+	})
+
+	// The upper bound exists so that RTTMillisecond * time.Millisecond cannot
+	// overflow the int64 nanosecond tick interval.
+	t.Run("above upper bound", func(t *testing.T) {
+		hc := validHostConfig()
+		hc.RTTMillisecond = 60_001
+		err := hc.Validate()
+		assertValidationError(t, err, "RTTMillisecond")
+	})
 }
 
 func TestHostConfig_Validate_DeploymentID(t *testing.T) {

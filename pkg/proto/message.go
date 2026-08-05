@@ -191,7 +191,21 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// Reset clears all fields for reuse.
+// maxRetainedEntries bounds the Entries capacity a message keeps across
+// Reset, mirroring maxRetainedRequests for MessageBatch.Requests. A message
+// lives inside a pooled MessageBatch, so without this a single crafted frame
+// carrying many oversized messages would pin
+// len(Requests) * cap(Entries) * unsafe.Sizeof(Entry) bytes in the pool for
+// the process lifetime. The bound sits above the legitimate working set —
+// UnmarshalFrom accepts up to maxMessagesPerBatch (10000) entries per
+// message, while a steady-state append carries at most
+// batch.DefaultMaxBatchSize (1000) proposals — so a normal replication
+// message still reuses its backing array.
+const maxRetainedEntries = 1024
+
+// Reset clears all fields for reuse. An Entries slice grown past
+// maxRetainedEntries is dropped rather than truncated so a pooled message
+// cannot retain attacker-influenced capacity.
 func (m *Message) Reset() {
 	m.Type = 0
 	m.From = 0
@@ -205,5 +219,9 @@ func (m *Message) Reset() {
 	m.Reject = false
 	m.Hint = 0
 	m.Snapshot.Reset()
+	if cap(m.Entries) > maxRetainedEntries {
+		m.Entries = nil
+		return
+	}
 	m.Entries = m.Entries[:0]
 }

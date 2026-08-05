@@ -380,6 +380,37 @@ func TestConfig_Validate_MaxApplyEntrySize(t *testing.T) {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
+
+	t.Run("at frame maximum", func(t *testing.T) {
+		c := validConfig()
+		c.MaxApplyEntrySize = MaxReplicationPayloadBytes
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil at the frame maximum", err)
+		}
+	})
+
+	// Raft sizes replication batches from MaxApplyEntrySize, so a value the
+	// transport cannot frame produces batches that are dropped at marshal time
+	// and rebuilt identically forever, leaving a lagging follower permanently
+	// unable to catch up.
+	t.Run("above frame maximum", func(t *testing.T) {
+		c := validConfig()
+		c.MaxApplyEntrySize = MaxReplicationPayloadBytes + 1
+		err := c.Validate()
+		if err == nil {
+			t.Fatal("expected error for MaxApplyEntrySize > MaxReplicationPayloadBytes, got nil")
+		}
+		var exceeded *MaxApplyEntrySizeExceededError
+		if !errors.As(err, &exceeded) {
+			t.Fatalf("expected *MaxApplyEntrySizeExceededError, got %T: %v", err, err)
+		}
+		if exceeded.Configured != MaxReplicationPayloadBytes+1 {
+			t.Errorf("Configured = %d, want %d", exceeded.Configured, MaxReplicationPayloadBytes+1)
+		}
+		if exceeded.FrameMaximum != MaxReplicationPayloadBytes {
+			t.Errorf("FrameMaximum = %d, want %d", exceeded.FrameMaximum, MaxReplicationPayloadBytes)
+		}
+	})
 }
 
 func TestConfig_Validate_SafetyBooleans_AllowedFalse(t *testing.T) {
@@ -775,6 +806,54 @@ func TestConfig_Validate_LeaseReadRequiresCheckQuorum(t *testing.T) {
 		if err := c.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil (LeaseRead disabled)", err)
 		}
+	})
+}
+
+// TestConfig_Validate_LeaseReadRequiresElectionRTT covers the second lease-read
+// precondition: the lease timeout is ElectionRTT-2 ticks, so an ElectionRTT
+// below 5 leaves a lease window too short to be useful (and, at ElectionRTT<=2,
+// non-positive).
+//
+// validateLeaseRead is exercised directly here because validateTiming already
+// rejects ElectionRTT < 5 for every configuration and runs first in Validate,
+// making this check unreachable through the public API. It is kept as
+// defense-in-depth: the lease-read requirement is independent of the general
+// timing floor and must survive a relaxation or reordering of validateTiming.
+func TestConfig_Validate_LeaseReadRequiresElectionRTT(t *testing.T) {
+	t.Run("LeaseRead with ElectionRTT below 5 is rejected", func(t *testing.T) {
+		c := validConfig()
+		c.LeaseRead = true
+		c.HeartbeatRTT = 1
+		c.ElectionRTT = 4
+		assertValidationError(t, c.validateLeaseRead(), "ElectionRTT")
+	})
+
+	t.Run("LeaseRead with ElectionRTT at 5 passes", func(t *testing.T) {
+		c := validConfig()
+		c.LeaseRead = true
+		c.HeartbeatRTT = 1
+		c.ElectionRTT = 5
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("LeaseRead disabled allows a low ElectionRTT", func(t *testing.T) {
+		c := validConfig()
+		c.LeaseRead = false
+		c.HeartbeatRTT = 1
+		c.ElectionRTT = 4
+		if err := c.validateLeaseRead(); err != nil {
+			t.Errorf("validateLeaseRead() = %v, want nil (LeaseRead disabled)", err)
+		}
+	})
+
+	// The general timing floor is what a real configuration hits first.
+	t.Run("Validate rejects a low ElectionRTT regardless of LeaseRead", func(t *testing.T) {
+		c := validConfig()
+		c.HeartbeatRTT = 1
+		c.ElectionRTT = 4
+		assertValidationError(t, c.Validate(), "ElectionRTT")
 	})
 }
 

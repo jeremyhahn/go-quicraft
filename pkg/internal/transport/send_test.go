@@ -1113,6 +1113,8 @@ func (noopTransportMetrics) IncMessagesSent(uint64, uint64, uint64)            {
 func (noopTransportMetrics) IncMessagesReceived(uint64, uint64, uint64)        {}
 func (noopTransportMetrics) IncSnapshotsSent(uint64, int64, time.Duration)     {}
 func (noopTransportMetrics) IncSnapshotsReceived(uint64, int64, time.Duration) {}
+func (noopTransportMetrics) IncSnapshotsRejected(uint64, string)               {}
+func (noopTransportMetrics) IncMessagesDropped(uint64, uint64, string)         {}
 
 // TestSendBatch_WithMetrics verifies that the metrics recording path
 // is exercised when the transport has a Metrics implementation.

@@ -14,7 +14,11 @@
 #   ./run-remote.sh fetch     # copy JSON results back into ./results
 set -euo pipefail
 
-HOST="${BENCH_HOST:-ci-node-1}"
+# ssh destination of the machine that runs the suite. Same variable name as the
+# bench-compare harness (scripts/bench-compare.sh) so one export covers both.
+# Unlike bench-compare this suite has no local mode: it rsyncs a working tree and
+# drives Docker on the target, so a host is always required.
+HOST="${PERF_HOST:-ci-node-1}"
 REMOTE_DIR="${REMOTE_DIR:-/home/jhahn/bench/go-quicraft}"
 DRAGONBOAT_SRC="${DRAGONBOAT_SRC:-/home/jhahn/sources/dragonboat}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

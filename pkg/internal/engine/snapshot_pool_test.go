@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/snappy"
+
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -1055,7 +1057,7 @@ func TestSnapshotPool_GCSnapshotDirs_NothingToClean(t *testing.T) {
 
 func TestSnapshotPool_WriteSnapshotMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
-	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 0)
+	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 0, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -1088,7 +1090,7 @@ func TestSnapshotPool_WriteSnapshotMetadata(t *testing.T) {
 }
 
 func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
-	err := writeSnapshotMetadata("/nonexistent/dir/that/does/not/exist", 1, 1, 1, 1, 0)
+	err := writeSnapshotMetadata("/nonexistent/dir/that/does/not/exist", 1, 1, 1, 1, 0, config.NoCompression)
 	if err == nil {
 		t.Fatal("expected error for invalid directory")
 	}
@@ -1278,172 +1280,173 @@ func assertNoTempFiles(t *testing.T, dir string) {
 }
 
 // ---------------------------------------------------------------------------
-// I.3: Snapshot encryption round-trip tests
+// I.3: Snapshot save/recover round-trip over the artifact matrix
+//
+// saveSnapshot builds its writer chain as
+//
+//	snapshotter -> [snappy.NewBufferedWriter] -> file -> [encrypt in place]
+//
+// and recoverSnapshot must mirror it in reverse: decrypt to a sibling file,
+// then wrap the plaintext in snappy.NewReader. The plaintext + uncompressed
+// cell is the ONE configuration in which a missing decrypt AND a missing
+// decompress are both invisible, so the round trip is driven over the whole
+// {plaintext, encrypted} x {uncompressed, snappy} matrix instead.
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_EncryptedSaveAndRecover(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	barrier := newTestBarrier(5)
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// Save a snapshot with encryption.
-	ss := newSnapshotTestSnapshotter(100)
-	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	saveNode := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID: 10, replicaID: 1, node: saveNode, save: true,
-	})
-	if err != nil {
-		t.Fatalf("save request failed: %v", err)
-	}
-
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("save failed: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("save timeout")
-	}
-
-	// Verify LogDB snapshot has the epoch.
-	snap, err := ldb.GetSnapshot(10, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot failed: %v", err)
-	}
-	if snap.Epoch != 5 {
-		t.Fatalf("logdb snapshot epoch = %d, want 5", snap.Epoch)
-	}
-
-	// Verify the on-disk data file is encrypted (not raw uint64 "100").
-	dataPath := filepath.Join(snapshotSaveDir(tmpDir, 10, 1, 100), snapshotDataFile)
-	encData, readErr := os.ReadFile(dataPath)
-	if readErr != nil {
-		t.Fatalf("failed to read encrypted data: %v", readErr)
-	}
-	// The encrypted file should have frame headers (4 bytes + encrypted chunk),
-	// not the raw 8-byte little-endian value.
-	if len(encData) == 8 {
-		t.Fatal("data file appears to be unencrypted (8 bytes raw)")
-	}
-
-	// Verify the metadata contains the epoch.
-	metaPath := filepath.Join(snapshotSaveDir(tmpDir, 10, 1, 100), snapshotMetadataFile)
-	metaData, metaErr := os.ReadFile(metaPath)
-	if metaErr != nil {
-		t.Fatalf("failed to read metadata: %v", metaErr)
-	}
-	if len(metaData) != snapshotMetaSize {
-		t.Fatalf("metadata size = %d, want %d", len(metaData), snapshotMetaSize)
-	}
-	metaEpoch := binary.LittleEndian.Uint64(metaData[40:])
-	if metaEpoch != 5 {
-		t.Fatalf("metadata epoch = %d, want 5", metaEpoch)
-	}
-
-	// Now recover into a fresh snapshotter using the same barrier.
-	recoverSS := newSnapshotTestSnapshotter(0)
-	recoverNode := NewNode(nil, nil, nil, cfg, 100, recoverSS, tmpDir, nil)
-
-	err = p.requestSnapshot(snapshotRequest{
-		shardID: 10, replicaID: 1, node: recoverNode, save: false,
-	})
-	if err != nil {
-		t.Fatalf("recover request failed: %v", err)
-	}
-
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("recover failed: %v", result.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("recover timeout")
-	}
-
-	// Verify the recovered state matches the original.
-	if recoverSS.state.Load() != 100 {
-		t.Fatalf("recovered state = %d, want 100", recoverSS.state.Load())
-	}
-	if recoverNode.lastApplied.Load() != 100 {
-		t.Fatalf("node.lastApplied = %d, want 100", recoverNode.lastApplied.Load())
-	}
+// snapshotRoundTripVariants is the at-rest artifact matrix the runtime
+// save/recover path is exercised over.
+var snapshotRoundTripVariants = []struct {
+	name      string
+	encrypted bool
+	snappy    bool
+}{
+	{name: "plaintext_uncompressed"},
+	{name: "plaintext_snappy", snappy: true},
+	{name: "encrypted_uncompressed", encrypted: true},
+	{name: "encrypted_snappy", encrypted: true, snappy: true},
 }
 
-func TestSnapshotPool_NoBarrier_PlaintextRoundTrip(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	// No barrier = plaintext snapshot.
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(42)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1, CompactionOverhead: 10}
-	saveNode := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: saveNode, save: true,
-	})
-	if err != nil {
-		t.Fatalf("save request failed: %v", err)
+// snappyFrame returns data as snappy.NewBufferedWriter would have written it,
+// which is exactly what saveSnapshot puts on disk before encryption when the
+// shard configures compression.
+func snappyFrame(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := snappy.NewBufferedWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("snappy write: %v", err)
 	}
-
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("save failed: %v", result.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("save timeout")
+	if err := w.Close(); err != nil {
+		t.Fatalf("snappy close: %v", err)
 	}
+	return buf.Bytes()
+}
 
-	// Verify LogDB snapshot has epoch 0 (no encryption).
-	snap, err := ldb.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot failed: %v", err)
-	}
-	if snap.Epoch != 0 {
-		t.Fatalf("logdb snapshot epoch = %d, want 0", snap.Epoch)
-	}
+// TestSnapshotPool_SaveAndRecoverRoundTrip drives the runtime snapshot path
+// through every at-rest artifact configuration: save, assert the on-disk
+// artifact is exactly what the writer chain should have produced (and that the
+// LogDB/metadata epoch records whether it is encrypted), then recover into a
+// fresh snapshotter and assert the state round-tripped.
+func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
+	const barrierEpoch = uint64(5)
+	for _, v := range snapshotRoundTripVariants {
+		t.Run(v.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			stopC := make(chan struct{})
+			defer close(stopC)
 
-	// Recover the plaintext snapshot.
-	recoverSS := newSnapshotTestSnapshotter(0)
-	recoverNode := NewNode(nil, nil, nil, cfg, 100, recoverSS, tmpDir, nil)
+			ldb := newSnapshotTestLogDB()
+			var barrier SnapshotBarrier
+			var wantEpoch uint64
+			if v.encrypted {
+				barrier = newTestBarrier(barrierEpoch)
+				wantEpoch = barrierEpoch
+			}
+			p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
 
-	err = p.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: recoverNode, save: false,
-	})
-	if err != nil {
-		t.Fatalf("recover request failed: %v", err)
-	}
+			var wg sync.WaitGroup
+			p.start(&wg)
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("recover failed: %v", result.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("recover timeout")
-	}
+			cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
+			if v.snappy {
+				cfg.SnapshotCompressionType = config.Snappy
+			}
 
-	if recoverSS.state.Load() != 42 {
-		t.Fatalf("recovered state = %d, want 42", recoverSS.state.Load())
+			ss := newSnapshotTestSnapshotter(100)
+			saveNode := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+
+			if err := p.requestSnapshot(snapshotRequest{
+				shardID: 10, replicaID: 1, node: saveNode, save: true,
+			}); err != nil {
+				t.Fatalf("save request failed: %v", err)
+			}
+			select {
+			case result := <-p.CompletedC():
+				if result.err != nil {
+					t.Fatalf("save failed: %v", result.err)
+				}
+				if result.index != 100 {
+					t.Fatalf("result.index = %d, want 100", result.index)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("save timeout")
+			}
+
+			// The LogDB record carries the at-rest epoch, and recovery keys off
+			// it: non-zero exactly when the artifact was encrypted.
+			snap, err := ldb.GetSnapshot(10, 1)
+			if err != nil {
+				t.Fatalf("GetSnapshot failed: %v", err)
+			}
+			if snap.Epoch != wantEpoch {
+				t.Fatalf("logdb snapshot epoch = %d, want %d", snap.Epoch, wantEpoch)
+			}
+
+			// The on-disk artifact must be exactly what the writer chain
+			// produces for this cell: the snapshotter's bytes, Snappy-framed
+			// when compression is on, then encrypted when a barrier is wired.
+			saveDir := snapshotSaveDir(tmpDir, 10, 1, 100)
+			onDisk, readErr := os.ReadFile(filepath.Join(saveDir, snapshotDataFile))
+			if readErr != nil {
+				t.Fatalf("failed to read snapshot data: %v", readErr)
+			}
+			raw := make([]byte, 8)
+			binary.LittleEndian.PutUint64(raw, 100)
+			preEncrypt := raw
+			if v.snappy {
+				preEncrypt = snappyFrame(t, raw)
+			}
+			if v.encrypted {
+				if bytes.Contains(onDisk, preEncrypt) {
+					t.Fatal("data file holds the pre-encryption bytes; it was not encrypted at rest")
+				}
+			} else if !bytes.Equal(onDisk, preEncrypt) {
+				t.Fatalf("data file = %x, want the writer chain's output %x", onDisk, preEncrypt)
+			}
+
+			// The metadata mirrors the LogDB epoch so a recovery that cannot
+			// reach LogDB still knows whether the artifact is ciphertext.
+			metaData, metaErr := os.ReadFile(filepath.Join(saveDir, snapshotMetadataFile))
+			if metaErr != nil {
+				t.Fatalf("failed to read metadata: %v", metaErr)
+			}
+			if len(metaData) != snapshotMetaSize {
+				t.Fatalf("metadata size = %d, want %d", len(metaData), snapshotMetaSize)
+			}
+			if metaEpoch := binary.LittleEndian.Uint64(metaData[40:]); metaEpoch != wantEpoch {
+				t.Fatalf("metadata epoch = %d, want %d", metaEpoch, wantEpoch)
+			}
+
+			// Recover into a fresh snapshotter through the same barrier and the
+			// same compression setting: the reader chain must undo the writer
+			// chain exactly.
+			recoverSS := newSnapshotTestSnapshotter(0)
+			recoverNode := NewNode(nil, nil, nil, cfg, 100, recoverSS, tmpDir, nil)
+
+			if err := p.requestSnapshot(snapshotRequest{
+				shardID: 10, replicaID: 1, node: recoverNode, save: false,
+			}); err != nil {
+				t.Fatalf("recover request failed: %v", err)
+			}
+			select {
+			case result := <-p.CompletedC():
+				if result.err != nil {
+					t.Fatalf("recover failed: %v", result.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("recover timeout")
+			}
+
+			if recoverSS.state.Load() != 100 {
+				t.Fatalf("recovered state = %d, want 100", recoverSS.state.Load())
+			}
+			if recoverNode.lastApplied.Load() != 100 {
+				t.Fatalf("node.lastApplied = %d, want 100", recoverNode.lastApplied.Load())
+			}
+
+			// The decrypt scratch sibling must not survive recovery.
+			assertNoTempFiles(t, saveDir)
+		})
 	}
 }
 
@@ -1898,6 +1901,14 @@ func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
 	}
 }
 
+// TestSnapshotPool_EncryptFile_SealedBarrier pins the fail-closed save.
+//
+// This test previously asserted the OPPOSITE — "even with barrier sealed, save
+// should work (encryption is skipped)" and epoch == 0 — which encoded the
+// plaintext-downgrade defect rather than a requirement: a configured barrier
+// that is sealed means encryption is UNAVAILABLE, not disabled, so a snapshot
+// written then would be durable plaintext for a shard required to be encrypted
+// at rest. The assertion is inverted deliberately.
 func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 	tmpDir := t.TempDir()
 	barrier := newTestBarrier(1)
@@ -1909,8 +1920,6 @@ func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 	var wg sync.WaitGroup
 	p.start(&wg)
 
-	// Even with barrier sealed, save should work (encryption is skipped
-	// when barrier.IsSealed() returns true).
 	ss := newSnapshotTestSnapshotter(50)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1, CompactionOverhead: 10}
 	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
@@ -1924,18 +1933,17 @@ func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 
 	select {
 	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("save failed: %v", result.err)
+		if !errors.Is(result.err, ErrSnapshotBarrierSealed) {
+			t.Fatalf("save error = %v, want ErrSnapshotBarrierSealed", result.err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout")
 	}
 
-	// Epoch should be 0 because barrier was sealed during save.
-	snap, _ := ldb.GetSnapshot(1, 1)
-	if snap.Epoch != 0 {
-		t.Fatalf("epoch = %d, want 0 (barrier sealed)", snap.Epoch)
+	if snap, _ := ldb.GetSnapshot(1, 1); snap.Index != 0 {
+		t.Fatalf("LogDB recorded a snapshot at index %d while the barrier was sealed", snap.Index)
 	}
+	assertNoSnapshotArtifact(t, tmpDir)
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,7 +1954,7 @@ func TestSnapshotPool_EpochInMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Write metadata with epoch.
-	err := writeSnapshotMetadata(tmpDir, 100, 5, 10, 1, 7)
+	err := writeSnapshotMetadata(tmpDir, 100, 5, 10, 1, 7, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -2033,7 +2041,7 @@ func TestSnapshotPool_PurgeOldEpochs_AfterCompaction(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2082,7 +2090,7 @@ func TestSnapshotPool_PurgeOldEpochs_AllPlaintext(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, idx, 1, 1, 1, 0); err != nil {
+		if err := writeSnapshotMetadata(dir, idx, 1, 1, 1, 0, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2161,7 +2169,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochFloor(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2195,7 +2203,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochHigherThanSnapshot(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2229,7 +2237,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochZeroIgnored(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2263,7 +2271,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALQueryError(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2297,7 +2305,7 @@ func TestSnapshotPool_PurgeOldEpochs_NonEpochAwareLogDB(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2329,7 +2337,7 @@ func TestSnapshotPool_PurgeOldEpochs_NilLogDB(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch); err != nil {
+		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2363,7 +2371,7 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardFloor(t *testing.T) {
 	if err := os.MkdirAll(dirA, 0o750); err != nil {
 		t.Fatalf("mkdir A: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 2); err != nil {
+	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 2, config.NoCompression); err != nil {
 		t.Fatalf("write metadata A: %v", err)
 	}
 
@@ -2372,7 +2380,7 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardFloor(t *testing.T) {
 	if err := os.MkdirAll(dirB, 0o750); err != nil {
 		t.Fatalf("mkdir B: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 5); err != nil {
+	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 5, config.NoCompression); err != nil {
 		t.Fatalf("write metadata B: %v", err)
 	}
 
@@ -2407,14 +2415,14 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardWALFloor(t *testing.T) {
 	if err := os.MkdirAll(dirA, 0o750); err != nil {
 		t.Fatalf("mkdir A: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 4); err != nil {
+	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 4, config.NoCompression); err != nil {
 		t.Fatalf("write metadata A: %v", err)
 	}
 	dirB := snapshotSaveDir(tmpDir, 2, 1, 200)
 	if err := os.MkdirAll(dirB, 0o750); err != nil {
 		t.Fatalf("mkdir B: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 6); err != nil {
+	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 6, config.NoCompression); err != nil {
 		t.Fatalf("write metadata B: %v", err)
 	}
 
@@ -2616,7 +2624,7 @@ func TestSnapshotPool_DecryptFile_EmptyFile(t *testing.T) {
 func TestSnapshotPool_WriteMetadataWithEpoch(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 7)
+	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 7, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -3864,7 +3872,7 @@ func TestSnapshotPool_GCSnapshotDirs_RemovesOrphanedDirs(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed for index %d: %v", idx, err)
 		}
-		if err := writeSnapshotMetadata(dir, idx, 1, shardID, replicaID, 0); err != nil {
+		if err := writeSnapshotMetadata(dir, idx, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
 			t.Fatalf("writeSnapshotMetadata failed for index %d: %v", idx, err)
 		}
 		// Write a data file to make it a complete snapshot directory.

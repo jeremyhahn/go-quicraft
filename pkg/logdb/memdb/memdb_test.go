@@ -354,10 +354,21 @@ func TestIterateEntriesCompactedRange(t *testing.T) {
 		}},
 	})
 
-	// Request entries below the available range.
+	// A range entirely below the stored entries holds nothing and no
+	// compaction floor was ever recorded, so the range is unavailable — not
+	// compacted. (This test previously asserted ErrCompacted, the divergence
+	// from waldb that told raft the prefix had been legitimately truncated.)
 	_, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 3, 0)
-	if !errors.Is(err, logdb.ErrCompacted) {
-		t.Errorf("IterateEntries() compacted range: got %v, want ErrCompacted", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Errorf("IterateEntries() range below the log: got %v, want ErrUnavailable", err)
+	}
+
+	// Once a floor exists, the same range is genuinely compacted.
+	if err := db.RemoveEntriesTo(1, 1, 4); err != nil {
+		t.Fatalf("RemoveEntriesTo: %v", err)
+	}
+	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 3, 0); !errors.Is(err, logdb.ErrCompacted) {
+		t.Errorf("IterateEntries() below the floor: got %v, want ErrCompacted", err)
 	}
 }
 

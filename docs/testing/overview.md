@@ -46,6 +46,8 @@ The E2E suite uses `.devcontainer/docker-compose.integration.yml` which spins up
 
 Invoked via `make bench-<package>`. The Makefile defines `GOBENCH := go test -run=^$ -bench=. -benchmem`, which excludes unit tests and includes memory allocation reporting.
 
+These targets are smoke tests only: a single unreplicated run whose spread on a loaded machine reaches 5x. To detect an actual hot-path regression use `make bench-compare`, which interleaves a baseline revision against the working tree across many rounds and compares the distributions with benchstat. It runs on the invoking machine by default; `PERF_HOST=user@host` runs the same comparison on a dedicated machine for tighter intervals. See [Benchmark Regression Testing](../performance/benchmarking.md).
+
 ### Performance Comparisons
 
 The `test/performance/` directory contains a cross-system benchmark framework that compares QuicRaft against dragonboat, etcd/raft, and OpenRaft. The `perfcompare` CLI orchestrator runs each system in Docker, collects JSON results, and generates comparison reports with SVG charts.

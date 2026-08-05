@@ -15,14 +15,18 @@
 package quicraft
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -341,7 +345,19 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	}
 	senderAddr, err := h.host.registry.Resolve(shardID, fromReplicaID)
 	if err != nil || senderAddr == "" {
-		return reject("sender address unknown")
+		// A shard started with join=true and empty initial members registers
+		// no membership and no addresses: the leader's bootstrap snapshot is
+		// the only thing that can deliver them, yet it is the very message
+		// being authorized. Take the sender's address from the membership the
+		// snapshot itself carries and require the connection's VERIFIED peer
+		// certificate to cover it — the authorization is still bound to the
+		// authenticated QUIC peer, only the source of the address changes. A
+		// non-joining shard keeps the registry requirement unconditionally.
+		claimed := first.Membership.Addresses[fromReplicaID]
+		if !h.host.isShardJoining(shardID) || claimed == "" {
+			return reject("sender address unknown")
+		}
+		senderAddr = claimed
 	}
 	if senderAuthorized == nil || !senderAuthorized(senderAddr) {
 		return reject("sender identity not covered by peer certificate")
@@ -383,6 +399,21 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// ReplicateResp ack the leader is waiting for.
 	if h.host.logdb != nil {
 		existing, err := h.host.logdb.GetSnapshot(shardID, replicaID)
+		// Fail closed when the lookup itself fails. Only ErrNoSnapshot means
+		// "nothing recorded"; any other error leaves it UNKNOWN whether LogDB
+		// already durably references this index. The snapshot directory is a
+		// pure function of the index and the failure path below removes it
+		// wholesale, so proceeding on an unknown would let a failed receive
+		// delete a committed snapshot. The leader re-sends after the ack
+		// timeout, and the dedup answers it once LogDB reads again.
+		if err != nil && !errors.Is(err, logdb.ErrNoSnapshot) {
+			return &SnapshotReceiveError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Op:        "logdb_read",
+				Err:       err,
+			}
+		}
 		if err == nil && existing.Index >= snapshotIndex {
 			slog.Debug("snapshot already persisted, re-delivering install without re-writing",
 				"shard", shardID,
@@ -390,6 +421,24 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 				"existing_index", existing.Index,
 				"received_index", snapshotIndex,
 			)
+			// Measure the artifact instead of trusting existing.FileSize, and
+			// point at snapshot.dat rather than at the directory LogDB stores.
+			// The re-delivered install reaches the LogReader, and this replica
+			// streams FROM that record once it becomes leader: a (non-empty
+			// Filepath, zero FileSize) pair there makes it ship a metadata-only
+			// snapshot, erasing the receiving follower's state. If the artifact
+			// cannot be measured its size is unknown, so refuse to re-deliver
+			// and let the leader re-send.
+			existingDataPath := filepath.Join(existing.Filepath, "snapshot.dat")
+			fi, statErr := h.host.snapshotFsys().Stat(existingDataPath)
+			if statErr != nil {
+				return &SnapshotReceiveError{
+					ShardID:   shardID,
+					ReplicaID: replicaID,
+					Op:        "stat_persisted",
+					Err:       statErr,
+				}
+			}
 			installMsg := proto.Message{
 				Type:    proto.InstallSnapshot,
 				ShardID: shardID,
@@ -400,8 +449,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 					ReplicaID:  replicaID,
 					Index:      existing.Index,
 					Term:       existing.Term,
-					Filepath:   existing.Filepath,
-					FileSize:   existing.FileSize,
+					Filepath:   existingDataPath,
+					FileSize:   uint64(fi.Size()),
 					Membership: logdbMembershipToProto(existing.Membership),
 					Epoch:      existing.Epoch,
 				},
@@ -426,6 +475,22 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 				}
 			}
 			return nil
+		}
+	}
+
+	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
+	// unavailable for this shard, not that the shard is plaintext. Refuse
+	// before any directory, data file or LogDB record exists: the wire bytes
+	// are plaintext (the sender decrypts before streaming), so persisting them
+	// while sealed would durably downgrade the snapshot to plaintext at rest.
+	// reencryptReceivedSnapshot re-checks below and covers a seal that lands
+	// mid-receive. A shard with NO barrier is unaffected.
+	if h.host.snapshotEncryptionSealed(shardID) {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "reencrypt",
+			Err:       ErrSnapshotBarrierSealed,
 		}
 	}
 
@@ -457,7 +522,9 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// letting a purge remove a DEK the snapshot still needs.
 	snapshotDir := node.SnapshotSaveDir(snapshotIndex)
 
-	if err := os.MkdirAll(snapshotDir, 0o750); err != nil {
+	fsys := h.host.snapshotFsys()
+
+	if err := fsys.MkdirAll(snapshotDir, 0o750); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -472,7 +539,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	var committed bool
 	defer func() {
 		if !committed {
-			if err := os.RemoveAll(snapshotDir); err != nil {
+			if err := fsys.RemoveAll(snapshotDir); err != nil {
 				slog.Debug("snapshot directory cleanup failed",
 					"shard", shardID,
 					"replica", replicaID,
@@ -484,7 +551,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 
 	// Write the reassembled snapshot data to disk.
 	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
-	f, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -541,7 +608,22 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// the follower-side at-rest gap WITHOUT any shared cross-node key — the
 	// receiver records and later recovers under its own epoch. A nil/sealed
 	// barrier is a no-op (snapshot stays plaintext, recvEpoch=0).
-	recvEpoch, encErr := reencryptReceivedSnapshot(dataPath, h.host.barrierForShard(shardID))
+	// Classify the artifact BEFORE re-encryption, while the file still holds
+	// the plaintext the leader streamed. The compression is a property of
+	// those bytes — the wire carries no compression field, and the receiver's
+	// own SnapshotCompressionType describes nothing about what the leader
+	// wrote — so recovery must read it from the artifact itself.
+	recvCompression, detectErr := detectSnapshotCompression(fsys, dataPath)
+	if detectErr != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "classify",
+			Err:       detectErr,
+		}
+	}
+
+	recvEpoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, h.host.barrierForShard(shardID))
 	if encErr != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -551,8 +633,24 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		}
 	}
 
+	// Measure the artifact AFTER re-encryption: FileSize must always mean
+	// "size of the file at Filepath", never the plaintext wire size. A zero
+	// FileSize on a record with a non-empty Filepath makes this replica
+	// stream an EMPTY snapshot once it becomes leader, silently erasing the
+	// receiving follower's state.
+	onDiskInfo, statErr := fsys.Stat(dataPath)
+	if statErr != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "stat",
+			Err:       statErr,
+		}
+	}
+	onDiskSize := uint64(onDiskInfo.Size())
+
 	// Write snapshot metadata file.
-	if err := writeReceivedSnapshotMetadata(snapshotDir, snapshotIndex, snapshotTerm, shardID, replicaID); err != nil {
+	if err := writeReceivedSnapshotMetadata(fsys, snapshotDir, snapshotIndex, snapshotTerm, shardID, replicaID); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -570,7 +668,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// Sync the directory chain up to the node's snapshot base (matching the
 	// snapshot pool's save path). The base — NOT NodeHostDir — is the correct
 	// root: for a DataDir shard NodeHostDir is not even an ancestor of snapshotDir.
-	if err := engine.SyncDirChain(snapshotDir, node.SnapshotDir()); err != nil {
+	if err := syncDirChain(fsys, snapshotDir, node.SnapshotDir()); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -600,11 +698,16 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 			Term:        snapshotTerm,
 			Membership:  membership,
 			Filepath:    snapshotDir,
+			FileSize:    onDiskSize,
 			OnDiskIndex: first.OnDiskIndex,
 			// Record the RECEIVER's at-rest epoch (from re-encryption above), not
 			// the wire epoch (first.Epoch is 0 — the sender streamed plaintext).
 			// recoverSnapshot decrypts under this node's barrier at this epoch.
 			Epoch: recvEpoch,
+			// Record the compression of the bytes actually on disk, classified
+			// above, so recoverSnapshot builds its reader chain from the
+			// artifact rather than from this node's own config.
+			Compression: recvCompression,
 		}
 		if saveErr := h.host.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil {
 			return &SnapshotReceiveError{
@@ -623,6 +726,15 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	// leader's re-send from it.
 	committed = true
 
+	if h.host.isShardJoining(shardID) {
+		// The bootstrap snapshot carries the full membership, so the join
+		// window closes here: record the certificate-verified sender address
+		// so the leader's retransmissions — and every later snapshot for this
+		// shard — authorize against the registry like any other.
+		h.host.registry.Register(shardID, fromReplicaID, senderAddr)
+		h.host.clearShardJoining(shardID)
+	}
+
 	// Deliver the InstallSnapshot to the local raft layer so it updates
 	// its log state (committed index, applied index, membership). Without
 	// this, the raft layer would still think it's behind and never accept
@@ -633,12 +745,15 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		From:    fromReplicaID,
 		To:      replicaID,
 		Snapshot: proto.Snapshot{
-			ShardID:    shardID,
-			ReplicaID:  replicaID,
-			Index:      snapshotIndex,
-			Term:       snapshotTerm,
-			Filepath:   filepath.Join(snapshotDir, "snapshot.dat"),
-			FileSize:   totalSize,
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Index:     snapshotIndex,
+			Term:      snapshotTerm,
+			Filepath:  dataPath,
+			// The ON-DISK size, not totalSize (the plaintext wire size): the
+			// artifact at Filepath is re-encrypted, and FileSize must describe
+			// the file the send path will read.
+			FileSize:   onDiskSize,
 			Membership: first.Membership,
 			// Deliver the RECEIVER's at-rest epoch (from reencryptReceivedSnapshot
 			// above, persisted to LogDB), NOT the wire epoch (first.Epoch is 0 —
@@ -814,15 +929,64 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 	return ordered, nil
 }
 
+// snappyStreamIdentifier is the mandatory first block of the Snappy framing
+// format: chunk type 0xff (stream identifier), a 3-byte length of 6, and the
+// payload "sNaPpY". Every non-empty stream snappy.NewBufferedWriter produces
+// begins with these bytes, and snappy.NewReader rejects any stream that does
+// not.
+var snappyStreamIdentifier = [snappyStreamIdentifierSize]byte{
+	0xff, 0x06, 0x00, 0x00, 's', 'N', 'a', 'P', 'p', 'Y',
+}
+
+// snappyStreamIdentifierSize is the length of the Snappy stream identifier
+// block: a 4-byte chunk header plus the 6-byte "sNaPpY" payload.
+const snappyStreamIdentifierSize = 4 + 6
+
+// detectSnapshotCompression classifies a received snapshot artifact by its
+// leading bytes.
+//
+// The snapshot wire protocol carries no compression field, and the receiver's
+// own Config.SnapshotCompressionType says nothing about how the LEADER wrote
+// the bytes it just streamed. The artifact itself is therefore the only
+// available source, and the Snappy stream identifier is a required, fixed
+// prefix of every non-empty Snappy stream — an artifact carrying it can only
+// be read through a Snappy reader, and one without it can only be read raw.
+//
+// An empty artifact classifies as NoCompression: both reader chains yield EOF
+// on zero bytes, so the choice is immaterial.
+func detectSnapshotCompression(fsys snapshotFS, path string) (config.CompressionType, error) {
+	f, err := fsys.Open(path)
+	if err != nil {
+		return config.NoCompression, err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Debug("snapshot classification file close failed",
+				"path", path,
+				"error", closeErr)
+		}
+	}()
+
+	var head [snappyStreamIdentifierSize]byte
+	n, err := io.ReadFull(f, head[:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return config.NoCompression, err
+	}
+	if n == len(head) && bytes.Equal(head[:], snappyStreamIdentifier[:]) {
+		return config.Snappy, nil
+	}
+	return config.NoCompression, nil
+}
+
 // snapshotRecvMetaSize is the metadata file size for received snapshots.
 // Format: Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | ReceivedAt(8)
 const snapshotRecvMetaSize = 5 * 8
 
 // writeReceivedSnapshotMetadata writes a binary metadata file for a
 // received snapshot.
-func writeReceivedSnapshotMetadata(dir string, index, term, shardID, replicaID uint64) error {
+func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, shardID, replicaID uint64) error {
 	metaPath := filepath.Join(dir, "snapshot.meta")
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := fsys.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}

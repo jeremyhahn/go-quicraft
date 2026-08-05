@@ -44,7 +44,7 @@ func collectSnapshotChunks(msg proto.Message) ([]proto.SnapshotChunk, error) {
 	}
 
 	chunks := make([]proto.SnapshotChunk, 0, chunkCount)
-	err := forEachSnapshotChunk(msg, func(chunk proto.SnapshotChunk) error {
+	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
 	})
@@ -1002,7 +1002,7 @@ func TestForEachSnapshotChunk_StreamsOneAtATime(t *testing.T) {
 
 	var callCount int
 	var reassembled []byte
-	err := forEachSnapshotChunk(msg, func(chunk proto.SnapshotChunk) error {
+	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
 		// Verify chunk metadata on each callback invocation.
 		if chunk.ChunkID != uint64(callCount) {
 			t.Errorf("callback %d: ChunkID = %d, want %d", callCount, chunk.ChunkID, callCount)
@@ -1054,7 +1054,7 @@ func TestForEachSnapshotChunk_CallbackErrorStopsIteration(t *testing.T) {
 
 	callbackErr := errors.New("simulated send failure")
 	var callCount int
-	err := forEachSnapshotChunk(msg, func(chunk proto.SnapshotChunk) error {
+	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
 		callCount++
 		if callCount == 2 {
 			return callbackErr
@@ -1087,7 +1087,7 @@ func TestForEachSnapshotChunk_EmptySnapshot(t *testing.T) {
 	}
 
 	var callCount int
-	err := forEachSnapshotChunk(msg, func(chunk proto.SnapshotChunk) error {
+	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
 		callCount++
 		if chunk.ChunkSize != 0 {
 			t.Errorf("expected ChunkSize=0 for empty snapshot, got %d", chunk.ChunkSize)

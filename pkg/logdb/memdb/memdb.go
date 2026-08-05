@@ -257,14 +257,18 @@ func (m *MemDB) IterateEntries(
 		return nd.entries[i].Index >= low
 	})
 
-	// Check if low is in the compacted range.
-	if startIdx >= len(nd.entries) || nd.entries[startIdx].Index > low {
-		// The exact entry at 'low' was not found. If low is below the
-		// first available entry, it has been compacted.
-		if startIdx == 0 && nd.entries[0].Index > low {
-			return entries, size, logdb.ErrCompacted
-		}
+	// Nothing stored inside [low, high): the range is simply not held.
+	if startIdx >= len(nd.entries) || nd.entries[startIdx].Index >= high {
 		return entries, size, logdb.ErrUnavailable
+	}
+
+	// The range holds entries but not the one at low, and low is at or above
+	// the compaction floor (checked before the slice): the prefix is MISSING,
+	// not compacted. The contract — and waldb — require the loud error;
+	// reporting ErrCompacted told raft the range had been legitimately
+	// truncated and hid the hole.
+	if nd.entries[startIdx].Index != low {
+		return entries, size, logdb.ErrLogGapDetected
 	}
 
 	expected := low
@@ -420,8 +424,16 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 		return logdb.ErrSnapshotOutOfDate
 	}
 
+	// The snapshot's membership becomes the node's membership, exactly as it
+	// does on the SaveState path and in waldb (whose ReadState serves the
+	// latest snapshot's membership); leaving it untouched made ReadState
+	// report an empty membership after a snapshot install. The maps are
+	// deep-copied for the same reason Entry.Cmd is: the caller owns them.
+	membership := copyMembership(snapshot.Membership)
 	nd.snapshot = snapshot
+	nd.snapshot.Membership = membership
 	nd.hasSnap = true
+	nd.membership = membership
 	return nil
 }
 

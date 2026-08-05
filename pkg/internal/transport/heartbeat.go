@@ -104,6 +104,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 				"msg_type", proto.MessageTypeName(msgs[i].Type),
 				"error", err,
 			)
+			t.incBatchDropped(msgs, dropReasonMarshalFailed)
 			t.putBuf(bufPtr)
 			return
 		}
@@ -129,11 +130,13 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 				"error", err,
 			)
 		}
+		t.incBatchDropped(msgs, dropReasonStreamUnavailable)
 		t.putBuf(bufPtr)
 		return
 	}
 
 	if err := stream.SetWriteDeadline(time.Now().Add(heartbeatWriteDeadline)); err != nil {
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.putBuf(bufPtr)
 		t.removeAndCloseConnection(target, "heartbeat write deadline failure")
 		t.evictStreamsForTarget(target)
@@ -152,20 +155,24 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 				"error", err,
 			)
 		}
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.removeAndCloseConnection(target, "heartbeat stream write failure")
 		t.evictStreamsForTarget(target)
 	}
 }
 
 // isHeartbeatBatch returns true if all messages in the batch are heartbeat
-// or heartbeat response types carrying no entries. This is used by Send()
-// to route batches to the heartbeat fast path. The fast path marshals each
-// message into a fixed HeartbeatMessageSize slot, so a heartbeat that ever
-// carries entries must fall through to the general sendBatch path — the
-// fixed-size buffer would otherwise overflow and drop the whole batch.
+// or heartbeat response types carrying neither entries nor a snapshot. This is
+// used by Send() to route batches to the heartbeat fast path. The fast path
+// marshals each message into a fixed HeartbeatMessageSize slot, so a heartbeat
+// carrying ANY variable-length payload must fall through to the general
+// sendBatch path — the fixed-size buffer would otherwise overflow and the
+// whole batch would be dropped, which is a liveness event.
 func isHeartbeatBatch(msgs []proto.Message) bool {
 	for i := range msgs {
-		if !isHeartbeatMessage(msgs[i].Type) || len(msgs[i].Entries) > 0 {
+		if !isHeartbeatMessage(msgs[i].Type) ||
+			len(msgs[i].Entries) > 0 ||
+			!msgs[i].Snapshot.IsEmpty() {
 			return false
 		}
 	}

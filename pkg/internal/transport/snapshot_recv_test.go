@@ -2413,3 +2413,62 @@ func TestReceiveChunksZeroChunkCountReportsRejection(t *testing.T) {
 		t.Fatal("an empty transfer must not be committed as a snapshot")
 	}
 }
+
+// TestReceiveChunks_BudgetExhaustedCountsRejection verifies the memory-budget
+// abort increments IncSnapshotsRejected under the fixed "memory_budget"
+// reason, so operators can alert on dropped transfers instead of grepping logs.
+func TestReceiveChunks_BudgetExhaustedCountsRejection(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 50, 0, 42, handler)
+	rec := &dropRecorder{}
+	sr.metrics = rec
+
+	chunk := proto.SnapshotChunk{
+		BinVer:       proto.WireVersion,
+		ShardID:      1,
+		ReplicaID:    2,
+		From:         1,
+		Index:        50,
+		Term:         3,
+		ChunkID:      0,
+		ChunkCount:   1,
+		ChunkSize:    64,
+		Data:         bytes.Repeat([]byte("X"), 64),
+		DeploymentID: 42,
+	}
+	data := buildChunkFrames(t, []proto.SnapshotChunk{chunk})
+	reader := &testChunkReader{data: data}
+
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
+	sr.receiveChunks(reader, hdr, nil, make(chan struct{}))
+
+	got := rec.rejects()
+	if len(got) != 1 {
+		t.Fatalf("IncSnapshotsRejected calls = %d, want 1", len(got))
+	}
+	if got[0].shardID != 1 || got[0].reason != string(snapshotRejectMemory) {
+		t.Fatalf("rejection = %+v, want shard 1 reason %q", got[0], snapshotRejectMemory)
+	}
+}
+
+// TestReceiveSnapshot_ConcurrencyLimitCountsRejection verifies an admission
+// failure with a parsed header is counted under "concurrency_limit".
+func TestReceiveSnapshot_ConcurrencyLimitCountsRejection(t *testing.T) {
+	sr := newSnapshotReceiver(1, 1<<20, 1<<20, 42, newTestHandler())
+	rec := &dropRecorder{}
+	sr.metrics = rec
+
+	// Occupy the only host-global slot so the next admission fails.
+	sr.sem <- struct{}{}
+
+	hdr := &SnapshotHeader{ShardID: 9, ReplicaID: 2, Index: 7}
+	sr.receiveSnapshot(nil, hdr, "", nil, make(chan struct{}))
+
+	got := rec.rejects()
+	if len(got) != 1 {
+		t.Fatalf("IncSnapshotsRejected calls = %d, want 1", len(got))
+	}
+	if got[0].shardID != 9 || got[0].reason != string(snapshotRejectConcurrency) {
+		t.Fatalf("rejection = %+v, want shard 9 reason %q", got[0], snapshotRejectConcurrency)
+	}
+}

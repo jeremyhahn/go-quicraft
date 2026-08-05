@@ -89,8 +89,19 @@ func (m *mockLogDB) IterateEntries(entries []logdb.Entry, size uint64, shardID, 
 	return entries, 0, nil
 }
 
+// ReadState returns the hard state SaveState persisted, so a test can describe
+// a node that recovered. Returning ErrNoState unconditionally would make every
+// node look freshly bootstrapped no matter what it had durably written, which
+// hides recovery bugs and manufactures states production cannot reach (an
+// applied marker with no commit index behind it).
 func (m *mockLogDB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Membership, error) {
-	return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.states[mockNodeKey{shardID, replicaID}]
+	if !ok {
+		return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
+	}
+	return u.State, logdb.Membership{}, nil
 }
 
 func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) { return 0, 0, nil }
@@ -20150,6 +20161,17 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", wErr)
 	}
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 1, Filepath: snapDir})
+	// Persist a HardState consistent with the SM's durable marker. The
+	// engine writes Commit with every batch, so a node whose on-disk SM
+	// reached index 100 has necessarily persisted Commit >= 100; a mock
+	// with no HardState describes a state production cannot reach, and
+	// recovery legitimately refuses to trust an applied marker that runs
+	// past the commit index it can prove.
+	db.SaveState([]logdb.Update{{
+		ShardID:   1,
+		ReplicaID: 1,
+		State:     logdb.State{Term: 1, Vote: 1, Commit: 100},
+	}})
 
 	diskSM := &recordingOnDiskSM{openLastApplied: 100}
 	create := func(shardID, replicaID uint64) interface{} { return diskSM }
@@ -20230,6 +20252,13 @@ func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", mkErr)
 	}
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 25, Term: 1, Filepath: missingDir})
+	// HardState consistent with the SM's durable marker — see the note in
+	// TestStartShard_OnDiskSM_NoSnapshotRollback.
+	db.SaveState([]logdb.Update{{
+		ShardID:   1,
+		ReplicaID: 1,
+		State:     logdb.State{Term: 1, Vote: 1, Commit: 75},
+	}})
 
 	diskSM := &recordingOnDiskSM{openLastApplied: 75}
 	diskSM.kv = map[string]uint64{"k": 75}

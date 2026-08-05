@@ -222,6 +222,13 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 		offset += 8
 		valLen := binary.LittleEndian.Uint32(buf[offset:])
 		offset += 4
+		// Checked before int(valLen), matching getBytes/getString: on a 32-bit
+		// platform int(valLen) is negative for valLen > MaxInt32, which passes
+		// both the limit check and the remaining-buffer check below and then
+		// panics on the slice expression.
+		if valLen > math.MaxInt32 {
+			return nil, 0, ErrBufferTooSmall
+		}
 		if int(valLen) > MaxAddressLength {
 			return nil, 0, ErrAddressTooLong
 		}

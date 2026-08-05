@@ -40,6 +40,42 @@ var (
 	// the configured Config.MaxSnapshotSize limit.
 	ErrSnapshotTooLarge = errors.New("engine: snapshot exceeds MaxSnapshotSize")
 
+	// ErrSnapshotEncryptedBarrierUnavailable is returned when a snapshot
+	// recorded with Epoch > 0 cannot be read because the barrier required to
+	// decrypt it is absent or sealed. Recovery fails so the leader re-sends
+	// rather than handing ciphertext to RecoverFromSnapshot.
+	//
+	// This sentinel is declared here — not in the quicraft package — because
+	// both the runtime recovery path (snapshotPool.recoverSnapshot) and the
+	// startup path (Host.StartShard) must fail with the SAME error identity,
+	// and quicraft imports engine. The quicraft package re-exports it, which
+	// is why the message keeps the public "quicraft:" prefix.
+	ErrSnapshotEncryptedBarrierUnavailable = errors.New(
+		"quicraft: snapshot is encrypted but barrier is unavailable for decryption")
+
+	// ErrSnapshotBarrierSealed is returned when a snapshot must be written
+	// (saved locally or re-encrypted after a receive) while the shard's
+	// barrier is CONFIGURED but SEALED. It is the write-side counterpart of
+	// ErrSnapshotEncryptedBarrierUnavailable and exists to keep the two
+	// barrier states distinct: a nil barrier means encryption is DISABLED for
+	// the shard (plaintext is the configured outcome), whereas a sealed
+	// barrier means encryption is temporarily UNAVAILABLE. Producing a
+	// plaintext artifact in the second case would durably downgrade a shard
+	// whose data is required to be encrypted at rest.
+	//
+	// Declared here, like ErrSnapshotEncryptedBarrierUnavailable, so the
+	// engine save path and the quicraft receive path fail with the SAME error
+	// identity; the quicraft package re-exports it, hence the public prefix.
+	ErrSnapshotBarrierSealed = errors.New(
+		"quicraft: snapshot encryption unavailable: barrier is sealed")
+
+	// ErrUnsupportedSnapshotCompression is returned when a snapshot record
+	// declares a compression algorithm this binary cannot decompress. The
+	// artifact is unreadable, so recovery fails instead of feeding the state
+	// machine bytes in an unknown encoding.
+	ErrUnsupportedSnapshotCompression = errors.New(
+		"quicraft: snapshot declares an unsupported compression algorithm")
+
 	// ErrApplyGap is returned when a committed batch does not start at
 	// lastApplied+1. The missing range can never be re-offered (Raft's
 	// processed marker already advanced past it), so the shard is failed
@@ -180,23 +216,59 @@ func (e *CommitError) Unwrap() error {
 }
 
 // SnapshotRecoveryBehindError is returned when a state machine recovery is
-// requested for a snapshot index the Raft log has not committed. Advancing
-// the node's apply markers to that index would make the next Update carry a
-// LastApplied greater than the raft log's committed/processed markers, which
-// the commit path asserts against. It signals a failed snapshot receive: the
-// InstallSnapshot was never installed into the Raft log.
+// requested for a snapshot index the Raft log has not yet committed AND
+// processed. Advancing the node's apply markers to that index would make the
+// next Update carry a LastApplied greater than the raft log's
+// committed/processed markers, which the commit path asserts against.
+//
+// The condition is TRANSIENT by construction: the InstallSnapshot that moves
+// the markers is queued on the node inbox and installed by the step worker,
+// which runs concurrently with the recovery request. The state machine is
+// left untouched, so the caller may retry once the markers catch up.
 type SnapshotRecoveryBehindError struct {
 	ShardID       uint64
 	ReplicaID     uint64
 	SnapshotIndex uint64
 	Committed     uint64
+	Processed     uint64
 }
 
 // Error returns a human-readable description of the recovery mismatch.
 func (e *SnapshotRecoveryBehindError) Error() string {
 	return fmt.Sprintf(
-		"engine: snapshot recovery for shard %d replica %d at index %d is ahead of committed index %d",
-		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.Committed)
+		"engine: snapshot recovery for shard %d replica %d at index %d is ahead of the raft log (committed %d, processed %d)",
+		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.Committed, e.Processed)
+}
+
+// Retryable reports that the recovery may be re-requested unchanged. It is
+// always true: the snapshot is durable and the state machine was not touched,
+// so the same request succeeds as soon as the step worker installs the
+// snapshot into the raft log.
+func (e *SnapshotRecoveryBehindError) Retryable() bool { return true }
+
+// SnapshotRecoveryStaleError is returned when a state machine recovery is
+// requested for a snapshot that is NOT strictly ahead of the state machine's
+// apply frontier. Recovering it would REPLACE the state machine with older
+// state and REGRESS lastApplied, discarding every entry applied between the
+// snapshot index and the current frontier; the next committed batch would then
+// start past lastApplied+1 and fail the shard with ErrApplyGap.
+//
+// It is reachable whenever a leader ships an InstallSnapshot below the
+// follower's real progress (a leader change or rejection walk-down that drives
+// remote.next backwards). Raft itself rejects such a snapshot, so the engine
+// must refuse it too rather than recover behind raft's back.
+type SnapshotRecoveryStaleError struct {
+	ShardID       uint64
+	ReplicaID     uint64
+	SnapshotIndex uint64
+	LastApplied   uint64
+}
+
+// Error returns a human-readable description of the stale recovery.
+func (e *SnapshotRecoveryStaleError) Error() string {
+	return fmt.Sprintf(
+		"engine: snapshot recovery for shard %d replica %d at index %d is not ahead of applied index %d",
+		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.LastApplied)
 }
 
 // SnapshotExportError is returned when exporting a snapshot to the

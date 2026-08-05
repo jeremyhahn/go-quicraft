@@ -25,9 +25,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// faultFS wraps an FS and injects errors into Remove and/or OpenFile for
-// segment files whose base name is in failNames (or for all files when
-// failAll is set). Arm/disarm at any point via the mutex-protected fields.
+// faultFS wraps an FS and injects errors into Remove, OpenFile and/or Stat
+// for files whose base name is in failNames (or for all files when failAll is
+// set). Arm/disarm at any point via the mutex-protected fields.
 type faultFS struct {
 	FS
 	mu           sync.Mutex
@@ -35,6 +35,9 @@ type faultFS struct {
 	failNames    map[string]bool
 	failRemove   error
 	failOpenFile error
+	// failStat injects an error that is NOT fs.ErrNotExist, the case a
+	// presence probe must never read as absence.
+	failStat error
 }
 
 func (f *faultFS) matches(name string) bool {
@@ -61,6 +64,17 @@ func (f *faultFS) OpenFile(name string, flag int, perm fs.FileMode) (File, error
 		return nil, injected
 	}
 	return f.FS.OpenFile(name, flag, perm)
+}
+
+func (f *faultFS) Stat(name string) (fs.FileInfo, error) {
+	f.mu.Lock()
+	injected := f.failStat
+	match := f.matches(name)
+	f.mu.Unlock()
+	if injected != nil && match {
+		return nil, injected
+	}
+	return f.FS.Stat(name)
 }
 
 // arm sets the fault configuration under the mutex.

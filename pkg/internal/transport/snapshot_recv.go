@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -34,23 +35,29 @@ const (
 	// chunks. Corresponds to POSIX PATH_MAX.
 	maxSnapshotFilepathLen = 4096
 
-	// snapshotChunkFixedOverhead is the minimum number of bytes a SnapshotChunk
-	// occupies for its non-Data fields (see SnapshotChunk.Size): 9 fixed uint64
-	// fields (72) + filepath length prefix (4) + FileChunkID/FileChunkCount (16)
-	// + HasFileInfo (8) + OnDiskIndex/DeploymentID/BinVer/Epoch (32) + Data
-	// length prefix (4). Filepath content, FileInfo, and Membership only add to
-	// this, so it is a safe lower bound on the per-chunk framing overhead.
-	snapshotChunkFixedOverhead = 9*8 + 4 + 2*8 + 8 + 4*8 + 4 // 136 bytes
-
 	// maxSnapshotChunkDataLen is the maximum Data payload length for a single
-	// snapshot chunk. Every chunk travels inside one transport frame, whose
-	// total payload is already capped at MaxFrameSize by ReadFrameHeader. Since
-	// Data is length-prefixed *within* that frame alongside the fixed fields
-	// above, the largest Data that can legitimately arrive is MaxFrameSize minus
-	// the chunk framing overhead. Bounding it at the full MaxFrameSize (as a
-	// prior version did) made the check unreachable; subtracting the fixed
-	// overhead makes a malformed/oversized Data length prefix actually catchable.
-	maxSnapshotChunkDataLen = int(MaxFrameSize) - snapshotChunkFixedOverhead
+	// snapshot chunk. The limit lives in one place: the decoder
+	// (proto.SnapshotChunk.UnmarshalFrom) already rejects a longer Data length
+	// prefix with ErrChunkDataTooLong, so restating it as any other bound —
+	// e.g. MaxFrameSize minus the framing overhead, which is larger — makes
+	// validateChunk's check unreachable and lets the two limits drift.
+	maxSnapshotChunkDataLen = int(proto.MaxSnapshotChunkDataLen)
+)
+
+var (
+	// snapshotChunkStructBytes is the resident size of one retained
+	// proto.SnapshotChunk header. receiveChunks accumulates every accepted
+	// chunk in a slice for the whole transfer, so charging the memory budget
+	// the frame length alone under-counts residency — by ~2.6x for
+	// minimum-size chunks — and lets concurrent transfers hold multiples of
+	// the configured budget.
+	snapshotChunkStructBytes = int64(unsafe.Sizeof(proto.SnapshotChunk{}))
+
+	// minSnapshotChunkResidentBytes is the least memory one admitted chunk can
+	// occupy: the smallest frame a valid chunk can arrive in, plus its
+	// retained struct header. It converts a memory budget into a chunk-count
+	// ceiling at admission time.
+	minSnapshotChunkResidentBytes = int64((&proto.SnapshotChunk{}).Size()) + snapshotChunkStructBytes
 )
 
 // maxRateLimitChunkSleep caps the per-chunk rate-limit sleep. A pathologically
@@ -270,7 +277,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	// between WaitGroup.Add(1) and WaitGroup.Wait().
 	if sr.snapshotTracker != nil {
 		if !sr.snapshotTracker.TryAdd() {
-			sr.rejectSnapshotStream("transport shutting down", hdr, nil)
+			sr.rejectSnapshotStream(snapshotRejectShutdown, "transport shutting down", hdr, nil)
 			return
 		}
 		defer sr.snapshotTracker.Done()
@@ -278,7 +285,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 
 	select {
 	case <-stopC:
-		sr.rejectSnapshotStream("transport shutting down", hdr, nil)
+		sr.rejectSnapshotStream(snapshotRejectShutdown, "transport shutting down", hdr, nil)
 		return
 	default:
 	}
@@ -287,7 +294,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	// hold every slot, silently starving snapshot delivery to every other
 	// recovering follower.
 	if !sr.acquirePeerSlot(peer) {
-		sr.rejectSnapshotStream("per-peer snapshot concurrency limit reached", hdr, nil)
+		sr.rejectSnapshotStream(snapshotRejectConcurrency, "per-peer snapshot concurrency limit reached", hdr, nil)
 		return
 	}
 	defer sr.releasePeerSlot(peer)
@@ -298,7 +305,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 		defer func() { <-sr.sem }()
 	default:
 		// At concurrency limit, drop the snapshot.
-		sr.rejectSnapshotStream("global snapshot concurrency limit reached", hdr, nil)
+		sr.rejectSnapshotStream(snapshotRejectConcurrency, "global snapshot concurrency limit reached", hdr, nil)
 		return
 	}
 
@@ -345,15 +352,20 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		initCap = maxInitialChunkCap
 	}
 	chunks := make([]proto.SnapshotChunk, 0, initCap)
-	var totalBytes int64
+	// totalBytes counts WIRE bytes: it drives the throughput floor and the
+	// bytes-received metric. charged counts what was reserved against the
+	// memory budget, which is the wire bytes PLUS the retained struct header
+	// of every accumulated chunk. Keeping them separate stops the accounting
+	// correction from inflating the reported transfer size.
+	var totalBytes, charged int64
 
 	// Ensure all accumulated memory budget is restored on every exit path.
 	// Without this defer, early returns leak the budget for previously
-	// received chunks whose bytes were tracked in totalBytes but never
-	// returned to the atomic budget counter.
+	// received chunks whose bytes were reserved but never returned to the
+	// atomic budget counter.
 	defer func() {
-		if totalBytes > 0 {
-			sr.memoryBudget.Add(totalBytes)
+		if charged > 0 {
+			sr.memoryBudget.Add(charged)
 		}
 	}()
 
@@ -381,7 +393,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		// header per deadline and hold its concurrency slot for years.
 		elapsed := time.Since(recvStart)
 		if sr.maxTransferDuration > 0 && elapsed > sr.maxTransferDuration {
-			sr.rejectSnapshot(hdr, "transfer exceeded maximum duration", totalBytes,
+			sr.rejectSnapshot(hdr, snapshotRejectLiveness, "transfer exceeded maximum duration", totalBytes,
 				&SnapshotTransferTimeoutError{
 					Elapsed:       elapsed,
 					Limit:         sr.maxTransferDuration,
@@ -391,7 +403,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		}
 		if sr.minBytesPerSec > 0 && elapsed > sr.progressGracePeriod &&
 			totalBytes < int64(elapsed/time.Second)*sr.minBytesPerSec {
-			sr.rejectSnapshot(hdr, "transfer below minimum throughput", totalBytes,
+			sr.rejectSnapshot(hdr, snapshotRejectLiveness, "transfer below minimum throughput", totalBytes,
 				&SnapshotProgressStalledError{
 					Elapsed:        elapsed,
 					ReceivedBytes:  totalBytes,
@@ -423,14 +435,14 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 				truncated = true
 				break
 			}
-			sr.rejectSnapshot(hdr, "chunk frame read failed", totalBytes, err)
+			sr.rejectSnapshot(hdr, snapshotRejectIO, "chunk frame read failed", totalBytes, err)
 			return
 		}
 
 		if length == 0 {
 			zeroFrames++
 			if zeroFrames > maxConsecutiveZeroLengthFrames {
-				sr.rejectSnapshot(hdr, "zero-length chunk frame flood", totalBytes,
+				sr.rejectSnapshot(hdr, snapshotRejectLiveness, "zero-length chunk frame flood", totalBytes,
 					&SnapshotZeroLengthFrameFloodError{
 						Count: zeroFrames,
 						Max:   maxConsecutiveZeroLengthFrames,
@@ -441,15 +453,19 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		}
 		zeroFrames = 0
 
-		// Check memory budget before allocating.
-		remaining := sr.memoryBudget.Add(-int64(length))
+		// Check memory budget before allocating. The charge covers the frame
+		// buffer AND the SnapshotChunk header that will be retained in chunks
+		// until the transfer completes; charging the frame length alone lets a
+		// flood of minimum-size chunks hold multiples of the accounted memory.
+		chunkCharge := int64(length) + snapshotChunkStructBytes
+		remaining := sr.memoryBudget.Add(-chunkCharge)
 		if remaining < 0 {
 			// Over budget, restore and reject. This chunk was never
-			// added to totalBytes so it must be restored inline.
-			sr.memoryBudget.Add(int64(length))
-			sr.rejectSnapshot(hdr, "receive memory budget exhausted", totalBytes+int64(length),
+			// added to charged so it must be restored inline.
+			sr.memoryBudget.Add(chunkCharge)
+			sr.rejectSnapshot(hdr, snapshotRejectMemory, "receive memory budget exhausted", totalBytes+int64(length),
 				&SnapshotMemoryBudgetExceededError{
-					Accumulated: totalBytes + int64(length),
+					Accumulated: charged + chunkCharge,
 					Budget:      sr.maxMemory,
 				})
 			return
@@ -458,18 +474,18 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		buf := make([]byte, length)
 		if _, err := io.ReadFull(stream, buf); err != nil {
 			// Read failed. This chunk was deducted from budget but
-			// not yet added to totalBytes, so restore it inline.
-			sr.memoryBudget.Add(int64(length))
-			sr.rejectSnapshot(hdr, "chunk body read failed", totalBytes, err)
+			// not yet added to charged, so restore it inline.
+			sr.memoryBudget.Add(chunkCharge)
+			sr.rejectSnapshot(hdr, snapshotRejectIO, "chunk body read failed", totalBytes, err)
 			return
 		}
 
 		var chunk proto.SnapshotChunk
 		if _, err := chunk.UnmarshalFrom(buf); err != nil {
 			// Unmarshal failed. Same as above: restore inline since
-			// this chunk is not yet tracked in totalBytes.
-			sr.memoryBudget.Add(int64(length))
-			sr.rejectSnapshot(hdr, "chunk unmarshal failed", totalBytes, err)
+			// this chunk is not yet tracked in charged.
+			sr.memoryBudget.Add(chunkCharge)
+			sr.rejectSnapshot(hdr, snapshotRejectMalformed, "chunk unmarshal failed", totalBytes, err)
 			return
 		}
 
@@ -477,22 +493,23 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		// header used for epoch pinning) to prevent oversized allocations
 		// and cross-cluster data corruption.
 		if err := sr.validateChunk(&chunk, hdr); err != nil {
-			sr.memoryBudget.Add(int64(length))
-			sr.rejectSnapshot(hdr, "chunk validation failed", totalBytes, err)
+			sr.memoryBudget.Add(chunkCharge)
+			sr.rejectSnapshot(hdr, snapshotRejectMalformed, "chunk validation failed", totalBytes, err)
 			return
 		}
 
 		chunks = append(chunks, chunk)
 		totalBytes += int64(length)
+		charged += chunkCharge
 
 		// Guard against unbounded memory growth from a single snapshot
 		// receive. The per-chunk atomic budget check above protects
 		// against global overcommit, but this check ensures a single
 		// receive does not consume the entire budget.
-		if totalBytes > sr.maxMemory {
-			sr.rejectSnapshot(hdr, "per-receive memory budget exceeded", totalBytes,
+		if charged > sr.maxMemory {
+			sr.rejectSnapshot(hdr, snapshotRejectMemory, "per-receive memory budget exceeded", totalBytes,
 				&SnapshotMemoryBudgetExceededError{
-					Accumulated: totalBytes,
+					Accumulated: charged,
 					Budget:      sr.maxMemory,
 				})
 			return
@@ -576,14 +593,16 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 }
 
-// rejectSnapshot records a discarded inbound snapshot transfer: a structured
-// warning with the transfer's identity and size, plus the OnSnapshotRejected
-// listener — the same failure signal the truncated-transfer path fires — so a
-// dropped receive is observable instead of silently timing out the sender's
-// ack wait.
-func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason string, receivedBytes int64, err error) {
+// rejectSnapshot records a discarded inbound snapshot transfer: the
+// IncSnapshotsRejected counter bucketed by reason, a structured warning
+// carrying the transfer's identity, size and free-form detail, plus the
+// OnSnapshotRejected listener — the same failure signal the truncated-transfer
+// path fires — so a dropped receive is observable instead of silently timing
+// out the sender's ack wait.
+func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotRejectReason, detail string, receivedBytes int64, err error) {
 	slog.Warn("snapshot receive rejected, discarding transfer",
 		"reason", reason,
+		"detail", detail,
 		"shard", hdr.ShardID,
 		"replica", hdr.ReplicaID,
 		"index", hdr.Index,
@@ -591,6 +610,9 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason string, r
 		"expected_chunks", hdr.ChunkCount,
 		"error", err,
 	)
+	if sr.metrics != nil {
+		sr.metrics.IncSnapshotsRejected(hdr.ShardID, string(reason))
+	}
 	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
 		sr.listener.OnSnapshotRejected(config.SnapshotInfo{
 			ShardID:   hdr.ShardID,
@@ -606,8 +628,9 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason string, r
 // known yet. It fires the same OnSnapshotRejected listener and structured
 // warning as rejectSnapshot so every discarded transfer is observable through
 // one signal, rather than some paths returning silently and leaving the sender
-// to time out its ack wait. hdr may be nil when the header never parsed.
-func (sr *snapshotReceiver) rejectSnapshotStream(reason string, hdr *SnapshotHeader, err error) {
+// to time out its ack wait. hdr may be nil when the header never parsed, in
+// which case the counter is attributed to shard 0.
+func (sr *snapshotReceiver) rejectSnapshotStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, err error) {
 	var info config.SnapshotInfo
 	if hdr != nil {
 		info = config.SnapshotInfo{
@@ -618,11 +641,15 @@ func (sr *snapshotReceiver) rejectSnapshotStream(reason string, hdr *SnapshotHea
 	}
 	slog.Warn("snapshot stream rejected, discarding transfer",
 		"reason", reason,
+		"detail", detail,
 		"shard", info.ShardID,
 		"replica", info.ReplicaID,
 		"index", info.Index,
 		"error", err,
 	)
+	if sr.metrics != nil {
+		sr.metrics.IncSnapshotsRejected(info.ShardID, string(reason))
+	}
 	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
 		sr.listener.OnSnapshotRejected(info)
 	}
@@ -741,6 +768,23 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *Snaps
 		}
 	}
 	return nil
+}
+
+// maxAdmissibleChunkCount returns the largest declared ChunkCount this
+// receiver can admit: the fixed protocol ceiling, lowered to what the
+// configured memory budget could actually hold. The fixed ceiling alone is not
+// a memory bound — a peer declaring it and sending minimum-size chunks holds
+// ChunkCount * minSnapshotChunkResidentBytes, which for a small budget is
+// orders of magnitude past it — so the transfer is refused at the header
+// instead of after the memory has been committed.
+func (sr *snapshotReceiver) maxAdmissibleChunkCount() uint64 {
+	limit := uint64(defaultMaxSnapshotChunkCount)
+	if sr.maxMemory > 0 {
+		if budgeted := uint64(sr.maxMemory / minSnapshotChunkResidentBytes); budgeted < limit {
+			limit = budgeted
+		}
+	}
+	return limit
 }
 
 // AvailableMemory returns the remaining memory budget for snapshot receives.

@@ -1,0 +1,161 @@
+# quicraft benchmark run
+# generated:     2026-08-04T19:33:29Z
+# mode:          baseline
+# run-host:      omega  (PERF_HOST=jhahn@198.51.100.90)
+# cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+# cpu-count:     20
+# governor:      powersave
+# loadavg:       1.29 0.90 0.48  (at start of run)
+# build-host:    vm-host-1
+# go-version:    go version go1.26.5 linux/amd64
+# current-ref:   64bc2882844a4109c698b99ef022ef9219a391ef  [clean (pinned to HEAD (64bc288))]
+# packages:      ./pkg/proto/
+# bench-filter:  .
+# rounds:        10 (interleaved)
+# iterations:    5000000x (fixed)
+# command:       BASELINE_REF='HEAD' PERF_HOST='jhahn@198.51.100.90' BENCH_PKGS='./pkg/proto/' BENCH_FILTER='.' BENCH_ROUNDS='10' BENCH_ITERS='5000000x' make bench-baseline
+#
+# Raw samples follow in Go benchmark format. Diff a future run against
+# this file with:
+#   benchstat test/performance/baselines/omega-64bc288-codec.txt build/bench-compare/<run>/current.txt
+#
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        22.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	         8.185 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        64.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.74 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       186.7 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        82.89 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       572.7 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         3.699 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         2.402 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        23.48 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	         8.413 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        61.31 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.54 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       194.1 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        74.17 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       554.8 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         1.330 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         1.476 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        22.84 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	        10.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        65.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        39.92 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       210.0 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        83.20 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       618.8 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         1.818 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         3.386 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        25.35 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	        13.27 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        67.53 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.40 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       202.8 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        88.07 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       610.6 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         1.913 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         3.382 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        23.50 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	         8.196 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        64.78 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        39.64 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       220.2 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        78.12 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       565.0 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         3.186 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         3.980 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        23.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	         8.114 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        61.06 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.25 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       206.6 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        81.75 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       577.5 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         2.678 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         3.803 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        22.92 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	        15.29 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        61.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        35.60 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       202.3 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        84.76 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       572.3 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         3.833 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         2.306 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        22.81 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	        11.48 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        65.32 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.64 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       202.0 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        86.63 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       631.5 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         2.746 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         3.963 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        27.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	        11.25 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        61.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        32.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       199.3 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        78.58 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       594.4 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         4.409 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         2.578 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/jeremyhahn/go-quicraft/pkg/proto
+cpu: Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
+BenchmarkEntryMarshalTo-20                  	 5000000	        23.26 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEntryUnmarshalFrom-20              	 5000000	         8.101 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageMarshalTo-20                	 5000000	        63.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageUnmarshalFrom-20            	 5000000	        36.21 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMessageBatchUnmarshalFrom-20       	 5000000	       208.2 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPut-20           	 5000000	        84.29 ns/op	       5 B/op	       1 allocs/op
+BenchmarkEntrySlicePool_GetPutBatch16-20    	 5000000	       597.4 ns/op	      85 B/op	      16 allocs/op
+BenchmarkStateMarshalTo-20                  	 5000000	         3.687 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStateUnmarshalFrom-20              	 5000000	         2.328 ns/op	       0 B/op	       0 allocs/op
+PASS

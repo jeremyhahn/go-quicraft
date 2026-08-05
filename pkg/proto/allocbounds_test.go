@@ -243,3 +243,27 @@ func TestMessageBatch_Reset_DropsOversizedRequests(t *testing.T) {
 		}
 	})
 }
+
+// TestMessage_Reset_DropsOversizedEntries asserts a message grown past
+// maxRetainedEntries releases the slice, so a message held inside a pooled
+// batch cannot retain attacker-influenced capacity for the process lifetime.
+func TestMessage_Reset_DropsOversizedEntries(t *testing.T) {
+	t.Run("oversized capacity dropped", func(t *testing.T) {
+		m := Message{Entries: make([]Entry, maxRetainedEntries+1)}
+		m.Reset()
+		if cap(m.Entries) != 0 {
+			t.Fatalf("cap = %d after Reset, want 0", cap(m.Entries))
+		}
+	})
+
+	t.Run("capacity within threshold retained", func(t *testing.T) {
+		m := Message{Entries: make([]Entry, 0, maxRetainedEntries)}
+		m.Reset()
+		if cap(m.Entries) != maxRetainedEntries {
+			t.Fatalf("cap = %d after Reset, want %d", cap(m.Entries), maxRetainedEntries)
+		}
+		if len(m.Entries) != 0 {
+			t.Fatalf("len = %d after Reset, want 0", len(m.Entries))
+		}
+	})
+}

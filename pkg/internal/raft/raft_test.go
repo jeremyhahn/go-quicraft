@@ -573,7 +573,7 @@ func TestRaft_Election_CandidateLosesWithMajorityRejection(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRaft_Election_PreVoteGranted(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	initialTerm := r.term
 	r.becomePreCandidate()
 	r.broadcastPreVote()
@@ -599,7 +599,7 @@ func TestRaft_Election_PreVoteGranted(t *testing.T) {
 }
 
 func TestRaft_Election_PreVoteRejected(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	initialTerm := r.term
 	r.becomePreCandidate()
 	r.broadcastPreVote()
@@ -673,7 +673,7 @@ func TestRaft_PreVoteReject_UsesResponderTerm(t *testing.T) {
 // responder path (term = responder's term, which equals the pre-candidate's
 // current term) does NOT advance its term in step().
 func TestRaft_PreVoteReject_DoesNotAdvancePreCandidate(t *testing.T) {
-	pc := newTestRaft(1)
+	pc := atTerm(newTestRaft(1), 1)
 	pc.becomePreCandidate()
 	pc.broadcastPreVote()
 	startTerm := pc.term
@@ -790,7 +790,7 @@ func TestRaft_Election_HigherTermCausesStepDown(t *testing.T) {
 }
 
 func TestRaft_Election_LowerTermMessageIgnored(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
+	r := atTerm(newTestRaftPreVoteDisabled(1), 1)
 	electLeader(r)
 	currentTerm := r.term
 
@@ -1412,7 +1412,7 @@ func TestRaft_Heartbeat_LeaderSendsOnTick(t *testing.T) {
 }
 
 func TestRaft_Heartbeat_FollowerResponds(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.leaderID = 2
 	r.msgs = nil
 
@@ -1433,7 +1433,7 @@ func TestRaft_Heartbeat_FollowerResponds(t *testing.T) {
 }
 
 func TestRaft_Heartbeat_AdvancesFollowerCommit(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.log.append([]proto.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
@@ -1457,7 +1457,7 @@ func TestRaft_Heartbeat_AdvancesFollowerCommit(t *testing.T) {
 }
 
 func TestRaft_Heartbeat_DoesNotExceedLocalLog(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.log.append([]proto.Entry{
 		{Index: 1, Term: 1},
 	})
@@ -2152,7 +2152,7 @@ func TestRaft_LeaderTransfer_TimeoutClearsTransfer(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRaft_TimeoutNow_StartsElection(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
+	r := atTerm(newTestRaftPreVoteDisabled(1), 1)
 	r.msgs = nil
 
 	err := r.step(proto.Message{
@@ -2178,6 +2178,7 @@ func TestRaft_TimeoutNow_IgnoredByObserver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	r = atTerm(r, 1)
 
 	err = r.step(proto.Message{
 		Type: proto.TimeoutNow,
@@ -2330,7 +2331,7 @@ func TestRaft_ReadIndex_FollowerWithNoLeader(t *testing.T) {
 }
 
 func TestRaft_ReadIndexResp_PopulatesReadStates(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.readStates = nil
 
 	err := r.step(proto.Message{
@@ -2419,7 +2420,7 @@ func TestRaft_Quiesce_ExitOnProposal(t *testing.T) {
 }
 
 func TestRaft_Quiesce_FollowerEntersOnQuiesceMessage(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.leaderID = 2
 	r.quiesce.enabled = true
 
@@ -2438,7 +2439,7 @@ func TestRaft_Quiesce_FollowerEntersOnQuiesceMessage(t *testing.T) {
 }
 
 func TestRaft_Quiesce_FollowerIgnoresFromNonLeader(t *testing.T) {
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.leaderID = 2
 	r.quiesce.enabled = true
 
@@ -2662,6 +2663,7 @@ func TestRaft_Observer_DoesNotStartElectionOnTimeoutNow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	r = atTerm(r, 1)
 
 	err = r.step(proto.Message{
 		Type: proto.TimeoutNow,
@@ -3239,6 +3241,17 @@ func TestRaft_SnapshotStatus_NoResendWhileAwaitingAck(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
+	// The leader's own log must reach the snapshot index: a snapshot is
+	// built from the leader's committed log, so a follower can never ack
+	// an index the leader does not have.
+	r.log.append([]proto.Entry{
+		{Index: 2, Term: r.term}, {Index: 3, Term: r.term},
+		{Index: 4, Term: r.term}, {Index: 5, Term: r.term},
+		{Index: 6, Term: r.term}, {Index: 7, Term: r.term},
+		{Index: 8, Term: r.term}, {Index: 9, Term: r.term},
+		{Index: 10, Term: r.term},
+	})
+
 	rm := r.remotes[2]
 	rm.becomeSnapshot(10, 1)
 	if err := r.step(proto.Message{
@@ -3708,7 +3721,7 @@ func TestRaft_Leader_StepsDownOnHigherTermVoteRequest(t *testing.T) {
 }
 
 func TestRaft_Leader_IgnoresLowerTermVoteRequest(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
+	r := atTerm(newTestRaftPreVoteDisabled(1), 1)
 	electLeader(r)
 	r.drainMessages()
 
@@ -4536,6 +4549,7 @@ func TestRaft_Witness_TimeoutNowIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	r = atTerm(r, 1)
 
 	err = r.step(proto.Message{
 		Type: proto.TimeoutNow,
@@ -4892,6 +4906,7 @@ func TestRaft_BroadcastAppend_WitnessElectionTimerReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	witness = atTerm(witness, 1)
 
 	// Simulate some ticks elapsing on the witness.
 	for i := 0; i < 5; i++ {
@@ -8012,6 +8027,7 @@ func TestStepCandidate_VoteRespIgnoredInPreCandidateState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	r = atTerm(r, 1)
 
 	// Transition to preCandidate (term stays at 1).
 	r.becomePreCandidate()
@@ -9722,7 +9738,7 @@ func TestRaft_TimeoutNow_ExitsQuiesce(t *testing.T) {
 	// would use the quiesce liveness probe interval instead of normal
 	// heartbeats, and a failed election would use the extended quiesce
 	// election timeout (30x normal).
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.leaderID = 2
 	r.quiesce.enabled = true
 	r.quiesce.active = true
@@ -9757,7 +9773,7 @@ func TestRaft_TimeoutNow_ExitsQuiesce(t *testing.T) {
 func TestRaft_TimeoutNow_NotQuiesced_StillWorks(t *testing.T) {
 	// Verify that TimeoutNow works correctly when not quiesced (no
 	// regression from the quiesce exit fix).
-	r := newTestRaft(1)
+	r := atTerm(newTestRaft(1), 1)
 	r.leaderID = 2
 
 	err := r.step(proto.Message{

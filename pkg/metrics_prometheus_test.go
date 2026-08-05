@@ -1562,3 +1562,94 @@ func TestPrometheus_UnregisterShard_DeletesSeries(t *testing.T) {
 		t.Fatal("per-shard series must be deleted after UnregisterShard (cardinality leak)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TransportMetrics: Snapshots Rejected / Messages Dropped
+// ---------------------------------------------------------------------------
+
+func TestPrometheusMetricsCollector_IncSnapshotsRejected(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	c.IncSnapshotsRejected(1, "malformed")
+	c.IncSnapshotsRejected(1, "malformed")
+	c.IncSnapshotsRejected(1, "liveness")
+	// A header-stage rejection has no parsed shard and lands on shard 0.
+	c.IncSnapshotsRejected(0, "io_error")
+
+	mf := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_rejected_total")
+	if v := counterValue(t, mf, map[string]string{"shard_id": "1", "reason": "malformed"}); v != 2 {
+		t.Errorf("malformed counter = %v, want 2", v)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "1", "reason": "liveness"}); v != 1 {
+		t.Errorf("liveness counter = %v, want 1", v)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "0", "reason": "io_error"}); v != 1 {
+		t.Errorf("io_error counter = %v, want 1", v)
+	}
+}
+
+// TestPrometheusMetricsCollector_IncMessagesDropped_BoundedCardinality asserts
+// the drop counter keys on shard and reason only: the target replica id must
+// not multiply the series count by the shard's membership size.
+func TestPrometheusMetricsCollector_IncMessagesDropped_BoundedCardinality(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	const shard = uint64(3)
+	for to := uint64(1); to <= 100; to++ {
+		c.IncMessagesDropped(shard, to, "queue_full")
+	}
+
+	mf := gatherMetric(t, c.Registry, "quicraft_transport_messages_dropped_total")
+	if got := len(mf.GetMetric()); got != 1 {
+		t.Fatalf("messages_dropped_total has %d series, want 1 ('to' must not be a label)", got)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": "queue_full"}); v != 100 {
+		t.Fatalf("queue_full counter = %v, want 100", v)
+	}
+}
+
+// TestPrometheus_UnregisterShard_DeletesDropSeries asserts the reason-labeled
+// drop counters are torn down with the shard. They cannot use
+// DeleteLabelValues (which addresses one full label set), so a missed
+// DeletePartialMatch would leak one series per reason per stopped shard.
+func TestPrometheus_UnregisterShard_DeletesDropSeries(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	const shard = uint64(11)
+
+	c.RegisterShard(shard)
+	c.IncSnapshotsRejected(shard, "malformed")
+	c.IncSnapshotsRejected(shard, "liveness")
+	c.IncMessagesDropped(shard, 2, "queue_full")
+	c.IncMessagesDropped(shard, 3, "write_failed")
+
+	for _, name := range []string{
+		"quicraft_transport_snapshots_rejected_total",
+		"quicraft_transport_messages_dropped_total",
+	} {
+		if !shardSeriesExists(t, c.Registry, name, "11") {
+			t.Fatalf("%s series should exist before UnregisterShard", name)
+		}
+	}
+
+	c.UnregisterShard(shard)
+
+	for _, name := range []string{
+		"quicraft_transport_snapshots_rejected_total",
+		"quicraft_transport_messages_dropped_total",
+	} {
+		if shardSeriesExists(t, c.Registry, name, "11") {
+			t.Fatalf("%s series must be deleted after UnregisterShard (cardinality leak)", name)
+		}
+	}
+
+	// The tombstone must also stop a residual in-flight sample from
+	// re-creating the deleted series.
+	c.IncSnapshotsRejected(shard, "malformed")
+	c.IncMessagesDropped(shard, 2, "queue_full")
+	for _, name := range []string{
+		"quicraft_transport_snapshots_rejected_total",
+		"quicraft_transport_messages_dropped_total",
+	} {
+		if shardSeriesExists(t, c.Registry, name, "11") {
+			t.Fatalf("%s series re-created by a post-unregister sample", name)
+		}
+	}
+}

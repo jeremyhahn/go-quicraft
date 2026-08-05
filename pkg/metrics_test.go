@@ -230,3 +230,13 @@ func TestNoOpMetricsCollector_RegisterUnregisterCycle(t *testing.T) {
 	// Using metrics after unregister should still be no-op.
 	c.ObserveProposalLatency(1, time.Millisecond)
 }
+
+func TestNoOpMetricsCollector_IncSnapshotsRejected(t *testing.T) {
+	c := NoOpMetricsCollector{}
+	c.IncSnapshotsRejected(1, "malformed")
+}
+
+func TestNoOpMetricsCollector_IncMessagesDropped(t *testing.T) {
+	c := NoOpMetricsCollector{}
+	c.IncMessagesDropped(1, 2, "queue_full")
+}

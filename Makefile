@@ -326,6 +326,64 @@ bench-batch:
 bench-crypto:
 	$(GOBENCH) $(PKG_CRYPTO)
 
+# ----------------------------------------------------------------------------
+# Regression-grade benchmarking (release gate)
+#
+# The bench-<pkg> targets above are smoke tests: a single unreplicated run on
+# whatever machine you happen to be on. They CANNOT detect a hot-path
+# regression - run-to-run spread on a loaded dev box reaches 5x.
+#
+# bench-compare is the gate. It builds baseline and current test binaries from
+# the same toolchain, interleaves the two sides across many rounds at a fixed
+# iteration count, and compares the distributions with benchstat.
+#
+# The binaries run on this machine by default, or on PERF_HOST when set. The
+# method is identical either way; only the execution location changes. Both
+# modes are supported, including from CI.
+#
+# See docs/performance/benchmarking.md.
+# ----------------------------------------------------------------------------
+
+BENCH_SCRIPT   := scripts/bench-compare.sh
+
+# Git ref to compare the working tree against.
+BASELINE       ?= origin/main
+# Where the benchmark binaries execute. Unset = this machine. Set to an ssh
+# destination (user@host) to run them on a quiet, dedicated machine instead,
+# which yields tighter confidence intervals.
+PERF_HOST      ?=
+# Hot path per CLAUDE.md: append (raft log), replicate (proto codec), apply (engine).
+BENCH_PKGS     ?= ./pkg/internal/raft/ ./pkg/internal/engine/ ./pkg/proto/
+BENCH_FILTER   ?= .
+BENCH_ROUNDS   ?= 8
+BENCH_ITERS    ?= 100000x
+BENCH_TIMEOUT  ?= 30m
+
+# $(value ...) passes these through UNEXPANDED. A benchmark filter such as
+# 'BenchmarkA$|BenchmarkB$' contains '$|', which make would otherwise expand as
+# the automatic variable for order-only prerequisites (empty), silently
+# corrupting the regex into 'BenchmarkABenchmarkB$'.
+BENCH_ENV = BASELINE='$(value BASELINE)' PERF_HOST='$(value PERF_HOST)' \
+            BENCH_PKGS='$(value BENCH_PKGS)' BENCH_FILTER='$(value BENCH_FILTER)' \
+            BENCH_ROUNDS='$(value BENCH_ROUNDS)' BENCH_ITERS='$(value BENCH_ITERS)' \
+            BENCH_TIMEOUT='$(value BENCH_TIMEOUT)'
+
+.PHONY: bench-compare
+bench-compare:
+	@$(BENCH_ENV) $(BENCH_SCRIPT) compare
+
+# BASELINE_REF pins the stored baseline to a committed revision (recommended:
+# a baseline recorded from a dirty tree is not reproducible).
+.PHONY: bench-baseline
+bench-baseline:
+	@$(BENCH_ENV) BASELINE_REF='$(BASELINE_REF)' BASELINE_LABEL='$(BASELINE_LABEL)' \
+		$(BENCH_SCRIPT) baseline
+
+.PHONY: install-benchstat
+install-benchstat:
+	@echo "==> Installing benchstat..."
+	$(GO) install golang.org/x/perf/cmd/benchstat@latest
+
 # ============================================================================
 # Fuzz Testing (Phase 1)
 # ============================================================================
@@ -776,10 +834,21 @@ help:
 	@echo "  fuzz-session           Fuzz session encoding"
 	@echo "    Flags: FUZZ_TIME=60s"
 	@echo ""
-	@echo "Benchmarks:"
+	@echo "Benchmarks (smoke test only - single run, noise-prone):"
 	@echo "  bench-<pkg>            Run benchmarks for a specific package"
 	@echo "    packages: proto, raft, waldb, seal, registry, engine, transport, quicraft,"
 	@echo "              server, writemode"
+	@echo ""
+	@echo "Benchmark Regression Gate (see docs/performance/benchmarking.md):"
+	@echo "  bench-compare          Interleaved baseline-vs-current comparison (benchstat)"
+	@echo "  bench-baseline         Record the working tree as a stored baseline"
+	@echo "  install-benchstat      Install benchstat (required for proper statistics)"
+	@echo "    Flags: BASELINE=origin/main  PERF_HOST=user@host"
+	@echo "           BENCH_PKGS='./pkg/internal/raft/ ...'  BENCH_FILTER=."
+	@echo "           BENCH_ROUNDS=8  BENCH_ITERS=100000x  BENCH_TIMEOUT=30m"
+	@echo "    PERF_HOST selects where the binaries run. Unset = this machine"
+	@echo "    (supported, and what CI uses); set it to a quiet dedicated host"
+	@echo "    for tighter confidence intervals. The method is the same either way."
 	@echo ""
 	@echo "Performance Comparison (via perfcompare orchestrator):"
 	@echo "  perf-build                   Build the perfcompare orchestrator"

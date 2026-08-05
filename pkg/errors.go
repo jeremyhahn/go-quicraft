@@ -220,6 +220,11 @@ var (
 	// index range, such as firstIndex >= lastIndex.
 	ErrInvalidRange = errors.New("quicraft: invalid range")
 
+	// ErrInvalidMember is the sentinel form of InvalidMemberError, returned
+	// when a member in the initial members map has a zero replica ID or an
+	// empty address.
+	ErrInvalidMember = errors.New("quicraft: invalid member")
+
 	// ErrSnapshotTooLarge is the sentinel form of SnapshotTooLargeError,
 	// returned when an imported snapshot artifact exceeds the configured
 	// MaxSnapshotSize.
@@ -579,6 +584,11 @@ func (e *InvalidMemberError) Error() string {
 		"quicraft: invalid member in shard %d: replica %d address %q: %s",
 		e.ShardID, e.ReplicaID, e.Address, e.Reason,
 	)
+}
+
+// Is reports whether target matches the sentinel ErrInvalidMember error.
+func (e *InvalidMemberError) Is(target error) bool {
+	return target == ErrInvalidMember
 }
 
 // TypeAssertionError is returned when a type assertion fails on data

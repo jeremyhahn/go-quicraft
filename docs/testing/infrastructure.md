@@ -140,6 +140,14 @@ Measured via `make bench-<package>`. Key targets:
 | `transport` | Frame marshal, header validation, send batching |
 | `quicraft` | End-to-end Propose, SyncRead, leader lookup |
 
+These are single-run smoke tests and cannot detect a regression on their own.
+
+### Regression Gating
+
+`make bench-compare` builds test binaries for a baseline git ref and the working tree with an identical toolchain, interleaves them across many rounds at a fixed iteration count, and compares the distributions with benchstat. The binaries run on the invoking machine by default (including in CI); set `PERF_HOST=user@host` to ship them over ssh and run them on a quiet dedicated machine instead, which tightens the confidence intervals without changing the method. `make bench-baseline` records provenance-stamped baselines under `test/performance/baselines/`.
+
+Full rationale, variables, and interpretation guidance: [Benchmark Regression Testing](../performance/benchmarking.md).
+
 ### Performance Comparison
 
 The `test/performance/` directory provides cross-system benchmarking:

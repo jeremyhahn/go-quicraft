@@ -163,11 +163,20 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 // Reset clears all fields for reuse. A Requests slice grown past
 // maxRetainedRequests is dropped rather than truncated so a pooled batch
 // cannot retain attacker-influenced capacity.
+//
+// Each retained message is reset in turn: truncating Requests alone leaves the
+// backing array holding Message values whose Entries slices are still live, so
+// Message.maxRetainedEntries would never be applied and a pooled batch could
+// pin len(Requests) * cap(Entries) * sizeof(Entry) bytes for the process
+// lifetime.
 func (mb *MessageBatch) Reset() {
 	mb.BinVer = 0
 	mb.DeploymentID = 0
 	mb.SourceEpoch = 0
 	mb.SourceAddress = ""
+	for i := range mb.Requests {
+		mb.Requests[i].Reset()
+	}
 	if cap(mb.Requests) > maxRetainedRequests {
 		mb.Requests = nil
 		return

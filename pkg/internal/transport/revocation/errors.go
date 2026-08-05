@@ -313,3 +313,15 @@ var ErrNoCRLSources = &ConfigError{Field: "CRLPaths", Message: "selected mode re
 // unrecognized Mode string, which would otherwise silently select the
 // default mode.
 var ErrInvalidRevocationMode = &ConfigError{Field: "Mode", Message: "unrecognized revocation mode"}
+
+// ErrNoRevocationSources is returned when revocation is enforced (fail
+// closed) under the source-agnostic default mode but neither a CRL file nor
+// an OCSP responder is configured. That combination consults nothing and
+// returns "not revoked" for every certificate — no error, no log, no metric —
+// which silently disables the only mechanism that evicts an unexpired
+// compromised node certificate. A deployment that genuinely wants no
+// revocation checking leaves RevocationConfig unset or opts into soft-fail.
+var ErrNoRevocationSources = &ConfigError{
+	Field:   "CRLPaths/OCSPResponderURL",
+	Message: "enforced revocation requires at least one CRL file or an OCSP responder",
+}

@@ -230,6 +230,13 @@ type QUICTransport struct {
 	// maxConnMsgRecv is the per-inbound-connection ceiling on in-flight
 	// message-frame memory, derived from MaxMessageReceiveMemory.
 	maxConnMsgRecv int64
+
+	// lastProtocolViolationLog is the Unix-nanosecond timestamp of the most
+	// recent protocol-violation warning this transport emitted. Per-instance,
+	// not package-global: a shared limiter lets one transport's log flood
+	// suppress every other transport's first diagnostic, and in-process
+	// multi-node deployments (and the test suite) run many transports at once.
+	lastProtocolViolationLog atomic.Int64
 }
 
 // srcAddrAuthSlots is the number of distinct claimed SourceAddresses cached
@@ -359,9 +366,9 @@ func NewQUICTransport(
 		MaxIncomingStreams:         int64(maxIncomingStreams),
 		MaxIncomingUniStreams:      -1,
 		KeepAlivePeriod:            10 * time.Second,
-		InitialStreamReceiveWindow: 2 << 20,  // 2 MB
-		MaxStreamReceiveWindow:     8 << 20,  // 8 MB
-		MaxConnectionReceiveWindow: 32 << 20, // 32 MB
+		InitialStreamReceiveWindow: initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:     maxStreamReceiveWindow,
+		MaxConnectionReceiveWindow: connectionReceiveWindow(cfg.MaxMessageReceiveMemory, cfg.MaxIncomingConnections),
 		// 0-RTT is replayable per RFC 9001 Section 8. Raft's internal
 		// idempotency (duplicate message detection, term checks, log
 		// index checks) causes replayed RPCs to be harmlessly discarded.
@@ -692,6 +699,9 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 					"error", err,
 				)
 			}
+			if t.metrics != nil {
+				t.metrics.IncMessagesDropped(msg.ShardID, msg.To, dropReasonUnresolvedTarget)
+			}
 			continue
 		}
 		if !t.enqueueToTarget(addr, msg, debugOn) {
@@ -775,6 +785,9 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn 
 						"msg_type", proto.MessageTypeName(msg.Type),
 					)
 				}
+				if t.metrics != nil {
+					t.metrics.IncMessagesDropped(msg.ShardID, msg.To, dropReasonQueueFull)
+				}
 				return true // queue full; Raft retransmits
 			}
 		} else {
@@ -792,6 +805,9 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn 
 						"msg_type", proto.MessageTypeName(msg.Type),
 						"queue_cap", defaultSendQueueLen,
 					)
+				}
+				if t.metrics != nil {
+					t.metrics.IncMessagesDropped(msg.ShardID, msg.To, dropReasonQueueFull)
 				}
 				return true
 			}
@@ -1026,6 +1042,18 @@ func (t *QUICTransport) sendToTarget(target string, batch []proto.Message) {
 	}
 }
 
+// incBatchDropped records one IncMessagesDropped sample per message in a
+// dropped batch, so the counter measures messages rather than batches. No-op
+// when metrics are disabled.
+func (t *QUICTransport) incBatchDropped(msgs []proto.Message, reason string) {
+	if t.metrics == nil {
+		return
+	}
+	for i := range msgs {
+		t.metrics.IncMessagesDropped(msgs[i].ShardID, msgs[i].To, reason)
+	}
+}
+
 // sendBatch marshals a message batch and writes it as a framed payload to
 // the appropriate stream for the target. Errors are logged and dropped.
 func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolint:gocognit // metrics instrumentation adds branches
@@ -1056,6 +1084,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 			"batch_size", len(msgs),
 			"error", err,
 		)
+		t.incBatchDropped(msgs, dropReasonMarshalFailed)
 		t.putBuf(bufPtr)
 		return
 	}
@@ -1152,6 +1181,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 			"max_replication_payload_bytes", MaxReplicationPayloadBytes,
 			"error", err,
 		)
+		t.incBatchDropped(msgs, dropReasonMarshalFailed)
 		t.putBuf(bufPtr)
 		return
 	}
@@ -1169,12 +1199,14 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 				"error", err,
 			)
 		}
+		t.incBatchDropped(msgs, dropReasonStreamUnavailable)
 		t.putBuf(bufPtr)
 		return
 	}
 
 	err = stream.SetWriteDeadline(time.Now().Add(sendWriteDeadline))
 	if err != nil {
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.putBuf(bufPtr)
 		t.removeAndCloseConnection(target, "write deadline failure")
 		t.evictStreamsForTarget(target)
@@ -1198,6 +1230,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 				"error", err,
 			)
 		}
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.removeAndCloseConnection(target, "stream write failure")
 		t.evictStreamsForTarget(target)
 		return
@@ -1617,10 +1650,15 @@ func (t *QUICTransport) localAddr() string {
 	return t.cfg.ListenAddress
 }
 
-// getBuf retrieves a buffer from the pool, ensuring it has at least minCap capacity.
+// getBuf retrieves a buffer from the pool, ensuring it has at least minCap
+// capacity. When the pooled buffer is too small it is returned to the pool
+// before the replacement is allocated (as getRecvBuf does); dropping it would
+// discard a live pooled buffer on every oversized send and steadily drain the
+// pool.
 func (t *QUICTransport) getBuf(minCap int) *[]byte {
 	bufPtr := t.bufPool.Get().(*[]byte)
 	if cap(*bufPtr) < minCap {
+		t.putBuf(bufPtr)
 		buf := make([]byte, minCap)
 		return &buf
 	}

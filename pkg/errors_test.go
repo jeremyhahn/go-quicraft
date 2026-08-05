@@ -73,6 +73,7 @@ var allSentinelErrors = []struct {
 	{"ErrShardNotStopped", ErrShardNotStopped},
 	{"ErrReplicaNotFound", ErrReplicaNotFound},
 	{"ErrStaleConfigChange", ErrStaleConfigChange},
+	{"ErrInvalidMember", ErrInvalidMember},
 }
 
 func TestSentinelErrors_NonEmptyMessages(t *testing.T) {
@@ -950,5 +951,19 @@ func TestLoopPanicError_ErrorMessageDifferentLoop(t *testing.T) {
 	}
 	if !strings.Contains(msg, "42") {
 		t.Errorf("expected panic value '42' in error, got: %s", msg)
+	}
+}
+
+func TestInvalidMemberError_Is_MatchesSentinel(t *testing.T) {
+	err := &InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"}
+	if !errors.Is(err, ErrInvalidMember) {
+		t.Error("InvalidMemberError should match ErrInvalidMember")
+	}
+}
+
+func TestInvalidMemberError_Is_DoesNotMatchOther(t *testing.T) {
+	err := &InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"}
+	if errors.Is(err, ErrReplicaNotFound) {
+		t.Error("InvalidMemberError should not match ErrReplicaNotFound")
 	}
 }

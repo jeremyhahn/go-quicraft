@@ -130,6 +130,16 @@ type hostOptions struct {
 	metrics          MetricsCollector
 	logger           *slog.Logger
 	disableTransport bool
+	fsys             snapshotFS
+}
+
+// withSnapshotFS routes the host's snapshot persistence I/O through fsys.
+// Unexported on purpose: fault injection is a testing facility and must not
+// appear in the public option set.
+func withSnapshotFS(fsys snapshotFS) HostOption {
+	return func(o *hostOptions) {
+		o.fsys = fsys
+	}
 }
 
 // HostOption configures optional Host dependencies.
@@ -284,6 +294,9 @@ type transportSender struct {
 	shardBarriers func(shardID uint64) Barrier
 	logger        *slog.Logger
 	snapshotWg    sync.WaitGroup // tracks in-flight snapshot sends
+	// fsys routes snapshot decrypt-for-send I/O; nil means the real
+	// filesystem. Test-only injection, mirroring Host.fsys.
+	fsys snapshotFS
 }
 
 // barrierFor returns the barrier that encrypts the given shard's snapshots.
@@ -313,6 +326,16 @@ func (h *Host) barrierForShard(shardID uint64) Barrier {
 		}
 	}
 	return h.barrier
+}
+
+// snapshotEncryptionSealed reports that the shard HAS an at-rest barrier and
+// that barrier is currently sealed, so no snapshot may be written for it.
+// It separates the two states a barrier can be absent in: a nil barrier is a
+// configured plaintext deployment, a sealed barrier is encryption that is
+// temporarily unavailable and must fail closed rather than downgrade.
+func (h *Host) snapshotEncryptionSealed(shardID uint64) bool {
+	b := h.barrierForShard(shardID)
+	return b != nil && b.IsSealed()
 }
 
 // Send delegates regular message delivery to the transport.
@@ -442,7 +465,7 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 		// This ensures cleanup even if a panic occurs later in this function.
 		tempPath := decryptedPath
 		resourceCleanup = append(resourceCleanup, func() {
-			if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+			if err := s.snapshotFsys().Remove(tempPath); err != nil && !os.IsNotExist(err) {
 				s.logger.Debug("decrypted snapshot temp file removal failed",
 					"path", tempPath,
 					"error", err)
@@ -478,7 +501,7 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 	}
 
 	producer := func(emit func(proto.SnapshotChunk) error) error {
-		return forEachSnapshotChunk(msg, emit)
+		return forEachSnapshotChunk(s.snapshotFsys(), msg, emit)
 	}
 
 	if err := s.transport.SendSnapshotStreaming(meta, producer); err != nil {
@@ -499,17 +522,43 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 // sequence of frames: [4-byte LE length][encrypted chunk]...
 // Returns the temp file path and the plaintext file size.
 func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barrier) (string, uint64, error) {
-	// Pin the recorded snapshot epoch live for the duration of the read so a
-	// concurrent epoch purge cannot remove its DEK mid-decrypt. This mirrors the
-	// belt-and-suspenders RegisterInFlightEpoch saveSnapshot takes around its own
-	// encrypt. Frames embed their own epoch (a snapshot can span a rotation); the
-	// recorded epoch is the minimum across them, so pinning it protects the
-	// oldest DEK any frame may reference.
-	pinnedEpoch := msg.Snapshot.Epoch
-	barrier.RegisterInFlightEpoch(pinnedEpoch)
-	defer barrier.DeregisterInFlightEpoch(pinnedEpoch)
+	return decryptSnapshotToTemp(s.snapshotFsys(), msg.Snapshot.Filepath,
+		sendDecryptTempPattern, msg.Snapshot.Epoch, barrier)
+}
 
-	srcFile, err := os.Open(msg.Snapshot.Filepath)
+// sendDecryptTempPattern names the scratch file the send path decrypts into.
+const sendDecryptTempPattern = ".send-decrypt-*.tmp"
+
+// recoverDecryptTempPattern names the scratch file the restart-recovery path
+// decrypts into. It matches the engine's snapshotPool.decryptSnapshotToSibling
+// pattern so engine.sweepStaleDecryptTmp reclaims a file orphaned by a crash
+// mid-recovery.
+const recoverDecryptTempPattern = ".decrypt-*.tmp"
+
+// decryptSnapshotToTemp decrypts the framed snapshot ciphertext at srcPath into
+// a NEW sibling temp file created from pattern, returning that file's path and
+// the plaintext byte count. srcPath is never modified: the canonical encrypted
+// snapshot.dat stays the only durable artifact, which is what keeps a failed
+// decrypt retryable. Decrypting in place would leave plaintext on disk while
+// LogDB still records Epoch>0, so every later read would re-attempt decryption
+// on plaintext and fail permanently.
+//
+// The caller owns the returned file and must remove it. On any error the temp
+// file is closed and removed before returning.
+//
+// Each frame is decrypted with the epoch embedded in its own ciphertext header;
+// epoch is only pinned live for the duration of the read so a concurrent purge
+// cannot remove the oldest DEK a frame may reference mid-decrypt. This mirrors
+// the belt-and-suspenders RegisterInFlightEpoch saveSnapshot takes around its
+// own encrypt: the recorded epoch is the minimum across the frames.
+//
+// Shared by the transport send path (decryptSnapshotForSend) and StartShard's
+// local-snapshot recovery so both consume identical plaintext.
+func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string, epoch uint64, barrier Barrier) (string, uint64, error) {
+	barrier.RegisterInFlightEpoch(epoch)
+	defer barrier.DeregisterInFlightEpoch(epoch)
+
+	srcFile, err := fsys.Open(srcPath)
 	if err != nil {
 		return "", 0, err
 	}
@@ -521,15 +570,13 @@ func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barr
 		if !srcClosed {
 			if closeErr := srcFile.Close(); closeErr != nil {
 				slog.Debug("snapshot source file close failed",
-					"shard", msg.ShardID,
-					"path", msg.Snapshot.Filepath,
+					"path", srcPath,
 					"error", closeErr)
 			}
 		}
 	}()
 
-	dir := filepath.Dir(msg.Snapshot.Filepath)
-	tmpFile, err := os.CreateTemp(dir, ".send-decrypt-*.tmp")
+	tmpFile, err := fsys.CreateTemp(filepath.Dir(srcPath), pattern)
 	if err != nil {
 		return "", 0, err
 	}
@@ -544,15 +591,13 @@ func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barr
 			// since we may have closed it explicitly before an error.
 			if closeErr := tmpFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
 				slog.Debug("snapshot temp file close failed",
-					"shard", msg.ShardID,
 					"path", tmpPath,
 					"error", closeErr)
 			}
 			// Remove the temp file, ignoring "not exist" errors since
 			// file creation may have been rolled back by the OS.
-			if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			if rmErr := fsys.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Debug("snapshot temp file removal failed",
-					"shard", msg.ShardID,
 					"path", tmpPath,
 					"error", rmErr)
 			}
@@ -640,19 +685,28 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 // to a temp sibling, fsync, atomic rename). It returns the recorded min epoch.
 // The received wire bytes are plaintext (the sender decrypts before streaming —
 // see doSendSnapshot), so this is what makes the follower's at-rest snapshot
-// encrypted under its OWN per-node key. A nil/sealed barrier is a no-op (the
-// snapshot stays plaintext) and returns epoch 0.
-func reencryptReceivedSnapshot(path string, barrier Barrier) (uint64, error) {
-	if barrier == nil || barrier.IsSealed() {
+// encrypted under its OWN per-node key.
+//
+// A NIL barrier means encryption is disabled for the shard: the snapshot stays
+// plaintext and epoch 0 is returned. A CONFIGURED but SEALED barrier is the
+// distinct "encryption unavailable" state and fails with
+// ErrSnapshotBarrierSealed — writing the received bytes as plaintext would
+// durably downgrade a shard whose data must be encrypted at rest, at exactly
+// the moment an operator sealed the host.
+func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (uint64, error) {
+	if barrier == nil {
 		return 0, nil
 	}
-	src, err := os.Open(path)
+	if barrier.IsSealed() {
+		return 0, ErrSnapshotBarrierSealed
+	}
+	src, err := fsys.Open(path)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = src.Close() }()
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".recv-encrypt-*.tmp")
+	tmp, err := fsys.CreateTemp(filepath.Dir(path), ".recv-encrypt-*.tmp")
 	if err != nil {
 		return 0, err
 	}
@@ -661,7 +715,7 @@ func reencryptReceivedSnapshot(path string, barrier Barrier) (uint64, error) {
 	defer func() {
 		if !committed {
 			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
+			_ = fsys.Remove(tmpPath)
 		}
 	}()
 
@@ -678,7 +732,7 @@ func reencryptReceivedSnapshot(path string, barrier Barrier) (uint64, error) {
 	if err := src.Close(); err != nil {
 		return 0, err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := fsys.Rename(tmpPath, path); err != nil {
 		return 0, err
 	}
 	committed = true
@@ -763,35 +817,45 @@ func (s *transportSender) notifySnapshotStatus(shardID, localReplicaID, targetRe
 // caller. This streaming design allows the transport layer to send
 // each chunk over the wire as it is produced, avoiding the O(fileSize)
 // memory overhead of materializing all chunks in a slice.
-func forEachSnapshotChunk(msg proto.Message, emit func(proto.SnapshotChunk) error) error {
+// emptySnapshotChunk builds the single metadata-only chunk that represents a
+// snapshot with no data: a witness snapshot (no Filepath) or a data file that
+// is genuinely zero bytes.
+func emptySnapshotChunk(msg proto.Message, snap *proto.Snapshot) proto.SnapshotChunk {
+	return proto.SnapshotChunk{
+		ShardID:        msg.ShardID,
+		ReplicaID:      msg.To,
+		From:           msg.From,
+		Index:          snap.Index,
+		Term:           snap.Term,
+		ChunkID:        0,
+		ChunkCount:     1,
+		ChunkSize:      0,
+		FileSize:       0,
+		Filepath:       snap.Filepath,
+		FileChunkID:    0,
+		FileChunkCount: 1,
+		Membership:     snap.Membership,
+		OnDiskIndex:    snap.OnDiskIndex,
+		BinVer:         proto.WireVersion,
+		Epoch:          snap.Epoch,
+	}
+}
+
+func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.SnapshotChunk) error) error {
 	snap := &msg.Snapshot
 	filePath := snap.Filepath
 	fileSize := snap.FileSize
 
-	if filePath == "" || fileSize == 0 {
-		// Witness or empty snapshot: emit a single metadata-only chunk.
-		return emit(proto.SnapshotChunk{
-			ShardID:        msg.ShardID,
-			ReplicaID:      msg.To,
-			From:           msg.From,
-			Index:          snap.Index,
-			Term:           snap.Term,
-			ChunkID:        0,
-			ChunkCount:     1,
-			ChunkSize:      0,
-			FileSize:       0,
-			Filepath:       filePath,
-			FileChunkID:    0,
-			FileChunkCount: 1,
-			Membership:     snap.Membership,
-			OnDiskIndex:    snap.OnDiskIndex,
-			BinVer:         proto.WireVersion,
-			Epoch:          snap.Epoch,
-		})
+	// A snapshot with NO data file — a witness, or a state machine that saved
+	// nothing — is the only legitimate metadata-only transfer. A DECLARED size
+	// of zero is not: the file exists, and treating a metadata/artifact
+	// disagreement as "empty" ships a snapshot with no data, which the
+	// receiving follower recovers from and then marks every index at or below
+	// the snapshot index applied. That is silent, permanent state loss on the
+	// follower, so a non-empty Filepath is always opened and verified below.
+	if filePath == "" {
+		return emit(emptySnapshotChunk(msg, snap))
 	}
-
-	// Calculate chunk count.
-	chunkCount := (fileSize-1)/snapshotChunkSize + 1
 
 	// Open the snapshot data file for streaming reads. Only one chunk's
 	// worth of data is held in memory at a time, avoiding OOM on large
@@ -801,7 +865,7 @@ func forEachSnapshotChunk(msg proto.Message, emit func(proto.SnapshotChunk) erro
 	// open to ensure the file handle is always closed, even on panic.
 	// The fileClosed flag allows explicit early close while preventing
 	// double-close errors in the deferred cleanup.
-	f, err := os.Open(filePath)
+	f, err := fsys.Open(filePath)
 	if err != nil {
 		return &SnapshotSendError{
 			ShardID:   msg.ShardID,
@@ -841,6 +905,14 @@ func forEachSnapshotChunk(msg proto.Message, emit func(proto.SnapshotChunk) erro
 			Err:       ErrSnapshotSizeMismatch,
 		}
 	}
+
+	// A genuinely empty data file: metadata agrees with disk, so there is
+	// nothing to stream. Computing chunkCount here would underflow.
+	if fileSize == 0 {
+		return emit(emptySnapshotChunk(msg, snap))
+	}
+
+	chunkCount := (fileSize-1)/snapshotChunkSize + 1
 
 	for i := uint64(0); i < chunkCount; i++ {
 		remaining := fileSize - i*snapshotChunkSize
@@ -1747,6 +1819,35 @@ type Host struct {
 	sweepDone      chan struct{} // closed when the sweeper goroutine exits
 	drainC         chan struct{} // closed when pendingOps reaches 0 during drain
 	drainCMu       sync.Mutex    // protects drainC creation
+	// fsys routes snapshot persistence I/O. nil means the real filesystem;
+	// only tests set it (withSnapshotFS), so the injection never reaches the
+	// public API.
+	fsys snapshotFS
+
+	// joiningShards holds the shards started with join=true whose bootstrap
+	// snapshot has not arrived yet (map[uint64]struct{}). Such a shard has no
+	// membership and no registered peer addresses, so the leader's first
+	// snapshot — the only carrier of the full membership — cannot be
+	// authorized against the registry. The entry is removed as soon as a
+	// snapshot is accepted for the shard, closing the window.
+	joiningShards sync.Map
+}
+
+// markShardJoining records that a shard is in its join bootstrap window.
+func (h *Host) markShardJoining(shardID uint64) {
+	h.joiningShards.Store(shardID, struct{}{})
+}
+
+// clearShardJoining ends a shard's join bootstrap window. It is idempotent.
+func (h *Host) clearShardJoining(shardID uint64) {
+	h.joiningShards.Delete(shardID)
+}
+
+// isShardJoining reports whether a shard is still in its join bootstrap
+// window: started with join=true and not yet given a snapshot.
+func (h *Host) isShardJoining(shardID uint64) bool {
+	_, ok := h.joiningShards.Load(shardID)
+	return ok
 }
 
 // NewHost creates a new Host with the given configuration and options.
@@ -1789,11 +1890,15 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		logger = config.NewLogger(cfg.LogConfig)
 	}
 
-	// Ensure directories exist.
-	if err := os.MkdirAll(cfg.NodeHostDir, 0o750); err != nil {
+	// Ensure the host directories exist AND are durable. A directory entry
+	// created by MkdirAll survives a crash only once every directory in the
+	// created chain is fsynced; without this a crash can lose the directory a
+	// durably-written WAL lives in, which is the identical defect the WAL
+	// layer closes one level down for its own subdirectories.
+	if err := mkdirAllSynced(cfg.NodeHostDir); err != nil {
 		return nil, &HostInitError{Field: "NodeHostDir", Err: err}
 	}
-	if err := os.MkdirAll(cfg.WALDir, 0o750); err != nil {
+	if err := mkdirAllSynced(cfg.WALDir); err != nil {
 		return nil, &HostInitError{Field: "WALDir", Err: err}
 	}
 
@@ -1868,6 +1973,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			barrier:       options.barrier,
 			shardBarriers: options.shardBarriers,
 			logger:        logger,
+			fsys:          options.fsys,
 		}
 	} else {
 		sender = &noopSender{}
@@ -1953,6 +2059,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		keyRotDone:    make(chan struct{}),
 		sweepStopC:    make(chan struct{}),
 		sweepDone:     make(chan struct{}),
+		fsys:          options.fsys,
 	}
 
 	// Wire the host into the message handler so HandleSnapshot can
@@ -2195,9 +2302,13 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	// A joining node starts with incomplete membership. Mark it so
 	// per-shard message auth is bypassed until a snapshot delivers
-	// the full cluster membership.
+	// the full cluster membership. The Host keeps its own marker: the
+	// snapshot receive path needs it to authorize the bootstrap snapshot
+	// against the sender's certificate instead of an address registry that
+	// is necessarily empty here.
 	if join {
 		peer.MarkJoining()
+		h.markShardJoining(cfg.ShardID)
 	}
 
 	// Create the managed state machine (RSM) from the factory.
@@ -2308,7 +2419,50 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		ss, ssErr := h.logdb.GetSnapshot(cfg.ShardID, cfg.ReplicaID)
 		if ssErr == nil && ss.Index > 0 && ss.Filepath != "" {
 			dataPath := filepath.Join(ss.Filepath, "snapshot.dat")
-			f, openErr := os.Open(dataPath)
+
+			// snapshot.dat is stored ENCRYPTED whenever the record carries a
+			// non-zero epoch, so it must be decrypted before the state machine
+			// sees it — feeding it the raw frames either fails recovery or
+			// installs corrupt state. Decryption goes to a throwaway sibling
+			// file, removed on every path below, leaving the canonical
+			// encrypted artifact untouched; this mirrors the runtime path
+			// (snapshotPool.recoverSnapshot) exactly.
+			//
+			// The barrier is resolved PER SHARD: with WithShardBarriers the
+			// snapshot was encrypted under the shard's own key, and the
+			// host-wide barrier would be the wrong key.
+			//
+			// An encrypted snapshot with no usable barrier fails closed. A node
+			// that cannot decrypt its own snapshot must say so at startup
+			// rather than recover a state machine from ciphertext.
+			recoverPath := dataPath
+			if ss.Epoch > 0 {
+				barrier := h.barrierForShard(cfg.ShardID)
+				if barrier == nil || barrier.IsSealed() {
+					return &HostInitError{
+						Field: "snapshot_decrypt",
+						Err:   ErrSnapshotEncryptedBarrierUnavailable,
+					}
+				}
+				plainPath, _, decErr := decryptSnapshotToTemp(
+					h.snapshotFsys(), dataPath, recoverDecryptTempPattern, ss.Epoch, barrier,
+				)
+				if decErr != nil {
+					return &HostInitError{Field: "snapshot_decrypt", Err: decErr}
+				}
+				defer func() {
+					if rmErr := h.snapshotFsys().Remove(plainPath); rmErr != nil && !os.IsNotExist(rmErr) {
+						h.logger.Debug("failed to remove decrypted snapshot scratch file",
+							"shard_id", cfg.ShardID,
+							"replica_id", cfg.ReplicaID,
+							"path", plainPath,
+							"error", rmErr)
+					}
+				}()
+				recoverPath = plainPath
+			}
+
+			f, openErr := h.snapshotFsys().Open(recoverPath)
 			if openErr != nil {
 				// A snapshot record exists in LogDB but its data file is
 				// missing or unreadable. We must NOT silently continue: the
@@ -2319,9 +2473,27 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				// in-memory path and the on-disk bootstrap path. Fail StartShard.
 				return &HostInitError{Field: "snapshot_open", Err: openErr}
 			}
+			// The reader chain must mirror the chain the ARTIFACT was written
+			// through, which the snapshot record carries. Deriving it from
+			// cfg instead reads the artifact wrong whenever the setting has
+			// changed since the save, or whenever the snapshot was streamed
+			// by a leader configured differently. Decompression sits INSIDE
+			// decryption: the save path compresses first and encrypts the
+			// resulting file, so recovery decrypts first (above) and
+			// decompresses here.
+			recoverReader, readerErr := engine.DecompressingSnapshotReader(f, ss.Compression)
+			if readerErr != nil {
+				if closeErr := f.Close(); closeErr != nil {
+					h.logger.Debug("snapshot file close failed after reader build error",
+						"shard_id", cfg.ShardID,
+						"replica_id", cfg.ReplicaID,
+						"error", closeErr)
+				}
+				return &HostInitError{Field: "snapshot_compression", Err: readerErr}
+			}
 			stopper := make(chan struct{})
 			recoverErr := stateMachine.RecoverFromSnapshot(
-				context.Background(), f, stopper,
+				context.Background(), recoverReader, stopper,
 			)
 			if closeErr := f.Close(); closeErr != nil {
 				return &HostInitError{Field: "snapshot_close", Err: closeErr}
@@ -2353,7 +2525,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// SetProcessedIndex(recoveredIndex) there is a consistent no-op-equivalent
 	// that keeps the marker explicit. A fresh start leaves processed at 0.
 	if recoveredIndex > 0 {
-		peer.SetProcessedIndex(recoveredIndex)
+		// Adopt the value raft actually applied. It clamps to the recovered
+		// commit index, and the engine markers below MUST agree with it —
+		// seeding lastApplied above raft's processed makes the first Commit
+		// trip commitUpdate's assertion and take the commit worker down.
+		recoveredIndex = peer.SetProcessedIndex(recoveredIndex)
 	}
 
 	ns := &nodeState{
@@ -2544,6 +2720,9 @@ func (h *Host) StopShard(shardID uint64) error {
 		h.registry.Remove(shardID, replicaID)
 	}
 	ns.nodesMu.RUnlock()
+	// The join bootstrap window belongs to the loaded shard; a stopped shard
+	// must not leave a relaxed snapshot authorization behind.
+	h.clearShardJoining(shardID)
 
 	// Unregister pre-bound metrics for this shard.
 	if h.metrics != nil {
@@ -3847,13 +4026,34 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	return rs, nil
 }
 
-// ErrSnapshotEncryptedBarrierUnavailable indicates that ExportSnapshot was
-// asked to export a snapshot that is encrypted at rest (Epoch > 0) but the
-// barrier required to decrypt it is unavailable (either no barrier is
-// configured or the barrier is sealed). Because exported snapshots must be
-// plaintext, emitting the raw ciphertext would corrupt the export -> import
-// round-trip, so this error is returned instead.
-var ErrSnapshotEncryptedBarrierUnavailable = errors.New("quicraft: snapshot is encrypted but barrier is unavailable for decryption")
+// ErrSnapshotEncryptedBarrierUnavailable indicates that a snapshot encrypted
+// at rest (Epoch > 0) cannot be read because the barrier required to decrypt
+// it is unavailable (either no barrier is configured for the shard or the
+// barrier is sealed).
+//
+// ExportSnapshot returns it because exported snapshots must be plaintext, so
+// emitting the raw ciphertext would corrupt the export -> import round-trip.
+// StartShard returns it (wrapped in HostInitError{Field: "snapshot_decrypt"})
+// because recovering a state machine from ciphertext would either fail inside
+// the state machine or install corrupt state; a node that cannot decrypt its
+// own snapshot must fail closed at startup. The runtime recovery path
+// (snapshotPool.recoverSnapshot) returns the same sentinel on the same
+// predicate, which is why it is declared in the engine and re-exported here:
+// both consumers of the artifact must be distinguishable by one errors.Is.
+var ErrSnapshotEncryptedBarrierUnavailable = engine.ErrSnapshotEncryptedBarrierUnavailable
+
+// ErrSnapshotBarrierSealed indicates that a snapshot could not be WRITTEN
+// because the shard's barrier is configured but sealed. It is the write-side
+// counterpart of ErrSnapshotEncryptedBarrierUnavailable: the local save path
+// (snapshotPool.saveSnapshot) and the receive path (HandleSnapshot, via
+// reencryptReceivedSnapshot) both refuse rather than produce a plaintext
+// artifact for a shard that is configured to be encrypted at rest. A shard
+// with NO barrier is unaffected — plaintext is its configured outcome.
+//
+// It is declared in the engine and re-exported here for the same reason
+// ErrSnapshotEncryptedBarrierUnavailable is: both packages must fail with one
+// error identity.
+var ErrSnapshotBarrierSealed = engine.ErrSnapshotBarrierSealed
 
 // snapshotArtifactMagic identifies a QuicRaft exported-snapshot artifact.
 // It is written as the first 8 bytes of every export so that ImportSnapshot
@@ -3863,13 +4063,18 @@ var snapshotArtifactMagic = [8]byte{'Q', 'R', 'S', 'N', 'A', 'P', '0', '1'}
 // snapshotArtifactVersion is the current artifact header version. It is
 // bumped when the header layout changes so older/newer readers can detect
 // incompatibility instead of misparsing.
-const snapshotArtifactVersion uint32 = 1
+// Version 2 added the Compression field: a v1 artifact carries no statement
+// of how its data was encoded, so a destination host whose own config differs
+// from the exporter's would decode it wrong. Such an artifact is rejected
+// rather than assumed uncompressed.
+const snapshotArtifactVersion uint32 = 2
 
 // snapshotArtifactFixedHeaderSize is the size of the fixed portion of the
 // artifact header that precedes the variable-length membership block:
 //
-//	magic[8] | version:u32 | index:u64 | term:u64 | onDiskIndex:u64 | membLen:u32
-const snapshotArtifactFixedHeaderSize = 8 + 4 + 8 + 8 + 8 + 4
+//	magic[8] | version:u32 | index:u64 | term:u64 | onDiskIndex:u64 |
+//	compression:u16 | membLen:u32
+const snapshotArtifactFixedHeaderSize = 8 + 4 + 8 + 8 + 8 + 2 + 4
 
 // maxSnapshotArtifactMembLen bounds the membership block declared by an
 // imported artifact header before it is allocated, so a crafted/corrupt
@@ -3891,10 +4096,15 @@ const maxSnapshotArtifactMembLen = 16 * 1024 * 1024
 // The Epoch is deliberately not carried: exported artifacts are always
 // PLAINTEXT (ExportSnapshot decrypts), and imports persist Epoch=0 so the
 // recovery path does not attempt to decrypt with a foreign barrier key.
+// Compression IS carried: exports are decrypted but never decompressed, so
+// the destination host must be told how the payload is encoded. Without it an
+// import between hosts whose SnapshotCompressionType differs recovers the
+// state machine from bytes in the wrong encoding.
 type snapshotArtifactHeader struct {
 	Index       uint64
 	Term        uint64
 	OnDiskIndex uint64
+	Compression config.CompressionType
 	Membership  proto.Membership
 }
 
@@ -3909,9 +4119,10 @@ func marshalSnapshotArtifactHeader(h snapshotArtifactHeader) ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[12:20], h.Index)
 	binary.LittleEndian.PutUint64(buf[20:28], h.Term)
 	binary.LittleEndian.PutUint64(buf[28:36], h.OnDiskIndex)
-	binary.LittleEndian.PutUint32(buf[36:40], uint32(membSize))
+	binary.LittleEndian.PutUint16(buf[36:38], uint16(h.Compression))
+	binary.LittleEndian.PutUint32(buf[38:42], uint32(membSize))
 	if membSize > 0 {
-		if _, err := h.Membership.MarshalTo(buf[40:]); err != nil {
+		if _, err := h.Membership.MarshalTo(buf[snapshotArtifactFixedHeaderSize:]); err != nil {
 			return nil, err
 		}
 	}
@@ -3940,8 +4151,17 @@ func readSnapshotArtifactHeader(r io.Reader) (snapshotArtifactHeader, error) {
 		Index:       binary.LittleEndian.Uint64(fixed[12:20]),
 		Term:        binary.LittleEndian.Uint64(fixed[20:28]),
 		OnDiskIndex: binary.LittleEndian.Uint64(fixed[28:36]),
+		Compression: config.CompressionType(binary.LittleEndian.Uint16(fixed[36:38])),
 	}
-	membLen := binary.LittleEndian.Uint32(fixed[36:40])
+	// An algorithm this binary cannot decompress makes the payload
+	// unreadable; reject the artifact rather than import bytes that will be
+	// handed to a state machine in an unknown encoding.
+	if !hdr.Compression.IsValid() {
+		return snapshotArtifactHeader{}, &SnapshotArtifactError{
+			Reason: fmt.Sprintf("unsupported compression %d", uint16(hdr.Compression)),
+		}
+	}
+	membLen := binary.LittleEndian.Uint32(fixed[38:42])
 	if membLen > maxSnapshotArtifactMembLen {
 		return snapshotArtifactHeader{}, &SnapshotArtifactError{
 			Reason: fmt.Sprintf("membership length %d exceeds maximum %d", membLen, maxSnapshotArtifactMembLen),
@@ -4051,7 +4271,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	}
 
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	f, err := os.Open(dataPath)
+	f, err := h.snapshotFsys().Open(dataPath)
 	if err != nil {
 		return ErrSnapshotNotFound
 	}
@@ -4086,6 +4306,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		Index:       logdbSnap.Index,
 		Term:        logdbSnap.Term,
 		OnDiskIndex: logdbSnap.OnDiskIndex,
+		Compression: logdbSnap.Compression,
 		Membership:  logdbMembershipToProto(logdbSnap.Membership),
 	})
 	if err != nil {
@@ -4275,13 +4496,18 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		fmt.Sprintf("replica-%d", replicaID),
 		fmt.Sprintf("snapshot-%020d", dirSeq))
 
-	if mkdirErr := os.MkdirAll(snapDir, 0o750); mkdirErr != nil {
+	fsys := h.snapshotFsys()
+	// Record the deepest pre-existing ancestor BEFORE MkdirAll: the directory
+	// fsync below must cover every directory this call creates (same
+	// bookkeeping as ReencryptSnapshotFile).
+	syncRoot := deepestExistingAncestor(fsys, snapDir)
+	if mkdirErr := fsys.MkdirAll(snapDir, 0o750); mkdirErr != nil {
 		return mkdirErr
 	}
 
 	// Write snapshot data file from the remaining (post-header) bytes.
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	f, createErr := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, createErr := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if createErr != nil {
 		return createErr
 	}
@@ -4308,7 +4534,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		}
 		// Do not leave a partial (possibly multi-gigabyte) artifact behind
 		// for an import that will never be recorded in LogDB.
-		if rmErr := os.RemoveAll(snapDir); rmErr != nil {
+		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
 			slog.Debug("snapshot import directory cleanup failed",
 				"shard", shardID,
 				"dir", snapDir,
@@ -4332,6 +4558,16 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 			"error", closeErr)
 	}
 
+	// Make the directory entries durable BEFORE recording the snapshot in
+	// LogDB. The data file is fsynced, but the entries MkdirAll and the file
+	// create added are not durable until each directory in the chain is
+	// fsynced; without this a crash right after the import leaves LogDB
+	// pointing at a directory that no longer exists, and StartShard then
+	// fails with snapshot_open. Same invariant HandleSnapshot enforces.
+	if syncErr := syncDirChain(fsys, snapDir, syncRoot); syncErr != nil {
+		return syncErr
+	}
+
 	// Check context before committing to LogDB.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
@@ -4339,7 +4575,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 
 	// Determine the data file size for recovery's InstallSnapshot path.
 	var fileSize uint64
-	if fi, statErr := os.Stat(dataPath); statErr == nil {
+	if fi, statErr := fsys.Stat(dataPath); statErr == nil {
 		fileSize = uint64(fi.Size())
 	}
 
@@ -4364,6 +4600,9 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		Filepath:    snapDir,
 		FileSize:    fileSize,
 		OnDiskIndex: header.OnDiskIndex,
+		// The artifact's own compression, NOT this host's config: the bytes
+		// were written by the exporting host and are stored verbatim.
+		Compression: header.Compression,
 	}
 	return h.logdb.SaveSnapshot(shardID, replicaID, logdbSnap)
 }
@@ -6129,7 +6368,7 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 		var snapFileSize uint64
 		if ss.Filepath != "" {
 			dataPath := filepath.Join(ss.Filepath, "snapshot.dat")
-			if fi, statErr := os.Stat(dataPath); statErr == nil {
+			if fi, statErr := h.snapshotFsys().Stat(dataPath); statErr == nil {
 				snapFilePath = dataPath
 				snapFileSize = uint64(fi.Size())
 			}

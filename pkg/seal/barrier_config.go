@@ -54,6 +54,13 @@ type BarrierConfig struct {
 	// to approach the invocation limit. Disable it (and rely on the
 	// random-nonce + invocation-cap argument) for extreme-throughput, long-epoch
 	// deployments where per-epoch memory must stay flat.
+	//
+	// The default tracker ENFORCES this rather than only documenting it: past
+	// DefaultMaxTrackedNonces it logs at error level and disables reuse
+	// detection for the epoch instead of growing until the process is killed.
+	// NewBarrier additionally warns when this is on with neither a
+	// StatePersister nor an InvocationCounter — the combination that provably
+	// cannot rotate, and therefore can never release the tracked set.
 	NonceTracking bool
 
 	// InvocationLimit is the max encrypt operations per key epoch.

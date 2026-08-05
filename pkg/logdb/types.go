@@ -14,6 +14,8 @@
 
 package logdb
 
+import "github.com/jeremyhahn/go-quicraft/pkg/config"
+
 // LogDB-layer types define the storage-specific structures used by the
 // persistence layer. These are separate from proto types to maintain a
 // clean boundary between the serialization format and storage format.
@@ -95,6 +97,14 @@ type Snapshot struct {
 	// Epoch is the barrier encryption epoch used when this snapshot was
 	// saved. Zero indicates no encryption (plaintext snapshot).
 	Epoch uint64
+	// Compression is the algorithm the snapshot data file was written
+	// through. It describes the ARTIFACT, not the writer's configuration:
+	// every recovery path must build its reader chain from this field, not
+	// from the local Config.SnapshotCompressionType, which is per-shard,
+	// mutable across restarts, and independent on every host. The zero
+	// value is config.NoCompression, which matches both the package default
+	// and every record written before this field existed.
+	Compression config.CompressionType
 }
 
 // Bootstrap contains the initial cluster configuration used to

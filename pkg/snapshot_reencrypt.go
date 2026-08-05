@@ -6,10 +6,7 @@ package quicraft
 import (
 	"encoding/binary"
 	"io"
-	"os"
 	"path/filepath"
-
-	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // snapshotFrameEpochs scans the framed snapshot ciphertext at src and returns
@@ -83,7 +80,14 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // reencryptReceivedSnapshot: that path encrypts just-received plaintext, this
 // path re-keys an already-sealed snapshot from one barrier to another.
 func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
-	src, err := os.Open(srcPath)
+	return reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, srcBarrier, dstBarrier)
+}
+
+// reencryptSnapshotFile is ReencryptSnapshotFile over an injectable
+// filesystem. The exported entry point pins the os-backed one; tests supply a
+// fault-injecting implementation to exercise the crash-safety sequence.
+func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
+	src, err := fsys.Open(srcPath)
 	if err != nil {
 		return 0, err
 	}
@@ -94,21 +98,11 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 	// MkdirAll creates, or a crash could lose the new directories' entries
 	// even though the renamed file's data was fsynced.
 	dstDir := filepath.Dir(dstPath)
-	syncRoot := dstDir
-	for {
-		if _, statErr := os.Stat(syncRoot); statErr == nil {
-			break
-		}
-		parent := filepath.Dir(syncRoot)
-		if parent == syncRoot {
-			break
-		}
-		syncRoot = parent
-	}
-	if err := os.MkdirAll(dstDir, 0o750); err != nil {
+	syncRoot := deepestExistingAncestor(fsys, dstDir)
+	if err := fsys.MkdirAll(dstDir, 0o750); err != nil {
 		return 0, err
 	}
-	tmp, err := os.CreateTemp(dstDir, ".reencrypt-snapshot-*.tmp")
+	tmp, err := fsys.CreateTemp(dstDir, ".reencrypt-snapshot-*.tmp")
 	if err != nil {
 		return 0, err
 	}
@@ -117,7 +111,7 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 	defer func() {
 		if !committed {
 			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
+			_ = fsys.Remove(tmpPath)
 		}
 	}()
 
@@ -177,14 +171,14 @@ func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barri
 	if err := tmp.Close(); err != nil {
 		return 0, err
 	}
-	if err := os.Rename(tmpPath, dstPath); err != nil {
+	if err := fsys.Rename(tmpPath, dstPath); err != nil {
 		return 0, err
 	}
 	// Make the rename (and any directories MkdirAll created) durable before
 	// reporting success: without the directory fsync a crash could leave the
 	// caller's durably-recorded migration pointing at a directory entry that
 	// no longer exists (same hazard HandleSnapshot closes with SyncDirChain).
-	if err := engine.SyncDirChain(dstDir, syncRoot); err != nil {
+	if err := syncDirChain(fsys, dstDir, syncRoot); err != nil {
 		return 0, err
 	}
 	committed = true

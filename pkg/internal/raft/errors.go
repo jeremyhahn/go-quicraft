@@ -127,6 +127,20 @@ var (
 	// contains internal index gaps. Accepting such a batch would corrupt
 	// the in-memory log long before persistence-time gap detection fires.
 	ErrGappedEntryBatch = errors.New("raft: non-contiguous entry batch in append")
+
+	// ErrZeroTermMessage is returned when a protocol message that is only
+	// ever produced by raft.send() arrives with Term == 0. Term 0 is the
+	// local-injection escape hatch (the engine and the message handler
+	// build Propose/ReadIndex/InstallSnapshot/SnapshotStatus/Unreachable/
+	// LeaderTransfer without a term); on a wire message it would bypass
+	// every term comparison in step().
+	ErrZeroTermMessage = errors.New("raft: protocol message carries no term")
+
+	// ErrJoiningNodeCannotCampaign is returned when a TimeoutNow reaches a
+	// node that is still joining. Its membership is incomplete until a
+	// snapshot delivers the bootstrap confState, so an election it wins
+	// would be decided by a quorum of one.
+	ErrJoiningNodeCannotCampaign = errors.New("raft: joining node cannot campaign with incomplete membership")
 )
 
 // DecompressError wraps an underlying Snappy decode failure with context

@@ -68,6 +68,14 @@ var (
 	// oversized length can only be corruption.
 	ErrCmdTooLarge = errors.New("waldb: entry Cmd exceeds maximum entry size")
 
+	// ErrMembershipTooLarge is returned when a snapshot's membership maps or a
+	// bootstrap's address map declare more than maxMembershipMapEntries
+	// entries. Replay rejects such a record as corruption and fails the whole
+	// recovery, so the write path must refuse it: a record that is durable but
+	// unreadable makes the node permanently unopenable. Same symmetry rule as
+	// ErrCmdTooLarge.
+	ErrMembershipTooLarge = errors.New("waldb: membership exceeds maximum entry count")
+
 	// ErrTruncatedEntryRecord is returned when WAL replay finds an entry
 	// batch record that ends mid-entry. The batch was written as a single
 	// CRC-protected record, so a mid-record decode failure is corruption

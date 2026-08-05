@@ -65,6 +65,7 @@ New to QuicRaft? Start here:
 | Document | Description |
 |----------|-------------|
 | [Performance Architecture](performance/architecture.md) | Zero-alloc paths, compression, rate limiting, memory budgets |
+| [Benchmark Regression Testing](performance/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
 | [Testing Overview](testing/overview.md) | Unit, integration, E2E tests, coverage targets, Makefile targets |
 | [Test Infrastructure](testing/infrastructure.md) | Fuzzing, linearizability verification, I/O error injection |
 

@@ -326,3 +326,88 @@ func TestCopyMembershipPreservesNilMaps(t *testing.T) {
 		t.Fatalf("nil maps were replaced by empty maps: %+v", got)
 	}
 }
+
+// TestIterateEntriesReportsHeadGap is the M1 regression test. A requested low
+// below the first stored entry with NO compaction floor is a head GAP, not a
+// compaction: the LogDB contract (and waldb) require ErrLogGapDetected there.
+// Reporting ErrCompacted told raft the range was legitimately truncated and
+// hid a missing prefix.
+func TestIterateEntriesReportsHeadGap(t *testing.T) {
+	db := New()
+	defer db.Close()
+
+	// Entries start at 5 with no RemoveEntriesTo call, so compactedTo is 0.
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		Entries: []logdb.Entry{
+			{Index: 5, Term: 1}, {Index: 6, Term: 1}, {Index: 7, Term: 1},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrLogGapDetected) {
+		t.Fatalf("IterateEntries(low=3) = %v, want ErrLogGapDetected", err)
+	}
+
+	// Once a floor exists it wins: below the floor the range really is compacted.
+	if err := db.RemoveEntriesTo(1, 1, 4); err != nil {
+		t.Fatalf("RemoveEntriesTo: %v", err)
+	}
+	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrCompacted) {
+		t.Fatalf("IterateEntries(low=3) below the floor = %v, want ErrCompacted", err)
+	}
+}
+
+// TestSaveSnapshotUpdatesMembership is the M2 regression test. SaveSnapshot
+// stored the snapshot but left nd.membership untouched and kept the caller's
+// maps, so ReadState reported an EMPTY membership where waldb reports the
+// snapshot's real one, and a later caller mutation rewrote the stored copy.
+func TestSaveSnapshotUpdatesMembership(t *testing.T) {
+	db := New()
+	defer db.Close()
+
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		State: logdb.State{Term: 2, Vote: 1, Commit: 5},
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	m := logdb.Membership{
+		ConfigChangeID: 9,
+		Addresses:      map[uint64]string{1: "a1"},
+		Observers:      map[uint64]string{2: "o2"},
+		Witnesses:      map[uint64]string{3: "w3"},
+		Removed:        map[uint64]bool{4: true},
+	}
+	if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 5, Term: 2, Membership: m}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	// Mutate the caller's maps after the call.
+	m.Addresses[1] = "MUTATED"
+	m.Removed[4] = false
+
+	_, stored, err := db.ReadState(1, 1)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if stored.ConfigChangeID != 9 {
+		t.Fatalf("ReadState membership = %+v, want the snapshot's membership", stored)
+	}
+	if stored.Addresses[1] != "a1" || len(stored.Addresses) != 1 {
+		t.Errorf("Addresses aliased the caller's map: %v", stored.Addresses)
+	}
+	if !stored.Removed[4] {
+		t.Errorf("Removed aliased the caller's map: %v", stored.Removed)
+	}
+
+	ss, err := db.GetSnapshot(1, 1)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if ss.Membership.Addresses[1] != "a1" {
+		t.Errorf("snapshot membership aliased the caller's map: %v", ss.Membership.Addresses)
+	}
+}

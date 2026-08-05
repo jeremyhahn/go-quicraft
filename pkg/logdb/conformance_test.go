@@ -147,6 +147,92 @@ func TestConformanceCompactionFloorReturnsErrCompacted(t *testing.T) {
 	})
 }
 
+// TestConformanceCompactionFloorIsMonotonic pins the floor's monotonicity: a
+// lower RemoveEntriesTo call must not lower a floor whose entries are already
+// gone, or reads between the two floors surface a hard log hole instead of
+// ErrCompacted and raft never falls back to InstallSnapshot.
+func TestConformanceCompactionFloorIsMonotonic(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		saveEntries(t, db, 1, 1, 1, 20, 4)
+		if err := db.RemoveEntriesTo(1, 1, 15); err != nil {
+			t.Fatalf("RemoveEntriesTo(15): %v", err)
+		}
+		if err := db.RemoveEntriesTo(1, 1, 5); err != nil {
+			t.Fatalf("RemoveEntriesTo(5): %v", err)
+		}
+
+		if _, _, err := db.IterateEntries(nil, 0, 1, 1, 10, 21, 0); !errors.Is(err, logdb.ErrCompacted) {
+			t.Fatalf("IterateEntries(low=10) = %v, want ErrCompacted", err)
+		}
+		got, _, err := db.IterateEntries(nil, 0, 1, 1, 16, 21, 0)
+		if err != nil {
+			t.Fatalf("IterateEntries above the floor: %v", err)
+		}
+		if len(got) != 5 || got[0].Index != 16 {
+			t.Fatalf("live suffix = %d entries starting %d, want 5 starting 16", len(got), got[0].Index)
+		}
+	})
+}
+
+// TestConformanceHeadGapReturnsErrLogGapDetected pins the distinction between
+// a compaction and a missing prefix: with no compaction floor, a low below the
+// first stored entry is a GAP.
+func TestConformanceHeadGapReturnsErrLogGapDetected(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		saveEntries(t, db, 1, 1, 5, 3, 4)
+		if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrLogGapDetected) {
+			t.Fatalf("IterateEntries(low=3) = %v, want ErrLogGapDetected", err)
+		}
+	})
+}
+
+// TestConformanceSaveSnapshotMembershipVisibleInReadState pins that the
+// membership a snapshot carries becomes the node's membership, whichever entry
+// point stored the snapshot.
+func TestConformanceSaveSnapshotMembershipVisibleInReadState(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 2, Vote: 1, Commit: 5},
+		}}); err != nil {
+			t.Fatalf("SaveState: %v", err)
+		}
+		if err := db.SaveSnapshot(1, 1, logdb.Snapshot{
+			Index: 5, Term: 2,
+			Membership: logdb.Membership{
+				ConfigChangeID: 9,
+				Addresses:      map[uint64]string{1: "a1"},
+			},
+		}); err != nil {
+			t.Fatalf("SaveSnapshot: %v", err)
+		}
+
+		_, membership, err := db.ReadState(1, 1)
+		if err != nil {
+			t.Fatalf("ReadState: %v", err)
+		}
+		if membership.ConfigChangeID != 9 || membership.Addresses[1] != "a1" {
+			t.Fatalf("ReadState membership = %+v, want the snapshot's membership", membership)
+		}
+	})
+}
+
+// TestConformanceZeroIndexSnapshotIsAbsent pins the snapshot-presence
+// predicate on Index > 0: a zero-index snapshot is no snapshot at all.
+func TestConformanceZeroIndexSnapshotIsAbsent(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: 1, ReplicaID: 1,
+			State:    logdb.State{Term: 5, Vote: 1},
+			Snapshot: logdb.Snapshot{Index: 0, Term: 5},
+		}}); err != nil {
+			t.Fatalf("SaveState: %v", err)
+		}
+		if _, err := db.GetSnapshot(1, 1); !errors.Is(err, logdb.ErrNoSnapshot) {
+			t.Fatalf("GetSnapshot = %v, want ErrNoSnapshot", err)
+		}
+	})
+}
+
 func TestConformanceMaxSizeBudget(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		const cmdSize = 100
