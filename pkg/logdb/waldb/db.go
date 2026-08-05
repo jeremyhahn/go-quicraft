@@ -232,9 +232,43 @@ func (db *DB) writeGate() error {
 
 // walShard is a single WAL directory shard. Each shard manages its own
 // segment file rotation, in-memory entry store, state, bootstrap, and
-// snapshot metadata. The mutex protects all operations.
+// snapshot metadata.
+//
+// # Locking
+//
+// Two locks split the shard by what they actually protect:
+//
+//   - mu guards the SEGMENT FILE state — activeSegment, activeSegmentID,
+//     nextSegmentID, knownSegments, marshalBuf, batchMode, closed — and
+//     therefore every record write, rotation, fsync and rollback. It is the
+//     writer lock: it makes a SaveState batch atomic per WAL segment across
+//     its whole lifecycle (checkpoint -> write -> fsync -> commit/rollback).
+//   - dataMu guards the IN-MEMORY maps that serve reads: indexes, entries,
+//     states, bootstraps, snapshots, compactedTo, metaSegments,
+//     committedSegmentHWM, minWriteEpoch and segmentEpochs.
+//
+// The split exists so a reader never waits on an fsync. Readers
+// (IterateEntries, ReadState, EntryRange, GetSnapshot, GetBootstrap,
+// CompactedTo, ListNodeInfo, MinLiveEpoch) touch only in-memory maps — never
+// a segment — so they take dataMu.RLock ALONE. With 16 WAL shards serving
+// 10k+ Raft groups, taking mu for a read would stall every group hashing to
+// the shard for the duration of the batch's fdatasync.
+//
+// Every mutator of a dataMu field already holds mu (all of them are commit
+// points of a durable write), so a mutator takes both, and a read performed
+// while holding mu needs no dataMu. dataMu exists purely to exclude the
+// lock-free readers.
+//
+// LOCK ORDER IS ALWAYS mu THEN dataMu, never the reverse: mu is never
+// acquired while dataMu is held. Per-index locks (index.mu) are innermost and
+// are only ever taken under mu and/or dataMu. dataMu is never held across any
+// I/O — no write, fsync, rotation, directory scan or segment deletion.
 type walShard struct {
 	mu sync.Mutex
+
+	// dataMu guards the in-memory maps only. See the Locking section above
+	// for the field list and the mu -> dataMu ordering rule.
+	dataMu sync.RWMutex
 
 	fs              FS
 	dir             string
@@ -256,25 +290,27 @@ type walShard struct {
 	diskMon *DiskMonitor
 
 	// Per-node entry indexes for range queries and compaction tracking.
+	// The map itself is protected by dataMu; each index has its own lock.
 	indexes map[nodeKey]*index
 
 	// Per-node entry data store. The WAL provides durability; this map
-	// provides fast reads without parsing WAL records.
+	// provides fast reads without parsing WAL records. Protected by dataMu.
 	entries map[nodeKey]map[uint64]logdb.Entry
 
-	// Per-node hard state.
+	// Per-node hard state. Protected by dataMu.
 	states map[nodeKey]logdb.State
 
-	// Per-node bootstrap info.
+	// Per-node bootstrap info. Protected by dataMu.
 	bootstraps map[nodeKey]logdb.Bootstrap
 
-	// Per-node snapshot metadata.
+	// Per-node snapshot metadata. Protected by dataMu.
 	snapshots map[nodeKey]logdb.Snapshot
 
-	// Per-node compaction markers.
+	// Per-node compaction markers. Protected by dataMu.
 	compactedTo map[nodeKey]uint64
 
 	// Set of all segment IDs that have ever been created in this shard.
+	// Segment file state: protected by mu.
 	knownSegments map[uint64]bool
 
 	// minWriteEpoch tracks the minimum barrier encryption epoch across
@@ -282,12 +318,14 @@ type walShard struct {
 	// populated during WAL recovery from ciphertext headers and updated
 	// on each encrypted write. After compaction + GC, it is recomputed
 	// from the remaining segment epochs. Zero means no encrypted records
-	// exist in this shard.
+	// exist in this shard. Protected by dataMu — MinLiveEpoch reads it
+	// without mu.
 	minWriteEpoch uint64
 
 	// segmentEpochs tracks the minimum epoch written to each segment ID.
 	// This enables efficient recomputation of minWriteEpoch after segment
-	// garbage collection without re-scanning ciphertext headers.
+	// garbage collection without re-scanning ciphertext headers. Protected
+	// by dataMu, alongside the minWriteEpoch it derives.
 	segmentEpochs map[uint64]uint64
 
 	// metaSegments tracks, per node, the segment ID that holds the latest
@@ -298,7 +336,8 @@ type walShard struct {
 	// holds the sole durable copy of a node's State/Snapshot/Bootstrap/Compact
 	// marker or RemoveNode tombstone. Compact and RemoveNodeData fold these
 	// IDs into their live-segment set before running GC. A zero ID means no
-	// such record has landed for that node. Last write wins.
+	// such record has landed for that node. Last write wins. Protected by
+	// dataMu.
 	metaSegments map[nodeKey]metaSegments
 
 	// committedSegmentHWM is the highest segment ID whose batch has fully
@@ -313,7 +352,9 @@ type walShard struct {
 	// refuses to delete any segment ID greater than this high-water mark, so
 	// a segment that is durably written but not yet reflected in the
 	// in-memory index/pins is never reclaimed. Advanced only at the commit
-	// points, monotonically, and always under shard.mu.
+	// points, monotonically, and always under shard.mu. Protected by dataMu
+	// as well, so it commits atomically with the index/pin updates it
+	// covers.
 	committedSegmentHWM uint64
 
 	// marshalBuf is a reusable buffer for encoding records.
@@ -473,6 +514,14 @@ func openWALShard(dir string, opts dbOptions, barrier WALBarrier, metrics LogDBM
 
 // recover scans the shard directory for existing segment files and replays
 // their contents to rebuild the in-memory state.
+//
+// Neither lock is taken anywhere below this call: recover runs inside
+// openWALShard, before the shard is reachable from any DB the caller can
+// observe, so the entire replay (and the truncation/orphan-discard repair it
+// may perform) is exclusive by construction. Locking per replayed record
+// would cost a mutex round trip per WAL record on the recovery path and
+// protect nothing. Every mutator reachable from a LIVE shard does take both
+// locks; see the walShard Locking section.
 func (s *walShard) recover() error {
 	dirEntries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
@@ -1641,7 +1690,8 @@ func (s *walShard) rotateSegment() error {
 }
 
 // getOrCreateIndex returns the entry index for the given node, creating
-// one if it does not exist.
+// one if it does not exist. It mutates the indexes map, so the caller must
+// hold s.dataMu for writing (and, on a live shard, s.mu).
 func (s *walShard) getOrCreateIndex(key nodeKey) *index {
 	idx, ok := s.indexes[key]
 	if !ok {
@@ -1691,15 +1741,19 @@ func (s *walShard) writeRecord(data []byte) error {
 
 	// Record the write epoch against the segment the record actually landed
 	// in (s.activeSegmentID is the post-rotation segment when a rotation
-	// occurred above).
+	// occurred above). The epoch floor is dataMu state — MinLiveEpoch reads
+	// it without s.mu — so take dataMu for the map update alone, never
+	// across the write or the fdatasync below.
 	if writeEpoch > 0 {
+		segID := s.activeSegmentID
+		s.dataMu.Lock()
 		if s.minWriteEpoch == 0 || writeEpoch < s.minWriteEpoch {
 			s.minWriteEpoch = writeEpoch
 		}
-		segID := s.activeSegmentID
 		if existing, ok := s.segmentEpochs[segID]; !ok || writeEpoch < existing {
 			s.segmentEpochs[segID] = writeEpoch
 		}
+		s.dataMu.Unlock()
 	}
 
 	if s.metrics != nil {
@@ -1936,8 +1990,9 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 	// batch's already-acknowledged committed records. Locks are acquired in
 	// ascending shard-index order so two batches with overlapping shard sets
 	// share a canonical lock order and cannot deadlock; single-shard lockers
-	// (Compact, SaveSnapshot, reads) hold at most one lock and cannot close a
-	// cycle.
+	// (Compact, SaveSnapshot, RemoveEntriesTo, RemoveNodeData) hold at most one
+	// mu and cannot close a cycle. Reads take no mu at all — only dataMu, which
+	// this batch acquires solely inside Phase 3 and always after mu.
 	var touched [DefaultShardCount]bool
 	for i := range updates {
 		touched[uint16(updates[i].ShardID%DefaultShardCount)] = true
@@ -2006,9 +2061,11 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 
 	// Phase 3: Apply in-memory updates now that all WAL data is durable. This
 	// is the commit point — reads see these changes only after the data is
-	// safely persisted. The shard locks are still held, so this commit is
+	// safely persisted. The shard mu locks are still held, so this commit is
 	// atomic with the durable write relative to any concurrent same-shard
-	// batch.
+	// batch. applyTo additionally takes each shard's dataMu, which is what
+	// makes the commit atomic for the lock-free readers; it is the ONLY point
+	// in the batch where a reader can be blocked, and it holds no I/O.
 	for i := range dirtyShards {
 		if dirtyShards[i] != nil {
 			pending[i].applyTo(dirtyShards[i])
@@ -2070,9 +2127,18 @@ type pendingMemUpdates struct {
 	snapshots []pendingSnapshotUpdate
 }
 
-// applyTo applies all pending in-memory updates to the shard. The caller
-// must hold shard.mu.
+// applyTo applies all pending in-memory updates to the shard. The caller must
+// hold shard.mu (Phase 3 of a SaveState batch, or a standalone SaveSnapshot).
+//
+// It additionally takes dataMu for the whole application, making the batch's
+// index, entry, state, snapshot, pin and high-water-mark updates a single
+// atomic commit for the lock-free readers: no reader can observe a batch
+// half-applied. The section is pure memory work — no write, fsync or
+// rotation happens under dataMu.
 func (p *pendingMemUpdates) applyTo(s *walShard) {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+
 	for i := range p.entries {
 		eu := &p.entries[i]
 		idx := s.getOrCreateIndex(eu.key)
@@ -2210,7 +2276,11 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 			return &SegmentDiscardError{SegmentID: id, Err: rmErr}
 		}
 		delete(ds.knownSegments, id)
+		// The epoch map is dataMu state; take it for the delete alone so no
+		// lock is held across the Remove above.
+		ds.dataMu.Lock()
 		delete(ds.segmentEpochs, id)
+		ds.dataMu.Unlock()
 	}
 
 	// Empty the current segment (all its content is batch data). It remains
@@ -2344,7 +2414,9 @@ func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *s
 	// its segment against garbage collection permanently.
 	if u.Snapshot.Index > 0 {
 		// Check against both persisted snapshots and any pending snapshot
-		// updates in this batch to avoid writing stale data.
+		// updates in this batch to avoid writing stale data. The snapshots map
+		// is read under s.mu alone: every mutator of it holds s.mu too, so no
+		// dataMu is needed for a read on this side of the lock.
 		stale := false
 		if existing, ok := s.snapshots[key]; ok && u.Snapshot.Index <= existing.Index {
 			stale = true
@@ -2737,12 +2809,16 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	if err := s.writeRecord(buf[:pos]); err != nil {
 		return err
 	}
+	// Commit point: publish the bootstrap record, pin the segment it landed in
+	// (post-rotation if writeRecord rotated) against garbage collection, and
+	// raise the commit high-water mark — atomically for readers, under dataMu.
+	// The write is already durable here because non-batch writeRecord
+	// fdatasyncs inline.
+	s.dataMu.Lock()
 	s.bootstraps[key] = bs
-	// Pin the segment the record landed in (post-rotation if writeRecord
-	// rotated) against garbage collection. The write is already durable here
-	// because non-batch writeRecord fdatasyncs inline.
 	s.setBootstrapSegment(key, s.activeSegmentID)
 	s.advanceCommittedHWM(s.activeSegmentID)
+	s.dataMu.Unlock()
 	return nil
 }
 
@@ -2785,8 +2861,11 @@ func (db *DB) IterateEntries(
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	// Read lock on the in-memory maps ONLY. This path never touches a segment,
+	// so it must not wait behind a concurrent batch's fdatasync on shard.mu;
+	// dataMu still serializes it against the batch's atomic Phase-3 commit.
+	shard.dataMu.RLock()
+	defer shard.dataMu.RUnlock()
 
 	compactedTo := shard.compactedTo[key]
 	if low <= compactedTo {
@@ -2857,10 +2936,11 @@ func (db *DB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Membershi
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
+	// In-memory read only; see IterateEntries for why this takes dataMu, not mu.
+	shard.dataMu.RLock()
 	state, ok := shard.states[key]
 	ss := shard.snapshots[key]
-	shard.mu.Unlock()
+	shard.dataMu.RUnlock()
 
 	if !ok {
 		return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
@@ -2884,9 +2964,10 @@ func (db *DB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) {
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
+	// In-memory read only; see IterateEntries for why this takes dataMu, not mu.
+	shard.dataMu.RLock()
 	idx, ok := shard.indexes[key]
-	shard.mu.Unlock()
+	shard.dataMu.RUnlock()
 
 	if !ok {
 		return 0, 0, nil
@@ -2931,7 +3012,8 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	// persisting the lower marker also re-pins garbage collection to it,
 	// letting the higher marker's segment be reclaimed — the regression would
 	// then survive restart. Callers can lower the floor legitimately only by
-	// removing the node.
+	// removing the node. Reading compactedTo under shard.mu alone is sufficient:
+	// every mutator of it holds shard.mu as well.
 	if cur, ok := shard.compactedTo[key]; ok && index <= cur {
 		return nil
 	}
@@ -2953,12 +3035,19 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 		return db.rollbackStandalone(shard, &cp, err)
 	}
 
-	// Pin the segment the compaction marker landed in against garbage
-	// collection, and advance the commit high-water mark — mirroring
-	// writeBootstrap. Without the pin, GC could reclaim the marker's segment
-	// once its entries are compacted away, and compactedTo would reset to 0 on
-	// recovery. The write is durable here (non-batch writeRecord fdatasyncs
-	// inline).
+	// Commit point. Everything below is in-memory state the lock-free readers
+	// consume, so it is applied as one atomic dataMu section: a reader must
+	// never see the raised compaction floor without the matching index/entry
+	// pruning (or the reverse, which reads as a log gap).
+	//
+	// The pin of the segment the compaction marker landed in and the commit
+	// high-water mark mirror writeBootstrap. Without the pin, GC could reclaim
+	// the marker's segment once its entries are compacted away, and compactedTo
+	// would reset to 0 on recovery. The write is durable here (non-batch
+	// writeRecord fdatasyncs inline).
+	shard.dataMu.Lock()
+	defer shard.dataMu.Unlock()
+
 	shard.setCompactSegment(key, shard.activeSegmentID)
 	shard.advanceCommittedHWM(shard.activeSegmentID)
 
@@ -2995,6 +3084,10 @@ func (db *DB) Compact(shardID, _ uint64) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	// The live-set survey reads indexes, metaSegments and committedSegmentHWM
+	// without dataMu: every mutator of those fields also holds shard.mu, which
+	// is held here, so mu alone already excludes them. dataMu exists only to
+	// exclude the lock-free readers, which mutate nothing.
 	comp := newCompactor(shard.fs, shard.dir, shard.opts.blockSize)
 	liveSegments := make(map[uint64]bool)
 	for _, idx := range shard.indexes {
@@ -3099,9 +3192,10 @@ func (db *DB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
+	// In-memory read only; see IterateEntries for why this takes dataMu, not mu.
+	shard.dataMu.RLock()
 	ss, ok := shard.snapshots[key]
-	shard.mu.Unlock()
+	shard.dataMu.RUnlock()
 
 	if !ok {
 		return logdb.Snapshot{}, logdb.ErrNoSnapshot
@@ -3145,9 +3239,19 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	// here (non-batch writeRecord fdatasyncs inline).
 	tombstoneSegID := shard.activeSegmentID
 
-	// Clear all in-memory state for this node. Dropping the removed node's
-	// meta tracking lets its now-obsolete State/Snapshot/Bootstrap segments
-	// be reclaimed below if no surviving node references them.
+	// Commit point: clear all in-memory state for this node and re-pin the
+	// tombstone in one atomic dataMu section, so a lock-free reader sees the
+	// node either wholly present or wholly gone. Dropping the removed node's
+	// meta tracking lets its now-obsolete State/Snapshot/Bootstrap segments be
+	// reclaimed below if no surviving node references them.
+	//
+	// The tombstone's own segment is pinned against garbage collection and the
+	// commit high-water mark advanced, mirroring the compaction-marker pin.
+	// Without the pin, GC could reclaim the tombstone's segment while OLDER
+	// segments holding this node's records survive (pinned by other nodes
+	// sharing the WAL shard) — replay would then resurrect the removed replica
+	// (see setRemoveSegment).
+	shard.dataMu.Lock()
 	delete(shard.indexes, key)
 	delete(shard.entries, key)
 	delete(shard.states, key)
@@ -3155,15 +3259,9 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	delete(shard.snapshots, key)
 	delete(shard.compactedTo, key)
 	delete(shard.metaSegments, key)
-
-	// Pin the tombstone's segment against garbage collection and advance the
-	// commit high-water mark, mirroring the compaction-marker pin. Without
-	// the pin, GC could reclaim the tombstone's segment while OLDER segments
-	// holding this node's records survive (pinned by other nodes sharing the
-	// WAL shard) — replay would then resurrect the removed replica (see
-	// setRemoveSegment).
 	shard.setRemoveSegment(key, tombstoneSegID)
 	shard.advanceCommittedHWM(tombstoneSegID)
+	shard.dataMu.Unlock()
 
 	// Trigger segment garbage collection to reclaim disk space. Collect
 	// the set of segments still referenced by remaining live nodes.
@@ -3236,7 +3334,10 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	seen := make(map[nodeKey]bool)
 	for i := 0; i < DefaultShardCount; i++ {
 		shard := db.shards[i]
-		shard.mu.Lock()
+		// In-memory read only; see IterateEntries for why this takes dataMu,
+		// not mu. It matters most here: this walks EVERY shard, so taking mu
+		// would serialize the scan behind up to DefaultShardCount fdatasyncs.
+		shard.dataMu.RLock()
 		for key := range shard.indexes {
 			seen[key] = true
 		}
@@ -3249,7 +3350,7 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 		for key := range shard.snapshots {
 			seen[key] = true
 		}
-		shard.mu.Unlock()
+		shard.dataMu.RUnlock()
 	}
 
 	result := make([]logdb.NodeInfo, 0, len(seen))
@@ -3286,9 +3387,10 @@ func (db *DB) GetBootstrap(shardID, replicaID uint64) (logdb.Bootstrap, bool, er
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
+	// In-memory read only; see IterateEntries for why this takes dataMu, not mu.
+	shard.dataMu.RLock()
 	bs, ok := shard.bootstraps[key]
-	shard.mu.Unlock()
+	shard.dataMu.RUnlock()
 
 	if !ok {
 		return logdb.Bootstrap{}, false, nil
@@ -3376,9 +3478,10 @@ func (db *DB) CompactedTo(shardID, replicaID uint64) (uint64, error) {
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	shard.mu.Lock()
+	// In-memory read only; see IterateEntries for why this takes dataMu, not mu.
+	shard.dataMu.RLock()
 	compactedTo := shard.compactedTo[key]
-	shard.mu.Unlock()
+	shard.dataMu.RUnlock()
 
 	return compactedTo, nil
 }
@@ -3403,9 +3506,12 @@ func (db *DB) MinLiveEpoch() (uint64, error) {
 	var globalMin uint64
 	for i := 0; i < DefaultShardCount; i++ {
 		shard := db.shards[i]
-		shard.mu.Lock()
+		// In-memory read only; see IterateEntries for why this takes dataMu,
+		// not mu. Like ListNodeInfo this walks every shard, so mu would put
+		// the epoch query behind every in-flight fdatasync.
+		shard.dataMu.RLock()
 		shardMin := shard.minWriteEpoch
-		shard.mu.Unlock()
+		shard.dataMu.RUnlock()
 
 		if shardMin > 0 && (globalMin == 0 || shardMin < globalMin) {
 			globalMin = shardMin
@@ -3465,7 +3571,8 @@ var _ logdb.EpochAwareLogDB = (*DB)(nil)
 var _ logdb.PerBarrierEpochAwareLogDB = (*DB)(nil)
 
 // setStateSegment records segID as the segment holding the latest durable
-// State record for key. Last write wins. Caller must hold s.mu.
+// State record for key. Last write wins. Caller must hold s.mu and
+// s.dataMu for writing, except on the recover() path (see walShard).
 func (s *walShard) setStateSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3477,7 +3584,8 @@ func (s *walShard) setStateSegment(key nodeKey, segID uint64) {
 }
 
 // setSnapshotSegment records segID as the segment holding the latest durable
-// Snapshot record for key. Last write wins. Caller must hold s.mu.
+// Snapshot record for key. Last write wins. Caller must hold s.mu and
+// s.dataMu for writing, except on the recover() path (see walShard).
 func (s *walShard) setSnapshotSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3489,7 +3597,8 @@ func (s *walShard) setSnapshotSegment(key nodeKey, segID uint64) {
 }
 
 // setBootstrapSegment records segID as the segment holding the durable
-// Bootstrap record for key. Last write wins. Caller must hold s.mu.
+// Bootstrap record for key. Last write wins. Caller must hold s.mu and
+// s.dataMu for writing, except on the recover() path (see walShard).
 func (s *walShard) setBootstrapSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3520,7 +3629,8 @@ func (s *walShard) setBootstrapSegment(key nodeKey, segID uint64) {
 // the re-added log's range. The cost of holding the pin is one retained
 // segment per removed key — disk only, never correctness.
 //
-// Last write wins. Caller must hold s.mu.
+// Last write wins. Caller must hold s.mu and s.dataMu for writing, except on
+// the recover() path (see walShard).
 func (s *walShard) setRemoveSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3537,7 +3647,8 @@ func (s *walShard) setRemoveSegment(key nodeKey, segID uint64) {
 // all been compacted away could be garbage-collected, discarding the marker —
 // on recovery compactedTo would then reset to 0 and GetEntries/IterateEntries
 // would return empty instead of ErrCompacted for compacted indices. Last write
-// wins. Caller must hold s.mu.
+// wins. Caller must hold s.mu and s.dataMu for writing, except on the recover()
+// path (see walShard).
 func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3552,8 +3663,9 @@ func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
 // pin that points at segID, resetting both the field and its presence flag.
 // Used when a segment is discarded (truncation-recovery cleanup) so no
 // phantom pin to a non-existent segment lingers in metaSegments. An entry
-// whose pins all become absent is removed from the map. Caller must hold
-// s.mu.
+// whose pins all become absent is removed from the map. Called only from
+// discardSegmentsAbove, i.e. from recover(), where the shard is not yet
+// published and neither lock is required (see walShard).
 func (s *walShard) clearMetaSegmentPins(segID uint64) {
 	for key, m := range s.metaSegments {
 		if m.hasState && m.state == segID {
@@ -3587,7 +3699,8 @@ func (s *walShard) clearMetaSegmentPins(segID uint64) {
 // advanceCommittedHWM raises the commit high-water mark to segID if segID is
 // higher. The mark is monotonic: a batch that landed in an earlier segment
 // must never lower it below a later batch that already committed. Caller must
-// hold s.mu.
+// hold s.mu and s.dataMu for writing, except on the recover() path (see
+// walShard).
 func (s *walShard) advanceCommittedHWM(segID uint64) {
 	if segID > s.committedSegmentHWM {
 		s.committedSegmentHWM = segID
@@ -3599,7 +3712,8 @@ func (s *walShard) advanceCommittedHWM(segID uint64) {
 // are never tracked by an entry index, so they must be pinned explicitly
 // before garbage collection or the sole durable copy of a node's
 // State/Snapshot/Bootstrap — or of a removed node's tombstone — could be
-// deleted. Caller must hold s.mu.
+// deleted. This only READS metaSegments, and every mutator of it holds s.mu,
+// so holding s.mu alone is sufficient exclusion (see walShard).
 func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 	for _, m := range s.metaSegments {
 		if m.hasState {
@@ -3620,12 +3734,6 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 	}
 }
 
-// recomputeMinWriteEpoch recalculates the shard's minWriteEpoch from the
-// segmentEpochs map after garbage collection removes dead segments.
-// liveSegments contains the set of segment IDs that survived GC. The
-// active segment is always considered live.
-//
-// Caller must hold s.mu.
 // recomputeMinWriteEpochFromDisk re-derives the shard's epoch floor from the
 // segment files actually present in the shard directory. The floor must never
 // be driven by the intended live-segment set handed to GarbageCollect: GC
@@ -3634,7 +3742,8 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 // let the engine purge a DEK the surviving segment still needs, making the
 // next restart fail with WALDecryptError. A ReadDir failure keeps the floor
 // unchanged, which is conservative: the floor can only be too LOW, retaining
-// DEKs longer than strictly necessary. Caller must hold s.mu.
+// DEKs longer than strictly necessary. Caller must hold s.mu; this takes
+// s.dataMu itself for the map rewrite.
 func (s *walShard) recomputeMinWriteEpochFromDisk() {
 	dirEntries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
@@ -3651,9 +3760,20 @@ func (s *walShard) recomputeMinWriteEpochFromDisk() {
 			surviving[segID] = true
 		}
 	}
+	// The directory scan above is I/O and stays outside dataMu; only the map
+	// rewrite it feeds is taken under the lock.
+	s.dataMu.Lock()
 	s.recomputeMinWriteEpoch(surviving)
+	s.dataMu.Unlock()
 }
 
+// recomputeMinWriteEpoch recalculates the shard's minWriteEpoch from the
+// segmentEpochs map after garbage collection removes dead segments.
+// liveSegments contains the set of segment IDs that survived GC. The active
+// segment is always considered live.
+//
+// It rewrites segmentEpochs and minWriteEpoch, so the caller must hold s.mu
+// and s.dataMu for writing.
 func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) {
 	// Remove dead segments from the epoch map.
 	for segID := range s.segmentEpochs {
