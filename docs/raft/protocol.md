@@ -496,9 +496,31 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13):
 1. Reject if `ss.Index <= committed` (snapshot is stale, prevents applying
    older state).
 2. **Log matching optimization**: If the existing log has an entry at
-   `ss.Index` with the same term, only advance the commit index. Entries
-   following the snapshot point are retained. This avoids discarding
-   valid log entries the follower already has.
+   `ss.Index` with the same term **and no snapshot is pending
+   persistence**, advance the commit index and the processed marker.
+   Entries following the snapshot point are retained. This avoids
+   discarding valid log entries the follower already has.
+
+   Advancing `processed` here is a deliberate divergence from
+   dragonboat and etcd, which advance only `committed`. It is what makes
+   the no-pending-snapshot precondition load-bearing rather than
+   cosmetic: a pending snapshot is the one `GetUpdate` has yet to hand
+   to the engine, and it is cleared only by the engine's persistence
+   ack. Taking this branch while one is pending would fast-forward both
+   markers past a snapshot the engine has never seen, so the next
+   `GetUpdate` would emit the now-superseded pending snapshot — rewinding
+   the `LogReader` range behind the apply frontier (or failing the shard
+   outright in `Peer.Commit` with `ErrSnapshotOutOfDate`) and silently
+   skipping apply for every entry in `(pending.Index, ss.Index]`.
+
+   The precondition is safe to enforce by falling through to `restore`:
+   a pending snapshot is always at or below `committed`, and step 1
+   guarantees `ss.Index > committed`, so the incoming snapshot is
+   strictly newer. Restoring keeps the pending snapshot monotonic. The
+   entries discarded above `ss.Index` were never persisted or acked —
+   `Peer.Commit` persists entries and clears the pending snapshot in the
+   same cycle — and the `ReplicateResp` carries `ss.Index`, so the
+   leader re-sends them.
 3. Otherwise, call `log.restore(ss)` which discards all entries and
    resets from the snapshot.
 4. Rebuild all remote tracking maps from `ss.Membership`.

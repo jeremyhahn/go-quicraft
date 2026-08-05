@@ -2271,7 +2271,28 @@ func (r *raft) handleSnapshot(msg proto.Message) error {
 
 	// Per Raft Figure 13: if existing log entry has same index and
 	// term as snapshot's last included entry, retain following entries.
-	if t, err := r.log.term(ss.Index); err == nil && t == ss.Term {
+	//
+	// The matching branch is additionally gated on the log holding NO
+	// pending (not yet persisted) snapshot. GetUpdate ships that pending
+	// snapshot to the engine, which registers it with the LogReader and
+	// recovers the state machine from it; it is cleared only by the
+	// engine's persistence ack (commitUpdate -> savedSnapshot). Taking the
+	// matching branch while one is pending fast-forwards committed AND
+	// processed past a snapshot the engine has not been told about yet, so
+	// the next GetUpdate emits the now-SUPERSEDED pending snapshot: the
+	// LogReader's tracked range is rewound behind the apply frontier (or
+	// ApplySnapshot rejects it as out of date, failing the shard in
+	// Peer.Commit), and the entries in (pending.Index, ss.Index] are never
+	// emitted for apply. A pending snapshot is always at or below committed
+	// (restore sets committed to its index), and ss.Index is above committed
+	// here, so this snapshot is strictly newer: restoring from it keeps the
+	// pending snapshot monotonic and the engine always sees the newest one.
+	// The restore discards entries retained above ss.Index, but while a
+	// snapshot is pending nothing above it has been persisted or
+	// acknowledged (Peer.Commit persists entries and clears the pending
+	// snapshot in the same cycle), so the leader simply re-sends them.
+	if t, err := r.log.term(ss.Index); err == nil && t == ss.Term &&
+		r.log.pendingSnapshot() == nil {
 		// Log matches at snapshot point; advance commit AND the
 		// processed marker. The engine restores the state machine from
 		// the received snapshot (HandleSnapshot always requests SM

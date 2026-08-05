@@ -329,6 +329,19 @@ func (p *Peer) Handle(msg proto.Message) error {
 		return ErrJoiningNodeCannotCampaign
 	}
 
+	// The snapshot the log held BEFORE this message was stepped. restore()
+	// installs a fresh pending snapshot, so identity is what distinguishes
+	// "THIS snapshot replaced the log" from "an earlier snapshot is still
+	// waiting to be persisted". A merely non-nil pendingSnapshot() would let
+	// a REJECTED (index at or below committed) retransmission of an older
+	// snapshot inherit the newer one's restore below and roll membership
+	// backwards. The pending snapshot is cleared only by the engine's
+	// persistence ack, so it routinely outlives the message that installed it.
+	var pendingBefore *proto.Snapshot
+	if msg.Type == proto.InstallSnapshot {
+		pendingBefore = p.r.log.pendingSnapshot()
+	}
+
 	err := p.r.step(msg)
 
 	// Config changes take effect on COMMIT, not on log append: committed
@@ -369,7 +382,8 @@ func (p *Peer) Handle(msg proto.Message) error {
 		// rejects the only message that can repair it, leaving joining set
 		// forever and per-shard authorization bypassed for the shard.
 		ss := msg.Snapshot
-		restored := p.r.log.pendingSnapshot() != nil
+		pending := p.r.log.pendingSnapshot()
+		restored := pending != nil && pending != pendingBefore
 		joining := p.joining.Load()
 		if restored || joining || ss.Membership.ConfigChangeID > p.membership.configChangeID {
 			p.membership = newMembership(ss.Membership)
