@@ -925,16 +925,34 @@ func TestRefcount_ReleaseRefBeforeReleaseDefersRecycle(t *testing.T) {
 	}
 }
 
+// pinnedStatePool returns a pool that always hands back the same
+// RequestState storage, together with that storage. sync.Pool is free to
+// drop a Put object (per-P caches, GC victim eviction), so a test that
+// hopes the production pool returns the object it just recycled is
+// nondeterministic. Pinning the storage makes the recycle-then-reuse path
+// run on every execution while leaving the production reuse semantics
+// (newRequestState's field reset and channel drain) exactly as they are:
+// the storage itself is built by the production pool's New func.
+func pinnedStatePool() (*sync.Pool, *RequestState) {
+	storage := NewRequestStatePool().Get().(*RequestState)
+	return &sync.Pool{New: func() interface{} { return storage }}, storage
+}
+
 // TestRefcount_NoCrossDeliveryAfterRecycle reproduces the use-after-Release
 // hazard: request A times out and is released, its RequestState is recycled
 // and reused for request B, then A's late completion fires. B's result
 // channel must be untouched.
 func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
-	pool := NewRequestStatePool()
+	pool, storage := pinnedStatePool()
 
-	// Request A registers and the caller releases on timeout.
+	// Request A registers and, before the caller gives up, a result and an
+	// early commit notification land in its channels. Nobody consumes them:
+	// this is the timed-out Sync* caller that walked away. The recycled
+	// storage therefore carries A's stale payload into B's hands.
 	rsA := newRequestState(pool, 100, time.Time{}, true)
 	rsA.acquireRef()
+	rsA.commitNotify(RequestResult{Value: 1})
+	rsA.complete(RequestResult{Value: 100})
 	rsA.Release()
 
 	// A's late completion removes its reference, recycling rsA into the pool.
@@ -943,30 +961,56 @@ func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
 		t.Fatal("rsA not recycled after timeout + late releaseRef")
 	}
 
-	// Request B obtains a fresh RequestState from the pool. With a single
-	// object in the pool this returns the recycled rsA storage.
+	// Request B obtains its RequestState from the pool, which hands back the
+	// recycled rsA storage.
 	rsB := newRequestState(pool, 200, time.Time{}, true)
-	if rsB != rsA {
-		t.Skip("pool did not hand back the recycled object; race-free path")
+	if rsB != storage {
+		t.Fatal("pool did not hand back the recycled storage")
 	}
 	rsB.acquireRef()
 
-	// Now A's stale completion fires again (e.g., a duplicated callback). It
-	// must be a no-op because the recycled object is a different logical
-	// request. complete() is CAS-guarded by the completed flag, which was
-	// reset for B; but A's completion attempt happens via the SAME storage,
-	// so guard correctness depends on B not having been completed yet.
-	//
-	// The critical invariant: a late complete() targeting the recycled object
-	// must not deliver into B's channel unless it is B's own completion. Here
-	// we assert B's channel is empty until B is explicitly completed.
+	// B is a different logical request even though it shares A's storage:
+	// every per-request flag must have been reset by newRequestState.
+	if rsB.key != 200 {
+		t.Fatalf("recycled rsB.key = %d, want 200", rsB.key)
+	}
+	if rsB.released.Load() {
+		t.Fatal("recycled rsB is still marked released")
+	}
+	if rsB.recycled.Load() {
+		t.Fatal("recycled rsB is still marked recycled")
+	}
+	if rsB.completed.Load() {
+		t.Fatal("recycled rsB still carries A's completed flag")
+	}
+	if rsB.committedDone.Load() {
+		t.Fatal("recycled rsB still carries A's committedDone flag")
+	}
+
+	// The critical invariant: A's undelivered result must not surface as B's.
+	// Both channels must be empty until B completes on its own.
 	select {
 	case got := <-rsB.ResultC():
-		t.Fatalf("rsB result channel unexpectedly delivered %+v", got)
+		t.Fatalf("rsB result channel delivered A's stale result %+v", got)
+	default:
+	}
+	select {
+	case got := <-rsB.CommittedC():
+		t.Fatalf("rsB committed channel delivered A's stale notification %+v", got)
 	default:
 	}
 
-	// Complete B legitimately and confirm B receives its own result.
+	// Complete B legitimately and confirm B receives its own result on both
+	// channels: a leftover completed/committedDone flag would swallow them.
+	rsB.commitNotify(RequestResult{Value: 2})
+	select {
+	case got := <-rsB.CommittedC():
+		if got.Value != 2 {
+			t.Fatalf("rsB committed result = %d, want 2", got.Value)
+		}
+	default:
+		t.Fatal("rsB did not receive its own commit notification")
+	}
 	rsB.complete(RequestResult{Value: 200})
 	select {
 	case got := <-rsB.ResultC():
@@ -978,6 +1022,9 @@ func TestRefcount_NoCrossDeliveryAfterRecycle(t *testing.T) {
 	}
 	rsB.releaseRef()
 	rsB.Release()
+	if !rsB.recycled.Load() {
+		t.Fatal("rsB not recycled after its own release")
+	}
 }
 
 // TestRefcount_MultipleRefs verifies the object survives until ALL references

@@ -17,6 +17,7 @@ package quicraft
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,21 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
+
+// waitUntil polls cond until it returns true or the timeout expires,
+// yielding the processor between polls. Returns false on timeout.
+func waitUntil(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		runtime.Gosched()
+	}
+}
 
 // ---------------------------------------------------------------------------
 // M14: sweepPendingReads must expire a batch key's unreachable aliases
@@ -304,7 +320,9 @@ func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 // ran releaseRef (driving outstanding negative — the RequestState is
 // permanently lost from the pool) and completePendingOp a second time
 // (undercounting pendingOps so Drain can close early). With the
-// LoadAndDelete claim, pendingOps always balances back to exactly zero.
+// LoadAndDelete claim, exactly one claimant rolls the entry back: the
+// RequestState always returns to the pool with outstanding == 0 and
+// pendingOps always balances back to exactly zero.
 func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
@@ -324,6 +342,43 @@ func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
 		t.Fatal("engine node should not be nil")
+	}
+
+	// Park the step worker off this shard. DrainProposals is only ever
+	// called from processReady, and processReady skips a node whose
+	// recovering flag is set (a snapshot recovery owns the state machine).
+	// That is exactly the production state in which the proposal queue
+	// genuinely backs up, and it makes the fill below stick: without it the
+	// worker drains the queue between the fill and the proposal, so the
+	// queue-full rollback is only reached by luck.
+	engNode.SetRecovering(true)
+	defer func() {
+		// Discard the entries the test injected before handing the queue
+		// back to the step worker. Safe as the single consumer: the worker
+		// still skips this node while recovering is set.
+		engNode.DrainProposals(nil)
+		engNode.SetRecovering(false)
+	}()
+
+	// Fill the proposal queue to its exact capacity through the real API.
+	filled := 0
+	for engNode.DeliverProposal([]proto.Entry{{Type: proto.EntryNormal}}) {
+		filled++
+	}
+	if filled == 0 {
+		t.Fatal("proposal queue rejected the first entry; nothing was filled")
+	}
+
+	// Pin the RequestState storage for this shard so every proposal below
+	// uses the same object and its reference count can be inspected
+	// directly. newRequestState resets the object on every handout, so the
+	// production semantics are unchanged; only the pool's identity choice
+	// is made deterministic.
+	pool, storage := pinnedStatePool()
+	ns.requestPool = pool
+
+	if !waitUntil(5*time.Second, func() bool { return h.pendingOps.Load() == 0 }) {
+		t.Fatalf("pendingOps = %d before the test began; baseline must be 0", h.pendingOps.Load())
 	}
 
 	// Hammer the sweeper concurrently with expired-deadline proposals that
@@ -348,37 +403,72 @@ func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
 	defer cancel()
 
-	sawQueueFull := false
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		// Fill the proposal queue so DeliverProposal fails.
-		for i := 0; i < 8192; i++ {
-			if !engNode.DeliverProposal([]proto.Entry{{Type: proto.EntryNormal}}) {
-				break
+	// Run until the sweeper has demonstrably won the claim race enough
+	// times (that is the branch where an unconditional Delete double-rolls
+	// back), bounded by a wall-clock deadline.
+	const wantSweeperWins = 20
+	rollbacks, sweeperWins := 0, 0
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && sweeperWins < wantSweeperWins {
+		rs, propErr := h.proposeEntry(expiredCtx, ns, 1, proto.Entry{Type: proto.EntryNormal, Cmd: []byte("x")})
+		if !errors.Is(propErr, ErrSystemBusy) {
+			if rs != nil {
+				rs.Release()
 			}
+			t.Fatalf("proposeEntry with a full proposal queue: error = %v, want ErrSystemBusy", propErr)
 		}
-		_, propErr := h.proposeEntry(expiredCtx, ns, 1, proto.Entry{Type: proto.EntryNormal, Cmd: []byte("x")})
-		if errors.Is(propErr, ErrSystemBusy) {
-			sawQueueFull = true
+		rollbacks++
+
+		// Fence before inspecting the shared storage: both claim sites run
+		// releaseRef immediately before completePendingOp, and the caller's
+		// Release runs inside proposeEntry, so a zero pendingOps means the
+		// RequestState has fully settled on both goroutines.
+		if !waitUntil(5*time.Second, func() bool { return h.pendingOps.Load() == 0 }) {
+			t.Fatalf("rollback %d: pendingOps = %d, want 0; the claimed entry was never completed",
+				rollbacks, h.pendingOps.Load())
+		}
+
+		// Exactly one of the rollback and the sweeper claims the entry and
+		// drops the pending-map reference, so the object always makes it
+		// back to the pool. A double releaseRef drives outstanding to -1,
+		// and tryRecycle then never puts the object back.
+		if got := storage.outstanding.Load(); got != 0 {
+			t.Fatalf("rollback %d: RequestState outstanding = %d, want 0; the rollback and the sweeper both dropped the pending-map reference", rollbacks, got)
+		}
+		if !storage.recycled.Load() {
+			t.Fatalf("rollback %d: RequestState never returned to the pool (outstanding = %d, released = %v)",
+				rollbacks, storage.outstanding.Load(), storage.released.Load())
+		}
+		if n := countSyncMap(&ns.pendingProposals); n != 0 {
+			t.Fatalf("rollback %d: pendingProposals holds %d entries, want 0", rollbacks, n)
+		}
+		// The sweeper completes the RequestState when it wins the claim;
+		// the rollback path never completes it. Under-counts when the
+		// caller's Release beats the sweeper's complete, which only makes
+		// this gate stricter.
+		if storage.completed.Load() {
+			sweeperWins++
 		}
 	}
 	close(stop)
 	sweeperWG.Wait()
-	if !sawQueueFull {
-		t.Skip("proposal queue never filled; rollback path not exercised on this run")
-	}
 
-	// Let in-flight applies/sweeps quiesce, then require an exact balance:
-	// a double completePendingOp drives the counter negative.
-	waitDeadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(waitDeadline) {
-		if h.pendingOps.Load() == 0 {
-			break
-		}
-		h.sweepExpiredPending()
-		time.Sleep(10 * time.Millisecond)
+	if rollbacks == 0 {
+		t.Fatal("no queue-full rollback was exercised")
 	}
-	if got := h.pendingOps.Load(); got != 0 {
-		t.Fatalf("pendingOps = %d, want exactly 0 (negative means a double rollback)", got)
+	if sweeperWins == 0 {
+		t.Fatalf("the sweeper never won the claim race over %d rollbacks; the contended branch was not exercised", rollbacks)
+	}
+	t.Logf("queue-full rollbacks: %d (%d claimed by the sweeper)", rollbacks, sweeperWins)
+
+	// Let in-flight sweeps quiesce, then require an exact balance: a double
+	// completePendingOp undercounts the pending operations so Drain can
+	// close early.
+	if !waitUntil(5*time.Second, func() bool {
+		h.sweepExpiredPending()
+		return h.pendingOps.Load() == 0
+	}) {
+		t.Fatalf("pendingOps = %d after %d rollbacks (%d swept), want exactly 0",
+			h.pendingOps.Load(), rollbacks, sweeperWins)
 	}
 }
