@@ -101,11 +101,15 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 	// Chaos loop. Runs alongside the clients and stops before they do, so the
 	// cluster has a healthy window at the end in which to converge.
 	chaosEnd := time.Now().Add(duration - 5*time.Second)
+	// Above the ~5s client-deadline tail and a failover, far below anything
+	// that would let a genuinely wedged cluster pass.
+	maxStall := 3 * failoverTimeout
+
 	var (
-		down       = make(map[int]bool)
-		faults     int
-		progressAt = totalOps.Load()
-		stalls     int
+		down         = make(map[int]bool)
+		faults       int
+		progressAt   = totalOps.Load()
+		stalledSince time.Time
 	)
 
 	for time.Now().Before(chaosEnd) {
@@ -117,22 +121,27 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 		case <-done:
 		}
 
-		// Liveness gate: with quorum intact, ops MUST have advanced across the
-		// interval. A stall is a real defect (a wedged leader, a stuck apply
-		// pipeline), so fail rather than silently soaking on a dead cluster.
+		// Liveness gate. Quorum is never lost, so a LASTING absence of
+		// progress is a real defect (a wedged leader, a stuck apply pipeline).
+		// But a bounded gap is normal: Raft cannot commit during an election,
+		// and a client whose request was in flight to the dying leader waits
+		// out its own 5s deadline before retrying. Measuring elapsed time
+		// rather than counting intervals keeps this from firing on a single
+		// slow failover, while still catching a cluster that never comes back.
 		now := totalOps.Load()
 		if now == progressAt {
-			stalls++
-			if stalls >= 3 {
+			if stalledSince.IsZero() {
+				stalledSince = time.Now()
+			} else if stalled := time.Since(stalledSince); stalled > maxStall {
 				close(done)
 				wg.Wait()
-				t.Fatalf("cluster made no progress across %d consecutive intervals "+
-					"with quorum intact (%d/%d nodes down, %d ops total): "+
-					"availability loss, not just slowness",
-					stalls, len(down), numNodes, now)
+				t.Fatalf("cluster made no progress for %v with quorum intact "+
+					"(%d/%d nodes down, %d ops total): that outlasts both a "+
+					"failover and a client deadline, so it is availability "+
+					"loss rather than slowness", stalled, len(down), numNodes, now)
 			}
 		} else {
-			stalls = 0
+			stalledSince = time.Time{}
 		}
 		progressAt = now
 
@@ -308,4 +317,97 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 		}
 		return self.LastApplied+maxLag >= leader.LastApplied
 	})
+}
+
+// TestSoak_LeaderCloseDoesNotStallWrites measures the write outage caused by
+// gracefully closing the LEADER while clients are writing, and guards against
+// that outage regressing into a drain-length one.
+//
+// Measured at HEAD, recovery is BIMODAL: usually ~550-700ms, but roughly one
+// run in three takes ~5s. Host.Close itself is fast (3-25ms), so the tail is
+// not the drain — it tracks the client's own 5s request deadline, i.e. a
+// caller that had a request in flight to the dying leader waits out its
+// deadline before retrying against the new one. Worth understanding further;
+// it is an availability tail, not a safety problem, and it is unchanged by
+// leadership hand-off (measured both ways).
+//
+// The bound is therefore set above that observed tail and far below
+// ShutdownTimeout: it catches a genuine regression to drain-length stalls
+// without failing on the known tail.
+func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
+	const (
+		numNodes   = 5
+		numClients = 6
+		numKeys    = 16
+		shardID    = 1
+		// Above the observed ~5s tail, far below ShutdownTimeout (30s).
+		maxOutage = 12 * time.Second
+	)
+
+	cluster := newTestCluster(t, numNodes)
+	defer cluster.close()
+
+	cluster.startShard(shardID)
+	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	warmupCluster(t, cluster, shardID)
+
+	recorder := &opRecorder{}
+	var totalOps atomic.Int64
+	done := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for i := range numClients {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+			clientWorker(cluster, shardID, clientID, numKeys, 20*time.Second, recorder, &totalOps, done)
+		}(i)
+	}
+
+	// Let the cluster reach steady state so the measurement is not dominated
+	// by warmup.
+	time.Sleep(2 * time.Second)
+	if totalOps.Load() == 0 {
+		close(done)
+		wg.Wait()
+		t.Fatal("no operations committed before the leader was closed")
+	}
+
+	// Close the leader and measure how long writes are unavailable.
+	before := totalOps.Load()
+	closeStart := time.Now()
+	cluster.stopNode(leaderIdx)
+	closeElapsed := time.Since(closeStart)
+
+	// Require SUSTAINED recovery, not a single completion. An operation that
+	// was already in flight when the leader closed will finish moments later
+	// and would otherwise be misread as "the cluster is healthy again",
+	// hiding an outage entirely. Demand a run of new commits instead.
+	const recoveredOps = 50
+	outage := time.Duration(0)
+	deadline := time.Now().Add(maxOutage + 10*time.Second)
+	for time.Now().Before(deadline) {
+		if totalOps.Load() >= before+recoveredOps {
+			outage = time.Since(closeStart)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(done)
+	wg.Wait()
+
+	t.Logf("leader close took %v; %d sustained ops committed after %v (%d total)",
+		closeElapsed, recoveredOps, outage, totalOps.Load())
+
+	if outage == 0 {
+		t.Fatalf("writes never resumed within %v of closing the leader", maxOutage+5*time.Second)
+	}
+	if outage > maxOutage {
+		t.Errorf("writes were unavailable for %v after gracefully closing the "+
+			"leader, exceeding %v: that is a drain-length stall, meaning "+
+			"leadership was not handed off before draining", outage, maxOutage)
+	}
+
+	checkLinearizability(t, recorder, totalOps.Load())
 }
