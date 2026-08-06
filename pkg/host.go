@@ -1411,9 +1411,20 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 	// completed by L1. Detect this by comparing the previous leader ID
 	// with the new one. Only fail when:
 	// 1. We were NOT the leader (follower path; leader loss is handled above)
-	// 2. There was a known previous leader (prevLeaderID != 0)
-	// 3. The leader actually changed (not the same leader re-elected)
-	if !wasLeader && prevLeaderID != 0 && prevLeaderID != leaderID {
+	// 2. The leader actually changed (not the same leader re-elected)
+	// 3. The new leader is not US — proposals we are about to commit
+	//    ourselves must not be failed out from under the caller.
+	//
+	// prevLeaderID == 0 is INCLUDED deliberately. A dying leader takes the
+	// shard through leaderID 0 first, so by the time the new leader is
+	// observed prevLeaderID is already 0. Requiring prevLeaderID != 0 here
+	// meant every proposal submitted during the leaderless window stayed
+	// pending after a leader existed again, and the caller blocked until its
+	// OWN deadline — measured as a ~5s tail on an election that completed in
+	// ~530ms. Those proposals were never forwarded anywhere and cannot
+	// complete, so the new leader's arrival is exactly when to fail them and
+	// let the caller retry against it.
+	if !wasLeader && prevLeaderID != leaderID && leaderID != ns.replicaID {
 		c.h.logger.Debug("follower detected leader change, failing forwarded proposals",
 			"shard", shardID,
 			"replica", ns.replicaID,

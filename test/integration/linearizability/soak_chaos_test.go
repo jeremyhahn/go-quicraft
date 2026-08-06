@@ -379,6 +379,17 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	cluster.stopNode(leaderIdx)
 	closeElapsed := time.Since(closeStart)
 
+	// Split the outage into "how long until a new leader exists" and "how
+	// long after that until writes actually land". Those have different
+	// causes -- a slow election vs. clients not retrying promptly -- and the
+	// aggregate number cannot distinguish them.
+	electedAt := time.Duration(0)
+	go func() {
+		es := time.Now()
+		cluster.waitForClusterLeader(shardID, failoverTimeout)
+		electedAt = time.Since(es)
+	}()
+
 	// Require SUSTAINED recovery, not a single completion. An operation that
 	// was already in flight when the leader closed will finish moments later
 	// and would otherwise be misread as "the cluster is healthy again",
@@ -397,8 +408,8 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	close(done)
 	wg.Wait()
 
-	t.Logf("leader close took %v; %d sustained ops committed after %v (%d total)",
-		closeElapsed, recoveredOps, outage, totalOps.Load())
+	t.Logf("leader close took %v; new leader after %v; %d sustained ops committed after %v (%d total)",
+		closeElapsed, electedAt, recoveredOps, outage, totalOps.Load())
 
 	if outage == 0 {
 		t.Fatalf("writes never resumed within %v of closing the leader", maxOutage+5*time.Second)

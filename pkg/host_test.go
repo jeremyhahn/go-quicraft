@@ -10556,6 +10556,92 @@ func TestOnLeaderUpdated_FollowerLeaderChangeFailsForwardedProposals(t *testing.
 	rsRead.Release()
 }
 
+// TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals covers the
+// transition a real failover actually takes: a follower observes the dying
+// leader as leaderID 0 FIRST, so by the time the new leader appears the
+// previous leader is already 0.
+//
+// The condition here used to require prevLeaderID != 0, so this second
+// transition never fired and every proposal submitted during the leaderless
+// window stayed pending after a leader existed again. The caller then blocked
+// until its OWN deadline: measured on a 5-node cluster, elections completed in
+// ~530ms but writes did not resume for ~5.2s in roughly one failover in three.
+// Those proposals were never forwarded anywhere and can never complete, so the
+// new leader's arrival is exactly when to fail them.
+func TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals(t *testing.T) {
+	h := newTestHost(t)
+	addTestNodeState(h, 1, 1)
+	ns := testLoadNode(h, 1)
+	pool := NewRequestStatePool()
+	cb := &hostEngineCallback{h: h}
+
+	// The dying leader is observed as "no leader" first.
+	ns.leaderID.Store(2)
+	ns.isLeader.Store(false)
+	cb.OnLeaderUpdated(1, 0, 5)
+	if got := ns.leaderID.Load(); got != 0 {
+		t.Fatalf("leaderID = %d after leader loss, want 0", got)
+	}
+
+	// A proposal submitted during the leaderless window.
+	rs := newRequestState(pool, 200, time.Time{}, true)
+	ns.pendingProposals.Store(uint64(200), &pendingProposal{rs: rs})
+	h.addPendingOp()
+
+	// A new leader is elected. prevLeaderID is 0 at this point.
+	cb.OnLeaderUpdated(1, 3, 6)
+
+	select {
+	case result := <-rs.ResultC():
+		if !errors.Is(result.Err, ErrNotLeader) {
+			t.Errorf("proposal result.Err = %v, want NotLeaderError", result.Err)
+		}
+		var nle *NotLeaderError
+		if errors.As(result.Err, &nle) && nle.LeaderID != 3 {
+			t.Errorf("NotLeaderError.LeaderID = %d, want 3 so the caller "+
+				"retries against the new leader", nle.LeaderID)
+		}
+	default:
+		t.Fatal("a proposal submitted while leaderless was left pending after " +
+			"a new leader appeared; the caller would block until its own deadline")
+	}
+	rs.Release()
+}
+
+// TestOnLeaderUpdated_BecomingLeaderKeepsPendingProposals verifies the
+// exclusion: when THIS replica is the one elected, its pending proposals must
+// survive, because it is about to commit them itself. Failing them here would
+// turn the fix above into spurious errors on every local election win.
+func TestOnLeaderUpdated_BecomingLeaderKeepsPendingProposals(t *testing.T) {
+	h := newTestHost(t)
+	addTestNodeState(h, 1, 1)
+	ns := testLoadNode(h, 1)
+	pool := NewRequestStatePool()
+	cb := &hostEngineCallback{h: h}
+
+	ns.leaderID.Store(0)
+	ns.isLeader.Store(false)
+
+	rs := newRequestState(pool, 300, time.Time{}, true)
+	ns.pendingProposals.Store(uint64(300), &pendingProposal{rs: rs})
+	h.addPendingOp()
+
+	// This replica (1) wins the election.
+	cb.OnLeaderUpdated(1, 1, 7)
+
+	select {
+	case result := <-rs.ResultC():
+		t.Fatalf("pending proposal was failed with %v when THIS replica became "+
+			"leader; it is about to be committed locally", result.Err)
+	default:
+	}
+
+	if _, ok := ns.pendingProposals.Load(uint64(300)); !ok {
+		t.Error("pending proposal was removed when this replica became leader")
+	}
+	rs.Release()
+}
+
 func TestOnLeaderUpdated_FollowerSameLeaderReelectedDoesNotFail(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -10588,36 +10674,44 @@ func TestOnLeaderUpdated_FollowerSameLeaderReelectedDoesNotFail(t *testing.T) {
 	rs.Release()
 }
 
-func TestOnLeaderUpdated_FollowerNoPreviousLeaderDoesNotFail(t *testing.T) {
+// TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals asserts
+// that a proposal still pending when a new leader appears is failed, even
+// though the previously observed leader was 0.
+//
+// This test previously asserted the OPPOSITE ("first-election should not fail
+// proposals"), reasoning there was no previous leader to lose. That reasoning
+// does not survive contact with the real transition. Raft rejects a proposal
+// outright with NotLeaderError when it knows no leader, so a proposal that is
+// still PENDING here is not a first-election proposal at all — it is one that
+// was forwarded to a leader which then died, arriving after the leaderID -> 0
+// transition had already been consumed. It can never complete, and leaving it
+// pending made the caller wait out its own deadline: ~5s on a cluster whose
+// election finished in ~530ms, in roughly one failover in three.
+func TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
 
-	// Set up: replica 1 is a follower, no leader known yet.
 	ns.leaderID.Store(0)
 	ns.isLeader.Store(false)
 
-	// Register a pending proposal.
 	rs := newRequestState(pool, 300, time.Time{}, true)
 	ns.pendingProposals.Store(uint64(300), &pendingProposal{rs: rs})
 	h.addPendingOp()
 
-	// First leader is elected (prev=0, new=2). Should not fail proposals
-	// because there was no previous leader to lose.
 	cb := &hostEngineCallback{h: h}
 	cb.OnLeaderUpdated(1, 2, 5)
 
-	// Proposal should NOT be failed.
 	select {
 	case result := <-rs.ResultC():
-		t.Fatalf("first-election should not fail proposals, got %v", result)
+		if !errors.Is(result.Err, ErrNotLeader) {
+			t.Errorf("result.Err = %v, want NotLeaderError", result.Err)
+		}
 	default:
-		// Expected.
+		t.Fatal("a proposal stranded by a dead leader was left pending once a " +
+			"new leader appeared; the caller blocks until its own deadline")
 	}
-
-	// Clean up.
-	rs.complete(RequestResult{})
 	rs.Release()
 }
 
