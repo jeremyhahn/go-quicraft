@@ -161,11 +161,17 @@ func (db *DB) getShard(shardID uint64) *walShard {
 }
 ```
 
-Each shard is an independent unit with its own mutex, segment files, and in-memory state maps:
+Each shard is an independent unit with its own segment files and in-memory state maps, guarded by **two** locks:
+
+- `mu` protects the segment FILE state — the active segment, segment IDs, rotation, record writes, `fsync`, and rollback. `SaveState` holds it across write → fsync → commit, which is load-bearing: releasing it between the durable write and a rollback would let a concurrent same-shard batch commit past this batch's checkpoint, after which the rollback would truncate the segment and erase acknowledged records.
+- `dataMu` (an `RWMutex`) protects only the in-memory maps that reads consult. Readers take `dataMu.RLock()` and **no** `mu` at all, so they are never blocked by a writer's `fsync`; `SaveState` takes `dataMu` only for its brief phase-3 commit, which keeps a batch atomic as far as readers are concerned.
+
+Lock order is always `mu` → `dataMu`, never the reverse, and `dataMu` is never held across I/O.
 
 ```go
 type walShard struct {
-    mu sync.Mutex
+    mu     sync.Mutex   // segment file state
+    dataMu sync.RWMutex // in-memory maps read by IterateEntries/ReadState/...
 
     dir             string
     opts            dbOptions
@@ -378,7 +384,24 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 
 ### Per-Update Processing
 
-`saveUpdate` writes up to three WAL records per update: entries, hard state, and snapshot metadata. Each record type is only written when the corresponding field is non-zero:
+`saveUpdate` writes three KINDS of WAL record per update — entries, hard state, and snapshot metadata — each only when the corresponding field is non-zero:
+
+The entry payload may span **several** records. A single record must fit inside
+one segment, and its usable payload is strictly smaller than the segment size —
+a record spends `recordHeaderSize` bytes in every block it spans — while the WAL
+also adds a 76-byte header per entry that Raft's batch cap does not account for.
+`writeEntries` therefore splits a large batch across as many records as it needs;
+without that, a batch Raft legitimately produced (a lagging follower catching up
+on many small entries is the realistic case) would fail permanently with
+`ErrRecordTooLarge`. A lone entry too large for any record still returns that
+permanent error.
+
+Splitting is safe on replay, which already accepts several entry records per
+update, and safe across a crash: the entry records still precede this update's
+state record in log order and the WAL truncates at a prefix, so a torn tail can
+only lose state while keeping entries — never the reverse, which would recover
+with a commit index past the last entry. Each chunk is stamped with the segment
+it individually landed in, because consecutive chunks can straddle a rotation.
 
 ```go
 func (s *walShard) saveUpdate(u *logdb.Update) error {
