@@ -1781,6 +1781,17 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 	if errors.Is(err, raft.ErrReadIndexNotReady) {
 		return ErrReadIndexNotReady
 	}
+	if errors.Is(err, raft.ErrPendingConfigChange) {
+		// A config change proposed while another is still uncommitted, or
+		// two batched into one Propose (PhD 4.1 permits only one in flight).
+		// Without this the internal error escapes verbatim, and since it
+		// lives in an internal package no caller can match it with
+		// errors.Is — every consumer falls through to its own catch-all and
+		// reports a retryable rejection as a fatal error. It IS retryable:
+		// nothing entered the log, so re-proposing once the pending change
+		// commits succeeds.
+		return ErrRejected
+	}
 	return err
 }
 

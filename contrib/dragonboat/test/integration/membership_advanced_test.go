@@ -340,12 +340,26 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 		}
 	}
 
-	// Wait for the first config change to complete.
+	// Wait for the first config change to resolve.
+	//
+	// Completing is the common outcome, but it is NOT guaranteed. The step
+	// worker batches proposals, so when both requests land in a single
+	// Propose the leader rejects the WHOLE batch — PhD 4.1 permits only one
+	// config change in flight, and rejecting the batch rather than the
+	// second entry alone is what keeps pendingConfigChange from sticking
+	// true forever. Both callers then get a retryable rejection and nothing
+	// enters the log, which is the safe outcome; demanding that the first
+	// always wins asserts a scheduling race.
 	select {
 	case result := <-rs1.ResultC():
-		if !result.Completed() {
-			t.Fatalf("first config change did not complete: timeout=%v rejected=%v",
-				result.Timeout(), result.Rejected())
+		if !result.Completed() && !result.Rejected() {
+			t.Fatalf("first config change neither completed nor was rejected: "+
+				"timeout=%v rejected=%v dropped=%v aborted=%v terminated=%v",
+				result.Timeout(), result.Rejected(), result.Dropped(), result.Aborted(), result.Terminated())
+		}
+		if result.Rejected() {
+			t.Logf("first config change rejected: both changes batched into one Propose")
+			return
 		}
 		t.Logf("first config change completed successfully")
 	case <-time.After(defaultTimeout):

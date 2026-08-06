@@ -13355,6 +13355,43 @@ func TestTranslateProposalError_ReadIndexOverloaded(t *testing.T) {
 	}
 }
 
+// TestTranslateProposalError_PendingConfigChange verifies that the raft
+// layer's pending-config-change rejection reaches callers as the PUBLIC
+// ErrRejected.
+//
+// PhD 4.1 allows only one config change in flight, and the leader rejects a
+// whole Propose batch containing a second one — nothing enters the log, so
+// the caller can simply retry once the pending change commits. But
+// raft.ErrPendingConfigChange lives in an internal package: returned
+// verbatim, no consumer can match it with errors.Is, so every caller falls
+// through to its own catch-all and reports a retryable rejection as a fatal
+// error. The dragonboat compatibility shim did exactly that, mapping it to
+// RequestAborted instead of RequestRejected.
+func TestTranslateProposalError_PendingConfigChange(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+
+	v, _ := h.nodes.Load(uint64(1))
+	ns := v.(*nodeState)
+
+	result := h.translateProposalError(ns, raft.ErrPendingConfigChange)
+	if !errors.Is(result, ErrRejected) {
+		t.Fatalf("translateProposalError(ErrPendingConfigChange) = %v, want "+
+			"ErrRejected: an internal error a caller cannot match forces "+
+			"every consumer into a catch-all", result)
+	}
+}
+
 // TestTranslateProposalError_PassThrough verifies that unrecognized errors
 // are returned as-is without wrapping.
 func TestTranslateProposalError_PassThrough(t *testing.T) {
