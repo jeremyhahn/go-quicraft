@@ -17506,22 +17506,34 @@ func TestSyncRead_BlockingSelectDeadlineExceeded(t *testing.T) {
 // Coverage: SyncGetShardMembership with deadline exceeded
 // ---------------------------------------------------------------------------
 
+// TestSyncGetShardMembership_DeadlineExceeded verifies that a linearizable
+// membership read is bounded by the caller's deadline.
+//
+// The read must be genuinely unable to resolve, or this test asserts a coin
+// flip. On a single-voter shard the ReadIndex takes the ReadOnly bypass and
+// can land in rs.ResultC() before the select runs; with BOTH that case and
+// ctx.Done() ready, Go chooses uniformly at random, so the call returns a
+// valid membership roughly half the time it reaches that state. (It passed 40
+// consecutive isolated runs and failed under full-suite scheduling — exactly
+// the profile of a latent race.) Adding voter 4 makes quorum 2 of 2 with one
+// replica absent, so the ReadIndex can never confirm and the deadline is the
+// only reachable outcome.
 func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
+	h := startSingleVoterShard(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer setupCancel()
+	if err := h.SyncRequestAddNode(setupCtx, 1, 4, "127.0.0.1:6001", 0); err != nil {
+		t.Fatalf("SyncRequestAddNode: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	<-ctx.Done() // wait for deadline to expire
 
 	_, err := h.SyncGetShardMembership(ctx, 1)
-	if err == nil {
-		t.Fatal("expected error from SyncGetShardMembership with expired deadline")
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("SyncGetShardMembership = %v, want ErrTimeout: a read that "+
+			"cannot reach quorum must be bounded by the caller's deadline", err)
 	}
 }
 
