@@ -559,18 +559,37 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 	}
 }
 
+// publishLeaderChange fires OnLeaderUpdated when this shard's leader differs
+// from the last value published, and is the ONLY way ns.isLeader — and
+// therefore Host.GetShardInfo().IsLeader — ever changes.
+//
+// It must be reachable from every path that can change leadership, not just
+// the one that produces a proto.Update. A node can win an election entirely
+// inside processCommitPendingInbox (a RequestVoteResp there drives
+// handleVoteResp -> becomeLeader), and a CheckQuorum step-down changes no
+// hard-state field at all, so neither produces an update and neither used to
+// publish anything. The result was a real Raft leader that the public API
+// reported as a follower, and a stepped-down node that kept reporting itself
+// leader — clients route writes by exactly this flag.
+func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
+	if w.callback == nil || node.peer == nil {
+		return
+	}
+	currentLeader := node.peer.LeaderID()
+	if currentLeader == w.prevLeaders[shardID] {
+		return
+	}
+	w.prevLeaders[shardID] = currentLeader
+	w.callback.OnLeaderUpdated(shardID, currentLeader, node.peer.Term())
+}
+
 // processCallbacks detects leader changes, delivers ReadyToRead notifications,
 // and detects campaign launches. All notifications are delivered through the
 // callback interface.
 func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.Update) {
 	// Detect leader change and notify callback.
 	if w.callback != nil {
-		currentLeader := node.peer.LeaderID()
-		prevLeader := w.prevLeaders[shardID]
-		if currentLeader != prevLeader {
-			w.prevLeaders[shardID] = currentLeader
-			w.callback.OnLeaderUpdated(shardID, currentLeader, update.State.Term)
-		}
+		w.publishLeaderChange(shardID, node)
 		// Notify confirmed read index requests.
 		if len(update.ReadyToRead) > 0 {
 			w.callback.OnReadyToRead(shardID, update.ReadyToRead)
@@ -838,6 +857,13 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// latency under write load — defeating this method's purpose. Phase 2
 	// drains again for any messages it generates; DrainFreeOrderMessages only
 	// returns what is currently buffered, so there is no double-send.
+	//
+	// A RequestVoteResp stepped above can also drive this node all the way to
+	// becomeLeader, and a CheckQuorum step-down can drop it. Neither produces
+	// a proto.Update, so without publishing here the Host would keep serving a
+	// stale IsLeader through GetShardInfo — the flag clients route writes by.
+	w.publishLeaderChange(shardID, node)
+
 	phase1FreeOrder := node.peer.DrainFreeOrderMessages()
 
 	// Extract ReadIndex completions immediately after processing

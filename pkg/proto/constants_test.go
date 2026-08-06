@@ -170,8 +170,8 @@ func TestIsFreeOrderMessage(t *testing.T) {
 		{"SnapshotReceived", SnapshotReceived, false},
 		{"LeaderTransfer", LeaderTransfer, false},
 		{"TimeoutNow", TimeoutNow, false},
-		{"RequestPreVote", RequestPreVote, false},
-		{"RequestPreVoteResp", RequestPreVoteResp, false},
+		{"RequestPreVote", RequestPreVote, true},
+		{"RequestPreVoteResp", RequestPreVoteResp, true},
 		{"RateLimit", RateLimit, false},
 	}
 	for _, tt := range tests {

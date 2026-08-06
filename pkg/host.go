@@ -1872,6 +1872,16 @@ func (h *Host) isShardJoining(shardID uint64) bool {
 	return ok
 }
 
+// IsShardJoining reports whether shardID is still in its join bootstrap
+// window: started locally with join=true and not yet given its first
+// snapshot. Once a snapshot is accepted the shard leaves this window
+// permanently for the life of the process. Callers (e.g. qrdb's placement
+// reconciler) use this to know when a dynamically added replica has caught
+// up enough to be treated as an established member on future restarts.
+func (h *Host) IsShardJoining(shardID uint64) bool {
+	return h.isShardJoining(shardID)
+}
+
 // NewHost creates a new Host with the given configuration and options.
 // It validates the configuration, generates or loads a host ID, and
 // initializes all subsystems.
@@ -1932,10 +1942,29 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// Create the default WAL-based LogDB when no LogDB was provided.
 	// This ensures all production hosts persist raft state to disk.
 	if options.logdb == nil {
+		// Per-shard barriers cannot reach the default WAL: waldb takes ONE
+		// barrier. Without a multiplexing LogDB, configuring per-shard
+		// encryption and nothing else yields encrypted snapshots over a
+		// PLAINTEXT log -- every user command readable on disk, while the
+		// operator's spot-check of the snapshot directory says encryption is
+		// on. Refuse rather than silently downgrade.
+		if options.shardBarriers != nil && options.barrier == nil {
+			return nil, ErrShardBarriersPlaintextWAL
+		}
 		walOpts := buildWALOptions(cfg, &diskFullFlag)
 		// Wire barrier encryption into the WAL when a barrier is configured.
 		if options.barrier != nil {
 			walOpts = append(walOpts, waldb.WithBarrier(options.barrier))
+			// Per-shard barriers plus the default WAL is legal but weaker
+			// than it looks: the log is encrypted under the HOST-WIDE key,
+			// so the per-tenant key isolation WithShardBarriers exists to
+			// provide covers snapshots only.
+			if options.shardBarriers != nil {
+				slog.Warn("per-shard barriers do not cover the default WAL; " +
+					"log entries are encrypted under the host-wide barrier, not " +
+					"per-shard keys. Supply WithLogDB with a multiplexing LogDB " +
+					"for per-shard WAL encryption.")
+			}
 		}
 		// Wire LogDB metrics when a MetricsCollector is provided.
 		if options.metrics != nil {

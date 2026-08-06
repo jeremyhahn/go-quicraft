@@ -36,9 +36,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
@@ -7100,6 +7103,102 @@ func TestRequestRemoveNode_Success(t *testing.T) {
 	}
 	if !errors.Is(err, raft.ErrNodeNotFound) {
 		t.Fatalf("RequestRemoveNode error = %v, want ErrNodeNotFound", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsShardJoining
+// ---------------------------------------------------------------------------
+
+// TestIsShardJoining_TransitionsOnSnapshot verifies that a shard started with
+// join=true reports IsShardJoining() == true until its first snapshot is
+// accepted, after which it reports false for the remaining life of the
+// process. qrdb's placement reconciler polls this to know when a dynamically
+// added replica has caught up enough that a LATER restart of that same
+// replica must use join=false instead of re-entering the join bootstrap
+// window (see pkg/server/tenant_shard_reconciler.go in go-qrdb).
+func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
+	const shardID = 1
+	const localReplicaID = 2
+	const fromReplicaID = 1
+
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+
+	ldb := memdb.New()
+	sender := &noopSender{}
+	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
+	eng.Start()
+	defer eng.Stop()
+
+	h := &Host{
+		cfg:      cfg,
+		logdb:    ldb,
+		registry: registry.NewRegistry(),
+	}
+
+	// markShardJoining mirrors what StartShard(members, join=true, ...) does
+	// internally when this host joins the shard as a dynamically added
+	// replica with no initial membership of its own.
+	h.markShardJoining(shardID)
+	if !h.isShardJoining(shardID) {
+		t.Fatal("isShardJoining = false immediately after markShardJoining, want true")
+	}
+	if !h.IsShardJoining(shardID) {
+		t.Fatal("IsShardJoining = false immediately after markShardJoining, want true")
+	}
+
+	// Load an engine node whose membership includes both replicas. The
+	// sender (fromReplicaID) is deliberately NOT pre-registered in the
+	// registry, forcing HandleSnapshot down the join-window claimed-address
+	// path (messagehandler.go) rather than a normal registry resolve — this
+	// is exactly the situation a freshly join=true-started replica is in
+	// before its first snapshot arrives.
+	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
+		localReplicaID: "127.0.0.1:6001",
+		fromReplicaID:  "127.0.0.1:6002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(shardID)
+
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	chunks := []proto.SnapshotChunk{
+		{
+			ShardID:    shardID,
+			ReplicaID:  localReplicaID,
+			From:       fromReplicaID,
+			Index:      500,
+			Term:       10,
+			ChunkID:    0,
+			ChunkCount: 1,
+			Data:       []byte("bootstrap-snapshot"),
+			Membership: proto.Membership{
+				ConfigChangeID: 1,
+				Addresses: map[uint64]string{
+					localReplicaID: "127.0.0.1:6001",
+					fromReplicaID:  "127.0.0.1:6002",
+				},
+			},
+		},
+	}
+
+	if err := handler.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleSnapshot returned error: %v", err)
+	}
+
+	if h.isShardJoining(shardID) {
+		t.Error("isShardJoining = true after snapshot accepted, want false")
+	}
+	if h.IsShardJoining(shardID) {
+		t.Error("IsShardJoining = true after snapshot accepted, want false")
 	}
 }
 

@@ -3,6 +3,7 @@
 package linearizability_test
 
 import (
+	"log/slog"
 	"math/rand"
 	"os"
 	"strconv"
@@ -171,7 +172,13 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 
 		// A leader must exist again promptly; otherwise the remaining nodes
 		// cannot form quorum, which contradicts the invariant above.
-		cluster.waitForClusterLeader(shardID, failoverTimeout)
+		if !waitForLeaderOrDump(t, cluster, shardID, failoverTimeout, down) {
+			close(done)
+			wg.Wait()
+			t.Fatalf("no leader elected within %v with %d/%d nodes down after "+
+				"%d faults: quorum is intact, so this is an election failure",
+				failoverTimeout, len(down), numNodes, faults)
+		}
 	}
 
 	// Heal: bring everything back so the cluster can converge before the check.
@@ -421,4 +428,52 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	}
 
 	checkLinearizability(t, recorder, totalOps.Load())
+}
+
+// waitForLeaderOrDump waits for a leader and, on timeout, dumps every live
+// replica's view so an election failure can be diagnosed from the log rather
+// than guessed at. Returns false instead of calling Fatalf so the caller can
+// shut the clients down cleanly first.
+func waitForLeaderOrDump(t *testing.T, cluster *testCluster, shardID uint64,
+	timeout time.Duration, down map[int]bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cluster.findLeader(shardID) >= 0 {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Logf("ELECTION FAILURE: no leader after %v; per-replica state follows", timeout)
+	cluster.hostsMu.RLock()
+	defer cluster.hostsMu.RUnlock()
+	for i := range cluster.hosts {
+		if cluster.stopped[i].Load() {
+			t.Logf("  node[%d]: STOPPED", i)
+			continue
+		}
+		info, err := cluster.hosts[i].GetShardInfo(shardID)
+		if err != nil {
+			t.Logf("  node[%d]: GetShardInfo error: %v", i, err)
+			continue
+		}
+		t.Logf("  node[%d]: replica=%d term=%d leader=%d isLeader=%v "+
+			"lastApplied=%d ccIndex=%d observer=%v witness=%v",
+			i, info.ReplicaID, info.Term, info.LeaderID, info.IsLeader,
+			info.LastApplied, info.ConfigChangeIndex, info.IsObserver, info.IsWitness)
+	}
+	return false
+}
+
+// Soak debugging: set QUICRAFT_SOAK_DEBUG=1 to surface the library's debug
+// logs (election, vote grant/deny, snapshot recovery) for a failing seed.
+// Off by default so a normal soak is not drowned in output.
+func init() {
+	if os.Getenv("QUICRAFT_SOAK_DEBUG") == "" {
+		return
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
 }

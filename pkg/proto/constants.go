@@ -224,7 +224,21 @@ func ConfigChangeTypeName(t uint64) string {
 // assertions, not responses to RPCs. Quiesce is free-order because it
 // is an advisory message with no persistence dependency.
 //
-// All other messages (VoteResp, HeartbeatResp, ReplicateResp, etc.)
+// PRE-VOTE is free-order for a different reason: it persists nothing.
+// becomePreCandidate explicitly does not change term or vote, and
+// handleVoteRequest sets r.vote only on the real-vote path, so neither
+// RequestPreVote nor RequestPreVoteResp has any durable state to wait for.
+// Treating them as ordered starved elections under sustained write load:
+// while commitPending is set the step worker transmits only free-order
+// messages, and on a busy shard commitPending is set almost continuously,
+// so pre-vote traffic sat in the outbound buffer. Measured on a 5-node
+// cluster under chaos, all three surviving replicas pre-campaigned ~28
+// times each without a single round completing, and the shard had no leader
+// for over 20 seconds with quorum fully available. PreVote's whole purpose
+// is to test electability without touching persistent state; delaying it
+// behind a WAL write inverts that.
+//
+// All remaining messages (VoteResp, HeartbeatResp, ReplicateResp, etc.)
 // are "ordered" and MUST NOT be sent until the corresponding state
 // change (vote grant, term update, log append) is durable on stable
 // storage. Violating this invariant can cause split-brain: a follower
@@ -232,7 +246,8 @@ func ConfigChangeTypeName(t uint64) string {
 // again for a different candidate in the same term.
 func IsFreeOrderMessage(msgType uint64) bool {
 	return msgType == Replicate || msgType == Ping ||
-		msgType == Heartbeat || msgType == Quiesce
+		msgType == Heartbeat || msgType == Quiesce ||
+		msgType == RequestPreVote || msgType == RequestPreVoteResp
 }
 
 // State machine type constants.

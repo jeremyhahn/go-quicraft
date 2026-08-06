@@ -82,6 +82,11 @@ type Peer struct {
 	// accessed exclusively by the owning worker goroutine.
 	leaderID atomic.Uint64
 
+	// term mirrors r.term for the same reason leaderID mirrors r.leaderID:
+	// callers outside the step worker need the term that accompanies a
+	// leadership change, and the raft struct is not thread-safe.
+	term atomic.Uint64
+
 	// shardID and replicaID identify this peer. Cached from cfg for
 	// fast access without going through raft.
 	shardID   uint64
@@ -1233,4 +1238,11 @@ func (p *Peer) CommittedIndex() uint64 {
 // LeaderID() and IsLeader().
 func (p *Peer) syncLeaderID() {
 	p.leaderID.Store(p.r.leaderID)
+	p.term.Store(p.r.term)
+}
+
+// Term returns the current raft term. Safe for concurrent access; kept in
+// step with LeaderID by syncLeaderID.
+func (p *Peer) Term() uint64 {
+	return p.term.Load()
 }

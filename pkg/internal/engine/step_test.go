@@ -2611,8 +2611,8 @@ func TestCommitMemoryMode_MessageSplitParity_WithWALMode(t *testing.T) {
 		{proto.Quiesce, "Quiesce", true},
 		{proto.RequestVote, "RequestVote", false},
 		{proto.RequestVoteResp, "RequestVoteResp", false},
-		{proto.RequestPreVote, "RequestPreVote", false},
-		{proto.RequestPreVoteResp, "RequestPreVoteResp", false},
+		{proto.RequestPreVote, "RequestPreVote", true},
+		{proto.RequestPreVoteResp, "RequestPreVoteResp", true},
 		{proto.ReplicateResp, "ReplicateResp", false},
 		{proto.HeartbeatResp, "HeartbeatResp", false},
 		{proto.ReadIndex, "ReadIndex", false},
@@ -3436,13 +3436,13 @@ func TestStepWorker_OrderedMessages_DeferredUntilAfterSave(t *testing.T) {
 
 		// Ordered: MUST be deferred until after WAL write.
 		{"RequestVoteResp", proto.RequestVoteResp, false},
-		{"RequestPreVoteResp", proto.RequestPreVoteResp, false},
+		{"RequestPreVoteResp", proto.RequestPreVoteResp, true},
 		{"ReplicateResp", proto.ReplicateResp, false},
 		{"HeartbeatResp", proto.HeartbeatResp, false},
 		{"ReadIndexResp", proto.ReadIndexResp, false},
 		{"InstallSnapshot", proto.InstallSnapshot, false},
 		{"RequestVote", proto.RequestVote, false},
-		{"RequestPreVote", proto.RequestPreVote, false},
+		{"RequestPreVote", proto.RequestPreVote, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3464,12 +3464,21 @@ func TestStepWorker_OrderedMessages_DeferredUntilAfterSave(t *testing.T) {
 func TestStepWorker_OrderedMessages_VoteRespNotFreeOrder(t *testing.T) {
 	// These response types MUST NOT be free-order. Sending any of them
 	// before the corresponding state is durable violates Raft safety.
+	//
+	// RequestPreVoteResp is deliberately NOT in this list. The rule is that a
+	// response must wait for the state it implies to be durable; a pre-vote
+	// response implies no state at all. becomePreCandidate does not touch term
+	// or vote, and the pre-vote grant path never sets r.vote, so there is
+	// nothing a crash could un-persist. Classifying it as ordered starved
+	// elections instead: while commitPending is set only free-order messages
+	// are transmitted, and on a shard under sustained write load that is
+	// nearly always, so pre-vote traffic sat buffered and rounds never
+	// completed.
 	orderedResponses := []struct {
 		name    string
 		msgType uint64
 	}{
 		{"RequestVoteResp", proto.RequestVoteResp},
-		{"RequestPreVoteResp", proto.RequestPreVoteResp},
 		{"ReplicateResp", proto.ReplicateResp},
 		{"HeartbeatResp", proto.HeartbeatResp},
 	}

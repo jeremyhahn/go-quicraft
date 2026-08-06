@@ -49,6 +49,19 @@ var (
 	// an internal state transition such as leadership change.
 	ErrAborted = errors.New("quicraft: operation aborted")
 
+	// ErrShardBarriersPlaintextWAL is returned by NewHost when
+	// WithShardBarriers is configured but the resulting WAL would hold
+	// plaintext: the default WAL takes a single host-wide barrier, so
+	// per-shard barriers alone leave every Raft log entry -- and therefore
+	// every user command -- unencrypted on disk while snapshots ARE
+	// encrypted. Silently accepting that hands an operator who configured
+	// encryption a cleartext command log whose spot-check looks correct.
+	// Supply WithLogDB with a multiplexing LogDB for genuine per-shard WAL
+	// keys, or WithBarrier to at least encrypt the WAL host-wide.
+	ErrShardBarriersPlaintextWAL = errors.New(
+		"quicraft: WithShardBarriers requires WithLogDB (per-shard WAL keys) " +
+			"or WithBarrier (host-wide WAL key); the default WAL would store plaintext")
+
 	// ErrDropped is returned when a proposal is dropped by the engine
 	// due to queue overflow or shutdown in progress.
 	ErrDropped = errors.New("quicraft: proposal dropped")
