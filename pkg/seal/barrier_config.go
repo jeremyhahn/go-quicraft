@@ -124,8 +124,17 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 	}
 }
 
-// validate checks that config values are consistent.
-func (c *BarrierConfig) validate() error {
+// Validate reports whether the configuration can be used to construct a
+// Barrier, returning ErrUnsupportedAlgorithm for an unknown algorithm and
+// ErrAlgorithmNotFIPSApproved when FIPS mode is active and the configured
+// cipher is not FIPS-approved.
+//
+// NewBarrier PANICS on an invalid configuration, which is appropriate for a
+// compile-time-constant config but not for one assembled at runtime from a
+// file, an API request, or per-tenant settings. Embedders building a config
+// dynamically should call Validate first and surface the error, rather than
+// letting a bad algorithm take the process down.
+func (c *BarrierConfig) Validate() error {
 	if !c.Algorithm.Valid() {
 		return ErrUnsupportedAlgorithm
 	}

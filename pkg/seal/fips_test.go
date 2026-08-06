@@ -141,7 +141,7 @@ func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 
 	for _, alg := range []SymmetricAlgorithm{AlgChaCha20Poly1305, AlgXChaCha20Poly1305} {
 		cfg := BarrierConfig{Algorithm: alg, DeploymentID: 1}
-		if err := cfg.validate(); !errors.Is(err, ErrAlgorithmNotFIPSApproved) {
+		if err := cfg.Validate(); !errors.Is(err, ErrAlgorithmNotFIPSApproved) {
 			t.Fatalf("validate(%v) under FIPS = %v, want ErrAlgorithmNotFIPSApproved", alg, err)
 		}
 	}
@@ -149,7 +149,7 @@ func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 	// AES variants remain valid.
 	for _, alg := range []SymmetricAlgorithm{AlgAES128GCM, AlgAES192GCM, AlgAES256GCM} {
 		cfg := BarrierConfig{Algorithm: alg, DeploymentID: 1}
-		if err := cfg.validate(); err != nil {
+		if err := cfg.Validate(); err != nil {
 			t.Fatalf("validate(%v) under FIPS = %v, want nil", alg, err)
 		}
 	}
@@ -160,7 +160,7 @@ func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 func TestNonFIPSAllowsChaCha(t *testing.T) {
 	t.Setenv("GOFIPS140", "")
 	cfg := BarrierConfig{Algorithm: AlgChaCha20Poly1305, DeploymentID: 1}
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate(ChaCha20) outside FIPS = %v, want nil", err)
 	}
 }

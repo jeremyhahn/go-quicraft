@@ -217,9 +217,17 @@ type EpochBarrier = Barrier
 // The config.Algorithm selects the symmetric encryption algorithm. Both AEAD
 // safety trackers (InvocationCounter and NonceTracker) are initialized from config.
 //
-// Panics if config.Algorithm is not a valid algorithm (programmer error).
+// Panics if the configuration is invalid — an unknown algorithm, or a
+// non-FIPS-approved cipher while FIPS mode is active. That is appropriate for
+// a config built from compile-time constants, where an invalid value is a
+// programmer error that should never reach production.
+//
+// A config assembled at RUNTIME — from a file, an API request, or per-tenant
+// settings — should be checked with BarrierConfig.Validate first, so an
+// operator's bad algorithm surfaces as an error instead of taking down the
+// embedding process.
 func NewBarrier(config BarrierConfig) *Barrier {
-	if err := config.validate(); err != nil {
+	if err := config.Validate(); err != nil {
 		panic("seal.NewBarrier: " + err.Error())
 	}
 
