@@ -679,7 +679,12 @@ build-fips:
 # ============================================================================
 
 .PHONY: ci
-ci: fmt vet lint gosec vuln trivy nancy build test
+# nancy is intentionally NOT in this list: it requires OSS Index credentials
+# and fails closed without them, and govulncheck + trivy already cover Go
+# dependency vulnerabilities. Run `make nancy` explicitly where credentials
+# are configured. This is not a reduction in coverage — with a 401 the scan
+# was never running, it was only reporting that it had.
+ci: fmt vet lint gosec vuln trivy build test
 	@echo "CI pipeline passed"
 
 # ============================================================================
@@ -710,7 +715,7 @@ fmt:
 
 # Comprehensive security target - runs all security analysis tools
 .PHONY: security
-security: gosec vuln trivy nancy
+security: gosec vuln trivy
 	@echo "All security scans passed"
 
 .PHONY: gosec
@@ -718,12 +723,25 @@ gosec:
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
 
 .PHONY: vuln
+# Fails the build on any vulnerability govulncheck finds reachable from our
+# code. It previously swallowed a non-zero exit into a WARNING, which meant a
+# real finding printed a message and PASSED — a security gate that cannot fail
+# is not a gate. If a stdlib vulnerability is genuinely unfixable without a Go
+# upgrade, record that decision explicitly rather than hiding it here.
 vuln:
-	$(GOVULNCHECK) ./... || echo "WARNING: govulncheck found stdlib vulnerabilities (upgrade Go to fix)"
+	$(GOVULNCHECK) ./...
 
 .PHONY: trivy
+# Scoped to what actually ships. test/performance/* are SEPARATE modules with
+# their own go.mod, pulled in only to benchmark against dragonboat and etcd, so
+# their transitive CVEs (x/net, x/crypto/ssh, x/text via dragonboat) never
+# reach a consumer of this library — `go get github.com/jeremyhahn/go-quicraft`
+# does not fetch them. .build-cache is a local build artifact. Excluding them
+# is what makes this gate mean "the shipped library is clean" rather than
+# failing permanently on benchmark tooling and training everyone to ignore it.
 trivy:
-	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 .
+	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 \
+		--skip-dirs .build-cache --skip-dirs test/performance .
 
 .PHONY: trivy-image
 trivy-image: docker-build
@@ -733,12 +751,18 @@ trivy-image: docker-build
 # Note: nancy requires Sonatype OSS Index API access. If it fails, govulncheck
 # provides similar coverage for Go module vulnerabilities.
 .PHONY: nancy
+# nancy exits non-zero BOTH when it finds vulnerabilities and when it cannot
+# reach OSS Index, so the previous `|| echo "scan completed"` reported success
+# for a real CVE, an expired credential, and a network failure alike. It now
+# fails closed. Not-installed is still a legitimate skip, because govulncheck
+# and trivy cover the same ground; an installed-but-failing nancy is not.
+# OSS Index requires credentials (~/.oss-index-config or OSSI_USERNAME /
+# OSSI_TOKEN); a 401 will now stop the build rather than pass silently.
 nancy:
 	@if command -v nancy >/dev/null 2>&1; then \
-		$(GO) list -json -m all 2>/dev/null | nancy sleuth --quiet 2>/dev/null || \
-		echo "nancy scan completed (check ~/.ossindex/nancy.combined.log for details)"; \
+		$(GO) list -json -m all | nancy sleuth --quiet; \
 	else \
-		echo "nancy not installed, skipping (govulncheck provides similar coverage)"; \
+		echo "nancy not installed, skipping (govulncheck and trivy cover this)"; \
 	fi
 
 # Generate SARIF reports for all security tools (for CI integration)
