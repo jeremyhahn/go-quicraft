@@ -5845,23 +5845,33 @@ func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
 		t.Fatal("engine node should not be nil")
 	}
 
-	// Continuously try to fill the ReadIndex queue and call ReadIndex
-	// until we observe ErrSystemBusy. The step worker drains the queue
-	// concurrently, so we may need several attempts.
-	deadline := time.Now().Add(2 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		for i := 0; i < 8192; i++ {
-			if !engNode.DeliverReadIndex(uint64(i)) {
-				break
-			}
+	// Park the step worker off this shard so the queue STAYS full.
+	// processReady skips a recovering node before it reaches
+	// drainAndHandleReadIndex, and that drain is the only consumer. Racing
+	// a live drain instead makes the test opportunistic: on idle hardware
+	// the worker wins every round and the queue never fills, which is
+	// exactly how this failed on a 20-thread idle host.
+	engNode.SetRecovering(true)
+	defer engNode.SetRecovering(false)
+
+	// Fill to capacity through the real API; DeliverReadIndex reports the
+	// queue full by returning false.
+	filled := 0
+	for i := 0; i < 1<<20; i++ {
+		if !engNode.DeliverReadIndex(uint64(i)) {
+			break
 		}
-		_, lastErr = h.ReadIndex(context.Background(), 1)
-		if errors.Is(lastErr, ErrSystemBusy) {
-			return // success
-		}
+		filled++
 	}
-	t.Errorf("ReadIndex error = %v, want ErrSystemBusy (readIndexQ never became full)", lastErr)
+	if filled == 0 {
+		t.Fatal("readIndexQ accepted nothing; cannot exercise the full-queue path")
+	}
+
+	// With the queue full, ReadIndex must shed load rather than block.
+	if _, err := h.ReadIndex(context.Background(), 1); !errors.Is(err, ErrSystemBusy) {
+		t.Errorf("ReadIndex error = %v, want ErrSystemBusy after filling "+
+			"readIndexQ with %d entries", err, filled)
+	}
 }
 
 func TestNoOpMetricsCollector_AllMethods(t *testing.T) {
