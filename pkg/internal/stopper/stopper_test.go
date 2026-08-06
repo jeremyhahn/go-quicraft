@@ -136,3 +136,58 @@ func TestStop_NoWorkers(t *testing.T) {
 	s := New()
 	s.Stop()
 }
+
+// TestRunWorker_RefusedAfterStop asserts the fail-closed post-shutdown branch:
+// once Stop has completed, RunWorker must NOT launch the goroutine (and must
+// not call wg.Add, which would be "WaitGroup misuse: Add concurrent with Wait").
+// Launching work after shutdown would leak a goroutine past Stop's return.
+func TestRunWorker_RefusedAfterStop(t *testing.T) {
+	s := New()
+	s.Stop()
+
+	ran := make(chan struct{})
+	s.RunWorker(func() { close(ran) })
+
+	select {
+	case <-ran:
+		t.Fatal("RunWorker launched a worker after Stop; must be refused")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Stop must still return promptly: no wg.Add was performed, so there is
+	// nothing outstanding to wait for.
+	done := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop blocked after a refused RunWorker: wg counter was incremented")
+	}
+
+	select {
+	case <-ran:
+		t.Fatal("refused worker ran late")
+	default:
+	}
+}
+
+// TestRunWorker_RefusedAfterClose asserts Close (the io.Closer alias) installs
+// the same post-shutdown refusal as Stop.
+func TestRunWorker_RefusedAfterClose(t *testing.T) {
+	s := New()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close returned %v, want nil", err)
+	}
+	var ran atomic.Bool
+	s.RunWorker(func() { ran.Store(true) })
+	// Second Close must observe no tracked workers and return promptly.
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close returned %v, want nil", err)
+	}
+	if ran.Load() {
+		t.Fatal("RunWorker launched a worker after Close; must be refused")
+	}
+}

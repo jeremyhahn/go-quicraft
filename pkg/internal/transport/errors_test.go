@@ -18,6 +18,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -476,5 +477,93 @@ func TestFrameDecompressErrorUnwrap(t *testing.T) {
 	}
 	if !errors.Is(err, underlying) {
 		t.Fatal("errors.Is should match through Unwrap")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel identity of the snapshot/frame abort errors
+// ---------------------------------------------------------------------------
+
+// TestSnapshotAbortErrors_SentinelIdentity pins the errors.Is contract for the
+// typed abort errors. Callers (and the receive-side rejection accounting)
+// distinguish an abort reason by matching the sentinel, not by string: an
+// error whose Is does not report its own sentinel would be silently
+// misclassified, and one that matched a FOREIGN sentinel would send the caller
+// down the wrong recovery path.
+func TestSnapshotAbortErrors_SentinelIdentity(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		sentinel error
+		wants    []string
+	}{
+		{
+			name:     "frame drain incomplete",
+			err:      &FrameDrainError{Declared: 4096, Drained: 100, Err: errors.New("eof")},
+			sentinel: ErrFrameDrainIncomplete,
+			wants:    []string{"100", "4096", "desynchronised", "eof"},
+		},
+		{
+			name:     "transfer timeout",
+			err:      &SnapshotTransferTimeoutError{Elapsed: time.Minute, Limit: time.Second, ReceivedBytes: 17},
+			sentinel: ErrSnapshotTransferTimeout,
+			wants:    []string{"1m0s", "1s", "17"},
+		},
+		{
+			name:     "progress stalled",
+			err:      &SnapshotProgressStalledError{Elapsed: time.Second, ReceivedBytes: 3, MinBytesPerSec: 999},
+			sentinel: ErrSnapshotProgressStalled,
+			wants:    []string{"3", "1s", "999"},
+		},
+		{
+			name:     "zero-length frame flood",
+			err:      &SnapshotZeroLengthFrameFloodError{Count: 51, Max: 50},
+			sentinel: ErrSnapshotZeroLengthFrameFlood,
+			wants:    []string{"51", "50"},
+		},
+		{
+			name:     "header length out of range",
+			err:      &SnapshotHeaderLengthError{Declared: 9, Min: 32, Max: 4096},
+			sentinel: ErrSnapshotHeaderLength,
+			wants:    []string{"9", "32", "4096"},
+		},
+		{
+			name:     "chunk count out of range",
+			err:      &SnapshotChunkCountError{Declared: 1 << 40, Max: 1024},
+			sentinel: ErrSnapshotChunkCount,
+			wants:    []string{"1099511627776", "1024"},
+		},
+	}
+
+	allSentinels := []error{
+		ErrFrameDrainIncomplete,
+		ErrSnapshotTransferTimeout,
+		ErrSnapshotProgressStalled,
+		ErrSnapshotZeroLengthFrameFlood,
+		ErrSnapshotHeaderLength,
+		ErrSnapshotChunkCount,
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !errors.Is(tc.err, tc.sentinel) {
+				t.Fatalf("errors.Is(%T, %v) = false, want true", tc.err, tc.sentinel)
+			}
+			// Must not answer for any OTHER sentinel.
+			for _, other := range allSentinels {
+				if other == tc.sentinel {
+					continue
+				}
+				if errors.Is(tc.err, other) {
+					t.Errorf("%T also matches the unrelated sentinel %v", tc.err, other)
+				}
+			}
+			msg := tc.err.Error()
+			for _, want := range tc.wants {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error message %q missing %q", msg, want)
+				}
+			}
+		})
 	}
 }

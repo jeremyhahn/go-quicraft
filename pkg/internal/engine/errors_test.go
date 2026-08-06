@@ -310,6 +310,52 @@ func TestTypeAssertionError_Error_NilValue(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot recovery bound errors
+// ---------------------------------------------------------------------------
+
+func TestSnapshotRecoveryBehindError_Error(t *testing.T) {
+	e := &SnapshotRecoveryBehindError{
+		ShardID:       9,
+		ReplicaID:     2,
+		SnapshotIndex: 300,
+		Committed:     120,
+		Processed:     110,
+	}
+	msg := e.Error()
+	// Operators triage these from logs: every bound that made the recovery
+	// inadmissible must be present.
+	for _, want := range []string{"shard 9", "replica 2", "index 300", "committed 120", "processed 110"} {
+		if !contains(msg, want) {
+			t.Fatalf("error message missing %q: %s", want, msg)
+		}
+	}
+	if !e.Retryable() {
+		t.Fatal("SnapshotRecoveryBehindError must report itself retryable")
+	}
+}
+
+func TestSnapshotRecoveryStaleError_Error(t *testing.T) {
+	e := &SnapshotRecoveryStaleError{
+		ShardID:       9,
+		ReplicaID:     2,
+		SnapshotIndex: 100,
+		LastApplied:   400,
+	}
+	msg := e.Error()
+	for _, want := range []string{"shard 9", "replica 2", "index 100", "applied index 400"} {
+		if !contains(msg, want) {
+			t.Fatalf("error message missing %q: %s", want, msg)
+		}
+	}
+	// A stale recovery is permanent, not retryable: it must NOT expose the
+	// retryable behavior that would make a caller re-request it forever.
+	var retryable interface{ Retryable() bool }
+	if errors.As(error(e), &retryable) {
+		t.Fatal("SnapshotRecoveryStaleError must not be retryable: recovering it would regress the state machine")
+	}
+}
+
 // contains is a helper that checks whether s contains substr.
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
