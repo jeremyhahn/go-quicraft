@@ -123,7 +123,18 @@ func TestReadsDoNotBlockOnFsync(t *testing.T) {
 	}
 
 	// The commit must NOT be visible yet: the writer has not passed Phase 3.
-	if state, _, err := db.ReadState(1, 1); err == nil && state.Commit != 1 {
+	// ReadState must also SUCCEED here — tolerating an error would let any
+	// change that makes a concurrent read fail mid-batch silently turn this
+	// check into a no-op.
+	state, _, err := db.ReadState(1, 1)
+	if err != nil {
+		// Release the stalled writer first: failing while it still holds
+		// shard.mu inside fsync would deadlock the deferred Close.
+		close(slow.release)
+		t.Fatalf("ReadState during an unfinished fsync: %v — reads must not "+
+			"fail while a batch holds the shard's write path", err)
+	}
+	if state.Commit != 1 {
 		t.Errorf("state.Commit = %d during an unfinished fsync, want 1 — reads "+
 			"must not observe a batch before it is durable", state.Commit)
 	}
@@ -134,7 +145,7 @@ func TestReadsDoNotBlockOnFsync(t *testing.T) {
 	}
 
 	// And it must be visible once the batch commits.
-	state, _, err := db.ReadState(1, 1)
+	state, _, err = db.ReadState(1, 1)
 	if err != nil {
 		t.Fatalf("ReadState after commit: %v", err)
 	}

@@ -612,9 +612,16 @@ func (p *Peer) syncRaftRemotes() {
 	p.r.maxWitnesses = p.membership.maxWitnesses
 	p.r.requireFullReplicaMajority = p.membership.requireFullReplicaMajority
 
+	// Track whether this replica is still in the configuration. A removed
+	// replica must stop campaigning: the surviving configuration computes
+	// its quorum without it, so its self-counted vote could elect it leader
+	// for a term the real configuration is also electing a leader in.
+	p.r.setSelfMembership(p.membership.isMember(p.replicaID))
+
 	// Drop vote records for replicas that just left. The election quorum is
 	// computed over the voting set this call just reshaped; a stale grant
 	// from a departed replica would be tallied against the smaller quorum.
+	// This now includes a self vote cast before a self-removal committed.
 	p.r.purgeDepartedVotes()
 
 	// When the node is leader, rebuild quorum and lease tracking maps

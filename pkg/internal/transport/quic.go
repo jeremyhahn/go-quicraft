@@ -134,8 +134,26 @@ type QUICTransport struct {
 	quicTr   *quic.Transport
 	listener *quic.Listener
 
-	connMu    sync.RWMutex
-	conns     map[string]*quic.Conn
+	connMu sync.RWMutex
+	conns  map[string]*quic.Conn
+
+	// connEpoch records, for each cached outbound in conns, the peer boot
+	// epoch this node believed the target to be running when that outbound
+	// was dialed (0 when the peer had never been heard from). It is written
+	// and deleted under connMu at exactly the sites that write and delete
+	// conns, so the two maps never diverge.
+	//
+	// It is what makes restart detection COMPLETE. peerEpoch alone only
+	// records incarnations we have HEARD FROM, and an outbound can easily
+	// exist for a target whose epoch we have never recorded (we dial before
+	// the peer's first batch reaches us, and every teardown used to drop the
+	// record while a later re-dial repopulated conns). In that state a
+	// restart is indistinguishable from first contact, so the black-holed
+	// outbound survived until MaxIdleTimeout -- 30s of one-way silence.
+	// Comparing the RECEIVED epoch against the epoch the outbound was dialed
+	// under decides the question without needing to remember history.
+	connEpoch map[string]uint64
+
 	dialGroup singleflight.Group
 
 	// bootEpoch is this process's per-start identity, stamped into every
@@ -143,11 +161,10 @@ type QUICTransport struct {
 	// restarts.
 	bootEpoch uint64
 
-	// peerEpoch tracks the last-seen bootEpoch per peer address. A change in
-	// a peer's epoch means that peer's process restarted: its view of our
-	// previously-dialed outbound connection is gone (that outbound is now
-	// black-holed), so we evict it immediately rather than waiting for
-	// MaxIdleTimeout. Keying on the epoch (not the inbound *quic.Conn
+	// peerEpoch tracks the last-seen bootEpoch per peer address. It is the
+	// value a new outbound is stamped with in connEpoch, so that a later
+	// batch can tell whether the cached outbound belongs to the incarnation
+	// that sent it. Keying on the epoch (not the inbound *quic.Conn
 	// identity) avoids the eviction cascade that benign re-dials caused,
 	// because a re-dial from the same process carries the SAME epoch.
 	peerEpochMu sync.Mutex
@@ -387,6 +404,7 @@ func NewQUICTransport(
 		tlsPair:        pair,
 		quicCfg:        qcfg,
 		conns:          make(map[string]*quic.Conn),
+		connEpoch:      make(map[string]uint64),
 		bootEpoch:      newBootEpoch(),
 		peerEpoch:      make(map[string]uint64),
 		sendQueues:     make(map[string]*sendQueue),
@@ -586,6 +604,7 @@ func (t *QUICTransport) Stop() error {
 			slog.Debug("QUIC connection close failed", "addr", addr, "error", err)
 		}
 		delete(t.conns, addr)
+		delete(t.connEpoch, addr)
 	}
 	t.connMu.Unlock()
 

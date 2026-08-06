@@ -100,6 +100,14 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 		return nil, &DialError{Target: target, Err: ErrEmptyDialHost}
 	}
 
+	// Capture the peer incarnation this dial is being made under BEFORE the
+	// dial, so the stamp recorded below can never be newer than the
+	// connection it describes. Stamping a NEWER epoch than the one the
+	// connection actually reached would mark a stale outbound as current and
+	// re-open the black hole; stamping an older one only costs one extra
+	// eviction and re-dial, which is self-correcting.
+	dialEpoch := t.knownPeerEpoch(target)
+
 	ctx, cancel := context.WithTimeout(t.shutdownCtx, dialTimeout)
 	defer cancel()
 
@@ -144,6 +152,7 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 		}
 	}
 	t.conns[target] = conn
+	t.connEpoch[target] = dialEpoch
 	t.connMu.Unlock()
 
 	// Pre-open the heartbeat stream (index 0) for this target. This
@@ -226,17 +235,35 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 }
 
 // removeConnection removes a connection from the pool without closing it.
+//
+// The peerEpoch record is deliberately NOT dropped here. Removing a connection
+// is the FIRST half of a re-dial, and the epoch is what the re-dial stamps the
+// replacement with (see dialConnection). Forgetting it would stamp the fresh
+// outbound with "unknown", the next batch from the peer would find a stamp
+// mismatch and evict again, and the eviction would forget again -- an endless
+// evict/re-dial cascade. peerEpoch is reaped by connectionCleanup instead,
+// which observes a genuinely dead connection rather than a deliberate teardown.
 func (t *QUICTransport) removeConnection(target string) {
 	t.connMu.Lock()
 	delete(t.conns, target)
+	delete(t.connEpoch, target)
 	t.connMu.Unlock()
-	t.forgetPeerEpoch(target)
+}
+
+// knownPeerEpoch returns the last boot epoch observed from target, or 0 if the
+// peer has never been heard from.
+func (t *QUICTransport) knownPeerEpoch(target string) uint64 {
+	t.peerEpochMu.Lock()
+	epoch := t.peerEpoch[target]
+	t.peerEpochMu.Unlock()
+	return epoch
 }
 
 // forgetPeerEpoch drops the cached last-seen bootEpoch for a target. Called
-// whenever a connection is permanently torn down so the peerEpoch map does not
-// grow unbounded across membership churn (it would otherwise only be cleared
-// at Stop()).
+// when a connection is found DEAD by the periodic cleanup, so the peerEpoch map
+// does not grow unbounded across membership churn (it would otherwise only be
+// cleared at Stop()). It must not be called from an eviction path -- see
+// removeConnection.
 func (t *QUICTransport) forgetPeerEpoch(target string) {
 	t.peerEpochMu.Lock()
 	delete(t.peerEpoch, target)
@@ -251,8 +278,8 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) {
 	t.connMu.Lock()
 	conn, ok := t.conns[target]
 	delete(t.conns, target)
+	delete(t.connEpoch, target)
 	t.connMu.Unlock()
-	t.forgetPeerEpoch(target)
 
 	if ok && conn != nil {
 		if closeErr := conn.CloseWithError(0, reason); closeErr != nil {
@@ -508,6 +535,7 @@ func (t *QUICTransport) cleanStaleConnections() {
 				t.eventListener.OnConnectionFailed(config.ConnectionInfo{Address: addr})
 			}
 			delete(t.conns, addr)
+			delete(t.connEpoch, addr)
 			deadTargets = append(deadTargets, addr)
 		default:
 		}
@@ -608,14 +636,10 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 	// record/act on the epoch once the claimed target is bound to the inbound
 	// connection's authenticated certificate, so a spoofed SourceAddress cannot
 	// poison peerEpoch or evict a live outbound.
-	restarted := false
 	if srcEpoch != 0 {
 		t.peerEpochMu.Lock()
 		prev, known := t.peerEpoch[target]
 		if (!known || prev != srcEpoch) && t.inboundAuthorizedForCached(inboundConn, target) {
-			if known && prev != srcEpoch {
-				restarted = true
-			}
 			t.peerEpoch[target] = srcEpoch
 		}
 		t.peerEpochMu.Unlock()
@@ -623,6 +647,7 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 
 	t.connMu.RLock()
 	outbound, ok := t.conns[target]
+	stamp := t.connEpoch[target]
 	t.connMu.RUnlock()
 	if !ok {
 		return
@@ -639,19 +664,25 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 		t.removeConnection(target)
 		t.evictStreamsForTarget(target)
 	default:
-		// Alive outbound. Evict ONLY on a confirmed peer restart; a living
-		// outbound that merely differs from the inbound is the common
-		// dual-dial case and must be preserved.
-		if restarted {
-			slog.Info("evicting stale outbound after peer restart",
-				"target", target, "peer_epoch", srcEpoch)
-			if closeErr := outbound.CloseWithError(QUICErrShutdown, "stale outbound after peer restart"); closeErr != nil {
-				slog.Debug("transport: connection close failed during stale eviction",
-					"target", target, "error", closeErr)
-			}
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
+		// Alive outbound. Evict only when it cannot be attributed to the
+		// incarnation this batch came from. In the steady state stamp ==
+		// srcEpoch and this is a single integer compare, so the common
+		// dual-dial case (two live connections per pair) is preserved and
+		// the certificate check stays off the hot receive path.
+		if srcEpoch == 0 || stamp == srcEpoch {
+			return
 		}
+		if !t.inboundAuthorizedForCached(inboundConn, target) {
+			return
+		}
+		slog.Info("evicting outbound not attributable to the sending peer incarnation",
+			"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp)
+		if closeErr := outbound.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation"); closeErr != nil {
+			slog.Debug("transport: connection close failed during stale eviction",
+				"target", target, "error", closeErr)
+		}
+		t.removeConnection(target)
+		t.evictStreamsForTarget(target)
 	}
 }
 

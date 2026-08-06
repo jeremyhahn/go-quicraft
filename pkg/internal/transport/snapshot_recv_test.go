@@ -17,6 +17,7 @@ package transport
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,17 +142,128 @@ func TestSnapshotSingleChunkRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSnapshotReceiverStopDuringReceive verifies that stopping the transport
-// during snapshot reception does not panic.
+// stopAfterReader closes stopC once the underlying reader has delivered at
+// least `after` bytes, so a shutdown lands deterministically on a chunk
+// boundary instead of racing a timer.
+type stopAfterReader struct {
+	*testChunkReader
+	after int
+	stopC chan struct{}
+	once  sync.Once
+}
+
+func (r *stopAfterReader) Read(p []byte) (int, error) {
+	n, err := r.testChunkReader.Read(p)
+	if r.testChunkReader.pos >= r.after {
+		r.once.Do(func() { close(r.stopC) })
+	}
+	return n, err
+}
+
+// TestSnapshotReceiverStopDuringReceive covers the two points a transport
+// shutdown can interrupt an inbound snapshot: at admission, and part-way
+// through the chunk stream.
+//
+// Both must be observable and must consume nothing: an unobserved refusal
+// leaves the sender waiting out its ack timeout, and a leaked concurrency slot
+// or memory reservation is permanent for the life of the process.
 func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
-	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<30, 1<<30, 0, handler)
+	t.Run("shutdown before admission", func(t *testing.T) {
+		handler := newTestHandler()
+		sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+		rec := &dropRecorder{}
+		sr.metrics = rec
 
-	stopC := make(chan struct{})
-	close(stopC)
+		var rejected atomic.Int64
+		sr.listener = &config.EventListener{
+			OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
+		}
 
-	// Should return immediately since stopC is closed.
-	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, "", nil, stopC)
+		stopC := make(chan struct{})
+		close(stopC)
+
+		hdr := &SnapshotHeader{ShardID: 4, ReplicaID: 2, Index: 11, ChunkCount: 3}
+		sr.receiveSnapshot(nil, hdr, "10.0.0.8:5000", nil, stopC)
+
+		if got := rejected.Load(); got != 1 {
+			t.Fatalf("OnSnapshotRejected fired %d times, want 1", got)
+		}
+		got := rec.rejects()
+		if len(got) != 1 {
+			t.Fatalf("IncSnapshotsRejected calls = %d, want 1 (%+v)", len(got), got)
+		}
+		if got[0].shardID != 4 || got[0].reason != string(snapshotRejectShutdown) {
+			t.Fatalf("rejection = %+v, want shard 4 reason %q", got[0], snapshotRejectShutdown)
+		}
+		if n := handler.snapshotCount.Load(); n != 0 {
+			t.Fatalf("HandleSnapshot called %d times during shutdown, want 0", n)
+		}
+		if n := len(sr.sem); n != 0 {
+			t.Fatalf("global snapshot semaphore holds %d slots after a shutdown refusal, want 0", n)
+		}
+		sr.peerMu.Lock()
+		slots := len(sr.peerSlots)
+		sr.peerMu.Unlock()
+		if slots != 0 {
+			t.Fatalf("peer slots retained after a shutdown refusal: %d, want 0", slots)
+		}
+		if sr.AvailableMemory() != sr.maxMemory {
+			t.Fatalf("memory budget = %d after a shutdown refusal, want %d",
+				sr.AvailableMemory(), sr.maxMemory)
+		}
+	})
+
+	t.Run("shutdown mid-stream discards the partial transfer", func(t *testing.T) {
+		handler := newTestHandler()
+		sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+		before := sr.AvailableMemory()
+
+		var rejected atomic.Int64
+		sr.listener = &config.EventListener{
+			OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
+		}
+
+		chunks := make([]proto.SnapshotChunk, 3)
+		for i := range chunks {
+			chunks[i] = proto.SnapshotChunk{
+				BinVer:       proto.WireVersion,
+				ShardID:      1,
+				ReplicaID:    2,
+				From:         1,
+				Index:        50,
+				Term:         3,
+				ChunkID:      uint64(i),
+				ChunkCount:   3,
+				ChunkSize:    16,
+				Data:         bytes.Repeat([]byte("Z"), 16),
+				DeploymentID: 42,
+			}
+		}
+		firstFrame := len(buildChunkFrames(t, chunks[:1]))
+
+		stopC := make(chan struct{})
+		reader := &stopAfterReader{
+			testChunkReader: &testChunkReader{data: buildChunkFrames(t, chunks)},
+			after:           firstFrame,
+			stopC:           stopC,
+		}
+
+		hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 3}
+		sr.receiveChunks(reader, hdr, nil, stopC)
+
+		// A partial snapshot committed as the latest snapshot would be loaded
+		// on recovery as if whole.
+		if n := handler.snapshotCount.Load(); n != 0 {
+			t.Fatalf("HandleSnapshot called %d times for a transfer stopped mid-stream, want 0", n)
+		}
+		if got := rejected.Load(); got != 1 {
+			t.Fatalf("OnSnapshotRejected fired %d times for a stopped transfer, want 1", got)
+		}
+		if after := sr.AvailableMemory(); after != before {
+			t.Fatalf("memory budget = %d after a stopped transfer, want %d (leaked %d bytes)",
+				after, before, before-after)
+		}
+	})
 }
 
 // TestSnapshotReceiverAvailableMemoryReturnsToFull verifies that after
@@ -1092,19 +1204,152 @@ func TestReceiveChunks_ValidateChunkFailure(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// receiveChunks memory budget exceeded (snapshot_recv.go:250-258)
+// receiveChunks memory budget accounting
 // ---------------------------------------------------------------------------
 
-// TestReceiveChunks_MemoryBudgetExceeded verifies that when accumulated
-// bytes exceed maxMemory, receiveChunks stops and returns.
+// buildRawFrame frames an arbitrary payload as a chunk frame, so a test can
+// feed receiveChunks a body that is not a decodable SnapshotChunk.
+func buildRawFrame(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, payload, FlagNone); err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
+	}
+	return buf.Bytes()
+}
 
+// TestReceiveChunks_MemoryBudgetExceeded covers the host-wide receive memory
+// budget and, critically, the RESTORE on every rejection path.
+//
+// The budget is a host-global atomic shared by all concurrent inbound
+// snapshots. Each accepted chunk reserves its wire bytes plus the retained
+// SnapshotChunk header; every path that abandons a chunk must give that
+// reservation back. A single missed restore is not a transient error — the
+// budget never recovers, and once it is exhausted the host rejects EVERY
+// inbound snapshot from then on, so no lagging follower can ever be caught up
+// again.
+//
+// The budget-exhausted case deliberately reserves the budget FIRST, then sends
+// a transfer that is tiny in absolute terms. That distinguishes the host-global
+// admission check from the per-receive cap: a single small transfer never trips
+// the per-receive cap, so if the global check is removed the chunk is admitted
+// and committed and this test fails.
 func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
-	handler := newTestHandler()
-	// Create receiver with very small max memory (50 bytes).
-	sr := newSnapshotReceiver(4, 50, 0, 42, handler)
+	const maxMemory = int64(1 << 20)
 
-	// Build 3 chunks, each with enough data to exceed the 50-byte budget.
-	chunks := make([]proto.SnapshotChunk, 3)
+	validChunk := func(deploymentID uint64) proto.SnapshotChunk {
+		return proto.SnapshotChunk{
+			BinVer:       proto.WireVersion,
+			ShardID:      1,
+			ReplicaID:    2,
+			From:         1,
+			Index:        50,
+			Term:         3,
+			ChunkID:      0,
+			ChunkCount:   1,
+			ChunkSize:    64,
+			Data:         bytes.Repeat([]byte("X"), 64),
+			DeploymentID: deploymentID,
+		}
+	}
+
+	tests := []struct {
+		name string
+		// reserve is budget held by a simulated concurrent transfer before
+		// this one starts; it must still be held when this one aborts.
+		reserve    int64
+		frames     func(t *testing.T) []byte
+		wantReason snapshotRejectReason
+	}{
+		{
+			name:    "global budget exhausted by a concurrent transfer",
+			reserve: maxMemory - 1,
+			frames: func(t *testing.T) []byte {
+				return buildChunkFrames(t, []proto.SnapshotChunk{validChunk(42)})
+			},
+			wantReason: snapshotRejectMemory,
+		},
+		{
+			name: "chunk body read failure",
+			frames: func(t *testing.T) []byte {
+				// A full frame header followed by a short body: the header is
+				// charged against the budget, then io.ReadFull fails.
+				full := buildChunkFrames(t, []proto.SnapshotChunk{validChunk(42)})
+				return full[:len(full)-8]
+			},
+			wantReason: snapshotRejectIO,
+		},
+		{
+			name: "chunk unmarshal failure",
+			frames: func(t *testing.T) []byte {
+				return buildRawFrame(t, bytes.Repeat([]byte{0xEE}, 32))
+			},
+			wantReason: snapshotRejectMalformed,
+		},
+		{
+			name: "chunk validation failure",
+			frames: func(t *testing.T) []byte {
+				// Wrong DeploymentID: decodes cleanly, fails validateChunk.
+				return buildChunkFrames(t, []proto.SnapshotChunk{validChunk(999)})
+			},
+			wantReason: snapshotRejectMalformed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newTestHandler()
+			sr := newSnapshotReceiver(4, maxMemory, 0, 42, handler)
+			rec := &dropRecorder{}
+			sr.metrics = rec
+
+			var rejected atomic.Int64
+			sr.listener = &config.EventListener{
+				OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
+			}
+
+			if tc.reserve > 0 {
+				sr.memoryBudget.Add(-tc.reserve)
+			}
+			before := sr.AvailableMemory()
+
+			hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
+			sr.receiveChunks(&testChunkReader{data: tc.frames(t)}, hdr, nil, make(chan struct{}))
+
+			if got := handler.snapshotCount.Load(); got != 0 {
+				t.Fatalf("HandleSnapshot called %d times; the transfer must not be committed", got)
+			}
+			if got := rejected.Load(); got != 1 {
+				t.Fatalf("OnSnapshotRejected fired %d times, want 1", got)
+			}
+			got := rec.rejects()
+			if len(got) != 1 {
+				t.Fatalf("IncSnapshotsRejected calls = %d, want 1 (%+v)", len(got), got)
+			}
+			if got[0].shardID != 1 || got[0].reason != string(tc.wantReason) {
+				t.Fatalf("rejection = %+v, want shard 1 reason %q", got[0], tc.wantReason)
+			}
+
+			// The abandoned chunk's reservation must be returned in full, and
+			// the concurrent transfer's reservation must NOT be returned.
+			if after := sr.AvailableMemory(); after != before {
+				t.Fatalf("memory budget = %d after rejection, want %d (leaked %d bytes; "+
+					"a leaked reservation is permanent and eventually rejects every inbound snapshot)",
+					after, before, before-after)
+			}
+		})
+	}
+}
+
+// TestReceiveChunks_MemoryBudgetRestoredOnSuccess is the counterpart: a
+// COMPLETED transfer must also return its whole reservation, so a busy host
+// does not bleed budget one successful snapshot at a time.
+func TestReceiveChunks_MemoryBudgetRestoredOnSuccess(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+	before := sr.AvailableMemory()
+
+	chunks := make([]proto.SnapshotChunk, 4)
 	for i := range chunks {
 		chunks[i] = proto.SnapshotChunk{
 			BinVer:       proto.WireVersion,
@@ -1114,43 +1359,41 @@ func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 			Index:        50,
 			Term:         3,
 			ChunkID:      uint64(i),
-			ChunkCount:   3,
-			ChunkSize:    30,
-			Data:         bytes.Repeat([]byte("X"), 30),
+			ChunkCount:   4,
+			ChunkSize:    16,
+			Data:         bytes.Repeat([]byte("Y"), 16),
 			DeploymentID: 42,
 		}
 	}
 
-	data := buildChunkFrames(t, chunks)
-	reader := &testChunkReader{data: data}
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 4}
+	sr.receiveChunks(&testChunkReader{data: buildChunkFrames(t, chunks)}, hdr, nil, make(chan struct{}))
 
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      50,
-		Term:       3,
-		ChunkCount: 3,
+	if got := handler.snapshotCount.Load(); got != 1 {
+		t.Fatalf("HandleSnapshot called %d times, want 1", got)
 	}
-	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, nil, stopC)
-
-	// May or may not have received some chunks depending on per-chunk
-	// vs accumulated budget, but the test exercises the budget exceeded path.
+	if after := sr.AvailableMemory(); after != before {
+		t.Fatalf("memory budget = %d after a successful transfer, want %d", after, before)
+	}
 }
 
 // ---------------------------------------------------------------------------
-// receiveChunks large ChunkCount (snapshot_recv.go:166-168)
+// receiveChunks initial slice capacity cap
 // ---------------------------------------------------------------------------
 
-// TestReceiveChunks_LargeChunkCountInitCapCapped verifies that when
-// ChunkCount exceeds maxInitialChunkCap (1024), the initial slice
-// allocation is capped to prevent oversized allocations.
-
+// TestReceiveChunks_LargeChunkCountInitCapCapped verifies that the accumulator
+// slice is pre-allocated from maxInitialChunkCap, not from the peer-declared
+// ChunkCount. The header is attacker-controlled and is read before a single
+// chunk has been admitted or charged against the memory budget, so sizing the
+// allocation from it lets one frame commit hundreds of megabytes.
+//
+// The assertion is on bytes actually allocated by the call: a declared count of
+// 1<<20 would pre-allocate 1<<20 * sizeof(SnapshotChunk) if uncapped, orders of
+// magnitude above the ceiling asserted here.
 func TestReceiveChunks_LargeChunkCountInitCapCapped(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
 
-	// Build a single valid chunk but set ChunkCount > 1024 in the header.
 	chunk := proto.SnapshotChunk{
 		BinVer:       proto.WireVersion,
 		ShardID:      1,
@@ -1164,22 +1407,53 @@ func TestReceiveChunks_LargeChunkCountInitCapCapped(t *testing.T) {
 		Data:         []byte("hello"),
 		DeploymentID: 42,
 	}
-
 	data := buildChunkFrames(t, []proto.SnapshotChunk{chunk})
-	reader := &testChunkReader{data: data}
 
+	const declaredCount = uint64(1) << 20
 	hdr := &SnapshotHeader{
 		ShardID:    1,
 		ReplicaID:  2,
 		Index:      50,
 		Term:       3,
-		ChunkCount: 2000, // > maxInitialChunkCap (1024)
+		ChunkCount: declaredCount,
 	}
-	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, nil, stopC)
 
-	// Should still receive the one chunk even though ChunkCount was large.
-	// (The loop exits after EOF since only 1 chunk was provided.)
+	// Take the minimum over several runs: TotalAlloc is process-wide, so an
+	// unrelated background goroutine can only inflate a sample, never shrink it.
+	minDelta := int64(-1)
+	for i := 0; i < 5; i++ {
+		var m0, m1 runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m0)
+		sr.receiveChunks(&testChunkReader{data: data}, hdr, nil, make(chan struct{}))
+		runtime.ReadMemStats(&m1)
+		delta := int64(m1.TotalAlloc - m0.TotalAlloc)
+		if minDelta < 0 || delta < minDelta {
+			minDelta = delta
+		}
+	}
+
+	// receiveChunks' maxInitialChunkCap is function-local; mirror it here. The
+	// assertion does not depend on the exact value, only on the allocation not
+	// scaling with the declared count.
+	const wantInitialChunkCap = 1024
+	capped := int64(wantInitialChunkCap) * snapshotChunkStructBytes
+	uncapped := int64(declaredCount) * snapshotChunkStructBytes
+	limit := 4*capped + (1 << 20)
+	if limit >= uncapped {
+		t.Fatalf("test precondition: limit %d must be far below the uncapped allocation %d", limit, uncapped)
+	}
+	if minDelta > limit {
+		t.Fatalf("receiveChunks allocated %d bytes for a declared ChunkCount of %d; "+
+			"want at most %d (initial capacity is not capped at %d chunks)",
+			minDelta, declaredCount, limit, wantInitialChunkCap)
+	}
+
+	// The transfer itself is truncated (one chunk on the wire, 1<<20 declared)
+	// and must not be committed.
+	if got := handler.snapshotCount.Load(); got != 0 {
+		t.Fatalf("HandleSnapshot called %d times for a truncated transfer, want 0", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,9 +1609,24 @@ func TestReceiveSnapshot_TrackerShutdownRejects(t *testing.T) {
 // same IP are rejected. This exercises the tryAcquire failure path
 // at recv.go:180-191.
 
+// TestReceiveChunks_HandleSnapshotError verifies that a complete transfer whose
+// handler REJECTS the snapshot is not reported as received. HandleSnapshot is
+// what actually persists the snapshot; if it fails, firing OnSnapshotReceived or
+// the snapshots-received counter tells the operator (and any listener driving
+// recovery bookkeeping) that a snapshot landed when nothing did. The budget must
+// still be returned in full on this path.
 func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 	handler := &errorSnapshotHandler{}
-	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+	rec := &snapshotMetricsRecorder{}
+	sr.metrics = rec
+	before := sr.AvailableMemory()
+
+	var received, rejected atomic.Int64
+	sr.listener = &config.EventListener{
+		OnSnapshotReceived: func(config.SnapshotInfo) { received.Add(1) },
+		OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
+	}
 
 	chunk := proto.SnapshotChunk{
 		BinVer:       proto.WireVersion,
@@ -1363,9 +1652,39 @@ func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 		Term:       3,
 		ChunkCount: 1,
 	}
-	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, nil, make(chan struct{}))
+
+	// The transfer WAS complete, so the handler must have been offered it.
+	if got := handler.calls.Load(); got != 1 {
+		t.Fatalf("HandleSnapshot called %d times, want 1 (the transfer was complete)", got)
+	}
+	// ...but its failure must not be reported as a successful receive.
+	if got := received.Load(); got != 0 {
+		t.Fatalf("OnSnapshotReceived fired %d times after HandleSnapshot failed, want 0", got)
+	}
+	if got := rec.receivedCalls(); got != 0 {
+		t.Fatalf("IncSnapshotsReceived called %d times after HandleSnapshot failed, want 0", got)
+	}
+	if got := rejected.Load(); got != 0 {
+		t.Fatalf("OnSnapshotRejected fired %d times, want 0: the transfer itself was complete", got)
+	}
+	if after := sr.AvailableMemory(); after != before {
+		t.Fatalf("memory budget = %d after a failed handler, want %d", after, before)
+	}
 }
+
+// snapshotMetricsRecorder counts the successful-receive metric so a test can
+// assert it is NOT emitted on a handler failure.
+type snapshotMetricsRecorder struct {
+	noopTransportMetrics
+	received atomic.Int64
+}
+
+func (r *snapshotMetricsRecorder) IncSnapshotsReceived(uint64, int64, time.Duration) {
+	r.received.Add(1)
+}
+
+func (r *snapshotMetricsRecorder) receivedCalls() int64 { return r.received.Load() }
 
 // TestReceiveChunks_TruncatedTransferNotCommitted verifies that a snapshot
 // stream that EOFs after fewer chunks than the header's ChunkCount is treated
@@ -1500,12 +1819,16 @@ func TestReceiveChunks_ZeroChunkCountCommitsNothing(t *testing.T) {
 }
 
 // errorSnapshotHandler is a MessageHandler that returns errors from
-// HandleSnapshot to test error handling in receiveChunks.
+// HandleSnapshot to test error handling in receiveChunks. calls records how
+// many times the handler was offered a snapshot, so a test can distinguish
+// "the handler failed" from "the handler was never reached".
 type errorSnapshotHandler struct {
 	testHandler
+	calls atomic.Int64
 }
 
 func (h *errorSnapshotHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ func(string) bool) error {
+	h.calls.Add(1)
 	return errors.New("snapshot handler error")
 }
 
@@ -1572,52 +1895,73 @@ func TestReceiveChunks_MemoryBudgetExceededPerReceive(t *testing.T) {
 // that cleanStaleConnections fires the OnConnectionFailed event for dead
 // connections.
 
+// TestReceiveSnapshot_ShutdownTrackerRejectsNew exercises the shutdown-tracker
+// admission check in receiveSnapshot itself. That check is what makes Stop()
+// safe: TryAdd and the tracker's WaitGroup.Wait are atomic with respect to each
+// other, so a receive admitted after shutdown began could still be running when
+// Stop() tears the connections down.
+//
+// The branch runs before the stream is ever touched, so a nil *quic.Stream is
+// sufficient to reach it — and is also the proof: if the rejection did not
+// return early, receiveChunks would dereference the nil stream on the first
+// declared chunk.
 func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+	rec := &dropRecorder{}
+	sr.metrics = rec
+
+	var rejected atomic.Int64
+	var rejectedInfo config.SnapshotInfo
+	sr.listener = &config.EventListener{
+		OnSnapshotRejected: func(info config.SnapshotInfo) {
+			rejectedInfo = info
+			rejected.Add(1)
+		},
+	}
 
 	tracker := &shutdownTracker{}
 	sr.SetSnapshotTracker(tracker)
-
-	// Shut down the tracker first.
 	tracker.ShutdownAndWait()
 
-	// Create a valid chunk.
-	chunk := proto.SnapshotChunk{
-		BinVer:       proto.WireVersion,
-		ShardID:      1,
-		ReplicaID:    2,
-		From:         1,
-		Index:        50,
-		Term:         3,
-		ChunkID:      0,
-		ChunkCount:   1,
-		ChunkSize:    5,
-		Data:         []byte("hello"),
-		DeploymentID: 42,
+	hdr := &SnapshotHeader{ShardID: 7, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
+	sr.receiveSnapshot(nil, hdr, "10.0.0.9:5000", nil, make(chan struct{}))
+
+	// The refusal must be observable, or the sender simply times out its ack
+	// wait with no signal on this side.
+	if got := rejected.Load(); got != 1 {
+		t.Fatalf("OnSnapshotRejected fired %d times, want 1", got)
+	}
+	if rejectedInfo.ShardID != 7 || rejectedInfo.ReplicaID != 2 || rejectedInfo.Index != 50 {
+		t.Fatalf("rejection info = %+v, want shard 7 replica 2 index 50", rejectedInfo)
+	}
+	got := rec.rejects()
+	if len(got) != 1 {
+		t.Fatalf("IncSnapshotsRejected calls = %d, want 1 (%+v)", len(got), got)
+	}
+	if got[0].shardID != 7 || got[0].reason != string(snapshotRejectShutdown) {
+		t.Fatalf("rejection = %+v, want shard 7 reason %q", got[0], snapshotRejectShutdown)
 	}
 
-	data := buildChunkFrames(t, []proto.SnapshotChunk{chunk})
-	reader := &testChunkReader{data: data}
-
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      50,
-		Term:       3,
-		ChunkCount: 1,
+	if n := handler.snapshotCount.Load(); n != 0 {
+		t.Fatalf("HandleSnapshot called %d times after shutdown, want 0", n)
 	}
 
-	// This should return immediately without processing chunks because
-	// the tracker is shut down.
-	stopC := make(chan struct{})
-	// We need a real *quic.Stream for receiveSnapshot, but we can test
-	// the tracker rejection path by checking that no snapshots arrive.
-	sr.receiveChunks(reader, hdr, nil, stopC)
-
-	// The chunks were processed because receiveChunks doesn't check tracker.
-	// The tracker check is in receiveSnapshot which requires *quic.Stream.
-	// However, this still exercises the receiveChunks path.
+	// A rejected admission must consume nothing: TryAdd failed, so no matching
+	// Done may run, and neither the host-global semaphore nor a per-peer slot
+	// may be held once the call returns.
+	if n := tracker.InFlight(); n != 0 {
+		t.Fatalf("tracker in-flight = %d after a rejected admission, want 0", n)
+	}
+	if n := len(sr.sem); n != 0 {
+		t.Fatalf("global snapshot semaphore holds %d slots after a rejected admission, want 0", n)
+	}
+	sr.peerMu.Lock()
+	slots := len(sr.peerSlots)
+	sr.peerMu.Unlock()
+	if slots != 0 {
+		t.Fatalf("peer slots retained after a rejected admission: %d, want 0", slots)
+	}
 }
 
 // ---------------------------------------------------------------------------

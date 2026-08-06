@@ -46,6 +46,22 @@ type applyItem struct {
 	node   *Node
 }
 
+// shardMembership is a single ordered load/unload notification for the
+// commit worker. unload marks the shard retired (Peer.Commit is skipped
+// for it); clearing unload re-admits it.
+//
+// Both directions travel on ONE channel because select chooses uniformly
+// at random among ready cases: with a separate unloadC and reloadC, an
+// UnloadNode followed by a LoadNode for the same shard could be applied
+// in reverse, leaving the shard permanently in the unloaded set. The
+// commit worker would then skip Peer.Commit forever, so the restarted
+// replica would persist and vote (even win elections) while applying
+// nothing. A single channel makes the sequence FIFO by construction.
+type shardMembership struct {
+	shardID uint64
+	unload  bool
+}
+
 // commitWorker writes Updates to LogDB using a drain-then-batch pattern
 // for maximum write throughput. Multiple updates arriving while the
 // worker is fsync'ing are batched into a single SaveState call.
@@ -118,11 +134,9 @@ type commitWorker struct {
 	// on a node that has already been torn down.
 	unloaded *unloadedSet
 
-	// unloadC receives shard IDs to add to the unloaded set.
-	unloadC chan uint64
-
-	// reloadC receives shard IDs to remove from the unloaded set.
-	reloadC chan uint64
+	// membershipC receives ordered unload/reload notifications. See
+	// shardMembership for why both directions share one channel.
+	membershipC chan shardMembership
 }
 
 // newCommitWorker creates a commit worker. The sender parameter is used
@@ -162,8 +176,7 @@ func newCommitWorker(
 		metrics:            metrics,
 		commitTimes:        make(map[uint64]time.Time),
 		unloaded:           newUnloadedSet(),
-		unloadC:            make(chan uint64, 64),
-		reloadC:            make(chan uint64, 64),
+		membershipC:        make(chan shardMembership, 128),
 	}
 }
 
@@ -182,11 +195,8 @@ func (w *commitWorker) run() {
 		case <-w.stopC:
 			w.drainAndProcess()
 			return
-		case shardID := <-w.unloadC:
-			w.unloaded.add(shardID)
-			continue
-		case shardID := <-w.reloadC:
-			w.unloaded.remove(shardID)
+		case m := <-w.membershipC:
+			w.applyMembership(m)
 			continue
 		case item := <-w.commitC:
 			w.batch = append(w.batch[:0], item.update)
@@ -592,17 +602,27 @@ func (w *commitWorker) clearBatch() {
 	clear(w.orderedMsgsBuf)
 }
 
+// applyMembership folds one ordered unload/reload notification into the
+// unloaded set. Must run on the commit worker goroutine (single-owner
+// invariant on unloadedSet).
+func (w *commitWorker) applyMembership(m shardMembership) {
+	if m.unload {
+		w.unloaded.add(m.shardID)
+		return
+	}
+	w.unloaded.remove(m.shardID)
+}
+
 // drainUnloadReload non-blocking drains all pending unload and reload
-// requests from their respective channels. Called at the top of each
-// run loop iteration to process requests that arrived while the worker
-// was busy with SaveState or message sending.
+// requests. Called at the top of each run loop iteration to process
+// requests that arrived while the worker was busy with SaveState or
+// message sending. Requests are applied in the order they were sent
+// because they share a single channel.
 func (w *commitWorker) drainUnloadReload() {
 	for {
 		select {
-		case shardID := <-w.unloadC:
-			w.unloaded.add(shardID)
-		case shardID := <-w.reloadC:
-			w.unloaded.remove(shardID)
+		case m := <-w.membershipC:
+			w.applyMembership(m)
 		default:
 			return
 		}
@@ -610,20 +630,22 @@ func (w *commitWorker) drainUnloadReload() {
 }
 
 // requestUnload sends a shard removal request to the commit worker via
-// the unloadC channel. Safe for concurrent use by the Host goroutine.
+// the membership channel. Safe for concurrent use by the Host goroutine.
 func (w *commitWorker) requestUnload(shardID uint64) {
 	select {
-	case w.unloadC <- shardID:
+	case w.membershipC <- shardMembership{shardID: shardID, unload: true}:
 	case <-w.stopC:
 	}
 }
 
 // requestReload clears a shard from the unloaded set, allowing the
-// commit worker to process Peer.Commit for the shard again. Safe for
-// concurrent use by the Host goroutine.
+// commit worker to process Peer.Commit for the shard again. It is
+// ordered behind any earlier requestUnload for the same shard because
+// both travel on the membership channel. Safe for concurrent use by the
+// Host goroutine.
 func (w *commitWorker) requestReload(shardID uint64) {
 	select {
-	case w.reloadC <- shardID:
+	case w.membershipC <- shardMembership{shardID: shardID, unload: false}:
 	case <-w.stopC:
 	}
 }

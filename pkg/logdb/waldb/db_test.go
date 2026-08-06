@@ -1206,58 +1206,140 @@ func TestConcurrentWritesDifferentShards(t *testing.T) {
 	}
 }
 
-// TestConcurrentWritesAndReads verifies concurrent writes and reads
-// do not race.
+// TestConcurrentWritesAndReads verifies that concurrent per-shard appends and
+// reads are not merely race-free but CORRECT: every append succeeds, every
+// concurrent read observes a contiguous prefix of the log (never a hole, never
+// a shortened result, never a regression of the durable tail), and the final
+// log is exactly what was written.
 func TestConcurrentWritesAndReads(t *testing.T) {
 	db := openTestDB(t)
 
+	const shards, perShard = 8, 50
+
 	var wg sync.WaitGroup
 
-	// Writers.
-	for i := 0; i < 8; i++ {
+	// Writers: one shard each, appending indexes 1..perShard in order.
+	for i := 0; i < shards; i++ {
 		wg.Add(1)
 		go func(shardID uint64) {
 			defer wg.Done()
-			for j := uint64(1); j <= 50; j++ {
+			for j := uint64(1); j <= perShard; j++ {
 				entries := []logdb.Entry{
 					{Index: j, Term: 1, Cmd: []byte("data")},
 				}
-				db.SaveEntries(shardID, 1, entries)
+				if err := db.SaveEntries(shardID, 1, entries); err != nil {
+					t.Errorf("SaveEntries(shard %d, index %d): %v", shardID, j, err)
+					return
+				}
 			}
 		}(uint64(i))
 	}
 
-	// Readers.
-	for i := 0; i < 8; i++ {
+	// Readers: each read must return a contiguous prefix 1..k of its shard's
+	// log, and k must never go backwards — the log is append-only, so a shorter
+	// result than a previous read means a committed prefix became invisible.
+	for i := 0; i < shards; i++ {
 		wg.Add(1)
 		go func(shardID uint64) {
 			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				db.GetEntries(shardID, 1, 1, 51, 0)
+			var highWater int
+			for j := 0; j < perShard; j++ {
+				got, err := db.GetEntries(shardID, 1, 1, perShard+1, 0)
+				if err != nil {
+					t.Errorf("GetEntries(shard %d): %v", shardID, err)
+					return
+				}
+				if len(got) > perShard {
+					t.Errorf("GetEntries(shard %d): got %d entries, want at most %d",
+						shardID, len(got), perShard)
+					return
+				}
+				for k, e := range got {
+					if e.Index != uint64(k+1) {
+						t.Errorf("GetEntries(shard %d): entry %d has index %d, want %d (hole in prefix)",
+							shardID, k, e.Index, k+1)
+						return
+					}
+					if string(e.Cmd) != "data" {
+						t.Errorf("GetEntries(shard %d): entry %d cmd = %q, want %q",
+							shardID, k, e.Cmd, "data")
+						return
+					}
+				}
+				if len(got) < highWater {
+					t.Errorf("GetEntries(shard %d): visible prefix shrank from %d to %d entries",
+						shardID, highWater, len(got))
+					return
+				}
+				highWater = len(got)
 			}
 		}(uint64(i))
 	}
 
 	wg.Wait()
+
+	// Every shard must end with exactly the log its writer appended.
+	for i := 0; i < shards; i++ {
+		got, err := db.GetEntries(uint64(i), 1, 1, perShard+1, 0)
+		if err != nil {
+			t.Fatalf("GetEntries(shard %d) after writers: %v", i, err)
+		}
+		if len(got) != perShard {
+			t.Fatalf("shard %d has %d entries, want %d", i, len(got), perShard)
+		}
+		for k, e := range got {
+			if e.Index != uint64(k+1) || e.Term != 1 || string(e.Cmd) != "data" {
+				t.Fatalf("shard %d entry %d = %+v, want index %d term 1 cmd %q", i, k, e, k+1, "data")
+			}
+		}
+	}
 }
 
-// TestConcurrentStateOperations verifies concurrent state reads and writes.
+// TestConcurrentStateOperations verifies that concurrent per-shard hard-state
+// writes both succeed and read back the exact state written. Each goroutine
+// owns its shard, so the read-back is fully determined: a state that is lost,
+// truncated, or attributed to the wrong shard fails the test.
 func TestConcurrentStateOperations(t *testing.T) {
 	db := openTestDB(t)
 
-	var wg sync.WaitGroup
+	const shards = 16
 
-	for i := 0; i < 16; i++ {
+	want := func(shardID uint64) logdb.State {
+		return logdb.State{Term: shardID, Vote: 1, Commit: shardID * 10}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < shards; i++ {
 		wg.Add(1)
 		go func(shardID uint64) {
 			defer wg.Done()
-			state := logdb.State{Term: shardID, Vote: 1, Commit: shardID * 10}
-			db.SaveNodeState(shardID, 1, state)
-			db.GetState(shardID, 1)
+			if err := db.SaveNodeState(shardID, 1, want(shardID)); err != nil {
+				t.Errorf("SaveNodeState(shard %d): %v", shardID, err)
+				return
+			}
+			got, err := db.GetState(shardID, 1)
+			if err != nil {
+				t.Errorf("GetState(shard %d): %v", shardID, err)
+				return
+			}
+			if got != want(shardID) {
+				t.Errorf("GetState(shard %d) = %+v, want %+v", shardID, got, want(shardID))
+			}
 		}(uint64(i))
 	}
-
 	wg.Wait()
+
+	// Re-read every shard once the writers have quiesced: each must still hold
+	// its own state, proving no cross-shard clobbering occurred.
+	for i := 0; i < shards; i++ {
+		got, err := db.GetState(uint64(i), 1)
+		if err != nil {
+			t.Fatalf("GetState(shard %d) after writers: %v", i, err)
+		}
+		if got != want(uint64(i)) {
+			t.Fatalf("GetState(shard %d) = %+v, want %+v", i, got, want(uint64(i)))
+		}
+	}
 }
 
 // --- Recovery tests ---

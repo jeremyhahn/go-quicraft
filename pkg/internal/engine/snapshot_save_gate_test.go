@@ -164,7 +164,11 @@ func TestSavingGateAndDrainConsistency(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Apply a batch whose last entry is (index=7, term=3).
+	// Apply a batch whose last entry is (index=7, term=3). The node is seeded
+	// at index 5 the way Host.StartShard seeds a recovered replica, so the
+	// batch continues at lastApplied+1 (the apply gap check rejects a batch
+	// that starts anywhere else).
+	node.SeedLastApplied(5, 1)
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
 	item.update = proto.Update{

@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -226,6 +228,149 @@ func TestReencrypt_NoSnapshot(t *testing.T) {
 	}
 	if len(got) != len(wantEntries) {
 		t.Fatalf("got %d entries, want %d", len(got), len(wantEntries))
+	}
+}
+
+// soleSegmentRel returns the path of the single WAL segment holding shardID's
+// records, relative to the WAL root, and fails the test when the shard did not
+// land in exactly one segment (which would make a single-file truncation sweep
+// an incomplete crash simulation).
+func soleSegmentRel(t *testing.T, dir string, shardID uint64) string {
+	t.Helper()
+	shardDir := shardDirName(int(shardID % DefaultShardCount))
+	matches, err := filepath.Glob(filepath.Join(dir, shardDir, "*.log"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("shard %d spans %d segments (%v), want exactly 1", shardID, len(matches), matches)
+	}
+	return filepath.Join(shardDir, filepath.Base(matches[0]))
+}
+
+// TestReencrypt_EntriesDurableBeforeState is the M3 regression test.
+//
+// Reencrypt writes the destination WAL through a sequence of independently
+// fsynced SaveState calls, so the destination's durable record order IS that
+// call order and the WAL recovers at a record prefix. Writing the hard state
+// before the entries therefore produced a legal, cleanly-recovering destination
+// carrying HardState.Commit = N over a log ending at k < N — a commit index past
+// the last entry, which nothing in waldb cross-validates on reopen.
+//
+// The test simulates a crash at many points during a migration by truncating
+// the destination segment to a prefix and reopening it, asserting the surviving
+// state never commits past the surviving log. It refuses to pass vacuously: the
+// sweep must reach past the state record at least once (so the invariant is
+// actually evaluated) and must cut the entry stream mid-way at least once (so
+// the inverted ordering has a prefix that would violate it).
+func TestReencrypt_EntriesDurableBeforeState(t *testing.T) {
+	// Stream the entries in many small batches so the destination holds several
+	// entry records and a truncation can land between them.
+	saved := reencryptBatchBytes
+	reencryptBatchBytes = 256
+	defer func() { reencryptBatchBytes = saved }()
+
+	const shardID, replicaID = uint64(1), uint64(1)
+	const total = 64
+
+	srcDir := filepath.Join(t.TempDir(), "src")
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	barrier := newNoneBarrier(t)
+
+	src := openWALAt(t, srcDir, barrier)
+	entries := make([]logdb.Entry, total)
+	for i := range entries {
+		entries[i] = logdb.Entry{
+			Index: uint64(i + 1), Term: 1,
+			Cmd: []byte(fmt.Sprintf("m3-entry-payload-%04d", i)),
+		}
+	}
+	if err := src.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State:   logdb.State{Term: 1, Vote: replicaID, Commit: total},
+		Entries: entries,
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatalf("close src: %v", err)
+	}
+
+	if _, err := Reencrypt(srcDir, barrier, dstDir, barrier, nil); err != nil {
+		t.Fatalf("Reencrypt: %v", err)
+	}
+
+	// Close() truncates each segment to its written size, so the file length is
+	// exactly how far the migration got.
+	segRel := soleSegmentRel(t, dstDir, shardID)
+	info, err := os.Stat(filepath.Join(dstDir, segRel))
+	if err != nil {
+		t.Fatalf("stat migrated segment: %v", err)
+	}
+	full := info.Size()
+	if full == 0 {
+		t.Fatal("migrated segment is empty")
+	}
+
+	const points = 48
+	var recovered, sawState, sawPartialLog int
+	for i := 0; i <= points; i++ {
+		cut := full * int64(i) / int64(points)
+
+		crashed := filepath.Join(t.TempDir(), "crashed")
+		if err := os.CopyFS(crashed, os.DirFS(dstDir)); err != nil {
+			t.Fatalf("copy dst at cut %d: %v", cut, err)
+		}
+		if err := os.Truncate(filepath.Join(crashed, segRel), cut); err != nil {
+			t.Fatalf("truncate to %d: %v", cut, err)
+		}
+
+		db, oerr := Open(crashed, WithBarrier(barrier))
+		if oerr != nil {
+			// A torn tail that refuses to recover is fail-loud, not the silent
+			// inversion this test guards against.
+			continue
+		}
+		recovered++
+
+		first, length, rerr := db.EntryRange(shardID, replicaID)
+		if rerr != nil {
+			_ = db.Close()
+			t.Fatalf("EntryRange at cut %d: %v", cut, rerr)
+		}
+		var last uint64
+		if length > 0 {
+			last = first + length - 1
+		}
+		state, _, serr := db.ReadState(shardID, replicaID)
+		if cerr := db.Close(); cerr != nil {
+			t.Fatalf("close recovered WAL at cut %d: %v", cut, cerr)
+		}
+
+		switch {
+		case serr == nil:
+			sawState++
+			if state.Commit > last {
+				t.Fatalf("crash at byte %d/%d recovered HardState.Commit=%d over a log ending at %d: "+
+					"the state record precedes its entries in the migrated WAL", cut, full, state.Commit, last)
+			}
+		case !errors.Is(serr, logdb.ErrNoState):
+			t.Fatalf("ReadState at cut %d: %v", cut, serr)
+		}
+
+		if length > 0 && last < total {
+			sawPartialLog++
+		}
+	}
+
+	if recovered == 0 {
+		t.Fatal("no truncation point recovered; the sweep asserted nothing")
+	}
+	if sawState == 0 {
+		t.Fatal("no truncation point recovered a hard state; the commit-vs-log invariant was never evaluated")
+	}
+	if sawPartialLog == 0 {
+		t.Fatal("no truncation point recovered a partial entry log; the sweep never cut the entry stream")
 	}
 }
 

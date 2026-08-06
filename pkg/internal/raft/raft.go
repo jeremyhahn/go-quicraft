@@ -223,6 +223,23 @@ type raft struct {
 	isObserver  bool
 	isWitness   bool
 
+	// selfRemoved records that this replica is not part of the current
+	// configuration: it is absent from the membership's voters, observers
+	// and witnesses. Maintained by setSelfMembership from every point where
+	// the configuration is (re)established — construction, snapshot restore,
+	// and commit-time config change application.
+	//
+	// The raft struct's remotes/observers/witnesses maps deliberately exclude
+	// self (quorum() adds the +1), so membership of self cannot be derived
+	// from them the way dragonboat's selfRemoved() derives it from r.remotes.
+	// This flag is that missing information.
+	//
+	// A self-removed replica must never campaign (Raft thesis §4.2.2). The
+	// surviving configuration computes its quorum without this replica, so a
+	// removed replica that counts its own vote against its own stale voting
+	// set can "win" a term the real configuration also elects a leader in.
+	selfRemoved bool
+
 	// Lease-based read fields (PhD Section 6.4). When leaseRead is
 	// enabled, the leader can serve ReadIndex requests without a
 	// heartbeat round-trip if it has received acks from a quorum of
@@ -385,6 +402,40 @@ func (r *raft) initRemotes(membership proto.Membership) {
 		}
 		r.witnesses[id] = newRemote(nextIdx, maxInflightMsgs)
 	}
+	r.setSelfMembership(membershipHasSelf(membership, r.replicaID))
+}
+
+// membershipHasSelf reports whether replicaID appears anywhere in the
+// configuration (voter, observer or witness).
+func membershipHasSelf(m proto.Membership, replicaID uint64) bool {
+	if _, ok := m.Addresses[replicaID]; ok {
+		return true
+	}
+	if _, ok := m.Observers[replicaID]; ok {
+		return true
+	}
+	_, ok := m.Witnesses[replicaID]
+	return ok
+}
+
+// setSelfMembership records whether this replica is part of the current
+// configuration. See the selfRemoved field for why this is tracked.
+//
+// An empty configuration counts as "not a member", matching dragonboat's
+// selfRemoved(): a replica that knows no configuration has no basis to
+// campaign, and a joining node is seeded with exactly the existing members
+// (self excluded) precisely so it cannot self-elect before the leader adds
+// it. The flag is cleared as soon as the AddNode config change commits.
+func (r *raft) setSelfMembership(present bool) {
+	if r.selfRemoved == !present {
+		return
+	}
+	r.selfRemoved = !present
+	slog.Debug("self membership changed",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"term", r.term,
+		"self_removed", r.selfRemoved)
 }
 
 // --------------------------------------------------------------------------
@@ -505,21 +556,34 @@ func (r *raft) becomeLeader() {
 	// Reset all remote tracking. Set next to lastIndex+1 so the leader
 	// probes each follower starting at its own last known position.
 	// becomeProbe() resets inflights and state but we override next after.
+	//
+	// The activity flag must be cleared too (etcd/raft reset(): RecentActive
+	// = (id == r.id)). remote structs survive leadership changes, so a node
+	// that led at term T, stepped down, and regains leadership at T+k would
+	// otherwise open its first CheckQuorum window with active flags earned
+	// during a previous tenure — hasQuorumActive() would return true on
+	// evidence a whole leadership term old and the leader would survive an
+	// extra election timeout with no contact at all, which is precisely the
+	// window CheckQuorum exists to close. dragonboat gets this for free by
+	// allocating fresh remote structs in resetRemotes().
 	lastIdx := r.log.lastIndex()
 	for _, rm := range r.remotes {
 		rm.match = 0
 		rm.becomeProbe()
 		rm.next = lastIdx + 1
+		rm.setNotActive()
 	}
 	for _, rm := range r.observers {
 		rm.match = 0
 		rm.becomeProbe()
 		rm.next = lastIdx + 1
+		rm.setNotActive()
 	}
 	for _, wm := range r.witnesses {
 		wm.match = 0
 		wm.becomeProbe()
 		wm.next = lastIdx + 1
+		wm.setNotActive()
 	}
 
 	// Build replicaToBit mapping for zero-allocation ReadIndex ack tracking.
@@ -1027,8 +1091,16 @@ func (r *raft) scanUncommittedConfigChange() (bool, error) {
 // replicating an uncommitted config change to a majority, no follower in
 // that majority could ever start an election, permanently stalling the
 // cluster.
+// A replica that is no longer in the configuration never campaigns
+// (dragonboat gates followerTick on !selfRemoved for the same reason). The
+// surviving configuration's quorum is computed without this replica, so a
+// removed replica that still counts its own vote against its own stale
+// voting set can declare itself leader for a term the real configuration is
+// electing a leader in — two leaders in one term. It has no work to do
+// either: it is no longer replicated to and its removal is already
+// committed.
 func (r *raft) startElection() {
-	if r.isObserver || r.isWitness {
+	if r.isObserver || r.isWitness || r.selfRemoved {
 		return
 	}
 	if r.onCampaign != nil {
@@ -1150,9 +1222,28 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		leaderActive := r.leaderID != noLeader && r.electionTick < r.electionTimeout
 		canVote = logOK && !leaderActive
 	} else {
-		// For real vote: grant if log is up-to-date and we haven't
-		// voted for someone else in this term.
-		canVote = logOK && (r.vote == noNode || r.vote == msg.From)
+		// For a real vote: grant if the log is up-to-date AND either this
+		// is a repeat of the vote already cast this term, or no vote has
+		// been cast AND no leader is known for this term.
+		//
+		// The "no leader known" clause is not optional (etcd/raft canVote,
+		// Raft §5.2 + thesis p.42). A follower can reach term T without
+		// voting — it learns T from the leader's Replicate/Heartbeat, which
+		// clears r.vote in becomeFollower while setting r.leaderID. A stale
+		// candidate that campaigns at that same term T is NOT filtered by
+		// dropHighTermVote (that guard only fires for msg.Term > r.term), so
+		// without this clause the follower gratuitously unseats a healthy
+		// leader. Worse, granting sets r.electionTick = 0 while r.leaderID
+		// still names the old leader, which arms dropHighTermVote and makes
+		// the follower silently discard every higher-term RequestVote for a
+		// full election timeout — a self-inflicted vote blackout.
+		//
+		// Leadership-transfer votes (Hint == From) are exempt, exactly as in
+		// dropHighTermVote: the outgoing leader asked for this election, so
+		// the known-leader lease must not veto it.
+		noCompetingLeader := r.leaderID == noLeader || msg.Hint == msg.From
+		canVote = logOK && (r.vote == msg.From ||
+			(r.vote == noNode && noCompetingLeader))
 	}
 
 	// PreVote response term depends on the outcome:
@@ -1232,10 +1323,13 @@ func (r *raft) handleVoteResp(msg proto.Message) error {
 }
 
 // isVotingMember reports whether id belongs to the current configuration's
-// voting set (remotes + witnesses + self).
+// voting set (remotes + witnesses + self). Self counts only while it is
+// still part of the configuration: a self-removed replica is not a voting
+// member of anything, so its own vote must not be tallied toward a quorum
+// the configuration computes without it.
 func (r *raft) isVotingMember(id uint64) bool {
 	if id == r.replicaID {
-		return true
+		return !r.selfRemoved
 	}
 	if _, ok := r.remotes[id]; ok {
 		return true
@@ -1271,7 +1365,9 @@ func (r *raft) countVotes() (granted, rejected int) {
 			rejected++
 		}
 	}
-	tally(r.replicaID)
+	if !r.selfRemoved {
+		tally(r.replicaID)
+	}
 	for id := range r.remotes {
 		if id != r.replicaID {
 			tally(id)
@@ -2381,6 +2477,10 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 			r.witnesses[id] = newRemote(nextIdx, maxInflightMsgs)
 		}
 	}
+	// A snapshot can carry a configuration this replica is no longer in
+	// (it was removed while it lagged), so self membership is re-derived
+	// here before purgeDepartedVotes drops the now-invalid self vote.
+	r.setSelfMembership(membershipHasSelf(m, r.replicaID))
 	r.purgeDepartedVotes()
 }
 
@@ -2840,7 +2940,10 @@ func (r *raft) sendTimeoutNow(to uint64) {
 // handleTimeoutNow processes a TimeoutNow message by immediately
 // starting an election.
 func (r *raft) handleTimeoutNow(_ proto.Message) error {
-	if r.isObserver || r.isWitness {
+	// A removed replica must not campaign even when told to: a TimeoutNow
+	// in flight when the removal committed would otherwise hand leadership
+	// to a replica the configuration no longer contains.
+	if r.isObserver || r.isWitness || r.selfRemoved {
 		return nil
 	}
 	// A leader must never call becomeCandidate (invariant assertion).
@@ -2891,7 +2994,17 @@ func (r *raft) broadcastQuiesce() {
 }
 
 // handleQuiesceMessage processes a quiesce notification from the leader.
+//
+// Quiesce is a local configuration choice, not replicated state, so a peer
+// cannot impose it: a node started with Quiesce disabled must keep its
+// normal election timer. Entering quiesce switches tickFollower to
+// quiesceElectionTimeout() (livenessInterval * 3 = electionTimeout * 30),
+// which on an operator-configured non-quiescing node turns a leader failure
+// into a multi-second leaderless window it never opted into.
 func (r *raft) handleQuiesceMessage(msg proto.Message) {
+	if !r.quiesce.enabled {
+		return
+	}
 	if r.state == follower && msg.From == r.leaderID {
 		r.quiesce.active = true
 		r.quiesce.livenessTick = 0

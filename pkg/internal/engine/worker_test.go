@@ -4243,7 +4243,7 @@ func TestStepWorker_ClearStepCommitPending_EmptyNodes(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestCommitWorker_DrainUnloadReload_ProcessesUnloads verifies that
-// drainUnloadReload adds shard IDs from unloadC to the unloaded set.
+// drainUnloadReload adds unload requests to the unloaded set.
 func TestCommitWorker_DrainUnloadReload_ProcessesUnloads(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -4254,9 +4254,9 @@ func TestCommitWorker_DrainUnloadReload_ProcessesUnloads(t *testing.T) {
 	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
 
 	// Enqueue unload requests.
-	cw.unloadC <- 10
-	cw.unloadC <- 20
-	cw.unloadC <- 30
+	cw.membershipC <- shardMembership{shardID: 10, unload: true}
+	cw.membershipC <- shardMembership{shardID: 20, unload: true}
+	cw.membershipC <- shardMembership{shardID: 30, unload: true}
 
 	cw.drainUnloadReload()
 
@@ -4269,7 +4269,7 @@ func TestCommitWorker_DrainUnloadReload_ProcessesUnloads(t *testing.T) {
 }
 
 // TestCommitWorker_DrainUnloadReload_ProcessesReloads verifies that
-// drainUnloadReload removes shard IDs from the unloaded set via reloadC.
+// drainUnloadReload removes shard IDs from the unloaded set on reload.
 func TestCommitWorker_DrainUnloadReload_ProcessesReloads(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -4284,8 +4284,8 @@ func TestCommitWorker_DrainUnloadReload_ProcessesReloads(t *testing.T) {
 	cw.unloaded.add(20)
 
 	// Enqueue reload requests.
-	cw.reloadC <- 10
-	cw.reloadC <- 20
+	cw.membershipC <- shardMembership{shardID: 10}
+	cw.membershipC <- shardMembership{shardID: 20}
 
 	cw.drainUnloadReload()
 
@@ -4311,8 +4311,8 @@ func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T
 	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
 
 	// First pass: unload shard 10 and shard 20.
-	cw.unloadC <- 10
-	cw.unloadC <- 20
+	cw.membershipC <- shardMembership{shardID: 10, unload: true}
+	cw.membershipC <- shardMembership{shardID: 20, unload: true}
 
 	cw.drainUnloadReload()
 
@@ -4325,7 +4325,7 @@ func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T
 	}
 
 	// Second pass: reload shard 10 only.
-	cw.reloadC <- 10
+	cw.membershipC <- shardMembership{shardID: 10}
 
 	cw.drainUnloadReload()
 
@@ -4338,8 +4338,60 @@ func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T
 	}
 }
 
+// TestCommitWorker_DrainUnloadReload_OrderIsDeterministic verifies that
+// unload and reload requests are applied in the order they were made, even
+// when both are already queued when the worker drains.
+//
+// select picks uniformly at random among ready cases, so while unloads and
+// reloads travelled on two separate channels the drain applied them in an
+// arbitrary order. StopShard(S) followed by StartShard(S) could therefore
+// leave S permanently in the unloaded set: processBatch would skip
+// Peer.Commit for S forever, so the restarted replica would persist to the
+// WAL, vote, and even win elections while never applying anything and timing
+// out every proposal. The reverse inversion is just as bad in the other
+// direction: a shard that was unloaded would come back "loaded".
+//
+// The loop runs the race many times because a two-channel drain picks the
+// wrong order roughly half the time.
+func TestCommitWorker_DrainUnloadReload_OrderIsDeterministic(t *testing.T) {
+	const iterations = 1000
+	ldb := newTestLogDB()
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+
+	newWorker := func(stopC chan struct{}) *commitWorker {
+		return newCommitWorker(0, ldb, nil, make(chan *commitItem, 1),
+			make(chan *applyItem, 1), applyPool, NewWorkSignal(1), nil, stopC, nil)
+	}
+
+	for i := range iterations {
+		stopC := make(chan struct{})
+
+		// StopShard(9) then StartShard(9): the shard must end up LOADED.
+		cw := newWorker(stopC)
+		cw.requestUnload(9)
+		cw.requestReload(9)
+		cw.drainUnloadReload()
+		if cw.unloaded.has(9) {
+			t.Fatalf("iteration %d: shard 9 is unloaded after unload-then-reload; "+
+				"the reload was applied before the unload it followed", i)
+		}
+
+		// StartShard(9) then StopShard(9): the shard must end up UNLOADED.
+		cw = newWorker(stopC)
+		cw.requestReload(9)
+		cw.requestUnload(9)
+		cw.drainUnloadReload()
+		if !cw.unloaded.has(9) {
+			t.Fatalf("iteration %d: shard 9 is loaded after reload-then-unload; "+
+				"the unload was applied before the reload it followed", i)
+		}
+
+		close(stopC)
+	}
+}
+
 // TestCommitWorker_DrainUnloadReload_EmptyChannels verifies that
-// drainUnloadReload returns immediately when both channels are empty.
+// drainUnloadReload returns immediately when the channel is empty.
 func TestCommitWorker_DrainUnloadReload_EmptyChannels(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -4360,7 +4412,7 @@ func TestCommitWorker_DrainUnloadReload_EmptyChannels(t *testing.T) {
 	case <-done:
 		// Expected.
 	case <-time.After(time.Second):
-		t.Fatal("drainUnloadReload blocked on empty channels")
+		t.Fatal("drainUnloadReload blocked on an empty channel")
 	}
 }
 
@@ -4412,8 +4464,12 @@ func TestApplyWorker_Dispatch_SkipsUnloadedShard(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestCommitWorker_Run_HandlesUnloadInMainLoop verifies that the commit
-// worker's main run loop correctly handles unload messages received
-// via the unloadC select case (not just via drainUnloadReload).
+// worker's main run loop correctly handles unload/reload requests received
+// via the membership select case (not just via drainUnloadReload), and that
+// the resulting unloaded set reflects the ORDER the requests were made in:
+// unload(55), reload(55), unload(66) must leave 55 loaded and 66 unloaded.
+// Draining the channel is not enough — a worker that applied the requests in
+// an arbitrary order would drain it just the same while wedging shard 55.
 func TestCommitWorker_Run_HandlesUnloadInMainLoop(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -4431,24 +4487,31 @@ func TestCommitWorker_Run_HandlesUnloadInMainLoop(t *testing.T) {
 		close(done)
 	}()
 
-	// Send unload and reload requests via the channels (not pre-filled).
+	// Send unload and reload requests via the channel (not pre-filled).
 	cw.requestUnload(55)
 	cw.requestReload(55)
 	cw.requestUnload(66)
 
-	// Wait for the channels to be drained by the worker's select loop.
+	// Wait for the channel to be drained by the worker's select loop.
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for unload/reload channels to drain",
-		func() bool {
-			return len(cw.unloadC) == 0 && len(cw.reloadC) == 0
-		})
+		"timed out waiting for the membership channel to drain",
+		func() bool { return len(cw.membershipC) == 0 })
 
+	// Stop the worker before reading the unloaded set: it is owned by the
+	// worker goroutine and must not be read concurrently.
 	close(stopC)
 	select {
 	case <-done:
 		// Expected.
 	case <-time.After(2 * time.Second):
 		t.Fatal("commit worker did not stop within timeout")
+	}
+
+	if cw.unloaded.has(55) {
+		t.Fatal("shard 55 must not be unloaded: the reload followed the unload")
+	}
+	if !cw.unloaded.has(66) {
+		t.Fatal("shard 66 must be unloaded")
 	}
 }
 
@@ -4937,7 +5000,7 @@ func TestStepWorker_SendMessages_NoSnapshot(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestApplyWorker_RequestUnload_MarksShard verifies that requestUnload
-// adds the shard to the unloaded set via the unloadC channel during
+// adds the shard to the unloaded set via the membership channel during
 // the dispatcher's run loop.
 func TestApplyWorker_RequestUnload_MarksShard(t *testing.T) {
 	applyC := make(chan *applyItem, 16)
@@ -4953,13 +5016,9 @@ func TestApplyWorker_RequestUnload_MarksShard(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Request unload for shard 77.
-	aw.requestUnload(77)
-
-	// Wait for the dispatcher to drain unloadC.
-	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for unloadC to drain",
-		func() bool { return len(aw.unloadC) == 0 })
+	// Request unload for shard 77. The request is synchronous: done closes
+	// once the dispatcher has processed it.
+	<-aw.requestUnload(77)
 
 	close(stopC)
 	<-runDone
@@ -4982,20 +5041,18 @@ func TestApplyWorker_RequestReload_ClearsUnloaded(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Unload then reload shard 88. Wait for each channel to drain
-	// before sending the next request to ensure ordering.
-	aw.requestUnload(88)
-	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for unloadC to drain",
-		func() bool { return len(aw.unloadC) == 0 })
+	// Unload then reload shard 88. Both requests rendezvous with the
+	// dispatcher on the same channel, so they are applied in this order.
+	<-aw.requestUnload(88)
 	aw.requestReload(88)
-	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for reloadC to drain",
-		func() bool { return len(aw.reloadC) == 0 })
 
 	close(stopC)
 	<-runDone
 	wg.Wait()
+
+	if aw.unloaded.has(88) {
+		t.Fatal("shard 88 should have been cleared from the unloaded set")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -6657,12 +6714,12 @@ func TestCommitWorker_Run_ReloadInMainLoop(t *testing.T) {
 	}()
 
 	// Send reload request.
-	cw.reloadC <- uint64(5)
+	cw.requestReload(5)
 
 	// Wait for the select loop to process the reload (channel drained).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for reloadC to drain",
-		func() bool { return len(cw.reloadC) == 0 })
+		"timed out waiting for the membership channel to drain",
+		func() bool { return len(cw.membershipC) == 0 })
 
 	close(stopC)
 	wg.Wait()
@@ -6777,12 +6834,12 @@ func TestCommitWorker_Run_UnloadInMainLoop(t *testing.T) {
 	}()
 
 	// Send unload request.
-	cw.unloadC <- uint64(7)
+	cw.requestUnload(7)
 
 	// Wait for the select loop to process the unload (channel drained).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for unloadC to drain",
-		func() bool { return len(cw.unloadC) == 0 })
+		"timed out waiting for the membership channel to drain",
+		func() bool { return len(cw.membershipC) == 0 })
 
 	close(stopC)
 	wg.Wait()

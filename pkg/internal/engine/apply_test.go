@@ -485,22 +485,20 @@ initialApplied:
 	// LoadNode creates a fresh Node, so we do the same to avoid sharing
 	// the old node's non-atomic fields with the old goroutine (which
 	// may still be draining).
+	// The reload rendezvouses with the dispatcher, which applies it before
+	// it can pick up the item queued below.
 	aw.requestReload(5)
-	deadline3 := time.After(5 * time.Second)
-	for len(aw.reloadC) > 0 {
-		select {
-		case <-deadline3:
-			t.Fatal("timed out waiting for reloadC to be drained")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
 
 	goodSM2 := newTestSM()
 	goodApplier2 := newTestApplier(goodSM2)
 	cfg2 := config.Config{ShardID: 5, ReplicaID: 1}
 	cfg2.SetDefaults()
 	node2 := NewNode(nil, goodApplier2, nil, cfg2, 100, nil, "", nil)
+	// Host.StartShard seeds the new incarnation's applied marker from raft's
+	// processed marker before LoadNode. Index 2 was dropped by the unloaded
+	// guard above and re-offered to this incarnation as part of its recovered
+	// frontier, so the next batch legitimately starts at 3.
+	node2.SeedLastApplied(2, 1)
 
 	// Step 5: Send a new item. It should be applied normally.
 	node2.commitPending.Store(true)
@@ -559,17 +557,10 @@ func TestApplyWorker_UnloadedMapCleanup(t *testing.T) {
 		<-aw.requestUnload(i)
 	}
 
+	// Each reload rendezvouses with the dispatcher, so all 100 are applied
+	// before the items queued below can be dispatched.
 	for i := uint64(1); i <= 100; i++ {
 		aw.requestReload(i)
-	}
-	deadlineR := time.After(5 * time.Second)
-	for len(aw.reloadC) > 0 {
-		select {
-		case <-deadlineR:
-			t.Fatal("timed out waiting for reloadC to be drained")
-		default:
-		}
-		time.Sleep(time.Millisecond)
 	}
 
 	// Verify the unloaded map is empty by sending items for all 100
@@ -654,10 +645,11 @@ func TestSMPanicError_Is_DoesNotMatchOther(t *testing.T) {
 
 // TestApplyWorker_ReloadServicedBeforeQueuedItem verifies that a re-loaded
 // shard's first committed batch is applied rather than dropped. LoadNode
-// enqueues the reload before publishing the node, but the dispatcher's select
-// picks uniformly at random among ready cases, so the reload must be serviced
-// explicitly before dispatching. A dropped batch is permanent: Peer.Commit has
-// already advanced the processed marker, so it is never re-offered.
+// requests the reload before publishing the node; the request rendezvouses
+// with the dispatcher, which therefore clears the unloaded mark before it can
+// pick up the shard's next committed batch. A dropped batch is permanent:
+// Peer.Commit has already advanced the processed marker, so it is never
+// re-offered.
 func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	applyC := make(chan *applyItem, 4)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -673,11 +665,12 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	cfg.SetDefaults()
 	node := NewNode(nil, newTestApplier(testSm), nil, cfg, 100, nil, "", nil)
 
-	// The shard was unloaded, then re-loaded: the reload request and the new
-	// incarnation's first committed batch are both ready when the dispatcher
-	// wakes up.
+	// The shard was unloaded, then re-loaded, and the new incarnation's first
+	// committed batch follows immediately.
 	aw.unloaded.add(7)
-	aw.reloadC <- 7
+	go aw.run()
+	aw.requestReload(7)
+
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
 	item.update = proto.Update{
@@ -688,8 +681,6 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	go aw.run()
-
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"committed batch of the re-loaded shard was never applied",
 		func() bool { return testSm.applyCount.Load() == 1 })
@@ -699,6 +690,67 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	}
 	if got := node.lastApplied.Load(); got != 1 {
 		t.Fatalf("lastApplied = %d, want 1", got)
+	}
+}
+
+// TestApplyWorker_MembershipOrderIsDeterministic verifies that the dispatcher
+// applies unload and reload requests in the order they were made.
+//
+// While the two travelled on separate channels (an unbuffered unloadC and a
+// buffered reloadC) the dispatcher's select picked between them uniformly at
+// random whenever both were ready. A LoadNode(S) immediately followed by a
+// StopShard(S) could therefore be applied in reverse, leaving S OUT of the
+// unloaded set after it had been unloaded: a stale applyItem would then spawn
+// a per-shard goroutine that nothing ever closes and apply committed entries
+// into a state machine StopShard has already closed. The reverse inversion
+// leaves a re-loaded shard marked unloaded, so its batches are dropped.
+//
+// The loop runs the race many times because a two-channel dispatcher picks
+// the wrong order roughly half the time.
+func TestApplyWorker_MembershipOrderIsDeterministic(t *testing.T) {
+	const iterations = 500
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+
+	// runCase starts a dispatcher, lets ops stage its membership requests,
+	// then stops the dispatcher and reports whether shard 4 ended up
+	// unloaded. The set is read only after the dispatcher goroutine exits.
+	runCase := func(ops func(aw *applyWorker)) bool {
+		applyC := make(chan *applyItem, 1)
+		var wg sync.WaitGroup
+		stopC := make(chan struct{})
+		aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
+		runDone := make(chan struct{})
+		go func() {
+			aw.run()
+			close(runDone)
+		}()
+		ops(aw)
+		close(stopC)
+		<-runDone
+		wg.Wait()
+		return aw.unloaded.has(4)
+	}
+
+	for i := range iterations {
+		// StartShard(4) then StopShard(4): the shard must end up UNLOADED.
+		unloaded := runCase(func(aw *applyWorker) {
+			aw.requestReload(4)
+			<-aw.requestUnload(4)
+		})
+		if !unloaded {
+			t.Fatalf("iteration %d: shard 4 is loaded after reload-then-unload; "+
+				"the unload was applied before the reload it followed", i)
+		}
+
+		// StopShard(4) then StartShard(4): the shard must end up LOADED.
+		unloaded = runCase(func(aw *applyWorker) {
+			<-aw.requestUnload(4)
+			aw.requestReload(4)
+		})
+		if unloaded {
+			t.Fatalf("iteration %d: shard 4 is unloaded after unload-then-reload; "+
+				"the reload was applied before the unload it followed", i)
+		}
 	}
 }
 
@@ -745,6 +797,74 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 		t.Fatal("entries after a gap must not be applied")
 	}
 	if got := node.lastApplied.Load(); got != 5 {
+		t.Fatalf("lastApplied must not advance past the gap, got %d", got)
+	}
+	failed := cb.getProposalFailedCalls()
+	if !errors.Is(failed[0].err, ErrApplyGap) {
+		t.Fatalf("expected ErrApplyGap, got %v", failed[0].err)
+	}
+}
+
+// TestApplyWorker_GapDetection_FailsShardWhenNothingApplied verifies that the
+// gap check also covers a shard whose applied marker is still zero.
+//
+// A fresh shard is seeded with SeedLastApplied(0, 0) and raft's processed
+// marker is 0 with it, so raft offers its first batch at index 1. A first
+// batch that starts anywhere above 1 therefore means an earlier batch was
+// dropped by one of the three drop paths (the commit worker's unloaded skip,
+// the apply dispatcher's unloaded/shutdown drop, a failed Peer.Commit), each
+// of which relies on this check as its safety net. Peer.Commit has already
+// advanced the processed marker past the missing range, so it can never be
+// re-offered: applying over the hole would leave the replica acking the leader
+// and serving reads from a state machine missing committed entries — a state
+// machine safety violation with no error and no failed shard.
+func TestApplyWorker_GapDetection_FailsShardWhenNothingApplied(t *testing.T) {
+	applyC := make(chan *applyItem, 4)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	var wg sync.WaitGroup
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	cb := newTestCallback()
+	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, NewWorkSignal(1), stopC, nil)
+
+	testSm := newTestSM()
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(nil, newTestApplier(testSm), nil, cfg, 100, nil, "", nil)
+	// A fresh shard: nothing recovered, nothing applied.
+	node.SeedLastApplied(0, 0)
+
+	go aw.run()
+
+	// Entries 1..7 were dropped; the pipeline offers 8..9 next.
+	node.commitPending.Store(true)
+	item := applyPool.Get().(*applyItem)
+	item.update = proto.Update{
+		ShardID:   1,
+		ReplicaID: 1,
+		CommittedEntries: []proto.Entry{
+			{Index: 8, Term: 1, Cmd: []byte("gap")},
+			{Index: 9, Term: 1, Cmd: []byte("gap")},
+		},
+	}
+	item.node = node
+	applyC <- item
+
+	waitFor(t, 5*time.Second, time.Millisecond,
+		"timed out waiting for the gap to be reported",
+		func() bool { return cb.proposalFailedCount.Load() == 1 })
+
+	if !node.IsFailed() {
+		t.Fatal("node must be marked failed on a committed-entry gap")
+	}
+	if got := testSm.applyCount.Load(); got != 0 {
+		t.Fatalf("entries after a gap must not be applied, applyCount = %d", got)
+	}
+	if got := cb.appliedCount.Load(); got != 0 {
+		t.Fatalf("OnApplied must not fire for a gapped batch, got %d calls", got)
+	}
+	if got := node.lastApplied.Load(); got != 0 {
 		t.Fatalf("lastApplied must not advance past the gap, got %d", got)
 	}
 	failed := cb.getProposalFailedCalls()

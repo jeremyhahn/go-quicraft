@@ -2025,35 +2025,101 @@ func TestSendBatch_DirectSnappyPoolHitAndReturn(t *testing.T) {
 // stops processing when a single snapshot receive accumulates more bytes
 // than the receiver's maxMemory budget.
 
+// TestSendBatch_WriteErrorEvictsConnection verifies that a stream write failure
+// evicts AND closes the cached connection along with every stream pooled on it.
+// Eviction is what stops the transport writing into a black-holed connection:
+// without it every cached stream on the dead connection stalls for the full
+// write deadline on each subsequent batch, and Raft sees a peer that is
+// reachable-but-silent.
+//
+// The failure is injected deterministically by cancelling the send side of the
+// pooled stream — subsequent writes on it fail immediately — so the test never
+// depends on a peer teardown racing the send. It asserts identity, not mere
+// absence, of the connection, so a legitimate re-dial cannot mask a missing
+// eviction.
 func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
+	rec := &dropRecorder{}
+	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler(),
+		func(c *Config) { c.Metrics = rec })
 	defer cleanup()
 
 	t2Addr := t2.Addr().String()
+	const shardID = uint64(1)
 
-	// Establish a connection by sending a message.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	time.Sleep(200 * time.Millisecond)
+	// Establish the connection and the exact pooled stream sendBatch will reuse
+	// for this shard.
+	stream, err := t1.getStream(t2Addr, shardID, false)
+	if err != nil {
+		t.Fatalf("getStream failed: %v", err)
+	}
+	if stream == nil {
+		t.Fatal("getStream returned a nil stream")
+	}
 
-	// Stop t2 to close the remote side.
-	t2.Stop()
-	// Give time for the connection context to cancel.
-	time.Sleep(200 * time.Millisecond)
-
-	// Direct sendBatch call should hit the write error path.
-	// The getStream may fail or the write may fail, both are acceptable.
-	t1.sendBatch(t2Addr, []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-
-	// The connection should have been evicted.
 	t1.connMu.RLock()
-	_, connExists := t1.conns[t2Addr]
+	conn := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
-	if connExists {
-		t.Log("connection still exists after write failure (may have been re-dialed)")
+	if conn == nil {
+		t.Fatal("no cached connection after getStream")
+	}
+	select {
+	case <-conn.Context().Done():
+		t.Fatal("connection already dead before the write error was injected")
+	default:
+	}
+
+	// Cancelling the send side makes every subsequent Write on this stream fail
+	// while leaving the connection itself healthy — so only sendBatch's write
+	// error path can be responsible for the eviction that follows.
+	stream.CancelWrite(1)
+
+	t1.sendBatch(t2Addr, []proto.Message{
+		{Type: proto.Replicate, ShardID: shardID, From: 1, To: 2, Term: 2},
+	})
+
+	// The batch must be reported dropped as a write failure, not as an
+	// unavailable stream: the latter would mean getStream, not the write,
+	// failed and the eviction below proves nothing.
+	var sawWriteFailed bool
+	for _, d := range rec.drops() {
+		if d.reason == dropReasonWriteFailed && d.shardID == shardID && d.to == 2 {
+			sawWriteFailed = true
+		}
+	}
+	if !sawWriteFailed {
+		t.Fatalf("no %q drop recorded for the failed write; drops=%+v",
+			dropReasonWriteFailed, rec.drops())
+	}
+
+	// The evicted connection must be CLOSED, not merely dropped from the map:
+	// a forgotten-but-open connection keeps its streams writable into a peer
+	// that will never read them.
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection was not closed after the write failure")
+	}
+
+	// And it must no longer be the cached connection for the target. Compare
+	// identity rather than presence so a concurrent re-dial cannot hide a
+	// missing eviction.
+	t1.connMu.RLock()
+	cached, cachedOK := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
+	if cachedOK && cached == conn {
+		t.Fatal("the dead connection is still cached after the write failure")
+	}
+
+	// Every stream pooled on that connection must have been evicted too, so the
+	// next send does not reuse the broken stream.
+	next, err := t1.getStream(t2Addr, shardID, false)
+	if err != nil {
+		// A dial failure here is acceptable; what must not happen is the
+		// cancelled stream being handed back.
+		return
+	}
+	if next == stream {
+		t.Fatal("getStream returned the cancelled stream; streams were not evicted with the connection")
 	}
 }
 

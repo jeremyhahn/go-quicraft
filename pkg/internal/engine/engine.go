@@ -315,8 +315,17 @@ func (e *Engine) LoadNode(node *Node) {
 	// Enqueueing the reload first makes it strictly precede any applyItem the
 	// new incarnation can produce; the dispatcher consumes reload requests
 	// before dispatching (see applyWorker.run).
+	//
+	// The apply-side reload rendezvouses with the dispatcher goroutine (it
+	// shares the unbuffered membership channel with requestUnload so unload
+	// and reload can never be applied out of order), so it is skipped before
+	// Start for the same reason UnloadNode skips the apply-side unload: with
+	// no dispatcher running nothing can have been unloaded, so the unloaded
+	// set is provably empty and the reload would have nothing to clear.
 	e.commitWorkers[workerID].requestReload(node.shardID)
-	e.applyWorkers[workerID].requestReload(node.shardID)
+	if e.started.Load() {
+		e.applyWorkers[workerID].requestReload(node.shardID)
+	}
 
 	e.stepWorkers[workerID].loadNode(node)
 

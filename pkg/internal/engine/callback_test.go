@@ -921,6 +921,10 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	cfg := config.Config{ShardID: 42, ReplicaID: 7}
 	cfg.SetDefaults()
 	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	// Seed the applied frontier so the batch below continues at
+	// lastApplied+1; otherwise the apply gap check rejects it before
+	// SM.Apply is ever called and this test would pass vacuously.
+	node.SeedLastApplied(9, 1)
 
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
@@ -987,6 +991,10 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 		t.Errorf("ApplyError shard/replica = %d/%d, want 42/7",
 			applyErr.ShardID, applyErr.ReplicaID)
 	}
+	// The failure must be the SM.Apply error, not a gap rejection.
+	if applyErr.Err == nil || applyErr.Err.Error() != "disk full" {
+		t.Fatalf("ApplyError.Err = %v, want the SM.Apply error", applyErr.Err)
+	}
 }
 
 // TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied verifies the
@@ -1011,9 +1019,12 @@ func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
 	cfg.SetDefaults()
 	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
 
-	// Verify initial lastApplied is zero.
-	if node.lastApplied.Load() != 0 {
-		t.Fatalf("expected initial lastApplied 0, got %d", node.lastApplied.Load())
+	// Seed the applied frontier so the batch below continues at
+	// lastApplied+1; otherwise the apply gap check rejects it before
+	// SM.Apply is ever called and this test would pass vacuously.
+	node.SeedLastApplied(4, 1)
+	if node.lastApplied.Load() != 4 {
+		t.Fatalf("expected initial lastApplied 4, got %d", node.lastApplied.Load())
 	}
 
 	node.commitPending.Store(true)
@@ -1051,9 +1062,9 @@ func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
 	<-runDone
 	wg.Wait()
 
-	// lastApplied must remain at zero under fail-fast.
-	if got := node.lastApplied.Load(); got != 0 {
-		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", got)
+	// lastApplied must remain at the seeded frontier under fail-fast.
+	if got := node.lastApplied.Load(); got != 4 {
+		t.Fatalf("lastApplied = %d, want 4 (fail-fast does not advance)", got)
 	}
 }
 
@@ -1076,6 +1087,10 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	// Seed the applied frontier so the batch below continues at
+	// lastApplied+1; otherwise the apply gap check rejects it before
+	// SM.Apply is ever called and this test would pass vacuously.
+	node.SeedLastApplied(2, 1)
 
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
@@ -1112,8 +1127,8 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 
 	// Fail-fast: lastApplied must NOT advance on apply error. Advancing it
 	// while skipping the batch would diverge the SM from its peers.
-	if got := node.lastApplied.Load(); got != 0 {
-		t.Fatalf("lastApplied = %d, want 0 (fail-fast does not advance)", got)
+	if got := node.lastApplied.Load(); got != 2 {
+		t.Fatalf("lastApplied = %d, want 2 (fail-fast does not advance)", got)
 	}
 }
 

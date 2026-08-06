@@ -34,22 +34,32 @@ import (
 // filling its buffer blocks only the dispatcher's send to that shard,
 // but with a larger buffer the window for backpressure is reduced.
 //
-// Invariant relied on by requestUnload: a shard has at most ONE applyItem in
-// flight at a time (commitPending gates the step worker from producing a
-// second update until the first has been applied), so the per-shard channel
-// can never be full and the dispatcher can never park in a per-shard send.
-// That is what keeps the unbuffered unloadC rendezvous reachable. Raising the
-// per-shard in-flight limit above this buffer size would require servicing
-// unloadC from the blocking-send select in dispatch.
+// A shard has at most ONE applyItem in flight at a time (commitPending gates
+// the step worker from producing a second update until the first has been
+// applied), so in practice the per-shard channel never fills and the
+// dispatcher never parks in a per-shard send. The blocking send in dispatch
+// nonetheless services membershipC, so even if that invariant is ever
+// weakened the unbuffered unload/reload rendezvous stays reachable.
 const defaultShardChanBuffer = 64
 
-// applyUnloadRequest asks the apply worker's dispatcher goroutine to tear
-// down a shard's apply resources. done is closed only after the per-shard
-// channel has been closed AND the per-shard apply goroutine (if one exists)
-// has fully exited, so the requester can treat the unload as synchronous:
-// once done is closed, no SM.Apply for the shard is or will be in flight.
-type applyUnloadRequest struct {
+// applyMembershipRequest asks the apply worker's dispatcher goroutine to
+// tear down (unload) or re-admit (reload) a shard's apply resources.
+//
+// For an unload, done is closed only after the per-shard channel has been
+// closed AND the per-shard apply goroutine (if one exists) has fully exited,
+// so the requester can treat the unload as synchronous: once done is closed,
+// no SM.Apply for the shard is or will be in flight. Reload requests carry a
+// nil done — nothing waits on them.
+//
+// Unloads and reloads share ONE channel because select chooses uniformly at
+// random among ready cases. With a separate unloadC and reloadC the two could
+// be applied in reverse order, leaving a shard OUT of the unloaded set after
+// it was unloaded; a stale applyItem would then spawn a per-shard goroutine
+// nothing ever closes and apply entries into a state machine StopShard has
+// already closed. A single channel makes the sequence FIFO by construction.
+type applyMembershipRequest struct {
 	shardID uint64
+	unload  bool
 	done    chan struct{}
 }
 
@@ -141,8 +151,7 @@ type applyWorker struct {
 	callback        Callback
 	snapshotPool    *snapshotPool
 	workSignal      *WorkSignal
-	unloadC         chan applyUnloadRequest // unload requests handled by the dispatcher goroutine
-	reloadC         chan uint64             // shard IDs to re-load (clear from unloaded set)
+	membershipC     chan applyMembershipRequest // ordered unload/reload requests handled by the dispatcher
 	stopC           chan struct{}
 
 	// metrics collects raft-level metrics. Nil when disabled.
@@ -176,21 +185,22 @@ func newApplyWorker(
 		callback:        callback,
 		snapshotPool:    snapshotPool,
 		workSignal:      workSignal,
-		// unloadC is deliberately unbuffered: requestUnload must rendezvous
+		// membershipC is deliberately unbuffered: requestUnload must rendezvous
 		// with the dispatcher (or observe stopC) so an unload request can
 		// never be stranded in a buffer after the dispatcher has exited,
 		// which would leave the synchronous UnloadNode waiter blocked forever.
-		unloadC: make(chan applyUnloadRequest),
-		reloadC: make(chan uint64, 64),
-		stopC:   stopC,
-		metrics: metrics,
+		// Reloads ride the same channel to keep the two ordered, so they
+		// rendezvous too — see requestReload.
+		membershipC: make(chan applyMembershipRequest),
+		stopC:       stopC,
+		metrics:     metrics,
 	}
 }
 
 // run is the dispatcher loop. It reads items from applyC and routes
 // each item to the owning per-shard goroutine, spawning one on demand.
-// It also listens on unloadC for shard removal requests from the Host
-// goroutine, ensuring per-shard goroutines are cleaned up when nodes
+// It also listens on membershipC for shard unload/reload requests from the
+// Host goroutine, ensuring per-shard goroutines are cleaned up when nodes
 // are unloaded.
 func (w *applyWorker) run() {
 	// Join the per-shard goroutines on EVERY exit path taken while the
@@ -205,10 +215,8 @@ func (w *applyWorker) run() {
 			// applied to deliver results and advance lastApplied.
 			w.drain()
 			return
-		case req := <-w.unloadC:
-			w.handleUnload(req)
-		case shardID := <-w.reloadC:
-			w.unloaded.remove(shardID)
+		case req := <-w.membershipC:
+			w.handleMembership(req)
 		case item := <-w.applyC:
 			// Unload/reload requests are ordered ahead of any applyItem a
 			// re-loaded shard can produce (LoadNode enqueues the reload
@@ -243,10 +251,21 @@ func (w *applyWorker) shutdownIfStopping() {
 	w.ackPendingUnloads()
 }
 
+// handleMembership applies one ordered unload/reload request. Must run on
+// the dispatcher goroutine (single-owner invariant on shardChans/shardExits
+// and the unloaded set).
+func (w *applyWorker) handleMembership(req applyMembershipRequest) {
+	if !req.unload {
+		w.unloaded.remove(req.shardID)
+		return
+	}
+	w.handleUnload(req)
+}
+
 // handleUnload tears down a shard's apply resources and acks the requester
 // once the per-shard goroutine has exited. Must run on the dispatcher
 // goroutine (single-owner invariant on shardChans/shardExits).
-func (w *applyWorker) handleUnload(req applyUnloadRequest) {
+func (w *applyWorker) handleUnload(req applyMembershipRequest) {
 	exited := w.removeShardChan(req.shardID)
 	if exited == nil {
 		// No per-shard goroutine was ever spawned: nothing to join.
@@ -264,14 +283,12 @@ func (w *applyWorker) handleUnload(req applyUnloadRequest) {
 
 // drainUnloadReload non-blocking drains pending unload and reload requests.
 // Called before dispatching so shard membership changes are always observed
-// ahead of the items they govern.
+// ahead of the items they govern, and in the order they were requested.
 func (w *applyWorker) drainUnloadReload() {
 	for {
 		select {
-		case req := <-w.unloadC:
-			w.handleUnload(req)
-		case shardID := <-w.reloadC:
-			w.unloaded.remove(shardID)
+		case req := <-w.membershipC:
+			w.handleMembership(req)
 		default:
 			return
 		}
@@ -294,11 +311,7 @@ func (w *applyWorker) dispatch(item *applyItem) {
 		)
 		// Release the item back to the pool and clear commitPending
 		// so the pipeline does not stall waiting for this item.
-		item.update.ReleaseCommittedEntries()
-		if item.node != nil {
-			item.node.commitPending.Store(false)
-		}
-		releaseApplyItem(w.applyPool, item)
+		w.discardItem(item)
 		return
 	}
 
@@ -325,33 +338,60 @@ func (w *applyWorker) dispatch(item *applyItem) {
 	// committed entries, which would violate Raft safety.
 	select {
 	case ch <- item:
+		return
 	default:
-		slog.Warn("apply dispatcher backpressure: shard channel full, blocking",
-			"worker", w.workerID,
-			"shard", shardID,
-			"channel_cap", cap(ch),
-		)
-		// Block until the shard drains, BUT remain responsive to shutdown:
-		// without the stopC guard a stalled/stopped shard goroutine whose
-		// channel is full would wedge the dispatcher forever, preventing the
-		// engine from tearing down. Committed entries are still never dropped
-		// in normal operation — this branch only abandons delivery when the
-		// engine is already stopping.
+	}
+	slog.Warn("apply dispatcher backpressure: shard channel full, blocking",
+		"worker", w.workerID,
+		"shard", shardID,
+		"channel_cap", cap(ch),
+	)
+	// Block until the shard drains, BUT remain responsive to shutdown and to
+	// membership requests: without the stopC guard a stalled/stopped shard
+	// goroutine whose channel is full would wedge the dispatcher forever,
+	// preventing the engine from tearing down; without the membershipC case
+	// it would also stall UnloadNode and LoadNode for EVERY shard on this
+	// worker, since both rendezvous with this goroutine. Committed entries
+	// are still never dropped in normal operation — the abandon branches
+	// below run only when the engine is stopping or this very shard was
+	// unloaded underneath us.
+	for {
 		select {
 		case ch <- item:
+			return
+		case req := <-w.membershipC:
+			w.handleMembership(req)
+			if _, live := w.shardChans[shardID]; !live {
+				// This shard was just unloaded: removeShardChan closed ch, so
+				// retrying the send would panic, and the entries can never be
+				// applied. Drop the item exactly as the unloaded guard does.
+				slog.Warn("apply dispatch skipped for shard unloaded while backpressured",
+					"worker", w.workerID, "shard", shardID)
+				w.discardItem(item)
+				return
+			}
 		case <-w.stopC:
 			slog.Warn("apply dispatcher shutting down; committed item not delivered",
 				"worker", w.workerID, "shard", shardID)
 			// Mirror the unloaded-shard cleanup: release committed entries,
 			// clear commitPending, and return the item to the pool so we
 			// don't leak pooled state or wedge the node on shutdown.
-			item.update.ReleaseCommittedEntries()
-			if item.node != nil {
-				item.node.commitPending.Store(false)
-			}
-			releaseApplyItem(w.applyPool, item)
+			w.discardItem(item)
+			return
 		}
 	}
+}
+
+// discardItem releases a committed batch that will never be applied. It
+// returns the pooled committed-entries slice, clears commitPending so the
+// shard's pipeline does not stall waiting for an apply that will not happen,
+// and returns the applyItem to the pool.
+func (w *applyWorker) discardItem(item *applyItem) {
+	item.update.ReleaseCommittedEntries()
+	if item.node != nil {
+		item.node.commitPending.Store(false)
+	}
+	releaseApplyItem(w.applyPool, item)
 }
 
 // drain non-blocking drains all items from applyC and dispatches them
@@ -485,10 +525,20 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			// The missing range can never be re-offered, so applying this
 			// batch would silently skip committed entries and keep the shard
 			// serving reads from a divergent state machine. Fail the shard
-			// instead. la == 0 is a shard that has not applied anything yet
-			// (fresh start, or an on-disk SM whose frontier is seeded
-			// elsewhere), where no continuity claim can be made.
-			if la > 0 && entries[0].Index != la+1 {
+			// instead.
+			//
+			// The check covers la == 0 as well. A zero applied marker is not
+			// an "unknown frontier" that has to be trusted: node.lastApplied
+			// is seeded to raft's processed marker before the node enters the
+			// pipeline (Host.StartShard: SetProcessedIndex then
+			// SeedLastApplied) and to the snapshot index by snapshot recovery,
+			// so la == 0 means raft.processed == 0 and raft offers batches
+			// starting at index 1. A first batch above index 1 with la == 0
+			// therefore means entries were lost — exactly the drop this guard
+			// exists to catch, and the only window the three drop paths
+			// (unloaded skip, shutdown drop, failed Peer.Commit) were not
+			// covered in.
+			if entries[0].Index != la+1 {
 				slog.Error("committed entry gap before apply",
 					"shard", node.shardID,
 					"replica", node.replicaID,
@@ -650,7 +700,7 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 }
 
 // requestUnload sends a shard removal request to the dispatcher goroutine
-// via the unloadC channel and returns a channel that is closed once the
+// via the membership channel and returns a channel that is closed once the
 // unload is COMPLETE: the per-shard channel closed and the per-shard apply
 // goroutine (if any) fully exited. This is safe for concurrent use by the
 // Host goroutine because the actual map mutation (removeShardChan) happens
@@ -663,7 +713,7 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 func (w *applyWorker) requestUnload(shardID uint64) <-chan struct{} {
 	done := make(chan struct{})
 	select {
-	case w.unloadC <- applyUnloadRequest{shardID: shardID, done: done}:
+	case w.membershipC <- applyMembershipRequest{shardID: shardID, unload: true, done: done}:
 	case <-w.stopC:
 		close(done)
 	}
@@ -671,14 +721,18 @@ func (w *applyWorker) requestUnload(shardID uint64) <-chan struct{} {
 }
 
 // ackPendingUnloads closes the done channel of every unload request still
-// pending on unloadC. Called by the dispatcher after wg.Wait() during
+// pending on membershipC. Called by the dispatcher after wg.Wait() during
 // shutdown, when all per-shard goroutines have already exited, so closing
-// done keeps the synchronous-unload contract truthful.
+// done keeps the synchronous-unload contract truthful. Reload requests
+// parked on the same channel are discarded: the dispatcher is gone, so
+// there is no unloaded set left to maintain.
 func (w *applyWorker) ackPendingUnloads() {
 	for {
 		select {
-		case req := <-w.unloadC:
-			close(req.done)
+		case req := <-w.membershipC:
+			if req.done != nil {
+				close(req.done)
+			}
 		default:
 			return
 		}
@@ -691,11 +745,20 @@ func (w *applyWorker) ackPendingUnloads() {
 // prevent the unloaded map from growing without bound and to allow the
 // re-loaded shard to process committed entries.
 //
+// It rendezvouses with the dispatcher (or observes stopC), because the
+// request shares the unbuffered membership channel with requestUnload so
+// the two are applied in the order they were made. The wait is bounded by
+// the dispatcher's liveness only: every dispatcher path either selects on
+// membershipC or on stopC (dispatch's blocking per-shard send services
+// membershipC for exactly this reason), so a slow state machine cannot
+// stall a reload. Engine.LoadNode calls it only after Engine.Start, when a
+// dispatcher goroutine exists to answer.
+//
 // Safe for concurrent use: the actual map deletion happens in the
 // dispatcher goroutine's select loop.
 func (w *applyWorker) requestReload(shardID uint64) {
 	select {
-	case w.reloadC <- shardID:
+	case w.membershipC <- applyMembershipRequest{shardID: shardID}:
 	case <-w.stopC:
 	}
 }

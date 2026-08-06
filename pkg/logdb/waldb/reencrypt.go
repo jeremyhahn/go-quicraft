@@ -69,10 +69,16 @@ var ErrSnapshotReencryptRequired = errors.New(
 //
 // It performs a logical copy through the public LogDB surface: for every node it
 // reproduces the bootstrap record, the most recent snapshot metadata (which
-// carries cluster membership), the hard state, and the full live log-entry range
-// in bounded batches. The source LogDB decrypts each record under srcBarrier and
-// the destination encrypts under dstBarrier, so WAL records are byte-for-byte
-// identical at the Raft level while their at-rest encryption changes.
+// carries cluster membership), the compaction floor, the full live log-entry
+// range in bounded batches, and finally the hard state. The source LogDB
+// decrypts each record under srcBarrier and the destination encrypts under
+// dstBarrier, so WAL records are byte-for-byte identical at the Raft level while
+// their at-rest encryption changes.
+//
+// The hard state is written LAST on purpose: each step is independently fsynced
+// and the destination WAL recovers at a record prefix, so a crash mid-migration
+// can only lose the state while keeping the entries, never recover a commit
+// index past the last durable entry. See reencryptNode.
 //
 // Snapshot DATA FILES are NOT WAL records and live outside this layer. When a
 // barrier is involved, snapFn (provided by the host) re-encrypts each node's
@@ -170,15 +176,6 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		}
 	}
 
-	// Hard state, saved in its own batch before the entries so a large entry
-	// log does not have to be buffered alongside it.
-	if state, _, stateErr := src.ReadState(ni.ShardID, ni.ReplicaID); stateErr == nil {
-		upd := logdb.Update{ShardID: ni.ShardID, ReplicaID: ni.ReplicaID, State: state}
-		if err := dst.SaveState([]logdb.Update{upd}); err != nil {
-			return &ReencryptError{Op: "save-state", Err: err}
-		}
-	}
-
 	// Compaction floor. Without carrying the marker, the destination's
 	// compactedTo stays 0 and a post-migration request below the true floor
 	// would fail as a log gap (or, before that guard existed, be served as
@@ -191,8 +188,31 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		}
 	}
 
-	// Live log entries, streamed in bounded batches.
-	return streamEntries(src, dst, ni)
+	// Live log entries, streamed in bounded batches, BEFORE the hard state.
+	// Each SaveState call is independently fsynced, so the destination WAL's
+	// record order is this call order, and the WAL truncates at a prefix. Every
+	// entry record therefore becomes durable before the state record naming the
+	// commit index that covers it. Writing the state first would invert exactly
+	// the invariant writeEntries preserves for a normal Update: a crash midway
+	// through a migration would leave dstDir recovering CLEANLY with
+	// HardState.Commit = N over a log that ends at k < N -- a commit index past
+	// the last entry, which nothing in waldb cross-validates on reopen. The
+	// state is a single small record, so it costs nothing to write it last.
+	if err := streamEntries(src, dst, ni); err != nil {
+		return err
+	}
+
+	// Hard state LAST, in its own batch so a large entry log does not have to
+	// be buffered alongside it, and so a torn tail can only lose the state
+	// while keeping the entries -- never the reverse.
+	if state, _, stateErr := src.ReadState(ni.ShardID, ni.ReplicaID); stateErr == nil {
+		upd := logdb.Update{ShardID: ni.ShardID, ReplicaID: ni.ReplicaID, State: state}
+		if err := dst.SaveState([]logdb.Update{upd}); err != nil {
+			return &ReencryptError{Op: "save-state", Err: err}
+		}
+	}
+
+	return nil
 }
 
 // streamEntries copies a node's entire live log-entry range from src to dst in
