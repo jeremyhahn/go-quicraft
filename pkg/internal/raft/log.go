@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"log/slog"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/invariant"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -126,6 +127,28 @@ func newRaftLog(logdb LogReader) *raftLog {
 		committed: committed,
 		processed: processed,
 	}
+
+	// Clamp DOWN to what the log actually holds. A recovered
+	// HardState.Commit ahead of the last recovered entry (a torn batch that
+	// kept the state record but lost entries behind it, or a snapshot record
+	// that outlived them) would otherwise be trusted absolutely:
+	// getConflictIndex skips every entry at or below committed as
+	// "cannot conflict", so tryAppend reports success for indices this
+	// replica does not have, handleAppend sends a NON-rejecting
+	// ReplicateResp for them, and the leader counts that phantom match
+	// toward quorum -- committing entries a majority does not hold. The
+	// invariant assertion in commitTo would eventually panic, but only after
+	// the false acknowledgement had already gone out.
+	if last := l.lastIndex(); l.committed > last {
+		slog.Warn("recovered commit index exceeds last log entry, clamping",
+			"recovered_commit", l.committed,
+			"last_index", last,
+			"snapshot_index", ss.Index)
+		l.committed = last
+		if l.processed > l.committed {
+			l.processed = l.committed
+		}
+	}
 	return l
 }
 
@@ -154,13 +177,23 @@ func (l *raftLog) firstIndex() uint64 {
 	return l.inmem.firstIndex()
 }
 
-// lastTerm returns the term of the last log entry.
-func (l *raftLog) lastTerm() uint64 {
+// lastTerm returns the term of the last log entry, and whether it could be
+// determined at all.
+//
+// The distinction matters: term 0 is Raft's "no term" sentinel, and a
+// fabricated 0 is dangerous in BOTH directions. Fed to isUpToDate as our own
+// last term it makes every candidate look up to date, so a replica holding a
+// committed entry no one else has would vote for a candidate missing it -- a
+// Leader Completeness violation. Advertised in a campaign it makes this node
+// look empty, so every peer rejects it and it can never win. The LogReader
+// deliberately refuses to fabricate a zero term for exactly this reason
+// (logdb/reader.go termLocked); this layer must not undo that.
+func (l *raftLog) lastTerm() (uint64, bool) {
 	t, err := l.term(l.lastIndex())
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return t
+	return t, true
 }
 
 // term returns the term at the given index. Checks in-memory first,
@@ -344,7 +377,15 @@ func (l *raftLog) lastIndexOfTerm(targetTerm uint64) uint64 {
 // the candidate's last log entry has a higher term, or same term with
 // equal or higher index.
 func (l *raftLog) isUpToDate(lastIndex, lastTerm uint64) bool {
-	ourLastTerm := l.lastTerm()
+	ourLastTerm, ok := l.lastTerm()
+	if !ok {
+		// Our own last term is unreadable (a compaction race, a torn tail, a
+		// closed LogDB). We cannot prove the candidate is at least as
+		// up-to-date as us, so we must not grant. Failing OPEN here -- the
+		// previous behaviour, via a fabricated term 0 -- meant granting to
+		// every candidate including one missing entries we have committed.
+		return false
+	}
 	if lastTerm > ourLastTerm {
 		return true
 	}

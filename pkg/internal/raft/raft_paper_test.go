@@ -426,7 +426,7 @@ func TestPaper_FollowerVoteOncePerTerm(t *testing.T) {
 		From:     2,
 		Term:     1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -451,7 +451,7 @@ func TestPaper_FollowerVoteOncePerTerm(t *testing.T) {
 		From:     3,
 		Term:     1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

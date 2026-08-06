@@ -107,7 +107,38 @@ func (m *mockLogDB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Mem
 	return u.State, logdb.Membership{}, nil
 }
 
-func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) { return 0, 0, nil }
+// EntryRange reports the range implied by what the test actually persisted:
+// entries from SaveState, or the recovered commit index when a test seeds
+// hard state without materialising entries. Returning (0, 0) unconditionally
+// described a node that had committed entries it did not hold — a state
+// production cannot reach, since HardState.Commit == N means the log holds
+// entries through N (or a snapshot covering them). Recovery legitimately
+// clamps a commit index past the end of the log, so the stub made faithful
+// recovery look like a bug.
+func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := mockNodeKey{shardID, replicaID}
+	u, ok := m.states[key]
+	if !ok {
+		return 0, 0, nil
+	}
+	last := u.State.Commit
+	if n := len(u.Entries); n > 0 && u.Entries[n-1].Index > last {
+		last = u.Entries[n-1].Index
+	}
+	if last == 0 {
+		return 0, 0, nil
+	}
+	first := uint64(1)
+	if snap, sok := m.snapshots[key]; sok && snap.Index > 0 {
+		first = snap.Index + 1
+	}
+	if first > last {
+		return 0, 0, nil
+	}
+	return first, last, nil
+}
 
 func (m *mockLogDB) RemoveEntriesTo(shardID, replicaID, index uint64) error { return nil }
 func (m *mockLogDB) Compact(shardID, replicaID uint64) error                { return nil }

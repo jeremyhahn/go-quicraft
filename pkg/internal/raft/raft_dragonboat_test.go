@@ -261,7 +261,7 @@ func TestDragonboat_LeaderTransferReceiveHigherTermVote(t *testing.T) {
 		From:     3,
 		Term:     r.term + 2,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 		Hint:     3,
 	})
 	if err != nil {
@@ -1012,7 +1012,7 @@ func TestDragonboat_VoteFromAnyState(t *testing.T) {
 				From:     3,
 				Term:     currentTerm + 5,
 				LogIndex: r.log.lastIndex(),
-				LogTerm:  r.log.lastTerm(),
+				LogTerm:  mustLastTerm(t, r),
 			})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1488,7 +1488,7 @@ func TestDragonboat_CastVoteToDifferentNodesAcrossTerms(t *testing.T) {
 		From:     2,
 		Term:     1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("RequestVote from 2: %v", err)
@@ -1514,7 +1514,7 @@ func TestDragonboat_CastVoteToDifferentNodesAcrossTerms(t *testing.T) {
 		From:     3,
 		Term:     2,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("RequestVote from 3: %v", err)
@@ -1638,7 +1638,7 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 		From:     2,
 		Term:     leaderTerm + 1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("RequestVote (fresh lease): %v", err)
@@ -1658,7 +1658,7 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 		From:     2,
 		Term:     leaderTerm + 1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("RequestVote (expired lease): %v", err)
@@ -1682,4 +1682,16 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 	if !voted {
 		t.Fatal("superseded leader should grant vote to higher-term candidate")
 	}
+}
+
+// mustLastTerm returns the raft log's last term, failing the test if it is
+// unreadable. lastTerm reports (term, ok) so callers cannot silently treat an
+// unreadable term as 0 — see raftLog.lastTerm.
+func mustLastTerm(t *testing.T, r *raft) uint64 {
+	t.Helper()
+	term, ok := r.log.lastTerm()
+	if !ok {
+		t.Fatalf("lastTerm unreadable")
+	}
+	return term
 }

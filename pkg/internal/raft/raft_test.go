@@ -402,7 +402,7 @@ func TestRaft_BecomeFollower_PreventDoubleVote(t *testing.T) {
 		From:     3,
 		Term:     candidateTerm,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -645,7 +645,7 @@ func TestRaft_PreVoteReject_UsesResponderTerm(t *testing.T) {
 		From:     3,
 		Term:     responderTerm + 1,
 		LogIndex: r.log.lastIndex(),
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 	}); err != nil {
 		t.Fatalf("step RequestPreVote: %v", err)
 	}
@@ -3708,7 +3708,7 @@ func TestRaft_Leader_StepsDownOnHigherTermVoteRequest(t *testing.T) {
 		Type:     proto.RequestVote,
 		From:     2,
 		Term:     r.term + 1,
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  mustLastTerm(t, r),
 		LogIndex: r.log.lastIndex(),
 	})
 	if err != nil {
@@ -5754,25 +5754,40 @@ func TestRaftLog_Entries_LogDBReturnsError(t *testing.T) {
 // Test: log.lastTerm error path
 // ---------------------------------------------------------------------------
 
-func TestRaftLog_LastTerm_ReturnsZeroOnError(t *testing.T) {
-	// Create a log where the last index is not available from either inmem or LogDB.
+// TestRaftLog_LastTerm_ReportsUnreadable asserts that an unreadable last term
+// is reported as NOT OK rather than fabricated as 0, and that isUpToDate then
+// refuses the vote.
+//
+// This test previously asserted the opposite -- that lastTerm returns 0 on
+// error -- and so pinned a Leader Completeness hazard in place. Term 0 is
+// Raft's "no term" sentinel: fed to isUpToDate as our OWN last term it makes
+// every candidate compare as up to date, so a replica holding a committed
+// entry no other node has would vote for a candidate missing it. The
+// LogReader deliberately refuses to fabricate a zero term for exactly this
+// reason; this layer must not undo it.
+func TestRaftLog_LastTerm_ReportsUnreadable(t *testing.T) {
+	// A log whose last index resolves from neither inmem nor LogDB.
 	logdb := newTestLogReader(nil, proto.State{})
 	l := &raftLog{
 		logdb:     logdb,
-		inmem:     newInMemory(5), // markerIndex = 6, lastIndex returns 5
+		inmem:     newInMemory(5), // markerIndex 6, so lastIndex() == 5
 		committed: 0,
 		processed: 0,
 	}
-	// lastIndex() returns 5, but term(5) will fail because:
-	// - inmem has no entries and markerIndex is 6, so 5 < 6 is false... actually
-	//   inmem.term(5) would need to check markerIndex. Let me verify.
-	// markerIndex = 6, entries = nil. For index 5: 5 < 6, so it checks if
-	// index == snapshot.Index. No snapshot, so returns false.
-	// Then logdb.Term(5) returns ErrUnavailable.
-	// So lastTerm returns 0.
-	term := l.lastTerm()
+
+	term, ok := l.lastTerm()
+	if ok {
+		t.Fatalf("lastTerm() = %d, true; want ok=false when the term cannot "+
+			"be read from inmem or LogDB", term)
+	}
 	if term != 0 {
-		t.Fatalf("expected lastTerm 0, got %d", term)
+		t.Errorf("lastTerm() term = %d, want 0 alongside ok=false", term)
+	}
+
+	// The vote must be refused rather than granted on a fabricated term.
+	if l.isUpToDate(1000, 99) {
+		t.Error("isUpToDate granted while our own last term is unreadable; " +
+			"a replica that cannot prove its own log state must not vote")
 	}
 }
 
@@ -12026,7 +12041,7 @@ func TestRaft_Election_BroadcastVoteSendsToAllPeers(t *testing.T) {
 		{Index: 3, Term: 5},
 	})
 
-	expectedLogTerm := r.log.lastTerm()
+	expectedLogTerm, _ := r.log.lastTerm()
 	expectedLogIndex := r.log.lastIndex()
 
 	r.becomeCandidate()

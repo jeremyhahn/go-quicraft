@@ -240,15 +240,16 @@ func TestRaftLog_LastTerm_WithEntries(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	if l.lastTerm() != 3 {
-		t.Fatalf("expected lastTerm 3, got %d", l.lastTerm())
+	if term, ok := l.lastTerm(); !ok || term != 3 {
+		t.Fatalf("lastTerm() = %d, %v; want 3, true", term, ok)
 	}
 }
 
 func TestRaftLog_LastTerm_Empty(t *testing.T) {
 	l := newTestRaftLog(nil)
-	if l.lastTerm() != 0 {
-		t.Fatalf("expected lastTerm 0, got %d", l.lastTerm())
+	if term, ok := l.lastTerm(); !ok || term != 0 {
+		t.Fatalf("lastTerm() = %d, %v; want 0, true (an EMPTY log has a "+
+			"known last term of 0; only an unreadable one is !ok)", term, ok)
 	}
 }
 

@@ -1067,10 +1067,25 @@ func (r *raft) campaign(msgType uint64, transfer bool) {
 		term = r.term + 1
 	}
 
+	// Campaigning while our own last term is unreadable would advertise
+	// LogTerm 0, which every peer with a non-empty log rejects — so the round
+	// is guaranteed to fail while still resetting timers and, for a real vote,
+	// burning a term. Skip it and retry on the next election timeout, by
+	// which point the transient read failure has usually cleared.
+	campaignLogTerm, ok := r.log.lastTerm()
+	if !ok {
+		slog.Warn("campaign skipped: local last log term unreadable",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term,
+			"last_index", r.log.lastIndex())
+		return
+	}
+
 	msg := proto.Message{
 		Type:     msgType,
 		Term:     term,
-		LogTerm:  r.log.lastTerm(),
+		LogTerm:  campaignLogTerm,
 		LogIndex: r.log.lastIndex(),
 	}
 	// Mark a leadership-transfer election by setting Hint to the
