@@ -396,7 +396,7 @@ func TestCompactRespectsCommittedHWM(t *testing.T) {
 	binary.LittleEndian.PutUint64(buf[17:], 7)  // Term
 	binary.LittleEndian.PutUint64(buf[25:], 1)  // Vote
 	binary.LittleEndian.PutUint64(buf[33:], 12) // Commit
-	if err := shard.writeRecord(buf[:1+stateRecordSize]); err != nil {
+	if _, err := shard.writeRecord(buf[:1+stateRecordSize]); err != nil {
 		shard.mu.Unlock()
 		t.Fatalf("writeRecord(state): %v", err)
 	}

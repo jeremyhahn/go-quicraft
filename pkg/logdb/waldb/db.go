@@ -1701,17 +1701,79 @@ func (s *walShard) getOrCreateIndex(key nodeKey) *index {
 	return idx
 }
 
+// recordLanding says where a written record came to rest: the segment it was
+// appended to (post-rotation, so it is the segment that actually holds the
+// bytes) and the barrier epoch its ciphertext header carries. A zero epoch
+// means the record is not encrypted — no barrier is configured — and the
+// landing contributes nothing to the shard's epoch floor.
+//
+// writeRecord returns a landing instead of applying it, so the caller can fold
+// it into the floor at its own DURABILITY point. See applyEpochLocked.
+type recordLanding struct {
+	segID uint64
+	epoch uint64
+}
+
+// applyEpochLocked folds a DURABLE record's write epoch into the shard's epoch
+// floor: the minimum epoch overall and the minimum epoch per segment, which is
+// what recomputeMinWriteEpoch re-derives the floor from after segment garbage
+// collection.
+//
+// It is deliberately NOT called from writeRecord. Applying the epoch at the
+// write would record epochs for records that never commit: a batch that rolls
+// back leaves the floor pinned to an epoch no live record was ever encrypted
+// under, because rollbackShard drops segmentEpochs only for the intermediate
+// segments it unlinks and can restore neither minWriteEpoch nor the checkpoint
+// segment's entry. Each writer therefore applies its own landing once its
+// record is durable, and a rolled-back batch applies nothing.
+//
+// Caller must hold s.dataMu for writing (and, on a live shard, s.mu).
+func (s *walShard) applyEpochLocked(l recordLanding) {
+	if l.epoch == 0 {
+		return
+	}
+	if s.minWriteEpoch == 0 || l.epoch < s.minWriteEpoch {
+		s.minWriteEpoch = l.epoch
+	}
+	if existing, ok := s.segmentEpochs[l.segID]; !ok || l.epoch < existing {
+		s.segmentEpochs[l.segID] = l.epoch
+	}
+}
+
+// commitEpoch is applyEpochLocked for a caller that is not already inside a
+// dataMu section. An unencrypted record carries no epoch and takes no lock at
+// all, so the barrier-less path stays exactly as cheap as before.
+func (s *walShard) commitEpoch(l recordLanding) {
+	if l.epoch == 0 {
+		return
+	}
+	s.dataMu.Lock()
+	s.applyEpochLocked(l)
+	s.dataMu.Unlock()
+}
+
 // writeRecord writes a raw record to the active segment, rotating if the
 // segment is full. On a lazy shard, this triggers directory and segment
 // creation via ensureActiveSegment. When a barrier is configured, the
 // record data is encrypted before writing.
-func (s *walShard) writeRecord(data []byte) error {
+//
+// It returns where the record landed. The landing is NOT applied to the epoch
+// floor here: the record is not durable yet (in batchMode the fdatasync is the
+// caller's, and even outside it the batch may still roll back), so the caller
+// applies it at its own commit point. See applyEpochLocked.
+//
+// On error the returned landing is zero, with one deliberate exception: when
+// the record was fully written and only the inline fdatasync failed, the epoch
+// is applied here. That record may well be on the medium, and a floor above a
+// record recovery still has to decrypt is the one direction that breaks the
+// node (WALDecryptError at startup) rather than merely retaining a key.
+func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	if err := s.ensureActiveSegment(); err != nil {
-		return err
+		return recordLanding{}, err
 	}
 
-	// Encrypt the record data when a barrier is configured. The write epoch
-	// is parsed here but APPLIED to segmentEpochs only AFTER the write lands,
+	// Encrypt the record data when a barrier is configured. The write epoch is
+	// parsed here but attributed to a segment only AFTER the write lands,
 	// because the write below may rotate to a new segment — recording the
 	// epoch against the pre-rotation activeSegmentID would mis-attribute it
 	// and let recomputeMinWriteEpoch purge a DEK still needed by the record.
@@ -1720,7 +1782,7 @@ func (s *walShard) writeRecord(data []byte) error {
 	if s.barrier != nil {
 		encrypted, err := s.barrier.Encrypt(nil, data)
 		if err != nil {
-			return &WALEncryptError{Err: err}
+			return recordLanding{}, &WALEncryptError{Err: err}
 		}
 		writeData = encrypted
 		if len(encrypted) >= ciphertextEpochSize {
@@ -1731,30 +1793,17 @@ func (s *walShard) writeRecord(data []byte) error {
 	_, err := s.activeSegment.Write(writeData)
 	if err == ErrSegmentFull {
 		if err := s.rotateSegment(); err != nil {
-			return err
+			return recordLanding{}, err
 		}
 		_, err = s.activeSegment.Write(writeData)
 	}
 	if err != nil {
-		return err
+		return recordLanding{}, err
 	}
 
-	// Record the write epoch against the segment the record actually landed
-	// in (s.activeSegmentID is the post-rotation segment when a rotation
-	// occurred above). The epoch floor is dataMu state — MinLiveEpoch reads
-	// it without s.mu — so take dataMu for the map update alone, never
-	// across the write or the fdatasync below.
-	if writeEpoch > 0 {
-		segID := s.activeSegmentID
-		s.dataMu.Lock()
-		if s.minWriteEpoch == 0 || writeEpoch < s.minWriteEpoch {
-			s.minWriteEpoch = writeEpoch
-		}
-		if existing, ok := s.segmentEpochs[segID]; !ok || writeEpoch < existing {
-			s.segmentEpochs[segID] = writeEpoch
-		}
-		s.dataMu.Unlock()
-	}
+	// s.activeSegmentID is the post-rotation segment when a rotation occurred
+	// above, so this names the segment that actually holds the record.
+	landing := recordLanding{segID: s.activeSegmentID, epoch: writeEpoch}
 
 	if s.metrics != nil {
 		s.metrics.IncWriteBytes(int64(len(writeData)))
@@ -1766,14 +1815,19 @@ func (s *walShard) writeRecord(data []byte) error {
 		if s.metrics != nil {
 			s.metrics.ObserveFsyncLatency(time.Since(fsyncStart))
 		}
-		if syncErr != nil && s.poison != nil {
+		if syncErr != nil {
 			// The record was written but its durability cannot be
-			// established. Fail-stop: see DB.poison.
-			s.poison(syncErr)
+			// established. Fail-stop: see DB.poison. The caller returns
+			// without reaching its commit point, so apply the epoch here —
+			// the record may be on disk and its DEK must stay retained.
+			s.commitEpoch(landing)
+			if s.poison != nil {
+				s.poison(syncErr)
+			}
+			return landing, syncErr
 		}
-		return syncErr
 	}
-	return nil
+	return landing, nil
 }
 
 // syncSegment flushes the active segment to stable storage. This is the
@@ -2025,7 +2079,7 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		// captureCheckpointAfterEnsure for the invariant).
 		if !checkpoints[shardIdx].valid && shard.activeSegment != nil {
 			if err := shard.activeSegment.flushBlock(); err != nil {
-				return db.rollbackBatch(&checkpoints, err)
+				return db.rollbackBatch(&checkpoints, &pending, err)
 			}
 			checkpoints[shardIdx] = shardCheckpoint{
 				fileOffset:  shard.activeSegment.fileOffset,
@@ -2040,7 +2094,7 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		err := shard.saveUpdate(u, &pending[shardIdx], &checkpoints[shardIdx])
 		shard.batchMode = false
 		if err != nil {
-			return db.rollbackBatch(&checkpoints, err)
+			return db.rollbackBatch(&checkpoints, &pending, err)
 		}
 
 		if dirtyShards[shardIdx] == nil {
@@ -2056,6 +2110,10 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 	// caller alongside the underlying cause.
 	if err := syncDirtyShardsLocked(&dirtyShards, dirtyCount); err != nil {
 		db.poison(err)
+		// Phase 3 never runs, so the batch's staged epochs would be dropped —
+		// yet its records ARE written and nothing truncates them, so they can
+		// replay on the next start. Retain their DEKs; see commitPendingEpochs.
+		db.commitPendingEpochs(&pending)
 		return errors.Join(ErrDBPoisoned, err)
 	}
 
@@ -2125,6 +2183,20 @@ type pendingMemUpdates struct {
 	entries   []pendingEntryUpdate
 	states    []pendingStateUpdate
 	snapshots []pendingSnapshotUpdate
+	// epochs holds the landing of every encrypted record this batch wrote, so
+	// the epoch floor is raised only at the commit point. A batch that rolls
+	// back discards these and leaves the floor untouched.
+	epochs []recordLanding
+}
+
+// stageEpoch defers a written record's epoch to the batch's commit point. A
+// landing with no epoch (no barrier configured) is dropped, so an unencrypted
+// batch stages nothing and allocates nothing.
+func (p *pendingMemUpdates) stageEpoch(l recordLanding) {
+	if l.epoch == 0 {
+		return
+	}
+	p.epochs = append(p.epochs, l)
 }
 
 // applyTo applies all pending in-memory updates to the shard. The caller must
@@ -2191,6 +2263,13 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 		s.setSnapshotSegment(p.snapshots[i].key, p.snapshots[i].landedSegID)
 		s.advanceCommittedHWM(p.snapshots[i].landedSegID)
 	}
+
+	// The batch's records are durable, so their epochs may now lower the
+	// floor. This rides the dataMu section the commit already takes: no extra
+	// lock acquisition, and a rolled-back batch never gets here.
+	for i := range p.epochs {
+		s.applyEpochLocked(p.epochs[i])
+	}
 }
 
 // rollbackBatch rolls back every shard that captured a checkpoint in the
@@ -2202,7 +2281,15 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 // for its whole lifecycle), so rollbackShard is invoked directly without
 // re-locking. writeErr is the originating Phase 1 failure; if rollback itself
 // fails, both the write error and the discard errors are surfaced.
-func (db *DB) rollbackBatch(checkpoints *[DefaultShardCount]shardCheckpoint, writeErr error) error {
+//
+// The batch's staged epochs are discarded along with the records they belong
+// to — that is the whole point of deferring them to the commit point — EXCEPT
+// when the rollback could not be proven durable. See commitPendingEpochs.
+func (db *DB) rollbackBatch(
+	checkpoints *[DefaultShardCount]shardCheckpoint,
+	pending *[DefaultShardCount]pendingMemUpdates,
+	writeErr error,
+) error {
 	var discardErrors []error
 	for j := range checkpoints {
 		if !checkpoints[j].valid {
@@ -2212,10 +2299,41 @@ func (db *DB) rollbackBatch(checkpoints *[DefaultShardCount]shardCheckpoint, wri
 			discardErrors = append(discardErrors, dErr)
 		}
 	}
+	if db.poisoned.Load() {
+		db.commitPendingEpochs(pending)
+	}
 	if len(discardErrors) > 0 {
 		return &BatchWriteError{WriteErr: writeErr, DiscardErrors: discardErrors}
 	}
 	return writeErr
+}
+
+// commitPendingEpochs folds a batch's staged record landings into their shards'
+// epoch floors WITHOUT applying any other in-memory state. It is the
+// conservative fallback for a batch that neither committed nor could prove its
+// records gone: after a failed fdatasync, or a rollback whose truncation could
+// not be made durable, the records may still replay from disk, so the DEKs
+// that decrypt them must stay retained.
+//
+// The asymmetry is deliberate. A floor that is too LOW only holds a key longer
+// than necessary; a floor that is too HIGH lets the engine purge a DEK a
+// surviving record needs, and the next start dies with a fatal
+// WALDecryptError. When in doubt, retain.
+//
+// The caller holds every touched shard's mu, so this observes the mu -> dataMu
+// order and holds no I/O under dataMu.
+func (db *DB) commitPendingEpochs(pending *[DefaultShardCount]pendingMemUpdates) {
+	for i := range pending {
+		if len(pending[i].epochs) == 0 {
+			continue
+		}
+		s := db.shards[i]
+		s.dataMu.Lock()
+		for j := range pending[i].epochs {
+			s.applyEpochLocked(pending[i].epochs[j])
+		}
+		s.dataMu.Unlock()
+	}
 }
 
 // rollbackShard rolls a shard's WAL back to the state captured in cp. The
@@ -2587,15 +2705,16 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 	}
 
 	// Persist to WAL. On failure, no in-memory state is affected.
-	if err := s.writeRecord(buf[:pos]); err != nil {
+	landing, err := s.writeRecord(buf[:pos])
+	if err != nil {
 		return err
 	}
+	pending.stageEpoch(landing)
 
 	// Stamp the index entries with the segment this chunk actually landed in
 	// (post-rotation if writeRecord rotated).
-	landedSegID := s.activeSegmentID
 	for i := range stagedIdx {
-		stagedIdx[i].SegmentID = landedSegID
+		stagedIdx[i].SegmentID = landing.segID
 	}
 
 	// WAL write succeeded. Stage in-memory updates for deferred application.
@@ -2684,15 +2803,17 @@ func (s *walShard) writeState(key nodeKey, shardID, replicaID uint64, state logd
 	binary.LittleEndian.PutUint64(buf[25:], state.Vote)
 	binary.LittleEndian.PutUint64(buf[33:], state.Commit)
 
-	if err := s.writeRecord(buf[:1+stateRecordSize]); err != nil {
+	landing, err := s.writeRecord(buf[:1+stateRecordSize])
+	if err != nil {
 		return err
 	}
+	pending.stageEpoch(landing)
 	// Capture the segment the record landed in (post-rotation if writeRecord
 	// rotated) so the commit point can pin it against garbage collection.
 	pending.states = append(pending.states, pendingStateUpdate{
 		key:         key,
 		state:       state,
-		landedSegID: s.activeSegmentID,
+		landedSegID: landing.segID,
 	})
 	return nil
 }
@@ -2749,15 +2870,17 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalAddrMap(buf, pos, ss.Membership.Witnesses)
 	pos = marshalRemovedMap(buf, pos, ss.Membership.Removed)
 
-	if err := s.writeRecord(buf[:pos]); err != nil {
+	landing, err := s.writeRecord(buf[:pos])
+	if err != nil {
 		return err
 	}
+	pending.stageEpoch(landing)
 	// Capture the segment the record landed in (post-rotation if writeRecord
 	// rotated) so the commit point can pin it against garbage collection.
 	pending.snapshots = append(pending.snapshots, pendingSnapshotUpdate{
 		key:         key,
 		snapshot:    ss,
-		landedSegID: s.activeSegmentID,
+		landedSegID: landing.segID,
 	})
 	return nil
 }
@@ -2806,18 +2929,20 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 		pos += 12 + len(addr)
 	}
 
-	if err := s.writeRecord(buf[:pos]); err != nil {
+	landing, err := s.writeRecord(buf[:pos])
+	if err != nil {
 		return err
 	}
 	// Commit point: publish the bootstrap record, pin the segment it landed in
-	// (post-rotation if writeRecord rotated) against garbage collection, and
-	// raise the commit high-water mark — atomically for readers, under dataMu.
-	// The write is already durable here because non-batch writeRecord
-	// fdatasyncs inline.
+	// (post-rotation if writeRecord rotated) against garbage collection, raise
+	// the commit high-water mark and lower the epoch floor to this record's
+	// epoch — atomically for readers, under dataMu. The write is already
+	// durable here because non-batch writeRecord fdatasyncs inline.
 	s.dataMu.Lock()
 	s.bootstraps[key] = bs
-	s.setBootstrapSegment(key, s.activeSegmentID)
-	s.advanceCommittedHWM(s.activeSegmentID)
+	s.setBootstrapSegment(key, landing.segID)
+	s.advanceCommittedHWM(landing.segID)
+	s.applyEpochLocked(landing)
 	s.dataMu.Unlock()
 	return nil
 }
@@ -3031,7 +3156,8 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	binary.LittleEndian.PutUint64(buf[1:], shardID)
 	binary.LittleEndian.PutUint64(buf[9:], replicaID)
 	binary.LittleEndian.PutUint64(buf[17:], index)
-	if err := shard.writeRecord(buf[:1+compactionRecordSize]); err != nil {
+	landing, err := shard.writeRecord(buf[:1+compactionRecordSize])
+	if err != nil {
 		return db.rollbackStandalone(shard, &cp, err)
 	}
 
@@ -3043,13 +3169,15 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	// The pin of the segment the compaction marker landed in and the commit
 	// high-water mark mirror writeBootstrap. Without the pin, GC could reclaim
 	// the marker's segment once its entries are compacted away, and compactedTo
-	// would reset to 0 on recovery. The write is durable here (non-batch
-	// writeRecord fdatasyncs inline).
+	// would reset to 0 on recovery. The marker's own epoch joins the floor in
+	// the same section. The write is durable here (non-batch writeRecord
+	// fdatasyncs inline).
 	shard.dataMu.Lock()
 	defer shard.dataMu.Unlock()
 
-	shard.setCompactSegment(key, shard.activeSegmentID)
-	shard.advanceCommittedHWM(shard.activeSegmentID)
+	shard.setCompactSegment(key, landing.segID)
+	shard.advanceCommittedHWM(landing.segID)
+	shard.applyEpochLocked(landing)
 
 	// Update in-memory compaction marker.
 	shard.compactedTo[key] = index
@@ -3231,13 +3359,13 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	buf[0] = payloadTypeRemoveNode
 	binary.LittleEndian.PutUint64(buf[1:], shardID)
 	binary.LittleEndian.PutUint64(buf[9:], replicaID)
-	if err := shard.writeRecord(buf[:1+removeNodeRecordSize]); err != nil {
+	landing, err := shard.writeRecord(buf[:1+removeNodeRecordSize])
+	if err != nil {
 		return db.rollbackStandalone(shard, &cp, err)
 	}
-	// The tombstone landed in the (post-rotation) active segment; capture the
-	// ID before any further writes could rotate again. The record is durable
-	// here (non-batch writeRecord fdatasyncs inline).
-	tombstoneSegID := shard.activeSegmentID
+	// The tombstone landed in landing.segID (post-rotation). The record is
+	// durable here (non-batch writeRecord fdatasyncs inline).
+	tombstoneSegID := landing.segID
 
 	// Commit point: clear all in-memory state for this node and re-pin the
 	// tombstone in one atomic dataMu section, so a lock-free reader sees the
@@ -3261,6 +3389,9 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	delete(shard.metaSegments, key)
 	shard.setRemoveSegment(key, tombstoneSegID)
 	shard.advanceCommittedHWM(tombstoneSegID)
+	// The tombstone is durable, so its epoch joins the floor — before the
+	// recompute below, which would otherwise drop it.
+	shard.applyEpochLocked(landing)
 	shard.dataMu.Unlock()
 
 	// Trigger segment garbage collection to reclaim disk space. Collect

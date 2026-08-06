@@ -575,7 +575,7 @@ func TestRotateSegmentClearsSegmentOnCloseFailure(t *testing.T) {
 	}
 
 	// The shard must recover on the next write by creating a fresh segment.
-	if err := s.writeRecord([]byte{payloadTypeCompact, 0}); err != nil {
+	if _, err := s.writeRecord([]byte{payloadTypeCompact, 0}); err != nil {
 		t.Fatalf("writeRecord after failed rotation: %v", err)
 	}
 	if s.activeSegment == nil || s.activeSegmentID != 1 {
