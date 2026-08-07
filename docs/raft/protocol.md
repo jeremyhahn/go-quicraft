@@ -393,7 +393,11 @@ Uses a pre-allocated sort buffer (`r.matched`) to find the median match:
 ```go
 func (r *raft) tryCommit() bool {
     r.matched = r.matched[:0]
-    r.matched = append(r.matched, r.log.lastIndex())  // leader's own
+    // The leader's own match is its DURABLE index, not lastIndex(): an
+    // entry it has appended but not yet fsynced must not count toward the
+    // commit quorum, or a leader crash could lose an entry it had already
+    // reported committed.
+    r.matched = append(r.matched, r.log.inmem.savedTo)
     for _, rm := range r.remotes {
         r.matched = append(r.matched, rm.match)
     }

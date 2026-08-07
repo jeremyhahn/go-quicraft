@@ -262,6 +262,48 @@ On-disk SMs persist their own state, but in-memory SMs start empty and must repl
 
 A recorded snapshot whose data file cannot be opened is **fatal**: `StartShard` returns a `HostInitError` (`Field: "snapshot_open"`) rather than silently skipping recovery. This is required for correctness — the Raft layer initializes the processed index to the snapshot index, and the pre-snapshot entries are compacted away, so a skipped recovery would bring the in-memory state machine up empty and it could never replay them. A failed close of the snapshot file (`snapshot_close`) or a failed `RecoverFromSnapshot` (`snapshot_recovery`) are likewise fatal `HostInitError`s.
 
+### Log Loss: a Replica That Recovers Committed-But-Empty
+
+A replica can come up with a durable `HardState.Commit` and **no entries** —
+a wiped or partially restored data directory, a truncated WAL segment set, a
+restore that recovered the state record but not the entry records. Left alone
+this is a Leader Completeness hazard: every index at or below `committed` is
+skipped by conflict detection as "cannot conflict", so the replica answers a
+backtracking leader with a **non-rejecting** `ReplicateResp` for entries it
+does not have, and the leader counts that phantom match toward quorum.
+
+`newRaftLog` clamps `committed` down to what the log actually holds, so a
+replica in this state comes up at `committed = 0` and is indistinguishable
+from a fresh one. It re-learns its log and its commit index from the leader.
+The clamp logs at `ERROR` with the recovered and actual indices.
+
+**The host does not refuse to start.** A single shard's corruption must not
+take down a process that may be carrying thousands of shards, and self-healing
+from the leader is the correct outcome for a wiped replica. The failure is
+loud in the log and visible through `ShardInfo`; the operator diagnoses and
+repairs the one shard while the rest of the host keeps serving.
+
+**Operational procedure — and the residual this does NOT close.** The clamp
+fixes the phantom acknowledgement. It does **not** fix Raft amnesia: the
+replica keeps its recovered `Term` and `Vote`, so it can still vote in *new*
+terms while holding no entries, and can therefore help elect a leader that is
+missing committed entries. No code change closes that — a voter that has
+forgotten its log is indistinguishable, from the outside, from one that never
+had it.
+
+When you see the clamp's `ERROR` line, treat the replica as having lost its
+identity, not merely its data:
+
+1. Stop the replica.
+2. `RequestDeleteNode` to remove it from the configuration, and wait for that
+   change to commit.
+3. Wipe its data directory.
+4. Re-add it under a **new replica ID** (`RequestAddNode`), so the cluster
+   never counts the amnesiac identity's vote again.
+
+Restarting it in place — even with an empty directory — re-enters the same
+identity into the configuration and leaves the residual open.
+
 ---
 
 ## Snapshot Recovery Protocol
