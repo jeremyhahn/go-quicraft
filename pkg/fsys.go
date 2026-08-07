@@ -54,6 +54,7 @@ type snapshotFS interface {
 	Open(name string) (snapshotFile, error)
 	CreateTemp(dir, pattern string) (snapshotFile, error)
 	MkdirAll(path string, perm fs.FileMode) error
+	MkdirTemp(dir, pattern string) (string, error)
 	Rename(oldpath, newpath string) error
 	Remove(name string) error
 	RemoveAll(path string) error
@@ -94,6 +95,18 @@ func (osSnapshotFS) CreateTemp(dir, pattern string) (snapshotFile, error) {
 // MkdirAll creates path and every missing parent directory.
 func (osSnapshotFS) MkdirAll(path string, perm fs.FileMode) error {
 	return os.MkdirAll(path, perm)
+}
+
+// MkdirTemp creates a new directory in dir whose name is guaranteed not to
+// collide with any existing one, and returns its path.
+//
+// The GUARANTEE is the point: unlike MkdirAll, which succeeds on a directory
+// that already exists, this fails rather than hand back a directory holding
+// someone else's data. Every path that writes a snapshot artifact staged for a
+// rename depends on it, because such a path is entitled to delete what it
+// created on failure.
+func (osSnapshotFS) MkdirTemp(dir, pattern string) (string, error) {
+	return os.MkdirTemp(dir, pattern)
 }
 
 // Rename renames oldpath to newpath.

@@ -504,6 +504,11 @@ func (m *MemDB) SaveBootstrap(shardID uint64, replicaID uint64, bootstrap logdb.
 	nd.mu.Lock()
 	defer nd.mu.Unlock()
 
+	// A record stored by this version always carries an explicit DataDir, so
+	// mark it recorded regardless of what the caller passed: DataDirRecorded
+	// describes the RECORD, not the request, and a reader must be able to tell
+	// "the shard has no DataDir" from "nothing was ever written here".
+	bootstrap.DataDirRecorded = true
 	nd.bootstrap = bootstrap
 	nd.hasBoot = true
 	return nil

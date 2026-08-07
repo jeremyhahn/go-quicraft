@@ -128,10 +128,30 @@ type Bootstrap struct {
 	// computed by SCANNING the tree, lets the next PurgeEpochsBefore destroy
 	// the DEK the artifact needs.
 	//
-	// Records written before this field existed decode it as "" and are
-	// indistinguishable from a NodeHostDir-rooted shard; callers that cannot
-	// prove the layout must fail closed rather than assume.
+	// A record written before this field existed carries no DataDir at all.
+	// DataDirRecorded — not the emptiness of this string — is what tells the
+	// two apart.
 	DataDir string
+
+	// DataDirRecorded reports whether the persisted record actually CARRIED
+	// the DataDir field, as opposed to predating it.
+	//
+	// It is the same distinction snapshot.meta draws with EpochRecorded, and
+	// for the same reason: DataDir "" is a meaningful VALUE ("this shard roots
+	// its tree under the host's NodeHostDir"), so a caller that reads a legacy
+	// record's zero value as that statement is trusting a field nobody wrote.
+	// Host.ImportSnapshot would then write the artifact under NodeHostDir for a
+	// shard whose tree is actually under its own DataDir — outside everything
+	// snapshot garbage collection and the DEK purge-floor scan enumerate — and
+	// simultaneously REFUSE the operator's WithImportDataDir override as a
+	// contradiction. Every shard bootstrapped before this field existed is
+	// broken both ways unless "absent" is distinguishable from "empty".
+	//
+	// It is a property of the RECORD, not of the caller's request: a backend
+	// sets it when it stores a record (every record this version writes carries
+	// the field) and derives it on replay from what was actually on the wire.
+	// A value passed to SaveBootstrap is ignored.
+	DataDirRecorded bool
 }
 
 // Update represents a batch of state changes for a single shard

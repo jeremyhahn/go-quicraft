@@ -1515,15 +1515,51 @@ type snapshotFloorScan struct {
 	// needs, or 0 when no evaluable artifact is encrypted.
 	minEpoch uint64
 
-	// blockers names every directory that could not be evaluated. Non-empty
-	// means the floor is unusable and nothing may be purged.
+	// blockedCount counts EVERY directory that could not be evaluated. Non-zero
+	// means the floor is unusable and nothing may be purged. It is the verdict
+	// and the operator-facing total; it is a counter rather than len(blockers)
+	// because the slice below is deliberately bounded.
+	blockedCount uint64
+
+	// blockers is a bounded SAMPLE of the blocking directories, kept for the
+	// operator log. This scan runs on EVERY snapshot save (purgeOldEpochs), on
+	// a host that can hold thousands of shards, and an unevaluable directory is
+	// a persistent condition rather than a transient one — so accumulating one
+	// struct plus one path string per blocking directory per save allocated
+	// tens of thousands of objects per save, forever, to print at most
+	// maxReportedFloorBlockers of them.
 	blockers []snapshotFloorBlocker
 }
 
 // maxReportedFloorBlockers bounds how many blocking directories a single log
-// record names. A host with thousands of shards can have many; the count is
-// always reported in full, the paths are a sample.
+// record names, and with it how many the scan retains. The COUNT is always
+// reported in full; the paths are a sample.
 const maxReportedFloorBlockers = 8
+
+// floorReportInterval bounds how often the purge-suppression warning is
+// emitted. The condition it describes is persistent — it clears only when the
+// directories roll off or are repaired — while the scan that detects it runs
+// after every snapshot save, so an unthrottled warning is one log record per
+// save per shard saying the same thing.
+const floorReportInterval = time.Minute
+
+// lastFloorReport is the unix-nano time the suppression warning was last
+// emitted, process-wide. Process-wide is the right scope: the message names a
+// condition of the host's snapshot tree, and an operator needs it once, not
+// once per shard.
+var lastFloorReport atomic.Int64
+
+// floorReportDue reports whether enough time has passed to emit the warning
+// again, claiming the slot when it has. The compare-and-swap makes concurrent
+// scans (one per snapshot worker) yield exactly one record.
+func floorReportDue() bool {
+	now := time.Now().UnixNano()
+	prev := lastFloorReport.Load()
+	if prev != 0 && now-prev < int64(floorReportInterval) {
+		return false
+	}
+	return lastFloorReport.CompareAndSwap(prev, now)
+}
 
 // addNode folds every retained snapshot directory of one node into the scan.
 func (s *snapshotFloorScan) addNode(node *Node) {
@@ -1550,40 +1586,48 @@ func (s *snapshotFloorScan) addNode(node *Node) {
 	}
 }
 
-// block records an unevaluable directory.
+// block records an unevaluable directory. The COUNT is always incremented — it
+// is the verdict, and the scan must not short-circuit — while the retained
+// sample stops at maxReportedFloorBlockers, which is all report can print.
 func (s *snapshotFloorScan) block(path string, node *Node, reason string) {
-	s.blockers = append(s.blockers, snapshotFloorBlocker{
-		path:      path,
-		shardID:   node.ShardID(),
-		replicaID: node.ReplicaID(),
-		reason:    reason,
-	})
+	s.blockedCount++
+	if len(s.blockers) < maxReportedFloorBlockers {
+		s.blockers = append(s.blockers, snapshotFloorBlocker{
+			path:      path,
+			shardID:   node.ShardID(),
+			replicaID: node.ReplicaID(),
+			reason:    reason,
+		})
+	}
 }
 
 // blocked reports whether any directory could not be evaluated.
 func (s *snapshotFloorScan) blocked() bool {
-	return len(s.blockers) > 0
+	return s.blockedCount > 0
 }
 
-// report logs the complete set of blocking directories as ONE record, so an
-// operator can see at a glance why key purging is suppressed and which
-// directories must roll off (or be repaired) before it resumes.
+// report logs the blocking directories as ONE record, so an operator can see at
+// a glance why key purging is suppressed and which directories must roll off
+// (or be repaired) before it resumes. The full count is always given; the paths
+// are a bounded sample.
+//
+// It is rate-limited process-wide: the caller runs it after every snapshot
+// save, and the condition it reports does not change between saves.
 func (s *snapshotFloorScan) report(scope string) {
 	if !s.blocked() {
 		return
 	}
-	sample := s.blockers
-	if len(sample) > maxReportedFloorBlockers {
-		sample = sample[:maxReportedFloorBlockers]
+	if !floorReportDue() {
+		return
 	}
-	paths := make([]string, 0, len(sample))
-	for _, b := range sample {
+	paths := make([]string, 0, len(s.blockers))
+	for _, b := range s.blockers {
 		paths = append(paths, fmt.Sprintf("%s (shard=%d replica=%d reason=%s)",
 			b.path, b.shardID, b.replicaID, b.reason))
 	}
 	slog.Warn("epoch purge suppressed: snapshot directories with an indeterminate epoch",
 		"scope", scope,
-		"blocking_directories", len(s.blockers),
+		"blocking_directories", s.blockedCount,
 		"sample", paths,
 	)
 }

@@ -1874,6 +1874,43 @@ type Host struct {
 	// authorized against the registry. The entry is removed as soon as a
 	// snapshot is accepted for the shard, closing the window.
 	joiningShards sync.Map
+
+	// importLocks serialises ImportSnapshot per shard
+	// (map[uint64]chan struct{}, each of capacity one).
+	//
+	// Nothing else serialises imports, and two concurrent imports of the same
+	// shard race over the SAME on-disk directory: the artifact index names it,
+	// so two calls carrying the same index resolve to one path, and both the
+	// staleness check and the destination-exists check below would otherwise be
+	// evaluated against a tree the other call is midway through changing. The
+	// lock makes the check-then-write sequence atomic per shard.
+	importLocks sync.Map
+}
+
+// acquireImportLock takes the shard's exclusive import lock, waiting until it
+// is free or ctx is done. The returned function releases it.
+//
+// The channel is the lock: a buffered channel of capacity one admits exactly
+// one holder and, unlike a sync.Mutex, lets a caller abandon the wait when its
+// context is cancelled — an import can run for as long as it takes to write a
+// multi-gigabyte artifact, so blocking uninterruptibly behind one is not an
+// acceptable answer to a cancelled request.
+func (h *Host) acquireImportLock(ctx context.Context, shardID uint64) (func(), error) {
+	v, _ := h.importLocks.LoadOrStore(shardID, make(chan struct{}, 1))
+	lock, ok := v.(chan struct{})
+	if !ok {
+		return nil, &TypeAssertionError{
+			Context:      "acquireImportLock importLocks lookup",
+			ExpectedType: "chan struct{}",
+			ActualValue:  v,
+		}
+	}
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, mapContextError(ctx.Err())
+	}
 }
 
 // markShardJoining records that a shard is in its join bootstrap window.
@@ -2307,41 +2344,6 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		}
 	}
 
-	// A witness or an observer must never be seeded through the members map.
-	//
-	// members seeds proto.Membership.Addresses — the FULL VOTER set — and
-	// membership is REPLICATED state: every peer seeds the same replica from
-	// its own copy of the map, so this replica cannot hold a different role for
-	// itself than its peers hold for it. The local Config.IsWitness /
-	// Config.IsObserver bit would then contradict the configuration the whole
-	// shard agrees on: the leader sends this replica FULL entry payloads
-	// (sendAppend, not sendWitnessAppend), it counts as a full replica for the
-	// RequireFullReplicaMajority policy and toward every quorum, and the only
-	// witness-like behaviour left is this host's local read gate refusing the
-	// reads the operator asked for. raft.checkSelfRole latches that
-	// disagreement permanently for a witness.
-	//
-	// Fail closed. Seeding the local node into Membership.Witnesses instead
-	// would be worse — a replica-local membership that no peer shares — and
-	// suppressing the latch would hide a real misconfiguration. The supported
-	// flow is two-step (as for etcd/dragonboat learners): bootstrap the voters,
-	// then start this replica with join=true and add it with RequestAddWitness
-	// / RequestAddObserver so the role enters membership through a committed
-	// config change.
-	if cfg.IsWitness || cfg.IsObserver {
-		if _, listed := members[cfg.ReplicaID]; listed {
-			role := "observer"
-			if cfg.IsWitness {
-				role = "witness"
-			}
-			return &NonVotingRoleInMembersError{
-				ShardID:   cfg.ShardID,
-				ReplicaID: cfg.ReplicaID,
-				Role:      role,
-			}
-		}
-	}
-
 	// Enforce per-node certificate SANs before the shard exists.
 	//
 	// The transport's in-band authorization (spoofed-SourceAddress clearing,
@@ -2421,6 +2423,59 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		len(recovered.Addresses) == 0 &&
 		len(recovered.Observers) == 0 &&
 		len(recovered.Witnesses) == 0
+
+	// A witness or an observer must never be seeded through the members map —
+	// but ONLY when this call is actually BOOTSTRAPPING the shard.
+	//
+	// members seeds proto.Membership.Addresses — the FULL VOTER set — and
+	// membership is REPLICATED state: every peer seeds the same replica from
+	// its own copy of the map, so this replica cannot hold a different role for
+	// itself than its peers hold for it. The local Config.IsWitness /
+	// Config.IsObserver bit would then contradict the configuration the whole
+	// shard agrees on: the leader sends this replica FULL entry payloads
+	// (sendAppend, not sendWitnessAppend), it counts as a full replica for the
+	// RequireFullReplicaMajority policy and toward every quorum, and the only
+	// witness-like behaviour left is this host's local read gate refusing the
+	// reads the operator asked for. raft.checkSelfRole latches that
+	// disagreement permanently for a witness.
+	//
+	// Fail closed. Seeding the local node into Membership.Witnesses instead
+	// would be worse — a replica-local membership that no peer shares — and
+	// suppressing the latch would hide a real misconfiguration. The supported
+	// flow is two-step (as for etcd/dragonboat learners): bootstrap the voters,
+	// then start this replica with join=true and add it with RequestAddWitness
+	// / RequestAddObserver so the role enters membership through a committed
+	// config change.
+	//
+	// # Why this is gated on nothingRecovered
+	//
+	// On a RESTART the members map seeds nothing: the recovered membership is
+	// authoritative and the block below does not run, so the map cannot make
+	// this replica a voter and there is nothing to refuse. Refusing anyway left
+	// a legitimately-added witness with NO working restart: join=false with
+	// itself listed hit this error, join=false without itself hit
+	// SelfNotInMembersError, and the only form that returned nil — join=true —
+	// set the joining marker, which is cleared in exactly ONE place (the
+	// InstallSnapshot adopt branch in raft). A caught-up witness receives
+	// Replicate and never InstallSnapshot, so the marker became PERMANENT for
+	// the process: Peer.IsMember reports true for every replica ID (per-shard
+	// message authorization off), the handler skips SourceAddress binding, and
+	// Peer.Tick returns early — no election timer and no CheckQuorum. The gate
+	// meant to prevent a misconfiguration was itself producing a far worse one.
+	if nothingRecovered && (cfg.IsWitness || cfg.IsObserver) {
+		if _, listed := members[cfg.ReplicaID]; listed {
+			role := "observer"
+			if cfg.IsWitness {
+				role = "witness"
+			}
+			return &NonVotingRoleInMembersError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: cfg.ReplicaID,
+				Role:      role,
+			}
+		}
+	}
+
 	if nothingRecovered && (!join || len(nodesCopy) > 0) {
 		// Seed the replicated witness policy from this node's config. This
 		// is the ONLY point where config.WitnessConfig enters the shard:
@@ -4362,6 +4417,17 @@ func readSnapshotArtifactHeader(r io.Reader) (snapshotArtifactHeader, error) {
 		OnDiskIndex: binary.LittleEndian.Uint64(fixed[28:36]),
 		Compression: config.CompressionType(binary.LittleEndian.Uint16(fixed[36:38])),
 	}
+	// Index 0 is "no snapshot", not a snapshot at index zero. It is also the
+	// artifact's on-disk NAME: snapshot-00000000000000000000 sorts FIRST among
+	// the shard's snapshot directories, so such an import would be the first
+	// thing gcSnapshotDirs destroys and would never be chosen by
+	// latestSnapshotDir, the recovery fallback. Recovery would additionally
+	// read it as an empty compaction boundary.
+	if hdr.Index == 0 {
+		return snapshotArtifactHeader{}, &SnapshotArtifactError{
+			Reason: "snapshot index is zero",
+		}
+	}
 	// An algorithm this binary cannot decompress makes the payload
 	// unreadable; reject the artifact rather than import bytes that will be
 	// handed to a state machine in an unknown encoding.
@@ -4652,10 +4718,12 @@ type importOptions struct {
 // collection and the DEK purge-floor scan enumerate — which leaks it and lets
 // the next PurgeEpochsBefore destroy the DEK it needs.
 //
-// The option remains meaningful for a shard with NO bootstrap record (one
-// started with join=true, which records none): the layout cannot be discovered
-// there, so ImportSnapshot fails closed with ErrImportLayoutUnknown unless the
-// caller states it here.
+// The option remains meaningful for a shard whose layout cannot be discovered:
+// one with NO bootstrap record (started with join=true, which records none),
+// and one whose record PREDATES the DataDir field. Both fail closed with
+// ErrImportLayoutUnknown unless the caller states the layout here, and in both
+// cases the stated value is trusted because there is nothing to cross-check it
+// against.
 func WithImportDataDir(dir string) ImportOption {
 	return func(o *importOptions) {
 		o.dataDir = dir
@@ -4680,7 +4748,15 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 	if err != nil {
 		return "", err
 	}
-	if !ok {
+	// A record that PREDATES the DataDir field proves nothing about the layout:
+	// it decodes the field as "" and that is indistinguishable from a shard
+	// that genuinely has none, so it is treated exactly like no record at all.
+	// Reading it as proof was wrong in both directions — it silently resolved a
+	// DataDir shard's import to the NodeHostDir tree (the DEK destruction this
+	// whole mechanism exists to prevent), AND it refused the documented
+	// WithImportDataDir escape hatch as a contradiction, leaving the operator no
+	// way through.
+	if !ok || !bs.DataDirRecorded {
 		// No recorded layout. Only the caller can supply it, and a wrong
 		// guess costs the artifact's DEK, so refuse rather than assume.
 		if !iopts.dataDirSet {
@@ -4717,7 +4793,8 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // The shard's snapshot-tree root is DISCOVERED from the Config.DataDir
 // StartShard recorded in the LogDB bootstrap record. When there is no such
 // record (a shard started with join=true, or one this host has never started —
-// the disaster-recovery case) the layout cannot be discovered and the import
+// the disaster-recovery case), or when the record predates the DataDir field
+// and therefore carries none, the layout cannot be discovered and the import
 // fails closed with ErrImportLayoutUnknown; pass WithImportDataDir to state it,
 // using WithImportDataDir("") to assert the shard has no DataDir. A supplied
 // value that contradicts the recorded one is refused with
@@ -4727,6 +4804,35 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // same way every other snapshot writer names one: the snapshot tree is ORDERED
 // by that name, so an import must take its rightful place among the shard's
 // existing snapshots rather than sorting as the oldest.
+//
+// # Why the artifact is staged and renamed
+//
+// Naming the directory by the artifact's index means an import can resolve to a
+// path it does NOT own: an operator retry of the same artifact, a
+// disaster-recovery artifact exported from a peer at an index this replica also
+// reached (snapshot indices are largely deterministic), or a concurrent second
+// import. So the import never writes through that path directly. It refuses a
+// destination that already exists, stages everything in a directory MkdirTemp
+// created — one this call provably owns, and the only thing a failure is ever
+// allowed to delete — and renames it into place once the artifact is complete
+// and durable. Writing in place would have truncated a LIVE snapshot.dat before
+// anything was validated, leaving the shard's LogDB record describing a file it
+// no longer matched: a short FileSize ships a truncated snapshot that erases the
+// receiving follower's state, and a stale Epoch makes StartShard fail closed on
+// an undecryptable snapshot.
+//
+// Two refusals follow from that, both raised before the tree is touched:
+//
+//   - an artifact whose index does not ADVANCE the shard's recorded snapshot is
+//     refused with *ImportSnapshotOutOfDateError, which matches
+//     logdb.ErrSnapshotOutOfDate — the same answer the LogDB would have given
+//     after the damage was done, and
+//   - a destination directory that already exists is refused with
+//     *ImportSnapshotDirExistsError. Clearing it is an operator decision; an
+//     import never removes a directory it did not create.
+//
+// Concurrent imports of one shard are serialised, so the checks above cannot be
+// interleaved with another import's writes.
 func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, opts ...ImportOption) error {
 	replicaID, err := h.importPreflight(ctx, shardID)
 	if err != nil {
@@ -4742,6 +4848,25 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return err
 	}
 
+	// Serialise imports for this shard. Everything from here on reasons about
+	// the shard's recorded snapshot and its on-disk tree, and both are resolved
+	// from the artifact's index, so a second concurrent import of the same
+	// index would otherwise interleave with this one's checks.
+	release, err := h.acquireImportLock(ctx, shardID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Refuse an artifact that does not ADVANCE the shard's recorded snapshot,
+	// before the tree is touched. Every production LogDB refuses such a save
+	// with logdb.ErrSnapshotOutOfDate, so deferring the check to the final
+	// SaveSnapshot meant the refusal arrived after the artifact had already
+	// been written over the directory the recorded snapshot lives in.
+	if err := h.checkImportAdvancesSnapshot(shardID, replicaID, header.Index); err != nil {
+		return err
+	}
+
 	// Check context before performing I/O.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
@@ -4753,19 +4878,45 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	}
 
 	fsys := h.snapshotFsys()
+	// A destination that already exists is a directory this import did not
+	// create. It may be a retained snapshot the shard still recovers from, so
+	// neither writing into it nor removing it is permissible.
+	if _, statErr := fsys.Stat(snapDir); statErr == nil {
+		return &ImportSnapshotDirExistsError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Index:     header.Index,
+			Dir:       snapDir,
+		}
+	} else if !os.IsNotExist(statErr) {
+		// The destination's existence is indeterminate; fail closed rather
+		// than proceed towards a rename that might clobber it.
+		return statErr
+	}
+
 	// Record the deepest pre-existing ancestor BEFORE MkdirAll: the directory
 	// fsync below must cover every directory this call creates (same
 	// bookkeeping as ReencryptSnapshotFile).
 	syncRoot := deepestExistingAncestor(fsys, snapDir)
-	if mkdirErr := fsys.MkdirAll(snapDir, 0o750); mkdirErr != nil {
+	stageParent := filepath.Dir(snapDir)
+	if mkdirErr := fsys.MkdirAll(stageParent, 0o750); mkdirErr != nil {
 		return mkdirErr
 	}
 
-	dataPath := filepath.Join(snapDir, "snapshot.dat")
+	// Stage in a directory this call provably owns. The name cannot parse as
+	// "snapshot-<index>", so engine.listSnapshotDirs — and with it snapshot GC,
+	// the recovery fallback and the DEK purge-floor scan — never sees a
+	// half-written import.
+	stageDir, tempErr := fsys.MkdirTemp(stageParent, importStageDirPattern)
+	if tempErr != nil {
+		return tempErr
+	}
+
+	dataPath := filepath.Join(stageDir, "snapshot.dat")
 	if writeErr := h.writeImportedSnapshotData(fsys, shardID, dataPath, r); writeErr != nil {
 		// Do not leave a partial (possibly multi-gigabyte) artifact behind
 		// for an import that will never be recorded in LogDB.
-		discardImportDir(fsys, shardID, snapDir)
+		discardImportDir(fsys, shardID, stageDir)
 		return writeErr
 	}
 
@@ -4782,7 +4933,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	if encErr != nil {
 		// Never recorded in LogDB, so the partial artifact must not be left
 		// behind for a later scan to trip over.
-		discardImportDir(fsys, shardID, snapDir)
+		discardImportDir(fsys, shardID, stageDir)
 		return encErr
 	}
 
@@ -4799,19 +4950,47 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	if term == 0 {
 		term = 1
 	}
-	if metaErr := writeReceivedSnapshotMetadata(fsys, snapDir, header.Index, term,
+	if metaErr := writeReceivedSnapshotMetadata(fsys, stageDir, header.Index, term,
 		shardID, replicaID, epoch, header.Compression); metaErr != nil {
-		discardImportDir(fsys, shardID, snapDir)
+		discardImportDir(fsys, shardID, stageDir)
 		return metaErr
+	}
+
+	// Determine the data file size for recovery's InstallSnapshot path. This
+	// is measured AFTER reencryption so FileSize always means "size of the
+	// file at Filepath", matching the framed-ciphertext size when a barrier
+	// is configured rather than the plaintext size written above. It is read
+	// from the staging path, which is the same file the rename below publishes.
+	var fileSize uint64
+	if fi, statErr := fsys.Stat(dataPath); statErr == nil {
+		fileSize = uint64(fi.Size())
+	}
+
+	// Make the staged directory's own entries durable before it is published:
+	// the rename below makes the whole directory reachable at once, and a
+	// directory whose entries are not durable would come back after a crash
+	// under the canonical name with files missing.
+	if syncErr := syncDir(fsys, stageDir); syncErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return syncErr
+	}
+
+	// Publish. The destination did not exist when this call started and no
+	// other import for this shard can have created it since (the per-shard
+	// lock above), so this rename adds a name rather than replacing one — and
+	// a rename onto a non-empty directory would fail rather than destroy it.
+	if renameErr := fsys.Rename(stageDir, snapDir); renameErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return renameErr
 	}
 
 	// Make the directory entries durable BEFORE recording the snapshot in
 	// LogDB. The data file is fsynced (both the original write and the
-	// reencrypt rename above), but the entries MkdirAll, the file create, and
-	// the reencrypt rename added are not durable until each directory in the
-	// chain is fsynced; without this a crash right after the import leaves
-	// LogDB pointing at a directory that no longer exists, and StartShard
-	// then fails with snapshot_open. Same invariant HandleSnapshot enforces.
+	// reencrypt rename above), but the entries the MkdirAll and the publishing
+	// rename added are not durable until each directory in the chain is
+	// fsynced; without this a crash right after the import leaves LogDB
+	// pointing at a directory that no longer exists, and StartShard then fails
+	// with snapshot_open. Same invariant HandleSnapshot enforces.
 	if syncErr := syncDirChain(fsys, snapDir, syncRoot); syncErr != nil {
 		return syncErr
 	}
@@ -4819,15 +4998,6 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// Check context before committing to LogDB.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
-	}
-
-	// Determine the data file size for recovery's InstallSnapshot path. This
-	// is measured AFTER reencryption so FileSize always means "size of the
-	// file at Filepath", matching the framed-ciphertext size when a barrier
-	// is configured rather than the plaintext size written above.
-	var fileSize uint64
-	if fi, statErr := fsys.Stat(dataPath); statErr == nil {
-		fileSize = uint64(fi.Size())
 	}
 
 	// Persist the ORIGINAL snapshot metadata from the artifact header so the
@@ -4918,6 +5088,50 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	return replicaID, nil
 }
 
+// importStageDirPattern names the directory an import stages its artifact in
+// before publishing it under the canonical, index-derived name.
+//
+// The leading dot and the "import" word make an orphan (a process killed
+// mid-import) self-identifying, and the name deliberately cannot parse as
+// "snapshot-<index>": engine.listSnapshotDirs skips it, so a half-written
+// import is invisible to snapshot GC, to latestSnapshotDir — the recovery
+// fallback — and to the DEK purge-floor scan.
+const importStageDirPattern = ".import-*"
+
+// checkImportAdvancesSnapshot refuses an artifact whose index does not advance
+// the shard's recorded snapshot.
+//
+// This is the SAME condition memdb.SaveSnapshot and waldb.DB.SaveSnapshot
+// enforce with logdb.ErrSnapshotOutOfDate; running it here makes the refusal
+// arrive BEFORE the shard's snapshot tree is touched. Snapshot indices are
+// largely deterministic (a save is triggered at processed - lastSnapshotIndex
+// >= SnapshotEntries), so an artifact exported from a peer routinely carries an
+// index this replica also reached, and an idempotent operator retry carries the
+// same index by construction — the collision is the expected case, not a rare
+// one.
+//
+// A shard with no recorded snapshot imposes no constraint. Any error other than
+// logdb.ErrNoSnapshot is returned: an import must not proceed on an
+// indeterminate view of what it might be about to replace.
+func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) error {
+	existing, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil {
+		if errors.Is(err, logdb.ErrNoSnapshot) {
+			return nil
+		}
+		return err
+	}
+	if index > existing.Index {
+		return nil
+	}
+	return &ImportSnapshotOutOfDateError{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Index:     index,
+		Recorded:  existing.Index,
+	}
+}
+
 // importSnapshotDir resolves the canonical on-disk directory an imported
 // artifact must be written to.
 //
@@ -5000,9 +5214,15 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 	return nil
 }
 
-// discardImportDir removes an import directory that will never be recorded in
-// LogDB. A removal failure is logged and otherwise ignored: the caller is
-// already returning the error that caused the discard.
+// discardImportDir removes an import's STAGING directory when the import will
+// never be recorded in LogDB. A removal failure is logged and otherwise
+// ignored: the caller is already returning the error that caused the discard.
+//
+// dir must always be a directory the failing import itself created
+// (fsys.MkdirTemp). It was once called with the canonical, index-named
+// destination, which an import does not necessarily own: a failed import at a
+// colliding index then deleted the shard's PRE-EXISTING snapshot outright while
+// LogDB still referenced it.
 func discardImportDir(fsys snapshotFS, shardID uint64, dir string) {
 	if rmErr := fsys.RemoveAll(dir); rmErr != nil {
 		slog.Debug("snapshot import directory cleanup failed",

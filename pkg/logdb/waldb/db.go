@@ -1493,7 +1493,13 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 	// predates it and carries no DataDir; anything else must parse as the
 	// complete field, with no bytes left over (matching the replaySnapshot
 	// trailing-byte check).
+	//
+	// dataDirRecorded reports which of the two it was. "Absent" and "empty" are
+	// DIFFERENT statements — empty means the shard roots its snapshot tree under
+	// the host's NodeHostDir, absent means nothing is known — and collapsing
+	// them lets a caller act on a value no writer ever produced.
 	var dataDir string
+	var dataDirRecorded bool
 	if pos != len(data) {
 		if len(data)-pos < bootstrapDataDirLenSize {
 			slog.Error("waldb: bootstrap record has trailing bytes during replay",
@@ -1517,14 +1523,16 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 				"segment_id", segID, "parsed", pos, "length", len(data))
 			return ErrTruncatedBootstrapRecord
 		}
+		dataDirRecorded = true
 	}
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 	s.bootstraps[key] = logdb.Bootstrap{
-		Addresses: addrs,
-		Join:      join,
-		Type:      smType,
-		DataDir:   dataDir,
+		Addresses:       addrs,
+		Join:            join,
+		Type:            smType,
+		DataDir:         dataDir,
+		DataDirRecorded: dataDirRecorded,
 	}
 	// Pin the segment so post-recovery compaction does not delete the sole
 	// durable copy of this bootstrap record.
@@ -2984,6 +2992,11 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	// epoch — atomically for readers, under dataMu. The write is already
 	// durable here because non-batch writeRecord fdatasyncs inline.
 	s.dataMu.Lock()
+	// The record just written always carries the DataDir length prefix, so the
+	// in-memory copy must say so too — otherwise a GetBootstrap served before
+	// the next restart would report the field as absent while a replay of the
+	// very same bytes reports it as present.
+	bs.DataDirRecorded = true
 	s.bootstraps[key] = bs
 	s.setBootstrapSegment(key, landing.segID)
 	s.advanceCommittedHWM(landing.segID)

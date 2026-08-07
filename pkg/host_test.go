@@ -143,13 +143,25 @@ func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error
 func (m *mockLogDB) RemoveEntriesTo(shardID, replicaID, index uint64) error { return nil }
 func (m *mockLogDB) Compact(shardID, replicaID uint64) error                { return nil }
 
+// SaveSnapshot rejects a snapshot that does not advance the recorded index,
+// exactly as memdb.MemDB.SaveSnapshot and waldb.DB.SaveSnapshot do.
+//
+// Storing unconditionally made this mock the ONE LogDB in the tree that accepts
+// a stale save, and every ImportSnapshot test ran against it — so the import
+// path's behaviour when the LogDB refuses (which is what a real deployment
+// does on a retried or index-colliding artifact) was untestable here, and the
+// data-destruction that behaviour exposed went unseen.
 func (m *mockLogDB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveSnapshotErr != nil {
 		return m.saveSnapshotErr
 	}
-	m.snapshots[mockNodeKey{shardID, replicaID}] = snapshot
+	key := mockNodeKey{shardID, replicaID}
+	if existing, ok := m.snapshots[key]; ok && snapshot.Index <= existing.Index {
+		return logdb.ErrSnapshotOutOfDate
+	}
+	m.snapshots[key] = snapshot
 	return nil
 }
 
@@ -174,12 +186,17 @@ func (m *mockLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	return m.nodeInfos, nil
 }
 
+// SaveBootstrap stamps DataDirRecorded, exactly as memdb and waldb do: a record
+// written by this version always carries an explicit DataDir. A test that wants
+// a LEGACY record (one written before the field existed) seeds m.bootstraps
+// directly and leaves the flag clear.
 func (m *mockLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveBootstrapErr != nil {
 		return m.saveBootstrapErr
 	}
+	bootstrap.DataDirRecorded = true
 	m.bootstraps[mockNodeKey{shardID, replicaID}] = bootstrap
 	return nil
 }
@@ -5333,6 +5350,12 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	// Set up nodeInfo for import (it uses ListNodeInfo to find replicaID).
 	db.mu.Lock()
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	// Model the disaster the import exists for: this replica no longer has the
+	// snapshot the artifact carries. Re-importing an artifact ONTO the record
+	// it was exported from is refused by every LogDB in the tree
+	// (logdb.ErrSnapshotOutOfDate — the index does not advance), so leaving the
+	// record in place would not be a round trip production can perform.
+	delete(db.snapshots, mockNodeKey{1, 1})
 	db.mu.Unlock()
 
 	// Import the exported data.
@@ -5411,6 +5434,10 @@ func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	}
 	db.mu.Lock()
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	// See TestExportImportSnapshot_RoundTrip: an artifact cannot be imported
+	// back onto the very record it was exported from, so the disaster that
+	// makes the restore necessary is modelled here.
+	delete(db.snapshots, mockNodeKey{1, 1})
 	db.mu.Unlock()
 
 	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
@@ -20312,6 +20339,10 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 	}
 	db.mu.Lock()
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	// See TestExportImportSnapshot_RoundTrip: an artifact cannot be imported
+	// back onto the very record it was exported from, so the disaster that
+	// makes the restore necessary is modelled here.
+	delete(db.snapshots, mockNodeKey{1, 1})
 	db.mu.Unlock()
 	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
 		t.Fatalf("ImportSnapshot failed: %v", importErr)

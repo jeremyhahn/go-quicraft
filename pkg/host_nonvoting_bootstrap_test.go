@@ -15,12 +15,16 @@
 package quicraft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // ---------------------------------------------------------------------------
@@ -101,6 +105,142 @@ func TestStartShard_RejectsWitnessOrObserverInMembers(t *testing.T) {
 			// joins with join=true and the leader adds it with a config change.
 			if joinErr := h.StartShard(nil, true, testCreateFunc, scfg); joinErr != nil {
 				t.Fatalf("StartShard(join=true) for a %s failed: %v", tt.wantRole, joinErr)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// H2: the refusal above must not apply to a RESTART
+// ---------------------------------------------------------------------------
+
+// TestStartShard_NonVotingRestartWithRecoveredMembership pins the other side of
+// the same gate: a witness or observer that was legitimately added through a
+// committed config change must be able to RESTART.
+//
+// On a restart the members map seeds nothing — the recovered membership is
+// authoritative and the bootstrap seeding block does not run — so the map
+// cannot make this replica a voter and there is nothing to refuse. Refusing
+// anyway left no working restart at all:
+//
+//	join=false, self listed  -> NonVotingRoleInMembersError
+//	join=false, self omitted -> SelfNotInMembersError
+//	join=true                -> nil, but the shard is marked JOINING
+//
+// and join=true was therefore the only form that worked. The joining marker is
+// cleared in exactly ONE place, the InstallSnapshot adopt branch; a caught-up
+// witness receives Replicate and never InstallSnapshot, so the marker was
+// PERMANENT for the process lifetime. That is not a cosmetic flag:
+// Node.IsMember then answers true for EVERY replica ID, which disables
+// per-shard message authorization and the handler's SourceAddress binding, and
+// Peer.Tick returns early, so the replica runs with no election timer and no
+// CheckQuorum. The gate against a misconfiguration was producing a worse one.
+//
+// The assertions are on those CONSEQUENCES, not merely on the returned error.
+func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{name: "witness", mutate: func(c *config.Config) { c.IsWitness = true }},
+		{name: "observer", mutate: func(c *config.Config) { c.IsObserver = true }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const shardID, replicaID uint64 = 61, 2
+			const voterAddr, selfAddr = "127.0.0.1:5000", "127.0.0.1:5001"
+			payload := []byte("witness restart state")
+
+			cfg := testHostConfig(t)
+			db := memdb.New()
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+			if err != nil {
+				t.Fatalf("NewHost failed: %v", err)
+			}
+			defer h.Close()
+
+			// Give this replica the durable state a legitimately-added
+			// non-voting replica has after its config change committed: a
+			// snapshot whose REPLICATED membership carries the role. The
+			// artifact is installed through the public import path so the
+			// on-disk tree is the real one StartShard recovers from.
+			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+				Addresses: map[uint64]string{1: voterAddr},
+			}); bsErr != nil {
+				t.Fatalf("SaveBootstrap failed: %v", bsErr)
+			}
+			memb := proto.Membership{
+				ConfigChangeID: 4,
+				Addresses:      map[uint64]string{1: voterAddr},
+			}
+			scfg := testShardConfig(shardID, replicaID)
+			tt.mutate(&scfg)
+			scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
+			if scfg.IsWitness {
+				memb.Witnesses = map[uint64]string{replicaID: selfAddr}
+			} else {
+				memb.Observers = map[uint64]string{replicaID: selfAddr}
+			}
+			artifact := buildSnapshotArtifact(t, 900, 5, 0, memb, snapshotEnvelope(payload))
+			if impErr := h.ImportSnapshot(context.Background(), shardID,
+				bytes.NewReader(artifact)); impErr != nil {
+				t.Fatalf("seeding the recovered snapshot: %v", impErr)
+			}
+
+			// The restart the operator actually performs: the same members map
+			// as every other replica, join=false.
+			members := map[uint64]string{1: voterAddr, replicaID: selfAddr}
+			memSM := &recordingMemSM{want: payload}
+			create := func(_, _ uint64) interface{} { return memSM }
+			if startErr := h.StartShard(members, false, create, scfg); startErr != nil {
+				t.Fatalf("restarting a %s with a recovered membership failed: %v; "+
+					"there is then NO working restart path for this replica",
+					tt.name, startErr)
+			}
+			defer func() { _ = h.StopShard(shardID) }()
+
+			if !memSM.recoverCalled.Load() {
+				t.Fatal("the recovered snapshot was not applied, so this test is not " +
+					"exercising a restart")
+			}
+
+			// Consequence 1: the shard must NOT be in its join bootstrap window.
+			if h.IsShardJoining(shardID) {
+				t.Error("the restarted replica is marked joining; the marker is cleared " +
+					"only by an InstallSnapshot adopt, which a caught-up witness never " +
+					"receives, so it would never clear")
+			}
+
+			// Consequence 2: per-shard message authorization must be ON. A
+			// joining peer answers IsMember true for every replica ID.
+			node := h.engine.GetNode(shardID)
+			if node == nil {
+				t.Fatal("engine node missing after the restart")
+			}
+			if node.IsMember(999) {
+				t.Error("IsMember(999) is true: per-shard message authorization is " +
+					"disabled for the life of the process, and the handler's " +
+					"SourceAddress binding is skipped with it")
+			}
+			if !node.IsMember(1) {
+				t.Error("IsMember(1) is false: the recovered voter is not recognised")
+			}
+
+			// The role really did come from REPLICATED state, not local config.
+			after, memErr := h.GetShardMembership(shardID)
+			if memErr != nil {
+				t.Fatalf("GetShardMembership failed: %v", memErr)
+			}
+			roleMap := after.Witnesses
+			if scfg.IsObserver {
+				roleMap = after.Observers
+			}
+			if _, ok := roleMap[replicaID]; !ok {
+				t.Fatalf("replica %d is not in the recovered role map: %+v", replicaID, after)
+			}
+			if _, ok := after.Nodes[replicaID]; ok {
+				t.Fatalf("the members map made the replica a full voter after all: %+v", after)
 			}
 		})
 	}

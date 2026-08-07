@@ -193,11 +193,19 @@ func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 // parseVersionedSnapshotMeta decodes a record carrying the magic. The declared
 // body length — not len(data) — bounds every field read, so a record whose
 // body was truncated after the header is rejected instead of read past its end.
+//
+// bodyLen stays a uint32 and every comparison is made in unsigned arithmetic.
+// Converting it to int first was safe only on a 64-bit platform: on a 32-bit
+// GOARCH a declared length of 2^31 or more becomes NEGATIVE, the "claims more
+// body than the file holds" guard is then false, and body[:bodyLen] panics —
+// inside the DEK purge-floor scan, which walks every snapshot directory on the
+// host and is driven by bytes on disk. waldb's replayBootstrap avoids the same
+// truncation deliberately.
 func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	version := binary.LittleEndian.Uint16(data[snapshotMetaVersionOff:])
-	bodyLen := int(binary.LittleEndian.Uint32(data[snapshotMetaBodyLenOff:]))
+	bodyLen := binary.LittleEndian.Uint32(data[snapshotMetaBodyLenOff:])
 	body := data[snapshotMetaHeaderSize:]
-	if bodyLen > len(body) {
+	if uint64(bodyLen) > uint64(len(body)) {
 		// The record claims more body than the file holds: truncated.
 		return SnapshotMeta{}, ErrSnapshotMetaCorrupt
 	}

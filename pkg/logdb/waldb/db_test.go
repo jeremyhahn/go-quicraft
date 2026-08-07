@@ -4232,6 +4232,9 @@ func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
 	if got.DataDir != dataDir {
 		t.Fatalf("DataDir = %q after reopen, want %q", got.DataDir, dataDir)
 	}
+	if !got.DataDirRecorded {
+		t.Fatal("DataDirRecorded is false after reopen although the record carries a DataDir")
+	}
 	if len(got.Addresses) != 2 || got.Addresses[2] != "addr2" || got.Type != 3 {
 		t.Fatalf("the trailing DataDir field disturbed the rest of the record: %+v", got)
 	}
@@ -4242,6 +4245,53 @@ func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
 	}
 	if plain.DataDir != "" {
 		t.Fatalf("DataDir = %q for a shard with none, want empty", plain.DataDir)
+	}
+	// An EMPTY DataDir is still an explicit statement ("this shard roots its
+	// tree under the host's NodeHostDir"), and must be distinguishable from the
+	// legacy record below, which states nothing.
+	if !plain.DataDirRecorded {
+		t.Fatal("DataDirRecorded is false for a record written by this version with an " +
+			"empty DataDir; the import path cannot then tell it from a pre-DataDir " +
+			"record and refuses a shard it could have resolved")
+	}
+}
+
+// The in-memory record SaveBootstrap publishes must agree with what a replay of
+// the same bytes produces: a GetBootstrap served before the next restart cannot
+// report the DataDir field as absent when the record on disk carries it.
+func TestSaveBootstrap_MarksDataDirRecordedBeforeReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, tc := range []struct {
+		name    string
+		dataDir string
+	}{
+		{name: "with DataDir", dataDir: "/srv/tenant-b/shard-11"},
+		{name: "without DataDir"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := db.SaveBootstrap(11, 1, logdb.Bootstrap{
+				Addresses: map[uint64]string{1: "addr1"},
+				DataDir:   tc.dataDir,
+			}); err != nil {
+				t.Fatalf("SaveBootstrap: %v", err)
+			}
+			got, found, err := db.GetBootstrap(11, 1)
+			if err != nil || !found {
+				t.Fatalf("GetBootstrap: found=%v err=%v", found, err)
+			}
+			if !got.DataDirRecorded {
+				t.Fatal("DataDirRecorded is false immediately after SaveBootstrap")
+			}
+			if got.DataDir != tc.dataDir {
+				t.Fatalf("DataDir = %q, want %q", got.DataDir, tc.dataDir)
+			}
+		})
 	}
 }
 
@@ -4271,6 +4321,18 @@ func TestReplayBootstrap_LegacyRecordWithoutDataDir(t *testing.T) {
 	got := s.bootstraps[nodeKey{ShardID: 4, ReplicaID: 1}]
 	if got.DataDir != "" {
 		t.Fatalf("DataDir = %q for a legacy record, want empty", got.DataDir)
+	}
+	// The empty string here is the ABSENCE of the field, not the statement
+	// "this shard has no DataDir". Reporting it as recorded lets
+	// Host.ImportSnapshot resolve the shard's snapshot tree to the host's
+	// NodeHostDir on no evidence at all — and, for a shard that really does have
+	// a DataDir, write the artifact outside everything snapshot GC and the DEK
+	// purge-floor scan enumerate, so the next PurgeEpochsBefore destroys the key
+	// the restore needs. It also makes the operator's WithImportDataDir override
+	// look like a contradiction and be refused, leaving no way through.
+	if got.DataDirRecorded {
+		t.Fatal("a pre-DataDir record replayed as DataDirRecorded: the absent field is " +
+			"indistinguishable from an explicit empty one, so callers cannot fail closed")
 	}
 	if got.Type != 2 || got.Addresses[1] != addr {
 		t.Fatalf("legacy record did not replay correctly: %+v", got)

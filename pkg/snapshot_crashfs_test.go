@@ -90,6 +90,7 @@ const (
 	opOpen       crashOp = "open"
 	opCreateTemp crashOp = "createtemp"
 	opMkdirAll   crashOp = "mkdirall"
+	opMkdirTemp  crashOp = "mkdirtemp"
 	opRename     crashOp = "rename"
 	opRemove     crashOp = "remove"
 	opRemoveAll  crashOp = "removeall"
@@ -319,6 +320,30 @@ func (c *crashFS) MkdirAll(path string, _ fs.FileMode) error {
 	return nil
 }
 
+// MkdirTemp implements snapshotFS. The created directory is unique by
+// construction (the sequence counter never repeats within a run), so a caller
+// staging an artifact for a later rename owns everything beneath it.
+func (c *crashFS) MkdirTemp(dir, pattern string) (string, error) {
+	dir = filepath.Clean(dir)
+	if err := c.intercept(opMkdirTemp, dir); err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	parent, ok := c.lookupLocked(dir)
+	if !ok || !parent.dir {
+		return "", notExist("mkdirtemp", dir)
+	}
+	c.tempSeq++
+	name := strings.Replace(pattern, "*", "crashfs"+itoa(c.tempSeq), 1)
+	if !strings.Contains(pattern, "*") {
+		name = pattern + itoa(c.tempSeq)
+	}
+	path := filepath.Join(dir, name)
+	c.nodes[path] = &crashNode{dir: true}
+	return path, nil
+}
+
 // Rename implements snapshotFS. The new name is visible immediately but is
 // not durable until the parent directory is fsynced; a crash before that
 // reverts to the source name.
@@ -336,6 +361,27 @@ func (c *crashFS) Rename(oldpath, newpath string) error {
 	}
 	if existing, ok := c.lookupLocked(newpath); ok {
 		c.tombs[newpath] = existing
+	}
+	// Renaming a DIRECTORY relocates everything beneath it in one step. Moving
+	// only the directory node left its children addressable under the old name
+	// alone, so a path that staged a whole directory and published it with a
+	// single rename looked — to this model — like it had lost every file it
+	// wrote, and a durability test could not tell that from a missing fsync.
+	oldPrefix := oldpath + string(filepath.Separator)
+	newPrefix := newpath + string(filepath.Separator)
+	var moved []string
+	for p := range c.nodes {
+		if strings.HasPrefix(p, oldPrefix) {
+			moved = append(moved, p)
+		}
+	}
+	for _, p := range moved {
+		child := c.nodes[p]
+		delete(c.nodes, p)
+		// The old name survives a crash that does not cover the rename, so the
+		// child is tombstoned exactly as the directory itself is.
+		c.tombs[p] = child.clone()
+		c.nodes[newPrefix+strings.TrimPrefix(p, oldPrefix)] = child
 	}
 	c.tombs[oldpath] = n.clone()
 	delete(c.nodes, oldpath)

@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
@@ -748,4 +749,81 @@ func (e *ImportDataDirMismatchError) Error() string {
 // Is reports whether target matches the sentinel ErrImportDataDirMismatch.
 func (e *ImportDataDirMismatchError) Is(target error) bool {
 	return target == ErrImportDataDirMismatch
+}
+
+// ImportSnapshotOutOfDateError is returned by Host.ImportSnapshot when the
+// artifact's snapshot index is not NEWER than the snapshot the shard already
+// has recorded in LogDB.
+//
+// The check runs BEFORE the import touches the shard's snapshot tree. Every
+// production LogDB (memdb, waldb) refuses such a save with
+// logdb.ErrSnapshotOutOfDate, so leaving the check to the final SaveSnapshot
+// meant the artifact had already been written — over the LIVE snapshot
+// directory, whose name is the same index — by the time the refusal arrived.
+// The operator saw an error and believed nothing had happened while the LogDB
+// record described a file it no longer matched: a wrong FileSize ships a short
+// snapshot that erases the receiving follower's state, and a wrong Epoch makes
+// StartShard fail closed on an undecryptable snapshot.
+//
+// It matches logdb.ErrSnapshotOutOfDate under errors.Is so a caller sees one
+// error identity whichever layer refused.
+type ImportSnapshotOutOfDateError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	// Index is the artifact's snapshot index.
+	Index uint64
+	// Recorded is the index of the snapshot already recorded in LogDB.
+	Recorded uint64
+}
+
+// Error returns a human-readable description of the stale import.
+func (e *ImportSnapshotOutOfDateError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d already has snapshot index %d recorded; "+
+			"importing index %d would not advance it",
+		e.ShardID, e.ReplicaID, e.Recorded, e.Index,
+	)
+}
+
+// Is reports whether target matches logdb.ErrSnapshotOutOfDate, the sentinel
+// every LogDB backend returns for the same condition.
+func (e *ImportSnapshotOutOfDateError) Is(target error) bool {
+	return target == logdb.ErrSnapshotOutOfDate
+}
+
+// ErrImportSnapshotDirExists is the sentinel for *ImportSnapshotDirExistsError.
+var ErrImportSnapshotDirExists = errors.New("quicraft: snapshot import destination directory already exists")
+
+// ImportSnapshotDirExistsError is returned by Host.ImportSnapshot when the
+// canonical directory for the artifact's index is already present on disk.
+//
+// Snapshot directories are named by the snapshot's own index so the tree ORDERS
+// correctly, which means an import can collide with a directory it did not
+// create — an operator retry of the same artifact, a disaster-recovery artifact
+// exported from a peer at an index this replica also reached, or the remains of
+// an import that died before it finished. The import refuses instead of
+// reusing or removing it: the directory may be the shard's live snapshot, and
+// both writing into it and deleting it destroy data the LogDB still references.
+//
+// Clearing it is an operator decision. An import NEVER deletes a directory it
+// did not create.
+type ImportSnapshotDirExistsError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	Index     uint64
+	Dir       string
+}
+
+// Error returns a human-readable description of the collision.
+func (e *ImportSnapshotDirExistsError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d snapshot directory %q for index %d already exists; "+
+			"the import will not overwrite a directory it did not create",
+		e.ShardID, e.ReplicaID, e.Dir, e.Index,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrImportSnapshotDirExists.
+func (e *ImportSnapshotDirExistsError) Is(target error) bool {
+	return target == ErrImportSnapshotDirExists
 }
