@@ -1142,11 +1142,14 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	recoverPath := dataPath
 
 	// Sweep stale decrypt scratch files left by a crash during a prior
-	// recovery. decryptSnapshotToSibling writes plaintext to a sibling
-	// .decrypt-*.tmp file and removes it via defer once recovery completes,
-	// but a process crash orphans these files. Without this sweep a crash
-	// loop would leak disk in the snapshot directory.
-	sweepStaleDecryptTmp(snapshotDir)
+	// recovery OR a prior snapshot SEND. Both write plaintext to a sibling
+	// scratch file and remove it via defer once done, but a process crash
+	// orphans these files. The whole shard tree is swept, not just the
+	// directory being recovered, because the send path decrypts inside
+	// whichever snapshot directory it streams. snapshotDir is swept too: a
+	// LogDB-recorded Filepath is not required to sit under the node's base.
+	SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
+	SweepStaleDecryptTmp(snapshotDir)
 
 	// An encrypted artifact with no usable barrier fails CLOSED, matching
 	// Host.StartShard on the identical predicate. Falling through would hand
@@ -1409,7 +1412,7 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barri
 	}()
 
 	dir := filepath.Dir(path)
-	tmpFile, err := os.CreateTemp(dir, ".decrypt-*.tmp")
+	tmpFile, err := os.CreateTemp(dir, RecoverDecryptTempPattern)
 	if err != nil {
 		return "", &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
@@ -1756,18 +1759,91 @@ func (p *snapshotPool) applyPurge(barrier SnapshotBarrier, purgeFloor, shardID, 
 	}
 }
 
-// sweepStaleDecryptTmp removes orphaned decrypt scratch files from the
-// given snapshot directory. These files are created by
-// decryptSnapshotToSibling with the os.CreateTemp pattern ".decrypt-*.tmp"
-// and are normally removed via defer after recovery completes, but a
-// process crash mid-recovery orphans them. This sweep, run at recovery
-// start, prevents crash loops from leaking disk.
+// Snapshot decrypt scratch-file naming. EVERY path that decrypts a snapshot
+// into a sibling scratch file must build its os.CreateTemp pattern from these
+// constants, because SweepStaleDecryptTmp is what reclaims such a file when the
+// process dies before its owner can remove it — and a scratch file the sweeper
+// does not match is a COMPLETE PLAINTEXT COPY of the state machine left next to
+// the ciphertext for the life of the snapshot directory.
+//
+// The prefixes differ only so an orphan names the path that created it; both are
+// swept. Adding a new decrypt path means adding its prefix to
+// IsSnapshotDecryptTemp, not inventing an unswept name.
+const (
+	// DecryptTempSuffix terminates every decrypt scratch file name.
+	DecryptTempSuffix = ".tmp"
+
+	// RecoverDecryptTempPrefix marks a scratch file written by a snapshot
+	// RECOVERY decrypt (snapshotPool.decryptSnapshotToSibling and
+	// Host.StartShard's local-snapshot recovery).
+	RecoverDecryptTempPrefix = ".decrypt-"
+
+	// SendDecryptTempPrefix marks a scratch file written by the transport
+	// SEND decrypt (Host's transportSender.decryptSnapshotForSend).
+	SendDecryptTempPrefix = ".send-decrypt-"
+
+	// RecoverDecryptTempPattern is the os.CreateTemp pattern for a recovery
+	// decrypt scratch file.
+	RecoverDecryptTempPattern = RecoverDecryptTempPrefix + "*" + DecryptTempSuffix
+
+	// SendDecryptTempPattern is the os.CreateTemp pattern for a send decrypt
+	// scratch file.
+	SendDecryptTempPattern = SendDecryptTempPrefix + "*" + DecryptTempSuffix
+)
+
+// IsSnapshotDecryptTemp reports whether a directory entry name is a snapshot
+// decrypt scratch file produced by any decrypt path. It is the single matcher
+// the sweeper uses, so a name that can be CREATED is by construction a name that
+// can be RECLAIMED.
+func IsSnapshotDecryptTemp(name string) bool {
+	if !strings.HasSuffix(name, DecryptTempSuffix) {
+		return false
+	}
+	return strings.HasPrefix(name, RecoverDecryptTempPrefix) ||
+		strings.HasPrefix(name, SendDecryptTempPrefix)
+}
+
+// SweepStaleDecryptTmpTree removes orphaned decrypt scratch files from EVERY
+// retained snapshot directory of the given shard/replica, not just the one
+// currently being recovered.
+//
+// The whole tree must be swept because the transport send path decrypts inside
+// whichever snapshot directory it is streaming — which need not be the newest
+// retained snapshot — and a leader killed mid-send orphans a full plaintext copy
+// there. Sweeping only the recovered directory leaves that copy on disk
+// permanently: the snapshot directory is retained indefinitely, so the leak is
+// too, while snapshot.dat next to it still reads as ciphertext.
+//
+// Errors are logged and ignored: a failed cleanup must not abort startup.
+func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
+	dirs, err := listSnapshotDirs(baseDir, shardID, replicaID)
+	if err != nil {
+		slog.Debug("snapshot: stale decrypt tmp tree sweep: list failed",
+			"base_dir", baseDir,
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"error", err,
+		)
+		return
+	}
+	for _, d := range dirs {
+		SweepStaleDecryptTmp(d.path)
+	}
+}
+
+// SweepStaleDecryptTmp removes orphaned decrypt scratch files from the
+// given snapshot directory. These files are created by the recovery and send
+// decrypt paths (see RecoverDecryptTempPattern / SendDecryptTempPattern) and are
+// normally removed via defer once the caller is done, but a process crash
+// orphans them. This sweep, run at startup and at recovery start, prevents both
+// a disk leak and — far worse — an indefinitely retained plaintext copy of the
+// state machine.
 //
 // The sweep is strictly scoped to the snapshot directory and only matches
-// the ".decrypt-*.tmp" pattern, so it never touches the canonical
+// IsSnapshotDecryptTemp names, so it never touches the canonical
 // snapshot.dat / snapshot.meta files or any unrelated content. Errors are
 // logged and ignored: a failed cleanup must not abort recovery.
-func sweepStaleDecryptTmp(dir string) {
+func SweepStaleDecryptTmp(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1783,9 +1859,7 @@ func sweepStaleDecryptTmp(dir string) {
 			continue
 		}
 		name := entry.Name()
-		// Match the os.CreateTemp(".decrypt-*.tmp") naming: a ".decrypt-"
-		// prefix and a ".tmp" suffix.
-		if !strings.HasPrefix(name, ".decrypt-") || !strings.HasSuffix(name, ".tmp") {
+		if !IsSnapshotDecryptTemp(name) {
 			continue
 		}
 		stalePath := filepath.Join(dir, name)
@@ -1893,6 +1967,14 @@ func snapshotSaveDir(baseDir string, shardID, replicaID, index uint64) string {
 		fmt.Sprintf("replica-%d", replicaID),
 		fmt.Sprintf("snapshot-%020d", index),
 	)
+}
+
+// SnapshotSaveDir is snapshotSaveDir for callers outside the engine (the Host's
+// snapshot import path). Every writer of a snapshot artifact must use it so the
+// artifact lands in the tree garbage collection and the DEK purge-floor scan
+// enumerate; see Node.SnapshotSaveDir for why writing elsewhere destroys keys.
+func SnapshotSaveDir(baseDir string, shardID, replicaID, index uint64) string {
+	return snapshotSaveDir(baseDir, shardID, replicaID, index)
 }
 
 // snapshotBaseDir returns the per-shard/replica base directory.

@@ -136,6 +136,17 @@ var (
 	// every term comparison in step().
 	ErrZeroTermMessage = errors.New("raft: protocol message carries no term")
 
+	// ErrWitnessRoleMismatch is returned when this replica's LOCALLY
+	// configured witness role contradicts the REPLICATED membership: the
+	// configuration lists it as a witness while it was started with
+	// IsWitness=false, or the reverse. The two roles run different data
+	// paths — a leader strips entry payloads for witnesses — so a replica
+	// on the wrong side of that split holds a state machine that never saw
+	// the entry data, while every local gate keyed on the config believes
+	// it is a full replica. Elections and reads are refused until the two
+	// agree.
+	ErrWitnessRoleMismatch = errors.New("raft: local witness role contradicts the replicated membership")
+
 	// ErrJoiningNodeCannotCampaign is returned when a TimeoutNow reaches a
 	// node that is still joining. Its membership is incomplete until a
 	// snapshot delivers the bootstrap confState, so an election it wins

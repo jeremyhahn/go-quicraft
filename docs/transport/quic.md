@@ -630,13 +630,68 @@ revocation is still enforced on session resumption.
   determined.
 
 All nodes in a cluster must share the same CA certificate for mutual
-verification. Each node may have its own leaf certificate (with unique CN/SAN)
-signed by that CA.
+verification.
+
+### Per-node SANs are a hard deployment precondition
+
+Each node **must** have its own leaf certificate whose SANs name **only that
+node's advertised Raft host**. This is not a hardening recommendation; it is a
+correctness precondition for three separate authorization controls, and
+`StartShard` **fails closed** when it is violated.
+
+`MessageBatch.SourceAddress` and `MessageBatch.SourceEpoch` travel **in band**.
+mTLS authenticates the *connection*, not those fields, so the transport binds
+them to the sender's verified certificate via `inboundAuthorizedFor`
+(`certs[0].VerifyHostname(host) == nil`). Three controls reduce to that answer:
+
+1. clearing a spoofed `SourceAddress` before it reaches the handler
+   (`recv.go`, which otherwise poisons the `(shardID, replicaID) -> address`
+   registry),
+2. deciding who may mutate `peerEpoch` and **evict a live outbound**
+   (`observePeerEpoch` / `evictStaleOutboundOnRecv`),
+3. binding a snapshot sender to a shard member (`messagehandler.go`).
+
+`VerifyHostname` tests SAN **presence**, not SAN **exclusivity**. Issue the
+cluster one wildcard certificate (`*.raft.svc.cluster.local`), or one
+certificate carrying every node's SAN, and all three answer "authorized" for
+**every** peer address. A single compromised replica can then claim any peer's
+address with a fresh `SourceEpoch` per batch and drive every node to evict its
+healthy outbound to a **third-party** victim — an attacker-controlled,
+cluster-wide replication stall, i.e. exactly the cascade the epoch mechanism
+exists to prevent.
+
+`Host.StartShard` therefore calls
+`QUICTransport.VerifyPeerAddressExclusivity(RaftAddress, memberAddresses)` and
+returns `transport.ErrSharedPeerCertificate` (a `*SharedPeerCertificateError`
+naming the offending hosts) when this node's own leaf also covers another
+member's host. It fails closed rather than warning because the weakness is
+invisible from a running cluster, the operator has no signal to act on, and the
+only remediation — re-issued certificates — has to happen before the cluster
+carries data.
+
+**Known limitation — co-located replicas.** A certificate is matched on its
+HOST only; the port is not part of the decision. Replicas separated only by port
+(`127.0.0.1:5000`, `127.0.0.1:5001`) are therefore indistinguishable to all
+three controls, and no certificate policy can separate them. The startup check
+skips peers sharing this node's own host, since flagging them would fail every
+single-machine deployment while offering nothing actionable. **Deployments that
+need these controls must give each replica its own host.**
 
 The internal transport builds separate server and client `tls.Config`
 instances from the provided PEM material. The `ServerName` field on the client
 is dynamically set to the target host during dial (extracted via
 `net.SplitHostPort`), enabling mTLS with non-localhost targets.
+
+### Peer-restart eviction budget
+
+An authorized restart hint is bounded as well as authenticated. Each peer
+address may drive at most `evictionBudget` (4) epoch-driven evictions per
+`evictionWindow` (30 s); past that the hint is ignored and recovery degrades to
+the QUIC `MaxIdleTimeout` path. A genuine restart costs exactly one eviction,
+so the budget is invisible in normal operation — but without it an
+authenticated peer could stamp a fresh `SourceEpoch` on every batch and, past
+the 4-slot `supersededEpochRing` hysteresis, force a full QUIC handshake plus
+stream-pool teardown **per batch**.
 
 ## Node Registry
 

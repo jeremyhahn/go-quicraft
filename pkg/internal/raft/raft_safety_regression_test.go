@@ -699,3 +699,317 @@ func TestConfigChangeGate_RecoversFromTransientScanFailure(t *testing.T) {
 		t.Fatalf("config change rejected after the scan recovered: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// F2: the config change gate must be anchored at the APPLIED frontier
+// ---------------------------------------------------------------------------
+
+// newConfigChangeGateRaft builds a leader-elect over a log whose last entry is
+// a config change that has COMMITTED but has NOT been applied to membership
+// yet — the window between r.log.committed advancing in the step worker and
+// Peer.Commit -> processConfigChanges running.
+func newConfigChangeGateRaft(t *testing.T, applied uint64) *raft {
+	t.Helper()
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}
+	lr := newTestLogReader([]proto.Entry{
+		{Index: 1, Term: 1, Type: proto.EntryNormal},
+		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: marshalConfigChange(t, cc)},
+	}, proto.State{Term: 1, Commit: 2})
+	lr.membership = threeNodeMembership()
+
+	r, err := newRaft(raftTestCfgPreVote(1, 2, false), lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	if r.log.committed != 2 {
+		t.Fatalf("fixture: committed = %d, want 2", r.log.committed)
+	}
+	if applied > 0 {
+		r.log.appliedTo(applied)
+	}
+	if r.log.processed != applied {
+		t.Fatalf("fixture: processed = %d, want %d", r.log.processed, applied)
+	}
+	return r
+}
+
+// TestConfigChangeGate_ArmedByCommittedButUnappliedChange is the F2
+// regression.
+//
+// Membership does not take effect at commit; it takes effect in Peer.Commit
+// -> processConfigChanges, a stage BEHIND r.log.committed. becomeLeader armed
+// pendingConfigChange from a scan of (committed, lastIndex] only, so a config
+// change that had committed but not yet been folded into the membership was
+// invisible to it.
+//
+// {A,B,C}: A commits AddNode(D) at index 2 and crashes. B has committed=2 but
+// has not run Peer.Commit for it, so B.membership is still {A,B,C}. B wins the
+// election; the old scan starts at committed+1 = 3 over a log whose last index
+// is 2, returns immediately, and leaves pendingConfigChange=false. A client
+// then proposes AddNode(E) and it is ACCEPTED. B now computes its commit
+// quorum over {A,B,C} (q=2) while the newest configuration in the log is
+// {A,B,C,D,E} (q=3): commit quorum {A,B} and election quorum {C,D,E} do not
+// intersect, and Leader Completeness fails.
+func TestConfigChangeGate_ArmedByCommittedButUnappliedChange(t *testing.T) {
+	r := newConfigChangeGateRaft(t, 1)
+
+	// The config change at index 2 is committed but unapplied.
+	if !r.hasConfigChangeToApply() {
+		t.Fatal("a COMMITTED but UNAPPLIED config change was not detected: " +
+			"membership takes effect in Peer.Commit, which lags " +
+			"r.log.committed, so a scan anchored at committed reports " +
+			"\"nothing pending\" for a change whose membership effect has " +
+			"not landed")
+	}
+
+	r.becomeCandidate()
+	r.becomeLeader()
+	if !r.pendingConfigChange {
+		t.Fatal("becomeLeader did not arm pendingConfigChange for a " +
+			"committed-but-unapplied config change")
+	}
+
+	// The second config change must be refused. Accepting it puts two
+	// configurations in flight whose quorums need not intersect.
+	next := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "a5"}
+	err := r.step(proto.Message{
+		Type: proto.Propose,
+		Entries: []proto.Entry{{
+			Type: proto.EntryConfigChange,
+			Cmd:  marshalConfigChange(t, next),
+		}},
+	})
+	if !errors.Is(err, ErrPendingConfigChange) {
+		t.Fatalf("second config change accepted (err = %v) while the first "+
+			"had not been applied to membership: the leader computes commit "+
+			"quorum over the OLD voting set while the log's newest "+
+			"configuration is larger, so the commit quorum and the election "+
+			"quorum need not intersect", err)
+	}
+}
+
+// The gate must RELEASE once the change has actually been applied, or a
+// leader could never make a second membership change.
+func TestConfigChangeGate_ReleasedOnceChangeIsApplied(t *testing.T) {
+	r := newConfigChangeGateRaft(t, 2)
+
+	if r.hasConfigChangeToApply() {
+		t.Fatal("a fully APPLIED config change still armed the gate: no " +
+			"further membership change would ever be accepted")
+	}
+
+	r.becomeCandidate()
+	r.becomeLeader()
+	if r.pendingConfigChange {
+		t.Fatal("becomeLeader armed pendingConfigChange over a fully " +
+			"applied log")
+	}
+
+	next := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "a5"}
+	err := r.step(proto.Message{
+		Type: proto.Propose,
+		Entries: []proto.Entry{{
+			Type: proto.EntryConfigChange,
+			Cmd:  marshalConfigChange(t, next),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("config change rejected over a fully applied log: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F4: the local witness role must be cross-checked against replicated
+// membership
+// ---------------------------------------------------------------------------
+
+// witnessMismatchMembership lists replica 1 as a WITNESS alongside two full
+// replicas. A node started with IsWitness=false over this configuration is on
+// the wrong side of the witness/full-replica split.
+func witnessMismatchMembership() proto.Membership {
+	return proto.Membership{
+		ConfigChangeID: 4,
+		Addresses:      map[uint64]string{2: "addr2", 3: "addr3"},
+		Witnesses:      map[uint64]string{1: "addr1"},
+	}
+}
+
+// TestWitnessRoleMismatch_CannotCampaign is the F4 regression.
+//
+// r.isWitness comes only from local config; nothing validated it against the
+// replicated membership. A node the configuration lists as a witness but that
+// was started with IsWitness=false passed every witness gate — they all key
+// on the local config — and could win an election. Its leader has been
+// sending it metadata-only entries (sendAppend strips the payload for
+// witnesses), so the state machine it would then answer reads from never saw
+// the entry data: linearizability is violated for the whole shard.
+//
+// dragonboat fails closed on this disagreement by panicking
+// (internal/raft/raft.go addNode/addWitness).
+func TestWitnessRoleMismatch_CannotCampaign(t *testing.T) {
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.IsWitness = false // contradicts the replicated membership below
+
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = witnessMismatchMembership()
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	if !r.roleMismatch {
+		t.Fatal("a replicated membership that lists this replica as a " +
+			"WITNESS while it was started with IsWitness=false was not " +
+			"detected: every local witness gate keys on the config, so " +
+			"nothing else catches it")
+	}
+
+	// The election timer must not produce a candidacy.
+	for i := 0; i < 10*int(cfg.ElectionRTT); i++ {
+		r.tickFunc(r)
+	}
+	if r.state == candidate || r.state == preCandidate || r.state == leader {
+		t.Fatalf("replica campaigned (state=%v) while the configuration "+
+			"lists it as a witness: a term it wins puts a state machine "+
+			"that only ever received metadata-only entries in charge of "+
+			"answering reads", r.state)
+	}
+
+	// TimeoutNow is the other campaign entry point and bypasses startElection.
+	err = r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1})
+	if !errors.Is(err, ErrWitnessRoleMismatch) {
+		t.Fatalf("TimeoutNow accepted (err = %v) on a role-mismatched replica", err)
+	}
+	if r.state == candidate || r.state == leader {
+		t.Fatalf("TimeoutNow made a role-mismatched replica a %v", r.state)
+	}
+}
+
+// A role-mismatched replica must not serve a linearizable read either: the
+// leader has been stripping entry payloads for it, so its state machine
+// cannot answer one correctly.
+func TestWitnessRoleMismatch_RefusesReadIndex(t *testing.T) {
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.IsWitness = false
+
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = witnessMismatchMembership()
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	r.becomeFollower(3, 2) // a leader is known, so the read would be forwarded
+
+	err = r.step(proto.Message{Type: proto.ReadIndex, Hint: 42})
+	if !errors.Is(err, ErrWitnessRoleMismatch) {
+		t.Fatalf("ReadIndex accepted (err = %v) on a replica the "+
+			"configuration lists as a witness: its state machine never "+
+			"received the entry data the read would return", err)
+	}
+}
+
+// The reverse disagreement — started as a witness, listed as a full voting
+// replica — must latch too. Such a node applies nothing and would answer
+// reads from an empty state machine.
+func TestWitnessRoleMismatch_ConfiguredWitnessListedAsVoter(t *testing.T) {
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.IsWitness = true
+
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = threeNodeMembership() // replica 1 is a full voter here
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	if !r.roleMismatch {
+		t.Fatal("a replica started as a WITNESS but listed as a full voting " +
+			"member was not detected")
+	}
+}
+
+// An AGREEING configuration must not latch anything, or every witness and
+// every full replica in the cluster would stop campaigning and stop reading.
+func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
+	t.Run("full replica", func(t *testing.T) {
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.IsWitness = false
+		lr := newTestLogReader(nil, proto.State{})
+		lr.membership = threeNodeMembership()
+		r, err := newRaft(cfg, lr)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		if r.roleMismatch {
+			t.Fatal("a full replica listed as a full replica was latched")
+		}
+		if err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 1}); errors.Is(err, ErrWitnessRoleMismatch) {
+			t.Fatal("a correctly configured full replica was refused a read")
+		}
+	})
+
+	t.Run("witness", func(t *testing.T) {
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.IsWitness = true
+		lr := newTestLogReader(nil, proto.State{})
+		lr.membership = witnessMismatchMembership() // lists 1 as a witness
+		r, err := newRaft(cfg, lr)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		if r.roleMismatch {
+			t.Fatal("a witness listed as a witness was latched")
+		}
+	})
+
+	t.Run("not in configuration", func(t *testing.T) {
+		// A joining node knows only the existing members. The configuration
+		// makes no statement about its role yet, so nothing may be latched.
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.IsWitness = false
+		lr := newTestLogReader(nil, proto.State{})
+		lr.membership = proto.Membership{
+			Addresses: map[uint64]string{2: "addr2", 3: "addr3"},
+		}
+		r, err := newRaft(cfg, lr)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		if r.roleMismatch {
+			t.Fatal("a replica absent from the configuration was latched")
+		}
+	})
+}
+
+// A leader that only learns of the disagreement from a committed config
+// change must step down: it has been answering reads and counting quorums it
+// had no right to.
+func TestWitnessRoleMismatch_LeaderStepsDownWhenLearned(t *testing.T) {
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.IsWitness = false
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = threeNodeMembership()
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	r.becomeCandidate()
+	r.becomeLeader()
+	if r.state != leader {
+		t.Fatalf("fixture: expected leader, got %v", r.state)
+	}
+
+	// A snapshot delivers a configuration that calls this replica a witness.
+	r.rebuildRemotesFromMembership(witnessMismatchMembership())
+
+	if !r.roleMismatch {
+		t.Fatal("the disagreement carried by the snapshot membership was not detected")
+	}
+	if r.state == leader {
+		t.Fatal("a leader that learned the configuration calls it a witness " +
+			"stayed leader: it keeps answering reads out of a state machine " +
+			"the leader path never sent entry data to")
+	}
+}

@@ -765,12 +765,31 @@ nancy:
 		echo "nancy not installed, skipping (govulncheck and trivy cover this)"; \
 	fi
 
-# Generate SARIF reports for all security tools (for CI integration)
+# Generate SARIF reports for all security tools (for CI integration).
+#
+# Both tools previously ended in `|| true`, so this target reported success for
+# a CRITICAL finding, an unparsable config and a missing binary alike — a CI job
+# that gates on this target could never fail, exactly the vacuous-gate pattern
+# `security` (gosec/vuln/trivy) was already fixed for.
+#
+# It now fails closed on findings while still WRITING the SARIF files, which is
+# the whole point of the target: each tool's exit status is captured, the report
+# is left on disk for the CI uploader, and the target exits non-zero afterwards.
+# Trivy is scoped identically to the `trivy` gate so the two agree on what
+# "clean" means.
 .PHONY: security-sarif
 security-sarif:
-	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium -fmt=sarif -out=$(BUILD_DIR)/gosec-results.sarif ./... || true
-	$(TRIVY) fs --severity CRITICAL,HIGH --format sarif --output $(BUILD_DIR)/trivy-results.sarif . || true
-	@echo "SARIF reports generated in $(BUILD_DIR)/"
+	@mkdir -p $(BUILD_DIR)
+	@rc=0; \
+	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium -fmt=sarif -out=$(BUILD_DIR)/gosec-results.sarif ./... || rc=1; \
+	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 \
+		--skip-dirs .build-cache --skip-dirs test/performance \
+		--format sarif --output $(BUILD_DIR)/trivy-results.sarif . || rc=1; \
+	echo "SARIF reports generated in $(BUILD_DIR)/"; \
+	if [ $$rc -ne 0 ]; then \
+		echo "security-sarif: findings reported (or a scanner failed); see the SARIF reports"; \
+	fi; \
+	exit $$rc
 
 # ============================================================================
 # Tool installation

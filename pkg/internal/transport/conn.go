@@ -16,11 +16,13 @@ package transport
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +42,20 @@ const (
 	// peer. Each slot covers one restart whose late frames may still be in
 	// flight; four spans a crash-loop without letting the record grow.
 	supersededEpochRing = 4
+
+	// evictionBudget is how many epoch-driven evictions ONE peer address may
+	// force within evictionWindow. A genuine restart costs exactly one; the
+	// remaining headroom covers a peer that restarts a few times in quick
+	// succession. Beyond it the hint is ignored.
+	//
+	// Without a budget an authenticated peer could stamp a fresh SourceEpoch
+	// on every batch and, past the supersededEpochRing hysteresis, force a
+	// full QUIC handshake plus stream-pool teardown PER BATCH — arbitrary
+	// attacker-driven work against a third-party victim address.
+	evictionBudget = 4
+
+	// evictionWindow is the period over which evictionBudget applies.
+	evictionWindow = 30 * time.Second
 
 	// peerIncarnationRetention is how long a peer's incarnation record
 	// survives with neither a cached outbound nor an exchanged batch. It is
@@ -289,6 +305,13 @@ type peerIncarnation struct {
 	// so reapPeerIncarnations can tell a peer that is gone from one that is
 	// merely quiet.
 	lastSeen time.Time
+
+	// evictions counts the epoch-driven evictions this peer address has
+	// forced since evictWindowStart, and evictWindowStart is when the
+	// current budget window opened. Together they bound how much work one
+	// authenticated peer can make this node do; see allowEviction.
+	evictions        int
+	evictWindowStart time.Time
 }
 
 // isSuperseded reports whether epoch is an incarnation this node has already
@@ -355,6 +378,40 @@ func (t *QUICTransport) observePeerEpoch(target string, srcEpoch uint64, inbound
 	rec.retire(rec.epoch)
 	rec.epoch = srcEpoch
 	rec.lastSeen = now
+	return true
+}
+
+// allowEviction charges one epoch-driven eviction against target's budget and
+// reports whether it may proceed.
+//
+// The epoch mechanism exists to recover from a peer RESTART, which costs one
+// eviction. Everything past evictionBudget in a window is either a peer in a
+// crash loop — already unreachable, and recovered by the QUIC MaxIdleTimeout
+// path exactly as it was before the mechanism existed — or a peer manufacturing
+// epochs to make this node tear down and re-handshake a connection on demand.
+// Refusing the hint costs at most one idle-timeout's delay; granting it without
+// limit is unbounded attacker-driven work.
+//
+// The budget lives on the incarnation record, so reapPeerIncarnations retires it
+// with the rest of the peer's state once the address goes quiet.
+func (t *QUICTransport) allowEviction(target string, now time.Time) bool {
+	t.peerEpochMu.Lock()
+	defer t.peerEpochMu.Unlock()
+
+	rec, known := t.peerEpoch[target]
+	if !known {
+		rec = &peerIncarnation{}
+		t.peerEpoch[target] = rec
+	}
+	rec.lastSeen = now
+	if now.Sub(rec.evictWindowStart) >= evictionWindow {
+		rec.evictWindowStart = now
+		rec.evictions = 0
+	}
+	if rec.evictions >= evictionBudget {
+		return false
+	}
+	rec.evictions++
 	return true
 }
 
@@ -807,6 +864,15 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 		if !t.inboundAuthorizedForCached(inboundConn, target) {
 			return
 		}
+		// Bound how often one peer may drive this. Authorization proves the
+		// sender may SPEAK for this address; it does not bound how much work it
+		// may ask for.
+		if !t.allowEviction(target, time.Now()) {
+			slog.Warn("epoch-driven eviction budget exhausted for peer; ignoring restart hint",
+				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp,
+				"budget", evictionBudget, "window", evictionWindow)
+			return
+		}
 		slog.Info("evicting outbound not attributable to the sending peer incarnation",
 			"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp)
 		if closeErr := outbound.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation"); closeErr != nil {
@@ -835,11 +901,7 @@ func (t *QUICTransport) inboundAuthorizedFor(conn *quic.Conn, target string) boo
 	if conn == nil {
 		return false
 	}
-	host, _, err := net.SplitHostPort(target)
-	if err != nil {
-		// target may be a bare host with no port; fall back to it verbatim.
-		host = target
-	}
+	host := certAuthHost(target)
 	if host == "" {
 		return false
 	}
@@ -851,6 +913,78 @@ func (t *QUICTransport) inboundAuthorizedFor(conn *quic.Conn, target string) boo
 	// cert's DNSNames/IPAddresses (and legacy CN), exactly as the dial path's
 	// ServerName check does.
 	return certs[0].VerifyHostname(host) == nil
+}
+
+// certAuthHost extracts the host component a certificate is matched against for
+// a Raft address. It is shared by the authorization gate (inboundAuthorizedFor)
+// and the startup exclusivity check (VerifyPeerAddressExclusivity) so the check
+// characterises exactly the same matching the gate performs — including the fact
+// that the PORT is not part of the decision.
+func certAuthHost(target string) string {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		// target may be a bare host with no port; fall back to it verbatim.
+		return target
+	}
+	return host
+}
+
+// VerifyPeerAddressExclusivity reports whether this node's own leaf certificate
+// ALSO covers any of the given peer addresses, which is a fatal deployment
+// error.
+//
+// inboundAuthorizedFor answers "is the claimed address present in the sender's
+// certificate", and three separate controls reduce to that answer: clearing a
+// spoofed SourceAddress, deciding who may mutate peerEpoch and evict a live
+// outbound, and binding a snapshot sender to its shard identity. Presence is
+// only a meaningful authorization when SANs are EXCLUSIVE per node. Issue the
+// cluster one wildcard certificate (*.raft.example.com) or one certificate
+// carrying every node's SAN — both routine, both perfectly valid against the CA
+// — and every one of those checks succeeds for EVERY peer address. A single
+// compromised replica can then claim any peer's address with a fresh
+// SourceEpoch per batch and drive every node to evict its healthy outbound to a
+// third-party victim: an attacker-controlled cluster-wide replication stall,
+// precisely the cascade the epoch mechanism exists to prevent.
+//
+// Because a certificate is only ever matched on its HOST, peers sharing this
+// node's own host (the co-located case: 127.0.0.1:5000 and 127.0.0.1:5001) are
+// indistinguishable by construction and are skipped — flagging them would fail
+// every single-machine deployment while telling the operator nothing they could
+// act on. Per-node SANs on DISTINCT hosts are therefore a hard deployment
+// precondition for the guarantees above; co-located replicas do not get them.
+func (t *QUICTransport) VerifyPeerAddressExclusivity(selfAddr string, peers []string) error {
+	if t.tlsPair == nil || t.tlsPair.leaf == nil {
+		// Unreachable: NewQUICTransport fails when the leaf cannot be parsed.
+		// Fail CLOSED rather than silently skipping a security precondition.
+		return ErrNoLocalCertificate
+	}
+	return verifyCertificateExclusivity(t.tlsPair.leaf, selfAddr, peers)
+}
+
+// verifyCertificateExclusivity is VerifyPeerAddressExclusivity over an explicit
+// leaf, so the rule is testable without a live transport.
+func verifyCertificateExclusivity(leaf *x509.Certificate, selfAddr string, peers []string) error {
+	selfHost := certAuthHost(selfAddr)
+	seen := make(map[string]struct{}, len(peers))
+	var covered []string
+	for _, peer := range peers {
+		host := certAuthHost(peer)
+		if host == "" || host == selfHost {
+			continue
+		}
+		if _, dup := seen[host]; dup {
+			continue
+		}
+		seen[host] = struct{}{}
+		if leaf.VerifyHostname(host) == nil {
+			covered = append(covered, host)
+		}
+	}
+	if len(covered) == 0 {
+		return nil
+	}
+	sort.Strings(covered)
+	return &SharedPeerCertificateError{SelfAddress: selfAddr, CoveredPeers: covered}
 }
 
 // inboundAuthorizedForCached is the per-connection-cached form of

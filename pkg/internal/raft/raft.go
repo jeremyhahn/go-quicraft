@@ -241,6 +241,25 @@ type raft struct {
 	// set can "win" a term the real configuration also elects a leader in.
 	selfRemoved bool
 
+	// roleMismatch is set when this replica's LOCALLY configured witness
+	// role contradicts the REPLICATED membership. It is the witness
+	// analogue of selfRemoved: a safety latch, derived (never proposed)
+	// from the configuration, re-evaluated everywhere the configuration is
+	// (re)established.
+	//
+	// The two roles run different data paths: a leader sends witnesses
+	// metadata-only entries (sendAppend strips the payload). A replica the
+	// configuration lists as a witness but that was started with
+	// IsWitness=false therefore applies stripped entries into a full state
+	// machine, while every local gate keyed on the config — propose, read,
+	// campaign — believes it is a full replica. It can then win an election
+	// and serve linearizable reads out of a state machine that never saw
+	// the data. dragonboat fails closed on exactly this disagreement
+	// (addNode/addWitness panic when the replicated role contradicts the
+	// local one); this latch is the non-fatal equivalent: no campaigning,
+	// no reads, until the two agree.
+	roleMismatch bool
+
 	// Lease-based read fields (PhD Section 6.4). When leaseRead is
 	// enabled, the leader can serve ReadIndex requests without a
 	// heartbeat round-trip if it has received acks from a quorum of
@@ -416,6 +435,60 @@ func (r *raft) initRemotes(membership proto.Membership) {
 		r.witnesses[id] = newRemote(nextIdx, maxInflightMsgs)
 	}
 	r.setSelfMembership(membershipHasSelf(membership, r.replicaID))
+	_, listedWitness := membership.Witnesses[r.replicaID]
+	r.checkSelfRole(membershipHasSelf(membership, r.replicaID), listedWitness)
+}
+
+// checkSelfRole cross-checks this replica's LOCALLY configured witness role
+// against the REPLICATED membership and latches roleMismatch when they
+// disagree. Called wherever the configuration is (re)established:
+// construction, snapshot restore, and commit-time config change application.
+//
+// Nothing else validates the two against each other. config.IsWitness feeds
+// r.isWitness and every host-side propose/read gate, while the replicated
+// membership is what the LEADER uses to decide whether to strip entry
+// payloads for this replica. A replica on the wrong side of that split runs
+// a state machine that never saw the entry data while believing itself a
+// full replica, and the disagreement is invisible until it wins an election
+// and starts answering reads out of it.
+//
+// dragonboat fails closed by panicking (internal/raft/raft.go addNode /
+// addWitness). Panicking a whole host over one shard's configuration is not
+// available here — a host carries thousands of shards — so the latch refuses
+// the two operations that can turn the bad state machine into an
+// authoritative answer: campaigning and serving reads. Voting is deliberately
+// NOT refused; witnesses vote, and a replica that stopped voting would remove
+// itself from a quorum the rest of the cluster still counts it in.
+func (r *raft) checkSelfRole(inConfig, listedWitness bool) {
+	// A replica the configuration does not mention makes no statement about
+	// its role. setSelfMembership already makes it unelectable.
+	if !inConfig {
+		return
+	}
+	mismatch := listedWitness != r.isWitness
+	if mismatch == r.roleMismatch {
+		return
+	}
+	r.roleMismatch = mismatch
+	if !mismatch {
+		slog.Info("replica role now agrees with the replicated membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"is_witness", r.isWitness)
+		return
+	}
+	slog.Error("replica role contradicts the replicated membership: refusing to campaign or serve reads until they agree",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"configured_witness", r.isWitness,
+		"membership_witness", listedWitness,
+		"term", r.term)
+	// A leader that only now learns the configuration calls it a witness has
+	// been answering reads and counting quorums it had no right to. Step
+	// down immediately rather than waiting for an election timeout.
+	if r.state == leader {
+		r.becomeFollower(r.term, noLeader)
+	}
 }
 
 // membershipHasSelf reports whether replicaID appears anywhere in the
@@ -1087,25 +1160,41 @@ func tickLeader(r *raft) {
 // Election
 // --------------------------------------------------------------------------
 
-// hasConfigChangeToApply returns true if there are uncommitted config
-// change entries between the committed index and the last log index.
-// During this window, the cluster is transitioning between membership
-// configurations, and starting an election could violate the overlap
-// guarantee required for safe membership changes.
-// The whole uncommitted range must be scanned, in bounded chunks. Membership
-// now takes effect at COMMIT time, and the sole safety argument for that is
-// "at most one config change is ever uncommitted" — enforced by the propose
-// gate plus this re-arm. A byte-bounded scan that stopped early would miss a
-// config change beyond the bound and let a second one be proposed, which is
-// the classic two-simultaneous-configurations unsafety. Every failure to
-// prove absence therefore fails CLOSED (returns true, blocking new config
-// change proposals) rather than open.
+// hasConfigChangeToApply returns true if there are config change entries
+// between the APPLIED (processed) frontier and the last log index — that is,
+// any config change whose membership effect has not taken hold yet. During
+// this window the cluster is transitioning between membership
+// configurations, and proposing a second change would put two configurations
+// in flight at once.
+//
+// The frontier is `processed`, NOT `committed`. Membership takes effect at
+// COMMIT time in this implementation, but "commit time" here means
+// Peer.Commit -> processConfigChanges, a stage BEHIND r.log.committed:
+// r.log.committed advances in the step worker while the commit/apply cycle is
+// still in flight, and becomeLeader runs inside that window. A scan bounded
+// at `committed` therefore reports "nothing pending" for a config change that
+// has committed but has NOT been folded into p.membership yet — so a new
+// leader arms pendingConfigChange=false, accepts a second config change, and
+// computes its commit quorum over the OLD voting set while the log's newest
+// configuration is a larger one. The commit quorum and the election quorum
+// then need not intersect, and Leader Completeness fails. Scanning from
+// `processed` is etcd/raft's `applied >= pendingConfIndex` shape: no new
+// config change until every earlier one has actually been applied.
+//
+// The whole range must be scanned, in bounded chunks. The sole safety
+// argument for commit-time membership is "at most one config change is ever
+// un-applied" — enforced by the propose gate plus this re-arm. A byte-bounded
+// scan that stopped early would miss a config change beyond the bound and let
+// a second one be proposed, which is the classic two-simultaneous-
+// configurations unsafety. Every failure to prove absence therefore fails
+// CLOSED (returns true, blocking new config change proposals) rather than
+// open.
 //
 // A fail-closed result is recorded in configChangeScanUnproven so the
 // propose gate can re-run the scan instead of latching a transient LogDB
 // read error for the rest of the leadership term.
 func (r *raft) hasConfigChangeToApply() bool {
-	found, err := r.scanUncommittedConfigChange()
+	found, err := r.scanUnappliedConfigChange()
 	if err != nil {
 		r.configChangeScanUnproven = true
 		r.configChangeScanFailures++
@@ -1121,15 +1210,21 @@ func (r *raft) hasConfigChangeToApply() bool {
 	return found
 }
 
-// scanUncommittedConfigChange reports whether the uncommitted tail holds a
-// config change entry. A non-nil error means absence could not be proven;
+// scanUnappliedConfigChange reports whether the log holds a config change
+// entry that has not been handed to the apply pipeline yet, i.e. anywhere in
+// (processed, lastIndex]. A non-nil error means absence could not be proven;
 // it is never a statement that no config change exists.
-func (r *raft) scanUncommittedConfigChange() (bool, error) {
+//
+// The range deliberately includes committed-but-not-yet-applied entries: the
+// membership effect of a config change lands in Peer.Commit, which advances
+// r.log.processed in the same step, so `processed` is the exact frontier at
+// which a config change can be said to have taken effect.
+func (r *raft) scanUnappliedConfigChange() (bool, error) {
 	lastIdx := r.log.lastIndex()
-	if r.log.committed >= lastIdx {
+	if r.log.processed >= lastIdx {
 		return false, nil
 	}
-	for low := r.log.committed + 1; low <= lastIdx; {
+	for low := r.log.processed + 1; low <= lastIdx; {
 		high := low + configChangeScanChunkEntries
 		if high > lastIdx+1 {
 			high = lastIdx + 1
@@ -1175,6 +1270,19 @@ func (r *raft) scanUncommittedConfigChange() (bool, error) {
 // committed.
 func (r *raft) startElection() {
 	if r.isObserver || r.isWitness || r.selfRemoved {
+		return
+	}
+	// The replicated configuration calls this replica a witness while it was
+	// started as a full replica (or the reverse). Its state machine and the
+	// data path the leader uses for it disagree, so a term it won would put
+	// an incomplete state machine in charge of answering reads. See
+	// checkSelfRole.
+	if r.roleMismatch {
+		slog.Warn("election skipped: local role contradicts the replicated membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"configured_witness", r.isWitness,
+			"term", r.term)
 		return
 	}
 	// Refuse to start an election at all when this node's own last log term
@@ -2584,6 +2692,8 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 	// (it was removed while it lagged), so self membership is re-derived
 	// here before purgeDepartedVotes drops the now-invalid self vote.
 	r.setSelfMembership(membershipHasSelf(m, r.replicaID))
+	_, listedWitness := m.Witnesses[r.replicaID]
+	r.checkSelfRole(membershipHasSelf(m, r.replicaID), listedWitness)
 	r.purgeDepartedVotes()
 }
 
@@ -2755,6 +2865,14 @@ func (r *raft) hasValidLease() bool {
 func (r *raft) handleLeaderReadIndex(msg proto.Message) error {
 	r.recordActivity()
 
+	// A leader that has just learned the replicated configuration calls it a
+	// witness steps down in checkSelfRole, but a ReadIndex already in the
+	// same inbox batch would still be answered from a state machine that
+	// never saw the entry data. See checkSelfRole.
+	if r.roleMismatch {
+		return ErrWitnessRoleMismatch
+	}
+
 	// Per PhD thesis 6.4: leader must have committed an entry in its
 	// current term before serving linearizable reads.
 	if !r.hasCommittedEntryAtCurrentTerm() {
@@ -2872,6 +2990,14 @@ func (r *raft) addReadState(rs proto.ReadyToRead) error {
 // handleFollowerReadIndex handles a read index request on a follower
 // by forwarding to the leader.
 func (r *raft) handleFollowerReadIndex(msg proto.Message) error {
+	// A replica whose local role contradicts the replicated configuration
+	// must not serve a linearizable read: if the configuration lists it as a
+	// witness, the leader has been sending it metadata-only entries and its
+	// state machine never saw the data the read would return. See
+	// checkSelfRole.
+	if r.roleMismatch {
+		return ErrWitnessRoleMismatch
+	}
 	if r.leaderID == noLeader {
 		return &NotLeaderError{LeaderID: 0}
 	}
@@ -3045,9 +3171,19 @@ func (r *raft) sendTimeoutNow(to uint64) {
 func (r *raft) handleTimeoutNow(_ proto.Message) error {
 	// A removed replica must not campaign even when told to: a TimeoutNow
 	// in flight when the removal committed would otherwise hand leadership
-	// to a replica the configuration no longer contains.
+	// to a replica the configuration no longer contains. The same applies to
+	// a replica whose local role contradicts the replicated configuration —
+	// TimeoutNow is the campaign entry point that bypasses startElection.
 	if r.isObserver || r.isWitness || r.selfRemoved {
 		return nil
+	}
+	if r.roleMismatch {
+		slog.Warn("ignoring TimeoutNow: local role contradicts the replicated membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"configured_witness", r.isWitness,
+			"term", r.term)
+		return ErrWitnessRoleMismatch
 	}
 	// A leader must never call becomeCandidate (invariant assertion).
 	// This can happen if a same-term TimeoutNow arrives at the leader

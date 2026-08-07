@@ -343,11 +343,40 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// backwards. The pending snapshot is cleared only by the engine's
 	// persistence ack, so it routinely outlives the message that installed it.
 	var pendingBefore *proto.Snapshot
+	var termBefore uint64
 	if msg.Type == proto.InstallSnapshot {
 		pendingBefore = p.r.log.pendingSnapshot()
+		termBefore = p.r.term
 	}
 
 	err := p.r.step(msg)
+
+	// raft.step DROPS a message whose term is behind ours and returns nil
+	// (see the msg.Term < r.term branch in step). A nil error therefore does
+	// NOT mean raft acted on the message, and membership must never be
+	// adopted from a message raft did not act on: the snapshot's Membership
+	// is the very set quorum() is computed over, and a stale-term
+	// InstallSnapshot carries no term check, no log proof and no committed
+	// entry behind it — only its own ConfigChangeID, which the sender
+	// chooses. Any authenticated shard member could hand this node a
+	// configuration of its choosing.
+	//
+	// Term 0 is the LOCAL-injection escape hatch, not a stale term: the
+	// message handler builds InstallSnapshot without a term and step exempts
+	// it from every term comparison, so it is deliberately not treated as
+	// stale here.
+	staleTerm := msg.Type == proto.InstallSnapshot &&
+		msg.Term > 0 && msg.Term < termBefore
+	if staleTerm {
+		slog.Warn("ignoring membership from a stale-term InstallSnapshot",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"from", msg.From,
+			"msg_term", msg.Term,
+			"term", termBefore,
+			"snapshot_index", msg.Snapshot.Index,
+		)
+	}
 
 	// Config changes take effect on COMMIT, not on log append: committed
 	// EntryConfigChange entries are applied to membership in Peer.Commit
@@ -355,7 +384,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// only committed entries mutate membership, log truncation on
 	// conflict can never remove an applied config change, so no
 	// membership rollback/rebuild is needed here.
-	if msg.Type == proto.InstallSnapshot && err == nil {
+	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm {
 		// Adopt the snapshot's membership on BOTH branches, gated on it
 		// not being older than what we already have.
 		//
@@ -617,6 +646,13 @@ func (p *Peer) syncRaftRemotes() {
 	// its quorum without it, so its self-counted vote could elect it leader
 	// for a term the real configuration is also electing a leader in.
 	p.r.setSelfMembership(p.membership.isMember(p.replicaID))
+
+	// Cross-check the locally configured witness role against the replicated
+	// configuration this call just applied. A committed AddWitness naming
+	// this replica, or an AddNode promoting it out of the witness set, is the
+	// point at which the two can start to disagree.
+	p.r.checkSelfRole(p.membership.isMember(p.replicaID),
+		p.membership.isWitness(p.replicaID))
 
 	// Drop vote records for replicas that just left. The election quorum is
 	// computed over the voting set this call just reshaped; a stale grant

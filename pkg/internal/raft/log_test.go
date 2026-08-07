@@ -1075,8 +1075,15 @@ func TestRaftLog_LimitEntrySize_LimitsCorrectly(t *testing.T) {
 }
 
 func TestRaftLog_NewRaftLog_InitializesFromState(t *testing.T) {
-	state := proto.State{Commit: 5}
-	logdb := newTestLogReader(nil, state)
+	// The log must actually HOLD what the hard state claims. A Commit of 5
+	// over an empty log is a corrupt recovery, and newRaftLog clamps it (see
+	// TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero), so the fixture
+	// carries the entries the state record refers to.
+	state := proto.State{Term: 1, Commit: 5}
+	logdb := newTestLogReader([]proto.Entry{
+		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
+		{Index: 4, Term: 1}, {Index: 5, Term: 1},
+	}, state)
 
 	l := newRaftLog(logdb)
 	if l.committed != 5 {
@@ -1091,8 +1098,12 @@ func TestRaftLog_NewRaftLog_InitializesFromState(t *testing.T) {
 }
 
 func TestRaftLog_NewRaftLog_ProcessedFromSnapshot(t *testing.T) {
-	state := proto.State{Commit: 10}
-	logdb := newTestLogReader(nil, state)
+	state := proto.State{Term: 2, Commit: 10}
+	// Entries 8..10 are the committed tail above the snapshot; without them
+	// on disk a Commit of 10 is not backed by anything and gets clamped.
+	logdb := newTestLogReader([]proto.Entry{
+		{Index: 8, Term: 2}, {Index: 9, Term: 2}, {Index: 10, Term: 2},
+	}, state)
 	logdb.snapshot = proto.Snapshot{Index: 7, Term: 2}
 
 	l := newRaftLog(logdb)
@@ -1104,6 +1115,57 @@ func TestRaftLog_NewRaftLog_ProcessedFromSnapshot(t *testing.T) {
 	if l.processed != 7 {
 		t.Fatalf("expected processed 7 (snapshot index), got %d", l.processed)
 	}
+}
+
+// TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot covers the
+// same recovery with the committed tail above the snapshot LOST. The
+// snapshot index is the only thing the replica can prove it holds, so
+// committed must come down to it rather than stay at the recovered 10.
+func TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot(t *testing.T) {
+	logdb := newTestLogReader(nil, proto.State{Term: 2, Commit: 10})
+	logdb.snapshot = proto.Snapshot{Index: 7, Term: 2}
+
+	l := newRaftLog(logdb)
+	if l.committed != 7 {
+		t.Fatalf("committed = %d with only a snapshot at index 7 and no "+
+			"entries above it: indices 8..10 are held by nothing, so "+
+			"acknowledging them is a phantom match", l.committed)
+	}
+	if l.processed != 7 {
+		t.Fatalf("expected processed 7 (snapshot index), got %d", l.processed)
+	}
+}
+
+// TestRaftLog_NewRaftLog_ClampsUpToSnapshotIndex protects the OTHER
+// direction of the commit reconciliation: a snapshot's index is COMMITTED by
+// construction (a snapshot is only ever taken over committed state), so it is
+// a lower bound on committed no matter what HardState survived.
+//
+// Without the clamp UP, restoring from a snapshot whose HardState.Commit was
+// lost or lagging comes up with processed (= snapshot index) ABOVE committed.
+// commitUpdate asserts LastApplied <= committed and LastApplied <= processed,
+// so the very first commit cycle trips the invariant and takes the commit
+// worker — and with it the shard — down.
+func TestRaftLog_NewRaftLog_ClampsUpToSnapshotIndex(t *testing.T) {
+	// HardState lags the snapshot: Commit=3, snapshot at 7.
+	logdb := newTestLogReader(nil, proto.State{Term: 2, Commit: 3})
+	logdb.snapshot = proto.Snapshot{Index: 7, Term: 2}
+
+	l := newRaftLog(logdb)
+	if l.committed != 7 {
+		t.Fatalf("committed = %d with a snapshot at index 7: a snapshot is "+
+			"only ever taken over COMMITTED state, so its index is a lower "+
+			"bound on committed regardless of the recovered HardState",
+			l.committed)
+	}
+	if l.processed > l.committed {
+		t.Fatalf("processed = %d exceeds committed = %d: commitUpdate "+
+			"asserts LastApplied <= committed on the first commit and would "+
+			"take the commit worker down", l.processed, l.committed)
+	}
+
+	// The invariant commitUpdate enforces must actually hold end to end.
+	l.commitUpdate(proto.UpdateCommit{Processed: true, LastApplied: 7})
 }
 
 func TestRaftLog_NewRaftLog_EmptyState(t *testing.T) {

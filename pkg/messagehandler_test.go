@@ -1008,7 +1008,7 @@ func TestNoopSender_SendSnapshot_DoesNotPanic(t *testing.T) {
 func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	dir := t.TempDir()
 
-	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, dir, 42, 7, 10, 3)
+	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, dir, 42, 7, 10, 3, 9, config.Snappy)
 	if err != nil {
 		t.Fatalf("writeReceivedSnapshotMetadata returned error: %v", err)
 	}
@@ -1027,6 +1027,8 @@ func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	shardID := binary.LittleEndian.Uint64(data[16:])
 	replicaID := binary.LittleEndian.Uint64(data[24:])
 	receivedAt := binary.LittleEndian.Uint64(data[32:])
+	epoch := binary.LittleEndian.Uint64(data[40:])
+	compression := binary.LittleEndian.Uint64(data[48:])
 
 	if index != 42 {
 		t.Errorf("index = %d, want 42", index)
@@ -1043,6 +1045,15 @@ func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	if receivedAt == 0 {
 		t.Error("receivedAt should be non-zero")
 	}
+	// The epoch field is what the DEK purge-floor scan reads; a metadata file
+	// too short to hold it reads as corrupt and one that omits it lets the
+	// artifact's DEK be purged.
+	if epoch != 9 {
+		t.Errorf("epoch = %d, want 9", epoch)
+	}
+	if compression != uint64(config.Snappy) {
+		t.Errorf("compression = %d, want %d", compression, uint64(config.Snappy))
+	}
 }
 
 // TestWriteReceivedSnapshotMetadata_InvalidDir verifies error handling when
@@ -1057,7 +1068,7 @@ func TestWriteReceivedSnapshotMetadata_InvalidDir(t *testing.T) {
 
 	// Try to write metadata into a directory path where a file exists.
 	invalidDir := filepath.Join(filePath, "subdir")
-	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, invalidDir, 1, 1, 1, 1)
+	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, invalidDir, 1, 1, 1, 1, 0, config.NoCompression)
 	if err == nil {
 		t.Fatal("expected error for invalid directory, got nil")
 	}

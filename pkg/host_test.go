@@ -5241,9 +5241,15 @@ func TestImportSnapshot_VerifiesSnapshotDirStructure(t *testing.T) {
 	snap := db.snapshots[mockNodeKey{5, 3}]
 	db.mu.Unlock()
 
-	// The filepath should contain the expected shard-N/replica-N structure.
-	expectedPrefix := filepath.Join(cfg.NodeHostDir, "snapshots", "shard-5", "replica-3")
-	if len(snap.Filepath) < len(expectedPrefix) || snap.Filepath[:len(expectedPrefix)] != expectedPrefix {
+	// The import must land in the CANONICAL tree: the shard's snapshot base
+	// directory (<NodeHostDir>/snapshots/shard-N, which itself already carries
+	// the shard segment) plus the engine's shard-N/replica-M/snapshot-... save
+	// path. An earlier hand-rolled path was one level shallower, which is
+	// invisible to listSnapshotDirs — see
+	// TestImportSnapshot_ReachesDEKPurgeFloorAndGC for what that costs.
+	base := shardSnapshotBaseDir(cfg.NodeHostDir, "", 5)
+	expectedPrefix := filepath.Join(base, "shard-5", "replica-3") + string(filepath.Separator)
+	if !strings.HasPrefix(snap.Filepath, expectedPrefix) {
 		t.Errorf("snapshot Filepath = %q, want prefix %q", snap.Filepath, expectedPrefix)
 	}
 }

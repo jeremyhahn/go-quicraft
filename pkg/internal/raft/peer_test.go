@@ -3906,12 +3906,42 @@ func TestPeer_GetPiggybackUpdate_DoesNotTouchSnapshot(t *testing.T) {
 // SetProcessedIndex tests
 // ---------------------------------------------------------------------------
 
+// contiguousEntries returns entries [1, last] all at term 1.
+func contiguousEntries(last uint64) []proto.Entry {
+	entries := make([]proto.Entry, 0, last)
+	for i := uint64(1); i <= last; i++ {
+		entries = append(entries, proto.Entry{Index: i, Term: 1})
+	}
+	return entries
+}
+
+// newTestPeerWithLog builds a peer over a LogReader that actually HOLDS the
+// entries the recovered hard state claims. A hard state whose Commit runs
+// past the last recovered entry is a corrupt/incomplete recovery and is
+// clamped by newRaftLog, so a fixture that omits the entries does not test
+// what it appears to.
+func newTestPeerWithLog(t *testing.T, cfg config.Config, entries []proto.Entry, state proto.State, ms proto.Membership) *Peer {
+	t.Helper()
+	lr := newTestLogReader(entries, state)
+	lr.membership = ms
+	p, err := NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("failed to create peer: %v", err)
+	}
+	return p
+}
+
 func TestPeer_SetProcessedIndex_SetsLogProcessedMarker(t *testing.T) {
 	cfg := testConfig()
-	// The marker is clamped to the recovered commit index, so the recovered
-	// hard state must actually cover the index under test.
-	p := newTestPeer(t, cfg, proto.State{Commit: 100}, singleNodeMembership())
+	// The marker is clamped to the recovered commit index, and the recovered
+	// commit index is itself clamped to what the log actually holds, so the
+	// log must really carry entries 1..100.
+	p := newTestPeerWithLog(t, cfg, contiguousEntries(100),
+		proto.State{Term: 1, Commit: 100}, singleNodeMembership())
 
+	if p.r.log.committed != 100 {
+		t.Fatalf("fixture: expected committed 100, got %d", p.r.log.committed)
+	}
 	// Initial processed should be 0.
 	if p.r.log.processed != 0 {
 		t.Fatalf("expected initial processed 0, got %d", p.r.log.processed)
@@ -3927,7 +3957,8 @@ func TestPeer_SetProcessedIndex_SetsLogProcessedMarker(t *testing.T) {
 
 func TestPeer_SetProcessedIndex_ZeroValue(t *testing.T) {
 	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{Commit: 50}, singleNodeMembership())
+	p := newTestPeerWithLog(t, cfg, contiguousEntries(50),
+		proto.State{Term: 1, Commit: 50}, singleNodeMembership())
 
 	// Set to a non-zero value first.
 	p.SetProcessedIndex(50)
@@ -3946,7 +3977,19 @@ func TestPeer_SetProcessedIndex_ZeroValue(t *testing.T) {
 func TestPeer_SetProcessedIndex_LargeValue(t *testing.T) {
 	cfg := testConfig()
 	largeIndex := uint64(1 << 40)
-	p := newTestPeer(t, cfg, proto.State{Commit: largeIndex}, singleNodeMembership())
+	// A large applied index only arises from an on-disk state machine
+	// recovered behind a SNAPSHOT; the snapshot index is what makes the
+	// recovered commit index legitimate at that height.
+	lr := newTestLogReader(nil, proto.State{Term: 1, Commit: largeIndex})
+	lr.membership = singleNodeMembership()
+	lr.snapshot = proto.Snapshot{Index: largeIndex, Term: 1}
+	p, err := NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("failed to create peer: %v", err)
+	}
+	if p.r.log.committed != largeIndex {
+		t.Fatalf("fixture: expected committed %d, got %d", largeIndex, p.r.log.committed)
+	}
 
 	// A large value simulates on-disk state machine recovery.
 	p.SetProcessedIndex(largeIndex)

@@ -197,3 +197,112 @@ func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 		t.Fatal("raft remotes rolled back by a rejected snapshot")
 	}
 }
+
+// TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership is the F3
+// regression.
+//
+// raft.step DROPS a message whose term is behind the local term and returns
+// nil. Peer.Handle gated membership adoption on `err == nil` alone, so a
+// stale-term InstallSnapshot — one raft refused to act on — still rewrote the
+// membership: the set quorum() is computed over, replaced with no term check,
+// no log proof and no committed entry behind it. The only guard left was the
+// ConfigChangeID carried in the message itself, which the sender chooses.
+//
+// Any authenticated member of the shard could therefore hand a peer an
+// arbitrary configuration — for example one in which it is the sole voter.
+func TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	p.r.becomeFollower(9, 2)
+
+	if len(p.membership.addresses) != 3 {
+		t.Fatalf("precondition: expected 3 voters, got %d", len(p.membership.addresses))
+	}
+
+	// A deposed leader (or any shard member) at term 3 sends a snapshot
+	// carrying a configuration of its choosing, with a ConfigChangeID high
+	// enough to beat the strictly-newer test.
+	forged := proto.Snapshot{
+		Index: 50,
+		Term:  3,
+		Membership: proto.Membership{
+			ConfigChangeID: 9999,
+			Addresses:      map[uint64]string{2: "addr2"},
+		},
+	}
+	msg := installSnapshotMsg(forged)
+	msg.Term = 3 // stale: below the local term 9
+
+	if err := p.Handle(msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(p.membership.addresses) != 3 {
+		t.Fatalf("membership rewritten to %v by a STALE-TERM InstallSnapshot "+
+			"that raft dropped without acting on: quorum() is now computed "+
+			"over a configuration no committed entry ever established",
+			p.membership.addresses)
+	}
+	if p.membership.configChangeID == forged.Membership.ConfigChangeID {
+		t.Fatalf("adopted ConfigChangeID %d from a stale-term InstallSnapshot",
+			p.membership.configChangeID)
+	}
+	if p.r.log.committed != 0 {
+		t.Fatalf("committed advanced to %d on a dropped message", p.r.log.committed)
+	}
+}
+
+// A CURRENT-term InstallSnapshot must still install its membership, so the
+// stale-term guard cannot be satisfied by refusing every snapshot.
+func TestPeer_InstallSnapshot_CurrentTermStillAdoptsMembership(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	p.r.becomeFollower(9, 2)
+
+	ss := proto.Snapshot{
+		Index: 50,
+		Term:  9,
+		Membership: proto.Membership{
+			ConfigChangeID: 7,
+			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4"},
+		},
+	}
+	if err := p.Handle(installSnapshotMsg(ss)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(p.membership.addresses) != 4 {
+		t.Fatalf("current-term snapshot membership not adopted: %v", p.membership.addresses)
+	}
+}
+
+// A LOCALLY injected InstallSnapshot carries no term (term 0 is the
+// local-injection escape hatch that step exempts from every term comparison).
+// It must not be mistaken for a stale-term message, or the snapshot-receive
+// path — which is the only thing that can repair a joining node's incomplete
+// membership — would stop adopting membership entirely.
+func TestPeer_InstallSnapshot_ZeroTermIsLocalNotStale(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	p.r.becomeFollower(9, 2)
+
+	ss := proto.Snapshot{
+		Index: 50,
+		Term:  9,
+		Membership: proto.Membership{
+			ConfigChangeID: 7,
+			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4"},
+		},
+	}
+	msg := installSnapshotMsg(ss)
+	msg.Term = 0 // as built by the snapshot receive path
+
+	if err := p.Handle(msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(p.membership.addresses) != 4 {
+		t.Fatalf("locally injected snapshot membership not adopted: %v", p.membership.addresses)
+	}
+}

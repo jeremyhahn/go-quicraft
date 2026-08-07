@@ -73,6 +73,17 @@ var (
 	// Self-signed and unauthenticated modes are not supported.
 	ErrMTLSConfigRequired = errors.New("transport: MTLSConfig is required (mutual TLS is mandatory)")
 
+	// ErrSharedPeerCertificate is the sentinel form of
+	// SharedPeerCertificateError, for errors.Is() matching.
+	ErrSharedPeerCertificate = errors.New("transport: local certificate covers peer addresses")
+
+	// ErrNoLocalCertificate is returned when an operation needs this node's own
+	// leaf certificate and it is unavailable. NewQUICTransport rejects an
+	// unparsable leaf, so this only guards against a future construction path
+	// that forgets to populate it — failing CLOSED rather than skipping a
+	// security precondition.
+	ErrNoLocalCertificate = errors.New("transport: local leaf certificate unavailable")
+
 	// ErrInvalidMaxStreamsPerConnection is returned when MaxStreamsPerConnection < 1.
 	ErrInvalidMaxStreamsPerConnection = errors.New("transport: max streams per connection must be >= 1")
 
@@ -628,4 +639,38 @@ func (e *SnapshotChunkCountError) Error() string {
 // Is reports whether target matches the sentinel ErrSnapshotChunkCount.
 func (e *SnapshotChunkCountError) Is(target error) bool {
 	return target == ErrSnapshotChunkCount
+}
+
+// SharedPeerCertificateError reports that this node's own leaf certificate also
+// covers one or more OTHER member addresses of the cluster.
+//
+// Every in-band authorization decision the transport makes — clearing a spoofed
+// SourceAddress, permitting a peerEpoch mutation and the eviction of a live
+// outbound, and binding a snapshot sender to a shard member — reduces to
+// "is the claimed host present in the sender's verified certificate". A
+// certificate that covers other members' hosts (a wildcard SAN, or one shared
+// certificate carrying every node's SAN) makes that question answer yes for
+// every peer address, so any single compromised replica can speak for every
+// other node. Per-node SANs are a hard deployment precondition, and this error
+// is what enforces it at startup.
+type SharedPeerCertificateError struct {
+	// SelfAddress is this node's own advertised Raft address.
+	SelfAddress string
+	// CoveredPeers are the OTHER members' hosts this node's certificate also
+	// covers, sorted for a deterministic message.
+	CoveredPeers []string
+}
+
+// Error returns a human-readable description of the certificate overlap.
+func (e *SharedPeerCertificateError) Error() string {
+	return fmt.Sprintf(
+		"transport: local certificate for %s also covers peer hosts %v; "+
+			"per-node certificate SANs are required (a wildcard or shared "+
+			"certificate lets any replica speak for every peer)",
+		e.SelfAddress, e.CoveredPeers)
+}
+
+// Is reports whether target matches the sentinel ErrSharedPeerCertificate.
+func (e *SharedPeerCertificateError) Is(target error) bool {
+	return target == ErrSharedPeerCertificate
 }

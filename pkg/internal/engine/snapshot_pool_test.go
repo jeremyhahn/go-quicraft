@@ -2498,8 +2498,14 @@ func TestSnapshotPool_GlobalSafePurgeFloor_ScanError(t *testing.T) {
 func TestSweepStaleDecryptTmp(t *testing.T) {
 	dir := t.TempDir()
 
-	// Orphaned decrypt scratch files (should be removed).
-	stale := []string{".decrypt-123.tmp", ".decrypt-abcdef.tmp"}
+	// Orphaned decrypt scratch files (should be removed). BOTH decrypt paths
+	// must be swept: the send path's scratch file is a full plaintext copy of
+	// the state machine, and it was previously left behind forever because the
+	// sweeper only matched the recovery path's prefix.
+	stale := []string{
+		".decrypt-123.tmp", ".decrypt-abcdef.tmp",
+		".send-decrypt-123.tmp", ".send-decrypt-abcdef.tmp",
+	}
 	for _, name := range stale {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
@@ -2520,7 +2526,7 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 		}
 	}
 
-	sweepStaleDecryptTmp(dir)
+	SweepStaleDecryptTmp(dir)
 
 	for _, name := range stale {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
@@ -2538,7 +2544,87 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 // a nonexistent directory.
 func TestSweepStaleDecryptTmp_MissingDir(t *testing.T) {
 	// Must not panic or error.
-	sweepStaleDecryptTmp(filepath.Join(t.TempDir(), "does-not-exist"))
+	SweepStaleDecryptTmp(filepath.Join(t.TempDir(), "does-not-exist"))
+}
+
+// TestSweepStaleDecryptTmpTree_ReclaimsEveryRetainedSnapshot verifies the sweep
+// covers EVERY retained snapshot directory, not just the newest.
+//
+// The send path decrypts inside whichever snapshot directory it is streaming,
+// which need not be the one recovery will load. A sweep scoped to the recovered
+// directory leaves a full plaintext copy of the state machine in every other
+// retained directory, permanently.
+func TestSweepStaleDecryptTmpTree_ReclaimsEveryRetainedSnapshot(t *testing.T) {
+	base := t.TempDir()
+	const shardID, replicaID uint64 = 3, 1
+
+	orphans := make([]string, 0, 3)
+	for _, index := range []uint64{100, 200, 300} {
+		dir := snapshotSaveDir(base, shardID, replicaID, index)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+		orphan := filepath.Join(dir, ".send-decrypt-abc.tmp")
+		if err := os.WriteFile(orphan, []byte("plaintext"), 0o600); err != nil {
+			t.Fatalf("write orphan: %v", err)
+		}
+		orphans = append(orphans, orphan)
+		if err := os.WriteFile(filepath.Join(dir, snapshotDataFile), []byte("ct"), 0o600); err != nil {
+			t.Fatalf("write snapshot.dat: %v", err)
+		}
+	}
+
+	SweepStaleDecryptTmpTree(base, shardID, replicaID)
+
+	for _, orphan := range orphans {
+		if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+			t.Fatalf("orphaned plaintext %s survived the tree sweep (err=%v)", orphan, err)
+		}
+	}
+	for _, index := range []uint64{100, 200, 300} {
+		dataPath := filepath.Join(snapshotSaveDir(base, shardID, replicaID, index), snapshotDataFile)
+		if _, err := os.Stat(dataPath); err != nil {
+			t.Fatalf("canonical %s was destroyed by the sweep: %v", dataPath, err)
+		}
+	}
+}
+
+// TestIsSnapshotDecryptTemp pins the single matcher every decrypt path's
+// os.CreateTemp pattern must satisfy.
+func TestIsSnapshotDecryptTemp(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{".decrypt-123.tmp", true},
+		{".send-decrypt-123.tmp", true},
+		{".decrypt-.tmp", true},
+		{"decrypt-123.tmp", false},
+		{".decrypt-123", false},
+		{".encrypt-123.tmp", false},
+		{snapshotDataFile, false},
+		{snapshotMetadataFile, false},
+	}
+	for _, tt := range tests {
+		if got := IsSnapshotDecryptTemp(tt.name); got != tt.want {
+			t.Errorf("IsSnapshotDecryptTemp(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+
+	// Every pattern a decrypt path can create must be reclaimable.
+	for _, pattern := range []string{RecoverDecryptTempPattern, SendDecryptTempPattern} {
+		f, err := os.CreateTemp(t.TempDir(), pattern)
+		if err != nil {
+			t.Fatalf("CreateTemp(%q): %v", pattern, err)
+		}
+		name := filepath.Base(f.Name())
+		if err := f.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if !IsSnapshotDecryptTemp(name) {
+			t.Errorf("pattern %q created %q, which the sweeper does not match", pattern, name)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

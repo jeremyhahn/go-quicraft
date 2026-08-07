@@ -9030,18 +9030,49 @@ func TestHasConfigChangeToApplyNoChanges(t *testing.T) {
 	}
 }
 
-// TestHasConfigChangeToApplyAllCommitted verifies that hasConfigChangeToApply
-// returns false when committed >= lastIndex (all entries are committed).
-func TestHasConfigChangeToApplyAllCommitted(t *testing.T) {
+// TestHasConfigChangeToApplyAllApplied verifies that hasConfigChangeToApply
+// returns false via the early-return branch when processed >= lastIndex (every
+// entry has already been handed to the apply pipeline, so no config change can
+// still be waiting to take effect).
+//
+// The frontier is processed, not committed: membership takes effect in
+// Peer.Commit -> processConfigChanges, which lags r.log.committed.
+func TestHasConfigChangeToApplyAllApplied(t *testing.T) {
 	r := newTestRaft(1)
 	electLeader(r)
 	r.drainMessages()
 
-	// Commit everything by advancing committed to lastIndex.
+	// Commit AND apply everything.
+	r.log.commitTo(r.log.lastIndex())
+	r.log.appliedTo(r.log.committed)
+
+	if r.log.processed != r.log.lastIndex() {
+		t.Fatalf("fixture: processed = %d, lastIndex = %d",
+			r.log.processed, r.log.lastIndex())
+	}
+	if r.hasConfigChangeToApply() {
+		t.Fatal("expected hasConfigChangeToApply to return false when every entry has been applied")
+	}
+}
+
+// TestHasConfigChangeToApplyCommittedNotApplied verifies the complement: a
+// config change that is COMMITTED but whose membership effect has not landed
+// yet must still arm the gate.
+func TestHasConfigChangeToApplyCommittedNotApplied(t *testing.T) {
+	r := newTestRaft(1)
+	electLeader(r)
+	r.drainMessages()
+
+	r.log.append([]proto.Entry{
+		{Term: r.term, Index: r.log.lastIndex() + 1, Type: proto.EntryConfigChange},
+	})
+	// Commit it, but do NOT apply it: Peer.Commit -> processConfigChanges
+	// has not run, so the membership is still the pre-change one.
 	r.log.commitTo(r.log.lastIndex())
 
-	if r.hasConfigChangeToApply() {
-		t.Fatal("expected hasConfigChangeToApply to return false when all entries committed")
+	if !r.hasConfigChangeToApply() {
+		t.Fatal("a committed but unapplied config change must still arm the gate: " +
+			"the membership it changes has not taken effect yet")
 	}
 }
 

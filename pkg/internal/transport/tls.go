@@ -48,6 +48,13 @@ const tlsALPN = "quicraft"
 type tlsPair struct {
 	server *tls.Config
 	client *tls.Config
+
+	// leaf is this node's OWN parsed end-entity certificate — the same
+	// certificate peers see in both the server and client roles. It is kept so
+	// the startup exclusivity check (VerifyPeerAddressExclusivity) can ask
+	// whether this node's SANs also cover other members' hosts, which would
+	// collapse every in-band authorization decision the transport makes.
+	leaf *x509.Certificate
 }
 
 // parseCACertificates parses every CERTIFICATE block in a PEM CA bundle and
@@ -118,6 +125,22 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			return nil, ErrInvalidCertKeyPair
 		}
 	}
+	// Parse this node's own leaf once. tls.X509KeyPair populates Leaf, but a
+	// pre-built Certificate (hardware signer) may not, so fall back to parsing
+	// the DER. A certificate whose leaf cannot be parsed is rejected outright:
+	// the startup SAN-exclusivity precondition cannot be evaluated without it.
+	leaf := cert.Leaf
+	if leaf == nil {
+		if len(cert.Certificate) == 0 {
+			return nil, ErrInvalidCertKeyPair
+		}
+		parsed, parseErr := x509.ParseCertificate(cert.Certificate[0])
+		if parseErr != nil {
+			return nil, ErrInvalidCertKeyPair
+		}
+		leaf = parsed
+	}
+
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(mtls.CACert) {
 		return nil, ErrInvalidCACert
@@ -199,5 +222,5 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		ClientSessionCache: tls.NewLRUClientSessionCache(256),
 	}
 
-	return &tlsPair{server: serverCfg, client: clientCfg}, nil
+	return &tlsPair{server: serverCfg, client: clientCfg, leaf: leaf}, nil
 }

@@ -649,8 +649,12 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	}
 	onDiskSize := uint64(onDiskInfo.Size())
 
-	// Write snapshot metadata file.
-	if err := writeReceivedSnapshotMetadata(fsys, snapshotDir, snapshotIndex, snapshotTerm, shardID, replicaID); err != nil {
+	// Write snapshot metadata file. It records the RECEIVER's own at-rest epoch
+	// and the classified compression, so the directory describes itself even
+	// without its LogDB record — and so the DEK purge floor, which is computed
+	// by scanning these directories, sees the epoch this artifact needs.
+	if err := writeReceivedSnapshotMetadata(fsys, snapshotDir, snapshotIndex, snapshotTerm,
+		shardID, replicaID, recvEpoch, recvCompression); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -978,13 +982,31 @@ func detectSnapshotCompression(fsys snapshotFS, path string) (config.Compression
 	return config.NoCompression, nil
 }
 
-// snapshotRecvMetaSize is the metadata file size for received snapshots.
-// Format: Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | ReceivedAt(8)
-const snapshotRecvMetaSize = 5 * 8
+// snapshotRecvMetaSize is the metadata file size written beside a snapshot
+// artifact this host did not produce itself (received or imported). It is the
+// CANONICAL layout the snapshot pool writes for locally saved snapshots
+// (engine.writeSnapshotMetadata):
+//
+//	Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | CreatedAt(8) |
+//	Epoch(8) | Compression(8)
+//
+// The Epoch field is the reason the full layout is mandatory. The DEK purge
+// floor is computed by SCANNING snapshot directories and reading this field
+// (engine.readSnapshotEpoch): a file too short to contain it reads as CORRUPT
+// and a missing file reads as "no snapshot here, imposes no floor" — the latter
+// letting PurgeEpochsBefore destroy the DEK the artifact needs. Every writer of
+// a snapshot directory must therefore record its true epoch here.
+const snapshotRecvMetaSize = 7 * 8
 
-// writeReceivedSnapshotMetadata writes a binary metadata file for a
-// received snapshot.
-func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, shardID, replicaID uint64) error {
+// writeReceivedSnapshotMetadata writes the binary metadata file beside a
+// snapshot artifact received from a peer or imported from an operator artifact.
+//
+// epoch is the at-rest encryption epoch of the artifact AS STORED (0 when it is
+// plaintext) and compression describes the bytes on disk; both must be the
+// values actually applied, never this host's configured defaults, because
+// recovery and the DEK purge floor read them back as fact.
+func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, shardID, replicaID, epoch uint64,
+	compression config.CompressionType) error {
 	metaPath := filepath.Join(dir, "snapshot.meta")
 	f, err := fsys.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1006,6 +1028,8 @@ func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, sha
 	binary.LittleEndian.PutUint64(buf[16:], shardID)
 	binary.LittleEndian.PutUint64(buf[24:], replicaID)
 	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
+	binary.LittleEndian.PutUint64(buf[40:], epoch)
+	binary.LittleEndian.PutUint64(buf[48:], uint64(compression))
 
 	if _, writeErr := f.Write(buf[:]); writeErr != nil {
 		return writeErr

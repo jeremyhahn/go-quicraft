@@ -526,14 +526,38 @@ func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barr
 		sendDecryptTempPattern, msg.Snapshot.Epoch, barrier)
 }
 
-// sendDecryptTempPattern names the scratch file the send path decrypts into.
-const sendDecryptTempPattern = ".send-decrypt-*.tmp"
+// sendDecryptTempPattern names the scratch file the send path decrypts into,
+// and recoverDecryptTempPattern the one the restart-recovery path uses. Both
+// are taken from the engine's shared constants, which is what guarantees
+// engine.SweepStaleDecryptTmp reclaims either file when a crash orphans it: a
+// send-path scratch file the sweeper did not match was a complete plaintext copy
+// of the state machine left beside the ciphertext for the life of the snapshot
+// directory.
+const (
+	sendDecryptTempPattern    = engine.SendDecryptTempPattern
+	recoverDecryptTempPattern = engine.RecoverDecryptTempPattern
+)
 
-// recoverDecryptTempPattern names the scratch file the restart-recovery path
-// decrypts into. It matches the engine's snapshotPool.decryptSnapshotToSibling
-// pattern so engine.sweepStaleDecryptTmp reclaims a file orphaned by a crash
-// mid-recovery.
-const recoverDecryptTempPattern = ".decrypt-*.tmp"
+// shardSnapshotBaseDir returns the BASE snapshot directory for a shard — the
+// directory engine.Node.SnapshotDir() reports and that every snapshot path
+// (save, receive, import, garbage collection, and the DEK purge-floor scan)
+// resolves against via snapshotSaveDir/listSnapshotDirs.
+//
+// It is the single definition of that layout. Any path that builds it by hand
+// risks writing snapshot artifacts into a tree the GC and the purge-floor scan
+// never enumerate; because the purge floor is computed by SCANNING these
+// directories, an artifact outside the tree contributes no floor and its DEK is
+// legitimately destroyed by the next PurgeEpochsBefore, leaving the snapshot
+// permanently undecryptable.
+//
+// dataDir is the shard's optional Config.DataDir: when set, the shard's
+// snapshot tree roots on the tenant's own volume instead of under NodeHostDir.
+func shardSnapshotBaseDir(nodeHostDir, dataDir string, shardID uint64) string {
+	if dataDir != "" {
+		return filepath.Join(dataDir, fmt.Sprintf("shard-%d", shardID))
+	}
+	return filepath.Join(nodeHostDir, "snapshots", fmt.Sprintf("shard-%d", shardID))
+}
 
 // decryptSnapshotToTemp decrypts the framed snapshot ciphertext at srcPath into
 // a NEW sibling temp file created from pattern, returning that file's path and
@@ -2179,6 +2203,32 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	return h, nil
 }
 
+// verifyMemberCertificateExclusivity rejects a startup whose own leaf
+// certificate also covers another member's host. See
+// transport.QUICTransport.VerifyPeerAddressExclusivity for why SAN PRESENCE is
+// only an authorization when SANs are EXCLUSIVE.
+//
+// Peers sharing this node's own host (co-located replicas separated only by
+// port) are not flagged: a certificate is matched on host alone, so they are
+// indistinguishable by construction and no certificate policy can separate
+// them. With no transport there is no in-band authorization to collapse, so the
+// check does not apply.
+func (h *Host) verifyMemberCertificateExclusivity(members map[uint64]string) error {
+	if h.transport == nil || len(members) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(members))
+	for _, addr := range members {
+		if addr != "" && addr != h.cfg.RaftAddress {
+			peers = append(peers, addr)
+		}
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	return h.transport.VerifyPeerAddressExclusivity(h.cfg.RaftAddress, peers)
+}
+
 // StartShard starts a Raft shard on this host. members maps replicaID to
 // address for initial cluster members. join indicates whether this node
 // is joining an existing cluster. create is the state machine factory.
@@ -2246,6 +2296,25 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				Reason:    "address must be non-empty",
 			}
 		}
+	}
+
+	// Enforce per-node certificate SANs before the shard exists.
+	//
+	// The transport's in-band authorization (spoofed-SourceAddress clearing,
+	// peerEpoch mutation / live-outbound eviction, snapshot-sender binding) all
+	// reduce to "is the claimed host in the sender's verified certificate".
+	// That is only an authorization if SANs are exclusive per node; a wildcard
+	// or shared cluster certificate makes it true for every peer and lets one
+	// compromised replica drive cluster-wide replication stalls.
+	//
+	// This fails CLOSED. A warning is worthless here: the deployment is
+	// silently unauthenticated for every one of those decisions, the operator
+	// cannot observe the weakness from the running cluster, and the only
+	// remediation is re-issuing certificates — something that must happen
+	// before the cluster carries data, not after an incident. Refusing to start
+	// is also cheap to fix and impossible to miss.
+	if err := h.verifyMemberCertificateExclusivity(members); err != nil {
+		return err
 	}
 
 	// Early duplicate check. The authoritative check uses LoadOrStore
@@ -2372,12 +2441,18 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// tenant's own volume (dragonboat's "the on-disk SM owns its storage
 	// location" behavior). The Raft log/WAL is unaffected: it always remains
 	// in the shared host-wide LogDB.
-	snapshotDir := filepath.Join(h.cfg.NodeHostDir, "snapshots",
-		fmt.Sprintf("shard-%d", cfg.ShardID))
-	if cfg.DataDir != "" {
-		snapshotDir = filepath.Join(cfg.DataDir,
-			fmt.Sprintf("shard-%d", cfg.ShardID))
-	}
+	snapshotDir := shardSnapshotBaseDir(h.cfg.NodeHostDir, cfg.DataDir, cfg.ShardID)
+
+	// Reclaim decrypt scratch files orphaned by a crash BEFORE anything else
+	// touches the shard's snapshot tree. A leader killed mid-snapshot-send (or
+	// mid-recovery) leaves a COMPLETE PLAINTEXT COPY of the state machine beside
+	// the ciphertext; the snapshot directory is retained indefinitely, so without
+	// a sweep here the plaintext survives restarts and backups while snapshot.dat
+	// next to it still reads as ciphertext. This runs on EVERY start, including
+	// the on-disk-state-machine path below that skips snapshot recovery entirely
+	// and the case where no snapshot record exists at all.
+	engine.SweepStaleDecryptTmpTree(snapshotDir, cfg.ShardID, cfg.ReplicaID)
+
 	stateMachine, err := rsm.NewStateMachine(
 		cfg.ShardID, cfg.ReplicaID, create, snapshotDir,
 		cfg.MaxSessionsPerClient, cfg.MaxTotalSessions,
@@ -4504,6 +4579,28 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 	return result
 }
 
+// ImportOption configures ImportSnapshot.
+type ImportOption func(*importOptions)
+
+// importOptions carries the shard facts ImportSnapshot cannot discover on its
+// own because the shard is, by contract, not running.
+type importOptions struct {
+	dataDir string
+}
+
+// WithImportDataDir tells ImportSnapshot that the shard will be started with
+// this Config.DataDir, so the imported artifact is written into the SAME
+// snapshot tree StartShard will use.
+//
+// It must be supplied whenever the shard's Config.DataDir is non-empty and must
+// match it exactly. Omitting it for a DataDir shard writes the artifact under
+// NodeHostDir, outside the tree snapshot garbage collection and the DEK
+// purge-floor scan enumerate — which leaks the artifact and lets the next
+// PurgeEpochsBefore destroy the DEK the imported snapshot needs.
+func WithImportDataDir(dir string) ImportOption {
+	return func(o *importOptions) { o.dataDir = dir }
+}
+
 // ImportSnapshot imports a snapshot artifact from the reader for the given
 // shard. The shard must be stopped (not loaded on this host) before calling
 // this method. The artifact is the versioned header + plaintext data
@@ -4513,10 +4610,16 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 // recorded in LogDB so the next StartShard recovers the SAME logical
 // snapshot. The context is checked for cancellation at key blocking points.
 //
+// The artifact is written to the canonical snapshot path — the same
+// shardSnapshotBaseDir + engine.SnapshotSaveDir construction StartShard, the
+// snapshot pool and the receive path use — so it is visible to snapshot garbage
+// collection and, critically, to the directory scan that computes the DEK purge
+// floor. A shard configured with Config.DataDir must pass WithImportDataDir.
+//
 // The monotonic importSeq counter is used ONLY for the on-disk directory
 // name to guarantee uniqueness across rapid sequential imports; it is NOT
 // used as the Raft snapshot index (which comes from the artifact header).
-func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) error {
+func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, opts ...ImportOption) error {
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
@@ -4588,10 +4691,22 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		return mapContextError(err)
 	}
 
-	snapDir := filepath.Join(h.cfg.NodeHostDir, "snapshots",
-		fmt.Sprintf("shard-%d", shardID),
-		fmt.Sprintf("replica-%d", replicaID),
-		fmt.Sprintf("snapshot-%020d", dirSeq))
+	// Build the path exactly as every other snapshot writer does: the shard's
+	// canonical base directory plus the engine's save-dir construction. Hand
+	// -rolling it here produced a tree one level shallower than the canonical
+	// one, so listSnapshotDirs never saw the import: snapshot GC leaked it, and
+	// — far worse — the imported snapshot's epoch never reached the DEK purge
+	// floor (which is computed by SCANNING these directories), so the next
+	// PurgeEpochsBefore legitimately dropped the DEK and StartShard then failed
+	// closed on an undecryptable snapshot: total loss of a disaster-recovery
+	// restore.
+	var iopts importOptions
+	for _, opt := range opts {
+		opt(&iopts)
+	}
+	snapDir := engine.SnapshotSaveDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, iopts.dataDir, shardID),
+		shardID, replicaID, dirSeq)
 
 	fsys := h.snapshotFsys()
 	// Record the deepest pre-existing ancestor BEFORE MkdirAll: the directory
@@ -4677,6 +4792,30 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 		return encErr
 	}
 
+	// Write the snapshot metadata file beside the artifact, recording the epoch
+	// the re-encryption above actually used.
+	//
+	// Without it the directory is anonymous to every scan: engine's purge-floor
+	// computation reads snapshot.meta for each snapshot directory and treats a
+	// MISSING file as "GC'd, imposes no floor", so the imported snapshot's DEK
+	// is legitimately dropped by the next PurgeEpochsBefore and the restored
+	// state becomes permanently undecryptable — StartShard then fails closed.
+	// For a disaster-recovery import that is total loss of the restore.
+	term := header.Term
+	if term == 0 {
+		term = 1
+	}
+	if metaErr := writeReceivedSnapshotMetadata(fsys, snapDir, header.Index, term,
+		shardID, replicaID, epoch, header.Compression); metaErr != nil {
+		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
+			slog.Debug("snapshot import directory cleanup failed",
+				"shard", shardID,
+				"dir", snapDir,
+				"error", rmErr)
+		}
+		return metaErr
+	}
+
 	// Make the directory entries durable BEFORE recording the snapshot in
 	// LogDB. The data file is fsynced (both the original write and the
 	// reencrypt rename above), but the entries MkdirAll, the file create, and
@@ -4714,11 +4853,8 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) 
 	// as imported), or the DEK epoch it was just re-encrypted under when a
 	// barrier is configured and unsealed. Recovery reads Epoch>0 as "decrypt
 	// before use", so this must reflect this host's own at-rest state, not
-	// the artifact's.
-	term := header.Term
-	if term == 0 {
-		term = 1
-	}
+	// the artifact's. term was floored above and is shared with the on-disk
+	// metadata so both descriptions of this snapshot agree.
 	logdbSnap := logdb.Snapshot{
 		Index:       header.Index,
 		Term:        term,

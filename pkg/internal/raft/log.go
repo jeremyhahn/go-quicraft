@@ -95,11 +95,32 @@ func newRaftLog(logdb LogReader) *raftLog {
 	ss := logdb.Snapshot()
 	firstIdx, lastIdx := logdb.IndexRange()
 
-	// Use LogDB's last index for inmem boundary, matching dragonboat.
-	// When no entries exist (lastIdx==0), fall back to state.Commit.
+	// Use LogDB's last index for the inmem boundary, matching dragonboat.
+	//
+	// The boundary must describe what the log ACTUALLY holds, and the only
+	// two things that establish that are recovered entries and a recovered
+	// snapshot. Deriving it from state.Commit — the previous fallback when
+	// lastIdx==0 — made the clamp below VACUOUS in the exact case the clamp
+	// exists for: newInMemory(state.Commit) sets markerIndex = state.Commit+1,
+	// so lastIndex() falls through to inmem.lastIndex() == state.Commit and
+	// `committed > lastIndex()` compares state.Commit against itself. A
+	// replica whose entry records were lost while its state record survived
+	// (disk wipe, partial restore, truncated WAL) came up claiming
+	// committed==state.Commit over an EMPTY log, and getConflictIndex skips
+	// every index at or below committed as "cannot conflict" — so it ACKed
+	// indices it holds nothing for and the leader counted that phantom match
+	// toward quorum.
+	//
+	// A snapshot's index IS a real lower bound on the log's extent: every
+	// index at or below it is captured by the snapshot. Taking the max of the
+	// two also keeps the clamp UP to the snapshot index (below) meaningful
+	// when a stale entry range outlives a newer snapshot record; deriving the
+	// boundary from the entry range alone would clamp committed straight back
+	// DOWN below the snapshot and re-open the processed > committed panic that
+	// clamp exists to prevent.
 	inmemStart := lastIdx
-	if inmemStart == 0 {
-		inmemStart = state.Commit
+	if ss.Index > inmemStart {
+		inmemStart = ss.Index
 	}
 
 	// processed = snapshot index, or firstIndex-1 if no snapshot.
@@ -140,10 +161,28 @@ func newRaftLog(logdb LogReader) *raftLog {
 	// invariant assertion in commitTo would eventually panic, but only after
 	// the false acknowledgement had already gone out.
 	if last := l.lastIndex(); l.committed > last {
-		slog.Warn("recovered commit index exceeds last log entry, clamping",
-			"recovered_commit", l.committed,
-			"last_index", last,
-			"snapshot_index", ss.Index)
+		if last == 0 {
+			// TOTAL loss: the state record survived but the log holds
+			// nothing at all — no entries and no snapshot. Clamping to 0
+			// makes this replica indistinguishable from a fresh one, which
+			// is exactly right: it re-learns its whole log, and its commit
+			// index, from the leader. It is also the only state in which
+			// the replica has NOTHING to prove any of its prior
+			// acknowledgements with, so it is logged at ERROR rather than
+			// WARN — the shard is running one replica short of its
+			// nominal durability until the leader refills it, and only an
+			// operator can tell a wiped volume from a restore that was
+			// never finished.
+			slog.Error("recovered commit index over an EMPTY log: entry records were lost while the state record survived; clamping to 0 and re-learning the log from the leader",
+				"recovered_commit", l.committed,
+				"recovered_term", state.Term,
+				"snapshot_index", ss.Index)
+		} else {
+			slog.Warn("recovered commit index exceeds last log entry, clamping",
+				"recovered_commit", l.committed,
+				"last_index", last,
+				"snapshot_index", ss.Index)
+		}
 		l.committed = last
 		if l.processed > l.committed {
 			l.processed = l.committed
