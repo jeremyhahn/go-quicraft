@@ -16,7 +16,6 @@ package quicraft
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -994,24 +993,17 @@ func detectSnapshotCompression(fsys snapshotFS, path string) (config.Compression
 	return config.NoCompression, nil
 }
 
-// snapshotRecvMetaSize is the metadata file size written beside a snapshot
-// artifact this host did not produce itself (received or imported). It is the
-// CANONICAL layout the snapshot pool writes for locally saved snapshots
-// (engine.writeSnapshotMetadata):
+// writeReceivedSnapshotMetadata writes the metadata record beside a snapshot
+// artifact this host did not produce itself (received from a peer or imported
+// from an operator artifact).
 //
-//	Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | CreatedAt(8) |
-//	Epoch(8) | Compression(8)
-//
-// The Epoch field is the reason the full layout is mandatory. The DEK purge
-// floor is computed by SCANNING snapshot directories and reading this field
-// (engine.readSnapshotEpoch): a file too short to contain it reads as CORRUPT
-// and a missing file reads as "no snapshot here, imposes no floor" — the latter
-// letting PurgeEpochsBefore destroy the DEK the artifact needs. Every writer of
-// a snapshot directory must therefore record its true epoch here.
-const snapshotRecvMetaSize = 7 * 8
-
-// writeReceivedSnapshotMetadata writes the binary metadata file beside a
-// snapshot artifact received from a peer or imported from an operator artifact.
+// The record is encoded by engine.MarshalSnapshotMeta — the SAME encoder the
+// snapshot pool uses for locally saved snapshots. Sharing it is mandatory, not
+// tidiness: the DEK purge floor is computed by SCANNING snapshot directories
+// and reading the Epoch field back (engine.readSnapshotEpoch). A record this
+// path writes in a layout of its own reads as corrupt or as epoch-less, and an
+// epoch-less directory suppresses key purging for the whole barrier until it
+// rolls off. That is exactly what a divergent 5-field layout here did.
 //
 // epoch is the at-rest encryption epoch of the artifact AS STORED (0 when it is
 // plaintext) and compression describes the bytes on disk; both must be the
@@ -1034,16 +1026,15 @@ func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, sha
 		}
 	}()
 
-	var buf [snapshotRecvMetaSize]byte
-	binary.LittleEndian.PutUint64(buf[0:], index)
-	binary.LittleEndian.PutUint64(buf[8:], term)
-	binary.LittleEndian.PutUint64(buf[16:], shardID)
-	binary.LittleEndian.PutUint64(buf[24:], replicaID)
-	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
-	binary.LittleEndian.PutUint64(buf[40:], epoch)
-	binary.LittleEndian.PutUint64(buf[48:], uint64(compression))
-
-	if _, writeErr := f.Write(buf[:]); writeErr != nil {
+	buf := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index:       index,
+		Term:        term,
+		ShardID:     shardID,
+		ReplicaID:   replicaID,
+		Epoch:       epoch,
+		Compression: compression,
+	})
+	if _, writeErr := f.Write(buf); writeErr != nil {
 		return writeErr
 	}
 	return f.Sync()

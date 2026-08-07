@@ -134,6 +134,17 @@ func isLocalControlMessage(msgType uint64) bool {
 	return ok
 }
 
+// isLocallyInjectedControlMessage reports whether msg is one this process built
+// and injected itself, and is therefore exempt from the Term != 0 requirement.
+//
+// BOTH conditions are required. The exemption is keyed on the ORIGIN as well as
+// the type: a wire Propose or ReadIndex forwarded by a follower carries that
+// follower's term and must go through the normal term comparisons, while a
+// term-less one can only have been built in this process.
+func isLocallyInjectedControlMessage(msg proto.Message) bool {
+	return msg.Origin.IsLocal() && isLocalControlMessage(msg.Type)
+}
+
 // isProcessLocalMessage reports whether a message type may only ever be
 // injected in-process, never received from a peer.
 func isProcessLocalMessage(msgType uint64) bool {
@@ -808,7 +819,7 @@ func (r *raft) step(msg proto.Message) error {
 	// Propose or ReadIndex forwarded by a follower carries that follower's
 	// term and passes through the normal term comparisons below, while a
 	// term-less one can only have been built in this process.
-	if msg.Term == 0 && !(msg.Origin.IsLocal() && isLocalControlMessage(msg.Type)) {
+	if msg.Term == 0 && !isLocallyInjectedControlMessage(msg) {
 		slog.Warn("dropped protocol message with no term",
 			"shard", r.shardID,
 			"replica", r.replicaID,

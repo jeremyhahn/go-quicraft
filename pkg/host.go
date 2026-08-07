@@ -213,7 +213,7 @@ func isNilMetricsCollector(c MetricsCollector) bool {
 	}
 	rv := reflect.ValueOf(c)
 	switch rv.Kind() {
-	case reflect.Ptr, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.Interface:
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.Interface:
 		return rv.IsNil()
 	default:
 		return false
@@ -1099,8 +1099,6 @@ type hostEngineCallback struct {
 // applied to the state machine. entries and results are parallel
 // slices. For each entry with a registered RequestState, the result
 // is delivered to the caller's channel.
-//
-//nolint:gocyclo // multi-branch dispatch for applied entry types is inherently complex
 func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, results []sm.Result) {
 	v, exists := c.h.nodes.Load(shardID)
 	if !exists {
@@ -1857,7 +1855,6 @@ type Host struct {
 	proposalKeySeq atomic.Uint64 // monotonic key generator for proposal tracking
 	readKeySeq     atomic.Uint64 // monotonic key generator for read request tracking
 	snapshotKeySeq atomic.Uint64 // monotonic key generator for snapshot request tracking
-	importSeq      atomic.Uint64 // monotonic counter for ImportSnapshot index uniqueness
 	pendingOps     atomic.Int64  // tracks outstanding pending operations for drain
 	keyRotStopC    chan struct{} // closed to stop the key rotation goroutine
 	keyRotDone     chan struct{} // closed when the key rotation goroutine exits
@@ -2242,6 +2239,12 @@ func (h *Host) verifyMemberCertificateExclusivity(members map[uint64]string) err
 //
 // ShardID and ReplicaID are taken from cfg. Both must be greater than zero.
 //
+// A replica configured as a witness (cfg.IsWitness) or an observer
+// (cfg.IsObserver) must NOT appear in members: that map seeds the full voting
+// membership, so it is rejected with *NonVotingRoleInMembersError. Bootstrap
+// the voters first, then start such a replica with join=true and add it with
+// RequestAddWitness / RequestAddObserver.
+//
 //nolint:gocyclo // shard startup has many validation and configuration branches
 func (h *Host) StartShard(members map[uint64]string, join bool, create sm.CreateFunc, cfg config.Config) error {
 	if h.closed.Load() {
@@ -2300,6 +2303,41 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				ReplicaID: replicaID,
 				Address:   addr,
 				Reason:    "address must be non-empty",
+			}
+		}
+	}
+
+	// A witness or an observer must never be seeded through the members map.
+	//
+	// members seeds proto.Membership.Addresses — the FULL VOTER set — and
+	// membership is REPLICATED state: every peer seeds the same replica from
+	// its own copy of the map, so this replica cannot hold a different role for
+	// itself than its peers hold for it. The local Config.IsWitness /
+	// Config.IsObserver bit would then contradict the configuration the whole
+	// shard agrees on: the leader sends this replica FULL entry payloads
+	// (sendAppend, not sendWitnessAppend), it counts as a full replica for the
+	// RequireFullReplicaMajority policy and toward every quorum, and the only
+	// witness-like behaviour left is this host's local read gate refusing the
+	// reads the operator asked for. raft.checkSelfRole latches that
+	// disagreement permanently for a witness.
+	//
+	// Fail closed. Seeding the local node into Membership.Witnesses instead
+	// would be worse — a replica-local membership that no peer shares — and
+	// suppressing the latch would hide a real misconfiguration. The supported
+	// flow is two-step (as for etcd/dragonboat learners): bootstrap the voters,
+	// then start this replica with join=true and add it with RequestAddWitness
+	// / RequestAddObserver so the role enters membership through a committed
+	// config change.
+	if cfg.IsWitness || cfg.IsObserver {
+		if _, listed := members[cfg.ReplicaID]; listed {
+			role := "observer"
+			if cfg.IsWitness {
+				role = "witness"
+			}
+			return &NonVotingRoleInMembersError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: cfg.ReplicaID,
+				Role:      role,
 			}
 		}
 	}
@@ -4685,60 +4723,14 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // value that contradicts the recorded one is refused with
 // ErrImportDataDirMismatch rather than silently resolved.
 //
-// The monotonic importSeq counter is used ONLY for the on-disk directory
-// name to guarantee uniqueness across rapid sequential imports; it is NOT
-// used as the Raft snapshot index (which comes from the artifact header).
+// The on-disk directory is named by the artifact's own snapshot INDEX, the
+// same way every other snapshot writer names one: the snapshot tree is ORDERED
+// by that name, so an import must take its rightful place among the shard's
+// existing snapshots rather than sorting as the oldest.
 func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, opts ...ImportOption) error {
-	if err := ctx.Err(); err != nil {
-		return mapContextError(err)
-	}
-	if h.closed.Load() {
-		return ErrClosed
-	}
-
-	// The import writes a full snapshot artifact to disk; starting one while
-	// the WAL disk monitor reports the volume full would only deepen the
-	// exhaustion and leave a truncated artifact behind.
-	if h.diskFull != nil && h.diskFull.Load() {
-		return ErrDiskFull
-	}
-
-	// Verify shard is NOT running.
-	_, running := h.nodes.Load(shardID)
-	if running {
-		return ErrInvalidOperation
-	}
-
-	if h.logdb == nil {
-		return ErrInvalidOperation
-	}
-
-	// Determine the replicaID from LogDB bootstrap info.
-	nodes, err := h.logdb.ListNodeInfo()
+	replicaID, err := h.importPreflight(ctx, shardID)
 	if err != nil {
 		return err
-	}
-	var replicaID uint64
-	for _, ni := range nodes {
-		if ni.ShardID == shardID {
-			replicaID = ni.ReplicaID
-			break
-		}
-	}
-	if replicaID == 0 {
-		return ErrShardNotFound
-	}
-
-	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
-	// unavailable for this shard, not that the shard is plaintext. Refuse
-	// before any directory, data file, or LogDB record exists, mirroring the
-	// same precheck HandleSnapshot enforces on the receive path: an imported
-	// artifact's bytes are plaintext (ExportSnapshot decrypts before writing
-	// them), so persisting them while sealed would durably downgrade a shard
-	// whose data must be encrypted at rest. reencryptReceivedSnapshot below
-	// re-checks and covers a seal that lands mid-import.
-	if h.snapshotEncryptionSealed(shardID) {
-		return ErrSnapshotBarrierSealed
 	}
 
 	// Parse the self-describing artifact header BEFORE touching disk so a
@@ -4750,39 +4742,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return err
 	}
 
-	// Use a monotonic atomic counter for the on-disk DIRECTORY NAME only,
-	// to guarantee uniqueness across rapid sequential calls (immune to
-	// clock rollback). The Raft snapshot index comes from the header.
-	dirSeq := h.importSeq.Add(1)
-
 	// Check context before performing I/O.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
 
-	// Build the path exactly as every other snapshot writer does: the shard's
-	// canonical base directory plus the engine's save-dir construction. Hand
-	// -rolling it here produced a tree one level shallower than the canonical
-	// one, so listSnapshotDirs never saw the import: snapshot GC leaked it, and
-	// — far worse — the imported snapshot's epoch never reached the DEK purge
-	// floor (which is computed by SCANNING these directories), so the next
-	// PurgeEpochsBefore legitimately dropped the DEK and StartShard then failed
-	// closed on an undecryptable snapshot: total loss of a disaster-recovery
-	// restore.
-	var iopts importOptions
-	for _, opt := range opts {
-		opt(&iopts)
-	}
-	// The layout comes from what StartShard RECORDED, not from what the caller
-	// remembered to declare. resolveImportDataDir fails closed when it can
-	// prove neither.
-	importDataDir, err := h.resolveImportDataDir(shardID, replicaID, iopts)
+	snapDir, err := h.importSnapshotDir(shardID, replicaID, header.Index, opts)
 	if err != nil {
 		return err
 	}
-	snapDir := engine.SnapshotSaveDir(
-		shardSnapshotBaseDir(h.cfg.NodeHostDir, importDataDir, shardID),
-		shardID, replicaID, dirSeq)
 
 	fsys := h.snapshotFsys()
 	// Record the deepest pre-existing ancestor BEFORE MkdirAll: the directory
@@ -4793,57 +4761,12 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return mkdirErr
 	}
 
-	// Write snapshot data file from the remaining (post-header) bytes.
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	f, createErr := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if createErr != nil {
-		return createErr
-	}
-	// Bound the copy by the maximum snapshot size. An unbounded io.Copy lets
-	// any artifact — a malformed stream, or one produced by a host with a
-	// larger limit — fill the volume before anything notices. The reader is
-	// given one byte past the maximum so an artifact exactly at the limit
-	// still imports while an oversized one is detected.
-	//
-	// The shard is stopped by definition here, so its per-shard
-	// Config.MaxSnapshotSize is not available; the package default is the
-	// applicable ceiling.
-	maxSize := config.DefaultMaxSnapshotSize
-	written, copyErr := io.Copy(f, io.LimitReader(r, int64(maxSize)+1))
-	if copyErr == nil && uint64(written) > maxSize {
-		copyErr = &SnapshotTooLargeError{ShardID: shardID, MaxSize: maxSize}
-	}
-	if copyErr != nil {
-		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot import file close failed after copy error",
-				"shard", shardID,
-				"path", dataPath,
-				"error", closeErr)
-		}
+	if writeErr := h.writeImportedSnapshotData(fsys, shardID, dataPath, r); writeErr != nil {
 		// Do not leave a partial (possibly multi-gigabyte) artifact behind
 		// for an import that will never be recorded in LogDB.
-		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
-			slog.Debug("snapshot import directory cleanup failed",
-				"shard", shardID,
-				"dir", snapDir,
-				"error", rmErr)
-		}
-		return copyErr
-	}
-	if syncErr := f.Sync(); syncErr != nil {
-		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot import file close failed after sync error",
-				"shard", shardID,
-				"path", dataPath,
-				"error", closeErr)
-		}
-		return syncErr
-	}
-	if closeErr := f.Close(); closeErr != nil {
-		slog.Debug("snapshot import file close failed",
-			"shard", shardID,
-			"path", dataPath,
-			"error", closeErr)
+		discardImportDir(fsys, shardID, snapDir)
+		return writeErr
 	}
 
 	// Re-encrypt the imported snapshot under THIS host's own barrier so it is
@@ -4859,12 +4782,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	if encErr != nil {
 		// Never recorded in LogDB, so the partial artifact must not be left
 		// behind for a later scan to trip over.
-		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
-			slog.Debug("snapshot import directory cleanup failed",
-				"shard", shardID,
-				"dir", snapDir,
-				"error", rmErr)
-		}
+		discardImportDir(fsys, shardID, snapDir)
 		return encErr
 	}
 
@@ -4883,12 +4801,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	}
 	if metaErr := writeReceivedSnapshotMetadata(fsys, snapDir, header.Index, term,
 		shardID, replicaID, epoch, header.Compression); metaErr != nil {
-		if rmErr := fsys.RemoveAll(snapDir); rmErr != nil {
-			slog.Debug("snapshot import directory cleanup failed",
-				"shard", shardID,
-				"dir", snapDir,
-				"error", rmErr)
-		}
+		discardImportDir(fsys, shardID, snapDir)
 		return metaErr
 	}
 
@@ -4944,6 +4857,159 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		Compression: header.Compression,
 	}
 	return h.logdb.SaveSnapshot(shardID, replicaID, logdbSnap)
+}
+
+// importPreflight refuses an import that must not touch disk at all, and
+// resolves the shard's replicaID from the LogDB bootstrap records.
+//
+// Every check here runs BEFORE any directory, data file or LogDB record
+// exists, so a refusal leaves no partial state behind.
+func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, mapContextError(err)
+	}
+	if h.closed.Load() {
+		return 0, ErrClosed
+	}
+
+	// The import writes a full snapshot artifact to disk; starting one while
+	// the WAL disk monitor reports the volume full would only deepen the
+	// exhaustion and leave a truncated artifact behind.
+	if h.diskFull != nil && h.diskFull.Load() {
+		return 0, ErrDiskFull
+	}
+
+	// Verify shard is NOT running.
+	if _, running := h.nodes.Load(shardID); running {
+		return 0, ErrInvalidOperation
+	}
+
+	if h.logdb == nil {
+		return 0, ErrInvalidOperation
+	}
+
+	// Determine the replicaID from LogDB bootstrap info.
+	nodes, err := h.logdb.ListNodeInfo()
+	if err != nil {
+		return 0, err
+	}
+	var replicaID uint64
+	for _, ni := range nodes {
+		if ni.ShardID == shardID {
+			replicaID = ni.ReplicaID
+			break
+		}
+	}
+	if replicaID == 0 {
+		return 0, ErrShardNotFound
+	}
+
+	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
+	// unavailable for this shard, not that the shard is plaintext. Refuse
+	// before any directory, data file, or LogDB record exists, mirroring the
+	// same precheck HandleSnapshot enforces on the receive path: an imported
+	// artifact's bytes are plaintext (ExportSnapshot decrypts before writing
+	// them), so persisting them while sealed would durably downgrade a shard
+	// whose data must be encrypted at rest. reencryptReceivedSnapshot in the
+	// caller re-checks and covers a seal that lands mid-import.
+	if h.snapshotEncryptionSealed(shardID) {
+		return 0, ErrSnapshotBarrierSealed
+	}
+	return replicaID, nil
+}
+
+// importSnapshotDir resolves the canonical on-disk directory an imported
+// artifact must be written to.
+//
+// The path is built exactly as every other snapshot writer builds one: the
+// shard's canonical base directory plus the engine's save-dir construction.
+// Hand-rolling it here produced a tree one level shallower than the canonical
+// one, so listSnapshotDirs never saw the import: snapshot GC leaked it, and —
+// far worse — the imported snapshot's epoch never reached the DEK purge floor
+// (which is computed by SCANNING these directories), so the next
+// PurgeEpochsBefore legitimately dropped the DEK and StartShard then failed
+// closed on an undecryptable snapshot: total loss of a disaster-recovery
+// restore.
+//
+// index is the artifact's OWN snapshot index and names the directory, exactly
+// as every other snapshot writer names one. That name is not decoration:
+// listSnapshotDirs PARSES it and ORDERS by it, gcSnapshotDirs deletes the
+// lowest-ordered directories, and latestSnapshotDir — the recovery fallback —
+// picks the highest. Naming an import by a per-host sequence number instead
+// made a disaster-recovery restore sort as the OLDEST snapshot on a node that
+// already had some: first in line for GC, and never chosen by the recovery
+// fallback, which would prefer a stale but higher-numbered directory.
+func (h *Host) importSnapshotDir(shardID, replicaID, index uint64, opts []ImportOption) (string, error) {
+	var iopts importOptions
+	for _, opt := range opts {
+		opt(&iopts)
+	}
+	// The layout comes from what StartShard RECORDED, not from what the caller
+	// remembered to declare. resolveImportDataDir fails closed when it can
+	// prove neither.
+	importDataDir, err := h.resolveImportDataDir(shardID, replicaID, iopts)
+	if err != nil {
+		return "", err
+	}
+	return engine.SnapshotSaveDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, importDataDir, shardID),
+		shardID, replicaID, index), nil
+}
+
+// writeImportedSnapshotData writes the artifact's post-header bytes to the
+// snapshot data file and makes them durable. The file is always closed; on
+// error the caller discards the whole directory.
+func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPath string, r io.Reader) error {
+	f, createErr := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if createErr != nil {
+		return createErr
+	}
+	closeFile := func(when string) {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Debug("snapshot import file close failed",
+				"shard", shardID,
+				"path", dataPath,
+				"when", when,
+				"error", closeErr)
+		}
+	}
+
+	// Bound the copy by the maximum snapshot size. An unbounded io.Copy lets
+	// any artifact — a malformed stream, or one produced by a host with a
+	// larger limit — fill the volume before anything notices. The reader is
+	// given one byte past the maximum so an artifact exactly at the limit
+	// still imports while an oversized one is detected.
+	//
+	// The shard is stopped by definition here, so its per-shard
+	// Config.MaxSnapshotSize is not available; the package default is the
+	// applicable ceiling.
+	maxSize := config.DefaultMaxSnapshotSize
+	written, copyErr := io.Copy(f, io.LimitReader(r, int64(maxSize)+1))
+	if copyErr == nil && uint64(written) > maxSize {
+		copyErr = &SnapshotTooLargeError{ShardID: shardID, MaxSize: maxSize}
+	}
+	if copyErr != nil {
+		closeFile("copy_error")
+		return copyErr
+	}
+	if syncErr := f.Sync(); syncErr != nil {
+		closeFile("sync_error")
+		return syncErr
+	}
+	closeFile("write_complete")
+	return nil
+}
+
+// discardImportDir removes an import directory that will never be recorded in
+// LogDB. A removal failure is logged and otherwise ignored: the caller is
+// already returning the error that caused the discard.
+func discardImportDir(fsys snapshotFS, shardID uint64, dir string) {
+	if rmErr := fsys.RemoveAll(dir); rmErr != nil {
+		slog.Debug("snapshot import directory cleanup failed",
+			"shard", shardID,
+			"dir", dir,
+			"error", rmErr)
+	}
 }
 
 // clampNonNegative converts an activeNodes count to a slice capacity, flooring

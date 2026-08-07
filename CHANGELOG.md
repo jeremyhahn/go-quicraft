@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`snapshot.meta` is now self-describing and grew to 72 bytes.** Every record written by this version carries a `QRSNAPMD` magic, a format version and a body length ahead of the existing fields (`Index | Term | ShardID | ReplicaID | CreatedAt | Epoch | Compression`), so a reader can tell a field that is ABSENT — written by a different version — from bytes that are CORRUPT. Body fields are append-only from here: appending one bumps the version and leaves every existing offset alone.
+
+  Compatibility is one-way and requires no migration step. **Records written by earlier versions are still read**, positionally, at their original offsets: the 40-byte layout (the snapshot receive and import paths, which recorded no `Epoch`), and the 48- and 56-byte layouts (the snapshot save path, with `Epoch`, and with `Epoch` + `Compression`). Nothing rewrites an existing record; a legacy directory keeps its record until the snapshot rolls off. **An older binary cannot read a record written by this version** — it will read one as corrupt, which is fail-safe there (it suppresses DEK purging) but means a downgrade must be treated as a wipe-and-restore, consistent with the `0.2.0-alpha` on-disk break
+
 - `TransportConfig.MaxDecompressedSize` is pinned to `MaxFrameSize` and rejected if set to anything else. Configuring it lower bought no bomb protection — a peer that wants the node to buffer 16 MB can simply send an uncompressed 16 MB frame — while creating an asymmetric wire contract in which a receiver silently stopped accepting replication that every sender considered valid. `SetDefaults` still maps 0 to the pinned value, so deployments that never set it are unaffected
 
 ### Fixed
@@ -34,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - `WithShardBarriers` without `WithBarrier` or `WithLogDB` is refused: the default WAL takes one barrier, so per-shard encryption alone produced encrypted snapshots over a plaintext log while an operator's spot-check showed encryption working
+- **A failed sweep of a snapshot decrypt scratch file is now reported.** Both decrypt paths (recovery and snapshot send) write a full plaintext copy of the state machine to a sibling scratch file and remove it when done; the sweeper reclaims what a crash orphaned. A failed removal — a read-only mount, a permissions or ownership change — was logged at DEBUG and returned to no caller, so the plaintext copy stayed next to its ciphertext for the life of the snapshot directory with nothing to signal it. Failures (and a directory the sweep cannot even list) now log at WARN and increment a process-wide counter, `engine.StaleDecryptSweepFailures()`; any increase warrants an alert
+- **One snapshot directory with an indeterminate epoch no longer hides the others.** The DEK purge-floor scan returned on the first directory it could not evaluate, so its log named one directory while the next scan named the next. The scan now visits every directory and reports them all in a single record, with the reason for each (`legacy_record_without_epoch` vs `unreadable`). The VERDICT is unchanged and deliberately so: an epoch that cannot be established may be any epoch, so such a directory suppresses purging for the barrier that could have sealed it — in per-shard-barrier mode that is one tenant's barrier, and other tenants keep purging normally
 
 
 ## [0.2.0-alpha] - 2026-08-06

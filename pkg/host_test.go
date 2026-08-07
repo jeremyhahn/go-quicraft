@@ -3878,10 +3878,13 @@ func TestReadIndex_WitnessReturnsInvalidOperation(t *testing.T) {
 	}
 	defer h.Close()
 
-	members := map[uint64]string{1: "127.0.0.1:5000"}
+	// A witness can only enter a shard through the supported two-step flow:
+	// it starts with join=true and the leader adds it with RequestAddWitness.
+	// StartShard refuses to bootstrap it through the members map, which seeds
+	// the full voting set (see TestStartShard_RejectsWitnessOrObserverInMembers).
 	scfg := testShardConfig(1, 1)
 	scfg.IsWitness = true
-	err = h.StartShard(members, false, testCreateFunc, scfg)
+	err = h.StartShard(nil, true, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
@@ -5445,9 +5448,14 @@ func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	if !got.Membership.Removed[5] {
 		t.Errorf("imported Removed not preserved: %#v", got.Membership.Removed)
 	}
-	// The on-disk directory uses importSeq (not the Raft index 4242).
-	if filepath.Base(got.Filepath) == "snapshot-00000000000000004242" {
-		t.Errorf("directory name should use importSeq, not the Raft index: %q", got.Filepath)
+	// The on-disk directory is named by the snapshot's own Raft index, the
+	// same way every other snapshot writer names one. The snapshot tree is
+	// ORDERED by that name (listSnapshotDirs parses it; gcSnapshotDirs deletes
+	// the lowest, latestSnapshotDir picks the highest), so a per-host import
+	// sequence number would make this restore sort as the oldest snapshot on
+	// the node.
+	if base := filepath.Base(got.Filepath); base != "snapshot-00000000000000004242" {
+		t.Errorf("directory name = %q, want snapshot-00000000000000004242 (the Raft index)", base)
 	}
 }
 

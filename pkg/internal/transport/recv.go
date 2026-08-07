@@ -435,8 +435,14 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 				// rather than blocking acceptance of new streams.
 				return
 			}
-			defer func() { <-snapSem }()
-			t.handleSnapshotStream(inboundConn, stream, length)
+			// The release is deferred inside a closure rather than in the
+			// loop body: the transfer is the last thing this stream does, so
+			// the slot must come back when handleSnapshotStream returns —
+			// including when it panics.
+			func() {
+				defer func() { <-snapSem }()
+				t.handleSnapshotStream(inboundConn, stream, length)
+			}()
 			return
 		}
 

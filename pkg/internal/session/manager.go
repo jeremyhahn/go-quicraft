@@ -138,7 +138,11 @@ func (m *Manager) CheckDuplicate(clientID, seriesID, index uint64) (sm.Result, b
 // preserving at-most-once semantics: an entry that cannot be cached must
 // never be applied, otherwise a later replay would re-apply it because no
 // cached response exists to deduplicate against.
-func (m *Manager) CanRecord(clientID, seriesID, respondedTo, pending uint64) error {
+// The entry's own seriesID is deliberately not a parameter: the question is
+// whether the cache has ROOM after eviction, and a new response always consumes
+// a slot (a duplicate seriesID is answered from the cache by the dedup path and
+// never reaches this check).
+func (m *Manager) CanRecord(clientID, respondedTo, pending uint64) error {
 	sess, exists := m.sessions[clientID]
 	if !exists {
 		return ErrSessionNotFound

@@ -1048,6 +1048,18 @@ Source: `pkg/config/config.go`
 | `ZeroCopyEntryCmd`      | `bool`            | `false`    | Zero-copy Entry.Cmd (unsafe if retained) |
 | `LeaseRead`             | `bool`            | `false`    | Enable lease-based reads (PhD 6.4)       |
 
+> **`IsObserver` / `IsWitness` are join-only.** The authoritative role lives in
+> REPLICATED membership (`Membership.Observers` / `Membership.Witnesses`), not in
+> the local config. The `members` map passed to `StartShard` seeds
+> `Membership.Addresses` — the **full voter set** — on every replica that lists
+> it, so a witness or observer named there is a full voter in the configuration
+> the whole shard agrees on: the leader replicates full entry payloads to it, it
+> counts toward every quorum, and only this host's local read gate still behaves
+> like a witness. `StartShard` rejects that shape with
+> `*NonVotingRoleInMembersError`. Bootstrap the voters first, then start the
+> replica with `join=true` and add it with `RequestAddWitness` /
+> `RequestAddObserver`.
+
 ### TransportConfig
 
 Source: `pkg/config/transportconfig.go`

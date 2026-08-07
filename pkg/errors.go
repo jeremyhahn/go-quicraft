@@ -604,6 +604,67 @@ func (e *InvalidMemberError) Is(target error) bool {
 	return target == ErrInvalidMember
 }
 
+// ErrNonVotingRoleInMembers is the sentinel for *NonVotingRoleInMembersError.
+var ErrNonVotingRoleInMembers = errors.New(
+	"quicraft: a witness or observer cannot be bootstrapped through the initial members map")
+
+// NonVotingRoleInMembersError is returned by Host.StartShard when the local
+// replica is configured as a witness (Config.IsWitness) or an observer
+// (Config.IsObserver) and also appears in the initial members map.
+//
+// The members map seeds proto.Membership.Addresses — the FULL VOTER set — and
+// membership is REPLICATED state: every peer seeds the same replica into its
+// own Addresses from its own copy of that map, so one replica cannot
+// unilaterally hold a different role for itself than its peers hold for it.
+// A witness bootstrapped this way is therefore a full voter everywhere:
+//
+//   - the leader replicates FULL entry payloads to it (sendAppend), never the
+//     metadata-only entries sendWitnessAppend produces for
+//     Membership.Witnesses, so it consumes the disk of a full replica;
+//   - it counts as a full replica for the replicated
+//     RequireFullReplicaMajority policy, inflating the shard's apparent
+//     durability;
+//   - the only behaviour that still looks like a witness is this host's local
+//     propose/read gate, which refuses exactly the reads the operator expects
+//     the replica to serve;
+//   - and the raft layer permanently latches the disagreement (roleMismatch),
+//     after which the replica can neither campaign nor serve reads.
+//
+// An observer bootstrapped this way is likewise a full VOTER: it is counted in
+// every quorum and it grants votes, while the local Config.IsObserver gate only
+// stops it from campaigning. The operator asks for a non-voting learner and
+// silently gets a voter that never stands for election — the voting set is
+// larger than the operator believes, so the shard tolerates fewer failures than
+// intended.
+//
+// The supported flow is the two-step one etcd and dragonboat use for learners:
+// bootstrap the full voters, then start the witness/observer with join=true and
+// add it with Host.RequestAddWitness / Host.RequestAddObserver, which writes it
+// into Membership.Witnesses / Membership.Observers through a committed config
+// change every replica applies identically.
+type NonVotingRoleInMembersError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	// Role is the non-voting role the local Config declared: "witness" or
+	// "observer". Config.Validate already rejects both at once.
+	Role string
+}
+
+// Error returns a human-readable description.
+func (e *NonVotingRoleInMembersError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d is configured as a %s but is listed in the initial "+
+			"members map, which seeds the full voting membership; bootstrap the voters "+
+			"first, then start this replica with join=true and add it through a config change",
+		e.ShardID, e.ReplicaID, e.Role,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrNonVotingRoleInMembers.
+func (e *NonVotingRoleInMembersError) Is(target error) bool {
+	return target == ErrNonVotingRoleInMembers
+}
+
 // TypeAssertionError is returned when a type assertion fails on data
 // retrieved from sync.Map or other interface{} sources. This indicates
 // an internal programming error where the stored type does not match

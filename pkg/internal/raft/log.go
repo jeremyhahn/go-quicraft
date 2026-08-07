@@ -145,12 +145,30 @@ func newRaftLog(logdb LogReader) *raftLog {
 	// toward quorum.
 	//
 	// A snapshot's index IS a real lower bound on the log's extent: every
-	// index at or below it is captured by the snapshot. Taking the max of the
-	// two also keeps the clamp UP to the snapshot index (below) meaningful
-	// when a stale entry range outlives a newer snapshot record; deriving the
-	// boundary from the entry range alone would clamp committed straight back
-	// DOWN below the snapshot and re-open the processed > committed panic that
-	// clamp exists to prevent.
+	// index at or below it is captured by the snapshot.
+	//
+	// The max has effect in EXACTLY ONE case: lastIdx == 0, i.e. the LogDB
+	// holds no entries. lastIndex() prefers logdb.IndexRange() whenever it is
+	// non-zero and only falls through to inmem.lastIndex() when it is zero, so
+	// with any recovered entry range this seed is never read back and the max
+	// changes nothing (a snapshot record NEWER than a surviving entry range is
+	// therefore still clamped down to that entry range by the clamp below —
+	// the boundary seed does not protect against it).
+	//
+	// That last case is NOT reachable through recovery: recoverLogReader calls
+	// LogReader.ApplySnapshot before SetState, which moves the reader's marker
+	// to ss.Index, so IndexRange — and hence lastIndex() — never reports a last
+	// index BELOW a recovered snapshot. Probed directly: entries 1..5 with a
+	// snapshot record at 10 yields lastIndex()==10 and committed stays 10.
+	// The clamp below therefore cannot pull committed under a snapshot index
+	// that is committed by construction.
+	//
+	// The one case it does cover is the snapshot-only replica: a replica whose
+	// entries were all compacted away, or lost, while its snapshot record
+	// survived. Seeding the boundary from ss.Index makes inmem.lastIndex() —
+	// and hence lastIndex() — report the snapshot index instead of 0, so the
+	// clamp below does not read the log as EMPTY and reset a replica that
+	// legitimately holds state through ss.Index back to a fresh one.
 	inmemStart := lastIdx
 	if ss.Index > inmemStart {
 		inmemStart = ss.Index

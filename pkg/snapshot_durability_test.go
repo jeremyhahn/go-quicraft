@@ -275,9 +275,16 @@ func TestSnapshotReceive_AckImpliesDurable(t *testing.T) {
 			if !ok {
 				t.Fatalf("DURABILITY VIOLATION: %s is gone after crash", metaPath)
 			}
-			if len(meta) != snapshotRecvMetaSize {
-				t.Fatalf("DURABILITY VIOLATION: snapshot metadata is %d bytes after crash, want %d",
-					len(meta), snapshotRecvMetaSize)
+			parsed, parseErr := engine.ParseSnapshotMeta(meta)
+			if parseErr != nil {
+				t.Fatalf("DURABILITY VIOLATION: snapshot metadata (%d bytes) does not decode "+
+					"after crash: %v", len(meta), parseErr)
+			}
+			if !parsed.EpochRecorded || !parsed.CompressionRecorded {
+				t.Fatalf("DURABILITY VIOLATION: snapshot metadata survived the crash without "+
+					"its epoch/compression fields (epoch_recorded=%v compression_recorded=%v); "+
+					"the artifact's DEK floor and reader chain are then unknown",
+					parsed.EpochRecorded, parsed.CompressionRecorded)
 			}
 		})
 	}

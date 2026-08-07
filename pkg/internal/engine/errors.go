@@ -40,6 +40,13 @@ var (
 	// the configured Config.MaxSnapshotSize limit.
 	ErrSnapshotTooLarge = errors.New("engine: snapshot exceeds MaxSnapshotSize")
 
+	// ErrSnapshotMetaCorrupt is returned by ParseSnapshotMeta when a
+	// snapshot.meta image is neither a versioned record nor one of the
+	// recognised pre-magic layouts. It means "these bytes say nothing about
+	// the artifact beside them", NOT "the artifact is unencrypted": the DEK
+	// purge floor must treat the directory as unevaluable.
+	ErrSnapshotMetaCorrupt = errors.New("engine: snapshot metadata record is corrupt or foreign")
+
 	// ErrSnapshotEncryptedBarrierUnavailable is returned when a snapshot
 	// recorded with Epoch > 0 cannot be read because the barrier required to
 	// decrypt it is absent or sealed. Recovery fails so the leader re-sends

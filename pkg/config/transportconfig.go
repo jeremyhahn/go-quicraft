@@ -311,7 +311,21 @@ func (tc *TransportConfig) SetDefaults() {
 // Validate checks all transport configuration constraints. Returns a
 // *ValidationError describing the first violated rule, or nil
 // if the configuration is valid.
+//
+// The three groups are checked in a FIXED order — limits, then mTLS material,
+// then revocation — because callers and tests observe the FIRST violated rule.
 func (tc *TransportConfig) Validate() error {
+	if err := tc.validateLimits(); err != nil {
+		return err
+	}
+	if err := tc.validateMTLS(); err != nil {
+		return err
+	}
+	return tc.validateRevocation()
+}
+
+// validateLimits checks the numeric transport limits.
+func (tc *TransportConfig) validateLimits() error {
 	if tc.StreamPoolSize < 1 {
 		return newValidationError("TransportConfig.StreamPoolSize", "must be >= 1")
 	}
@@ -370,10 +384,15 @@ func (tc *TransportConfig) Validate() error {
 		return newValidationError("TransportConfig.StreamReadIdleTimeout",
 			"must be >= 0 (0 uses the default)")
 	}
-	// When transport is enabled, MTLSConfig must be provided. All QUIC
-	// connections require mTLS; there is no insecure fallback. When
-	// TransportDisabled is true (set by WithoutTransport()), this
-	// validation is skipped.
+	return nil
+}
+
+// validateMTLS checks the mandatory mTLS material.
+//
+// When transport is enabled, MTLSConfig must be provided. All QUIC connections
+// require mTLS; there is no insecure fallback. When TransportDisabled is true
+// (set by WithoutTransport()), this validation is skipped.
+func (tc *TransportConfig) validateMTLS() error {
 	if !tc.TransportDisabled {
 		if tc.MTLSConfig == nil {
 			return &MTLSConfigRequiredError{}
@@ -409,6 +428,11 @@ func (tc *TransportConfig) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateRevocation checks the optional certificate-revocation configuration.
+func (tc *TransportConfig) validateRevocation() error {
 	if rc := tc.RevocationConfig; rc != nil {
 		// Reject unknown mode strings: a typo ("CRL", "strict") would
 		// otherwise silently select the default strategy.

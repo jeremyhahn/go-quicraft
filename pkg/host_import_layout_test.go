@@ -17,7 +17,6 @@ package quicraft
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -104,9 +103,10 @@ func TestImportSnapshot_ReachesDEKPurgeFloorAndGC(t *testing.T) {
 			}
 
 			// The path must be the SAME construction every other snapshot
-			// writer uses, honouring the shard's DataDir.
+			// writer uses, honouring the shard's DataDir — including the
+			// directory name, which is the snapshot's own index (900 here).
 			base := shardSnapshotBaseDir(cfg.NodeHostDir, shardCfg.DataDir, shardID)
-			wantDir := engine.SnapshotSaveDir(base, shardID, replicaID, 1)
+			wantDir := engine.SnapshotSaveDir(base, shardID, replicaID, 900)
 			if imported.Filepath != wantDir {
 				t.Fatalf("imported snapshot Filepath = %q, want the canonical %q",
 					imported.Filepath, wantDir)
@@ -206,14 +206,16 @@ func readSnapshotMetaFields(t *testing.T, dir string) (epoch, index, term uint64
 		t.Fatalf("snapshot.meta unreadable in %s: %v (the purge-floor scan reads "+
 			"a missing file as \"imposes no floor\")", dir, err)
 	}
-	if len(data) != snapshotRecvMetaSize {
-		t.Fatalf("snapshot.meta size = %d, want %d: too short to carry the epoch "+
-			"field the purge-floor scan reads", len(data), snapshotRecvMetaSize)
+	meta, parseErr := engine.ParseSnapshotMeta(data)
+	if parseErr != nil {
+		t.Fatalf("snapshot.meta in %s is not a record the purge-floor scan can read: %v",
+			dir, parseErr)
 	}
-	index = binary.LittleEndian.Uint64(data[0:])
-	term = binary.LittleEndian.Uint64(data[8:])
-	epoch = binary.LittleEndian.Uint64(data[40:])
-	return epoch, index, term
+	if !meta.EpochRecorded {
+		t.Fatalf("snapshot.meta in %s does not carry the epoch field the purge-floor "+
+			"scan reads", dir)
+	}
+	return meta.Epoch, meta.Index, meta.Term
 }
 
 // H3. The DataDir layout must be DISCOVERED, not declared.

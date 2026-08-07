@@ -147,8 +147,8 @@ Source: `pkg/config/config.go`
 |-------|------|---------|-------------|
 | `ShardID` | uint64 | (set by StartShard) | Shard identifier (caller-provided) |
 | `ReplicaID` | uint64 | (set by StartShard) | Replica identifier (caller-provided) |
-| `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution) |
-| `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only) |
+| `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Join-only: never list it in the `StartShard` members map — see below |
+| `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only). Join-only: never list it in the `StartShard` members map — see below |
 | `CheckQuorum` | bool | `true` | Leader steps down on quorum loss (safety-critical) |
 | `PreVote` | bool | `true` | Pre-vote prevents disruptive elections (safety-critical) |
 | `ElectionRTT` | uint64 | `10` | Election timeout in RTT multiples (must be >= 5) |
@@ -169,6 +169,29 @@ Source: `pkg/config/config.go`
 | `ZeroCopyEntryCmd` | bool | `false` | Zero-copy entry data (SM must copy if retained) |
 | `SessionExpiryEntries` | uint64 | `0` (disabled) | Expire sessions inactive for this many log entries |
 | `LeaseRead` | bool | `false` | Lease-based reads (no heartbeat RTT, requires CheckQuorum) |
+
+#### Starting a witness or an observer
+
+A replica's witness/observer role is REPLICATED state (`Membership.Witnesses` /
+`Membership.Observers`); `IsWitness` / `IsObserver` only tell the local replica
+what it was started as. The `members` map passed to `StartShard` seeds
+`Membership.Addresses` — the **full voter set** — on every replica that lists
+it, so naming a witness there makes it a full voter in the configuration the
+whole shard agrees on: the leader replicates full entry payloads to it (no
+metadata-only stripping), it counts as a full replica for
+`RequireFullReplicaMajority` and toward every quorum, it consumes full-replica
+disk, and the only witness-like behaviour left is this host refusing the reads
+you wanted it to serve. `StartShard` rejects that shape with
+`*NonVotingRoleInMembersError`.
+
+Use the two-step flow:
+
+1. Bootstrap the full voters with `StartShard(members, join=false, ...)`.
+2. On the witness/observer node, `StartShard(nil, join=true, ...)` with
+   `IsWitness` / `IsObserver` set.
+3. On the leader, `SyncRequestAddWitness` / `SyncRequestAddObserver` for that
+   replica ID. The role then enters membership through a committed config change
+   every replica applies identically.
 
 ### TransportConfig
 

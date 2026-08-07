@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
@@ -166,15 +167,7 @@ type snapshotPool struct {
 const (
 	snapshotDataFile     = "snapshot.dat"
 	snapshotMetadataFile = "snapshot.meta"
-	// snapshotMetaSize covers 7 uint64 fields: Index, Term, ShardID,
-	// ReplicaID, CreatedAt, Epoch, Compression.
-	snapshotMetaSize = 7 * 8
-	// snapshotMetaEpochOffset is the byte offset of the Epoch field. Readers
-	// that need only Epoch bound-check against this offset rather than the
-	// whole record, so a metadata file written before a later field was
-	// appended still yields a trustworthy epoch for the DEK purge floor.
-	snapshotMetaEpochOffset = 5 * 8
-	maxSnapshotsRetained    = 3 // keep last 3 snapshots
+	maxSnapshotsRetained = 3 // keep last 3 snapshots
 
 	// snapshotEncryptChunkSize is the chunk size for streaming encryption
 	// of snapshot data. 64 KB balances between per-chunk overhead and
@@ -1494,6 +1487,107 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barri
 	return tmpPath, nil
 }
 
+// snapshotFloorBlocker names one snapshot directory that could not be
+// evaluated, and why.
+type snapshotFloorBlocker struct {
+	path      string
+	shardID   uint64
+	replicaID uint64
+	reason    string
+}
+
+// snapshotFloorScan folds the retained snapshot directories of one or more
+// shards into the minimum barrier epoch those artifacts still require.
+//
+// It NEVER short-circuits. The verdict is fixed the moment the first
+// unevaluable directory is seen — an epoch that cannot be established may be
+// any epoch, so purging must stop — but the scan continues so a single
+// operator-facing log names EVERY blocking directory. Returning on the first
+// one is what made this condition so hard to clear: the operator fixed the
+// directory the log named and the next scan simply named the next.
+//
+// A directory can be unevaluable for two different reasons (a legacy record
+// that predates the Epoch field, or an unreadable/corrupt one); both are
+// recorded with their reason and both block. The distinction is diagnostic
+// ONLY — see the note on purgeOldEpochs for why neither can be skipped.
+type snapshotFloorScan struct {
+	// minEpoch is the lowest epoch any evaluable retained artifact still
+	// needs, or 0 when no evaluable artifact is encrypted.
+	minEpoch uint64
+
+	// blockers names every directory that could not be evaluated. Non-empty
+	// means the floor is unusable and nothing may be purged.
+	blockers []snapshotFloorBlocker
+}
+
+// maxReportedFloorBlockers bounds how many blocking directories a single log
+// record names. A host with thousands of shards can have many; the count is
+// always reported in full, the paths are a sample.
+const maxReportedFloorBlockers = 8
+
+// addNode folds every retained snapshot directory of one node into the scan.
+func (s *snapshotFloorScan) addNode(node *Node) {
+	dirs, err := listSnapshotDirs(node.SnapshotDir(), node.ShardID(), node.ReplicaID())
+	if err != nil {
+		// Cannot enumerate this shard's snapshots: which epochs it still
+		// references is unknown, so the floor is unusable.
+		s.block(node.SnapshotDir(), node, "snapshot_directory_scan_failed")
+		return
+	}
+	for _, d := range dirs {
+		epoch, status := readSnapshotEpoch(d.path)
+		switch status {
+		case snapshotEpochKnown:
+			if epoch == 0 {
+				continue // unencrypted (or GC'd) snapshot, contributes no floor
+			}
+			if s.minEpoch == 0 || epoch < s.minEpoch {
+				s.minEpoch = epoch
+			}
+		default:
+			s.block(d.path, node, status.String())
+		}
+	}
+}
+
+// block records an unevaluable directory.
+func (s *snapshotFloorScan) block(path string, node *Node, reason string) {
+	s.blockers = append(s.blockers, snapshotFloorBlocker{
+		path:      path,
+		shardID:   node.ShardID(),
+		replicaID: node.ReplicaID(),
+		reason:    reason,
+	})
+}
+
+// blocked reports whether any directory could not be evaluated.
+func (s *snapshotFloorScan) blocked() bool {
+	return len(s.blockers) > 0
+}
+
+// report logs the complete set of blocking directories as ONE record, so an
+// operator can see at a glance why key purging is suppressed and which
+// directories must roll off (or be repaired) before it resumes.
+func (s *snapshotFloorScan) report(scope string) {
+	if !s.blocked() {
+		return
+	}
+	sample := s.blockers
+	if len(sample) > maxReportedFloorBlockers {
+		sample = sample[:maxReportedFloorBlockers]
+	}
+	paths := make([]string, 0, len(sample))
+	for _, b := range sample {
+		paths = append(paths, fmt.Sprintf("%s (shard=%d replica=%d reason=%s)",
+			b.path, b.shardID, b.replicaID, b.reason))
+	}
+	slog.Warn("epoch purge suppressed: snapshot directories with an indeterminate epoch",
+		"scope", scope,
+		"blocking_directories", len(s.blockers),
+		"sample", paths,
+	)
+}
+
 // globalSafePurgeFloor computes the minimum barrier epoch still required by
 // ANY shard sharing this process-wide barrier. It is the single source of
 // truth for safe DEK purging and is the minimum over:
@@ -1519,30 +1613,17 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 		return 0, false
 	}
 
-	var snapshotMinEpoch uint64
+	var scan snapshotFloorScan
 	for _, node := range p.nodes() {
-		dirs, err := listSnapshotDirs(node.SnapshotDir(), node.ShardID(), node.ReplicaID())
-		if err != nil {
-			// Fail safe: a scan error means we cannot know which epochs are
-			// still referenced, so we must not purge anything.
-			return 0, false
-		}
-		for _, d := range dirs {
-			epoch, ok := readSnapshotEpoch(d.path)
-			if !ok {
-				// Unreadable/corrupt snapshot metadata: the epoch is unknown,
-				// so we cannot prove which DEKs are still referenced. Fail safe
-				// rather than dropping this snapshot from the floor (over-purge).
-				return 0, false
-			}
-			if epoch == 0 {
-				continue // unencrypted (or GC'd) snapshot, contributes no floor
-			}
-			if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
-				snapshotMinEpoch = epoch
-			}
-		}
+		scan.addNode(node)
 	}
+	if scan.blocked() {
+		// Fail safe: at least one directory's epoch is indeterminate, so we
+		// cannot know which DEKs are still referenced.
+		scan.report("global")
+		return 0, false
+	}
+	snapshotMinEpoch := scan.minEpoch
 
 	// Determine the global WAL floor. The LogDB is per-host, so MinLiveEpoch
 	// already spans all shards (verified: waldb.DB.MinLiveEpoch ranges all
@@ -1628,28 +1709,20 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		}
 	}
 
-	// (a) Snapshot floor restricted to shards mapped to the target barrier.
-	var snapshotMinEpoch uint64
+	// (a) Snapshot floor restricted to shards mapped to the target barrier. A
+	// directory belonging to a DIFFERENT barrier is never scanned here, so an
+	// indeterminate directory under barrier B cannot suppress purging for
+	// barrier A: the blast radius of an unevaluable directory is exactly the
+	// set of shards whose DEKs it could name.
+	var scan snapshotFloorScan
 	for _, node := range loadedForTarget {
-		dirs, err := listSnapshotDirs(node.SnapshotDir(), node.ShardID(), node.ReplicaID())
-		if err != nil {
-			return 0, false // fail safe: cannot enumerate this barrier's snapshots
-		}
-		for _, d := range dirs {
-			epoch, ok := readSnapshotEpoch(d.path)
-			if !ok {
-				// Unreadable/corrupt snapshot metadata: epoch unknown, fail safe
-				// rather than dropping it from the floor (over-purge).
-				return 0, false
-			}
-			if epoch == 0 {
-				continue // unencrypted (or GC'd) snapshot, contributes no floor
-			}
-			if snapshotMinEpoch == 0 || epoch < snapshotMinEpoch {
-				snapshotMinEpoch = epoch
-			}
-		}
+		scan.addNode(node)
 	}
+	if scan.blocked() {
+		scan.report("barrier")
+		return 0, false // fail safe: this barrier has an indeterminate directory
+	}
+	snapshotMinEpoch := scan.minEpoch
 
 	// (b) WAL floor restricted to the target barrier's records. When a LogDB
 	// is present it MUST support per-barrier epoch queries; a plain
@@ -1708,6 +1781,27 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 //
 // The barrier's in-flight epoch protection inside PurgeEpochsBefore remains the
 // last line of defense in both modes.
+//
+// # Why an unevaluable snapshot directory cannot simply be skipped
+//
+// The floor is a MINIMUM over the retained artifacts. A directory whose epoch
+// cannot be established constrains that minimum from BELOW by an unknown
+// amount: it may hold ciphertext sealed at any epoch, and the record that would
+// have said which is exactly the one that is missing. Excluding it and purging
+// below the other directories' minimum would destroy the DEK it needs — the
+// artifact becomes permanently undecryptable and StartShard fails closed on it.
+// So "this directory cannot be evaluated" can only mean "do not purge"; it can
+// never mean "this directory imposes no floor". The two are opposites, and no
+// evidence available to the scan distinguishes them (a pre-Epoch-field record
+// was written by builds whose receive path DID re-encrypt under the receiver's
+// barrier, so such a directory is frequently encrypted).
+//
+// What IS bounded is the blast radius. An unevaluable directory suppresses
+// purging only for the barrier that could have sealed it: in per-shard-barrier
+// mode that is the one barrier its shard maps to, and other tenants' barriers
+// keep purging normally. In single-barrier mode every shard shares one keyring,
+// so there is no smaller scope to fall back to — suppression is host-wide by
+// construction, not by conservatism.
 func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
 	if p.shardBarriers == nil {
 		// Original global single-barrier path, unchanged.
@@ -1847,10 +1941,10 @@ func SweepStaleDecryptTmp(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Debug("snapshot: stale decrypt tmp sweep: read dir failed",
-				"dir", dir,
-				"error", err,
-			)
+			// The sweep could not even look. Whether a plaintext copy is
+			// sitting there is now unknown, which is the same operational
+			// state as a failed removal: report it the same way.
+			noteStaleDecryptSweepFailure(dir, "read_dir", err)
 		}
 		return
 	}
@@ -1864,45 +1958,43 @@ func SweepStaleDecryptTmp(dir string) {
 		}
 		stalePath := filepath.Join(dir, name)
 		if rmErr := os.Remove(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
-			slog.Debug("snapshot: stale decrypt tmp sweep: remove failed",
-				"path", stalePath,
-				"error", rmErr,
-			)
+			noteStaleDecryptSweepFailure(stalePath, "remove", rmErr)
 		}
 	}
 }
 
-// readSnapshotEpoch reads the epoch field from a snapshot metadata file. The
-// ok return value distinguishes a trustworthy answer from one that must be
-// treated fail-safe by the purge-floor callers:
+// staleDecryptSweepFailures counts the times the sweeper could not reclaim (or
+// could not even inspect) a snapshot decrypt scratch file.
 //
-//   - (epoch, true)  — the metadata was read and parsed. epoch == 0 is the
-//     legacy/plaintext case (an unencrypted snapshot that imposes no floor);
-//     epoch > 0 pins the floor at that snapshot's encryption epoch.
-//   - (0, true)      — the metadata file does not exist (the snapshot was
-//     garbage-collected between directory enumeration and this read). This is
-//     a benign skip: the snapshot is gone and imposes no floor.
-//   - (0, false)     — the metadata could not be read (a real I/O error, not
-//     os.IsNotExist) or is too short to contain the epoch field (truncated or
-//     corrupt). The epoch is UNKNOWN, so the caller must fail safe (not purge)
-//     rather than silently dropping this snapshot from the floor, which would
-//     over-purge a DEK the snapshot may still need.
-func readSnapshotEpoch(dir string) (epoch uint64, ok bool) {
-	metaPath := filepath.Join(dir, snapshotMetadataFile)
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Snapshot GC'd between enumeration and read: benign, no floor.
-			return 0, true
-		}
-		// Real read error: epoch indeterminate, fail safe.
-		return 0, false
-	}
-	if len(data) < snapshotMetaEpochOffset+8 {
-		// Truncated/corrupt metadata: cannot read the epoch field, fail safe.
-		return 0, false
-	}
-	return binary.LittleEndian.Uint64(data[snapshotMetaEpochOffset:]), true
+// A non-zero value means a COMPLETE PLAINTEXT COPY of a state machine may be
+// sitting on disk next to its ciphertext, for the life of the snapshot
+// directory. That is the exact outcome the sweeper exists to prevent, and its
+// usual causes — a read-only mount, a permissions or ownership change, an
+// immutable attribute — are silent, persistent, and invisible in the data path.
+// The counter is monotonic and process-wide; a monitor should alert on any
+// increase.
+var staleDecryptSweepFailures atomic.Uint64
+
+// StaleDecryptSweepFailures returns the number of snapshot decrypt scratch
+// files this process has failed to reclaim or inspect since start. See
+// staleDecryptSweepFailures for why a non-zero value is a security condition
+// and not merely a disk-space one.
+func StaleDecryptSweepFailures() uint64 {
+	return staleDecryptSweepFailures.Load()
+}
+
+// noteStaleDecryptSweepFailure records a failed sweep. It logs at WARN, not
+// DEBUG: the failure leaves plaintext state-machine data at rest with nothing
+// else to signal it — no error is returned to any caller (the sweep must never
+// abort startup or recovery), and the data path behaves normally.
+func noteStaleDecryptSweepFailure(path, op string, err error) {
+	staleDecryptSweepFailures.Add(1)
+	slog.Warn("snapshot: decrypt scratch file not reclaimed; plaintext state machine data may remain at rest",
+		"path", path,
+		"op", op,
+		"error", err,
+		"total_failures", staleDecryptSweepFailures.Load(),
+	)
 }
 
 // setCallback replaces the engine callback. Used by Engine.SetCallback
@@ -2005,13 +2097,12 @@ func DecompressingSnapshotReader(r io.Reader, c config.CompressionType) (io.Read
 	}
 }
 
-// writeSnapshotMetadata writes the binary metadata file to the snapshot
-// directory. The format is:
-// Index(8) | Term(8) | ShardID(8) | ReplicaID(8) | CreatedAt(8) | Epoch(8) |
-// Compression(8).
-// Epoch is 0 for unencrypted snapshots; Compression is 0 (NoCompression)
-// for uncompressed ones. Both describe the artifact next to it, so a
-// directory that outlives its LogDB record still says how to read itself.
+// writeSnapshotMetadata writes the metadata record to the snapshot directory.
+// The layout and its compatibility rules are documented on MarshalSnapshotMeta.
+//
+// Epoch is 0 for unencrypted snapshots; Compression is 0 (NoCompression) for
+// uncompressed ones. Both describe the artifact next to it, so a directory
+// that outlives its LogDB record still says how to read itself.
 func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64,
 	compression config.CompressionType) error {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
@@ -2030,16 +2121,15 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 		}
 	}()
 
-	var buf [snapshotMetaSize]byte
-	binary.LittleEndian.PutUint64(buf[0:], index)
-	binary.LittleEndian.PutUint64(buf[8:], term)
-	binary.LittleEndian.PutUint64(buf[16:], shardID)
-	binary.LittleEndian.PutUint64(buf[24:], replicaID)
-	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
-	binary.LittleEndian.PutUint64(buf[40:], epoch)
-	binary.LittleEndian.PutUint64(buf[48:], uint64(compression))
-
-	if _, err := f.Write(buf[:]); err != nil {
+	buf := MarshalSnapshotMeta(SnapshotMeta{
+		Index:       index,
+		Term:        term,
+		ShardID:     shardID,
+		ReplicaID:   replicaID,
+		Epoch:       epoch,
+		Compression: compression,
+	})
+	if _, err := f.Write(buf); err != nil {
 		return err
 	}
 	return f.Sync()

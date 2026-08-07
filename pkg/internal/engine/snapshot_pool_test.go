@@ -965,17 +965,15 @@ func TestSnapshotPool_MetadataWritten(t *testing.T) {
 		t.Fatalf("metadata size = %d, want %d", len(data), snapshotMetaSize)
 	}
 
-	index := binary.LittleEndian.Uint64(data[0:])
-	if index != 42 {
-		t.Fatalf("metadata index = %d, want 42", index)
+	meta := mustParseSnapshotMeta(t, data)
+	if meta.Index != 42 {
+		t.Fatalf("metadata index = %d, want 42", meta.Index)
 	}
-	shardID := binary.LittleEndian.Uint64(data[16:])
-	if shardID != 7 {
-		t.Fatalf("metadata shardID = %d, want 7", shardID)
+	if meta.ShardID != 7 {
+		t.Fatalf("metadata shardID = %d, want 7", meta.ShardID)
 	}
-	replicaID := binary.LittleEndian.Uint64(data[24:])
-	if replicaID != 3 {
-		t.Fatalf("metadata replicaID = %d, want 3", replicaID)
+	if meta.ReplicaID != 3 {
+		t.Fatalf("metadata replicaID = %d, want 3", meta.ReplicaID)
 	}
 }
 
@@ -1070,19 +1068,20 @@ func TestSnapshotPool_WriteSnapshotMetadata(t *testing.T) {
 		t.Fatalf("size = %d, want %d", len(data), snapshotMetaSize)
 	}
 
-	if binary.LittleEndian.Uint64(data[0:]) != 42 {
+	meta := mustParseSnapshotMeta(t, data)
+	if meta.Index != 42 {
 		t.Fatal("index mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[8:]) != 5 {
+	if meta.Term != 5 {
 		t.Fatal("term mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[16:]) != 10 {
+	if meta.ShardID != 10 {
 		t.Fatal("shardID mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[24:]) != 3 {
+	if meta.ReplicaID != 3 {
 		t.Fatal("replicaID mismatch")
 	}
-	createdAt := int64(binary.LittleEndian.Uint64(data[32:]))
+	createdAt := int64(meta.CreatedAt)
 	now := time.Now().Unix()
 	if createdAt < now-5 || createdAt > now+5 {
 		t.Fatalf("createdAt = %d, expected near %d", createdAt, now)
@@ -1413,7 +1412,7 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			if len(metaData) != snapshotMetaSize {
 				t.Fatalf("metadata size = %d, want %d", len(metaData), snapshotMetaSize)
 			}
-			if metaEpoch := binary.LittleEndian.Uint64(metaData[40:]); metaEpoch != wantEpoch {
+			if metaEpoch := mustParseSnapshotMeta(t, metaData).Epoch; metaEpoch != wantEpoch {
 				t.Fatalf("metadata epoch = %d, want %d", metaEpoch, wantEpoch)
 			}
 
@@ -1959,21 +1958,21 @@ func TestSnapshotPool_EpochInMetadata(t *testing.T) {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
 
-	// Read and verify epoch (ok=true: metadata parsed cleanly).
-	epoch, ok := readSnapshotEpoch(tmpDir)
-	if !ok || epoch != 7 {
-		t.Fatalf("readSnapshotEpoch = (%d, %v), want (7, true)", epoch, ok)
+	// Read and verify epoch (status=known: metadata parsed cleanly).
+	epoch, status := readSnapshotEpoch(tmpDir)
+	if status != snapshotEpochKnown || epoch != 7 {
+		t.Fatalf("readSnapshotEpoch = (%d, %v), want (7, known)", epoch, status)
 	}
 }
 
 func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Write a 40-byte file that is shorter than snapshotMetaSize (48): the
-	// epoch field cannot be read. Under the MED-1 fail-safe contract this is
-	// treated as corrupt/indeterminate (ok=false), NOT a zero-epoch
-	// non-constraint — so the purge-floor callers refuse to purge rather than
-	// dropping this snapshot from the floor.
+	// Write a 40-byte pre-magic record: the layout earlier builds' snapshot
+	// RECEIVE path wrote, which carries no epoch field at all. The epoch is
+	// therefore UNKNOWN, and under the fail-safe contract the purge-floor
+	// callers must refuse to purge rather than drop this snapshot from the
+	// floor. It is reported as legacy (a recognised record), not as corrupt.
 	metaPath := filepath.Join(tmpDir, snapshotMetadataFile)
 	var buf [40]byte
 	binary.LittleEndian.PutUint64(buf[0:], 100) // Index
@@ -1982,17 +1981,22 @@ func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 		t.Fatalf("write short metadata failed: %v", err)
 	}
 
-	if epoch, ok := readSnapshotEpoch(tmpDir); ok {
-		t.Fatalf("readSnapshotEpoch for short file = (%d, true), want fail-safe (0, false)", epoch)
+	epoch, status := readSnapshotEpoch(tmpDir)
+	if status == snapshotEpochKnown {
+		t.Fatalf("readSnapshotEpoch for legacy epoch-less file = (%d, known), "+
+			"want a fail-safe status", epoch)
+	}
+	if status != snapshotEpochLegacy {
+		t.Fatalf("readSnapshotEpoch status = %v, want legacy", status)
 	}
 }
 
 func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	// A missing metadata file (snapshot GC'd) is a benign skip: (0, true).
-	epoch, ok := readSnapshotEpoch(tmpDir)
-	if !ok || epoch != 0 {
-		t.Fatalf("readSnapshotEpoch for missing file = (%d, %v), want (0, true)", epoch, ok)
+	// A missing metadata file (snapshot GC'd) is a benign skip: (0, known).
+	epoch, status := readSnapshotEpoch(tmpDir)
+	if status != snapshotEpochKnown || epoch != 0 {
+		t.Fatalf("readSnapshotEpoch for missing file = (%d, %v), want (0, known)", epoch, status)
 	}
 }
 
@@ -2723,25 +2727,26 @@ func TestSnapshotPool_WriteMetadataWithEpoch(t *testing.T) {
 		t.Fatalf("metadata size = %d, want %d", len(data), snapshotMetaSize)
 	}
 
-	// Verify all 6 fields.
-	if binary.LittleEndian.Uint64(data[0:]) != 42 {
+	// Verify every field the record carries.
+	meta := mustParseSnapshotMeta(t, data)
+	if meta.Index != 42 {
 		t.Fatal("index mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[8:]) != 5 {
+	if meta.Term != 5 {
 		t.Fatal("term mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[16:]) != 10 {
+	if meta.ShardID != 10 {
 		t.Fatal("shardID mismatch")
 	}
-	if binary.LittleEndian.Uint64(data[24:]) != 3 {
+	if meta.ReplicaID != 3 {
 		t.Fatal("replicaID mismatch")
 	}
-	createdAt := int64(binary.LittleEndian.Uint64(data[32:]))
+	createdAt := int64(meta.CreatedAt)
 	now := time.Now().Unix()
 	if createdAt < now-5 || createdAt > now+5 {
 		t.Fatalf("createdAt = %d, expected near %d", createdAt, now)
 	}
-	if binary.LittleEndian.Uint64(data[40:]) != 7 {
+	if !meta.EpochRecorded || meta.Epoch != 7 {
 		t.Fatal("epoch mismatch")
 	}
 }

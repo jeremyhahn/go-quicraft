@@ -15,7 +15,6 @@
 package quicraft
 
 import (
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -629,27 +628,25 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("failed to read snapshot metadata file: %v", readErr)
 	}
-	if len(metaData) != snapshotRecvMetaSize {
-		t.Fatalf("metadata size = %d, want %d", len(metaData), snapshotRecvMetaSize)
+	meta, parseErr := engine.ParseSnapshotMeta(metaData)
+	if parseErr != nil {
+		t.Fatalf("ParseSnapshotMeta rejected the received record: %v", parseErr)
+	}
+	if !meta.EpochRecorded {
+		t.Error("received record does not carry the epoch field the purge-floor scan reads")
 	}
 
-	// Verify metadata fields.
-	metaIndex := binary.LittleEndian.Uint64(metaData[0:])
-	metaTerm := binary.LittleEndian.Uint64(metaData[8:])
-	metaShardID := binary.LittleEndian.Uint64(metaData[16:])
-	metaReplicaID := binary.LittleEndian.Uint64(metaData[24:])
-
-	if metaIndex != 500 {
-		t.Errorf("metadata index = %d, want 500", metaIndex)
+	if meta.Index != 500 {
+		t.Errorf("metadata index = %d, want 500", meta.Index)
 	}
-	if metaTerm != 10 {
-		t.Errorf("metadata term = %d, want 10", metaTerm)
+	if meta.Term != 10 {
+		t.Errorf("metadata term = %d, want 10", meta.Term)
 	}
-	if metaShardID != 1 {
-		t.Errorf("metadata shardID = %d, want 1", metaShardID)
+	if meta.ShardID != 1 {
+		t.Errorf("metadata shardID = %d, want 1", meta.ShardID)
 	}
-	if metaReplicaID != 2 {
-		t.Errorf("metadata replicaID = %d, want 2", metaReplicaID)
+	if meta.ReplicaID != 2 {
+		t.Errorf("metadata replicaID = %d, want 2", meta.ReplicaID)
 	}
 
 	// Verify LogDB received the snapshot metadata.
@@ -1018,41 +1015,44 @@ func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("failed to read metadata file: %v", readErr)
 	}
-	if len(data) != snapshotRecvMetaSize {
-		t.Fatalf("metadata size = %d, want %d", len(data), snapshotRecvMetaSize)
+	// Decode through the SHARED decoder rather than re-deriving the offsets
+	// here: the point of the assertion is that the receive path writes a
+	// record the purge-floor scan can read, and the scan uses this decoder.
+	meta, parseErr := engine.ParseSnapshotMeta(data)
+	if parseErr != nil {
+		t.Fatalf("ParseSnapshotMeta rejected the received record: %v (the purge-floor "+
+			"scan reads such a record as indeterminate and stops purging)", parseErr)
 	}
 
-	index := binary.LittleEndian.Uint64(data[0:])
-	term := binary.LittleEndian.Uint64(data[8:])
-	shardID := binary.LittleEndian.Uint64(data[16:])
-	replicaID := binary.LittleEndian.Uint64(data[24:])
-	receivedAt := binary.LittleEndian.Uint64(data[32:])
-	epoch := binary.LittleEndian.Uint64(data[40:])
-	compression := binary.LittleEndian.Uint64(data[48:])
-
-	if index != 42 {
-		t.Errorf("index = %d, want 42", index)
+	if meta.Index != 42 {
+		t.Errorf("index = %d, want 42", meta.Index)
 	}
-	if term != 7 {
-		t.Errorf("term = %d, want 7", term)
+	if meta.Term != 7 {
+		t.Errorf("term = %d, want 7", meta.Term)
 	}
-	if shardID != 10 {
-		t.Errorf("shardID = %d, want 10", shardID)
+	if meta.ShardID != 10 {
+		t.Errorf("shardID = %d, want 10", meta.ShardID)
 	}
-	if replicaID != 3 {
-		t.Errorf("replicaID = %d, want 3", replicaID)
+	if meta.ReplicaID != 3 {
+		t.Errorf("replicaID = %d, want 3", meta.ReplicaID)
 	}
-	if receivedAt == 0 {
+	if meta.CreatedAt == 0 {
 		t.Error("receivedAt should be non-zero")
 	}
-	// The epoch field is what the DEK purge-floor scan reads; a metadata file
-	// too short to hold it reads as corrupt and one that omits it lets the
-	// artifact's DEK be purged.
-	if epoch != 9 {
-		t.Errorf("epoch = %d, want 9", epoch)
+	// The epoch field is what the DEK purge-floor scan reads; a record that
+	// does not carry it is unevaluable and lets the artifact's DEK be purged
+	// only after suppressing every other purge under the same barrier.
+	if !meta.EpochRecorded {
+		t.Error("record does not carry the epoch field")
 	}
-	if compression != uint64(config.Snappy) {
-		t.Errorf("compression = %d, want %d", compression, uint64(config.Snappy))
+	if meta.Epoch != 9 {
+		t.Errorf("epoch = %d, want 9", meta.Epoch)
+	}
+	if !meta.CompressionRecorded {
+		t.Error("record does not carry the compression field")
+	}
+	if meta.Compression != config.Snappy {
+		t.Errorf("compression = %d, want %d", meta.Compression, config.Snappy)
 	}
 }
 

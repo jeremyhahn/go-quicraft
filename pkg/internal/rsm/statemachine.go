@@ -389,7 +389,7 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 			// the state machine. The check is deterministic across replicas
 			// (index/series driven, no wall clock).
 			if err := s.sessions.CanRecord(
-				entry.ClientID, entry.SeriesID, entry.RespondedTo,
+				entry.ClientID, entry.RespondedTo,
 				admittedThisBatch[entry.ClientID]); err != nil {
 				slog.Warn("rsm: session response cache full, returning SESSION_EXPIRED",
 					"shardID", s.shardID,

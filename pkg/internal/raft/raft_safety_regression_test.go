@@ -1161,6 +1161,83 @@ func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
 	})
 }
 
+// TG-16. checkSelfRole's `if !inConfig { return }` early return.
+//
+// The check compares the LOCAL witness flag against the membership's witness
+// list. For a replica the membership does not mention, "not listed as a
+// witness" is not a statement that the replica is a full voter — the
+// configuration says nothing about it at all. Without the early return, that
+// silence reads as "listed as a full replica" and a replica started as a
+// WITNESS latches a role mismatch against a configuration that never disagreed
+// with it.
+//
+// That is the normal state of a JOINING witness: it is started with
+// IsWitness=true and knows only the existing members until the AddWitness
+// naming it commits. Latching there logs an ERROR declaring the replica
+// unsafe, and turns its TimeoutNow and read paths into
+// ErrWitnessRoleMismatch — a diagnosis of a corrupted replica, produced by the
+// one check whose entire job is to distinguish a corrupted replica from a
+// healthy one.
+//
+// The existing "not in configuration" coverage cannot see this: it uses
+// IsWitness=false, where listedWitness==false agrees with the local flag and
+// the early return changes nothing.
+func TestCheckSelfRole_AbsentFromConfigurationMakesNoStatement(t *testing.T) {
+	// The configuration lists the two existing members; this replica (1) is
+	// joining and is not mentioned anywhere.
+	joiningMembership := func() proto.Membership {
+		return proto.Membership{
+			ConfigChangeID: 3,
+			Addresses:      map[uint64]string{2: "addr2", 3: "addr3"},
+		}
+	}
+
+	t.Run("joining witness is not latched", func(t *testing.T) {
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.IsWitness = true
+
+		lr := newTestLogReader(nil, proto.State{})
+		lr.membership = joiningMembership()
+
+		r, err := newRaft(cfg, lr)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		if r.roleMismatch {
+			t.Fatal("a WITNESS the configuration does not mention was latched as " +
+				"role-mismatched: absence from the configuration is not a claim " +
+				"that this replica is a full voter, and a joining witness is in " +
+				"exactly this state until the AddWitness naming it commits")
+		}
+		if err := r.handleTimeoutNow(proto.Message{Type: proto.TimeoutNow}); errors.Is(err, ErrWitnessRoleMismatch) {
+			t.Fatal("a joining witness was refused with ErrWitnessRoleMismatch: the " +
+				"latch turned a healthy replica into a diagnosed corrupt one")
+		}
+	})
+
+	// Control: once the configuration DOES make a statement about this
+	// replica, the disagreement must still be caught. Without this the test
+	// above would also pass against a checkSelfRole that never latches.
+	t.Run("witness listed as a voter is latched", func(t *testing.T) {
+		cfg := raftTestCfgPreVote(1, 1, false)
+		cfg.IsWitness = true
+
+		lr := newTestLogReader(nil, proto.State{})
+		ms := joiningMembership()
+		ms.Addresses[1] = "addr1" // now listed, as a FULL voter
+		lr.membership = ms
+
+		r, err := newRaft(cfg, lr)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		if !r.roleMismatch {
+			t.Fatal("a replica started as a WITNESS but listed as a full voter was " +
+				"not latched")
+		}
+	})
+}
+
 // A leader that only learns of the disagreement from a committed config
 // change must step down: it has been answering reads and counting quorums it
 // had no right to.

@@ -138,11 +138,12 @@ func TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate(t *testing.T) {
 	if len(data) < snapshotMetaSize {
 		t.Fatalf("metadata too short: %d bytes", len(data))
 	}
-	if gotIdx := binary.LittleEndian.Uint64(data[0:8]); gotIdx != 100 {
-		t.Fatalf("metadata index = %d, want 100", gotIdx)
+	meta := mustParseSnapshotMeta(t, data)
+	if meta.Index != 100 {
+		t.Fatalf("metadata index = %d, want 100", meta.Index)
 	}
-	if gotTerm := binary.LittleEndian.Uint64(data[8:16]); gotTerm != 3 {
-		t.Fatalf("metadata term = %d, want 3: term was read after the gate released", gotTerm)
+	if meta.Term != 3 {
+		t.Fatalf("metadata term = %d, want 3: term was read after the gate released", meta.Term)
 	}
 }
 

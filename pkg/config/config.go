@@ -123,11 +123,23 @@ type Config struct {
 	// IsObserver marks this replica as a non-voting learner that receives
 	// replicated data but does not participate in elections or quorum.
 	// Mutually exclusive with IsWitness.
+	//
+	// The role lives in REPLICATED membership, not here: this bit only tells
+	// the local replica what it was started as. A replica with this bit set
+	// must be added through a committed AddObserver config change, so
+	// Host.StartShard refuses to bootstrap it through the initial members map
+	// (which seeds the full voting set). Start it with join=true and add it
+	// with Host.RequestAddObserver.
 	IsObserver bool
 
 	// IsWitness marks this replica as a voting member that participates
 	// in elections and quorum but does not maintain a state machine.
 	// Mutually exclusive with IsObserver.
+	//
+	// As for IsObserver, the authoritative role lives in replicated
+	// membership. Host.StartShard refuses to bootstrap a witness through the
+	// initial members map; start it with join=true and add it with
+	// Host.RequestAddWitness.
 	IsWitness bool
 
 	// Witness seeds the shard's replicated witness policy at bootstrap.
