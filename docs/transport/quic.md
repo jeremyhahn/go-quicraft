@@ -78,13 +78,38 @@ hostname is extracted via fallback parsing.
 
 **Stale connection eviction:** A background goroutine (`connectionCleanup`)
 scans connections every 30 seconds and removes those whose `Context()` is done
-(closed by peer, idle timeout, or transport error).
+(closed by peer, idle timeout, or transport error). The same sweep reaps peer
+incarnation records (below) for addresses that have neither a cached outbound
+nor any traffic for `peerIncarnationRetention` (5 minutes), so the map cannot
+grow without bound across membership churn.
 
-**Rolling restart detection:** When receiving on a new inbound connection,
-`evictStaleOutboundOnRecv` compares the QUIC connection pointer with the
-cached outbound connection. If they differ, the peer has restarted; the stale
-outbound is evicted immediately (instead of waiting 30 seconds for the cleanup
-scan). This eliminates multi-second ReplicateResp delays during rolling restarts.
+**Rolling restart detection:** Every `MessageBatch` carries the sender's
+`SourceEpoch` — a per-process boot epoch — and every outbound records, in
+`connEpoch`, the epoch its target was believed to be running when it was
+dialed. On receive, `evictStaleOutboundOnRecv` evicts the cached outbound when
+that stamp does not match the epoch of the batch that just arrived: the
+outbound belongs to an incarnation the peer has left behind, so it is
+black-holed and would otherwise linger until `MaxIdleTimeout` (~30s), stalling
+`HeartbeatResp`/`ReplicateResp` and triggering avoidable elections. Keying on
+the epoch rather than the inbound `*quic.Conn` pointer is what makes this
+converge: each peer dials independently and re-dials benignly, and those
+re-dials carry the SAME epoch, whereas the earlier pointer-identity heuristic
+evicted on every one of them and produced a self-sustaining cascade.
+
+Boot epochs are `UnixNano ^ crypto/rand`, so two of them cannot be ordered by
+comparison. Each peer's record therefore keeps a small ring of **superseded**
+epochs, making its incarnation history one-way. Without it the record was
+last-writer-wins: a restart leaves the old inbound draining, so a frame written
+by the DEAD incarnation can arrive after the fresh outbound has been dialed,
+drag the record backwards, and evict the healthy connection — which the next
+genuine batch evicts again. A batch bearing an already-superseded epoch is
+ignored for both recording and eviction.
+
+Acting on `SourceEpoch` requires authorization: it and `SourceAddress` are
+in-band and unauthenticated by mTLS, so a record is created or advanced only
+when the claimed target's host appears in the inbound connection's verified
+peer certificate. The dead-outbound branch is exempt — a spoofed batch cannot
+make our own outbound's context `Done`.
 
 **Connection liveness:** Before returning a cached connection, `getStream`
 fast-checks `conn.Context().Done()` to verify the connection is still alive.
@@ -454,8 +479,14 @@ Maximum frame payload: `MaxFrameSize = 16 * 1024 * 1024` (16 MB).
 accidental misinterpretation of uninitialized buffers as valid frames).
 
 **Decompression limit:** Payloads are decompressed only if the decompressed
-size is within `MaxDecompressedSize` (default 16 MB). Oversized payloads are
-rejected to prevent decompression bombs.
+size is within `MaxDecompressedSize`, which is PINNED to `MaxFrameSize` (16 MB)
+and rejected by `Validate` at any other value. It prevents decompression bombs
+without being a per-node tunable: the send path admits frames against the
+`MaxFrameSize` constant, so a receiver configured lower would refuse frames
+every peer considers valid — and because a frame rejection deliberately keeps
+the connection (see "Peer frame rejection"), that replica would silently stop
+replicating. Nothing is bought by lowering it either, since a peer wanting this
+node to buffer 16 MB can simply send an uncompressed 16 MB frame.
 
 ### Frame Flags
 
@@ -668,7 +699,7 @@ and cleaned by `Host.StopShard()` when a shard is unloaded.
 | `MaxSnapshotReceiveRate`        | int64   | 256 MB/s       | Snapshot bandwidth limit             |
 | `MaxConcurrentSnapshotReceives` | int     | 4              | Parallel snapshot downloads          |
 | `MaxSnapshotReceiveMemory`      | int64   | 1 GB           | Total snapshot buffer budget         |
-| `MaxDecompressedSize`           | uint32  | 16 MB          | Decompression size limit             |
+| `MaxDecompressedSize`           | uint32  | 16 MB (pinned) | Decompression size limit; must equal `MaxFrameSize` |
 | `MaxConnectionsPerIP`           | int     | 16             | Concurrent connections per IP        |
 | `MaxIncomingConnections`        | int     | 256            | Total incoming connection limit      |
 | `SendBatchMaxSize`              | int     | 64 KB          | Max bytes per send batch             |

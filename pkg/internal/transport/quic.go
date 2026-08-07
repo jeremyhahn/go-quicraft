@@ -161,14 +161,20 @@ type QUICTransport struct {
 	// restarts.
 	bootEpoch uint64
 
-	// peerEpoch tracks the last-seen bootEpoch per peer address. It is the
-	// value a new outbound is stamped with in connEpoch, so that a later
-	// batch can tell whether the cached outbound belongs to the incarnation
-	// that sent it. Keying on the epoch (not the inbound *quic.Conn
-	// identity) avoids the eviction cascade that benign re-dials caused,
-	// because a re-dial from the same process carries the SAME epoch.
+	// peerEpoch tracks what is known about each peer address's process
+	// incarnations. Its epoch field is the value a new outbound is stamped
+	// with in connEpoch, so that a later batch can tell whether the cached
+	// outbound belongs to the incarnation that sent it. Keying on the epoch
+	// (not the inbound *quic.Conn identity) avoids the eviction cascade that
+	// benign re-dials caused, because a re-dial from the same process carries
+	// the SAME epoch.
+	//
+	// Entries are created only for addresses an authenticated peer certificate
+	// covers, and reaped by reapPeerIncarnations once the address has neither a
+	// cached outbound nor recent traffic, so the map cannot grow without bound
+	// across membership churn.
 	peerEpochMu sync.Mutex
-	peerEpoch   map[string]uint64
+	peerEpoch   map[string]*peerIncarnation
 
 	streamShards [streamShardCount]streamShard
 
@@ -419,7 +425,7 @@ func NewQUICTransport(
 		conns:          make(map[string]*quic.Conn),
 		connEpoch:      make(map[string]uint64),
 		bootEpoch:      newBootEpoch(),
-		peerEpoch:      make(map[string]uint64),
+		peerEpoch:      make(map[string]*peerIncarnation),
 		sendQueues:     make(map[string]*sendQueue),
 		stopC:          make(chan struct{}),
 		shutdownCtx:    shutdownCtx,

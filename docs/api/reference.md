@@ -1059,7 +1059,7 @@ Source: `pkg/config/transportconfig.go`
 | `MaxSnapshotReceiveRate`       | `int64`         | `256 MB/s`  | Inbound snapshot bandwidth limit (floor 64 KB/s) |
 | `MaxConcurrentSnapshotReceives`| `int`           | `4`         | Concurrent inbound snapshots      |
 | `MaxSnapshotReceiveMemory`     | `int64`         | `1 GB`      | Total snapshot receive buffer     |
-| `MaxDecompressedSize`          | `uint32`        | `16 MB`     | Max Snappy decompressed payload   |
+| `MaxDecompressedSize`          | `uint32`        | `16 MB`     | Max Snappy decompressed payload; pinned to the frame size (any other value is a validation error) |
 | `MaxConnectionsPerIP`          | `int`           | `16`        | Connections per source IP         |
 | `MaxIncomingConnections`       | `int`           | `256`       | Total inbound connections         |
 | `SendBatchMaxSize`             | `int`           | `64 KB`     | Max send buffer before flush      |

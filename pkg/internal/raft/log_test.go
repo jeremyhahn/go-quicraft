@@ -397,7 +397,11 @@ func TestRaftLog_IsUpToDate_HigherTerm(t *testing.T) {
 	l := newTestRaftLog(entries)
 
 	// Candidate has higher term, even with lower index.
-	if !l.isUpToDate(1, 3) {
+	upToDate, readable := l.isUpToDate(1, 3)
+	if !readable {
+		t.Fatal("expected our own last term to be readable")
+	}
+	if !upToDate {
 		t.Fatal("expected isUpToDate(1, 3) to be true")
 	}
 }
@@ -409,7 +413,11 @@ func TestRaftLog_IsUpToDate_SameTermHigherIndex(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	if !l.isUpToDate(3, 2) {
+	upToDate, readable := l.isUpToDate(3, 2)
+	if !readable {
+		t.Fatal("expected our own last term to be readable")
+	}
+	if !upToDate {
 		t.Fatal("expected isUpToDate(3, 2) to be true")
 	}
 }
@@ -421,7 +429,11 @@ func TestRaftLog_IsUpToDate_SameTermSameIndex(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	if !l.isUpToDate(2, 2) {
+	upToDate, readable := l.isUpToDate(2, 2)
+	if !readable {
+		t.Fatal("expected our own last term to be readable")
+	}
+	if !upToDate {
 		t.Fatal("expected isUpToDate(2, 2) to be true")
 	}
 }
@@ -433,7 +445,11 @@ func TestRaftLog_IsUpToDate_LowerTerm(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	if l.isUpToDate(10, 1) {
+	upToDate, readable := l.isUpToDate(10, 1)
+	if !readable {
+		t.Fatal("expected our own last term to be readable")
+	}
+	if upToDate {
 		t.Fatal("expected isUpToDate(10, 1) to be false")
 	}
 }
@@ -445,7 +461,11 @@ func TestRaftLog_IsUpToDate_SameTermLowerIndex(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	if l.isUpToDate(1, 2) {
+	upToDate, readable := l.isUpToDate(1, 2)
+	if !readable {
+		t.Fatal("expected our own last term to be readable")
+	}
+	if upToDate {
 		t.Fatal("expected isUpToDate(1, 2) to be false")
 	}
 }

@@ -112,10 +112,31 @@ type testCluster struct {
 	replicas map[uint64]*clusterReplica
 }
 
+// clusterOption customizes a test cluster before its replicas are built.
+type clusterOption func(*clusterOptions)
+
+// clusterOptions holds the customizable parts of newTestCluster.
+type clusterOptions struct {
+	// applierFor supplies the Applier for a replica. When nil each replica
+	// gets a plain testApplier over its own testSM.
+	applierFor func(replicaID uint64) Applier
+}
+
+// withApplier makes every replica use the Applier returned by fn. It exists so
+// a test can control when apply completes, which is what holds commitPending.
+func withApplier(fn func(replicaID uint64) Applier) clusterOption {
+	return func(o *clusterOptions) { o.applierFor = fn }
+}
+
 // newTestCluster builds and starts an n-replica cluster for shardID. Each
 // replica gets its own in-memory LogDB and a real Engine.
-func newTestCluster(t *testing.T, shardID uint64, n int) *testCluster {
+func newTestCluster(t *testing.T, shardID uint64, n int, opts ...clusterOption) *testCluster {
 	t.Helper()
+
+	var options clusterOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 
 	members := make(map[uint64]string, n)
 	for i := 1; i <= n; i++ {
@@ -161,8 +182,13 @@ func newTestCluster(t *testing.T, shardID uint64, n int) *testCluster {
 		hostCfg.MaxApplyWorkers = 1
 		hostCfg.RTTMillisecond = 10
 
+		applier := Applier(newTestApplier(newTestSM()))
+		if options.applierFor != nil {
+			applier = options.applierFor(replicaID)
+		}
+
 		e := NewEngine(hostCfg, ldb, c.router, nil, nil, nil)
-		node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+		node := NewNode(peer, applier, lr, cfg, 100, nil, "", nil)
 		e.LoadNode(node)
 		c.router.register(replicaID, e)
 		e.Start()

@@ -5778,10 +5778,20 @@ func TestRaftLog_LastTerm_ReportsUnreadable(t *testing.T) {
 		t.Errorf("lastTerm() term = %d, want 0 alongside ok=false", term)
 	}
 
-	// The vote must be refused rather than granted on a fabricated term.
-	if l.isUpToDate(1000, 99) {
+	// The vote must be refused rather than granted on a fabricated term, and
+	// the refusal must be distinguishable from an ordinary "candidate is
+	// behind" denial: the two have completely different causes and only the
+	// second is normal Raft.
+	upToDate, readable := l.isUpToDate(1000, 99)
+	if upToDate {
 		t.Error("isUpToDate granted while our own last term is unreadable; " +
 			"a replica that cannot prove its own log state must not vote")
+	}
+	if readable {
+		t.Error("isUpToDate reported our own last term as readable when it is " +
+			"not; the caller cannot then tell a local storage fault from an " +
+			"out-of-date candidate, and a shard made unelectable by that fault " +
+			"is completely silent")
 	}
 }
 

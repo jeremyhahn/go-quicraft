@@ -1830,16 +1830,19 @@ func TestHandleMessageFrame_CompressedExceedsMaxDecompressedSize(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
 	cfg := Config{
-		ListenAddress:       ":0",
-		DeploymentID:        42,
-		MaxDecompressedSize: 10, // very small limit
-		MTLSConfig:          testMTLSConfig(t),
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
 	}
 
 	tr, err := NewQUICTransport(cfg, handler, reg)
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
+	// MaxDecompressedSize is pinned to MaxFrameSize by Validate (it is the
+	// receiving half of the wire contract, not a tunable), so the ceiling is
+	// lowered on the constructed transport to exercise the guard.
+	tr.cfg.MaxDecompressedSize = 10
 
 	// Build a valid payload larger than 10 bytes when decompressed.
 	mb := proto.MessageBatch{
@@ -1907,10 +1910,9 @@ func TestHandleMessageFrame_CompressedBoundaryCondition(t *testing.T) {
 
 	t.Run("exactly_at_limit_accepted", func(t *testing.T) {
 		cfg := Config{
-			ListenAddress:       ":0",
-			DeploymentID:        42,
-			MaxDecompressedSize: uint32(decompressedSize), // exactly at boundary
-			MTLSConfig:          testMTLSConfig(t),
+			ListenAddress: ":0",
+			DeploymentID:  42,
+			MTLSConfig:    testMTLSConfig(t),
 		}
 
 		tr, err := NewQUICTransport(cfg, handler, reg)
@@ -1918,6 +1920,10 @@ func TestHandleMessageFrame_CompressedBoundaryCondition(t *testing.T) {
 			t.Fatalf("NewQUICTransport failed: %v", err)
 		}
 		defer tr.Stop()
+		// MaxDecompressedSize is pinned to MaxFrameSize by Validate (it is the
+		// receiving half of the wire contract, not a tunable), so the boundary
+		// is set on the constructed transport.
+		tr.cfg.MaxDecompressedSize = uint32(decompressedSize) // exactly at boundary
 
 		compressed := snappyEncode(nil, rawBuf[:n])
 		reader := bytes.NewReader(compressed)
@@ -1931,10 +1937,9 @@ func TestHandleMessageFrame_CompressedBoundaryCondition(t *testing.T) {
 
 	t.Run("one_byte_over_rejected", func(t *testing.T) {
 		cfg := Config{
-			ListenAddress:       ":0",
-			DeploymentID:        42,
-			MaxDecompressedSize: uint32(decompressedSize - 1), // one byte under payload
-			MTLSConfig:          testMTLSConfig(t),
+			ListenAddress: ":0",
+			DeploymentID:  42,
+			MTLSConfig:    testMTLSConfig(t),
 		}
 
 		tr, err := NewQUICTransport(cfg, handler, reg)
@@ -1942,6 +1947,8 @@ func TestHandleMessageFrame_CompressedBoundaryCondition(t *testing.T) {
 			t.Fatalf("NewQUICTransport failed: %v", err)
 		}
 		defer tr.Stop()
+		// See above: the ceiling is lowered on the constructed transport.
+		tr.cfg.MaxDecompressedSize = uint32(decompressedSize - 1) // one byte under payload
 
 		compressed := snappyEncode(nil, rawBuf[:n])
 		reader := bytes.NewReader(compressed)

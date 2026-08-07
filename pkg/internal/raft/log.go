@@ -372,11 +372,19 @@ func (l *raftLog) lastIndexOfTerm(targetTerm uint64) uint64 {
 	return lo
 }
 
-// isUpToDate returns true if the given (lastIndex, lastTerm) is at least
-// as up-to-date as this log. The Raft paper defines "up-to-date" as:
-// the candidate's last log entry has a higher term, or same term with
-// equal or higher index.
-func (l *raftLog) isUpToDate(lastIndex, lastTerm uint64) bool {
+// isUpToDate reports whether the given (lastIndex, lastTerm) is at least as
+// up-to-date as this log, and whether that question could be ANSWERED at all.
+// The Raft paper defines "up-to-date" as: the candidate's last log entry has a
+// higher term, or the same term with an equal or higher index.
+//
+// The second return value separates "this candidate is behind us" from "we
+// cannot tell". Both deny the vote, but they are completely different
+// operational conditions: the first is ordinary Raft, the second is a storage
+// fault on THIS replica. Collapsing them into a single false was silent — if
+// the fault hits a majority the shard simply cannot elect, and the only
+// observable is a leaderless shard with quorum apparently intact. Callers
+// report the second case; see handleVoteRequest.
+func (l *raftLog) isUpToDate(lastIndex, lastTerm uint64) (upToDate, readable bool) {
 	ourLastTerm, ok := l.lastTerm()
 	if !ok {
 		// Our own last term is unreadable (a compaction race, a torn tail, a
@@ -384,15 +392,15 @@ func (l *raftLog) isUpToDate(lastIndex, lastTerm uint64) bool {
 		// up-to-date as us, so we must not grant. Failing OPEN here -- the
 		// previous behaviour, via a fabricated term 0 -- meant granting to
 		// every candidate including one missing entries we have committed.
-		return false
+		return false, false
 	}
 	if lastTerm > ourLastTerm {
-		return true
+		return true, true
 	}
 	if lastTerm == ourLastTerm {
-		return lastIndex >= l.lastIndex()
+		return lastIndex >= l.lastIndex(), true
 	}
-	return false
+	return false, true
 }
 
 // tryAppend attempts to append entries after prevLogIndex/prevLogTerm.

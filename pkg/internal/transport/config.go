@@ -195,9 +195,10 @@ var (
 	// ErrInvalidSendBatchMaxSize is returned when SendBatchMaxSize <= 0.
 	ErrInvalidSendBatchMaxSize = errors.New("transport: send batch max size must be > 0")
 
-	// ErrInvalidMaxDecompressedSize is returned when MaxDecompressedSize exceeds
-	// MaxFrameSize or is zero.
-	ErrInvalidMaxDecompressedSize = errors.New("transport: max decompressed size out of range")
+	// ErrInvalidMaxDecompressedSize is returned when MaxDecompressedSize is
+	// anything other than MaxFrameSize. It is the receiving half of the wire
+	// contract, not a local tunable — see the field's documentation.
+	ErrInvalidMaxDecompressedSize = errors.New("transport: max decompressed size must equal MaxFrameSize")
 
 	// ErrIncompleteMTLSConfig is returned when MTLSConfig is partially set.
 	ErrIncompleteMTLSConfig = errors.New("transport: mTLS config requires CACert, Cert, and Key")
@@ -314,7 +315,19 @@ type Config struct {
 	SendBatchMaxSize int
 
 	// MaxDecompressedSize is the maximum allowed decompressed payload size.
-	// Prevents decompression bombs. Default: MaxFrameSize.
+	// Prevents decompression bombs. It must equal MaxFrameSize; zero selects
+	// that value and anything else is rejected by Validate.
+	//
+	// It is NOT a per-node tunable. MaxFrameSize is a compile-time constant
+	// and is what the SEND path admits against (messageFrameError,
+	// sendableGroup), so a receiver configured below it rejects frames every
+	// sender in the cluster considers valid. The sender treats that rejection
+	// as a frame-level failure — it drops the batch and KEEPS the connection
+	// (deliberately, so a wire-version mismatch cannot become a dial storm) —
+	// so the misconfigured replica simply stops making replication progress,
+	// with a 10s-rate-limited warning and a "peer_rejected" drop counter as
+	// the only signal. Pinning the value turns that silent, asymmetric wire
+	// contract into a startup error.
 	MaxDecompressedSize uint32
 
 	// MaxIncomingConnections is the total number of concurrent inbound
@@ -476,7 +489,7 @@ func (c *Config) Validate() error {
 	if c.SendBatchMaxSize <= 0 {
 		return ErrInvalidSendBatchMaxSize
 	}
-	if c.MaxDecompressedSize == 0 || c.MaxDecompressedSize > MaxFrameSize {
+	if c.MaxDecompressedSize != MaxFrameSize {
 		return ErrInvalidMaxDecompressedSize
 	}
 	if c.MaxIncomingConnections < 1 {

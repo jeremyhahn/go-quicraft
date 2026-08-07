@@ -256,6 +256,20 @@ func TestValidateRejectsInvalidDecompressedSize(t *testing.T) {
 	}{
 		{"zero", 0},
 		{"exceeds max frame size", MaxFrameSize + 1},
+		// Below the frame size is the dangerous direction and the reason the
+		// value is pinned. MaxFrameSize is a compile-time constant and is what
+		// the SEND path admits against (messageFrameError/sendableGroup), so a
+		// receiver configured lower rejects frames every peer in the cluster
+		// considers valid. The sender treats that as a frame-level failure: it
+		// drops the batch and KEEPS the connection (deliberately, so a
+		// wire-version mismatch cannot become a dial storm), which leaves this
+		// replica unable to replicate with nothing but a 10s-rate-limited
+		// warning and a "peer_rejected" drop counter to show for it. Nothing is
+		// bought in exchange — a peer that wants this node to buffer MaxFrameSize
+		// bytes can just send an uncompressed frame of that size — so a lower
+		// decompression ceiling is pure downside and must fail at startup.
+		{"below max frame size", MaxFrameSize - 1},
+		{"one byte", 1},
 	}
 
 	for _, tc := range tests {

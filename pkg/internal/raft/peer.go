@@ -1156,6 +1156,19 @@ func (p *Peer) IsMember(replicaID uint64) bool {
 // DiagRaftState returns diagnostic raft state for debugging pipeline stalls.
 // Returns term, committed index, processed index, lastIndex, number of
 // pending messages, and the raft state name (leader/follower/candidate).
+//
+// The state string also carries the two conditions under which this replica
+// cannot participate in an election. Both are fail-closed and were otherwise
+// invisible, which is the worst possible combination: they present as a shard
+// that will not elect a leader while every node is up and reachable, with
+// nothing in the diagnostics to say why.
+//
+//   - "self-removed": the replica is absent from the current configuration, so
+//     startElection refuses to campaign. Permanent until a config change
+//     re-adds it.
+//   - "unreadable-log-denials=N": N votes were denied because this replica's
+//     own last log term could not be read (a compaction race, a torn tail, a
+//     closed LogDB), which denies every candidate regardless of its log.
 func (p *Peer) DiagRaftState() (term, committed, processed, lastIdx uint64, msgs int, state string) {
 	r := p.r
 	var stateStr string
@@ -1170,6 +1183,12 @@ func (p *Peer) DiagRaftState() (term, committed, processed, lastIdx uint64, msgs
 		stateStr = "preCandidate"
 	default:
 		stateStr = "unknown"
+	}
+	if r.selfRemoved {
+		stateStr += " self-removed"
+	}
+	if r.unreadableLogVoteDenials > 0 {
+		stateStr += fmt.Sprintf(" unreadable-log-denials=%d", r.unreadableLogVoteDenials)
 	}
 	return r.term, r.log.committed, r.log.processed, r.log.lastIndex(), len(r.msgs), stateStr
 }

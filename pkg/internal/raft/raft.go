@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	mathrand "math/rand"
 	"slices"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/invariant"
@@ -269,6 +270,18 @@ type raft struct {
 	// errors, not by protocol state.
 	configChangeScanFailures uint64
 
+	// unreadableLogVoteDenials counts votes denied because this replica's OWN
+	// last log term could not be read, rather than because the candidate was
+	// behind. It is a storage fault that denies every candidate while it lasts,
+	// so a nonzero value on a majority explains a shard that cannot elect
+	// despite quorum being up. Surfaced by DiagRaftState and by the
+	// rate-limited warning in recordUnreadableLogVoteDenial.
+	unreadableLogVoteDenials uint64
+
+	// lastUnreadableLogWarn rate-limits that warning. A vote storm would
+	// otherwise emit one line per RequestVote per candidate.
+	lastUnreadableLogWarn time.Time
+
 	// Leader transfer state.
 	transferTarget  uint64
 	transferElapsed int
@@ -431,11 +444,57 @@ func (r *raft) setSelfMembership(present bool) {
 		return
 	}
 	r.selfRemoved = !present
-	slog.Debug("self membership changed",
+	if r.selfRemoved {
+		// Entering selfRemoved makes this replica permanently unelectable:
+		// startElection returns immediately, so nothing this node does can ever
+		// restore it — only a config change that re-adds it, applied from the
+		// leader. Debug is far too quiet for a terminal state. It is normal and
+		// expected for a replica that has just been removed, and a serious fault
+		// for one that has not (a truncated or empty membership restored from a
+		// damaged snapshot), and only an operator can tell those apart. The
+		// transition is edge-triggered — this line is unreachable unless the
+		// value actually changes — so it cannot become a log flood.
+		slog.Warn("replica is not in the current configuration and will not campaign",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term)
+		return
+	}
+	slog.Info("replica is back in the current configuration and may campaign",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"term", r.term)
+}
+
+// unreadableLogWarnInterval rate-limits the vote-denial warning emitted when
+// this replica's own last log term cannot be read. Every RequestVote from every
+// candidate hits the same condition, so an unrate-limited line would flood.
+const unreadableLogWarnInterval = 10 * time.Second
+
+// recordUnreadableLogVoteDenial counts and reports a vote denied because this
+// replica could not read its OWN last log term.
+//
+// The denial is correct — granting on a fabricated term 0 would make every
+// candidate look up to date and violate Leader Completeness — but it is caused
+// by local storage, not by the candidate, and it applies to every candidate
+// equally. On a majority of replicas it makes the shard unelectable while every
+// node is up and reachable, which without this report is entirely silent.
+func (r *raft) recordUnreadableLogVoteDenial(from uint64) {
+	r.unreadableLogVoteDenials++
+	now := time.Now()
+	if now.Sub(r.lastUnreadableLogWarn) < unreadableLogWarnInterval {
+		return
+	}
+	r.lastUnreadableLogWarn = now
+	slog.Warn("vote denied: local last log term unreadable",
 		"shard", r.shardID,
 		"replica", r.replicaID,
 		"term", r.term,
-		"self_removed", r.selfRemoved)
+		"candidate", from,
+		"last_index", r.log.lastIndex(),
+		"denials", r.unreadableLogVoteDenials,
+		"rate_limit", unreadableLogWarnInterval,
+	)
 }
 
 // --------------------------------------------------------------------------
@@ -1244,8 +1303,16 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		respType = proto.RequestPreVoteResp
 	}
 
-	// Check if the candidate's log is at least as up-to-date.
-	logOK := r.log.isUpToDate(msg.LogIndex, msg.LogTerm)
+	// Check if the candidate's log is at least as up-to-date. A denial because
+	// our OWN last log term is unreadable is a storage fault on this replica,
+	// not a statement about the candidate, and it denies EVERY candidate for as
+	// long as it lasts. Report it: hit a majority and the shard cannot elect at
+	// all, with a silently leaderless shard as the only symptom. The sibling
+	// check in startElection already warns; this one used to say nothing.
+	logOK, logReadable := r.log.isUpToDate(msg.LogIndex, msg.LogTerm)
+	if !logReadable {
+		r.recordUnreadableLogVoteDenial(msg.From)
+	}
 
 	// Check if we can grant the vote.
 	var canVote bool

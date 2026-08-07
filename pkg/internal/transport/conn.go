@@ -35,6 +35,18 @@ const (
 
 	// dialTimeout is the maximum time for a single dial attempt.
 	dialTimeout = 5 * time.Second
+
+	// supersededEpochRing is how many retired boot epochs are remembered per
+	// peer. Each slot covers one restart whose late frames may still be in
+	// flight; four spans a crash-loop without letting the record grow.
+	supersededEpochRing = 4
+
+	// peerIncarnationRetention is how long a peer's incarnation record
+	// survives with neither a cached outbound nor an exchanged batch. It is
+	// an order of magnitude above the QUIC MaxIdleTimeout, so an ordinary
+	// outage never loses the epoch a re-dial needs to be stamped with, while
+	// a replica removed from membership is forgotten promptly.
+	peerIncarnationRetention = 10 * connectionCleanupInterval
 )
 
 // getConnection returns an existing QUIC connection to the target address or
@@ -241,8 +253,10 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 // replacement with (see dialConnection). Forgetting it would stamp the fresh
 // outbound with "unknown", the next batch from the peer would find a stamp
 // mismatch and evict again, and the eviction would forget again -- an endless
-// evict/re-dial cascade. peerEpoch is reaped by connectionCleanup instead,
-// which observes a genuinely dead connection rather than a deliberate teardown.
+// evict/re-dial cascade. A dead connection is no different: it is re-dialed
+// too, so dropping the record there has exactly the same effect. The record is
+// aged out by reapPeerIncarnations instead, which forgets only an address that
+// has been both disconnected AND silent for peerIncarnationRetention.
 func (t *QUICTransport) removeConnection(target string) {
 	t.connMu.Lock()
 	delete(t.conns, target)
@@ -250,23 +264,146 @@ func (t *QUICTransport) removeConnection(target string) {
 	t.connMu.Unlock()
 }
 
-// knownPeerEpoch returns the last boot epoch observed from target, or 0 if the
-// peer has never been heard from.
-func (t *QUICTransport) knownPeerEpoch(target string) uint64 {
-	t.peerEpochMu.Lock()
-	epoch := t.peerEpoch[target]
-	t.peerEpochMu.Unlock()
-	return epoch
+// peerIncarnation is what this node remembers about one peer address's
+// process incarnations.
+//
+// Boot epochs are UnixNano ^ crypto/rand (see newBootEpoch), so they carry NO
+// usable ordering: "newer" cannot be decided by comparing two values. The only
+// ordering available is the one this node WITNESSED, which is what superseded
+// records. Without it, restart detection is last-writer-wins over an unordered
+// value and a single late frame from a dead incarnation can drag the record
+// backwards -- see observePeerEpoch.
+type peerIncarnation struct {
+	// epoch is the peer's current boot epoch, as last observed from a batch
+	// whose claimed source address the sender's certificate covers.
+	epoch uint64
+
+	// superseded is a small ring of epochs that were once current and have
+	// since been replaced. It is the hysteresis that makes a peer's
+	// incarnation history one-way.
+	superseded [supersededEpochRing]uint64
+	next       int
+
+	// lastSeen is when a batch bearing this peer's SourceAddress last
+	// arrived, or when an outbound to it was last dialed. It exists solely
+	// so reapPeerIncarnations can tell a peer that is gone from one that is
+	// merely quiet.
+	lastSeen time.Time
 }
 
-// forgetPeerEpoch drops the cached last-seen bootEpoch for a target. Called
-// when a connection is found DEAD by the periodic cleanup, so the peerEpoch map
-// does not grow unbounded across membership churn (it would otherwise only be
-// cleared at Stop()). It must not be called from an eviction path -- see
-// removeConnection.
-func (t *QUICTransport) forgetPeerEpoch(target string) {
+// isSuperseded reports whether epoch is an incarnation this node has already
+// watched the peer replace.
+func (p *peerIncarnation) isSuperseded(epoch uint64) bool {
+	for _, e := range p.superseded {
+		if e != 0 && e == epoch {
+			return true
+		}
+	}
+	return false
+}
+
+// retire records epoch as superseded, evicting the oldest ring slot.
+func (p *peerIncarnation) retire(epoch uint64) {
+	if epoch == 0 || p.isSuperseded(epoch) {
+		return
+	}
+	p.superseded[p.next] = epoch
+	p.next = (p.next + 1) % supersededEpochRing
+}
+
+// observePeerEpoch folds a batch's SourceEpoch into target's incarnation
+// record and reports whether that epoch may drive an eviction decision.
+//
+// It returns false for an epoch this node has already watched the peer
+// replace. That case is not hypothetical: a restart E1->E2 leaves the old
+// inbound connection draining, so a frame written by the DEAD incarnation can
+// still be delivered after the fresh outbound has been dialed under E2. Under
+// plain last-writer-wins that late frame rewrote the record back to E1 and,
+// because the fresh outbound is stamped E2, evicted a perfectly healthy
+// connection and re-dialed it stamped E1 -- which the next genuine E2 batch
+// evicted in turn. Each round costs a dial, a stream re-open and every
+// in-flight replication on the connection, and it fires during a peer restart:
+// precisely the event the mechanism exists to handle. Epochs cannot be
+// compared, so the guard has to be a memory of what has already been retired.
+//
+// Authorization is unchanged: only a batch whose claimed target the inbound
+// connection's verified certificate covers may create or advance a record.
+// An unauthorized claim returns true so the caller's own (identical)
+// certificate gate keeps deciding the eviction, exactly as before.
+func (t *QUICTransport) observePeerEpoch(target string, srcEpoch uint64, inbound *quic.Conn) bool {
+	now := time.Now()
 	t.peerEpochMu.Lock()
-	delete(t.peerEpoch, target)
+	defer t.peerEpochMu.Unlock()
+
+	rec, known := t.peerEpoch[target]
+	if known {
+		rec.lastSeen = now
+		if rec.epoch == srcEpoch {
+			return true
+		}
+		if rec.isSuperseded(srcEpoch) {
+			return false
+		}
+	}
+	if !t.inboundAuthorizedForCached(inbound, target) {
+		return true
+	}
+	if !known {
+		rec = &peerIncarnation{}
+		t.peerEpoch[target] = rec
+	}
+	rec.retire(rec.epoch)
+	rec.epoch = srcEpoch
+	rec.lastSeen = now
+	return true
+}
+
+// knownPeerEpoch returns the last boot epoch observed from target, or 0 if the
+// peer has never been heard from. Dialing counts as contact for reaping
+// purposes: an address this node is actively connecting to is not gone.
+func (t *QUICTransport) knownPeerEpoch(target string) uint64 {
+	t.peerEpochMu.Lock()
+	defer t.peerEpochMu.Unlock()
+	rec, ok := t.peerEpoch[target]
+	if !ok {
+		return 0
+	}
+	rec.lastSeen = time.Now()
+	return rec.epoch
+}
+
+// reapPeerIncarnations drops the incarnation records of addresses this node
+// neither holds an outbound to nor has exchanged a batch with for
+// peerIncarnationRetention.
+//
+// The record must NOT be dropped on a teardown or eviction path: removing a
+// connection is the first half of a re-dial and the epoch is what the re-dial
+// stamps the replacement with, so forgetting there stamps the fresh outbound
+// "unknown" and the next batch evicts it again -- an endless evict/re-dial
+// cascade (see removeConnection). Reaping on an idle window instead only ever
+// forgets an address that is neither connected nor talking, where the cost of
+// being wrong is the ordinary first-contact eviction, which converges after one
+// re-dial. Without any reaper the map retains every address ever heard from for
+// the process lifetime, which membership churn grows without bound.
+func (t *QUICTransport) reapPeerIncarnations(now time.Time) {
+	t.connMu.RLock()
+	live := make(map[string]struct{}, len(t.conns))
+	for addr := range t.conns {
+		live[addr] = struct{}{}
+	}
+	t.connMu.RUnlock()
+
+	cutoff := now.Add(-peerIncarnationRetention)
+	t.peerEpochMu.Lock()
+	for addr, rec := range t.peerEpoch {
+		if _, connected := live[addr]; connected {
+			continue
+		}
+		if rec.lastSeen.After(cutoff) {
+			continue
+		}
+		delete(t.peerEpoch, addr)
+	}
 	t.peerEpochMu.Unlock()
 }
 
@@ -512,7 +649,8 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 // evicts all pooled streams that targeted the dead connection. Without
 // stream eviction, subsequent getStream calls would return cached but
 // broken streams, causing repeated write failures until the stream is
-// individually evicted by sendBatch.
+// individually evicted by sendBatch. It also reaps the incarnation records of
+// peers that are neither connected nor talking.
 func (t *QUICTransport) cleanStaleConnections() {
 	var deadTargets []string
 
@@ -532,13 +670,19 @@ func (t *QUICTransport) cleanStaleConnections() {
 	}
 	t.connMu.Unlock()
 
-	// Evict all pooled streams belonging to dead connections, and forget their
-	// cached epochs so peerEpoch does not grow unbounded. This must happen
+	// Evict all pooled streams belonging to dead connections. This must happen
 	// outside connMu to avoid lock ordering issues with shard locks.
+	//
+	// The dead targets' incarnation records are deliberately NOT dropped here:
+	// a connection found dead is re-dialed, and the re-dial is stamped from
+	// that record (see removeConnection). They age out through
+	// reapPeerIncarnations instead, which only forgets an address that has
+	// been both disconnected and silent for a long window.
 	for _, target := range deadTargets {
 		t.evictStreamsForTarget(target)
-		t.forgetPeerEpoch(target)
 	}
+
+	t.reapPeerIncarnations(time.Now())
 }
 
 // evictStreamsForTarget removes and closes all pooled streams whose
@@ -625,14 +769,12 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 	// Track the peer's boot epoch and detect a restart (epoch change). Only
 	// record/act on the epoch once the claimed target is bound to the inbound
 	// connection's authenticated certificate, so a spoofed SourceAddress cannot
-	// poison peerEpoch or evict a live outbound.
+	// poison peerEpoch or evict a live outbound. An epoch already witnessed
+	// being superseded is a late frame from a dead incarnation: it neither
+	// updates the record nor decides attribution below.
+	attributable := true
 	if srcEpoch != 0 {
-		t.peerEpochMu.Lock()
-		prev, known := t.peerEpoch[target]
-		if (!known || prev != srcEpoch) && t.inboundAuthorizedForCached(inboundConn, target) {
-			t.peerEpoch[target] = srcEpoch
-		}
-		t.peerEpochMu.Unlock()
+		attributable = t.observePeerEpoch(target, srcEpoch, inboundConn)
 	}
 
 	t.connMu.RLock()
@@ -659,7 +801,7 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 		// srcEpoch and this is a single integer compare, so the common
 		// dual-dial case (two live connections per pair) is preserved and
 		// the certificate check stays off the hot receive path.
-		if srcEpoch == 0 || stamp == srcEpoch {
+		if srcEpoch == 0 || !attributable || stamp == srcEpoch {
 			return
 		}
 		if !t.inboundAuthorizedForCached(inboundConn, target) {

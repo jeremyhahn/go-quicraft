@@ -1095,14 +1095,17 @@ func TestHandleMessageFrame_CompressedDecompressedSizeExceeded(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
 	tr, err := NewQUICTransport(Config{
-		ListenAddress:       ":0",
-		DeploymentID:        42,
-		MTLSConfig:          testMTLSConfig(t),
-		MaxDecompressedSize: 10, // Very small limit.
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
 	}, handler, reg)
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
+	// MaxDecompressedSize is pinned to MaxFrameSize by Validate (it is the
+	// receiving half of the wire contract, not a tunable), so the ceiling is
+	// lowered on the constructed transport to exercise the guard.
+	tr.cfg.MaxDecompressedSize = 10
 	if err := tr.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}

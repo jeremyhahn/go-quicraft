@@ -376,9 +376,33 @@ func TestTransportConfig_Validate_MaxDecompressedSize(t *testing.T) {
 		assertTransportValidationError(t, err, "TransportConfig.MaxDecompressedSize")
 	})
 
-	t.Run("minimum valid", func(t *testing.T) {
+	// A value below the frame size is the dangerous one. The send path admits
+	// frames against the MaxFrameSize constant, so a replica configured lower
+	// rejects frames every peer in the cluster considers valid. The sender
+	// deliberately keeps the connection on a frame rejection (so a wire-version
+	// mismatch cannot become a dial storm) and merely drops the batch, so the
+	// misconfigured replica stops replicating with nothing but a rate-limited
+	// warning to show for it. Nothing is gained in exchange: an attacker who
+	// wants to make this node buffer 16 MB can simply send an uncompressed
+	// 16 MB frame, so a decompression ceiling below the frame ceiling adds no
+	// protection at all. It must be a startup error, not a silent stall.
+	t.Run("below the frame size is rejected", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxDecompressedSize = 1
+		err := tc.Validate()
+		assertTransportValidationError(t, err, "TransportConfig.MaxDecompressedSize")
+	})
+
+	t.Run("above the frame size is rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxDecompressedSize = DefaultMaxDecompressedSize + 1
+		err := tc.Validate()
+		assertTransportValidationError(t, err, "TransportConfig.MaxDecompressedSize")
+	})
+
+	t.Run("the frame size is valid", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxDecompressedSize = DefaultMaxDecompressedSize
 		if err := tc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
 		}

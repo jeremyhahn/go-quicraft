@@ -170,7 +170,16 @@ type TransportConfig struct {
 	MaxMessageReceiveMemory int64
 
 	// MaxDecompressedSize is the maximum allowed size after Snappy
-	// decompression. Default: 16 MB (MaxFrameSize).
+	// decompression. It must equal DefaultMaxDecompressedSize, which is the
+	// transport's MaxFrameSize; zero selects that value.
+	//
+	// It is the receiving half of the wire contract rather than a local
+	// tunable. The send path admits messages against MaxFrameSize, a
+	// compile-time constant, so a replica configured below it rejects frames
+	// every other node considers valid. The sender treats such a rejection as
+	// a frame-level failure and keeps the connection (so a wire-version
+	// mismatch cannot become a dial storm), which leaves the misconfigured
+	// replica silently unable to replicate. Validate rejects the value instead.
 	MaxDecompressedSize uint32
 
 	// MaxConnectionsPerIP is the maximum number of QUIC connections
@@ -334,9 +343,12 @@ func (tc *TransportConfig) Validate() error {
 		return newValidationError("TransportConfig.MaxMessageReceiveMemory",
 			"must be >= 0")
 	}
-	if tc.MaxDecompressedSize == 0 {
+	if tc.MaxDecompressedSize != DefaultMaxDecompressedSize {
 		return newValidationError("TransportConfig.MaxDecompressedSize",
-			"must be > 0")
+			"must equal DefaultMaxDecompressedSize (the transport frame size): "+
+				"the send path admits frames against that constant, so a lower "+
+				"value silently rejects frames every peer considers valid and "+
+				"stops replication to this node")
 	}
 	if tc.MaxConnectionsPerIP < 1 {
 		return newValidationError("TransportConfig.MaxConnectionsPerIP",

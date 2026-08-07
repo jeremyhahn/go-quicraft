@@ -199,7 +199,7 @@ func (w *stepWorker) drainTick(ticker *time.Ticker) {
 func (w *stepWorker) tick() {
 	w.nodesMu.RLock()
 	defer w.nodesMu.RUnlock()
-	for _, node := range w.nodes {
+	for shardID, node := range w.nodes {
 		if node.IsFailed() || node.peer == nil {
 			continue
 		}
@@ -230,6 +230,17 @@ func (w *stepWorker) tick() {
 		node.publishLogMarkers()
 		node.publishDiagLocked()
 		node.raftMu.Unlock()
+		// A CheckQuorum step-down happens entirely inside Tick(): tickLeader
+		// calls becomeFollower(r.term, noLeader), which changes neither term,
+		// vote nor commit index and emits no message. hasStateChanged() is
+		// therefore false and HasUpdate() false, so processReady skips the
+		// shard and NEITHER of the two other publish sites can ever run. The
+		// node kept reporting itself leader through Host.GetShardInfo() —
+		// the flag clients route writes by — until it campaigned roughly an
+		// election timeout later. Publishing here is the only way this
+		// transition is ever observed. Runs outside raftMu (LeaderID/Term are
+		// atomics) so the callback never executes under the node lock.
+		w.publishLeaderChange(shardID, node)
 	}
 }
 
