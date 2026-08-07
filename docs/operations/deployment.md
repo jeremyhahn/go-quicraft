@@ -65,6 +65,50 @@ For discovery-driven formation (multicast/DNS/token/static-with-quorum), use go-
 
 **Production recommendation:** Place `WALDir` and `NodeHostDir` on separate physical disks to isolate WAL write I/O from snapshot reads.
 
+### Disaster Recovery: importing a snapshot
+
+`Host.ImportSnapshot` restores a shard from a snapshot artifact produced by
+`ExportSnapshot` on another cluster. The import must land inside the tree that
+snapshot GC and the DEK purge floor scan, or the imported snapshot is invisible
+to both: garbage collection never reclaims it, and — the dangerous half — the
+next `PurgeEpochsBefore` legitimately drops the key that decrypts it, leaving
+the restored state permanently unreadable.
+
+The layout depends on the shard's `Config.DataDir`, which is per-shard and is
+not part of the artifact. `ImportSnapshot` therefore discovers it from the
+shard's bootstrap record when one exists:
+
+```go
+// Shard has run on this host before: layout is discovered, no option needed.
+err := h.ImportSnapshot(ctx, shardID, artifact)
+```
+
+On a **fresh disaster-recovery host** the shard has never started, so there is
+no bootstrap record and nothing on disk states the layout. The import cannot
+guess it and refuses rather than writing to the wrong tree:
+
+```go
+// Fresh DR host: state the layout explicitly. It is cross-checked against the
+// bootstrap record if one later exists, and a contradiction is refused.
+err := h.ImportSnapshot(ctx, shardID, artifact,
+    quicraft.WithImportDataDir("/var/lib/quicraft/data/shard-100"))
+
+// The shard has no DataDir (default NodeHostDir layout) — say so explicitly:
+err := h.ImportSnapshot(ctx, shardID, artifact, quicraft.WithImportDataDir(""))
+```
+
+Omitting the option on a shard with no bootstrap record returns
+`ErrImportLayoutUnknown`. Supplying one that contradicts a recorded value
+returns `ErrImportDataDirMismatch`. Both fail before anything is written.
+
+**Order of operations for a full-shard restore:**
+
+1. Ensure the shard is **stopped** on this host (`ImportSnapshot` requires it).
+2. Import the artifact, stating `WithImportDataDir` if the shard has never run here.
+3. `StartShard` with the same `Config.DataDir` used in step 2.
+4. Confirm recovery: `ShardInfo.LastApplied` should reach the imported snapshot's
+   index, and `Health` should leave `recovering`.
+
 ## Configuration Reference
 
 ### HostConfig (per-host)
