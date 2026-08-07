@@ -93,7 +93,7 @@ func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 
 // UnmarshalFrom reads the message batch from buf and returns bytes
 // consumed. Validates BinVer == WireVersion, request count against
-// maxMessagesPerBatch, and cumulative size against MaxBatchSize.
+// MaxMessagesPerBatch, and cumulative size against MaxBatchSize.
 // Returns ErrUnsupportedVersion, ErrTooManyMessages,
 // ErrBatchSizeLimitExceeded, or ErrBufferTooSmall as appropriate.
 func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
@@ -123,7 +123,7 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	reqCount := getUint32(buf[offset:])
 	offset += 4
-	if reqCount > maxMessagesPerBatch {
+	if reqCount > MaxMessagesPerBatch {
 		return 0, ErrTooManyMessages
 	}
 	// The count alone drives the allocation below, so it must also be

@@ -259,91 +259,111 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	close(stopC)
 }
 
-// TestRecovering_StepWorkerSkipsNode verifies that the step worker
-// skips a node entirely when the recovering flag is set. No inbox
-// drain, no GetUpdate, no commit pipeline entry -- the node is
-// completely inert until recovery completes.
-func TestRecovering_StepWorkerSkipsNode(t *testing.T) {
+// TestRecovering_StepWorkerSuppressesOnlyCommittedEntries pins the
+// recovering contract: the step worker keeps the node in the Raft protocol
+// (it still drains the inbox, produces updates, and persists hard state so
+// ordered responses can be sent) and suppresses EXACTLY ONE thing — the
+// extraction of committed entries, the only part of an update that reaches
+// the state machine the snapshot pool is replacing.
+//
+// The node used to be skipped entirely, which made it invisible to
+// consensus for the whole unbounded duration of user RecoverFromSnapshot
+// code: two replicas recovering at once dissolved a five-replica shard's
+// quorum with every node still up.
+func TestRecovering_StepWorkerSuppressesOnlyCommittedEntries(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
 	commitC := make(chan *commitItem, 16)
 	cb := newTestCallback()
 	stopC := make(chan struct{})
+	defer close(stopC)
 
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
 
-	// Create a single-node cluster and tick to leader. This ensures
-	// the peer has pending state (messages, state changes) that would
-	// normally produce a commit item in processReady.
+	// Single-node cluster: a proposal becomes committable after one full
+	// step + commit cycle, giving the second cycle real committed entries
+	// to extract.
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
 	sw.loadNode(node)
-
-	// Tick to leader so there is pending state to process.
 	tickPeerToLeader(peer)
 
-	// Verify that without recovering, processReady produces work.
+	// Cycle 1 (not recovering): propose an entry and persist it.
+	node.DeliverProposal([]proto.Entry{{Cmd: []byte("before-recovery")}})
 	ws.Notify(1)
 	sw.processReady()
 
-	// Drain any commit items produced.
-	drained := false
+	var first *commitItem
 	select {
-	case <-commitC:
-		drained = true
+	case first = <-commitC:
 	default:
+		t.Fatal("expected a commit item for the proposed entry")
 	}
-	if !drained {
-		// Even if no commit item (single-node may have already
-		// committed inline), the lack of a crash is fine. We'll
-		// verify the recovering guard next.
+	if len(first.update.EntriesToSave) == 0 {
+		t.Fatal("expected entries to save in the first update")
 	}
-
-	// Now set recovering and verify processReady produces nothing.
-	// First, clear commitPending if it was set.
+	// Stand in for the commit worker: persisting the entry makes it
+	// committable, so the peer now holds committed entries to apply.
+	if err := peer.Commit(first.update); err != nil {
+		t.Fatalf("peer.Commit failed: %v", err)
+	}
 	node.commitPending.Store(false)
+
+	// Cycle 2 (recovering): the peer HAS committed entries, but they must
+	// stay in the log while the state machine is being replaced.
 	node.SetRecovering(true)
-
-	// Deliver a proposal to the node's inbox to create pending work.
-	node.DeliverProposal([]proto.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("during-recovery")},
-	})
-
+	if !peer.HasUpdate(node.lastApplied.Load()) {
+		t.Fatal("expected a pending update before the recovering cycle")
+	}
 	ws.Notify(1)
 	sw.processReady()
 
-	// No commit item should be produced while recovering.
 	select {
-	case <-commitC:
-		t.Fatal("step worker should not produce commit items for recovering node")
+	case item := <-commitC:
+		if len(item.update.CommittedEntries) != 0 {
+			t.Fatalf("recovering node extracted %d committed entries; they must stay in the log",
+				len(item.update.CommittedEntries))
+		}
 	default:
-		// Expected: no commit items produced.
+		// Nothing left to persist in this cycle is legitimate; the
+		// liveness half is asserted next.
 	}
+	node.commitPending.Store(false)
 
-	// Clear recovering and verify work resumes.
+	// Protocol liveness: a message delivered while recovering is stepped,
+	// not dropped. A higher-term heartbeat must move the peer's term.
+	priorTerm := peer.Term()
+	if !node.Deliver(proto.Message{
+		Type:    proto.Heartbeat,
+		ShardID: 1,
+		From:    2,
+		To:      1,
+		Term:    priorTerm + 5,
+	}) {
+		t.Fatal("failed to deliver heartbeat to node inbox")
+	}
+	ws.Notify(1)
+	sw.processReady()
+	if got := peer.Term(); got <= priorTerm {
+		t.Fatalf("recovering node did not step the delivered heartbeat: term %d -> %d", priorTerm, got)
+	}
+	node.commitPending.Store(false)
+
+	// Cycle 3: recovery finished. The committed entries held back above are
+	// re-offered now that the state machine is available again.
 	node.SetRecovering(false)
-
 	ws.Notify(1)
 	sw.processReady()
-
-	// The step worker should now process the node. The exact behavior
-	// depends on raft state, but the key assertion is that we get here
-	// without the node being skipped.
-	// Drain any commit items (there may or may not be one depending
-	// on raft state).
 	select {
-	case <-commitC:
-		// Work was produced -- recovery unblocked the node.
+	case item := <-commitC:
+		if len(item.update.CommittedEntries) == 0 {
+			t.Fatal("expected the held-back committed entries after recovery cleared")
+		}
 	default:
-		// No commit item produced, which is also fine -- the node
-		// may not have had enough state change to produce an update.
-		// The key test is that processReady did NOT skip the node
-		// (which we verified by the absence of a panic or skip log).
+		t.Fatal("expected a commit item after recovery cleared")
 	}
-
-	close(stopC)
 }
 
 // TestRecovering_FlagOnlySetsForRecoveryNotSave verifies that the
@@ -523,5 +543,111 @@ func TestRecovering_NodeAccessors(t *testing.T) {
 	node.SetRecovering(false)
 	if node.IsRecovering() {
 		t.Fatal("node should not be recovering after SetRecovering(false)")
+	}
+}
+
+// TestRecovering_ApplyWorkerDoesNotParkEmptyBatch verifies that a batch
+// with NO committed entries is released immediately instead of waiting on
+// the recovering gate. An empty batch never touches the state machine, so
+// parking it buys nothing and costs everything: commitPending stays set for
+// the entire unbounded duration of user RecoverFromSnapshot code, which in
+// memory mode (where every update reaches the apply worker, including a
+// bare hard-state change) silences the shard's ordered responses — vote
+// grants included — for exactly as long as the recovery runs.
+func TestRecovering_ApplyWorkerDoesNotParkEmptyBatch(t *testing.T) {
+	applyC := make(chan *applyItem, 8)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	var wg sync.WaitGroup
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	cb := newTestCallback()
+	ws := NewWorkSignal(1)
+	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, ws, stopC, nil)
+
+	goodSM := newTestSM()
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(nil, newTestApplier(goodSM), nil, cfg, 100, nil, "", nil)
+	node.SetRecovering(true)
+
+	go aw.run()
+
+	node.commitPending.Store(true)
+	item := applyPool.Get().(*applyItem)
+	item.update = proto.Update{ShardID: 1, ReplicaID: 1, State: proto.State{Term: 7}}
+	item.node = node
+	applyC <- item
+
+	deadline := time.After(5 * time.Second)
+	for node.commitPending.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("commitPending still set: an empty batch was parked on the recovering gate")
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if goodSM.applyCount.Load() != 0 {
+		t.Fatalf("expected 0 SM.Apply calls for an empty batch, got %d", goodSM.applyCount.Load())
+	}
+	if node.lastApplied.Load() != 0 {
+		t.Fatalf("expected lastApplied to stay 0, got %d", node.lastApplied.Load())
+	}
+}
+
+// TestRecovering_CommitWorkerSkipsPiggyback verifies that the commit
+// worker does not extract piggyback committed entries for a recovering
+// node. Extracting them advances raft's processed marker and hands the
+// batch to an apply worker that must park it on the recovering gate,
+// holding commitPending — and with it every ordered response, vote grants
+// included — for the whole recovery. The entries stay in the log and are
+// re-offered once the gate clears.
+func TestRecovering_CommitWorkerSkipsPiggyback(t *testing.T) {
+	ldb := newTestLogDB()
+	sender := newTestSender()
+	commitC := make(chan *commitItem, 16)
+	applyC := make(chan *applyItem, 16)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	ws := NewWorkSignal(64)
+	cb := newTestCallback()
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	cw := newCommitWorker(0, ldb, sender, commitC, applyC, applyPool, ws, cb, stopC, nil)
+	cw.noRetryDelay = true
+
+	peer, lr, update, _ := setupPiggybackPeer(t, 1, 1)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node.commitPending.Store(true)
+	node.SetRecovering(true)
+
+	cw.batch = append(cw.batch[:0], update)
+	cw.batchNodes = []*Node{node}
+
+	cw.processBatch()
+
+	select {
+	case ai := <-applyC:
+		t.Fatalf("recovering node forwarded %d piggyback entries to the apply worker",
+			len(ai.update.CommittedEntries))
+	default:
+	}
+	if node.commitPending.Load() {
+		t.Fatal("commitPending must be cleared so the recovering node keeps producing updates")
+	}
+	// The entries were NOT consumed: they are still offered once the gate
+	// clears.
+	node.SetRecovering(false)
+	pb, err := peer.GetPiggybackUpdate(node.lastApplied.Load())
+	if err != nil {
+		t.Fatalf("GetPiggybackUpdate failed: %v", err)
+	}
+	if len(pb.CommittedEntries) == 0 {
+		t.Fatal("committed entries were consumed during recovery; they must stay in the log")
 	}
 }

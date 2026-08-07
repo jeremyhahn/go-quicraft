@@ -1656,7 +1656,7 @@ func TestHandleMessageFrame_HeartbeatOnlyBatchPooling(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestHandleMessageFrame_TooManyMessages verifies that a batch exceeding
-// maxMessagesPerBatch is rejected.
+// proto.MaxMessagesPerBatch is rejected.
 
 func TestHandleMessageFrame_TooManyMessages(t *testing.T) {
 	handler := newTestHandler()
@@ -1674,8 +1674,8 @@ func TestHandleMessageFrame_TooManyMessages(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	// Build a batch with > maxMessagesPerBatch messages.
-	msgs := make([]proto.Message, maxMessagesPerBatch+1)
+	// Build a batch with > proto.MaxMessagesPerBatch messages.
+	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
 	for i := range msgs {
 		msgs[i] = proto.Message{
 			Type:    proto.Replicate,
@@ -2393,7 +2393,7 @@ func TestHandleMessageFrame_CompressedDeploymentMismatch(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestHandleMessageFrame_CompressedTooManyMessages verifies that a compressed
-// batch exceeding maxMessagesPerBatch is rejected.
+// batch exceeding proto.MaxMessagesPerBatch is rejected.
 
 func TestHandleMessageFrame_CompressedTooManyMessages(t *testing.T) {
 	handler := newTestHandler()
@@ -2411,7 +2411,7 @@ func TestHandleMessageFrame_CompressedTooManyMessages(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	msgs := make([]proto.Message, maxMessagesPerBatch+1)
+	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
 	for i := range msgs {
 		msgs[i] = proto.Message{
 			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
@@ -2463,10 +2463,10 @@ func TestHandleMessageFrame_UncompressedTooManyMessagesWithBufCleanup(t *testing
 	}
 	defer tr.Stop()
 
-	// Build a batch with > maxMessagesPerBatch messages, uncompressed.
+	// Build a batch with > proto.MaxMessagesPerBatch messages, uncompressed.
 	// The key difference from TestHandleMessageFrame_TooManyMessages is
 	// that this verifies buf cleanup on the uncompressed path.
-	msgs := make([]proto.Message, maxMessagesPerBatch+1)
+	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
 	for i := range msgs {
 		msgs[i] = proto.Message{
 			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
@@ -3247,8 +3247,13 @@ func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 // open: the peer keeps writing into a stream nobody drains (silently
 // black-holing up to the stream receive window) and the abandoned stream
 // permanently holds one of the peer's stream credits. CancelRead sends
-// STOP_SENDING, so the peer's next Write on the stream fails fast with the
-// receiver-gone stream error code.
+// STOP_SENDING, so the peer's next Write on the stream fails fast.
+//
+// The code carried is QUICStreamErrFrameRejected rather than the default
+// QUICStreamErrReceiverGone, because this exit is a protocol violation: the
+// frame was unacceptable, the connection is fine. That distinction is what
+// stops the peer from tearing the connection down and re-dialling on every
+// rejected frame.
 func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -3273,7 +3278,7 @@ func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 
 	// The receiver's CancelRead arrives as STOP_SENDING: subsequent writes
 	// must start failing with a quic.StreamError carrying
-	// QUICStreamErrReceiverGone. Without the fix, every write below succeeds
+	// QUICStreamErrFrameRejected. Without the fix, every write below succeeds
 	// silently (we send far less than the stream receive window) and the
 	// deadline elapses.
 	junk := make([]byte, 1024)
@@ -3284,9 +3289,9 @@ func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 			if !errors.As(err, &streamErr) {
 				t.Fatalf("expected quic.StreamError from write after CancelRead, got %T: %v", err, err)
 			}
-			if streamErr.ErrorCode != QUICStreamErrReceiverGone {
-				t.Fatalf("stream error code = %d, want %d (QUICStreamErrReceiverGone)",
-					streamErr.ErrorCode, QUICStreamErrReceiverGone)
+			if streamErr.ErrorCode != QUICStreamErrFrameRejected {
+				t.Fatalf("stream error code = %d, want %d (QUICStreamErrFrameRejected)",
+					streamErr.ErrorCode, QUICStreamErrFrameRejected)
 			}
 			return
 		}

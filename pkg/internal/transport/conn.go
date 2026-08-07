@@ -296,17 +296,7 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) {
 // The stream pool is sharded across streamShardCount buckets to reduce
 // lock contention.
 func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat bool) (*quic.Stream, error) {
-	var idx uint64
-	if isHeartbeat {
-		idx = 0
-	} else {
-		poolSize := uint64(t.cfg.StreamPoolSize)
-		if poolSize <= 1 {
-			idx = 0
-		} else {
-			idx = (shardID % (poolSize - 1)) + 1
-		}
-	}
+	idx := t.streamIndexFor(shardID, isHeartbeat)
 
 	shardIdx := idx & (streamShardCount - 1)
 	shard := &t.streamShards[shardIdx]
@@ -825,6 +815,68 @@ func (t *QUICTransport) StreamCount() int {
 		shard.mu.RUnlock()
 	}
 	return total
+}
+
+// isPeerFrameRejection reports whether err is a stream reset the PEER raised
+// because a frame we wrote was unacceptable to its decoder
+// (QUICStreamErrFrameRejected), as opposed to any other write failure.
+//
+// Only a live peer that has read and parsed one of our frames sends this code,
+// so it proves the connection is healthy: the correct response is to drop the
+// offending batch and replace the stream, never to close the connection. The
+// Remote check keeps a locally-initiated cancellation from being mistaken for
+// a peer verdict.
+func isPeerFrameRejection(err error) bool {
+	var streamErr *quic.StreamError
+	return errors.As(err, &streamErr) &&
+		streamErr.Remote &&
+		streamErr.ErrorCode == QUICStreamErrFrameRejected
+}
+
+// streamIndexFor returns the stream-pool index a message with the given shard
+// uses: heartbeats are pinned to index 0 so they are never queued behind a
+// replication burst, data messages are spread over the remaining indices.
+func (t *QUICTransport) streamIndexFor(shardID uint64, isHeartbeat bool) uint64 {
+	if isHeartbeat {
+		return 0
+	}
+	poolSize := uint64(t.cfg.StreamPoolSize)
+	if poolSize <= 1 {
+		return 0
+	}
+	return (shardID % (poolSize - 1)) + 1
+}
+
+// evictStream removes and closes exactly one pooled stream, leaving the
+// connection and every other stream on it untouched. Used when a stream is
+// individually unusable (the peer reset it) rather than when the connection is
+// suspect — evictStreamsForTarget plus removeAndCloseConnection remains the
+// response to a dead connection.
+//
+// The pooled entry is replaced only if it is still the same stream: a
+// concurrent sender may already have opened a healthy replacement at this key,
+// and evicting that would leak it along with its flow-control credit.
+func (t *QUICTransport) evictStream(target string, shardID uint64, isHeartbeat bool, stream *quic.Stream) {
+	if stream == nil {
+		return
+	}
+	idx := t.streamIndexFor(shardID, isHeartbeat)
+	shard := &t.streamShards[idx&(streamShardCount-1)]
+	key := streamKey{target: target, idx: idx}
+
+	shard.mu.Lock()
+	if cached, ok := shard.streams[key]; ok && cached == stream {
+		delete(shard.streams, key)
+	}
+	shard.mu.Unlock()
+
+	if closeErr := stream.Close(); closeErr != nil {
+		slog.Debug("transport: stream close failed during single-stream eviction",
+			"target", target,
+			"shard_id", shardID,
+			"error", closeErr,
+		)
+	}
 }
 
 // isConnectionClosed returns true if the error indicates a closed connection.

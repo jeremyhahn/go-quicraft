@@ -6780,9 +6780,14 @@ func TestStepWorker_EnqueueForCommit_WithMessages(t *testing.T) {
 	}
 }
 
-// TestStepWorker_ProcessReady_RecoveringSkipped verifies that nodes
-// with the recovering flag set are skipped during processReady.
-func TestStepWorker_ProcessReady_RecoveringSkipped(t *testing.T) {
+// TestStepWorker_ProcessReady_RecoveringDefersSnapshot verifies that a
+// recovering node steps ordinary Raft traffic but DEFERS InstallSnapshot.
+// Handling one would restore the raft log onto a newer snapshot index while
+// the snapshot pool is still installing an older one into the state machine,
+// leaving lastApplied permanently below the log's snapshot floor (an apply
+// gap that fails the shard). The deferred message is re-injected once the
+// recovering gate clears.
+func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
 	commitC := make(chan *commitItem, 16)
@@ -6799,18 +6804,49 @@ func TestStepWorker_ProcessReady_RecoveringSkipped(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	// Queue a proposal - it should NOT be processed because recovering.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("ignored")}})
+	if !node.Deliver(proto.Message{
+		Type:     proto.InstallSnapshot,
+		ShardID:  1,
+		From:     2,
+		To:       1,
+		Term:     peer.Term() + 1,
+		Snapshot: proto.Snapshot{ShardID: 1, ReplicaID: 1, Index: 50, Term: 1},
+	}) {
+		t.Fatal("failed to deliver InstallSnapshot to node inbox")
+	}
 
 	ws.Notify(1)
 	sw.processReady()
 
-	// No commit items should be produced.
-	select {
-	case <-commitC:
-		t.Fatal("no commit items expected for recovering node")
-	default:
-		// Expected.
+	deferred := sw.deferredSnapshots[1]
+	if len(deferred) != 1 {
+		t.Fatalf("expected 1 deferred InstallSnapshot while recovering, got %d", len(deferred))
+	}
+	if deferred[0].Snapshot.Index != 50 {
+		t.Fatalf("unexpected deferred snapshot index %d", deferred[0].Snapshot.Index)
+	}
+
+	// The recovering node must not have installed the snapshot into its
+	// raft log: no update may carry it.
+	for {
+		select {
+		case item := <-commitC:
+			if item.update.Snapshot.Index != 0 {
+				t.Fatalf("recovering node installed snapshot %d into the raft log",
+					item.update.Snapshot.Index)
+			}
+			continue
+		default:
+		}
+		break
+	}
+
+	// Once recovery clears, the deferred snapshot is re-delivered.
+	node.SetRecovering(false)
+	node.commitPending.Store(false)
+	sw.redeliverDeferredSnapshots(1, node)
+	if d := node.DiagState(); d.InboxLen != 1 {
+		t.Fatalf("expected the deferred snapshot back in the inbox, inbox len %d", d.InboxLen)
 	}
 }
 
@@ -6965,5 +7001,113 @@ func TestExecutePiggyback_CommitError_FailsShard(t *testing.T) {
 	}
 	if cb.proposalFailedCount.Load() != 1 {
 		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
+	}
+}
+
+// TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail verifies that a
+// shutdown early-return inside processBatch releases the WHOLE remainder of
+// the batch, not just the item it was working on. Every item in the batch
+// arrived with commitPending set by the step worker; an item that is never
+// reached keeps it set forever, so Engine.Stop returns with the shard
+// wedged and a restarted pipeline never produces another update for it.
+func TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+
+	ldb := newTestLogDB()
+	commitC := make(chan *commitItem, 4)
+	// Unbuffered applyC with no reader: the delivery of the first item
+	// blocks and takes the stopC branch.
+	applyC := make(chan *applyItem)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	ws := NewWorkSignal(4)
+	stopC := make(chan struct{})
+	close(stopC) // engine is shutting down
+
+	cw := newCommitWorker(0, ldb, newTestSender(), commitC, applyC, applyPool, ws, nil, stopC, nil)
+	cw.noRetryDelay = true
+
+	// First batch item: a real peer update carrying committed entries, so
+	// processBatch reaches the applyC delivery.
+	peer, lr := newTestPeer(t, 1, 1)
+	tickPeerToLeader(peer)
+	u1, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate failed: %v", err)
+	}
+	if err := peer.Commit(u1); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	u2, err := peer.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (committed) failed: %v", err)
+	}
+	if len(u2.CommittedEntries) == 0 {
+		t.Fatal("expected committed entries in the second update")
+	}
+	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg1.SetDefaults()
+	head := NewNode(peer, nil, lr, cfg1, 100, nil, "", nil)
+	head.commitPending.Store(true)
+
+	// Tail item: never reached, because the head early-returns.
+	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
+	cfg2.SetDefaults()
+	tail := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	tail.commitPending.Store(true)
+
+	cw.batch = append(cw.batch[:0], u2, proto.Update{ShardID: 2, ReplicaID: 1})
+	cw.batchNodes = append(cw.batchNodes[:0], head, tail)
+
+	cw.processBatch()
+
+	if head.commitPending.Load() {
+		t.Fatal("head node left with commitPending after the shutdown early-return")
+	}
+	if tail.commitPending.Load() {
+		t.Fatal("batch tail left wedged with commitPending: it never reached apply and never will")
+	}
+}
+
+// TestCommitWorker_ProcessBatch_PiggybackShutdownAbandonsBatchTail is the
+// piggyback twin of TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail:
+// when executePiggyback aborts on shutdown, the rest of the batch must be
+// released too instead of being left wedged with commitPending set.
+func TestCommitWorker_ProcessBatch_PiggybackShutdownAbandonsBatchTail(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+
+	ldb := newTestLogDB()
+	commitC := make(chan *commitItem, 4)
+	applyC := make(chan *applyItem) // unbuffered, no reader
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	ws := NewWorkSignal(4)
+	stopC := make(chan struct{})
+	close(stopC)
+
+	cw := newCommitWorker(0, ldb, newTestSender(), commitC, applyC, applyPool, ws, nil, stopC, nil)
+	cw.noRetryDelay = true
+
+	peer, lr, update, _ := setupPiggybackPeer(t, 1, 1)
+	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg1.SetDefaults()
+	head := NewNode(peer, nil, lr, cfg1, 100, nil, "", nil)
+	head.commitPending.Store(true)
+
+	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
+	cfg2.SetDefaults()
+	tail := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	tail.commitPending.Store(true)
+
+	cw.batch = append(cw.batch[:0], update, proto.Update{ShardID: 2, ReplicaID: 1})
+	cw.batchNodes = append(cw.batchNodes[:0], head, tail)
+
+	cw.processBatch()
+
+	if head.commitPending.Load() {
+		t.Fatal("head node left with commitPending after the piggyback shutdown early-return")
+	}
+	if tail.commitPending.Load() {
+		t.Fatal("batch tail left wedged with commitPending after the piggyback shutdown early-return")
 	}
 }

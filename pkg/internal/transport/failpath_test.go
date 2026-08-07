@@ -214,12 +214,17 @@ func TestSendBatch_StreamUnavailableDropsBatch(t *testing.T) {
 }
 
 // TestSendBatch_OversizedFrameDropsBatch covers the ErrPayloadTooLarge branch.
-// This is a configuration defect with a silent-quorum-degradation failure mode:
+// This is a producer defect with a silent-quorum-degradation failure mode:
 // raft sizes replication batches against MaxApplyEntrySize, and if that exceeds
-// the frame cap the batch is dropped WITHOUT advancing the follower's next
-// index, so raft rebuilds the identical oversized batch forever and the
+// the frame cap the message is dropped WITHOUT advancing the follower's next
+// index, so raft rebuilds the identical oversized message forever and the
 // follower can never catch up. The drop must at minimum be attributed so the
 // condition is observable rather than silent.
+//
+// The message is refused by the pre-write sendability check
+// (dropReasonUnsendable), not by MarshalFrame: an unacceptable frame must
+// never reach the wire, because the peer's rejection of it is indistinguishable
+// at the sender from a broken connection.
 func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 	tr, rec := newDropTransport(t)
 
@@ -244,8 +249,8 @@ func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 	if len(drops) != 1 {
 		t.Fatalf("recorded %d drops, want 1", len(drops))
 	}
-	if drops[0].reason != dropReasonMarshalFailed {
-		t.Fatalf("drop reason = %q, want %q", drops[0].reason, dropReasonMarshalFailed)
+	if drops[0].reason != dropReasonUnsendable {
+		t.Fatalf("drop reason = %q, want %q", drops[0].reason, dropReasonUnsendable)
 	}
 	if drops[0].shardID != 9 || drops[0].to != 2 {
 		t.Fatalf("drop attributed to shard %d / replica %d, want 9 / 2", drops[0].shardID, drops[0].to)

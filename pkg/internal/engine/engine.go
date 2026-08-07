@@ -546,10 +546,10 @@ func (e *Engine) runApplyWorkerOnce(aw *applyWorker) (panicked bool) {
 }
 
 // runCommitWorkerLoop runs a commit worker with automatic restart on
-// panic. If the worker panics, the loop logs the panic with a full
-// stack trace, clears commitPending on all nodes assigned to this
-// worker to unblock them, and restarts the worker after a brief delay.
-// The loop exits cleanly when the commit stop channel is closed.
+// panic. If the worker panics, the loop logs the panic with a full stack
+// trace, unblocks the nodes whose updates died with the panicking batch,
+// and restarts the worker after a brief delay. The loop exits cleanly when
+// the commit stop channel is closed.
 func (e *Engine) runCommitWorkerLoop(cw *commitWorker) {
 	for {
 		panicked := e.runCommitWorkerOnce(cw)
@@ -602,6 +602,21 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 			// committed-entries slice returned to proto's pool twice — handing
 			// one backing array to two shards.
 			e.drainCommitC(cw.commitC)
+			// Unwedge exactly the nodes whose updates died with the batch.
+			// A blanket clear over every node this worker owns would also
+			// clear nodes the STEP worker is mid-enqueueForCommit for: that
+			// worker sets commitPending before its commitC send, so clearing
+			// it lets the very next processReady call GetUpdate again while
+			// the first update is still in flight. Raft's processed marker
+			// has not advanced yet, so the same committed entries are
+			// extracted TWICE (double Peer.Commit, double apply, double
+			// ReleaseCommittedEntries on one pooled slice), and
+			// getCommitSlot hands back the SAME *commitItem that is still
+			// queued — one pointer enqueued twice. Items in the batch have
+			// already been consumed from commitC and copied into w.batch, so
+			// clearing them is safe; items still in commitC were cleared by
+			// the drain above.
+			cw.clearBatchCommitPending(e.workSignal)
 			// The panic may have unwound out of processBatch before
 			// clearBatch ran, leaving orderedMsgsBuf holding this batch's
 			// VoteResp/HeartbeatResp and batch/commitTimes holding its
@@ -611,7 +626,6 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 			// never persisted (Raft PhD 10.2.1). Safe to touch here: the
 			// worker goroutine is unwinding, so nothing else owns the batch.
 			cw.clearBatch()
-			e.clearCommitPending(cw.workerID)
 		}
 	}()
 	cw.run()
@@ -621,9 +635,10 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 // drainCommitC non-blocking drains all items from the given commitC
 // channel, clearing commitPending on each drained node. Called during
 // panic recovery to discard stale in-flight commitItems that were
-// enqueued before the panic. Without this drain, the restarted worker
-// would pick up a stale item whose node already had commitPending
-// cleared by clearCommitPending, causing a double-process race.
+// enqueued before the panic. Draining an item BEFORE its node's
+// commitPending is cleared is what makes the clear safe: the step worker
+// can only reuse the shard's pre-allocated commitItem slot once the item
+// is out of the channel, so no pointer is ever queued twice.
 func (e *Engine) drainCommitC(commitC chan *commitItem) {
 	for {
 		select {
@@ -643,30 +658,6 @@ func (e *Engine) drainCommitC(commitC chan *commitItem) {
 			return
 		}
 	}
-}
-
-// clearCommitPending iterates all nodes in the engine and clears the
-// commitPending flag on nodes assigned to the given worker ID. This
-// unblocks nodes that were waiting for the commit worker to process
-// their updates when the worker panicked. Without this, nodes would
-// remain stuck with commitPending=true indefinitely, preventing the
-// step worker from producing new updates for those shards.
-func (e *Engine) clearCommitPending(workerID int) {
-	numWorkers := len(e.stepWorkers)
-	e.allNodes.Range(func(key, val any) bool {
-		node, ok := val.(*Node)
-		if !ok {
-			return true
-		}
-		shardID, shardOK := key.(uint64)
-		if !shardOK {
-			return true
-		}
-		if int(shardID%uint64(numWorkers)) == workerID {
-			node.commitPending.Store(false)
-		}
-		return true
-	})
 }
 
 // runStepWorkerLoop runs a step worker with automatic restart on panic.

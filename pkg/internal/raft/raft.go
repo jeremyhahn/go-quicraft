@@ -857,10 +857,25 @@ func tickFollower(r *raft) {
 			"election_timeout", r.randomizedElectionTimeout,
 		)
 		r.electionTick = 0
-		// Check if quiesce should be entered.
-		if r.quiesce.tryEnter() {
-			return
-		}
+		// A follower whose election timer just expired has heard nothing from
+		// a leader for a full timeout, which is precisely when it must
+		// campaign. This used to call quiesce.tryEnter() first and RETURN
+		// when it fired, suppressing the election and then running at
+		// quiesceElectionTimeout (30x the normal timeout).
+		//
+		// The call was also miscounted into near-irrelevance -- threshold is
+		// in ticks and tickLeader increments once per tick, but this site ran
+		// only once per election timeout, so it needed ~100 election timeouts
+		// to fire. Correcting the arithmetic would have ACTIVATED the
+		// liveness hazard rather than removed it. Nothing on the follower
+		// path resets that counter for heartbeats either (recordActivity is
+		// reached only from the write paths), so it advanced exactly while
+		// the follower was leaderless.
+		//
+		// Quiesce is leader-driven by design: the leader enters it and calls
+		// broadcastQuiesce, and followers enter via handleQuiesceMessage,
+		// which is now correctly gated on the local enabled flag. A follower
+		// self-quiescing independently of its leader was never the design.
 		r.startElection()
 	}
 }
@@ -1691,6 +1706,7 @@ func (r *raft) sendAppend(to uint64) {
 			r.sendSnapshot(to)
 			return
 		}
+		entries = limitEntryCount(entries)
 
 		// Send the Replicate message. An empty entries slice is valid: in
 		// Probe state the follower uses prevLogIndex/prevLogTerm to detect
@@ -1766,6 +1782,7 @@ func (r *raft) sendWitnessAppend(to uint64) {
 			r.sendSnapshot(to)
 			return
 		}
+		entries = limitEntryCount(entries)
 
 		// Same probe logic as sendAppend: witnesses in Probe state need
 		// empty Replicate messages for log divergence detection.

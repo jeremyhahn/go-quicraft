@@ -121,6 +121,22 @@ const (
 	// stream nobody drains.
 	QUICStreamErrReceiverGone quic.StreamErrorCode = 0x1
 
+	// QUICStreamErrFrameRejected is sent via CancelRead when the receiver
+	// abandons an inbound stream because a FRAME on it was unacceptable
+	// (bad magic, wrong wire version, foreign deployment, undecodable or
+	// over-limit batch) rather than because the receiver or the connection
+	// is gone.
+	//
+	// The distinction is what keeps a rejected frame from tearing the
+	// connection down. Both cases surface at the sender as the same
+	// *quic.StreamError from Write, so without a distinct code the sender
+	// must assume the connection is dead: it closes and re-dials, retries the
+	// identical unacceptable frame, and loops — a dial storm that also starves
+	// the peer of the very data it is waiting for. Seeing this code, the
+	// sender drops the batch and replaces only the stream (see
+	// isPeerFrameRejection).
+	QUICStreamErrFrameRejected quic.StreamErrorCode = 0x3
+
 	// QUICStreamErrShutdown is sent via CancelWrite when the transport is
 	// stopping while a snapshot chunk write is in flight. The RESET_STREAM
 	// unblocks a Write that would otherwise hold Stop() hostage for up to

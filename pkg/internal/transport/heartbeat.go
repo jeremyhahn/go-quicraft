@@ -146,6 +146,17 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 	_, err = stream.Write(buf[:frameSize])
 	t.putBuf(bufPtr)
 	if err != nil {
+		// The peer refused a frame on the heartbeat stream (see sendFrame for
+		// why this is not a connection failure). Replace the stream only: a
+		// peer that rejects every frame — a deployment or wire-version
+		// mismatch — would otherwise turn each heartbeat tick into a
+		// connection teardown and re-dial.
+		if isPeerFrameRejection(err) {
+			t.incBatchDropped(msgs, dropReasonPeerRejected)
+			t.recordPeerFrameRejection(target, shardID, msgCount, err)
+			t.evictStream(target, shardID, true, stream)
+			return
+		}
 		// Debug level: a dead peer fails every heartbeat until eviction
 		// completes; the next tick retries on a fresh connection.
 		if debugEnabled() {

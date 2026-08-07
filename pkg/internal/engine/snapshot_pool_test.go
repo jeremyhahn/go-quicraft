@@ -4471,3 +4471,86 @@ func TestHandleRequest_PanicRecovery_PostCompletionCallback(t *testing.T) {
 		t.Fatal("OnSnapshotRejected must not fire for a snapshot that completed")
 	}
 }
+
+// TestSnapshotPool_ShutdownReleasesQueuedRequests verifies that a request
+// still queued when the pool shuts down does not strand the per-shard state
+// requestSnapshot established for it. The in-flight entry and the node's
+// snapshotting flag are cleared only by the worker that runs the request, so
+// a pool that stops without draining requestC leaves the shard permanently
+// unable to snapshot and the caller's pending request waiting for a
+// completion callback that can never fire.
+func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
+	t.Run("shutdown races the producer", func(t *testing.T) {
+		// stopC is already closed when the request is submitted: the send
+		// still succeeds (the buffer has room) and no worker will ever read
+		// it, so requestSnapshot itself must release it.
+		stopC := make(chan struct{})
+		close(stopC)
+		cb := newTestCallback()
+		p := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+
+		cfg := config.Config{ShardID: 7, ReplicaID: 1}
+		cfg.SetDefaults()
+		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+		if !node.TryStartSnapshot() {
+			t.Fatal("TryStartSnapshot should succeed on a fresh node")
+		}
+
+		if err := p.requestSnapshot(snapshotRequest{
+			shardID: 7, replicaID: 1, node: node, save: true,
+		}); err != nil {
+			t.Fatalf("requestSnapshot failed: %v", err)
+		}
+
+		if node.snapshotting.Load() {
+			t.Fatal("node left marked snapshotting by a request no worker will run")
+		}
+		if _, loaded := p.inFlight.Load(uint64(7)); loaded {
+			t.Fatal("shard left marked in-flight: no further snapshot could ever be accepted")
+		}
+		if cb.snapshotRejected.Load() == 0 {
+			t.Fatal("expected OnSnapshotRejected so the caller stops waiting")
+		}
+		if len(p.requestC) != 0 {
+			t.Fatal("the stranded request was left on requestC")
+		}
+	})
+
+	t.Run("workers drain on exit", func(t *testing.T) {
+		// The request is queued while the pool is live, then the pool is
+		// stopped. Whichever branch the worker's select takes, the request
+		// must not be left holding the shard's snapshot state. (A worker
+		// that picks up the request runs it normally; one that observes
+		// stopC first drains it.)
+		stopC := make(chan struct{})
+		cb := newTestCallback()
+		p := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+
+		cfg := config.Config{ShardID: 8, ReplicaID: 1}
+		cfg.SetDefaults()
+		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+		if !node.TryStartSnapshot() {
+			t.Fatal("TryStartSnapshot should succeed on a fresh node")
+		}
+		if err := p.requestSnapshot(snapshotRequest{
+			shardID: 8, replicaID: 1, node: node, save: true,
+		}); err != nil {
+			t.Fatalf("requestSnapshot failed: %v", err)
+		}
+
+		close(stopC)
+		var wg sync.WaitGroup
+		p.start(&wg)
+		wg.Wait()
+
+		if node.snapshotting.Load() {
+			t.Fatal("node left marked snapshotting after the pool stopped")
+		}
+		if _, loaded := p.inFlight.Load(uint64(8)); loaded {
+			t.Fatal("shard left marked in-flight after the pool stopped")
+		}
+		if len(p.requestC) != 0 {
+			t.Fatal("a request was left on requestC after every worker exited")
+		}
+	})
+}

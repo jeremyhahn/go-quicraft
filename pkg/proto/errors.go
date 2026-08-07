@@ -48,7 +48,8 @@ var (
 	ErrBatchSizeLimitExceeded = errors.New("proto: batch size exceeds MaxBatchSize")
 
 	// ErrTooManyMessages is returned when the message count in a
-	// MessageBatch exceeds maxMessagesPerBatch during unmarshal.
+	// MessageBatch (MaxMessagesPerBatch) or the entry count in a Message
+	// (MaxEntriesPerMessage) is exceeded during unmarshal.
 	ErrTooManyMessages = errors.New("proto: message count exceeds limit")
 
 	// ErrTooManyMembershipEntries is returned when a membership map

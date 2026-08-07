@@ -1301,11 +1301,11 @@ func TestHandleMessageFrameTooManyMessages(t *testing.T) {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
 
-	// Create a batch with more messages than maxMessagesPerBatch.
+	// Create a batch with more messages than proto.MaxMessagesPerBatch.
 	// We can't easily create 10001 real messages in the wire format,
 	// but we can verify the limit exists.
-	if maxMessagesPerBatch != 10000 {
-		t.Fatalf("expected maxMessagesPerBatch=10000, got %d", maxMessagesPerBatch)
+	if proto.MaxMessagesPerBatch != 10000 {
+		t.Fatalf("expected proto.MaxMessagesPerBatch=10000, got %d", proto.MaxMessagesPerBatch)
 	}
 
 	// Create a valid batch with correct deployment ID and 1 message

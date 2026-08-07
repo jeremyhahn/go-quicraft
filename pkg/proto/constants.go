@@ -76,9 +76,26 @@ const MaxMetadataLen uint32 = 65536 // 64KB
 // chunk's data payload. Matches MaxEntrySize as a reasonable upper bound.
 const MaxSnapshotChunkDataLen uint32 = MaxEntrySize
 
-// maxMessagesPerBatch is the maximum number of messages allowed in a
-// single MessageBatch. Validated before allocation in UnmarshalFrom.
-const maxMessagesPerBatch = 10000
+// MaxMessagesPerBatch is the maximum number of messages allowed in a
+// single MessageBatch. Validated before allocation in MessageBatch's
+// UnmarshalFrom, which returns ErrTooManyMessages beyond it.
+//
+// Exported because it is a property of the wire protocol, not of the
+// decoder: a producer that exceeds it emits a batch every peer rejects,
+// and a rejection is indistinguishable from a broken connection at the
+// sender. Producers MUST bound themselves by this value.
+const MaxMessagesPerBatch = 10000
+
+// MaxEntriesPerMessage is the maximum number of log entries a single
+// Message may carry. Validated before allocation in Message's
+// UnmarshalFrom, which returns ErrTooManyMessages beyond it.
+//
+// Exported for the same reason as MaxMessagesPerBatch: raft sizes a
+// Replicate message against Config.MaxApplyEntrySize (a BYTE bound), so
+// with small entries it can build a message no peer will accept. Every
+// producer of multi-entry messages must also bound the entry COUNT by
+// this value.
+const MaxEntriesPerMessage = 10000
 
 // maxMembershipEntries is the maximum number of entries allowed in a
 // single Membership map. Validated before allocation in UnmarshalFrom.

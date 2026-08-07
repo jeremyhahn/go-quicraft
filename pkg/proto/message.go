@@ -121,7 +121,7 @@ func (m *Message) MarshalTo(buf []byte) (int, error) {
 
 // UnmarshalFrom reads the message from buf and returns bytes consumed.
 // Validates Message.Type against the known range and entries count
-// against maxMessagesPerBatch before allocation. Returns ErrBufferTooSmall
+// against MaxEntriesPerMessage before allocation. Returns ErrBufferTooSmall
 // on truncated input, ErrInvalidMessageType for unknown types, or
 // ErrTooManyMessages if the entry count exceeds the limit.
 func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
@@ -148,7 +148,7 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	// Entries
 	entryCount := getUint32(buf[offset:])
 	offset += 4
-	if entryCount > maxMessagesPerBatch {
+	if entryCount > MaxEntriesPerMessage {
 		return 0, ErrTooManyMessages
 	}
 	// entryHeaderSize is the minimum encoding of one Entry (empty Cmd), so
@@ -197,7 +197,7 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 // carrying many oversized messages would pin
 // len(Requests) * cap(Entries) * unsafe.Sizeof(Entry) bytes in the pool for
 // the process lifetime. The bound sits above the legitimate working set —
-// UnmarshalFrom accepts up to maxMessagesPerBatch (10000) entries per
+// UnmarshalFrom accepts up to MaxEntriesPerMessage (10000) entries per
 // message, while a steady-state append carries at most
 // batch.DefaultMaxBatchSize (1000) proposals — so a normal replication
 // message still reuses its backing array.

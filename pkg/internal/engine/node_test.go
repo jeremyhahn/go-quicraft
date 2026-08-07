@@ -817,16 +817,44 @@ func TestNode_DiagState_IncludesReadIndexQ(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
 
-	_, _, _, riq := n.DiagState()
-	if riq != 0 {
-		t.Fatalf("readIndexQ should be 0 initially, got %d", riq)
+	if d := n.DiagState(); d.ReadIndexQLen != 0 {
+		t.Fatalf("readIndexQ should be 0 initially, got %d", d.ReadIndexQLen)
 	}
 
 	n.DeliverReadIndex(1)
 	n.DeliverReadIndex(2)
-	_, _, _, riq = n.DiagState()
-	if riq != 2 {
-		t.Fatalf("readIndexQ should be 2 after 2 deliveries, got %d", riq)
+	if d := n.DiagState(); d.ReadIndexQLen != 2 {
+		t.Fatalf("readIndexQ should be 2 after 2 deliveries, got %d", d.ReadIndexQLen)
+	}
+}
+
+// TestNode_DiagState_ReportsSnapshotGates verifies that the diagnostic
+// snapshot exposes the recovering and saving gates and the apply drain
+// counter. Without them an operator sees a shard that is applying nothing
+// and cannot tell whether a snapshot gate is holding it.
+func TestNode_DiagState_ReportsSnapshotGates(t *testing.T) {
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+
+	if d := n.DiagState(); d.Recovering || d.Saving || d.ApplyInFlight != 0 {
+		t.Fatalf("fresh node reported gates %+v", d)
+	}
+
+	n.SetRecovering(true)
+	n.applyInFlight.Add(1)
+	d := n.DiagState()
+	if !d.Recovering {
+		t.Fatal("DiagState must report the recovering gate")
+	}
+	if d.ApplyInFlight != 1 {
+		t.Fatalf("DiagState ApplyInFlight = %d, want 1", d.ApplyInFlight)
+	}
+	n.SetRecovering(false)
+	n.applyInFlight.Add(-1)
+
+	n.SetSaving(true)
+	if d := n.DiagState(); !d.Saving {
+		t.Fatal("DiagState must report the saving gate")
 	}
 }
 

@@ -136,7 +136,7 @@ func TestMessageBatchTooManyMessages(t *testing.T) {
 	mb.MarshalTo(buf)
 	// Find the requests count field and corrupt it
 	offset := messageBatchFixedSize + 4 + 1 // after BinVer + DeploymentID + sourceAddress("x")
-	putUint32(buf[offset:], uint32(maxMessagesPerBatch+1))
+	putUint32(buf[offset:], uint32(MaxMessagesPerBatch+1))
 	var mb2 MessageBatch
 	_, err := mb2.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrTooManyMessages) {

@@ -16,8 +16,10 @@ package transport
 
 import (
 	"encoding/binary"
-	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"io"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // Wire format constants for the transport frame protocol.
@@ -47,10 +49,6 @@ const (
 	// Layout: Magic(2) + Version(1) + Flags(1) + Length(4) = 8 bytes.
 	FrameHeaderSize = 8
 
-	// maxMessagesPerBatch is the maximum number of messages allowed in
-	// a single batch, as a sanity limit against malformed payloads.
-	maxMessagesPerBatch = 10000
-
 	// maxPoolBufSize is the maximum buffer size returned to sync.Pool.
 	// Buffers larger than this are left for GC to prevent pool pollution.
 	maxPoolBufSize = 256 * 1024
@@ -65,13 +63,18 @@ const (
 // MaxReplicationPayloadBytes is the largest raw entry payload a single
 // replication batch may carry and still fit in one transport frame.
 //
-// MarshalFrame rejects anything above MaxFrameSize with ErrPayloadTooLarge,
-// and a rejected batch is DROPPED: raft does not advance the follower's next
-// index, so it rebuilds the identical oversized batch on every replicate
-// cycle and the follower can never catch up (no backoff, no batch-size
-// reduction, and no snapshot fallback because the entries are still present).
-// Configuration that sizes replication batches — raft's maxReplicationPayload,
-// i.e. Config.MaxApplyEntrySize — MUST be clamped to this bound.
+// A message above this bound cannot be framed and is DROPPED by the send path:
+// raft does not advance the follower's next index, so it rebuilds the identical
+// oversized message on every replicate cycle and the follower can never catch
+// up (no backoff, no batch-size reduction, and no snapshot fallback because the
+// entries are still present). Configuration that sizes replication batches —
+// raft's maxReplicationPayload, i.e. Config.MaxApplyEntrySize — MUST be clamped
+// to this bound.
+//
+// This is only the BYTE half of the contract. proto.MaxEntriesPerMessage is the
+// other half: a byte-bounded batch of small entries still exceeds the decoder's
+// entry-count limit, with the same starvation outcome. Both must be enforced
+// where a replication message is built (see raft's limitEntryCount).
 const MaxReplicationPayloadBytes = int(MaxFrameSize) - FrameHeaderSize - batchFramingReserve
 
 // config.MaxReplicationPayloadBytes duplicates this value because this package
@@ -79,6 +82,84 @@ const MaxReplicationPayloadBytes = int(MaxFrameSize) - FrameHeaderSize - batchFr
 // build if the two ever drift: config uses it to reject a MaxApplyEntrySize
 // that would make raft build replication batches this transport cannot frame.
 const _ = uint64(MaxReplicationPayloadBytes) - config.MaxReplicationPayloadBytes
+
+// Send-side framing admission control.
+//
+// A frame the peer will not accept is worse than no frame at all: the peer's
+// decoder rejects it and resets the stream, the sender reads that reset as a
+// generic write failure, and retrying the identical batch reproduces it
+// forever. The sender must therefore decide BEFORE writing whether a batch can
+// be carried, splitting what can be split and dropping (not retrying, and
+// never at the cost of the connection) what cannot.
+//
+// Sizing is done on the UNCOMPRESSED marshaled payload even though the wire
+// may carry a Snappy-compressed one. The receiver's MaxDecompressedSize is
+// itself capped at MaxFrameSize, so a payload that only fits after compression
+// is rejected on arrival with ErrDecompressedSizeLimitExceeded — checking the
+// compressed length alone (what MarshalFrame does) is not sufficient.
+
+// batchHeaderSize returns the marshaled byte size of a MessageBatch carrying
+// no requests, i.e. the per-frame overhead every group of messages pays.
+// MessageBatch.Size() is the sum of this and each request's Size(), so a group
+// fits a frame exactly when headerSize + sum(Size()) <= MaxFrameSize.
+func batchHeaderSize(sourceAddress string) int {
+	header := proto.MessageBatch{SourceAddress: sourceAddress}
+	return header.Size()
+}
+
+// messageFrameError reports why msg can never be delivered in a frame, given
+// its already-computed marshaled size, or nil if it can. The two conditions
+// are the wire limits the peer's decoder enforces: a message that violates
+// either is rejected by every peer, so emitting it can only destroy the stream
+// it is written to.
+func messageFrameError(msg *proto.Message, headerSize, size int) error {
+	if len(msg.Entries) > proto.MaxEntriesPerMessage {
+		return proto.ErrTooManyMessages
+	}
+	if headerSize+size > int(MaxFrameSize) {
+		return ErrPayloadTooLarge
+	}
+	return nil
+}
+
+// messageFrameable reports whether msg can be carried by a frame at all. It is
+// the predicate form of messageFrameError, for the group scan, which ends a
+// group at an unframeable message rather than reporting the reason: the caller
+// takes that message as the next head and drops it there, once.
+func messageFrameable(msg *proto.Message, headerSize, size int) bool {
+	return messageFrameError(msg, headerSize, size) == nil
+}
+
+// sendableGroup returns how many of the leading messages in msgs marshal into
+// a single frame together, and the payload size that frame will have. The
+// group ends at the first message that would overflow the frame, at the first
+// message that can never be framed (the caller drops it as the next head), or
+// at proto.MaxMessagesPerBatch messages.
+//
+// It returns a non-nil error only when msgs[0] itself cannot ever be framed;
+// otherwise the count is >= 1, so a caller looping over the batch always makes
+// progress. Each message's size is computed once here and handed to the
+// marshal path, keeping the send hot path to a single sizing pass.
+func sendableGroup(headerSize int, msgs []proto.Message) (count, payload int, err error) {
+	size := msgs[0].Size()
+	if err := messageFrameError(&msgs[0], headerSize, size); err != nil {
+		return 0, 0, err
+	}
+	total := headerSize + size
+	n := 1
+	for n < len(msgs) && n < proto.MaxMessagesPerBatch {
+		size = msgs[n].Size()
+		if !messageFrameable(&msgs[n], headerSize, size) {
+			break
+		}
+		if total+size > int(MaxFrameSize) {
+			break
+		}
+		total += size
+		n++
+	}
+	return n, total, nil
+}
 
 // FrameFlags is a bitfield encoding frame-level options in a single byte.
 type FrameFlags byte

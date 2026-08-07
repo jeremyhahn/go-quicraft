@@ -249,15 +249,25 @@ func (w *stepWorker) processReady() {
 		if node.IsFailed() {
 			continue
 		}
-		// When recovering is true, a snapshot recovery is in progress
-		// on the snapshot pool goroutine. The state machine is being
-		// replaced by RecoverFromSnapshot. Skip all pipeline operations
-		// (inbox drain, GetUpdate, commit) for this node to prevent
-		// concurrent state machine access. The snapshot pool will clear
-		// the flag and notify the work signal when recovery completes.
-		if node.IsRecovering() {
-			continue
-		}
+		// When recovering is true, a snapshot recovery is in progress on
+		// the snapshot pool goroutine and the state machine is being
+		// replaced by RecoverFromSnapshot — arbitrary user code with no
+		// time bound. The node nevertheless STAYS IN THE PROTOCOL: nothing
+		// in Handle(RequestVote)/Handle(Heartbeat), nor in the WAL persist
+		// that lets their (ordered) responses be sent, touches the state
+		// machine. Only the extraction of committed entries feeds the apply
+		// worker, so that is the single thing suppressed here — GetUpdate
+		// is called with moreEntriesToApply=false — plus InstallSnapshot,
+		// which would move the raft log's snapshot floor out from under the
+		// recovery in progress (see drainAndHandleInbox).
+		//
+		// Skipping the node outright (the previous behavior) made it
+		// invisible to consensus for the whole recovery: it stepped no
+		// RequestVote, emitted no RequestVoteResp, and answered no
+		// Heartbeat, while Node.Deliver DISCARDED inbound messages once the
+		// inbox filled. Two replicas recovering at once therefore dissolved
+		// a five-replica shard's quorum with every node still up.
+		recovering := node.IsRecovering()
 		// When commitPending is true, the commit/apply pipeline owns the
 		// Peer for write operations. However, incoming transport messages
 		// (HeartbeatResp, ReadIndexResp) can satisfy pending ReadIndex
@@ -279,17 +289,29 @@ func (w *stepWorker) processReady() {
 		// (written by Host.Propose goroutines) and transport messages
 		// remain in inboxC (written by transport delivery goroutines).
 		if node.peer != nil {
-			w.drainAndHandleProposals(shardID, node)
-			// Update the per-shard rate limiter cache immediately after
-			// proposals are appended to the in-memory log. On single-node
-			// clusters, entries are committed and compacted in the same
-			// processReady iteration, so the tick-based evaluation in
-			// tickLeader() would always see an empty log. Evaluating here
-			// captures the peak in-memory size before commit/apply drains it.
-			node.peer.RateLimited()
-			w.drainAndHandleReadIndex(shardID, node)
-			w.redeliverDeferredSnapshots(shardID, node)
-			w.drainAndHandleInbox(shardID, node)
+			// Client work — proposals and ReadIndex requests — stays queued
+			// while a recovery owns the state machine. Neither can produce a
+			// result before the gate clears (the apply pipeline is stopped and
+			// lastApplied does not move), so accepting them buys nothing;
+			// leaving them queued lets the queues apply their own backpressure
+			// (ErrSystemBusy), which is the honest answer from a replica that
+			// cannot serve them yet. Raft protocol traffic below is a different
+			// matter and MUST keep flowing.
+			if !recovering {
+				w.drainAndHandleProposals(shardID, node)
+				// Update the per-shard rate limiter cache immediately after
+				// proposals are appended to the in-memory log. On single-node
+				// clusters, entries are committed and compacted in the same
+				// processReady iteration, so the tick-based evaluation in
+				// tickLeader() would always see an empty log. Evaluating here
+				// captures the peak in-memory size before commit/apply drains it.
+				node.peer.RateLimited()
+				w.drainAndHandleReadIndex(shardID, node)
+				// Deferred snapshots are re-injected only once the pipeline can
+				// accept them: not while a recovery is installing one.
+				w.redeliverDeferredSnapshots(shardID, node)
+			}
+			w.drainAndHandleInbox(shardID, node, recovering)
 			node.peer.FlushReadIndex()
 		}
 		// commitC backpressure guard (WAL mode only). This worker is the
@@ -306,6 +328,22 @@ func (w *stepWorker) processReady() {
 		// An unbuffered commitC is a test-only rendezvous configuration
 		// (NewEngine always allocates a buffer), so the guard does not apply.
 		if !w.memoryMode && cap(w.commitC) > 0 && len(w.commitC) == cap(w.commitC) {
+			// Flush free-order messages before skipping. GetUpdate is the
+			// only other drain of p.r.msgs on this path, and commitPending
+			// is false here so tick()'s drain does not run either — so
+			// heartbeats, Replicate, and the Ping/Quiesce control traffic
+			// produced by the inbox processing above would sit unsent for as
+			// long as the commit worker stays behind. A SaveState retry
+			// backoff (up to ~1.76s) would therefore silence every shard
+			// this worker owns and trigger elections against a live leader.
+			// Only free-order messages may go: everything else (VoteResp,
+			// HeartbeatResp) still has to wait for its state to be durable
+			// (Raft PhD 10.2.1).
+			if node.peer != nil {
+				if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
+					w.sendMessages(msgs)
+				}
+			}
 			continue
 		}
 		lastApplied := node.lastApplied.Load()
@@ -313,7 +351,13 @@ func (w *stepWorker) processReady() {
 		if !hasUpdate {
 			continue
 		}
-		update, err := node.peer.GetUpdate(true, lastApplied)
+		// moreEntriesToApply is false while a snapshot recovery owns the
+		// state machine: committed entries stay in the raft log (the
+		// processed marker does not advance, so they are re-offered once
+		// the gate clears) instead of entering the commit/apply pipeline.
+		// Everything else in the update — hard state, entries to save,
+		// messages — is protocol-level and must keep flowing.
+		update, err := node.peer.GetUpdate(!recovering, lastApplied)
 		if err != nil {
 			node.handleError(err)
 			continue
@@ -404,11 +448,53 @@ func (w *stepWorker) deferSnapshot(shardID uint64, msg proto.Message) {
 	w.deferredSnapshots[shardID] = buf[:1]
 }
 
+// filterSnapshots moves every InstallSnapshot message in msgs into the
+// shard's deferred-snapshot buffer and returns the remaining messages.
+// The input slice is filtered in place into a fresh header, so the caller
+// must use the returned slice. When msgs holds no snapshot it is returned
+// unchanged and nothing is allocated.
+func (w *stepWorker) filterSnapshots(shardID uint64, msgs []proto.Message) []proto.Message {
+	hasSnapshot := false
+	for i := range msgs {
+		if msgs[i].Type == proto.InstallSnapshot {
+			hasSnapshot = true
+			break
+		}
+	}
+	if !hasSnapshot {
+		return msgs
+	}
+	// Buffer InstallSnapshot messages locally instead of re-delivering
+	// them to the inbox. Re-delivery causes an infinite drain-redeliver
+	// loop: each processReady cycle drains the same message and puts it
+	// back, burning CPU until the gate clears. Buffering here ensures the
+	// messages are processed exactly once when it does.
+	filtered := msgs[:0:0]
+	for i := range msgs {
+		if msgs[i].Type == proto.InstallSnapshot {
+			w.deferSnapshot(shardID, msgs[i])
+		} else {
+			filtered = append(filtered, msgs[i])
+		}
+	}
+	return filtered
+}
+
 // drainAndHandleInbox drains transport messages (Replicate, Heartbeat,
 // ReadIndex, etc.) from inboxQ and handles them individually through
 // the Raft peer.
-func (w *stepWorker) drainAndHandleInbox(shardID uint64, node *Node) {
+//
+// While recovering is true, InstallSnapshot messages are deferred instead
+// of handled: handleSnapshot restores the raft log onto a NEWER snapshot
+// index while the pool is still installing an older one into the state
+// machine, which would leave lastApplied permanently below the log's
+// snapshot floor and fail the shard with an apply gap. Every other message
+// type is pure Raft protocol and is safe to step during recovery.
+func (w *stepWorker) drainAndHandleInbox(shardID uint64, node *Node, recovering bool) {
 	w.inboxBuf = node.DrainInbox(w.inboxBuf)
+	if recovering {
+		w.inboxBuf = w.filterSnapshots(shardID, w.inboxBuf)
+	}
 	for i := range w.inboxBuf {
 		var handleStart time.Time
 		if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -745,37 +831,11 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	//
 	// InstallSnapshot messages are buffered in deferredSnapshots
 	// (per-shard on the step worker) instead of re-delivered to the
-	// inbox. Re-delivery to the inbox caused a CPU-burning loop: each
-	// processReady cycle drained the same message and put it back.
-	// The deferredSnapshots buffer is re-injected into the inbox when
-	// commitPending clears and the normal processReady path runs.
-	hasDeferred := false
-	for i := range w.inboxBuf {
-		if w.inboxBuf[i].Type == proto.InstallSnapshot {
-			hasDeferred = true
-			break
-		}
-	}
-	if hasDeferred {
-		filtered := w.inboxBuf[:0:0]
-		for i := range w.inboxBuf {
-			if w.inboxBuf[i].Type == proto.InstallSnapshot {
-				// Buffer InstallSnapshot messages locally instead of
-				// re-delivering them to the inbox. Re-delivery causes
-				// an infinite drain-redeliver loop: each processReady
-				// cycle drains the same message and puts it back,
-				// burning CPU until commitPending clears. Buffering
-				// here ensures the messages are processed exactly once
-				// when commitPending transitions to false.
-				w.deferSnapshot(shardID, w.inboxBuf[i])
-			} else {
-				filtered = append(filtered, w.inboxBuf[i])
-			}
-		}
-		w.inboxBuf = filtered
-		if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.proposeBuf) == 0 {
-			return
-		}
+	// inbox. The buffer is re-injected into the inbox when commitPending
+	// clears and the normal processReady path runs.
+	w.inboxBuf = w.filterSnapshots(shardID, w.inboxBuf)
+	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.proposeBuf) == 0 {
+		return
 	}
 
 	// Separate HeartbeatResp messages from other inbox messages for

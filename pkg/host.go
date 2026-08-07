@@ -2659,6 +2659,27 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// here, so the StartShard rollback close must not also run.
 	smPublished = true
 
+	// Close-vs-Start TOCTOU guard. The entry check above can be passed
+	// microseconds before Host.Close sets closed and runs its h.nodes sweep,
+	// and Close stops the engine BEFORE that sweep. A shard published into
+	// that window is invisible to the sweep and permanently inert: it sits in
+	// h.nodes with activeNodes incremented, inside a stopped engine, holding
+	// an open state machine nobody will ever close — whose file lock bricks
+	// the next host start on the same DataDir. Because both flags are set
+	// before the sweep reads h.nodes, a sweep that missed this shard is
+	// guaranteed to be visible here (the same reasoning proposeEntry,
+	// ReadIndex, RequestSnapshot and requestConfigChange rely on). Losing the
+	// ns.stopped CAS means a concurrent Close/StopShard claimed teardown and
+	// owns it; this call must not touch the shard again.
+	if h.closed.Load() || h.draining.Load() {
+		if ns.stopped.CompareAndSwap(false, true) {
+			h.teardownShard(ns, cfg.ShardID, ErrClosed)
+		}
+		h.logger.Warn("shard start aborted: host is closing",
+			"shard_id", cfg.ShardID, "replica_id", cfg.ReplicaID)
+		return ErrClosed
+	}
+
 	// Pre-bind metrics for this shard to avoid expensive label lookups
 	// in hot paths. This must be called before any metrics are recorded.
 	if h.metrics != nil {
@@ -2724,6 +2745,30 @@ func (h *Host) StopShard(shardID uint64) error {
 	if !ns.stopped.CompareAndSwap(false, true) {
 		return ErrShardNotFound // another StopShard/Close already owns teardown
 	}
+	h.teardownShard(ns, shardID, ErrAborted)
+
+	// Fire OnNodeUnloaded event listener.
+	if el := h.cfg.EventListener; el != nil && el.OnNodeUnloaded != nil {
+		el.OnNodeUnloaded(config.EventShardInfo{
+			ShardID:   shardID,
+			ReplicaID: ns.replicaID,
+		})
+	}
+
+	h.logger.Info("shard stopped", "shard_id", shardID)
+	return nil
+}
+
+// teardownShard releases every resource a loaded shard holds. The caller
+// MUST have claimed teardown by winning ns.stopped's CompareAndSwap, which
+// makes this run exactly once per shard incarnation: StopShard, Host.Close,
+// and the StartShard close-race rollback all funnel through it, so none of
+// them can double-unload a node, double-close a state machine, or drive
+// activeNodes negative.
+//
+// pendingErr is the error delivered to the shard's still-pending proposals,
+// reads, and snapshots.
+func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
 	ns.health.Store(uint32(ShardUnloaded))
 
 	// Signal cancellation to any in-progress DiskStateMachine.Open()
@@ -2740,8 +2785,8 @@ func (h *Host) StopShard(shardID uint64) error {
 
 	// Fail all remaining pending proposals, reads, and snapshots. Any
 	// items completed by OnApplied during the drain are already removed
-	// from these maps, so only truly orphaned items receive ErrAborted.
-	h.failPendingRequests(ns, ErrAborted)
+	// from these maps, so only truly orphaned items receive the error.
+	h.failPendingRequests(ns, pendingErr)
 
 	// Remove nodeState last, after the engine is fully unloaded and all
 	// pending items have been resolved. No more callbacks will reference
@@ -2755,7 +2800,7 @@ func (h *Host) StopShard(shardID uint64) error {
 	// directory fails with "lock held by current process".
 	if ns.rsm != nil {
 		if err := ns.rsm.Close(); err != nil {
-			h.logger.Warn("state machine close failed during stop shard",
+			h.logger.Warn("state machine close failed during shard teardown",
 				"shard_id", shardID, "error", err)
 		}
 		// Do NOT nil ns.rsm: a concurrent reader (SyncRead/StaleRead/etc.)
@@ -2779,17 +2824,6 @@ func (h *Host) StopShard(shardID uint64) error {
 	if h.metrics != nil {
 		h.metrics.UnregisterShard(shardID)
 	}
-
-	// Fire OnNodeUnloaded event listener.
-	if el := h.cfg.EventListener; el != nil && el.OnNodeUnloaded != nil {
-		el.OnNodeUnloaded(config.EventShardInfo{
-			ShardID:   shardID,
-			ReplicaID: ns.replicaID,
-		})
-	}
-
-	h.logger.Info("shard stopped", "shard_id", shardID)
-	return nil
 }
 
 // SyncPropose proposes cmd through Raft consensus and blocks until the
@@ -4744,13 +4778,14 @@ func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 }
 
 // DiagPipelineState returns diagnostic pipeline state for the given shard.
-// Used for debugging pipeline stalls.
+// Used for debugging pipeline stalls. The snapshot gates that can also stall
+// a shard are reported by DiagShardGates.
 func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQLen int, inboxLen int, pendingProposals int, err error) {
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return false, 0, 0, 0, ErrShardNotReady
 	}
-	cp, pq, inbox, _ := engNode.DiagState() // readIndexQLen not exposed in DiagPipelineState
+	d := engNode.DiagState() // readIndexQLen not exposed in DiagPipelineState
 	v, exists := h.nodes.Load(shardID)
 	pp := 0
 	if exists {
@@ -4770,7 +4805,28 @@ func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQL
 			})
 		}
 	}
-	return cp, pq, inbox, pp, nil
+	return d.CommitPending, d.ProposalQLen, d.InboxLen, pp, nil
+}
+
+// DiagShardGates reports the snapshot gates that suspend a shard's state
+// machine work, together with the number of apply closures still in flight.
+//
+// While recovering is true the shard's state machine is being replaced by a
+// received snapshot: it applies nothing and extracts no committed entries,
+// though it keeps voting and replicating. While saving is true a snapshot
+// capture has quiesced applies. applyInFlight is the drain counter both
+// gates wait on before touching the state machine; a non-zero value with a
+// gate up means the drain has not completed yet.
+//
+// Both states are also surfaced through ShardInfo.Health as ShardRecovering
+// and ShardSnapshotting.
+func (h *Host) DiagShardGates(shardID uint64) (recovering, saving bool, applyInFlight int64, err error) {
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil {
+		return false, false, 0, ErrShardNotReady
+	}
+	d := engNode.DiagState()
+	return d.Recovering, d.Saving, d.ApplyInFlight, nil
 }
 
 // DiagRaftState returns diagnostic raft state for the given shard.
@@ -6289,6 +6345,18 @@ func (h *Host) shardHealth(ns *nodeState, leaderID, lastApplied uint64) ShardHea
 	// proposal times out, so HealthCheck must report degraded rather than ok.
 	if engNode.IsFailed() {
 		return ShardError
+	}
+	// A snapshot gate is the most specific answer available: while it is up
+	// the replica applies nothing, serves no up-to-date local read, and (for
+	// recovery) extracts no committed entries at all. Reporting such a
+	// replica as healthy is what makes a snapshot-recovery outage so hard to
+	// diagnose — it looks fine from every angle the API exposes. Checked
+	// before the leader and lag conditions, which are consequences of it.
+	if engNode.IsRecovering() {
+		return ShardRecovering
+	}
+	if engNode.IsSaving() {
+		return ShardSnapshotting
 	}
 	if leaderID == 0 {
 		return ShardNoLeader

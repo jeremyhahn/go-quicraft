@@ -254,6 +254,19 @@ type QUICTransport struct {
 	// suppress every other transport's first diagnostic, and in-process
 	// multi-node deployments (and the test suite) run many transports at once.
 	lastProtocolViolationLog atomic.Int64
+
+	// peerFrameRejections counts every frame a peer's decoder refused
+	// (QUICStreamErrFrameRejected). The warning below it is rate-limited, and
+	// the receiver's own diagnostic is rate-limited to 10s, so a storm of
+	// rejections — the signature of a producer emitting a batch no peer can
+	// accept — is otherwise nearly invisible in logs. The counter is
+	// incremented on every rejection, never sampled.
+	peerFrameRejections atomic.Uint64
+
+	// lastPeerRejectionLog is the Unix-nanosecond timestamp of the most recent
+	// peer-rejection warning, per transport instance (see
+	// lastProtocolViolationLog for why it is not package-global).
+	lastPeerRejectionLog atomic.Int64
 }
 
 // srcAddrAuthSlots is the number of distinct claimed SourceAddresses cached
@@ -1073,9 +1086,99 @@ func (t *QUICTransport) incBatchDropped(msgs []proto.Message, reason string) {
 	}
 }
 
-// sendBatch marshals a message batch and writes it as a framed payload to
-// the appropriate stream for the target. Errors are logged and dropped.
-func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolint:gocognit // metrics instrumentation adds branches
+// sendBatch delivers a batch of messages to target, splitting it into as many
+// frames as it takes. A batch is a coalescing artifact of the send queue, not a
+// unit the peer sees, so it must never be all-or-nothing:
+//
+//   - Messages whose combined marshaled size exceeds MaxFrameSize are split
+//     across consecutive frames on the same (ordered) stream, instead of being
+//     dropped together on a MarshalFrame failure.
+//   - A message no peer can accept — more entries than
+//     proto.MaxEntriesPerMessage, or bigger on its own than a frame — is
+//     dropped here, BEFORE it is written. Writing it makes the peer's decoder
+//     reject the frame and reset the stream, which the sender can only read as
+//     an I/O failure; the batch is then retried unchanged and the loop is
+//     unbounded. Dropping it also stops one unsendable message from taking the
+//     rest of its batch (heartbeats included) down with it.
+func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) {
+	headerSize := batchHeaderSize(t.localAddr())
+	for len(msgs) > 0 {
+		n, payload, err := sendableGroup(headerSize, msgs)
+		if err != nil {
+			t.dropUnsendable(target, &msgs[0], headerSize, err)
+			msgs = msgs[1:]
+			continue
+		}
+		t.sendFrame(target, msgs[:n], payload)
+		msgs = msgs[n:]
+	}
+}
+
+// dropUnsendable records and reports a message the transport refuses to write.
+// It is logged at Error because it is a producer defect — raft must bound both
+// the byte size (Config.MaxApplyEntrySize) and the entry count
+// (proto.MaxEntriesPerMessage) of every message it builds — and because the
+// data in it is never delivered: the peer waiting on those entries stalls
+// until the producer stops emitting the same message.
+func (t *QUICTransport) dropUnsendable(target string, msg *proto.Message, headerSize int, reason error) {
+	slog.Error("transport: dropping message that cannot be framed; the peer will not receive it until the producer bounds this message",
+		"target", target,
+		"shard", msg.ShardID,
+		"to", msg.To,
+		"msg_type", proto.MessageTypeName(msg.Type),
+		"entries", len(msg.Entries),
+		"message_bytes", msg.Size(),
+		"batch_header_bytes", headerSize,
+		"max_frame_size", MaxFrameSize,
+		"max_entries_per_message", proto.MaxEntriesPerMessage,
+		"error", reason,
+	)
+	if t.metrics != nil {
+		t.metrics.IncMessagesDropped(msg.ShardID, msg.To, dropReasonUnsendable)
+	}
+}
+
+// peerRejectionLogInterval rate-limits the peer-rejection warning. It matches
+// protocolViolationLogInterval so the two ends of the same event are sampled at
+// the same cadence.
+const peerRejectionLogInterval = 10 * time.Second
+
+// recordPeerFrameRejection counts a frame the peer's decoder refused and emits
+// a rate-limited warning carrying the running total, so a storm is visible as a
+// number even though the log lines are sampled.
+func (t *QUICTransport) recordPeerFrameRejection(target string, shardID uint64, batchSize int, err error) {
+	total := t.peerFrameRejections.Add(1)
+
+	now := time.Now().UnixNano()
+	last := t.lastPeerRejectionLog.Load()
+	if now-last < int64(peerRejectionLogInterval) {
+		return
+	}
+	if !t.lastPeerRejectionLog.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("transport: peer rejected a frame; batch dropped, connection kept",
+		"target", target,
+		"shard", shardID,
+		"batch_size", batchSize,
+		"total_rejections", total,
+		"rate_limit", peerRejectionLogInterval,
+		"error", err,
+	)
+}
+
+// PeerFrameRejections returns the number of frames peers have rejected since
+// this transport started.
+func (t *QUICTransport) PeerFrameRejections() uint64 {
+	return t.peerFrameRejections.Load()
+}
+
+// sendFrame marshals msgs as one MessageBatch and writes it as a single framed
+// payload to the appropriate stream for the target. payloadSize is the size
+// sendBatch already measured the group at, which it has verified fits a frame;
+// a stale value can only under-size the buffer, which MarshalTo reports as
+// ErrBufferTooSmall on the drop path below. Errors are logged and dropped.
+func (t *QUICTransport) sendFrame(target string, msgs []proto.Message, payloadSize int) { //nolint:gocognit // metrics instrumentation adds branches
 	debugOn := debugEnabled()
 	var sendStart time.Time
 	if t.metrics != nil || debugOn {
@@ -1089,7 +1192,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 		Requests:      msgs,
 	}
 
-	sz := mb.Size()
+	sz := payloadSize
 	bufPtr := t.getBuf(sz + FrameHeaderSize)
 	buf := (*bufPtr)[:sz+FrameHeaderSize]
 
@@ -1183,15 +1286,13 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	snappyBuf = nil //nolint:wastedassign // defensive nil to prevent use-after-pool-return
 
 	if err != nil {
-		// A MarshalFrame failure here is almost always ErrPayloadTooLarge: the
-		// serialized batch exceeds MaxFrameSize because raft sized it against
-		// maxReplicationPayload (Config.MaxApplyEntrySize), which is larger
-		// than the frame cap. The batch is dropped and raft does not advance
-		// the follower's next index, so it rebuilds the SAME oversized batch
-		// every cycle: the follower can never catch up and quorum silently
-		// degrades. This is a configuration defect, not a transient failure —
-		// clamp MaxApplyEntrySize to MaxReplicationPayloadBytes.
-		slog.Error("transport: dropping batch that failed to marshal into a frame; a lagging follower cannot catch up until MaxApplyEntrySize is clamped",
+		// Unreachable in normal operation: sendBatch sizes every group against
+		// MaxFrameSize before this point, so a failure here means the marshaled
+		// size disagreed with MessageBatch.Size() — an internal sizing defect.
+		// Dropping (rather than writing an unacceptable frame) is still the
+		// correct response: retrying it unchanged can never succeed, and
+		// emitting it would cost the connection.
+		slog.Error("transport: dropping frame that failed to marshal despite passing the pre-write size check",
 			"target", target,
 			"shard", shardID,
 			"batch_size", len(msgs),
@@ -1235,6 +1336,19 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) { //nolin
 	_, err = stream.Write(buf[:frameSize])
 	t.putBuf(bufPtr)
 	if err != nil {
+		// The peer's decoder rejected a frame on this stream and reset it.
+		// That is a statement about the FRAME, not about the connection — the
+		// connection is provably alive, since the peer had to receive and parse
+		// a frame on it to reject one. Treating it as a dead connection is what
+		// turns a single unacceptable batch into a dial storm: close, re-dial,
+		// re-send the same batch, repeat. Drop the batch and replace only the
+		// stream; the connection, and every other stream on it, survives.
+		if isPeerFrameRejection(err) {
+			t.incBatchDropped(msgs, dropReasonPeerRejected)
+			t.recordPeerFrameRejection(target, shardID, len(msgs), err)
+			t.evictStream(target, shardID, isHeartbeat, stream)
+			return
+		}
 		// Stream write failed — likely a dead connection. Close and evict
 		// the connection and all its streams so the next send attempt dials
 		// fresh. Without this, other cached streams on the same dead

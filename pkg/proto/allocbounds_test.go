@@ -52,7 +52,7 @@ func craftedBatchHeader(reqCount uint32) []byte {
 // ErrBufferTooSmall — a ~90,000x amplification over the frame length the
 // transport's receive-memory budget charges.
 func TestMessageBatch_UnmarshalFrom_CountExceedsBuffer(t *testing.T) {
-	buf := craftedBatchHeader(maxMessagesPerBatch)
+	buf := craftedBatchHeader(MaxMessagesPerBatch)
 	if len(buf) != 32 {
 		t.Fatalf("crafted header = %d bytes, want 32", len(buf))
 	}
@@ -99,7 +99,7 @@ func TestMessageBatch_UnmarshalFrom_CountBoundaryAccepted(t *testing.T) {
 func TestMessage_UnmarshalFrom_EntryCountExceedsBuffer(t *testing.T) {
 	buf := make([]byte, messageFixedSize+4)
 	putUint64(buf[0:], Replicate)
-	putUint32(buf[messageFixedSize:], maxMessagesPerBatch)
+	putUint32(buf[messageFixedSize:], MaxEntriesPerMessage)
 
 	var m Message
 	if _, err := m.UnmarshalFrom(buf); !errors.Is(err, ErrBufferTooSmall) {

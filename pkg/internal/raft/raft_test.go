@@ -4047,7 +4047,24 @@ func TestRaft_TickFollower_QuiesceActiveReturnsEarlyWithoutNormalPath(t *testing
 	}
 }
 
-func TestRaft_TickFollower_EntersQuiesceAfterThreshold(t *testing.T) {
+// TestRaft_TickFollower_CampaignsRatherThanQuiescing asserts that a follower
+// whose election timer expires CAMPAIGNS, and never suppresses that election
+// to enter quiesce on its own.
+//
+// This replaces TestRaft_TickFollower_EntersQuiesceAfterThreshold, which
+// exercised a self-quiesce path that has been removed. That path gated
+// startElection on quiesce.tryEnter() and returned when it fired, so a
+// follower that had heard nothing from a leader for a full election timeout
+// would skip the election and then run at 30x the timeout. The old test's own
+// comment documented that the counter was miscounted into near-irrelevance
+// ("we need to go through 100 election timeout cycles"), so it was asserting
+// the shape of dead code. Correcting the arithmetic would have activated the
+// hazard rather than removed it.
+//
+// Quiesce remains leader-driven: the leader enters it and broadcasts, and
+// followers enter through handleQuiesceMessage, gated on the local enabled
+// flag so a peer cannot impose it.
+func TestRaft_TickFollower_CampaignsRatherThanQuiescing(t *testing.T) {
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgQuiesce(1, 1)
 	cfg.PreVote = config.BoolPtr(false)
@@ -4057,49 +4074,26 @@ func TestRaft_TickFollower_EntersQuiesceAfterThreshold(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Tick past the election timeout so tryEnter gets called.
-	// We need to accumulate enough ticks for tryEnter to return true.
-	// The quiesce threshold is electionTimeout * quiesceThresholdMultiplier = 10*10 = 100.
-	// Each time the election fires, the tick counter in quiesce is incremented,
-	// and electionTick resets.
-	// But tryEnter is only called once per election timeout. So we need to go
-	// through 100 election timeout cycles for tryEnter to fire.
-	threshold := r.quiesce.threshold
-	for i := 0; i < threshold; i++ {
-		// Each election timeout cycle triggers an election, but we want tryEnter
-		// to fire. We need to tick past the randomized election timeout each cycle.
-		// The easier approach: directly tick the follower many times.
-		// The follower will start elections each time the randomized timeout fires,
-		// but will also call tryEnter at each timeout.
-		r.tickFunc(r)
-		// If an election started, reset back to follower to keep ticking.
-		if r.state != follower {
-			r.becomeFollower(r.term, noLeader)
-		}
-		r.drainMessages()
-	}
-
-	// After enough ticks, tryEnter may have activated quiesce.
-	// The tryEnter logic increments quiesce.tick each time it is called,
-	// but it is only called when electionTick >= randomizedElectionTimeout.
-	// So we need to cycle through enough election timeouts.
-
-	// Let's use a more direct approach: manually set the quiesce.tick
-	// to just below threshold and tick past one more election timeout.
+	// Put the quiesce counter one call short of its threshold, so the removed
+	// tryEnter call would fire on the very next election timeout. Driving the
+	// counter there with plain ticks is not possible in a reasonable loop --
+	// the old follower call site ran once per election timeout against a
+	// threshold measured in ticks, which is exactly the miscounting that made
+	// the path dead. Setting it directly is what gives this test power.
 	r.quiesce.tick = r.quiesce.threshold - 1
-	r.quiesce.active = false
-	advanceElection(r)
-	r.drainMessages()
 
-	// If the node entered quiesce mode, it should NOT have started an election.
-	if !r.quiesce.active {
-		// tryEnter is only called AFTER the election check. Looking at
-		// tickFollower code: the quiesce tryEnter path is checked after
-		// electionTick >= randomizedElectionTimeout, and if tryEnter returns
-		// true, it returns without calling startElection.
-		// Since quiesce.tick was at threshold-1, one more tryEnter call
-		// should push it to threshold and activate.
-		t.Fatal("expected quiesce to be active after threshold reached")
+	// Expire the election timer.
+	r.electionTick = r.randomizedElectionTimeout
+	r.tickFunc(r)
+
+	if r.quiesce.active {
+		t.Error("follower entered quiesce on its own; quiesce must be " +
+			"leader-driven, or a leaderless follower stops holding elections")
+	}
+	if r.state == follower {
+		t.Fatal("follower did not campaign when its election timer expired: " +
+			"the election was suppressed to enter quiesce, and the node would " +
+			"then run at 30x the election timeout while leaderless")
 	}
 }
 

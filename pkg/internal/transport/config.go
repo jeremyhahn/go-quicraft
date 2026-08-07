@@ -104,6 +104,17 @@ const (
 	// dropReasonProtocolViolation is an inbound frame discarded before its
 	// messages could be parsed, so neither shard nor target is known.
 	dropReasonProtocolViolation = "protocol_violation"
+
+	// dropReasonUnsendable is a message no peer can accept — more entries
+	// than proto.MaxEntriesPerMessage, or larger on its own than a frame —
+	// refused by the send path before it is written. Retrying it unchanged
+	// can never succeed, so it is dropped rather than emitted.
+	dropReasonUnsendable = "unsendable"
+
+	// dropReasonPeerRejected is a batch the peer's decoder refused, signalled
+	// by a stream reset carrying QUICStreamErrFrameRejected. The connection is
+	// healthy; only the frame was unacceptable.
+	dropReasonPeerRejected = "peer_rejected"
 )
 
 // Default configuration values for QUICTransport.

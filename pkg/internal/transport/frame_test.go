@@ -20,6 +20,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // TestWriteFrameAndReadFrameHeaderRoundTrip verifies that a frame written
@@ -383,8 +385,8 @@ func TestFrameConstantValues(t *testing.T) {
 	if FrameHeaderSize != 8 {
 		t.Fatalf("FrameHeaderSize: expected 8, got %d", FrameHeaderSize)
 	}
-	if maxMessagesPerBatch != 10000 {
-		t.Fatalf("maxMessagesPerBatch: expected 10000, got %d", maxMessagesPerBatch)
+	if proto.MaxMessagesPerBatch != 10000 {
+		t.Fatalf("proto.MaxMessagesPerBatch: expected 10000, got %d", proto.MaxMessagesPerBatch)
 	}
 	if maxPoolBufSize != 256*1024 {
 		t.Fatalf("maxPoolBufSize: expected %d, got %d", 256*1024, maxPoolBufSize)

@@ -710,7 +710,7 @@ func TestEngine_RequestSnapshotRecovery_Success(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// drainCommitC and clearCommitPending
+// drainCommitC and clearBatchCommitPending
 // ---------------------------------------------------------------------------
 
 func TestEngine_DrainCommitC(t *testing.T) {
@@ -777,47 +777,45 @@ func TestEngine_DrainCommitC(t *testing.T) {
 	})
 }
 
-func TestEngine_ClearCommitPending(t *testing.T) {
-	t.Run("clears commitPending for nodes on target worker", func(t *testing.T) {
-		cfg := newTestHostConfig()
-		cfg.NumWorkers = 2
-		ldb := newTestLogDB()
-		sender := newTestSender()
-		e := NewEngine(cfg, ldb, sender, nil, nil, nil)
+func TestCommitWorker_ClearBatchCommitPending(t *testing.T) {
+	t.Run("clears commitPending for the batch only", func(t *testing.T) {
+		ws := NewWorkSignal(1)
+		cw := newCommitWorker(0, newTestLogDB(), nil, make(chan *commitItem, 1),
+			make(chan *applyItem, 1), &sync.Pool{New: func() interface{} { return &applyItem{} }},
+			ws, nil, make(chan struct{}), nil)
 
-		// Load nodes with shardIDs that map to different workers.
-		// With 2 workers: shard 0,2,4 -> worker 0; shard 1,3,5 -> worker 1.
-		for i := uint64(0); i < 6; i++ {
-			nodeCfg := config.Config{ShardID: i, ReplicaID: 1}
-			n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
-			n.commitPending.Store(true)
-			e.LoadNode(n)
+		inBatch := make([]*Node, 3)
+		for i := range inBatch {
+			nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
+			inBatch[i] = NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+			inBatch[i].commitPending.Store(true)
+			cw.batch = append(cw.batch, proto.Update{ShardID: nodeCfg.ShardID})
+			cw.batchNodes = append(cw.batchNodes, inBatch[i])
 		}
+		outside := NewNode(nil, nil, nil, config.Config{ShardID: 9, ReplicaID: 1}, 100, nil, "", nil)
+		outside.commitPending.Store(true)
 
-		// Clear commitPending for worker 0 (shards 0, 2, 4).
-		e.clearCommitPending(0)
+		cw.clearBatchCommitPending(ws)
 
-		// Verify worker 0 nodes have commitPending cleared.
-		for _, shardID := range []uint64{0, 2, 4} {
-			n := e.GetNode(shardID)
-			if n == nil {
-				t.Fatalf("node %d should be loaded", shardID)
-			}
+		for i, n := range inBatch {
 			if n.commitPending.Load() {
-				t.Errorf("shard %d (worker 0) commitPending should be false", shardID)
+				t.Errorf("batch node %d should have commitPending cleared", i+1)
+			}
+			if !ws.HasWork(0) {
+				t.Error("expected the step worker to be notified")
 			}
 		}
+		if !outside.commitPending.Load() {
+			t.Error("a node outside the batch must keep its commitPending")
+		}
+	})
 
-		// Verify worker 1 nodes still have commitPending set.
-		for _, shardID := range []uint64{1, 3, 5} {
-			n := e.GetNode(shardID)
-			if n == nil {
-				t.Fatalf("node %d should be loaded", shardID)
-			}
-			if !n.commitPending.Load() {
-				t.Errorf("shard %d (worker 1) commitPending should still be true", shardID)
-			}
-		}
+	t.Run("tolerates nil batch node slots", func(t *testing.T) {
+		cw := newCommitWorker(0, newTestLogDB(), nil, make(chan *commitItem, 1),
+			make(chan *applyItem, 1), &sync.Pool{New: func() interface{} { return &applyItem{} }},
+			NewWorkSignal(1), nil, make(chan struct{}), nil)
+		cw.batchNodes = append(cw.batchNodes, nil)
+		cw.clearBatchCommitPending(nil)
 	})
 }
 
@@ -1277,48 +1275,61 @@ func TestEngine_GetNode_TypeAssertionFailure(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// clearCommitPending edge cases
+// commit-worker panic recovery: commitPending ownership
 // ---------------------------------------------------------------------------
 
-// TestEngine_ClearCommitPending_NonNodeValues verifies that
-// clearCommitPending skips non-*Node values in allNodes without
-// panicking (the type assertion guard).
-func TestEngine_ClearCommitPending_NonNodeValues(t *testing.T) {
-	cfg := newTestHostConfig()
-	cfg.NumWorkers = 2
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+// TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending verifies that a
+// panicking commit worker unwedges EXACTLY the nodes whose updates died with
+// its batch, and leaves every other node's commitPending alone.
+//
+// The step worker keeps running through a commit-worker panic. It sets
+// commitPending BEFORE its commitC send, so a blanket clear over every node
+// the worker owns steals ownership from an enqueue that is still in flight:
+// the next processReady calls GetUpdate again while raft's processed marker
+// has not advanced, extracting the SAME committed entries twice (double
+// Peer.Commit, double apply, double ReleaseCommittedEntries on one pooled
+// slice) and re-enqueueing the SAME pre-allocated *commitItem pointer.
+func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
 
-	// Store a non-*Node value.
-	e.allNodes.Store(uint64(0), "not-a-node")
-
-	// Also store a real node.
-	nodeCfg := config.Config{ShardID: 2, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
-	n.commitPending.Store(true)
-	e.LoadNode(n)
-
-	// Should not panic despite the non-*Node value in allNodes.
-	e.clearCommitPending(0)
-
-	// The real node on worker 0 (shardID 2 % 2 = 0) should be cleared.
-	if n.commitPending.Load() {
-		t.Fatal("commitPending should be cleared for node on matching worker")
-	}
-}
-
-// TestEngine_ClearCommitPending_NonUint64Key verifies that
-// clearCommitPending skips entries with non-uint64 keys without
-// panicking.
-func TestEngine_ClearCommitPending_NonUint64Key(t *testing.T) {
 	cfg := newTestHostConfig()
 	cfg.NumWorkers = 1
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+	ldb := newTestLogDB()
+	e := NewEngine(cfg, ldb, newTestSender(), nil, nil, nil)
+	cw := e.CommitWorker(0)
 
-	// Store a value with a string key (non-uint64).
-	e.allNodes.Store("bad-key", &Node{})
+	// batched is the node whose update is in the batch when the panic hits.
+	batched := NewNode(nil, nil, nil, config.Config{ShardID: 1, ReplicaID: 1}, 100, nil, "", nil)
+	batched.commitPending.Store(true)
+	e.LoadNode(batched)
 
-	// Should not panic.
-	e.clearCommitPending(0)
+	// enqueueing stands in for a node the step worker is mid-enqueue for:
+	// commitPending is set, but its item has not reached commitC yet, so it
+	// is in neither the channel nor the batch.
+	enqueueing := NewNode(nil, nil, nil, config.Config{ShardID: 2, ReplicaID: 1}, 100, nil, "", nil)
+	enqueueing.commitPending.Store(true)
+	e.LoadNode(enqueueing)
+
+	// Drive a batch containing only `batched` and panic inside processBatch
+	// (SaveState error -> retryWait -> hook).
+	ldb.setSaveError(errors.New("disk error"))
+	cw.retryHookForTest = func(_ int) { panic("injected commit worker panic") }
+	cw.commitC <- &commitItem{
+		update: proto.Update{ShardID: 1, ReplicaID: 1, State: proto.State{Term: 1}},
+		node:   batched,
+	}
+
+	if panicked := e.runCommitWorkerOnce(cw); !panicked {
+		t.Fatal("expected runCommitWorkerOnce to report panic")
+	}
+
+	if batched.commitPending.Load() {
+		t.Fatal("batched node stayed wedged: its update died with the panicking batch")
+	}
+	if !enqueueing.commitPending.Load() {
+		t.Fatal("commitPending was stolen from a node whose enqueue is still in flight")
+	}
 }
 
 // ---------------------------------------------------------------------------

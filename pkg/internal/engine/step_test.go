@@ -3978,12 +3978,16 @@ func TestProcessCallbacks_NoCallbackOnNonElectionMessages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processReady skips recovering nodes (merged from coverage_step_test.go)
+// processReady keeps recovering nodes in the protocol
 // ---------------------------------------------------------------------------
 
-// TestProcessReady_SkipsRecoveringNodes verifies that processReady skips
-// nodes that are in the recovering state.
-func TestProcessReady_SkipsRecoveringNodes(t *testing.T) {
+// TestProcessReady_RecoveringNodeDrainsInbox verifies that processReady
+// still drains and steps the inbox of a recovering node. Raft message
+// handling touches only raft state and the log, never the state machine
+// the snapshot pool is replacing, so a recovering replica must keep
+// answering RequestVote and Heartbeat. When it does not, a shard with two
+// replicas recovering at once loses quorum with every node still up.
+func TestProcessReady_RecoveringNodeDrainsInbox(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
 	commitC := make(chan *commitItem, 16)
@@ -4001,20 +4005,27 @@ func TestProcessReady_SkipsRecoveringNodes(t *testing.T) {
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
+	priorTerm := peer.Term()
 
-	// Deliver a proposal. Since the node is recovering, processReady
-	// should skip it entirely.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("data")}})
+	// A higher-term heartbeat must be stepped, not left queued.
+	if !node.Deliver(proto.Message{
+		Type:    proto.Heartbeat,
+		ShardID: 1,
+		From:    2,
+		To:      1,
+		Term:    priorTerm + 3,
+	}) {
+		t.Fatal("failed to deliver heartbeat to node inbox")
+	}
 
 	ws.Notify(1)
 	sw.processReady()
 
-	// No commit item should have been produced.
-	select {
-	case <-commitC:
-		t.Fatal("recovering node should not produce a commit item")
-	default:
-		// Expected: no commit item.
+	if d := node.DiagState(); d.InboxLen != 0 {
+		t.Fatalf("recovering node left %d messages in its inbox; it must be drained", d.InboxLen)
+	}
+	if got := peer.Term(); got <= priorTerm {
+		t.Fatalf("recovering node did not step the heartbeat: term %d -> %d", priorTerm, got)
 	}
 }
 
@@ -4578,5 +4589,67 @@ func TestCommitMemoryMode_CommitError_FailsShard(t *testing.T) {
 	}
 	if cb.proposalFailedCount.Load() != 1 {
 		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// commitC backpressure must not silence the shard
+// ---------------------------------------------------------------------------
+
+// TestProcessReady_CommitCFull_FlushesFreeOrderMessages verifies that the
+// commitC-full backpressure skip still flushes the peer's free-order
+// messages (heartbeats, Replicate). GetUpdate is the only other drain of
+// those messages on this path and commitPending is false here, so tick()'s
+// drain does not run either: skipping without a flush leaves a leader's
+// heartbeats sitting in the peer for as long as the commit worker is
+// behind. A single SaveState retry backoff (up to ~1.76s) is enough for
+// followers to time out and campaign against a live leader.
+func TestProcessReady_CommitCFull_FlushesFreeOrderMessages(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	// Capacity 1 and already full: the backpressure guard trips.
+	commitC := make(chan *commitItem, 1)
+	commitC <- &commitItem{}
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+
+	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	// Tick the leader so heartbeats accumulate in the peer. commitPending
+	// is false, so tick() deliberately does not drain them.
+	for range 30 {
+		sw.tick()
+	}
+	if sender.sentCount() != 0 {
+		t.Fatalf("tick() must not send while commitPending is false, sent %d", sender.sentCount())
+	}
+
+	ws.Notify(1)
+	sw.processReady()
+
+	sent := sender.sentMessages()
+	if len(sent) == 0 {
+		t.Fatal("commitC-full skip sent nothing: the shard's heartbeats are stuck in the peer")
+	}
+	for i := range sent {
+		if !proto.IsFreeOrderMessage(sent[i].Type) {
+			t.Fatalf("ordered message %s sent before its state was persisted",
+				proto.MessageTypeName(sent[i].Type))
+		}
+	}
+
+	// The guard must still hold back the update itself: nothing new may be
+	// queued while commitC is full.
+	if len(commitC) != cap(commitC) {
+		t.Fatal("the backpressure guard must not enqueue while commitC is full")
+	}
+	if node.commitPending.Load() {
+		t.Fatal("no update was extracted, so commitPending must stay false")
 	}
 }

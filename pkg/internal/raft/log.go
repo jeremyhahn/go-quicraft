@@ -671,3 +671,24 @@ func limitEntrySize(entries []proto.Entry, maxSize uint64) []proto.Entry {
 	}
 	return entries[:count]
 }
+
+// limitEntryCount limits the number of entries in a single outbound message to
+// proto.MaxEntriesPerMessage.
+//
+// maxReplicationPayload (Config.MaxApplyEntrySize) bounds a Replicate message
+// in BYTES only, so a follower catching up on small entries — 16MB of 60-byte
+// entries is ~270,000 of them — produces a message that exceeds the wire's
+// entry-count limit. Every peer's decoder rejects such a message
+// (proto.ErrTooManyMessages) and resets the stream it arrived on, the leader
+// cannot advance that follower's next index, and it rebuilds the identical
+// message on the next replicate cycle: the follower is starved and the link
+// churns. The count bound must therefore be applied wherever the byte bound is.
+//
+// Truncation costs nothing: sendAppend pipelines, so the remaining entries go
+// out in the following message of the same cycle.
+func limitEntryCount(entries []proto.Entry) []proto.Entry {
+	if len(entries) > proto.MaxEntriesPerMessage {
+		return entries[:proto.MaxEntriesPerMessage]
+	}
+	return entries
+}

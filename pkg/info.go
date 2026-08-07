@@ -42,6 +42,18 @@ const (
 	// ShardError indicates the shard experienced a fatal error such as
 	// a state machine failure or LogDB failure.
 	ShardError
+
+	// ShardRecovering indicates the shard's state machine is being
+	// replaced by a received snapshot (RecoverFromSnapshot). The replica
+	// keeps participating in Raft — it votes and replicates — but applies
+	// nothing and serves no up-to-date local read until recovery
+	// completes, which takes as long as the user state machine needs.
+	ShardRecovering
+
+	// ShardSnapshotting indicates the shard is capturing a consistent
+	// point-in-time for a snapshot save. Applies are quiesced for the
+	// duration of the capture.
+	ShardSnapshotting
 )
 
 // String returns a human-readable representation of the ShardHealth value.
@@ -71,20 +83,24 @@ func (h *ShardHealth) UnmarshalJSON(data []byte) error {
 
 // shardHealthValues maps string representations to ShardHealth values.
 var shardHealthValues = map[string]ShardHealth{
-	"healthy":   ShardHealthy,
-	"no-leader": ShardNoLeader,
-	"lagging":   ShardLagging,
-	"unloaded":  ShardUnloaded,
-	"error":     ShardError,
+	"healthy":      ShardHealthy,
+	"no-leader":    ShardNoLeader,
+	"lagging":      ShardLagging,
+	"unloaded":     ShardUnloaded,
+	"error":        ShardError,
+	"recovering":   ShardRecovering,
+	"snapshotting": ShardSnapshotting,
 }
 
 // shardHealthNames maps ShardHealth values to their string representations.
 var shardHealthNames = map[ShardHealth]string{
-	ShardHealthy:  "healthy",
-	ShardNoLeader: "no-leader",
-	ShardLagging:  "lagging",
-	ShardUnloaded: "unloaded",
-	ShardError:    "error",
+	ShardHealthy:      "healthy",
+	ShardNoLeader:     "no-leader",
+	ShardLagging:      "lagging",
+	ShardUnloaded:     "unloaded",
+	ShardError:        "error",
+	ShardRecovering:   "recovering",
+	ShardSnapshotting: "snapshotting",
 }
 
 // ShardInfo provides a point-in-time snapshot of a shard's status.

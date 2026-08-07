@@ -279,16 +279,28 @@ type Node struct {
 
 	// recovering is set to true when the snapshot pool begins a
 	// RecoverFromSnapshot operation and cleared when it completes
-	// (successfully or with error). While true, the apply worker
-	// skips entry application and the step worker skips GetUpdate
-	// for this node to prevent concurrent state machine access
-	// between the recovery goroutine and the apply pipeline.
+	// (successfully or with error). It gates STATE MACHINE ACCESS ONLY:
+	// the apply worker holds committed batches at the gate, and the step
+	// worker stops extracting committed entries (GetUpdate is called with
+	// moreEntriesToApply=false, and the commit worker skips the piggyback
+	// extraction). Without that, a leader could send Replicate messages
+	// with entries at ss.Index+1 immediately after InstallSnapshot and
+	// those entries would flow through step->commit->apply concurrently
+	// with RecoverFromSnapshot, corrupting state machine state.
 	//
-	// Without this guard, a leader could send Replicate messages
-	// with entries at ss.Index+1 immediately after InstallSnapshot,
-	// and those entries would flow through step->commit->apply
-	// concurrently with the snapshot pool's RecoverFromSnapshot
-	// call, corrupting state machine state.
+	// It deliberately does NOT gate Raft protocol traffic. The node keeps
+	// draining its inbox, stepping RequestVote/Heartbeat, persisting hard
+	// state and sending the resulting responses, because none of that
+	// touches the state machine. Gating it made a recovering replica
+	// invisible to consensus for the entire unbounded duration of user
+	// RecoverFromSnapshot code — two replicas recovering at once dissolved
+	// a five-replica shard's quorum with every node still up. The one
+	// message type still withheld is InstallSnapshot (deferred by the step
+	// worker), which would move the log's snapshot floor out from under the
+	// recovery in progress.
+	//
+	// Client work (proposals, ReadIndex) also stays queued: it cannot
+	// produce a result until applies resume.
 	recovering atomic.Bool
 
 	// saving is set to true while the snapshot pool captures a consistent
@@ -551,10 +563,10 @@ func (n *Node) ClearSnapshotting() {
 	n.snapshotting.Store(false)
 }
 
-// IsRecovering returns true if a snapshot recovery is in progress for
-// this node. While recovering, the apply worker skips entry application
-// and the step worker skips GetUpdate to prevent concurrent state
-// machine access.
+// IsRecovering returns true if a snapshot recovery is in progress for this
+// node. While recovering, the apply worker holds committed batches and the
+// step worker extracts no committed entries, so nothing reaches the state
+// machine; Raft protocol traffic keeps flowing. See the recovering field.
 func (n *Node) IsRecovering() bool {
 	return n.recovering.Load()
 }
@@ -622,10 +634,36 @@ func (n *Node) IsMember(replicaID uint64) bool {
 	return n.peer.IsMember(replicaID)
 }
 
-// DiagState returns diagnostic pipeline state: commitPending, proposalQ depth,
-// inboxQ depth, readIndexQ depth. Used for debugging pipeline stalls.
-func (n *Node) DiagState() (commitPending bool, proposalQLen int, inboxLen int, readIndexQLen int) {
-	return n.commitPending.Load(), n.proposalQ.Len(), n.inboxQ.Len(), n.readIndexQ.Len()
+// DiagPipeline is a point-in-time snapshot of a node's pipeline state.
+//
+// It carries the three gates that can hold a shard back — commitPending, and
+// the snapshot recovering/saving gates with their apply drain counter — not
+// just commitPending. A shard whose recovering gate is up applies nothing and
+// extracts no committed entries for as long as user RecoverFromSnapshot code
+// runs, which is exactly the state an operator needs to see when diagnosing a
+// stalled or election-churning shard.
+type DiagPipeline struct {
+	CommitPending bool
+	ProposalQLen  int
+	InboxLen      int
+	ReadIndexQLen int
+	Recovering    bool
+	Saving        bool
+	ApplyInFlight int64
+}
+
+// DiagState returns the node's diagnostic pipeline state. Used for debugging
+// pipeline stalls.
+func (n *Node) DiagState() DiagPipeline {
+	return DiagPipeline{
+		CommitPending: n.commitPending.Load(),
+		ProposalQLen:  n.proposalQ.Len(),
+		InboxLen:      n.inboxQ.Len(),
+		ReadIndexQLen: n.readIndexQ.Len(),
+		Recovering:    n.recovering.Load(),
+		Saving:        n.saving.Load(),
+		ApplyInFlight: n.applyInFlight.Load(),
+	}
 }
 
 // diagSnapshot is a point-in-time copy of the Peer's diagnostic state,

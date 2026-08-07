@@ -253,10 +253,45 @@ func (p *snapshotPool) worker() {
 	for {
 		select {
 		case <-p.stopC:
+			// Release requests still queued behind us. Returning without
+			// this strands them: their inFlight entry and the node's
+			// snapshotting flag were both set by requestSnapshot and are
+			// only ever cleared by the worker that runs the request, so
+			// the shard could never snapshot again and the caller's
+			// pending RequestState would wait for a completion callback
+			// that can no longer fire.
+			p.drainRequests()
 			return
 		case req := <-p.requestC:
 			p.handleRequest(req)
 		}
+	}
+}
+
+// drainRequests releases every request still queued on requestC. Safe to
+// run from several goroutines at once: a channel receive is exclusive, so
+// each request is released exactly once.
+func (p *snapshotPool) drainRequests() {
+	for {
+		select {
+		case req := <-p.requestC:
+			p.abandonRequest(req)
+		default:
+			return
+		}
+	}
+}
+
+// abandonRequest undoes the per-shard state requestSnapshot established for
+// a request that will never run, and reports the rejection so the caller
+// does not wait for a completion that cannot come.
+func (p *snapshotPool) abandonRequest(req snapshotRequest) {
+	p.inFlight.Delete(req.shardID)
+	if req.node != nil {
+		req.node.snapshotting.Store(false)
+	}
+	if p.callback != nil {
+		p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
 	}
 }
 
@@ -339,12 +374,13 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// apply is observed by the drain.
 	var blocked error
 	if !req.save {
-		// The recovering gate stops the step worker from processing this node
-		// AT ALL — including draining its inbox — so the InstallSnapshot that
-		// advances the raft log to the snapshot index cannot be installed
-		// while the gate is up. Wait for the log to reach the snapshot index
-		// BEFORE raising the gate, otherwise the recovery would exclude the
-		// very message that makes it admissible.
+		// The step worker DEFERS InstallSnapshot while the recovering gate is
+		// up (handling one would move the raft log's snapshot floor out from
+		// under this recovery), so the InstallSnapshot that advances the log
+		// to the snapshot index cannot be installed once the gate is raised.
+		// Wait for the log to reach the snapshot index BEFORE raising it,
+		// otherwise the recovery would exclude the very message that makes it
+		// admissible.
 		blocked = p.awaitRecoverableLog(req)
 	}
 	if !req.save && blocked == nil {
@@ -1811,6 +1847,17 @@ func (p *snapshotPool) requestSnapshot(req snapshotRequest) error {
 	}
 	select {
 	case p.requestC <- req:
+		// Shutdown may have raced the send. The workers drain requestC as
+		// they exit, but one that already exited cannot, so re-check and
+		// drain here: whichever request this drain pulls out (ours or
+		// another producer's) is released with exactly the same cleanup,
+		// so no queued request is left holding inFlight and the node's
+		// snapshotting flag after the pool is gone.
+		select {
+		case <-p.stopC:
+			p.drainRequests()
+		default:
+		}
 		return nil
 	default:
 		// Request channel full. Clear the in-flight flag and let

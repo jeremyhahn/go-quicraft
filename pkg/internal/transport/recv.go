@@ -348,6 +348,11 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			<-streamSem
 		}
 	}()
+	// cancelCode is the STOP_SENDING code this stream is abandoned with. It is
+	// raised to QUICStreamErrFrameRejected on the protocol-violation exits so
+	// the peer can tell "your frame was unacceptable" (drop it, keep the
+	// connection) from "this receiver is gone" (the connection is suspect).
+	cancelCode := QUICStreamErrReceiverGone
 	defer func() {
 		// stream.Close only closes the SEND direction in quic-go; the receive
 		// direction would otherwise stay open after handleStream abandons the
@@ -364,7 +369,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		// (errStreamIdle) never exits this function, and on the one exit whose
 		// receive direction was fully consumed (snapshot completion) CancelRead
 		// is a no-op.
-		stream.CancelRead(QUICStreamErrReceiverGone)
+		stream.CancelRead(cancelCode)
 		if closeErr := stream.Close(); closeErr != nil {
 			slog.Debug("transport: stream close failed after handleStream",
 				"remote", inboundConn.RemoteAddr().String(),
@@ -402,6 +407,9 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		if err != nil {
 			if errors.Is(err, errStreamIdle) {
 				continue
+			}
+			if isProtocolViolation(err) {
+				cancelCode = QUICStreamErrFrameRejected
 			}
 			t.recordProtocolViolation("inbound frame header rejected", inboundConn, err)
 			return
@@ -442,6 +450,9 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			// connection churn for every OTHER peer sharing it.
 			if errors.Is(err, ErrMessageRecvMemoryBudgetExceeded) {
 				continue
+			}
+			if isProtocolViolation(err) {
+				cancelCode = QUICStreamErrFrameRejected
 			}
 			t.recordProtocolViolation("inbound message frame rejected", inboundConn, err)
 			return
@@ -830,7 +841,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	t.evictStaleOutboundOnRecv(batch.SourceAddress, batch.SourceEpoch, inboundConn)
 
 	// Validate message count.
-	if len(batch.Requests) > maxMessagesPerBatch {
+	if len(batch.Requests) > proto.MaxMessagesPerBatch {
 		batch.Reset()
 		batchPool.Put(batch)
 		if buf != nil {

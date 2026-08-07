@@ -244,8 +244,8 @@ func TestMessageTooManyEntries(t *testing.T) {
 	m := Message{Type: Replicate, From: 1, To: 2, Term: 1}
 	buf := make([]byte, m.Size())
 	m.MarshalTo(buf)
-	// Set entry count to maxMessagesPerBatch + 1
-	putUint32(buf[messageFixedSize:], uint32(maxMessagesPerBatch+1))
+	// Set entry count to MaxEntriesPerMessage + 1
+	putUint32(buf[messageFixedSize:], uint32(MaxEntriesPerMessage+1))
 	var m2 Message
 	_, err := m2.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrTooManyMessages) {

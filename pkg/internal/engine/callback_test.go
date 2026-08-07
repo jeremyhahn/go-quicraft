@@ -52,6 +52,7 @@ type testCallback struct {
 	proposalFailedCount  atomic.Int64
 	readIndexFailedCalls []readIndexFailedCall
 	readIndexFailedCount atomic.Int64
+	snapshotRejected     atomic.Int64
 }
 
 type readIndexBatchCall struct {
@@ -209,7 +210,9 @@ func (c *testCallback) getCampaignSkippedCalls() []campaignCall {
 	return result
 }
 
-func (c *testCallback) OnSnapshotRejected(_, _ uint64) {}
+func (c *testCallback) OnSnapshotRejected(_, _ uint64) {
+	c.snapshotRejected.Add(1)
+}
 
 func (c *testCallback) OnReadIndexBatched(shardID uint64, batchKey uint64, aliasKeys []uint64) {
 	c.batchCount.Add(1)

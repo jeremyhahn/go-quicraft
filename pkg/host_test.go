@@ -21048,3 +21048,158 @@ func TestStartShard_OnDiskSM_NoDataDir_DefaultLayout(t *testing.T) {
 		t.Fatalf("on-disk SM Open dir = %q, want %q (default NodeHostDir layout)", got, wantDir)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// StartShard vs Close TOCTOU
+// ---------------------------------------------------------------------------
+
+// gatedStateMachine records its Close so the test can prove the shard's
+// resources were released.
+type gatedStateMachine struct {
+	mockStateMachine
+	closed *atomic.Bool
+}
+
+func (m *gatedStateMachine) Close(_ context.Context) error {
+	m.closed.Store(true)
+	return nil
+}
+
+// TestStartShard_LosesRaceWithClose verifies that a StartShard which passes
+// the closed/draining entry check and then loses the race to a complete
+// Host.Close does NOT publish an orphaned shard.
+//
+// Close stops the engine and then sweeps h.nodes; a shard published after
+// that sweep would live forever in a stopped engine: permanently inert, with
+// activeNodes incremented and its state machine open, whose on-disk lock
+// bricks the next host start on the same DataDir.
+func TestStartShard_LosesRaceWithClose(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+
+	var smClosed atomic.Bool
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	create := func(_, _ uint64) interface{} {
+		close(entered)
+		<-release
+		return &gatedStateMachine{closed: &smClosed}
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		// join=true so the shard never writes bootstrap state: this test is
+		// about the publish race, not about LogDB writes after Close.
+		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
+			create, testShardConfig(1, 1))
+	}()
+
+	// StartShard is now past its closed/draining entry check.
+	<-entered
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Let StartShard run to completion against the closed host.
+	close(release)
+
+	select {
+	case err := <-startErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("StartShard returned %v, want ErrClosed", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard did not return")
+	}
+
+	if _, loaded := h.nodes.Load(uint64(1)); loaded {
+		t.Fatal("shard published into a closed host: it is inert and nothing will ever stop it")
+	}
+	if n := h.activeNodes.Load(); n != 0 {
+		t.Fatalf("activeNodes = %d after the losing StartShard, want 0", n)
+	}
+	if !smClosed.Load() {
+		t.Fatal("state machine left open by the losing StartShard: its file lock bricks the next host start")
+	}
+	if node := h.engine.GetNode(1); node != nil {
+		t.Fatal("engine still holds the node of a shard that never started")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot gates on the observability surface
+// ---------------------------------------------------------------------------
+
+// TestShardHealth_ReportsSnapshotGates verifies that a shard whose state
+// machine is held by a snapshot gate is NOT reported as healthy.
+//
+// A replica in snapshot recovery applies nothing and serves no up-to-date
+// local read for as long as user RecoverFromSnapshot code runs. Reporting it
+// as healthy is what made the recovery blackout so hard to diagnose: every
+// API said the replica was fine.
+func TestShardHealth_ReportsSnapshotGates(t *testing.T) {
+	h := newTestHost(t)
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("engine node missing for started shard")
+	}
+
+	info, err := h.GetShardInfo(1)
+	if err != nil {
+		t.Fatalf("GetShardInfo failed: %v", err)
+	}
+	if info.Health != ShardHealthy {
+		t.Fatalf("baseline health = %v, want healthy", info.Health)
+	}
+
+	engNode.SetRecovering(true)
+	info, err = h.GetShardInfo(1)
+	if err != nil {
+		t.Fatalf("GetShardInfo failed: %v", err)
+	}
+	if info.Health != ShardRecovering {
+		t.Fatalf("health during snapshot recovery = %v, want recovering", info.Health)
+	}
+	recovering, saving, _, err := h.DiagShardGates(1)
+	if err != nil {
+		t.Fatalf("DiagShardGates failed: %v", err)
+	}
+	if !recovering || saving {
+		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (true, false)", recovering, saving)
+	}
+	engNode.SetRecovering(false)
+
+	engNode.SetSaving(true)
+	info, err = h.GetShardInfo(1)
+	if err != nil {
+		t.Fatalf("GetShardInfo failed: %v", err)
+	}
+	if info.Health != ShardSnapshotting {
+		t.Fatalf("health during snapshot save = %v, want snapshotting", info.Health)
+	}
+	recovering, saving, _, err = h.DiagShardGates(1)
+	if err != nil {
+		t.Fatalf("DiagShardGates failed: %v", err)
+	}
+	if recovering || !saving {
+		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (false, true)", recovering, saving)
+	}
+	engNode.SetSaving(false)
+
+	if info, err = h.GetShardInfo(1); err != nil {
+		t.Fatalf("GetShardInfo failed: %v", err)
+	} else if info.Health != ShardHealthy {
+		t.Fatalf("health after the gates cleared = %v, want healthy", info.Health)
+	}
+}

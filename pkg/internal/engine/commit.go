@@ -447,6 +447,20 @@ func (w *commitWorker) processBatch() {
 		}
 
 		if len(u.CommittedEntries) == 0 {
+			// A snapshot recovery owns the state machine: extracting
+			// committed entries here would advance raft's processed marker
+			// and hand the batch to an apply worker that must park it on the
+			// recovering gate, holding commitPending — and with it every
+			// ordered response, including vote grants — for the whole
+			// unbounded recovery. The step worker suppresses the same
+			// extraction (GetUpdate moreEntriesToApply=false); entries stay
+			// in the log and are re-offered once the gate clears.
+			if node.IsRecovering() {
+				node.raftMu.Unlock()
+				node.commitPending.Store(false)
+				w.workSignal.Notify(node.shardID)
+				continue
+			}
 			// Piggyback: check if entries became committable during the
 			// commitPending window (processCommitPendingInbox advanced the
 			// commit index after handling follower ReplicateResp).
@@ -469,6 +483,8 @@ func (w *commitWorker) processBatch() {
 			// batch entirely rather than iterating cleared/nil batch slots
 			// (which would nil-deref node.raftMu on the next item).
 			if !w.executePiggyback(node, piggyback) {
+				node.commitPending.Store(false)
+				w.abandonBatchTail(i + 1)
 				w.clearBatch()
 				return
 			}
@@ -500,12 +516,44 @@ func (w *commitWorker) processBatch() {
 					"shard", ai.update.ShardID)
 				ai.update.ReleaseCommittedEntries()
 				releaseApplyItem(w.applyPool, ai)
+				node.commitPending.Store(false)
+				w.abandonBatchTail(i + 1)
 				w.clearBatch()
 				return
 			}
 		}
 	}
 	w.clearBatch()
+}
+
+// abandonBatchTail releases the batch items from index start onwards, which
+// processBatch's shutdown early-returns would otherwise leave behind. Those
+// items were persisted by SaveState but never reached Peer.Commit, so their
+// nodes still hold commitPending: without this the step worker never produces
+// another update for them and Engine.Stop returns with the shards wedged —
+// permanently, since the flag survives into the next batch cycle if the
+// worker keeps running.
+//
+// Dropping the entries is safe on exactly this path: nothing advanced raft's
+// processed marker for them (Peer.Commit never ran), they are durable in the
+// WAL, and the engine is shutting down — restart re-derives the apply
+// frontier from LogDB, the same rationale as the apply worker's shutdown
+// drop. Their pooled committed-entry slices are returned so a shutdown does
+// not drain proto's entry pool.
+func (w *commitWorker) abandonBatchTail(start int) {
+	for i := start; i < len(w.batch); i++ {
+		node := w.batchNodes[i]
+		if node == nil {
+			continue
+		}
+		slog.Warn("commit worker shutting down, batch item abandoned",
+			"worker", w.workerID, "shard", w.batch[i].ShardID)
+		w.batch[i].ReleaseCommittedEntries()
+		node.commitPending.Store(false)
+		if w.workSignal != nil {
+			w.workSignal.Notify(node.shardID)
+		}
+	}
 }
 
 // failBatchSaveState handles a terminal SaveState failure (either the
@@ -581,6 +629,34 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	// Return the pooled slice only after the callback, which must not
 	// retain the entries beyond the call.
 	u.ReleaseCommittedEntries()
+}
+
+// clearBatchCommitPending releases the pipeline ownership of every node in
+// the current batch and wakes its step worker. It is called ONLY from the
+// commit worker's panic recovery, where the batch's updates die with the
+// panic and would otherwise leave their nodes wedged with commitPending set
+// forever.
+//
+// It is scoped to the batch on purpose: the batch's commitItems have
+// already been consumed from commitC and copied into w.batch, so their
+// per-shard slots are free and a fresh GetUpdate for them is correct. Nodes
+// OUTSIDE the batch either have no update in flight or have one the step
+// worker is still enqueueing, and clearing those would let the step worker
+// re-extract committed entries raft has not marked processed yet.
+//
+// Must run on the (unwinding) commit worker goroutine: nothing else owns
+// the batch buffers at that point.
+func (w *commitWorker) clearBatchCommitPending(workSignal *WorkSignal) {
+	for i := range w.batchNodes {
+		node := w.batchNodes[i]
+		if node == nil {
+			continue
+		}
+		node.commitPending.Store(false)
+		if workSignal != nil {
+			workSignal.Notify(node.shardID)
+		}
+	}
 }
 
 // clearBatch clears the batch node pointers, update values, commit times,

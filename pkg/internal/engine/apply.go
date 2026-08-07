@@ -466,6 +466,17 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 				}
 			}()
 
+			// An empty batch never touches the state machine, so it must
+			// NOT wait on the recovering/saving gate below: parking it
+			// would hold commitPending — and with it the shard's whole
+			// pipeline — for the entire, unbounded duration of user
+			// RecoverFromSnapshot/SaveSnapshot code, for a batch that has
+			// nothing to apply. Memory mode forwards such batches (a hard
+			// state change with no committed entries) on every update.
+			if len(entries) == 0 {
+				return
+			}
+
 			// If a snapshot recovery OR a snapshot-save capture is in
 			// progress, WAIT for the gate to clear rather than dropping the
 			// batch. Raft's processed marker already advanced past these
