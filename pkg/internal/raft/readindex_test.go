@@ -35,7 +35,7 @@ func TestReadIndex_RequestCanBeAdded(t *testing.T) {
 
 	// Send a ReadIndex request.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42, // client key
 	})
 	if err != nil {
@@ -69,11 +69,11 @@ func TestReadIndex_DuplicateContextRejected(t *testing.T) {
 	r.drainMessages()
 
 	// Send two ReadIndex requests with the same key.
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 42})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 42})
 	if err != nil {
 		t.Fatalf("unexpected error on first request: %v", err)
 	}
-	err = r.step(proto.Message{Type: proto.ReadIndex, Hint: 42})
+	err = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 42})
 	if err != nil {
 		t.Fatalf("unexpected error on second request: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestReadIndex_LeaderConfirmation(t *testing.T) {
 	r.drainMessages()
 
 	// Submit a ReadIndex request.
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 100})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 100})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -157,11 +157,11 @@ func TestReadIndex_ResetOnStateChange(t *testing.T) {
 	r.drainMessages()
 
 	// Add pending reads.
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 1})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 1})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	err = r.step(proto.Message{Type: proto.ReadIndex, Hint: 2})
+	err = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestReadIndex_InputIndexValidation(t *testing.T) {
 	// Do NOT call commitNoOp -- the noop is not committed yet.
 	r.drainMessages()
 
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 1})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 1})
 	if !errors.Is(err, ErrReadIndexNotReady) {
 		t.Fatalf("expected ErrReadIndexNotReady before noop committed, got %v", err)
 	}
@@ -200,7 +200,7 @@ func TestReadIndex_InputIndexValidation(t *testing.T) {
 	r.drainMessages()
 
 	// ReadIndex should now work.
-	err = r.step(proto.Message{Type: proto.ReadIndex, Hint: 2})
+	err = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("expected ReadIndex to succeed after noop committed, got %v", err)
 	}
@@ -216,14 +216,14 @@ func TestReadIndex_OverloadProtection(t *testing.T) {
 
 	// Fill up to the limit.
 	for i := 0; i < maxPendingReadIndex; i++ {
-		err := r.step(proto.Message{Type: proto.ReadIndex, Hint: uint64(i)})
+		err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: uint64(i)})
 		if err != nil {
 			t.Fatalf("unexpected error at request %d: %v", i, err)
 		}
 	}
 
 	// The next request should be rejected.
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 99999})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 99999})
 	if !errors.Is(err, ErrReadIndexOverloaded) {
 		t.Fatalf("expected ErrReadIndexOverloaded, got %v", err)
 	}

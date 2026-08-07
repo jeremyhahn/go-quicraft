@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,11 +77,13 @@ func TestImportSnapshot_ReachesDEKPurgeFloorAndGC(t *testing.T) {
 			defer h.Close()
 
 			shardCfg := testShardConfig(shardID, replicaID)
-			var opts []ImportOption
 			if tt.dataDir {
 				shardCfg.DataDir = t.TempDir()
-				opts = append(opts, WithImportDataDir(shardCfg.DataDir))
 			}
+			// The shard was never started on this host, so there is no
+			// bootstrap record to discover the layout from: the caller has to
+			// state it, and ImportSnapshot fails closed if it does not.
+			opts := []ImportOption{WithImportDataDir(shardCfg.DataDir)}
 
 			artifact := buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
 				snapshotEnvelope(payload))
@@ -171,7 +174,7 @@ func TestImportSnapshot_WritesEpochMetadata(t *testing.T) {
 	artifact := buildSnapshotArtifact(t, 123, 4, 0, proto.Membership{},
 		snapshotEnvelope([]byte("payload")))
 	if impErr := h.ImportSnapshot(context.Background(), shardID,
-		bytes.NewReader(artifact)); impErr != nil {
+		bytes.NewReader(artifact), WithImportDataDir("")); impErr != nil {
 		t.Fatalf("ImportSnapshot failed: %v", impErr)
 	}
 
@@ -211,4 +214,173 @@ func readSnapshotMetaFields(t *testing.T, dir string) (epoch, index, term uint64
 	term = binary.LittleEndian.Uint64(data[8:])
 	epoch = binary.LittleEndian.Uint64(data[40:])
 	return epoch, index, term
+}
+
+// H3. The DataDir layout must be DISCOVERED, not declared.
+//
+// WithImportDataDir was documented as required whenever Config.DataDir is
+// non-empty, but nothing validated it and ImportSnapshot could not detect the
+// omission. Omitting it wrote the artifact under NodeHostDir while StartShard
+// pointed the shard's SnapshotDir at DataDir/shard-N, so listSnapshotDirs
+// never enumerated it: the artifact contributed no floor to the DEK purge and
+// the next PurgeEpochsBefore destroyed the key it needed. That is exactly the
+// bug TestImportSnapshot_ReachesDEKPurgeFloorAndGC covers, still live, behind
+// a silent caller opt-in.
+//
+// StartShard now records Config.DataDir in the shard's LogDB bootstrap record,
+// so an import of a shard this host has started resolves the layout itself.
+func TestImportSnapshot_DiscoversDataDirFromBootstrapRecord(t *testing.T) {
+	const shardID, replicaID uint64 = 41, 1
+	dataDir := t.TempDir()
+
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	shardCfg := testShardConfig(shardID, replicaID)
+	shardCfg.DataDir = dataDir
+	if startErr := h.StartShard(map[uint64]string{replicaID: "127.0.0.1:5000"},
+		false, testCreateFunc, shardCfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+	if stopErr := h.StopShard(shardID); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	// The mock LogDB does not derive ListNodeInfo from its records.
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
+	db.mu.Unlock()
+
+	bs, ok, bsErr := db.GetBootstrap(shardID, replicaID)
+	if bsErr != nil || !ok {
+		t.Fatalf("GetBootstrap: ok=%v err=%v", ok, bsErr)
+	}
+	if bs.DataDir != dataDir {
+		t.Fatalf("StartShard recorded DataDir %q, want %q: without it the "+
+			"import cannot discover the shard's snapshot tree", bs.DataDir, dataDir)
+	}
+
+	// NO WithImportDataDir: the layout must come from the record.
+	artifact := buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("imported disaster-recovery state")))
+	if impErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact)); impErr != nil {
+		t.Fatalf("ImportSnapshot failed: %v", impErr)
+	}
+
+	imported, getErr := db.GetSnapshot(shardID, replicaID)
+	if getErr != nil {
+		t.Fatalf("GetSnapshot failed: %v", getErr)
+	}
+	base := shardSnapshotBaseDir(cfg.NodeHostDir, dataDir, shardID)
+	if rel, relErr := filepath.Rel(base, imported.Filepath); relErr != nil ||
+		rel == ".." || len(rel) > 2 && rel[:3] == ".."+string(filepath.Separator) {
+		t.Fatalf("imported snapshot landed at %q, outside the shard's snapshot "+
+			"tree %q: snapshot GC and the DEK purge-floor scan never enumerate "+
+			"it, so the next PurgeEpochsBefore destroys its key",
+			imported.Filepath, base)
+	}
+}
+
+// A WithImportDataDir that contradicts the recorded value is refused rather
+// than silently resolved: one of the two is wrong, the import cannot tell
+// which, and choosing wrongly costs the artifact's DEK.
+func TestImportSnapshot_RejectsDataDirContradictingTheRecord(t *testing.T) {
+	const shardID, replicaID uint64 = 42, 1
+	dataDir := t.TempDir()
+
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	shardCfg := testShardConfig(shardID, replicaID)
+	shardCfg.DataDir = dataDir
+	if startErr := h.StartShard(map[uint64]string{replicaID: "127.0.0.1:5000"},
+		false, testCreateFunc, shardCfg); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+	if stopErr := h.StopShard(shardID); stopErr != nil {
+		t.Fatalf("StopShard failed: %v", stopErr)
+	}
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
+	db.mu.Unlock()
+
+	artifact := buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("payload")))
+
+	// The omission the old contract could not detect: no DataDir declared for
+	// a DataDir shard. It must no longer land under NodeHostDir.
+	if impErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact), WithImportDataDir("")); !errorsIsImportMismatch(impErr) {
+		t.Fatalf("declaring no DataDir for a DataDir shard: err = %v, want "+
+			"ErrImportDataDirMismatch", impErr)
+	}
+
+	// A different DataDir is equally refused.
+	if impErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact), WithImportDataDir(t.TempDir())); !errorsIsImportMismatch(impErr) {
+		t.Fatalf("declaring the wrong DataDir: err = %v, want ErrImportDataDirMismatch", impErr)
+	}
+
+	// Nothing was written for either refusal.
+	if _, getErr := db.GetSnapshot(shardID, replicaID); getErr == nil {
+		t.Fatal("a refused import still recorded a snapshot in LogDB")
+	}
+}
+
+// A shard with NO bootstrap record (started with join=true, or restored onto a
+// host that has never run it) cannot have its layout discovered. The import
+// must fail closed rather than assume NodeHostDir: assuming wrongly is silent
+// and destroys the DEK.
+func TestImportSnapshot_FailsClosedWhenLayoutIsUnknown(t *testing.T) {
+	const shardID, replicaID uint64 = 43, 1
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
+	db.mu.Unlock()
+
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	artifact := buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("payload")))
+	impErr := h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact))
+	if !errorsIsImportUnknown(impErr) {
+		t.Fatalf("import with no recorded layout: err = %v, want "+
+			"ErrImportLayoutUnknown; assuming NodeHostDir here writes the "+
+			"artifact outside a DataDir shard's tree and the next "+
+			"PurgeEpochsBefore destroys its DEK", impErr)
+	}
+	if _, getErr := db.GetSnapshot(shardID, replicaID); getErr == nil {
+		t.Fatal("a refused import still recorded a snapshot in LogDB")
+	}
+
+	// An explicit assertion unblocks it.
+	if impErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact), WithImportDataDir("")); impErr != nil {
+		t.Fatalf("import with an explicit layout assertion failed: %v", impErr)
+	}
+}
+
+// errorsIsImportMismatch and errorsIsImportUnknown keep the assertions above
+// readable while still matching on the sentinel rather than on message text.
+func errorsIsImportMismatch(err error) bool {
+	return errors.Is(err, ErrImportDataDirMismatch)
+}
+
+func errorsIsImportUnknown(err error) bool {
+	return errors.Is(err, ErrImportLayoutUnknown)
 }

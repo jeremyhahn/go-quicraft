@@ -621,3 +621,70 @@ func (e *TypeAssertionError) Error() string {
 		e.Context, e.ExpectedType, e.ActualValue,
 	)
 }
+
+// ErrImportLayoutUnknown is the sentinel for
+// *ImportLayoutUnknownError.
+var ErrImportLayoutUnknown = errors.New("quicraft: snapshot import cannot determine the shard's on-disk layout")
+
+// ImportLayoutUnknownError is returned by Host.ImportSnapshot when the
+// shard's snapshot-tree root can be neither discovered nor asserted.
+//
+// StartShard records Config.DataDir in the shard's LogDB bootstrap record, so
+// the layout is normally discovered. A shard started with join=true records no
+// bootstrap, and a record written before the field existed carries no DataDir;
+// in those cases the import must be told explicitly with WithImportDataDir
+// (pass "" to assert the shard has no DataDir).
+//
+// It fails closed rather than assuming NodeHostDir because a wrong assumption
+// is silent and destructive: the artifact lands outside the tree that snapshot
+// garbage collection and the DEK purge-floor scan enumerate, so the next
+// PurgeEpochsBefore destroys the key it needs and the restore is unrecoverable.
+type ImportLayoutUnknownError struct {
+	ShardID   uint64
+	ReplicaID uint64
+}
+
+// Error returns a human-readable description of the unknown layout.
+func (e *ImportLayoutUnknownError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d has no recorded DataDir; pass WithImportDataDir "+
+			"to state the shard's Config.DataDir (or WithImportDataDir(\"\") if it has none)",
+		e.ShardID, e.ReplicaID,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrImportLayoutUnknown.
+func (e *ImportLayoutUnknownError) Is(target error) bool {
+	return target == ErrImportLayoutUnknown
+}
+
+// ErrImportDataDirMismatch is the sentinel for *ImportDataDirMismatchError.
+var ErrImportDataDirMismatch = errors.New("quicraft: snapshot import DataDir disagrees with the shard's recorded DataDir")
+
+// ImportDataDirMismatchError is returned by Host.ImportSnapshot when the
+// caller's WithImportDataDir contradicts the DataDir StartShard recorded for
+// the shard.
+//
+// One of the two is wrong and the import cannot tell which, so it refuses
+// instead of choosing. Choosing wrongly writes the artifact into a tree the
+// shard will not scan, which leaks it and lets the next PurgeEpochsBefore
+// destroy its DEK.
+type ImportDataDirMismatchError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	Declared  string
+	Recorded  string
+}
+
+// Error returns a human-readable description of the disagreement.
+func (e *ImportDataDirMismatchError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d was started with DataDir %q but the import declares %q",
+		e.ShardID, e.ReplicaID, e.Recorded, e.Declared,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrImportDataDirMismatch.
+func (e *ImportDataDirMismatchError) Is(target error) bool {
+	return target == ErrImportDataDirMismatch
+}

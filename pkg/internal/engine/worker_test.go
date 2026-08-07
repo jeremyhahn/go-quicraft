@@ -5230,7 +5230,7 @@ func TestStepWorker_ProcessCommitPendingInbox_InstallSnapshotDeferred(t *testing
 
 	// Deliver an InstallSnapshot message while commitPending is true.
 	node.Deliver(proto.Message{
-		Type: proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 2,
 		To:   1,
 	})
@@ -6805,7 +6805,7 @@ func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 	tickPeerToLeader(peer)
 
 	if !node.Deliver(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		ShardID:  1,
 		From:     2,
 		To:       1,

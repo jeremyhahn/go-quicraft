@@ -307,6 +307,88 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 			peers:    []string{"node-a.raft.test:6000"},
 			wantFail: false,
 		},
+
+		// H4. The SKIP used a raw, case-sensitive string compare while the
+		// MATCH used x509.VerifyHostname, which lower-cases names, tolerates
+		// the trailing-dot FQDN form and canonicalises IP literals. Every row
+		// below is a legitimate deployment that the mismatch REJECTED at
+		// startup, with no configuration override available.
+		{
+			name: "co-located peer written in a different case",
+			leaf: perNode,
+			self: "node-a.raft.test:5000",
+			// VerifyHostname matches this against the SAN; the skip did not.
+			peers:    []string{"NODE-A.RAFT.TEST:5001"},
+			wantFail: false,
+		},
+		{
+			name:     "co-located peer written as an absolute FQDN",
+			leaf:     perNode,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"node-a.raft.test.:5001"},
+			wantFail: false,
+		},
+		{
+			name: "this node's OWN entry listed by IP while RaftAddress is a hostname",
+			// The members map routinely lists nodes by IP while RaftAddress is
+			// a name. The raw compare made the node flag ITSELF and refuse to
+			// start.
+			leaf:     perNode,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"127.0.0.1:5000"},
+			wantFail: false,
+		},
+		{
+			name: "standard single-box deployment across IPv6 and IPv4 loopback",
+			// A loopback address is reachable only from this machine, so a
+			// member listed at one is co-located by construction.
+			leaf:     perNode,
+			self:     "[::1]:5000",
+			peers:    []string{"127.0.0.1:5001", "[::1]:5002"},
+			wantFail: false,
+		},
+		{
+			name:     "equivalent IPv6 spellings of our own host",
+			leaf:     perNode,
+			self:     "[0:0:0:0:0:0:0:1]:5000",
+			peers:    []string{"[::1]:5001"},
+			wantFail: false,
+		},
+		{
+			name: "normalisation does not weaken the check: a covered remote host still fails",
+			// The whole point of the check. Case-folding a peer name must not
+			// turn a genuinely remote covered host into a skip.
+			leaf:     wildcard,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"NODE-B.RAFT.TEST:5000"},
+			wantFail: true,
+		},
+		{
+			name:     "normalisation does not weaken the check: FQDN form of a remote host still fails",
+			leaf:     wildcard,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"node-b.raft.test.:5000"},
+			wantFail: true,
+		},
+		{
+			name: "a non-loopback IP peer is still checked",
+			// Only LOOPBACK implies co-location. Any other IP the certificate
+			// covers is a real exclusivity failure and must not be skipped
+			// just because it is an IP literal. The test leaf carries :: in
+			// its IPAddresses SANs.
+			leaf:     perNode,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"[::]:5000"},
+			wantFail: true,
+		},
+		{
+			name: "every loopback form in 127.0.0.0/8 is co-located",
+			// 127.0.0.2 is as unreachable from another machine as 127.0.0.1.
+			leaf:     perNode,
+			self:     "node-a.raft.test:5000",
+			peers:    []string{"127.0.0.2:5000"},
+			wantFail: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -444,5 +526,58 @@ func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 				"still tore down the connection: one peer can force a QUIC "+
 				"handshake per batch", i+1, evictionBudget, evictionWindow)
 		}
+	}
+}
+
+// TG-26. The eviction budget must be keyed PER PEER ADDRESS.
+//
+// The budget bounds attacker-driven teardown work, but its OTHER job is
+// isolation: a peer stuck in a crash loop — or one deliberately manufacturing
+// epochs — exhausts its own budget and nothing else. A single global counter
+// would satisfy every existing assertion about the cap while letting one
+// flapping peer consume the budget every other peer needs to recover from its
+// own genuine restart, converting a one-node fault into a cluster-wide
+// reconnection stall. That is precisely the cascade the epoch mechanism exists
+// to prevent, re-introduced by its own defence.
+func TestAllowEviction_BudgetIsPerPeerAddress(t *testing.T) {
+	tr := &QUICTransport{peerEpoch: make(map[string]*peerIncarnation)}
+	now := time.Now()
+
+	const flapping = "10.0.0.1:5000"
+	const healthy = "10.0.0.2:5000"
+
+	for i := 0; i < evictionBudget; i++ {
+		if !tr.allowEviction(flapping, now) {
+			t.Fatalf("eviction %d of %d refused for the flapping peer: a genuine "+
+				"restart must be handled within the budget", i+1, evictionBudget)
+		}
+	}
+	if tr.allowEviction(flapping, now) {
+		t.Fatalf("the flapping peer exceeded %d evictions per %s and was still "+
+			"granted one", evictionBudget, evictionWindow)
+	}
+
+	// A DIFFERENT peer restarts once, legitimately. It must get its own full
+	// budget: the first peer's abuse is not charged to it.
+	for i := 0; i < evictionBudget; i++ {
+		if !tr.allowEviction(healthy, now) {
+			t.Fatalf("eviction %d of %d refused for a second, healthy peer: one "+
+				"flapping peer has consumed the recovery budget of every other "+
+				"peer, so a real restart elsewhere cannot be acted on until the "+
+				"%s window rolls over", i+1, evictionBudget, evictionWindow)
+		}
+	}
+	if tr.allowEviction(healthy, now) {
+		t.Fatal("the second peer's own budget was not enforced either")
+	}
+
+	// The window is also per peer: rolling the flapping peer's window forward
+	// must restore its budget without touching the other's.
+	later := now.Add(evictionWindow)
+	if !tr.allowEviction(flapping, later) {
+		t.Fatal("the flapping peer's budget did not refresh after its window elapsed")
+	}
+	if tr.allowEviction(healthy, now) {
+		t.Fatal("rolling one peer's window refreshed another peer's budget")
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -929,6 +930,66 @@ func certAuthHost(target string) string {
 	return host
 }
 
+// canonicalCertHost normalises a host the way x509.VerifyHostname compares it,
+// so two spellings of the SAME host are recognised as one.
+//
+// VerifyHostname lower-cases DNS names, tolerates a single trailing dot (the
+// absolute-FQDN form), and parses an IP literal before matching it against the
+// IPAddresses SANs. Any check that decides "is this the same host?" with a raw
+// string compare while the MATCH is done by VerifyHostname is inconsistent by
+// construction: it will call two names different that the certificate calls
+// the same. That inconsistency is what made the exclusivity check reject
+// legitimate deployments — N1.EXAMPLE.COM against n1.example.com, the FQDN
+// form against the relative one, ::1 against 0:0:0:0:0:0:0:1.
+//
+// IP literals are canonicalised through net.IP.String(), which also collapses
+// the IPv4-mapped IPv6 form (::ffff:127.0.0.1) onto its IPv4 spelling. An
+// empty host stays empty; callers treat that as "no host to check".
+func canonicalCertHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	// A single trailing dot marks an absolute FQDN and is not part of the
+	// name for matching purposes.
+	if len(host) > 1 && strings.HasSuffix(host, ".") {
+		host = host[:len(host)-1]
+	}
+	// Bracketed IPv6 literals reach here when the address had no port.
+	if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return host
+}
+
+// isCoLocatedCertHost reports whether a peer host must be treated as sharing
+// this node's machine, and therefore cannot be separated from it by any
+// certificate policy.
+//
+// Two cases qualify:
+//
+//   - The peer names the SAME host as this node (after canonicalisation): a
+//     co-located replica separated only by port, or this node's own entry in
+//     the members map written in a different but equivalent form.
+//   - The peer names a LOOPBACK address. A loopback address is only reachable
+//     from the machine it is on, so a member listed at one is necessarily on
+//     this machine — including the case where the members map lists this very
+//     node by IP while its RaftAddress is a hostname, which made a node flag
+//     ITSELF.
+//
+// Certificates are matched on host alone, so neither case can be given
+// per-node SANs; flagging them would fail single-machine and mixed-form
+// deployments while telling the operator nothing they could act on.
+func isCoLocatedCertHost(selfHost, peerHost string) bool {
+	if peerHost == "" || peerHost == selfHost {
+		return true
+	}
+	if ip := net.ParseIP(peerHost); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 // VerifyPeerAddressExclusivity reports whether this node's own leaf certificate
 // ALSO covers any of the given peer addresses, which is a fatal deployment
 // error.
@@ -946,12 +1007,15 @@ func certAuthHost(target string) string {
 // third-party victim: an attacker-controlled cluster-wide replication stall,
 // precisely the cascade the epoch mechanism exists to prevent.
 //
-// Because a certificate is only ever matched on its HOST, peers sharing this
-// node's own host (the co-located case: 127.0.0.1:5000 and 127.0.0.1:5001) are
-// indistinguishable by construction and are skipped — flagging them would fail
-// every single-machine deployment while telling the operator nothing they could
-// act on. Per-node SANs on DISTINCT hosts are therefore a hard deployment
-// precondition for the guarantees above; co-located replicas do not get them.
+// Because a certificate is only ever matched on its HOST, peers that share
+// this node's machine are indistinguishable from it by construction and are
+// skipped — see isCoLocatedCertHost for the two forms that takes (the same
+// host under any spelling, and any loopback address). Flagging them would fail
+// every single-machine deployment, and would fail a multi-machine one whose
+// members map simply lists this node by IP while its RaftAddress is a
+// hostname, while telling the operator nothing they could act on. Per-node
+// SANs on DISTINCT hosts are therefore a hard deployment precondition for the
+// guarantees above; co-located replicas do not get them.
 func (t *QUICTransport) VerifyPeerAddressExclusivity(selfAddr string, peers []string) error {
 	if t.tlsPair == nil || t.tlsPair.leaf == nil {
 		// Unreachable: NewQUICTransport fails when the leaf cannot be parsed.
@@ -964,12 +1028,12 @@ func (t *QUICTransport) VerifyPeerAddressExclusivity(selfAddr string, peers []st
 // verifyCertificateExclusivity is VerifyPeerAddressExclusivity over an explicit
 // leaf, so the rule is testable without a live transport.
 func verifyCertificateExclusivity(leaf *x509.Certificate, selfAddr string, peers []string) error {
-	selfHost := certAuthHost(selfAddr)
+	selfHost := canonicalCertHost(certAuthHost(selfAddr))
 	seen := make(map[string]struct{}, len(peers))
 	var covered []string
 	for _, peer := range peers {
-		host := certAuthHost(peer)
-		if host == "" || host == selfHost {
+		host := canonicalCertHost(certAuthHost(peer))
+		if isCoLocatedCertHost(selfHost, host) {
 			continue
 		}
 		if _, dup := seen[host]; dup {

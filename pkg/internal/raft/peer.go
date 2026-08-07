@@ -361,10 +361,35 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// chooses. Any authenticated shard member could hand this node a
 	// configuration of its choosing.
 	//
-	// Term 0 is the LOCAL-injection escape hatch, not a stale term: the
-	// message handler builds InstallSnapshot without a term and step exempts
-	// it from every term comparison, so it is deliberately not treated as
-	// stale here.
+	// An InstallSnapshot that did not arrive through the local injection API
+	// is refused outright. raft.step already rejects it (ErrWireLocalMessage,
+	// so err != nil and the adopt below is skipped), but the check is
+	// repeated at the adopt site because THIS is the code that replaces the
+	// membership: the property "only a snapshot this host received, verified
+	// and persisted may redefine the voting set" has to be checkable here,
+	// not inferred from a non-nil error produced three call frames away.
+	//
+	// The origin is stamped by the delivery API (Node.Deliver /
+	// Node.DeliverLocal) and is not part of the wire format, so it is not a
+	// value the sender can choose — unlike the term, which the previous
+	// version of this check relied on and which a forged Term 0 walked
+	// straight past.
+	wireOrigin := msg.Type == proto.InstallSnapshot && !msg.Origin.IsLocal()
+	if wireOrigin {
+		slog.Warn("ignoring membership from a wire-delivered InstallSnapshot",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"from", msg.From,
+			"msg_term", msg.Term,
+			"term", termBefore,
+			"snapshot_index", msg.Snapshot.Index,
+		)
+	}
+
+	// A locally injected snapshot whose term is behind ours is stale: the
+	// snapshot receive path can complete after this replica has moved on to a
+	// later term, and its membership is then older than what the log already
+	// applied.
 	staleTerm := msg.Type == proto.InstallSnapshot &&
 		msg.Term > 0 && msg.Term < termBefore
 	if staleTerm {
@@ -384,7 +409,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// only committed entries mutate membership, log truncation on
 	// conflict can never remove an applied config change, so no
 	// membership rollback/rebuild is needed here.
-	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm {
+	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm && !wireOrigin {
 		// Adopt the snapshot's membership on BOTH branches, gated on it
 		// not being older than what we already have.
 		//
@@ -463,6 +488,7 @@ func (p *Peer) Propose(entries []proto.Entry) (uint64, error) {
 		Type:    proto.Propose,
 		From:    p.replicaID,
 		Entries: entries,
+		Origin:  proto.OriginLocal,
 	}
 	err := p.r.step(msg)
 	p.syncLeaderID()
@@ -516,6 +542,7 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 		Type:    proto.Propose,
 		From:    p.replicaID,
 		Entries: []proto.Entry{entry},
+		Origin:  proto.OriginLocal,
 	}
 	err = p.r.step(msg)
 	if err != nil {
@@ -774,9 +801,10 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 // (multi-node) or responds immediately (single-node).
 func (p *Peer) ReadIndex(key uint64) error {
 	msg := proto.Message{
-		Type: proto.ReadIndex,
-		From: p.replicaID,
-		Hint: key,
+		Type:   proto.ReadIndex,
+		From:   p.replicaID,
+		Hint:   key,
+		Origin: proto.OriginLocal,
 	}
 	err := p.r.step(msg)
 	p.syncLeaderID()
@@ -820,9 +848,10 @@ func (p *Peer) RequestLeaderTransfer(target uint64) error {
 		return nil
 	}
 	msg := proto.Message{
-		Type: proto.LeaderTransfer,
-		From: p.replicaID,
-		Hint: target,
+		Type:   proto.LeaderTransfer,
+		From:   p.replicaID,
+		Hint:   target,
+		Origin: proto.OriginLocal,
 	}
 	err := p.r.step(msg)
 	p.syncLeaderID()

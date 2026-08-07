@@ -42,6 +42,7 @@ import (
 // *engine.Engine satisfies it.
 type engineDeliverer interface {
 	DeliverMessage(shardID uint64, msg proto.Message) bool
+	DeliverLocal(shardID uint64, msg proto.Message) bool
 	NotifyWork(shardID uint64)
 	GetNode(shardID uint64) *engine.Node
 	RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error
@@ -72,9 +73,12 @@ type snapshotRecvKey struct {
 }
 
 // snapshotCtrlDeliverer is the minimal engine surface needed to deliver
-// one-shot snapshot control messages with retry.
+// one-shot snapshot control messages with retry. It deliberately names
+// DeliverLocal and not DeliverMessage: these messages are built in-process
+// and carry no term, so they must reach the inbox stamped OriginLocal —
+// the stamp raft.step's term-gate exemption is keyed on.
 type snapshotCtrlDeliverer interface {
-	DeliverMessage(shardID uint64, msg proto.Message) bool
+	DeliverLocal(shardID uint64, msg proto.Message) bool
 	NotifyWork(shardID uint64)
 }
 
@@ -98,7 +102,7 @@ const (
 // persistently saturated inbox).
 func deliverSnapshotControl(eng snapshotCtrlDeliverer, shardID uint64, msg proto.Message) bool {
 	for attempt := 0; ; attempt++ {
-		if eng.DeliverMessage(shardID, msg) {
+		if eng.DeliverLocal(shardID, msg) {
 			eng.NotifyWork(shardID)
 			return true
 		}
@@ -207,6 +211,14 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 			h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress)
 		}
 
+		// DeliverMessage (not DeliverLocal) stamps the message OriginRemote.
+		// The shard inbox is shared with the in-process injectors — the
+		// snapshot receive path's InstallSnapshot, the transport's
+		// SnapshotStatus, the host's LeaderTransfer — and raft.step exempts
+		// exactly those types from its term gate. The stamp is what keeps the
+		// exemption unreachable from here: without it a peer could name one of
+		// those types in a MessageBatch and be stepped as if this host had
+		// injected it (a term-less InstallSnapshot then rewrites membership).
 		h.engine.DeliverMessage(msg.ShardID, *msg)
 		h.engine.NotifyWork(msg.ShardID)
 	}

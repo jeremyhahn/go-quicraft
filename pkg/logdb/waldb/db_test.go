@@ -4183,3 +4183,116 @@ func TestBoundedMapHintClampsToBody(t *testing.T) {
 		t.Fatalf("boundedMapHint = %d, want 0 (empty body)", got)
 	}
 }
+
+// TestBootstrapDataDirSurvivesReopen covers the H3 field: the shard's DataDir
+// must survive a WAL close and reopen, because the only consumer
+// (Host.ImportSnapshot) runs on a host where the shard is STOPPED and has
+// nothing else to learn the snapshot-tree root from. A DataDir that did not
+// replay would put the imported artifact outside the tree the DEK purge-floor
+// scan enumerates, and the next PurgeEpochsBefore would destroy its key.
+func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const dataDir = "/srv/tenant-a/shard-9"
+	bs := logdb.Bootstrap{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2"},
+		Join:      false,
+		Type:      3,
+		DataDir:   dataDir,
+	}
+	if err := db.SaveBootstrap(9, 1, bs); err != nil {
+		t.Fatalf("SaveBootstrap: %v", err)
+	}
+	// A second shard with NO DataDir, to prove the empty case round-trips as
+	// empty rather than inheriting anything.
+	if err := db.SaveBootstrap(10, 1, logdb.Bootstrap{
+		Addresses: map[uint64]string{1: "addr1"},
+		Type:      3,
+	}); err != nil {
+		t.Fatalf("SaveBootstrap(10,1): %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer db2.Close()
+
+	got, found, err := db2.GetBootstrap(9, 1)
+	if err != nil || !found {
+		t.Fatalf("GetBootstrap(9,1) after reopen: found=%v err=%v", found, err)
+	}
+	if got.DataDir != dataDir {
+		t.Fatalf("DataDir = %q after reopen, want %q", got.DataDir, dataDir)
+	}
+	if len(got.Addresses) != 2 || got.Addresses[2] != "addr2" || got.Type != 3 {
+		t.Fatalf("the trailing DataDir field disturbed the rest of the record: %+v", got)
+	}
+
+	plain, found, err := db2.GetBootstrap(10, 1)
+	if err != nil || !found {
+		t.Fatalf("GetBootstrap(10,1) after reopen: found=%v err=%v", found, err)
+	}
+	if plain.DataDir != "" {
+		t.Fatalf("DataDir = %q for a shard with none, want empty", plain.DataDir)
+	}
+}
+
+// A bootstrap record written BEFORE the DataDir field existed ends at the
+// address map. Replay must accept it as "no DataDir" rather than rejecting the
+// whole WAL as corrupt, which would make an upgrade unopenable.
+func TestReplayBootstrap_LegacyRecordWithoutDataDir(t *testing.T) {
+	s := &walShard{
+		bootstraps: make(map[nodeKey]logdb.Bootstrap),
+	}
+
+	const addr = "addr1"
+	data := make([]byte, bootstrapRecordBaseSize+12+len(addr))
+	binary.LittleEndian.PutUint64(data[0:], 4)  // ShardID
+	binary.LittleEndian.PutUint64(data[8:], 1)  // ReplicaID
+	data[16] = 0                                // Join
+	binary.LittleEndian.PutUint64(data[17:], 2) // Type
+	binary.LittleEndian.PutUint32(data[25:], 1) // NumAddrs
+	pos := bootstrapRecordBaseSize
+	binary.LittleEndian.PutUint64(data[pos:], 1)
+	binary.LittleEndian.PutUint32(data[pos+8:], uint32(len(addr)))
+	copy(data[pos+12:], addr)
+
+	if err := s.replayBootstrap(data, 1); err != nil {
+		t.Fatalf("replayBootstrap of a pre-DataDir record: %v", err)
+	}
+	got := s.bootstraps[nodeKey{ShardID: 4, ReplicaID: 1}]
+	if got.DataDir != "" {
+		t.Fatalf("DataDir = %q for a legacy record, want empty", got.DataDir)
+	}
+	if got.Type != 2 || got.Addresses[1] != addr {
+		t.Fatalf("legacy record did not replay correctly: %+v", got)
+	}
+}
+
+// A record whose DataDir length runs past the payload is corruption and must
+// be rejected, not silently truncated.
+func TestReplayBootstrap_TruncatedDataDirRejected(t *testing.T) {
+	s := &walShard{
+		bootstraps: make(map[nodeKey]logdb.Bootstrap),
+	}
+
+	data := make([]byte, bootstrapRecordBaseSize+bootstrapDataDirLenSize)
+	binary.LittleEndian.PutUint64(data[0:], 4)
+	binary.LittleEndian.PutUint64(data[8:], 1)
+	binary.LittleEndian.PutUint64(data[17:], 2)
+	binary.LittleEndian.PutUint32(data[25:], 0) // no addresses
+	// Declares 32 bytes of DataDir with none following.
+	binary.LittleEndian.PutUint32(data[bootstrapRecordBaseSize:], 32)
+
+	if err := s.replayBootstrap(data, 1); !errors.Is(err, ErrTruncatedBootstrapRecord) {
+		t.Fatalf("replayBootstrap = %v, want ErrTruncatedBootstrapRecord", err)
+	}
+}

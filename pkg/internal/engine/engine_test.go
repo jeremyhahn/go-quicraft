@@ -487,7 +487,7 @@ func TestNode_Deliver_Success(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
 
-	msg := proto.Message{Type: proto.Propose, From: 1}
+	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
 	ok := n.Deliver(msg)
 	if !ok {
 		t.Fatal("Deliver should return true")
@@ -498,7 +498,7 @@ func TestNode_Deliver_InboxFull(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
 
-	msg := proto.Message{Type: proto.Propose, From: 1}
+	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
 	for i := 0; i < defaultInboxQueueSize; i++ {
 		n.Deliver(msg)
 	}
@@ -523,7 +523,7 @@ func TestNode_DrainInbox_Multiple(t *testing.T) {
 	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
 
 	for i := 0; i < 5; i++ {
-		n.Deliver(proto.Message{Type: proto.Propose, From: uint64(i + 1)})
+		n.Deliver(proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: uint64(i + 1)})
 	}
 
 	buf := n.DrainInbox(nil)
@@ -1245,8 +1245,32 @@ func TestEngine_DeliverMessage_TypeAssertionFailure(t *testing.T) {
 	}
 
 	logOutput := logBuf.String()
-	if !contains(logOutput, "DeliverMessage type assertion failed") {
+	if !contains(logOutput, "node lookup type assertion failed") {
 		t.Fatalf("expected type assertion error log, got: %s", logOutput)
+	}
+	// The log must still identify WHICH entry point hit it: DeliverMessage and
+	// DeliverLocal share the lookup, and a report that cannot tell them apart
+	// cannot tell a wire delivery from a local injection.
+	if !contains(logOutput, "DeliverMessage node lookup") {
+		t.Fatalf("expected the DeliverMessage caller context in the log, got: %s", logOutput)
+	}
+}
+
+// TestEngine_DeliverLocal_TypeAssertionFailure verifies the local-injection
+// entry point reports the same failure under its own name.
+func TestEngine_DeliverLocal_TypeAssertionFailure(t *testing.T) {
+	logBuf, restore := captureLogOutput(t)
+	defer restore()
+
+	cfg := newTestHostConfig()
+	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+	e.allNodes.Store(uint64(42), "not-a-node")
+
+	if e.DeliverLocal(42, proto.Message{Type: proto.SnapshotStatus, From: 2, To: 1}) {
+		t.Fatal("DeliverLocal should return false on type assertion failure")
+	}
+	if !contains(logBuf.String(), "DeliverLocal node lookup") {
+		t.Fatalf("expected the DeliverLocal caller context in the log, got: %s", logBuf.String())
 	}
 }
 

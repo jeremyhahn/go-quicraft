@@ -16,6 +16,8 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -264,6 +266,111 @@ func TestStep_AllowsZeroTermLocalControlMessages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// C1/L4: the Term==0 bypass belongs to the LOCAL delivery path, not to the
+// message TYPE. Every type in localControlMessages is decodable from the wire
+// (proto.Message.UnmarshalFrom accepts any known type), the transport hands
+// whole batches to the message handler with no type filter, and the handler
+// delivers into the SAME inbox the in-process injectors use. Keying the
+// exemption on the type alone therefore exposed all six to the network.
+// ---------------------------------------------------------------------------
+
+// A wire message of a local-control type carrying Term 0 must be dropped, not
+// stepped. Propose and ReadIndex are legitimately FORWARDED by followers, but
+// a forward is produced by send() and always carries the sender's term; a
+// term-less one can only be a forgery.
+func TestStep_RejectsZeroTermLocalControlFromWire(t *testing.T) {
+	for msgType := range localControlMessages {
+		name := proto.MessageTypeName(msgType)
+		t.Run(name, func(t *testing.T) {
+			r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3"})
+			r.becomeFollower(7, 2)
+
+			// Origin defaults to proto.OriginRemote — exactly what
+			// UnmarshalFrom leaves on a decoded message.
+			err := r.step(proto.Message{Type: msgType, From: 3, Term: 0})
+			if err == nil {
+				t.Fatalf("wire %s with Term 0 was accepted", name)
+			}
+			if !errors.Is(err, ErrZeroTermMessage) && !errors.Is(err, ErrWireLocalMessage) {
+				t.Fatalf("wire %s with Term 0: expected a rejection, got %v", name, err)
+			}
+		})
+	}
+}
+
+// The four types that are NEVER exchanged between replicas must be refused
+// from the wire at ANY term, including the receiver's own current term.
+// Supplying a matching term is free for an attacker (terms are observable in
+// every heartbeat), so a term-value heuristic is not a boundary.
+func TestStep_RejectsProcessLocalTypesFromWireAtAnyTerm(t *testing.T) {
+	for msgType := range processLocalMessages {
+		name := proto.MessageTypeName(msgType)
+		for _, term := range []uint64{0, 7, 99} {
+			t.Run(fmt.Sprintf("%s/term%d", name, term), func(t *testing.T) {
+				r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3"})
+				r.becomeFollower(7, 2)
+
+				err := r.step(proto.Message{Type: msgType, From: 3, Term: term})
+				if !errors.Is(err, ErrWireLocalMessage) {
+					t.Fatalf("wire %s at term %d: expected ErrWireLocalMessage, got %v",
+						name, term, err)
+				}
+			})
+		}
+	}
+}
+
+// Every process-local type must also be a local-control type: the two sets
+// share the "carries no term" property, and a type in processLocalMessages
+// that step still required a term from would be unreachable altogether.
+func TestProcessLocalMessagesAreLocalControlMessages(t *testing.T) {
+	for msgType := range processLocalMessages {
+		if !isLocalControlMessage(msgType) {
+			t.Fatalf("%s is process-local but not exempt from the term gate",
+				proto.MessageTypeName(msgType))
+		}
+	}
+	// Propose and ReadIndex must NOT be process-local: followers forward both
+	// to the leader, and refusing them from the wire would break every
+	// non-leader client request and every follower ReadIndex.
+	for _, msgType := range []uint64{proto.Propose, proto.ReadIndex} {
+		if isProcessLocalMessage(msgType) {
+			t.Fatalf("%s is forwarded between replicas and must not be process-local",
+				proto.MessageTypeName(msgType))
+		}
+	}
+}
+
+// The forwarding paths must keep working: a follower's Propose and ReadIndex
+// reach the leader over the wire with the sender's term.
+func TestStep_AcceptsForwardedProposeAndReadIndexFromWire(t *testing.T) {
+	r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3"})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.log.commitTo(r.log.lastIndex())
+	r.log.appliedTo(r.log.lastIndex())
+	term := r.term
+
+	if err := r.step(proto.Message{
+		Type:    proto.Propose,
+		From:    2,
+		Term:    term,
+		Entries: []proto.Entry{{Cmd: []byte("forwarded")}},
+	}); err != nil {
+		t.Fatalf("forwarded Propose rejected: %v", err)
+	}
+
+	if err := r.step(proto.Message{
+		Type: proto.ReadIndex,
+		From: 2,
+		Term: term,
+		Hint: 42,
+	}); err != nil {
+		t.Fatalf("forwarded ReadIndex rejected: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // F3: a joining node must not be elected on its own one-member view
 // ---------------------------------------------------------------------------
 
@@ -322,7 +429,7 @@ func TestJoiningNode_AdoptsSnapshotWithEqualConfigChangeID(t *testing.T) {
 	// index with the snapshot's term.
 	p.r.log.append([]proto.Entry{{Index: 1, Term: 2}})
 	if err := p.Handle(proto.Message{
-		Type: proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 1,
 		Term: 2,
 		Snapshot: proto.Snapshot{
@@ -505,7 +612,7 @@ func TestQuiesceExit_ResetsLeaseAcks(t *testing.T) {
 
 	// A client proposal wakes the leader up.
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Type: proto.EntryNormal, Cmd: []byte("wake")}},
 	}); err != nil {
 		t.Fatalf("Propose: %v", err)
@@ -575,11 +682,25 @@ func TestHandleAppendResp_RejectsMatchBeyondLastIndex(t *testing.T) {
 	}
 }
 
-// hasConfigChangeToApply scans the uncommitted tail in bounded chunks. The
-// loop must cover ranges wider than a single chunk.
-func TestHasConfigChangeToApply_ScansBeyondOneChunk(t *testing.T) {
+// countingLogReader counts GetRange calls so a test can assert that a code
+// path does no log reading at all.
+type countingLogReader struct {
+	*testLogReader
+	reads atomic.Int64
+}
+
+func (c *countingLogReader) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) {
+	c.reads.Add(1)
+	return c.testLogReader.GetRange(low, high, maxSize)
+}
+
+// hasConfigChangeToApply is answered from an incrementally maintained bound
+// (raftLog.confChangeIndex), so it must cover ranges of any width — including
+// ones far wider than the 1024-index chunk the previous re-scanning
+// implementation read at a time — at the same O(1) cost.
+func TestHasConfigChangeToApply_CoversArbitrarilyWideRanges(t *testing.T) {
 	r := newTestRaft(1)
-	const total = configChangeScanChunkEntries + 200
+	const total = uint64(1224)
 	entries := make([]proto.Entry, 0, total)
 	for i := uint64(1); i <= total; i++ {
 		e := proto.Entry{Index: i, Term: 1}
@@ -591,7 +712,7 @@ func TestHasConfigChangeToApply_ScansBeyondOneChunk(t *testing.T) {
 	r.log.append(entries)
 
 	if !r.hasConfigChangeToApply() {
-		t.Fatalf("config change at index %d beyond the first chunk was missed", total)
+		t.Fatalf("config change at index %d was missed", total)
 	}
 
 	// Same log without the trailing config change must report absence.
@@ -606,97 +727,155 @@ func TestHasConfigChangeToApply_ScansBeyondOneChunk(t *testing.T) {
 	}
 }
 
-// errInjectedRead is the injected LogReader failure used to exercise the
-// fail-closed branch of hasConfigChangeToApply.
-var errInjectedRead = errors.New("raft: injected logdb read failure")
-
-// flakyLogReader fails GetRange while fail is true, then behaves normally.
-type flakyLogReader struct {
-	*testLogReader
-	fail bool
-}
-
-func (f *flakyLogReader) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) {
-	if f.fail {
-		return nil, errInjectedRead
+// H2. becomeLeader must not do work proportional to the unapplied log.
+//
+// The gate used to re-read (processed, lastIndex] in 1024-index chunks with
+// maxSize 0 — no byte bound at all — synchronously on the step worker. On a
+// restart processed starts at the snapshot index, and Config.SnapshotEntries
+// has no default, so a default deployment never compacts: the range is the
+// whole log. 200k unapplied 1KB entries is ~200MB copied before the new
+// leader can send its first heartbeat, so the election it had just won timed
+// out and the shard election-looped.
+//
+// A counting LogReader proves the property directly: answering the gate over
+// a large unapplied range must not read the log at all.
+func TestHasConfigChangeToApply_DoesNotReadTheLog(t *testing.T) {
+	entries := make([]proto.Entry, 0, 20000)
+	for i := uint64(1); i <= 20000; i++ {
+		entries = append(entries, proto.Entry{Index: i, Term: 1, Cmd: make([]byte, 1024)})
 	}
-	return f.testLogReader.GetRange(low, high, maxSize)
-}
-
-// A read error must fail closed, and the latch must be re-evaluated on the
-// next call so one transient error does not block membership changes for
-// the whole term.
-func TestHasConfigChangeToApply_FailsClosedAndRecovers(t *testing.T) {
-	inner := newTestLogReader([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-		{Index: 5, Term: 1},
-	}, proto.State{Commit: 1})
-	inner.membership = singleNodeMembership()
-	lr := &flakyLogReader{testLogReader: inner, fail: true}
-
-	r, err := newRaft(raftTestCfg(1, 1), lr)
-	if err != nil {
-		t.Fatalf("newRaft: %v", err)
-	}
-
-	if !r.hasConfigChangeToApply() {
-		t.Fatal("a read failure must fail closed")
-	}
-	if !r.configChangeScanUnproven {
-		t.Fatal("fail-closed scan did not record that absence was unproven")
-	}
-	if r.configChangeScanFailures == 0 {
-		t.Fatal("fail-closed scan was not counted")
-	}
-	lr.fail = false
-	if r.hasConfigChangeToApply() {
-		t.Fatal("the fail-closed result was latched across a successful re-scan")
-	}
-	if r.configChangeScanUnproven {
-		t.Fatal("the unproven flag survived a successful scan")
-	}
-}
-
-// A leader whose becomeLeader scan failed closed must not reject config
-// changes for the rest of the term once the log is readable again.
-func TestConfigChangeGate_RecoversFromTransientScanFailure(t *testing.T) {
-	inner := newTestLogReader([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-		{Index: 5, Term: 1},
-	}, proto.State{Commit: 1})
+	inner := newTestLogReader(entries, proto.State{Term: 1, Commit: 20000})
 	inner.membership = threeNodeMembership()
-	lr := &flakyLogReader{testLogReader: inner, fail: true}
+	counting := &countingLogReader{testLogReader: inner}
 
-	cfg := raftTestCfgPreVote(1, 1, false)
-	r, err := newRaft(cfg, lr)
+	r, err := newRaft(raftTestCfgPreVote(1, 1, false), counting)
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	if r.log.processed != 0 || r.log.lastIndex() != 20000 {
+		t.Fatalf("fixture: processed=%d lastIndex=%d, want 0 and 20000",
+			r.log.processed, r.log.lastIndex())
+	}
 
+	counting.reads.Store(0)
+	r.becomeCandidate()
+	r.becomeLeader()
+
+	if got := counting.reads.Load(); got != 0 {
+		t.Fatalf("becomeLeader issued %d log range reads over a 20000-entry "+
+			"unapplied tail; the config-change gate must be O(1) or the "+
+			"first heartbeat is delayed behind the whole log", got)
+	}
+	// It must still FAIL CLOSED over an unclassified recovered tail.
+	if !r.pendingConfigChange {
+		t.Fatal("a restarted leader with an unapplied tail did not arm the " +
+			"config-change gate: the tail may hold a config change this " +
+			"process never classified")
+	}
+}
+
+// The conservative arming must RELEASE as the recovered tail is applied, or a
+// leader elected after a restart would reject membership changes for its whole
+// term. This is what the old scan's configChangeScanUnproven re-check existed
+// to guarantee; the bound now releases without reading anything, so a LogDB
+// read error cannot latch the gate at all.
+func TestConfigChangeGate_ConservativeArmingReleasesOnApply(t *testing.T) {
+	entries := []proto.Entry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 1},
+		{Index: 4, Term: 1},
+		{Index: 5, Term: 1},
+	}
+	inner := newTestLogReader(entries, proto.State{Term: 1, Commit: 5})
+	inner.membership = threeNodeMembership()
+
+	r, err := newRaft(raftTestCfgPreVote(1, 1, false), inner)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
 	r.becomeCandidate()
 	r.becomeLeader()
 	if !r.pendingConfigChange {
-		t.Fatal("becomeLeader did not fail closed on the unreadable tail")
+		t.Fatal("becomeLeader did not fail closed over an unclassified recovered tail")
 	}
 
-	// The log is readable again and holds no config change.
-	lr.fail = false
 	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}
-	err = r.step(proto.Message{
-		Type: proto.Propose,
-		Entries: []proto.Entry{{
-			Type: proto.EntryConfigChange,
-			Cmd:  marshalConfigChange(t, cc),
-		}},
-	})
-	if err != nil {
-		t.Fatalf("config change rejected after the scan recovered: %v", err)
+	ccMsg := func() proto.Message {
+		return proto.Message{
+			Type:   proto.Propose,
+			Origin: proto.OriginLocal,
+			Entries: []proto.Entry{{
+				Type: proto.EntryConfigChange,
+				Cmd:  marshalConfigChange(t, cc),
+			}},
+		}
+	}
+	if err := r.step(ccMsg()); !errors.Is(err, ErrPendingConfigChange) {
+		t.Fatalf("config change accepted over an unclassified tail: %v", err)
+	}
+
+	// Apply the recovered tail: nothing in it was a config change, and the
+	// gate must now open.
+	r.log.appliedTo(r.log.committed)
+	if r.hasConfigChangeToApply() {
+		t.Fatal("the gate stayed armed after the recovered tail was applied")
+	}
+	if err := r.step(ccMsg()); err != nil {
+		t.Fatalf("config change rejected after the recovered tail was applied: %v", err)
+	}
+}
+
+// A config change that IS in the log must keep the gate armed until its
+// membership effect has landed, not merely until it commits. This is the
+// safety property the O(1) bound has to preserve: reverting the anchor from
+// processed to committed, or dropping the bound entirely, must fail here.
+func TestConfigChangeGate_ArmedUntilConfigChangeIsApplied(t *testing.T) {
+	r := newTestRaft(1)
+	r.becomeCandidate()
+	r.becomeLeader()
+	ccIndex := r.log.lastIndex() + 1
+	r.log.append([]proto.Entry{{
+		Index: ccIndex,
+		Term:  r.term,
+		Type:  proto.EntryConfigChange,
+	}})
+
+	// Committed but NOT applied: the membership effect lands in Peer.Commit.
+	r.log.commitTo(ccIndex)
+	if !r.hasConfigChangeToApply() {
+		t.Fatal("a committed but unapplied config change left the gate open")
+	}
+
+	r.log.appliedTo(ccIndex)
+	if r.hasConfigChangeToApply() {
+		t.Fatal("the gate stayed armed after the config change was applied")
+	}
+}
+
+// A snapshot restore adopts the configuration as of the snapshot index and
+// discards everything above it, so it must clear the bound. Leaving it set
+// would block membership changes on a replica that caught up by snapshot
+// until its log grew past a stale index.
+func TestConfigChangeGate_ClearedBySnapshotRestore(t *testing.T) {
+	r := newTestRaft(1)
+	// The config change sits ABOVE the snapshot index, so it is one of the
+	// entries the restore DISCARDS. A bound left behind here outlives every
+	// entry it described.
+	r.log.append([]proto.Entry{{Index: 20, Term: 1, Type: proto.EntryConfigChange}})
+	if !r.hasConfigChangeToApply() {
+		t.Fatal("fixture: the appended config change did not arm the gate")
+	}
+
+	r.log.restore(proto.Snapshot{Index: 10, Term: 2})
+	if r.log.processed != 10 {
+		t.Fatalf("fixture: processed = %d after restore, want 10", r.log.processed)
+	}
+	if r.hasConfigChangeToApply() {
+		t.Fatalf("a snapshot restore left the config-change gate armed at index "+
+			"%d over a log that now ends at %d: the replica refuses every "+
+			"membership change until its log grows past an entry the restore "+
+			"threw away", r.log.confChangeIndex, r.log.lastIndex())
 	}
 }
 
@@ -773,7 +952,7 @@ func TestConfigChangeGate_ArmedByCommittedButUnappliedChange(t *testing.T) {
 	// configurations in flight whose quorums need not intersect.
 	next := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "a5"}
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  marshalConfigChange(t, next),
@@ -807,7 +986,7 @@ func TestConfigChangeGate_ReleasedOnceChangeIsApplied(t *testing.T) {
 
 	next := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "a5"}
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  marshalConfigChange(t, next),
@@ -901,7 +1080,7 @@ func TestWitnessRoleMismatch_RefusesReadIndex(t *testing.T) {
 	}
 	r.becomeFollower(3, 2) // a leader is known, so the read would be forwarded
 
-	err = r.step(proto.Message{Type: proto.ReadIndex, Hint: 42})
+	err = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 42})
 	if !errors.Is(err, ErrWitnessRoleMismatch) {
 		t.Fatalf("ReadIndex accepted (err = %v) on a replica the "+
 			"configuration lists as a witness: its state machine never "+
@@ -944,7 +1123,7 @@ func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
 		if r.roleMismatch {
 			t.Fatal("a full replica listed as a full replica was latched")
 		}
-		if err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 1}); errors.Is(err, ErrWitnessRoleMismatch) {
+		if err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 1}); errors.Is(err, ErrWitnessRoleMismatch) {
 			t.Fatal("a correctly configured full replica was refused a read")
 		}
 	})
@@ -1011,5 +1190,140 @@ func TestWitnessRoleMismatch_LeaderStepsDownWhenLearned(t *testing.T) {
 		t.Fatal("a leader that learned the configuration calls it a witness " +
 			"stayed leader: it keeps answering reads out of a state machine " +
 			"the leader path never sent entry data to")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TG-10 / TG-15: the witness role latch on the paths that were untested
+// ---------------------------------------------------------------------------
+
+// TG-15. syncRaftRemotes is the only DYNAMIC detection path for a role
+// disagreement: construction (newRaft -> initRemotes) catches a mismatch that
+// exists at startup, and snapshot restore catches one that arrives whole, but
+// a replica that JOINS as a witness while it was started with IsWitness=false
+// only learns about it when the committed AddWitness naming it is applied to
+// membership. Nothing else cross-checks the two — every witness gate in the
+// host and in raft keys on the LOCAL config — so if this call is missing the
+// replica runs a payload-stripped state machine while believing itself a full
+// replica, indefinitely.
+func TestSyncRaftRemotes_LatchesWitnessRoleMismatchOnCommittedAddWitness(t *testing.T) {
+	cfg := testConfigWithID(1, 4)
+	cfg.IsWitness = false // contradicts the AddWitness applied below
+
+	// Replica 4 is not yet in the configuration: it is joining.
+	ms := proto.Membership{
+		ConfigChangeID: 1,
+		Addresses:      map[uint64]string{1: "a1", 2: "a2", 3: "a3"},
+	}
+	p := newTestPeer(t, cfg, proto.State{}, ms)
+	if p.r.roleMismatch {
+		t.Fatal("fixture: a replica the configuration does not mention must not " +
+			"be flagged; it makes no statement about its role")
+	}
+
+	// The cluster adds it as a WITNESS and the change commits.
+	if err := p.membership.apply(proto.ConfigChange{
+		Type:      proto.AddWitness,
+		ReplicaID: 4,
+		Address:   "a4",
+	}, 2); err != nil {
+		t.Fatalf("apply AddWitness: %v", err)
+	}
+	p.syncRaftRemotes()
+
+	if !p.r.roleMismatch {
+		t.Fatal("a committed AddWitness naming this replica did not latch the " +
+			"role mismatch: the leader now strips entry payloads for it while " +
+			"every local gate still treats it as a full replica, so a state " +
+			"machine that never saw the data can win an election and answer " +
+			"linearizable reads out of it")
+	}
+
+	// The latch must actually refuse the two operations that turn the bad
+	// state machine into an authoritative answer.
+	if err := p.r.handleFollowerReadIndex(proto.Message{Type: proto.ReadIndex, Hint: 1}); !errors.Is(err, ErrWitnessRoleMismatch) {
+		t.Fatalf("a role-mismatched replica served a read: %v", err)
+	}
+	p.r.startElection()
+	if p.r.state == candidate || p.r.state == preCandidate {
+		t.Fatal("a role-mismatched replica campaigned")
+	}
+}
+
+// The latch must CLEAR when the disagreement is resolved, or a replica whose
+// configuration and membership are brought back into agreement stays
+// permanently unelectable and unable to serve reads. syncRaftRemotes is the
+// clearing path too: Peer.Handle replaces the membership wholesale from a
+// snapshot and then calls it.
+func TestSyncRaftRemotes_ClearsWitnessRoleMismatchWhenRolesAgree(t *testing.T) {
+	cfg := testConfigWithID(1, 4)
+	cfg.IsWitness = false
+
+	p := newTestPeer(t, cfg, proto.State{}, proto.Membership{
+		ConfigChangeID: 1,
+		Addresses:      map[uint64]string{1: "a1", 2: "a2", 3: "a3"},
+		Witnesses:      map[uint64]string{4: "a4"},
+	})
+	if !p.r.roleMismatch {
+		t.Fatal("fixture: the mismatch must be latched at construction")
+	}
+
+	// A snapshot delivers a configuration that lists this replica as the full
+	// voting member it was started as.
+	p.membership = newMembership(proto.Membership{
+		ConfigChangeID: 5,
+		Addresses:      map[uint64]string{1: "a1", 2: "a2", 3: "a3", 4: "a4"},
+	})
+	p.publishMembership()
+	p.syncRaftRemotes()
+
+	if p.r.roleMismatch {
+		t.Fatal("the latch survived a configuration that agrees with the " +
+			"local role: the replica can never campaign or serve reads again")
+	}
+}
+
+// TG-10. The LEADER-side read gate.
+//
+// The follower gate (handleFollowerReadIndex) is covered; the leader gate is
+// the one that matters. A follower refusing a read merely fails the request —
+// the client retries against the leader. A LEADER that answers one from a
+// payload-stripped state machine returns data the shard never agreed on,
+// under the linearizability guarantee, to a client that has no way to tell.
+// checkSelfRole steps a mismatched leader down, but a ReadIndex already
+// dispatched in the same inbox batch reaches this handler with the latch set
+// and the role still leader, which is exactly the window this gate covers.
+func TestHandleLeaderReadIndex_RefusesOnWitnessRoleMismatch(t *testing.T) {
+	r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3"})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.log.commitTo(r.log.lastIndex())
+	r.log.appliedTo(r.log.lastIndex())
+
+	// Preconditions: without the latch this read WOULD be answered, so the
+	// assertion below cannot pass for an unrelated reason.
+	if err := r.handleLeaderReadIndex(proto.Message{Type: proto.ReadIndex, Hint: 7}); err != nil {
+		t.Fatalf("fixture: the leader must be able to serve this read: %v", err)
+	}
+	if len(r.readStates) == 0 && len(r.pendingReadIndex) == 0 {
+		t.Fatal("fixture: the read produced neither a read state nor a pending entry")
+	}
+	r.readStates = nil
+	r.pendingReadIndex = r.pendingReadIndex[:0]
+
+	// checkSelfRole has latched the disagreement; the step-down it performs
+	// lands after the messages already drained from this inbox batch.
+	r.roleMismatch = true
+
+	err := r.handleLeaderReadIndex(proto.Message{Type: proto.ReadIndex, Hint: 8})
+	if !errors.Is(err, ErrWitnessRoleMismatch) {
+		t.Fatalf("a role-confused LEADER accepted a linearizable read "+
+			"(err = %v): the configuration calls it a witness, so the leader "+
+			"has been stripping entry payloads for it and its state machine "+
+			"never saw the data this read returns", err)
+	}
+	if len(r.readStates) != 0 || len(r.pendingReadIndex) != 0 {
+		t.Fatalf("the refused read still produced read state (%d ready, %d pending)",
+			len(r.readStates), len(r.pendingReadIndex))
 	}
 }

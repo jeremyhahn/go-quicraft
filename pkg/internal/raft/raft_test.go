@@ -965,7 +965,7 @@ func TestRaft_Replication_LeaderSendsAppend(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Cmd: []byte("hello")},
 		},
@@ -985,7 +985,7 @@ func TestRaft_Replication_ProposalOnFollowerReturnsError(t *testing.T) {
 	r.leaderID = noLeader
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 
@@ -1000,7 +1000,7 @@ func TestRaft_Replication_ProposalOnFollowerForwardsToLeader(t *testing.T) {
 	r.leaderID = 2
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 	if err != nil {
@@ -1027,7 +1027,7 @@ func TestRaft_Replication_BatchAppend(t *testing.T) {
 		{Cmd: []byte("c")},
 	}
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: entries,
 	})
 	if err != nil {
@@ -1047,7 +1047,7 @@ func TestRaft_Replication_ProposalDuringTransferFails(t *testing.T) {
 	r.transferTarget = 2
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 	if !errors.Is(err, ErrTransferInProgress) {
@@ -1266,7 +1266,7 @@ func TestRaft_HandleAppendResp_WitnessGetsMetadataOnSuccess(t *testing.T) {
 
 	// Propose entries so there is data beyond the witness's match.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("payload")}},
 	})
 	if err != nil {
@@ -1312,7 +1312,7 @@ func TestRaft_Commit_MajorityAdvancesCommitIndex(t *testing.T) {
 
 	// Propose an entry.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if err != nil {
@@ -1752,7 +1752,7 @@ func TestRaft_HeartbeatResp_ReplicateNoFallbackWhenMoreToSend(t *testing.T) {
 	// Propose several entries so lastIndex is well ahead.
 	for i := 0; i < 5; i++ {
 		_ = r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: []proto.Entry{{Cmd: []byte("test")}},
 		})
 	}
@@ -1968,7 +1968,7 @@ func TestRaft_Snapshot_FollowerRestoresFromSnapshot(t *testing.T) {
 	}
 
 	err := r.step(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     3,
 		Snapshot: ss,
@@ -2004,7 +2004,7 @@ func TestRaft_Snapshot_RejectedWhenBehindCommit(t *testing.T) {
 	ss := proto.Snapshot{Index: 2, Term: 1}
 
 	err := r.step(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     1,
 		Snapshot: ss,
@@ -2035,7 +2035,7 @@ func TestRaft_LeaderTransfer_TargetCaughtUp(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	})
 	if err != nil {
@@ -2061,7 +2061,7 @@ func TestRaft_LeaderTransfer_TargetBehind(t *testing.T) {
 	r.remotes[2].match = 0
 
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	})
 	if err != nil {
@@ -2084,7 +2084,7 @@ func TestRaft_LeaderTransfer_InvalidTarget(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 99, // not in cluster
 	})
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -2099,14 +2099,14 @@ func TestRaft_LeaderTransfer_AlreadyInProgress(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	// First transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	r.drainMessages()
 
 	// Second transfer should fail.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 3})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 3})
 	if !errors.Is(err, ErrTransferInProgress) {
 		t.Fatalf("expected ErrTransferInProgress, got %v", err)
 	}
@@ -2117,7 +2117,7 @@ func TestRaft_LeaderTransfer_TransferToSelf(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 1})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 1})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2212,7 +2212,7 @@ func TestRaft_ReadIndex_SingleNodeRespondsImmediately(t *testing.T) {
 	r.readStates = nil
 
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -2247,7 +2247,7 @@ func TestRaft_ReadIndex_MultiNodeRequiresQuorum(t *testing.T) {
 	r.readStates = nil
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -2295,7 +2295,7 @@ func TestRaft_ReadIndex_FollowerForwardsToLeader(t *testing.T) {
 	r.msgs = nil
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -2320,7 +2320,7 @@ func TestRaft_ReadIndex_FollowerWithNoLeader(t *testing.T) {
 	r.leaderID = noLeader
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 
@@ -2407,7 +2407,7 @@ func TestRaft_Quiesce_ExitOnProposal(t *testing.T) {
 
 	// Propose should exit quiesce.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if err != nil {
@@ -2560,7 +2560,7 @@ func TestRaft_SingleNode_CommitsImmediately(t *testing.T) {
 	}
 
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if err != nil {
@@ -2963,7 +2963,7 @@ func TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe(t *testing.T) {
 	rm := r.remotes[2]
 	rm.becomeSnapshot(10, 1)
 	if err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -3014,7 +3014,7 @@ func TestRaft_SnapshotStatus_StaleTransferIgnored(t *testing.T) {
 
 	for _, reject := range []bool{false, true} {
 		if err := r.step(proto.Message{
-			Type:   proto.SnapshotStatus,
+			Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 			From:   2,
 			Term:   r.term,
 			Hint:   3, // stale: reports a superseded transfer attempt
@@ -3052,7 +3052,7 @@ func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
 
 	// The late status for attempt #1 arrives: same index, stale seq.
 	if err := r.step(proto.Message{
-		Type: proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From: 2,
 		Term: r.term,
 		Hint: 1,
@@ -3064,7 +3064,7 @@ func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
 	}
 	// Attempt #2's own status is honored.
 	if err := r.step(proto.Message{
-		Type: proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From: 2,
 		Term: r.term,
 		Hint: 2,
@@ -3126,7 +3126,7 @@ func TestRaft_LeaderProposeEnforcesWitnessPolicy(t *testing.T) {
 	}
 	propose := func(r *raft, cmd []byte) error {
 		return r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: cmd}},
 		})
 	}
@@ -3255,7 +3255,7 @@ func TestRaft_SnapshotStatus_NoResendWhileAwaitingAck(t *testing.T) {
 	rm := r.remotes[2]
 	rm.becomeSnapshot(10, 1)
 	if err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -3310,7 +3310,7 @@ func TestRaft_SnapshotStatus_Failure(t *testing.T) {
 	rm.becomeSnapshot(10, 1)
 
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -3344,7 +3344,7 @@ func TestRaft_Unreachable_TransitionsToProbe(t *testing.T) {
 	r.remotes[2].becomeReplicate()
 
 	err := r.step(proto.Message{
-		Type: proto.Unreachable,
+		Type: proto.Unreachable, Origin: proto.OriginLocal,
 		From: 2,
 		Term: r.term,
 	})
@@ -3364,7 +3364,7 @@ func TestRaft_Unreachable_UnknownPeerIgnored(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type: proto.Unreachable,
+		Type: proto.Unreachable, Origin: proto.OriginLocal,
 		From: 99,
 		Term: r.term,
 	})
@@ -3663,7 +3663,7 @@ func TestRaft_Candidate_RejectsProposal(t *testing.T) {
 	r.becomeCandidate()
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 
@@ -3678,7 +3678,7 @@ func TestRaft_Candidate_ProposalErrorHasNoLeader(t *testing.T) {
 	r.becomeCandidate()
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 
@@ -3761,7 +3761,7 @@ func TestRaft_LeaderTransfer_SendsTimeoutNowOnCatchup(t *testing.T) {
 
 	// Start transfer to peer 2 (behind).
 	r.remotes[2].match = 0
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3805,7 +3805,7 @@ func TestRaft_LeaderTransfer_DoesNotSendTimeoutNowBeforeCatchup(t *testing.T) {
 
 	// Add more entries so the target will be behind.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("a")}, {Cmd: []byte("b")}},
 	})
 	if err != nil {
@@ -3818,7 +3818,7 @@ func TestRaft_LeaderTransfer_DoesNotSendTimeoutNowBeforeCatchup(t *testing.T) {
 	r.remotes[2].becomeProbe()
 	r.remotes[2].next = noopIdx + 1
 
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4474,7 +4474,7 @@ func TestRaft_Candidate_RevertsToFollowerOnSnapshot(t *testing.T) {
 
 	ss := proto.Snapshot{Index: 10, Term: r.term}
 	err := r.step(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     r.term,
 		Snapshot: ss,
@@ -4499,7 +4499,7 @@ func TestRaft_Candidate_ReceivesProposalReturnsNotLeader(t *testing.T) {
 	r.becomeCandidate()
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("test")}},
 	})
 
@@ -4600,7 +4600,7 @@ func TestRaft_Witness_ReadIndexUsesElectionQuorum(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 99,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -4673,7 +4673,7 @@ func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 77,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -5093,7 +5093,7 @@ func TestRaft_SendWitnessAppend_MetadataEntries(t *testing.T) {
 
 	// Propose some entries so there is data to replicate.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data1")}, {Cmd: []byte("data2")}},
 	})
 	if err != nil {
@@ -5475,7 +5475,7 @@ func TestRaft_HeartbeatResp_WitnessAcksReadIndex(t *testing.T) {
 	r.readStates = nil
 
 	// ReadIndex generates heartbeat ctx.
-	if err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 77}); err != nil {
+	if err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 77}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
 	}
 	r.flushReadIndex()
@@ -5629,7 +5629,7 @@ func TestRaft_SnapshotStatus_NotInSnapshotStateIgnored(t *testing.T) {
 	r.remotes[2].becomeProbe()
 
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Reject: false,
@@ -5650,7 +5650,7 @@ func TestRaft_SnapshotStatus_UnknownPeerIgnored(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   99,
 		Term:   r.term,
 		Reject: false,
@@ -5807,7 +5807,7 @@ func TestRaft_LeaderTransfer_UsesFromWhenHintZero(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 		Hint: 0, // no hint, use From
 	})
@@ -5843,7 +5843,7 @@ func TestRaft_ReadIndex_RejectsBeforeNoopCommitted(t *testing.T) {
 	}
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: r.replicaID,
 		Hint: 42,
 	})
@@ -5875,7 +5875,7 @@ func TestRaft_ReadIndex_AcceptsAfterNoopCommitted(t *testing.T) {
 
 	// Now ReadIndex should succeed (no error).
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: r.replicaID,
 		Hint: 42,
 	})
@@ -5910,7 +5910,7 @@ func TestRaft_ReadIndex_ForwardedFromFollowerGetsResponse(t *testing.T) {
 
 	// Submit a ReadIndex from follower 3.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 3,
 		Hint: 99,
 	})
@@ -5974,7 +5974,7 @@ func TestRaft_ReadIndex_LocalRequestAddsReadState(t *testing.T) {
 
 	// Submit a local ReadIndex (From=0 means local).
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 77,
 	})
@@ -6047,7 +6047,7 @@ func TestRaft_ReadIndex_MultiplePendingRequests(t *testing.T) {
 	ctxs := make([]uint64, 3)
 	for i := 0; i < 3; i++ {
 		err = r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 0,
 			Hint: uint64(100 + i),
 		})
@@ -6122,7 +6122,7 @@ func TestRaft_ReadIndex_PendingClearedOnBecomeFollower(t *testing.T) {
 
 	// Submit a ReadIndex.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 42,
 	})
@@ -6158,7 +6158,7 @@ func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
 
 	// First config change entry.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 		},
@@ -6173,7 +6173,7 @@ func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
 
 	// Second config change before the first commits.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
 		},
@@ -6191,7 +6191,7 @@ func TestRaft_PendingConfigChange_ClearedOnBecomeFollower(t *testing.T) {
 
 	// Set a pending config change.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 		},
@@ -6221,7 +6221,7 @@ func TestRaft_BecomeLeader_ScansUncommittedConfigChange(t *testing.T) {
 
 	// Propose a config change as leader.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 		},
@@ -6273,7 +6273,7 @@ func TestRaft_BecomeLeader_ScansUncommittedConfigChange(t *testing.T) {
 
 	// A second config change proposal must be rejected.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
 		},
@@ -6293,7 +6293,7 @@ func TestRaft_BecomeLeader_NoUncommittedConfigChange_AllowsProposal(t *testing.T
 
 	// No config change proposed, just normal entries.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryNormal, Cmd: []byte("data1")},
 		},
@@ -6334,7 +6334,7 @@ func TestRaft_BecomeLeader_NoUncommittedConfigChange_AllowsProposal(t *testing.T
 
 	// A config change proposal must succeed.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc-new")},
 		},
@@ -6365,7 +6365,7 @@ func TestRaft_HandleSnapshot_UpdatesRemotes(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -6407,7 +6407,7 @@ func TestRaft_HandleSnapshot_ExcludesSelfFromRemotes(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -6458,7 +6458,7 @@ func TestRaft_HandleSnapshot_RetainsFollowingEntries(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -6501,7 +6501,7 @@ func TestRaft_HandleSnapshot_DiscardsOnMismatch(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     3,
 		Snapshot: ss,
@@ -6556,7 +6556,7 @@ func TestRaft_HandleSnapshot_MatchDoesNotRebuildRemotes(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -6603,7 +6603,7 @@ func TestRaft_HandleSnapshot_MismatchRebuildsRemotes(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     3,
 		Snapshot: ss,
@@ -6777,8 +6777,9 @@ func TestFix19_StepFollower_Propose_ExitsQuiesce(t *testing.T) {
 
 	// Send a Propose message through the follower step function.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
-		From: 1,
+		Type:   proto.Propose,
+		From:   1,
+		Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Term: 1, Index: 1, Cmd: []byte("data")},
 		},
@@ -6814,8 +6815,9 @@ func TestFix19_StepFollower_Propose_NoLeader_DoesNotExitQuiesce(t *testing.T) {
 
 	// Send a Propose message - should fail because no leader.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
-		From: 1,
+		Type:   proto.Propose,
+		From:   1,
+		Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Term: 1, Index: 1, Cmd: []byte("data")},
 		},
@@ -6999,7 +7001,7 @@ func TestOPT1_ReadIndex_BitsetQuorumDetection(t *testing.T) {
 
 			// Issue a ReadIndex request.
 			if err := r.step(proto.Message{
-				Type: proto.ReadIndex,
+				Type: proto.ReadIndex, Origin: proto.OriginLocal,
 				Hint: 42,
 			}); err != nil {
 				t.Fatalf("ReadIndex: %v", err)
@@ -7065,7 +7067,7 @@ func TestOPT1_ReadIndex_DuplicateAckDoesNotDoubleCount(t *testing.T) {
 
 	// Issue a ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 99,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7149,7 +7151,7 @@ func TestOPT1_ReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 77,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7267,7 +7269,7 @@ func TestOPT1_ReadIndex_UnknownReplicaAckIgnored(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 55,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7327,7 +7329,7 @@ func TestReadIndexBatching_SingleBroadcast(t *testing.T) {
 	// Submit 4 ReadIndex requests WITHOUT flushing between them.
 	for i := 0; i < 4; i++ {
 		if err := r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 0,
 			Hint: uint64(10 + i),
 		}); err != nil {
@@ -7426,7 +7428,7 @@ func TestReadIndexHeartbeatResp_ConfirmsEarlierCtx(t *testing.T) {
 	ctxs := make([]uint64, 3)
 	for i := 0; i < 3; i++ {
 		if err := r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 0,
 			Hint: uint64(200 + i),
 		}); err != nil {
@@ -7498,7 +7500,7 @@ func TestReadIndexHeartbeatResp_RegularHeartbeatCtxZeroDoesNotConfirm(t *testing
 
 	// Issue a ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7551,7 +7553,7 @@ func TestReadIndexBatching_TickHeartbeatPiggybacksCtx(t *testing.T) {
 
 	// Issue a ReadIndex but do NOT flush yet.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 99,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7619,7 +7621,7 @@ func TestReadIndexBatching_BroadcastPendingClearedOnBecomeFollower(t *testing.T)
 
 	// Issue a ReadIndex (sets readIndexBroadcastPending = true).
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -7732,7 +7734,7 @@ func TestFix21_Peer_Handle_InstallSnapshot_SetsPendingSnapshot(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -7771,7 +7773,7 @@ func TestFix21_Peer_Handle_InstallSnapshot_RejectedDoesNotSetPendingSnapshot(t *
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -7837,7 +7839,7 @@ func TestSendAppend_UsesMaxReplicationPayload(t *testing.T) {
 	}
 	for range totalEntries {
 		err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		})
@@ -7927,7 +7929,7 @@ func TestSendAppend_UnlimitedWhenPayloadZero(t *testing.T) {
 	cmd := make([]byte, 100)
 	for range totalEntries {
 		err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		})
@@ -8109,7 +8111,7 @@ func TestLeaseRead_ImmediateResponseWithValidLease(t *testing.T) {
 
 	// Submit a ReadIndex request.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 42,
 	}); err != nil {
@@ -8153,7 +8155,7 @@ func TestLeaseRead_FallbackToHeartbeatWhenLeaseExpired(t *testing.T) {
 
 	// Submit a ReadIndex request.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 99,
 	}); err != nil {
@@ -8304,7 +8306,7 @@ func TestLeaseRead_SingleNodeBypassesLeaseCheck(t *testing.T) {
 
 	// No need for lease -- single node should respond immediately.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 77,
 	}); err != nil {
@@ -8336,7 +8338,7 @@ func TestLeaseRead_RestoredAfterFailedLeaderTransfer(t *testing.T) {
 
 	// Initiate a leader transfer -- this nils remoteLastAck.
 	if err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	}); err != nil {
 		t.Fatalf("LeaderTransfer: %v", err)
@@ -8383,7 +8385,7 @@ func TestLeaseRead_DisabledDuringActiveLeaderTransfer(t *testing.T) {
 
 	// Initiate a leader transfer.
 	if err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	}); err != nil {
 		t.Fatalf("LeaderTransfer: %v", err)
@@ -8484,7 +8486,7 @@ func TestLeaseRead_DisabledBehavesAsReadIndex(t *testing.T) {
 
 	// ReadIndex should use heartbeat path (pending, not immediate).
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 55,
 	}); err != nil {
@@ -8511,7 +8513,7 @@ func TestLeaseRead_ForwardedFromFollower(t *testing.T) {
 
 	// Submit ReadIndex forwarded from follower 2.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 2,
 		Hint: 123,
 	}); err != nil {
@@ -8612,7 +8614,7 @@ func TestLeaseRead_MultipleConsecutiveReads(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		if err := r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 0,
 			Hint: uint64(100 + i),
 		}); err != nil {
@@ -8689,7 +8691,7 @@ func TestLeaseRead_PartialAckNotQuorum(t *testing.T) {
 
 	// ReadIndex should use heartbeat path.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 88,
 	}); err != nil {
@@ -9317,7 +9319,7 @@ func TestSendAppendPipelining(t *testing.T) {
 	cmd := make([]byte, 100)
 	for range totalEntries {
 		if err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		}); err != nil {
@@ -9399,7 +9401,7 @@ func TestSendAppendPipeliningStopsAtInflightLimit(t *testing.T) {
 	cmd := make([]byte, 100)
 	for range totalEntries {
 		if err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		}); err != nil {
@@ -9463,7 +9465,7 @@ func TestSendAppendPipeliningProbeNoLoop(t *testing.T) {
 	cmd := make([]byte, 100)
 	for range totalEntries {
 		if err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		}); err != nil {
@@ -9566,7 +9568,7 @@ func TestSendWitnessAppendPipelining(t *testing.T) {
 	cmd := make([]byte, 100)
 	for range totalEntries {
 		if err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		}); err != nil {
@@ -9652,7 +9654,7 @@ func TestSendAppendPipeliningSnapshotState(t *testing.T) {
 	cmd := make([]byte, 10)
 	for range 3 {
 		if err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: cmd}},
 		}); err != nil {
@@ -9709,7 +9711,7 @@ func TestRaft_LeaderTransfer_ExitsQuiesce(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	})
 	if err != nil {
@@ -9765,7 +9767,7 @@ func TestRaft_LeaderTransfer_ExitsQuiesce_InvalidTarget(t *testing.T) {
 	}
 
 	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 99, // not in cluster
 	})
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -9921,7 +9923,7 @@ func TestRaft_Step_StaleInstallSnapshotFromOldTermSendsResponse(t *testing.T) {
 
 	// Send an InstallSnapshot from term 1 (older than current term 2).
 	err := r.step(proto.Message{
-		Type: proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 2,
 		Term: 1,
 	})
@@ -9959,7 +9961,7 @@ func TestRaft_Step_StaleInstallSnapshotNoStateChange(t *testing.T) {
 	lastIndexBefore := r.log.lastIndex()
 
 	err := r.step(proto.Message{
-		Type: proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 2,
 		Term: 1,
 	})
@@ -10006,7 +10008,7 @@ func TestRaft_LeaderTransfer_InvalidatesLease(t *testing.T) {
 
 	// Initiate leader transfer to node 2.
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 	})
 	if err != nil {
@@ -10033,7 +10035,7 @@ func TestRaft_LeaderTransfer_LeaseReadBlockedDuringTransfer(t *testing.T) {
 
 	// Initiate transfer.
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 	})
 	if err != nil {
@@ -10043,7 +10045,7 @@ func TestRaft_LeaderTransfer_LeaseReadBlockedDuringTransfer(t *testing.T) {
 
 	// Attempt a ReadIndex during active transfer.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 42,
 	})
@@ -10067,7 +10069,7 @@ func TestRaft_ReadIndex_BlockedDuringTransfer(t *testing.T) {
 
 	// Initiate transfer.
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 	})
 	if err != nil {
@@ -10077,7 +10079,7 @@ func TestRaft_ReadIndex_BlockedDuringTransfer(t *testing.T) {
 
 	// Attempt a ReadIndex during active transfer.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 99,
 	})
@@ -10106,7 +10108,7 @@ func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
 
 	// Initiate and then clear the transfer (simulating timeout).
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 	})
 	if err != nil {
@@ -10128,7 +10130,7 @@ func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
 
 	// ReadIndex should succeed now.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 0,
 		Hint: 77,
 	})
@@ -10187,7 +10189,7 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 55,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -10278,7 +10280,7 @@ func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testin
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 33,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -10445,7 +10447,7 @@ func TestRaft_Witness_HeartbeatRespSendsWitnessAppendNotFullAppend(t *testing.T)
 
 	// Propose entries so there is data to replicate.
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("payload-data")}},
 	}); err != nil {
 		t.Fatalf("propose: %v", err)
@@ -10556,7 +10558,7 @@ func TestHandleLeaderReadIndex_RejectsWhenPendingReadIndexFull(t *testing.T) {
 
 	// The next ReadIndex must be rejected.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 9999,
 	})
 	if !errors.Is(err, ErrReadIndexOverloaded) {
@@ -10589,7 +10591,7 @@ func TestHandleLeaderReadIndex_AcceptsAfterDrainingPendingReads(t *testing.T) {
 
 	// Verify it is full.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 9999,
 	})
 	if !errors.Is(err, ErrReadIndexOverloaded) {
@@ -10601,7 +10603,7 @@ func TestHandleLeaderReadIndex_AcceptsAfterDrainingPendingReads(t *testing.T) {
 
 	// Now a new ReadIndex must succeed.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 8888,
 	})
 	if err != nil {
@@ -10632,7 +10634,7 @@ func TestHandleLeaderReadIndex_CtxWrapsToOneNotZero(t *testing.T) {
 
 	// Issue a ReadIndex which will increment readIndexCtx.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -10663,7 +10665,7 @@ func TestHandleLeaderReadIndex_CtxDoesNotWrapUnderNormalOps(t *testing.T) {
 	r.readIndexCtx = 100
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -11308,7 +11310,7 @@ func TestRaft_LogMatchingProperty_SameIndexTermImpliesSameCommand(t *testing.T) 
 	// Propose an entry with specific command bytes.
 	cmd := []byte("log-matching-test")
 	err = leaderNode.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: cmd}},
 	})
 	if err != nil {
@@ -11648,7 +11650,7 @@ func TestRaft_Safety_StateMachineSafety_NoDivergentApply(t *testing.T) {
 
 	// Propose entries.
 	err = leaderNode.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Cmd: []byte("cmd1")},
 			{Cmd: []byte("cmd2")},
@@ -11768,7 +11770,7 @@ func TestRaft_Safety_LeaderCompleteness_CommittedEntryOnNewLeader(t *testing.T) 
 
 	// Propose an entry and commit via majority ack.
 	err = leaderNode.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("committed-entry")}},
 	})
 	if err != nil {
@@ -12506,7 +12508,7 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 
 	// Propose a new entry. The leader appends it locally.
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("entry")}},
 	}); err != nil {
 		t.Fatalf("propose: %v", err)
@@ -12573,7 +12575,7 @@ func TestRaft_WitnessOnlyCommitQuorum(t *testing.T) {
 	electLeaderOnWitnessVotes(t, r, 4, 5)
 
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("witness-quorum-entry")}},
 	}); err != nil {
 		t.Fatalf("propose: %v", err)
@@ -12811,7 +12813,7 @@ func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask(t *testing.T) {
 	compressedCC := proto.EntryConfigChange | proto.EntryCompressFlag
 
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: compressedCC, Cmd: []byte("cc-compressed")},
 		},
@@ -12826,7 +12828,7 @@ func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask(t *testing.T) {
 	// A second config change (also with extra flags) must be rejected
 	// because there is already a pending config change.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: compressedCC, Cmd: []byte("cc2-compressed")},
 		},
@@ -12849,7 +12851,7 @@ func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask_NormalEntryNotBlocked
 	compressedNormal := proto.EntryNormal | proto.EntryCompressFlag
 
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: compressedNormal, Cmd: []byte("data")},
 		},
@@ -12938,7 +12940,7 @@ func TestRaft_LeaderTransfer_WitnessReturnsNotVoter(t *testing.T) {
 	r.drainMessages()
 
 	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 20,
 	})
 	if !errors.Is(err, ErrTransferTargetNotVoter) {
@@ -12960,7 +12962,7 @@ func TestRaft_LeaderTransfer_ObserverReturnsNotVoter(t *testing.T) {
 	r.drainMessages()
 
 	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 10,
 	})
 	if !errors.Is(err, ErrTransferTargetNotVoter) {
@@ -12983,7 +12985,7 @@ func TestRaft_LeaderTransfer_NonExistentNodeReturnsNodeNotFound(t *testing.T) {
 
 	// Node 99 is not in remotes, witnesses, or observers.
 	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 99,
 	})
 	if !errors.Is(err, ErrNodeNotFound) {
@@ -12998,7 +13000,7 @@ func TestRaft_LeaderTransfer_ValidVoterSucceeds(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		Hint: 2,
 	})
 	if err != nil {
@@ -13025,7 +13027,7 @@ func TestRaft_BatchConfigChange_DoesNotStickPendingFlag(t *testing.T) {
 	// Batch two config change entries in one proposal. This must be
 	// rejected because only one config change can be pending at a time.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
@@ -13050,7 +13052,7 @@ func TestRaft_BatchConfigChange_SubsequentSingleSucceeds(t *testing.T) {
 
 	// Reject dual-CC batch.
 	_ = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
@@ -13059,7 +13061,7 @@ func TestRaft_BatchConfigChange_SubsequentSingleSucceeds(t *testing.T) {
 
 	// Single config change must succeed after rejection.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc-single")},
 		},
@@ -13090,7 +13092,7 @@ func TestRaft_ReadStates_BoundedGrowth(t *testing.T) {
 	// Fill readStates to capacity.
 	for i := range maxReadStates {
 		err := r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 1,
 			Hint: uint64(i + 1),
 		})
@@ -13104,7 +13106,7 @@ func TestRaft_ReadStates_BoundedGrowth(t *testing.T) {
 
 	// Next ReadIndex must be rejected.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 1,
 		Hint: 99999,
 	})
@@ -13124,7 +13126,7 @@ func TestRaft_ReadStates_AcceptsAfterDrain(t *testing.T) {
 	// Fill to capacity.
 	for i := range maxReadStates {
 		_ = r.step(proto.Message{
-			Type: proto.ReadIndex,
+			Type: proto.ReadIndex, Origin: proto.OriginLocal,
 			From: 1,
 			Hint: uint64(i + 1),
 		})
@@ -13135,7 +13137,7 @@ func TestRaft_ReadStates_AcceptsAfterDrain(t *testing.T) {
 
 	// Should accept again.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 1,
 		Hint: 42,
 	})
@@ -13225,7 +13227,7 @@ func TestH1_NewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
 	// Issue a ReadIndex request.
 	r.readStates = nil
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		From: 1,
 		Hint: 99,
 	}); err != nil {
@@ -13311,7 +13313,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -13373,7 +13375,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 
 	// Issue ReadIndex.
 	if err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 11,
 	}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
@@ -13561,7 +13563,7 @@ func TestS3_QuiesceBlockedDuringLeaderTransfer(t *testing.T) {
 
 	// Start a leader transfer to node 2.
 	if err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 		Hint: 2,
 	}); err != nil {

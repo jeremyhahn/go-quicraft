@@ -240,7 +240,7 @@ func committedUpdateFromPeer(t *testing.T, peer *raft.Peer) proto.Update {
 		}
 	}
 	if err := peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		ShardID: 1,
 		From:    1,
 		Entries: []proto.Entry{{Cmd: []byte("payload")}},

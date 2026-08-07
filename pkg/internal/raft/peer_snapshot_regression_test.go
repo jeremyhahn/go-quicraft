@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -23,15 +24,31 @@ import (
 
 // installSnapshotMsg builds an InstallSnapshot message from leader 2 to
 // replica 1 carrying the given snapshot at the snapshot's term.
+//
+// It is stamped proto.OriginLocal because that is the only way an
+// InstallSnapshot ever reaches raft: the transport streams a snapshot as
+// chunks and the receiving host rebuilds this message itself once the
+// artifact is persisted and verified (hostMessageHandler.HandleSnapshot ->
+// deliverSnapshotControl -> Engine.DeliverLocal). A test that built it
+// without the stamp would be modelling a message the system cannot produce.
 func installSnapshotMsg(ss proto.Snapshot) proto.Message {
 	return proto.Message{
 		Type:     proto.InstallSnapshot,
+		Origin:   proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
 		Term:     ss.Term,
 		Snapshot: ss,
 	}
+}
+
+// localInstallSnapshotMsg builds the InstallSnapshot exactly as
+// hostMessageHandler.HandleSnapshot does: locally injected, with NO term.
+func localInstallSnapshotMsg(ss proto.Snapshot) proto.Message {
+	msg := installSnapshotMsg(ss)
+	msg.Term = 0
+	return msg
 }
 
 // TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded verifies that a
@@ -277,32 +294,130 @@ func TestPeer_InstallSnapshot_CurrentTermStillAdoptsMembership(t *testing.T) {
 	}
 }
 
-// A LOCALLY injected InstallSnapshot carries no term (term 0 is the
-// local-injection escape hatch that step exempts from every term comparison).
-// It must not be mistaken for a stale-term message, or the snapshot-receive
-// path — which is the only thing that can repair a joining node's incomplete
-// membership — would stop adopting membership entirely.
-func TestPeer_InstallSnapshot_ZeroTermIsLocalNotStale(t *testing.T) {
+// The LOCAL snapshot-receive path builds its InstallSnapshot exactly as
+// hostMessageHandler.HandleSnapshot does — no term at all — and injects it
+// through the local delivery API. That message must still install its
+// membership: it is the ONLY thing that can repair a joining node's
+// incomplete membership (the bootstrap confState is not in the log).
+func TestPeer_InstallSnapshot_LocalInjectionAdoptsMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
 	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
 	p.r.becomeFollower(9, 2)
 
-	ss := proto.Snapshot{
+	msg := localInstallSnapshotMsg(proto.Snapshot{
 		Index: 50,
 		Term:  9,
 		Membership: proto.Membership{
 			ConfigChangeID: 7,
 			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4"},
 		},
-	}
-	msg := installSnapshotMsg(ss)
-	msg.Term = 0 // as built by the snapshot receive path
+	})
 
 	if err := p.Handle(msg); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if len(p.membership.addresses) != 4 {
 		t.Fatalf("locally injected snapshot membership not adopted: %v", p.membership.addresses)
+	}
+	if p.membership.configChangeID != 7 {
+		t.Fatalf("local snapshot ConfigChangeID not adopted: %d", p.membership.configChangeID)
+	}
+}
+
+// C1. The same message arriving from the WIRE must be refused outright.
+//
+// InstallSnapshot never travels as a message between replicas — a snapshot is
+// streamed as a SnapshotHeader plus chunks and the RECEIVER rebuilds the
+// message locally after persisting and verifying the artifact — so an
+// InstallSnapshot in a MessageBatch is always forged. It is also unconstrained
+// by anything the protocol checks: it carries a full Membership (the set
+// quorum() is computed over) and its own ConfigChangeID, both chosen by the
+// sender, with no term, no log match and no committed entry behind them.
+//
+// The forgery below is the published attack: Term 0 so step's term-transition
+// block is skipped entirely, and an Index deliberately BELOW committed so
+// handleSnapshot "rejects" it and returns nil — the nil that the previous
+// guard read as "raft acted on this".
+func TestPeer_InstallSnapshot_WireDeliveredIsRefused(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	p.r.becomeFollower(9, 2)
+	p.r.log.append(makeEntries(1, 11, 9))
+	p.r.log.commitTo(10)
+	leaderBefore := p.r.leaderID
+	p.r.electionTick = 7
+
+	forged := proto.Message{
+		Type:    proto.InstallSnapshot,
+		From:    2,
+		To:      1,
+		ShardID: 1,
+		Term:    0,
+		Snapshot: proto.Snapshot{
+			Index: 1, // at or below committed: handleSnapshot returns nil
+			Term:  9,
+			Membership: proto.Membership{
+				ConfigChangeID: 1 << 62,
+				Addresses:      map[uint64]string{2: "attacker"},
+			},
+		},
+		// Origin left at its zero value: proto.OriginRemote, which is what
+		// UnmarshalFrom produces for anything decoded off the wire.
+	}
+
+	err := p.Handle(forged)
+	if !errors.Is(err, ErrWireLocalMessage) {
+		t.Fatalf("expected ErrWireLocalMessage for a wire InstallSnapshot, got %v", err)
+	}
+	if len(p.membership.addresses) != 3 {
+		t.Fatalf("membership rewritten to %v by a WIRE InstallSnapshot: quorum() "+
+			"is now computed over a configuration the attacker chose",
+			p.membership.addresses)
+	}
+	if p.membership.configChangeID == 1<<62 {
+		t.Fatalf("adopted attacker ConfigChangeID %d", p.membership.configChangeID)
+	}
+	if p.r.leaderID != leaderBefore {
+		t.Fatalf("wire InstallSnapshot installed leader %d (was %d)",
+			p.r.leaderID, leaderBefore)
+	}
+	if p.r.electionTick != 7 {
+		t.Fatalf("wire InstallSnapshot reset the election timer to %d", p.r.electionTick)
+	}
+}
+
+// C1, joining-node variant. A joining node adopts membership UNCONDITIONALLY
+// (its own ConfigChangeID equals the snapshot's, so the strictly-newer test
+// cannot protect it), which makes it the softest target for the forgery. Its
+// adoption must be gated on the delivery path just the same.
+func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	p.MarkJoining()
+	p.r.becomeFollower(9, 2)
+
+	forged := proto.Message{
+		Type:    proto.InstallSnapshot,
+		From:    2,
+		To:      1,
+		ShardID: 1,
+		Snapshot: proto.Snapshot{
+			Index:      1,
+			Term:       9,
+			Membership: proto.Membership{Addresses: map[uint64]string{2: "attacker"}},
+		},
+	}
+	if err := p.Handle(forged); !errors.Is(err, ErrWireLocalMessage) {
+		t.Fatalf("expected ErrWireLocalMessage, got %v", err)
+	}
+	if len(p.membership.addresses) != 3 {
+		t.Fatalf("joining node adopted a wire membership: %v", p.membership.addresses)
+	}
+	if !p.joining.Load() {
+		t.Fatal("a wire InstallSnapshot cleared the joining flag, re-enabling " +
+			"campaigning and per-shard authorization with an attacker configuration")
 	}
 }

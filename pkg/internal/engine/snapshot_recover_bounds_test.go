@@ -93,7 +93,7 @@ func newRecoveryTestNode(t *testing.T, shardID, replicaID uint64,
 func installSnapshotIntoLog(t *testing.T, node *Node, peer *raft.Peer, index, term uint64) {
 	t.Helper()
 	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      node.ReplicaID(),
 		ShardID: node.ShardID(),
@@ -261,7 +261,7 @@ func TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker(t *testing.
 	// Install the snapshot the step worker would have delivered, then let the
 	// waiting recovery observe it.
 	installMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      node.ReplicaID(),
 		ShardID: node.ShardID(),

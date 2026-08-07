@@ -26,7 +26,7 @@ import (
 // lagging replica forward.
 func installSnapshotMessage(node *Node, index, term uint64) proto.Message {
 	return proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      node.ReplicaID(),
 		ShardID: node.ShardID(),

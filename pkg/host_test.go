@@ -5181,7 +5181,7 @@ func TestImportSnapshot_Success(t *testing.T) {
 	snapshotData := []byte("imported snapshot payload for testing")
 	memb := proto.Membership{Addresses: map[uint64]string{1: "127.0.0.1:5000"}}
 	artifact := buildSnapshotArtifact(t, 500, 7, 0, memb, snapshotData)
-	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact))
+	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact), WithImportDataDir(""))
 	if err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
@@ -5232,7 +5232,7 @@ func TestImportSnapshot_VerifiesSnapshotDirStructure(t *testing.T) {
 	defer h.Close()
 
 	artifact := buildSnapshotArtifact(t, 42, 1, 0, proto.Membership{}, []byte("test data"))
-	err = h.ImportSnapshot(context.Background(), 5, bytes.NewReader(artifact))
+	err = h.ImportSnapshot(context.Background(), 5, bytes.NewReader(artifact), WithImportDataDir(""))
 	if err != nil {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
@@ -5274,7 +5274,7 @@ func TestImportSnapshot_MultipleShardNodes(t *testing.T) {
 	defer h.Close()
 
 	artifact := buildSnapshotArtifact(t, 100, 1, 0, proto.Membership{}, []byte("data"))
-	err = h.ImportSnapshot(context.Background(), 20, bytes.NewReader(artifact))
+	err = h.ImportSnapshot(context.Background(), 20, bytes.NewReader(artifact), WithImportDataDir(""))
 	if err != nil {
 		t.Fatalf("ImportSnapshot for shard 20 failed: %v", err)
 	}
@@ -5619,7 +5619,7 @@ func TestImportSnapshot_SaveSnapshotError(t *testing.T) {
 	defer h.Close()
 
 	artifact := buildSnapshotArtifact(t, 1, 1, 0, proto.Membership{}, []byte("data"))
-	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact))
+	err = h.ImportSnapshot(context.Background(), 1, bytes.NewReader(artifact), WithImportDataDir(""))
 	if err == nil {
 		t.Fatal("ImportSnapshot should fail when SaveSnapshot returns error")
 	}
@@ -8763,14 +8763,14 @@ func TestImportSnapshot_MonotonicCounter(t *testing.T) {
 	art1 := buildSnapshotArtifact(t, 100, 1, 0, proto.Membership{}, []byte("snapshot-1"))
 	art2 := buildSnapshotArtifact(t, 200, 1, 0, proto.Membership{}, []byte("snapshot-2"))
 
-	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art1)); importErr != nil {
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art1), WithImportDataDir("")); importErr != nil {
 		t.Fatalf("first ImportSnapshot failed: %v", importErr)
 	}
 	db.mu.Lock()
 	snap1 := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
 
-	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art2)); importErr != nil {
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(art2), WithImportDataDir("")); importErr != nil {
 		t.Fatalf("second ImportSnapshot failed: %v", importErr)
 	}
 	db.mu.Lock()
@@ -8820,7 +8820,7 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 			defer wg.Done()
 			shardID := uint64(idx + 1)
 			artifact := buildSnapshotArtifact(t, 1, 1, 0, proto.Membership{}, []byte("data"))
-			errs[idx] = h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact))
+			errs[idx] = h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact), WithImportDataDir(""))
 			if errs[idx] == nil {
 				db.mu.Lock()
 				snap := db.snapshots[mockNodeKey{shardID, shardID}]

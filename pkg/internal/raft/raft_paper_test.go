@@ -540,7 +540,7 @@ func TestPaper_LeaderCommitsEntry(t *testing.T) {
 
 	// Propose an entry.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		From:    r.replicaID,
 		Entries: []proto.Entry{{Cmd: []byte("cmd1")}},
 	})
@@ -590,7 +590,7 @@ func TestPaper_LeaderCommitsPrecedingEntries(t *testing.T) {
 	// Propose three entries in sequence.
 	for i := 0; i < 3; i++ {
 		err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			From:    r.replicaID,
 			Entries: []proto.Entry{{Cmd: []byte("cmd")}},
 		})

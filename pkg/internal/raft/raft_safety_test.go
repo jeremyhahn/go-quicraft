@@ -374,7 +374,7 @@ func TestSafety_SinglePendingConfigChange(t *testing.T) {
 
 	// First config change should succeed.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  []byte("add-node-4"),
@@ -389,7 +389,7 @@ func TestSafety_SinglePendingConfigChange(t *testing.T) {
 
 	// Second config change must be rejected while first is pending.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  []byte("add-node-5"),
@@ -401,7 +401,7 @@ func TestSafety_SinglePendingConfigChange(t *testing.T) {
 
 	// Normal entries should still be accepted even with pending config change.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryNormal,
 			Cmd:  []byte("normal-data"),
@@ -437,7 +437,7 @@ func TestSafety_ConfigChangeRecoveryAfterRestart(t *testing.T) {
 
 	// Proposing another config change must fail.
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  []byte("new-cc"),
@@ -518,7 +518,7 @@ func TestSafety_SnapshotFailureRecovery(t *testing.T) {
 
 	// Report snapshot failure (Hint binds the status to this transfer).
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -575,7 +575,7 @@ func TestSafety_SnapshotAbortDuringTransfer(t *testing.T) {
 
 	// Report snapshot success (Hint binds the status to this transfer).
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -623,7 +623,7 @@ func TestSafety_PendingSnapshotPausesReplication(t *testing.T) {
 	// Proposing an entry should not generate any Replicate messages to
 	// the paused remote.
 	_ = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	msgs := r.drainMessages()
@@ -651,7 +651,7 @@ func TestSafety_LeaderTransferTimeout(t *testing.T) {
 	// Peer 2 is behind so TimeoutNow won't be sent immediately.
 	r.remotes[2].match = 0
 
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestSafety_LeaderTransferTimeout(t *testing.T) {
 
 	// Proposals must be rejected during transfer.
 	propErr := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("blocked")}},
 	})
 	if !errors.Is(propErr, ErrTransferInProgress) {
@@ -683,7 +683,7 @@ func TestSafety_LeaderTransferTimeout(t *testing.T) {
 
 	// Proposals should be accepted again after timeout.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("allowed")}},
 	})
 	if err != nil {
@@ -700,7 +700,7 @@ func TestSafety_LeaderTransferBlocksProposals(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	// Initiate transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestSafety_LeaderTransferBlocksProposals(t *testing.T) {
 
 	// Normal proposal must be rejected.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if !errors.Is(err, ErrTransferInProgress) {
@@ -717,7 +717,7 @@ func TestSafety_LeaderTransferBlocksProposals(t *testing.T) {
 
 	// Config change proposal must also be rejected.
 	err = r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  []byte("cc"),
@@ -738,7 +738,7 @@ func TestSafety_LeaderTransferInterruptedByHigherTerm(t *testing.T) {
 	r.remotes[2].match = 0
 
 	// Start transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -775,14 +775,14 @@ func TestSafety_ConcurrentTransferPrevented(t *testing.T) {
 	r.remotes[2].match = r.log.lastIndex()
 
 	// First transfer succeeds.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("expected first transfer to succeed, got %v", err)
 	}
 	r.drainMessages()
 
 	// Second transfer to a different target must fail.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 3})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 3})
 	if !errors.Is(err, ErrTransferInProgress) {
 		t.Fatalf("expected ErrTransferInProgress for concurrent transfer, got %v", err)
 	}
@@ -942,7 +942,7 @@ func TestSafety_LogReplicationMultiScenario(t *testing.T) {
 
 	// Scenario 1: Propose and commit a normal entry.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("entry1")}},
 	})
 	if err != nil {
@@ -984,7 +984,7 @@ func TestSafety_LogReplicationMultiScenario(t *testing.T) {
 
 	// Scenario 3: Propose another entry and verify both peers can ack.
 	_ = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("entry2")}},
 	})
 	entry2Idx := r.log.lastIndex()
@@ -1024,7 +1024,7 @@ func TestSafety_ReadIndexRequiresLeaderQuorum(t *testing.T) {
 
 	// Issue a ReadIndex request.
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 100,
 	})
 	if err != nil {
@@ -1076,7 +1076,7 @@ func TestSafety_ReadIndexResetOnStateChange(t *testing.T) {
 	r.drainMessages()
 
 	// Issue a ReadIndex that creates a pending entry.
-	_ = r.step(proto.Message{Type: proto.ReadIndex, Hint: 200})
+	_ = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 200})
 	r.flushReadIndex()
 	r.drainMessages()
 
@@ -1113,7 +1113,7 @@ func TestSafety_ReadIndexDuringLeaderTransfer(t *testing.T) {
 
 	// Start a leader transfer.
 	r.remotes[2].match = r.log.lastIndex()
-	_ = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	_ = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	r.drainMessages()
 
 	if r.transferTarget != 2 {
@@ -1121,7 +1121,7 @@ func TestSafety_ReadIndexDuringLeaderTransfer(t *testing.T) {
 	}
 
 	// ReadIndex must be rejected during transfer.
-	err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 300})
+	err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 300})
 	if !errors.Is(err, ErrTransferInProgress) {
 		t.Fatalf("expected ErrTransferInProgress for ReadIndex during transfer, got %v", err)
 	}
@@ -1158,7 +1158,7 @@ func TestSafety_SingleNodeCommit(t *testing.T) {
 	// is durable, without any peer acknowledgment.
 	for i := 0; i < 5; i++ {
 		err = r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: []proto.Entry{{Cmd: []byte("data")}},
 		})
 		if err != nil {
@@ -1197,7 +1197,7 @@ func TestSafety_SingleNodeReadIndex(t *testing.T) {
 
 	// ReadIndex should respond immediately.
 	err = r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 42,
 	})
 	if err != nil {
@@ -1224,7 +1224,7 @@ func TestSafety_SingleNodeReadIndex(t *testing.T) {
 	// Issue multiple ReadIndex requests to verify they all resolve immediately.
 	r.readStates = nil
 	for i := uint64(100); i < 105; i++ {
-		err = r.step(proto.Message{Type: proto.ReadIndex, Hint: i})
+		err = r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: i})
 		if err != nil {
 			t.Fatalf("ReadIndex %d failed: %v", i, err)
 		}
@@ -1249,7 +1249,7 @@ func TestSafety_ReadIndexBeforeNoopCommit(t *testing.T) {
 	// Do NOT commit the no-op: readStates should stay nil.
 
 	err := r.step(proto.Message{
-		Type: proto.ReadIndex,
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
 		Hint: 999,
 	})
 	if !errors.Is(err, ErrReadIndexNotReady) {
@@ -1270,7 +1270,7 @@ func TestSafety_BatchWithTwoConfigChangesRejected(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
 			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
@@ -1306,7 +1306,7 @@ func TestSafety_LeaderTransferToWitnessRejected(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 3})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 3})
 	if !errors.Is(err, ErrTransferTargetNotVoter) {
 		t.Fatalf("expected ErrTransferTargetNotVoter, got %v", err)
 	}
@@ -1329,7 +1329,7 @@ func TestSafety_SnapshotStatusIgnoredForNonSnapshotRemote(t *testing.T) {
 	prevState := rm.state
 
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Reject: false,
@@ -1365,7 +1365,7 @@ func TestSafety_LeaderTransferInvalidatesLease(t *testing.T) {
 
 	// Start transfer.
 	r.remotes[2].match = r.log.lastIndex()
-	_ = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	_ = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	r.drainMessages()
 
 	// Lease must be invalidated.

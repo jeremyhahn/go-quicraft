@@ -40,6 +40,15 @@ func (c *capturingEngineDeliverer) DeliverMessage(shardID uint64, msg proto.Mess
 	return c.engineDeliverer.DeliverMessage(shardID, msg)
 }
 
+// DeliverLocal captures the IN-PROCESS injection path, which is the one the
+// snapshot receive path uses for InstallSnapshot (deliverSnapshotControl).
+func (c *capturingEngineDeliverer) DeliverLocal(shardID uint64, msg proto.Message) bool {
+	c.mu.Lock()
+	c.delivered = append(c.delivered, msg)
+	c.mu.Unlock()
+	return c.engineDeliverer.DeliverLocal(shardID, msg)
+}
+
 // firstInstallSnapshot returns the first InstallSnapshot message delivered to
 // the raft layer, which is the message that seeds the LogReader's snapshot
 // record and therefore what this node would stream as leader.

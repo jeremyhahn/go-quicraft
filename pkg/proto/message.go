@@ -14,6 +14,43 @@
 
 package proto
 
+// MessageOrigin records how a message reached the raft state machine.
+//
+// It is PROCESS-LOCAL state, deliberately NOT part of the wire format:
+// MarshalTo never writes it, UnmarshalFrom never reads it, and Reset zeroes
+// it. The zero value is therefore OriginRemote, so a message decoded from
+// the network — or recycled through the message pool — is untrusted by
+// construction and no peer can forge a local origin. Only in-process
+// injectors stamp OriginLocal, and they do it through the delivery API
+// (Node.DeliverLocal / Engine.DeliverLocal) rather than by hand.
+type MessageOrigin uint8
+
+const (
+	// OriginRemote marks a message that was decoded from the wire. It is the
+	// zero value so that "untrusted" is the default for every code path that
+	// forgets to say otherwise.
+	OriginRemote MessageOrigin = iota
+	// OriginLocal marks a message injected by this process: the engine's
+	// Propose/ReadIndex batching, the snapshot receive path's InstallSnapshot,
+	// the transport's SnapshotStatus/Unreachable notifications and the host's
+	// LeaderTransfer request. These carry no term and are exempt from the
+	// term gate in raft.step, so the exemption must never be reachable from
+	// the network.
+	OriginLocal
+)
+
+// IsLocal reports whether the message was injected by this process rather
+// than decoded from the wire.
+func (o MessageOrigin) IsLocal() bool { return o == OriginLocal }
+
+// String returns the origin name for logs and errors.
+func (o MessageOrigin) String() string {
+	if o == OriginLocal {
+		return "local"
+	}
+	return "remote"
+}
+
 // Message represents a Raft protocol message exchanged between peers.
 // It has 11 fixed uint64 fields (88 bytes) followed by a count-prefixed
 // list of entries and an inline snapshot. The wire format is:
@@ -23,6 +60,8 @@ package proto
 //	[EntriesCount:4][entries...][HasSnapshot:8][snapshot...]
 //
 // Reject is stored as uint64 on wire (0 or 1) for fixed-width encoding.
+//
+// Origin is process-local and is NOT part of that layout; see MessageOrigin.
 type Message struct {
 	// Type identifies the message type (Replicate, RequestVote, etc.).
 	Type uint64
@@ -50,6 +89,9 @@ type Message struct {
 	Snapshot Snapshot
 	// Entries carries log entries for Replicate messages.
 	Entries []Entry
+	// Origin records whether this message was injected by the local process
+	// or decoded from the wire. It never crosses the wire; see MessageOrigin.
+	Origin MessageOrigin
 }
 
 // messageFixedSize is the wire size of the 11 fixed uint64 fields.
@@ -129,6 +171,11 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < messageFixedSize+4 {
 		return 0, ErrBufferTooSmall
 	}
+	// Anything reconstructed from bytes is remote by definition. Setting it
+	// here (rather than relying on the caller to have Reset the message)
+	// makes the wire decoder itself the place that establishes the property
+	// raft.step depends on.
+	m.Origin = OriginRemote
 	m.Type = getUint64(buf[0:])
 	m.From = getUint64(buf[8:])
 	m.To = getUint64(buf[16:])
@@ -218,6 +265,10 @@ func (m *Message) Reset() {
 	m.Commit = 0
 	m.Reject = false
 	m.Hint = 0
+	// A pooled message must come back as UNTRUSTED. Leaving a stale
+	// OriginLocal on a recycled message would let the next wire decode inherit
+	// the local-injection exemption in raft.step.
+	m.Origin = OriginRemote
 	m.Snapshot.Reset()
 	if cap(m.Entries) > maxRetainedEntries {
 		m.Entries = nil

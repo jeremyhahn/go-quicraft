@@ -437,7 +437,7 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 	// place by compacting the undelivered messages to the front.
 	kept := deferred[:0]
 	for _, msg := range deferred {
-		if !node.Deliver(msg) {
+		if !node.redeliver(msg) {
 			kept = append(kept, msg)
 		}
 	}
@@ -600,6 +600,7 @@ func (w *stepWorker) drainAndHandleProposals(shardID uint64, node *Node) {
 		if err := node.peer.Handle(proto.Message{
 			Type:    proto.Propose,
 			Entries: w.proposeBuf,
+			Origin:  proto.OriginLocal,
 		}); err != nil {
 			slog.Warn("batched proposal failed",
 				"shard_id", shardID,
@@ -641,9 +642,10 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 			w.callback.OnReadIndexBatched(shardID, batchKey, w.readKeyBuf[1:])
 		}
 		if err := node.peer.Handle(proto.Message{
-			Type: proto.ReadIndex,
-			From: node.ReplicaID(),
-			Hint: batchKey,
+			Type:   proto.ReadIndex,
+			From:   node.ReplicaID(),
+			Hint:   batchKey,
+			Origin: proto.OriginLocal,
 		}); err != nil {
 			slog.Warn("batched ReadIndex failed",
 				"shard_id", shardID,
@@ -892,9 +894,10 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 			w.callback.OnReadIndexBatched(shardID, batchKey, w.readKeyBuf[1:])
 		}
 		if err := node.peer.Handle(proto.Message{
-			Type: proto.ReadIndex,
-			From: node.ReplicaID(),
-			Hint: batchKey,
+			Type:   proto.ReadIndex,
+			From:   node.ReplicaID(),
+			Hint:   batchKey,
+			Origin: proto.OriginLocal,
 		}); err != nil {
 			slog.Warn("batched ReadIndex failed (commitPending)",
 				"shard_id", shardID,
@@ -984,6 +987,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 		if err := node.peer.Handle(proto.Message{
 			Type:    proto.Propose,
 			Entries: w.proposeBuf,
+			Origin:  proto.OriginLocal,
 		}); err != nil {
 			slog.Warn("batched proposal failed (commitPending)",
 				"shard_id", shardID,

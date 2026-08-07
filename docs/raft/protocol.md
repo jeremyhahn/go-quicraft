@@ -485,6 +485,50 @@ where a proposal reaches the leader with no prior validation.
 
 ## 7. Snapshots
 
+### Message Origin: wire vs in-process injection
+
+Six message types carry no term, because nothing in this process produces
+one for them: `Propose` and `ReadIndex` (built by the engine's batching),
+`InstallSnapshot` (built by the snapshot receive path after the artifact is
+persisted and verified), `SnapshotStatus` and `Unreachable` (transport-local
+notifications) and `LeaderTransfer` (the host's admin API). `raft.step`
+exempts them from its `Term != 0` gate.
+
+That exemption belongs to the DELIVERY PATH, not to the message type. All
+six decode off the wire — `proto.Message.UnmarshalFrom` accepts any known
+type — the transport hands whole batches to `hostMessageHandler.HandleMessage`
+with no type filter, and the handler delivers into the SAME per-shard inbox
+the in-process injectors use.
+
+`proto.Message.Origin` (`proto.MessageOrigin`) makes the two distinguishable.
+It is process-local: `MarshalTo` never writes it, `UnmarshalFrom` and `Reset`
+force it to `OriginRemote`, so no peer can express it and a pooled message
+cannot leak a stale stamp. `Node.Deliver` / `Engine.DeliverMessage` (the wire
+path) stamp `OriginRemote`; `Node.DeliverLocal` / `Engine.DeliverLocal` (used
+by `deliverSnapshotControl` and the host's `LeaderTransfer`) stamp
+`OriginLocal`. The step worker's deferred-snapshot buffer re-injects through
+`Node.redeliver`, which preserves whatever the message already carried.
+
+`step` then enforces two rules:
+
+1. `InstallSnapshot`, `SnapshotStatus`, `Unreachable` and `LeaderTransfer`
+   are refused at ANY term when the origin is remote (`ErrWireLocalMessage`).
+   None of them is ever exchanged between replicas: a snapshot travels as a
+   `SnapshotHeader` plus chunks (`stepWorker.sendMessages` routes
+   `InstallSnapshot` to `sender.SendSnapshot`), and the other three are
+   reports about work this host itself performed.
+2. `Term == 0` is accepted only for a local-origin message of one of the six
+   types. `Propose` and `ReadIndex` are deliberately still accepted from the
+   wire WITH a term: followers forward both to the leader, and `send()`
+   stamps the sender's term on the forward.
+
+`Peer.Handle` repeats the origin check at the membership-adoption site,
+because that is the code that replaces the set `quorum()` is computed over.
+A wire `InstallSnapshot` carries a full `Membership` and its own
+`ConfigChangeID`, both chosen by the sender, with no term, no log match and
+no committed entry behind them; adopting one lets any authenticated shard
+member redefine the voting set of every replica it can reach.
+
 ### Snapshot Membership Persistence
 
 Snapshots now persist full membership information in the WAL, including

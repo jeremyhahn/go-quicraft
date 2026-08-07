@@ -75,6 +75,39 @@ type raftLog struct {
 	inmem     inMemory
 	committed uint64
 	processed uint64 // committed entries already returned for apply
+
+	// confChangeIndex is an UPPER BOUND on the index of a config-change entry
+	// whose membership effect may not have landed yet. It is maintained
+	// incrementally — append() raises it when a config change enters the log,
+	// restore() drops it, and it self-clears as processed advances past it —
+	// so the "is a config change still pending?" question (raft's
+	// hasConfigChangeToApply) is answered in O(1) instead of by re-reading
+	// every unapplied entry.
+	//
+	// The bound is CONSERVATIVE, never optimistic: newRaftLog seeds it with
+	// the recovered last index because entries recovered from LogDB were not
+	// classified by this process, so their contents are unknown here. That
+	// blocks new config-change proposals on a just-restarted leader until it
+	// has applied the tail it started with — the fail-closed direction — and
+	// releases automatically, with no log reads and therefore no way for a
+	// LogDB read error to latch the gate.
+	//
+	// An over-estimate (a config change that was later truncated away by a
+	// conflicting append) is likewise safe and transient: processed advances
+	// past the index as the log is applied.
+	confChangeIndex uint64
+}
+
+// noteConfigChanges raises confChangeIndex to cover any config-change entry in
+// the batch. The type mask is required: a compressed entry carries
+// proto.EntryCompressFlag alongside its base type.
+func (l *raftLog) noteConfigChanges(entries []proto.Entry) {
+	for i := range entries {
+		if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange &&
+			entries[i].Index > l.confChangeIndex {
+			l.confChangeIndex = entries[i].Index
+		}
+	}
 }
 
 // newRaftLog creates a new raftLog backed by the given LogReader.
@@ -188,6 +221,13 @@ func newRaftLog(logdb LogReader) *raftLog {
 			l.processed = l.committed
 		}
 	}
+
+	// Seed the config-change bound conservatively over the recovered range.
+	// Nothing in this process classified those entries, so any of them may be
+	// an unapplied config change; assuming the worst blocks new config-change
+	// proposals until the recovered tail has been applied, and costs nothing
+	// once it has (see confChangeIndex).
+	l.confChangeIndex = l.lastIndex()
 	return l
 }
 
@@ -501,6 +541,10 @@ func (l *raftLog) append(entries []proto.Entry) uint64 {
 	}
 	invariant.Assert(entries[0].Index > l.committed,
 		"cannot append entries at or below committed index")
+	// Every path that puts an entry into the log runs through here (leader
+	// propose, follower append via tryAppend, the leadership no-op), so this
+	// is the one place that has to notice a config change.
+	l.noteConfigChanges(entries)
 	l.inmem.merge(entries)
 	return l.lastIndex()
 }
@@ -628,6 +672,10 @@ func (l *raftLog) restore(ss proto.Snapshot) {
 	l.inmem.restore(ss)
 	l.committed = ss.Index
 	l.processed = ss.Index
+	// The snapshot carries the configuration as of ss.Index, and Peer.Handle
+	// adopts it, so every config change at or below ss.Index has taken effect
+	// and every entry above it was just discarded. Nothing is pending.
+	l.confChangeIndex = 0
 }
 
 // getConflictIndex finds where the given entries first conflict with the

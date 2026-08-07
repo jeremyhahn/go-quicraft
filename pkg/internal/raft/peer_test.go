@@ -573,7 +573,7 @@ func TestPeer_Handle_InstallSnapshot_Success(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -603,7 +603,7 @@ func TestPeer_Handle_InstallSnapshot_BehindCommit(t *testing.T) {
 		Term:  1,
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -632,7 +632,7 @@ func TestPeer_Handle_InstallSnapshot_EmptySnapshot(t *testing.T) {
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
 	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: 1,
@@ -2599,7 +2599,7 @@ func TestPeer_Handle_SnapshotUpdatesMembership(t *testing.T) {
 		Membership: newMembershipProto,
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -2660,7 +2660,7 @@ func TestPeer_Handle_SnapshotUpdatesMembership_ReducedCluster(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -3114,7 +3114,7 @@ func TestPeer_IsMember_SnapshotRestore(t *testing.T) {
 		Membership: newMs,
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		Snapshot: snap,
 	}
 	_ = p.Handle(msg)
@@ -3174,7 +3174,7 @@ func TestPeer_AppliedToTerm_AfterSnapshotRestore(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -3239,7 +3239,7 @@ func TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership(t *testing.T) {
 		},
 	}
 	if err := p.Handle(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -3300,7 +3300,7 @@ func TestPeer_Handle_InstallSnapshot_MatchRetainsMembership(t *testing.T) {
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -3362,7 +3362,7 @@ func TestPeer_Handle_InstallSnapshot_MismatchOverwritesMembership(t *testing.T) 
 		},
 	}
 	msg := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,

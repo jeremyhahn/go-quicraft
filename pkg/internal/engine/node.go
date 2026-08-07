@@ -407,14 +407,48 @@ func (n *Node) DrainProposals(buf []proto.Entry) []proto.Entry {
 	return n.proposalQ.Swap(buf)
 }
 
-// Deliver sends a Raft message to this node's inbox for processing by
-// the step worker. Returns true if the message was accepted, false if
-// the inbox queue is at capacity. Dropped messages are safe because
+// Deliver sends a WIRE-RECEIVED Raft message to this node's inbox for
+// processing by the step worker. Returns true if the message was accepted,
+// false if the inbox queue is at capacity. Dropped messages are safe because
 // Raft handles retransmission via heartbeat/replicate cycles.
+//
+// The message is stamped OriginRemote. Local and wire messages share one
+// inbox, so the origin is what tells raft.step which of the two it is
+// holding: the term gate (and the membership adoption that hangs off it) is
+// exempted only for LOCALLY injected control messages, and that exemption
+// must be unreachable from the network. Stamping here rather than trusting
+// the decoder means a future caller cannot hand wire bytes to the inbox with
+// a local stamp still attached.
 //
 // Deliver is safe for concurrent use by multiple goroutines (transport
 // delivery goroutines).
 func (n *Node) Deliver(msg proto.Message) bool {
+	msg.Origin = proto.OriginRemote
+	return n.inboxQ.AddOne(msg)
+}
+
+// DeliverLocal sends a message injected by THIS process (the snapshot
+// receive path's InstallSnapshot, the transport's SnapshotStatus, the host's
+// LeaderTransfer) to this node's inbox, stamping it OriginLocal.
+//
+// These messages carry no term — they are not produced by raft.send() and
+// have no term to carry — so raft.step exempts them from its term gate. The
+// exemption is keyed on the origin stamp, which the wire format cannot
+// express, so an authenticated peer cannot reach it by naming one of these
+// types in a MessageBatch.
+//
+// DeliverLocal is safe for concurrent use by multiple goroutines.
+func (n *Node) DeliverLocal(msg proto.Message) bool {
+	msg.Origin = proto.OriginLocal
+	return n.inboxQ.AddOne(msg)
+}
+
+// redeliver re-injects a message that was already drained from this node's
+// inbox, preserving its recorded origin. It exists for the step worker's
+// deferred-snapshot buffer: those messages were admitted through Deliver or
+// DeliverLocal once already, and re-stamping them would either grant a wire
+// message a local origin or strip a legitimate local one.
+func (n *Node) redeliver(msg proto.Message) bool {
 	return n.inboxQ.AddOne(msg)
 }
 

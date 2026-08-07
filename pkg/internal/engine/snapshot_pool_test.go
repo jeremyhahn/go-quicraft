@@ -3371,7 +3371,7 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 	// Install a snapshot at index 100, term 7. This sets
 	// appliedToTerm=7 via inmem.restore().
 	snapMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: shardID,
@@ -3517,7 +3517,7 @@ func TestSnapshotRequest_AppliedToTermCarriedInRequest(t *testing.T) {
 		t.Fatalf("failed to create peer: %v", err)
 	}
 	snapMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: shardID,
@@ -3659,7 +3659,7 @@ func TestSnapshotRequest_TermOverridesStaleValue(t *testing.T) {
 
 	// Install snapshot at index 100, term 5.
 	snapMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: shardID,

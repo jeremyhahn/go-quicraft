@@ -2203,16 +2203,22 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	return h, nil
 }
 
-// verifyMemberCertificateExclusivity rejects a startup whose own leaf
-// certificate also covers another member's host. See
+// verifyMemberCertificateExclusivity rejects a configuration whose hosts this
+// node's own leaf certificate also covers. See
 // transport.QUICTransport.VerifyPeerAddressExclusivity for why SAN PRESENCE is
 // only an authorization when SANs are EXCLUSIVE.
 //
-// Peers sharing this node's own host (co-located replicas separated only by
-// port) are not flagged: a certificate is matched on host alone, so they are
-// indistinguishable by construction and no certificate policy can separate
-// them. With no transport there is no in-band authorization to collapse, so the
-// check does not apply.
+// Peers that share this node's machine are not flagged: a certificate is
+// matched on host alone, so they are indistinguishable by construction and no
+// certificate policy can separate them (transport.isCoLocatedCertHost defines
+// the two forms — the same host under any spelling, and any loopback address).
+// With no transport there is no in-band authorization to collapse, so the check
+// does not apply.
+//
+// It is called from StartShard with the initial members and from
+// requestConfigChange with the single address a membership add introduces; the
+// latter is what covers the grow-by-join flow, whose initial members map is
+// empty on every node.
 func (h *Host) verifyMemberCertificateExclusivity(members map[uint64]string) error {
 	if h.transport == nil || len(members) == 0 {
 		return nil
@@ -2698,6 +2704,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			Addresses: nodesCopy,
 			Join:      join,
 			Type:      ns.smType,
+			// Record where this shard's on-disk tree is rooted. Operations
+			// that run while the shard is STOPPED — Host.ImportSnapshot — have
+			// no other way to discover it, and writing an artifact outside the
+			// tree costs the artifact's DEK at the next purge.
+			DataDir: cfg.DataDir,
 		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
 			// Mark the nodeState stopped BEFORE removing it from h.nodes
@@ -4055,7 +4066,7 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 		From: ns.replicaID,
 		Hint: targetReplicaID,
 	}
-	if !engNode.Deliver(msg) {
+	if !engNode.DeliverLocal(msg) {
 		return ErrSystemBusy
 	}
 	h.engine.NotifyWork(shardID)
@@ -4582,23 +4593,72 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 // ImportOption configures ImportSnapshot.
 type ImportOption func(*importOptions)
 
-// importOptions carries the shard facts ImportSnapshot cannot discover on its
-// own because the shard is, by contract, not running.
+// importOptions carries an explicit operator assertion about the shard's
+// on-disk layout, used to CROSS-CHECK what ImportSnapshot discovers from the
+// shard's persisted bootstrap record.
 type importOptions struct {
-	dataDir string
+	dataDir    string
+	dataDirSet bool
 }
 
-// WithImportDataDir tells ImportSnapshot that the shard will be started with
-// this Config.DataDir, so the imported artifact is written into the SAME
-// snapshot tree StartShard will use.
+// WithImportDataDir asserts that the shard will be started with this
+// Config.DataDir. Passing "" asserts that the shard has none and roots its
+// snapshot tree under the host's NodeHostDir.
 //
-// It must be supplied whenever the shard's Config.DataDir is non-empty and must
-// match it exactly. Omitting it for a DataDir shard writes the artifact under
-// NodeHostDir, outside the tree snapshot garbage collection and the DEK
-// purge-floor scan enumerate — which leaks the artifact and lets the next
-// PurgeEpochsBefore destroy the DEK the imported snapshot needs.
+// It is no longer REQUIRED: StartShard records the shard's DataDir in its
+// LogDB bootstrap record, and ImportSnapshot reads it back, so the layout is
+// discovered rather than declared. When the option IS supplied it must match
+// the recorded value exactly; a disagreement is refused with
+// *ImportDataDirMismatchError rather than silently resolved, because either
+// side being wrong puts the artifact outside the tree snapshot garbage
+// collection and the DEK purge-floor scan enumerate — which leaks it and lets
+// the next PurgeEpochsBefore destroy the DEK it needs.
+//
+// The option remains meaningful for a shard with NO bootstrap record (one
+// started with join=true, which records none): the layout cannot be discovered
+// there, so ImportSnapshot fails closed with ErrImportLayoutUnknown unless the
+// caller states it here.
 func WithImportDataDir(dir string) ImportOption {
-	return func(o *importOptions) { o.dataDir = dir }
+	return func(o *importOptions) {
+		o.dataDir = dir
+		o.dataDirSet = true
+	}
+}
+
+// resolveImportDataDir determines the shard's snapshot-tree root for an import,
+// preferring the value StartShard recorded in the bootstrap record over the
+// caller's assertion, and refusing to guess.
+//
+// The previous contract — "a shard configured with Config.DataDir must pass
+// WithImportDataDir" — was unenforceable: nothing validated it and
+// ImportSnapshot could not detect the omission, so omitting it wrote the
+// artifact under NodeHostDir while StartShard pointed the shard's SnapshotDir
+// at DataDir/shard-N. listSnapshotDirs then never enumerated the artifact, it
+// contributed no floor to the DEK purge, and the next PurgeEpochsBefore
+// legitimately destroyed the key it needed: the imported disaster-recovery
+// snapshot became permanently undecryptable, silently, behind a caller opt-in.
+func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptions) (string, error) {
+	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		// No recorded layout. Only the caller can supply it, and a wrong
+		// guess costs the artifact's DEK, so refuse rather than assume.
+		if !iopts.dataDirSet {
+			return "", &ImportLayoutUnknownError{ShardID: shardID, ReplicaID: replicaID}
+		}
+		return iopts.dataDir, nil
+	}
+	if iopts.dataDirSet && iopts.dataDir != bs.DataDir {
+		return "", &ImportDataDirMismatchError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Declared:  iopts.dataDir,
+			Recorded:  bs.DataDir,
+		}
+	}
+	return bs.DataDir, nil
 }
 
 // ImportSnapshot imports a snapshot artifact from the reader for the given
@@ -4614,7 +4674,16 @@ func WithImportDataDir(dir string) ImportOption {
 // shardSnapshotBaseDir + engine.SnapshotSaveDir construction StartShard, the
 // snapshot pool and the receive path use — so it is visible to snapshot garbage
 // collection and, critically, to the directory scan that computes the DEK purge
-// floor. A shard configured with Config.DataDir must pass WithImportDataDir.
+// floor.
+//
+// The shard's snapshot-tree root is DISCOVERED from the Config.DataDir
+// StartShard recorded in the LogDB bootstrap record. When there is no such
+// record (a shard started with join=true, or one this host has never started —
+// the disaster-recovery case) the layout cannot be discovered and the import
+// fails closed with ErrImportLayoutUnknown; pass WithImportDataDir to state it,
+// using WithImportDataDir("") to assert the shard has no DataDir. A supplied
+// value that contradicts the recorded one is refused with
+// ErrImportDataDirMismatch rather than silently resolved.
 //
 // The monotonic importSeq counter is used ONLY for the on-disk directory
 // name to guarantee uniqueness across rapid sequential imports; it is NOT
@@ -4704,8 +4773,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	for _, opt := range opts {
 		opt(&iopts)
 	}
+	// The layout comes from what StartShard RECORDED, not from what the caller
+	// remembered to declare. resolveImportDataDir fails closed when it can
+	// prove neither.
+	importDataDir, err := h.resolveImportDataDir(shardID, replicaID, iopts)
+	if err != nil {
+		return err
+	}
 	snapDir := engine.SnapshotSaveDir(
-		shardSnapshotBaseDir(h.cfg.NodeHostDir, iopts.dataDir, shardID),
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, importDataDir, shardID),
 		shardID, replicaID, dirSeq)
 
 	fsys := h.snapshotFsys()
@@ -6270,6 +6346,32 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// here gives the caller a prompt, actionable failure instead.
 	if err := engNode.Peer().ValidateConfigChange(cc); err != nil {
 		return nil, err
+	}
+
+	// Re-run the certificate-exclusivity precondition for the address this
+	// change introduces.
+	//
+	// StartShard checks it against the INITIAL members map, which leaves the
+	// grow-by-join flow completely unchecked: the seed node starts with only
+	// itself (so the peer list is empty after self-filtering) and every joiner
+	// starts with an empty map, so no node ever evaluates it. Under a wildcard
+	// or shared cluster certificate that means the deployment the check exists
+	// to refuse comes up clean, and every in-band authorization the transport
+	// performs (SourceAddress clearing, peerEpoch mutation and live-outbound
+	// eviction, snapshot-sender binding) is satisfied by every peer for every
+	// other peer's address.
+	//
+	// A membership add is the point at which a new peer host first becomes
+	// known to this node, so it is where the precondition can be evaluated at
+	// all. Failing here is also the least damaging place to fail: the shard
+	// keeps running with its current membership and the operator gets the
+	// error on the API call rather than at the next restart.
+	if cc.Address != "" {
+		if err := h.verifyMemberCertificateExclusivity(map[uint64]string{
+			cc.ReplicaID: cc.Address,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// Pre-register the address in the transport registry for Add operations.

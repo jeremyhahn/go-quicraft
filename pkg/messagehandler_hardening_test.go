@@ -112,6 +112,15 @@ func (d *refusingInstallDeliverer) DeliverMessage(shardID uint64, msg proto.Mess
 	return d.engineDeliverer.DeliverMessage(shardID, msg)
 }
 
+// DeliverLocal refuses the InstallSnapshot on the in-process injection path
+// too: that is the path deliverSnapshotControl actually uses.
+func (d *refusingInstallDeliverer) DeliverLocal(shardID uint64, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot {
+		return false
+	}
+	return d.engineDeliverer.DeliverLocal(shardID, msg)
+}
+
 func (d *refusingInstallDeliverer) RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error {
 	d.mu.Lock()
 	d.recoveryRequests++

@@ -27,7 +27,7 @@ func proposeTinyEntries(t *testing.T, r *raft, n int) {
 	t.Helper()
 	entries := make([]proto.Entry, n)
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		From:    r.replicaID,
 		Entries: entries,
 	}); err != nil {

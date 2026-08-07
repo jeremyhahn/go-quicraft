@@ -385,29 +385,56 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	e.allNodes.Delete(shardID)
 }
 
-// DeliverMessage routes a Raft message to the target shard's node
-// inbox for processing by the step worker. Returns true if the
+// DeliverMessage routes a WIRE-RECEIVED Raft message to the target shard's
+// node inbox for processing by the step worker. Returns true if the
 // message was delivered, false if the shard is not loaded or the
 // inbox is full.
 //
+// This is the transport's entry point and the message is stamped
+// OriginRemote (see Node.Deliver). Locally injected control messages must
+// use DeliverLocal.
+//
 // Safe for concurrent use by multiple goroutines (transport layer).
 func (e *Engine) DeliverMessage(shardID uint64, msg proto.Message) bool {
-	val, ok := e.allNodes.Load(shardID)
-	if !ok {
-		return false
-	}
-	node, nodeOK := val.(*Node)
-	if !nodeOK {
-		slog.Error("DeliverMessage type assertion failed",
-			"shard_id", shardID,
-			"error", &TypeAssertionError{
-				Context:      "DeliverMessage node lookup",
-				ExpectedType: "*Node",
-				ActualValue:  val,
-			})
+	node := e.lookupNode(shardID, "DeliverMessage")
+	if node == nil {
 		return false
 	}
 	return node.Deliver(msg)
+}
+
+// DeliverLocal routes a message injected by this process to the target
+// shard's node inbox, stamping it OriginLocal. Returns true if the message
+// was delivered, false if the shard is not loaded or the inbox is full.
+//
+// Safe for concurrent use by multiple goroutines.
+func (e *Engine) DeliverLocal(shardID uint64, msg proto.Message) bool {
+	node := e.lookupNode(shardID, "DeliverLocal")
+	if node == nil {
+		return false
+	}
+	return node.DeliverLocal(msg)
+}
+
+// lookupNode resolves a loaded shard's node, reporting a type-assertion
+// failure against the named caller.
+func (e *Engine) lookupNode(shardID uint64, context string) *Node {
+	val, ok := e.allNodes.Load(shardID)
+	if !ok {
+		return nil
+	}
+	node, nodeOK := val.(*Node)
+	if !nodeOK {
+		slog.Error("node lookup type assertion failed",
+			"shard_id", shardID,
+			"error", &TypeAssertionError{
+				Context:      context + " node lookup",
+				ExpectedType: "*Node",
+				ActualValue:  val,
+			})
+		return nil
+	}
+	return node
 }
 
 // GetNode returns the engine Node for the given shardID, or nil if

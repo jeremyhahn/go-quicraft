@@ -193,7 +193,7 @@ func TestDragonboat_LeaderTransferAfterSnapshot(t *testing.T) {
 
 	// Snapshot completes successfully (Hint binds status to transfer).
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -215,7 +215,7 @@ func TestDragonboat_LeaderTransferAfterSnapshot(t *testing.T) {
 	r.drainMessages()
 
 	// Now transfer leadership to follower 2.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestDragonboat_LeaderTransferReceiveHigherTermVote(t *testing.T) {
 	r.remotes[2].match = 0 // follower 2 needs catch-up
 
 	// Start transfer to follower 2.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestDragonboat_LeaderTransferRemoveNode(t *testing.T) {
 	r.remotes[2].match = 0
 
 	// Start transfer to follower 2.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestDragonboat_LeaderTransferRemoveNode(t *testing.T) {
 
 	// Proposals should still be blocked because transferTarget is set.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if !errors.Is(err, ErrTransferInProgress) {
@@ -319,7 +319,7 @@ func TestDragonboat_LeaderTransferRemoveNode(t *testing.T) {
 
 	// Now proposals should work again.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data2")}},
 	})
 	if err != nil {
@@ -334,7 +334,7 @@ func TestDragonboat_LeaderTransferToSelf(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: r.replicaID})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: r.replicaID})
 	if err != nil {
 		t.Fatalf("expected no error for self-transfer, got %v", err)
 	}
@@ -356,7 +356,7 @@ func TestDragonboat_LeaderTransferToSlowFollower(t *testing.T) {
 
 	// Propose some entries to get ahead of followers.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("a")}, {Cmd: []byte("b")}},
 	})
 	if err != nil {
@@ -371,7 +371,7 @@ func TestDragonboat_LeaderTransferToSlowFollower(t *testing.T) {
 	r.remotes[2].probeSent = false
 
 	// Transfer to slow follower.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -426,7 +426,7 @@ func TestDragonboat_LeaderTransferToNonExistingNode(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 99})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 99})
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("expected ErrNodeNotFound, got %v", err)
 	}
@@ -458,7 +458,7 @@ func TestDragonboat_LeaderTransferWithCheckQuorum(t *testing.T) {
 	// Match follower 2 so transfer proceeds immediately.
 	r.remotes[2].match = r.log.lastIndex()
 
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestDragonboat_LeaderTransferWithPreVote(t *testing.T) {
 
 	r.remotes[2].match = r.log.lastIndex()
 
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -542,14 +542,14 @@ func TestDragonboat_LeaderTransferSecondTransferToSameNode(t *testing.T) {
 	r.remotes[2].match = 0 // slow follower
 
 	// First transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if err != nil {
 		t.Fatalf("unexpected error on first transfer: %v", err)
 	}
 	r.drainMessages()
 
 	// Second transfer to same target.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Hint: 2})
+	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
 	if !errors.Is(err, ErrTransferInProgress) {
 		t.Fatalf("expected ErrTransferInProgress for second transfer to same node, got %v", err)
 	}
@@ -571,7 +571,7 @@ func TestDragonboat_LeaderTransferFromFollower(t *testing.T) {
 	// Follower receives LeaderTransfer. stepFollower does not handle it,
 	// so it should be silently ignored.
 	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer,
+		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
 		From: 2,
 		Hint: 3,
 		Term: 1,
@@ -617,7 +617,7 @@ func TestDragonboat_RecoverPendingConfigChange(t *testing.T) {
 
 	// New config change should be rejected.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: []byte("cc2")}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -626,7 +626,7 @@ func TestDragonboat_RecoverPendingConfigChange(t *testing.T) {
 
 	// Normal proposals should still work.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Type: proto.EntryNormal, Cmd: []byte("normal")}},
 	})
 	if err != nil {
@@ -660,7 +660,7 @@ func TestDragonboat_RecoverDoublePendingConfigChange(t *testing.T) {
 	// Verify the committed CC at index 1 is not preventing this detection.
 	// The scan only looks at entries above committed.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: []byte("cc3")}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -692,7 +692,7 @@ func TestDragonboat_SnapshotAbort(t *testing.T) {
 
 	// Abort: report failure (Hint binds status to transfer).
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   2,
 		Term:   r.term,
 		Hint:   1,
@@ -737,7 +737,7 @@ func TestDragonboat_SnapshotFailureResetToProbe(t *testing.T) {
 
 	// Report failure (Hint binds status to transfer); backoff then expiry.
 	err := r.step(proto.Message{
-		Type:   proto.SnapshotStatus,
+		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
 		From:   3,
 		Term:   r.term,
 		Hint:   1,
@@ -781,7 +781,7 @@ func TestDragonboat_RestoreFromSnapMsg(t *testing.T) {
 	}
 
 	err := r.step(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -836,7 +836,7 @@ func TestDragonboat_RestoreIgnoresStaleSnapshot(t *testing.T) {
 	}
 
 	err := r.step(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		Term:     2,
 		Snapshot: ss,
@@ -1070,7 +1070,7 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 
 	// Propose an entry.
 	propErr := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 	if propErr != nil {
@@ -1118,7 +1118,7 @@ func TestDragonboat_ProposalByProxy(t *testing.T) {
 
 	// Propose on the follower.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("client-data")}},
 	})
 	if err != nil {
@@ -1149,7 +1149,7 @@ func TestDragonboat_ProposalByProxy_NoLeader(t *testing.T) {
 	r.drainMessages()
 
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data")}},
 	})
 
@@ -1199,7 +1199,7 @@ func TestDragonboat_CannotCommitWithoutNewTermEntry(t *testing.T) {
 
 	// Now propose an additional entry at term 1.
 	err = r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("data-term1")}},
 	})
 	if err != nil {
@@ -1321,7 +1321,7 @@ func TestDragonboat_LeaderCycle(t *testing.T) {
 	// Propose entries.
 	for _, cmd := range []string{"a", "b", "c"} {
 		err := r.step(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: []proto.Entry{{Cmd: []byte(cmd)}},
 		})
 		if err != nil {
@@ -1414,7 +1414,7 @@ func TestDragonboat_LeaderElectionOverwriteNewerLogs(t *testing.T) {
 
 	// Propose entries at current term.
 	err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("leader-data")}},
 	})
 	if err != nil {

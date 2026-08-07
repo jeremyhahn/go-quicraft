@@ -84,23 +84,43 @@ const noLeader uint64 = 0
 // noNode indicates no specific node.
 const noNode uint64 = 0
 
-// configChangeScanChunkEntries bounds how many entry INDICES are read per
-// chunk when scanning the uncommitted tail for config changes. Chunking by
-// index rather than by byte size keeps peak memory bounded while still
-// covering the entire range: a byte bound would stop early and could miss a
-// config change, breaking the one-uncommitted-change invariant that
-// commit-time membership depends on.
-const configChangeScanChunkEntries uint64 = 1024
-
-// localControlMessages is the set of message types that are injected into
-// step() by the local process rather than received from the network: the
-// engine builds Propose and ReadIndex, the message handler builds
-// InstallSnapshot and SnapshotStatus, the host builds LeaderTransfer, and
-// Unreachable is a transport-local notification. None of them carry a term,
-// so they are the only types allowed past the Term != 0 gate in step().
+// localControlMessages is the set of message types that the local process
+// injects into step() without a term: the engine builds Propose and
+// ReadIndex, the message handler builds InstallSnapshot and SnapshotStatus,
+// the host builds LeaderTransfer, and Unreachable is a transport-local
+// notification. They are the only types allowed past the Term != 0 gate in
+// step(), and ONLY when the message is stamped proto.OriginLocal — the
+// origin is process-local state the wire format cannot express (see
+// proto.MessageOrigin), so the exemption is unreachable from the network.
 var localControlMessages = map[uint64]struct{}{
 	proto.Propose:         {},
 	proto.ReadIndex:       {},
+	proto.InstallSnapshot: {},
+	proto.SnapshotStatus:  {},
+	proto.Unreachable:     {},
+	proto.LeaderTransfer:  {},
+}
+
+// processLocalMessages is the subset of localControlMessages that is NEVER
+// legitimately received from a peer, at any term:
+//
+//   - InstallSnapshot travels as a SnapshotHeader + chunk stream, not as a
+//     message (stepWorker.sendMessages routes it to sender.SendSnapshot);
+//     the follower's own snapshot receive path rebuilds the message locally
+//     once the artifact is on disk and verified.
+//   - SnapshotStatus is the transport reporting the outcome of a transfer it
+//     performed, to the raft instance that started it.
+//   - Unreachable is a transport-local reachability notification.
+//   - LeaderTransfer is only ever produced by this host's own API; nothing
+//     forwards it between replicas.
+//
+// Accepting any of them from the wire hands an authenticated peer a message
+// that no term, log, or quorum check constrains: a wire InstallSnapshot
+// alone carries a full Membership — the very set quorum() is computed over —
+// plus a Filepath the receiver would restore from. Propose and ReadIndex are
+// deliberately NOT in this set: followers legitimately forward both to the
+// leader, and those forwards carry the sender's term.
+var processLocalMessages = map[uint64]struct{}{
 	proto.InstallSnapshot: {},
 	proto.SnapshotStatus:  {},
 	proto.Unreachable:     {},
@@ -111,6 +131,13 @@ var localControlMessages = map[uint64]struct{}{
 // and therefore exempt from the Term != 0 requirement.
 func isLocalControlMessage(msgType uint64) bool {
 	_, ok := localControlMessages[msgType]
+	return ok
+}
+
+// isProcessLocalMessage reports whether a message type may only ever be
+// injected in-process, never received from a peer.
+func isProcessLocalMessage(msgType uint64) bool {
+	_, ok := processLocalMessages[msgType]
 	return ok
 }
 
@@ -275,19 +302,6 @@ type raft struct {
 	// appended but not yet committed. Per PhD thesis 4.1, only one
 	// config change may be pending at a time to prevent safety issues.
 	pendingConfigChange bool
-
-	// configChangeScanUnproven records that pendingConfigChange was armed
-	// by a scan that could not prove absence (a LogDB read error) rather
-	// than by an observed entry. The propose gate re-runs the scan in that
-	// case, so one transient read failure cannot block every membership
-	// change for the rest of the leadership term.
-	configChangeScanUnproven bool
-
-	// configChangeScanFailures counts fail-closed config change scans since
-	// process start. Reported with every fail-closed warning: a nonzero and
-	// growing value means membership changes are being blocked by storage
-	// errors, not by protocol state.
-	configChangeScanFailures uint64
 
 	// unreadableLogVoteDenials counts votes denied because this replica's OWN
 	// last log term could not be read, rather than because the candidate was
@@ -762,6 +776,25 @@ func (r *raft) dropHighTermVote(msg proto.Message) bool {
 }
 
 func (r *raft) step(msg proto.Message) error {
+	// Refuse process-local message types that arrived from the wire, at ANY
+	// term. These four are never sent between replicas (see
+	// processLocalMessages), so a peer naming one is claiming to be this
+	// host's own snapshot receiver, transport or admin API. The origin stamp
+	// is set by the delivery API and cannot be marshaled, so this is a
+	// property of HOW the message arrived, not of a field the sender chose —
+	// which is what makes it a real boundary rather than another value the
+	// attacker controls.
+	if !msg.Origin.IsLocal() && isProcessLocalMessage(msg.Type) {
+		slog.Warn("dropped process-local message received from the wire",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"type", proto.MessageTypeName(msg.Type),
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrWireLocalMessage
+	}
+
 	// Term 0 is the local-injection escape hatch, not a wire value. Every
 	// message type produced by send() carries r.term, so a zero term on one
 	// of those types can only come from a peer that would thereby bypass
@@ -770,7 +803,12 @@ func (r *raft) step(msg proto.Message) error {
 	// state machine and a later truncation by the real leader violates
 	// State Machine Safety), a vote response could escape the stale-term
 	// filter, and a Heartbeat could install a leader at any term.
-	if msg.Term == 0 && !isLocalControlMessage(msg.Type) {
+	//
+	// The hatch is keyed on the ORIGIN, not on the type alone: a wire
+	// Propose or ReadIndex forwarded by a follower carries that follower's
+	// term and passes through the normal term comparisons below, while a
+	// term-less one can only have been built in this process.
+	if msg.Term == 0 && !(msg.Origin.IsLocal() && isLocalControlMessage(msg.Type)) {
 		slog.Warn("dropped protocol message with no term",
 			"shard", r.shardID,
 			"replica", r.replicaID,
@@ -907,6 +945,25 @@ func stepFollower(r *raft, msg proto.Message) error {
 // after a preCandidate→candidate transition within the same inbox
 // batch. Without this guard, multiple candidates can independently
 // reach quorum at the same term, violating Raft's safety property.
+// stepDownToFollower abandons a candidacy because a leader for this term (or
+// a later one) has made itself known.
+//
+// It must never REGRESS the term. A locally injected message carries no term
+// -- the snapshot receive path builds InstallSnapshot with Term 0 -- and
+// becomeFollower assigns msg.Term unconditionally, so passing it straight
+// through set a candidate's term to 0 and cleared its vote. The replica would
+// then grant votes again in terms it had already voted in, which is an
+// Election Safety violation: two leaders in one term. Reachable in production
+// whenever a follower catching up by snapshot has its election timer fire
+// mid-transfer and the install lands on the resulting candidate.
+func (r *raft) stepDownToFollower(msg proto.Message) {
+	term := msg.Term
+	if term < r.term {
+		term = r.term
+	}
+	r.becomeFollower(term, msg.From)
+}
+
 func stepCandidate(r *raft, msg proto.Message) error {
 	switch msg.Type {
 	case proto.RequestVoteResp:
@@ -920,13 +977,13 @@ func stepCandidate(r *raft, msg proto.Message) error {
 		}
 		return r.handleVoteResp(msg)
 	case proto.Replicate:
-		r.becomeFollower(msg.Term, msg.From)
+		r.stepDownToFollower(msg)
 		return r.handleAppend(msg)
 	case proto.Heartbeat:
-		r.becomeFollower(msg.Term, msg.From)
+		r.stepDownToFollower(msg)
 		return r.handleHeartbeat(msg)
 	case proto.InstallSnapshot:
-		r.becomeFollower(msg.Term, msg.From)
+		r.stepDownToFollower(msg)
 		return r.handleSnapshot(msg)
 	case proto.Propose:
 		return &NotLeaderError{LeaderID: 0}
@@ -1160,93 +1217,38 @@ func tickLeader(r *raft) {
 // Election
 // --------------------------------------------------------------------------
 
-// hasConfigChangeToApply returns true if there are config change entries
-// between the APPLIED (processed) frontier and the last log index — that is,
-// any config change whose membership effect has not taken hold yet. During
-// this window the cluster is transitioning between membership
-// configurations, and proposing a second change would put two configurations
-// in flight at once.
+// hasConfigChangeToApply reports whether the log may still hold a config
+// change whose membership effect has not taken hold yet. During that window
+// the cluster is transitioning between configurations, and proposing a second
+// change would put two of them in flight at once.
 //
 // The frontier is `processed`, NOT `committed`. Membership takes effect at
 // COMMIT time in this implementation, but "commit time" here means
 // Peer.Commit -> processConfigChanges, a stage BEHIND r.log.committed:
 // r.log.committed advances in the step worker while the commit/apply cycle is
-// still in flight, and becomeLeader runs inside that window. A scan bounded
-// at `committed` therefore reports "nothing pending" for a config change that
-// has committed but has NOT been folded into p.membership yet — so a new
-// leader arms pendingConfigChange=false, accepts a second config change, and
-// computes its commit quorum over the OLD voting set while the log's newest
-// configuration is a larger one. The commit quorum and the election quorum
-// then need not intersect, and Leader Completeness fails. Scanning from
-// `processed` is etcd/raft's `applied >= pendingConfIndex` shape: no new
-// config change until every earlier one has actually been applied.
+// still in flight, and becomeLeader runs inside that window. A test bounded at
+// `committed` therefore reports "nothing pending" for a config change that has
+// committed but has NOT been folded into p.membership yet — so a new leader
+// arms pendingConfigChange=false, accepts a second config change, and computes
+// its commit quorum over the OLD voting set while the log's newest
+// configuration is a larger one. The commit quorum and the election quorum then
+// need not intersect, and Leader Completeness fails. Anchoring at `processed`
+// is etcd/raft's `applied >= pendingConfIndex` shape: no new config change
+// until every earlier one has actually been applied.
 //
-// The whole range must be scanned, in bounded chunks. The sole safety
-// argument for commit-time membership is "at most one config change is ever
-// un-applied" — enforced by the propose gate plus this re-arm. A byte-bounded
-// scan that stopped early would miss a config change beyond the bound and let
-// a second one be proposed, which is the classic two-simultaneous-
-// configurations unsafety. Every failure to prove absence therefore fails
-// CLOSED (returns true, blocking new config change proposals) rather than
-// open.
-//
-// A fail-closed result is recorded in configChangeScanUnproven so the
-// propose gate can re-run the scan instead of latching a transient LogDB
-// read error for the rest of the leadership term.
+// This is O(1). It used to re-read the whole unapplied range in 1024-index
+// chunks with NO byte bound, from becomeLeader, on the step worker. On a
+// restart processed starts at the snapshot index and Config.SnapshotEntries has
+// no default, so a default deployment never compacts and the range is the
+// ENTIRE log: 200k unapplied 1KB entries meant ~200MB read synchronously
+// before the first heartbeat could go out, so the election that had just been
+// won timed out again — and a leader elected while IsRecovering() froze
+// processed hit the same wall on every attempt. The bound is now maintained
+// incrementally by the log itself (raftLog.confChangeIndex), which is also
+// strictly safer: the scan could fail to READ, and a failed read had to be
+// treated as "a change might be pending"; there is nothing to read here.
 func (r *raft) hasConfigChangeToApply() bool {
-	found, err := r.scanUnappliedConfigChange()
-	if err != nil {
-		r.configChangeScanUnproven = true
-		r.configChangeScanFailures++
-		slog.Warn("config change scan failed, assuming a pending change",
-			"shard", r.shardID,
-			"replica", r.replicaID,
-			"failures", r.configChangeScanFailures,
-			"error", err,
-		)
-		return true
-	}
-	r.configChangeScanUnproven = false
-	return found
-}
-
-// scanUnappliedConfigChange reports whether the log holds a config change
-// entry that has not been handed to the apply pipeline yet, i.e. anywhere in
-// (processed, lastIndex]. A non-nil error means absence could not be proven;
-// it is never a statement that no config change exists.
-//
-// The range deliberately includes committed-but-not-yet-applied entries: the
-// membership effect of a config change lands in Peer.Commit, which advances
-// r.log.processed in the same step, so `processed` is the exact frontier at
-// which a config change can be said to have taken effect.
-func (r *raft) scanUnappliedConfigChange() (bool, error) {
-	lastIdx := r.log.lastIndex()
-	if r.log.processed >= lastIdx {
-		return false, nil
-	}
-	for low := r.log.processed + 1; low <= lastIdx; {
-		high := low + configChangeScanChunkEntries
-		if high > lastIdx+1 {
-			high = lastIdx + 1
-		}
-		// maxSize 0 means "no byte limit" for this index-bounded chunk, so
-		// the scan cannot silently stop short of `high`.
-		entries, err := r.log.entries(low, high, 0)
-		if err != nil {
-			return false, err
-		}
-		if len(entries) == 0 {
-			// No progress possible; absence is unprovable, not established.
-			return false, ErrUnavailable
-		}
-		for i := range entries {
-			if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
-				return true, nil
-			}
-		}
-		low = entries[len(entries)-1].Index + 1
-	}
-	return false, nil
+	return r.log.confChangeIndex > r.log.processed
 }
 
 // startElection starts a new election. Uses PreVote if enabled.
@@ -1674,11 +1676,13 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 
 	r.recordActivity()
 
-	// Re-run a scan that previously failed closed. becomeLeader arms
-	// pendingConfigChange from the inherited uncommitted tail; when that
-	// scan could not read the log, the arming was a guess, and leaving it
-	// latched rejects every membership change for the whole term.
-	if r.pendingConfigChange && r.configChangeScanUnproven {
+	// Re-evaluate the arming becomeLeader did. It is a CONSERVATIVE bound
+	// (see raftLog.confChangeIndex): on a restart every recovered entry is
+	// assumed to be a possible unapplied config change, and that assumption
+	// has to be released as the tail is applied — otherwise a leader elected
+	// straight after a restart would reject every membership change for the
+	// whole term. Re-reading the bound is O(1), so this runs unconditionally.
+	if r.pendingConfigChange {
 		r.pendingConfigChange = r.hasConfigChangeToApply()
 	}
 

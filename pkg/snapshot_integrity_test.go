@@ -296,7 +296,7 @@ func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {
 			}
 			defer dst.Close()
 
-			if impErr := dst.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); impErr != nil {
+			if impErr := dst.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes()), WithImportDataDir("")); impErr != nil {
 				t.Fatalf("ImportSnapshot: %v", impErr)
 			}
 			imported, getErr := dstDB.GetSnapshot(1, 1)

@@ -1437,7 +1437,21 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 // Bootstrap encoding layout:
 // [ShardID:8][ReplicaID:8][Join:1][Type:8][NumAddrs:4]
 // For each addr: [ReplicaID:8][AddrLen:4][Addr:N]
+// [DataDirLen:4][DataDir:N]
+//
+// The DataDir field is a TRAILING extension: records written before it existed
+// end at the address map, and replayBootstrap treats that as DataDir "". A
+// record written by this version always carries the length prefix, so a
+// zero-length DataDir is still explicit on the wire.
 const bootstrapRecordBaseSize = 8 + 8 + 1 + 8 + 4 // 29 bytes
+
+// bootstrapDataDirLenSize is the length prefix of the trailing DataDir field.
+const bootstrapDataDirLenSize = 4
+
+// maxBootstrapDataDirLen bounds the DataDir a bootstrap record may declare,
+// so a corrupt length cannot drive a huge allocation. It is far above any
+// real filesystem path.
+const maxBootstrapDataDirLen = 4096
 
 // replayBootstrap rebuilds per-node bootstrap info. A parse failure is
 // corruption (the chunk CRC already passed) and returns
@@ -1475,12 +1489,34 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 		pos += int(addrLen)
 	}
 
-	// The address map is the final field; leftover bytes mean the record did
-	// not parse cleanly, matching the replaySnapshot trailing-byte check.
+	// DataDir is a trailing extension. A record that ends at the address map
+	// predates it and carries no DataDir; anything else must parse as the
+	// complete field, with no bytes left over (matching the replaySnapshot
+	// trailing-byte check).
+	var dataDir string
 	if pos != len(data) {
-		slog.Error("waldb: bootstrap record has trailing bytes during replay",
-			"segment_id", segID, "parsed", pos, "length", len(data))
-		return ErrTruncatedBootstrapRecord
+		if len(data)-pos < bootstrapDataDirLenSize {
+			slog.Error("waldb: bootstrap record has trailing bytes during replay",
+				"segment_id", segID, "parsed", pos, "length", len(data))
+			return ErrTruncatedBootstrapRecord
+		}
+		dirLen := binary.LittleEndian.Uint32(data[pos:])
+		pos += bootstrapDataDirLenSize
+		if dirLen > maxBootstrapDataDirLen {
+			return ErrTruncatedBootstrapRecord
+		}
+		// uint64 comparison: see unmarshalAddrMap for the 32-bit
+		// sign-truncation hazard this avoids.
+		if uint64(len(data)-pos) < uint64(dirLen) {
+			return ErrTruncatedBootstrapRecord
+		}
+		dataDir = string(data[pos : pos+int(dirLen)])
+		pos += int(dirLen)
+		if pos != len(data) {
+			slog.Error("waldb: bootstrap record has trailing bytes during replay",
+				"segment_id", segID, "parsed", pos, "length", len(data))
+			return ErrTruncatedBootstrapRecord
+		}
 	}
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
@@ -1488,6 +1524,7 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 		Addresses: addrs,
 		Join:      join,
 		Type:      smType,
+		DataDir:   dataDir,
 	}
 	// Pin the segment so post-recovery compaction does not delete the sole
 	// durable copy of this bootstrap record.
@@ -2903,11 +2940,15 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	if len(bs.Addresses) > maxMembershipMapEntries {
 		return ErrMembershipTooLarge
 	}
+	if len(bs.DataDir) > maxBootstrapDataDirLen {
+		return ErrMembershipTooLarge
+	}
 	// Calculate total size.
 	totalSize := 1 + bootstrapRecordBaseSize
 	for _, addr := range bs.Addresses {
 		totalSize += 8 + 4 + len(addr)
 	}
+	totalSize += bootstrapDataDirLenSize + len(bs.DataDir)
 
 	buf := s.getMarshalBuf(totalSize)
 	buf[0] = payloadTypeBootstrap
@@ -2928,6 +2969,10 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 		copy(buf[pos+12:], addr)
 		pos += 12 + len(addr)
 	}
+	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(bs.DataDir)))
+	pos += bootstrapDataDirLenSize
+	copy(buf[pos:], bs.DataDir)
+	pos += len(bs.DataDir)
 
 	landing, err := s.writeRecord(buf[:pos])
 	if err != nil {

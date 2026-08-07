@@ -117,6 +117,21 @@ type Bootstrap struct {
 	Join bool
 	// Type identifies the state machine type for this shard.
 	Type uint64
+	// DataDir is the shard's Config.DataDir, empty when the shard roots its
+	// on-disk tree under the host's NodeHostDir.
+	//
+	// It is recorded because the shard's snapshot tree — the tree snapshot
+	// garbage collection and, critically, the DEK purge-floor scan enumerate —
+	// hangs off it, and operations that run while the shard is STOPPED
+	// (Host.ImportSnapshot) have no other way to learn it. Writing a snapshot
+	// artifact outside that tree leaks it and, because the purge floor is
+	// computed by SCANNING the tree, lets the next PurgeEpochsBefore destroy
+	// the DEK the artifact needs.
+	//
+	// Records written before this field existed decode it as "" and are
+	// indistinguishable from a NodeHostDir-rooted shard; callers that cannot
+	// prove the layout must fail closed rather than assume.
+	DataDir string
 }
 
 // Update represents a batch of state changes for a single shard

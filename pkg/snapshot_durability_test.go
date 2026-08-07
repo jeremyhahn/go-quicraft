@@ -562,7 +562,7 @@ func TestImportSnapshot_SurvivesCrashAfterSuccess(t *testing.T) {
 
 	payload := bytes.Repeat([]byte("imported-snapshot-bytes"), 100)
 	artifact := buildSnapshotArtifact(t, 42, 1, 0, proto.Membership{}, payload)
-	if err := h.ImportSnapshot(context.Background(), 5, bytes.NewReader(artifact)); err != nil {
+	if err := h.ImportSnapshot(context.Background(), 5, bytes.NewReader(artifact), WithImportDataDir("")); err != nil {
 		t.Fatalf("ImportSnapshot: %v", err)
 	}
 

@@ -136,6 +136,15 @@ var (
 	// every term comparison in step().
 	ErrZeroTermMessage = errors.New("raft: protocol message carries no term")
 
+	// ErrWireLocalMessage is returned when a message type that is only ever
+	// injected in-process (InstallSnapshot, SnapshotStatus, Unreachable,
+	// LeaderTransfer) arrives stamped proto.OriginRemote, i.e. it was decoded
+	// from the network. None of them is constrained by a term, a log match or
+	// a quorum, so an authenticated peer that could inject one would be able
+	// to replace this replica's membership, install a leader, or fabricate a
+	// snapshot transfer outcome.
+	ErrWireLocalMessage = errors.New("raft: process-local message type received from the wire")
+
 	// ErrWitnessRoleMismatch is returned when this replica's LOCALLY
 	// configured witness role contradicts the REPLICATED membership: the
 	// configuration lists it as a witness while it was started with

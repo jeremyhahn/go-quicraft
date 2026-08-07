@@ -169,7 +169,7 @@ func TestReadIndexRecordsCommittedNotLastIndex(t *testing.T) {
 		t.Fatal("fixture: the log must hold an uncommitted tail")
 	}
 
-	if err := r.step(proto.Message{Type: proto.ReadIndex, Hint: 77}); err != nil {
+	if err := r.step(proto.Message{Type: proto.ReadIndex, Origin: proto.OriginLocal, Hint: 77}); err != nil {
 		t.Fatalf("ReadIndex: %v", err)
 	}
 	if len(r.pendingReadIndex) != 1 {
@@ -334,7 +334,7 @@ func TestVotingMemberCapRejectsSixtyFifthVoter(t *testing.T) {
 		Address:   "addr65",
 	}
 	err := r.step(proto.Message{
-		Type: proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
 			Cmd:  marshalConfigChange(t, cc),

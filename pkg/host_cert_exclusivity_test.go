@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -162,4 +163,110 @@ func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
 		t.Fatalf("StartShard rejected co-located replicas: %v", startErr)
 	}
+}
+
+// M1. The grow-by-join flow never evaluated the precondition at all.
+//
+// StartShard checks the INITIAL members map. A cluster grown by join starts
+// its seed node with members={self} — the peer list is empty after
+// self-filtering, so the check returns nil — and every joiner with members={},
+// which returns nil on the len()==0 guard. Under a wildcard certificate the
+// deployment the check exists to refuse therefore comes up entirely clean, and
+// the addresses that DO arrive later, through RequestAddNode, were never
+// looked at.
+func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
+	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	// The seed node of a grow-by-join cluster: itself only. StartShard's
+	// check is vacuous here, which is the point.
+	members := map[uint64]string{1: "node-a.raft.test:5000"}
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard rejected the seed configuration: %v", startErr)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, addErr := h.RequestAddNode(ctx, 1, 2, "node-b.raft.test:5000", 0)
+	if addErr == nil {
+		t.Fatal("RequestAddNode accepted a peer this node's own wildcard " +
+			"certificate covers: every in-band transport authorization " +
+			"(SourceAddress clearing, peerEpoch/eviction, snapshot-sender " +
+			"binding) now succeeds for that address from any replica")
+	}
+	if !errors.Is(addErr, transport.ErrSharedPeerCertificate) {
+		t.Fatalf("RequestAddNode error = %v, want transport.ErrSharedPeerCertificate", addErr)
+	}
+
+	// The membership must be unchanged: the rejection happens before the
+	// config change is proposed.
+	ms, msErr := h.SyncGetShardMembership(ctx, 1)
+	if msErr != nil {
+		t.Fatalf("SyncGetShardMembership: %v", msErr)
+	}
+	if _, added := ms.Nodes[2]; added {
+		t.Fatal("the rejected replica was added to the membership anyway")
+	}
+}
+
+// The same gate must not fire for a correctly issued per-node certificate, or
+// growing a cluster by join would be impossible.
+func TestRequestAddNode_AcceptsUncoveredPeerUnderPerNodeCertificate(t *testing.T) {
+	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if startErr := h.StartShard(map[uint64]string{1: "node-a.raft.test:5000"},
+		false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard: %v", startErr)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rs, addErr := h.RequestAddNode(ctx, 1, 2, "node-b.raft.test:5000", 0)
+	if addErr != nil {
+		t.Fatalf("RequestAddNode rejected an uncovered peer under a per-node "+
+			"certificate: %v", addErr)
+	}
+	rs.Release()
+}
+
+// A co-located replica added later must not be flagged either, for the same
+// reason StartShard does not flag one: the certificate cannot distinguish it.
+func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
+	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"},
+		false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard: %v", startErr)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rs, addErr := h.RequestAddNode(ctx, 1, 2, "127.0.0.1:5001", 0)
+	if addErr != nil {
+		t.Fatalf("RequestAddNode rejected a co-located replica: %v", addErr)
+	}
+	rs.Release()
 }

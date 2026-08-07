@@ -59,7 +59,7 @@ func TestSendMessages_OnlySnapshots(t *testing.T) {
 		make(chan *commitItem, 1), nil, make(chan struct{}), nil)
 
 	msgs := []proto.Message{
-		{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 2},
+		{Type: proto.InstallSnapshot, Origin: proto.OriginLocal, ShardID: 1, From: 1, To: 2},
 		{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 3},
 	}
 
@@ -152,7 +152,7 @@ func TestSendMessages_SingleSnapshot(t *testing.T) {
 		make(chan *commitItem, 1), nil, make(chan struct{}), nil)
 
 	msgs := []proto.Message{
-		{Type: proto.InstallSnapshot, ShardID: 5, From: 1, To: 2,
+		{Type: proto.InstallSnapshot, Origin: proto.OriginLocal, ShardID: 5, From: 1, To: 2,
 			Snapshot: proto.Snapshot{
 				Index:    100,
 				Term:     3,
@@ -2069,7 +2069,7 @@ func TestCommitMemoryMode_SplitsFreeOrderFromOrderedMessages(t *testing.T) {
 	buf := node.DrainProposals(nil)
 	if len(buf) > 0 {
 		_ = peer.Handle(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: buf,
 		})
 	}
@@ -2204,7 +2204,7 @@ func TestCommitMemoryMode_NoMessages(t *testing.T) {
 	buf := node.DrainProposals(nil)
 	if len(buf) > 0 {
 		_ = peer.Handle(proto.Message{
-			Type:    proto.Propose,
+			Type: proto.Propose, Origin: proto.OriginLocal,
 			Entries: buf,
 		})
 	}
@@ -2286,7 +2286,7 @@ func TestCommitMemoryMode_CommitError_OrderedNotSent(t *testing.T) {
 	node.DeliverProposal([]proto.Entry{{Cmd: []byte("error-test")}})
 	buf := node.DrainProposals(nil)
 	_ = peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: buf,
 	})
 	peer.FlushReadIndex()
@@ -2378,7 +2378,7 @@ func TestCommitMemoryMode_OnlyFreeOrderMessages(t *testing.T) {
 	node.DeliverProposal([]proto.Entry{{Cmd: []byte("all-free-test")}})
 	buf := node.DrainProposals(nil)
 	_ = peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: buf,
 	})
 	peer.FlushReadIndex()
@@ -2465,7 +2465,7 @@ func TestCommitMemoryMode_OnlyOrderedMessages(t *testing.T) {
 	node.DeliverProposal([]proto.Entry{{Cmd: []byte("all-ordered-test")}})
 	buf := node.DrainProposals(nil)
 	_ = peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: buf,
 	})
 	peer.FlushReadIndex()
@@ -2688,7 +2688,7 @@ func TestCommitMemoryMode_CommitError_HandleErrorCalled(t *testing.T) {
 	node.DeliverProposal([]proto.Entry{{Cmd: []byte("listener-test")}})
 	buf := node.DrainProposals(nil)
 	_ = peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: buf,
 	})
 	peer.FlushReadIndex()
@@ -2792,7 +2792,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshot(t *testing.T) {
 
 	// Deliver an InstallSnapshot message while commitPending is true.
 	snapMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: 1,
@@ -2893,7 +2893,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 		Hint: 200,
 	})
 	node.Deliver(proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: 1,
@@ -2967,7 +2967,7 @@ func TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered(t *testing.T) 
 
 	// Seed a deferred InstallSnapshot for the shard.
 	snap := proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
@@ -3029,14 +3029,14 @@ func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T
 
 	// Deliver two InstallSnapshot messages.
 	node.Deliver(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
 		Snapshot: proto.Snapshot{Index: 50, Term: 3},
 	})
 	node.Deliver(proto.Message{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     3,
 		To:       1,
 		ShardID:  1,
@@ -3091,7 +3091,7 @@ func TestStepWorker_InstallSnapshot_ProcessedDuringNormalProcessReady(t *testing
 
 	// Deliver an InstallSnapshot while commitPending is false (normal path).
 	node.Deliver(proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: 1,
@@ -4067,7 +4067,7 @@ func TestDrainAndProcess_WithPendingItems(t *testing.T) {
 
 	// Propose an entry through the peer so GetUpdate produces a real update.
 	if err := peer.Handle(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		ShardID: 1,
 		From:    1,
 		Entries: []proto.Entry{{Cmd: []byte("drain-item-1")}},
@@ -4133,7 +4133,7 @@ func TestDrainAndProcess_WithMetrics(t *testing.T) {
 
 	// Propose to generate a real update.
 	if handleErr := peer.Handle(proto.Message{
-		Type: proto.Propose, ShardID: 5, From: 1,
+		Type: proto.Propose, Origin: proto.OriginLocal, ShardID: 5, From: 1,
 		Entries: []proto.Entry{{Cmd: []byte("metrics")}},
 	}); handleErr != nil {
 		t.Fatalf("Handle propose failed: %v", handleErr)
@@ -4195,7 +4195,7 @@ func TestDrainAndProcess_WithOrderedMessages(t *testing.T) {
 
 	// Propose to generate a real update.
 	if handleErr := peer.Handle(proto.Message{
-		Type: proto.Propose, ShardID: 3, From: 1,
+		Type: proto.Propose, Origin: proto.OriginLocal, ShardID: 3, From: 1,
 		Entries: []proto.Entry{{Cmd: []byte("ordered")}},
 	}); handleErr != nil {
 		t.Fatalf("Handle propose failed: %v", handleErr)
@@ -4447,7 +4447,7 @@ func TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop(t *testin
 	// Set commitPending and deliver an InstallSnapshot.
 	node.commitPending.Store(true)
 	snapMsg := proto.Message{
-		Type:    proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
 		ShardID: 1,
@@ -4530,7 +4530,7 @@ func TestStepWorker_CommitPendingInbox_DeferredSnapshotReinjected(t *testing.T) 
 
 	// Manually add a deferred snapshot to simulate the deferral.
 	sw.deferredSnapshots[1] = []proto.Message{{
-		Type:     proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,

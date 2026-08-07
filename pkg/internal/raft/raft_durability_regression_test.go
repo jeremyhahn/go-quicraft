@@ -37,7 +37,7 @@ func TestTryCommit_LeaderSelfMatchIsDurableIndex(t *testing.T) {
 	// Propose an entry; it is appended in memory but NOT persisted, so
 	// the leader's durable index (savedTo) still points at the no-op.
 	if err := r.step(proto.Message{
-		Type:    proto.Propose,
+		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{Cmd: []byte("durable-quorum")}},
 	}); err != nil {
 		t.Fatalf("propose: %v", err)
@@ -110,7 +110,7 @@ func TestHandleSnapshot_MatchingLogAdvancesProcessed(t *testing.T) {
 	}
 
 	msg := proto.Message{
-		Type: proto.InstallSnapshot,
+		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 2,
 		Term: snapTerm,
 		Snapshot: proto.Snapshot{

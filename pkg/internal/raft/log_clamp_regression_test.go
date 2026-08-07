@@ -152,3 +152,46 @@ func TestNewRaftLog_KeepsValidCommitted(t *testing.T) {
 			"survive recovery unchanged", l.committed)
 	}
 }
+
+// TG-3. The INNER clamp — processed down to the clamped committed — has its
+// own reachable case, and TestNewRaftLog_ClampsCommittedToLastIndex does not
+// reach it: that fixture has no snapshot, so processed is derived as
+// firstIndex-1 == 0 and `processed > committed` compares 0 against 5. The
+// assertion there is vacuously true and would survive deleting the clamp.
+//
+// The real case is a SNAPSHOT record that outlives the entries it was taken
+// over: processed is seeded from the snapshot index, committed is raised to it
+// (a snapshot index is committed by construction), and the outer clamp then
+// pulls committed back down to the last entry the log actually holds. Without
+// the inner clamp processed is left ABOVE committed, which is the exact state
+// commitUpdate asserts against — the first Commit after restart panics and
+// takes the commit worker, and with it every shard on that worker, down.
+func TestNewRaftLog_SnapshotAheadOfEntries_ClampsProcessedToCommitted(t *testing.T) {
+	// Entries 1..5 survived; the snapshot record claims index 10.
+	entries := []proto.Entry{
+		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
+		{Index: 4, Term: 1}, {Index: 5, Term: 1},
+	}
+	lr := newTestLogReader(entries, proto.State{Term: 2, Commit: 5})
+	lr.snapshot = proto.Snapshot{Index: 10, Term: 2}
+
+	l := newRaftLog(lr)
+
+	last := l.lastIndex()
+	if last != 5 {
+		t.Fatalf("fixture: lastIndex = %d, want 5 (the entries the log holds)", last)
+	}
+	if l.committed > last {
+		t.Fatalf("committed = %d exceeds lastIndex = %d", l.committed, last)
+	}
+	if l.processed > l.committed {
+		t.Fatalf("processed = %d exceeds committed = %d after clamping: "+
+			"commitUpdate asserts LastApplied <= processed <= committed, so "+
+			"the first Commit after this restart panics the commit worker",
+			l.processed, l.committed)
+	}
+	if l.processed != 5 {
+		t.Fatalf("processed = %d, want 5 (clamped to the clamped committed)",
+			l.processed)
+	}
+}
