@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING
+
+- `TransportConfig.MaxDecompressedSize` is pinned to `MaxFrameSize` and rejected if set to anything else. Configuring it lower bought no bomb protection — a peer that wants the node to buffer 16 MB can simply send an uncompressed 16 MB frame — while creating an asymmetric wire contract in which a receiver silently stopped accepting replication that every sender considered valid. `SetDefaults` still maps 0 to the pinned value, so deployments that never set it are unaffected
+
+### Fixed
+
+- **A restarted peer could black-hole every vote response for ~30 seconds.** Survivors held outbound QUIC connections to the dead incarnation; `stream.Write` succeeded locally while nothing arrived until `MaxIdleTimeout`. With two nodes down in a five-node shard every survivor's grant is mandatory, so one silently broken direction left the cluster leaderless with quorum available. Outbound connections are now attributed to a peer incarnation and evicted when they cannot be
+- **A leader could re-dial one follower thousands of times per second.** `sendAppend` bounded a `Replicate` message in bytes but never in entry COUNT, so a follower catching up on small entries drew a message every peer must reject — and that rejection was indistinguishable from a dead connection, so the sender tore down, re-dialed, and retried the identical message forever. Entry count is now bounded, oversized batches are split, and a rejected frame evicts only that stream
+- **PreVote messages were withheld behind WAL persistence.** They persist nothing, so the ordering rule never applied to them; under sustained write load `commitPending` is set almost continuously and pre-vote traffic never left the node, so elections could not complete
+- **A replica recovering from a snapshot was absent from consensus entirely** — no votes, no heartbeat replies — while its tick kept campaigning. Two concurrent recoveries could dissolve quorum with every node up. The gate now covers state-machine access only
+- **A replica removed from the configuration could still elect itself**, counting its own vote toward a quorum it was not part of — two leaders in one term
+- A same-term vote was granted while a live leader was known, and the grant then silently blackholed higher-term vote requests for a full election timeout
+- `lastTerm` fabricated term 0 when the log was unreadable, so a replica holding a committed entry no one else had would vote for a candidate missing it
+- A recovered commit index ahead of the last recovered entry was trusted absolutely, letting a follower acknowledge entries it did not have
+- A follower whose election timer expired could suppress its own election to enter quiesce, then run at 30x the election timeout while leaderless
+- Unload and reload raced through a random `select`, which could leave a shard permanently unable to apply while it still voted and won elections
+- Apply-gap detection was disabled at `lastApplied == 0`, so a dropped first batch silently diverged the state machine
+- A data race on the snapshot recovery markers could abandon a recovering replica's snapshot install, leaving it admitted to the configuration and starving
+
+### Changed
+
+- `ShardInfo.Health` reports `recovering` and `snapshotting` instead of `healthy` while those gates are up; `Host.DiagShardGates` exposes them directly. A replica invisible to consensus previously reported healthy
+- `BarrierConfig.Validate` is exported so a runtime-built config can be rejected instead of panicking
+
+### Security
+
+- `WithShardBarriers` without `WithBarrier` or `WithLogDB` is refused: the default WAL takes one barrier, so per-shard encryption alone produced encrypted snapshots over a plaintext log while an operator's spot-check showed encryption working
+
+
 ## [0.2.0-alpha] - 2026-08-06
 
 ### BREAKING
