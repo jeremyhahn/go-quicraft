@@ -525,7 +525,9 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13):
    resets from the snapshot.
 4. Rebuild all remote tracking maps from `ss.Membership`.
 5. Set `recovering` atomic flag during log truncation to gate state
-   machine apply operations and prevent concurrent recovery races.
+   machine apply operations and prevent concurrent recovery races. The
+   flag gates SM access only; the replica keeps answering votes and
+   heartbeats throughout (see §7, "Snapshot Recovery vs Apply Race").
 6. Respond with `ReplicateResp` carrying the snapshot index.
 
 ### Snapshot Sending (raft.go:863)
@@ -590,16 +592,37 @@ snapshot's membership, creating fresh `remote` structs for each peer.
 
 ### Snapshot Recovery vs Apply Race
 
-The `recovering` atomic flag gates state machine apply operations during
-snapshot recovery. When a snapshot is being restored:
+The `recovering` atomic flag gates **state machine access only**. When a
+snapshot is being restored:
 
-1. Engine thread acquires `recovering` lock for log truncation.
-2. Apply worker checks `recovering` flag before applying entries.
-3. Once log is truncated and ready, `recovering` is released.
-4. Apply worker resumes applying remaining entries.
+1. The snapshot pool raises `recovering` before calling `RecoverFromSnapshot`.
+2. The step worker keeps draining the node's inbox and stepping messages, but
+   calls `GetUpdate` with `moreEntriesToApply = false`, so no committed entry
+   is extracted for apply. The processed marker does not advance, so those
+   entries are re-offered once the gate clears.
+3. The apply worker parks before touching the state machine, and the commit
+   worker skips piggyback extraction (handing the apply worker a batch would
+   park it holding `commitPending`).
+4. `InstallSnapshot` is deferred via `deferredSnapshots` and re-delivered
+   afterwards — handling one mid-recovery would move the log's snapshot floor
+   out from under the recovery and leave a permanent apply gap.
+5. The pool clears `recovering` and notifies the work signal.
 
-This prevents the state machine from applying entries that exist in both
-the snapshot and the log, maintaining deterministic SM state.
+This prevents the state machine from applying entries that exist in both the
+snapshot and the log, maintaining deterministic SM state.
+
+**The gate deliberately does NOT suspend protocol participation.** Nothing in
+`Handle(RequestVote)` or `Handle(Heartbeat)` touches the state machine — only
+`GetUpdate`'s committed-entry extraction does. An earlier implementation
+skipped the node entirely, including its inbox drain, so a recovering replica
+answered no votes and no heartbeats while its tick kept campaigning into a
+void. Because `RecoverFromSnapshot` runs arbitrary state-machine code with no
+time bound, two concurrent recoveries could dissolve quorum with every node
+up: a 5-replica test with 2 recovering and the leader killed elected NO LEADER
+FOR 20 SECONDS. A replica that cannot apply must still vote.
+
+Recovery is visible in `ShardInfo.Health` as `recovering` (and `snapshotting`
+during a save) rather than `healthy`, and through `Host.DiagShardGates`.
 
 ## 8. ReadIndex
 
