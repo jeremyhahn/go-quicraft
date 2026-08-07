@@ -1118,6 +1118,25 @@ func (r *raft) startElection() {
 	if r.isObserver || r.isWitness || r.selfRemoved {
 		return
 	}
+	// Refuse to start an election at all when this node's own last log term
+	// is unreadable, BEFORE becomeCandidate/becomePreCandidate runs.
+	//
+	// campaign() also checks this, but by then becomeCandidate has already
+	// incremented the term, cleared leaderID and reset the timers. The node
+	// would sit as a candidate at T+1 having sent zero RequestVotes -- and
+	// because send() stamps r.term on every reply, its rising term reaches
+	// the live leader through ordinary Replicate/Heartbeat rejections and
+	// forces a step-down on each exchange. One replica with an unreadable
+	// log term would escalate into cluster-wide leader churn while emitting
+	// no election traffic of its own.
+	if _, ok := r.log.lastTerm(); !ok {
+		slog.Warn("election skipped: local last log term unreadable",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term,
+			"last_index", r.log.lastIndex())
+		return
+	}
 	if r.onCampaign != nil {
 		r.onCampaign(r.shardID, r.replicaID, r.term)
 	}

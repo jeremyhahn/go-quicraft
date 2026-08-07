@@ -109,6 +109,9 @@ func installSnapshotIntoLog(t *testing.T, node *Node, peer *raft.Peer, index, te
 	if err := peer.Handle(msg); err != nil {
 		t.Fatalf("install snapshot into raft log: %v", err)
 	}
+	// The step worker publishes the log markers after touching the Peer; the
+	// snapshot pool reads only what is published, never the Peer itself.
+	node.publishLogMarkers()
 }
 
 // TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier pins the
@@ -223,10 +226,9 @@ func (s *signallingSnapshotter) RecoverFromSnapshot(ctx context.Context, r io.Re
 // therefore wait for the log to reach the snapshot index BEFORE gating and
 // before the state machine is touched.
 //
-// raftMu is held for the first phase: every read of the raft markers goes
-// through it, so a worker that consults the log before recovering blocks
-// there, while a worker that recovers first reaches the state machine and
-// signals it.
+// The first phase publishes no log markers at all, so a worker that consults
+// the log before recovering keeps waiting, while a worker that recovers first
+// reaches the state machine and signals it.
 func TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)
@@ -274,6 +276,7 @@ func TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker(t *testing.
 		node.raftMu.Unlock()
 		t.Fatalf("install snapshot into raft log: %v", err)
 	}
+	node.publishLogMarkers()
 	node.raftMu.Unlock()
 
 	select {

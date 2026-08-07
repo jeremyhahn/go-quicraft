@@ -218,10 +218,16 @@ func (w *stepWorker) tick() {
 				w.sendMessages(msgs)
 			}
 		}
-		// Publish the diagnostic snapshot under raftMu — the only
-		// race-free point to read Peer.r from (excludes the commit
-		// worker; sequential with the step worker's own Handle). No-op
-		// unless a diagnostic accessor has been called.
+		// Publish the log markers and the diagnostic snapshot under
+		// raftMu — the only race-free point to read Peer.r from
+		// (excludes the commit worker; sequential with the step worker's
+		// own Handle). The markers are published on EVERY tick, not just
+		// when an update is produced, so a snapshot pool waiting for the
+		// raft log to install a snapshot keeps seeing fresh values even
+		// on a node whose processReady work is otherwise idle. Two atomic
+		// stores; the diagnostic snapshot below stays a no-op unless a
+		// diagnostic accessor has been called.
+		node.publishLogMarkers()
 		node.publishDiagLocked()
 		node.raftMu.Unlock()
 	}
@@ -362,11 +368,13 @@ func (w *stepWorker) processReady() {
 			node.handleError(err)
 			continue
 		}
-		// Propagate the committed index so FollowerRead can wait for
-		// lastApplied to catch up without a ReadIndex round-trip. The
-		// step worker holds exclusive access to the Peer here, so
-		// reading CommittedIndex is safe without additional locking.
-		node.SetCommittedIndex(node.peer.CommittedIndex())
+		// Propagate the log markers so FollowerRead can wait for
+		// lastApplied to catch up without a ReadIndex round-trip, and so
+		// the snapshot pool observes an InstallSnapshot the moment this
+		// cycle installs it rather than a tick later. The step worker
+		// holds exclusive access to the Peer here, so reading them is
+		// safe without additional locking.
+		node.publishLogMarkers()
 		// Detect leader change, ReadyToRead, and campaign launch.
 		w.processCallbacks(shardID, node, update)
 		// Read-only updates (e.g., ReadIndex confirmations) carry no

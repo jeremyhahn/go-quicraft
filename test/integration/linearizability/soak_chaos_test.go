@@ -390,11 +390,13 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	// long after that until writes actually land". Those have different
 	// causes -- a slow election vs. clients not retrying promptly -- and the
 	// aggregate number cannot distinguish them.
-	electedAt := time.Duration(0)
+	// electedAt is written by the election watcher and read by the log line
+	// below while that goroutine may still be running, so it has to be atomic.
+	var electedAt atomic.Int64
 	go func() {
 		es := time.Now()
 		cluster.waitForClusterLeader(shardID, failoverTimeout)
-		electedAt = time.Since(es)
+		electedAt.Store(int64(time.Since(es)))
 	}()
 
 	// Require SUSTAINED recovery, not a single completion. An operation that
@@ -416,7 +418,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	wg.Wait()
 
 	t.Logf("leader close took %v; new leader after %v; %d sustained ops committed after %v (%d total)",
-		closeElapsed, electedAt, recoveredOps, outage, totalOps.Load())
+		closeElapsed, time.Duration(electedAt.Load()), recoveredOps, outage, totalOps.Load())
 
 	if outage == 0 {
 		t.Fatalf("writes never resumed within %v of closing the leader", maxOutage+5*time.Second)

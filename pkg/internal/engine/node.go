@@ -238,12 +238,20 @@ type Node struct {
 	lastAppliedTerm atomic.Uint64
 
 	// committedIndex tracks the highest log index known to be committed
-	// in the Raft log. Written exclusively by the step worker after
-	// each GetUpdate call and atomically visible to user goroutines
+	// in the Raft log. Written exclusively by the step worker (see
+	// publishLogMarkers) and atomically visible to user goroutines
 	// calling FollowerRead. This enables followers to serve reads
 	// without a ReadIndex round-trip while still guaranteeing the
 	// result reflects all entries committed at the time of the read.
 	committedIndex atomic.Uint64
+
+	// processedIndex mirrors the Raft log's processed marker — the highest
+	// committed index already extracted for apply. Written by the step
+	// worker alongside committedIndex, it lets the snapshot pool decide
+	// whether the log has installed a snapshot WITHOUT reading the Peer
+	// from its own goroutine, which the Peer's single-owner invariant
+	// forbids (see the diagSnap comment above).
+	processedIndex atomic.Uint64
 
 	// maxApplyRetries is carried from config.Config.MaxApplyRetries and is
 	// RESERVED for a future apply-retry circuit breaker; it is not yet consulted.
@@ -529,6 +537,34 @@ func (n *Node) IsFailed() bool {
 // Updated atomically by the step worker; safe to read from any goroutine.
 func (n *Node) CommittedIndex() uint64 {
 	return n.committedIndex.Load()
+}
+
+// publishLogMarkers copies the Raft log's committed and processed markers
+// out of the Peer into atomics other goroutines may read. It MUST run on
+// the step worker goroutine — the Peer's owner — because that is the only
+// race-free place to read Peer.r from (the commit worker is excluded by
+// raftMu, which tick() holds, or by commitPending).
+//
+// Both markers are monotonically non-decreasing (raftLog.commitTo,
+// appliedTo's assertion, and restore's "snapshot index >= committed"
+// invariant), so a reader that loads them separately still gets values that
+// were each true at some instant, and a conjunction over both — the only
+// way they are consumed — therefore held at the later of the two. A reader
+// can only ever be BEHIND the log, never ahead of it, which is the safe
+// direction for every consumer.
+func (n *Node) publishLogMarkers() {
+	if n.peer == nil {
+		return
+	}
+	committed, processed := n.peer.LogMarkers()
+	n.committedIndex.Store(committed)
+	n.processedIndex.Store(processed)
+}
+
+// LogMarkers returns the last committed and processed markers published by
+// the step worker. Safe to call from any goroutine.
+func (n *Node) LogMarkers() (committed, processed uint64) {
+	return n.committedIndex.Load(), n.processedIndex.Load()
 }
 
 // SetCommittedIndex updates the committed log index. Must only be called

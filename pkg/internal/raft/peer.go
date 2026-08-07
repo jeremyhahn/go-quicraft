@@ -1238,6 +1238,16 @@ func (p *Peer) CommittedIndex() uint64 {
 	return p.r.log.committed
 }
 
+// LogMarkers returns the Raft log's committed and processed markers as a
+// consistent pair. Must only be called from the step worker goroutine (the
+// single-owner invariant CommittedIndex documents); it exists so that owner
+// can PUBLISH both markers for goroutines that may not touch the Peer at all.
+// Unlike DiagRaftState it formats nothing and allocates nothing, so it is
+// cheap enough to call on every tick.
+func (p *Peer) LogMarkers() (committed, processed uint64) {
+	return p.r.log.committed, p.r.log.processed
+}
+
 // syncLeaderID copies the raft state machine's leaderID to the atomic
 // field on Peer. This is called after every operation that may change
 // leadership (tick, step, GetUpdate). The raft struct is not thread-safe,

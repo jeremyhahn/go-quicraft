@@ -956,25 +956,29 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	return snapshotIndex, nil
 }
 
-// peerLogMarkers returns the Raft log's committed and processed markers, read
-// under raftMu — the lock that serializes the step worker's Tick and the
-// commit worker's Commit. The third result is false when the node has no peer
-// (there is then no raft log whose markers a recovery could get ahead of).
+// peerLogMarkers returns the Raft log's committed and processed markers as
+// last published by the step worker. The third result is false when the node
+// has no peer (there is then no raft log whose markers a recovery could get
+// ahead of).
+//
+// The markers are read from the node's published atomics, NEVER from the Peer.
+// raftMu serializes the step worker's Tick with the commit worker's Commit; it
+// does NOT cover the step worker's inbox handling, so reading Peer.r from this
+// (snapshot pool) goroutine races with the very handleSnapshot the wait below
+// is waiting for — see the Node.diagSnap comment for the same rule applied to
+// diagnostics. The published values can only lag the log, never lead it, so a
+// stale read costs one more poll interval and can never let a recovery start
+// before the log holds the snapshot.
 //
 // BOTH markers are needed. committed alone is not sufficient: with
 // processed < index <= committed, seeding lastApplied to the snapshot index
 // makes the next Update carry a LastApplied above the log's processed marker,
-// which commitUpdate asserts against. DiagRaftState is the only accessor the
-// raft package exposes for processed, and it is safe here for the same reason
-// CommittedIndex is: the read happens under raftMu.
+// which commitUpdate asserts against.
 func peerLogMarkers(node *Node) (committed, processed uint64, ok bool) {
-	peer := node.Peer()
-	if peer == nil {
+	if node.Peer() == nil {
 		return 0, 0, false
 	}
-	node.raftMu.Lock()
-	defer node.raftMu.Unlock()
-	_, committed, processed, _, _, _ = peer.DiagRaftState()
+	committed, processed = node.LogMarkers()
 	return committed, processed, true
 }
 
