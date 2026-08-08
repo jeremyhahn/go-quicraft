@@ -424,6 +424,88 @@ func containsEpoch(epochs []uint64, want uint64) bool {
 	return false
 }
 
+// TestImportSnapshot_PinsInFlightEpoch is the regression test for the one at-rest
+// persistence path that pinned nothing. ImportSnapshot re-encrypts the imported
+// plaintext under the shard's barrier at the current epoch and records that epoch
+// in LogDB — but the shard is STOPPED during the import, so the purge-floor scan
+// (which counts only LOADED nodes) contributes zero floor for it. Without a pin,
+// a concurrent Rotate + purge on another shard sharing the barrier can drop the
+// epoch's DEK between the re-encryption and the SaveSnapshot, leaving the recorded
+// snapshot permanently undecryptable — total loss of a disaster-recovery restore.
+func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := newMockLogDB()
+	real := createTestBarrier(t)
+	pinning := &pinRecordingBarrier{Barrier: real}
+
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithBarrier(pinning))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"},
+		false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard: %v", startErr)
+	}
+
+	// Produce a valid exported artifact to import back.
+	snapDir := filepath.Join(t.TempDir(), "snap-import-pin")
+	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
+		t.Fatalf("MkdirAll: %v", mkErr)
+	}
+	writeEncryptedSnapshotFile(t, pinning, filepath.Join(snapDir, "snapshot.dat"),
+		[]byte("import must pin the epoch it seals under"))
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1700, Filepath: snapDir, Epoch: 1})
+
+	var exported bytes.Buffer
+	if exportErr := h.ExportSnapshot(context.Background(), 1, &exported); exportErr != nil {
+		t.Fatalf("ExportSnapshot: %v", exportErr)
+	}
+
+	if stopErr := h.StopShard(1); stopErr != nil {
+		t.Fatalf("StopShard: %v", stopErr)
+	}
+	db.mu.Lock()
+	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
+	delete(db.snapshots, mockNodeKey{1, 1})
+	db.mu.Unlock()
+
+	// Only observe the import's pinning, not the export's.
+	pinning.mu.Lock()
+	pinning.registered = nil
+	pinning.deregistered = nil
+	pinning.mu.Unlock()
+
+	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {
+		t.Fatalf("ImportSnapshot: %v", importErr)
+	}
+
+	snap, snapErr := db.GetSnapshot(1, 1)
+	if snapErr != nil {
+		t.Fatalf("GetSnapshot after import: %v", snapErr)
+	}
+	if snap.Epoch == 0 {
+		t.Fatal("import recorded Epoch 0 for a shard WITH a barrier: the pinning " +
+			"contract is not reachable and the test would pass vacuously")
+	}
+
+	pinning.mu.Lock()
+	registered := append([]uint64(nil), pinning.registered...)
+	deregistered := append([]uint64(nil), pinning.deregistered...)
+	pinning.mu.Unlock()
+
+	if !containsEpoch(registered, snap.Epoch) {
+		t.Fatalf("registered epochs = %v, want the recorded snapshot epoch %d pinned "+
+			"across the import; a concurrent purge could otherwise drop its DEK before "+
+			"SaveSnapshot records it", registered, snap.Epoch)
+	}
+	if !containsEpoch(deregistered, snap.Epoch) {
+		t.Fatalf("deregistered epochs = %v, want epoch %d released after the import",
+			deregistered, snap.Epoch)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // LOW: ImportSnapshot must bound the artifact and map context errors
 // ---------------------------------------------------------------------------

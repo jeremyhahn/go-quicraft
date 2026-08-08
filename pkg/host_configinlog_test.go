@@ -15,11 +15,49 @@
 package quicraft
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
+
+// iterateErrorLogDB injects a fixed error into the log-read path so a test can
+// exercise reconstruction's fail-closed behaviour on a genuine read failure.
+type iterateErrorLogDB struct {
+	mockLogDB
+	err error
+}
+
+func (e *iterateErrorLogDB) IterateEntries(entries []logdb.Entry, size, shardID, replicaID, low, high, maxSize uint64) ([]logdb.Entry, uint64, error) {
+	return entries, size, e.err
+}
+
+// TestReconstructShardMembership_FailsClosedOnReadError pins that a genuine log
+// read error during config-in-log reconstruction ABORTS StartShard rather than
+// silently returning "no bootstrap found" and letting the caller re-seed
+// membership from its local members map. ErrCompacted/ErrUnavailable are benign
+// scan boundaries; anything else (a corrupt/gapped read) must fail closed, like
+// every other step in recoverLogReader.
+func TestReconstructShardMembership_FailsClosedOnReadError(t *testing.T) {
+	ldb := &iterateErrorLogDB{err: logdb.ErrLogGapDetected}
+	lr := logdb.NewLogReader(1, 1, ldb)
+	if err := lr.SetRange(1, 5); err != nil {
+		t.Fatalf("SetRange: %v", err)
+	}
+
+	_, ok, err := (&Host{}).reconstructShardMembership(lr, 5)
+	if ok {
+		t.Fatal("reconstruction claimed success over an unreadable log")
+	}
+	if !errors.Is(err, logdb.ErrLogGapDetected) {
+		t.Fatalf("reconstruction err = %v, want ErrLogGapDetected: a genuine read "+
+			"error must fail closed and abort StartShard, not silently fall back to "+
+			"re-seeding membership from the caller's map (dropping witnesses, "+
+			"observers, tombstones and the replicated witness policy)", err)
+	}
+}
 
 // TestConfigInLog_BootstrapWritesInitialMembershipEntry proves the founding
 // member lays its initial configuration down as a committed

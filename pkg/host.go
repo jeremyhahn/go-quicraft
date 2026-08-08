@@ -5290,6 +5290,20 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		discardImportDir(fsys, shardID, stageDir)
 		return encErr
 	}
+	// Pin the epoch the artifact was sealed under for the rest of the import.
+	// The imported shard is STOPPED, so the purge-floor scan — which only counts
+	// LOADED nodes — contributes ZERO floor for it during the import. Without this
+	// pin, a concurrent Rotate + purgeOldEpochs on another shard sharing the
+	// barrier (or the key-rotation loop) can retire this epoch's DEK between the
+	// re-encryption above and the SaveSnapshot below, so the record would name
+	// ciphertext nothing can ever open — total, silent loss of a disaster-recovery
+	// restore. The sibling paths pin for the same reason (HandleSnapshot's
+	// recvEpoch, ExportSnapshot's logdbSnap.Epoch, ReencryptSnapshotFile's source
+	// epochs); ImportSnapshot was the one persistence path that pinned nothing.
+	if importBarrier != nil && epoch != 0 {
+		importBarrier.RegisterInFlightEpoch(epoch)
+		defer importBarrier.DeregisterInFlightEpoch(epoch)
+	}
 
 	// Write the snapshot metadata file beside the artifact, recording the epoch
 	// the re-encryption above actually used.
@@ -7476,10 +7490,24 @@ func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (p
 			high = commit + 1
 		}
 		entries, err := lr.GetRange(low, high, maxMembershipReconstructBytes)
-		if err != nil || len(entries) == 0 {
-			// Compacted, unreadable, or exhausted: a genuine compaction floor is
-			// always accompanied by a snapshot whose membership the caller uses
-			// instead, so reconstructing only the readable suffix is correct.
+		if err != nil {
+			// ErrCompacted / ErrUnavailable are benign scan boundaries: a real
+			// compaction floor is always accompanied by a snapshot whose
+			// membership the caller uses instead (nothingRecovered would be
+			// false), and ErrUnavailable means the committed prefix is exhausted.
+			// Any OTHER error is a genuine read/corruption failure
+			// (e.g. ErrLogGapDetected) — reconstruction must FAIL CLOSED and abort
+			// StartShard, exactly like every other step in recoverLogReader,
+			// rather than silently return foundBootstrap=false and let the caller
+			// re-seed membership from its local members map (which drops witnesses,
+			// observers, Removed tombstones and the replicated witness policy — the
+			// split this reconstruction exists to prevent).
+			if errors.Is(err, logdb.ErrCompacted) || errors.Is(err, logdb.ErrUnavailable) {
+				break
+			}
+			return proto.Membership{}, false, err
+		}
+		if len(entries) == 0 {
 			break
 		}
 		for i := range entries {
