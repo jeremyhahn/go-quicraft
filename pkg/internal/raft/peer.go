@@ -207,7 +207,14 @@ func (p *Peer) replayConfigChangesTo(index uint64) {
 		if high > index+1 {
 			high = index + 1
 		}
-		entries, err := p.r.log.entries(low, high, 0)
+		// Bound each read in BYTES as well as in entries. A 1024-entry chunk of
+		// arbitrary log entries — config changes are interspersed with ordinary
+		// data entries — is otherwise unbounded (maxSize 0), up to
+		// 1024×MaxApplyEntrySize per read at startup. limitEntrySize always
+		// returns at least one entry and the loop advances by the last index
+		// read, so the byte bound cannot stall progress even on a lone oversized
+		// entry.
+		entries, err := p.r.log.entries(low, high, p.r.maxReplicationPayload)
 		if err != nil || len(entries) == 0 {
 			// Compacted or unreadable: the snapshot membership already
 			// covers everything below the compaction floor.

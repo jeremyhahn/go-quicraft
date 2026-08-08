@@ -272,10 +272,21 @@ func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
 // from committed entries only, validate() ran on the leader before the entry
 // was proposed and guaranteed the target was not a member, so the extra
 // deletes below are provably no-ops and the behaviour is byte-for-byte the
-// old one. The rejections that remain are the ones whose precondition holds
-// identically on every replica — a Removed tombstone, and the two role
-// transitions the seed can never manufacture, since it only ever populates
-// addresses — so they cannot make replicas diverge.
+// old one. The rejections that remain all have a precondition that either
+// holds identically on every replica or that the seed can only LOOSEN, never
+// tighten, so none can make replicas diverge:
+//
+//   - the two add refusals (a Removed tombstone, and promoting a witness via
+//     AddNode) — the seed only populates addresses, so it can manufacture
+//     neither a tombstone nor a witness role; the precondition is therefore
+//     identical to the committed-only membership.
+//   - handleRemoveNode's three (ErrNodeNotFound, ErrRemoveLastFullReplica,
+//     ErrRemoveLastVoter) — these read len(m.addresses)/isMember/isWitness,
+//     and seeding every listed non-voter as a voter can only make isMember
+//     more likely true, len(m.addresses) larger, and isWitness less likely
+//     true. Each of those makes the refusal STRICTLY LESS likely to fire than
+//     on the true membership, so a committed remove the true membership would
+//     apply is never refused by the seeded one.
 
 // handleAddNode adds a full voting member. An existing observer is promoted;
 // an existing voter has its address updated (the committed entry is

@@ -1326,6 +1326,16 @@ func (r *raft) hasConfigChangeToApply() bool {
 // committed.
 func (r *raft) startElection() {
 	if r.isObserver || r.isWitness || r.selfRemoved {
+		// Reaching here means the election timeout expired without a heartbeat.
+		// Forget the leader for the SAME reason the joining branch below does:
+		// tickFollower has already zeroed electionTick, so leaving leaderID set
+		// keeps the shared leader-lease test (leaderID != noLeader &&
+		// electionTick < electionTimeout) true for most of every tick cycle.
+		// A witness's vote counts toward quorum and a self-removed/observer
+		// replica still answers RequestVote, so a stale leaderID here makes
+		// them deny PreVotes and silently drop higher-term RequestVotes,
+		// which can hold a shard with an otherwise-healthy quorum leaderless.
+		r.leaderID = noLeader
 		return
 	}
 	// The replicated configuration calls this replica a witness while it was
@@ -1339,6 +1349,11 @@ func (r *raft) startElection() {
 			"replica", r.replicaID,
 			"configured_witness", r.isWitness,
 			"term", r.term)
+		// Same stale-leaderID hazard as the branches above: a role-mismatched
+		// replica the replicated membership still counts as a voter must not
+		// keep asserting the dead leader is live, or it stalls the election it
+		// is a required part of.
+		r.leaderID = noLeader
 		return
 	}
 	// A joining replica's membership is incomplete by construction: the
