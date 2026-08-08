@@ -279,6 +279,11 @@ func (s *segment) Sync() error {
 // there so the corrupt tail is repaired on disk instead of re-triggering
 // prefix truncation — and the destruction of every later segment — on every
 // subsequent restart.
+// distinguishing a legal torn tail from corruption. That distinction is the
+// whole function; splitting it separates the hole detection from the stride
+// arithmetic it depends on.
+//
+//nolint:gocyclo // WAL recovery walks blocks, chunk types and padding while
 func (s *segment) ReadAll() ([][]byte, int64, error) {
 	if s.closed {
 		return nil, 0, ErrClosed

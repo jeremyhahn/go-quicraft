@@ -217,6 +217,11 @@ func (s *StateMachine) IsOnDisk() bool {
 //   - Non-session entries (clientID == 0) go directly to the user SM.
 //
 // The results slice must be pre-allocated with len(results) == len(entries).
+// dedup and witness metadata in one pass over the batch. Splitting it would
+// separate the session lifecycle decisions from the result recording that must
+// agree with them within the same batch index.
+//
+//nolint:gocyclo // the apply path branches over entry type, session state,
 func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// Defence in depth: the engine's synchronous UnloadNode guarantees no
 	// Apply is in flight when Close runs, but a misordered caller must get a

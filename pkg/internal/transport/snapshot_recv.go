@@ -342,6 +342,11 @@ func rateLimitChunkSleep(length uint32, bytesPerSec int64) time.Duration {
 
 // receiveChunks reads snapshot chunks from the stream, enforces the memory
 // budget, applies rate limiting, and dispatches chunks to the handler.
+// distinct release paths, liveness accounting and validation. The budget
+// charge and its release must stay in one function: a missed release is a
+// permanent leak that eventually rejects every inbound snapshot host-wide.
+//
+//nolint:gocyclo // chunk streaming interleaves budget reservation with four
 func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, senderAuthorized func(address string) bool, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
 	recvStart := time.Now()
 	// Cap initial allocation to prevent a malicious header from causing an

@@ -133,15 +133,6 @@ type hostOptions struct {
 	fsys             snapshotFS
 }
 
-// withSnapshotFS routes the host's snapshot persistence I/O through fsys.
-// Unexported on purpose: fault injection is a testing facility and must not
-// appear in the public option set.
-func withSnapshotFS(fsys snapshotFS) HostOption {
-	return func(o *hostOptions) {
-		o.fsys = fsys
-	}
-}
-
 // HostOption configures optional Host dependencies.
 type HostOption func(*hostOptions)
 
@@ -6681,6 +6672,11 @@ func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
 // requestConfigChange is the shared implementation for all membership
 // operations. It serializes the ConfigChange, wraps it in an
 // EntryConfigChange entry, and delivers it via the engine inbox.
+// witness-policy gating, cert exclusivity, claim/rollback and the pending-op
+// bookkeeping. Splitting it would move validation away from the rollback that
+// pairs with it, which is exactly where this path has produced defects.
+//
+//nolint:gocyclo // one funnel for every membership change: role validation,
 func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto.ConfigChange) (*RequestState, error) {
 	configChangeIndex := cc.ConfigChangeID
 	if h.closed.Load() {

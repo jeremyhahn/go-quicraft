@@ -414,6 +414,11 @@ func (w *applyWorker) drain() {
 //
 // The semaphore is acquired before each Apply call and released after,
 // so idle goroutines do not hold semaphore slots.
+// applyInFlight handshake, gap detection, snapshot coverage skipping and the
+// auto-snapshot trigger are one ordered sequence of side effects. Extracting
+// any stage reorders them relative to the gates that guard them.
+//
+//nolint:gocyclo // the per-shard apply loop: recovering/saving gates, the
 func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 	var results []sm.Result
 	for item := range ch {

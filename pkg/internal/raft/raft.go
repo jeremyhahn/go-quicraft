@@ -786,6 +786,10 @@ func (r *raft) dropHighTermVote(msg proto.Message) bool {
 	return r.leaderID != noLeader && r.electionTick < r.electionTimeout
 }
 
+// in a fixed order before any role dispatch, and each gate's placement is a
+// safety property (see the wire/local and zero-term comments below).
+//
+//nolint:gocyclo // the protocol entry point: origin and term gates must run
 func (r *raft) step(msg proto.Message) error {
 	// Refuse process-local message types that arrived from the wire, at ANY
 	// term. These four are never sent between replicas (see

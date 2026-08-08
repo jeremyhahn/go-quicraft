@@ -123,6 +123,23 @@ func TestFollowerRead_LaggingApplyRespectsDeadline(t *testing.T) {
 	if committed == 0 {
 		t.Fatal("committed index is 0 after a successful proposal; the lag cannot be modelled")
 	}
+	// Wait for the apply callback to publish its lastApplied BEFORE injecting
+	// the lag. SyncPropose returns from rs.complete, which OnApplied runs
+	// several statements EARLIER than ns.lastApplied.Store — so a store of 0
+	// here can be overwritten by the still-running callback, and the read then
+	// completes immediately instead of timing out. That ordering is fine in
+	// production (a caller that observes a not-yet-updated marker makes a
+	// follower read wait, which is the safe direction); it is only the test's
+	// setup that needs to be sequenced.
+	applyDeadline := time.Now().Add(5 * time.Second)
+	for ns.lastApplied.Load() < committed {
+		if time.Now().After(applyDeadline) {
+			t.Fatalf("apply callback never published lastApplied >= %d (got %d)",
+				committed, ns.lastApplied.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	// Model a replica whose apply loop has fallen behind the commit index.
 	ns.lastApplied.Store(0)
 
