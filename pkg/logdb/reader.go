@@ -258,11 +258,25 @@ type LogReader struct {
 
 	// protoEntryBuf is a reusable buffer for the []proto.Entry result
 	// of converting logdb entries to proto entries. Avoids allocating
-	// a new slice per GetRange call. Callers must not retain the
-	// returned slice past the next GetRange/Term call on the same
-	// LogReader, which matches the step worker's single-goroutine
-	// access pattern.
+	// a new slice per GetRange call.
+	//
+	// It is RETAINED by GetRange's caller past the lock, so it is confined to
+	// the ONE goroutine that owns GetRange: the raft step worker on a running
+	// shard, and StartShard before the shard's step worker exists (they never
+	// overlap on the same per-shard LogReader). Every OTHER reader uses a
+	// separate path — termLocked has its own term buffers, and GetRangeCopy
+	// copies under the lock into a private buffer — so no goroutine can overwrite
+	// this buffer while GetRange's caller is still reading it.
 	protoEntryBuf []proto.Entry
+
+	// termLogdbBuf / termProtoBuf back termLocked's single-entry reads. termLocked
+	// is reachable from goroutines OTHER than the step worker (the snapshot pool's
+	// Compact -> termLocked), so it must NOT share the GetRange buffers the step
+	// worker retains past the lock. It never retains its result (it returns only a
+	// term) and always holds lr.mu, so these buffers are safe to share across its
+	// callers: every access is serialized and none outlives the lock.
+	termLogdbBuf []Entry
+	termProtoBuf []proto.Entry
 }
 
 // NewLogReader creates a LogReader for the specified shard and replica,
@@ -317,8 +331,22 @@ func (lr *LogReader) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) 
 	return lr.getRangeLocked(low, high, maxSize)
 }
 
-// getRangeLocked performs the entry retrieval with the read lock held.
+// getRangeLocked performs the entry retrieval with the lock held, reusing the
+// GetRange buffers. Its result is backed by protoEntryBuf, which the caller
+// retains past the lock — so getRangeLocked is only for the step worker's own
+// GetRange (and StartShard reconstruction, which never overlaps it). termLocked
+// and GetRangeCopy use getRangeLockedInto with their own buffers.
 func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, error) {
+	return lr.getRangeLockedInto(low, high, maxSize, &lr.logdbEntryBuf, &lr.protoEntryBuf)
+}
+
+// getRangeLockedInto performs the entry retrieval with the lock held, into the
+// caller-supplied reuse buffers. Separating the buffers is what makes the reader
+// safe under its real multi-goroutine access: the step worker's GetRange retains
+// its result, so no other goroutine may write the buffers backing it. termLocked
+// (reachable from the snapshot pool) and GetRangeCopy (an arbitrary API caller)
+// therefore pass DIFFERENT buffers than GetRange.
+func (lr *LogReader) getRangeLockedInto(low, high, maxSize uint64, logdbBuf *[]Entry, protoBuf *[]proto.Entry) ([]proto.Entry, error) {
 	if low > high {
 		return nil, ErrUnavailable
 	}
@@ -351,12 +379,12 @@ func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, e
 		return result, nil
 	}
 
-	// Reuse the logdb entry buffer to avoid per-call allocation. The maxSize
-	// budget is enforced by IterateEntries itself: every LogDB backend stops
-	// BEFORE appending an entry that would exceed it, except for the first
-	// entry which is always included so a single oversized entry can still
-	// make progress. No post-trim is therefore possible or needed here.
-	ents := lr.logdbEntryBuf[:0]
+	// Reuse the caller's logdb entry buffer to avoid per-call allocation. The
+	// maxSize budget is enforced by IterateEntries itself: every LogDB backend
+	// stops BEFORE appending an entry that would exceed it, except for the first
+	// entry which is always included so a single oversized entry can still make
+	// progress. No post-trim is therefore possible or needed here.
+	ents := (*logdbBuf)[:0]
 	var err error
 	ents, _, err = lr.logdb.IterateEntries(
 		ents, 0, lr.shardID, lr.replicaID, low, high, maxSize,
@@ -364,12 +392,42 @@ func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, e
 	if err != nil {
 		return nil, err
 	}
-	lr.logdbEntryBuf = ents
+	*logdbBuf = ents
 
-	// Reuse the proto entry buffer to avoid per-call conversion allocation.
-	lr.protoEntryBuf = logdbEntriesToProtoReuse(lr.protoEntryBuf, ents)
+	// Reuse the caller's proto entry buffer to avoid per-call conversion alloc.
+	*protoBuf = logdbEntriesToProtoReuse(*protoBuf, ents)
 
-	return lr.protoEntryBuf, nil
+	return *protoBuf, nil
+}
+
+// GetRangeCopy returns entries in [low, high) as freshly-allocated proto entries
+// the caller fully owns, safe to read on any goroutine at any time.
+//
+// Unlike GetRange it does NOT hand out a reused buffer: it copies each entry
+// (including Cmd) UNDER the lock into private storage, so an arbitrary API-caller
+// goroutine (Host.QueryRaftLog) never touches the buffers the step worker retains
+// past the lock. Use this from any goroutine that is not the step worker.
+func (lr *LogReader) GetRangeCopy(low, high, maxSize uint64) ([]proto.Entry, error) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	// Private per-call buffers: never the GetRange buffers, so this call cannot
+	// race a step-worker GetRange result that is being read without the lock.
+	var logdbBuf []Entry
+	var protoBuf []proto.Entry
+	ents, err := lr.getRangeLockedInto(low, high, maxSize, &logdbBuf, &protoBuf)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]proto.Entry, len(ents))
+	for i := range ents {
+		out[i] = ents[i]
+		if len(ents[i].Cmd) > 0 {
+			out[i].Cmd = append([]byte(nil), ents[i].Cmd...)
+		} else {
+			out[i].Cmd = nil
+		}
+	}
+	return out, nil
 }
 
 // Term returns the term for the entry at the given index.
@@ -398,7 +456,12 @@ func (lr *LogReader) termLocked(index uint64) (uint64, error) {
 			return t, nil
 		}
 	}
-	ents, err := lr.getRangeLocked(index, index+1, 0)
+	// Use termLocked's OWN buffers, never GetRange's: termLocked is reachable
+	// from the snapshot pool (Compact) as well as the step worker, and writing
+	// GetRange's protoEntryBuf here would race a step-worker GetRange result that
+	// is being read without the lock. termLocked returns only a term, so nothing
+	// retains these buffers past the lock.
+	ents, err := lr.getRangeLockedInto(index, index+1, 0, &lr.termLogdbBuf, &lr.termProtoBuf)
 	if err != nil {
 		return 0, err
 	}

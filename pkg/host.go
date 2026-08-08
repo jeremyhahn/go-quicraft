@@ -6936,33 +6936,15 @@ func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint
 		return nil, ErrShardNotFound
 	}
 
-	// Use the LogReader's GetRange which handles compacted/unavailable checks
-	// and converts logdb entries to proto entries.
-	entries, err := lr.GetRange(firstIndex, lastIndex, maxSize)
+	// GetRangeCopy handles the compacted/unavailable checks and returns entries
+	// the caller fully owns, deep-copied UNDER the reader lock. QueryRaftLog runs
+	// on an arbitrary API-caller goroutine, so it must NOT use GetRange — that
+	// hands out a buffer the step worker retains past the lock, and copying it
+	// here (after the lock) would race a concurrent step-worker GetRange.
+	result, err := lr.GetRangeCopy(firstIndex, lastIndex, maxSize)
 	if err != nil {
 		return nil, err
 	}
-
-	// Deep-copy entries so the caller owns the data. LogReader's GetRange
-	// returns entries backed by reusable internal buffers that may be
-	// overwritten on the next call.
-	result := make([]proto.Entry, len(entries))
-	for i := range entries {
-		result[i] = proto.Entry{
-			Term:        entries[i].Term,
-			Index:       entries[i].Index,
-			Type:        entries[i].Type,
-			Key:         entries[i].Key,
-			ClientID:    entries[i].ClientID,
-			SeriesID:    entries[i].SeriesID,
-			RespondedTo: entries[i].RespondedTo,
-		}
-		if len(entries[i].Cmd) > 0 {
-			result[i].Cmd = make([]byte, len(entries[i].Cmd))
-			copy(result[i].Cmd, entries[i].Cmd)
-		}
-	}
-
 	return result, nil
 }
 
