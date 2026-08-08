@@ -3102,13 +3102,24 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		recoveredIndex = peer.SetProcessedIndex(recoveredIndex)
 	}
 
+	// ns.nodes is the shard's MUTABLE routing table, guarded by ns.nodesMu and
+	// written by the apply worker (applyMembershipRouting on committed membership
+	// entries — the bootstrap entry fires this on the first apply of every shard).
+	// It must be a COPY of effectiveNodes, not the same map: StartShard keeps
+	// reading effectiveNodes without the lock after LoadNode makes the node live
+	// (the registry-registration loop below), so aliasing them races the apply
+	// worker's first write.
+	routingNodes := make(map[uint64]string, len(effectiveNodes))
+	for id, addr := range effectiveNodes {
+		routingNodes[id] = addr
+	}
 	ns := &nodeState{
 		shardID:          cfg.ShardID,
 		replicaID:        cfg.ReplicaID,
 		cfg:              cfg,
 		createFn:         create,
 		smType:           stateMachine.SMType().TypeCode(),
-		nodes:            effectiveNodes,
+		nodes:            routingNodes,
 		requestPool:      NewRequestStatePool(),
 		rsm:              stateMachine,
 		openStopper:      openStopper,
