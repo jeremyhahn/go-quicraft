@@ -2792,11 +2792,16 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// deterministically instead of waiting for a snapshot.
 		//
 		// Every founding member builds a BYTE-IDENTICAL entry from the same
-		// members map (Membership marshals with sorted keys), which is what makes
-		// it safe to commit at index 1 on each independently — the etcd bootstrap
-		// model. A join=true replica must NOT write its own index-1 entry: it
-		// would conflict with the authoritative one the leader replicates. It
-		// keeps only the in-memory seed and adopts the cluster's entry on arrival.
+		// bootstrap input (Membership marshals with sorted keys), which is what
+		// makes it safe to commit at index 1 on each independently — the etcd
+		// bootstrap model. That input is the members map AND the witness policy
+		// (MaxWitnesses/RequireFullReplicaMajority, from this node's local
+		// Config.Witness): founders configured with a different policy produce a
+		// divergent index-1 entry that Log Matching never reconciles, so all
+		// founders must be configured identically (see BuildInitialMembershipEntry).
+		// A join=true replica must NOT write its own index-1 entry: it would
+		// conflict with the authoritative one the leader replicates. It keeps only
+		// the in-memory seed and adopts the cluster's entry on arrival.
 		if firstStart && !join {
 			entry, err := raft.BuildInitialMembershipEntry(initialMembership)
 			if err != nil {

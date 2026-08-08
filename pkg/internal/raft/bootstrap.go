@@ -55,6 +55,18 @@ const (
 // identical entry at BootstrapMembershipIndex or the Log Matching property is
 // violated the moment two of them compare logs.
 //
+// CONTRACT: every founding member commits this entry at index 1 INDEPENDENTLY,
+// so byte-identity is only a guarantee when every founder is given identical
+// bootstrap INPUT. That input is the whole Membership, not only its address map:
+// MaxWitnesses and RequireFullReplicaMajority come from each founder's local
+// Config.Witness (see Host.StartShard), so founders configured with different
+// witness policy — or different member addresses — produce byte-DIFFERENT index-1
+// entries at the same (index=1, term=1). AppendEntries matches on (index, term)
+// only, so such a divergence is never reconciled and each replica then computes
+// quorum over its own policy. Founders MUST be configured identically (members
+// map AND witness policy); this is the same unenforced operator contract the
+// initial member list has always carried, now extended to the policy fields.
+//
 // The membership's ConfigChangeID is left at 0: the initial configuration
 // predates any config change, so a caller observes ConfigChangeID 0 until the
 // first real membership change — exactly as the previous out-of-band seed

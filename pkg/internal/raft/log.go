@@ -98,12 +98,20 @@ type raftLog struct {
 	confChangeIndex uint64
 }
 
-// noteConfigChanges raises confChangeIndex to cover any config-change entry in
-// the batch. The type mask is required: a compressed entry carries
-// proto.EntryCompressFlag alongside its base type.
+// noteConfigChanges raises confChangeIndex to cover any config-carrying entry in
+// the batch — an incremental EntryConfigChange or the bootstrap
+// EntryInitialMembership, both of which define membership. The type mask is
+// required: a compressed entry carries proto.EntryCompressFlag alongside its
+// base type.
+//
+// Including the bootstrap entry is for consistency with the rest of the
+// config-change gating; it is not load-bearing, because the bootstrap entry only
+// ever occupies index 1 and commits before any replica can lead, and newRaftLog
+// already seeds confChangeIndex = lastIndex() conservatively on recovery.
 func (l *raftLog) noteConfigChanges(entries []proto.Entry) {
 	for i := range entries {
-		if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange &&
+		t := entries[i].Type & proto.EntryTypeMask
+		if (t == proto.EntryConfigChange || t == proto.EntryInitialMembership) &&
 			entries[i].Index > l.confChangeIndex {
 			l.confChangeIndex = entries[i].Index
 		}

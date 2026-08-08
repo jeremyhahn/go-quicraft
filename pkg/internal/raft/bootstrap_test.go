@@ -66,6 +66,52 @@ func TestBuildInitialMembershipEntry_Deterministic(t *testing.T) {
 	}
 }
 
+// TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput pins the
+// determinism CONTRACT: the witness policy (MaxWitnesses /
+// RequireFullReplicaMajority) is part of the bootstrap input, not only the
+// address map. Two founders with an IDENTICAL members map but DIFFERENT local
+// witness policy produce byte-DIFFERENT entries at the same (index=1, term=1),
+// which AppendEntries (matching on index+term only) would never reconcile. This
+// test documents that every founding member must be configured with an identical
+// witness policy, exactly as it must pass an identical member list.
+func TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput(t *testing.T) {
+	base := map[uint64]string{1: "a", 2: "b", 3: "c"}
+
+	strict, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: base, MaxWitnesses: 1, RequireFullReplicaMajority: true,
+	})
+	if err != nil {
+		t.Fatalf("build strict: %v", err)
+	}
+	loose, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: base, MaxWitnesses: 2, RequireFullReplicaMajority: false,
+	})
+	if err != nil {
+		t.Fatalf("build loose: %v", err)
+	}
+
+	if strict.Index != loose.Index || strict.Term != loose.Term {
+		t.Fatalf("fixture: entries must share (index,term); got (%d,%d) vs (%d,%d)",
+			strict.Index, strict.Term, loose.Index, loose.Term)
+	}
+	if bytes.Equal(strict.Cmd, loose.Cmd) {
+		t.Fatal("differing witness policy produced IDENTICAL bootstrap bytes: the " +
+			"policy would silently NOT be part of the committed configuration, and a " +
+			"cluster could form with each founder using its own policy undetected")
+	}
+	// The corollary: SAME policy + same members => identical, which is the safe
+	// path founders must stay on.
+	same, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: base, MaxWitnesses: 1, RequireFullReplicaMajority: true,
+	})
+	if err != nil {
+		t.Fatalf("build same: %v", err)
+	}
+	if !bytes.Equal(strict.Cmd, same.Cmd) {
+		t.Fatal("identical input produced different bytes: determinism is broken")
+	}
+}
+
 // TestInitialMembershipRoundTrip confirms the entry decodes back to the
 // configuration it was built from, with ConfigChangeID pinned to the entry's
 // own index.
