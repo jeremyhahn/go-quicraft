@@ -1224,36 +1224,44 @@ func (p *Peer) setJoining(joining bool) {
 	p.r.setJoining(joining)
 }
 
-// clearJoiningIfKnown ends the joining window once this replica knows that the
-// LEADER it is following is a member of the configuration it has learned.
+// clearJoiningIfKnown ends the joining window once this replica can authorize the
+// messages it must accept to make progress. Two sufficient signals, either of
+// which clears the bypass:
 //
-// The auth bypass exists so a fresh joiner — which starts knowing no members —
-// can accept the leader's replication before it learns the configuration. It
-// must therefore be retired the moment the joiner can AUTHORIZE THAT LEADER, and
-// not one step sooner. Clearing on "knows any member other than itself" is
-// wrong: the current leader may have been ADDED AFTER the initial bootstrap, so
-// it is NOT in the founding membership the index-1 EntryInitialMembership
-// carries. If replication delivers the bootstrap entry in an earlier batch than
-// the leader's own AddNode, the joiner would learn the founding members, clear
-// the bypass, and then REJECT the current leader's next append as unauthorized —
-// stranding itself, unable to replay the very entries that add the leader (and
-// itself). Gating on the leader closes that gap: the joiner keeps the bypass
-// until it has replayed far enough to know the leader is a member, by which
-// point every other member has arrived with it.
+//	(a) the LEADER it is following is a known member. This covers the
+//	    forward/replicate path, where membership is learned incrementally and may
+//	    still be PARTIAL: the current leader may have been ADDED AFTER the initial
+//	    bootstrap, so it is NOT in the founding membership the index-1
+//	    EntryInitialMembership carries. Clearing on "knows any member" would let a
+//	    joiner that received the bootstrap entry in an earlier batch than the
+//	    leader's own AddNode clear the bypass and then REJECT the current leader's
+//	    next append — stranding itself, unable to replay the entries that add the
+//	    leader (and itself). Gating on the leader closes that gap.
 //
-// This still ends DETERMINISTICALLY and cannot reintroduce the permanent-bypass
-// bug: a joiner always receives from some leader (that is how it catches up), so
-// leaderID is set, and the committed log it replays necessarily contains the
-// AddNode that made that leader a voter (a leader is always in its own committed
-// configuration). A snapshot also clears joining (Handle's adopt branch), for
-// the compacted case. A single-node bootstrap never sets joining, so this is
-// only ever reached by a replica added to an existing cluster.
+//	(b) this replica is itself a member. It has replayed or received its own
+//	    AddNode, so the committed membership up to its addition is COMPLETE —
+//	    every member that predates it (including whatever leader it will follow)
+//	    is known — and enforcing IsMember is safe. This is what covers the RESTART
+//	    path: replayConfigChangesTo (SetProcessedIndex) runs before the first
+//	    Tick, so leaderID is noLeader and (a) cannot fire; without (b) a replica
+//	    restarted with join=true on a fully-caught-up log would reconstruct its
+//	    full membership yet keep the bypass set until the next snapshot or config
+//	    change — a lingering per-shard auth bypass.
+//
+// Neither signal fires too early: (a) only once the leader is authorizable, and
+// (b) only once this replica is officially in the configuration. In the
+// post-bootstrap-leader case both are false after the founding entry alone, so
+// the bypass correctly persists until the leader's AddNode arrives. A snapshot
+// also clears joining unconditionally (Handle's adopt branch), for the compacted
+// case. A single-node bootstrap never sets joining, so this is only ever reached
+// by a replica added to an existing cluster.
 func (p *Peer) clearJoiningIfKnown() {
 	if !p.joining.Load() {
 		return
 	}
 	leaderID := p.r.leaderID
-	if leaderID != noLeader && p.membership.isMember(leaderID) {
+	if (leaderID != noLeader && p.membership.isMember(leaderID)) ||
+		p.membership.isMember(p.replicaID) {
 		p.setJoining(false)
 	}
 }

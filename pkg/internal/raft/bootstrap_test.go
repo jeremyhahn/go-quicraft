@@ -256,3 +256,47 @@ func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
 		t.Fatal("IsMember still authorizes an unknown replica after the bypass ended")
 	}
 }
+
+// TestJoiningClearsOnRestartReplayWithoutLeader is the residual-fix regression:
+// on the RESTART path, replayConfigChangesTo (SetProcessedIndex) runs BEFORE the
+// first Tick, so leaderID is noLeader and the leader-based clear cannot fire. A
+// replica restarted with join=true whose durable log already holds the full
+// membership must still clear the bypass — via the "self is a member" signal —
+// rather than keep per-shard authorization disabled until the next snapshot.
+func TestJoiningClearsOnRestartReplayWithoutLeader(t *testing.T) {
+	// Replica 4 comes up joining, with NO leader contact yet (leaderID == noLeader,
+	// the pre-first-Tick restart-replay state).
+	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
+	p.MarkJoining()
+	if p.r.leaderID != noLeader {
+		t.Fatalf("fixture: expected no leader, got %d", p.r.leaderID)
+	}
+
+	// Replay reconstructs the full committed membership from the durable log: the
+	// bootstrap founders {1,2,3} and this replica's own AddNode(4).
+	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+	})
+	if err != nil {
+		t.Fatalf("build bootstrap entry: %v", err)
+	}
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "d"}
+	ccBuf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(ccBuf); err != nil {
+		t.Fatalf("marshal AddNode: %v", err)
+	}
+	p.processConfigChanges([]proto.Entry{
+		bootstrap,
+		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: ccBuf},
+	})
+
+	if p.joining.Load() {
+		t.Fatal("a join=true replica that replayed its FULL membership on restart " +
+			"(with no leader yet) did not clear the auth bypass: IsMember stays disabled " +
+			"for the process until a snapshot or new config change — a lingering per-shard " +
+			"authorization bypass")
+	}
+	if p.IsMember(999) {
+		t.Fatal("IsMember still authorizes an unknown replica after restart-replay")
+	}
+}
