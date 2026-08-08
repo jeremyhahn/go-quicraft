@@ -104,7 +104,8 @@ func (e *Entry) UnmarshalFrom(buf []byte) (int, error) {
 	// Validate Entry.Type against known enum values (stripped of compression flag).
 	entryType := e.Type & EntryTypeMask
 	if entryType != EntryNormal && entryType != EntryConfigChange &&
-		entryType != EntryEncodedEntry && entryType != EntryMetadata {
+		entryType != EntryEncodedEntry && entryType != EntryMetadata &&
+		entryType != EntryInitialMembership {
 		return 0, ErrInvalidEntryType
 	}
 	if cmdLen > 0 {
@@ -118,6 +119,15 @@ func (e *Entry) UnmarshalFrom(buf []byte) (int, error) {
 // IsConfigChange returns true if this entry is a configuration change.
 func (e *Entry) IsConfigChange() bool {
 	return e.Type&EntryTypeMask == EntryConfigChange
+}
+
+// IsInitialMembership reports whether this entry is the bootstrap membership
+// entry a shard writes at index 1 on first start. Its Cmd is a marshaled
+// Membership carrying the full initial configuration (voters, observers,
+// witnesses, and the witness policy), so a replica reconstructs its membership
+// by replaying the committed log rather than from an out-of-band seed.
+func (e *Entry) IsInitialMembership() bool {
+	return e.Type&EntryTypeMask == EntryInitialMembership
 }
 
 // IsMetadataEntry returns true if this entry is a witness metadata entry.

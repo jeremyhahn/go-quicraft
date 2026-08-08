@@ -97,11 +97,13 @@ type Peer struct {
 	// GetUpdate returns it.
 	hasPendingSnapshot bool
 
-	// joining is true for nodes that were started with join=true. These
-	// nodes have incomplete membership until they receive a snapshot from
-	// the leader. Per-shard auth is bypassed while joining is true.
-	// Cleared when a snapshot is applied (handleSnapshot updates the
-	// membership to the full cluster state).
+	// joining is true for nodes that were started with join=true. These nodes
+	// have incomplete membership until they learn the configuration, so per-shard
+	// auth is bypassed while joining is true. Under config-in-log it is cleared
+	// deterministically by clearJoiningIfKnown the moment the node applies the
+	// bootstrap membership entry (replicated like any other entry) or any config
+	// change that names a member other than itself; a snapshot adopt also clears
+	// it, for the compacted case.
 	joining atomic.Bool
 }
 
@@ -227,46 +229,20 @@ func (p *Peer) replayConfigChangesTo(index uint64) {
 			break
 		}
 		for i := range entries {
-			if entries[i].Type&proto.EntryTypeMask != proto.EntryConfigChange {
-				continue
+			// applyMembershipEntry folds both the bootstrap EntryInitialMembership
+			// at index 1 (which is the first entry replayed, since the loop starts
+			// at firstIndex) and every incremental EntryConfigChange above it. It
+			// converges on the committed role and logs any deterministic refusal.
+			if p.applyMembershipEntry(entries[i]) {
+				changed = true
 			}
-			if len(entries[i].Cmd) == 0 {
-				continue
-			}
-			var cc proto.ConfigChange
-			if _, err := cc.UnmarshalFrom(entries[i].Cmd); err != nil {
-				slog.Warn("config change replay unmarshal failed",
-					"shard", p.shardID,
-					"replica", p.replicaID,
-					"entry_index", entries[i].Index,
-					"error", err,
-				)
-				continue
-			}
-			if err := p.membership.apply(cc, entries[i].Index); err != nil {
-				// A skip leaves this replica's membership disagreeing with the
-				// committed configuration, and nothing later repairs it, so it
-				// is NOT routinely benign. apply converges on the role every
-				// committed add names; what remains are the deterministic
-				// refusals (a Removed tombstone re-add, an add contradicting a
-				// role only a committed change could have set), which every
-				// replica evaluates identically. Logged so anything else is
-				// visible.
-				slog.Warn("config change replay skipped",
-					"shard", p.shardID,
-					"replica", p.replicaID,
-					"entry_index", entries[i].Index,
-					"error", err,
-				)
-				continue
-			}
-			changed = true
 		}
 		low = entries[len(entries)-1].Index + 1
 	}
 	if changed {
 		p.publishMembership()
 		p.syncRaftRemotes()
+		p.clearJoiningIfKnown()
 	}
 }
 
@@ -741,6 +717,74 @@ func (p *Peer) checkLeaderSelfRemoval() {
 	}
 }
 
+// applyMembershipEntry folds one committed entry into p.membership and reports
+// whether it changed the membership. It handles the two entry types that carry
+// configuration:
+//
+//   - EntryInitialMembership: the bootstrap entry at index 1. Its Cmd is the
+//     full initial Membership, adopted wholesale (like handleSnapshot). It is
+//     always the lowest committed index, so it is folded before any incremental
+//     change, and re-adopting it on replay is idempotent.
+//   - EntryConfigChange: an incremental add/remove/policy change.
+//
+// Any other entry type is ignored. A decode or apply error is logged and
+// treated as "no change": a committed entry is never re-delivered, so the caller
+// must not abort its scan on one. membership.apply CONVERGES on the role each
+// committed add names rather than refusing an entry whose target already exists,
+// so the only errors that reach here are the deterministic refusals every
+// replica evaluates identically (a Removed tombstone re-add, or an add
+// contradicting a role only a committed change could have set).
+func (p *Peer) applyMembershipEntry(e proto.Entry) bool {
+	switch e.Type & proto.EntryTypeMask {
+	case proto.EntryInitialMembership:
+		ms, err := initialMembershipFromEntry(e)
+		if err != nil {
+			slog.Error("initial membership entry unmarshal failed",
+				"shard_id", p.shardID,
+				"replica_id", p.replicaID,
+				"entry_index", e.Index,
+				"error", err,
+			)
+			return false
+		}
+		p.membership = newMembership(ms)
+		return true
+	case proto.EntryConfigChange:
+		if len(e.Cmd) == 0 {
+			return false
+		}
+		var cc proto.ConfigChange
+		if _, err := cc.UnmarshalFrom(e.Cmd); err != nil {
+			slog.Error("config change unmarshal failed",
+				"shard_id", p.shardID,
+				"replica_id", p.replicaID,
+				"entry_index", e.Index,
+				"entry_type", e.Type,
+				"error", err,
+			)
+			return false
+		}
+		if err := p.membership.apply(cc, e.Index); err != nil {
+			// The Host membership API pre-validates against current membership
+			// (ValidateConfigChange) before proposing, so a skip on the leader's
+			// own freshly proposed entry is unexpected and would mean the
+			// caller's RequestState hangs until deadline. Log at WARN so any
+			// skip is visible to operators rather than silently swallowed.
+			slog.Warn("config change apply skipped",
+				"shard_id", p.shardID,
+				"replica_id", p.replicaID,
+				"entry_index", e.Index,
+				"entry_type", e.Type,
+				"error", err,
+			)
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // processConfigChanges scans COMMITTED entries for config changes and
 // applies them to the peer's membership, publishing the updated snapshot
 // and syncing raft remote tracking. Called from Peer.Commit: membership
@@ -748,78 +792,19 @@ func (p *Peer) checkLeaderSelfRemoval() {
 func (p *Peer) processConfigChanges(entries []proto.Entry) {
 	needsSync := false
 	for i := range entries {
-		if entries[i].Type&proto.EntryTypeMask != proto.EntryConfigChange {
-			continue
+		if p.applyMembershipEntry(entries[i]) {
+			needsSync = true
 		}
-		if len(entries[i].Cmd) == 0 {
-			continue
-		}
-		var cc proto.ConfigChange
-		if _, err := cc.UnmarshalFrom(entries[i].Cmd); err != nil {
-			slog.Error("config change unmarshal failed",
-				"shard_id", p.shardID,
-				"replica_id", p.replicaID,
-				"entry_index", entries[i].Index,
-				"entry_type", entries[i].Type,
-				"error", err,
-			)
-			continue
-		}
-		if err := p.membership.apply(cc, entries[i].Index); err != nil {
-			// apply must NOT reject an already-committed change on grounds
-			// another replica could evaluate differently, or the two diverge
-			// permanently: nothing re-delivers a committed entry, so a skip is
-			// final. It therefore converges on the role each committed add
-			// names (including over a provisional bootstrap-map seed) and only
-			// the deterministic refusals reach here — a Removed tombstone
-			// re-add, or an add contradicting a role only a committed change
-			// could have set. The Host membership API also pre-validates
-			// against current membership (ValidateConfigChange) before
-			// proposing, so a skip on the leader's own freshly proposed entry
-			// is unexpected and would mean the caller's RequestState hangs
-			// until deadline. Log at WARN so any skip is visible to operators
-			// rather than silently swallowed.
-			slog.Warn("config change apply skipped",
-				"shard_id", p.shardID,
-				"replica_id", p.replicaID,
-				"entry_index", entries[i].Index,
-				"entry_type", entries[i].Type,
-				"error", err,
-			)
-			continue
-		}
-		needsSync = true
 	}
 	if needsSync {
 		// Publish immutable snapshot for concurrent readers.
 		p.publishMembership()
 		p.syncRaftRemotes()
-
-		// NOTE: do NOT clear p.joining here on config-change application.
-		// The initial cluster members are established via bootstrap confState,
-		// NOT as config-change entries in the log, so a joining node that has
-		// only applied its own AddNode entry has an INCOMPLETE membership
-		// (just itself). Clearing joining at that point would make the node
-		// start rejecting messages from the real members (including the
-		// leader) as unauthorized and would let it campaign with a one-member
-		// view — winning a higher term with a quorum of one and disrupting the
-		// cluster. The joining flag is cleared only when a snapshot delivers
-		// the full cluster membership (see the InstallSnapshot path in Handle)
-		// — the mechanism for conveying the bootstrapped confState (which is
-		// NOT in the log) to a new node.
-		//
-		// A node that instead catches up purely by log replay (leader never
-		// compacted, so no snapshot is sent) stays joining for the life of the
-		// process: SnapshotEntries defaults to 0, so that is the ORDINARY case,
-		// not an edge one. What that costs is exactly one thing — this replica
-		// never initiates an election. It still ticks its election clock, votes
-		// (PreVote and RequestVote alike), follows, and replicates, so the
-		// remaining voters can still elect a leader without it.
-		//
-		// The clock part is load-bearing and was the bug: Tick used to return
-		// before tickFunc while joining, which froze electionTick at 0 and made
-		// this replica deny every PreVote and silently drop every higher-term
-		// RequestVote for the life of the process. See Peer.Tick.
+		// A committed entry that gave this replica a membership beyond itself
+		// ends the joining window: it now knows every member and can enforce
+		// per-shard authorization. The bootstrap EntryInitialMembership is the
+		// ordinary carrier of that on the replicate path.
+		p.clearJoiningIfKnown()
 	}
 }
 
@@ -1239,6 +1224,34 @@ func (p *Peer) setJoining(joining bool) {
 	p.r.setJoining(joining)
 }
 
+// clearJoiningIfKnown ends the joining window once this replica has learned a
+// membership that names members other than itself.
+//
+// Under config-in-log the initial configuration is a committed log entry
+// (EntryInitialMembership at index 1), so a joiner learns the full membership by
+// ordinary replication of that entry — guaranteed, since the leader replicates
+// from the joiner's match point up — or by replaying it on restart. The window
+// therefore ends DETERMINISTICALLY at the index that entry occupies, rather than
+// waiting for a snapshot the leader may never send (the old permanent-bypass
+// bug). A snapshot still clears joining too (Handle's adopt branch), for the
+// compacted case.
+//
+// "Knows a member other than itself" is the exact end condition: the whole
+// reason IsMember bypasses authorization while joining is that a fresh joiner
+// knows no members and would reject the leader's own replication. The moment it
+// knows any other member it can authorize, so the bypass is retired. A
+// single-node bootstrap never sets joining, so this is only ever reached by a
+// replica added to an existing cluster, whose learned membership always names
+// the other members.
+func (p *Peer) clearJoiningIfKnown() {
+	if !p.joining.Load() {
+		return
+	}
+	if p.membership.hasMemberOtherThan(p.replicaID) {
+		p.setJoining(false)
+	}
+}
+
 // IsMember returns true if the given replicaID is a known member of
 // this shard in any active role (voter, observer, or witness). This is
 // used by the transport message handler to enforce per-shard message
@@ -1249,13 +1262,14 @@ func (p *Peer) setJoining(joining bool) {
 // pointer to an immutable membership snapshot, avoiding locks on the
 // hot recv path.
 func (p *Peer) IsMember(replicaID uint64) bool {
-	// A joining node starts with empty membership. After processing
-	// its own AddNode config change, it has only itself as a member.
-	// The initial cluster members were set via bootstrap confState
-	// (not config change entries), so the joining node's membership
-	// is incomplete until a snapshot delivers the full confState.
-	// Transport-level mTLS and deployment ID provide security during
-	// this bootstrapping window.
+	// A joining node starts with empty membership: it must accept the leader's
+	// first replication before it can learn who the members are, so while
+	// joining it authorizes every replica ID. Under config-in-log this window is
+	// BOUNDED and deterministic — the initial configuration is a committed log
+	// entry (EntryInitialMembership at index 1), which the leader replicates like
+	// any other entry, and clearJoiningIfKnown ends the window the moment this
+	// replica applies it (or any config change) and thus knows a member other
+	// than itself. Transport-level mTLS and the deployment ID gate the window.
 	if p.joining.Load() {
 		return true
 	}

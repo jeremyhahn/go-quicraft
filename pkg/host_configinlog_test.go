@@ -1,0 +1,137 @@
+// Copyright 2026 Jeremy Hahn
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package quicraft
+
+import (
+	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
+
+// TestConfigInLog_BootstrapWritesInitialMembershipEntry proves the founding
+// member lays its initial configuration down as a committed
+// EntryInitialMembership at index 1, so membership is a function of the durable
+// log rather than an out-of-band seed.
+func TestConfigInLog_BootstrapWritesInitialMembershipEntry(t *testing.T) {
+	const shardID, replicaID uint64 = 70, 1
+	db := memdb.New()
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:6001"}
+	create := func(_, _ uint64) interface{} { return &recordingMemSM{} }
+	if err := h.StartShard(members, false, create, testShardConfig(shardID, replicaID)); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	defer func() { _ = h.StopShard(shardID) }()
+
+	first, count, err := db.EntryRange(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("EntryRange: %v", err)
+	}
+	if first != 1 || count < 1 {
+		t.Fatalf("entry range = (first %d, count %d), want first 1 and at least one "+
+			"entry: the bootstrap entry was not persisted at index 1", first, count)
+	}
+
+	entries, _, err := db.IterateEntries(nil, 0, shardID, replicaID, 1, 2, 0)
+	if err != nil {
+		t.Fatalf("IterateEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("read %d entries at index 1, want 1", len(entries))
+	}
+	if entries[0].Type&proto.EntryTypeMask != proto.EntryInitialMembership {
+		t.Fatalf("index 1 entry type = %d, want EntryInitialMembership (%d)",
+			entries[0].Type&proto.EntryTypeMask, proto.EntryInitialMembership)
+	}
+	var ms proto.Membership
+	if _, err := ms.UnmarshalFrom(entries[0].Cmd); err != nil {
+		t.Fatalf("index 1 entry does not decode as a Membership: %v", err)
+	}
+	if ms.Addresses[1] != "127.0.0.1:6001" {
+		t.Fatalf("bootstrap entry membership = %v, want voter 1 at 127.0.0.1:6001",
+			ms.Addresses)
+	}
+}
+
+// TestConfigInLog_MembershipReconstructsFromLogOnRestart is the definitive
+// config-in-log property test: on restart, membership comes from the committed
+// LOG, not from the members map the caller passes to StartShard. It is proven by
+// restarting with a DELIBERATELY WRONG members map and asserting the recovered
+// membership matches the log, not the map.
+//
+// Before config-in-log, StartShard re-seeded membership from its members
+// argument on every start, so a caller that passed a different map on restart
+// would have silently changed the shard's membership. Now the map is ignored on
+// restart (nothingRecovered is false) and the index-1 entry is authoritative.
+func TestConfigInLog_MembershipReconstructsFromLogOnRestart(t *testing.T) {
+	const shardID, replicaID uint64 = 71, 1
+	const trueAddr = "127.0.0.1:6101"
+	db := memdb.New()
+
+	// First boot: bootstrap with the true single-voter configuration.
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+	create := func(_, _ uint64) interface{} { return &recordingMemSM{} }
+	if err := h.StartShard(map[uint64]string{1: trueAddr}, false, create,
+		testShardConfig(shardID, replicaID)); err != nil {
+		t.Fatalf("StartShard 1: %v", err)
+	}
+	waitForLeader(t, h, shardID)
+
+	// Unload the shard: the in-memory peer, its membership, and the engine node
+	// are all torn down, so the restart below must reconstruct membership from
+	// the durable log alone.
+	if err := h.StopShard(shardID); err != nil {
+		t.Fatalf("StopShard: %v", err)
+	}
+
+	// Restart on the SAME durable log, but hand StartShard a WRONG members map:
+	// a different address for voter 1 and a phantom voter 99. If membership were
+	// still seeded from this map, the recovered shard would contain voter 99 and
+	// the wrong address for 1.
+	wrongMap := map[uint64]string{1: "127.0.0.1:9999", 99: "127.0.0.1:6199"}
+	if err := h.StartShard(wrongMap, false, create, testShardConfig(shardID, replicaID)); err != nil {
+		t.Fatalf("StartShard 2 (restart): %v", err)
+	}
+	defer func() { _ = h.StopShard(shardID) }()
+
+	memb, err := h.GetShardMembership(shardID)
+	if err != nil {
+		t.Fatalf("GetShardMembership: %v", err)
+	}
+	if _, ok := memb.Nodes[99]; ok {
+		t.Fatal("recovered membership contains phantom voter 99 from the restart " +
+			"members map: membership is being re-seeded from local config instead of " +
+			"reconstructed from the committed log")
+	}
+	if got := memb.Nodes[1]; got != trueAddr {
+		t.Fatalf("recovered voter 1 address = %q, want %q (the LOG's value): the "+
+			"restart members map overrode the durable membership", got, trueAddr)
+	}
+	if len(memb.Nodes) != 1 {
+		t.Fatalf("recovered membership has %d voters, want 1: %v", len(memb.Nodes), memb.Nodes)
+	}
+}

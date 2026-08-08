@@ -2132,7 +2132,11 @@ func makeMetadataEntries(entries []proto.Entry) []proto.Entry {
 	}
 	meta := make([]proto.Entry, 0, len(entries))
 	for i := range entries {
-		if entries[i].IsConfigChange() {
+		if entries[i].IsConfigChange() || entries[i].IsInitialMembership() {
+			// Witnesses must apply membership changes to hold the correct
+			// configuration, and the bootstrap entry at index 1 is how a witness
+			// learns the initial configuration in the first place, so both are
+			// preserved with their Cmd intact rather than stripped to metadata.
 			meta = append(meta, entries[i])
 		} else {
 			meta = append(meta, proto.Entry{

@@ -288,7 +288,12 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 		// entries reach here. Forwarding config change Cmd to the user SM would
 		// cause it to decode the config change wire format as an application op
 		// and return an UnknownOpError.
-		if entry.IsConfigChange() {
+		//
+		// The bootstrap EntryInitialMembership at index 1 is skipped for the same
+		// reason: its Cmd is a marshaled Membership, not a user command, and the
+		// membership it carries is adopted in processConfigChanges before entries
+		// reach here.
+		if entry.IsConfigChange() || entry.IsInitialMembership() {
 			results[i] = sm.Result{}
 			continue
 		}

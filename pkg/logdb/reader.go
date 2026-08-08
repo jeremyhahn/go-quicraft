@@ -543,6 +543,51 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 	return nil
 }
 
+// PersistBootstrap durably writes a shard's initial log entries and hard state,
+// then registers them in the reader's in-memory tracking. It is called exactly
+// once, at first StartShard of a founding member, to lay down the
+// EntryInitialMembership entry at index 1 (config-in-log bootstrap) so that a
+// replica's membership is a function of its durable log rather than an
+// out-of-band seed.
+//
+// The durable write happens FIRST: if it fails, nothing is registered in memory,
+// so the reader never reports a range the LogDB does not hold. With a nil LogDB
+// (testing) only the in-memory registration runs, which Append already backs
+// with an entry cache.
+func (lr *LogReader) PersistBootstrap(entries []proto.Entry, state proto.State) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if lr.logdb != nil {
+		dbEntries := make([]Entry, len(entries))
+		for i := range entries {
+			dbEntries[i] = Entry{
+				Index:       entries[i].Index,
+				Term:        entries[i].Term,
+				Type:        entries[i].Type,
+				Key:         entries[i].Key,
+				ClientID:    entries[i].ClientID,
+				SeriesID:    entries[i].SeriesID,
+				RespondedTo: entries[i].RespondedTo,
+				Cmd:         entries[i].Cmd,
+			}
+		}
+		if err := lr.logdb.SaveState([]Update{{
+			ShardID:   lr.shardID,
+			ReplicaID: lr.replicaID,
+			State:     State{Term: state.Term, Vote: state.Vote, Commit: state.Commit},
+			Entries:   dbEntries,
+		}}); err != nil {
+			return err
+		}
+	}
+	if err := lr.Append(entries); err != nil {
+		return err
+	}
+	lr.SetState(state)
+	return nil
+}
+
 // NodeState returns the cached hard state and membership.
 func (lr *LogReader) NodeState() (proto.State, proto.Membership) {
 	lr.mu.RLock()

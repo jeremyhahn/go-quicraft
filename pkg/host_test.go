@@ -480,19 +480,22 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 // The function also syncs the Host's cached leader state.
 func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		engNode := h.engine.GetNode(shardID)
 		if engNode != nil && engNode.Peer() != nil && engNode.Peer().IsLeader() {
 			// Sync the host's cached leader state.
 			h.updateNodeLeader(shardID, engNode.Peer().LeaderID(), 0)
-			// The leader's no-op commits asynchronously on the
-			// persistence edge, and ReadIndex serves only after an entry
-			// from the current term is committed (PhD 6.4). Wait for the
-			// first apply so Sync* calls immediately after this helper
-			// don't race ErrReadIndexNotReady.
+			// The leader's no-op commits asynchronously on the persistence
+			// edge, and ReadIndex serves only after an entry from the CURRENT
+			// term is committed (PhD 6.4). Under config-in-log a founding
+			// leader's log is bootstrap@1 (term 1) then no-op@2 (current term),
+			// so waiting for the first apply (lastApplied>=1) is not enough —
+			// that is the bootstrap entry, whose term is not current, and
+			// ReadIndex would still be unready. Wait for lastApplied>=2 so the
+			// current-term no-op is applied before Sync* calls that follow.
 			if v, ok := h.nodes.Load(shardID); ok {
-				if ns, nsOK := v.(*nodeState); nsOK && ns.lastApplied.Load() == 0 {
+				if ns, nsOK := v.(*nodeState); nsOK && ns.lastApplied.Load() < 2 {
 					runtime.Gosched()
 					continue
 				}

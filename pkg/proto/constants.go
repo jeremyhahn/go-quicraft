@@ -107,10 +107,11 @@ const maxMembershipEntries = 10000
 //
 //	entryType := e.Type & EntryTypeMask
 const (
-	EntryNormal       uint64 = 0
-	EntryConfigChange uint64 = 1
-	EntryEncodedEntry uint64 = 2 // session-managed entry
-	EntryMetadata     uint64 = 3 // witness metadata entry (Index+Term only, no Cmd)
+	EntryNormal            uint64 = 0
+	EntryConfigChange      uint64 = 1
+	EntryEncodedEntry      uint64 = 2 // session-managed entry
+	EntryMetadata          uint64 = 3 // witness metadata entry (Index+Term only, no Cmd)
+	EntryInitialMembership uint64 = 4 // bootstrap membership (Cmd = marshaled proto.Membership)
 )
 
 // Compression constants. Compression is indicated by OR'ing the

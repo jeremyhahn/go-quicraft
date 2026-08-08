@@ -1242,10 +1242,12 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		return
 	}
 
-	// Detect membership changes outside the lock.
+	// Detect membership changes outside the lock. Both an incremental config
+	// change and the bootstrap membership entry update the routing table.
 	hasMembershipChange := false
 	for _, entry := range entries {
-		if entry.Type == proto.EntryConfigChange {
+		t := entry.Type & proto.EntryTypeMask
+		if t == proto.EntryConfigChange || t == proto.EntryInitialMembership {
 			hasMembershipChange = true
 			break
 		}
@@ -1319,45 +1321,92 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// then update the Host routing table (ns.nodes + registry) so that
 	// the transport can resolve the new/removed replica addresses.
 	if hasMembershipChange {
-		if el := c.h.cfg.EventListener; el != nil && el.OnMembershipChanged != nil {
-			el.OnMembershipChanged(config.EventShardInfo{
-				ShardID:   shardID,
-				ReplicaID: ns.replicaID,
-			})
+		c.applyMembershipRouting(ns, shardID, entries)
+	}
+}
+
+// applyMembershipRouting fires OnMembershipChanged and updates the host routing
+// table (ns.nodes + registry) from the committed membership entries in a batch,
+// so the transport can resolve new/removed replica addresses. It handles both
+// the bootstrap EntryInitialMembership and incremental config changes.
+func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint64, entries []proto.Entry) {
+	if el := c.h.cfg.EventListener; el != nil && el.OnMembershipChanged != nil {
+		el.OnMembershipChanged(config.EventShardInfo{
+			ShardID:   shardID,
+			ReplicaID: ns.replicaID,
+		})
+	}
+	for _, entry := range entries {
+		// The bootstrap membership entry carries the FULL initial configuration.
+		// Register every member's address so a replica that learned its
+		// membership from the LOG (a joiner given an empty members map) can route
+		// to the founding members — not only one that received the map at
+		// StartShard. Registration is idempotent, so a founding member that
+		// already registered via effectiveNodes is unaffected.
+		if entry.Type&proto.EntryTypeMask == proto.EntryInitialMembership {
+			c.registerBootstrapAddresses(ns, shardID, entry)
+			continue
 		}
-		for _, entry := range entries {
-			if entry.Type != proto.EntryConfigChange {
-				continue
-			}
-			var cc proto.ConfigChange
-			if _, err := cc.UnmarshalFrom(entry.Cmd); err != nil {
-				c.h.logger.Error("failed to unmarshal config change",
-					"shard", shardID,
-					"index", entry.Index,
-					"error", err,
-				)
-				continue
-			}
-			switch cc.Type {
-			case proto.AddNode, proto.AddNonVoting, proto.AddWitness:
-				ns.nodesMu.Lock()
-				ns.nodes[cc.ReplicaID] = cc.Address
-				ns.nodesMu.Unlock()
-				c.h.registry.Register(shardID, cc.ReplicaID, cc.Address)
-			case proto.RemoveNode:
-				ns.nodesMu.Lock()
-				delete(ns.nodes, cc.ReplicaID)
-				ns.nodesMu.Unlock()
-				c.h.registry.Remove(shardID, cc.ReplicaID)
-			}
-			ns.configChangeIndex.Store(entry.Index)
-			c.h.logger.Info("membership changed",
+		if entry.Type&proto.EntryTypeMask != proto.EntryConfigChange {
+			continue
+		}
+		var cc proto.ConfigChange
+		if _, err := cc.UnmarshalFrom(entry.Cmd); err != nil {
+			c.h.logger.Error("failed to unmarshal config change",
 				"shard", shardID,
-				"replica", ns.replicaID,
-				"type", proto.ConfigChangeTypeName(cc.Type),
-				"target", cc.ReplicaID,
-				"address", cc.Address,
+				"index", entry.Index,
+				"error", err,
 			)
+			continue
+		}
+		switch cc.Type {
+		case proto.AddNode, proto.AddNonVoting, proto.AddWitness:
+			ns.nodesMu.Lock()
+			ns.nodes[cc.ReplicaID] = cc.Address
+			ns.nodesMu.Unlock()
+			c.h.registry.Register(shardID, cc.ReplicaID, cc.Address)
+		case proto.RemoveNode:
+			ns.nodesMu.Lock()
+			delete(ns.nodes, cc.ReplicaID)
+			ns.nodesMu.Unlock()
+			c.h.registry.Remove(shardID, cc.ReplicaID)
+		}
+		ns.configChangeIndex.Store(entry.Index)
+		c.h.logger.Info("membership changed",
+			"shard", shardID,
+			"replica", ns.replicaID,
+			"type", proto.ConfigChangeTypeName(cc.Type),
+			"target", cc.ReplicaID,
+			"address", cc.Address,
+		)
+	}
+}
+
+// registerBootstrapAddresses registers every member address carried by a
+// committed EntryInitialMembership into the host's routing table (ns.nodes) and
+// the transport registry, so a replica that learned its configuration from the
+// log can resolve the founding members. Registration is idempotent.
+func (c *hostEngineCallback) registerBootstrapAddresses(ns *nodeState, shardID uint64, entry proto.Entry) {
+	var ms proto.Membership
+	if _, err := ms.UnmarshalFrom(entry.Cmd); err != nil {
+		c.h.logger.Error("failed to unmarshal bootstrap membership",
+			"shard", shardID,
+			"index", entry.Index,
+			"error", err,
+		)
+		return
+	}
+	groups := []map[uint64]string{ms.Addresses, ms.Observers, ms.Witnesses}
+	ns.nodesMu.Lock()
+	for _, group := range groups {
+		for id, addr := range group {
+			ns.nodes[id] = addr
+		}
+	}
+	ns.nodesMu.Unlock()
+	for _, group := range groups {
+		for id, addr := range group {
+			c.h.registry.Register(shardID, id, addr)
 		}
 	}
 }
@@ -2611,11 +2660,30 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// witness policy to this node's local config — a restarted replica
 	// would then compute quorum over a smaller voting set than its peers
 	// and two leaders could be elected in the same term.
-	_, recovered := lr.NodeState()
+	recoveredState, recovered := lr.NodeState()
 	nothingRecovered := recovered.ConfigChangeID == 0 &&
 		len(recovered.Addresses) == 0 &&
 		len(recovered.Observers) == 0 &&
 		len(recovered.Witnesses) == 0
+
+	// Config-in-log recovery. A restart recovered committed log entries but no
+	// snapshot carried the membership (nothingRecovered is true because ReadState
+	// returns a membership only alongside a snapshot record). Reconstruct
+	// membership from the committed log so both the address routing below and the
+	// Raft peer come up with the DURABLE configuration, NOT a re-seed from the
+	// caller's members map — the property that makes membership a function of the
+	// log across restarts. A genuine first start (no persisted entries) skips
+	// this and falls through to the bootstrap seed.
+	if hasPersistedState && nothingRecovered {
+		reconstructed, ok, rErr := h.reconstructShardMembership(lr, recoveredState.Commit)
+		if rErr != nil {
+			return &HostInitError{Field: "membership_reconstruct", Err: rErr}
+		}
+		if ok {
+			lr.SetMembership(reconstructed)
+			nothingRecovered = false
+		}
+	}
 
 	// A witness or an observer must never be seeded through the members map —
 	// but ONLY when this call is actually BOOTSTRAPPING the shard.
@@ -2705,11 +2773,40 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// (snapshot + log) and changes only via UpdateWitnessPolicy config
 		// changes, so every replica enforces the same policy regardless of
 		// local configuration.
-		lr.SetMembership(proto.Membership{
+		initialMembership := proto.Membership{
 			Addresses:                  nodesCopy,
 			MaxWitnesses:               uint64(max(0, cfg.Witness.MaxWitnesses)),
 			RequireFullReplicaMajority: cfg.Witness.GetRequireFullReplicaMajority(),
-		})
+		}
+		// In-memory seed so the peer has membership available immediately at
+		// creation — before the first apply cycle reconstructs it from the log —
+		// for the initial election's quorum calculation.
+		lr.SetMembership(initialMembership)
+
+		// Config-in-log bootstrap: a FOUNDING member (join=false) lays the
+		// initial configuration down as a committed EntryInitialMembership at
+		// index 1, so membership becomes a function of the durable log. On
+		// restart it is reconstructed by replaying that entry (no more re-seeding
+		// from local config), and a later joiner learns it by ordinary
+		// replication of the same entry, ending the joining window
+		// deterministically instead of waiting for a snapshot.
+		//
+		// Every founding member builds a BYTE-IDENTICAL entry from the same
+		// members map (Membership marshals with sorted keys), which is what makes
+		// it safe to commit at index 1 on each independently — the etcd bootstrap
+		// model. A join=true replica must NOT write its own index-1 entry: it
+		// would conflict with the authoritative one the leader replicates. It
+		// keeps only the in-memory seed and adopts the cluster's entry on arrival.
+		if firstStart && !join {
+			entry, err := raft.BuildInitialMembershipEntry(initialMembership)
+			if err != nil {
+				return &HostInitError{Field: "bootstrap_membership", Err: err}
+			}
+			if err := lr.PersistBootstrap([]proto.Entry{entry},
+				proto.State{Term: entry.Term, Commit: entry.Index}); err != nil {
+				return &HostInitError{Field: "bootstrap_persist", Err: err}
+			}
+		}
 	}
 
 	// Address routing must follow the EFFECTIVE membership, not the
@@ -7335,6 +7432,74 @@ func buildTransportConfig(hc config.HostConfig) transport.Config {
 	}
 	cfg.SetDefaults()
 	return cfg
+}
+
+// maxMembershipReconstructBytes bounds each chunk read during config-in-log
+// membership reconstruction, so a committed log holding large data entries
+// between config changes is not pulled into memory whole. limitEntrySize returns
+// at least one entry per read and the loop advances by the last index seen, so
+// the bound cannot stall progress.
+const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
+
+// reconstructShardMembership rebuilds a shard's membership from its committed
+// log for a restart whose membership was not carried by a snapshot
+// (config-in-log). It scans the committed prefix [firstIndex, commit] in bounded
+// chunks, collects the bootstrap and config-change entries, and folds them.
+//
+// It returns ok=true ONLY when the committed prefix contains the bootstrap
+// EntryInitialMembership — the authoritative base that names the initial voters.
+// A log holding config changes but NO bootstrap entry (a shard bootstrapped the
+// legacy out-of-band way, whose initial voters live only in the caller's members
+// map) would reconstruct to a membership MISSING those voters, so it returns
+// ok=false and the caller falls back to the bootstrap seed plus the ordinary
+// commit-time config-change repair. That keeps both log shapes correct and
+// guarantees reconstruction never drops the initial voting set.
+//
+// Collected entries are deep-copied because GetRange reuses its return buffer
+// across calls.
+func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (proto.Membership, bool, error) {
+	first, _ := lr.IndexRange()
+	if first == 0 || commit < first {
+		return proto.Membership{}, false, nil
+	}
+	var collected []proto.Entry
+	foundBootstrap := false
+	const chunk uint64 = 1024
+	for low := first; low <= commit; {
+		high := low + chunk
+		if high > commit+1 {
+			high = commit + 1
+		}
+		entries, err := lr.GetRange(low, high, maxMembershipReconstructBytes)
+		if err != nil || len(entries) == 0 {
+			// Compacted, unreadable, or exhausted: a genuine compaction floor is
+			// always accompanied by a snapshot whose membership the caller uses
+			// instead, so reconstructing only the readable suffix is correct.
+			break
+		}
+		for i := range entries {
+			t := entries[i].Type & proto.EntryTypeMask
+			if t != proto.EntryInitialMembership && t != proto.EntryConfigChange {
+				continue
+			}
+			if t == proto.EntryInitialMembership {
+				foundBootstrap = true
+			}
+			e := entries[i]
+			e.Cmd = append([]byte(nil), entries[i].Cmd...)
+			collected = append(collected, e)
+		}
+		low = entries[len(entries)-1].Index + 1
+	}
+	if !foundBootstrap {
+		// No authoritative base in the log: defer to the seed + repair path.
+		return proto.Membership{}, false, nil
+	}
+	ms, err := raft.ReconstructMembership(collected)
+	if err != nil {
+		return proto.Membership{}, false, err
+	}
+	return ms, true, nil
 }
 
 // recoverLogReader initializes a LogReader from persisted LogDB state on
