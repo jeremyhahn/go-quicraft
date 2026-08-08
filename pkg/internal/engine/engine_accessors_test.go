@@ -15,6 +15,11 @@
 package engine
 
 import (
+	"bytes"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -66,7 +71,11 @@ func TestEngine_SetShardBarriers_RoutesPerShard(t *testing.T) {
 
 	// Default (resolver never installed): every shard uses the process-wide
 	// barrier, byte-for-byte the single-barrier behavior.
-	if got := e.SnapshotPool().barrierForShard(42); got != SnapshotBarrier(global) {
+	got, err := e.SnapshotPool().barrierForShard(42)
+	if err != nil {
+		t.Fatalf("barrierForShard(42) before SetShardBarriers: %v", err)
+	}
+	if got != SnapshotBarrier(global) {
 		t.Fatalf("barrierForShard(42) = %v before SetShardBarriers, want the process-wide barrier", got)
 	}
 
@@ -78,12 +87,129 @@ func TestEngine_SetShardBarriers_RoutesPerShard(t *testing.T) {
 		return nil
 	})
 
-	if got := e.SnapshotPool().barrierForShard(1); got != SnapshotBarrier(tenant) {
+	got, err = e.SnapshotPool().barrierForShard(1)
+	if err != nil {
+		t.Fatalf("barrierForShard(1): %v", err)
+	}
+	if got != SnapshotBarrier(tenant) {
 		t.Fatalf("barrierForShard(1) = %v, want the tenant barrier", got)
 	}
-	if got := e.SnapshotPool().barrierForShard(2); got != SnapshotBarrier(global) {
+	got, err = e.SnapshotPool().barrierForShard(2)
+	if err != nil {
+		t.Fatalf("barrierForShard(2): %v", err)
+	}
+	if got != SnapshotBarrier(global) {
 		t.Fatalf("barrierForShard(2) = %v, want fallback to the process-wide barrier", got)
 	}
+}
+
+// TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed pins the fail-closed
+// half of the resolver contract: with per-shard barriers configured and NO
+// process-wide barrier, a shard the resolver does not know is refused rather
+// than written in plaintext.
+//
+// The asymmetry this removes is the whole point. A SEALED barrier already fails
+// closed on every path; an ABSENT one used to fail OPEN, so the one tenant whose
+// shard the resolver missed — an async-provisioned tenant, a remapped shard ID,
+// any map miss — was the only shard on the host written in cleartext, while
+// every other tenant's snapshot directory still showed encryption working.
+func TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed(t *testing.T) {
+	cfg := newTestHostConfig()
+	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+
+	tenant := newTestBarrier(3)
+	e.SetShardBarriers(func(shardID uint64) SnapshotBarrier {
+		if shardID == 1 {
+			return tenant
+		}
+		return nil
+	})
+
+	got, err := e.SnapshotPool().barrierForShard(1)
+	if err != nil {
+		t.Fatalf("barrierForShard(1): %v", err)
+	}
+	if got != SnapshotBarrier(tenant) {
+		t.Fatalf("barrierForShard(1) = %v, want the tenant barrier", got)
+	}
+
+	got, err = e.SnapshotPool().barrierForShard(2)
+	if !errors.Is(err, ErrShardBarrierUnresolved) {
+		t.Fatalf("barrierForShard(2) = (%v, %v), want ErrShardBarrierUnresolved: "+
+			"an unresolved shard with no process-wide barrier must not be written in plaintext",
+			got, err)
+	}
+	if got != nil {
+		t.Fatalf("barrierForShard(2) returned barrier %v alongside its error; "+
+			"a caller that ignores the error must not receive a usable-looking nil-safe value", got)
+	}
+}
+
+// TestSaveSnapshot_UnresolvedShardBarrierWritesNothing asserts the CONSEQUENCE
+// of the refusal above: no snapshot directory, no artifact, and no LogDB record
+// are produced for a shard whose barrier does not resolve.
+func TestSaveSnapshot_UnresolvedShardBarrierWritesNothing(t *testing.T) {
+	base := t.TempDir()
+	stopC := make(chan struct{})
+	ldb := newTestLogDB()
+	pool := newSnapshotPool(1, ldb, nil, nil, NewWorkSignal(1), stopC, nil)
+	pool.shardBarriers = func(uint64) SnapshotBarrier { return nil }
+
+	cfg := config.Config{ShardID: 9, ReplicaID: 1}
+	cfg.SetDefaults()
+	// The state machine holds a recognisable secret, so a leaked artifact is
+	// identifiable as such rather than merely present.
+	secret := []byte("PLAINTEXT-USER-COMMAND-9")
+	node := NewNode(nil, nil, nil, cfg, 100, &largeSaveSnapshotter{data: secret}, base, nil)
+
+	_, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   9,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	})
+	if !errors.Is(err, ErrShardBarrierUnresolved) {
+		t.Fatalf("saveSnapshot with an unresolved shard barrier = %v, want ErrShardBarrierUnresolved", err)
+	}
+
+	// The consequence: nothing on disk. A refusal that still wrote the artifact
+	// would leave exactly the plaintext state machine it exists to prevent.
+	if found := grepTreeForBytes(t, base, secret); found != "" {
+		t.Fatalf("refused save wrote the plaintext state machine to %s", found)
+	}
+	shardBase := snapshotBaseDir(base, 9, 1)
+	if entries, readErr := os.ReadDir(shardBase); readErr == nil && len(entries) > 0 {
+		t.Fatalf("refused save left %d entries under %s; want none", len(entries), shardBase)
+	}
+	if snap, snapErr := ldb.GetSnapshot(9, 1); snapErr == nil && snap.Index != 0 {
+		t.Fatalf("refused save recorded a LogDB snapshot at index %d", snap.Index)
+	}
+}
+
+// grepTreeForBytes returns the path of the first file under root whose contents
+// contain want, or "" when no file does. It is how the barrier tests assert the
+// CONSEQUENCE — bytes on disk — rather than merely that a call returned an
+// error.
+func grepTreeForBytes(t *testing.T, root string, want []byte) string {
+	t.Helper()
+	var hit string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || hit != "" {
+			return nil //nolint:nilerr // an unreadable entry cannot hold the secret in readable form
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		if bytes.Contains(data, want) {
+			hit = path
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return hit
 }
 
 // TestNode_SnapshotSaveDir_MatchesPoolLayout pins the shared path construction.

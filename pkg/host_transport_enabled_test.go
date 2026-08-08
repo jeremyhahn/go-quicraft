@@ -139,10 +139,18 @@ func TestNewHost_TransportEnabledWithShardBarriers(t *testing.T) {
 
 	// barrierForShard is the host-side view of the same routing the engine
 	// and transport resolvers use.
-	if got := h.barrierForShard(1); got != Barrier(shardBarrier) {
+	got, err := h.barrierForShard(1)
+	if err != nil {
+		t.Fatalf("barrierForShard(1): %v", err)
+	}
+	if got != Barrier(shardBarrier) {
 		t.Fatal("shard 1 did not resolve to its per-shard barrier")
 	}
-	if got := h.barrierForShard(2); got != Barrier(hostBarrier) {
+	got, err = h.barrierForShard(2)
+	if err != nil {
+		t.Fatalf("barrierForShard(2): %v", err)
+	}
+	if got != Barrier(hostBarrier) {
 		t.Fatal("an unmapped shard did not fall back to the host-wide barrier")
 	}
 

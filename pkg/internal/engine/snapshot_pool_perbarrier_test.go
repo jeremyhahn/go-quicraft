@@ -601,8 +601,14 @@ func TestSnapshotPool_SingleBarrier_BackwardCompatUnchanged(t *testing.T) {
 	writeShardSnapshot(t, baseDir, 2, 1, 100, 5)
 
 	// barrierForShard returns the process-wide barrier for ALL shards.
-	if p.barrierForShard(1) != SnapshotBarrier(barrier) || p.barrierForShard(99) != SnapshotBarrier(barrier) {
-		t.Fatal("barrierForShard must return the process-wide barrier when shardBarriers is nil")
+	for _, shardID := range []uint64{1, 99} {
+		got, err := p.barrierForShard(shardID)
+		if err != nil {
+			t.Fatalf("barrierForShard(%d): %v", shardID, err)
+		}
+		if got != SnapshotBarrier(barrier) {
+			t.Fatalf("barrierForShard(%d) must return the process-wide barrier when shardBarriers is nil", shardID)
+		}
 	}
 
 	// Global floor = min(snapshot 3, snapshot 5, WAL 4) = 3 — exactly as before.

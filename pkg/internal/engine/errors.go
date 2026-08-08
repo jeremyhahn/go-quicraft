@@ -76,6 +76,19 @@ var (
 	ErrSnapshotBarrierSealed = errors.New(
 		"quicraft: snapshot encryption unavailable: barrier is sealed")
 
+	// ErrShardBarrierUnresolved is returned when per-shard barriers are
+	// configured, the resolver returns nil for a shard, and there is no
+	// process-wide barrier to fall back to. Writing the shard's snapshot in
+	// plaintext would downgrade exactly one tenant in a deployment that asked
+	// for per-shard encryption, so the operation fails closed instead.
+	//
+	// Declared here, like the other snapshot barrier sentinels, so the engine
+	// save/recover paths and the quicraft host paths fail with the SAME error
+	// identity; the quicraft package re-exports it, hence the public prefix.
+	ErrShardBarrierUnresolved = errors.New(
+		"quicraft: per-shard barriers resolved no barrier for this shard and no " +
+			"host-wide barrier is configured; refusing to write it in plaintext")
+
 	// ErrUnsupportedSnapshotCompression is returned when a snapshot record
 	// declares a compression algorithm this binary cannot decompress. The
 	// artifact is unreadable, so recovery fails instead of feeding the state

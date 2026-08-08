@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"io/fs"
@@ -539,6 +540,35 @@ func (c *crashFS) exists(path string) bool {
 	defer c.mu.Unlock()
 	_, ok := c.lookupLocked(filepath.Clean(path))
 	return ok
+}
+
+// findLiveBytes returns the path of the first file in the LIVE image whose
+// contents contain want, or "" when no file does. It is what lets a test assert
+// the CONSEQUENCE of an at-rest encryption rule — that a given plaintext is
+// nowhere on disk — instead of only that a call returned an error.
+//
+// It scans the live image, not the durable one: a plaintext file that exists
+// live but has not been fsynced is still readable by anyone with the disk while
+// the process runs, and is exactly what a kill (as opposed to a power loss)
+// leaves behind.
+func (c *crashFS) findLiveBytes(want []byte) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	paths := make([]string, 0, len(c.nodes))
+	for p := range c.nodes {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		n := c.nodes[p]
+		if n.dir {
+			continue
+		}
+		if bytes.Contains(n.live, want) {
+			return p
+		}
+	}
+	return ""
 }
 
 // entries lists the live names directly under dir.

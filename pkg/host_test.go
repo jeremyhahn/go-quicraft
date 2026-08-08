@@ -79,6 +79,14 @@ func newMockLogDB() *mockLogDB {
 
 func (m *mockLogDB) Name() string { return "mock" }
 
+// AtRestProtection declares what this test double actually is: a set of maps in
+// process memory that never touch a file. The host requires the declaration —
+// a LogDB that says nothing is treated as writing plaintext to disk — so this
+// fixture must make the same statement memdb does, not be exempted from it.
+func (m *mockLogDB) AtRestProtection() logdb.AtRestProtection {
+	return logdb.AtRestNonDurable
+}
+
 func (m *mockLogDB) SaveState(updates []logdb.Update) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

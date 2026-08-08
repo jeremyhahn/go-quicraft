@@ -47,6 +47,23 @@ func (b *tenantBarrier) setSealed(v bool) {
 	b.mu.Unlock()
 }
 
+// setTestShardBarrier points the pool at a per-shard barrier resolver, but
+// ONLY for a barrier that exists.
+//
+// A resolver that returns nil is NOT the same deployment as no resolver at
+// all: with per-shard barriers configured and no process-wide fallback, an
+// unresolved shard fails closed (ErrShardBarrierUnresolved) rather than being
+// written in plaintext beside encrypted tenants. These fixtures model the
+// plaintext deployment — no resolver, no barrier — so installing a
+// nil-returning resolver would make them assert the unresolved-shard error
+// instead of whatever the test is actually about.
+func setTestShardBarrier(p *snapshotPool, barrier SnapshotBarrier) {
+	if barrier == nil {
+		return
+	}
+	p.shardBarriers = func(uint64) SnapshotBarrier { return barrier }
+}
+
 // saveEncryptedTestSnapshot saves one snapshot for shard/replica under the
 // given barrier and returns the pool that wrote it, so a later pool can be
 // pointed at a different (or absent) barrier for the recovery half.
@@ -56,7 +73,7 @@ func saveEncryptedTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLo
 	stopC := make(chan struct{})
 	defer close(stopC)
 	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-	p.shardBarriers = func(uint64) SnapshotBarrier { return barrier }
+	setTestShardBarrier(p, barrier)
 	var wg sync.WaitGroup
 	p.start(&wg)
 
@@ -91,7 +108,7 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 	stopC := make(chan struct{})
 	defer close(stopC)
 	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-	p.shardBarriers = func(uint64) SnapshotBarrier { return barrier }
+	setTestShardBarrier(p, barrier)
 	var wg sync.WaitGroup
 	p.start(&wg)
 

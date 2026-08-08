@@ -489,19 +489,26 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		}
 	}
 
-	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
-	// unavailable for this shard, not that the shard is plaintext. Refuse
-	// before any directory, data file or LogDB record exists: the wire bytes
-	// are plaintext (the sender decrypts before streaming), so persisting them
-	// while sealed would durably downgrade the snapshot to plaintext at rest.
-	// reencryptReceivedSnapshot re-checks below and covers a seal that lands
-	// mid-receive. A shard with NO barrier is unaffected.
-	if h.host.snapshotEncryptionSealed(shardID) {
+	// Resolve the receiver's at-rest barrier BEFORE any directory, data file or
+	// LogDB record exists. The wire bytes are plaintext (the sender decrypts
+	// before streaming), so every way of not having a usable barrier persists
+	// them as a plaintext state machine at rest:
+	//
+	//   - CONFIGURED but SEALED: encryption is temporarily unavailable for this
+	//     shard, NOT a plaintext deployment.
+	//   - CONFIGURED per-shard but UNRESOLVED with no host-wide fallback: this
+	//     tenant alone would be downgraded, invisibly.
+	//
+	// A shard with NO barrier configured at all is unaffected: it resolves to
+	// (nil, nil) and stays plaintext as configured. reencryptReceivedSnapshot
+	// re-checks the seal below and covers one that lands mid-receive.
+	recvBarrier, barrierErr := h.host.snapshotBarrierForShard(shardID)
+	if barrierErr != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
 			Op:        "reencrypt",
-			Err:       ErrSnapshotBarrierSealed,
+			Err:       barrierErr,
 		}
 	}
 
@@ -560,7 +567,38 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		}
 	}()
 
-	// Write the reassembled snapshot data to disk.
+	// Classify the artifact from the reassembled PLAINTEXT bytes, before a
+	// single byte is written. The compression is a property of what the LEADER
+	// wrote — the wire carries no compression field, and the receiver's own
+	// SnapshotCompressionType describes nothing about it — so recovery must take
+	// it from the artifact. Reading it out of the chunks rather than back off
+	// the file is what lets the write below be encrypted from the start.
+	recvCompression := classifySnapshotCompression(snapshotChunkPrefix(ordered))
+
+	// Write the reassembled snapshot data, ENCRYPTED UNDER THE RECEIVER'S OWN
+	// BARRIER AS IT IS WRITTEN.
+	//
+	// The sender decrypts before streaming (doSendSnapshot sets Epoch=0), so the
+	// bytes in hand are plaintext and this is what closes the follower-side
+	// at-rest gap — with no shared cross-node key, since the receiver records
+	// and later recovers under its own epoch.
+	//
+	// It encrypts INLINE, straight from the in-memory chunks, rather than
+	// writing the plaintext to snapshot.dat and re-encrypting it afterwards.
+	// The chunks are already fully reassembled in memory (the transport's
+	// receive budget bounds them), so streaming them through the barrier costs
+	// nothing and removes the window the two-step form could not close: a
+	// process killed between the plaintext fsync and the re-encryption left a
+	// COMPLETE PLAINTEXT STATE MACHINE durably under the canonical
+	// snapshot-<index> name. The deferred RemoveAll below covers error returns,
+	// not a kill, and snapshot GC only reclaims a directory once
+	// maxSnapshotsRetained NEWER snapshots exist — on a follower that catches up
+	// once and never snapshots again, never.
+	//
+	// A nil barrier is the configured plaintext deployment and is copied
+	// through unchanged (recvEpoch stays 0). A barrier sealed between the
+	// resolution above and here fails inside EncryptWithEpoch, so the failure
+	// still arrives with no plaintext artifact in existence.
 	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
 	f, err := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -572,22 +610,49 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		}
 	}
 
-	for i := range ordered {
-		if len(ordered[i].Data) > 0 {
-			if _, writeErr := f.Write(ordered[i].Data); writeErr != nil {
-				if closeErr := f.Close(); closeErr != nil {
-					slog.Debug("snapshot file close failed after write error",
-						"shard", shardID,
-						"replica", replicaID,
-						"error", closeErr)
-				}
-				return &SnapshotReceiveError{
-					ShardID:   shardID,
-					ReplicaID: replicaID,
-					Op:        "write",
-					Err:       writeErr,
-				}
-			}
+	var recvEpoch uint64
+	var writeErr error
+	plain := &snapshotChunkReader{chunks: ordered}
+	if recvBarrier != nil {
+		// Pin the at-rest epoch across the write, the metadata file and the
+		// LogDB record — the whole window in which this artifact's epoch is
+		// durable but INVISIBLE to the purge-floor scan, which reads it out of
+		// snapshot.meta.
+		//
+		// The transport pins hdr.Epoch on the way in, but that protects nothing
+		// here: on the receive path hdr.Epoch is ALWAYS 0 because the sender
+		// decrypts before streaming. The epoch this node actually seals under is
+		// chosen right here, and a Rotate plus a concurrent purgeOldEpochs in
+		// this window would drop its DEK while SaveSnapshot goes on to record
+		// Epoch: E — durably naming ciphertext nothing can ever open.
+		//
+		// Pinning starts BEFORE the write (mirroring saveSnapshot) so the
+		// current epoch cannot be purged between the read and the first frame,
+		// and the epoch actually recorded is pinned as well: a rotation landing
+		// mid-write seals later frames at a higher epoch than the pre-read.
+		inFlightEpoch := recvBarrier.CurrentEpoch()
+		recvBarrier.RegisterInFlightEpoch(inFlightEpoch)
+		defer recvBarrier.DeregisterInFlightEpoch(inFlightEpoch)
+		recvEpoch, writeErr = encryptSnapshotFrames(recvBarrier, plain, f)
+		if recvEpoch != 0 && recvEpoch != inFlightEpoch {
+			recvBarrier.RegisterInFlightEpoch(recvEpoch)
+			defer recvBarrier.DeregisterInFlightEpoch(recvEpoch)
+		}
+	} else {
+		_, writeErr = io.Copy(f, plain)
+	}
+	if writeErr != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Debug("snapshot file close failed after write error",
+				"shard", shardID,
+				"replica", replicaID,
+				"error", closeErr)
+		}
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "write",
+			Err:       writeErr,
 		}
 	}
 
@@ -610,38 +675,6 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 			"shard", shardID,
 			"replica", replicaID,
 			"error", closeErr)
-	}
-
-	// Re-encrypt the received snapshot under THIS node's own barrier so it is
-	// encrypted at rest with the RECEIVER's per-node key. The sender decrypts an
-	// encrypted snapshot to plaintext before streaming (doSendSnapshot sets
-	// Epoch=0), so the bytes just written are plaintext; re-encrypting here closes
-	// the follower-side at-rest gap WITHOUT any shared cross-node key — the
-	// receiver records and later recovers under its own epoch. A nil/sealed
-	// barrier is a no-op (snapshot stays plaintext, recvEpoch=0).
-	// Classify the artifact BEFORE re-encryption, while the file still holds
-	// the plaintext the leader streamed. The compression is a property of
-	// those bytes — the wire carries no compression field, and the receiver's
-	// own SnapshotCompressionType describes nothing about what the leader
-	// wrote — so recovery must read it from the artifact itself.
-	recvCompression, detectErr := detectSnapshotCompression(fsys, dataPath)
-	if detectErr != nil {
-		return &SnapshotReceiveError{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Op:        "classify",
-			Err:       detectErr,
-		}
-	}
-
-	recvEpoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, h.host.barrierForShard(shardID))
-	if encErr != nil {
-		return &SnapshotReceiveError{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Op:        "reencrypt",
-			Err:       encErr,
-		}
 	}
 
 	// Measure the artifact AFTER re-encryption: FileSize must always mean
@@ -957,40 +990,87 @@ var snappyStreamIdentifier = [snappyStreamIdentifierSize]byte{
 // block: a 4-byte chunk header plus the 6-byte "sNaPpY" payload.
 const snappyStreamIdentifierSize = 4 + 6
 
-// detectSnapshotCompression classifies a received snapshot artifact by its
-// leading bytes.
+// classifySnapshotCompression classifies a snapshot artifact from its leading
+// bytes.
 //
 // The snapshot wire protocol carries no compression field, and the receiver's
 // own Config.SnapshotCompressionType says nothing about how the LEADER wrote
-// the bytes it just streamed. The artifact itself is therefore the only
-// available source, and the Snappy stream identifier is a required, fixed
-// prefix of every non-empty Snappy stream — an artifact carrying it can only
-// be read through a Snappy reader, and one without it can only be read raw.
+// the bytes it just streamed, so the artifact itself is the only available
+// source. The Snappy stream identifier is a required, fixed prefix of every
+// non-empty Snappy stream: bytes carrying it can only be read through a Snappy
+// reader, and bytes without it only raw.
 //
-// An empty artifact classifies as NoCompression: both reader chains yield EOF
-// on zero bytes, so the choice is immaterial.
-func detectSnapshotCompression(fsys snapshotFS, path string) (config.CompressionType, error) {
-	f, err := fsys.Open(path)
-	if err != nil {
-		return config.NoCompression, err
+// It takes the reassembled chunks in MEMORY rather than a path because the
+// artifact the receive path writes is encrypted from its first byte -- there is
+// no plaintext file left on disk to read the identifier back out of.
+//
+// head may be shorter than the identifier (a small or empty artifact); a prefix
+// that cannot contain the identifier is NoCompression, which is also the right
+// answer for an empty artifact since both reader chains yield EOF on zero bytes.
+func classifySnapshotCompression(head []byte) config.CompressionType {
+	if len(head) >= snappyStreamIdentifierSize &&
+		bytes.Equal(head[:snappyStreamIdentifierSize], snappyStreamIdentifier[:]) {
+		return config.Snappy
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot classification file close failed",
-				"path", path,
-				"error", closeErr)
-		}
-	}()
+	return config.NoCompression
+}
 
-	var head [snappyStreamIdentifierSize]byte
-	n, err := io.ReadFull(f, head[:])
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return config.NoCompression, err
+// snapshotChunkPrefix returns the first snappyStreamIdentifierSize bytes of the
+// reassembled snapshot, gathered across chunk boundaries. The identifier is 10
+// bytes and a chunk is megabytes, so the loop virtually always ends in the
+// first chunk — but a sender is free to split anywhere, and a classifier that
+// only looked at chunks[0] would silently misclassify a Snappy artifact whose
+// first chunk is shorter than the identifier.
+func snapshotChunkPrefix(chunks []*proto.SnapshotChunk) []byte {
+	head := make([]byte, 0, snappyStreamIdentifierSize)
+	for i := range chunks {
+		need := snappyStreamIdentifierSize - len(head)
+		if need <= 0 {
+			break
+		}
+		data := chunks[i].Data
+		if len(data) > need {
+			data = data[:need]
+		}
+		head = append(head, data...)
 	}
-	if n == len(head) && bytes.Equal(head[:], snappyStreamIdentifier[:]) {
-		return config.Snappy, nil
+	return head
+}
+
+// snapshotChunkReader streams the payloads of reassembled snapshot chunks as a
+// single io.Reader, without concatenating them into a second full-size buffer.
+// It is what lets the receive path encrypt straight from the chunks it already
+// holds instead of writing a plaintext artifact and re-encrypting it.
+type snapshotChunkReader struct {
+	chunks []*proto.SnapshotChunk
+	chunk  int // index of the chunk being read
+	off    int // read offset within that chunk
+}
+
+// Read fills p from the remaining chunk payloads, returning io.EOF once every
+// chunk is exhausted. Empty chunks are skipped rather than reported as a
+// zero-byte read, since a zero-byte read with a nil error stalls callers that
+// treat it as no-progress.
+func (r *snapshotChunkReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
 	}
-	return config.NoCompression, nil
+	n := 0
+	for n < len(p) && r.chunk < len(r.chunks) {
+		data := r.chunks[r.chunk].Data
+		if r.off >= len(data) {
+			r.chunk++
+			r.off = 0
+			continue
+		}
+		copied := copy(p[n:], data[r.off:])
+		r.off += copied
+		n += copied
+	}
+	if n == 0 {
+		return 0, io.EOF
+	}
+	return n, nil
 }
 
 // writeReceivedSnapshotMetadata writes the metadata record beside a snapshot

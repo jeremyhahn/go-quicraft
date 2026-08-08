@@ -273,22 +273,23 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 // this at a regular interval (RTTMillisecond). The raft state machine
 // uses ticks to drive election timeouts (followers/candidates) and
 // heartbeat intervals (leaders).
+//
+// A joining node TICKS LIKE ANY OTHER REPLICA. It is kept passive by the
+// raft-layer joining gate (see the raft.joining field), which suppresses the
+// campaign itself in startElection and handleTimeoutNow — not by freezing the
+// clock here.
+//
+// Freezing the clock was the original suppression and it was an availability
+// bug. r.electionTick stayed at 0 while r.leaderID kept naming whichever leader
+// last contacted the node, so `leaderID != noLeader && electionTick <
+// electionTimeout` was permanently true: handleVoteRequest denied every
+// PreVote and dropHighTermVote discarded every higher-term RequestVote without
+// a response. Because the joining flag is cleared only by an InstallSnapshot,
+// a node that caught up by pure log replay (SnapshotEntries defaults to 0, so
+// the leader never compacts and never sends a snapshot) stayed in that state
+// for the life of the process — and a three-voter shard that lost its leader
+// could not elect a new one despite having a healthy quorum.
 func (p *Peer) Tick() {
-	// A joining node suppresses its own election timer until it receives
-	// a snapshot from the existing cluster's leader (at which point
-	// MarkJoining is cleared). Without this suppression, the joining node
-	// would start elections whose rejected responses carry the existing
-	// cluster's high term — causing the joining node to reject the
-	// leader's AppendEntries (lower term) and force a re-election that
-	// disrupts the running cluster.
-	//
-	// A joining node is passive: it waits for the leader to contact it
-	// after the AddNode config change is committed. Once the leader sends
-	// an AppendEntries, the node becomes a follower and replays the log.
-	if p.joining.Load() {
-		p.syncLeaderID()
-		return
-	}
 	p.r.tickFunc(p.r)
 	p.syncLeaderID()
 }
@@ -458,7 +459,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 			// Snapshot delivers the full cluster membership. A joining
 			// node now has complete membership knowledge and can enforce
 			// per-shard message authorization.
-			p.joining.Store(false)
+			p.setJoining(false)
 		}
 		if restored {
 			// Mark pending snapshot for HasUpdate fast-path so the
@@ -793,16 +794,25 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 		// only applied its own AddNode entry has an INCOMPLETE membership
 		// (just itself). Clearing joining at that point would make the node
 		// start rejecting messages from the real members (including the
-		// leader) as unauthorized and enable its election timer with a
-		// one-member view — causing it to campaign, win a higher term, and
-		// disrupt the cluster. The joining flag is cleared only when a
-		// snapshot delivers the full cluster membership (see the
-		// InstallSnapshot path in Handle) — the mechanism for conveying the
-		// bootstrapped confState (which is NOT in the log) to a new node. A
-		// node that instead catches up purely by log replay (leader never
-		// compacted, so no snapshot is sent) may remain joining until a later
-		// snapshot; that is harmless — while joining it still votes, follows,
-		// and replicates, it simply does not initiate elections.
+		// leader) as unauthorized and would let it campaign with a one-member
+		// view — winning a higher term with a quorum of one and disrupting the
+		// cluster. The joining flag is cleared only when a snapshot delivers
+		// the full cluster membership (see the InstallSnapshot path in Handle)
+		// — the mechanism for conveying the bootstrapped confState (which is
+		// NOT in the log) to a new node.
+		//
+		// A node that instead catches up purely by log replay (leader never
+		// compacted, so no snapshot is sent) stays joining for the life of the
+		// process: SnapshotEntries defaults to 0, so that is the ORDINARY case,
+		// not an edge one. What that costs is exactly one thing — this replica
+		// never initiates an election. It still ticks its election clock, votes
+		// (PreVote and RequestVote alike), follows, and replicates, so the
+		// remaining voters can still elect a leader without it.
+		//
+		// The clock part is load-bearing and was the bug: Tick used to return
+		// before tickFunc while joining, which froze electionTick at 0 and made
+		// this replica deny every PreVote and silently drop every higher-term
+		// RequestVote for the life of the process. See Peer.Tick.
 	}
 }
 
@@ -1198,8 +1208,28 @@ func (p *Peer) GetMembership() proto.Membership {
 // the full cluster membership via snapshot. Until the snapshot is
 // received, per-shard auth is bypassed. Transport-level mTLS and
 // deployment ID provide security during this bootstrapping window.
+// The raft state machine gets its own mirror of the flag: it owns the two
+// campaign entry points (startElection, handleTimeoutNow) and cannot see a
+// field on Peer. The mirror is written only here — before the shard's step
+// worker starts — and in Handle's snapshot-adopt branch, which runs on the step
+// worker, so it needs no synchronization of its own. Peer.joining stays atomic
+// because IsMember reads it from the transport recv goroutine.
 func (p *Peer) MarkJoining() {
-	p.joining.Store(true)
+	p.setJoining(true)
+}
+
+// setJoining writes BOTH copies of the joining flag: the atomic one on Peer
+// that IsMember reads from the transport recv goroutine, and the raft-layer
+// mirror that gates campaigning. It is the only writer of either, so the two
+// cannot drift apart — a divergence would leave a node that has learned the
+// full membership still refusing to campaign, permanently.
+//
+// The raft mirror needs no synchronization of its own: this is called from
+// MarkJoining (before the shard's step worker starts) and from Handle's
+// snapshot-adopt branch (on the step worker).
+func (p *Peer) setJoining(joining bool) {
+	p.joining.Store(joining)
+	p.r.setJoining(joining)
 }
 
 // IsMember returns true if the given replicaID is a known member of

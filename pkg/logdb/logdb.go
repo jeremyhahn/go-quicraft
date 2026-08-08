@@ -212,3 +212,66 @@ type BarrierShardEnumerator interface {
 	// encrypted under barrier, and whether that set is fully enumerable (known).
 	ShardsForBarrier(barrier any) (shards []uint64, known bool)
 }
+
+// AtRestProtection classifies what a LogDB guarantees about the records it
+// holds once they leave the process: whether a Raft log entry -- and therefore
+// the user command inside it -- can be read off the machine's storage.
+//
+// It exists because "does this LogDB implement the per-barrier interfaces" is
+// NOT the same question as "is this LogDB encrypted". waldb.DB implements
+// PerBarrierEpochAwareLogDB whether or not it was opened WithBarrier, so a type
+// assertion accepts a store that writes every command to disk in cleartext. The
+// three states below are the smallest set that separates the two facts a caller
+// must not conflate: reaching durable storage at all, and being sealed once
+// there.
+type AtRestProtection uint8
+
+const (
+	// AtRestUnprotected means records reach durable storage in cleartext, OR
+	// the implementation cannot prove they do not. It is the ZERO VALUE
+	// deliberately: an implementation that says nothing must be read as
+	// unprotected, never as safe.
+	AtRestUnprotected AtRestProtection = iota
+
+	// AtRestNonDurable means this LogDB writes NOTHING to durable storage --
+	// every record lives in process memory and is lost on exit. There is no
+	// at-rest artifact to encrypt, so the at-rest guarantee holds vacuously.
+	AtRestNonDurable
+
+	// AtRestBarrierEncrypted means every record this LogDB writes to durable
+	// storage is encrypted under an at-rest barrier. It says nothing about
+	// WHICH barrier; that question belongs to
+	// PerBarrierEpochAwareLogDB.MinLiveEpochForBarrier, which answers it by
+	// barrier identity.
+	AtRestBarrierEncrypted
+)
+
+// String renders the classification for structured logs and error messages.
+func (p AtRestProtection) String() string {
+	switch p {
+	case AtRestUnprotected:
+		return "unprotected"
+	case AtRestNonDurable:
+		return "non_durable"
+	case AtRestBarrierEncrypted:
+		return "barrier_encrypted"
+	default:
+		return "invalid"
+	}
+}
+
+// AtRestProtectedLogDB is an optional interface a LogDB implements to declare
+// how the records it holds are protected at rest. Hosts that require at-rest
+// encryption consult it before accepting a caller-supplied LogDB.
+//
+// The declaration is a CONTRACT ASSERTION, not a cryptographic proof: a host
+// cannot verify another package's storage layer, so the only thing it can do is
+// require the implementation to state the guarantee and refuse the ones that do
+// not. That is why the missing-implementation case and the zero value both mean
+// AtRestUnprotected -- the caller fails closed on silence.
+type AtRestProtectedLogDB interface {
+	// AtRestProtection reports this LogDB's at-rest guarantee. It must not
+	// depend on the records currently stored: an empty encrypted store still
+	// reports AtRestBarrierEncrypted.
+	AtRestProtection() AtRestProtection
+}

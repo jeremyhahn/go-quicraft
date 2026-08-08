@@ -33,8 +33,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// Compile-time interface assertion.
+// Compile-time interface assertions.
 var _ logdb.LogDB = (*MemDB)(nil)
+var _ logdb.AtRestProtectedLogDB = (*MemDB)(nil)
 
 // entryOverheadBytes is the fixed per-entry byte overhead charged against the
 // IterateEntries maxSize budget. It is pinned to logdb.EntryOverheadBytes so
@@ -85,6 +86,17 @@ func New() *MemDB {
 // Name returns the name of this LogDB implementation.
 func (m *MemDB) Name() string {
 	return "memory"
+}
+
+// AtRestProtection reports that this LogDB has no at-rest artifact at all.
+//
+// Every record lives in the nodes map and nothing is ever written to a file,
+// so there is no on-disk copy of a Raft log entry for an attacker with the
+// disk to read, and none survives the process. The at-rest guarantee therefore
+// holds VACUOUSLY -- which is a different fact from "encrypted", and is
+// reported as its own state so a caller cannot mistake one for the other.
+func (m *MemDB) AtRestProtection() logdb.AtRestProtection {
+	return logdb.AtRestNonDurable
 }
 
 // Close marks the database as closed. All subsequent operations return

@@ -298,6 +298,26 @@ type raft struct {
 	// no reads, until the two agree.
 	roleMismatch bool
 
+	// joining mirrors Peer.joining into the state machine. A replica started
+	// with join=true holds an INCOMPLETE membership — the existing cluster was
+	// bootstrapped through a confState that is not in the log, so this replica
+	// may know only itself — and a campaign run against that voting set wins
+	// with a quorum of one, in a term the real configuration is also electing
+	// in. It is therefore a campaign gate of exactly the same kind as
+	// selfRemoved and roleMismatch, consulted in the same two places
+	// (startElection and handleTimeoutNow), and set from the same authority
+	// that owns the membership.
+	//
+	// It gates CAMPAIGNING ONLY. The election clock keeps ticking (see
+	// Peer.Tick): freezing electionTick left leaderID permanently "active",
+	// which made handleVoteRequest deny every PreVote and dropHighTermVote
+	// discard every higher-term RequestVote, so a joining node that had caught
+	// up by pure log replay silently withheld its vote forever and could hold a
+	// healthy quorum leaderless.
+	//
+	// Cleared when a snapshot delivers the full cluster membership (Peer.Handle).
+	joining bool
+
 	// Lease-based read fields (PhD Section 6.4). When leaseRead is
 	// enabled, the leader can serve ReadIndex requests without a
 	// heartbeat round-trip if it has received acks from a quorum of
@@ -514,6 +534,27 @@ func (r *raft) checkSelfRole(inConfig, listedWitness bool) {
 	if r.state == leader {
 		r.becomeFollower(r.term, noLeader)
 	}
+}
+
+// setJoining records whether this replica is still joining the cluster with an
+// incomplete membership. See the joining field: it suppresses campaigning only,
+// never ticking or voting.
+func (r *raft) setJoining(joining bool) {
+	if r.joining == joining {
+		return
+	}
+	r.joining = joining
+	if joining {
+		slog.Info("replica is joining and will not campaign until it learns the full membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term)
+		return
+	}
+	slog.Info("replica learned the full membership and may campaign",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"term", r.term)
 }
 
 // membershipHasSelf reports whether replicaID appears anywhere in the
@@ -1298,6 +1339,33 @@ func (r *raft) startElection() {
 			"replica", r.replicaID,
 			"configured_witness", r.isWitness,
 			"term", r.term)
+		return
+	}
+	// A joining replica's membership is incomplete by construction: the
+	// existing cluster was bootstrapped through a confState that is not in the
+	// log, so this replica may hold only itself and would "win" with a quorum
+	// of one. Its election clock still runs (Peer.Tick) so that it keeps
+	// granting votes to the real members; only the campaign is suppressed.
+	//
+	// Reaching here means the election timeout expired: this replica has not
+	// heard from the leader for a full timeout. Forget it. A campaigning
+	// replica clears leaderID in becomePreCandidate/becomeCandidate; one that
+	// refuses to campaign must still stop asserting the leader is live, because
+	// tickFollower has ALREADY zeroed electionTick on the way in. Leaving
+	// leaderID set would keep `leaderID != noLeader && electionTick <
+	// electionTimeout` — the leader-lease test shared by handleVoteRequest and
+	// dropHighTermVote — true for all but the (randomizedElectionTimeout -
+	// electionTimeout) ticks at the top of each cycle, and permanently true
+	// whenever that draw happens to be zero. This replica would then deny most
+	// PreVotes and silently drop most higher-term RequestVotes, holding a shard
+	// with a healthy quorum leaderless.
+	if r.joining {
+		slog.Debug("election skipped: still joining with incomplete membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term,
+			"last_leader", r.leaderID)
+		r.leaderID = noLeader
 		return
 	}
 	// Refuse to start an election at all when this node's own last log term
@@ -3201,6 +3269,18 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 			"configured_witness", r.isWitness,
 			"term", r.term)
 		return ErrWitnessRoleMismatch
+	}
+	// A joining replica must not campaign even when told to; see the joining
+	// field. Peer.Handle refuses the wire TimeoutNow before it reaches step,
+	// but the gate belongs here too: this is the campaign entry point that
+	// bypasses startElection, and a locally injected TimeoutNow reaches it
+	// directly.
+	if r.joining {
+		slog.Warn("ignoring TimeoutNow: still joining with incomplete membership",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term)
+		return ErrJoiningNodeCannotCampaign
 	}
 	// A leader must never call becomeCandidate (invariant assertion).
 	// This can happen if a same-term TimeoutNow arrives at the leader

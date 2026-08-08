@@ -124,7 +124,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 	if err := fsys.MkdirAll(dstDir, 0o750); err != nil {
 		return 0, err
 	}
-	tmp, err := fsys.CreateTemp(dstDir, ".reencrypt-snapshot-*.tmp")
+	tmp, err := fsys.CreateTemp(dstDir, reencryptTempPattern)
 	if err != nil {
 		return 0, err
 	}

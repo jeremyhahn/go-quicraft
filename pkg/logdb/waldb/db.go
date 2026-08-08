@@ -3810,9 +3810,29 @@ func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err
 	return min, true, nil
 }
 
+// AtRestProtection reports whether this DB's on-disk records are encrypted.
+//
+// A waldb.DB writes every record it accepts to a WAL segment on disk, so the
+// answer is decided entirely by whether it was opened WithBarrier: with a
+// barrier every record is sealed before it reaches a segment
+// (AtRestBarrierEncrypted); without one every record -- and therefore every
+// user command inside every Raft log entry -- lands on disk in cleartext
+// (AtRestUnprotected).
+//
+// This is deliberately NOT answerable by a type assertion: *DB implements
+// PerBarrierEpochAwareLogDB in BOTH cases, so a caller that treats the
+// interface as evidence of encryption accepts the plaintext store.
+func (db *DB) AtRestProtection() logdb.AtRestProtection {
+	if db.barrier == nil {
+		return logdb.AtRestUnprotected
+	}
+	return logdb.AtRestBarrierEncrypted
+}
+
 // Compile-time interface checks.
 var _ logdb.EpochAwareLogDB = (*DB)(nil)
 var _ logdb.PerBarrierEpochAwareLogDB = (*DB)(nil)
+var _ logdb.AtRestProtectedLogDB = (*DB)(nil)
 
 // setStateSegment records segID as the segment holding the latest durable
 // State record for key. Last write wins. Caller must hold s.mu and

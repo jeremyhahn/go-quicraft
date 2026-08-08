@@ -195,54 +195,56 @@ func TestReencryptReceivedSnapshot_FailsClosedWhenSealed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// detectSnapshotCompression
+// classifySnapshotCompression
 // ---------------------------------------------------------------------------
 
-// TestDetectSnapshotCompression verifies that a received artifact is
+// TestClassifySnapshotCompression verifies that a received artifact is
 // classified by its own bytes: the wire protocol carries no compression field,
 // so misclassifying it would hand the state machine data in an encoding it
 // cannot read.
-func TestDetectSnapshotCompression(t *testing.T) {
-	dir := t.TempDir()
-
-	t.Run("snappy stream identifier", func(t *testing.T) {
-		path := filepath.Join(dir, "snappy.dat")
-		data := append(append([]byte{}, snappyStreamIdentifier[:]...), []byte("body")...)
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		got, err := detectSnapshotCompression(osSnapshotFS{}, path)
-		if err != nil {
-			t.Fatalf("detectSnapshotCompression: %v", err)
-		}
-		if got != config.Snappy {
-			t.Fatalf("compression = %v, want Snappy", got)
-		}
-	})
-
-	t.Run("raw artifact", func(t *testing.T) {
-		path := filepath.Join(dir, "raw.dat")
-		if err := os.WriteFile(path, []byte("plain snapshot bytes"), 0o600); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		got, err := detectSnapshotCompression(osSnapshotFS{}, path)
-		if err != nil {
-			t.Fatalf("detectSnapshotCompression: %v", err)
-		}
-		if got != config.NoCompression {
-			t.Fatalf("compression = %v, want NoCompression", got)
-		}
-	})
-
-	t.Run("missing artifact", func(t *testing.T) {
-		got, err := detectSnapshotCompression(osSnapshotFS{}, filepath.Join(dir, "absent.dat"))
-		if err == nil {
-			t.Fatal("detectSnapshotCompression accepted a missing artifact")
-		}
-		if got != config.NoCompression {
-			t.Fatalf("compression = %v, want NoCompression on error", got)
-		}
-	})
+//
+// It classifies the reassembled chunks in MEMORY rather than reading the file
+// back, because the artifact the receive path writes is encrypted from its
+// first byte — there is no plaintext file on disk to read the identifier out
+// of. Classifying AFTER the write is what forced the old two-step
+// plaintext-then-encrypt receive.
+func TestClassifySnapshotCompression(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		head []byte
+		want config.CompressionType
+	}{
+		{
+			name: "snappy stream identifier",
+			head: append(append([]byte{}, snappyStreamIdentifier[:]...), []byte("body")...),
+			want: config.Snappy,
+		},
+		{
+			name: "raw artifact",
+			head: []byte("plain snapshot bytes"),
+			want: config.NoCompression,
+		},
+		{
+			// Shorter than the identifier: cannot be a Snappy stream, and both
+			// reader chains yield EOF, so raw is the only safe answer.
+			name: "short prefix",
+			head: snappyStreamIdentifier[:3],
+			want: config.NoCompression,
+		},
+		{
+			name: "empty artifact",
+			head: nil,
+			want: config.NoCompression,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifySnapshotCompression(tc.head); got != tc.want {
+				t.Fatalf("classifySnapshotCompression(%q) = %v, want %v; the "+
+					"receiver would build the wrong reader chain and hand the "+
+					"state machine unreadable bytes", tc.head, got, tc.want)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

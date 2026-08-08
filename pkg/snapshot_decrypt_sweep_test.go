@@ -119,17 +119,27 @@ func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	}
 }
 
-// TestSendDecryptTempPatternIsSwept is the structural guard: whatever pattern
-// the send path decrypts into must be a pattern the sweeper matches. It fails
-// the moment someone introduces a new, unswept scratch-file name — which is how
-// the leak was introduced in the first place.
-func TestSendDecryptTempPatternIsSwept(t *testing.T) {
-	for _, pattern := range []string{sendDecryptTempPattern, recoverDecryptTempPattern} {
+// TestSnapshotScratchPatternsAreSwept is the structural guard: EVERY pattern a
+// snapshot path writes a scratch file under must be a pattern the sweeper
+// matches. It fails the moment someone introduces a new, unswept scratch-file
+// name — which is how the leak was introduced in the first place.
+//
+// The encrypt-side patterns are covered too. Their orphans hold ciphertext, so
+// the exposure is a disk leak rather than a confidentiality one, but the
+// invariant the sweeper rests on admits no exceptions: a name that can be
+// CREATED is by construction a name that can be RECLAIMED.
+func TestSnapshotScratchPatternsAreSwept(t *testing.T) {
+	for _, pattern := range []string{
+		sendDecryptTempPattern,
+		recoverDecryptTempPattern,
+		recvEncryptTempPattern,
+		reencryptTempPattern,
+	} {
 		// os.CreateTemp substitutes the random component for the last "*".
 		name := strings.Replace(pattern, "*", "123456789", 1)
-		if !engine.IsSnapshotDecryptTemp(name) {
-			t.Fatalf("decrypt scratch pattern %q produces %q, which the orphan "+
-				"sweeper does not match: a crash leaves plaintext on disk forever",
+		if !engine.IsSnapshotScratchTemp(name) {
+			t.Fatalf("snapshot scratch pattern %q produces %q, which the orphan "+
+				"sweeper does not match: a crash leaves it on disk forever",
 				pattern, name)
 		}
 	}

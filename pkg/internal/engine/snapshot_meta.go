@@ -16,6 +16,7 @@ package engine
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -334,24 +335,39 @@ func (s snapshotEpochStatus) String() string {
 //
 //   - (epoch, snapshotEpochKnown)  — the record was read and carries the field.
 //     epoch == 0 means the artifact is unencrypted and imposes no floor;
-//     epoch > 0 pins the floor at that epoch. A MISSING metadata file also
-//     reports (0, known): the snapshot was garbage-collected between directory
-//     enumeration and this read, so there is no artifact to protect.
+//     epoch > 0 pins the floor at that epoch. A missing metadata file reports
+//     (0, known) ONLY when the ARTIFACT is missing too (see below).
 //   - (0, snapshotEpochLegacy)     — a recognised pre-Epoch-field record. The
 //     epoch is unknown; the caller must fail safe.
-//   - (0, snapshotEpochUnknown)    — unreadable or corrupt. The epoch is
-//     unknown; the caller must fail safe.
+//   - (0, snapshotEpochUnknown)    — unreadable, corrupt, or absent beside an
+//     artifact that is still there. The epoch is unknown; the caller must fail
+//     safe.
 //
 // The two failing statuses have IDENTICAL consequences for purging and differ
 // only in what they tell an operator. Dropping either from the floor would
 // over-purge a DEK the artifact may still need.
+//
+// # Why a missing record is not by itself a "no floor" answer
+//
+// The GC race the missing-file case exists for is real — a directory can be
+// removed between enumeration and this read — but observing that the METADATA
+// is absent is strictly weaker than observing that the ARTIFACT is. Half-built
+// snapshot directories with snapshot.dat present and snapshot.meta not yet
+// written are producible by any crash between the two writes, on the receive
+// path and on the local save path alike, and such a directory holds ciphertext
+// at an epoch nobody can name. Answering "imposes no floor" for it is the exact
+// inversion purgeOldEpochs warns about: "cannot be evaluated" can only mean "do
+// not purge"; it can never mean "this directory imposes no floor".
+//
+// So the artifact is what decides. Absent artifact: the directory really is
+// gone or was reclaimed, and there is nothing to protect. Present artifact with
+// no record: unknown, fail safe.
 func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Snapshot GC'd between enumeration and read: benign, no floor.
-			return 0, snapshotEpochKnown
+			return missingMetaEpochStatus(dir)
 		}
 		// Real read error: epoch indeterminate, fail safe.
 		return 0, snapshotEpochUnknown
@@ -364,4 +380,29 @@ func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 		return 0, snapshotEpochLegacy
 	}
 	return meta.Epoch, snapshotEpochKnown
+}
+
+// missingMetaEpochStatus classifies a snapshot directory whose snapshot.meta
+// does not exist, by looking at whether the ARTIFACT it would describe is still
+// there.
+//
+// A stat error other than not-exist leaves the artifact's presence unknown,
+// which is the same operational state as an unreadable record: fail safe.
+func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
+	if _, err := os.Stat(filepath.Join(dir, snapshotDataFile)); err != nil {
+		if os.IsNotExist(err) {
+			// No record and no artifact: the snapshot was garbage-collected
+			// between directory enumeration and this read. Nothing to protect.
+			return 0, snapshotEpochKnown
+		}
+		return 0, snapshotEpochUnknown
+	}
+	// The artifact outlived its record — a crash between the two writes, or a
+	// partial removal. It may be ciphertext at any epoch and the file that
+	// would have said which is the one that is missing.
+	slog.Warn("snapshot: artifact present with no metadata record; "+
+		"treating its epoch as unknown so no DEK is purged",
+		"dir", dir,
+	)
+	return 0, snapshotEpochUnknown
 }

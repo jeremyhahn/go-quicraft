@@ -303,30 +303,155 @@ func (s *transportSender) barrierFor(shardID uint64) Barrier {
 	return s.barrier
 }
 
-// barrierForShard resolves the at-rest barrier for a shard on the receive path
-// (snapshot re-encryption), mirroring transportSender.barrierFor on the send
-// path: the per-shard barrier when WithShardBarriers is configured and returns
-// non-nil, otherwise the host-wide barrier (which may itself be nil = plaintext).
-// This is what lets a follower re-encrypt a received snapshot under the SAME
-// per-shard barrier it will later read it through, so per-node/per-shard keys
-// stay consistent across the receive→recover→read cycle.
-func (h *Host) barrierForShard(shardID uint64) Barrier {
-	if h.shardBarriers != nil {
-		if b := h.shardBarriers(shardID); b != nil {
-			return b
-		}
+// logDBAtRestProtection reports a LogDB's declared at-rest guarantee. A LogDB
+// that does not implement logdb.AtRestProtectedLogDB declares nothing, and a
+// nil LogDB is not a store at all; both read as UNPROTECTED so every caller
+// fails closed on silence.
+func logDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
+	p, ok := db.(logdb.AtRestProtectedLogDB)
+	if !ok {
+		return logdb.AtRestUnprotected
 	}
-	return h.barrier
+	return p.AtRestProtection()
 }
 
-// snapshotEncryptionSealed reports that the shard HAS an at-rest barrier and
-// that barrier is currently sealed, so no snapshot may be written for it.
-// It separates the two states a barrier can be absent in: a nil barrier is a
-// configured plaintext deployment, a sealed barrier is encryption that is
-// temporarily unavailable and must fail closed rather than downgrade.
-func (h *Host) snapshotEncryptionSealed(shardID uint64) bool {
-	b := h.barrierForShard(shardID)
-	return b != nil && b.IsSealed()
+// requireEncryptedLogDB refuses a LogDB whose Raft log would be readable off
+// the machine's storage. It backs ErrShardBarriersPlaintextWAL: with per-shard
+// barriers and no host-wide barrier, nothing else in the host encrypts the log.
+//
+// AtRestNonDurable is accepted for the reason it is a distinct state: an
+// in-memory LogDB writes no file, so there is no at-rest artifact to protect
+// and no crash-surviving copy of a user command. That is a property of the
+// STORE, not a property of the caller having passed WithLogDB.
+func requireEncryptedLogDB(db logdb.LogDB) error {
+	if db == nil {
+		// The default WAL is about to be created and no barrier was configured
+		// for it, so it would write plaintext segments.
+		return ErrShardBarriersPlaintextWAL
+	}
+	switch logDBAtRestProtection(db) {
+	case logdb.AtRestBarrierEncrypted, logdb.AtRestNonDurable:
+		return nil
+	default:
+		return ErrShardBarriersPlaintextWAL
+	}
+}
+
+// barrierForShard resolves the at-rest barrier for a shard, mirroring
+// transportSender.barrierFor on the send path: the per-shard barrier when
+// WithShardBarriers is configured and returns non-nil, otherwise the host-wide
+// barrier. This is what lets a follower re-encrypt a received snapshot under
+// the SAME per-shard barrier it will later read it through, so per-node/
+// per-shard keys stay consistent across the receive→recover→read cycle.
+//
+// It fails CLOSED with ErrShardBarrierUnresolved when WithShardBarriers is
+// configured, the resolver returns nil, and there is no host-wide barrier to
+// fall back on. That combination has no encrypting outcome: the caller asked
+// for per-shard encryption and this shard resolved to nothing, so writing it in
+// plaintext would downgrade exactly one tenant invisibly. Note the asymmetry
+// this removes -- a SEALED barrier already fails closed everywhere, while an
+// ABSENT one used to fail open.
+//
+// A nil return with a nil error is the legitimate unencrypted deployment:
+// WithShardBarriers was never configured and no host-wide barrier exists.
+func (h *Host) barrierForShard(shardID uint64) (Barrier, error) {
+	if h.shardBarriers == nil {
+		return h.barrier, nil
+	}
+	if b := h.shardBarriers(shardID); b != nil {
+		return b, nil
+	}
+	if h.barrier == nil {
+		return nil, ErrShardBarrierUnresolved
+	}
+	// Documented fallback: WithShardBarriers says a nil result uses the
+	// host-wide barrier, which still encrypts. Warn once per shard so an
+	// unintended resolver miss is observable rather than merely legal.
+	h.warnBarrierFallback(shardID)
+	return h.barrier, nil
+}
+
+// warnBarrierFallback logs the host-wide-barrier fallback once per shard. The
+// resolution runs on every snapshot save, recovery, send, receive and purge, so
+// an unconditional warning would bury the first (and only informative) one.
+func (h *Host) warnBarrierFallback(shardID uint64) {
+	if _, warned := h.barrierFallbackWarned.LoadOrStore(shardID, struct{}{}); warned {
+		return
+	}
+	h.logger.Warn("per-shard barrier resolver returned no barrier; "+
+		"falling back to the host-wide barrier",
+		"shard_id", shardID)
+}
+
+// verifyShardLogDBBarrier refuses to start a shard whose Raft log the supplied
+// LogDB does not store under the shard's OWN barrier.
+//
+// It closes the second half of the per-shard axis. requireEncryptedLogDB proves
+// the log is encrypted; it does not prove it is encrypted under the key this
+// shard resolved to. A waldb opened with tenant A's barrier and a resolver that
+// hands shard 7 tenant B's barrier is encrypted at rest AND stores tenant B's
+// commands under tenant A's key -- exactly the cross-tenant key mixing
+// WithShardBarriers exists to prevent.
+//
+// The check applies only when there is no host-wide barrier. With WithBarrier
+// the WAL is encrypted host-wide by design (documented, and warned about at
+// construction) and the per-shard barriers cover snapshots only, so demanding
+// per-shard WAL ownership would refuse a supported configuration.
+//
+// logdb.PerBarrierEpochAwareLogDB answers by barrier IDENTITY: known == true
+// means "my records for this barrier are these", which for waldb.DB is decided
+// by the barrier it was opened with. A LogDB that cannot answer cannot prove
+// isolation, so it is refused rather than trusted.
+func (h *Host) verifyShardLogDBBarrier(shardID uint64, barrier Barrier) error {
+	if h.shardBarriers == nil || h.barrier != nil || h.logdb == nil {
+		return nil
+	}
+	if logDBAtRestProtection(h.logdb) != logdb.AtRestBarrierEncrypted {
+		// AtRestNonDurable has no at-rest artifact to attribute to a barrier;
+		// AtRestUnprotected was already refused by NewHost.
+		return nil
+	}
+	perBarrier, ok := h.logdb.(logdb.PerBarrierEpochAwareLogDB)
+	if !ok {
+		h.logger.Error("refusing to start shard: the supplied LogDB cannot "+
+			"attribute its records to a barrier, so it cannot prove this shard's "+
+			"log is stored under this shard's own key",
+			"shard_id", shardID)
+		return ErrShardBarrierLogDBMismatch
+	}
+	_, known, err := perBarrier.MinLiveEpochForBarrier(barrier)
+	if err != nil {
+		return err
+	}
+	if !known {
+		h.logger.Error("refusing to start shard: the supplied LogDB does not "+
+			"store this shard's log under the barrier the resolver returned for "+
+			"it; the log would be encrypted under another tenant's key",
+			"shard_id", shardID)
+		return ErrShardBarrierLogDBMismatch
+	}
+	return nil
+}
+
+// snapshotBarrierForShard resolves the shard's at-rest barrier for a path that
+// is about to WRITE a snapshot artifact, collapsing the two ways encryption can
+// be unavailable into one error:
+//
+//   - ErrShardBarrierUnresolved  — per-shard encryption is configured and this
+//     shard resolved to nothing (see barrierForShard).
+//   - ErrSnapshotBarrierSealed   — the shard HAS a barrier and it is sealed, so
+//     encryption is temporarily unavailable.
+//
+// A nil barrier with a nil error is the configured plaintext deployment.
+func (h *Host) snapshotBarrierForShard(shardID uint64) (Barrier, error) {
+	b, err := h.barrierForShard(shardID)
+	if err != nil {
+		return nil, err
+	}
+	if b != nil && b.IsSealed() {
+		return nil, ErrSnapshotBarrierSealed
+	}
+	return b, nil
 }
 
 // Send delegates regular message delivery to the transport.
@@ -524,9 +649,19 @@ func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barr
 // send-path scratch file the sweeper did not match was a complete plaintext copy
 // of the state machine left beside the ciphertext for the life of the snapshot
 // directory.
+//
+// recvEncryptTempPattern and reencryptTempPattern name the ENCRYPT-side
+// scratch files (an in-place re-encryption of a received/imported artifact, and
+// a barrier-to-barrier migration). They come from the same constants for the
+// same structural reason. Their orphans hold CIPHERTEXT, so the exposure is a
+// disk leak rather than a confidentiality one — but the invariant the sweeper
+// rests on is that a name which can be CREATED is a name that can be RECLAIMED,
+// and a locally-spelled pattern is exactly how a name escapes it.
 const (
 	sendDecryptTempPattern    = engine.SendDecryptTempPattern
 	recoverDecryptTempPattern = engine.RecoverDecryptTempPattern
+	recvEncryptTempPattern    = engine.RecvEncryptTempPattern
+	reencryptTempPattern      = engine.ReencryptTempPattern
 )
 
 // shardSnapshotBaseDir returns the BASE snapshot directory for a shard — the
@@ -721,7 +856,7 @@ func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (u
 	}
 	defer func() { _ = src.Close() }()
 
-	tmp, err := fsys.CreateTemp(filepath.Dir(path), ".recv-encrypt-*.tmp")
+	tmp, err := fsys.CreateTemp(filepath.Dir(path), recvEncryptTempPattern)
 	if err != nil {
 		return 0, err
 	}
@@ -1826,33 +1961,37 @@ var _ engine.Callback = (*hostEngineCallback)(nil)
 // One Host per process. It manages shard lifecycle, proposal routing,
 // read operations, session management, and cluster membership.
 type Host struct {
-	cfg            config.HostConfig
-	logger         *slog.Logger
-	logdb          logdb.LogDB
-	barrier        Barrier
-	shardBarriers  func(shardID uint64) Barrier // per-shard at-rest barrier resolver; nil when WithShardBarriers unused
-	metrics        MetricsCollector
-	engine         *engine.Engine
-	registry       *registry.Registry
-	sender         engine.MessageSender
-	transport      *transport.QUICTransport // nil when transport is disabled
-	nodes          sync.Map                 // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
-	activeNodes    atomic.Int64             // tracks the number of loaded shards (replaces len(h.nodes))
-	closed         atomic.Bool
-	draining       atomic.Bool
-	diskFull       *atomic.Bool // set by disk full callback in buildWALOptions
-	id             string
-	stopOnce       sync.Once
-	proposalKeySeq atomic.Uint64 // monotonic key generator for proposal tracking
-	readKeySeq     atomic.Uint64 // monotonic key generator for read request tracking
-	snapshotKeySeq atomic.Uint64 // monotonic key generator for snapshot request tracking
-	pendingOps     atomic.Int64  // tracks outstanding pending operations for drain
-	keyRotStopC    chan struct{} // closed to stop the key rotation goroutine
-	keyRotDone     chan struct{} // closed when the key rotation goroutine exits
-	sweepStopC     chan struct{} // closed to stop the pending proposal sweeper goroutine
-	sweepDone      chan struct{} // closed when the sweeper goroutine exits
-	drainC         chan struct{} // closed when pendingOps reaches 0 during drain
-	drainCMu       sync.Mutex    // protects drainC creation
+	cfg           config.HostConfig
+	logger        *slog.Logger
+	logdb         logdb.LogDB
+	barrier       Barrier
+	shardBarriers func(shardID uint64) Barrier // per-shard at-rest barrier resolver; nil when WithShardBarriers unused
+	// barrierFallbackWarned records the shards already warned about falling
+	// back from an unresolved per-shard barrier to the host-wide one, so the
+	// warning fires once per shard instead of once per snapshot operation.
+	barrierFallbackWarned sync.Map // map[uint64]struct{}
+	metrics               MetricsCollector
+	engine                *engine.Engine
+	registry              *registry.Registry
+	sender                engine.MessageSender
+	transport             *transport.QUICTransport // nil when transport is disabled
+	nodes                 sync.Map                 // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
+	activeNodes           atomic.Int64             // tracks the number of loaded shards (replaces len(h.nodes))
+	closed                atomic.Bool
+	draining              atomic.Bool
+	diskFull              *atomic.Bool // set by disk full callback in buildWALOptions
+	id                    string
+	stopOnce              sync.Once
+	proposalKeySeq        atomic.Uint64 // monotonic key generator for proposal tracking
+	readKeySeq            atomic.Uint64 // monotonic key generator for read request tracking
+	snapshotKeySeq        atomic.Uint64 // monotonic key generator for snapshot request tracking
+	pendingOps            atomic.Int64  // tracks outstanding pending operations for drain
+	keyRotStopC           chan struct{} // closed to stop the key rotation goroutine
+	keyRotDone            chan struct{} // closed when the key rotation goroutine exits
+	sweepStopC            chan struct{} // closed to stop the pending proposal sweeper goroutine
+	sweepDone             chan struct{} // closed when the sweeper goroutine exits
+	drainC                chan struct{} // closed when pendingOps reaches 0 during drain
+	drainCMu              sync.Mutex    // protects drainC creation
 	// fsys routes snapshot persistence I/O. nil means the real filesystem;
 	// only tests set it (withSnapshotFS), so the injection never reaches the
 	// public API.
@@ -2011,18 +2150,27 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// the callback closure captures the same atomic as the Host struct.
 	var diskFullFlag atomic.Bool
 
+	// Per-shard barriers with no host-wide barrier require a Raft log that is
+	// already encrypted at rest. Without one, configuring per-shard encryption
+	// yields encrypted snapshots over a PLAINTEXT log -- every user command
+	// readable on disk, while the operator's spot-check of the snapshot
+	// directory says encryption is on. Refuse rather than silently downgrade.
+	//
+	// The predicate is what the LogDB IS, not whether one was supplied. The
+	// default WAL takes ONE barrier and none was configured, so it would be
+	// plaintext; a supplied LogDB must declare its at-rest guarantee. Deciding
+	// on "did you call WithLogDB" instead accepted an unencrypted
+	// waldb.Open(walDir) -- the exact state this refusal exists to prevent,
+	// reached by the one-line change an integrator makes to relocate the WAL.
+	if options.shardBarriers != nil && options.barrier == nil {
+		if err := requireEncryptedLogDB(options.logdb); err != nil {
+			return nil, err
+		}
+	}
+
 	// Create the default WAL-based LogDB when no LogDB was provided.
 	// This ensures all production hosts persist raft state to disk.
 	if options.logdb == nil {
-		// Per-shard barriers cannot reach the default WAL: waldb takes ONE
-		// barrier. Without a multiplexing LogDB, configuring per-shard
-		// encryption and nothing else yields encrypted snapshots over a
-		// PLAINTEXT log -- every user command readable on disk, while the
-		// operator's spot-check of the snapshot directory says encryption is
-		// on. Refuse rather than silently downgrade.
-		if options.shardBarriers != nil && options.barrier == nil {
-			return nil, ErrShardBarriersPlaintextWAL
-		}
 		walOpts := buildWALOptions(cfg, &diskFullFlag)
 		// Wire barrier encryption into the WAL when a barrier is configured.
 		if options.barrier != nil {
@@ -2384,6 +2532,29 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return err
 	}
 
+	// Resolve this shard's at-rest barrier before anything is written for it.
+	//
+	// Both failures below are invisible once the shard is running: the log and
+	// the snapshots keep being written, just not under the key the operator
+	// configured, and every observable signal (the snapshot directory, the
+	// absence of errors) says encryption is on. They are also decidable here,
+	// where the shardID that selects the barrier first exists, and nothing has
+	// been persisted yet.
+	//
+	//  1. The resolver returned no barrier and there is no host-wide fallback:
+	//     this tenant's shard would be written in plaintext alone.
+	//  2. The LogDB holds this shard's records under some OTHER barrier: the
+	//     shard is encrypted, under the wrong tenant's key.
+	if h.shardBarriers != nil {
+		shardBarrier, barrierErr := h.barrierForShard(cfg.ShardID)
+		if barrierErr != nil {
+			return barrierErr
+		}
+		if err := h.verifyShardLogDBBarrier(cfg.ShardID, shardBarrier); err != nil {
+			return err
+		}
+	}
+
 	// Early duplicate check. The authoritative check uses LoadOrStore
 	// below, but this catches the common case without doing expensive
 	// peer/SM initialization.
@@ -2731,7 +2902,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			// rather than recover a state machine from ciphertext.
 			recoverPath := dataPath
 			if ss.Epoch > 0 {
-				barrier := h.barrierForShard(cfg.ShardID)
+				barrier, barrierErr := h.barrierForShard(cfg.ShardID)
+				if barrierErr != nil {
+					return &HostInitError{Field: "snapshot_decrypt", Err: barrierErr}
+				}
 				if barrier == nil || barrier.IsSealed() {
 					return &HostInitError{
 						Field: "snapshot_decrypt",
@@ -4632,7 +4806,10 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	// snapshot was encrypted under the per-shard key, so the host-wide
 	// barrier is the wrong (or absent) key for it; barrierForShard mirrors
 	// the receive/recover paths.
-	barrier := h.barrierForShard(shardID)
+	barrier, barrierErr := h.barrierForShard(shardID)
+	if barrierErr != nil {
+		return barrierErr
+	}
 
 	// Refuse early if the snapshot is encrypted but cannot be decrypted, so
 	// we never emit a (partial) artifact header for an unrecoverable export.
@@ -4997,8 +5174,14 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// same role reencryptReceivedSnapshot plays for a network-received
 	// snapshot. A nil barrier is a no-op (snapshot stays plaintext, epoch 0);
 	// a barrier sealed after the precheck above fails closed here rather than
-	// leaving the plaintext artifact durably recorded.
-	epoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, h.barrierForShard(shardID))
+	// leaving the plaintext artifact durably recorded, as does a per-shard
+	// barrier that stopped resolving since the precheck.
+	importBarrier, barrierErr := h.barrierForShard(shardID)
+	if barrierErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return barrierErr
+	}
+	epoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, importBarrier)
 	if encErr != nil {
 		// Never recorded in LogDB, so the partial artifact must not be left
 		// behind for a later scan to trip over.
@@ -5193,8 +5376,12 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	// them), so persisting them while sealed would durably downgrade a shard
 	// whose data must be encrypted at rest. reencryptReceivedSnapshot in the
 	// caller re-checks and covers a seal that lands mid-import.
-	if h.snapshotEncryptionSealed(shardID) {
-		return 0, ErrSnapshotBarrierSealed
+	//
+	// An UNRESOLVED per-shard barrier fails here for the same reason: the
+	// artifact would be published in plaintext for a shard the deployment
+	// asked to encrypt.
+	if _, barrierErr := h.snapshotBarrierForShard(shardID); barrierErr != nil {
+		return 0, barrierErr
 	}
 	return replicaID, nil
 }

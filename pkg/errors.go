@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
@@ -59,9 +60,52 @@ var (
 	// encryption a cleartext command log whose spot-check looks correct.
 	// Supply WithLogDB with a multiplexing LogDB for genuine per-shard WAL
 	// keys, or WithBarrier to at least encrypt the WAL host-wide.
+	//
+	// The refusal is decided by what the LogDB IS, never by whether one was
+	// supplied. WithLogDB is not itself a mitigation: an unencrypted
+	// waldb.Open(dir) handed to WithLogDB produces byte-for-byte the state
+	// this sentinel exists to prevent. The LogDB must report
+	// logdb.AtRestBarrierEncrypted or logdb.AtRestNonDurable, and a LogDB that
+	// does not implement logdb.AtRestProtectedLogDB at all declares nothing and
+	// is therefore treated as unprotected.
 	ErrShardBarriersPlaintextWAL = errors.New(
-		"quicraft: WithShardBarriers requires WithLogDB (per-shard WAL keys) " +
-			"or WithBarrier (host-wide WAL key); the default WAL would store plaintext")
+		"quicraft: WithShardBarriers requires a LogDB that is encrypted at rest " +
+			"(logdb.AtRestProtectedLogDB reporting barrier_encrypted or non_durable) " +
+			"or WithBarrier (host-wide WAL key); this LogDB would store plaintext")
+
+	// ErrShardBarrierUnresolved is returned when WithShardBarriers is
+	// configured, the resolver returns nil for a shard, and there is no
+	// host-wide barrier to fall back to.
+	//
+	// A resolver typed func(shardID uint64) Barrier cannot distinguish "this
+	// shard is deliberately plaintext" from "I do not know this shard yet",
+	// which is the normal outcome of a map lookup for an async-provisioned
+	// tenant or a remapped shard ID. Reading that nil as "plaintext is fine"
+	// downgrades exactly one tenant while every other tenant's spot-check still
+	// shows encryption working, so the miss fails CLOSED instead.
+	//
+	// It is NOT returned when WithBarrier supplied a host-wide barrier: a nil
+	// resolver result then means the documented fallback to that barrier, which
+	// still encrypts.
+	//
+	// Re-exported from the engine so the host paths (receive, import, export,
+	// StartShard) and the engine paths (snapshot save, recover, DEK purge) fail
+	// with ONE error identity for one condition.
+	ErrShardBarrierUnresolved = engine.ErrShardBarrierUnresolved
+
+	// ErrShardBarrierLogDBMismatch is returned when a shard's resolved
+	// per-shard barrier is NOT the barrier the supplied LogDB stores that
+	// shard's records under.
+	//
+	// It closes the second half of the per-shard axis: a LogDB can be encrypted
+	// at rest (satisfying ErrShardBarriersPlaintextWAL) and still hold this
+	// shard's log under a DIFFERENT tenant's key, which is precisely the key
+	// isolation WithShardBarriers exists to provide. The LogDB answers by
+	// barrier identity through logdb.PerBarrierEpochAwareLogDB; a LogDB that
+	// cannot answer cannot prove isolation and is refused.
+	ErrShardBarrierLogDBMismatch = errors.New(
+		"quicraft: the supplied LogDB does not store this shard's records under " +
+			"the barrier WithShardBarriers resolved for it")
 
 	// ErrDropped is returned when a proposal is dropped by the engine
 	// due to queue overflow or shutdown in progress.

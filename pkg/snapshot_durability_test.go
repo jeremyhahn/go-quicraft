@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -304,7 +305,6 @@ func TestSnapshotReceive_CrashDuringReceiveLeavesNoPartialSnapshot(t *testing.T)
 	}{
 		{name: "during_data_write", op: opWrite, match: "snapshot.dat"},
 		{name: "before_data_fsync", op: opSync, match: "snapshot.dat"},
-		{name: "before_reencrypt_rename", op: opRename, match: "snapshot.dat"},
 		{name: "before_metadata_fsync", op: opSync, match: "snapshot.meta"},
 		{name: "before_directory_fsync", op: opDirSync, match: "snapshot-"},
 	} {
@@ -341,6 +341,141 @@ func TestSnapshotReceive_CrashDuringReceiveLeavesNoPartialSnapshot(t *testing.T)
 	}
 }
 
+// TestSnapshotReceive_NeverWritesPlaintextAtRest asserts the at-rest claim of
+// the receive path in the only terms that matter: for a shard with a barrier,
+// the reassembled state machine must never exist in cleartext in any file, at
+// any point of the receive, including every point a SIGKILL can land on.
+//
+// The receive path used to write the plaintext chunks into the canonical
+// snapshot-<index>/snapshot.dat, fsync them, and re-encrypt in place
+// afterwards. A kill between the fsync and the re-encryption left a COMPLETE
+// PLAINTEXT STATE MACHINE durably under the canonical name. The deferred
+// RemoveAll covers error returns, not a kill, and snapshot GC only reclaims a
+// directory once maxSnapshotsRetained NEWER snapshots exist — on a follower
+// that catches up once and never snapshots again, never.
+//
+// Two halves, both required. The success path proves the steady state; the
+// crash sweep proves there is no window, and it is the crash sweep that fails
+// against the two-step write.
+func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
+	// A payload no encryption of it can contain verbatim.
+	payload := bytes.Repeat([]byte("SECRET-USER-COMMAND-PLAINTEXT!!"), 300)
+
+	t.Run("success", func(t *testing.T) {
+		barrier := createTestBarrier(t)
+		f := newRecvFixture(t, barrier)
+		const index, term = uint64(1300), uint64(2)
+
+		if err := f.handler.HandleSnapshot(f.chunks(index, term, payload), authorizeAllSenders); err != nil {
+			t.Fatalf("HandleSnapshot: %v", err)
+		}
+		if hit := f.fs.findLiveBytes(payload); hit != "" {
+			t.Fatalf("the received state machine is on disk in PLAINTEXT at %s", hit)
+		}
+		// And the artifact really is the snapshot, encrypted — not merely absent.
+		stored, ok := f.fs.liveBytes(f.dataPath(index))
+		if !ok {
+			t.Fatalf("no artifact at %s after a successful receive", f.dataPath(index))
+		}
+		if got := plaintextOf(t, barrier, stored); !bytes.Equal(got, payload) {
+			t.Fatalf("artifact decrypts to %d bytes, want the %d-byte payload", len(got), len(payload))
+		}
+	})
+
+	// Every filesystem operation the receive performs is a point a SIGKILL can
+	// land on. Walk them all: at each one, the process stops dead with whatever
+	// is in the live image, and none of it may be the plaintext.
+	for _, stage := range []struct {
+		name  string
+		op    crashOp
+		match string
+	}{
+		{name: "kill_at_mkdir", op: opMkdirAll, match: "snapshot-"},
+		{name: "kill_at_create", op: opOpenFile, match: "snapshot.dat"},
+		{name: "kill_at_data_write", op: opWrite, match: "snapshot.dat"},
+		{name: "kill_at_data_fsync", op: opSync, match: "snapshot.dat"},
+		{name: "kill_at_metadata_write", op: opWrite, match: "snapshot.meta"},
+		{name: "kill_at_metadata_fsync", op: opSync, match: "snapshot.meta"},
+		{name: "kill_at_directory_fsync", op: opDirSync, match: "snapshot-"},
+	} {
+		t.Run(stage.name, func(t *testing.T) {
+			f := newRecvFixture(t, createTestBarrier(t))
+			const index, term = uint64(1301), uint64(2)
+			f.fs.crashOn(stage.op, stage.match)
+
+			// The receive fails; what it leaves behind is the point.
+			_ = f.handler.HandleSnapshot(f.chunks(index, term, payload), authorizeAllSenders)
+
+			if hit := f.fs.findLiveBytes(payload); hit != "" {
+				t.Fatalf("a kill at %s left the received state machine on disk in PLAINTEXT at %s",
+					stage.name, hit)
+			}
+		})
+	}
+}
+
+// TestSnapshotReceive_PinsInFlightEpoch is the M-3 regression test.
+//
+// The receive path chooses the at-rest epoch it seals under RIGHT HERE: the
+// sender decrypts before streaming (doSendSnapshot sets Epoch=0), so hdr.Epoch
+// is always 0 on this path and the transport's pin protects nothing. Without a
+// pin of its own, a Rotate plus a concurrent purgeOldEpochs landing between the
+// first frame and the LogDB record can retire the very epoch this artifact was
+// sealed under, leaving a record that names ciphertext nothing can ever open —
+// a follower permanently unable to recover, from a snapshot it acknowledged.
+//
+// Two properties, and the second is the one a naive pin misses: the epoch
+// actually RECORDED must be pinned, not merely the epoch read before the write.
+func TestSnapshotReceive_PinsInFlightEpoch(t *testing.T) {
+	inner := createTestBarrier(t)
+	pin := &pinRecordingBarrier{Barrier: inner}
+	f := newRecvFixture(t, pin)
+
+	const index, term = uint64(1400), uint64(3)
+	payload := bytes.Repeat([]byte("epoch-pinned-receive-payload"), 64)
+
+	if err := f.handler.HandleSnapshot(f.chunks(index, term, payload), authorizeAllSenders); err != nil {
+		t.Fatalf("HandleSnapshot: %v", err)
+	}
+
+	snap, err := f.ldb.GetSnapshot(f.shardID, f.replicaID)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.Epoch == 0 {
+		t.Fatal("the receive recorded Epoch 0 for a shard WITH a barrier: " +
+			"the artifact is plaintext at rest, so the pinning contract is not " +
+			"even reachable and this test would pass vacuously")
+	}
+
+	pin.mu.Lock()
+	registered := append([]uint64(nil), pin.registered...)
+	deregistered := append([]uint64(nil), pin.deregistered...)
+	pin.mu.Unlock()
+
+	if len(registered) == 0 {
+		t.Fatal("the receive path registered NO in-flight epoch: a Rotate plus a " +
+			"concurrent purgeOldEpochs during the receive can retire the epoch " +
+			"this snapshot was sealed under, and the LogDB record then names " +
+			"ciphertext that can never be decrypted")
+	}
+	if !slices.Contains(registered, snap.Epoch) {
+		t.Fatalf("recorded Epoch %d was never pinned (pinned: %v): the pin covers "+
+			"the epoch read BEFORE the write, but a rotation landing mid-write "+
+			"seals later frames at a higher epoch, and it is the RECORDED epoch "+
+			"that must survive the purge", snap.Epoch, registered)
+	}
+
+	// The pin must be released, or a long-lived follower leaks a floor that
+	// blocks every future DEK purge for this barrier.
+	for _, e := range registered {
+		if !slices.Contains(deregistered, e) {
+			t.Fatalf("epoch %d was pinned and never released (released: %v): the "+
+				"DEK purge floor stays held for the life of the process", e, deregistered)
+		}
+	}
+}
+
 // TestSnapshotReceive_FailurePropagation asserts that every persistence
 // failure on the receive path reaches the caller. A swallowed failure reported
 // as success is the worst outcome available here: the leader stops re-sending
@@ -358,8 +493,12 @@ func TestSnapshotReceive_FailurePropagation(t *testing.T) {
 		{name: "create_fails", op: opOpenFile, match: "snapshot.dat", wants: "create"},
 		{name: "write_fails", op: opWrite, match: "snapshot.dat", wants: "write"},
 		{name: "data_fsync_fails", op: opSync, match: "snapshot.dat", wants: "sync"},
-		{name: "reencrypt_rename_fails", op: opRename, match: "snapshot.dat", wants: "reencrypt"},
-		{name: "reencrypt_fsync_fails", op: opSync, match: ".recv-encrypt-", wants: "reencrypt"},
+		// The receive encrypts INLINE, so the artifact is written exactly once:
+		// there is no plaintext file to re-encrypt, no scratch sibling, and no
+		// rename. The failure modes the two-step write had (a failed re-encrypt
+		// rename, a failed scratch fsync) are covered by write_fails and
+		// data_fsync_fails above, which are now the encrypting write itself.
+		{name: "metadata_write_fails", op: opWrite, match: "snapshot.meta", wants: "metadata"},
 		{name: "metadata_fsync_fails", op: opSync, match: "snapshot.meta", wants: "metadata"},
 		{name: "directory_fsync_fails", op: opDirSync, match: "snapshot-", wants: "sync_dir"},
 	} {

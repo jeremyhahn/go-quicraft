@@ -412,7 +412,7 @@ func TestJoiningNodeElectionTimerIsSuppressed(t *testing.T) {
 	// Once the snapshot has delivered the full configuration and cleared the
 	// joining flag, the election timer must work again — otherwise the guard
 	// would be a permanent liveness hole rather than a join-window one.
-	p.joining.Store(false)
+	p.setJoining(false)
 	for i := 0; i < 20*int(cfg.ElectionRTT); i++ {
 		p.Tick()
 	}

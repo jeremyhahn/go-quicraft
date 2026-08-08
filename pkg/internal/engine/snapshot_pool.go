@@ -220,16 +220,30 @@ func newSnapshotPool(workers int, ldb logdb.LogDB, barrier SnapshotBarrier, call
 // snapshots and WAL records. When per-shard barriers are not configured
 // (shardBarriers == nil) it returns the single process-wide barrier, which
 // preserves the original single-barrier behavior exactly. When per-shard
-// barriers ARE configured but the mapping returns nil for this shard, the
-// shard falls back to the process-wide barrier so an unmapped shard is never
-// left unencrypted by accident.
-func (p *snapshotPool) barrierForShard(shardID uint64) SnapshotBarrier {
-	if p.shardBarriers != nil {
-		if b := p.shardBarriers(shardID); b != nil {
-			return b
-		}
+// barriers ARE configured and the mapping returns nil for this shard, the shard
+// falls back to the process-wide barrier — but ONLY when there is one.
+//
+// With no process-wide barrier the fallback has no encrypting outcome, so the
+// unmapped shard fails CLOSED with ErrShardBarrierUnresolved instead of being
+// written in plaintext. A resolver typed func(shardID) SnapshotBarrier cannot
+// say "this shard is deliberately plaintext" as distinct from "I do not know
+// this shard", and the natural map-lookup implementation returns nil for an
+// async-provisioned tenant or a remapped shard ID; reading that as plaintext
+// downgrades one tenant while every other tenant still looks encrypted.
+//
+// A nil barrier with a nil error remains the configured plaintext deployment:
+// no per-shard resolver and no process-wide barrier.
+func (p *snapshotPool) barrierForShard(shardID uint64) (SnapshotBarrier, error) {
+	if p.shardBarriers == nil {
+		return p.barrier, nil
 	}
-	return p.barrier
+	if b := p.shardBarriers(shardID); b != nil {
+		return b, nil
+	}
+	if p.barrier == nil {
+		return nil, ErrShardBarrierUnresolved
+	}
+	return p.barrier, nil
 }
 
 // start launches the pool's worker goroutines. Each goroutine is tracked
@@ -517,7 +531,18 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// so a host sealed during incident response cannot durably write its next
 	// snapshot as plaintext at rest. A nil barrier is the distinct
 	// "encryption disabled" state and proceeds unencrypted as configured.
-	barrier := p.barrierForShard(req.shardID)
+	//
+	// An UNRESOLVED per-shard barrier fails at the same point and for the same
+	// reason: the shard would be the only one written in plaintext.
+	barrier, barrierErr := p.barrierForShard(req.shardID)
+	if barrierErr != nil {
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       barrierErr,
+		}
+	}
 	if barrier != nil && barrier.IsSealed() {
 		return 0, &SnapshotError{
 			ShardID:   req.shardID,
@@ -1180,7 +1205,15 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// the raw ciphertext to RecoverFromSnapshot; the leader must re-send
 	// instead. Reachable whenever the barrier is sealed or torn down between
 	// the snapshot receive and the (asynchronous, retried) recovery.
-	barrier := p.barrierForShard(req.shardID)
+	barrier, barrierErr := p.barrierForShard(req.shardID)
+	if barrierErr != nil {
+		return &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       barrierErr,
+		}
+	}
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return &SnapshotError{
 			ShardID:   req.shardID,
@@ -1756,7 +1789,14 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 	// by shard ID so the completeness guard below can check membership.
 	loadedForTarget := make(map[uint64]*Node)
 	for _, node := range p.nodes() {
-		if p.barrierForShard(node.ShardID()) != target {
+		nodeBarrier, barrierErr := p.barrierForShard(node.ShardID())
+		if barrierErr != nil {
+			// A loaded shard whose barrier cannot be resolved may or may not
+			// belong to the target: it can neither be scanned nor excluded, so
+			// its retained epochs cannot be proven absent from this floor.
+			return 0, false
+		}
+		if nodeBarrier != target {
 			continue // belongs to a different barrier; do not let it lower/raise this floor
 		}
 		loadedForTarget[node.ShardID()] = node
@@ -1891,9 +1931,10 @@ func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
 		return
 	}
 
-	// Per-shard-barrier path: dispatch to the shard's own barrier.
-	barrier := p.barrierForShard(shardID)
-	if barrier == nil || barrier.IsSealed() {
+	// Per-shard-barrier path: dispatch to the shard's own barrier. An
+	// unresolved barrier has no keyring to purge from.
+	barrier, barrierErr := p.barrierForShard(shardID)
+	if barrierErr != nil || barrier == nil || barrier.IsSealed() {
 		return
 	}
 	purgeFloor, ok := p.perBarrierSafePurgeFloor(barrier)
@@ -1928,48 +1969,90 @@ func (p *snapshotPool) applyPurge(barrier SnapshotBarrier, purgeFloor, shardID, 
 	}
 }
 
-// Snapshot decrypt scratch-file naming. EVERY path that decrypts a snapshot
-// into a sibling scratch file must build its os.CreateTemp pattern from these
-// constants, because SweepStaleDecryptTmp is what reclaims such a file when the
-// process dies before its owner can remove it — and a scratch file the sweeper
-// does not match is a COMPLETE PLAINTEXT COPY of the state machine left next to
-// the ciphertext for the life of the snapshot directory.
+// Snapshot scratch-file naming. EVERY path that writes a sibling scratch file
+// into a snapshot directory must build its os.CreateTemp pattern from these
+// constants, because SweepStaleScratchTmp is what reclaims such a file when the
+// process dies before its owner can remove it.
 //
-// The prefixes differ only so an orphan names the path that created it; both are
-// swept. Adding a new decrypt path means adding its prefix to
-// IsSnapshotDecryptTemp, not inventing an unswept name.
+// The DECRYPT names carry the higher stake: an orphan under one of them is a
+// COMPLETE PLAINTEXT COPY of the state machine left next to the ciphertext for
+// the life of the snapshot directory. The ENCRYPT names hold ciphertext, so an
+// orphan is a disk leak rather than a confidentiality one — but it is the same
+// unswept-name class, and the invariant that makes the sweeper trustworthy is
+// that a name which can be CREATED is by construction a name that can be
+// RECLAIMED. Adding a path that writes a scratch file means adding its prefix
+// here and to IsSnapshotScratchTemp, not inventing an unswept name.
+//
+// The prefixes differ only so an orphan names the path that created it.
 const (
-	// DecryptTempSuffix terminates every decrypt scratch file name.
-	DecryptTempSuffix = ".tmp"
+	// ScratchTempSuffix terminates every snapshot scratch file name.
+	ScratchTempSuffix = ".tmp"
+
+	// DecryptTempSuffix is the historical name for ScratchTempSuffix, kept
+	// because the decrypt patterns below read more clearly with it.
+	DecryptTempSuffix = ScratchTempSuffix
 
 	// RecoverDecryptTempPrefix marks a scratch file written by a snapshot
 	// RECOVERY decrypt (snapshotPool.decryptSnapshotToSibling and
-	// Host.StartShard's local-snapshot recovery).
+	// Host.StartShard's local-snapshot recovery). Holds PLAINTEXT.
 	RecoverDecryptTempPrefix = ".decrypt-"
 
 	// SendDecryptTempPrefix marks a scratch file written by the transport
-	// SEND decrypt (Host's transportSender.decryptSnapshotForSend).
+	// SEND decrypt (Host's transportSender.decryptSnapshotForSend). Holds
+	// PLAINTEXT.
 	SendDecryptTempPrefix = ".send-decrypt-"
+
+	// RecvEncryptTempPrefix marks the scratch file an in-place re-encryption of
+	// a just-received or just-imported artifact writes its output to
+	// (quicraft.reencryptReceivedSnapshot). Holds CIPHERTEXT.
+	RecvEncryptTempPrefix = ".recv-encrypt-"
+
+	// ReencryptTempPrefix marks the scratch file a barrier-to-barrier snapshot
+	// migration writes its output to (quicraft.ReencryptSnapshotFile). Holds
+	// CIPHERTEXT.
+	ReencryptTempPrefix = ".reencrypt-snapshot-"
 
 	// RecoverDecryptTempPattern is the os.CreateTemp pattern for a recovery
 	// decrypt scratch file.
-	RecoverDecryptTempPattern = RecoverDecryptTempPrefix + "*" + DecryptTempSuffix
+	RecoverDecryptTempPattern = RecoverDecryptTempPrefix + "*" + ScratchTempSuffix
 
 	// SendDecryptTempPattern is the os.CreateTemp pattern for a send decrypt
 	// scratch file.
-	SendDecryptTempPattern = SendDecryptTempPrefix + "*" + DecryptTempSuffix
+	SendDecryptTempPattern = SendDecryptTempPrefix + "*" + ScratchTempSuffix
+
+	// RecvEncryptTempPattern is the os.CreateTemp pattern for an in-place
+	// re-encryption scratch file.
+	RecvEncryptTempPattern = RecvEncryptTempPrefix + "*" + ScratchTempSuffix
+
+	// ReencryptTempPattern is the os.CreateTemp pattern for a barrier-to-barrier
+	// migration scratch file.
+	ReencryptTempPattern = ReencryptTempPrefix + "*" + ScratchTempSuffix
 )
 
-// IsSnapshotDecryptTemp reports whether a directory entry name is a snapshot
-// decrypt scratch file produced by any decrypt path. It is the single matcher
-// the sweeper uses, so a name that can be CREATED is by construction a name that
-// can be RECLAIMED.
-func IsSnapshotDecryptTemp(name string) bool {
-	if !strings.HasSuffix(name, DecryptTempSuffix) {
+// snapshotScratchTempPrefixes is the complete set of scratch-file prefixes any
+// snapshot path may create. The matcher and the writers read the same list, so
+// the two cannot drift.
+var snapshotScratchTempPrefixes = [...]string{
+	RecoverDecryptTempPrefix,
+	SendDecryptTempPrefix,
+	RecvEncryptTempPrefix,
+	ReencryptTempPrefix,
+}
+
+// IsSnapshotScratchTemp reports whether a directory entry name is a snapshot
+// scratch file produced by any encrypt or decrypt path. It is the single
+// matcher the sweeper uses, so a name that can be CREATED is by construction a
+// name that can be RECLAIMED.
+func IsSnapshotScratchTemp(name string) bool {
+	if !strings.HasSuffix(name, ScratchTempSuffix) {
 		return false
 	}
-	return strings.HasPrefix(name, RecoverDecryptTempPrefix) ||
-		strings.HasPrefix(name, SendDecryptTempPrefix)
+	for _, prefix := range snapshotScratchTempPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Snapshot import staging-directory naming. Host.ImportSnapshot writes the
@@ -2005,7 +2088,7 @@ func IsSnapshotImportStage(name string) bool {
 	return strings.HasPrefix(name, ImportStageDirPrefix)
 }
 
-// SweepStaleDecryptTmpTree removes orphaned decrypt scratch files from EVERY
+// SweepStaleDecryptTmpTree removes orphaned snapshot scratch files from EVERY
 // retained snapshot directory of the given shard/replica, not just the one
 // currently being recovered.
 //
@@ -2110,16 +2193,16 @@ func SweepStaleImportStageDirs(baseDir string, shardID, replicaID uint64) {
 	}
 }
 
-// SweepStaleDecryptTmp removes orphaned decrypt scratch files from the
-// given snapshot directory. These files are created by the recovery and send
-// decrypt paths (see RecoverDecryptTempPattern / SendDecryptTempPattern) and are
-// normally removed via defer once the caller is done, but a process crash
-// orphans them. This sweep, run at startup and at recovery start, prevents both
-// a disk leak and — far worse — an indefinitely retained plaintext copy of the
-// state machine.
+// SweepStaleDecryptTmp removes orphaned snapshot scratch files from the given
+// snapshot directory: every name IsSnapshotScratchTemp matches, which is every
+// name a snapshot encrypt or decrypt path can create (see the prefix block
+// above). They are normally removed via defer once the caller is done, but a
+// process crash orphans them. This sweep, run at startup and at recovery start,
+// prevents both a disk leak and — for the decrypt prefixes, which hold
+// PLAINTEXT — an indefinitely retained copy of the state machine.
 //
 // The sweep is strictly scoped to the snapshot directory and only matches
-// IsSnapshotDecryptTemp names, so it never touches the canonical
+// IsSnapshotScratchTemp names, so it never touches the canonical
 // snapshot.dat / snapshot.meta files or any unrelated content. Errors are
 // logged and ignored: a failed cleanup must not abort recovery.
 func SweepStaleDecryptTmp(dir string) {
@@ -2138,7 +2221,7 @@ func SweepStaleDecryptTmp(dir string) {
 			continue
 		}
 		name := entry.Name()
-		if !IsSnapshotDecryptTemp(name) {
+		if !IsSnapshotScratchTemp(name) {
 			continue
 		}
 		stalePath := filepath.Join(dir, name)

@@ -1993,10 +1993,69 @@ func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 
 func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	// A missing metadata file (snapshot GC'd) is a benign skip: (0, known).
+	// A missing metadata file with NO artifact beside it (snapshot GC'd
+	// between enumeration and read) is a benign skip: (0, known).
 	epoch, status := readSnapshotEpoch(tmpDir)
 	if status != snapshotEpochKnown || epoch != 0 {
 		t.Fatalf("readSnapshotEpoch for missing file = (%d, %v), want (0, known)", epoch, status)
+	}
+}
+
+// TestSnapshotPool_ReadSnapshotEpoch_ArtifactWithoutRecord pins the distinction
+// the missing-record case used to erase: "the METADATA is absent" is strictly
+// weaker than "the ARTIFACT is absent", and only the latter means the directory
+// imposes no purge floor.
+//
+// A snapshot.dat with no snapshot.meta is producible by any crash between the
+// two writes. Its bytes may be ciphertext at any epoch and the record that
+// would have said which is exactly the one that is missing, so reporting "no
+// floor" lets the next PurgeEpochsBefore destroy the DEK it needs — the
+// artifact becomes permanently undecryptable and StartShard fails closed on it.
+func TestSnapshotPool_ReadSnapshotEpoch_ArtifactWithoutRecord(t *testing.T) {
+	tmpDir := t.TempDir()
+	dataPath := filepath.Join(tmpDir, snapshotDataFile)
+	if err := os.WriteFile(dataPath, []byte("ciphertext-at-an-unknown-epoch"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+
+	epoch, status := readSnapshotEpoch(tmpDir)
+	if status != snapshotEpochUnknown {
+		t.Fatalf("readSnapshotEpoch with snapshot.dat present and snapshot.meta absent = (%d, %v), "+
+			"want (0, unknown): an unevaluable directory can only mean 'do not purge'",
+			epoch, status)
+	}
+	if epoch != 0 {
+		t.Fatalf("readSnapshotEpoch epoch = %d, want 0 alongside an unknown status", epoch)
+	}
+}
+
+// TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge asserts the
+// CONSEQUENCE of the classification above: the DEK purge is suppressed, so the
+// key the orphaned artifact may need survives.
+func TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge(t *testing.T) {
+	tmpDir := t.TempDir()
+	barrier := newTestBarrier(9)
+	stopC := make(chan struct{})
+	p := newSnapshotPool(1, newSnapshotTestLogDB(), barrier, nil, nil, stopC, nil)
+	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
+
+	// A well-formed recent snapshot at a high epoch, which on its own would put
+	// the floor at 7 and purge every older DEK.
+	writeShardSnapshot(t, tmpDir, 1, 1, 200, 7)
+
+	// An older directory left half-built by a crash: artifact, no record.
+	orphanDir := snapshotSaveDir(tmpDir, 1, 1, 100)
+	if err := os.MkdirAll(orphanDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, snapshotDataFile),
+		[]byte("ciphertext-at-an-unknown-epoch"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+
+	if floor, ok := p.globalSafePurgeFloor(); ok {
+		t.Fatalf("globalSafePurgeFloor = (%d, true) with an artifact whose epoch cannot be "+
+			"established; want ok=false so no DEK is purged", floor)
 	}
 }
 
@@ -2593,9 +2652,11 @@ func TestSweepStaleDecryptTmpTree_ReclaimsEveryRetainedSnapshot(t *testing.T) {
 	}
 }
 
-// TestIsSnapshotDecryptTemp pins the single matcher every decrypt path's
-// os.CreateTemp pattern must satisfy.
-func TestIsSnapshotDecryptTemp(t *testing.T) {
+// TestIsSnapshotScratchTemp pins the single matcher every snapshot scratch
+// path's os.CreateTemp pattern must satisfy — the encrypt side included. A
+// name a writer can create but the sweeper does not match is an orphan nothing
+// on the host will ever reclaim.
+func TestIsSnapshotScratchTemp(t *testing.T) {
 	tests := []struct {
 		name string
 		want bool
@@ -2603,20 +2664,28 @@ func TestIsSnapshotDecryptTemp(t *testing.T) {
 		{".decrypt-123.tmp", true},
 		{".send-decrypt-123.tmp", true},
 		{".decrypt-.tmp", true},
+		{".recv-encrypt-123.tmp", true},
+		{".reencrypt-snapshot-123.tmp", true},
 		{"decrypt-123.tmp", false},
 		{".decrypt-123", false},
+		{".recv-encrypt-123", false},
 		{".encrypt-123.tmp", false},
 		{snapshotDataFile, false},
 		{snapshotMetadataFile, false},
 	}
 	for _, tt := range tests {
-		if got := IsSnapshotDecryptTemp(tt.name); got != tt.want {
-			t.Errorf("IsSnapshotDecryptTemp(%q) = %v, want %v", tt.name, got, tt.want)
+		if got := IsSnapshotScratchTemp(tt.name); got != tt.want {
+			t.Errorf("IsSnapshotScratchTemp(%q) = %v, want %v", tt.name, got, tt.want)
 		}
 	}
 
-	// Every pattern a decrypt path can create must be reclaimable.
-	for _, pattern := range []string{RecoverDecryptTempPattern, SendDecryptTempPattern} {
+	// Every pattern a snapshot scratch path can create must be reclaimable.
+	for _, pattern := range []string{
+		RecoverDecryptTempPattern,
+		SendDecryptTempPattern,
+		RecvEncryptTempPattern,
+		ReencryptTempPattern,
+	} {
 		f, err := os.CreateTemp(t.TempDir(), pattern)
 		if err != nil {
 			t.Fatalf("CreateTemp(%q): %v", pattern, err)
@@ -2625,7 +2694,7 @@ func TestIsSnapshotDecryptTemp(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatalf("close: %v", err)
 		}
-		if !IsSnapshotDecryptTemp(name) {
+		if !IsSnapshotScratchTemp(name) {
 			t.Errorf("pattern %q created %q, which the sweeper does not match", pattern, name)
 		}
 	}
