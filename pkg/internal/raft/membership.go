@@ -214,9 +214,16 @@ func (m *membership) validate(cc proto.ConfigChange) error {
 	return validator(m, cc)
 }
 
-// apply applies a validated config change to the membership. The config
-// change must have been validated with validate() first. This method
-// modifies the membership in place.
+// apply applies a COMMITTED config change to the membership, modifying it in
+// place. It is the deterministic replicated-state-machine transition, not a
+// gate: every precondition that can legitimately refuse a change belongs in
+// validate(), which runs on the leader BEFORE the entry is proposed.
+//
+// The handlers therefore CONVERGE on the role the committed entry names rather
+// than refusing an entry whose target is already a member. A refusal here is
+// not a safe no-op: it leaves this replica holding a membership the rest of
+// the shard does not, and it does not advance configChangeID, so nothing later
+// repairs it. See the "Convergent application" comment above the handlers.
 func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
 	// Replay guard: a config change at or below configChangeID has already
 	// been applied (restart replay of committed entries on top of a
@@ -243,10 +250,37 @@ func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
 	return nil
 }
 
-// handleAddNode adds a full voting member. If the replica is currently an
-// observer, it is promoted to voter (address is updated). Returns an error
-// if the replica already exists as a voter or witness, or was previously
-// removed.
+// Convergent application of committed adds
+//
+// The three add handlers below place the target in exactly the role the
+// COMMITTED entry names, whatever role the membership currently records for
+// it. They never refuse an entry because the target "already exists".
+//
+// This matters because a membership is not always built purely from committed
+// entries. Host.StartShard seeds proto.Membership.Addresses from the caller's
+// members map whenever recovery restored nothing — the ordinary state of a
+// caught-up replica that has never snapshotted — and that map is the
+// operator's list of replica IDs, with no record of which of them the shard
+// has since made witnesses or observers. Every non-voter listed in it is
+// therefore seeded as a full VOTER. The committed AddWitness / AddNonVoting
+// entries that gave those replicas their real roles are still in the log and
+// are re-applied on restart; refusing them (ErrNodeAlreadyExists) left the
+// wrong roles in place permanently, because the seed is not repaired by
+// anything else and configChangeID never advanced past the skipped entry.
+//
+// Converging is not a weakening of the checks. When the membership WAS built
+// from committed entries only, validate() ran on the leader before the entry
+// was proposed and guaranteed the target was not a member, so the extra
+// deletes below are provably no-ops and the behaviour is byte-for-byte the
+// old one. The rejections that remain are the ones whose precondition holds
+// identically on every replica — a Removed tombstone, and the two role
+// transitions the seed can never manufacture, since it only ever populates
+// addresses — so they cannot make replicas diverge.
+
+// handleAddNode adds a full voting member. An existing observer is promoted;
+// an existing voter has its address updated (the committed entry is
+// authoritative over a seeded placement). Returns an error if the replica is a
+// witness or was previously removed.
 func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -254,9 +288,12 @@ func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	if m.removed[cc.ReplicaID] {
 		return ErrNodeRemoved
 	}
-	if m.isVoter(cc.ReplicaID) {
-		return ErrNodeAlreadyExists
-	}
+	// Promoting a witness to a full voter would make a replica that holds no
+	// entry payloads answer reads out of a state machine that never saw them.
+	// dragonboat panics here. The membership seed cannot produce this state
+	// (it only ever populates addresses) and validateAddNode rejects the
+	// proposal, so every replica evaluates this identically and refusing
+	// cannot cause divergence.
 	if m.isWitness(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
@@ -266,10 +303,10 @@ func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	// Peer.Commit, restart replay), and rejecting a committed change would
 	// make replicas diverge from the agreed membership — a Raft safety
 	// violation.
-	// Promote from observer if applicable.
-	if m.isObserver(cc.ReplicaID) {
-		delete(m.observers, cc.ReplicaID)
-	}
+	//
+	// Promote from observer if applicable. Unconditional: deleting an absent
+	// key is a no-op, and this is the only place a promotion can happen.
+	delete(m.observers, cc.ReplicaID)
 	if m.addresses == nil {
 		m.addresses = make(map[uint64]string)
 	}
@@ -306,8 +343,10 @@ func handleRemoveNode(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// handleAddNonVoting adds a non-voting observer. Returns an error if the
-// replica already exists in any role or was previously removed.
+// handleAddNonVoting adds a non-voting observer, demoting a replica the
+// membership currently records as a full voter (a bootstrap-map seed the
+// committed entry overrides). Returns an error if the replica is a witness or
+// was previously removed.
 func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -315,9 +354,14 @@ func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	if m.removed[cc.ReplicaID] {
 		return ErrNodeRemoved
 	}
-	if m.isMember(cc.ReplicaID) {
+	// A witness can only have been made one by an earlier committed
+	// AddWitness, which validateAddNonVoting would have refused to follow with
+	// this change; the seed cannot produce it either. Identical on every
+	// replica, so refusing cannot cause divergence.
+	if m.isWitness(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
+	delete(m.addresses, cc.ReplicaID)
 	if m.observers == nil {
 		m.observers = make(map[uint64]string)
 	}
@@ -325,8 +369,10 @@ func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// handleAddWitness adds a witness member. Returns an error if the replica
-// already exists in any role or was previously removed.
+// handleAddWitness adds a witness member, demoting a replica the membership
+// currently records as a full voter (a bootstrap-map seed the committed entry
+// overrides). Returns an error if the replica is an observer or was previously
+// removed.
 func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -334,9 +380,14 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	if m.removed[cc.ReplicaID] {
 		return ErrNodeRemoved
 	}
-	if m.isMember(cc.ReplicaID) {
+	// An observer can only have been made one by an earlier committed
+	// AddNonVoting, which validateAddWitness would have refused to follow with
+	// this change; the seed cannot produce it either. Identical on every
+	// replica, so refusing cannot cause divergence.
+	if m.isObserver(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
+	delete(m.addresses, cc.ReplicaID)
 	// The voting-member cap (witnesses count toward it) is enforced ONLY at
 	// propose/validate time (validateAddWitness). Re-checking here would let a
 	// replica reject an already-committed change and diverge — see handleAddNode.

@@ -237,8 +237,14 @@ func (p *Peer) replayConfigChangesTo(index uint64) {
 				continue
 			}
 			if err := p.membership.apply(cc, entries[i].Index); err != nil {
-				// Benign on the replay path (duplicate adds, removed
-				// tombstones); logged so an unexpected skip is visible.
+				// A skip leaves this replica's membership disagreeing with the
+				// committed configuration, and nothing later repairs it, so it
+				// is NOT routinely benign. apply converges on the role every
+				// committed add names; what remains are the deterministic
+				// refusals (a Removed tombstone re-add, an add contradicting a
+				// role only a committed change could have set), which every
+				// replica evaluates identically. Logged so anything else is
+				// visible.
 				slog.Warn("config change replay skipped",
 					"shard", p.shardID,
 					"replica", p.replicaID,
@@ -752,14 +758,19 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 			continue
 		}
 		if err := p.membership.apply(cc, entries[i].Index); err != nil {
-			// A skip here is benign on the committed-replay path (duplicate
-			// adds, removed-tombstone re-adds): apply must NOT reject already
-			// committed changes or replicas would diverge. But the Host
-			// membership API now pre-validates against current membership
-			// (ValidateConfigChange) before proposing, so a skip on the
-			// leader's own freshly proposed entry is unexpected and would mean
-			// the caller's RequestState hangs until deadline. Log at WARN so
-			// such a skip is visible to operators rather than silently swallowed.
+			// apply must NOT reject an already-committed change on grounds
+			// another replica could evaluate differently, or the two diverge
+			// permanently: nothing re-delivers a committed entry, so a skip is
+			// final. It therefore converges on the role each committed add
+			// names (including over a provisional bootstrap-map seed) and only
+			// the deterministic refusals reach here — a Removed tombstone
+			// re-add, or an add contradicting a role only a committed change
+			// could have set. The Host membership API also pre-validates
+			// against current membership (ValidateConfigChange) before
+			// proposing, so a skip on the leader's own freshly proposed entry
+			// is unexpected and would mean the caller's RequestState hangs
+			// until deadline. Log at WARN so any skip is visible to operators
+			// rather than silently swallowed.
 			slog.Warn("config change apply skipped",
 				"shard_id", p.shardID,
 				"replica_id", p.replicaID,

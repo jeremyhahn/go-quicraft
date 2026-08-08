@@ -231,16 +231,30 @@ func TestMembership_AddNode_Success(t *testing.T) {
 	}
 }
 
+// TestMembership_AddNode_AlreadyVoter pins the APPLY path's convergence on a
+// committed AddNode whose target the membership already records as a voter.
+//
+// Refusing it was not a safe no-op: configChangeID stops advancing at the
+// skipped entry, so this replica reports a stale ConfigChangeID as the CAS
+// token for every later membership change while its peers have moved on.
+// validate() still rejects the same change at propose time — see
+// TestMembership_Validate_AddNodeAlreadyVoter.
 func TestMembership_AddNode_AlreadyVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
 		Type:      proto.AddNode,
 		ReplicaID: 1,
-		Address:   "addr1",
+		Address:   "addr1-new",
 	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
+	if err := m.apply(cc, 10); err != nil {
+		t.Fatalf("apply(AddNode) over an existing voter: %v", err)
+	}
+	if m.addresses[1] != "addr1-new" {
+		t.Fatalf("addresses[1] = %q, want the committed entry's address", m.addresses[1])
+	}
+	if m.configChangeID != 10 {
+		t.Fatalf("configChangeID = %d, want 10; a skipped entry leaves this replica "+
+			"reporting a CAS token its peers have moved past", m.configChangeID)
 	}
 }
 
@@ -456,16 +470,52 @@ func TestMembership_AddNonVoting_Success(t *testing.T) {
 	}
 }
 
-func TestMembership_AddNonVoting_AlreadyMember(t *testing.T) {
+// TestMembership_AddNonVoting_DemotesSeededVoter is the C1 unit-level
+// regression. Host.StartShard seeds Membership.Addresses from the caller's
+// members map on a restart that recovered no snapshot, so an observer the
+// operator lists — as it must, join=false requires self in the map — is seeded
+// as a full VOTER. The committed AddNonVoting that gave it its real role is
+// still in the log and is re-applied on restart; refusing it because the target
+// "already exists" left the observer a voter in its own membership durably,
+// because nothing else repairs the seed.
+func TestMembership_AddNonVoting_DemotesSeededVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
 		Type:      proto.AddNonVoting,
 		ReplicaID: 1,
 		Address:   "addr1",
 	}
+	if err := m.apply(cc, 10); err != nil {
+		t.Fatalf("apply(AddNonVoting) over a seeded voter: %v", err)
+	}
+	if m.isVoter(1) {
+		t.Fatalf("replica 1 is still a full voter after a committed AddNonVoting: %+v", m.addresses)
+	}
+	if !m.isObserver(1) {
+		t.Fatalf("replica 1 is not an observer after a committed AddNonVoting: %+v", m.observers)
+	}
+	if m.configChangeID != 10 {
+		t.Fatalf("configChangeID = %d, want 10", m.configChangeID)
+	}
+}
+
+// TestMembership_AddNonVoting_AlreadyWitness pins the refusal that remains: a
+// witness role can only have been set by an earlier COMMITTED AddWitness, so
+// every replica evaluates this identically and refusing cannot diverge them.
+func TestMembership_AddNonVoting_AlreadyWitness(t *testing.T) {
+	m := testMembership()
+	m.witnesses = map[uint64]string{20: "wit1"}
+	cc := proto.ConfigChange{
+		Type:      proto.AddNonVoting,
+		ReplicaID: 20,
+		Address:   "obs20",
+	}
 	err := m.apply(cc, 10)
 	if !errors.Is(err, ErrNodeAlreadyExists) {
 		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
+	}
+	if m.isObserver(20) {
+		t.Fatal("a witness must not be demoted to observer by apply")
 	}
 }
 
@@ -532,16 +582,50 @@ func TestMembership_AddWitness_Success(t *testing.T) {
 	}
 }
 
-func TestMembership_AddWitness_AlreadyMember(t *testing.T) {
+// TestMembership_AddWitness_DemotesSeededVoter is the C1/H1 unit-level
+// regression for the witness half. A witness listed in the restart members map
+// is seeded into Addresses — the full voter set — and the leader then selects
+// sendAppend over sendWitnessAppend for it, replicating the complete command
+// stream to a replica whose purpose is to hold none of it. The committed
+// AddWitness in the log must put it back.
+func TestMembership_AddWitness_DemotesSeededVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
 		Type:      proto.AddWitness,
 		ReplicaID: 1,
 		Address:   "addr1",
 	}
+	if err := m.apply(cc, 10); err != nil {
+		t.Fatalf("apply(AddWitness) over a seeded voter: %v", err)
+	}
+	if m.isVoter(1) {
+		t.Fatalf("replica 1 is still a full voter after a committed AddWitness: %+v", m.addresses)
+	}
+	if !m.isWitness(1) {
+		t.Fatalf("replica 1 is not a witness after a committed AddWitness: %+v", m.witnesses)
+	}
+	if m.configChangeID != 10 {
+		t.Fatalf("configChangeID = %d, want 10", m.configChangeID)
+	}
+}
+
+// TestMembership_AddWitness_AlreadyObserver pins the refusal that remains: an
+// observer role can only have been set by an earlier COMMITTED AddNonVoting,
+// so every replica evaluates this identically and refusing cannot diverge them.
+func TestMembership_AddWitness_AlreadyObserver(t *testing.T) {
+	m := testMembership()
+	m.observers = map[uint64]string{10: "obs1"}
+	cc := proto.ConfigChange{
+		Type:      proto.AddWitness,
+		ReplicaID: 10,
+		Address:   "wit10",
+	}
 	err := m.apply(cc, 10)
 	if !errors.Is(err, ErrNodeAlreadyExists) {
 		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
+	}
+	if m.isWitness(10) {
+		t.Fatal("an observer must not be converted to a witness by apply")
 	}
 }
 
@@ -920,36 +1004,66 @@ func TestMembership_Validate_ConfigChangeIDUnchanged(t *testing.T) {
 	}
 }
 
+// TestMembership_Validate_MatchesApply_AllTypes pins the relationship between
+// the propose-time gate and the deterministic apply.
+//
+// The safety-critical direction is that apply() must NEVER refuse a change
+// validate() accepted: apply runs on already-COMMITTED entries and nothing
+// re-delivers one, so its refusal is final and leaves this replica holding a
+// membership the rest of the shard does not. That is asserted for every case
+// as a subset property, on top of the exact per-case expectation below.
+//
+// The converse does not hold, deliberately. validate() refuses an add whose
+// target is already a member; apply() converges on the role the committed
+// entry names, because the membership it applies to may be a provisional
+// bootstrap-map seed rather than the product of committed entries alone (see
+// the "Convergent application" comment in membership.go).
 func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
-	// Exhaustive equivalence test: for each config change type, validate()
-	// must return the same error as applying to a fresh copy of the membership.
 	cases := []struct {
 		name string
 		cc   proto.ConfigChange
+		// wantValidate/wantApply are the exact expected errors; nil means the
+		// change is accepted.
+		wantValidate error
+		wantApply    error
 	}{
-		{"AddNode-new", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}},
-		{"AddNode-existing", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 1, Address: "a1"}},
-		{"AddNode-empty-addr", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: ""}},
-		{"RemoveNode-exists", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}},
-		{"RemoveNode-missing", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 99}},
-		{"AddNonVoting-new", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "o10"}},
-		{"AddNonVoting-exists", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 1, Address: "a1"}},
-		{"AddWitness-new", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 20, Address: "w20"}},
-		{"AddWitness-exists", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 1, Address: "a1"}},
-		{"InvalidType", proto.ConfigChange{Type: 999, ReplicaID: 4, Address: "a4"}},
-		{"ZeroReplica", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 0, Address: "a0"}},
+		{"AddNode-new", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}, nil, nil},
+		// Converges: an already-listed voter is re-stated, not refused.
+		{"AddNode-existing", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
+		{"AddNode-empty-addr", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: ""}, ErrEmptyAddress, ErrEmptyAddress},
+		{"RemoveNode-exists", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, nil, nil},
+		{"RemoveNode-missing", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 99}, ErrNodeNotFound, ErrNodeNotFound},
+		{"AddNonVoting-new", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "o10"}, nil, nil},
+		// Converges: a seeded voter is demoted to the observer role the
+		// committed entry names.
+		{"AddNonVoting-exists", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
+		{"AddWitness-new", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 20, Address: "w20"}, nil, nil},
+		// Converges: a seeded voter is moved to the witness role.
+		{"AddWitness-exists", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
+		{"InvalidType", proto.ConfigChange{Type: 999, ReplicaID: 4, Address: "a4"}, ErrInvalidConfigChangeType, ErrInvalidConfigChangeType},
+		{"ZeroReplica", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 0, Address: "a0"}, ErrZeroReplicaID, ErrZeroReplicaID},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := testMembership()
 			validateErr := m.validate(tc.cc)
+			if !errors.Is(validateErr, tc.wantValidate) {
+				t.Fatalf("validate returned %v, want %v", validateErr, tc.wantValidate)
+			}
 
 			// Apply on a separate copy to get the "ground truth" error.
 			mCopy := testMembership()
 			applyErr := mCopy.apply(tc.cc, 100)
+			if !errors.Is(applyErr, tc.wantApply) {
+				t.Fatalf("apply returned %v, want %v", applyErr, tc.wantApply)
+			}
 
-			if !errors.Is(validateErr, applyErr) {
-				t.Fatalf("validate returned %v, apply returned %v", validateErr, applyErr)
+			// The subset property: whatever apply refuses, validate must
+			// refuse too, or a change can be proposed and committed that this
+			// replica then declines to apply.
+			if applyErr != nil && !errors.Is(validateErr, applyErr) {
+				t.Fatalf("apply refused a change validate accepted: apply=%v validate=%v",
+					applyErr, validateErr)
 			}
 		})
 	}

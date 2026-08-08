@@ -118,30 +118,16 @@ func TestFollowerRead_LaggingApplyRespectsDeadline(t *testing.T) {
 		t.Fatalf("SyncPropose: %v", err)
 	}
 
-	ns := testLoadNode(h, 1)
-	committed := h.engine.GetNode(1).CommittedIndex()
-	if committed == 0 {
-		t.Fatal("committed index is 0 after a successful proposal; the lag cannot be modelled")
-	}
-	// Wait for the apply callback to publish its lastApplied BEFORE injecting
-	// the lag. SyncPropose returns from rs.complete, which OnApplied runs
-	// several statements EARLIER than ns.lastApplied.Store — so a store of 0
-	// here can be overwritten by the still-running callback, and the read then
-	// completes immediately instead of timing out. That ordering is fine in
-	// production (a caller that observes a not-yet-updated marker makes a
-	// follower read wait, which is the safe direction); it is only the test's
-	// setup that needs to be sequenced.
-	applyDeadline := time.Now().Add(5 * time.Second)
-	for ns.lastApplied.Load() < committed {
-		if time.Now().After(applyDeadline) {
-			t.Fatalf("apply callback never published lastApplied >= %d (got %d)",
-				committed, ns.lastApplied.Load())
-		}
-		time.Sleep(time.Millisecond)
-	}
-
 	// Model a replica whose apply loop has fallen behind the commit index.
-	ns.lastApplied.Store(0)
+	//
+	// Waiting for "lastApplied >= committed" against a SINGLE sample of the
+	// commit marker is not enough: the step worker publishes that marker before
+	// the commit/apply pipeline runs, so the sample can name the term-opening
+	// no-op while the proposal's own entry is still on its way to the state
+	// machine. The wait then returns immediately, the apply that was still
+	// coming overwrites the injected 0, and this test completes on the FAST
+	// path and returns a value instead of ErrTimeout. See injectApplyLag.
+	injectApplyLag(t, h, 1)
 
 	// The deadline is far longer than the 50 fast polls (1ms each) that
 	// precede the backoff, so the backoff is exercised before it expires.

@@ -3463,10 +3463,23 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 		t.Fatal("replica 5 should be a member after first apply")
 	}
 
-	// Apply the same config change again at a higher index. The replay
-	// guard (logIndex <= configChangeID) no longer applies, so the
-	// duplicate-add handler error is surfaced and logged.
-	entries[0].Index = 3
+	// Remove replica 5, then re-add it at a higher index. The replay guard
+	// (logIndex <= configChangeID) does not cover either entry, so the
+	// Removed-tombstone refusal is surfaced and logged. A tombstone is
+	// replicated state every replica evaluates identically, which is what
+	// makes refusing it safe — unlike a duplicate add, which apply converges
+	// on rather than skipping (see membership.go).
+	rm := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 5}
+	rmBuf := make([]byte, rm.Size())
+	_, _ = rm.MarshalTo(rmBuf)
+	p.processConfigChanges([]proto.Entry{
+		{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: rmBuf},
+	})
+	if p.IsMember(5) {
+		t.Fatal("replica 5 should not be a member after the removal")
+	}
+
+	entries[0].Index = 4
 	buf.Reset()
 	p.processConfigChanges(entries)
 

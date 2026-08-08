@@ -970,7 +970,9 @@ leader.
 - Cannot remove the last full (non-witness) replica (`ErrRemoveLastFullReplica`).
 - Cannot remove the last voting member (`ErrRemoveLastVoter`).
 - Cannot add a previously removed node (`ErrNodeRemoved`).
-- Cannot add a node that already exists (`ErrNodeAlreadyExists`).
+- Cannot add a node that already exists (`ErrNodeAlreadyExists`) — at
+  **propose** time only; see "Convergent apply" below for why apply instead
+  converges on the role the committed entry names.
 - Cannot remove a node that is not a member (`ErrNodeNotFound`).
 - Reject a config change with a zero replica ID (`ErrZeroReplicaID`) or an
   empty address on an add (`ErrEmptyAddress`).
@@ -1014,18 +1016,52 @@ diverge from the agreed membership — a Raft safety violation. The cap is a
 propose-time admission control, so the only way an over-cap change reaches
 apply is if validation was bypassed; in that case the invariant assertion
 in `rebuildReplicaToBit` (`raft.go:2611`) panics rather than silently
-aliasing bits. Other invariants (duplicate-add via `ErrNodeAlreadyExists`,
-last-voter protection via `ErrRemoveLastVoter` /
-`ErrRemoveLastFullReplica`) are checked by both the validators and the
-handlers, since those checks remain correct regardless of replay.
+aliasing bits.
+
+### Convergent Apply
+
+The same reasoning that removes the cap check from apply removes the
+**duplicate-add** check. `handleAddNode`, `handleAddNonVoting` and
+`handleAddWitness` place the target in exactly the role the committed entry
+names, whatever role the membership currently records for it. They never
+return `ErrNodeAlreadyExists`; only `validate` does.
+
+This is required because a membership is not always built purely from
+committed entries. `Host.StartShard` seeds `Membership.Addresses` from the
+caller's `members` map whenever recovery restored nothing — the ordinary
+state of a caught-up replica that has never snapshotted, since membership is
+persisted only alongside a snapshot record. That map is the operator's list
+of replica IDs and records no roles, so **every witness and observer in it is
+seeded as a full voter**, including the local replica (`join=false` requires
+self to be listed). The committed `AddWitness` / `AddNonVoting` entries that
+gave those replicas their real roles are still in the log — config changes
+are compacted only behind a snapshot — and are re-applied on restart.
+Refusing them left the wrong roles in place permanently: nothing else repairs
+the seed, and `configChangeID` never advanced past the skipped entry.
+`checkSelfRole` is not a substitute; it compares only the *witness* bit, so an
+observer seeded as a voter raises nothing at all, and it is a latch rather
+than a repair.
+
+Converging is not a weakening. When the membership was built from committed
+entries alone, `validate` ran on the leader before the entry was proposed and
+guaranteed the target was not a member, so the role moves are provably no-ops
+and the behaviour is unchanged. The refusals that remain are exactly those
+whose precondition holds identically on every replica — a `Removed` tombstone
+(`ErrNodeRemoved`), and the two role transitions the seed can never
+manufacture, since it only ever populates `addresses`: `AddNode` over a
+witness, and `AddWitness` / `AddNonVoting` over each other's role. Those
+cannot make replicas diverge. Last-voter protection (`ErrRemoveLastVoter` /
+`ErrRemoveLastFullReplica`) is likewise evaluated over replicated state and
+stays in both the validators and the handlers.
 
 `processConfigChanges` (`peer.go:609`) applies committed config-change
-entries via `membership.apply`. An apply error there is logged and skipped:
-on the committed-replay path (duplicate adds, removed-tombstone re-adds) a
-skip is benign because apply must not reject already-committed changes, but
-on the leader's own freshly proposed entry a skip is unexpected — which is
-why the Host membership API pre-validates via `ValidateConfigChange` before
-proposing.
+entries via `membership.apply`. An apply error there is logged at WARN and
+skipped. A skip is **not** routinely benign: nothing re-delivers a committed
+entry, so it is final and leaves the replica's membership disagreeing with
+the committed configuration. What remains after convergence are the
+deterministic refusals above, plus the case the Host membership API guards
+against by pre-validating via `ValidateConfigChange` — a skip on the leader's
+own freshly proposed entry, which would hang the caller's `RequestState`.
 
 ### CampaignSkipped Event
 

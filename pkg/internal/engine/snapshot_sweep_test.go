@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -192,5 +193,149 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	// The canonical artifacts must be untouched.
 	if _, err := os.Stat(filepath.Join(recoverDir, snapshotDataFile)); err != nil {
 		t.Fatalf("the sweep destroyed the canonical snapshot data file: %v", err)
+	}
+}
+
+// TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock is the M1
+// regression guard. It covers a call site that previously had NO test at all —
+// deleting the sweep from recoverSnapshot left the package green.
+//
+// The staging directory holds the imported state machine in PLAINTEXT and is
+// indistinguishable by NAME from one a crash orphaned, so the only thing that
+// can tell a live one from an orphan is the shard's import lock. recoverSnapshot
+// used to sweep without taking it, justified by "no import can be in flight
+// here — Host.ImportSnapshot refuses a RUNNING shard". That is a TOCTOU: the
+// refusal is in importPreflight, which runs BEFORE the import lock is acquired
+// and is not held for the import's duration, and StartShard registers the node
+// hundreds of lines after its own sweep. So an import that passed preflight and
+// is midway through a multi-gigabyte write coexists with a running shard, and a
+// leader's InstallSnapshot then RemoveAll'd its staging directory — a
+// spuriously failed disaster-recovery restore.
+//
+// Both directions are asserted: the sweep must still reclaim an orphan when the
+// lock is free (which is what makes deleting the call fail), and must leave the
+// directory alone when an import holds it.
+func TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock(t *testing.T) {
+	tests := []struct {
+		name string
+		// importRunning models an ImportSnapshot holding the shard's lock.
+		importRunning bool
+		wantSurvives  bool
+	}{
+		{
+			name:          "no import in flight: the orphan is reclaimed",
+			importRunning: false,
+			wantSurvives:  false,
+		},
+		{
+			name:          "import in flight: its staging directory survives",
+			importRunning: true,
+			wantSurvives:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const shardID, replicaID uint64 = 11, 1
+			baseDir := t.TempDir()
+			stopC := make(chan struct{})
+			defer close(stopC)
+
+			// The staging directory, holding the imported state machine in
+			// plaintext exactly as ImportSnapshot leaves it mid-write.
+			stageDir := filepath.Join(snapshotBaseDir(baseDir, shardID, replicaID),
+				ImportStageDirPrefix+"live")
+			if err := os.MkdirAll(stageDir, 0o750); err != nil {
+				t.Fatalf("mkdir stage dir: %v", err)
+			}
+			stagedArtifact := filepath.Join(stageDir, snapshotDataFile)
+			if err := os.WriteFile(stagedArtifact, []byte("plaintext state machine"), 0o600); err != nil {
+				t.Fatalf("write staged artifact: %v", err)
+			}
+
+			// The snapshot the leader's InstallSnapshot delivered, which is
+			// what triggers the recovery.
+			recoverDir := snapshotSaveDir(baseDir, shardID, replicaID, 100)
+			if err := os.MkdirAll(recoverDir, 0o750); err != nil {
+				t.Fatalf("mkdir recover dir: %v", err)
+			}
+			var payload [8]byte
+			binary.LittleEndian.PutUint64(payload[:], 100)
+			if err := os.WriteFile(filepath.Join(recoverDir, snapshotDataFile), payload[:], 0o600); err != nil {
+				t.Fatalf("write snapshot data: %v", err)
+			}
+			if err := writeSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
+				t.Fatalf("write recover metadata: %v", err)
+			}
+
+			ldb := newSnapshotTestLogDB()
+			if err := ldb.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
+				Index:    100,
+				Term:     3,
+				Filepath: recoverDir,
+				FileSize: uint64(len(payload)),
+			}); err != nil {
+				t.Fatalf("SaveSnapshot: %v", err)
+			}
+
+			p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
+			// The host's real lock is a capacity-one channel; model it with the
+			// same try-semantics Host.tryAcquireImportLock provides.
+			lock := make(chan struct{}, 1)
+			if tt.importRunning {
+				lock <- struct{}{}
+			}
+			var released atomic.Bool
+			p.tryImportLock = func(id uint64) (func(), bool) {
+				if id != shardID {
+					t.Errorf("import lock taken for shard %d, want %d", id, shardID)
+				}
+				select {
+				case lock <- struct{}{}:
+					return func() {
+						<-lock
+						released.Store(true)
+					}, true
+				default:
+					return nil, false
+				}
+			}
+
+			cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
+			ss := newSnapshotTestSnapshotter(0)
+			node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+
+			if err := p.recoverSnapshot(snapshotRequest{
+				shardID: shardID, replicaID: replicaID, node: node, save: false,
+			}); err != nil {
+				t.Fatalf("recoverSnapshot failed: %v", err)
+			}
+			if got := ss.LastApplied(); got != 100 {
+				t.Fatalf("recovered lastApplied = %d, want 100: the recovery did not run, "+
+					"so this test would not have reached the sweep either", got)
+			}
+
+			_, statErr := os.Stat(stagedArtifact)
+			switch {
+			case tt.wantSurvives && statErr != nil:
+				t.Fatalf("recovery deleted the staging directory of a RUNNING import "+
+					"(%v): the operator's disaster-recovery restore fails for no reason",
+					statErr)
+			case !tt.wantSurvives && !os.IsNotExist(statErr):
+				t.Fatalf("the orphaned import staging directory survived recovery "+
+					"(err=%v): it holds a COMPLETE PLAINTEXT COPY of the state machine "+
+					"under a name no scan on the host enumerates, so nothing else ever "+
+					"reclaims it", statErr)
+			}
+			if !tt.importRunning && !released.Load() {
+				t.Fatal("the import lock was taken and never released; the next " +
+					"ImportSnapshot for this shard would block forever")
+			}
+
+			// The canonical artifact must be untouched either way.
+			if _, err := os.Stat(filepath.Join(recoverDir, snapshotDataFile)); err != nil {
+				t.Fatalf("the sweep destroyed the canonical snapshot data file: %v", err)
+			}
+		})
 	}
 }

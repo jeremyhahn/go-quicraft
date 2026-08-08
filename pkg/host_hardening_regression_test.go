@@ -300,14 +300,32 @@ func TestShardHealth_DerivesLiveState(t *testing.T) {
 	}
 
 	// A state machine far behind the committed index is lagging.
+	//
+	// This backlog has to be injected on the COMMITTED side: the threshold is
+	// a thousand entries and a freshly elected single-node shard has applied
+	// one, so there is no room to move the applied marker back instead (which
+	// is what the follower-read fixtures do — see injectApplyLag). The step
+	// worker republishes the real committed index from the raft log on EVERY
+	// tick (Node.publishLogMarkers), so an injected value survives at most one
+	// tick interval. Re-inject until the derivation is observed rather than
+	// racing that window once: the loop can only ever end by shardHealth
+	// actually returning ShardLagging for an injected backlog.
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		t.Fatal("engine node missing")
 	}
-	engNode.SetCommittedIndex(ns.lastApplied.Load() + shardLaggingThreshold)
-	if got := h.buildShardInfo(ns).Health; got != ShardLagging {
+	var lagging ShardHealth
+	laggingDeadline := time.Now().Add(10 * time.Second)
+	for {
+		engNode.SetCommittedIndex(ns.lastApplied.Load() + shardLaggingThreshold)
+		lagging = h.buildShardInfo(ns).Health
+		if lagging == ShardLagging || time.Now().After(laggingDeadline) {
+			break
+		}
+	}
+	if lagging != ShardLagging {
 		t.Errorf("health with a %d-entry apply backlog = %v, want ShardLagging",
-			shardLaggingThreshold, got)
+			shardLaggingThreshold, lagging)
 	}
 
 	// ShardUnloaded is a terminal lifecycle state and must not be refined.
@@ -456,13 +474,17 @@ func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 	waitForLeader(t, h, shardID)
 
 	ns := testLoadNode(h, shardID)
-	engNode := h.engine.GetNode(shardID)
-	if engNode == nil {
-		t.Fatal("engine node missing")
+
+	// Force the slow path. The lag is injected on the APPLIED side: an injected
+	// committed index is republished from the raft log on the next step-worker
+	// tick, after which the read completes on the FAST path and the shutdown
+	// exit this test exists for is never reached. See injectApplyLag.
+	proposeCtx, proposeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer proposeCancel()
+	if _, err := h.SyncPropose(proposeCtx, shardID, []byte("committed-write")); err != nil {
+		t.Fatalf("SyncPropose: %v", err)
 	}
-	// Force the slow path: committed is far ahead of the applied marker and
-	// will never be reached.
-	engNode.SetCommittedIndex(ns.lastApplied.Load() + 1_000_000)
+	injectApplyLag(t, h, shardID)
 
 	done := make(chan error, 1)
 	go func() {

@@ -268,13 +268,52 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 // snapshotted" is the ordinary condition of a witness. The discriminator is
 // therefore PERSISTED STATE (snapshot record, hard state, or log entries), not
 // membership.
+//
+// # What the seeded membership does, and what repairs it
+//
+// This is the ONLY start form in which the caller's members map is both seeded
+// AND contains a replica the shard has since made non-voting. join=false forces
+// the operator to list SELF (SelfNotInMembersError otherwise), and the seed
+// writes every listed replica into proto.Membership.Addresses — the FULL VOTER
+// set. So the replica comes up a voter in its own membership, and so does every
+// other witness/observer the operator listed.
+//
+// The repair is the committed AddWitness / AddNonVoting entry, still in the log
+// because config changes are compacted only behind a snapshot. The fixture
+// below therefore carries that entry, and the assertions are on the resulting
+// MEMBERSHIP — the roles and the ConfigChangeID — because that is what the
+// defect corrupted:
+//
+//   - OBSERVER: silent and DURABLE. checkSelfRole compares only the WITNESS
+//     bit, so an observer seeded as a voter raises nothing at all. The replica
+//     runs a full state machine, reaches SnapshotEntries, and saveSnapshot
+//     persists the WRONG membership into LogDB; compaction then removes the
+//     AddNonVoting entry and the corruption is authoritative from the next
+//     restart on. Promote that replica later and it campaigns with a voting set
+//     omitting every witness and observer — committing on two acks where the
+//     real configuration needs three.
+//   - WITNESS: checkSelfRole latches (no campaigning, no reads) but the
+//     membership still contradicts every peer's, and the leader-side effect of
+//     the seed is unaffected by the latch.
 func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 	tests := []struct {
-		name   string
-		mutate func(*config.Config)
+		name    string
+		ccType  uint64
+		mutate  func(*config.Config)
+		roleMap func(*Membership) map[uint64]string
 	}{
-		{name: "witness", mutate: func(c *config.Config) { c.IsWitness = true }},
-		{name: "observer", mutate: func(c *config.Config) { c.IsObserver = true }},
+		{
+			name:    "witness",
+			ccType:  proto.AddWitness,
+			mutate:  func(c *config.Config) { c.IsWitness = true },
+			roleMap: func(m *Membership) map[uint64]string { return m.Witnesses },
+		},
+		{
+			name:    "observer",
+			ccType:  proto.AddNonVoting,
+			mutate:  func(c *config.Config) { c.IsObserver = true },
+			roleMap: func(m *Membership) map[uint64]string { return m.Observers },
+		},
 	}
 
 	for _, tt := range tests {
@@ -293,10 +332,24 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 			// The durable state of a CAUGHT-UP replica that has never
 			// snapshotted: a bootstrap record, a hard state and log entries —
 			// and, by construction, no membership anywhere in the LogDB.
+			//
+			// Entry 2 is the COMMITTED config change that gave this replica its
+			// non-voting role. Without it the fixture cannot exercise the
+			// repair the seeded membership depends on, and the subtest would
+			// pass over a membership nobody looked at.
 			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
 				Addresses: map[uint64]string{1: voterAddr},
 			}); bsErr != nil {
 				t.Fatalf("SaveBootstrap failed: %v", bsErr)
+			}
+			cc := proto.ConfigChange{
+				Type:      tt.ccType,
+				ReplicaID: replicaID,
+				Address:   selfAddr,
+			}
+			ccCmd := make([]byte, cc.Size())
+			if _, mErr := cc.MarshalTo(ccCmd); mErr != nil {
+				t.Fatalf("marshalling the config change: %v", mErr)
 			}
 			if stErr := db.SaveState([]logdb.Update{{
 				ShardID:   shardID,
@@ -304,7 +357,7 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 				State:     logdb.State{Term: 7, Vote: 1, Commit: 2},
 				Entries: []logdb.Entry{
 					{Index: 1, Term: 7},
-					{Index: 2, Term: 7},
+					{Index: 2, Term: 7, Type: proto.EntryConfigChange, Cmd: ccCmd},
 				},
 			}}); stErr != nil {
 				t.Fatalf("SaveState failed: %v", stErr)
@@ -351,6 +404,44 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 			// fresh bootstrap that happened to be accepted.
 			if _, _, idxErr := db.EntryRange(shardID, replicaID); idxErr != nil {
 				t.Fatalf("EntryRange after the restart: %v", idxErr)
+			}
+
+			// The membership, which is the whole point. The committed entry is
+			// re-applied through the ordinary commit path (recovered
+			// HardState.Commit is 2, the processed marker is 0), so poll for
+			// it rather than assuming it landed before StartShard returned.
+			var after *Membership
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				var memErr error
+				after, memErr = h.GetShardMembership(shardID)
+				if memErr != nil {
+					t.Fatalf("GetShardMembership failed: %v", memErr)
+				}
+				if after.ConfigChangeID == 2 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the committed %s config change at index 2 was never applied: %+v; "+
+						"the replica was seeded into the FULL VOTER set by the members map "+
+						"and nothing repaired it", tt.name, after)
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+
+			if _, ok := after.Nodes[replicaID]; ok {
+				t.Fatalf("the members map made the %s a full voter after all: %+v; the "+
+					"leader replicates full entry payloads to it, it counts toward every "+
+					"quorum, and a snapshot would make this durable", tt.name, after)
+			}
+			if _, ok := tt.roleMap(after)[replicaID]; !ok {
+				t.Fatalf("replica %d is not in the %s role map: %+v", replicaID, tt.name, after)
+			}
+			if _, ok := after.Nodes[1]; !ok {
+				t.Fatalf("the bootstrap voter 1 is missing from the voting set: %+v", after)
+			}
+			if len(after.Nodes) != 1 {
+				t.Fatalf("voting set = %+v, want exactly the one full replica", after.Nodes)
 			}
 		})
 	}

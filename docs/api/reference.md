@@ -1059,6 +1059,14 @@ Source: `pkg/config/config.go`
 > `*NonVotingRoleInMembersError`. Bootstrap the voters first, then start the
 > replica with `join=true` and add it with `RequestAddWitness` /
 > `RequestAddObserver`.
+>
+> On a **restart** the same map must list every current member, non-voters
+> included, or they vanish from this replica's routing and remotes. The
+> rejection therefore applies only to a first start (no persisted state). The
+> seeded voter placement that results is provisional: the committed
+> `AddWitness` / `AddNonVoting` entries replay at commit time and move each
+> replica to its real role (see "Convergent Apply" in
+> `docs/raft/protocol.md`).
 
 ### TransportConfig
 

@@ -349,6 +349,57 @@ func testLoadNode(h *Host, shardID uint64) *nodeState {
 	return v.(*nodeState)
 }
 
+// injectApplyLag makes a shard's state machine look like it has fallen behind
+// its commit index, and returns the commit index the lag is measured against.
+// It is the fixture every follower-read slow-path test needs.
+//
+// The lag must be injected on the APPLIED side, never the committed one. The
+// step worker republishes the real committed index from the raft log on EVERY
+// tick (Node.publishLogMarkers), so a committed index written by a test — the
+// obvious engNode.SetCommittedIndex(lastApplied + N) — survives at most one
+// tick interval, after which the reader takes the fast path and the slow path
+// under test is never entered. ns.lastApplied is written only by the apply
+// callback, so it is the side a test can hold still.
+//
+// It must also not be moved back while an apply is still in flight. The step
+// worker publishes the commit marker BEFORE the commit/apply pipeline runs, so
+// a single read of it can name an index the apply callback has not reached yet:
+// waiting for "lastApplied >= committed" against one stale sample returns
+// immediately, the injected 0 is then overwritten by the apply that was still
+// coming, and the read completes on the fast path. Wait for the two markers to
+// agree AND stay agreed before injecting.
+//
+// The caller must have committed something first (a leader's term-opening no-op
+// is enough) so that the commit index is non-zero.
+func injectApplyLag(t *testing.T, h *Host, shardID uint64) uint64 {
+	t.Helper()
+
+	ns := testLoadNode(h, shardID)
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil {
+		t.Fatalf("engine node for shard %d missing", shardID)
+	}
+
+	const settle = 50 * time.Millisecond
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		committed := engNode.CommittedIndex()
+		if committed > 0 && ns.lastApplied.Load() == committed {
+			time.Sleep(settle)
+			if engNode.CommittedIndex() == committed && ns.lastApplied.Load() == committed {
+				ns.lastApplied.Store(0)
+				return committed
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shard %d never settled: committed=%d lastApplied=%d; the lag "+
+				"cannot be injected without racing an apply that is still coming",
+				shardID, engNode.CommittedIndex(), ns.lastApplied.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // countSyncMap counts the number of entries in a sync.Map.
 func countSyncMap(m *sync.Map) int {
 	count := 0

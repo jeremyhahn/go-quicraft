@@ -173,3 +173,124 @@ func TestWitnessBootstrapShape_LatchesRoleMismatch(t *testing.T) {
 			"never campaign", r.state)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H1: a RESTARTED leader must not replicate full payloads to a seeded witness
+// ---------------------------------------------------------------------------
+
+// TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange is the H1
+// regression, seen from the LEADER.
+//
+// Host.StartShard seeds proto.Membership.Addresses from the caller's members
+// map whenever recovery restored no membership — the ordinary state of a
+// replica that has never snapshotted. That map is the operator's list of
+// replica IDs; it records no roles, so every witness and observer in it is
+// seeded as a full VOTER. syncRaftRemotes then fills r.witnesses from
+// membership.witnesses alone, so the witness is absent from it, and
+// broadcastAppend selects sendAppend — the FULL command stream — for a replica
+// whose entire purpose is to hold none of it. Omitting the witness from the
+// map instead is not an alternative: it disappears from the leader's remotes
+// altogether.
+//
+// The committed AddWitness entry is still in the log (config changes are
+// compacted only behind a snapshot, and a snapshot would have restored the
+// membership instead) and is re-applied on restart. This asserts it moves the
+// witness OUT of the voting set and back onto the metadata-only data path.
+func TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange(t *testing.T) {
+	payload := []byte("full-entry-payload")
+
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.CheckQuorum = config.BoolPtr(false)
+
+	lr := newTestLogReader(nil, proto.State{})
+	// The restart seed: replica 4 is a WITNESS, but the members map the
+	// operator passed lists it exactly like every full replica.
+	lr.membership = proto.Membership{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 4: "wit4"},
+	}
+
+	p, err := NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if !p.membership.isVoter(4) {
+		t.Fatal("the fixture does not reproduce the seed: replica 4 must start " +
+			"in the full voter set")
+	}
+
+	// The committed config change that gave replica 4 its role, replayed from
+	// the log exactly as Peer.Commit replays it after a restart.
+	cc := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 4, Address: "wit4"}
+	ccCmd := make([]byte, cc.Size())
+	if _, mErr := cc.MarshalTo(ccCmd); mErr != nil {
+		t.Fatalf("marshalling the config change: %v", mErr)
+	}
+	p.processConfigChanges([]proto.Entry{
+		{Index: 5, Term: 1, Type: proto.EntryConfigChange, Cmd: ccCmd},
+	})
+
+	if p.membership.isVoter(4) {
+		t.Fatalf("replica 4 is still in the voting set after its committed "+
+			"AddWitness replayed: %+v", p.membership.addresses)
+	}
+	if !p.membership.isWitness(4) {
+		t.Fatalf("replica 4 is not a witness after its committed AddWitness "+
+			"replayed: %+v", p.membership.witnesses)
+	}
+	if p.membership.configChangeID != 5 {
+		t.Fatalf("configChangeID = %d, want 5", p.membership.configChangeID)
+	}
+	if _, ok := p.r.witnesses[4]; !ok {
+		t.Fatal("r.witnesses does not track replica 4; broadcastAppend selects " +
+			"sendWitnessAppend from this map and from nothing else")
+	}
+	if _, ok := p.r.remotes[4]; ok {
+		t.Fatal("r.remotes still tracks replica 4 as a full replica")
+	}
+
+	// The data path itself: the leader must strip the payload for replica 4
+	// and keep it for the full replica 2.
+	r := p.r
+	electLeader(r)
+	if err := r.step(proto.Message{
+		Type:    proto.Propose,
+		Origin:  proto.OriginLocal,
+		Entries: []proto.Entry{{Cmd: payload}},
+	}); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	proposed := r.log.lastIndex()
+	r.drainMessages()
+	for _, id := range []uint64{2, 4} {
+		rm := r.getRemote(id)
+		if rm == nil {
+			t.Fatalf("replica %d is not tracked by the leader", id)
+		}
+		rm.probeSent = false
+	}
+	r.broadcastAppend()
+
+	sent := make(map[uint64]*proto.Entry)
+	for _, msg := range collectMessages(r, proto.Replicate) {
+		for i := range msg.Entries {
+			if msg.Entries[i].Index == proposed {
+				sent[msg.To] = &msg.Entries[i]
+			}
+		}
+	}
+	if sent[4] == nil || sent[2] == nil {
+		t.Fatalf("no Replicate carried entry %d to both replicas: %v", proposed, sent)
+	}
+	if sent[4].Cmd != nil {
+		t.Errorf("the witness received the entry payload %q; a restarted leader "+
+			"replicated the complete command stream to it", sent[4].Cmd)
+	}
+	if sent[4].Type != proto.EntryMetadata {
+		t.Errorf("witness entry type = %d, want EntryMetadata (%d)",
+			sent[4].Type, proto.EntryMetadata)
+	}
+	if !bytes.Equal(sent[2].Cmd, payload) {
+		t.Errorf("the full replica received %q, want the full payload %q",
+			sent[2].Cmd, payload)
+	}
+}

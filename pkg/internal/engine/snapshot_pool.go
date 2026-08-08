@@ -157,6 +157,18 @@ type snapshotPool struct {
 	// the global floor falls back to the calling shard only.
 	nodes func() []*Node
 
+	// tryImportLock takes the host's per-shard import lock without waiting,
+	// reporting whether it did; the returned func releases it. It is wired by
+	// the Host, which owns the lock ImportSnapshot holds for the DURATION of
+	// an import.
+	//
+	// The import staging directory holds the imported state machine in
+	// PLAINTEXT and is indistinguishable by name from one a crash orphaned, so
+	// the sweep that reclaims it may only run when no import is in flight. Nil
+	// means no host owns this pool (standalone engine tests): nothing can be
+	// importing, so the sweep runs.
+	tryImportLock func(shardID uint64) (func(), bool)
+
 	// metrics collects raft-level metrics. Nil when disabled.
 	metrics RaftMetrics
 }
@@ -1146,10 +1158,22 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 
 	// Reclaim an import staging directory orphaned by a crash for the same
 	// reason and on the same trigger: it holds the imported state machine in
-	// PLAINTEXT and no scan on the host will ever look at it again. No import
-	// can be in flight here — Host.ImportSnapshot refuses a RUNNING shard, and
-	// this shard is running by construction.
-	SweepStaleImportStageDirs(node.SnapshotDir(), req.shardID, req.replicaID)
+	// PLAINTEXT and no scan on the host will ever look at it again.
+	//
+	// "The shard is running, so no import can be in flight" is NOT a valid
+	// justification for sweeping unlocked. Host.ImportSnapshot checks that the
+	// shard is stopped in its PREFLIGHT, before it takes the import lock and
+	// long before it finishes writing; StartShard registers the node hundreds
+	// of lines after its own sweep. An import that passed preflight and is
+	// midway through a multi-gigabyte write is therefore perfectly compatible
+	// with a shard that is running by the time a leader's InstallSnapshot lands
+	// here — and RemoveAll on its live staging directory fails the operator's
+	// disaster-recovery restore for no reason.
+	//
+	// Take the same try-lock StartShard takes: it is the only thing that
+	// distinguishes a live staging directory from an orphaned one, and an
+	// import that holds it owns its staging directory and removes it itself.
+	sweepImportStage(p.tryImportLock, node.SnapshotDir(), req.shardID, req.replicaID)
 
 	// An encrypted artifact with no usable barrier fails CLOSED, matching
 	// Host.StartShard on the identical predicate. Falling through would hand
@@ -2009,6 +2033,28 @@ func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
 	}
 }
 
+// sweepImportStage runs SweepStaleImportStageDirs only when the shard's import
+// lock can be taken without waiting, and releases it afterwards. A nil tryLock
+// means no host owns the caller (standalone engine tests), so nothing can be
+// importing and the sweep runs unconditionally.
+//
+// The wait must never happen: an import can run for as long as it takes to
+// write a multi-gigabyte artifact, and neither StartShard nor snapshot recovery
+// may block behind one. "An import holds the lock" is itself the answer —
+// whatever the sweep would have found belongs to that import.
+func sweepImportStage(tryLock func(shardID uint64) (func(), bool), baseDir string, shardID, replicaID uint64) {
+	if tryLock == nil {
+		SweepStaleImportStageDirs(baseDir, shardID, replicaID)
+		return
+	}
+	release, ok := tryLock(shardID)
+	if !ok {
+		return
+	}
+	defer release()
+	SweepStaleImportStageDirs(baseDir, shardID, replicaID)
+}
+
 // SweepStaleImportStageDirs removes orphaned import staging directories from a
 // shard/replica's snapshot tree.
 //
@@ -2032,7 +2078,9 @@ func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
 // otherwise ignored: a failed cleanup must not abort startup or recovery.
 //
 // The caller must ensure no import is in flight for the shard, since a live
-// staging directory is indistinguishable from an orphaned one by name.
+// staging directory is indistinguishable from an orphaned one by name — use
+// sweepImportStage, which takes the shard's import lock to establish exactly
+// that.
 func SweepStaleImportStageDirs(baseDir string, shardID, replicaID uint64) {
 	base := snapshotBaseDir(baseDir, shardID, replicaID)
 	entries, err := os.ReadDir(base)

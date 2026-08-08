@@ -2197,6 +2197,13 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	cb := &hostEngineCallback{h: h}
 	eng.SetCallback(cb)
 
+	// Wire the per-shard import lock into the snapshot pool. Snapshot recovery
+	// reclaims orphaned import staging directories, which are indistinguishable
+	// by name from the one a RUNNING import is writing its plaintext state
+	// machine into; the lock is the only thing that tells them apart, and the
+	// Host owns it.
+	eng.SetImportLocker(h.tryAcquireImportLock)
+
 	// Start the engine worker pipeline.
 	eng.Start()
 
@@ -2486,12 +2493,25 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	//
 	// A restart whose membership WAS recovered is additionally protected by the
 	// seeding gate below: the map cannot make this replica a voter because the
-	// map is not applied at all. A restart without a snapshot has no such
-	// protection — the map is still the only membership it has — but the
-	// still-uncompacted config-change entries replay at commit time and
-	// raft.checkSelfRole re-evaluates on every one of them, so the seeded
-	// placement is transient and self-correcting. Refusing to start is not: it
-	// has no remedy at all.
+	// map is not applied at all. A restart WITHOUT a snapshot has no such
+	// protection — the map is still the only membership it has — so the seed
+	// does place this replica, and every other non-voter the operator listed,
+	// in Addresses. That placement is PROVISIONAL and is repaired by the
+	// committed AddWitness / AddNonVoting entries, which are necessarily still
+	// in the log (config changes are compacted only behind a snapshot, and a
+	// snapshot would have restored the membership instead) and are re-applied
+	// at commit time on restart.
+	//
+	// The repair is the business of raft.membership.apply, which CONVERGES on
+	// the role each committed entry names instead of refusing an entry whose
+	// target is already a member — see the "Convergent application" comment in
+	// internal/raft/membership.go. Nothing here may rely on checkSelfRole for
+	// it: that compares only the WITNESS bit, so it does not see an observer
+	// seeded as a voter at all, and it is a latch, not a repair — it would
+	// leave the membership itself wrong on every replica that restarted this
+	// way, and a snapshot taken afterwards would make it durable.
+	//
+	// Refusing to start instead is not an option: it has no remedy at all.
 	firstStart := !hasPersistedState
 	if firstStart && (cfg.IsWitness || cfg.IsObserver) {
 		if _, listed := members[cfg.ReplicaID]; listed {
@@ -6672,11 +6692,8 @@ func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
 // requestConfigChange is the shared implementation for all membership
 // operations. It serializes the ConfigChange, wraps it in an
 // EntryConfigChange entry, and delivers it via the engine inbox.
-// witness-policy gating, cert exclusivity, claim/rollback and the pending-op
-// bookkeeping. Splitting it would move validation away from the rollback that
-// pairs with it, which is exactly where this path has produced defects.
 //
-//nolint:gocyclo // one funnel for every membership change: role validation,
+//nolint:gocyclo // one funnel for every membership change: role validation, witness-policy gating, cert exclusivity, claim/rollback and the pending-op bookkeeping; splitting it would move validation away from the rollback that pairs with it, which is exactly where this path has produced defects
 func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto.ConfigChange) (*RequestState, error) {
 	configChangeIndex := cc.ConfigChangeID
 	if h.closed.Load() {

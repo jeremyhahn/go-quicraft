@@ -770,8 +770,6 @@ func (r *raft) becomeLeader() {
 // Message dispatch
 // --------------------------------------------------------------------------
 
-// step handles a Raft message. Common term-based logic is handled first,
-// then delegation to the role-specific step function.
 // dropHighTermVote reports whether a higher-term RequestVote should be
 // dropped under the CheckQuorum rule: the node has a known leader and has
 // heard from it within the last election timeout. Transfer-hinted votes
@@ -786,10 +784,10 @@ func (r *raft) dropHighTermVote(msg proto.Message) bool {
 	return r.leaderID != noLeader && r.electionTick < r.electionTimeout
 }
 
-// in a fixed order before any role dispatch, and each gate's placement is a
-// safety property (see the wire/local and zero-term comments below).
+// step handles a Raft message. Common term-based logic is handled first,
+// then delegation to the role-specific step function.
 //
-//nolint:gocyclo // the protocol entry point: origin and term gates must run
+//nolint:gocyclo // the protocol entry point: origin and term gates must run in a fixed order before any role dispatch, and each gate's placement is a safety property (see the wire/local and zero-term comments below)
 func (r *raft) step(msg proto.Message) error {
 	// Refuse process-local message types that arrived from the wire, at ANY
 	// term. These four are never sent between replicas (see
