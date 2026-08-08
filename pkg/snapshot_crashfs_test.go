@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 )
 
@@ -54,7 +55,7 @@ type crashFS struct {
 	nodes map[string]*crashNode
 	// tombs holds entries unlinked from the live image whose removal is not
 	// yet durable; Crash resurrects them.
-	tombs   map[string]*crashNode
+	tombs   map[string]crashTomb
 	tempSeq int
 
 	hookMu sync.Mutex
@@ -62,6 +63,22 @@ type crashFS struct {
 	// it may call Crash to cut power mid-sequence. A non-nil error it returns
 	// fails the operation, which then has no effect.
 	hook func(op crashOp, path string) error
+}
+
+// crashTomb is an entry unlinked from the live image whose removal is not yet
+// durable.
+//
+// renamedTo links a tombstone to the name its content MOVED to, and is empty
+// for an unlink (Remove/RemoveAll, or a rename that replaced an existing
+// destination). The link is what makes a rename atomic across a crash: without
+// it Crash resurrected the old name from the tombstone AND kept the new name
+// whenever the destination's entry had become durable under a DIFFERENT parent,
+// so one file came back under BOTH names — a tree rename(2) cannot produce, and
+// exactly the kind of impossible state a durability test would then be written
+// against.
+type crashTomb struct {
+	node      *crashNode
+	renamedTo string
 }
 
 // crashNode is one filesystem object. Directories hold no content; only their
@@ -109,7 +126,7 @@ var errCrashed = errors.New("quicraft_test: handle used after simulated power lo
 func newCrashFS(seeded ...string) *crashFS {
 	c := &crashFS{
 		nodes: make(map[string]*crashNode),
-		tombs: make(map[string]*crashNode),
+		tombs: make(map[string]crashTomb),
 	}
 	for _, dir := range seeded {
 		for p := filepath.Clean(dir); ; {
@@ -189,13 +206,28 @@ func (c *crashFS) Crash() {
 	defer c.mu.Unlock()
 	c.gen++
 
-	// A removal that was never covered by a parent fsync did not happen.
-	for p, n := range c.tombs {
-		if n.entryDurable {
-			c.nodes[p] = n
+	// A removal that was never covered by a parent fsync did not happen — with
+	// one exception: an entry that was RENAMED away and whose destination
+	// survives this crash has moved, not been removed. Resurrecting it as well
+	// would leave one file reachable under both names at once, which no
+	// rename(2) can produce. Survivorship is evaluated against the pre-crash
+	// image, before any resurrection perturbs it.
+	survived := make(map[string]bool, len(c.tombs))
+	for _, t := range c.tombs {
+		if t.renamedTo != "" {
+			survived[t.renamedTo] = c.survivesLocked(t.renamedTo)
 		}
 	}
-	c.tombs = make(map[string]*crashNode)
+	for p, t := range c.tombs {
+		if !t.node.entryDurable {
+			continue
+		}
+		if t.renamedTo != "" && survived[t.renamedTo] {
+			continue
+		}
+		c.nodes[p] = t.node
+	}
+	c.tombs = make(map[string]crashTomb)
 
 	// Unsynced writes are lost.
 	for _, n := range c.nodes {
@@ -218,6 +250,26 @@ func (c *crashFS) Crash() {
 				delete(c.nodes, p)
 			}
 		}
+	}
+}
+
+// survivesLocked reports whether path would still be reachable after a crash at
+// this instant: it exists and its own entry, plus every ancestor entry, is
+// durable.
+func (c *crashFS) survivesLocked(path string) bool {
+	if _, ok := c.nodes[path]; !ok {
+		return false
+	}
+	for p := path; ; {
+		n, ok := c.nodes[p]
+		if !ok || !n.entryDurable {
+			return false
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return true
+		}
+		p = parent
 	}
 }
 
@@ -360,7 +412,8 @@ func (c *crashFS) Rename(oldpath, newpath string) error {
 		return notExist("rename", oldpath)
 	}
 	if existing, ok := c.lookupLocked(newpath); ok {
-		c.tombs[newpath] = existing
+		// Replaced, not moved: nothing carries this content forward.
+		c.tombs[newpath] = crashTomb{node: existing}
 	}
 	// Renaming a DIRECTORY relocates everything beneath it in one step. Moving
 	// only the directory node left its children addressable under the old name
@@ -378,12 +431,15 @@ func (c *crashFS) Rename(oldpath, newpath string) error {
 	for _, p := range moved {
 		child := c.nodes[p]
 		delete(c.nodes, p)
+		dst := newPrefix + strings.TrimPrefix(p, oldPrefix)
 		// The old name survives a crash that does not cover the rename, so the
-		// child is tombstoned exactly as the directory itself is.
-		c.tombs[p] = child.clone()
-		c.nodes[newPrefix+strings.TrimPrefix(p, oldPrefix)] = child
+		// child is tombstoned exactly as the directory itself is — and linked to
+		// where it went, so a crash that DOES cover the rename does not bring it
+		// back alongside its new name.
+		c.tombs[p] = crashTomb{node: child.clone(), renamedTo: dst}
+		c.nodes[dst] = child
 	}
-	c.tombs[oldpath] = n.clone()
+	c.tombs[oldpath] = crashTomb{node: n.clone(), renamedTo: newpath}
 	delete(c.nodes, oldpath)
 	n.entryDurable = false
 	c.nodes[newpath] = n
@@ -403,7 +459,7 @@ func (c *crashFS) Remove(name string) error {
 		return notExist("remove", name)
 	}
 	delete(c.nodes, name)
-	c.tombs[name] = n
+	c.tombs[name] = crashTomb{node: n}
 	return nil
 }
 
@@ -419,7 +475,7 @@ func (c *crashFS) RemoveAll(path string) error {
 	for p, n := range c.nodes {
 		if p == path || strings.HasPrefix(p, prefix) {
 			delete(c.nodes, p)
-			c.tombs[p] = n
+			c.tombs[p] = crashTomb{node: n}
 		}
 	}
 	return nil
@@ -676,3 +732,92 @@ var (
 	_ snapshotFS   = (*crashFS)(nil)
 	_ snapshotFile = (*crashFile)(nil)
 )
+
+// TestCrashFS_RenameIsAtomicAcrossACrash is a FIDELITY test for the double
+// itself.
+//
+// Rename tombstones every child at its old path and installs it at the new one.
+// Crash resurrected any tombstone whose entry was durable, unconditionally, so
+// when the destination's entry became durable under a DIFFERENT parent — the
+// old parent's tombstones are not cleared by an fsync of the new parent — the
+// same file came back under BOTH names. rename(2) cannot produce that tree, and
+// a durability test written against this double would have been asserting
+// against a state the production filesystem never reaches.
+//
+// Both directions are pinned: a rename the crash COVERS moves, and one it does
+// not reverts.
+func TestCrashFS_RenameIsAtomicAcrossACrash(t *testing.T) {
+	const payload = "staged-artifact-bytes"
+
+	// stage builds /vol/a/x/f with durable content and a durable entry for x,
+	// then renames x to /vol/b/y.
+	stage := func(t *testing.T) *crashFS {
+		t.Helper()
+		cfs := newCrashFS("/vol/a", "/vol/b")
+		if err := cfs.MkdirAll("/vol/a/x", 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		f, err := cfs.OpenFile("/vol/a/x/f", os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			t.Fatalf("OpenFile: %v", err)
+		}
+		if _, err := f.Write([]byte(payload)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := f.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := syncDir(cfs, "/vol/a/x"); err != nil {
+			t.Fatalf("syncDir(x): %v", err)
+		}
+		if err := syncDir(cfs, "/vol/a"); err != nil {
+			t.Fatalf("syncDir(a): %v", err)
+		}
+		if err := cfs.Rename("/vol/a/x", "/vol/b/y"); err != nil {
+			t.Fatalf("Rename: %v", err)
+		}
+		return cfs
+	}
+
+	t.Run("covered by the destination parent fsync", func(t *testing.T) {
+		cfs := stage(t)
+		if err := syncDir(cfs, "/vol/b"); err != nil {
+			t.Fatalf("syncDir(b): %v", err)
+		}
+		cfs.Crash()
+
+		got, ok := cfs.durableBytes("/vol/b/y/f")
+		if !ok {
+			t.Fatal("/vol/b/y/f is gone although the rename was made durable")
+		}
+		if string(got) != payload {
+			t.Fatalf("/vol/b/y/f = %q, want %q", got, payload)
+		}
+		if cfs.exists("/vol/a/x") || cfs.exists("/vol/a/x/f") {
+			t.Fatalf("the source name came back alongside the destination: %v under /vol/a; "+
+				"one file is reachable under BOTH names, which rename(2) cannot produce",
+				cfs.entries("/vol/a"))
+		}
+	})
+
+	t.Run("not covered: the rename reverts", func(t *testing.T) {
+		cfs := stage(t)
+		cfs.Crash()
+
+		got, ok := cfs.durableBytes("/vol/a/x/f")
+		if !ok {
+			t.Fatal("/vol/a/x/f is gone although the rename that moved it was never " +
+				"made durable; an uncovered rename must revert to the source name")
+		}
+		if string(got) != payload {
+			t.Fatalf("/vol/a/x/f = %q, want %q", got, payload)
+		}
+		if cfs.exists("/vol/b/y") || cfs.exists("/vol/b/y/f") {
+			t.Fatalf("the destination survived an uncovered rename: %v under /vol/b",
+				cfs.entries("/vol/b"))
+		}
+	})
+}

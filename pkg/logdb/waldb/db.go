@@ -2932,13 +2932,20 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 
 // writeBootstrap serializes and writes bootstrap info to the WAL.
 //
+// recordDataDir selects the on-wire shape. True appends the trailing DataDir
+// length prefix, which is what every record this version writes carries and
+// what replayBootstrap reads back as DataDirRecorded. False ends the record at
+// the address map — byte-for-byte what a pre-DataDir writer produced — and is
+// reserved for a migration copying a record that genuinely predates the field;
+// see DB.saveBootstrapPreservingProvenance for why absence must be copyable.
+//
 // INVARIANT: This method MUST only be called outside of batchMode (i.e. from
 // SaveBootstrap). In non-batch mode, writeRecord calls fdatasync inline before
 // returning, so the immediate in-memory update below is safe — the data is
 // already durable. If this method were ever called in batchMode, the immediate
 // update would create a phantom read before fsync. Callers adding batch-mode
 // bootstrap support must route through pendingMemUpdates instead.
-func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs logdb.Bootstrap) error {
+func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs logdb.Bootstrap, recordDataDir bool) error {
 	// Guard against accidental batch-mode usage. See invariant above.
 	if s.batchMode {
 		return &WriteBootstrapBatchModeError{}
@@ -2956,7 +2963,9 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	for _, addr := range bs.Addresses {
 		totalSize += 8 + 4 + len(addr)
 	}
-	totalSize += bootstrapDataDirLenSize + len(bs.DataDir)
+	if recordDataDir {
+		totalSize += bootstrapDataDirLenSize + len(bs.DataDir)
+	}
 
 	buf := s.getMarshalBuf(totalSize)
 	buf[0] = payloadTypeBootstrap
@@ -2977,10 +2986,12 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 		copy(buf[pos+12:], addr)
 		pos += 12 + len(addr)
 	}
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(bs.DataDir)))
-	pos += bootstrapDataDirLenSize
-	copy(buf[pos:], bs.DataDir)
-	pos += len(bs.DataDir)
+	if recordDataDir {
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(len(bs.DataDir)))
+		pos += bootstrapDataDirLenSize
+		copy(buf[pos:], bs.DataDir)
+		pos += len(bs.DataDir)
+	}
 
 	landing, err := s.writeRecord(buf[:pos])
 	if err != nil {
@@ -2992,11 +3003,14 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	// epoch — atomically for readers, under dataMu. The write is already
 	// durable here because non-batch writeRecord fdatasyncs inline.
 	s.dataMu.Lock()
-	// The record just written always carries the DataDir length prefix, so the
-	// in-memory copy must say so too — otherwise a GetBootstrap served before
-	// the next restart would report the field as absent while a replay of the
-	// very same bytes reports it as present.
-	bs.DataDirRecorded = true
+	// The in-memory copy must describe the BYTES just written: a GetBootstrap
+	// served before the next restart has to agree with a replay of the very same
+	// record, in both directions. A record written without the length prefix
+	// replays as absent, so the in-memory copy says absent too.
+	bs.DataDirRecorded = recordDataDir
+	if !recordDataDir {
+		bs.DataDir = ""
+	}
 	s.bootstraps[key] = bs
 	s.setBootstrapSegment(key, landing.segID)
 	s.advanceCommittedHWM(landing.segID)
@@ -3553,7 +3567,48 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 }
 
 // SaveBootstrap persists bootstrap information for a node.
+//
+// The record always carries the DataDir field, so the stored bootstrap reports
+// DataDirRecorded true regardless of what the caller passed: a caller states a
+// DataDir, it does not get to state that nobody ever stated one. See
+// saveBootstrapPreservingProvenance for the one path that must.
 func (db *DB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
+	return db.saveBootstrap(shardID, replicaID, bootstrap, true)
+}
+
+// saveBootstrapPreservingProvenance persists a bootstrap record COPIED from
+// another DB, keeping the source record's DataDir provenance intact.
+//
+// A record written before the DataDir field existed carries no DataDir at all,
+// and "absent" is a different statement from "empty": empty means the shard
+// roots its snapshot tree under the host's NodeHostDir, absent means nothing is
+// known. Copying such a record through SaveBootstrap would stamp
+// DataDirRecorded true and so turn a legacy record into an explicit
+// DataDir="" — which Host.ImportSnapshot then acts on, writing the artifact
+// under NodeHostDir for a shard whose tree is actually under its own DataDir
+// (outside everything snapshot GC and the DEK purge-floor scan enumerate) while
+// simultaneously refusing the operator's WithImportDataDir override as a
+// contradiction. A re-encryption migration would silently create that state for
+// every legacy shard it copied.
+//
+// It is deliberately not exported and not reachable through the logdb.LogDB
+// interface: only a copy of an existing record may claim absence, and only
+// because the record it came from claimed it.
+func (db *DB) saveBootstrapPreservingProvenance(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
+	if !bootstrap.DataDirRecorded && bootstrap.DataDir != "" {
+		// The source cannot have produced this: replay only fills DataDir when
+		// the record carried the field. Fail closed rather than drop a DataDir
+		// whose loss costs the artifact's DEK.
+		return ErrBootstrapDataDirProvenance
+	}
+	return db.saveBootstrap(shardID, replicaID, bootstrap, bootstrap.DataDirRecorded)
+}
+
+// saveBootstrap writes a bootstrap record. recordDataDir selects the on-wire
+// shape: true appends the DataDir length prefix (and so states the field as
+// fact), false ends the record at the address map, which is exactly what a
+// pre-DataDir writer produced and what replayBootstrap reads back as absent.
+func (db *DB) saveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap, recordDataDir bool) error {
 	if err := db.writeGate(); err != nil {
 		return err
 	}
@@ -3564,7 +3619,7 @@ func (db *DB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	return shard.writeBootstrap(key, shardID, replicaID, bootstrap)
+	return shard.writeBootstrap(key, shardID, replicaID, bootstrap, recordDataDir)
 }
 
 // GetBootstrap returns the bootstrap information for a node.

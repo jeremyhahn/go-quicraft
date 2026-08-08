@@ -1913,6 +1913,29 @@ func (h *Host) acquireImportLock(ctx context.Context, shardID uint64) (func(), e
 	}
 }
 
+// tryAcquireImportLock takes the shard's exclusive import lock if it is free,
+// reporting whether it did. The returned function releases it and is nil when
+// the lock was not taken.
+//
+// It exists for callers that must never WAIT for an import — StartShard sweeps
+// orphaned import staging directories and an import can run for as long as it
+// takes to write a multi-gigabyte artifact — and for which "an import holds the
+// lock" is itself the answer: whatever the sweep would have found belongs to
+// that import.
+func (h *Host) tryAcquireImportLock(shardID uint64) (func(), bool) {
+	v, _ := h.importLocks.LoadOrStore(shardID, make(chan struct{}, 1))
+	lock, ok := v.(chan struct{})
+	if !ok {
+		return nil, false
+	}
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, true
+	default:
+		return nil, false
+	}
+}
+
 // markShardJoining records that a shard is in its join bootstrap window.
 func (h *Host) markShardJoining(shardID uint64) {
 	h.joiningShards.Store(shardID, struct{}{})
@@ -2384,7 +2407,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// Recover LogReader state from LogDB on restart. On first boot the
 	// LogDB will return ErrNoSnapshot / ErrNoState / empty entry range
 	// and we fall through to the bootstrap membership below.
-	if err := h.recoverLogReader(lr, cfg.ShardID, cfg.ReplicaID); err != nil {
+	hasPersistedState, err := h.recoverLogReader(lr, cfg.ShardID, cfg.ReplicaID)
+	if err != nil {
 		return &HostInitError{Field: "log_recovery", Err: err}
 	}
 
@@ -2447,22 +2471,38 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// / RequestAddObserver so the role enters membership through a committed
 	// config change.
 	//
-	// # Why this is gated on nothingRecovered
+	// # Why this is gated on firstStart
 	//
-	// On a RESTART the members map seeds nothing: the recovered membership is
-	// authoritative and the block below does not run, so the map cannot make
-	// this replica a voter and there is nothing to refuse. Refusing anyway left
-	// a legitimately-added witness with NO working restart: join=false with
-	// itself listed hit this error, join=false without itself hit
-	// SelfNotInMembersError, and the only form that returned nil — join=true —
-	// set the joining marker, which is cleared in exactly ONE place (the
+	// The refusal must apply to a BOOTSTRAP and to nothing else. Refusing on a
+	// restart left a legitimately-added witness with NO working restart:
+	// join=false with itself listed hit this error, join=false without itself
+	// hit SelfNotInMembersError, and the only form that returned nil — join=true
+	// — set the joining marker, which is cleared in exactly ONE place (the
 	// InstallSnapshot adopt branch in raft). A caught-up witness receives
 	// Replicate and never InstallSnapshot, so the marker became PERMANENT for
 	// the process: Peer.IsMember reports true for every replica ID (per-shard
 	// message authorization off), the handler skips SourceAddress binding, and
 	// Peer.Tick returns early — no election timer and no CheckQuorum. The gate
 	// meant to prevent a misconfiguration was itself producing a far worse one.
-	if nothingRecovered && (cfg.IsWitness || cfg.IsObserver) {
+	//
+	// The discriminator is PERSISTED STATE, not recovered membership. Membership
+	// is written only alongside a snapshot record (both LogDB backends set it
+	// inside the u.Snapshot.Index > 0 branch), so a caught-up but never
+	// snapshotted witness — the common case, since a witness stores no entry
+	// payloads and a young shard may never reach SnapshotEntries — recovers no
+	// membership and looked exactly like a bootstrap. It hit the refusal, and
+	// with it every one of the outcomes above.
+	//
+	// A restart whose membership WAS recovered is additionally protected by the
+	// seeding gate below: the map cannot make this replica a voter because the
+	// map is not applied at all. A restart without a snapshot has no such
+	// protection — the map is still the only membership it has — but the
+	// still-uncompacted config-change entries replay at commit time and
+	// raft.checkSelfRole re-evaluates on every one of them, so the seeded
+	// placement is transient and self-correcting. Refusing to start is not: it
+	// has no remedy at all.
+	firstStart := !hasPersistedState
+	if firstStart && (cfg.IsWitness || cfg.IsObserver) {
 		if _, listed := members[cfg.ReplicaID]; listed {
 			role := "observer"
 			if cfg.IsWitness {
@@ -2551,6 +2591,24 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// the on-disk-state-machine path below that skips snapshot recovery entirely
 	// and the case where no snapshot record exists at all.
 	engine.SweepStaleDecryptTmpTree(snapshotDir, cfg.ShardID, cfg.ReplicaID)
+
+	// Reclaim an import staging directory orphaned by a crash. ImportSnapshot
+	// writes the artifact PLAINTEXT and re-encrypts it immediately afterwards;
+	// a process killed between the two leaves the complete plaintext state
+	// machine under a name NOTHING else on the host enumerates (that invisibility
+	// is what keeps a half-written import out of snapshot GC and the DEK
+	// purge-floor scan), so without this sweep the exposure is permanent.
+	//
+	// A live staging directory is indistinguishable from an orphaned one by
+	// name, so the sweep runs only when this call can prove no import is in
+	// flight for the shard: the per-shard import lock. Taking it is a TRY —
+	// StartShard must not block behind a multi-gigabyte restore, and an import
+	// that is running owns its staging directory and removes it itself on
+	// failure.
+	if release, ok := h.tryAcquireImportLock(cfg.ShardID); ok {
+		engine.SweepStaleImportStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
+		release()
+	}
 
 	stateMachine, err := rsm.NewStateMachine(
 		cfg.ShardID, cfg.ReplicaID, create, snapshotDir,
@@ -4970,6 +5028,20 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// the rename below makes the whole directory reachable at once, and a
 	// directory whose entries are not durable would come back after a crash
 	// under the canonical name with files missing.
+	//
+	// This is DEFENCE IN DEPTH, not the primary guarantee, and the distinction
+	// matters to anyone tempted to delete it or to write a test for it. The
+	// syncDirChain after the rename fsyncs snapDir FIRST and its parent second,
+	// and a rename does not change the inode — so the leaf fsync already covers
+	// these same entries, and snapDir's own entry does not become durable until
+	// the parent fsync that follows it. No crash point between the two can
+	// therefore expose an incomplete published directory, which is why deleting
+	// this call leaves the suite (including
+	// TestImportSnapshot_CrashAtEveryStepLeavesAConsistentTree, which walks the
+	// crash point across every filesystem operation the import performs) green.
+	// It is kept for the filesystem that makes a rename durable without covering
+	// the entries created beneath the source before it — an ordering POSIX does
+	// not forbid — at the cost of one fsync per operator-initiated import.
 	if syncErr := syncDir(fsys, stageDir); syncErr != nil {
 		discardImportDir(fsys, shardID, stageDir)
 		return syncErr
@@ -4983,6 +5055,28 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		discardImportDir(fsys, shardID, stageDir)
 		return renameErr
 	}
+
+	// The canonical directory now exists and THIS import is what created it —
+	// the destination-exists precheck above proved it did not exist, and the
+	// per-shard import lock has been held across both. published records that
+	// fact explicitly rather than leaving a later cleanup to infer it, because
+	// the whole point of the precheck is that an import must never remove a
+	// directory it did not create.
+	//
+	// Every remaining failure must take the publication back down. Leaving it
+	// standing turns a transient error — an fsync failure, a cancelled context,
+	// a LogDB write error during a disaster-recovery restore — into a permanent
+	// lockout: the retry hits the destination-exists precheck and is refused
+	// with *ImportSnapshotDirExistsError, whose remedy is a manual rm -rf
+	// performed against an error message that says an import never removes a
+	// directory it did not create. Before the staging rewrite the retry simply
+	// overwrote the half-published directory and succeeded.
+	published := true
+	defer func() {
+		if published {
+			discardImportDir(fsys, shardID, snapDir)
+		}
+	}()
 
 	// Make the directory entries durable BEFORE recording the snapshot in
 	// LogDB. The data file is fsynced (both the original write and the
@@ -5026,7 +5120,13 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		// were written by the exporting host and are stored verbatim.
 		Compression: header.Compression,
 	}
-	return h.logdb.SaveSnapshot(shardID, replicaID, logdbSnap)
+	if saveErr := h.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil {
+		return saveErr
+	}
+	// Recorded: the directory is now the shard's snapshot and the rollback above
+	// must not run.
+	published = false
+	return nil
 }
 
 // importPreflight refuses an import that must not touch disk at all, and
@@ -5096,7 +5196,13 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 // "snapshot-<index>": engine.listSnapshotDirs skips it, so a half-written
 // import is invisible to snapshot GC, to latestSnapshotDir — the recovery
 // fallback — and to the DEK purge-floor scan.
-const importStageDirPattern = ".import-*"
+//
+// That same invisibility is why the pattern is NOT defined here: an orphaned
+// staging directory holds the imported state machine in PLAINTEXT and nothing
+// else on the host will ever enumerate it, so the name a writer creates must be
+// the name engine.SweepStaleImportStageDirs reclaims. The constant is shared
+// with the sweeper for exactly the reason the decrypt scratch prefixes are.
+const importStageDirPattern = engine.ImportStageDirPattern
 
 // checkImportAdvancesSnapshot refuses an artifact whose index does not advance
 // the shard's recorded snapshot.
@@ -5218,11 +5324,16 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 // never be recorded in LogDB. A removal failure is logged and otherwise
 // ignored: the caller is already returning the error that caused the discard.
 //
-// dir must always be a directory the failing import itself created
-// (fsys.MkdirTemp). It was once called with the canonical, index-named
-// destination, which an import does not necessarily own: a failed import at a
-// colliding index then deleted the shard's PRE-EXISTING snapshot outright while
-// LogDB still referenced it.
+// dir must always be a directory the failing import itself created: the staging
+// directory (fsys.MkdirTemp), or the canonical destination once the publishing
+// rename has moved that staging directory onto it. It was once called with the
+// canonical, index-named destination UNCONDITIONALLY, which an import does not
+// necessarily own: a failed import at a colliding index then deleted the shard's
+// PRE-EXISTING snapshot outright while LogDB still referenced it. What makes the
+// post-publish call safe is that the caller has PROVED ownership — the
+// destination-exists precheck and the rename ran under one hold of the
+// per-shard import lock — and tracks it in an explicit flag rather than
+// inferring it from the path.
 func discardImportDir(fsys snapshotFS, shardID uint64, dir string) {
 	if rmErr := fsys.RemoveAll(dir); rmErr != nil {
 		slog.Debug("snapshot import directory cleanup failed",
@@ -7033,18 +7144,33 @@ func buildTransportConfig(hc config.HostConfig) transport.Config {
 //
 // On first boot (no persisted data) every step is a no-op and the
 // LogReader remains in its default empty state.
-func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) error {
+//
+// It reports whether the LogDB held ANY durable state for the replica, which is
+// what tells a RESTART from a shard's first start. See the persisted variable
+// for why recovered membership cannot answer that question.
+func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) (bool, error) {
 	if h.logdb == nil {
-		return nil
+		return false, nil
 	}
+
+	// persisted reports whether the LogDB holds ANY durable Raft state for this
+	// replica: a snapshot record, a hard state, or log entries. It is the
+	// discriminator between the shard's FIRST start on this replica and a
+	// RESTART, and membership cannot serve that purpose: membership is persisted
+	// ONLY alongside a snapshot record (memdb.applyUpdate and waldb both set it
+	// inside the u.Snapshot.Index > 0 branch), so a replica that has been
+	// running — even one fully caught up — recovers no membership at all until
+	// it snapshots, and is otherwise indistinguishable from a bootstrap.
+	var persisted bool
 
 	// Step 1: Restore snapshot metadata. This sets markerIndex,
 	// markerTerm, and membership on the LogReader.
 	ss, err := h.logdb.GetSnapshot(shardID, replicaID)
 	if err != nil && err != logdb.ErrNoSnapshot {
-		return err
+		return false, err
 	}
 	if err == nil && ss.Index > 0 {
+		persisted = true
 		// Resolve the snapshot data file path and size so the raft
 		// layer can send InstallSnapshot to followers after recovery.
 		// The LogDB stores the snapshot directory; the data file is
@@ -7069,16 +7195,17 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 			Epoch:      ss.Epoch,
 		}
 		if applyErr := lr.ApplySnapshot(protoSS); applyErr != nil {
-			return applyErr
+			return false, applyErr
 		}
 	}
 
 	// Step 2: Restore hard state (term, vote, commit).
 	state, membership, err := h.logdb.ReadState(shardID, replicaID)
 	if err != nil && err != logdb.ErrNoState {
-		return err
+		return false, err
 	}
 	if err == nil {
+		persisted = true
 		lr.SetState(proto.State{
 			Term:   state.Term,
 			Vote:   state.Vote,
@@ -7098,15 +7225,16 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 	// entry payloads.
 	firstIndex, entryCount, err := h.logdb.EntryRange(shardID, replicaID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if entryCount > 0 {
+		persisted = true
 		if rangeErr := lr.SetRange(firstIndex, entryCount); rangeErr != nil {
-			return rangeErr
+			return false, rangeErr
 		}
 	}
 
-	return nil
+	return persisted, nil
 }
 
 // logdbMembershipToProto converts a logdb.Membership to a proto.Membership.

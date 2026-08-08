@@ -246,6 +246,116 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 	}
 }
 
+// TestStartShard_NonVotingRestartWithoutASnapshot covers the case the gate's own
+// rationale names but its first implementation missed: a witness or observer
+// that is CAUGHT UP and has therefore never been snapshotted.
+//
+// The gate was derived from recovered MEMBERSHIP, and membership is persisted
+// ONLY alongside a snapshot record — memdb.applyUpdate sets nd.membership
+// solely inside the u.Snapshot.Index > 0 branch, and waldb sources the
+// membership ReadState reports from the latest snapshot record. A replica with
+// a hard state and log entries but no snapshot therefore recovers NO membership
+// and was indistinguishable from a bootstrap, so the refusal fired on exactly
+// the replicas it was written to exempt:
+//
+//	join=false, self listed  -> NonVotingRoleInMembersError
+//	join=false, self omitted -> SelfNotInMembersError
+//	join=true,  self omitted -> nil, but the shard is marked JOINING — the
+//	                            permanent marker the gate exists to avoid
+//
+// This is not an exotic state. A witness stores no entry payloads and a young
+// shard may never reach SnapshotEntries at all, so "running, caught up, never
+// snapshotted" is the ordinary condition of a witness. The discriminator is
+// therefore PERSISTED STATE (snapshot record, hard state, or log entries), not
+// membership.
+func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{name: "witness", mutate: func(c *config.Config) { c.IsWitness = true }},
+		{name: "observer", mutate: func(c *config.Config) { c.IsObserver = true }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const shardID, replicaID uint64 = 62, 2
+			const voterAddr, selfAddr = "127.0.0.1:5000", "127.0.0.1:5001"
+
+			cfg := testHostConfig(t)
+			db := memdb.New()
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+			if err != nil {
+				t.Fatalf("NewHost failed: %v", err)
+			}
+			defer h.Close()
+
+			// The durable state of a CAUGHT-UP replica that has never
+			// snapshotted: a bootstrap record, a hard state and log entries —
+			// and, by construction, no membership anywhere in the LogDB.
+			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+				Addresses: map[uint64]string{1: voterAddr},
+			}); bsErr != nil {
+				t.Fatalf("SaveBootstrap failed: %v", bsErr)
+			}
+			if stErr := db.SaveState([]logdb.Update{{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				State:     logdb.State{Term: 7, Vote: 1, Commit: 2},
+				Entries: []logdb.Entry{
+					{Index: 1, Term: 7},
+					{Index: 2, Term: 7},
+				},
+			}}); stErr != nil {
+				t.Fatalf("SaveState failed: %v", stErr)
+			}
+			if _, _, stateErr := db.ReadState(shardID, replicaID); stateErr != nil {
+				t.Fatalf("seeding the hard state: %v", stateErr)
+			}
+			if _, snapErr := db.GetSnapshot(shardID, replicaID); !errors.Is(snapErr, logdb.ErrNoSnapshot) {
+				t.Fatalf("the fixture recorded a snapshot (%v); this test must cover the "+
+					"UNSNAPSHOTTED restart, which is the case the gate missed", snapErr)
+			}
+
+			scfg := testShardConfig(shardID, replicaID)
+			tt.mutate(&scfg)
+			scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
+
+			// The restart the operator actually performs: the same members map
+			// as every other replica, join=false.
+			members := map[uint64]string{1: voterAddr, replicaID: selfAddr}
+			if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+				t.Fatalf("restarting a caught-up but unsnapshotted %s failed: %v; there "+
+					"is then NO working restart path for this replica", tt.name, startErr)
+			}
+			defer func() { _ = h.StopShard(shardID) }()
+
+			// The consequence, not the error code: join=true was the only form
+			// that returned nil before, and it set a marker nothing clears.
+			if h.IsShardJoining(shardID) {
+				t.Error("the restarted replica is marked joining; the marker is cleared " +
+					"only by an InstallSnapshot adopt, which a caught-up replica never " +
+					"receives, so it would never clear")
+			}
+			node := h.engine.GetNode(shardID)
+			if node == nil {
+				t.Fatal("engine node missing after the restart")
+			}
+			if node.IsMember(999) {
+				t.Error("IsMember(999) is true: per-shard message authorization is " +
+					"disabled for the life of the process, and the handler's " +
+					"SourceAddress binding is skipped with it")
+			}
+
+			// The recovered log is what proves this was a restart and not a
+			// fresh bootstrap that happened to be accepted.
+			if _, _, idxErr := db.EntryRange(shardID, replicaID); idxErr != nil {
+				t.Fatalf("EntryRange after the restart: %v", idxErr)
+			}
+		})
+	}
+}
+
 // TestStartShard_WitnessEntersMembershipThroughConfigChange pins the other half:
 // the supported flow puts the witness where the DATA PATH reads it from.
 //

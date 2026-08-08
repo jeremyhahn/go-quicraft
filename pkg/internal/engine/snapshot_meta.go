@@ -113,6 +113,24 @@ const (
 	legacyMetaSizeNoEpoch     = 5 * 8
 	legacyMetaSizeEpoch       = 6 * 8
 	legacyMetaSizeCompression = 7 * 8
+
+	// maxSnapshotMetaBodyLen bounds the body length a record may DECLARE.
+	//
+	// The declared length is a uint32 read from a file and is used to slice the
+	// body, so it must be bounded before it is converted to any narrower type:
+	// on a 32-bit GOARCH a declared length of 2^31 or more becomes a NEGATIVE
+	// int, "claims more body than the file holds" is then false, and the slice
+	// panics — inside the DEK purge-floor scan, which walks every snapshot
+	// directory on the host and whose entire input is bytes on disk. Rejecting
+	// above this cap makes that truncation UNREACHABLE by construction rather
+	// than merely unreached on a 64-bit build, so the guarantee no longer
+	// depends on the width of int.
+	//
+	// 64 KiB is 8192 uint64 body fields against the current 7. The body is
+	// append-only and grows a field at a time, so no legitimate record can
+	// approach it; anything that does is corruption or a foreign file.
+	// The same bounded-then-parsed shape waldb's replayBootstrap uses.
+	maxSnapshotMetaBodyLen = 1 << 16
 )
 
 // SnapshotMeta is the decoded content of a snapshot.meta record.
@@ -194,16 +212,23 @@ func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 // body length — not len(data) — bounds every field read, so a record whose
 // body was truncated after the header is rejected instead of read past its end.
 //
-// bodyLen stays a uint32 and every comparison is made in unsigned arithmetic.
-// Converting it to int first was safe only on a 64-bit platform: on a 32-bit
-// GOARCH a declared length of 2^31 or more becomes NEGATIVE, the "claims more
-// body than the file holds" guard is then false, and body[:bodyLen] panics —
-// inside the DEK purge-floor scan, which walks every snapshot directory on the
-// host and is driven by bytes on disk. waldb's replayBootstrap avoids the same
-// truncation deliberately.
+// The declared length is bounded by maxSnapshotMetaBodyLen FIRST, and every
+// comparison is then made in unsigned arithmetic. Both matter: converting the
+// uint32 to int before the bounds check is safe only where int is 64 bits, and
+// on a 32-bit GOARCH a declared length of 2^31 or more becomes NEGATIVE, the
+// "claims more body than the file holds" guard is false, and body[:bodyLen]
+// panics — inside the DEK purge-floor scan, which walks every snapshot
+// directory on the host and is driven by bytes on disk. The cap makes that
+// value unrepresentable here on every GOARCH; the unsigned comparison keeps the
+// remaining check honest. waldb's replayBootstrap has the same shape.
 func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	version := binary.LittleEndian.Uint16(data[snapshotMetaVersionOff:])
 	bodyLen := binary.LittleEndian.Uint32(data[snapshotMetaBodyLenOff:])
+	if bodyLen > maxSnapshotMetaBodyLen {
+		// No record this format produces declares a body anywhere near this;
+		// the value is corruption or a foreign file.
+		return SnapshotMeta{}, ErrSnapshotMetaCorrupt
+	}
 	body := data[snapshotMetaHeaderSize:]
 	if uint64(bodyLen) > uint64(len(body)) {
 		// The record claims more body than the file holds: truncated.

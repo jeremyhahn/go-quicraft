@@ -137,36 +137,83 @@ func captureWarnOutput(t *testing.T) (*bytes.Buffer, func()) {
 // L1: a declared body length must be compared unsigned
 // ---------------------------------------------------------------------------
 
-// TestParseSnapshotMeta_HugeDeclaredBodyLength covers a record that declares a
-// body of 2^31 bytes or more.
+// TestParseSnapshotMeta_HugeDeclaredBodyLength covers a record that declares an
+// absurd body length.
 //
-// The declared length is a uint32 read from a file. Converting it to int before
-// the bounds check is safe only where int is 64 bits: on a 32-bit GOARCH such a
-// value becomes NEGATIVE, "claims more body than the file holds" is then false,
-// and body[:bodyLen] panics — inside the DEK purge-floor scan, which walks every
-// snapshot directory on the host and whose entire input is bytes on disk. The
-// comparison is therefore made in unsigned arithmetic, as waldb's replayBootstrap
-// deliberately does for the same reason.
+// The declared length is a uint32 read from a file and is used to SLICE the
+// body. Converting it to int before the bounds check is safe only where int is
+// 64 bits: on a 32-bit GOARCH a declared length of 2^31 or more becomes
+// NEGATIVE, "claims more body than the file holds" is then false, and
+// body[:bodyLen] panics — inside the DEK purge-floor scan, which walks every
+// snapshot directory on the host and whose entire input is bytes on disk.
 //
-// The assertion holds on every GOARCH: an unsigned comparison rejects these
-// records as truncated on a 64-bit build too, so a regression to a signed
-// comparison changes the 64-bit result as well.
+// A test that only falsifies the length on a SHORT record cannot see that: on
+// amd64 the signed comparison gives the same answer as the unsigned one, so
+// such a test passes with the bug present and only a 386 build can distinguish
+// them. This one asserts the property that IS architecture-independent —
+// the declared length is capped BEFORE it is narrowed, so a value that could
+// truncate to a negative int is unrepresentable here on any GOARCH — and the
+// oversized_declaration_with_a_body_to_match case makes the cap load-bearing on
+// a 64-bit build: the file really does hold the bytes it declares, so every
+// length-versus-available comparison, signed or unsigned, accepts it and only
+// the cap rejects it.
 func TestParseSnapshotMeta_HugeDeclaredBodyLength(t *testing.T) {
-	for _, declared := range []uint32{1 << 31, 1<<32 - 1, 0x8000_0038} {
-		t.Run(strconv.FormatUint(uint64(declared), 16), func(t *testing.T) {
-			// A well-formed header and a real body, with only the declared
-			// length falsified — so nothing but the length check can reject it.
-			rec := MarshalSnapshotMeta(SnapshotMeta{
-				Index: 900, Term: 5, ShardID: 1, ReplicaID: 1, CreatedAt: 1, Epoch: 3,
-			})
-			binary.LittleEndian.PutUint32(rec[snapshotMetaBodyLenOff:], declared)
+	t.Run("declared beyond the file", func(t *testing.T) {
+		for _, declared := range []uint32{1 << 31, 1<<32 - 1, 0x8000_0038, maxSnapshotMetaBodyLen + 1} {
+			t.Run(strconv.FormatUint(uint64(declared), 16), func(t *testing.T) {
+				// A well-formed header and a real body, with only the declared
+				// length falsified — so nothing but the length check can reject it.
+				rec := MarshalSnapshotMeta(SnapshotMeta{
+					Index: 900, Term: 5, ShardID: 1, ReplicaID: 1, CreatedAt: 1, Epoch: 3,
+				})
+				binary.LittleEndian.PutUint32(rec[snapshotMetaBodyLenOff:], declared)
 
-			meta, err := ParseSnapshotMeta(rec)
-			if !errors.Is(err, ErrSnapshotMetaCorrupt) {
-				t.Fatalf("ParseSnapshotMeta(bodyLen=%#x) = (%+v, %v), want ErrSnapshotMetaCorrupt; "+
-					"a length that truncates to a negative int walks straight past the "+
-					"bounds check and panics on the slice", declared, meta, err)
-			}
-		})
-	}
+				meta, err := ParseSnapshotMeta(rec)
+				if !errors.Is(err, ErrSnapshotMetaCorrupt) {
+					t.Fatalf("ParseSnapshotMeta(bodyLen=%#x) = (%+v, %v), want ErrSnapshotMetaCorrupt; "+
+						"a length that truncates to a negative int walks straight past the "+
+						"bounds check and panics on the slice", declared, meta, err)
+				}
+			})
+		}
+	})
+
+	// The falsifiable half. The record CARRIES the body it declares, so the
+	// "claims more body than the file holds" guard — in either arithmetic — is
+	// false and the parse proceeds unless the declared length is capped.
+	t.Run("oversized declaration with a body to match", func(t *testing.T) {
+		const declared = maxSnapshotMetaBodyLen + 8
+		rec := make([]byte, snapshotMetaHeaderSize+declared)
+		copy(rec, MarshalSnapshotMeta(SnapshotMeta{
+			Index: 900, Term: 5, ShardID: 1, ReplicaID: 1, CreatedAt: 1, Epoch: 3,
+		}))
+		binary.LittleEndian.PutUint32(rec[snapshotMetaBodyLenOff:], declared)
+
+		meta, err := ParseSnapshotMeta(rec)
+		if !errors.Is(err, ErrSnapshotMetaCorrupt) {
+			t.Fatalf("ParseSnapshotMeta(bodyLen=%d over a %d-byte body) = (%+v, %v), want "+
+				"ErrSnapshotMetaCorrupt; an unbounded declared length is one a 32-bit "+
+				"build narrows to a negative int, and the epoch it yields is fed to the "+
+				"DEK purge floor as fact", declared, len(rec)-snapshotMetaHeaderSize, meta, err)
+		}
+	})
+
+	// The cap must not reject a record this format can actually produce,
+	// including one written by a NEWER version with more body fields.
+	t.Run("a body at the cap is still accepted", func(t *testing.T) {
+		const declared = maxSnapshotMetaBodyLen
+		rec := make([]byte, snapshotMetaHeaderSize+declared)
+		copy(rec, MarshalSnapshotMeta(SnapshotMeta{
+			Index: 900, Term: 5, ShardID: 1, ReplicaID: 1, CreatedAt: 1, Epoch: 3,
+		}))
+		binary.LittleEndian.PutUint32(rec[snapshotMetaBodyLenOff:], declared)
+
+		meta, err := ParseSnapshotMeta(rec)
+		if err != nil {
+			t.Fatalf("ParseSnapshotMeta(bodyLen=%d) = %v, want a parsed record", declared, err)
+		}
+		if meta.Index != 900 || meta.Epoch != 3 || !meta.EpochRecorded {
+			t.Fatalf("parsed record = %+v, want Index 900 and Epoch 3 recorded", meta)
+		}
+	})
 }

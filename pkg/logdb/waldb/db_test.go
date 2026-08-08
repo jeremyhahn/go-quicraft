@@ -450,6 +450,7 @@ func TestWriteBootstrapRejectsBatchMode(t *testing.T) {
 		nodeKey{ShardID: 1, ReplicaID: 1},
 		1, 1,
 		logdb.Bootstrap{Addresses: map[uint64]string{1: "addr1"}},
+		true,
 	)
 	shard.batchMode = false
 	shard.mu.Unlock()

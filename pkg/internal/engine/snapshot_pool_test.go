@@ -2631,6 +2631,79 @@ func TestIsSnapshotDecryptTemp(t *testing.T) {
 	}
 }
 
+// TestSweepStaleImportStageDirs_ReclaimsOrphansAndSparesCanonical pins the
+// import staging sweep's two halves: an orphaned staging directory (a plaintext
+// state machine nothing else on the host enumerates) is removed whole, and a
+// canonical snapshot directory is never touched.
+func TestSweepStaleImportStageDirs_ReclaimsOrphansAndSparesCanonical(t *testing.T) {
+	const shardID, replicaID uint64 = 3, 9
+	base := t.TempDir()
+	replicaDir := snapshotBaseDir(base, shardID, replicaID)
+
+	canonical := snapshotSaveDir(base, shardID, replicaID, 42)
+	if err := os.MkdirAll(canonical, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	canonicalData := filepath.Join(canonical, snapshotDataFile)
+	if err := os.WriteFile(canonicalData, []byte("ciphertext"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// A staging directory named exactly as an import names one, holding a
+	// nested tree so a shallow removal is visible.
+	stage, err := os.MkdirTemp(replicaDir, ImportStageDirPattern)
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	if !IsSnapshotImportStage(filepath.Base(stage)) {
+		t.Fatalf("pattern %q created %q, which the sweeper does not match",
+			ImportStageDirPattern, filepath.Base(stage))
+	}
+	nested := filepath.Join(stage, "nested")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, snapshotDataFile),
+		[]byte("plaintext state machine"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	before := StaleDecryptSweepFailures()
+	SweepStaleImportStageDirs(base, shardID, replicaID)
+
+	if _, err := os.Stat(stage); !os.IsNotExist(err) {
+		t.Errorf("staging directory %s survived the sweep (stat err %v)", stage, err)
+	}
+	if _, err := os.Stat(canonicalData); err != nil {
+		t.Errorf("the canonical snapshot artifact was destroyed by the sweep: %v", err)
+	}
+	if got := StaleDecryptSweepFailures(); got != before {
+		t.Errorf("StaleDecryptSweepFailures %d -> %d on a clean sweep", before, got)
+	}
+}
+
+// TestIsSnapshotImportStage pins the matcher against the names the sweeper must
+// and must not reclaim.
+func TestIsSnapshotImportStage(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{".import-123456", true},
+		{".import-", true},
+		{"import-123456", false},
+		{".imports-123", false},
+		{"snapshot-00000000000000000900", false},
+		{snapshotDataFile, false},
+		{snapshotMetadataFile, false},
+	}
+	for _, tt := range tests {
+		if got := IsSnapshotImportStage(tt.name); got != tt.want {
+			t.Errorf("IsSnapshotImportStage(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // I.6: In-flight epoch protection tests
 // ---------------------------------------------------------------------------

@@ -412,8 +412,15 @@ fuzz-seal:
 fuzz-session:
 	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_SESSION)
 
+# The raft package has two targets and `go test -fuzz` runs exactly one per
+# invocation, so they are listed explicitly rather than matched by -fuzz=Fuzz.
+.PHONY: fuzz-raft
+fuzz-raft:
+	$(GOFUZZ) -run=Fuzz -fuzz=FuzzRaftStepSequence -fuzztime=$(FUZZ_TIME) $(PKG_RAFT)
+	$(GOFUZZ) -run=Fuzz -fuzz=FuzzRaftLogRecovery -fuzztime=$(FUZZ_TIME) $(PKG_RAFT)
+
 .PHONY: fuzz-all
-fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session
+fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft
 
 # ============================================================================
 # ErrorFS I/O Error Injection (Phase 3)
@@ -871,10 +878,11 @@ help:
 	@echo "Fuzz Testing:"
 	@echo "  fuzz-all               Run all fuzz targets (FUZZ_TIME=60s)"
 	@echo "  fuzz-proto             Fuzz proto codec round-trips"
-	@echo "  fuzz-transport         Fuzz transport frame decoding"
+	@echo "  fuzz-transport         Fuzz transport frame decoding and the message-frame receive path"
 	@echo "  fuzz-waldb             Fuzz WAL record decoding"
 	@echo "  fuzz-seal              Fuzz AES-GCM encrypt/decrypt"
 	@echo "  fuzz-session           Fuzz session encoding"
+	@echo "  fuzz-raft              Fuzz adversarial raft message sequences and log recovery"
 	@echo "    Flags: FUZZ_TIME=60s"
 	@echo ""
 	@echo "Benchmarks (smoke test only - single run, noise-prone):"

@@ -1144,6 +1144,13 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
 	SweepStaleDecryptTmp(snapshotDir)
 
+	// Reclaim an import staging directory orphaned by a crash for the same
+	// reason and on the same trigger: it holds the imported state machine in
+	// PLAINTEXT and no scan on the host will ever look at it again. No import
+	// can be in flight here — Host.ImportSnapshot refuses a RUNNING shard, and
+	// this shard is running by construction.
+	SweepStaleImportStageDirs(node.SnapshotDir(), req.shardID, req.replicaID)
+
 	// An encrypted artifact with no usable barrier fails CLOSED, matching
 	// Host.StartShard on the identical predicate. Falling through would hand
 	// the raw ciphertext to RecoverFromSnapshot; the leader must re-send
@@ -1941,6 +1948,39 @@ func IsSnapshotDecryptTemp(name string) bool {
 		strings.HasPrefix(name, SendDecryptTempPrefix)
 }
 
+// Snapshot import staging-directory naming. Host.ImportSnapshot writes the
+// artifact into a directory it provably owns and publishes it with a single
+// rename, so a half-written import is never visible under a canonical
+// "snapshot-<index>" name.
+//
+// The prefix lives here, beside the decrypt scratch names, for the reason those
+// names do: the staging directory holds the artifact PLAINTEXT for the window
+// between the write and the re-encryption (an exported artifact carries
+// plaintext by construction), so a process killed inside that window leaves a
+// COMPLETE PLAINTEXT COPY of the state machine on disk. Unlike a partially
+// written canonical directory, which snapshot garbage collection eventually
+// reclaims, a staging directory is invisible to listSnapshotDirs — nothing else
+// on the host will ever look at it again. It must therefore be SWEPT, and the
+// prefix a writer builds its name from must be the same prefix the sweeper
+// matches.
+const (
+	// ImportStageDirPrefix marks a directory an import stages its artifact in.
+	// The leading dot and the "import" word make an orphan self-identifying,
+	// and the name deliberately cannot parse as "snapshot-<index>".
+	ImportStageDirPrefix = ".import-"
+
+	// ImportStageDirPattern is the os.MkdirTemp pattern for a staging
+	// directory. Every import must build its name from this.
+	ImportStageDirPattern = ImportStageDirPrefix + "*"
+)
+
+// IsSnapshotImportStage reports whether a directory entry name is an import
+// staging directory. It is the single matcher the sweeper uses, so a name that
+// can be CREATED is by construction a name that can be RECLAIMED.
+func IsSnapshotImportStage(name string) bool {
+	return strings.HasPrefix(name, ImportStageDirPrefix)
+}
+
 // SweepStaleDecryptTmpTree removes orphaned decrypt scratch files from EVERY
 // retained snapshot directory of the given shard/replica, not just the one
 // currently being recovered.
@@ -1966,6 +2006,59 @@ func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
 	}
 	for _, d := range dirs {
 		SweepStaleDecryptTmp(d.path)
+	}
+}
+
+// SweepStaleImportStageDirs removes orphaned import staging directories from a
+// shard/replica's snapshot tree.
+//
+// An import stages the artifact PLAINTEXT (an exported artifact is decrypted
+// before it is written, so an import never carries ciphertext) and re-encrypts
+// it under this host's own barrier immediately afterwards. A process killed
+// between the two leaves the complete plaintext state machine in the staging
+// directory.
+//
+// Nothing else ever reclaims it. listSnapshotDirs — and with it snapshot
+// garbage collection, the recovery fallback and the DEK purge-floor scan — skips
+// every name without the "snapshot-" prefix, which is precisely the property
+// that keeps a half-written import out of those scans. Without this sweep the
+// staging name converts a plaintext exposure that GC would eventually have
+// reclaimed into a PERMANENT one, which is the outcome
+// staleDecryptSweepFailures exists to make visible.
+//
+// The sweep is strictly scoped: it only removes direct children of the
+// shard/replica base directory whose names match IsSnapshotImportStage, so it
+// can never touch a canonical snapshot directory. Errors are logged and
+// otherwise ignored: a failed cleanup must not abort startup or recovery.
+//
+// The caller must ensure no import is in flight for the shard, since a live
+// staging directory is indistinguishable from an orphaned one by name.
+func SweepStaleImportStageDirs(baseDir string, shardID, replicaID uint64) {
+	base := snapshotBaseDir(baseDir, shardID, replicaID)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			// The sweep could not even look. Whether a plaintext copy is
+			// sitting there is now unknown, which is the same operational state
+			// as a failed removal: report it the same way.
+			noteStaleDecryptSweepFailure(base, "read_dir", err)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !IsSnapshotImportStage(entry.Name()) {
+			continue
+		}
+		stalePath := filepath.Join(base, entry.Name())
+		if rmErr := os.RemoveAll(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
+			noteStaleDecryptSweepFailure(stalePath, "remove_all", rmErr)
+			continue
+		}
+		slog.Warn("snapshot: reclaimed an orphaned import staging directory; it held the imported state machine in PLAINTEXT",
+			"path", stalePath,
+			"shard_id", shardID,
+			"replica_id", replicaID,
+		)
 	}
 }
 
@@ -2008,11 +2101,12 @@ func SweepStaleDecryptTmp(dir string) {
 }
 
 // staleDecryptSweepFailures counts the times the sweeper could not reclaim (or
-// could not even inspect) a snapshot decrypt scratch file.
+// could not even inspect) a snapshot decrypt scratch file or an import staging
+// directory.
 //
 // A non-zero value means a COMPLETE PLAINTEXT COPY of a state machine may be
 // sitting on disk next to its ciphertext, for the life of the snapshot
-// directory. That is the exact outcome the sweeper exists to prevent, and its
+// directory — or, for an import staging directory, indefinitely. That is the exact outcome the sweeper exists to prevent, and its
 // usual causes — a read-only mount, a permissions or ownership change, an
 // immutable attribute — are silent, persistent, and invisible in the data path.
 // The counter is monotonic and process-wide; a monitor should alert on any
@@ -2020,7 +2114,8 @@ func SweepStaleDecryptTmp(dir string) {
 var staleDecryptSweepFailures atomic.Uint64
 
 // StaleDecryptSweepFailures returns the number of snapshot decrypt scratch
-// files this process has failed to reclaim or inspect since start. See
+// files and import staging directories this process has failed to reclaim or
+// inspect since start. See
 // staleDecryptSweepFailures for why a non-zero value is a security condition
 // and not merely a disk-space one.
 func StaleDecryptSweepFailures() uint64 {
@@ -2033,7 +2128,7 @@ func StaleDecryptSweepFailures() uint64 {
 // abort startup or recovery), and the data path behaves normally.
 func noteStaleDecryptSweepFailure(path, op string, err error) {
 	staleDecryptSweepFailures.Add(1)
-	slog.Warn("snapshot: decrypt scratch file not reclaimed; plaintext state machine data may remain at rest",
+	slog.Warn("snapshot: scratch path not reclaimed; plaintext state machine data may remain at rest",
 		"path", path,
 		"op", op,
 		"error", err,

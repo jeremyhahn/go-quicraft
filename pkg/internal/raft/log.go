@@ -235,9 +235,26 @@ func newRaftLog(logdb LogReader) *raftLog {
 				"snapshot_index", ss.Index)
 		}
 		l.committed = last
-		if l.processed > l.committed {
-			l.processed = l.committed
-		}
+	}
+
+	// processed must never exceed committed, on ANY recovery shape — not only
+	// the one the clamp above fires on. `processed` is seeded from ss.Index,
+	// or from firstIdx-1 when there is no snapshot, and neither is bounded by
+	// the recovered HardState.Commit. A log recovered with a gapped start and
+	// a lower commit (firstIndex 100, Commit 50) therefore comes up with
+	// processed 99 > committed 50, and handleSnapshot's matching branch would
+	// then call appliedTo(ss.Index) for an index below processed, tripping
+	// appliedTo's monotonicity assertion and taking the step worker down.
+	//
+	// Not reachable through recovery today: an entry range starting above 1
+	// with no snapshot record makes LogReader.setRangeLocked return
+	// ErrLogGapDetected, so recoverLogReader fails and the shard never starts.
+	// Clamped unconditionally anyway — the seed and the clamp are three lines
+	// apart and the invariant they maintain is asserted at a panic, so it
+	// should not depend on a reachability argument made in a different file.
+	// Found by FuzzRaftLogRecovery.
+	if l.processed > l.committed {
+		l.processed = l.committed
 	}
 
 	// Seed the config-change bound conservatively over the recovered range.

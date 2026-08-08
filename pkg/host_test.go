@@ -7710,8 +7710,12 @@ func TestRecoverLogReader_NilLogDB(t *testing.T) {
 	defer h.Close()
 
 	lr := logdb.NewLogReader(1, 1, nil)
-	if err := h.recoverLogReader(lr, 1, 1); err != nil {
+	persisted, err := h.recoverLogReader(lr, 1, 1)
+	if err != nil {
 		t.Fatalf("recoverLogReader with nil logdb: got %v, want nil", err)
+	}
+	if persisted {
+		t.Error("recoverLogReader reported persisted state with no LogDB at all")
 	}
 }
 
@@ -7725,8 +7729,15 @@ func TestRecoverLogReader_FirstBoot(t *testing.T) {
 	defer h.Close()
 
 	lr := logdb.NewLogReader(1, 1, db)
-	if err := h.recoverLogReader(lr, 1, 1); err != nil {
+	persisted, err := h.recoverLogReader(lr, 1, 1)
+	if err != nil {
 		t.Fatalf("recoverLogReader first boot: got %v, want nil", err)
+	}
+	// The discriminator StartShard gates its bootstrap-only refusals on: a
+	// first boot has no snapshot record, no hard state and no entries.
+	if persisted {
+		t.Error("recoverLogReader reported persisted state on a FIRST BOOT; StartShard " +
+			"would then treat a bootstrap as a restart")
 	}
 
 	// Verify LogReader is still in default state (no entries).
@@ -7800,8 +7811,13 @@ func TestRecoverLogReader_WithPersistedState(t *testing.T) {
 	defer h.Close()
 
 	lr := logdb.NewLogReader(1, 1, db)
-	if err := h.recoverLogReader(lr, 1, 1); err != nil {
+	persisted, err := h.recoverLogReader(lr, 1, 1)
+	if err != nil {
 		t.Fatalf("recoverLogReader: %v", err)
+	}
+	if !persisted {
+		t.Error("recoverLogReader did not report persisted state although a snapshot, " +
+			"a hard state and log entries were all recovered")
 	}
 
 	// Verify hard state was restored.
@@ -7844,7 +7860,7 @@ func TestRecoverLogReader_SnapshotError(t *testing.T) {
 	defer h.Close()
 
 	lr := logdb.NewLogReader(1, 1, db)
-	err = h.recoverLogReader(lr, 1, 1)
+	_, err = h.recoverLogReader(lr, 1, 1)
 	if !errors.Is(err, errBoom) {
 		t.Errorf("recoverLogReader: got %v, want %v", err, errBoom)
 	}
@@ -14789,8 +14805,12 @@ func TestRecoverLogReader_WithSnapshotAndEntries(t *testing.T) {
 	}
 
 	lr := logdb.NewLogReader(1, 1, h.logdb)
-	if err := h.recoverLogReader(lr, 1, 1); err != nil {
+	persisted, err := h.recoverLogReader(lr, 1, 1)
+	if err != nil {
 		t.Fatalf("recoverLogReader failed: %v", err)
+	}
+	if !persisted {
+		t.Error("recoverLogReader did not report the persisted state it just recovered")
 	}
 
 	// Verify the LogReader was populated.
@@ -15724,8 +15744,12 @@ func TestRecoverLogReader_WithSnapshotFilepath(t *testing.T) {
 	}
 
 	lr := logdb.NewLogReader(1, 1, h.logdb)
-	if err := h.recoverLogReader(lr, 1, 1); err != nil {
+	persisted, err := h.recoverLogReader(lr, 1, 1)
+	if err != nil {
 		t.Fatalf("recoverLogReader failed: %v", err)
+	}
+	if !persisted {
+		t.Error("recoverLogReader did not report the persisted state it just recovered")
 	}
 
 	// Verify the LogReader was populated with the snapshot metadata.
