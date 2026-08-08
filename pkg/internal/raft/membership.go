@@ -196,30 +196,6 @@ func (m *membership) isMember(replicaID uint64) bool {
 	return m.isVoter(replicaID) || m.isObserver(replicaID) || m.isWitness(replicaID)
 }
 
-// hasMemberOtherThan reports whether the membership names any active member
-// (voter, observer, or witness) whose replica ID differs from self. It is the
-// end condition for the joining window: a fresh joiner knows no members, and the
-// moment it learns even one other member it can enforce per-shard authorization
-// instead of bypassing it.
-func (m *membership) hasMemberOtherThan(self uint64) bool {
-	for id := range m.addresses {
-		if id != self {
-			return true
-		}
-	}
-	for id := range m.observers {
-		if id != self {
-			return true
-		}
-	}
-	for id := range m.witnesses {
-		if id != self {
-			return true
-		}
-	}
-	return false
-}
-
 // validate checks that a config change is valid before application. It
 // enforces safety rules such as preventing removal of the last voter and
 // detecting duplicate or conflicting additions, plus the shard's replicated

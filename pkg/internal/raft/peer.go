@@ -1224,30 +1224,36 @@ func (p *Peer) setJoining(joining bool) {
 	p.r.setJoining(joining)
 }
 
-// clearJoiningIfKnown ends the joining window once this replica has learned a
-// membership that names members other than itself.
+// clearJoiningIfKnown ends the joining window once this replica knows that the
+// LEADER it is following is a member of the configuration it has learned.
 //
-// Under config-in-log the initial configuration is a committed log entry
-// (EntryInitialMembership at index 1), so a joiner learns the full membership by
-// ordinary replication of that entry — guaranteed, since the leader replicates
-// from the joiner's match point up — or by replaying it on restart. The window
-// therefore ends DETERMINISTICALLY at the index that entry occupies, rather than
-// waiting for a snapshot the leader may never send (the old permanent-bypass
-// bug). A snapshot still clears joining too (Handle's adopt branch), for the
-// compacted case.
+// The auth bypass exists so a fresh joiner — which starts knowing no members —
+// can accept the leader's replication before it learns the configuration. It
+// must therefore be retired the moment the joiner can AUTHORIZE THAT LEADER, and
+// not one step sooner. Clearing on "knows any member other than itself" is
+// wrong: the current leader may have been ADDED AFTER the initial bootstrap, so
+// it is NOT in the founding membership the index-1 EntryInitialMembership
+// carries. If replication delivers the bootstrap entry in an earlier batch than
+// the leader's own AddNode, the joiner would learn the founding members, clear
+// the bypass, and then REJECT the current leader's next append as unauthorized —
+// stranding itself, unable to replay the very entries that add the leader (and
+// itself). Gating on the leader closes that gap: the joiner keeps the bypass
+// until it has replayed far enough to know the leader is a member, by which
+// point every other member has arrived with it.
 //
-// "Knows a member other than itself" is the exact end condition: the whole
-// reason IsMember bypasses authorization while joining is that a fresh joiner
-// knows no members and would reject the leader's own replication. The moment it
-// knows any other member it can authorize, so the bypass is retired. A
-// single-node bootstrap never sets joining, so this is only ever reached by a
-// replica added to an existing cluster, whose learned membership always names
-// the other members.
+// This still ends DETERMINISTICALLY and cannot reintroduce the permanent-bypass
+// bug: a joiner always receives from some leader (that is how it catches up), so
+// leaderID is set, and the committed log it replays necessarily contains the
+// AddNode that made that leader a voter (a leader is always in its own committed
+// configuration). A snapshot also clears joining (Handle's adopt branch), for
+// the compacted case. A single-node bootstrap never sets joining, so this is
+// only ever reached by a replica added to an existing cluster.
 func (p *Peer) clearJoiningIfKnown() {
 	if !p.joining.Load() {
 		return
 	}
-	if p.membership.hasMemberOtherThan(p.replicaID) {
+	leaderID := p.r.leaderID
+	if leaderID != noLeader && p.membership.isMember(leaderID) {
 		p.setJoining(false)
 	}
 }

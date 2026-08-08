@@ -170,6 +170,10 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 		t.Fatal("fixture: a joining node must bypass IsMember")
 	}
 
+	// The joiner is following leader 1 (a founding member). The bypass clears
+	// only once it knows THIS leader is a member.
+	p.r.leaderID = 1
+
 	// The leader replicates the committed bootstrap entry (index 1) carrying the
 	// full initial configuration. Applying it at commit time is what
 	// processConfigChanges does on the joiner.
@@ -195,5 +199,60 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 			t.Fatalf("member %d not recognized after reconstructing membership from "+
 				"the bootstrap entry", id)
 		}
+	}
+}
+
+// TestJoiningDoesNotClearBeforeLeaderIsKnown is the Codex-found regression: a
+// joiner following a leader that was ADDED AFTER the initial bootstrap must NOT
+// clear the auth bypass merely from learning the founding membership. If
+// replication delivers the bootstrap entry in an earlier batch than that
+// leader's AddNode, clearing on "knows any member" would then reject the current
+// leader's next append and strand the joiner forever.
+func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
+	// Replica 6 joins a cluster whose founding members are {1,2,3}. The CURRENT
+	// leader is replica 5 — added after bootstrap, so NOT in the index-1 entry.
+	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{}, proto.Membership{})
+	p.MarkJoining()
+	p.r.leaderID = 5 // following leader 5, which the bootstrap entry does not name
+
+	// Batch 1: only the bootstrap entry (founders {1,2,3}), split from leader 5's
+	// AddNode by the replication byte limit.
+	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+	})
+	if err != nil {
+		t.Fatalf("build bootstrap entry: %v", err)
+	}
+	p.processConfigChanges([]proto.Entry{bootstrap})
+
+	if !p.joining.Load() {
+		t.Fatal("the joiner cleared the auth bypass after learning only the FOUNDING " +
+			"members — but the current leader 5 was added after bootstrap and is not " +
+			"among them, so the joiner would now REJECT leader 5's next append and " +
+			"strand itself, never replaying the entries that add it")
+	}
+	if !p.IsMember(5) {
+		// Still bypassing (correct) — it can accept leader 5's continued replication.
+		if !p.IsMember(999) {
+			t.Fatal("bypass ended early: the joiner can no longer accept leader 5")
+		}
+	}
+
+	// Batch 2: leader 5's AddNode arrives. Now the joiner knows the leader.
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "e"}
+	ccBuf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(ccBuf); err != nil {
+		t.Fatalf("marshal AddNode: %v", err)
+	}
+	p.processConfigChanges([]proto.Entry{{
+		Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: ccBuf,
+	}})
+
+	if p.joining.Load() {
+		t.Fatal("the joiner did NOT clear the bypass after learning the leader 5 is a " +
+			"member: the bypass would now persist for the process lifetime")
+	}
+	if p.IsMember(999) {
+		t.Fatal("IsMember still authorizes an unknown replica after the bypass ended")
 	}
 }

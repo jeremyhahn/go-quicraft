@@ -276,9 +276,22 @@ func mustRead(t *testing.T, path string) []byte {
 // registration so tests can assert the L12 pinning contract.
 type pinRecordingBarrier struct {
 	Barrier
-	mu           sync.Mutex
-	registered   []uint64
-	deregistered []uint64
+	mu                  sync.Mutex
+	registered          []uint64
+	deregistered        []uint64
+	sawEncryptBeforePin bool
+}
+
+// EncryptWithEpoch records whether a frame was ever encrypted BEFORE the first
+// in-flight epoch was pinned. A path that pins only AFTER its encrypt loop
+// (leaving the frames exposed to a concurrent rotate+purge mid-loop) trips this.
+func (p *pinRecordingBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error) {
+	p.mu.Lock()
+	if len(p.registered) == 0 {
+		p.sawEncryptBeforePin = true
+	}
+	p.mu.Unlock()
+	return p.Barrier.EncryptWithEpoch(dst, plaintext)
 }
 
 func (p *pinRecordingBarrier) RegisterInFlightEpoch(epoch uint64) {

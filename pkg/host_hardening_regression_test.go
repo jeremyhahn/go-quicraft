@@ -504,6 +504,16 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 		t.Fatalf("deregistered epochs = %v, want epoch %d released after the import",
 			deregistered, snap.Epoch)
 	}
+	// The pin must be armed BEFORE re-encryption, not only after: a rotate+purge
+	// landing mid-loop would otherwise strand frames sealed under a dropped DEK.
+	pinning.mu.Lock()
+	sawEarly := pinning.sawEncryptBeforePin
+	pinning.mu.Unlock()
+	if sawEarly {
+		t.Fatal("a snapshot frame was encrypted BEFORE any in-flight epoch was pinned: " +
+			"the import pins only after re-encryption, leaving the frames exposed to a " +
+			"concurrent rotate+purge for the duration of the encrypt loop")
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,49 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
+// bootstrapEntryForTest builds the index-1 EntryInitialMembership carrying the
+// given voters, for reconstruction tests.
+func bootstrapEntryForTest(t *testing.T, voters map[uint64]string) proto.Entry {
+	t.Helper()
+	ms := proto.Membership{Addresses: voters}
+	buf := make([]byte, ms.Size())
+	if _, err := ms.MarshalTo(buf); err != nil {
+		t.Fatalf("marshal bootstrap membership: %v", err)
+	}
+	return proto.Entry{Index: 1, Term: 1, Type: proto.EntryInitialMembership, Cmd: buf}
+}
+
+// TestReconstructShardMembership_ClampsToRecoveredLastIndex is the Codex-found
+// torn-tail regression: the recovered HardState.Commit can outrun the recovered
+// entry range (the state record survived while later entries were lost).
+// Reconstruction must still yield the bootstrap entry at index 1, not ask for a
+// range past the log's end — which returns ErrUnavailable before index 1 and
+// silently falls back to re-seeding membership from the local members map.
+func TestReconstructShardMembership_ClampsToRecoveredLastIndex(t *testing.T) {
+	// A LogReader (cache-only) holding ONLY the bootstrap entry at index 1.
+	lr := logdb.NewLogReader(1, 1, nil)
+	if err := lr.Append([]proto.Entry{bootstrapEntryForTest(t, map[uint64]string{1: "a", 2: "b", 3: "c"})}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, last := lr.IndexRange(); last != 1 {
+		t.Fatalf("fixture: recovered last index = %d, want 1", last)
+	}
+
+	// Commit=10 far outruns the log (last=1).
+	ms, ok, err := (&Host{}).reconstructShardMembership(lr, 10)
+	if err != nil {
+		t.Fatalf("reconstruction errored on a torn-tail commit overrun: %v", err)
+	}
+	if !ok {
+		t.Fatal("reconstruction did NOT find the bootstrap entry when Commit outran " +
+			"the recovered log: the durable config-in-log membership would be lost and " +
+			"the caller would re-seed from the local members map")
+	}
+	if len(ms.Addresses) != 3 || ms.Addresses[2] != "b" {
+		t.Fatalf("reconstructed membership = %v, want the 3 bootstrap voters", ms.Addresses)
+	}
+}
+
 // iterateErrorLogDB injects a fixed error into the log-read path so a test can
 // exercise reconstruction's fail-closed behaviour on a genuine read failure.
 type iterateErrorLogDB struct {

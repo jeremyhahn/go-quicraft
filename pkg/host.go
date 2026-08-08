@@ -843,6 +843,49 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 // ErrSnapshotBarrierSealed — writing the received bytes as plaintext would
 // durably downgrade a shard whose data must be encrypted at rest, at exactly
 // the moment an operator sealed the host.
+// reencryptImportPinned re-encrypts an imported snapshot's plaintext at path
+// under the barrier, PINNING the epoch it seals under for the whole import.
+//
+// It pins the CURRENT epoch BEFORE re-encrypting — not only the epoch reported
+// afterward — because reencryptReceivedSnapshot seals frames under the barrier's
+// live epoch as it runs, and a concurrent Rotate + purgeOldEpochs (another shard
+// on this barrier, or the key-rotation loop) can retire that epoch MID-LOOP;
+// pinning only after the fact leaves earlier frames sealed under a DEK the purge
+// dropped. It additionally pins the recorded epoch if a rotation landed
+// mid-loop. HandleSnapshot pins the same way. The imported shard is STOPPED, so
+// it contributes ZERO floor to the purge scan (which counts only loaded nodes):
+// this pin is its only protection, and losing it means SaveSnapshot records
+// ciphertext nothing can open — total, silent loss of a disaster-recovery
+// restore.
+//
+// The caller MUST defer the returned cleanup so the pin covers the SaveSnapshot
+// that records the epoch. On error the cleanup has already run and the returned
+// func is a no-op.
+func reencryptImportPinned(fsys snapshotFS, path string, barrier Barrier) (uint64, func(), error) {
+	var pinned []uint64
+	cleanup := func() {
+		for _, e := range pinned {
+			barrier.DeregisterInFlightEpoch(e)
+		}
+	}
+	var preEpoch uint64
+	if barrier != nil {
+		preEpoch = barrier.CurrentEpoch()
+		barrier.RegisterInFlightEpoch(preEpoch)
+		pinned = append(pinned, preEpoch)
+	}
+	epoch, err := reencryptReceivedSnapshot(fsys, path, barrier)
+	if err != nil {
+		cleanup()
+		return 0, func() {}, err
+	}
+	if barrier != nil && epoch != 0 && epoch != preEpoch {
+		barrier.RegisterInFlightEpoch(epoch)
+		pinned = append(pinned, epoch)
+	}
+	return epoch, cleanup, nil
+}
+
 func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (uint64, error) {
 	if barrier == nil {
 		return 0, nil
@@ -5294,26 +5337,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		discardImportDir(fsys, shardID, stageDir)
 		return barrierErr
 	}
-	epoch, encErr := reencryptReceivedSnapshot(fsys, dataPath, importBarrier)
+	epoch, unpin, encErr := reencryptImportPinned(fsys, dataPath, importBarrier)
+	// The pin must live until SaveSnapshot below records the epoch, so it is
+	// released on THIS function's return, not the helper's.
+	defer unpin()
 	if encErr != nil {
 		// Never recorded in LogDB, so the partial artifact must not be left
 		// behind for a later scan to trip over.
 		discardImportDir(fsys, shardID, stageDir)
 		return encErr
-	}
-	// Pin the epoch the artifact was sealed under for the rest of the import.
-	// The imported shard is STOPPED, so the purge-floor scan — which only counts
-	// LOADED nodes — contributes ZERO floor for it during the import. Without this
-	// pin, a concurrent Rotate + purgeOldEpochs on another shard sharing the
-	// barrier (or the key-rotation loop) can retire this epoch's DEK between the
-	// re-encryption above and the SaveSnapshot below, so the record would name
-	// ciphertext nothing can ever open — total, silent loss of a disaster-recovery
-	// restore. The sibling paths pin for the same reason (HandleSnapshot's
-	// recvEpoch, ExportSnapshot's logdbSnap.Epoch, ReencryptSnapshotFile's source
-	// epochs); ImportSnapshot was the one persistence path that pinned nothing.
-	if importBarrier != nil && epoch != 0 {
-		importBarrier.RegisterInFlightEpoch(epoch)
-		defer importBarrier.DeregisterInFlightEpoch(epoch)
 	}
 
 	// Write the snapshot metadata file beside the artifact, recording the epoch
@@ -7470,9 +7502,20 @@ const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 // Collected entries are deep-copied because GetRange reuses its return buffer
 // across calls.
 func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (proto.Membership, bool, error) {
-	first, _ := lr.IndexRange()
+	first, last := lr.IndexRange()
 	if first == 0 || commit < first {
 		return proto.Membership{}, false, nil
+	}
+	// Clamp the scan to what the log ACTUALLY holds. The recovered
+	// HardState.Commit can outrun the recovered entry range on a torn/lost tail
+	// (the state record survived while entries behind it did not — newRaftLog
+	// clamps committed the same way). Without this, the first GetRange asks for
+	// high > lastIndex+1, LogReader returns ErrUnavailable BEFORE yielding even
+	// the bootstrap entry at index 1, and the caller falls back to re-seeding
+	// membership from the local members map — losing the durable config-in-log
+	// membership on the exact recovery shape this path exists to handle.
+	if commit > last {
+		commit = last
 	}
 	var collected []proto.Entry
 	foundBootstrap := false
