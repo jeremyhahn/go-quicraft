@@ -66,6 +66,49 @@ func TestReconstructShardMembership_ClampsToRecoveredLastIndex(t *testing.T) {
 	}
 }
 
+// countingReadLogDB counts how many entries the log-read path is asked to
+// deliver, so a test can pin reconstruction's cost as O(1) rather than O(log).
+type countingReadLogDB struct {
+	mockLogDB
+	entriesRead int
+}
+
+func (c *countingReadLogDB) IterateEntries(entries []logdb.Entry, size, shardID, replicaID, low, high, maxSize uint64) ([]logdb.Entry, uint64, error) {
+	c.entriesRead += int(high - low)
+	return entries, size, logdb.ErrUnavailable
+}
+
+// TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry pins the cost of
+// restart membership recovery. It previously scanned the ENTIRE committed log —
+// every data entry, from disk, on every restart of a shard that never compacts
+// (SnapshotEntries=0) — which delayed StartShard enough that a restarted replica
+// could not catch up under sustained load. That was a REPRODUCIBLE regression:
+// the 10m rolling-restart soak failed 2/2 with the scan and passed 2/2 without it.
+//
+// The bootstrap entry lives at a known index, and every membership change above
+// it is folded by the ordinary commit-time replay, so exactly one entry must be
+// read no matter how large the log is.
+func TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry(t *testing.T) {
+	ldb := &countingReadLogDB{}
+	lr := logdb.NewLogReader(1, 1, ldb)
+	// A large committed log: 500k entries, as a long-running shard without
+	// compaction would have.
+	if err := lr.SetRange(1, 500_000); err != nil {
+		t.Fatalf("SetRange: %v", err)
+	}
+
+	if _, _, err := (&Host{}).reconstructShardMembership(lr, 500_000); err != nil {
+		t.Fatalf("reconstruction: %v", err)
+	}
+
+	if ldb.entriesRead > 16 {
+		t.Fatalf("reconstruction asked for %d entries over a 500k-entry log: it is "+
+			"scanning the log instead of reading the single bootstrap entry, which "+
+			"delays every restart in proportion to log size and breaks catch-up "+
+			"under sustained load", ldb.entriesRead)
+	}
+}
+
 // iterateErrorLogDB injects a fixed error into the log-read path so a test can
 // exercise reconstruction's fail-closed behaviour on a genuine read failure.
 type iterateErrorLogDB struct {

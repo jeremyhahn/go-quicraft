@@ -7521,86 +7521,76 @@ func buildTransportConfig(hc config.HostConfig) transport.Config {
 // the bound cannot stall progress.
 const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 
-// reconstructShardMembership rebuilds a shard's membership from its committed
-// log for a restart whose membership was not carried by a snapshot
-// (config-in-log). It scans the committed prefix [firstIndex, commit] in bounded
-// chunks, collects the bootstrap and config-change entries, and folds them.
+// reconstructShardMembership recovers a shard's INITIAL membership from its
+// committed log for a restart whose membership was not carried by a snapshot
+// (config-in-log).
 //
-// It returns ok=true ONLY when the committed prefix contains the bootstrap
-// EntryInitialMembership — the authoritative base that names the initial voters.
-// A log holding config changes but NO bootstrap entry (a shard bootstrapped the
-// legacy out-of-band way, whose initial voters live only in the caller's members
-// map) would reconstruct to a membership MISSING those voters, so it returns
-// ok=false and the caller falls back to the bootstrap seed plus the ordinary
-// commit-time config-change repair. That keeps both log shapes correct and
-// guarantees reconstruction never drops the initial voting set.
+// It reads exactly ONE entry: the bootstrap EntryInitialMembership at
+// BootstrapMembershipIndex. That is deliberate and is a correctness-preserving
+// O(1) replacement for the full-log scan this function used to perform.
 //
-// Collected entries are deep-copied because GetRange reuses its return buffer
-// across calls.
+// # Why one entry is enough
+//
+// The bootstrap entry is the authoritative BASE — the founding voter set that
+// exists nowhere else in the log. Every membership change ABOVE it is an ordinary
+// committed EntryConfigChange, and a restarting replica re-applies its committed
+// entries through the normal pipeline (Peer.Commit -> processConfigChanges, and
+// replayConfigChangesTo for an on-disk state machine that skips ahead), which
+// folds each one into the membership exactly as it did before config-in-log.
+// So the base comes from here and the deltas come from replay; nothing is lost.
+//
+// # Why the full scan had to go
+//
+// A shard with SnapshotEntries=0 never compacts, so nothingRecovered is true on
+// EVERY restart and the old scan read the ENTIRE committed log from disk — every
+// data entry, just to find the rare config entries — on every restart. Under
+// sustained write load that delayed StartShard enough that a restarted replica
+// could not catch up within the harness's budget: measured as a REPRODUCIBLE
+// regression (TestSoak_RollingRestartUnderLoad at 10m failed 2/2 at HEAD, passed
+// 2/2 both at the pre-config-in-log baseline and at HEAD with this reconstruction
+// disabled).
+//
+// It returns ok=true only when the bootstrap entry is present. A log without one
+// (a shard bootstrapped the legacy out-of-band way, whose initial voters live
+// only in the caller's members map) returns ok=false so the caller falls back to
+// the bootstrap seed plus the same commit-time repair. A compacted-away index 1
+// is likewise ok=false — that case always has a snapshot, whose membership the
+// caller uses instead.
+//
+// The returned entry's Cmd is decoded before returning, so the reader's reusable
+// buffer is not retained.
 func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (proto.Membership, bool, error) {
 	first, last := lr.IndexRange()
 	if first == 0 || commit < first {
 		return proto.Membership{}, false, nil
 	}
-	// Clamp the scan to what the log ACTUALLY holds. The recovered
-	// HardState.Commit can outrun the recovered entry range on a torn/lost tail
-	// (the state record survived while entries behind it did not — newRaftLog
-	// clamps committed the same way). Without this, the first GetRange asks for
-	// high > lastIndex+1, LogReader returns ErrUnavailable BEFORE yielding even
-	// the bootstrap entry at index 1, and the caller falls back to re-seeding
-	// membership from the local members map — losing the durable config-in-log
-	// membership on the exact recovery shape this path exists to handle.
-	if commit > last {
-		commit = last
-	}
-	var collected []proto.Entry
-	foundBootstrap := false
-	const chunk uint64 = 1024
-	for low := first; low <= commit; {
-		high := low + chunk
-		if high > commit+1 {
-			high = commit + 1
-		}
-		entries, err := lr.GetRange(low, high, maxMembershipReconstructBytes)
-		if err != nil {
-			// ErrCompacted / ErrUnavailable are benign scan boundaries: a real
-			// compaction floor is always accompanied by a snapshot whose
-			// membership the caller uses instead (nothingRecovered would be
-			// false), and ErrUnavailable means the committed prefix is exhausted.
-			// Any OTHER error is a genuine read/corruption failure
-			// (e.g. ErrLogGapDetected) — reconstruction must FAIL CLOSED and abort
-			// StartShard, exactly like every other step in recoverLogReader,
-			// rather than silently return foundBootstrap=false and let the caller
-			// re-seed membership from its local members map (which drops witnesses,
-			// observers, Removed tombstones and the replicated witness policy — the
-			// split this reconstruction exists to prevent).
-			if errors.Is(err, logdb.ErrCompacted) || errors.Is(err, logdb.ErrUnavailable) {
-				break
-			}
-			return proto.Membership{}, false, err
-		}
-		if len(entries) == 0 {
-			break
-		}
-		for i := range entries {
-			t := entries[i].Type & proto.EntryTypeMask
-			if t != proto.EntryInitialMembership && t != proto.EntryConfigChange {
-				continue
-			}
-			if t == proto.EntryInitialMembership {
-				foundBootstrap = true
-			}
-			e := entries[i]
-			e.Cmd = append([]byte(nil), entries[i].Cmd...)
-			collected = append(collected, e)
-		}
-		low = entries[len(entries)-1].Index + 1
-	}
-	if !foundBootstrap {
-		// No authoritative base in the log: defer to the seed + repair path.
+	// The bootstrap entry sits at a KNOWN index. If the log no longer starts at or
+	// below it, it was compacted away and a snapshot carries the membership.
+	if first > raft.BootstrapMembershipIndex || last < raft.BootstrapMembershipIndex ||
+		commit < raft.BootstrapMembershipIndex {
 		return proto.Membership{}, false, nil
 	}
-	ms, err := raft.ReconstructMembership(collected)
+	entries, err := lr.GetRange(raft.BootstrapMembershipIndex,
+		raft.BootstrapMembershipIndex+1, maxMembershipReconstructBytes)
+	if err != nil {
+		// ErrCompacted / ErrUnavailable mean the entry is simply not available:
+		// benign, fall back to the seed + commit-time repair. Any OTHER error is a
+		// genuine read/corruption failure and must FAIL CLOSED and abort StartShard,
+		// exactly like every other step in recoverLogReader, rather than silently
+		// letting the caller re-seed membership from its local members map (which
+		// drops witnesses, observers, Removed tombstones and the replicated witness
+		// policy — the split this reconstruction exists to prevent).
+		if errors.Is(err, logdb.ErrCompacted) || errors.Is(err, logdb.ErrUnavailable) {
+			return proto.Membership{}, false, nil
+		}
+		return proto.Membership{}, false, err
+	}
+	if len(entries) == 0 ||
+		entries[0].Index != raft.BootstrapMembershipIndex ||
+		entries[0].Type&proto.EntryTypeMask != proto.EntryInitialMembership {
+		return proto.Membership{}, false, nil
+	}
+	ms, err := raft.ReconstructMembership([]proto.Entry{entries[0]})
 	if err != nil {
 		return proto.Membership{}, false, err
 	}
