@@ -783,14 +783,19 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				Err:       ErrSnapshotBarrierSealed,
 			}
 		}
-		inFlightEpoch := barrier.CurrentEpoch()
-		barrier.RegisterInFlightEpoch(inFlightEpoch)
-		// Hold the pin until saveSnapshot returns — past the metadata-file and
-		// LogDB snapshot-record writes below — so a concurrent purge cannot
-		// remove this epoch's DEK in the window before the snapshot's recorded
-		// epoch becomes durable and visible to the snapshot-floor scan.
-		defer barrier.DeregisterInFlightEpoch(inFlightEpoch)
-		minEpoch, encryptErr := p.encryptSnapshotFile(dataPath, barrier)
+		// encryptSnapshotFile pins EVERY epoch it seals a frame under (before and
+		// after each seal) and returns the set. Hold those pins until saveSnapshot
+		// returns — past the metadata-file and LogDB snapshot-record writes below —
+		// so a concurrent rotate+purge cannot remove any frame's DEK in the window
+		// before the snapshot's recorded epoch becomes durable and visible to the
+		// snapshot-floor scan. Pinning every epoch (not just the pre-read) closes
+		// the intermediate-frame-epoch gap a mid-loop rotation opens.
+		minEpoch, encPins, encryptErr := p.encryptSnapshotFile(dataPath, barrier)
+		defer func() {
+			for _, e := range encPins {
+				barrier.DeregisterInFlightEpoch(e)
+			}
+		}()
 		if encryptErr != nil {
 			discardSaveDir(saveDir, req)
 			return 0, &SnapshotError{
@@ -1332,13 +1337,13 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 // Atomic write: output goes to a temporary file in the same directory,
 // synced to disk, then renamed over the original. If any step fails the
 // temp file is removed and the original is preserved intact.
-func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier) (uint64, error) {
+func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier) (uint64, []uint64, error) {
 	// Open the plaintext file for streaming reads. Only one chunk
 	// (snapshotEncryptChunkSize = 64KB) is held in memory at a time,
 	// avoiding OOM on large snapshot files.
 	srcFile, err := os.Open(path)
 	if err != nil {
-		return 0, &SnapshotEncryptError{Op: "read", Err: err}
+		return 0, nil, &SnapshotEncryptError{Op: "read", Err: err}
 	}
 	defer func() {
 		if closeErr := srcFile.Close(); closeErr != nil {
@@ -1352,7 +1357,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, ".encrypt-*.tmp")
 	if err != nil {
-		return 0, &SnapshotEncryptError{Op: "create_temp", Err: err}
+		return 0, nil, &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
 	tmpPath := tmpFile.Name()
 	committed := false
@@ -1383,13 +1388,44 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 	chunkBuf := make([]byte, snapshotEncryptChunkSize)
 	var frameBuf [4]byte
 	var minEpoch uint64
+	// Pin EVERY epoch a frame is sealed under, not just the minimum, so a
+	// concurrent rotation + PurgeEpochsBefore cannot orphan an INTERMEDIATE frame
+	// epoch's DEK (which the min-only record left exposed once two rotations
+	// landed mid-loop), leaving the snapshot undecryptable. The returned set is
+	// released by the caller AFTER the snapshot's epoch is durably recorded.
+	pinnedSet := make(map[uint64]struct{})
+	var pinned []uint64
+	pin := func(e uint64) {
+		if e == 0 {
+			return
+		}
+		if _, ok := pinnedSet[e]; ok {
+			return
+		}
+		barrier.RegisterInFlightEpoch(e)
+		pinnedSet[e] = struct{}{}
+		pinned = append(pinned, e)
+	}
+	unpinAll := func() {
+		for _, ep := range pinned {
+			barrier.DeregisterInFlightEpoch(ep)
+		}
+	}
+	encErrOf := func(op string, e error) error {
+		unpinAll()
+		return &SnapshotEncryptError{Op: op, Err: e}
+	}
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
 		if n > 0 {
+			// Pin the current epoch before sealing this frame, then the epoch
+			// actually used in case a rotation landed in between.
+			pin(barrier.CurrentEpoch())
 			encrypted, frameEpoch, encErr := barrier.EncryptWithEpoch(nil, chunkBuf[:n])
 			if encErr != nil {
-				return 0, &SnapshotEncryptError{Op: "encrypt", Err: encErr}
+				return 0, nil, encErrOf("encrypt", encErr)
 			}
+			pin(frameEpoch)
 			if minEpoch == 0 || frameEpoch < minEpoch {
 				minEpoch = frameEpoch
 			}
@@ -1397,42 +1433,42 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 			// Write frame: 4-byte little-endian length + encrypted data.
 			binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(encrypted)))
 			if _, err := tmpFile.Write(frameBuf[:]); err != nil {
-				return 0, &SnapshotEncryptError{Op: "write_frame", Err: err}
+				return 0, nil, encErrOf("write_frame", err)
 			}
 			if _, err := tmpFile.Write(encrypted); err != nil {
-				return 0, &SnapshotEncryptError{Op: "write_data", Err: err}
+				return 0, nil, encErrOf("write_data", err)
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return 0, &SnapshotEncryptError{Op: "read", Err: readErr}
+			return 0, nil, encErrOf("read", readErr)
 		}
 	}
 
 	// Fsync before rename to guarantee durability.
 	if err := tmpFile.Sync(); err != nil {
-		return 0, &SnapshotEncryptError{Op: "sync", Err: err}
+		return 0, nil, encErrOf("sync", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		return 0, &SnapshotEncryptError{Op: "close", Err: err}
+		return 0, nil, encErrOf("close", err)
 	}
 
 	// Atomic rename replaces the original file. Both paths are internal
 	// (tmpPath from os.CreateTemp, path from snapshot metadata) — not
 	// user-controlled, so path traversal is not a concern.
 	if err := os.Rename(tmpPath, path); err != nil { // #nosec G703 -- paths are internal, not user input
-		return 0, &SnapshotEncryptError{Op: "rename", Err: err}
+		return 0, nil, encErrOf("rename", err)
 	}
 	committed = true
 	// Fsync the directory so the rename itself is durable; without it a
 	// crash can roll the directory entry back to the (deleted) plaintext
 	// temp name even though the encrypted bytes were fsynced.
 	if err := SyncDir(dir); err != nil {
-		return 0, &SnapshotEncryptError{Op: "sync_dir", Err: err}
+		return 0, nil, encErrOf("sync_dir", err)
 	}
-	return minEpoch, nil
+	return minEpoch, pinned, nil
 }
 
 // decryptSnapshotToSibling reads the encrypted snapshot data file and writes

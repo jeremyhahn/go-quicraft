@@ -798,36 +798,72 @@ func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string, epoch uint6
 // RE-ENCRYPTED on receipt under the RECEIVER's own (per-node) barrier recovers
 // correctly with that same barrier — the basis for per-node at-rest encryption
 // of received snapshots without any shared cross-node key.
-func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint64, error) {
+// It PINS every epoch it seals a frame under (not just the minimum) as in-flight
+// on the barrier, and returns that set so the caller can release it AFTER the
+// snapshot is durably recorded. Pinning each frame's epoch — before the seal via
+// CurrentEpoch and again after via the reported epoch — is what stops a
+// concurrent key rotation + PurgeEpochsBefore from dropping the DEK of an
+// INTERMEDIATE frame epoch (which the min-only pin left exposed once two
+// rotations landed mid-loop), which would leave the snapshot undecryptable. The
+// caller MUST DeregisterInFlightEpoch every returned epoch once its durable
+// record exists. On error, all pins this call took are released before return.
+func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint64, []uint64, error) {
 	chunkBuf := make([]byte, snapshotEncryptChunkSize)
 	var frameLenBuf [4]byte
 	var minEpoch uint64
+	pinnedSet := make(map[uint64]struct{})
+	var pinned []uint64
+	pin := func(e uint64) {
+		if e == 0 {
+			return
+		}
+		if _, ok := pinnedSet[e]; ok {
+			return
+		}
+		barrier.RegisterInFlightEpoch(e)
+		pinnedSet[e] = struct{}{}
+		pinned = append(pinned, e)
+	}
+	unpinAll := func() {
+		for _, e := range pinned {
+			barrier.DeregisterInFlightEpoch(e)
+		}
+	}
 	for {
 		n, readErr := src.Read(chunkBuf)
 		if n > 0 {
+			// Pin the current epoch BEFORE sealing this frame so its DEK cannot be
+			// purged between here and the seal, then pin the epoch actually used in
+			// case a rotation landed in between.
+			pin(barrier.CurrentEpoch())
 			ct, epoch, encErr := barrier.EncryptWithEpoch(nil, chunkBuf[:n])
 			if encErr != nil {
-				return 0, encErr
+				unpinAll()
+				return 0, nil, encErr
 			}
+			pin(epoch)
 			if minEpoch == 0 || epoch < minEpoch {
 				minEpoch = epoch
 			}
 			binary.LittleEndian.PutUint32(frameLenBuf[:], uint32(len(ct)))
 			if _, werr := dst.Write(frameLenBuf[:]); werr != nil {
-				return 0, werr
+				unpinAll()
+				return 0, nil, werr
 			}
 			if _, werr := dst.Write(ct); werr != nil {
-				return 0, werr
+				unpinAll()
+				return 0, nil, werr
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return 0, readErr
+			unpinAll()
+			return 0, nil, readErr
 		}
 	}
-	return minEpoch, nil
+	return minEpoch, pinned, nil
 }
 
 // reencryptReceivedSnapshot re-encrypts a just-written PLAINTEXT snapshot.dat at
@@ -862,46 +898,37 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 // that records the epoch. On error the cleanup has already run and the returned
 // func is a no-op.
 func reencryptImportPinned(fsys snapshotFS, path string, barrier Barrier) (uint64, func(), error) {
-	var pinned []uint64
+	// encryptSnapshotFrames (inside reencryptReceivedSnapshot) pins every epoch it
+	// seals a frame under and returns them; the import must hold those pins until
+	// its SaveSnapshot records the epoch, so release them on THIS caller's return.
+	epoch, pinned, err := reencryptReceivedSnapshot(fsys, path, barrier)
 	cleanup := func() {
 		for _, e := range pinned {
 			barrier.DeregisterInFlightEpoch(e)
 		}
 	}
-	var preEpoch uint64
-	if barrier != nil {
-		preEpoch = barrier.CurrentEpoch()
-		barrier.RegisterInFlightEpoch(preEpoch)
-		pinned = append(pinned, preEpoch)
-	}
-	epoch, err := reencryptReceivedSnapshot(fsys, path, barrier)
 	if err != nil {
-		cleanup()
 		return 0, func() {}, err
-	}
-	if barrier != nil && epoch != 0 && epoch != preEpoch {
-		barrier.RegisterInFlightEpoch(epoch)
-		pinned = append(pinned, epoch)
 	}
 	return epoch, cleanup, nil
 }
 
-func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (uint64, error) {
+func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (uint64, []uint64, error) {
 	if barrier == nil {
-		return 0, nil
+		return 0, nil, nil
 	}
 	if barrier.IsSealed() {
-		return 0, ErrSnapshotBarrierSealed
+		return 0, nil, ErrSnapshotBarrierSealed
 	}
 	src, err := fsys.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer func() { _ = src.Close() }()
 
 	tmp, err := fsys.CreateTemp(filepath.Dir(path), recvEncryptTempPattern)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	tmpPath := tmp.Name()
 	committed := false
@@ -912,24 +939,35 @@ func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (u
 		}
 	}()
 
-	epoch, err := encryptSnapshotFrames(barrier, src, tmp)
+	epoch, pinned, err := encryptSnapshotFrames(barrier, src, tmp)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
+	}
+	// encryptSnapshotFrames now holds `pinned`. Any failure below must release
+	// them, since the caller never receives the set to release.
+	unpinAll := func() {
+		for _, ep := range pinned {
+			barrier.DeregisterInFlightEpoch(ep)
+		}
 	}
 	if err := tmp.Sync(); err != nil {
-		return 0, err
+		unpinAll()
+		return 0, nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return 0, err
+		unpinAll()
+		return 0, nil, err
 	}
 	if err := src.Close(); err != nil {
-		return 0, err
+		unpinAll()
+		return 0, nil, err
 	}
 	if err := fsys.Rename(tmpPath, path); err != nil {
-		return 0, err
+		unpinAll()
+		return 0, nil, err
 	}
 	committed = true
-	return epoch, nil
+	return epoch, pinned, nil
 }
 
 func decryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint64, error) {

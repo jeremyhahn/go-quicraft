@@ -182,7 +182,7 @@ func writeDurableFile(t *testing.T, fsys snapshotFS, path string, data []byte) {
 func encryptToBytes(t *testing.T, barrier Barrier, plaintext []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if _, err := encryptSnapshotFrames(barrier, bytes.NewReader(plaintext), &buf); err != nil {
+	if _, _, err := encryptSnapshotFrames(barrier, bytes.NewReader(plaintext), &buf); err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
 	return buf.Bytes()

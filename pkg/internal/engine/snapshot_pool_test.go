@@ -1467,7 +1467,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1523,7 +1523,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
 		t.Fatalf("write test data failed: %v", err)
 	}
-	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1698,7 +1698,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 		t.Fatalf("write plaintext failed: %v", err)
 	}
 
-	minEpoch, err := p.encryptSnapshotFile(dataPath, barrier)
+	minEpoch, _, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
@@ -1748,7 +1748,7 @@ func TestSnapshotPool_EncryptFile_AtomicPreservesOriginalOnFailure(t *testing.T)
 	}
 
 	// Encrypt should fail on the second chunk.
-	_, err := p.encryptSnapshotFile(dataPath, barrier)
+	_, _, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail on second chunk")
 	}
@@ -1858,7 +1858,7 @@ func TestSnapshotPool_EncryptFile_AtomicTempCleanup(t *testing.T) {
 	}
 
 	// Encrypt should fail because barrier is sealed.
-	_, err := p.encryptSnapshotFile(dataPath, barrier)
+	_, _, err := p.encryptSnapshotFile(dataPath, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail with sealed barrier")
 	}
@@ -3136,7 +3136,7 @@ func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -3192,7 +3192,7 @@ func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
@@ -3227,7 +3227,7 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, 2, barrier)
@@ -3257,7 +3257,7 @@ func TestSnapshotPool_EncryptFile_MissingFile(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	_, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", barrier)
+	_, _, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}

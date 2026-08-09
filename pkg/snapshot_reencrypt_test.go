@@ -35,6 +35,78 @@ func snapshotPlaintext() []byte {
 	return p
 }
 
+// rotatingRecordBarrier assigns a NEW epoch to every frame (simulating a key
+// rotation between each chunk) and records which epochs were pinned in-flight, so
+// a test can prove the encrypt loop pins EVERY epoch it seals — not just the min.
+type rotatingRecordBarrier struct {
+	mockBarrier
+	mu         sync.Mutex
+	epoch      uint64
+	used       map[uint64]bool
+	registered map[uint64]bool
+}
+
+func (b *rotatingRecordBarrier) CurrentEpoch() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.epoch
+}
+
+func (b *rotatingRecordBarrier) EncryptWithEpoch(_, pt []byte) ([]byte, uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e := b.epoch
+	b.epoch++ // a rotation lands between every frame
+	if b.used == nil {
+		b.used = map[uint64]bool{}
+	}
+	b.used[e] = true
+	return append([]byte(nil), pt...), e, nil
+}
+
+func (b *rotatingRecordBarrier) RegisterInFlightEpoch(e uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.registered == nil {
+		b.registered = map[uint64]bool{}
+	}
+	b.registered[e] = true
+}
+
+func (b *rotatingRecordBarrier) DeregisterInFlightEpoch(uint64) {}
+
+// TestEncryptSnapshotFrames_PinsEveryFrameEpoch pins the DEK-lifetime property:
+// when a snapshot's frames are sealed under multiple epochs (rotations landing
+// mid-loop), EVERY such epoch must be pinned in-flight — not just the minimum —
+// or a concurrent PurgeEpochsBefore could drop an intermediate frame's DEK and
+// leave the snapshot permanently undecryptable.
+func TestEncryptSnapshotFrames_PinsEveryFrameEpoch(t *testing.T) {
+	b := &rotatingRecordBarrier{epoch: 5}
+	// Several 64KiB chunks -> several frames, each sealed under a new epoch.
+	plain := make([]byte, snapshotEncryptChunkSize*3+100)
+	var out bytes.Buffer
+	_, pinned, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &out)
+	if err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	if len(b.used) < 3 {
+		t.Fatalf("fixture: only %d frame epochs used, want the multi-frame path", len(b.used))
+	}
+	pinnedSet := map[uint64]bool{}
+	for _, e := range pinned {
+		pinnedSet[e] = true
+	}
+	for e := range b.used {
+		if !pinnedSet[e] {
+			t.Fatalf("frame epoch %d was sealed but NOT returned as pinned (pinned=%v, used=%v): "+
+				"a concurrent purge could drop its DEK and orphan that frame", e, pinned, b.used)
+		}
+		if !b.registered[e] {
+			t.Fatalf("frame epoch %d was sealed but never RegisterInFlightEpoch'd", e)
+		}
+	}
+}
+
 // TestSnapshotFrames_EncryptDecryptRoundTrip proves encryptSnapshotFrames and
 // decryptSnapshotFrames are inverses under the same barrier and that the recorded
 // epoch is non-zero.
@@ -43,7 +115,7 @@ func TestSnapshotFrames_EncryptDecryptRoundTrip(t *testing.T) {
 	plain := snapshotPlaintext()
 
 	var enc bytes.Buffer
-	epoch, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &enc)
+	epoch, _, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &enc)
 	if err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
@@ -100,7 +172,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	if err := os.WriteFile(recvPath, mustRead(t, wirePath), 0o600); err != nil {
 		t.Fatalf("write received plaintext: %v", err)
 	}
-	recvEpoch, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, nodeB)
+	recvEpoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, nodeB)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot: %v", err)
 	}
@@ -144,7 +216,7 @@ func TestReceiveSnapshot_NilBarrierLeavesPlaintext(t *testing.T) {
 	if err := os.WriteFile(path, plain, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	epoch, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, nil)
+	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, nil)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot(nil): %v", err)
 	}
@@ -358,7 +430,7 @@ func TestSnapshotFrameEpochs_ScansHeadersWithoutDecrypting(t *testing.T) {
 	// Real frames produced by a live barrier scan to that barrier's epoch.
 	bar := createTestBarrier(t)
 	var enc bytes.Buffer
-	if _, err := encryptSnapshotFrames(bar, bytes.NewReader(snapshotPlaintext()), &enc); err != nil {
+	if _, _, err := encryptSnapshotFrames(bar, bytes.NewReader(snapshotPlaintext()), &enc); err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
 	epochs, err := snapshotFrameEpochs(bytes.NewReader(enc.Bytes()))

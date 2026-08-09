@@ -626,18 +626,19 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		// this window would drop its DEK while SaveSnapshot goes on to record
 		// Epoch: E — durably naming ciphertext nothing can ever open.
 		//
-		// Pinning starts BEFORE the write (mirroring saveSnapshot) so the
-		// current epoch cannot be purged between the read and the first frame,
-		// and the epoch actually recorded is pinned as well: a rotation landing
-		// mid-write seals later frames at a higher epoch than the pre-read.
-		inFlightEpoch := recvBarrier.CurrentEpoch()
-		recvBarrier.RegisterInFlightEpoch(inFlightEpoch)
-		defer recvBarrier.DeregisterInFlightEpoch(inFlightEpoch)
-		recvEpoch, writeErr = encryptSnapshotFrames(recvBarrier, plain, f)
-		if recvEpoch != 0 && recvEpoch != inFlightEpoch {
-			recvBarrier.RegisterInFlightEpoch(recvEpoch)
-			defer recvBarrier.DeregisterInFlightEpoch(recvEpoch)
-		}
+		// encryptSnapshotFrames pins EVERY epoch it seals a frame under — before
+		// the seal (so the current epoch cannot be purged between the read and the
+		// first frame) and after (so an intermediate epoch a mid-write rotation
+		// creates is protected too) — and returns the set. Hold those pins until
+		// this handler returns, which is past the SaveSnapshot that records the
+		// epoch, so a concurrent rotate+purge cannot orphan any frame's DEK.
+		var recvPins []uint64
+		recvEpoch, recvPins, writeErr = encryptSnapshotFrames(recvBarrier, plain, f)
+		defer func() {
+			for _, e := range recvPins {
+				recvBarrier.DeregisterInFlightEpoch(e)
+			}
+		}()
 	} else {
 		_, writeErr = io.Copy(f, plain)
 	}

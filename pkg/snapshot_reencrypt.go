@@ -159,7 +159,17 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 		}
 	}
 
+	// encryptSnapshotFrames pins every dest epoch it seals a frame under and
+	// returns the set; hold those pins across this function's durable write
+	// (Rename + syncDirChain below) so a concurrent rotate+purge on the DEST
+	// barrier cannot orphan an intermediate frame's DEK mid-migration.
 	var epoch uint64
+	var dstPins []uint64
+	defer func() {
+		for _, e := range dstPins {
+			dstBarrier.DeregisterInFlightEpoch(e)
+		}
+	}()
 	switch {
 	case srcLive && dstLive:
 		// Framed -> framed. Decrypt in one goroutine, feeding plaintext through
@@ -170,7 +180,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 			_, decErr := decryptSnapshotFrames(srcBarrier, src, pw)
 			_ = pw.CloseWithError(decErr)
 		}()
-		epoch, err = encryptSnapshotFrames(dstBarrier, pr, tmp)
+		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, pr, tmp)
 		// Unblock the decrypt goroutine if the encrypt side stopped early.
 		_ = pr.CloseWithError(err)
 	case srcLive && !dstLive:
@@ -178,7 +188,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 		_, err = decryptSnapshotFrames(srcBarrier, src, tmp)
 	case !srcLive && dstLive:
 		// Plaintext -> framed.
-		epoch, err = encryptSnapshotFrames(dstBarrier, src, tmp)
+		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, src, tmp)
 	default:
 		// Plaintext -> plaintext.
 		_, err = io.Copy(tmp, src)

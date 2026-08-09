@@ -134,7 +134,7 @@ func TestDecryptSnapshotFrames_PropagatesSinkFailure(t *testing.T) {
 func TestEncryptSnapshotFrames_PropagatesSinkFailure(t *testing.T) {
 	b := createTestBarrier(t)
 
-	epoch, err := encryptSnapshotFrames(b, bytes.NewReader([]byte("payload")), failingWriter{})
+	epoch, _, err := encryptSnapshotFrames(b, bytes.NewReader([]byte("payload")), failingWriter{})
 	if !errors.Is(err, errTestWriteRefused) {
 		t.Fatalf("encryptSnapshotFrames error = %v, want the sink error", err)
 	}
@@ -150,7 +150,7 @@ func TestEncryptSnapshotFrames_PropagatesSourceFailure(t *testing.T) {
 	b := createTestBarrier(t)
 
 	var out bytes.Buffer
-	epoch, err := encryptSnapshotFrames(b, &failingReader{prefix: []byte("partial")}, &out)
+	epoch, _, err := encryptSnapshotFrames(b, &failingReader{prefix: []byte("partial")}, &out)
 	if !errors.Is(err, errTestReadFailed) {
 		t.Fatalf("encryptSnapshotFrames error = %v, want the source error", err)
 	}
@@ -176,7 +176,7 @@ func TestReencryptReceivedSnapshot_FailsClosedWhenSealed(t *testing.T) {
 		t.Fatalf("seal: %v", err)
 	}
 
-	epoch, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, sealed)
+	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, sealed)
 	if !errors.Is(err, ErrSnapshotBarrierSealed) {
 		t.Fatalf("reencryptReceivedSnapshot error = %v, want ErrSnapshotBarrierSealed", err)
 	}

@@ -258,7 +258,7 @@ func TestReencryptReceivedSnapshot_FilesystemFailures(t *testing.T) {
 			}
 			b := createTestBarrier(t)
 
-			epoch, err := reencryptReceivedSnapshot(tt.fsys, path, b)
+			epoch, _, err := reencryptReceivedSnapshot(tt.fsys, path, b)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("reencryptReceivedSnapshot error = %v, want %v", err, tt.wantErr)
 			}
