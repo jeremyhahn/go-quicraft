@@ -75,6 +75,20 @@ type SnapshotBarrier interface {
 	PurgeEpochsBefore(minEpoch uint64) (int, error)
 }
 
+// atomicEpochPinner is an OPTIONAL capability a SnapshotBarrier may implement:
+// seal a frame and register the epoch it sealed under as in-flight in ONE atomic
+// step, under the barrier's own lock.
+//
+// EncryptWithEpoch releases that lock before returning, so a Rotate followed by
+// PurgeEpochsBefore can complete in the gap before the caller pins the returned
+// epoch — dropping the DEK of an already-sealed frame and making the snapshot
+// permanently undecryptable. Doing both under one lock closes that window.
+// encryptSnapshotFile uses it when available and falls back to
+// pin-before + pin-after otherwise.
+type atomicEpochPinner interface {
+	EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64, error)
+}
+
 // snapshotRequest is sent to the snapshot pool to request a snapshot
 // save or recover operation for a shard.
 //
@@ -1393,39 +1407,18 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 	// epoch's DEK (which the min-only record left exposed once two rotations
 	// landed mid-loop), leaving the snapshot undecryptable. The returned set is
 	// released by the caller AFTER the snapshot's epoch is durably recorded.
-	pinnedSet := make(map[uint64]struct{})
-	var pinned []uint64
-	pin := func(e uint64) {
-		if e == 0 {
-			return
-		}
-		if _, ok := pinnedSet[e]; ok {
-			return
-		}
-		barrier.RegisterInFlightEpoch(e)
-		pinnedSet[e] = struct{}{}
-		pinned = append(pinned, e)
-	}
-	unpinAll := func() {
-		for _, ep := range pinned {
-			barrier.DeregisterInFlightEpoch(ep)
-		}
-	}
+	pins := newEpochPinner(barrier)
 	encErrOf := func(op string, e error) error {
-		unpinAll()
+		pins.releaseAll()
 		return &SnapshotEncryptError{Op: op, Err: e}
 	}
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
 		if n > 0 {
-			// Pin the current epoch before sealing this frame, then the epoch
-			// actually used in case a rotation landed in between.
-			pin(barrier.CurrentEpoch())
-			encrypted, frameEpoch, encErr := barrier.EncryptWithEpoch(nil, chunkBuf[:n])
+			encrypted, frameEpoch, encErr := pins.sealFrame(chunkBuf[:n])
 			if encErr != nil {
 				return 0, nil, encErrOf("encrypt", encErr)
 			}
-			pin(frameEpoch)
 			if minEpoch == 0 || frameEpoch < minEpoch {
 				minEpoch = frameEpoch
 			}
@@ -1468,7 +1461,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 	if err := SyncDir(dir); err != nil {
 		return 0, nil, encErrOf("sync_dir", err)
 	}
-	return minEpoch, pinned, nil
+	return minEpoch, pins.epochs(), nil
 }
 
 // decryptSnapshotToSibling reads the encrypted snapshot data file and writes

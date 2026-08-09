@@ -23,6 +23,73 @@ import (
 	"testing"
 )
 
+// TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge is the TOCTOU
+// regression: EncryptWithEpoch releases b.mu before returning, so a Rotate +
+// PurgeEpochsBefore (both taking b.mu exclusively) can complete in the gap
+// before the caller pins the returned epoch — dropping the DEK of a frame that
+// is already sealed and making the artifact permanently undecryptable.
+// EncryptWithEpochPinned performs the seal and the pin under one lock, so the
+// ciphertext it returns must ALWAYS remain decryptable no matter how many
+// rotations and purges run immediately afterward.
+func TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge(t *testing.T) {
+	b, _ := testInitializedBarrier(t) // epoch 1
+	plaintext := []byte("frame that must stay decryptable")
+
+	ct, epoch, err := b.EncryptWithEpochPinned(nil, plaintext)
+	if err != nil {
+		t.Fatalf("EncryptWithEpochPinned: %v", err)
+	}
+	defer b.DeregisterInFlightEpoch(epoch)
+
+	// The exact interleaving that used to orphan the frame: rotate twice past
+	// the sealed epoch, then purge everything below the new current epoch.
+	if _, err := b.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if _, err := b.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if _, err := b.PurgeEpochsBefore(b.CurrentEpoch()); err != nil {
+		t.Fatalf("PurgeEpochsBefore: %v", err)
+	}
+
+	pt, err := b.DecryptForEpoch(nil, ct, epoch)
+	if err != nil {
+		t.Fatalf("frame sealed under epoch %d is UNDECRYPTABLE after a concurrent "+
+			"rotate+purge (%v): the atomic seal-and-pin did not protect its DEK", epoch, err)
+	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatal("decrypted frame does not match the original plaintext")
+	}
+}
+
+// TestEncryptWithEpochPinned_BalancesRefcount asserts the pin it takes is a
+// single, releasable reference: after the caller deregisters, the epoch is no
+// longer protected and a purge may reclaim it.
+func TestEncryptWithEpochPinned_BalancesRefcount(t *testing.T) {
+	b, _ := testInitializedBarrier(t)
+	_, epoch, err := b.EncryptWithEpochPinned(nil, []byte("x"))
+	if err != nil {
+		t.Fatalf("EncryptWithEpochPinned: %v", err)
+	}
+
+	b.inFlightMu.Lock()
+	held := b.inFlightEpochs[epoch]
+	b.inFlightMu.Unlock()
+	if held != 1 {
+		t.Fatalf("in-flight refcount for epoch %d = %d, want exactly 1", epoch, held)
+	}
+
+	b.DeregisterInFlightEpoch(epoch)
+	b.inFlightMu.Lock()
+	_, stillHeld := b.inFlightEpochs[epoch]
+	b.inFlightMu.Unlock()
+	if stillHeld {
+		t.Fatalf("epoch %d still pinned after Deregister: the pin leaks and would "+
+			"block every future DEK purge for this barrier", epoch)
+	}
+}
+
 // TestPurgeEpochsBefore_SyncsSealedKnownEpochs is the regression test for
 // PurgeEpochsBefore not rebuilding the persisted sealed state: without the
 // sync, SealedRootKeyData() kept returning the purged epochs and a restart

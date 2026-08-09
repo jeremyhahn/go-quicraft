@@ -300,3 +300,54 @@ func TestJoiningClearsOnRestartReplayWithoutLeader(t *testing.T) {
 		t.Fatal("IsMember still authorizes an unknown replica after restart-replay")
 	}
 }
+
+// TestJoiningClearsWhenReplayRemovesSelf is the third terminal state of the
+// joining window: a join=true replica that replays a committed RemoveNode for
+// ITSELF before any leader is known is neither a member (so the self signal is
+// false) nor following a leader (so the leader signal is false). Without an
+// explicit tombstone signal the auth bypass would persist for the whole process
+// — and because clearJoiningIfKnown only runs on membership changes, no later
+// heartbeat would ever clear it.
+func TestJoiningClearsWhenReplayRemovesSelf(t *testing.T) {
+	// Replica 4 comes up joining with no leader contact (restart-replay state).
+	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
+	p.MarkJoining()
+	if p.r.leaderID != noLeader {
+		t.Fatalf("fixture: expected no leader, got %d", p.r.leaderID)
+	}
+
+	// Replay: the founding membership, this replica's AddNode, then the committed
+	// RemoveNode that took it back out of the configuration.
+	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+	})
+	if err != nil {
+		t.Fatalf("build bootstrap entry: %v", err)
+	}
+	ccEntry := func(index uint64, t2 uint64, cc proto.ConfigChange) proto.Entry {
+		t.Helper()
+		buf := make([]byte, cc.Size())
+		if _, err := cc.MarshalTo(buf); err != nil {
+			t.Fatalf("marshal config change: %v", err)
+		}
+		return proto.Entry{Index: index, Term: t2, Type: proto.EntryConfigChange, Cmd: buf}
+	}
+	p.processConfigChanges([]proto.Entry{
+		bootstrap,
+		ccEntry(2, 1, proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "d"}),
+		ccEntry(3, 1, proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 4}),
+	})
+
+	if p.membership.isMember(4) {
+		t.Fatal("fixture: replica 4 should have been removed by the replayed RemoveNode")
+	}
+	if p.joining.Load() {
+		t.Fatal("a join=true replica that replayed its OWN committed removal did not " +
+			"clear the auth bypass: it is not a member and has no leader, so no later " +
+			"membership change or heartbeat will ever clear it — IsMember authorizes " +
+			"every sender for the life of the process")
+	}
+	if p.IsMember(999) {
+		t.Fatal("IsMember still authorizes an unknown replica after self-removal replay")
+	}
+}

@@ -1248,20 +1248,30 @@ func (p *Peer) setJoining(joining bool) {
 //	    full membership yet keep the bypass set until the next snapshot or config
 //	    change — a lingering per-shard auth bypass.
 //
-// Neither signal fires too early: (a) only once the leader is authorizable, and
-// (b) only once this replica is officially in the configuration. In the
-// post-bootstrap-leader case both are false after the founding entry alone, so
-// the bypass correctly persists until the leader's AddNode arrives. A snapshot
-// also clears joining unconditionally (Handle's adopt branch), for the compacted
-// case. A single-node bootstrap never sets joining, so this is only ever reached
-// by a replica added to an existing cluster.
+//	(c) this replica carries a Removed TOMBSTONE. A committed RemoveNode for
+//	    self is equally durable evidence that the committed configuration has
+//	    been learned, and it is the one terminal state (b) misses: a join=true
+//	    replica that replays its own removal before any leader is known is
+//	    neither a member nor following a leader, so without (c) the bypass would
+//	    persist for the process — and since clearJoiningIfKnown only runs on
+//	    membership changes, no later heartbeat would ever clear it.
+//
+// No signal fires too early: (a) only once the leader is authorizable, (b) only
+// once this replica is officially in the configuration, and (c) only once its
+// removal is committed. In the post-bootstrap-leader case all three are false
+// after the founding entry alone, so the bypass correctly persists until the
+// leader's AddNode arrives. A snapshot also clears joining unconditionally
+// (Handle's adopt branch), for the compacted case. A single-node bootstrap never
+// sets joining, so this is only ever reached by a replica added to an existing
+// cluster.
 func (p *Peer) clearJoiningIfKnown() {
 	if !p.joining.Load() {
 		return
 	}
 	leaderID := p.r.leaderID
 	if (leaderID != noLeader && p.membership.isMember(leaderID)) ||
-		p.membership.isMember(p.replicaID) {
+		p.membership.isMember(p.replicaID) ||
+		p.membership.isRemoved(p.replicaID) {
 		p.setJoining(false)
 	}
 }

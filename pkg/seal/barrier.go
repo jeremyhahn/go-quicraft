@@ -780,6 +780,60 @@ func (b *Barrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error
 	return ct, b.epoch, nil
 }
 
+// EncryptWithEpochPinned encrypts plaintext and ATOMICALLY registers the epoch
+// it sealed under as in-flight, returning the ciphertext and that epoch. The
+// caller MUST DeregisterInFlightEpoch the returned epoch once the artifact's
+// epoch is durably recorded.
+//
+// This closes a TOCTOU that EncryptWithEpoch + a separate RegisterInFlightEpoch
+// cannot: EncryptWithEpoch releases b.mu before returning, so a Rotate followed
+// by PurgeEpochsBefore — both of which take b.mu exclusively — can run to
+// completion in the gap before the caller pins the returned epoch, dropping the
+// DEK of a frame that was already sealed. A snapshot containing such a frame is
+// permanently undecryptable. Registering the pin while the same b.mu read lock
+// that produced the ciphertext is STILL HELD makes the seal and the pin a single
+// atomic step with respect to any purge.
+//
+// Lock order matches PurgeEpochsBefore (b.mu then inFlightMu), so this cannot
+// deadlock. Every returned epoch is pinned exactly once per successful call.
+func (b *Barrier) EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64, error) {
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		ct, err := b.hwEncryptor.Encrypt(plaintext)
+		if err != nil {
+			return nil, 0, err
+		}
+		b.pinInFlightLocked(b.epoch)
+		return ct, b.epoch, nil
+	}
+
+	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.pinInFlightLocked(b.epoch)
+	return ct, b.epoch, nil
+}
+
+// pinInFlightLocked increments the in-flight refcount for epoch. The caller must
+// hold b.mu (read or write), which is what makes the pin atomic with respect to
+// PurgeEpochsBefore's exclusive b.mu.
+func (b *Barrier) pinInFlightLocked(epoch uint64) {
+	b.inFlightMu.Lock()
+	b.inFlightEpochs[epoch]++
+	b.inFlightMu.Unlock()
+}
+
 // epochAAD constructs the Additional Authenticated Data (AAD) for AEAD
 // operations. The AAD binds each ciphertext to its epoch, preventing cross-epoch
 // ciphertext splicing attacks. The epoch is encoded as a fixed 8-byte

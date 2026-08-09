@@ -196,6 +196,15 @@ func (m *membership) isMember(replicaID uint64) bool {
 	return m.isVoter(replicaID) || m.isObserver(replicaID) || m.isWitness(replicaID)
 }
 
+// isRemoved reports whether the replica carries a Removed tombstone — a
+// committed RemoveNode was applied for it. A tombstone is durable evidence that
+// this replica has learned the committed configuration (its own removal was
+// agreed by the cluster), which is what makes it a valid terminal state for the
+// joining window even though the replica is no longer a member.
+func (m *membership) isRemoved(replicaID uint64) bool {
+	return m.removed[replicaID]
+}
+
 // validate checks that a config change is valid before application. It
 // enforces safety rules such as preventing removal of the last voter and
 // detecting duplicate or conflicting additions, plus the shard's replicated

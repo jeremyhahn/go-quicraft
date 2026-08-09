@@ -122,6 +122,26 @@ type Barrier interface {
 	ShouldRotateKey() bool
 }
 
+// atomicEpochPinner is an OPTIONAL capability a Barrier may implement: seal a
+// frame and register the epoch it sealed under as in-flight in ONE atomic step,
+// under the barrier's own lock.
+//
+// It exists because EncryptWithEpoch releases that lock before returning, so a
+// Rotate followed by PurgeEpochsBefore can complete in the gap before the caller
+// pins the returned epoch — dropping the DEK of a frame that is already sealed
+// into the artifact and making the snapshot permanently undecryptable. Doing both
+// under one lock closes that window entirely.
+//
+// The at-rest encrypt loops use it when available and fall back to
+// pin-before + pin-after otherwise, so a Barrier implementation that does not
+// provide it keeps working (with the narrower residual window).
+//
+// The caller must DeregisterInFlightEpoch the returned epoch once the artifact's
+// epoch is durably recorded, exactly as for a manual RegisterInFlightEpoch.
+type atomicEpochPinner interface {
+	EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64, error)
+}
+
 // hostOptions holds optional dependencies injected via HostOption functions.
 type hostOptions struct {
 	logdb            logdb.LogDB
@@ -811,47 +831,25 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 	chunkBuf := make([]byte, snapshotEncryptChunkSize)
 	var frameLenBuf [4]byte
 	var minEpoch uint64
-	pinnedSet := make(map[uint64]struct{})
-	var pinned []uint64
-	pin := func(e uint64) {
-		if e == 0 {
-			return
-		}
-		if _, ok := pinnedSet[e]; ok {
-			return
-		}
-		barrier.RegisterInFlightEpoch(e)
-		pinnedSet[e] = struct{}{}
-		pinned = append(pinned, e)
-	}
-	unpinAll := func() {
-		for _, e := range pinned {
-			barrier.DeregisterInFlightEpoch(e)
-		}
-	}
+	pins := newEpochPinner(barrier)
 	for {
 		n, readErr := src.Read(chunkBuf)
 		if n > 0 {
-			// Pin the current epoch BEFORE sealing this frame so its DEK cannot be
-			// purged between here and the seal, then pin the epoch actually used in
-			// case a rotation landed in between.
-			pin(barrier.CurrentEpoch())
-			ct, epoch, encErr := barrier.EncryptWithEpoch(nil, chunkBuf[:n])
+			ct, epoch, encErr := pins.sealFrame(chunkBuf[:n])
 			if encErr != nil {
-				unpinAll()
+				pins.releaseAll()
 				return 0, nil, encErr
 			}
-			pin(epoch)
 			if minEpoch == 0 || epoch < minEpoch {
 				minEpoch = epoch
 			}
 			binary.LittleEndian.PutUint32(frameLenBuf[:], uint32(len(ct)))
 			if _, werr := dst.Write(frameLenBuf[:]); werr != nil {
-				unpinAll()
+				pins.releaseAll()
 				return 0, nil, werr
 			}
 			if _, werr := dst.Write(ct); werr != nil {
-				unpinAll()
+				pins.releaseAll()
 				return 0, nil, werr
 			}
 		}
@@ -859,11 +857,11 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 			break
 		}
 		if readErr != nil {
-			unpinAll()
+			pins.releaseAll()
 			return 0, nil, readErr
 		}
 	}
-	return minEpoch, pinned, nil
+	return minEpoch, pins.epochs(), nil
 }
 
 // reencryptReceivedSnapshot re-encrypts a just-written PLAINTEXT snapshot.dat at
