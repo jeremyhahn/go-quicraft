@@ -334,9 +334,11 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// persistence ack, so it routinely outlives the message that installed it.
 	var pendingBefore *proto.Snapshot
 	var termBefore uint64
+	var committedBefore uint64
 	if msg.Type == proto.InstallSnapshot {
 		pendingBefore = p.r.log.pendingSnapshot()
 		termBefore = p.r.term
+		committedBefore = p.r.log.committed
 	}
 
 	err := p.r.step(msg)
@@ -399,7 +401,24 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// only committed entries mutate membership, log truncation on
 	// conflict can never remove an applied config change, so no
 	// membership rollback/rebuild is needed here.
-	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm && !wireOrigin {
+	// raft REJECTS a snapshot at or below the committed index and returns nil
+	// (handleSnapshot's first branch), so a nil error does not mean the snapshot
+	// was installed. Membership must never come from a snapshot raft refused:
+	// its configuration is older than what this replica has already committed,
+	// and adopting it rolls the voting set backwards. This mirrors
+	// handleSnapshot's own test against the PRE-step committed index, because
+	// an accepted snapshot advances committed past its own index.
+	//
+	// The joining branch below deliberately bypasses the ConfigChangeID
+	// staleness test, so without this gate a joining replica adopted the
+	// membership of EVERY rejected retransmission — including ones that do not
+	// name it at all, which leaves it self-removed, unelectable, and computing
+	// quorum over a stale configuration. The non-joining path was reachable too,
+	// via a rejected snapshot carrying a higher ConfigChangeID.
+	snapshotRejected := msg.Type == proto.InstallSnapshot &&
+		msg.Snapshot.Index <= committedBefore
+	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm && !wireOrigin &&
+		!snapshotRejected {
 		// Adopt the snapshot's membership on BOTH branches, gated on it
 		// not being older than what we already have.
 		//

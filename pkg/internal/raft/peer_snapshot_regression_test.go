@@ -434,3 +434,86 @@ func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
 			"campaigning and per-shard authorization with an attacker configuration")
 	}
 }
+
+// TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership pins the
+// gate on raft's snapshot REJECTION path. handleSnapshot refuses a snapshot at
+// or below the committed index and returns nil, so a nil error from step never
+// meant the snapshot was installed. Membership was adopted anyway.
+//
+// A rejected snapshot's configuration is by definition older than what this
+// replica has already committed, so adopting it rolls the voting set backwards.
+func TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership(t *testing.T) {
+	// The joining path is the sharp one: it deliberately bypasses the
+	// ConfigChangeID staleness test, so it adopted EVERY rejected
+	// retransmission — including configurations that do not name this replica.
+	t.Run("joining replica", func(t *testing.T) {
+		p := newTestPeerWithLog(t, testConfigWithID(1, 6), contiguousEntries(10),
+			proto.State{Term: 5, Commit: 10},
+			proto.Membership{Addresses: map[uint64]string{6: "self"}})
+		p.MarkJoining()
+		if !p.joining.Load() {
+			t.Fatal("fixture: the replica must actually be joining")
+		}
+
+		// Index 3 is far below committed=10, so handleSnapshot rejects it.
+		// Delivered LOCALLY, so the wire-origin gate is not what stops it.
+		err := p.Handle(proto.Message{
+			Type: proto.InstallSnapshot, From: 2, To: 6, ShardID: 1, Term: 5,
+			Origin: proto.OriginLocal,
+			Snapshot: proto.Snapshot{
+				Index: 3, Term: 5,
+				Membership: proto.Membership{
+					Addresses: map[uint64]string{9: "stale-only"},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if _, adopted := p.membership.addresses[9]; adopted {
+			t.Fatalf("membership adopted from a REJECTED snapshot: %v.\n"+
+				"raft refused this snapshot as behind the committed index, yet its "+
+				"configuration replaced the local one — and it does not name replica "+
+				"6 at all, leaving this replica self-removed, permanently unelectable, "+
+				"and computing quorum over a stale voting set.",
+				p.membership.addresses)
+		}
+		if _, self := p.membership.addresses[6]; !self {
+			t.Fatalf("replica removed itself from its own configuration: %v",
+				p.membership.addresses)
+		}
+	})
+
+	// The non-joining path was reachable too, through a rejected snapshot
+	// carrying a ConfigChangeID higher than the local one.
+	t.Run("established replica", func(t *testing.T) {
+		p := newTestPeerWithLog(t, testConfigWithID(1, 1), contiguousEntries(10),
+			proto.State{Term: 5, Commit: 10},
+			proto.Membership{
+				Addresses:      map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ConfigChangeID: 4,
+			})
+
+		err := p.Handle(proto.Message{
+			Type: proto.InstallSnapshot, From: 2, To: 1, ShardID: 1, Term: 5,
+			Origin: proto.OriginLocal,
+			Snapshot: proto.Snapshot{
+				Index: 3, Term: 5,
+				Membership: proto.Membership{
+					Addresses:      map[uint64]string{7: "elsewhere"},
+					ConfigChangeID: 99,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if _, adopted := p.membership.addresses[7]; adopted {
+			t.Fatalf("membership adopted from a REJECTED snapshot via the "+
+				"ConfigChangeID branch: %v", p.membership.addresses)
+		}
+		if len(p.membership.addresses) != 3 {
+			t.Fatalf("configuration changed: %v", p.membership.addresses)
+		}
+	})
+}
