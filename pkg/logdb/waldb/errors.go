@@ -36,6 +36,22 @@ var (
 	// ErrClosed is returned when an operation is attempted on a closed segment.
 	ErrClosed = errors.New("waldb: segment closed")
 
+	// ErrBarrierContextUnsupported is returned by Open when a barrier is
+	// configured but cannot bind caller context into its AEAD AAD (see
+	// walContextBarrier). Every encrypted WAL record is positionally bound, so
+	// there is nothing to fall back to: accepting such a barrier would write
+	// records an at-rest attacker could reorder or splice undetected.
+	ErrBarrierContextUnsupported = errors.New(
+		"waldb: barrier does not support context-bound encryption")
+
+	// ErrLandingSegmentOverflow is returned when a record that was pre-fitted
+	// to its landing segment nevertheless overflows it. It signals a broken
+	// invariant between segment.CanFit and segment.Write, never a condition a
+	// caller can provoke: the alternative — moving a positionally sealed record
+	// to a different segment — would make it permanently undecryptable.
+	ErrLandingSegmentOverflow = errors.New(
+		"waldb: record overflowed its pre-resolved landing segment")
+
 	// ErrInvalidBlockSize is returned when the configured block size is not a
 	// power of two or is smaller than the minimum required to hold a record header.
 	ErrInvalidBlockSize = errors.New("waldb: invalid block size")

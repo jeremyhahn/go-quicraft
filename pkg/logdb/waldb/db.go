@@ -88,6 +88,53 @@ type WALBarrier interface {
 	CurrentEpoch() uint64
 }
 
+// walContextBarrier is the context-AAD capability the WAL REQUIRES of any
+// configured barrier. Every encrypted WAL record binds its position — WAL
+// shard, segment and record ordinal — into the AEAD AAD (see
+// walRecordContext), which the plain Encrypt/Decrypt pair cannot express.
+//
+// It is a separate interface asserted at Open rather than extra methods on
+// WALBarrier because WALBarrier is part of the package's published surface and
+// is satisfied structurally by the engine's own Barrier interface; widening it
+// would break every embedder that passes a narrower barrier through. The
+// assertion is on the DYNAMIC type, so the concrete *seal.Barrier every
+// production path supplies satisfies it.
+//
+// The assertion FAILS CLOSED: a configured barrier that cannot bind context
+// makes Open return ErrBarrierContextUnsupported. There is deliberately no
+// epoch-only fallback — silently writing unbound records would reintroduce
+// exactly the splice/reorder exposure the context exists to remove.
+type walContextBarrier interface {
+	// EncryptWithContext seals plaintext with contextAAD folded into the AEAD
+	// AAD alongside the epoch. The context is not stored in the ciphertext.
+	EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
+
+	// DecryptWithContext opens a ciphertext sealed under the same contextAAD.
+	// A different context — or none — fails authentication.
+	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
+
+	// IsHardwareMode reports whether the barrier delegates to a hardware-backed
+	// encryptor, which takes no AAD at all.
+	IsHardwareMode() bool
+}
+
+// maxCiphertextExpansion is the largest number of bytes the seal barrier's
+// envelope can add to a record's plaintext. It bounds the framed length used to
+// pick a record's landing segment BEFORE the record is sealed, which is what
+// makes the segment ID in the context-AAD final at encryption time.
+//
+// COUPLING: this mirrors pkg/seal's envelope, whose per-record layout is
+// [epoch:8][algID:1][nonce:N][ciphertext+tag]. The AEAD ciphertext is exactly
+// as long as the plaintext, the tag is 16 bytes for every supported algorithm,
+// and N is at most 24 (XChaCha20-Poly1305; AES-256-GCM and ChaCha20-Poly1305
+// use 12). Those sizes are unexported in pkg/seal, so the bound lives here and
+// TestCiphertextExpansionWithinBound pins it against a real barrier.
+//
+// Over-estimating is safe by construction: segment.CanFit is monotonic in the
+// length it is given, so a slightly generous bound can only rotate a segment a
+// few bytes early, never overflow one.
+const maxCiphertextExpansion = 8 + 1 + 24 + 16
+
 // LogDBMetrics is the metrics interface consumed by the WAL DB for write
 // latency, fsync latency, compaction latency, and byte throughput. When nil,
 // all metric collection is skipped. The concrete implementation lives in
@@ -270,10 +317,36 @@ type walShard struct {
 	// for the field list and the mu -> dataMu ordering rule.
 	dataMu sync.RWMutex
 
-	fs              FS
-	dir             string
-	opts            dbOptions
-	barrier         WALBarrier
+	fs   FS
+	dir  string
+	opts dbOptions
+
+	// shardIdx is this shard's index within the owning DB (0..DefaultShardCount).
+	// It is bound into every encrypted record's context-AAD: each shard is its
+	// own directory with an INDEPENDENT segment-ID space while all shards share
+	// ONE barrier, so without it a record could be spliced from shard-3's
+	// 000007.log into shard-9's 000007.log undetected.
+	shardIdx uint64
+
+	barrier WALBarrier
+
+	// sealer is barrier's context-AAD capability, resolved once at open. Nil
+	// exactly when barrier is nil; openWALShard fails closed otherwise.
+	sealer walContextBarrier
+
+	// hwMode records that the barrier delegates to a hardware encryptor, which
+	// accepts no AAD. Records are then bound to their epoch only. It is a
+	// DEPLOYMENT-time capability limitation decided once at open and logged
+	// once — never a per-record decision, and never entered because a decrypt
+	// failed.
+	hwMode bool
+
+	// ctxBuf is the reusable scratch buffer for walRecordContext, so building a
+	// record's context-AAD allocates nothing on the write hot path. The write
+	// side uses it under mu; the read side uses it only from recover(), which
+	// runs before the shard is reachable from any DB, so the two never overlap.
+	ctxBuf [walContextSize]byte
+
 	metrics         LogDBMetrics
 	activeSegment   *segment
 	activeSegmentID uint64
@@ -409,6 +482,25 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		return nil, ErrSegmentTooSmallForEntry
 	}
 
+	// Every encrypted WAL record is positionally bound via context-AAD, so a
+	// configured barrier MUST be able to carry a context. Fail closed here
+	// rather than degrade to epoch-only binding, and announce the hardware-mode
+	// limitation exactly once for the whole DB.
+	if o.barrier != nil {
+		cb, ok := o.barrier.(walContextBarrier)
+		if !ok {
+			return nil, ErrBarrierContextUnsupported
+		}
+		if cb.IsHardwareMode() {
+			slog.Warn("waldb: barrier is in hardware mode; WAL records are bound "+
+				"to their epoch only, not to their segment and position. An "+
+				"at-rest attacker with write access can reorder or splice "+
+				"same-epoch records undetected.",
+				"dir", dir,
+			)
+		}
+	}
+
 	db := &DB{
 		dir:     dir,
 		opts:    o,
@@ -441,7 +533,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 
 	for i := 0; i < DefaultShardCount; i++ {
 		shardDir := filepath.Join(dir, shardDirName(i))
-		shard, err := openWALShard(shardDir, o, o.barrier, o.metrics)
+		shard, err := openWALShard(i, shardDir, o, o.barrier, o.metrics)
 		if err != nil {
 			// Close any shards we already opened.
 			for j := 0; j < i; j++ {
@@ -467,11 +559,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 // existing segments are recovered and in-memory state is rebuilt. If the
 // directory does not exist, the shard is initialized lazily -- no directory,
 // segment file, or marshal buffer is created until the first write.
-func openWALShard(dir string, opts dbOptions, barrier WALBarrier, metrics LogDBMetrics) (*walShard, error) {
+// idx is the shard's index in the owning DB and is bound into every encrypted
+// record's context-AAD, so it must be the shard's permanent identity (the same
+// index that names its directory), never a per-open ordinal.
+func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metrics LogDBMetrics) (*walShard, error) {
 	s := &walShard{
 		fs:            opts.fs,
 		dir:           dir,
 		opts:          opts,
+		shardIdx:      uint64(idx),
 		barrier:       barrier,
 		metrics:       metrics,
 		indexes:       make(map[nodeKey]*index),
@@ -484,6 +580,17 @@ func openWALShard(dir string, opts dbOptions, barrier WALBarrier, metrics LogDBM
 		segmentEpochs: make(map[uint64]uint64),
 		metaSegments:  make(map[nodeKey]metaSegments),
 		// marshalBuf is nil -- allocated lazily in getMarshalBuf.
+	}
+
+	// Resolve the barrier's context-AAD capability once, before any record is
+	// written or replayed. Fail closed: see walContextBarrier.
+	if barrier != nil {
+		cb, ok := barrier.(walContextBarrier)
+		if !ok {
+			return nil, ErrBarrierContextUnsupported
+		}
+		s.sealer = cb
+		s.hwMode = cb.IsHardwareMode()
 	}
 
 	// If the directory exists, recover any existing data. ONLY ErrNotExist may
@@ -842,7 +949,29 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 				}
 			}
 
-			decrypted, derr := s.barrier.Decrypt(nil, rec)
+			// Reproduce the record's positional context-AAD. ReadAll returns
+			// ASSEMBLED LOGICAL records — First/Middle/Last chunks are joined
+			// into one entry before being appended — so i counts exactly what
+			// the write side counted with segment.RecordCount, one per
+			// writeRecord call. ReadAll also stops at the first corrupt record
+			// or zero hole, so the survivors are a clean prefix and no ordinal
+			// is ever skipped.
+			//
+			// There is NO retry without the context if this fails: that
+			// fallback would BE the vulnerability it is here to close. A
+			// context mismatch is reported exactly like any other
+			// authentication failure — fatal, as an undecryptable record
+			// always has been.
+			//
+			// hwMode mirrors the write side exactly: the hardware encryptor
+			// takes no AAD, so those records were sealed with no context and
+			// must be opened with none. That is the SAME open-time decision the
+			// writer made, not a reaction to a failure.
+			var contextAAD []byte
+			if !s.hwMode {
+				contextAAD = s.recordContext(segID, uint64(i))
+			}
+			decrypted, derr := s.sealer.DecryptWithContext(nil, rec, contextAAD)
 			if derr != nil {
 				// Decryption failures are fatal: silently skipping records
 				// would cause undetected data loss. The caller must provide
@@ -1921,6 +2050,43 @@ func (s *walShard) commitEpoch(l recordLanding) {
 	s.dataMu.Unlock()
 }
 
+// recordContext builds the positional context-AAD for a record at (segID,
+// recordSeq) in this shard, reusing the shard's scratch buffer so the WAL write
+// hot path allocates nothing. Both the write side and the replay side call it,
+// which is what keeps the two byte-identical.
+//
+// The returned slice aliases s.ctxBuf and is only valid until the next call.
+// Callers hand it straight to the barrier, which reads it during the AEAD
+// operation and never retains it. Caller must hold s.mu (or, during recover(),
+// own the shard exclusively).
+func (s *walShard) recordContext(segID, recordSeq uint64) []byte {
+	return walRecordContext(s.ctxBuf[:], s.shardIdx, segID, recordSeq)
+}
+
+// reserveLanding makes the active segment the one a record of framedLen bytes
+// will actually land in, rotating first when the record no longer fits. After
+// it returns nil, s.activeSegmentID and s.activeSegment.RecordCount() name the
+// record's final position, so they can be sealed into its context-AAD.
+//
+// framedLen may be an UPPER bound on the record's eventual length;
+// segment.CanFit is monotonic in it, so a generous bound only rotates early.
+// Caller must hold s.mu.
+func (s *walShard) reserveLanding(framedLen int) error {
+	err := s.activeSegment.CanFit(framedLen)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrSegmentFull) {
+		// ErrRecordTooLarge is permanent and ErrClosed is terminal; neither is
+		// helped by a fresh segment.
+		return err
+	}
+	if rotErr := s.rotateSegment(); rotErr != nil {
+		return rotErr
+	}
+	return s.activeSegment.CanFit(framedLen)
+}
+
 // writeRecord writes a raw record to the active segment, rotating if the
 // segment is full. On a lazy shard, this triggers directory and segment
 // creation via ensureActiveSegment. When a barrier is configured, the
@@ -1941,15 +2107,41 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 		return recordLanding{}, err
 	}
 
+	// Resolve the LANDING segment before encrypting. The record's context-AAD
+	// binds the segment ID and the record's ordinal within that segment, so
+	// both must be final at seal time; encrypting first and discovering the
+	// rotation afterwards would bind the record to a segment it never reached.
+	// The framed length is bounded by the plaintext plus the barrier's maximum
+	// envelope expansion, which is all segment.CanFit needs (it is monotonic in
+	// that length), so the fit decision costs no encryption and the record is
+	// sealed exactly once — re-sealing after a rotation would burn a second
+	// nonce against the NIST invocation cap for nothing.
+	framedLen := len(data)
+	if s.barrier != nil {
+		framedLen += maxCiphertextExpansion
+	}
+	if err := s.reserveLanding(framedLen); err != nil {
+		return recordLanding{}, err
+	}
+
 	// Encrypt the record data when a barrier is configured. The write epoch is
-	// parsed here but attributed to a segment only AFTER the write lands,
-	// because the write below may rotate to a new segment — recording the
-	// epoch against the pre-rotation activeSegmentID would mis-attribute it
-	// and let recomputeMinWriteEpoch purge a DEK still needed by the record.
+	// parsed out of the ciphertext's own 8-byte big-endian prefix, exactly as
+	// the replay path does, but is attributed to a segment only AFTER the write
+	// lands so recomputeMinWriteEpoch can never purge a DEK a live record still
+	// needs.
 	writeData := data
 	var writeEpoch uint64
+	var positional bool
 	if s.barrier != nil {
-		encrypted, err := s.barrier.Encrypt(nil, data)
+		// In hardware mode the encryptor takes no AAD at all, so the record is
+		// bound to its epoch only. That is decided once at open (see hwMode),
+		// never per record and never because something failed.
+		var contextAAD []byte
+		if !s.hwMode {
+			contextAAD = s.recordContext(s.activeSegmentID, s.activeSegment.RecordCount())
+			positional = true
+		}
+		encrypted, err := s.sealer.EncryptWithContext(nil, data, contextAAD)
 		if err != nil {
 			return recordLanding{}, &WALEncryptError{Err: err}
 		}
@@ -1960,9 +2152,20 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	}
 
 	_, err := s.activeSegment.Write(writeData)
-	if err == ErrSegmentFull {
-		if err := s.rotateSegment(); err != nil {
-			return recordLanding{}, err
+	if errors.Is(err, ErrSegmentFull) {
+		if positional {
+			// Unreachable: reserveLanding pre-checked this exact record against
+			// a length bound that can only over-estimate. Moving the record to
+			// another segment now would store a ciphertext bound to a position
+			// it does not occupy, which recovery could never open — fail
+			// instead of writing an unreadable record.
+			return recordLanding{}, ErrLandingSegmentOverflow
+		}
+		// No context was bound (plaintext, or hardware mode), so these bytes
+		// are position-independent and may be moved to a fresh segment AS IS.
+		// Nothing is re-encrypted.
+		if rotErr := s.rotateSegment(); rotErr != nil {
+			return recordLanding{}, rotErr
 		}
 		_, err = s.activeSegment.Write(writeData)
 	}
@@ -2266,6 +2469,7 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 			checkpoints[shardIdx] = shardCheckpoint{
 				fileOffset:  shard.activeSegment.fileOffset,
 				blockOffset: shard.activeSegment.blockOffset,
+				recordCount: shard.activeSegment.RecordCount(),
 				seg:         shard.activeSegment,
 				segID:       shard.activeSegmentID,
 				valid:       true,
@@ -2324,6 +2528,11 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 type shardCheckpoint struct {
 	fileOffset  int64
 	blockOffset int
+	// recordCount is the segment's logical-record ordinal at capture time.
+	// Rollback rewinds the segment to it alongside the offsets, so the ordinal
+	// bound into each encrypted record's context-AAD keeps matching the records
+	// actually present in the file. See segment.DiscardPending.
+	recordCount uint64
 	// seg/segID identify the active segment when the checkpoint was captured.
 	// Rollback compares them against the current active segment to detect a
 	// mid-batch segment rotation, which needs a multi-segment rollback rather
@@ -2559,7 +2768,7 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 
 	// No rotation: the active segment is the checkpoint segment.
 	if ds.activeSegment != nil && (cp.seg == nil || ds.activeSegment == cp.seg) {
-		return ds.activeSegment.DiscardPending(cp.fileOffset, cp.blockOffset)
+		return ds.activeSegment.DiscardPending(cp.fileOffset, cp.blockOffset, cp.recordCount)
 	}
 
 	// Rotation occurred. Roll back the checkpoint segment on disk (it is
@@ -2597,7 +2806,9 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 	// batch records cannot replay.
 	switch {
 	case ds.activeSegment != nil:
-		if err := ds.activeSegment.DiscardPending(0, 0); err != nil {
+		// Every record in this segment is batch data, so its ordinal rewinds to
+		// zero along with its offsets.
+		if err := ds.activeSegment.DiscardPending(0, 0, 0); err != nil {
 			return err
 		}
 	case ds.activeSegmentID != cp.segID:
@@ -2961,6 +3172,7 @@ func captureCheckpointAfterEnsure(s *walShard, cp *shardCheckpoint) error {
 	}
 	cp.fileOffset = s.activeSegment.fileOffset
 	cp.blockOffset = s.activeSegment.blockOffset
+	cp.recordCount = s.activeSegment.RecordCount()
 	cp.seg = s.activeSegment
 	cp.segID = s.activeSegmentID
 	cp.valid = true

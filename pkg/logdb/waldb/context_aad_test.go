@@ -1,0 +1,715 @@
+// Copyright 2026 Jeremy Hahn
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package waldb
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
+)
+
+// aadTestBlockSize/aadTestMaxFileSize give the context-AAD tests a small,
+// predictable segment geometry: multi-block records and segment rotation are
+// both reachable with a handful of entries.
+const (
+	aadTestBlockSize   = 1024
+	aadTestMaxFileSize = int64(32 * 1024)
+)
+
+// openAADTestDB opens an encrypted WAL with the small test geometry. noSync is
+// left ON (fsync enabled is the default) so the recovery paths under test see
+// real durable bytes.
+func openAADTestDB(t *testing.T, dir string, barrier WALBarrier) *DB {
+	t.Helper()
+	db, err := Open(dir,
+		WithBlockSize(aadTestBlockSize),
+		WithMaxFileSize(aadTestMaxFileSize),
+		WithBarrier(barrier),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return db
+}
+
+// walShardDir returns the on-disk directory of the WAL shard that serves the
+// given Raft shard ID.
+func walShardDir(root string, shardID uint64) string {
+	return filepath.Join(root, shardDirName(int(shardID%DefaultShardCount)))
+}
+
+// readSegmentRecords returns the raw (still encrypted) logical records of a
+// segment file, in the order recovery would replay them.
+func readSegmentRecords(t *testing.T, dir string, segID uint64) [][]byte {
+	t.Helper()
+	seg := openSegmentForTest(t, dir, segID, aadTestBlockSize)
+	defer seg.Close()
+	records, _, err := seg.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll(%s/%s): %v", dir, segmentFilename(segID), err)
+	}
+	return records
+}
+
+// rewriteSegment replaces the segment file at dir/segID with exactly the given
+// raw records, reframed by the normal chunk encoder. It is the on-disk attacker
+// in these tests: the CRCs are all valid and the barrier envelope bytes are
+// untouched, so ONLY the context-AAD can notice the records moved.
+func rewriteSegment(t *testing.T, dir string, segID uint64, records [][]byte) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", dir, err)
+	}
+	seg, _, err := createSegment(defaultFS(), dir, segID, aadTestBlockSize, aadTestMaxFileSize)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	for i, rec := range records {
+		if _, err := seg.Write(rec); err != nil {
+			t.Fatalf("rewrite record %d: %v", i, err)
+		}
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("rewrite Sync: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("rewrite Close: %v", err)
+	}
+}
+
+// requireReopenRejects asserts that reopening the WAL at dir fails with a
+// decryption error, i.e. the tampering under test was caught by the AEAD.
+func requireReopenRejects(t *testing.T, dir string, barrier WALBarrier, what string) {
+	t.Helper()
+	db, err := Open(dir,
+		WithBlockSize(aadTestBlockSize),
+		WithMaxFileSize(aadTestMaxFileSize),
+		WithBarrier(barrier),
+	)
+	if err == nil {
+		_ = db.Close()
+		t.Fatalf("%s: Open succeeded, want a decryption failure", what)
+	}
+	var decErr *WALDecryptError
+	if !errors.As(err, &decErr) {
+		t.Fatalf("%s: Open error = %v, want *WALDecryptError", what, err)
+	}
+}
+
+// --- context layout ---
+
+// TestWALRecordContextLayout pins the exact on-the-wire context bytes. The
+// layout is a security contract shared by the encrypt and decrypt sides and by
+// any future reader, so it is asserted literally rather than by round-trip.
+func TestWALRecordContextLayout(t *testing.T) {
+	var buf [walContextSize]byte
+	got := walRecordContext(buf[:], 0x0102030405060708, 0x1112131415161718, 0x2122232425262728)
+
+	if len(got) != 30 {
+		t.Fatalf("context length = %d, want 30", len(got))
+	}
+	want := []byte{
+		'Q', 'R', 'W', 'A', 'L', '1',
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("context = % x\nwant       % x", got, want)
+	}
+
+	// Fixed-width big-endian with no delimiters: distinct positions must never
+	// collide, including the adjacent-field shifts a delimited encoding would
+	// alias.
+	var a, b [walContextSize]byte
+	if bytes.Equal(
+		walRecordContext(a[:], 1, 0, 0),
+		walRecordContext(b[:], 0, 1, 0),
+	) {
+		t.Fatal("shard 1/segment 0 collided with shard 0/segment 1")
+	}
+	if bytes.Equal(
+		walRecordContext(a[:], 0, 1, 0),
+		walRecordContext(b[:], 0, 0, 1),
+	) {
+		t.Fatal("segment 1/seq 0 collided with segment 0/seq 1")
+	}
+}
+
+// TestWALRecordContextDoesNotAllocate guards the WAL write hot path: the AAD
+// helper must reuse the caller's scratch buffer.
+func TestWALRecordContextDoesNotAllocate(t *testing.T) {
+	var buf [walContextSize]byte
+	allocs := testing.AllocsPerRun(1000, func() {
+		walRecordContext(buf[:], 3, 7, 11)
+	})
+	if allocs != 0 {
+		t.Fatalf("walRecordContext allocs/op = %v, want 0", allocs)
+	}
+}
+
+// TestCiphertextExpansionWithinBound pins maxCiphertextExpansion against a real
+// seal.Barrier. writeRecord picks a record's landing segment from
+// plaintext+maxCiphertextExpansion BEFORE sealing it, so an under-estimate
+// would let a sealed record overflow the segment it is bound to.
+func TestCiphertextExpansionWithinBound(t *testing.T) {
+	barrier := newTestBarrier(t)
+	for _, n := range []int{0, 1, 64, 4096, 70000} {
+		ct, err := barrier.EncryptWithContext(nil, make([]byte, n), nil)
+		if err != nil {
+			t.Fatalf("EncryptWithContext(%d): %v", n, err)
+		}
+		expansion := len(ct) - n
+		if expansion > maxCiphertextExpansion {
+			t.Fatalf("plaintext %d: expansion %d exceeds maxCiphertextExpansion %d",
+				n, expansion, maxCiphertextExpansion)
+		}
+		if expansion <= 0 {
+			t.Fatalf("plaintext %d: expansion %d, want positive", n, expansion)
+		}
+	}
+}
+
+// --- round trips ---
+
+// TestContextAADRoundTripAfterReopen is the baseline: records sealed with a
+// positional context are recovered by a reopen that reproduces it.
+func TestContextAADRoundTripAfterReopen(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	entries := makeBenchEntries(1, 12, 3, 64)
+	if err := db.SaveEntries(1, 1, entries); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		State: logdb.State{Term: 3, Vote: 2, Commit: 12},
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened := openAADTestDB(t, dir, barrier)
+	defer reopened.Close()
+
+	got, err := reopened.GetEntries(1, 1, 1, 13, 0)
+	if err != nil {
+		t.Fatalf("GetEntries after reopen: %v", err)
+	}
+	if len(got) != 12 {
+		t.Fatalf("GetEntries after reopen: got %d entries, want 12", len(got))
+	}
+	for i := range got {
+		if !bytes.Equal(got[i].Cmd, entries[i].Cmd) {
+			t.Fatalf("entry %d Cmd mismatch after reopen", i)
+		}
+	}
+	st, _, err := reopened.ReadState(1, 1)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if st.Term != 3 || st.Vote != 2 || st.Commit != 12 {
+		t.Fatalf("ReadState = %+v, want term 3 vote 2 commit 12", st)
+	}
+}
+
+// TestContextAADMultiChunkRecordRoundTrips proves the ordinal counts LOGICAL
+// records, not physical chunks: a record far larger than one block is split
+// into First/Middle/Last chunks on the way out and reassembled into a single
+// entry by ReadAll, so its ordinal must be the same on both sides. Records
+// written after it must therefore still decrypt.
+func TestContextAADMultiChunkRecordRoundTrips(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	// One entry whose Cmd spans many blocks (block size is 1 KiB), written
+	// between ordinary single-chunk records.
+	small := makeBenchEntries(1, 2, 1, 32)
+	if err := db.SaveEntries(1, 1, small); err != nil {
+		t.Fatalf("SaveEntries(small): %v", err)
+	}
+	big := makeBenchEntries(3, 1, 1, 5000)
+	if err := db.SaveEntries(1, 1, big); err != nil {
+		t.Fatalf("SaveEntries(big): %v", err)
+	}
+	tail := makeBenchEntries(4, 3, 1, 48)
+	if err := db.SaveEntries(1, 1, tail); err != nil {
+		t.Fatalf("SaveEntries(tail): %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened := openAADTestDB(t, dir, barrier)
+	defer reopened.Close()
+
+	got, err := reopened.GetEntries(1, 1, 1, 7, 0)
+	if err != nil {
+		t.Fatalf("GetEntries after reopen: %v", err)
+	}
+	if len(got) != 6 {
+		t.Fatalf("GetEntries after reopen: got %d entries, want 6", len(got))
+	}
+	if len(got[2].Cmd) != 5000 {
+		t.Fatalf("multi-chunk entry Cmd length = %d, want 5000", len(got[2].Cmd))
+	}
+	if !bytes.Equal(got[2].Cmd, big[0].Cmd) {
+		t.Fatal("multi-chunk entry Cmd corrupted across the round trip")
+	}
+}
+
+// TestContextAADSurvivesSegmentRotation exercises the pre-resolved landing
+// segment: enough encrypted records to roll several segments, all of which must
+// recover. A record sealed against the pre-rotation segment ID would be
+// unopenable in the segment it actually landed in.
+func TestContextAADSurvivesSegmentRotation(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	const batches = 40
+	for i := 0; i < batches; i++ {
+		entries := makeBenchEntries(uint64(i*8+1), 8, 1, 256)
+		if err := db.SaveEntries(1, 1, entries); err != nil {
+			t.Fatalf("SaveEntries(batch %d): %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	shardDir := walShardDir(dir, 1)
+	segs, err := os.ReadDir(shardDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(segs) < 3 {
+		t.Fatalf("only %d segment files; the test needs several rotations", len(segs))
+	}
+
+	reopened := openAADTestDB(t, dir, barrier)
+	defer reopened.Close()
+	got, err := reopened.GetEntries(1, 1, 1, batches*8+1, 0)
+	if err != nil {
+		t.Fatalf("GetEntries after reopen: %v", err)
+	}
+	if len(got) != batches*8 {
+		t.Fatalf("GetEntries after reopen: got %d entries, want %d", len(got), batches*8)
+	}
+}
+
+// --- tamper detection ---
+
+// TestContextAADRejectsReorderedRecord is the core security property: moving a
+// record's ciphertext to a different ordinal within its own segment — with a
+// perfectly valid CRC and an untouched barrier envelope — must fail to decrypt.
+// Before positional binding, the two records authenticated identically and the
+// swap was invisible.
+func TestContextAADRejectsReorderedRecord(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	// One SaveEntries call == one WAL record, so write four separate calls to
+	// get four independently sealed records in one segment.
+	for i := uint64(0); i < 4; i++ {
+		if err := db.SaveEntries(1, 1, makeBenchEntries(i+1, 1, 1, 64)); err != nil {
+			t.Fatalf("SaveEntries(%d): %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	shardDir := walShardDir(dir, 1)
+	records := readSegmentRecords(t, shardDir, 0)
+	if len(records) < 2 {
+		t.Fatalf("got %d records, need at least 2 to swap", len(records))
+	}
+	records[0], records[1] = records[1], records[0]
+	rewriteSegment(t, shardDir, 0, records)
+
+	requireReopenRejects(t, dir, barrier, "reordered record")
+}
+
+// TestContextAADRejectsTruncatedPrefix proves the binding also catches a
+// DELETED record: dropping the first record shifts every later ordinal down by
+// one, so nothing after the deletion authenticates.
+func TestContextAADRejectsTruncatedPrefix(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	// One SaveEntries call == one WAL record, so write four separate calls to
+	// get four independently sealed records in one segment.
+	for i := uint64(0); i < 4; i++ {
+		if err := db.SaveEntries(1, 1, makeBenchEntries(i+1, 1, 1, 64)); err != nil {
+			t.Fatalf("SaveEntries(%d): %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	shardDir := walShardDir(dir, 1)
+	records := readSegmentRecords(t, shardDir, 0)
+	if len(records) < 2 {
+		t.Fatalf("got %d records, need at least 2", len(records))
+	}
+	rewriteSegment(t, shardDir, 0, records[1:])
+
+	requireReopenRejects(t, dir, barrier, "dropped leading record")
+}
+
+// TestContextAADRejectsRecordCopiedToAnotherSegment proves the SegmentID field
+// carries its weight: the same records, at the same ordinals, in a different
+// segment file must not authenticate.
+func TestContextAADRejectsRecordCopiedToAnotherSegment(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	// One SaveEntries call == one WAL record, so write four separate calls to
+	// get four independently sealed records in one segment.
+	for i := uint64(0); i < 4; i++ {
+		if err := db.SaveEntries(1, 1, makeBenchEntries(i+1, 1, 1, 64)); err != nil {
+			t.Fatalf("SaveEntries(%d): %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	shardDir := walShardDir(dir, 1)
+	records := readSegmentRecords(t, shardDir, 0)
+
+	// Republish segment 0's records, in their original order, as segment 1 and
+	// remove the original. Ordinals are identical; only the segment ID moved.
+	rewriteSegment(t, shardDir, 1, records)
+	if err := os.Remove(filepath.Join(shardDir, segmentFilename(0))); err != nil {
+		t.Fatalf("Remove segment 0: %v", err)
+	}
+
+	requireReopenRejects(t, dir, barrier, "records copied to another segment")
+}
+
+// TestContextAADRejectsRecordCopiedToAnotherShard proves the WALShardIdx field
+// carries its weight. All DefaultShardCount WAL shards share ONE barrier and
+// each has its own independent %06d.log ID space, so without the shard index a
+// segment could be swapped wholesale between shard directories undetected.
+func TestContextAADRejectsRecordCopiedToAnotherShard(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+	// One SaveEntries call == one WAL record, so write four separate calls to
+	// get four independently sealed records in one segment.
+	for i := uint64(0); i < 4; i++ {
+		if err := db.SaveEntries(1, 1, makeBenchEntries(i+1, 1, 1, 64)); err != nil {
+			t.Fatalf("SaveEntries(%d): %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	srcDir := walShardDir(dir, 1)
+	records := readSegmentRecords(t, srcDir, 0)
+
+	// Same segment ID, same ordinals, different WAL shard directory.
+	dstDir := walShardDir(dir, 2)
+	rewriteSegment(t, dstDir, 0, records)
+	if err := os.RemoveAll(srcDir); err != nil {
+		t.Fatalf("RemoveAll(%s): %v", srcDir, err)
+	}
+
+	requireReopenRejects(t, dir, barrier, "segment moved to another WAL shard")
+}
+
+// --- BLOCKER-2 regression: rollback-aware ordinal ---
+
+// TestContextAADRecoversAfterBatchRollback is the DiscardPending regression
+// test. A failed batch is rolled back, rewinding the segment's write offsets;
+// the record ordinal MUST rewind with them. If it does not, every record
+// written after the rollback is sealed at an ordinal one or more ahead of the
+// index recovery will read it at, and the entire segment tail becomes
+// permanently undecryptable at the next start.
+func TestContextAADRecoversAfterBatchRollback(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+
+	db := openAADTestDB(t, dir, barrier)
+
+	// Durable, committed prefix.
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		Entries: makeBenchEntries(1, 3, 1, 64),
+		State:   logdb.State{Term: 1, Vote: 1, Commit: 3},
+	}}); err != nil {
+		t.Fatalf("SaveState(prefix): %v", err)
+	}
+
+	// A batch whose FIRST update writes records and whose SECOND update is
+	// rejected, forcing rollbackShard -> DiscardPending on a segment that
+	// already advanced. Raft shards 1 and 17 both hash to WAL shard 1, so both
+	// updates share one segment and one checkpoint.
+	oversized := makeBenchEntries(1, 1, 1, 8)
+	oversized[0].Cmd = make([]byte, maxCmdLen+1)
+	err := db.SaveState([]logdb.Update{
+		{
+			ShardID: 1, ReplicaID: 1,
+			Entries: makeBenchEntries(4, 3, 1, 64),
+			State:   logdb.State{Term: 2, Vote: 1, Commit: 6},
+		},
+		{
+			ShardID: 17, ReplicaID: 1,
+			Entries: oversized,
+		},
+	})
+	if err == nil {
+		t.Fatal("SaveState with an oversized entry succeeded, want failure")
+	}
+
+	// The rolled-back records must be gone, and further writes must land at the
+	// rewound ordinals.
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		Entries: makeBenchEntries(4, 4, 2, 64),
+		State:   logdb.State{Term: 2, Vote: 1, Commit: 7},
+	}}); err != nil {
+		t.Fatalf("SaveState(after rollback): %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Recovery must reproduce every ordinal. A stale (un-rewound) counter shows
+	// up here as a WALDecryptError.
+	reopened := openAADTestDB(t, dir, barrier)
+	defer reopened.Close()
+
+	got, err := reopened.GetEntries(1, 1, 1, 8, 0)
+	if err != nil {
+		t.Fatalf("GetEntries after rollback+reopen: %v", err)
+	}
+	if len(got) != 7 {
+		t.Fatalf("GetEntries after rollback+reopen: got %d entries, want 7", len(got))
+	}
+	for i := 4; i <= 7; i++ {
+		if got[i-1].Term != 2 {
+			t.Fatalf("entry %d term = %d, want 2 (post-rollback write)", i, got[i-1].Term)
+		}
+	}
+	st, _, err := reopened.ReadState(1, 1)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if st.Commit != 7 {
+		t.Fatalf("ReadState.Commit = %d, want 7", st.Commit)
+	}
+}
+
+// TestDiscardPendingRewindsRecordOrdinal is the unit-level half of the same
+// invariant: DiscardPending rewinds the ordinal exactly as it rewinds the
+// offsets, so the counter only ever reflects records present in the file.
+func TestDiscardPendingRewindsRecordOrdinal(t *testing.T) {
+	dir := t.TempDir()
+	seg, _, err := createSegment(defaultFS(), dir, 0, aadTestBlockSize, aadTestMaxFileSize)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	defer seg.Close()
+
+	for i := 0; i < 3; i++ {
+		if _, err := seg.Write([]byte("committed")); err != nil {
+			t.Fatalf("Write(committed %d): %v", i, err)
+		}
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	cleanFileOffset, cleanBlockOffset := seg.fileOffset, seg.blockOffset
+	cleanRecordCount := seg.RecordCount()
+	if cleanRecordCount != 3 {
+		t.Fatalf("RecordCount = %d, want 3", cleanRecordCount)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := seg.Write([]byte("rolled back")); err != nil {
+			t.Fatalf("Write(rolled back %d): %v", i, err)
+		}
+	}
+	if seg.RecordCount() != 7 {
+		t.Fatalf("RecordCount before discard = %d, want 7", seg.RecordCount())
+	}
+
+	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanRecordCount); err != nil {
+		t.Fatalf("DiscardPending: %v", err)
+	}
+	if got := seg.RecordCount(); got != 3 {
+		t.Fatalf("RecordCount after discard = %d, want 3", got)
+	}
+
+	// The next record must take ordinal 3 — the index ReadAll will report it at.
+	if _, err := seg.Write([]byte("after rollback")); err != nil {
+		t.Fatalf("Write(after rollback): %v", err)
+	}
+	if got := seg.RecordCount(); got != 4 {
+		t.Fatalf("RecordCount after next write = %d, want 4", got)
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	records := readSegmentRecords(t, dir, 0)
+	if len(records) != 4 {
+		t.Fatalf("ReadAll returned %d records, want 4", len(records))
+	}
+	if string(records[3]) != "after rollback" {
+		t.Fatalf("records[3] = %q, want %q", records[3], "after rollback")
+	}
+}
+
+// --- fail-closed barrier capability ---
+
+// noContextBarrier satisfies WALBarrier but not walContextBarrier: it cannot
+// bind a caller context into the AEAD AAD.
+type noContextBarrier struct{}
+
+func (noContextBarrier) Encrypt(dst, plaintext []byte) ([]byte, error) {
+	out := make([]byte, ciphertextEpochSize+len(plaintext))
+	binary.BigEndian.PutUint64(out[:ciphertextEpochSize], 1)
+	copy(out[ciphertextEpochSize:], plaintext)
+	return out, nil
+}
+
+func (noContextBarrier) Decrypt(dst, ciphertext []byte) ([]byte, error) {
+	return ciphertext[ciphertextEpochSize:], nil
+}
+
+func (b noContextBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error) {
+	ct, err := b.Encrypt(dst, plaintext)
+	return ct, 1, err
+}
+
+func (b noContextBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error) {
+	return b.Decrypt(dst, ciphertext)
+}
+
+func (noContextBarrier) CurrentEpoch() uint64 { return 1 }
+
+// TestOpenRejectsBarrierWithoutContextSupport pins the fail-closed rule: a
+// barrier that cannot carry context-AAD is refused at Open. Accepting it and
+// writing epoch-only records would be the silent downgrade the whole scheme
+// exists to prevent.
+func TestOpenRejectsBarrierWithoutContextSupport(t *testing.T) {
+	db, err := Open(t.TempDir(),
+		WithBlockSize(aadTestBlockSize),
+		WithMaxFileSize(aadTestMaxFileSize),
+		WithBarrier(noContextBarrier{}),
+	)
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open with a context-incapable barrier succeeded, want ErrBarrierContextUnsupported")
+	}
+	if !errors.Is(err, ErrBarrierContextUnsupported) {
+		t.Fatalf("Open error = %v, want ErrBarrierContextUnsupported", err)
+	}
+}
+
+// TestSealBarrierSatisfiesContextCapability is the compile-and-run check that
+// the production barrier provides the capability the WAL requires.
+func TestSealBarrierSatisfiesContextCapability(t *testing.T) {
+	var _ walContextBarrier = (*seal.Barrier)(nil)
+
+	barrier := newTestBarrier(t)
+	if barrier.IsHardwareMode() {
+		t.Fatal("software test barrier reports hardware mode")
+	}
+}
+
+// newBenchBarrier is newTestBarrier for a benchmark: a real seal.Barrier with
+// cheap KDF parameters.
+func newBenchBarrier(tb testing.TB) *seal.Barrier {
+	tb.Helper()
+	_ = seal.AllowWeakKDFParams()
+	strategy, err := seal.NewSoftwareStrategyWithParams(
+		[]byte("test-passphrase"), 1, 64*1024, 1,
+	)
+	if err != nil {
+		tb.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+	}
+	tb.Cleanup(func() { strategy.Close() })
+
+	barrier := seal.NewBarrier(testBarrierConfig(1))
+	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
+		tb.Fatalf("barrier.Initialize: %v", err)
+	}
+	return barrier
+}
+
+// BenchmarkDBSaveStateEncrypted measures the encrypted WAL write hot path
+// (marshal -> seal -> segment append) with fsync disabled so the AEAD and
+// framing costs are not buried under a 300us fdatasync.
+func BenchmarkDBSaveStateEncrypted(b *testing.B) {
+	b.ReportAllocs()
+	barrier := newBenchBarrier(b)
+	db, err := Open(b.TempDir(),
+		WithBlockSize(4096),
+		WithMaxFileSize(64*1024*1024),
+		WithNoSync(true),
+		WithBarrier(barrier),
+	)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+
+	entries := makeBenchEntries(1, 10, 1, 128)
+	updates := []logdb.Update{
+		{
+			ShardID:   1,
+			ReplicaID: 1,
+			Entries:   entries,
+			State:     logdb.State{Term: 1, Vote: 1, Commit: 10},
+		},
+	}
+
+	idx := uint64(11)
+	b.ResetTimer()
+	for b.Loop() {
+		for i := range updates[0].Entries {
+			updates[0].Entries[i].Index = idx + uint64(i)
+		}
+		updates[0].State.Commit = idx + 9
+		idx += 10
+
+		if err := db.SaveState(updates); err != nil {
+			b.Fatalf("SaveState: %v", err)
+		}
+	}
+}
