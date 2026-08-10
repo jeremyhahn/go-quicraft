@@ -46,10 +46,16 @@ const streamShardCount = 16
 const sendWriteDeadline = 2 * time.Second
 
 // sendQueueIdleTimeout is how long a per-target send queue worker waits
-// with no messages before cleaning itself up. Set to 2x the QUIC
-// MaxIdleTimeout (30s) so that by the time the worker exits, the QUIC
-// connection has already been idle-closed. The next Send to this target
-// will lazily re-create the queue and goroutine.
+// with no messages before cleaning itself up. It only retires the idle
+// GOROUTINE and channel; the next Send to this target lazily re-creates them.
+//
+// It does NOT idle-close the underlying QUIC connection. KeepAlivePeriod (10s)
+// is below MaxIdleTimeout (30s), so quic-go PINGs the connection indefinitely
+// and it never idle-closes on its own — a cached outbound to a peer that has
+// gone quiet (including one removed from membership but still running) is kept
+// alive by keep-alive traffic until it is torn down explicitly (a peer restart
+// via evictStaleOutboundOnRecv, a dead-context sweep in cleanStaleConnections,
+// or transport Stop). The 60s value simply frees the idle worker promptly.
 const sendQueueIdleTimeout = 60 * time.Second
 
 // snapshotChunkWriteDeadline is the maximum time for a single chunk write
@@ -75,9 +81,39 @@ const workerPanicRestartDelay = 100 * time.Millisecond
 
 // streamShard is a bucket in the sharded stream pool. Each shard has its
 // own mutex to reduce contention across concurrent senders.
+//
+// owners records, for each pooled stream, the *quic.Conn it was opened on.
+// A stream's liveness is judged against its OWN connection, not whatever
+// connection is currently cached for the target: in the peer-restart window a
+// delayed pre-open can store a stream opened on a now-closed conn while a fresh
+// conn is cached for the same target. Comparing only against the cached conn
+// would return that dead stream, the write would fail, and the failure path
+// would then tear down the HEALTHY cached conn. owners is kept in exact
+// lockstep with streams under mu (put/drop mutate both). A key present in
+// streams but absent from owners is treated as "owner unknown" and falls back
+// to the currently-cached-conn liveness check (only manually-constructed test
+// transports inject a raw stream without an owner).
 type streamShard struct {
 	mu      sync.RWMutex
 	streams map[streamKey]*quic.Stream
+	owners  map[streamKey]*quic.Conn
+}
+
+// put records stream as the pooled entry for key, owned by conn. The caller
+// must hold sh.mu. owners is nil only for a manually-constructed test transport
+// that never reaches an insert site, so the guard keeps that path panic-free.
+func (sh *streamShard) put(key streamKey, stream *quic.Stream, conn *quic.Conn) {
+	sh.streams[key] = stream
+	if sh.owners != nil {
+		sh.owners[key] = conn
+	}
+}
+
+// drop removes key from both the stream pool and the owner map. The caller must
+// hold sh.mu. delete on a nil map is a no-op, so no owners guard is needed.
+func (sh *streamShard) drop(key streamKey) {
+	delete(sh.streams, key)
+	delete(sh.owners, key)
 }
 
 // streamKey identifies a pooled stream by its target address and pool index.
@@ -449,6 +485,7 @@ func NewQUICTransport(
 
 	for i := range t.streamShards {
 		t.streamShards[i].streams = make(map[streamKey]*quic.Stream)
+		t.streamShards[i].owners = make(map[streamKey]*quic.Conn)
 	}
 
 	t.snapshotRecv = newSnapshotReceiver(
@@ -639,7 +676,7 @@ func (t *QUICTransport) Stop() error {
 			if err := s.Close(); err != nil {
 				slog.Debug("QUIC stream close failed", "target", k.target, "idx", k.idx, "error", err)
 			}
-			delete(shard.streams, k)
+			shard.drop(k)
 		}
 		shard.mu.Unlock()
 	}
