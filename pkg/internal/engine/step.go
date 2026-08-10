@@ -776,6 +776,17 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 	if currentLeader == w.prevLeaders[shardID] && term == w.prevLeaderTerms[shardID] {
 		return
 	}
+	// A term that advances while NO leader is known in either the previous or
+	// the current state is campaign churn, not a leadership event: a replica
+	// that cannot win keeps incrementing its term with leaderID still 0. It
+	// must not be published — OnLeaderUpdated overwrites the host's cached
+	// leader (clobbering a leader learned out-of-band with 0) and completes
+	// pending proposals with NotLeaderError on a leadership loss that did not
+	// happen. Record the term so the next genuine change is still detected.
+	if currentLeader == 0 && w.prevLeaders[shardID] == 0 {
+		w.prevLeaderTerms[shardID] = term
+		return
+	}
 	w.prevLeaders[shardID] = currentLeader
 	w.prevLeaderTerms[shardID] = term
 	w.callback.OnLeaderUpdated(shardID, currentLeader, term)
