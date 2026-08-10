@@ -2801,7 +2801,10 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshot(t *testing.T) {
 			Term:  5,
 		},
 	}
-	node.Deliver(snapMsg)
+	// DeliverLocal: a legitimate InstallSnapshot is built by the snapshot
+	// receive path and injected process-local (OriginLocal). A wire-origin one
+	// is dropped in filterSnapshots and refused by raft.
+	node.DeliverLocal(snapMsg)
 
 	// Process. commitPending is true, so processCommitPendingInbox runs.
 	ws.Notify(1)
@@ -2892,7 +2895,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 		Term: curTerm,
 		Hint: 200,
 	})
-	node.Deliver(proto.Message{
+	node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:    2,
 		To:      1,
@@ -3027,15 +3030,16 @@ func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T
 
 	tickPeerToLeader(peer)
 
-	// Deliver two InstallSnapshot messages.
-	node.Deliver(proto.Message{
+	// Deliver two InstallSnapshot messages (process-local, as the snapshot
+	// receive path builds them).
+	node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     2,
 		To:       1,
 		ShardID:  1,
 		Snapshot: proto.Snapshot{Index: 50, Term: 3},
 	})
-	node.Deliver(proto.Message{
+	node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From:     3,
 		To:       1,
@@ -4456,7 +4460,7 @@ func TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop(t *testin
 			Term:  5,
 		},
 	}
-	node.Deliver(snapMsg)
+	node.DeliverLocal(snapMsg)
 
 	// First processReady cycle: InstallSnapshot is buffered in
 	// deferredSnapshots, not re-delivered to inbox.

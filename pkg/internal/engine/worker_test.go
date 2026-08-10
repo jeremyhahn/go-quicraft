@@ -3946,14 +3946,12 @@ func TestCommitWorker_PiggybackNoEntries(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_PiggybackSkipsSaveState verifies that the piggyback
-// path no longer calls SaveState to persist the commit index. This is an
-// optimization that eliminates the double fsync per batch. The commit
-// index is persisted lazily in the next batch's SaveState call.
-//
-// Even when LogDB would fail on subsequent calls, the piggyback path
-// succeeds because it doesn't call SaveState at all.
-func TestCommitWorker_PiggybackPersistFailureFailsNode(t *testing.T) {
+// TestCommitWorker_PiggybackPersistFailureReoffers verifies that when the
+// piggyback commit-index persist fails after all retries, the path is
+// SELF-HEALING (not a shard failure): it does NOT forward to apply, releases the
+// entries, clears commitPending, and leaves the shard to re-offer the entries on
+// a later cycle. The persist is retried on the full backoff schedule first.
+func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
 	commitC := make(chan *commitItem, 16)
@@ -3990,9 +3988,11 @@ func TestCommitWorker_PiggybackPersistFailureFailsNode(t *testing.T) {
 
 	cw.processBatch()
 
-	// Two SaveState attempts: batch (ok) + piggyback persist (failed).
-	if got := ldb.saveCount.Load(); got != 2 {
-		t.Fatalf("expected 2 SaveState calls (batch + failed piggyback persist), got %d", got)
+	// SaveState attempts: 1 for the batch (ok) + saveStateMaxRetries for the
+	// piggyback commit-index persist (all fail), reusing the batch retry path.
+	if got, want := ldb.saveCount.Load(), int64(1+saveStateMaxRetries); got != want {
+		t.Fatalf("expected %d SaveState calls (batch + %d piggyback retries), got %d",
+			want, saveStateMaxRetries, got)
 	}
 
 	// No apply item must be produced when the commit-index persist fails.
@@ -4001,6 +4001,16 @@ func TestCommitWorker_PiggybackPersistFailureFailsNode(t *testing.T) {
 		t.Fatal("piggyback must NOT forward to apply when commit-index persist fails")
 	case <-time.After(100 * time.Millisecond):
 		// expected: nothing applied
+	}
+
+	// Self-healing: commitPending is cleared so the shard can re-offer the
+	// entries, and the shard is NOT failed (a transient fsync hiccup on the
+	// commit-index persist is recoverable — the entries were already durable).
+	if node.commitPending.Load() {
+		t.Fatal("commitPending should be cleared after a failed piggyback persist")
+	}
+	if node.IsFailed() {
+		t.Fatal("piggyback persist failure must not fail the shard: it is self-healing")
 	}
 }
 
@@ -4182,11 +4192,12 @@ func TestCommitWorker_PiggybackMetrics(t *testing.T) {
 // clearStepCommitPending tests
 // ---------------------------------------------------------------------------
 
-// TestStepWorker_ClearStepCommitPending_ClearsAllNodes verifies that
-// clearStepCommitPending resets commitPending on all nodes owned by the
-// step worker. This is called by the engine's panic recovery loop to
-// unblock nodes after a step worker crash.
-func TestStepWorker_ClearStepCommitPending_ClearsAllNodes(t *testing.T) {
+// TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode verifies that
+// clearStepCommitPending resets commitPending ONLY for the node that was mid
+// hand-off (enqueuingNode) when the step worker panicked. Nodes whose item is
+// owned by the commit worker's in-flight batch must be left untouched: a blanket
+// clear would race that batch and cause a double GetUpdate extraction (H4).
+func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
 	commitC := make(chan *commitItem, 16)
@@ -4195,32 +4206,32 @@ func TestStepWorker_ClearStepCommitPending_ClearsAllNodes(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	// Load multiple nodes with commitPending=true.
+	nodes := make(map[uint64]*Node)
 	for i := uint64(1); i <= 5; i++ {
 		cfg := config.Config{ShardID: i, ReplicaID: 1}
 		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
 		node.commitPending.Store(true)
 		sw.loadNode(node)
+		nodes[i] = node
 	}
 
-	// Verify all are pending.
-	for i := uint64(1); i <= 5; i++ {
-		sw.nodesMu.RLock()
-		if !sw.nodes[i].commitPending.Load() {
-			t.Fatalf("node %d commitPending should be true before clear", i)
-		}
-		sw.nodesMu.RUnlock()
-	}
+	// Node 3 was mid-enqueue when the panic hit.
+	sw.enqueuingNode = nodes[3]
 
-	// Clear all.
 	sw.clearStepCommitPending()
 
-	// Verify all are cleared.
+	// Only node 3 is cleared.
+	if nodes[3].commitPending.Load() {
+		t.Fatal("enqueuing node 3 commitPending should be cleared")
+	}
 	for i := uint64(1); i <= 5; i++ {
-		sw.nodesMu.RLock()
-		if sw.nodes[i].commitPending.Load() {
-			t.Fatalf("node %d commitPending should be false after clear", i)
+		if i == 3 {
+			continue
 		}
-		sw.nodesMu.RUnlock()
+		if !nodes[i].commitPending.Load() {
+			t.Fatalf("node %d commitPending must stay set: its item is owned by the "+
+				"commit worker's in-flight batch, and clearing it would race that batch", i)
+		}
 	}
 }
 
@@ -5228,8 +5239,10 @@ func TestStepWorker_ProcessCommitPendingInbox_InstallSnapshotDeferred(t *testing
 	tickPeerToLeader(peer)
 	node.commitPending.Store(true)
 
-	// Deliver an InstallSnapshot message while commitPending is true.
-	node.Deliver(proto.Message{
+	// Deliver an InstallSnapshot message while commitPending is true. Local
+	// origin: the snapshot receive path injects it process-local; a wire-origin
+	// one is dropped in filterSnapshots.
+	node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		From: 2,
 		To:   1,
@@ -6808,7 +6821,7 @@ func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	if !node.Deliver(proto.Message{
+	if !node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
 		ShardID:  1,
 		From:     2,

@@ -1067,11 +1067,14 @@ func TestEngine_RunStepWorkerOnce_PanicPath(t *testing.T) {
 	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
 	sw := e.StepWorker(0)
 
-	// Load a node and set commitPending.
+	// Load a node that was mid hand-off to the commit pipeline (commitPending
+	// set, recorded as enqueuingNode) when the panic hit. This is the ONE node
+	// clearStepCommitPending unwedges after a step-worker panic.
 	nodeCfg := config.Config{ShardID: 0, ReplicaID: 1}
 	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
+	sw.enqueuingNode = node
 
 	// Nil the workSignal to force a panic on WaitC.
 	sw.workSignal = nil
@@ -1087,7 +1090,7 @@ func TestEngine_RunStepWorkerOnce_PanicPath(t *testing.T) {
 		t.Fatalf("expected step worker panic log, got: %s", logOutput)
 	}
 
-	// Verify clearStepCommitPending was called.
+	// Verify clearStepCommitPending cleared the enqueuing node.
 	if node.commitPending.Load() {
 		t.Fatal("commitPending should be cleared by clearStepCommitPending")
 	}
