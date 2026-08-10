@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -27,6 +28,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
+
+// errCommitDrainedAfterPanic marks a commit batch whose HardState was extracted
+// by GetUpdate (advancing Peer.prevState) but never persisted, because a worker
+// panicked before SaveState ran. The batch is discarded during panic recovery
+// and its owning node is failed: the node's in-memory raft state has advanced
+// past stable storage, so letting it keep running could re-send an unpersisted
+// vote (a double vote) or ack entries that were never durable.
+var errCommitDrainedAfterPanic = errors.New(
+	"engine: commit batch discarded during worker panic recovery before SaveState")
 
 // RaftMetrics is the metrics interface consumed by the engine for proposal,
 // commit, apply, election, and snapshot measurements. When nil, all metric
@@ -180,6 +190,12 @@ func NewEngine(cfg config.HostConfig, ldb logdb.LogDB, sender MessageSender, bar
 		}
 		stepWorkers[i] = sw
 		commitWorkers[i] = newCommitWorker(i, ldb, sender, commitCs[i], applyCs[i], applyPool, workSignal, callback, commitStopC, metrics)
+		// The commit worker forwards committed items to the apply tier. During
+		// ordered shutdown its own stopC (commitStopC) closes in Stop step 3
+		// while the apply tier stays live until step 4, so the forward's
+		// give-up guard must watch applyStopC — not commitStopC — to avoid
+		// abandoning a WAL-persisted, Commit-advanced item on a coin flip.
+		commitWorkers[i].applyStopC = applyStopC
 		applyWorkers[i] = newApplyWorker(i, applyCs[i], applyPool, maxApplyWorkers, &sync.WaitGroup{}, callback, snapshots, workSignal, applyStopC, metrics)
 	}
 
@@ -304,9 +320,9 @@ func (e *Engine) Start() {
 		}()
 	}
 
-	// Start step workers with restart-on-panic. Same restart logic as
-	// commit workers: on panic, clear commitPending on all owned nodes
-	// to unblock them, then restart after a brief delay.
+	// Start step workers with restart-on-panic. On panic the recovery drains
+	// commitC (failing those nodes) and clears commitPending for the single
+	// node that was mid-enqueue, then restarts after a brief delay.
 	for _, sw := range e.stepWorkers {
 		e.stepWg.Add(1)
 		go func() {
@@ -605,6 +621,17 @@ func (e *Engine) runApplyWorkerOnce(aw *applyWorker) (panicked bool) {
 				"stack", string(stack),
 				"error", panicErr,
 			)
+			// The dispatcher panicked holding an applyItem it had received from
+			// applyC but not yet handed to a per-shard goroutine. That item's
+			// commitPending is set: dropping it silently would wedge the shard
+			// forever (no apply completes to clear the flag, so the step worker
+			// never produces another update). Discard it via the fail-the-node
+			// idiom — release its pooled entries, mark the shard failed, and
+			// report a typed error — because the committed batch is lost and the
+			// state machine would otherwise silently miss the range.
+			if item := aw.inFlight.Swap(nil); item != nil {
+				aw.failInFlightItem(item)
+			}
 		}
 	}()
 	aw.run()
@@ -698,28 +725,45 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 	return false
 }
 
-// drainCommitC non-blocking drains all items from the given commitC
-// channel, clearing commitPending on each drained node. Called during
-// panic recovery to discard stale in-flight commitItems that were
-// enqueued before the panic. Draining an item BEFORE its node's
-// commitPending is cleared is what makes the clear safe: the step worker
-// can only reuse the shard's pre-allocated commitItem slot once the item
-// is out of the channel, so no pointer is ever queued twice.
+// drainCommitC non-blocking drains all items from the given commitC channel,
+// FAILING each drained node. Called during panic recovery to discard stale
+// in-flight commitItems that were enqueued before the panic. Draining an item
+// BEFORE its node's commitPending is touched is what keeps the shard's
+// pre-allocated commitItem slot from being reused with a stale pointer: the
+// step worker can only reuse the slot once the item is out of the channel.
+//
+// Each drained item's HardState was extracted by GetUpdate (advancing
+// Peer.prevState) but never persisted by SaveState — the batch died with the
+// panic. Merely clearing commitPending and continuing would let the ReadOnly
+// fast path re-send an unpersisted VoteResp, granting a second vote in the same
+// term (two leaders). So the node is failed exactly as a terminal SaveState
+// failure is: its in-memory raft state has diverged from stable storage and it
+// must not keep voting or acking.
 func (e *Engine) drainCommitC(commitC chan *commitItem) {
 	for {
 		select {
 		case item := <-commitC:
-			// The update is discarded, so return its pooled committed-entries
-			// slice; otherwise every panic permanently drains proto's entry
-			// slice pool.
-			item.update.ReleaseCommittedEntries()
-			item.node.commitPending.Store(false)
-			// Wake the step worker so it immediately re-processes
-			// this shard. Without this notification, the step worker
-			// would wait for the next tick interval before seeing
-			// that commitPending was cleared, adding unnecessary
-			// latency to the pipeline recovery after a panic.
-			e.workSignal.Notify(item.node.shardID)
+			node := item.node
+			u := item.update
+			saveStateErr := &SaveStateError{
+				ShardID:   u.ShardID,
+				ReplicaID: u.ReplicaID,
+				Err:       errCommitDrainedAfterPanic,
+			}
+			node.failed.Store(true)
+			node.commitPending.Store(false)
+			node.handleError(saveStateErr)
+			// Complete pending proposals so callers see an error instead of
+			// blocking to their context deadline against a now-failed node.
+			failBatchProposals(e.callback, u, saveStateErr)
+			// Return the pooled committed-entries slice AFTER the callback (which
+			// must not retain it); otherwise every panic permanently drains
+			// proto's entry-slice pool.
+			u.ReleaseCommittedEntries()
+			// Wake the step worker so it re-processes the shard promptly. The
+			// node is failed, so the worker skips it — the notify only avoids a
+			// one-tick delay before that skip is observed.
+			e.workSignal.Notify(node.shardID)
 		default:
 			return
 		}
@@ -727,10 +771,10 @@ func (e *Engine) drainCommitC(commitC chan *commitItem) {
 }
 
 // runStepWorkerLoop runs a step worker with automatic restart on panic.
-// If the worker panics, the loop logs the panic with a full stack
-// trace, clears commitPending on all nodes owned by this worker to
-// unblock them, and restarts the worker after a brief delay. The loop
-// exits cleanly when the step stop channel is closed.
+// If the worker panics, the loop logs the panic with a full stack trace,
+// drains commitC (failing those nodes) and clears commitPending for the one
+// node that was mid-enqueue, and restarts the worker after a brief delay. The
+// loop exits cleanly when the step stop channel is closed.
 func (e *Engine) runStepWorkerLoop(sw *stepWorker) {
 	for {
 		panicked := e.runStepWorkerOnce(sw)
@@ -772,21 +816,23 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 				"stack", string(stack),
 				"error", panicErr,
 			)
-			// Drain stale commitItems already queued in commitC BEFORE
-			// clearing commitPending and restarting. The step worker's
-			// per-shard commitItem slots (getCommitSlot) are reused with
-			// commitPending as the ownership flag: clearing the flag while
-			// an item is still queued would let the restarted worker
-			// overwrite that slot and enqueue the SAME pointer again, so
-			// the commit worker would process it twice — double
-			// Peer.Commit, double apply, and a double
-			// ReleaseCommittedEntries on the same pooled slice. Drained
-			// updates are discarded exactly as in the commit-worker
-			// recovery path (drainCommitC); the commit worker may
-			// concurrently consume from commitC, but a channel receive is
-			// exclusive, so each item is either drained here or processed
-			// normally — never both.
+			// Drain stale commitItems already queued in commitC and fail their
+			// nodes. The step worker's per-shard commitItem slots
+			// (getCommitSlot) are reused with commitPending as the ownership
+			// flag: leaving a queued item would let the restarted worker
+			// overwrite that slot and enqueue the SAME pointer again, so the
+			// commit worker would process it twice — double Peer.Commit, double
+			// apply, and a double ReleaseCommittedEntries on the same pooled
+			// slice. The commit worker may concurrently consume from commitC,
+			// but a channel receive is exclusive, so each item is either drained
+			// here or processed normally — never both.
 			e.drainCommitC(sw.commitC)
+			// Clear commitPending for the ONE node that was mid-enqueueForCommit
+			// (or mid-commitMemoryMode) when the panic hit — its item never
+			// reached commitC/applyC, so nothing else owns it. A blanket clear
+			// over every owned node would race the commit worker's in-flight
+			// batch, which legitimately holds commitPending across SaveState,
+			// causing a double GetUpdate extraction and double apply.
 			sw.clearStepCommitPending()
 		}
 	}()

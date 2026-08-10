@@ -15,10 +15,12 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
@@ -26,6 +28,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
+
+// errApplyDispatcherPanic marks a committed batch discarded because the apply
+// dispatcher panicked while holding it (received from applyC but not yet handed
+// to a per-shard goroutine). The shard is failed: the batch is lost and its
+// processed marker already advanced, so the state machine would otherwise
+// silently miss the range.
+var errApplyDispatcherPanic = errors.New(
+	"engine: apply dispatcher panicked, committed batch discarded")
 
 // defaultShardChanBuffer is the per-shard channel buffer size for the
 // apply worker's fan-out pattern. Sized to absorb commit pipeline
@@ -154,6 +164,14 @@ type applyWorker struct {
 	membershipC     chan applyMembershipRequest // ordered unload/reload requests handled by the dispatcher
 	stopC           chan struct{}
 
+	// inFlight holds the applyItem the dispatcher has received from applyC but
+	// not yet handed to a per-shard goroutine. Set on receive, cleared after the
+	// hand-off. On a dispatcher panic the recovery discards it (fail-the-node)
+	// so the shard does not wedge with commitPending set forever. Written and
+	// read only on the dispatcher goroutine (recovery runs on it during the
+	// panic unwind); the atomic is for safe publication, not concurrent access.
+	inFlight atomic.Pointer[applyItem]
+
 	// metrics collects raft-level metrics. Nil when disabled.
 	metrics RaftMetrics
 }
@@ -218,6 +236,9 @@ func (w *applyWorker) run() {
 		case req := <-w.membershipC:
 			w.handleMembership(req)
 		case item := <-w.applyC:
+			// Track the item so a dispatcher panic before hand-off does not
+			// strand it (commitPending set forever, shard wedged).
+			w.inFlight.Store(item)
 			// Unload/reload requests are ordered ahead of any applyItem a
 			// re-loaded shard can produce (LoadNode enqueues the reload
 			// before publishing the node), but select picks uniformly at
@@ -225,6 +246,7 @@ func (w *applyWorker) run() {
 			// shard's first committed batch is not dropped as "unloaded".
 			w.drainUnloadReload()
 			w.dispatch(item)
+			w.inFlight.Store(nil)
 		}
 	}
 }
@@ -315,6 +337,24 @@ func (w *applyWorker) dispatch(item *applyItem) {
 		return
 	}
 
+	// Incarnation guard. Each StartShard builds a distinct *Node with its own
+	// stopC; the unloaded set is shardID-keyed and cannot tell a stale
+	// old-incarnation item from a fresh one after a rapid StopShard->StartShard.
+	// The node's own stopC does: an item whose node has stopped while the engine
+	// is still running belongs to a torn-down incarnation and must not reach a
+	// state machine that StopShard has already closed (use-after-close) or a new
+	// incarnation's SM (double-apply). During engine shutdown every node's stopC
+	// is closed, so gate on the worker's own stopC staying OPEN to preserve the
+	// shutdown drain that must still apply committed entries.
+	if item.node != nil && chanClosed(item.node.StopC()) && !chanClosed(w.stopC) {
+		slog.Warn("apply dispatch skipped for stopped shard incarnation",
+			"worker", w.workerID,
+			"shard", shardID,
+		)
+		w.discardItem(item)
+		return
+	}
+
 	ch, ok := w.shardChans[shardID]
 	if !ok {
 		ch = make(chan *applyItem, defaultShardChanBuffer)
@@ -382,6 +422,49 @@ func (w *applyWorker) dispatch(item *applyItem) {
 	}
 }
 
+// failInFlightItem discards the applyItem the dispatcher was holding when it
+// panicked, using the fail-the-node idiom: complete the batch's pending
+// proposals with a typed error, mark the shard failed, clear commitPending, and
+// return the pooled entries. The committed batch is lost and Peer.Commit already
+// advanced the processed marker past it, so the state machine can never re-offer
+// it — the shard must go offline rather than silently skip the range. Called
+// only from the dispatcher's panic recovery.
+func (w *applyWorker) failInFlightItem(item *applyItem) {
+	node := item.node
+	if node != nil {
+		applyErr := &ApplyError{
+			ShardID:   node.shardID,
+			ReplicaID: node.replicaID,
+			Err:       errApplyDispatcherPanic,
+		}
+		// Report proposals before releasing the pooled entries below.
+		if w.callback != nil {
+			w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries, applyErr)
+		}
+		node.failed.Store(true)
+		node.commitPending.Store(false)
+		node.handleError(applyErr)
+	}
+	item.update.ReleaseCommittedEntries()
+	// applyPool is always set in production; guard only so the panic-recovery
+	// path stays safe for unit tests that construct a worker without a pool.
+	if w.applyPool != nil {
+		releaseApplyItem(w.applyPool, item)
+	}
+}
+
+// chanClosed reports whether a struct{} channel has been closed, without
+// blocking. Used to distinguish a per-shard StopShard (node stopC closed while
+// the worker's own stopC is open) from engine-wide shutdown.
+func chanClosed(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
 // discardItem releases a committed batch that will never be applied. It
 // returns the pooled committed-entries slice, clears commitPending so the
 // shard's pipeline does not stall waiting for an apply that will not happen,
@@ -408,7 +491,9 @@ func (w *applyWorker) drain() {
 		w.drainUnloadReload()
 		select {
 		case item := <-w.applyC:
+			w.inFlight.Store(item)
 			w.dispatch(item)
+			w.inFlight.Store(nil)
 		default:
 			return
 		}

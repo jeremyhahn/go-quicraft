@@ -28,14 +28,17 @@ import (
 // LogDB.SaveState before giving up.
 const saveStateMaxRetries = 5
 
-// saveStateBackoff defines the exponential backoff schedule for
-// SaveState retries. Total wait: ~1.76s (10ms + 50ms + 200ms + 500ms + 1s).
-var saveStateBackoff = [saveStateMaxRetries]time.Duration{
+// saveStateBackoff defines the exponential backoff schedule between SaveState
+// attempts. There are saveStateMaxRetries (5) attempts and therefore at most
+// saveStateMaxRetries-1 (4) inter-attempt waits — the schedule is sized to that,
+// so no element is dead. Total pre-failure grace: ~760ms (10ms + 50ms + 200ms +
+// 500ms). retryWait indexes it by attempt (0..3); the final attempt is not
+// followed by a wait.
+var saveStateBackoff = [saveStateMaxRetries - 1]time.Duration{
 	10 * time.Millisecond,
 	50 * time.Millisecond,
 	200 * time.Millisecond,
 	500 * time.Millisecond,
-	1 * time.Second,
 }
 
 // applyItem carries a proto.Update and the owning Node from the commit
@@ -91,6 +94,15 @@ type commitWorker struct {
 	workSignal *WorkSignal
 	callback   Callback
 	stopC      chan struct{}
+
+	// applyStopC is the APPLY tier's stop channel (applyStopC in the engine),
+	// distinct from this worker's own stopC (commitStopC). The forward to the
+	// apply worker gives up only when the apply tier is actually gone: during
+	// ordered shutdown commitStopC closes in Stop step 3 while the apply tier
+	// stays live until step 4, so guarding the forward on stopC would abandon a
+	// WAL-persisted, Commit-advanced item on a coin-flip select. Nil in unit
+	// tests, where the forward falls back to stopC (see forwardGiveUpC).
+	applyStopC chan struct{}
 
 	// orderedMsgsBuf accumulates ordered messages from commitItems
 	// during batch draining. These are messages that must be sent
@@ -298,6 +310,19 @@ func (w *commitWorker) sendOrderedMessages(msgs []proto.Message) {
 	}
 }
 
+// forwardGiveUpC returns the channel whose close means "stop trying to forward
+// committed items to the apply tier". In production this is applyStopC: the apply
+// tier is live until Stop step 4, so a full applyC during ordered shutdown (step
+// 3) must be waited out, not abandoned. In unit tests applyStopC is nil, so it
+// falls back to the worker's own stopC, preserving the original single-channel
+// behavior.
+func (w *commitWorker) forwardGiveUpC() <-chan struct{} {
+	if w.applyStopC != nil {
+		return w.applyStopC
+	}
+	return w.stopC
+}
+
 // retryWait waits for the SaveState retry backoff delay for the given
 // attempt index, or returns early if the stop channel is closed.
 // Returns true if the stop channel was closed (caller should return),
@@ -437,6 +462,24 @@ func (w *commitWorker) processBatch() {
 			continue
 		}
 
+		// Incarnation guard, mirroring the apply dispatcher. The unloaded set is
+		// shardID-keyed and cannot distinguish a stale old-incarnation item from
+		// a fresh one after a rapid StopShard->StartShard. The node's own stopC
+		// can: an item whose node has stopped while the engine is still running
+		// belongs to a torn-down incarnation, and Commit on its peer would race
+		// the teardown. During engine shutdown every node's stopC is closed, so
+		// gate on the worker's own stopC staying OPEN to keep the shutdown drain
+		// committing.
+		if chanClosed(node.StopC()) && !chanClosed(w.stopC) {
+			slog.Warn("commit skipped for stopped shard incarnation",
+				"worker", w.workerID,
+				"shard", u.ShardID,
+			)
+			u.ReleaseCommittedEntries()
+			node.commitPending.Store(false)
+			continue
+		}
+
 		node.raftMu.Lock()
 		err := node.peer.Commit(u)
 
@@ -511,7 +554,7 @@ func (w *commitWorker) processBatch() {
 		default:
 			select {
 			case w.applyC <- ai:
-			case <-w.stopC:
+			case <-w.forwardGiveUpC():
 				slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
 					"shard", ai.update.ShardID)
 				ai.update.ReleaseCommittedEntries()
@@ -833,16 +876,42 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 				Commit: piggyback.State.Commit,
 			},
 		}}
-		if saveErr := w.logdb.SaveState(stateUpdate); saveErr != nil {
-			slog.Warn("piggyback commit-index persist failed",
-				"shard", piggyback.ShardID, "replica", piggyback.ReplicaID, "error", saveErr)
+		// Retry with the same backoff schedule as the batch path — a transient
+		// fsync hiccup should not give up on the first attempt.
+		var saveErr error
+		for attempt := range saveStateMaxRetries {
+			saveErr = w.logdb.SaveState(stateUpdate)
+			if saveErr == nil {
+				break
+			}
+			if attempt < saveStateMaxRetries-1 {
+				if cancelled := w.retryWait(attempt); cancelled {
+					break
+				}
+			}
+		}
+		if saveErr != nil {
+			// Terminal for this cycle, but SELF-HEALING — NOT a shard failure.
+			// The piggyback's entries were already fsynced by this batch's
+			// SaveState; only the commit-index advance failed to persist. Commit
+			// has not run yet (it is below), so the processed marker has not
+			// moved and the entries are re-offered on a later cycle. Do NOT fail
+			// the shard (no handleError/OnShardFailed for a transient disk
+			// hiccup): release the un-applied entries, clear commitPending, and
+			// wake the step worker to retry. The error is typed *SaveStateError
+			// because this WAS a SaveState failure, not a Commit failure.
+			slog.Warn("piggyback commit-index persist failed after retries",
+				"shard", piggyback.ShardID, "replica", piggyback.ReplicaID,
+				"error", &SaveStateError{
+					ShardID:   piggyback.ShardID,
+					ReplicaID: piggyback.ReplicaID,
+					Err:       saveErr,
+				})
 			piggyback.ReleaseCommittedEntries()
 			node.commitPending.Store(false)
-			node.handleError(&CommitError{
-				ShardID:   piggyback.ShardID,
-				ReplicaID: piggyback.ReplicaID,
-				Err:       saveErr,
-			})
+			if w.workSignal != nil {
+				w.workSignal.Notify(node.shardID)
+			}
 			return true
 		}
 	}
@@ -882,7 +951,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	default:
 		select {
 		case w.applyC <- ai:
-		case <-w.stopC:
+		case <-w.forwardGiveUpC():
 			slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
 				"shard", piggyback.ShardID)
 			ai.update.ReleaseCommittedEntries()

@@ -69,8 +69,26 @@ type stepWorker struct {
 	commitSlots  map[uint64]*commitItem
 	commitC      chan *commitItem
 	callback     Callback
-	prevLeaders  map[uint64]uint64 // shardID -> last known leaderID
-	stopC        chan struct{}
+	prevLeaders  map[uint64]uint64 // shardID -> last published leaderID
+	// prevLeaderTerms mirrors prevLeaders with the term published alongside each
+	// leader. publishLeaderChange compares the (leader, term) PAIR so a
+	// same-leader re-election at a higher term still fires OnLeaderUpdated;
+	// keying on the leader ID alone would silently swallow it. Kept as a
+	// separate map (not a struct value on prevLeaders) so the two stay
+	// individually addressable.
+	prevLeaderTerms map[uint64]uint64
+	stopC           chan struct{}
+
+	// enqueuingNode records the node currently being handed off to the commit
+	// pipeline (mid enqueueForCommit or commitMemoryMode): its commitPending is
+	// set but its item has not yet reached commitC/applyC, so nothing else owns
+	// it. Set before commitPending.Store(true) and cleared after the channel
+	// send. On a step-worker panic this is the ONE node the recovery must
+	// unwedge — the rest are covered by drainCommitC (items in the channel) or
+	// owned by the commit/apply worker (items already handed off). Written and
+	// read only on the step-worker goroutine (recovery runs on it during the
+	// panic unwind), so no synchronization is required.
+	enqueuingNode *Node
 	inboxBuf     []proto.Message // reusable buffer for draining node inboxes
 	proposeBuf   []proto.Entry   // reusable buffer for batching inbox proposals
 	// commitProposeBuf is a SEPARATE reusable buffer for the commit-pending
@@ -132,6 +150,7 @@ func newStepWorker(
 		commitC:           commitC,
 		callback:          callback,
 		prevLeaders:       make(map[uint64]uint64),
+		prevLeaderTerms:   make(map[uint64]uint64),
 		stopC:             stopC,
 		inboxBuf:          make([]proto.Message, 0, 64),
 		proposeBuf:        make([]proto.Entry, 0, 64),
@@ -221,12 +240,20 @@ func (w *stepWorker) tick() {
 		// But Tick may have produced heartbeat messages that must be
 		// sent immediately to maintain leader liveness. Drain and
 		// send only free-order messages inline. Tick during
-		// commitPending produces only Heartbeat messages (free-order)
-		// since the inbox is not processed. Filter defensively to
-		// ensure ordered messages (e.g., VoteResp) are never sent
-		// before WAL persist completes.
+		// commitPending produces Heartbeat (leader liveness) and, on an
+		// election timeout, RequestPreVote — both free-order. Filter
+		// defensively to ensure ordered messages (e.g., VoteResp) are never
+		// sent before WAL persist completes.
+		var campaignTerm uint64
+		var campaignLaunched bool
 		if node.commitPending.Load() {
 			if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
+				// Detect a pre-vote campaign under the lock (pure reads); the
+				// observability callback fires after the unlock below. Without
+				// this, a campaign launched from tick() while commitPending is
+				// set never reaches OnCampaignLaunched/IncElection because it
+				// bypasses processCallbacks entirely.
+				campaignTerm, campaignLaunched = scanPreVoteCampaign(msgs)
 				w.sendMessages(msgs)
 			}
 		}
@@ -252,6 +279,9 @@ func (w *stepWorker) tick() {
 		// election timeout later. Publishing here is the only way this
 		// transition is ever observed. Runs outside raftMu (LeaderID/Term are
 		// atomics) so the callback never executes under the node lock.
+		if campaignLaunched {
+			w.fireCampaign(shardID, node, campaignTerm)
+		}
 		w.publishLeaderChange(shardID, node)
 	}
 }
@@ -351,33 +381,41 @@ func (w *stepWorker) processReady() {
 			w.drainAndHandleInbox(shardID, node, node.IsRecovering())
 			node.peer.FlushReadIndex()
 		}
-		// commitC backpressure guard (WAL mode only). This worker is the
-		// ONLY producer for its commitC, so a free slot observed here cannot
-		// be taken by anyone else and the enqueue below is guaranteed not to
-		// block. When the channel is full, skip the shard WITHOUT calling
-		// GetUpdate: nothing has been extracted from the peer, so nothing is
-		// lost and the shard is simply retried. Blocking on the send instead
-		// would park this goroutine while holding nodesMu.RLock, stopping
-		// tick() for EVERY shard this worker owns (missed heartbeats,
-		// spurious elections on unrelated shards) and stalling UnloadNode.
-		// Liveness: the commit/apply pipeline notifies the work signal as it
-		// clears commitPending, and processReady also re-runs on every tick.
-		// An unbuffered commitC is a test-only rendezvous configuration
-		// (NewEngine always allocates a buffer), so the guard does not apply.
-		if !w.memoryMode && cap(w.commitC) > 0 && len(w.commitC) == cap(w.commitC) {
+		// Output-channel backpressure guard. This worker is the ONLY producer
+		// for its output channel — commitC in WAL mode, applyC in memory mode —
+		// so a free slot observed here cannot be taken by anyone else and the
+		// enqueue below is guaranteed not to block. When the channel is full,
+		// skip the shard WITHOUT calling GetUpdate: nothing has been extracted
+		// from the peer, so nothing is lost and the shard is simply retried.
+		// Blocking on the send instead would park this goroutine while holding
+		// nodesMu.RLock, stopping tick() for EVERY shard this worker owns
+		// (missed heartbeats, spurious elections on unrelated shards) and
+		// stalling UnloadNode. Memory mode has the same hazard: commitMemoryMode
+		// blocks on the applyC send under the same lock. Liveness: the pipeline
+		// notifies the work signal as it clears commitPending, and processReady
+		// also re-runs on every tick. An unbuffered output channel is a test-only
+		// rendezvous configuration (NewEngine always allocates a buffer), so the
+		// guard does not apply.
+		outLen, outCap := len(w.commitC), cap(w.commitC)
+		if w.memoryMode {
+			outLen, outCap = len(w.applyC), cap(w.applyC)
+		}
+		if outCap > 0 && outLen == outCap {
 			// Flush free-order messages before skipping. GetUpdate is the
 			// only other drain of p.r.msgs on this path, and commitPending
 			// is false here so tick()'s drain does not run either — so
 			// heartbeats, Replicate, and the Ping/Quiesce control traffic
 			// produced by the inbox processing above would sit unsent for as
-			// long as the commit worker stays behind. A SaveState retry
-			// backoff (up to ~1.76s) would therefore silence every shard
-			// this worker owns and trigger elections against a live leader.
-			// Only free-order messages may go: everything else (VoteResp,
-			// HeartbeatResp) still has to wait for its state to be durable
-			// (Raft PhD 10.2.1).
+			// long as the downstream worker stays behind. A SaveState retry
+			// backoff would therefore silence every shard this worker owns and
+			// trigger elections against a live leader. Only free-order messages
+			// may go: everything else (VoteResp, HeartbeatResp) still has to
+			// wait for its state to be durable (Raft PhD 10.2.1). A pre-vote
+			// campaign among them is reported so it stays visible to
+			// OnCampaignLaunched/IncElection.
 			if node.peer != nil {
 				if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
+					w.reportFreeOrderCampaign(shardID, node, msgs)
 					w.sendMessages(msgs)
 				}
 			}
@@ -475,6 +513,10 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 // them all would grow the buffer without bound for as long as the shard stays
 // in commitPending. An older snapshot is strictly superseded by a newer one,
 // so keeping the latest loses nothing.
+//
+// It only ever compares LOCAL-origin installs: filterSnapshots drops wire-origin
+// InstallSnapshot before it reaches here, so a forged high index on the wire can
+// never evict the legitimate local install from this highest-index-wins buffer.
 func (w *stepWorker) deferSnapshot(shardID uint64, msg proto.Message) {
 	buf := w.deferredSnapshots[shardID]
 	if len(buf) == 0 {
@@ -511,6 +553,22 @@ func (w *stepWorker) filterSnapshots(shardID uint64, msgs []proto.Message) []pro
 	filtered := msgs[:0:0]
 	for i := range msgs {
 		if msgs[i].Type == proto.InstallSnapshot {
+			// Only a process-local InstallSnapshot is legitimate here: the
+			// snapshot receive path builds it after verifying and persisting the
+			// artifact and injects it via DeliverLocal. A wire-origin one is
+			// refused by raft.step (ErrWireLocalMessage) regardless, so deferring
+			// it buys nothing — and it is actively harmful, because deferSnapshot
+			// keeps the HIGHEST index and a forged Snapshot.Index (e.g. 1<<60)
+			// would evict the real local install, wedging the follower behind the
+			// compaction floor. Drop wire-origin snapshots outright.
+			if msgs[i].Origin != proto.OriginLocal {
+				slog.Warn("dropping wire-origin InstallSnapshot",
+					"shard_id", shardID,
+					"snapshot_index", msgs[i].Snapshot.Index,
+					"from", msgs[i].From,
+				)
+				continue
+			}
 			w.deferSnapshot(shardID, msgs[i])
 		} else {
 			filtered = append(filtered, msgs[i])
@@ -567,6 +625,9 @@ func (w *stepWorker) drainAndHandleInbox(shardID uint64, node *Node, recovering 
 // commit worker and sent only after SaveState completes. Returns true
 // if the step worker should exit (stopC fired).
 func (w *stepWorker) enqueueForCommit(shardID uint64, node *Node, update proto.Update) bool {
+	// Record the hand-off in progress BEFORE raising commitPending, so a panic
+	// anywhere below leaves the recovery a way to unwedge exactly this node.
+	w.enqueuingNode = node
 	node.commitPending.Store(true)
 	item := w.getCommitSlot(shardID)
 	item.update = update
@@ -594,9 +655,11 @@ func (w *stepWorker) enqueueForCommit(shardID uint64, node *Node, update proto.U
 
 	select {
 	case w.commitC <- item:
+		w.enqueuingNode = nil
 		return false
 	case <-w.stopC:
 		node.commitPending.Store(false)
+		w.enqueuingNode = nil
 		return true
 	}
 }
@@ -707,10 +770,14 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 		return
 	}
 	currentLeader, term := node.peer.LeaderAndTerm()
-	if currentLeader == w.prevLeaders[shardID] {
+	// Compare the (leader, term) PAIR: a same-leader re-election at a higher
+	// term (leader unchanged, term advanced) is a real leadership event that
+	// keying on the leader ID alone would silently swallow.
+	if currentLeader == w.prevLeaders[shardID] && term == w.prevLeaderTerms[shardID] {
 		return
 	}
 	w.prevLeaders[shardID] = currentLeader
+	w.prevLeaderTerms[shardID] = term
 	w.callback.OnLeaderUpdated(shardID, currentLeader, term)
 }
 
@@ -743,6 +810,45 @@ func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.U
 				break
 			}
 		}
+	}
+}
+
+// scanPreVoteCampaign returns the term of the first RequestPreVote in msgs and
+// whether one was found. RequestVote is ordered and never travels as a
+// free-order message, so only the pre-vote needs detecting here.
+func scanPreVoteCampaign(msgs []proto.Message) (term uint64, launched bool) {
+	for i := range msgs {
+		if msgs[i].Type == proto.RequestPreVote {
+			return msgs[i].Term, true
+		}
+	}
+	return 0, false
+}
+
+// fireCampaign delivers the campaign-launch observability callbacks. Must be
+// called OUTSIDE raftMu — OnCampaignLaunched runs arbitrary user listener code.
+func (w *stepWorker) fireCampaign(shardID uint64, node *Node, term uint64) {
+	if w.callback == nil {
+		return
+	}
+	w.callback.OnCampaignLaunched(shardID, node.ReplicaID(), term)
+	if w.metrics != nil {
+		w.metrics.IncElection(shardID)
+	}
+}
+
+// reportFreeOrderCampaign fires the campaign-launch callbacks when a
+// RequestPreVote is present among free-order messages drained OUTSIDE the normal
+// GetUpdate/processCallbacks path (the commitPending drains and the commitC-full
+// skip). PreVote is free-order, so a campaign launched under commitPending
+// reaches the wire through these drains; without this scan it would be invisible
+// to OnCampaignLaunched/IncElection. Safe only when called outside raftMu.
+func (w *stepWorker) reportFreeOrderCampaign(shardID uint64, node *Node, msgs []proto.Message) {
+	if w.callback == nil {
+		return
+	}
+	if term, launched := scanPreVoteCampaign(msgs); launched {
+		w.fireCampaign(shardID, node, term)
 	}
 }
 
@@ -789,6 +895,9 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	if len(w.orderedMsgBuf) > 0 {
 		w.sendMessages(w.orderedMsgBuf)
 	}
+	// Record the hand-off in progress BEFORE raising commitPending so a panic
+	// before the applyC send leaves the recovery a way to unwedge this node.
+	w.enqueuingNode = node
 	node.commitPending.Store(true)
 	ai := w.applyPool.Get().(*applyItem)
 	ai.update = update
@@ -796,10 +905,12 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	select {
 	case w.applyC <- ai:
 		// Successfully queued for apply.
+		w.enqueuingNode = nil
 		return false
 	case <-w.stopC:
 		node.commitPending.Store(false)
 		releaseApplyItem(w.applyPool, ai)
+		w.enqueuingNode = nil
 		return true
 	}
 }
@@ -1001,8 +1112,11 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// exits from this function publish.
 	w.publishLeaderChange(shardID, node)
 
-	// Send Phase 1 free-order messages outside the lock.
+	// Send Phase 1 free-order messages outside the lock. A pre-vote campaign
+	// among them is reported so a campaign launched under commitPending stays
+	// visible to OnCampaignLaunched/IncElection.
 	if len(phase1FreeOrder) > 0 {
+		w.reportFreeOrderCampaign(shardID, node, phase1FreeOrder)
 		w.sendMessages(phase1FreeOrder)
 	}
 
@@ -1064,6 +1178,13 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 		}
 	}
 
+	// Flush deferred ReadIndex heartbeat broadcasts generated by the otherMsgs
+	// stepped above (e.g. a follower-forwarded ReadIndex parks its heartbeat
+	// broadcast until flushed). Mirrors the phase 1 flush: without it those
+	// heartbeats sit buffered a full commit/apply cycle, adding that latency to
+	// the reads they confirm.
+	node.peer.FlushReadIndex()
+
 	// Drain free-order messages (Replicate, Heartbeat, Ping, Quiesce)
 	// generated by proposal handling and inbox processing. These messages
 	// are safe to send before WAL persistence per PhD thesis 10.2.1.
@@ -1085,8 +1206,10 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 
 	node.raftMu.Unlock()
 
-	// Send free-order messages outside the lock.
+	// Send free-order messages outside the lock. A pre-vote campaign among them
+	// is reported so it stays visible to OnCampaignLaunched/IncElection.
 	if len(freeOrderMsgs) > 0 {
+		w.reportFreeOrderCampaign(shardID, node, freeOrderMsgs)
 		w.sendMessages(freeOrderMsgs)
 	}
 
@@ -1145,17 +1268,29 @@ func (w *stepWorker) sendMessages(msgs []proto.Message) {
 	}
 }
 
-// clearStepCommitPending clears the commitPending flag on all nodes owned
-// by this step worker. Called by the engine's restart loop after a step
-// worker panic to unblock nodes that may have had commitPending set by
-// processReady before the panic occurred. Without this, nodes would
-// remain stuck with commitPending=true indefinitely, preventing the
-// restarted worker from producing new updates for those shards.
+// clearStepCommitPending unwedges the ONE node that was mid hand-off to the
+// commit pipeline (enqueueForCommit or commitMemoryMode) when a step-worker
+// panic hit: its commitPending is set but its item never reached commitC/applyC,
+// so nothing else will ever clear it. Called by the engine's restart loop after
+// drainCommitC has already handled every item still in the channel.
+//
+// It is deliberately NOT a blanket clear over every owned node. A node whose
+// item is in the commit worker's in-flight batch legitimately holds
+// commitPending across SaveState; clearing it there would let the restarted step
+// worker GetUpdate again while the first update is still in flight (double
+// extraction, double apply, double ReleaseCommittedEntries).
+//
+// Runs on the step-worker goroutine during the panic unwind, the same goroutine
+// that writes enqueuingNode, so no locking is required.
 func (w *stepWorker) clearStepCommitPending() {
-	w.nodesMu.RLock()
-	defer w.nodesMu.RUnlock()
-	for _, node := range w.nodes {
-		node.commitPending.Store(false)
+	node := w.enqueuingNode
+	if node == nil {
+		return
+	}
+	w.enqueuingNode = nil
+	node.commitPending.Store(false)
+	if w.workSignal != nil {
+		w.workSignal.Notify(node.shardID)
 	}
 }
 
@@ -1199,6 +1334,7 @@ func (w *stepWorker) unloadNode(shardID uint64) {
 	delete(w.nodes, shardID)
 	delete(w.commitSlots, shardID)
 	delete(w.prevLeaders, shardID)
+	delete(w.prevLeaderTerms, shardID)
 	delete(w.deferredSnapshots, shardID)
 	w.nodesMu.Unlock()
 }
