@@ -766,6 +766,35 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 				Err:       saveErr,
 			}
 		}
+		// Advance the log compaction floor to the snapshot index, exactly as the
+		// local save path (engine snapshotPool) and ImportSnapshot do.
+		//
+		// Without this, a follower that fell behind and caught up via
+		// InstallSnapshot keeps its OLD entries below the snapshot and then
+		// resumes replication above it, so its durable entry index becomes
+		// {1..k} U {N+1..M}: a HOLE. EntryRange checks the stored count against
+		// the first..last span, correctly reports ErrLogGapDetected, and
+		// recoverLogReader turns that into a StartShard failure — so the replica
+		// is permanently unstartable after the next restart. There is no
+		// self-heal (SnapshotEntries has no default, so this replica never
+		// compacts on its own) and no repair path (RequestCompaction on an
+		// unloaded shard only runs segment GC). This is reachable through
+		// entirely normal operation: leader compacts, follower lags, follower
+		// catches up, follower restarts.
+		//
+		// The snapshot subsumes every index at or below it, so removing them
+		// loses nothing. It is done AFTER the snapshot record is durable: a crash
+		// in between leaves the pre-existing shape (recoverable by the next
+		// successful receive or a local snapshot), whereas removing first would
+		// discard entries with no snapshot recorded to cover them.
+		if rmErr := h.host.logdb.RemoveEntriesTo(shardID, replicaID, snapshotIndex); rmErr != nil {
+			return &SnapshotReceiveError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Op:        "logdb_compact",
+				Err:       rmErr,
+			}
+		}
 	}
 
 	// The snapshot file is fsynced and the LogDB record is written, so the
