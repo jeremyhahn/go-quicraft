@@ -16,6 +16,8 @@ package engine
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -23,6 +25,21 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
+
+// ErrSnapshotMetaTooLarge is returned when a snapshot.meta file is longer than
+// any record this format can produce. It is treated as unreadable (unevaluable)
+// by the DEK purge floor, never parsed: reading a multi-GB foreign file as a
+// metadata record would defeat the parser's bounded-before-alloc discipline
+// inside the per-save purge-floor scan, which walks every snapshot directory on
+// the host.
+var ErrSnapshotMetaTooLarge = errors.New(
+	"engine: snapshot metadata file exceeds the maximum record size")
+
+// maxSnapshotMetaFileLen bounds how many bytes readSnapshotEpoch reads from a
+// snapshot.meta file. The largest record this format writes is the header plus a
+// body no larger than maxSnapshotMetaBodyLen; a file longer than that is foreign
+// or corrupt, so it is rejected rather than slurped whole.
+const maxSnapshotMetaFileLen = snapshotMetaHeaderSize + maxSnapshotMetaBodyLen
 
 // snapshot.meta is the record written beside every snapshot artifact. A
 // snapshot directory MUST describe itself: it outlives its LogDB record (up to
@@ -364,12 +381,13 @@ func (s snapshotEpochStatus) String() string {
 // no record: unknown, fail safe.
 func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
-	data, err := os.ReadFile(metaPath)
+	data, err := readBoundedSnapshotMeta(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return missingMetaEpochStatus(dir)
 		}
-		// Real read error: epoch indeterminate, fail safe.
+		// Real read error, or a file too large to be a record (foreign): epoch
+		// indeterminate, fail safe.
 		return 0, snapshotEpochUnknown
 	}
 	meta, parseErr := ParseSnapshotMeta(data)
@@ -380,6 +398,35 @@ func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 		return 0, snapshotEpochLegacy
 	}
 	return meta.Epoch, snapshotEpochKnown
+}
+
+// readBoundedSnapshotMeta reads a snapshot.meta file, refusing to read more than
+// one byte past the largest record this format can produce. os.ReadFile would
+// slurp a corrupt or substituted multi-GB file whole — inside the per-save DEK
+// purge-floor scan that walks every snapshot directory on the host — defeating
+// the parser's own bounded-before-alloc discipline. A file that yields more than
+// the maximum is foreign and is rejected with ErrSnapshotMetaTooLarge; the
+// caller treats that identically to any other unreadable record (fail safe).
+func readBoundedSnapshotMeta(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Debug("snapshot: metadata file close failed", "path", path, "error", closeErr)
+		}
+	}()
+	// Read one byte past the maximum a valid record can occupy: if the file
+	// yields that many bytes it is longer than any record this format writes.
+	data, err := io.ReadAll(io.LimitReader(f, maxSnapshotMetaFileLen+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxSnapshotMetaFileLen {
+		return nil, ErrSnapshotMetaTooLarge
+	}
+	return data, nil
 }
 
 // missingMetaEpochStatus classifies a snapshot directory whose snapshot.meta

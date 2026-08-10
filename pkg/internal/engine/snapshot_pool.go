@@ -207,6 +207,28 @@ const (
 	maxSnapshotFrameOverhead = 256
 )
 
+// Snapshot-pool sentinel errors. They live here rather than in errors.go
+// because they are produced only by the snapshot pool's save/recover/enumerate
+// paths; keeping them beside those paths keeps the typed-error contract local.
+var (
+	// ErrSnapshotArtifactMissing is returned by recoverSnapshot when a LogDB
+	// snapshot record points at a directory whose snapshot.dat no longer
+	// exists. It is a typed FAILURE — never a silent success — so the leader's
+	// ack-expiry -> re-send -> dedup -> re-recovery path engages, matching the
+	// encrypted branch that already fails on a missing artifact. Reporting the
+	// missing artifact as recovery success would clear the recovering gate
+	// without seeding lastApplied, stranding the shard behind its own recorded
+	// snapshot until an ErrApplyGap kills it or it serves stale reads.
+	ErrSnapshotArtifactMissing = errors.New(
+		"engine: recorded snapshot artifact (snapshot.dat) is missing")
+
+	// ErrSnapshotNotFound is returned by latestSnapshotDir when no snapshot
+	// directory exists on disk for a shard/replica. It is distinct from
+	// ErrStopped so a storage-state answer ("there is no snapshot") is never
+	// conflated with a shutdown signal.
+	ErrSnapshotNotFound = errors.New("engine: no snapshot directory found")
+)
+
 // newSnapshotPool creates a snapshot pool with the given worker count.
 // The requestC and completedC channels are sized to the worker count
 // for reasonable buffering. The logdb is used to persist snapshot
@@ -613,6 +635,17 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		term = req.appliedToTerm
 	}
 
+	// L21: capture cluster membership ONCE, here under the apply gate together
+	// with the (index, term) pair. The LogDB record and the LogReader record
+	// below both derive from this single snapshot; reading membership twice
+	// (once per record, after the gate released) let a config change committing
+	// mid-save give the two records DIFFERENT memberships. A node with no peer
+	// contributes empty membership, exactly as before.
+	var membership proto.Membership
+	if peer := node.Peer(); peer != nil {
+		membership = peer.GetMembership()
+	}
+
 	// Create snapshot directory using the standard naming convention:
 	// <snapshotDir>/shard-<N>/replica-<N>/snapshot-<index>
 	saveDir := snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)
@@ -827,6 +860,15 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// gate above; do NOT re-read lastAppliedTerm here — applies may have
 	// resumed since afterCapture released the gate.
 	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression); err != nil {
+		// M14: the data file is (possibly encrypted) ciphertext with no
+		// snapshot.meta beside it. readSnapshotEpoch classifies such a directory
+		// UNEVALUABLE, which makes the global/per-barrier purge floor fail safe
+		// and suppresses DEK purging host-wide until three newer snapshots GC it.
+		// Nothing references this directory yet (no LogDB record, no LogReader
+		// entry), so discard it. Every failure BEFORE encryption already
+		// discards; this is the first post-encryption point where the directory
+		// is not yet self-describing.
+		discardSaveDir(saveDir, req)
 		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
@@ -853,6 +895,38 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
+	// L22/M15: export the snapshot BEFORE it is recorded in LogDB and published
+	// to the LogReader. Running it afterwards failed a snapshot that was already
+	// durable, recorded and published — skipping compaction and epoch purge —
+	// on an export error; doing it here means an export failure fails a snapshot
+	// that is not yet visible, and the caller's retry re-takes it cleanly. The
+	// canonical snapshot.dat is fsynced and self-describing at this point, so a
+	// failure leaves a valid (unrecorded) directory GC reclaims.
+	//
+	// The export is PLAINTEXT: exportSnapshotBackup decrypts an encrypted
+	// artifact and records Epoch 0, because the export lands OUTSIDE every DEK
+	// purge-floor scan (Host.ExportSnapshot's plaintext contract, and
+	// Host.ImportSnapshot's staging invariant that an exported artifact never
+	// carries ciphertext). Emitting epoch-bound ciphertext there would silently
+	// expire the backup when its DEK is purged.
+	if req.exportPath != "" {
+		if exportErr := p.exportSnapshotBackup(saveDir, req.exportPath, barrier, SnapshotMeta{
+			Index:       snapshotIndex,
+			Term:        term,
+			ShardID:     req.shardID,
+			ReplicaID:   req.replicaID,
+			Epoch:       epoch,
+			Compression: compression,
+		}); exportErr != nil {
+			return 0, &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      true,
+				Err:       exportErr,
+			}
+		}
+	}
+
 	// Measure the artifact AFTER encryption so FileSize always means "size of
 	// the file at Filepath". A record whose FileSize is 0 while Filepath is
 	// set makes this replica stream an empty snapshot once it becomes leader.
@@ -865,15 +939,10 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// membership. Without membership, ReadState on restart returns empty
 	// membership which breaks quorum calculation.
 	if p.logdb != nil {
-		membership := protoMembershipToLogDB(&proto.Membership{})
-		if peer := node.Peer(); peer != nil {
-			m := peer.GetMembership()
-			membership = protoMembershipToLogDB(&m)
-		}
 		logdbSnap := logdb.Snapshot{
 			Index:       snapshotIndex,
 			Term:        term,
-			Membership:  membership,
+			Membership:  protoMembershipToLogDB(&membership),
 			Filepath:    saveDir,
 			FileSize:    fileSize,
 			Epoch:       epoch,
@@ -895,10 +964,6 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// Filepath and FileSize) and serves it via Snapshot() when
 	// inmem.snapshot is nil.
 	if lr := node.LogReader(); lr != nil {
-		var m proto.Membership
-		if peer := node.Peer(); peer != nil {
-			m = peer.GetMembership()
-		}
 		if err := lr.CreateSnapshot(proto.Snapshot{
 			ShardID:    req.shardID,
 			ReplicaID:  req.replicaID,
@@ -906,7 +971,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			Term:       term,
 			Filepath:   dataPath,
 			FileSize:   fileSize,
-			Membership: m,
+			Membership: membership,
 			Epoch:      epoch,
 			Imported:   req.exported,
 		}); err != nil {
@@ -939,18 +1004,6 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 
 	// Update the node's last snapshot index.
 	node.lastSnapshotIndex.Store(snapshotIndex)
-
-	// Export the snapshot data to the requested path when ExportPath is set.
-	if req.exportPath != "" {
-		if exportErr := exportSnapshotToPath(saveDir, req.exportPath); exportErr != nil {
-			return 0, &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      true,
-				Err:       exportErr,
-			}
-		}
-	}
 
 	// Log compaction: remove log entries covered by the snapshot, keeping
 	// CompactionOverhead entries for follower catch-up. When the request
@@ -1269,7 +1322,19 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	f, err := os.Open(recoverPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // snapshot file was cleaned up, skip recovery
+			// M13: a LogDB-recorded snapshot whose artifact is gone is a
+			// FAILURE, not a no-op. Returning nil here clears the recovering
+			// gate without seeding lastApplied, which later fails the shard
+			// with ErrApplyGap or serves stale reads. Fail with a typed error
+			// so the leader's ack-expiry -> re-send -> dedup -> re-recovery
+			// path engages, matching the encrypted branch (which already fails
+			// on a missing artifact via SnapshotEncryptError{Op:"read"}).
+			return &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      false,
+				Err:       ErrSnapshotArtifactMissing,
+			}
 		}
 		return &SnapshotError{
 			ShardID:   req.shardID,
@@ -1750,8 +1815,25 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 		return 0, false
 	}
 
+	nodes := p.nodes()
+
+	// Completeness guard (C3): the floor below is a MINIMUM over LOADED shards
+	// only, but a StopShard'd shard keeps its encrypted snapshot on disk while
+	// dropping out of p.nodes(). In single-barrier mode that stopped shard's
+	// DEK is still needed, so a co-hosted shard rotating keys must not purge
+	// below the stopped shard's retained epoch — doing so durably destroys the
+	// DEK and makes the stopped shard's StartShard fail closed on decrypt
+	// forever. The per-barrier floor has an analogous guard (MED-2). Here there
+	// is no shard-set enumerator, so the on-disk snapshot tree IS the authority:
+	// any shard/replica directory no loaded node accounts for means the loaded
+	// set is incomplete and the floor may sit above an epoch some artifact still
+	// needs. Fail safe (do not purge) on that, or on any enumeration error.
+	if !p.loadedSnapshotTreeAccounted(nodes) {
+		return 0, false
+	}
+
 	var scan snapshotFloorScan
-	for _, node := range p.nodes() {
+	for _, node := range nodes {
 		scan.addNode(node)
 	}
 	if scan.blocked() {
@@ -1788,6 +1870,79 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 		return 0, false // nothing encrypted retained, nothing to purge
 	}
 	return floor, true
+}
+
+// loadedSnapshotTreeAccounted reports whether every shard/replica directory that
+// exists on disk under any loaded node's snapshot base directory is accounted
+// for by a currently-loaded node. It is the global (single-barrier) analogue of
+// the per-barrier completeness guard (MED-2): the global floor is a minimum over
+// LOADED shards only, so an on-disk shard/replica directory that no loaded node
+// owns — a StopShard'd shard whose encrypted snapshot is still on disk — may
+// hold artifacts sealed under an epoch the floor would purge. Since every shard
+// shares the one process-wide barrier here, that purge is host-wide data loss.
+//
+// The tree is enumerated at most two levels deep (shard-*/replica-*) under each
+// DISTINCT loaded base directory. Any enumeration error is treated as
+// unaccounted (fail safe): an unreadable tree cannot be proven free of a stopped
+// shard's directory.
+func (p *snapshotPool) loadedSnapshotTreeAccounted(nodes []*Node) bool {
+	// Group the loaded nodes by their snapshot base directory, recording the
+	// shard-N/replica-M directory name each one owns.
+	accounted := make(map[string]map[string]struct{})
+	for _, node := range nodes {
+		base := node.SnapshotDir()
+		set := accounted[base]
+		if set == nil {
+			set = make(map[string]struct{})
+			accounted[base] = set
+		}
+		key := filepath.Join(
+			fmt.Sprintf("shard-%d", node.ShardID()),
+			fmt.Sprintf("replica-%d", node.ReplicaID()),
+		)
+		set[key] = struct{}{}
+	}
+
+	for base, set := range accounted {
+		shardEntries, err := os.ReadDir(base)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // base not yet created: nothing on disk to strand
+			}
+			return false // cannot prove the tree holds no unaccounted shard
+		}
+		for _, shardEntry := range shardEntries {
+			if !shardEntry.IsDir() || !strings.HasPrefix(shardEntry.Name(), "shard-") {
+				continue
+			}
+			shardPath := filepath.Join(base, shardEntry.Name())
+			replicaEntries, err := os.ReadDir(shardPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return false
+			}
+			for _, replicaEntry := range replicaEntries {
+				if !replicaEntry.IsDir() || !strings.HasPrefix(replicaEntry.Name(), "replica-") {
+					continue
+				}
+				key := filepath.Join(shardEntry.Name(), replicaEntry.Name())
+				if _, ok := set[key]; ok {
+					continue
+				}
+				// An on-disk shard/replica directory no loaded node owns. Its
+				// retained encrypted snapshots may need DEKs the loaded-only
+				// floor would purge, so purging must not proceed.
+				slog.Warn("epoch purge suppressed: on-disk snapshot directory has no loaded shard; "+
+					"a purge could destroy a DEK the stopped shard still needs",
+					"path", filepath.Join(shardPath, replicaEntry.Name()),
+				)
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // perBarrierSafePurgeFloor computes the minimum barrier epoch still required by
@@ -2496,23 +2651,93 @@ func latestSnapshotDir(baseDir string, shardID, replicaID uint64) (string, uint6
 		return "", 0, err
 	}
 	if len(dirs) == 0 {
+		// L25: "no snapshot on disk" is a storage-state answer, not a shutdown
+		// signal. Reporting ErrStopped here conflated the two; ErrSnapshotNotFound
+		// keeps them distinct per the typed-errors convention.
 		return "", 0, &SnapshotError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
 			Save:      false,
-			Err:       ErrStopped, // no snapshot found
+			Err:       ErrSnapshotNotFound,
 		}
 	}
 	latest := dirs[len(dirs)-1]
 	return latest.path, latest.index, nil
 }
 
-// exportSnapshotToPath copies the snapshot data file from the internal
-// snapshot directory to the specified export path. The export directory
-// is created with 0750 permissions if it does not exist. The snapshot
-// data file is copied (not moved) so the internal snapshot directory
-// remains intact for log compaction and follower catch-up.
+// exportSnapshotBackup writes a PLAINTEXT copy of a just-saved snapshot to
+// exportPath. exportPath lies OUTSIDE every DEK purge-floor scan, and the export
+// contract requires plaintext (Host.ExportSnapshot decrypts; Host.ImportSnapshot's
+// staging invariant is that an exported artifact never carries ciphertext), so an
+// epoch-bound ciphertext export would silently expire the backup when its DEK is
+// purged.
+//
+// When the on-disk artifact is unencrypted (meta.Epoch == 0) the canonical
+// snapshot.dat is already plaintext and its snapshot.meta already records Epoch 0,
+// so a verbatim copy is a valid, purge-immune backup. When it is encrypted
+// (meta.Epoch > 0) the artifact is decrypted to a plaintext scratch sibling and
+// THAT is exported, with the exported meta rewritten to Epoch 0; the canonical
+// encrypted snapshot.dat is left untouched. A configured-but-unavailable barrier
+// fails the export closed rather than emit ciphertext.
+func (p *snapshotPool) exportSnapshotBackup(saveDir, exportPath string, barrier SnapshotBarrier, meta SnapshotMeta) error {
+	if meta.Epoch == 0 {
+		return exportSnapshotToPath(saveDir, exportPath)
+	}
+	if barrier == nil || barrier.IsSealed() {
+		return &SnapshotExportError{
+			ExportPath: filepath.Clean(exportPath),
+			Err:        ErrSnapshotBarrierSealed,
+		}
+	}
+	dataPath := filepath.Join(saveDir, snapshotDataFile)
+	plainPath, decErr := p.decryptSnapshotToSibling(dataPath, meta.Epoch, barrier)
+	if decErr != nil {
+		return &SnapshotExportError{
+			ExportPath: filepath.Clean(exportPath),
+			Err:        decErr,
+		}
+	}
+	defer func() {
+		if rmErr := os.Remove(plainPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Debug("snapshot export: decrypted scratch remove failed",
+				"path", plainPath,
+				"error", rmErr,
+			)
+		}
+	}()
+	// The exported artifact is plaintext, so its meta must say Epoch 0. Every
+	// other field describes the same snapshot (Compression is preserved: decrypt
+	// removes the encryption layer but not the compression layer beneath it).
+	exportMeta := meta
+	exportMeta.Epoch = 0
+	return writeSnapshotExport(plainPath, exportPath, MarshalSnapshotMeta(exportMeta))
+}
+
+// exportSnapshotToPath copies the (already-plaintext) snapshot artifact from the
+// internal snapshot directory to the specified export path, meta included
+// verbatim. The data file is copied (not moved) so the internal snapshot
+// directory remains intact for log compaction and follower catch-up.
+//
+// Callers that may hold an ENCRYPTED artifact must use exportSnapshotBackup,
+// which decrypts first; this function copies bytes as-is and would otherwise
+// emit ciphertext into an unscanned directory.
 func exportSnapshotToPath(saveDir, exportPath string) error {
+	srcDataPath := filepath.Join(saveDir, snapshotDataFile)
+	var metaBytes []byte
+	if b, readErr := os.ReadFile(filepath.Join(saveDir, snapshotMetadataFile)); readErr == nil {
+		metaBytes = b
+	}
+	return writeSnapshotExport(srcDataPath, exportPath, metaBytes)
+}
+
+// writeSnapshotExport copies srcDataPath into exportPath/snapshot.dat and, when
+// metaBytes is non-nil, writes it as exportPath/snapshot.meta, then fsyncs the
+// export directory so both entries survive a crash. The export directory is
+// created with 0750 permissions if it does not exist. A metadata write failure
+// is non-fatal — the data file is the artifact — while every other step fails
+// the export. It is the single copy path shared by the plaintext export and the
+// decrypt-then-export backup so neither can drift from the other.
+func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error {
 	// Clean the export path to prevent directory traversal. The public
 	// SnapshotOption.Validate() already ensures it is an absolute path.
 	exportPath = filepath.Clean(exportPath)
@@ -2523,8 +2748,7 @@ func exportSnapshotToPath(saveDir, exportPath string) error {
 		}
 	}
 
-	srcPath := filepath.Join(saveDir, snapshotDataFile)
-	src, err := os.Open(srcPath)
+	src, err := os.Open(srcDataPath)
 	if err != nil {
 		return &SnapshotExportError{
 			ExportPath: exportPath,
@@ -2534,7 +2758,7 @@ func exportSnapshotToPath(saveDir, exportPath string) error {
 	defer func() {
 		if closeErr := src.Close(); closeErr != nil {
 			slog.Debug("snapshot export: source file close failed",
-				"path", srcPath,
+				"path", srcDataPath,
 				"error", closeErr,
 			)
 		}
@@ -2571,11 +2795,10 @@ func exportSnapshotToPath(saveDir, exportPath string) error {
 		}
 	}
 
-	// Copy the metadata file as well for completeness.
-	srcMetaPath := filepath.Join(saveDir, snapshotMetadataFile)
-	if metaData, readErr := os.ReadFile(srcMetaPath); readErr == nil {
+	// Write the metadata beside it for completeness.
+	if metaBytes != nil {
 		dstMetaPath := filepath.Join(exportPath, snapshotMetadataFile)
-		if writeErr := os.WriteFile(dstMetaPath, metaData, 0o600); writeErr != nil { // #nosec G703 -- exportPath is filepath.Clean'd and validated as absolute
+		if writeErr := os.WriteFile(dstMetaPath, metaBytes, 0o600); writeErr != nil { // #nosec G703 -- exportPath is filepath.Clean'd and validated as absolute
 			slog.Warn("snapshot export: metadata copy failed",
 				"path", dstMetaPath,
 				"error", writeErr,

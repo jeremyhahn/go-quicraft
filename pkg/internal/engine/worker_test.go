@@ -5922,8 +5922,13 @@ func TestRecoverSnapshot_ZeroIndex(t *testing.T) {
 	}
 }
 
-// TestRecoverSnapshot_FileNotExist verifies that recoverSnapshot returns
-// nil when the snapshot data file doesn't exist (cleaned up).
+// TestRecoverSnapshot_FileNotExist verifies that recoverSnapshot FAILS with a
+// typed ErrSnapshotArtifactMissing when a LogDB-recorded snapshot's data file
+// is gone (M13). A recorded snapshot (Index != 0) whose snapshot.dat is missing
+// is NOT "cleaned up" — the record still points at it — so reporting recovery
+// success would clear the recovering gate without seeding lastApplied and later
+// fail the shard with ErrApplyGap or serve stale reads. The failure is what
+// engages the leader's re-send path, matching the encrypted branch.
 func TestRecoverSnapshot_FileNotExist(t *testing.T) {
 	stopC := make(chan struct{})
 	ws := NewWorkSignal(1)
@@ -5950,9 +5955,8 @@ func TestRecoverSnapshot_FileNotExist(t *testing.T) {
 		node:      node,
 		save:      false,
 	})
-	// File not found is treated as "snapshot cleaned up" -> nil error.
-	if err != nil {
-		t.Fatalf("expected nil for missing snapshot file, got %v", err)
+	if !errors.Is(err, ErrSnapshotArtifactMissing) {
+		t.Fatalf("expected ErrSnapshotArtifactMissing for a recorded-but-missing snapshot file, got %v", err)
 	}
 }
 
