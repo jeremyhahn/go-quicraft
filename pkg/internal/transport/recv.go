@@ -742,7 +742,12 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 			defer t.releaseConnMsgRecvBudget(inboundConn, delta)
 		}
 		snappyBuf = snappyDecPool.Get().(*[]byte)
-		decompressed, err := snappy.Decode(*snappyBuf, payload)
+		// snappy.Decode sizes its destination by len(dst), not cap(dst): a
+		// zero-length pooled buffer would force a fresh heap allocation of the
+		// full decompressed size on every frame, defeating the pool. Hand it
+		// the buffer's full capacity so an existing backing array is reused
+		// whenever it is large enough (the send side does the same at Encode).
+		decompressed, err := snappy.Decode((*snappyBuf)[:cap(*snappyBuf)], payload)
 		if err != nil {
 			putSnappyDecBuf(snappyBuf)
 			snappyBuf = nil

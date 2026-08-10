@@ -247,19 +247,44 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 	key := streamKey{target: target, idx: 0}
 
 	shard.mu.Lock()
-	if _, ok := shard.streams[key]; ok {
-		// Another goroutine (e.g., a concurrent heartbeat send) already
-		// created the stream. Close ours and use the existing one.
+	if existing, ok := shard.streams[key]; ok {
+		existingOwner := shard.owners[key]
+		// Keep the pooled entry — discarding ours — unless it belongs to a
+		// connection that is already DEAD. An entry owned by the same conn is a
+		// concurrent heartbeat open; an entry owned by an unknown conn is
+		// test-injected; an entry owned by a different but still-live conn may
+		// be a fresher one than ours (dial races leave one conn cached and the
+		// loser draining), and clobbering it here could install our stream over
+		// a live one out of order. Any entry that is merely superseded — owned
+		// by a conn no longer cached for this target — is evicted lazily by
+		// getStream's owner check, which reopens on the current conn. Only a
+		// dead owner is unambiguously safe to replace right now.
+		if existingOwner == nil || existingOwner == conn || existingOwner.Context().Err() == nil {
+			shard.mu.Unlock()
+			if closeErr := s.Close(); closeErr != nil {
+				slog.Debug("transport: stream close failed during preopen dedup",
+					"target", target,
+					"error", closeErr,
+				)
+			}
+			return
+		}
+		// Existing entry is on a dead connection: replace it with our fresh
+		// stream. Close the stale stream outside the lock.
+		shard.drop(key)
+		shard.put(key, s, conn)
 		shard.mu.Unlock()
-		if closeErr := s.Close(); closeErr != nil {
-			slog.Debug("transport: stream close failed during preopen dedup",
-				"target", target,
-				"error", closeErr,
-			)
+		if existing != nil {
+			if closeErr := existing.Close(); closeErr != nil {
+				slog.Debug("transport: stale stream close failed during preopen replace",
+					"target", target,
+					"error", closeErr,
+				)
+			}
 		}
 		return
 	}
-	shard.streams[key] = s
+	shard.put(key, s, conn)
 	shard.mu.Unlock()
 }
 
@@ -504,25 +529,54 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 	// to timeout and start unnecessary elections.
 	shard.mu.RLock()
 	stream, ok := shard.streams[key]
+	owner := shard.owners[key]
 	shard.mu.RUnlock()
 	if ok {
 		t.connMu.RLock()
 		conn, connOK := t.conns[target]
 		t.connMu.RUnlock()
-		if connOK {
+
+		switch {
+		case owner != nil:
+			// Judge the pooled stream by its OWN connection, and require that
+			// connection to be the one currently cached for the target.
+			switch {
+			case connOK && conn == owner && owner.Context().Err() == nil:
+				// Live and current. Re-verify the stream is still the cached
+				// entry after the conn read: a concurrent evict may have
+				// removed or replaced it, in which case the local variable
+				// holds a stale (closed) stream that would block for the full
+				// write deadline before failing.
+				shard.mu.RLock()
+				cached, stillCached := shard.streams[key]
+				shard.mu.RUnlock()
+				if stillCached && cached == stream {
+					return stream, nil
+				}
+				// Evicted or replaced between reads: fall through.
+			case connOK && conn == owner:
+				// The stream's owner IS the cached conn, but it is dead: evict
+				// the whole connection and its streams, then reconnect.
+				t.removeConnection(target)
+				t.evictStreamsForTarget(target)
+			default:
+				// The stream was opened on a connection that is no longer the
+				// one cached for this target (a superseded conn from a peer
+				// restart / re-dial) or no conn is cached at all. Drop just
+				// this stale stream so the slow path opens a fresh one on the
+				// current connection — WITHOUT tearing down the cached conn,
+				// which may be a healthy replacement.
+				t.evictStream(target, shardID, isHeartbeat, stream)
+			}
+		case connOK:
+			// Owner unknown (only manually-constructed test transports inject a
+			// raw stream). Preserve the original cached-conn liveness check.
 			select {
 			case <-conn.Context().Done():
 				// Connection is dead. Evict all streams and reconnect.
 				t.removeConnection(target)
 				t.evictStreamsForTarget(target)
 			default:
-				// Re-verify the stream is still in the shard after
-				// checking the connection. Between the initial stream
-				// read and the connection read, another goroutine may
-				// have evicted the connection and all its streams. If
-				// the stream was removed, the local variable holds a
-				// stale (closed) stream that would block for the full
-				// write deadline before failing.
 				shard.mu.RLock()
 				_, stillCached := shard.streams[key]
 				shard.mu.RUnlock()
@@ -533,8 +587,8 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 				// the slow path to open a fresh stream.
 			}
 		}
-		// No connection cached or connection is dead: fall through
-		// to the slow path which will dial a fresh connection.
+		// No usable cached stream: fall through to the slow path which
+		// will dial a fresh connection if needed.
 	}
 
 	// Slow path: open a new stream.
@@ -554,88 +608,109 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 	shard.mu.Lock()
 	// Double-check another goroutine didn't create it.
 	if existing, ok := shard.streams[key]; ok {
-		// Verify the connection backing the existing stream is still alive.
-		// Without this check, a concurrent goroutine may have cached a stream
-		// on a connection that has since died, and returning it would block
-		// for the full write deadline before failing.
+		// Judge the existing pooled stream by its OWN owning connection (when
+		// known) rather than whatever conn is currently cached: an entry left
+		// by a pre-open on a superseded conn must be treated as stale even
+		// while a fresh conn is cached, and returning a stream on a dead conn
+		// would block for the full write deadline before failing.
+		existingOwner := shard.owners[key]
 		t.connMu.RLock()
-		existingConn, connOK := t.conns[target]
+		cachedConn, connOK := t.conns[target]
 		t.connMu.RUnlock()
-		stale := !connOK
-		if connOK {
-			select {
-			case <-existingConn.Context().Done():
-				stale = true
-			default:
-			}
+
+		existingUsable := false
+		if existingOwner != nil {
+			existingUsable = connOK && cachedConn == existingOwner &&
+				existingOwner.Context().Err() == nil
+		} else if connOK {
+			// Owner unknown (only test-injected raw streams reach this): fall
+			// back to the cached conn's liveness, preserving prior behavior.
+			existingUsable = cachedConn.Context().Err() == nil
 		}
-		if stale {
-			// Existing stream is on a dead or missing connection. Discard
-			// it, close the duplicate we just opened, and retry once with
-			// a fresh connection and stream.
-			delete(shard.streams, key)
+		if existingUsable {
+			// Prefer the already-cached stream; close the duplicate we opened.
+			shard.mu.Unlock()
+			if closeErr := s.Close(); closeErr != nil {
+				slog.Debug("transport: stream close failed during getStream dedup",
+					"target", target,
+					"shard_id", shardID,
+					"error", closeErr,
+				)
+			}
+			return existing, nil
+		}
+
+		// The existing entry is stale. If the connection WE just opened on is
+		// the current, live cached conn, our fresh stream is good: replace the
+		// stale entry in place WITHOUT tearing down the healthy connection.
+		if connOK && cachedConn == conn && conn.Context().Err() == nil {
+			shard.put(key, s, conn)
 			shard.mu.Unlock()
 			if closeErr := existing.Close(); closeErr != nil {
-				slog.Debug("transport: stale stream close failed during getStream dedup",
+				slog.Debug("transport: stale stream close failed during getStream replace",
 					"target", target,
 					"shard_id", shardID,
 					"error", closeErr,
 				)
 			}
-			if closeErr := s.Close(); closeErr != nil {
-				slog.Debug("transport: new stream close failed during getStream dedup",
-					"target", target,
-					"shard_id", shardID,
-					"error", closeErr,
-				)
-			}
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
-			// Single retry: establish a fresh connection and stream.
-			// If this also fails, return the error to the caller.
-			retryConn, retryErr := t.getConnection(target)
-			if retryErr != nil {
-				return nil, retryErr
-			}
-			retryCtx, retryCancel := context.WithTimeout(t.shutdownCtx, 5*time.Second)
-			defer retryCancel()
-			retryStream, retryErr := retryConn.OpenStreamSync(retryCtx)
-			if retryErr != nil {
-				return nil, retryErr
-			}
-			// Double-check before inserting: between releasing the shard lock
-			// above (for eviction) and re-acquiring it here, a concurrent
-			// getStream/sendBatch/preOpenHeartbeatStream may have already cached
-			// a live stream at this key. Overwriting it would leak that stream
-			// (and its flow-control window), which is exactly the peer-restart
-			// churn scenario this path handles.
-			shard.mu.Lock()
-			if existingRetry, ok := shard.streams[key]; ok {
-				shard.mu.Unlock()
-				if closeErr := retryStream.Close(); closeErr != nil {
-					slog.Debug("transport: duplicate retry stream close failed",
-						"target", target,
-						"shard_id", shardID,
-						"error", closeErr,
-					)
-				}
-				return existingRetry, nil
-			}
-			shard.streams[key] = retryStream
-			shard.mu.Unlock()
-			return retryStream, nil
+			return s, nil
 		}
+
+		// Neither the existing entry nor our stream is on a healthy cached
+		// connection (the conn died out from under this dial, or was replaced).
+		// Discard both, tear the connection down, and retry once with a fresh
+		// dial and stream. If the retry also fails, return the error.
+		shard.drop(key)
 		shard.mu.Unlock()
-		if closeErr := s.Close(); closeErr != nil {
-			slog.Debug("transport: stream close failed during getStream dedup",
+		if closeErr := existing.Close(); closeErr != nil {
+			slog.Debug("transport: stale stream close failed during getStream dedup",
 				"target", target,
 				"shard_id", shardID,
 				"error", closeErr,
 			)
 		}
-		return existing, nil
+		if closeErr := s.Close(); closeErr != nil {
+			slog.Debug("transport: new stream close failed during getStream dedup",
+				"target", target,
+				"shard_id", shardID,
+				"error", closeErr,
+			)
+		}
+		t.removeConnection(target)
+		t.evictStreamsForTarget(target)
+		retryConn, retryErr := t.getConnection(target)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		retryCtx, retryCancel := context.WithTimeout(t.shutdownCtx, 5*time.Second)
+		defer retryCancel()
+		retryStream, retryErr := retryConn.OpenStreamSync(retryCtx)
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		// Double-check before inserting: between releasing the shard lock
+		// above (for eviction) and re-acquiring it here, a concurrent
+		// getStream/sendBatch/preOpenHeartbeatStream may have already cached
+		// a live stream at this key. Overwriting it would leak that stream
+		// (and its flow-control window), which is exactly the peer-restart
+		// churn scenario this path handles.
+		shard.mu.Lock()
+		if existingRetry, ok := shard.streams[key]; ok {
+			shard.mu.Unlock()
+			if closeErr := retryStream.Close(); closeErr != nil {
+				slog.Debug("transport: duplicate retry stream close failed",
+					"target", target,
+					"shard_id", shardID,
+					"error", closeErr,
+				)
+			}
+			return existingRetry, nil
+		}
+		shard.put(key, retryStream, retryConn)
+		shard.mu.Unlock()
+		return retryStream, nil
 	}
-	shard.streams[key] = s
+	shard.put(key, s, conn)
 	shard.mu.Unlock()
 
 	return s, nil
@@ -758,7 +833,7 @@ func (t *QUICTransport) evictStreamsForTarget(target string) {
 		for key, stream := range shard.streams {
 			if key.target == target {
 				toClose = append(toClose, stream)
-				delete(shard.streams, key)
+				shard.drop(key)
 			}
 		}
 		shard.mu.Unlock()
@@ -1206,7 +1281,7 @@ func (t *QUICTransport) evictStream(target string, shardID uint64, isHeartbeat b
 
 	shard.mu.Lock()
 	if cached, ok := shard.streams[key]; ok && cached == stream {
-		delete(shard.streams, key)
+		shard.drop(key)
 	}
 	shard.mu.Unlock()
 
