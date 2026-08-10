@@ -7731,7 +7731,42 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 	// entry payloads.
 	firstIndex, entryCount, err := h.logdb.EntryRange(shardID, replicaID)
 	if err != nil {
-		return false, err
+		// SELF-HEAL: a stale prefix left below a recorded snapshot.
+		//
+		// A replica whose log floor was never advanced past a snapshot it
+		// recorded holds {1..k} U {N+1..M} — a hole EntryRange correctly reports
+		// as ErrLogGapDetected, which otherwise makes StartShard fail FOREVER:
+		// nothing compacts it (SnapshotEntries has no default) and
+		// RequestCompaction cannot run on an unloaded shard. Two ways in: the
+		// receive path before it advanced the floor (now fixed), and a crash
+		// inside ImportSnapshot between recording the snapshot and advancing the
+		// floor — a window that still exists by construction.
+		//
+		// The snapshot subsumes every index at or below it, so removing that
+		// prefix loses nothing and is exactly what the writer should have done.
+		// Repairing here rescues replicas ALREADY wedged in the field, which a
+		// write-path fix alone cannot do.
+		//
+		// Strictly conditional: only when a snapshot is recorded (ss.Index > 0),
+		// only on ErrLogGapDetected. Any other error, or a gap with no snapshot
+		// covering it, still fails closed — a hole with nothing to subsume it is
+		// real data loss and must not be silently papered over.
+		if !errors.Is(err, logdb.ErrLogGapDetected) || ss.Index == 0 {
+			return false, err
+		}
+		h.logger.Warn("log entry index holed below a recorded snapshot; removing the "+
+			"subsumed prefix to repair recovery",
+			"shard_id", shardID, "replica_id", replicaID, "snapshot_index", ss.Index)
+		if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, ss.Index); rmErr != nil {
+			return false, err
+		}
+		firstIndex, entryCount, err = h.logdb.EntryRange(shardID, replicaID)
+		if err != nil {
+			return false, err
+		}
+		h.logger.Info("log entry index repaired",
+			"shard_id", shardID, "replica_id", replicaID,
+			"first_index", firstIndex, "entry_count", entryCount)
 	}
 	if entryCount > 0 {
 		persisted = true

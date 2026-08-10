@@ -101,3 +101,103 @@ func TestSnapshotCatchUp_LeavesNoHoleInTheEntryIndex(t *testing.T) {
 			"want a range starting above %d", first, count, snapshotIndex)
 	}
 }
+
+// TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot pins the self-heal that
+// rescues replicas ALREADY wedged in the field.
+//
+// A replica whose log floor was never advanced past a snapshot it recorded holds
+// {1..k} U {N+1..M}. EntryRange reports ErrLogGapDetected and StartShard fails
+// forever — nothing compacts it and RequestCompaction cannot run on an unloaded
+// shard. Two ways in: the receive path before it advanced the floor, and a crash
+// inside ImportSnapshot between recording the snapshot and advancing the floor,
+// a window that still exists by construction. A write-path fix alone cannot help
+// a replica that is already in this state, so recovery repairs it: the snapshot
+// subsumes the stale prefix, so removing it loses nothing.
+func TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot(t *testing.T) {
+	const shardID, replicaID = uint64(1), uint64(1)
+	const snapshotIndex = uint64(6000)
+	db := memdb.New()
+
+	// The wedged shape, written directly: stale prefix, a recorded snapshot far
+	// above it, and post-snapshot entries.
+	stale := make([]logdb.Entry, 0, 5)
+	for i := uint64(1); i <= 5; i++ {
+		stale = append(stale, logdb.Entry{Index: i, Term: 1, Cmd: []byte("old")})
+	}
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State:   logdb.State{Term: 1, Commit: 5},
+		Entries: stale,
+	}}); err != nil {
+		t.Fatalf("seed stale prefix: %v", err)
+	}
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: snapshotIndex, Term: 2}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State: logdb.State{Term: 2, Commit: snapshotIndex + 2},
+		Entries: []logdb.Entry{
+			{Index: snapshotIndex + 1, Term: 2, Cmd: []byte("new")},
+			{Index: snapshotIndex + 2, Term: 2, Cmd: []byte("new")},
+		},
+	}}); err != nil {
+		t.Fatalf("seed post-snapshot entries: %v", err)
+	}
+	if _, _, err := db.EntryRange(shardID, replicaID); !errors.Is(err, logdb.ErrLogGapDetected) {
+		t.Fatalf("fixture: expected a holed index (ErrLogGapDetected), got %v", err)
+	}
+
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	lr := logdb.NewLogReader(shardID, replicaID, db)
+	if _, err := h.recoverLogReader(lr, shardID, replicaID); err != nil {
+		t.Fatalf("recovery did NOT repair a hole a recorded snapshot fully subsumes: %v; "+
+			"this replica stays permanently unstartable with no repair path", err)
+	}
+	first, _ := lr.IndexRange()
+	if first <= snapshotIndex {
+		t.Fatalf("recovered range still starts at %d, at or below the snapshot index %d: "+
+			"the subsumed prefix was not removed", first, snapshotIndex)
+	}
+}
+
+// TestRecoverLogReader_FailsClosedOnGapWithNoSnapshot is the other half: a hole
+// with NO snapshot to subsume it is real data loss and must still fail closed.
+// Repairing it would silently discard entries nothing has captured.
+func TestRecoverLogReader_FailsClosedOnGapWithNoSnapshot(t *testing.T) {
+	const shardID, replicaID = uint64(1), uint64(1)
+	db := memdb.New()
+
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State:   logdb.State{Term: 1, Commit: 2},
+		Entries: []logdb.Entry{{Index: 1, Term: 1, Cmd: []byte("a")}, {Index: 2, Term: 1, Cmd: []byte("a")}},
+	}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// A hole with nothing recorded to cover it.
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State:   logdb.State{Term: 1, Commit: 900},
+		Entries: []logdb.Entry{{Index: 900, Term: 1, Cmd: []byte("b")}},
+	}}); err != nil {
+		t.Fatalf("seed gap: %v", err)
+	}
+
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	lr := logdb.NewLogReader(shardID, replicaID, db)
+	if _, err := h.recoverLogReader(lr, shardID, replicaID); err == nil {
+		t.Fatal("recovery ACCEPTED a log hole with no snapshot covering it: real data " +
+			"loss was silently repaired away instead of failing closed")
+	}
+}
