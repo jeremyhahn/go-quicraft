@@ -152,22 +152,22 @@ func TestInitialMembershipRoundTrip(t *testing.T) {
 }
 
 // TestJoiningClearsWhenBootstrapEntryApplied is the Stage-4 property: a joiner
-// that started with empty membership ends its joining window — and its IsMember
-// authorization bypass — the moment it applies the bootstrap membership entry
-// the leader replicates to it. Before config-in-log the window could only be
-// closed by a snapshot, so a joiner caught up by replication alone stayed in the
-// bypass permanently.
+// that started with empty membership ends its joining window the moment it
+// applies the bootstrap membership entry the leader replicates to it. Before
+// config-in-log the window could only be closed by a snapshot, so a joiner
+// caught up by replication alone stayed joining permanently.
+//
+// The window gates CAMPAIGNING (a replica holding an incomplete configuration
+// must not self-elect on a quorum of one) and the configuration test in
+// handleVoteRequest. It is no longer an authorization bypass: per-shard
+// authorization is a removed-tombstone deny-list that needs no bypass. See
+// Peer.IsRemoved.
 func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	// Replica 4 joins a {1,2,3} cluster: it starts knowing no members.
 	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
 	p.MarkJoining()
 	if !p.joining.Load() {
 		t.Fatal("fixture: joining flag must be set")
-	}
-	// While joining, IsMember authorizes every replica so the joiner can accept
-	// the leader's first replication.
-	if !p.IsMember(999) {
-		t.Fatal("fixture: a joining node must bypass IsMember")
 	}
 
 	// The joiner is following leader 1 (a founding member). The bypass clears
@@ -226,16 +226,15 @@ func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
 	p.processConfigChanges([]proto.Entry{bootstrap})
 
 	if !p.joining.Load() {
-		t.Fatal("the joiner cleared the auth bypass after learning only the FOUNDING " +
+		t.Fatal("the joiner left the joining window after learning only the FOUNDING " +
 			"members — but the current leader 5 was added after bootstrap and is not " +
-			"among them, so the joiner would now REJECT leader 5's next append and " +
-			"strand itself, never replaying the entries that add it")
+			"among them, so its configuration is still incomplete and the vote guard " +
+			"in handleVoteRequest would deny the real members it must vote for")
 	}
-	if !p.IsMember(5) {
-		// Still bypassing (correct) — it can accept leader 5's continued replication.
-		if !p.IsMember(999) {
-			t.Fatal("bypass ended early: the joiner can no longer accept leader 5")
-		}
+	// Leader 5 can always reach the joiner regardless: authorization is a
+	// deny-list, and leader 5 carries no removal tombstone.
+	if p.IsRemoved(5) {
+		t.Fatal("the joiner refused leader 5")
 	}
 
 	// Batch 2: leader 5's AddNode arrives. Now the joiner knows the leader.

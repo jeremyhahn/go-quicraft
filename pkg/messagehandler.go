@@ -158,13 +158,21 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 	for i := range batch.Requests {
 		msg := &batch.Requests[i]
 
-		// Per-shard authorization: verify the sender is a member of
-		// the target shard. When node is nil (shard not loaded locally),
-		// the message is allowed through because it may be a bootstrap
-		// or shard-loading trigger message.
+		// Per-shard authorization: refuse senders this shard has COMMITTED a
+		// removal for. This is deliberately a deny-list, not a member
+		// allow-list — a replica's configuration lags by design, so
+		// allow-listing makes a stale replica drop the Replicate, Heartbeat and
+		// InstallSnapshot from a leader added while it was behind, permanently
+		// wedging itself out of the shard. The removed set is monotone and is
+		// the only membership-derived fact that is safe to enforce here; see
+		// raft.Peer.IsRemoved. Authentication proper is the transport's mTLS
+		// node certificate plus the deployment ID.
+		//
+		// When node is nil (shard not loaded locally) the message is allowed
+		// through because it may be a bootstrap or shard-loading trigger.
 		node := h.engine.GetNode(msg.ShardID)
-		if node != nil && !node.IsMember(msg.From) {
-			slog.Warn("rejected unauthorized message",
+		if node != nil && node.IsRemoved(msg.From) {
+			slog.Warn("rejected message from removed replica",
 				"shard", msg.ShardID,
 				"from", msg.From,
 				"type", proto.MessageTypeName(msg.Type),
@@ -206,7 +214,17 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 		// Unloaded shards (node == nil) do not learn an address: the arbitrary
 		// replicaID in From cannot be verified as a real member until the shard
 		// is loaded with its configured membership.
-		if node != nil && batch.SourceAddress != "" && senderAuthorized(batch.SourceAddress) {
+		//
+		// Learning is gated on IsMember, NOT on the deny-list that gates message
+		// ACCEPTANCE above. The two are deliberately different predicates:
+		// accepting a message is a read that raft's own term and log rules then
+		// validate, and it must tolerate a stale configuration or a lagging
+		// replica wedges itself. Learning an address MUTATES this host's routing
+		// state, so it takes the strict test — only a replica the committed
+		// configuration actually names may rewrite where this host sends. A
+		// sender we have never heard of has nothing to route to anyway.
+		if node != nil && node.IsMember(msg.From) &&
+			batch.SourceAddress != "" && senderAuthorized(batch.SourceAddress) {
 			h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress)
 		}
 
@@ -348,8 +366,11 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 	if replicaID != node.ReplicaID() {
 		return reject("snapshot addressed to a different replica")
 	}
-	if !node.IsMember(fromReplicaID) {
-		return reject("sender not a shard member")
+	// Deny-list, not an allow-list: see raft.Peer.IsRemoved. A replica that has
+	// not yet applied the config change adding the sender must still be able to
+	// receive the snapshot that brings it up to date.
+	if node.IsRemoved(fromReplicaID) {
+		return reject("sender removed from the shard")
 	}
 	if h.host.registry == nil {
 		return reject("no registry to resolve sender address")

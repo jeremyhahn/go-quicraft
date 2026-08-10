@@ -97,13 +97,24 @@ type Peer struct {
 	// GetUpdate returns it.
 	hasPendingSnapshot bool
 
-	// joining is true for nodes that were started with join=true. These nodes
-	// have incomplete membership until they learn the configuration, so per-shard
-	// auth is bypassed while joining is true. Under config-in-log it is cleared
-	// deterministically by clearJoiningIfKnown the moment the node applies the
-	// bootstrap membership entry (replicated like any other entry) or any config
-	// change that names a member other than itself; a snapshot adopt also clears
-	// it, for the compacted case.
+	// joining is true for nodes started with join=true. It means exactly one
+	// thing: this replica's configuration is KNOWN-INCOMPLETE — it may hold only
+	// itself, or nothing at all, because it has not yet replayed the entries
+	// naming the rest of the shard.
+	//
+	// It is NOT an authorization bypass. Per-shard authorization is a
+	// removed-tombstone deny-list (Peer.IsRemoved) which needs no bypass,
+	// because it never wrongly refuses a peer it simply has not heard of. The
+	// flag gates the two decisions that a configuration this replica knows to be
+	// incomplete cannot safely support: campaigning (startElection,
+	// handleTimeoutNow — a replica holding only itself would self-elect on a
+	// quorum of one) and the candidate test in handleVoteRequest (it would deny
+	// every real member and strand the shard).
+	//
+	// Under config-in-log it is cleared deterministically by clearJoiningIfKnown
+	// the moment the node applies the bootstrap membership entry (replicated like
+	// any other entry) or any config change that names a member other than
+	// itself; a snapshot adopt also clears it, for the compacted case.
 	joining atomic.Bool
 }
 
@@ -467,8 +478,8 @@ func (p *Peer) Handle(msg proto.Message) error {
 		// construction (the bootstrap confState is not in the log), and it
 		// has usually already applied its own AddNode — so the local
 		// ConfigChangeID EQUALS the snapshot's and the strictly-newer test
-		// rejects the only message that can repair it, leaving joining set
-		// forever and per-shard authorization bypassed for the shard.
+		// rejects the only message that can repair it, leaving the replica
+		// permanently unable to campaign or to vote for the shard's real members.
 		ss := msg.Snapshot
 		pending := p.r.log.pendingSnapshot()
 		restored := pending != nil && pending != pendingBefore
@@ -1234,26 +1245,27 @@ func (p *Peer) GetMembership() proto.Membership {
 	return snap.toProto()
 }
 
-// MarkJoining marks this peer as a joining node with incomplete
-// membership. A joining node starts with empty membership and learns
-// the full cluster membership via snapshot. Until the snapshot is
-// received, per-shard auth is bypassed. Transport-level mTLS and
-// deployment ID provide security during this bootstrapping window.
-// The raft state machine gets its own mirror of the flag: it owns the two
-// campaign entry points (startElection, handleTimeoutNow) and cannot see a
-// field on Peer. The mirror is written only here — before the shard's step
+// MarkJoining records that this peer's configuration is known-incomplete: it
+// was started with join=true and has not yet replayed the entries naming the
+// rest of the shard. See the joining field for exactly what that gates — it is
+// not an authorization bypass.
+//
+// The raft state machine gets its own mirror of the flag: it owns the campaign
+// entry points (startElection, handleTimeoutNow) and the vote guard, and cannot
+// see a field on Peer. The mirror is written only here — before the shard's step
 // worker starts — and in Handle's snapshot-adopt branch, which runs on the step
 // worker, so it needs no synchronization of its own. Peer.joining stays atomic
-// because IsMember reads it from the transport recv goroutine.
+// because MarkJoining runs on the caller's goroutine before the step worker
+// exists, while every later read happens on a worker.
 func (p *Peer) MarkJoining() {
 	p.setJoining(true)
 	// Then immediately test whether this replica is joining AT ALL. join=true is
 	// a startup flag, not durable state: an operator restarting an established
 	// replica keeps it set, and NewPeer has already seeded the membership from
-	// the persisted NodeState. Without this evaluation the bypass would only ever
+	// the persisted NodeState. Without this evaluation the flag would only ever
 	// be reconsidered by a config change or a snapshot, so a restarted replica in
 	// a quiescent shard — nothing joining, nothing leaving, no compaction — would
-	// authorize every replica ID for the entire lifetime of the process.
+	// refuse to campaign for the entire lifetime of the process.
 	p.clearJoiningIfKnown()
 }
 
@@ -1271,56 +1283,50 @@ func (p *Peer) setJoining(joining bool) {
 	p.r.setJoining(joining)
 }
 
-// clearJoiningIfKnown ends the joining window once this replica can authorize the
-// messages it must accept to make progress. Two sufficient signals, either of
-// which clears the bypass:
+// clearJoiningIfKnown ends the joining window once this replica's configuration
+// is complete enough to trust. "Complete enough" means it can support the two
+// decisions the window gates — campaigning, and the candidate test in
+// handleVoteRequest — without either self-electing on a quorum of one or denying
+// votes to the real members. Three sufficient signals, any of which clears it:
 //
-//	(a) the LEADER it is following is a known member. This covers the
-//	    forward/replicate path, where membership is learned incrementally and may
-//	    still be PARTIAL: the current leader may have been ADDED AFTER the initial
-//	    bootstrap, so it is NOT in the founding membership the index-1
-//	    EntryInitialMembership carries. Clearing on "knows any member" would let a
-//	    joiner that received the bootstrap entry in an earlier batch than the
-//	    leader's own AddNode clear the bypass and then REJECT the current leader's
-//	    next append — stranding itself, unable to replay the entries that add the
-//	    leader (and itself). Gating on the leader closes that gap.
+//	(a) the LEADER it is following is a known member. Membership is learned
+//	    incrementally on the replicate path and may still be PARTIAL: the current
+//	    leader may have been ADDED AFTER the initial bootstrap, so it is not in
+//	    the founding membership the index-1 EntryInitialMembership carries.
+//	    Clearing on "knows any member" would let a joiner that received the
+//	    bootstrap entry in an earlier batch than the leader's own AddNode start
+//	    denying that leader's votes. Gating on the leader closes that gap.
 //
-//	(b) this replica is itself a member. It has replayed or received its own
-//	    AddNode, so the committed membership up to its addition is COMPLETE —
-//	    every member that predates it (including whatever leader it will follow)
-//	    is known — and enforcing IsMember is safe. This is what covers the RESTART
-//	    path: replayConfigChangesTo (SetProcessedIndex) runs before the first
-//	    Tick, so leaderID is noLeader and (a) cannot fire; without (b) a replica
-//	    restarted with join=true on a fully-caught-up log would reconstruct its
-//	    full membership yet keep the bypass set until the next snapshot or config
-//	    change — a lingering per-shard auth bypass.
+//	(b) this replica is itself a member ALONGSIDE somebody else. It has replayed
+//	    or received its own AddNode, so the committed membership up to its
+//	    addition is complete. This is what covers the RESTART path:
+//	    replayConfigChangesTo (SetProcessedIndex) runs before the first Tick, so
+//	    leaderID is noLeader and (a) cannot fire; without (b) a replica restarted
+//	    with join=true on a fully-caught-up log would reconstruct its whole
+//	    membership yet refuse to campaign until the next snapshot or config
+//	    change.
 //
-//	(c) this replica carries a Removed TOMBSTONE. A committed RemoveNode for
-//	    self is equally durable evidence that the committed configuration has
-//	    been learned, and it is the one terminal state (b) misses: a join=true
-//	    replica that replays its own removal before any leader is known is
-//	    neither a member nor following a leader, so without (c) the bypass would
-//	    persist for the process — and since clearJoiningIfKnown only runs on
-//	    membership changes, no later heartbeat would ever clear it.
+//	    The hasMemberOtherThan half matters because self-membership alone is not
+//	    knowledge of the shard: a configuration naming only this replica would
+//	    otherwise let it campaign and win with a quorum of one.
 //
-// No signal fires too early: (a) only once the leader is authorizable, (b) only
-// once this replica is officially in the configuration ALONGSIDE somebody else,
-// and (c) only once its removal is committed. In the post-bootstrap-leader case
-// all three are false after the founding entry alone, so the bypass correctly
-// persists until the leader's AddNode arrives.
+//	(c) this replica carries a Removed TOMBSTONE. A committed RemoveNode for self
+//	    is equally durable evidence that the committed configuration has been
+//	    learned, and it is the one terminal state (b) misses: a join=true replica
+//	    that replays its own removal before any leader is known is neither a
+//	    member nor following a leader, so without (c) the flag would persist for
+//	    the process — and since clearJoiningIfKnown only runs on membership
+//	    changes, no later heartbeat would ever clear it.
 //
-// (b) carries the extra hasMemberOtherThan test because self-membership alone is
-// not knowledge of the cluster. A replica whose configuration names only itself
-// — it applied an AddNode for itself without yet holding the entry that names
-// the rest of the shard — would clear the bypass and then reject the very leader
-// it needs to hear from, with no way left to learn more: a permanent wedge, not
-// a transient one. Requiring one other named member makes the configuration
-// actually usable for authorization before the bypass ends.
+// No signal fires too early: (a) only once the leader is in the configuration,
+// (b) only once this replica is in it alongside somebody else, and (c) only once
+// its removal is committed. In the post-bootstrap-leader case all three are
+// false after the founding entry alone, so the window correctly persists until
+// the leader's AddNode arrives.
 //
-// A snapshot also clears joining unconditionally
-// (Handle's adopt branch), for the compacted case. A single-node bootstrap never
-// sets joining, so this is only ever reached by a replica added to an existing
-// cluster.
+// A snapshot also clears joining unconditionally (Handle's adopt branch), for
+// the compacted case. A single-node bootstrap never sets joining, so this is
+// only ever reached by a replica added to an existing cluster.
 func (p *Peer) clearJoiningIfKnown() {
 	if !p.joining.Load() {
 		return
@@ -1351,32 +1357,61 @@ func (p *Peer) ReleaseGlobalRateLimit() {
 	p.r.log.inmem.setGlobalSize(0)
 }
 
-// IsMember returns true if the given replicaID is a known member of
-// this shard in any active role (voter, observer, or witness). This is
-// used by the transport message handler to enforce per-shard message
-// authorization, preventing compromised nodes from injecting messages
-// into shards they are not members of.
+// IsMember reports whether replicaID is in this shard's current configuration
+// in any active role (voter, observer, or witness).
 //
-// Safe for concurrent access from any goroutine. Reads from an atomic
-// pointer to an immutable membership snapshot, avoiding locks on the
-// hot recv path.
+// This is a view of REPLICATED STATE, not an authorization decision. It must
+// never be used to decide whether to accept an inbound message: see IsRemoved
+// for why, and use that instead.
+//
+// Safe for concurrent access from any goroutine. Reads an atomic pointer to an
+// immutable snapshot.
 func (p *Peer) IsMember(replicaID uint64) bool {
-	// A joining node starts with empty membership: it must accept the leader's
-	// first replication before it can learn who the members are, so while
-	// joining it authorizes every replica ID. Under config-in-log this window is
-	// BOUNDED and deterministic — the initial configuration is a committed log
-	// entry (EntryInitialMembership at index 1), which the leader replicates like
-	// any other entry, and clearJoiningIfKnown ends the window the moment this
-	// replica applies it (or any config change) and thus knows a member other
-	// than itself. Transport-level mTLS and the deployment ID gate the window.
-	if p.joining.Load() {
-		return true
-	}
 	snap := p.membershipSnap.Load()
 	if snap == nil {
 		return false
 	}
 	return snap.isMember(replicaID)
+}
+
+// IsRemoved reports whether replicaID carries a committed Removed tombstone in
+// this shard's configuration. It is the per-shard authorization predicate for
+// INBOUND messages, and it is a DENY-list on purpose.
+//
+// A replica's configuration is replicated state that LAGS BY DESIGN: a follower
+// legitimately has not yet applied the config change that added the current
+// leader. Using the member set as an allow-list therefore makes a stale replica
+// drop the very messages that would bring it up to date — it rejects the
+// leader's Replicate, rejects its Heartbeat, and rejects the InstallSnapshot
+// that would repair it, permanently, while the shard silently runs with reduced
+// redundancy. Membership cannot be an authorization oracle because it is not
+// guaranteed fresh.
+//
+// The removed set has the opposite character: it is MONOTONE. Entries are only
+// ever added, by a committed config change, so a stale replica's failure mode is
+// not yet knowing about a removal — which the next committed entry fixes — and
+// never wrongly rejecting a legitimate peer. That is the only membership-derived
+// fact it is safe to enforce on the receive path.
+//
+// This matches both reference implementations. etcd checks exactly this and
+// nothing else before stepping a message (EtcdServer.Process:
+// "cannot process message from removed member"), and its transport comments name
+// the lagging-follower case explicitly. hashicorp/raft, which Consul uses,
+// performs no sender-membership check on appendEntries at all and applies its
+// configuration test only to VOTE requests — which is where our equivalent guard
+// lives (see raft.handleVoteRequest).
+//
+// Authentication proper is the transport's job: mandatory mTLS with a verified
+// node certificate plus the deployment ID. This is defence in depth on top of an
+// already-authenticated peer.
+//
+// Safe for concurrent access from any goroutine.
+func (p *Peer) IsRemoved(replicaID uint64) bool {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return false
+	}
+	return snap.isRemoved(replicaID)
 }
 
 // DiagRaftState returns diagnostic raft state for debugging pipeline stalls.

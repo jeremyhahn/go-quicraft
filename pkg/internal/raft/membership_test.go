@@ -1770,3 +1770,89 @@ func TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied(t *testing.T) {
 			err, p.r.log.confChangeIndex, p.r.log.processed)
 	}
 }
+
+// TestVoteDeniedToCandidateOutsideTheConfiguration pins the guard that
+// compensates for the receive path no longer being an allow-list.
+//
+// Once any authenticated peer can reach raft, refusing the VOTE is what stops a
+// replica that is not part of this shard from winning a term and becoming its
+// leader. The configuration test belongs here and not on the receive path
+// because denying a vote can only ever cost liveness, never safety, whereas
+// dropping replication on a stale configuration wedges the replica permanently.
+//
+// hashicorp/raft places the identical test in requestVote/requestPreVote.
+func TestVoteDeniedToCandidateOutsideTheConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		voteType uint64
+		respType uint64
+	}{
+		{"RequestVote", proto.RequestVote, proto.RequestVoteResp},
+		{"RequestPreVote", proto.RequestPreVote, proto.RequestPreVoteResp},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPeer(t, testConfigWithID(1, 1), proto.State{Term: 5},
+				proto.Membership{Addresses: map[uint64]string{
+					1: "a", 2: "b", 3: "c",
+				}})
+			p.DrainMessages()
+
+			// Replica 42 is in no role in this configuration.
+			if err := p.Handle(proto.Message{
+				Type: tc.voteType, From: 42, To: 1, ShardID: 1, Term: 6,
+				LogIndex: 100, LogTerm: 5,
+			}); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+
+			var replied bool
+			for _, m := range p.DrainMessages() {
+				if m.Type != tc.respType {
+					continue
+				}
+				replied = true
+				if !m.Reject {
+					t.Fatalf("granted a vote to replica 42, which this configuration "+
+						"does not contain in any role: an outsider that collects a "+
+						"quorum becomes the leader of a shard it is not part of "+
+						"(membership=%v)", p.GetMembership().Addresses)
+				}
+			}
+			if !replied {
+				t.Fatal("no vote response at all: the candidate cannot distinguish a " +
+					"denial from a lost message and will retry indefinitely")
+			}
+		})
+	}
+}
+
+// TestVoteGrantedWhenTheConfigurationIsIncomplete is the liveness half. A
+// replica still joining holds a known-incomplete configuration -- it may name
+// only itself, having applied its own AddNode without yet holding the entry
+// naming the rest of the shard. Applying the guard in that state would make it
+// deny every real member and strand a shard whose quorum needs its vote. An
+// incomplete configuration is not evidence of non-membership.
+func TestVoteGrantedWhenTheConfigurationIsIncomplete(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{Term: 5},
+		proto.Membership{Addresses: map[uint64]string{6: "self"}})
+	p.MarkJoining()
+	if !p.joining.Load() {
+		t.Fatal("fixture: the replica must still be joining")
+	}
+	p.DrainMessages()
+
+	if err := p.Handle(proto.Message{
+		Type: proto.RequestVote, From: 2, To: 6, ShardID: 1, Term: 6,
+		LogIndex: 100, LogTerm: 5,
+	}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	for _, m := range p.DrainMessages() {
+		if m.Type == proto.RequestVoteResp && m.Reject {
+			t.Fatal("a joining replica denied a vote to a real member because its " +
+				"own configuration is incomplete: the shard cannot elect a leader " +
+				"if its quorum needs this replica's vote")
+		}
+	}
+}

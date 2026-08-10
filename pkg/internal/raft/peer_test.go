@@ -2972,27 +2972,55 @@ func TestPeer_IsMember_RemovedNotMember(t *testing.T) {
 	}
 }
 
-func TestPeer_IsMember_JoiningNodeAllowsAll(t *testing.T) {
-	cfg := testConfigWithID(1, 1)
-	// Create a peer with empty membership and mark as joining to simulate
-	// a newly-joining node that has not yet received a snapshot.
-	emptyMS := proto.Membership{
-		Addresses: map[uint64]string{},
-		Observers: map[uint64]string{},
-		Witnesses: map[uint64]string{},
-	}
-	p := newTestPeer(t, cfg, proto.State{}, emptyMS)
-	p.MarkJoining()
+// TestPeer_Authorization_IsADenyListNotAnAllowList pins the per-shard
+// authorization predicate.
+//
+// A replica's configuration is replicated state that LAGS BY DESIGN, so it
+// cannot serve as an allow-list: a replica that has not yet applied the config
+// change adding the current leader would reject that leader's Replicate,
+// Heartbeat and InstallSnapshot — including the very messages that would bring
+// it up to date — and wedge itself out of the shard permanently.
+//
+// The removed set is monotone: entries are only ever added by a committed config
+// change, so a stale replica's failure mode is not yet knowing about a removal,
+// which the next committed entry repairs. That is the only membership-derived
+// fact safe to enforce on the receive path. Same model as etcd
+// (EtcdServer.Process rejects only "message from removed member") and
+// hashicorp/raft (no sender-membership test on appendEntries at all).
+func TestPeer_Authorization_IsADenyListNotAnAllowList(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+		Removed:   map[uint64]bool{9: true},
+	})
 
-	// Any replica should be allowed through when joining.
-	if !p.IsMember(1) {
-		t.Fatal("expected IsMember(1) = true for joining node")
+	// A replica this configuration has never heard of is NOT refused. This is
+	// the lagging-follower case: it may be a member added after our last
+	// applied config change, and it may be the current leader.
+	if p.IsRemoved(42) {
+		t.Fatal("a replica absent from our configuration was refused: a replica " +
+			"added while we were behind — possibly the current leader — would be " +
+			"unable to reach us, and so could never bring us up to date")
 	}
-	if !p.IsMember(42) {
-		t.Fatal("expected IsMember(42) = true for joining node")
+
+	// A committed removal IS refused.
+	if !p.IsRemoved(9) {
+		t.Fatal("a replica with a committed Removed tombstone was authorized")
 	}
-	if !p.IsMember(999) {
-		t.Fatal("expected IsMember(999) = true for joining node")
+
+	// Ordinary members are of course fine.
+	for _, id := range []uint64{1, 2, 3} {
+		if p.IsRemoved(id) {
+			t.Fatalf("member %d was refused", id)
+		}
+	}
+
+	// IsMember remains available as a view of replicated state, and must NOT be
+	// conflated with the authorization decision above.
+	if p.IsMember(42) {
+		t.Fatal("IsMember reported an unknown replica as a member")
+	}
+	if !p.IsMember(2) {
+		t.Fatal("IsMember failed to report a real member")
 	}
 }
 

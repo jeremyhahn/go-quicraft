@@ -98,6 +98,13 @@ func (s *membershipSnapshot) isMember(replicaID uint64) bool {
 	return ok
 }
 
+// isRemoved reports whether the replica carries a Removed tombstone. Safe for
+// concurrent reads because the snapshot maps are never modified after
+// construction.
+func (s *membershipSnapshot) isRemoved(replicaID uint64) bool {
+	return s.removed[replicaID]
+}
+
 // toProto converts the snapshot to a proto.Membership value. The maps
 // are deep-copied to prevent external mutation of the immutable snapshot.
 func (s *membershipSnapshot) toProto() proto.Membership {

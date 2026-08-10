@@ -1542,6 +1542,46 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		r.recordUnreadableLogVoteDenial(msg.From)
 	}
 
+	// Never grant a vote to a replica our configuration does not contain. This
+	// is the counterpart to the receive path's deny-list (Peer.IsRemoved): once
+	// inbound replication is no longer allow-listed, refusing the VOTE is what
+	// stops a replica that is not part of this shard from ever winning a term
+	// and becoming its leader. Denying a vote can only cost liveness, never
+	// safety, which is why the configuration test belongs here rather than on
+	// the receive path where staleness would wedge the replica instead.
+	//
+	// Liveness is preserved because it is gated on knowing a configuration at
+	// all: a replica with no configuration yet (a joiner before the bootstrap
+	// entry arrives) skips the test and votes normally. And a legitimately added
+	// candidate cannot be starved by stale voters — its AddNode could only have
+	// committed if a quorum had already applied it, and those replicas hold it
+	// durably, so a quorum that recognises the candidate always exists.
+	//
+	// The test is skipped while this replica is JOINING, because that flag means
+	// its configuration is known-incomplete by construction — it may hold only
+	// itself, having applied its own AddNode without yet holding the entry that
+	// names the rest of the shard. Denying votes from that state would strand an
+	// otherwise healthy shard: the joiner is a voter its quorum needs, and it
+	// would refuse every real member. An incomplete configuration is not
+	// evidence of non-membership. This is the same reasoning that keeps the
+	// receive path off an allow-list, applied to the one place a configuration
+	// test is still safe.
+	//
+	// hashicorp/raft applies exactly this test, in requestVote and
+	// requestPreVote, under the same "only when a configuration is known" guard.
+	if !r.joining && r.membershipKnown() && !r.isKnownMember(msg.From) {
+		slog.Warn("vote denied: candidate is not in the current configuration",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"candidate", msg.From,
+			"term", r.term,
+			"msg_term", msg.Term,
+			"pre_vote", isPreVote,
+		)
+		r.send(proto.Message{Type: respType, To: msg.From, Reject: true})
+		return nil
+	}
+
 	// Check if we can grant the vote.
 	var canVote bool
 	if isPreVote {
@@ -3463,6 +3503,30 @@ func (r *raft) drainFreeOrderMessages() []proto.Message {
 
 // getRemote returns the remote tracker for a peer. Checks remotes first,
 // then observers, then witnesses. Returns nil if not found.
+// membershipKnown reports whether this replica knows a configuration at all.
+//
+// It cannot be answered from the remotes/observers/witnesses maps alone: those
+// deliberately EXCLUDE self, so a single-replica shard has all three empty while
+// its configuration is perfectly well known. Self-membership carries the rest of
+// the answer, which is what selfRemoved tracks.
+//
+// False means this replica holds no configuration whatsoever — a joiner that has
+// not yet received the bootstrap entry. Callers that gate on the configuration
+// must skip their check in that state rather than treat "I know nothing" as "you
+// are not a member".
+func (r *raft) membershipKnown() bool {
+	if !r.selfRemoved {
+		return true
+	}
+	return len(r.remotes)+len(r.observers)+len(r.witnesses) > 0
+}
+
+// isKnownMember reports whether id is this replica or appears in the current
+// configuration in any role.
+func (r *raft) isKnownMember(id uint64) bool {
+	return id == r.replicaID || r.getRemote(id) != nil
+}
+
 func (r *raft) getRemote(id uint64) *remote {
 	if rm, ok := r.remotes[id]; ok {
 		return rm

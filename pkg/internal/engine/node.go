@@ -694,20 +694,34 @@ func (n *Node) StopC() <-chan struct{} {
 	return n.stopC
 }
 
-// IsMember returns true if the given replicaID is a known member of
-// this shard (in remotes, observers, or witnesses). This is used by
-// the transport message handler to enforce per-shard authorization,
-// preventing compromised nodes from injecting messages into shards
-// they do not belong to.
+// IsMember reports whether replicaID is in this shard's current configuration.
+// It is a view of replicated state, NOT an authorization decision — see
+// IsRemoved, which is what the transport uses.
 //
-// When the peer is nil (e.g., during initialization), IsMember returns
-// true to avoid rejecting legitimate messages before the raft state
-// machine is fully initialized.
+// When the peer is nil (e.g. during initialization) it returns true, since
+// nothing is known yet.
 func (n *Node) IsMember(replicaID uint64) bool {
 	if n.peer == nil {
 		return true
 	}
 	return n.peer.IsMember(replicaID)
+}
+
+// IsRemoved reports whether replicaID carries a committed Removed tombstone for
+// this shard. This is the per-shard authorization predicate the transport
+// message handler enforces on inbound messages: a DENY-list, because a
+// replica's member set lags by design and using it as an allow-list makes a
+// stale replica reject the leader that would bring it up to date. See
+// raft.Peer.IsRemoved for the full rationale.
+//
+// When the peer is nil (e.g. during initialization) nothing is known to be
+// removed, so it returns false and the message is allowed through to a raft
+// layer that will apply its own term and log rules.
+func (n *Node) IsRemoved(replicaID uint64) bool {
+	if n.peer == nil {
+		return false
+	}
+	return n.peer.IsRemoved(replicaID)
 }
 
 // DiagPipeline is a point-in-time snapshot of a node's pipeline state.

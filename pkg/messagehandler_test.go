@@ -94,6 +94,24 @@ func TestHostMessageHandler_HandleMessage_EmptyBatch(t *testing.T) {
 // newEngineNodeWithMembership creates an engine.Node with a real raft.Peer
 // whose membership includes the specified voters. This enables per-shard
 // authorization tests where IsMember returns accurate results.
+// newEngineNodeWithFullMembership builds a node from a complete proto.Membership
+// so tests can seed Removed tombstones as well as voters.
+func newEngineNodeWithFullMembership(t *testing.T, shardID, replicaID uint64, ms proto.Membership) *engine.Node {
+	t.Helper()
+	ldb := memdb.New()
+	lr := logdb.NewLogReader(shardID, replicaID, ldb)
+	if err := lr.ApplySnapshot(proto.Snapshot{Membership: ms}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID}
+	cfg.SetDefaults()
+	peer, err := raft.NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("NewPeer failed: %v", err)
+	}
+	return engine.NewNode(peer, nil, lr, cfg, 100, nil, t.TempDir(), nil)
+}
+
 func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters map[uint64]string) *engine.Node {
 	t.Helper()
 	ldb := memdb.New()
@@ -2242,5 +2260,101 @@ func TestHandleSnapshot_LandsUnderNodeSnapshotDir(t *testing.T) {
 	hardcoded := filepath.Join(nodeHostDir, "snapshots")
 	if strings.HasPrefix(gotDir, hardcoded+string(filepath.Separator)) {
 		t.Fatalf("snapshot dir %q landed under the hardcoded NodeHostDir path (CX3 regression)", gotDir)
+	}
+}
+
+// authorizationRig builds an engine + handler with shard 1 loaded under ms.
+func authorizationRig(t *testing.T, ms proto.Membership) (*engine.Engine, *hostMessageHandler, *engine.Node) {
+	t.Helper()
+	cfg := config.HostConfig{
+		WALDir:                t.TempDir(),
+		NodeHostDir:           t.TempDir(),
+		RaftAddress:           "127.0.0.1:5000",
+		ListenAddress:         "127.0.0.1:5000",
+		DeploymentID:          1,
+		AllowZeroDeploymentID: false,
+	}
+	cfg.SetDefaults()
+	eng := engine.NewEngine(cfg, nil, &noopSender{}, nil, nil, nil)
+	eng.Start()
+	t.Cleanup(eng.Stop)
+
+	node := newEngineNodeWithFullMembership(t, 1, 1, ms)
+	eng.LoadNode(node)
+	t.Cleanup(func() { eng.UnloadNode(1) })
+
+	h := &Host{cfg: cfg, registry: registry.NewRegistry()}
+	return eng, &hostMessageHandler{engine: eng, host: h}, node
+}
+
+// TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration is the
+// regression for the wedge the member allow-list caused.
+//
+// A replica's configuration lags by design. Replica 5 is added to the shard and
+// becomes leader while this host is behind, so the local configuration still
+// reads {1,2}. Under an allow-list every Heartbeat, Replicate and
+// InstallSnapshot from leader 5 was dropped -- including the very messages that
+// would have delivered the config change naming 5 -- so the replica was deaf to
+// its own leader for the life of the process while the shard silently ran with
+// reduced redundancy, and nothing re-opened the window.
+//
+// Authorization is now a removed-tombstone deny-list: monotone, so it cannot go
+// stale in the unsafe direction. Same model as etcd (EtcdServer.Process rejects
+// only a "message from removed member") and hashicorp/raft (no sender-membership
+// test on appendEntries at all).
+func TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration(t *testing.T) {
+	_, handler, node := authorizationRig(t, proto.Membership{
+		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+	})
+
+	if node.IsRemoved(5) {
+		t.Fatal("fixture: replica 5 must not carry a removal tombstone")
+	}
+	before := node.DiagState().InboxLen
+
+	batch := proto.MessageBatch{
+		SourceAddress: "127.0.0.1:5005",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 5, To: 1, Type: proto.Heartbeat, Term: 9},
+		},
+	}
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+
+	if node.DiagState().InboxLen == before {
+		t.Fatal("the heartbeat from leader 5 was dropped because our configuration " +
+			"does not name it yet: this replica can never learn the config change " +
+			"that adds 5, so it stays deaf to its own leader permanently")
+	}
+}
+
+// TestHostMessageHandler_RejectsRemovedSender pins the other half: a COMMITTED
+// removal is still enforced. The tombstone is the one membership-derived fact
+// that is safe on the receive path, because it only ever grows.
+func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
+	_, handler, node := authorizationRig(t, proto.Membership{
+		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Removed:   map[uint64]bool{7: true},
+	})
+
+	if !node.IsRemoved(7) {
+		t.Fatal("fixture: replica 7 must carry a removal tombstone")
+	}
+	before := node.DiagState().InboxLen
+
+	batch := proto.MessageBatch{
+		SourceAddress: "127.0.0.1:5007",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 7, To: 1, Type: proto.Heartbeat, Term: 9},
+		},
+	}
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+
+	if node.DiagState().InboxLen != before {
+		t.Fatal("a message from a replica with a committed Removed tombstone was " +
+			"delivered to raft")
 	}
 }
