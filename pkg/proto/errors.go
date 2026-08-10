@@ -88,6 +88,13 @@ var (
 	// exceeds MaxSnapshotChunkDataLen during unmarshal.
 	ErrChunkDataTooLong = errors.New("proto: chunk data exceeds MaxSnapshotChunkDataLen")
 
+	// ErrChunkSizeMismatch is returned when a snapshot chunk's ChunkSize
+	// header does not equal the actual length of its Data payload. The two
+	// are written consistently by the sender, so a mismatch is a malformed
+	// or tampered chunk and is rejected rather than trusted for downstream
+	// allocation or offset math.
+	ErrChunkSizeMismatch = errors.New("proto: chunk size does not match data length")
+
 	// ErrInvalidSnapshotType is the sentinel for InvalidSnapshotTypeError.
 	// Use errors.Is to match.
 	ErrInvalidSnapshotType = errors.New("proto: invalid snapshot state machine type")

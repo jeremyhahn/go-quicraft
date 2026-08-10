@@ -61,8 +61,9 @@ func TestSnapshotChunkValidatesBinVer(t *testing.T) {
 	newChunk := func(binVer uint64) []byte {
 		sc := SnapshotChunk{
 			ShardID: 1, ReplicaID: 2, Index: 3, Term: 4,
-			BinVer: binVer,
-			Data:   []byte("payload"),
+			BinVer:    binVer,
+			ChunkSize: uint64(len("payload")),
+			Data:      []byte("payload"),
 		}
 		buf := make([]byte, sc.Size())
 		if _, err := sc.MarshalTo(buf); err != nil {

@@ -211,6 +211,12 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	sc.Data = data
 	offset += n
+	// ChunkSize is redundant with the length prefix on Data. Validate the
+	// two agree so a caller cannot trust an unverified header field for
+	// allocation or offset math against a shorter (or longer) payload.
+	if sc.ChunkSize != uint64(len(sc.Data)) {
+		return 0, ErrChunkSizeMismatch
+	}
 	return offset, nil
 }
 

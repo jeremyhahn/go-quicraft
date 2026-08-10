@@ -14,7 +14,10 @@
 
 package batch
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // lengthPrefixSize is the number of bytes used for each command's length
 // prefix in the batch wire format (4 bytes, big-endian uint32).
@@ -66,7 +69,14 @@ func DecodeBatch(data []byte) ([][]byte, error) {
 		if off+lengthPrefixSize > len(data) {
 			return nil, &DecodeError{Reason: "truncated length prefix"}
 		}
-		cmdLen := int(binary.BigEndian.Uint32(data[off : off+lengthPrefixSize]))
+		rawLen := binary.BigEndian.Uint32(data[off : off+lengthPrefixSize])
+		// On 32-bit builds int is 32-bit, so a length prefix above MaxInt32
+		// converts to a negative int, slips past the off+cmdLen bound check,
+		// and panics the slice expression. Reject it while still a uint32.
+		if rawLen > math.MaxInt32 {
+			return nil, &DecodeError{Reason: "command length exceeds MaxInt32"}
+		}
+		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
 		if off+cmdLen > len(data) {
@@ -89,7 +99,13 @@ func countCommands(data []byte) (int, error) {
 		if off+lengthPrefixSize > len(data) {
 			return 0, &DecodeError{Reason: "truncated length prefix"}
 		}
-		cmdLen := int(binary.BigEndian.Uint32(data[off : off+lengthPrefixSize]))
+		rawLen := binary.BigEndian.Uint32(data[off : off+lengthPrefixSize])
+		// See DecodeBatch: guard the int conversion against a negative wrap
+		// on 32-bit builds before it reaches the bounds check.
+		if rawLen > math.MaxInt32 {
+			return 0, &DecodeError{Reason: "command length exceeds MaxInt32"}
+		}
+		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
 		if off+cmdLen > len(data) {
