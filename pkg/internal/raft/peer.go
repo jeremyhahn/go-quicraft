@@ -1084,7 +1084,16 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	if !p.r.log.hasEntriesToApply() {
 		return proto.Update{}, nil
 	}
-	committedEntries, pooled, err := p.r.log.entriesToApply()
+	// Durability clamp. commitTo advances committed as far as lastIndex(),
+	// which counts entries still in memory and not yet fsynced. Applying that
+	// tail here, and returning a HardState.Commit that covers it, would let
+	// executePiggyback fsync a Commit past the last durable log entry: after a
+	// crash HardState.Commit would exceed the recovered log — the invariant
+	// this fix protects. Extract and advertise only up to the durable marker;
+	// the remainder re-emits on a later cycle once it is persisted, because
+	// prevState is set to the clamped hard state below rather than the raw one.
+	saved := p.r.log.savedIndex()
+	committedEntries, pooled, err := p.r.log.entriesToApplyUpTo(saved)
 	if err != nil {
 		return proto.Update{}, err
 	}
@@ -1092,6 +1101,9 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 		return proto.Update{}, nil
 	}
 	hs := p.r.hardState()
+	if hs.Commit > saved {
+		hs.Commit = saved
+	}
 	update := proto.Update{
 		ShardID:          p.shardID,
 		ReplicaID:        p.replicaID,

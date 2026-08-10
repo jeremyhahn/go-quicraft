@@ -118,6 +118,17 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 	for i := range entries {
 		switch entries[i].Type & proto.EntryTypeMask {
 		case proto.EntryInitialMembership:
+			// The founding configuration is defined to live at exactly
+			// BootstrapMembershipIndex. Adopting one anywhere else would
+			// REPLACE the whole membership and roll the voting set back to the
+			// founding members — a configuration no live replica shares. The
+			// runtime commit path refuses it (peer.applyMembershipEntry); make
+			// recovery reach the identical decision so the two cannot diverge.
+			// Today's sole caller pre-checks, but the guard must not depend on
+			// a caller-side invariant asserted in another file.
+			if entries[i].Index != BootstrapMembershipIndex {
+				continue
+			}
 			ms, err := initialMembershipFromEntry(entries[i])
 			if err != nil {
 				return proto.Membership{}, err
