@@ -245,6 +245,83 @@ func TestNodeNotFoundErrorIs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// AddressInUse
+// ---------------------------------------------------------------------------
+
+// TestAddressInUseEmptyRegistry verifies an empty registry reports no address
+// in use, including the empty string.
+func TestAddressInUseEmptyRegistry(t *testing.T) {
+	r := NewRegistry()
+	if r.AddressInUse("10.0.0.1:5000") {
+		t.Fatal("empty registry reported an address in use")
+	}
+	if r.AddressInUse("") {
+		t.Fatal("empty registry reported the empty address in use")
+	}
+}
+
+// TestAddressInUsePresentAndAbsent verifies the predicate matches on the
+// address value regardless of which (shard, replica) holds it, and that an
+// unregistered address (and the empty string) is reported absent.
+func TestAddressInUsePresentAndAbsent(t *testing.T) {
+	r := NewRegistry()
+	r.Register(1, 1, "10.0.0.1:5000")
+	r.Register(2, 7, "10.0.0.2:5000")
+
+	if !r.AddressInUse("10.0.0.1:5000") {
+		t.Fatal("registered address reported not in use")
+	}
+	if !r.AddressInUse("10.0.0.2:5000") {
+		t.Fatal("registered address on a different shard reported not in use")
+	}
+	if r.AddressInUse("10.0.0.3:5000") {
+		t.Fatal("unregistered address reported in use")
+	}
+	if r.AddressInUse("") {
+		t.Fatal("empty address reported in use")
+	}
+}
+
+// TestAddressInUseAfterRemove verifies an address shared by several members
+// stays in use until the LAST member mapping to it is removed. This is the
+// property a caller relies on before tearing down the address-keyed connection
+// that all of those members multiplex over.
+func TestAddressInUseAfterRemove(t *testing.T) {
+	r := NewRegistry()
+	const addr = "10.0.0.9:5000"
+	r.Register(1, 3, addr)
+	r.Register(2, 3, addr)
+
+	r.Remove(1, 3)
+	if !r.AddressInUse(addr) {
+		t.Fatal("address reported free while another shard still maps to it")
+	}
+
+	r.Remove(2, 3)
+	if r.AddressInUse(addr) {
+		t.Fatal("address reported in use after its last member was removed")
+	}
+	if r.Count() != 0 {
+		t.Fatalf("expected count 0 after removals, got %d", r.Count())
+	}
+}
+
+// TestAddressInUseAfterCompareAndRemove verifies the predicate observes the
+// rollback path (speculative pre-register removed by CompareAndRemove).
+func TestAddressInUseAfterCompareAndRemove(t *testing.T) {
+	r := NewRegistry()
+	const addr = "10.0.0.4:5000"
+	r.Register(3, 4, addr)
+
+	if !r.CompareAndRemove(3, 4, addr) {
+		t.Fatal("CompareAndRemove failed on a matching entry")
+	}
+	if r.AddressInUse(addr) {
+		t.Fatal("address reported in use after CompareAndRemove")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------
 

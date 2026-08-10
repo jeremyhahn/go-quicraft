@@ -126,6 +126,37 @@ func (r *Registry) CompareAndRegister(shardID, replicaID uint64, want, next stri
 	return r.addresses.CompareAndSwap(key, want, next)
 }
 
+// AddressInUse reports whether ANY registered (shardID, replicaID) pair still
+// maps to address. It exists because one transport connection is keyed by
+// ADDRESS and multiplexed across every shard that talks to that host: before a
+// caller may tear the connection down on behalf of one shard's committed
+// membership removal, it has to establish that no other shard still resolves a
+// replica to the same address. Tearing down while another shard is using the
+// peer would kill healthy traffic.
+//
+// The registry keeps no reverse (address -> members) index, so this is an O(n)
+// scan over registered members via sync.Map.Range, exiting at the first match.
+// It is intended for INFREQUENT, event-driven use — a committed membership
+// removal — and must never be placed on a message or resolve hot path.
+//
+// The scan is not a snapshot: sync.Map.Range makes no atomicity guarantee
+// across entries, so a concurrent Register may or may not be observed. The
+// caller must therefore treat a false result as "no member was registered at
+// this address during the scan", which is exactly the ordering a committed
+// removal already has (the removal is applied, hence out of the registry,
+// before the check runs).
+func (r *Registry) AddressInUse(address string) bool {
+	inUse := false
+	r.addresses.Range(func(_, val any) bool {
+		if val.(string) != address {
+			return true
+		}
+		inUse = true
+		return false
+	})
+	return inUse
+}
+
 // Count returns the number of registered nodes.
 func (r *Registry) Count() int {
 	return int(r.count.Load())
