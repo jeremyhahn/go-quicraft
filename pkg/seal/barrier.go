@@ -742,7 +742,7 @@ func (b *Barrier) Encrypt(dst, plaintext []byte) ([]byte, error) {
 		return b.hwEncryptor.Encrypt(plaintext)
 	}
 
-	return b.encryptLocked(dst, plaintext, b.epoch, b.cipher)
+	return b.encryptLocked(dst, plaintext, b.epoch, b.cipher, nil)
 }
 
 // EncryptWithEpoch encrypts plaintext and returns both the ciphertext and the
@@ -773,7 +773,7 @@ func (b *Barrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error
 		return ct, b.epoch, nil
 	}
 
-	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher)
+	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -817,7 +817,120 @@ func (b *Barrier) EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64,
 		return ct, b.epoch, nil
 	}
 
-	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher)
+	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.pinInFlightLocked(b.epoch)
+	return ct, b.epoch, nil
+}
+
+// EncryptWithContext behaves like Encrypt but ADDITIONALLY folds a caller-supplied
+// context into the AEAD AAD alongside the epoch. When the context uniquely
+// identifies the frame's position or artifact (e.g. a WAL segment's
+// SegmentID||RecordSeq or a snapshot's SnapshotIndex||ChunkSeq), it prevents an
+// at-rest attacker from reordering, splicing, or truncating same-epoch frames:
+// authentication fails unless the exact same context is supplied at decrypt time.
+//
+// The context is NOT stored in the ciphertext; the caller must reproduce the same
+// bytes when decrypting. Passing a nil/empty context is equivalent to Encrypt and
+// yields byte-identical, epoch-only-AAD output.
+//
+// Positional binding is opt-in: it exists ONLY when the caller passes a context.
+// The wire format is unchanged; see Encrypt for dst/overlap requirements.
+//
+// Hardware mode does not support context-AAD (the hardware encryptor takes no
+// AAD): a non-empty context returns ErrHardwareMode rather than silently dropping
+// the binding, so a caller never believes it has positional protection it lacks.
+// A nil/empty context is delegated to the hardware encryptor unchanged.
+func (b *Barrier) EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error) {
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		if len(contextAAD) != 0 {
+			return nil, ErrHardwareMode
+		}
+		return b.hwEncryptor.Encrypt(plaintext)
+	}
+
+	return b.encryptLocked(dst, plaintext, b.epoch, b.cipher, contextAAD)
+}
+
+// EncryptWithEpochContext is EncryptWithEpoch with an additional caller context
+// folded into the AAD; see EncryptWithContext for the context semantics and the
+// hardware-mode behavior. It returns the epoch the frame was sealed under, as
+// EncryptWithEpoch does, for callers (e.g. WAL) that record the epoch alongside
+// the frame.
+func (b *Barrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		if len(contextAAD) != 0 {
+			return nil, 0, ErrHardwareMode
+		}
+		ct, err := b.hwEncryptor.Encrypt(plaintext)
+		if err != nil {
+			return nil, 0, err
+		}
+		return ct, b.epoch, nil
+	}
+
+	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ct, b.epoch, nil
+}
+
+// EncryptWithEpochPinnedContext is EncryptWithEpochPinned with an additional
+// caller context folded into the AAD; see EncryptWithContext for the context
+// semantics and hardware-mode behavior, and EncryptWithEpochPinned for the pin
+// contract (the caller MUST DeregisterInFlightEpoch the returned epoch once the
+// artifact's epoch is durably recorded). The seal and the pin remain a single
+// atomic step with respect to any purge.
+func (b *Barrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, 0, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		if len(contextAAD) != 0 {
+			return nil, 0, ErrHardwareMode
+		}
+		ct, err := b.hwEncryptor.Encrypt(plaintext)
+		if err != nil {
+			return nil, 0, err
+		}
+		b.pinInFlightLocked(b.epoch)
+		return ct, b.epoch, nil
+	}
+
+	ct, err := b.encryptLocked(dst, plaintext, b.epoch, b.cipher, contextAAD)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -852,11 +965,39 @@ func epochAAD(epoch uint64) []byte {
 	return aad[:]
 }
 
+// aadForEpoch composes the AEAD Additional Authenticated Data from the epoch and
+// an OPTIONAL caller-supplied context. The context lets a caller additionally
+// bind a ciphertext frame to its position or artifact (e.g. a snapshot's
+// SnapshotIndex||ChunkSeq or a WAL segment's SegmentID||RecordSeq), so two frames
+// sealed under the same DEK+epoch no longer authenticate identically and cannot
+// be reordered, spliced, or truncated by an at-rest attacker.
+//
+// The epoch always occupies the fixed 8-byte little-endian prefix and the context
+// is appended after it, so the epoch/context boundary is unambiguous: because the
+// epoch is a fixed width, no context value can shift or alias the epoch bytes.
+//
+// A nil or empty context returns EXACTLY epochAAD(epoch) — the same bytes the
+// epoch-only path uses — so context-free ciphertext produced by Encrypt/Decrypt
+// stays byte-compatible and existing callers and stored ciphertext are unaffected.
+func aadForEpoch(epoch uint64, contextAAD []byte) []byte {
+	if len(contextAAD) == 0 {
+		return epochAAD(epoch)
+	}
+	aad := make([]byte, epochSize+len(contextAAD))
+	binary.LittleEndian.PutUint64(aad[:epochSize], epoch)
+	copy(aad[epochSize:], contextAAD)
+	return aad
+}
+
 // encryptLocked performs AEAD encryption with the algorithm-agile wire format.
 // Caller must hold at least b.mu.RLock().
 //
+// contextAAD is OPTIONAL caller context folded into the AEAD AAD alongside the
+// epoch (see aadForEpoch). A nil/empty contextAAD yields epoch-only AAD, keeping
+// the wire format and stored bytes identical to the epoch-only path.
+//
 // Wire format: [epoch:8][algID:1][nonce:N][ciphertext+tag]
-func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher.AEAD) ([]byte, error) {
+func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher.AEAD, contextAAD []byte) ([]byte, error) {
 	nonceSize := aead.NonceSize()
 	overhead := aead.Overhead()
 	totalSize := epochSize + algIDSize + nonceSize + len(plaintext) + overhead
@@ -897,8 +1038,9 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 		}
 	}
 
-	// Construct AAD binding the ciphertext to its epoch.
-	aad := epochAAD(epoch)
+	// Construct AAD binding the ciphertext to its epoch and, when supplied, to
+	// the caller's positional/artifact context.
+	aad := aadForEpoch(epoch, contextAAD)
 
 	// Encrypt in place after epoch+algID+nonce prefix.
 	// G407 false positive: nonce is randomly generated above via io.ReadFull(b.randReader, nonce).
@@ -951,7 +1093,7 @@ func (b *Barrier) Decrypt(dst, ciphertext []byte) ([]byte, error) {
 		return nil, ErrDecryptionFailed
 	}
 
-	return b.decryptLocked(dst, ciphertext, aead, algID)
+	return b.decryptLocked(dst, ciphertext, aead, algID, nil)
 }
 
 // DecryptForEpoch decrypts ciphertext using a specific epoch's DEK. This is
@@ -991,15 +1133,101 @@ func (b *Barrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte,
 		return nil, ErrDecryptionFailed
 	}
 
-	return b.decryptLocked(dst, ciphertext, aead, algID)
+	return b.decryptLocked(dst, ciphertext, aead, algID, nil)
+}
+
+// DecryptWithContext behaves like Decrypt but ADDITIONALLY requires the same
+// caller context that was folded into the AAD at encryption time (see
+// EncryptWithContext). Supplying a different context — or omitting one that was
+// present at encryption — fails authentication with the generic
+// ErrDecryptionFailed, exactly like any other tamper. Passing a nil/empty context
+// reproduces the epoch-only AAD, so ciphertext produced by Encrypt decrypts
+// unchanged.
+//
+// Hardware mode does not support context-AAD: a non-empty context returns
+// ErrHardwareMode; a nil/empty context is delegated to the hardware encryptor.
+func (b *Barrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		if len(contextAAD) != 0 {
+			return nil, ErrHardwareMode
+		}
+		return b.hwEncryptor.Decrypt(ciphertext)
+	}
+
+	// Minimum: epoch(8) + algID(1) + smallest nonce(12) + tag(16) = 37
+	if len(ciphertext) < minCiphertextHeader+12+16 {
+		return nil, ErrDecryptionFailed
+	}
+
+	epoch := binary.BigEndian.Uint64(ciphertext[:epochSize])
+	algID := SymmetricAlgorithm(ciphertext[epochSize])
+
+	aead, ok := b.ciphers[epoch]
+	if !ok {
+		return nil, ErrDecryptionFailed
+	}
+
+	return b.decryptLocked(dst, ciphertext, aead, algID, contextAAD)
+}
+
+// DecryptForEpochContext is DecryptForEpoch with the same caller context that was
+// folded into the AAD at encryption time; see DecryptWithContext for the context
+// semantics and hardware-mode behavior. It decrypts under the explicitly named
+// epoch's DEK, as DecryptForEpoch does, for callers (e.g. WAL) that carry the
+// epoch in an out-of-band header.
+func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, contextAAD []byte) ([]byte, error) {
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if !b.unsealed.Load() {
+		return nil, ErrBarrierSealed
+	}
+
+	if b.hwEncryptor != nil {
+		if len(contextAAD) != 0 {
+			return nil, ErrHardwareMode
+		}
+		return b.hwEncryptor.Decrypt(ciphertext)
+	}
+
+	// Minimum: epoch(8) + algID(1) + smallest nonce(12) + tag(16) = 37
+	if len(ciphertext) < minCiphertextHeader+12+16 {
+		return nil, ErrDecryptionFailed
+	}
+
+	algID := SymmetricAlgorithm(ciphertext[epochSize])
+
+	aead, ok := b.ciphers[epoch]
+	if !ok {
+		return nil, ErrDecryptionFailed
+	}
+
+	return b.decryptLocked(dst, ciphertext, aead, algID, contextAAD)
 }
 
 // decryptLocked performs AEAD decryption with the algorithm-agile wire format.
 // Caller must hold at least b.mu.RLock().
 //
-// The AAD is derived from the epoch encoded in the ciphertext header, which must
-// match the epoch used during encryption for authentication to succeed.
-func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg SymmetricAlgorithm) ([]byte, error) {
+// The AAD is derived from the epoch encoded in the ciphertext header and, when
+// supplied, the caller's contextAAD, both of which must match the values used at
+// encryption for authentication to succeed. A nil/empty contextAAD reproduces the
+// epoch-only AAD, so epoch-only ciphertext decrypts unchanged.
+func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg SymmetricAlgorithm, contextAAD []byte) ([]byte, error) {
 	nonceSize := alg.NonceSize()
 	// alg comes from the UNAUTHENTICATED algID header byte and never selects the
 	// cipher (the active AEAD is fixed by the authenticated epoch DEK). A tampered
@@ -1028,8 +1256,9 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 	nonce := ciphertext[nonceStart : nonceStart+nonceSize]
 	encrypted := ciphertext[nonceStart+nonceSize:]
 
-	// Construct AAD binding the ciphertext to its epoch.
-	aad := epochAAD(headerEpoch)
+	// Construct AAD binding the ciphertext to its epoch and, when supplied, the
+	// caller's positional/artifact context.
+	aad := aadForEpoch(headerEpoch, contextAAD)
 
 	plaintext, err := aead.Open(dst[:0], nonce, encrypted, aad)
 	if err != nil {
@@ -1496,8 +1725,14 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		b.hkdfVersion = sealed.HKDFVersion
 	}
 
-	// Restore known epochs from persisted data so Unseal can re-derive
-	// DEKs for all historical epochs.
+	// Restore known epochs from persisted data so Unseal can re-derive DEKs for
+	// all historical epochs. Allocate a FRESH set rather than merging into the
+	// existing one: the loaded blob is authoritative. Merging would let a second
+	// SetSealedRootKey after a PurgeEpochsBefore had reduced and persisted the set
+	// resurrect the purged epochs (which a later Rotate would then re-persist,
+	// making the resurrection durable). A fresh map makes the blob's KnownEpochs
+	// exactly the set Unseal re-derives.
+	b.knownEpochs = make(map[uint64]struct{}, len(sealed.KnownEpochs))
 	for _, ep := range sealed.KnownEpochs {
 		b.knownEpochs[ep] = struct{}{}
 	}
