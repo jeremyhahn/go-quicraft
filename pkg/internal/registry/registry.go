@@ -92,6 +92,40 @@ func (r *Registry) Remove(shardID, replicaID uint64) {
 	}
 }
 
+// CompareAndRemove deletes the entry for (shardID, replicaID) only if its
+// current address equals want. It returns true if the entry was removed.
+//
+// This is the atomic form of Resolve-then-Remove: a speculative pre-register
+// (used while a config-change proposal is in flight) can be rolled back on a
+// deadline sweep without racing the apply path that commits the same replica
+// at a possibly DIFFERENT address. Without the compare, a rollback could delete
+// the mapping the apply path just wrote, silently black-holing traffic to a
+// committed member. CompareAndDelete removes only when the mapping still holds
+// the speculative value, so a mapping already overwritten by the apply path is
+// left intact.
+func (r *Registry) CompareAndRemove(shardID, replicaID uint64, want string) bool {
+	key := NodeInfo{ShardID: shardID, ReplicaID: replicaID}
+	if r.addresses.CompareAndDelete(key, want) {
+		r.count.Add(-1)
+		return true
+	}
+	return false
+}
+
+// CompareAndRegister overwrites the entry for (shardID, replicaID) with next
+// only if its current address equals want. It returns true if the swap
+// happened. The count is unchanged: the entry exists both before and after.
+//
+// This is the atomic restore counterpart to CompareAndRemove: a speculative
+// pre-register that overwrote a PRIOR mapping rolls back by restoring the prior
+// value, but only while the mapping still holds the speculative value — a later
+// config change (or the apply of this one after it committed) that has already
+// claimed the entry with a different address must win over the late rollback.
+func (r *Registry) CompareAndRegister(shardID, replicaID uint64, want, next string) bool {
+	key := NodeInfo{ShardID: shardID, ReplicaID: replicaID}
+	return r.addresses.CompareAndSwap(key, want, next)
+}
+
 // Count returns the number of registered nodes.
 func (r *Registry) Count() int {
 	return int(r.count.Load())

@@ -1848,6 +1848,25 @@ func (c *hostEngineCallback) reconcileMembershipFromPeer(shardID uint64, ns *nod
 		c.h.registry.Register(shardID, replicaID, addr)
 	}
 	ns.nodesMu.Unlock()
+
+	// Seed the config-change guard from the reconciled membership. A snapshot
+	// compacts the config-change entries that produced this membership out of
+	// the log, so the incremental OnApplied path never re-fires for them and
+	// ns.configChangeIndex would otherwise stay behind (0 on a fresh
+	// nodeState). pm.ConfigChangeID is the log index of the last applied config
+	// change — the exact value SyncGetShardMembership reports — so storing it
+	// keeps RequestAddNode/RemoveNode's staleness guard round-tripping after a
+	// snapshot install. Never regress it: a concurrent higher incremental apply
+	// must win.
+	for {
+		cur := ns.configChangeIndex.Load()
+		if pm.ConfigChangeID <= cur {
+			break
+		}
+		if ns.configChangeIndex.CompareAndSwap(cur, pm.ConfigChangeID) {
+			break
+		}
+	}
 }
 
 // OnCampaignLaunched is called by the step worker when the raft state
@@ -3219,6 +3238,20 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		ns.lastApplied.Store(recoveredIndex)
 	}
 
+	// Seed the config-change staleness guard from the membership the peer came
+	// up with. ns.configChangeIndex is otherwise advanced ONLY by the
+	// incremental OnApplied path when a fresh EntryConfigChange applies; a
+	// restart (or a snapshot-adopted / log-reconstructed membership) reflects
+	// already-applied config changes WITHOUT re-firing OnApplied, so a fresh
+	// nodeState would start at 0. A restarted LEADER would then reject every
+	// RequestAddNode(..., N) with StaleConfigChangeError{Expected: 0, Got: N}
+	// permanently. peer.GetMembership().ConfigChangeID is the log index of the
+	// last applied config change — the exact value SyncGetShardMembership
+	// reports and callers pass back — so seeding it makes the guard round-trip.
+	if pm := peer.GetMembership(); pm.ConfigChangeID > 0 {
+		ns.configChangeIndex.Store(pm.ConfigChangeID)
+	}
+
 	// Atomically store the nodeState, detecting concurrent StartShard
 	// calls for the same shardID.
 	if _, loaded := h.nodes.LoadOrStore(cfg.ShardID, ns); loaded {
@@ -3402,9 +3435,25 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
 	// from these maps, so only truly orphaned items receive the error.
 	h.failPendingRequests(ns, pendingErr)
 
-	// Remove nodeState last, after the engine is fully unloaded and all
-	// pending items have been resolved. No more callbacks will reference
-	// this shardID.
+	// Clean up the registry and the join window BEFORE removing the nodeState
+	// from h.nodes. While ns is still present, a concurrent StartShard of the
+	// same shardID is turned away with ErrShardAlreadyExists, so it cannot
+	// re-register member addresses that this teardown would then wipe. Doing
+	// the removal AFTER h.nodes.Delete opened exactly that window: the restart
+	// pre-registers the members, and the still-running teardown's registry
+	// removal black-holes the leader's Replicate traffic to them.
+	ns.nodesMu.RLock()
+	for replicaID := range ns.nodes {
+		h.registry.Remove(shardID, replicaID)
+	}
+	ns.nodesMu.RUnlock()
+	// The join bootstrap window belongs to the loaded shard; a stopped shard
+	// must not leave a relaxed snapshot authorization behind.
+	h.clearShardJoining(shardID)
+
+	// Remove nodeState last, after the engine is fully unloaded, all pending
+	// items have been resolved, and the registry/join state is cleaned up. No
+	// more callbacks will reference this shardID.
 	h.nodes.Delete(shardID)
 	h.activeNodes.Add(-1)
 
@@ -3423,16 +3472,6 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
 		// reach it and existing readers gate on ns.stopped. Writing the
 		// field here would be a data race (mirrors Host.Close).
 	}
-
-	// Remove all registered members for this shard from the registry.
-	ns.nodesMu.RLock()
-	for replicaID := range ns.nodes {
-		h.registry.Remove(shardID, replicaID)
-	}
-	ns.nodesMu.RUnlock()
-	// The join bootstrap window belongs to the loaded shard; a stopped shard
-	// must not leave a relaxed snapshot authorization behind.
-	h.clearShardJoining(shardID)
 
 	// Unregister pre-bound metrics for this shard.
 	if h.metrics != nil {
@@ -7255,22 +7294,24 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// traffic to a node that was never actually added. The rollback restores
 	// the prior mapping when there was one rather than deleting it.
 	//
-	// The rollback is skipped when the current mapping is no longer the
-	// address this call speculatively wrote: a later config change (or an
-	// apply-path registration) has since claimed the entry and must win over
-	// a late rollback from this superseded attempt.
+	// The rollback acts ONLY if the mapping still holds the address this call
+	// speculatively wrote: a later config change — or the apply-path
+	// registration of THIS change after it committed — must win over a late
+	// rollback from this superseded attempt. The compare and the mutation are a
+	// single atomic step (CompareAndRegister / CompareAndRemove): the previous
+	// Resolve-then-Remove had a check-to-act gap in which a concurrent apply
+	// could register the committed member between the Resolve and the Remove,
+	// and the unconditional Remove would then delete that committed member's
+	// mapping, silently black-holing the leader's Replicate traffic to it.
 	rollbackPreRegister := func() {
 		if !preRegistered {
 			return
 		}
-		if cur, resolveErr := h.registry.Resolve(shardID, cc.ReplicaID); resolveErr != nil || cur != cc.Address {
-			return
-		}
 		if hadPrior {
-			h.registry.Register(shardID, cc.ReplicaID, priorAddr)
+			h.registry.CompareAndRegister(shardID, cc.ReplicaID, cc.Address, priorAddr)
 			return
 		}
-		h.registry.Remove(shardID, cc.ReplicaID)
+		h.registry.CompareAndRemove(shardID, cc.ReplicaID, cc.Address)
 	}
 
 	buf := make([]byte, cc.Size())

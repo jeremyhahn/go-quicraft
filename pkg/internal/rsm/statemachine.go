@@ -80,10 +80,13 @@ func (t SMType) TypeCode() uint64 {
 	return uint64(t)
 }
 
-// defaultMaxExpirePerBatch is the maximum number of sessions to expire
-// per Apply call. This amortizes the cost of session expiry over multiple
-// batches, preventing a single Apply from doing excessive cleanup work.
-const defaultMaxExpirePerBatch = 64
+// defaultMaxExpirePerCheckpoint is the maximum number of sessions to expire
+// at each deterministic expiry checkpoint (see Apply). Capping the count
+// amortizes the O(sessions) expiry scan. The cap is keyed to a fixed index
+// RANGE (one checkpoint per inactivity window), not to the number of Apply
+// calls, so the same committed-entry sequence expires the same sessions at the
+// same log indices regardless of how a replica batches applies.
+const defaultMaxExpirePerCheckpoint = 64
 
 // StateMachine wraps a user-implemented state machine with session
 // deduplication, entry conversion, and snapshot coordination. The
@@ -218,7 +221,22 @@ func (s *StateMachine) IsOnDisk() bool {
 //
 // The results slice must be pre-allocated with len(results) == len(entries).
 //
-//nolint:gocyclo // the classification loop is not a per-entry function: it reads and mutates six pieces of BATCH-scoped state (admittedThisBatch, batchSeen, mirrors, sessionLifecycleAt and the three reused smEntries/smResults/indexMap buffers), and four of those are keyed by the entry's POSITION in the batch, which the second loop then resolves against. Extracting the body would have to thread all of it through the helper or hoist it into a struct — relocating the state rather than reducing it
+// DETERMINISM CONTRACT (session expiry). The state produced by Apply — the
+// user SM state AND the session table — must be a pure function of the
+// committed entry SEQUENCE, never of how a replica happens to group entries
+// into Apply calls (apply batching is replica-local: it varies with message
+// timing, restart replay, and the recovery skip-prefix filter). Session expiry
+// is the subtle case: evaluating it at the batch's last index would let two
+// replicas that batch differently expire a session at different points and
+// diverge permanently while every Raft invariant still holds. Apply therefore
+// evaluates expiry only at fixed log-index checkpoints — multiples of the
+// inactivity threshold sessionExpiryEntries, so expiry is checked once per
+// inactivity window — splitting the incoming entries at those checkpoints so
+// each expiry runs against the session state as of exactly the entries at or
+// below the checkpoint index. The threshold is replicated config, identical on
+// every replica, so the checkpoint set and the resulting expiry sequence are
+// identical everywhere regardless of batching. When expiry is disabled (the
+// default) the whole batch is applied in one shot with no segmentation overhead.
 func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// Defence in depth: the engine's synchronous UnloadNode guarantees no
 	// Apply is in flight when Close runs, but a misordered caller must get a
@@ -230,7 +248,79 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	if s.closed {
 		return ErrClosed
 	}
+	if len(entries) == 0 {
+		return nil
+	}
 
+	lastIndex := entries[len(entries)-1].Index
+
+	// Fast path: expiry disabled — apply the whole batch in one shot. This is
+	// the default and keeps the hot path free of any segmentation overhead.
+	if s.sessionExpiryEntries == 0 {
+		if err := s.applyBatch(entries, results); err != nil {
+			return err
+		}
+		s.advanceLastApplied(lastIndex)
+		return nil
+	}
+
+	// Expiry enabled: walk the fixed checkpoints (multiples of the inactivity
+	// threshold) that fall in (prevIndex, lastIndex]. prevIndex is the last index applied
+	// before this call, so the checkpoint set continues seamlessly across Apply
+	// calls and across restart (lastApplied is restored from the snapshot). For
+	// each checkpoint we first flush every not-yet-applied entry at or below
+	// the checkpoint index, then run expiry — so expiry always observes a
+	// consistent, fully-applied session state as of that exact index.
+	interval := s.sessionExpiryEntries
+	prevIndex := s.lastApplied.Load()
+	firstK := prevIndex/interval + 1
+	lastK := lastIndex / interval
+	segStart := 0
+	i := 0
+	for k := firstK; k <= lastK; k++ {
+		boundary := k * interval
+		for i < len(entries) && entries[i].Index <= boundary {
+			i++
+		}
+		if i > segStart {
+			if err := s.applyBatch(entries[segStart:i], results[segStart:i]); err != nil {
+				return err
+			}
+			segStart = i
+		}
+		s.sessions.ExpireSessions(boundary, s.sessionExpiryEntries, defaultMaxExpirePerCheckpoint)
+	}
+	// Flush the trailing segment above the last checkpoint (indices in
+	// (lastK*interval, lastIndex]); its checkpoint is reached in a future Apply.
+	if segStart < len(entries) {
+		if err := s.applyBatch(entries[segStart:], results[segStart:]); err != nil {
+			return err
+		}
+	}
+	s.advanceLastApplied(lastIndex)
+	return nil
+}
+
+// advanceLastApplied stores idx as the new last-applied index when it advances
+// the counter. The atomic store guards against a concurrent LastApplied() read
+// from the snapshot pool worker goroutine.
+func (s *StateMachine) advanceLastApplied(idx uint64) {
+	if idx > s.lastApplied.Load() {
+		s.lastApplied.Store(idx)
+	}
+}
+
+// applyBatch processes one contiguous run of committed entries through the
+// session lifecycle and the user state machine. It is the body of Apply,
+// invoked once per expiry-checkpoint segment (and exactly once on the
+// expiry-disabled fast path). It does NOT evaluate session expiry and does NOT
+// advance lastApplied — Apply owns both so their evaluation stays a pure
+// function of the committed log rather than of segment boundaries. The caller
+// holds the read guard; results must be pre-allocated with
+// len(results) == len(entries).
+//
+//nolint:gocyclo // the classification loop is not a per-entry function: it reads and mutates six pieces of BATCH-scoped state (admittedThisBatch, batchSeen, mirrors, sessionLifecycleAt and the three reused smEntries/smResults/indexMap buffers), and four of those are keyed by the entry's POSITION in the batch, which the second loop then resolves against. Extracting the body would have to thread all of it through the helper or hoist it into a struct — relocating the state rather than reducing it
+func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) error {
 	// Build the filtered entry list and result mapping.
 	// We convert proto.Entry to sm.Entry for the user SM, skipping
 	// entries that are detected as duplicates by the session manager,
@@ -322,6 +412,17 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 					sessionLifecycleAt = make(map[uint64]int)
 				}
 				sessionLifecycleAt[entry.ClientID] = i
+				// A fresh session incarnation for this clientID starts its
+				// (clientID, seriesID) numbering over. Discard any in-batch
+				// dedup bookkeeping from a PRIOR incarnation that was
+				// unregistered/re-registered earlier in this same batch:
+				// otherwise the new session's first proposal could collide
+				// with a stale batchSeen entry (mirrored to the prior
+				// incarnation's result instead of applied) or be spuriously
+				// rejected by a stale admittedThisBatch count. delete on a nil
+				// map is a safe no-op.
+				delete(batchSeen, entry.ClientID)
+				delete(admittedThisBatch, entry.ClientID)
 				results[i] = sm.Result{Value: entry.ClientID}
 			}
 			continue
@@ -340,6 +441,11 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 					sessionLifecycleAt = make(map[uint64]int)
 				}
 				sessionLifecycleAt[entry.ClientID] = i
+				// The session is gone; its in-batch dedup bookkeeping must not
+				// survive to bind a later re-registration of the same clientID
+				// in this batch. delete on a nil map is a safe no-op.
+				delete(batchSeen, entry.ClientID)
+				delete(admittedThisBatch, entry.ClientID)
 				results[i] = sm.Result{Value: entry.ClientID}
 			}
 			continue
@@ -366,6 +472,17 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 				continue
 			}
 			if isDup {
+				// Return an OWNED copy of the cached response Data. The cache
+				// outlives this Apply and is serialized into snapshots via
+				// MarshalTo; handing the client the cache's backing array would
+				// let application mutation of the returned Data corrupt the
+				// replica-local dedup cache (and the snapshot). Value is a
+				// scalar and needs no copy.
+				if len(cached.Data) > 0 {
+					owned := make([]byte, len(cached.Data))
+					copy(owned, cached.Data)
+					cached.Data = owned
+				}
 				results[i] = cached
 				continue
 			}
@@ -469,16 +586,20 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 					continue
 				}
 				cached := smResults[j]
-				// In zero-copy mode, the user SM received Cmd as a direct
-				// alias into the engine's pooled CommittedEntries buffer
-				// and may have returned a Result whose Data aliases that
-				// buffer. The session cache outlives this Apply call, but
-				// the engine recycles the buffer afterward, so a later
-				// apply could corrupt the cached response — breaking
-				// at-most-once delivery. Deep-copy the Data before caching
-				// it. The non-zero-copy path already hands the SM owned
-				// command memory, so it is not penalized here.
-				if s.zeroCopyEntryCmd && len(cached.Data) > 0 {
+				// Deep-copy the Result Data before caching it. Two independent
+				// aliasing hazards make this mandatory regardless of
+				// zeroCopyEntryCmd:
+				//   1. The SAME smResults[j].Data was just handed to the client
+				//      via results[origIdx] above → OnApplied → RequestResult.
+				//      Application mutation of that returned buffer would
+				//      corrupt the replica-local dedup cache and, via MarshalTo,
+				//      the snapshot — a determinism hazard.
+				//   2. In zero-copy mode the user SM may have returned Data that
+				//      aliases the engine's pooled CommittedEntries buffer, which
+				//      the engine recycles after Apply returns.
+				// The client keeps the original buffer (results[origIdx] is left
+				// untouched); only the cached copy is owned.
+				if len(cached.Data) > 0 {
 					owned := make([]byte, len(cached.Data))
 					copy(owned, cached.Data)
 					cached.Data = owned
@@ -528,27 +649,10 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 		results[mirrorIdx] = results[firstIdx]
 	}
 
-	// Retain grown buffers for the next Apply() call.
+	// Retain grown buffers for the next applyBatch() call.
 	s.smEntryBuf = smEntries
 	s.smResultBuf = smResults
 	s.indexMapBuf = indexMap
-
-	// Update lastApplied to the highest index in the batch.
-	// Uses atomic store because LastApplied() may be called concurrently
-	// from the snapshot pool worker goroutine.
-	if len(entries) > 0 {
-		lastIndex := entries[len(entries)-1].Index
-		if lastIndex > s.lastApplied.Load() {
-			s.lastApplied.Store(lastIndex)
-		}
-
-		// Expire inactive sessions after each batch. This is deterministic
-		// because it is driven by log index: all replicas process the same
-		// entries and expire the same sessions at the same point.
-		if s.sessionExpiryEntries > 0 {
-			s.sessions.ExpireSessions(lastIndex, s.sessionExpiryEntries, defaultMaxExpirePerBatch)
-		}
-	}
 
 	return nil
 }

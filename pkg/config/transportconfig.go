@@ -15,6 +15,7 @@
 package config
 
 import (
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"time"
@@ -251,14 +252,16 @@ type TransportConfig struct {
 
 	// TransportDisabled indicates that the transport layer is not used.
 	// When true, MTLSConfig validation is skipped because no QUIC
-	// connections will be established. This is set internally by
-	// WithoutTransport() and must not be configured directly.
+	// connections will be established. WithoutTransport() sets this
+	// internally, but the field is exported and honoured when set directly.
 	//
-	// Setting it directly does NOT prevent transport creation — that is
-	// gated on the WithoutTransport() host option alone — so the only
-	// effect is to skip mTLS validation here. The result fails closed: the
-	// transport is still constructed and rejects the nil MTLSConfig, but
-	// the failure surfaces at startup instead of at config validation.
+	// NewHost gates transport creation on
+	// (WithoutTransport() || TransportConfig.TransportDisabled), so setting
+	// this field directly both skips mTLS validation AND prevents the QUIC
+	// transport from being constructed — the same effect as the
+	// WithoutTransport() host option. The two are kept in lockstep on
+	// purpose: skipping the mTLS check without also disabling the transport
+	// would be exactly backwards.
 	TransportDisabled bool
 }
 
@@ -414,6 +417,15 @@ func (tc *TransportConfig) validateMTLS() error {
 		if mtls.Certificate != nil {
 			if len(mtls.Certificate.Certificate) == 0 {
 				return newValidationError("TransportConfig.MTLSConfig.Certificate", "must contain at least one certificate")
+			}
+			// A pre-built leaf with no private key produces a Certificate that
+			// passes the length check yet fails every QUIC handshake at runtime.
+			// Require a usable signer here. Accept any crypto.Signer so a
+			// hardware-signer-backed key (TPM/PKCS#11) — whose PrivateKey is an
+			// opaque signer, not raw key bytes — is still allowed.
+			if _, ok := mtls.Certificate.PrivateKey.(crypto.Signer); !ok {
+				return newValidationError("TransportConfig.MTLSConfig.Certificate",
+					"PrivateKey must be a non-nil crypto.Signer")
 			}
 		} else {
 			if len(mtls.Cert) == 0 {
