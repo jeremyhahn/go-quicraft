@@ -705,6 +705,17 @@ func (lr *LogReader) setSnapshot(ss proto.Snapshot) error {
 		if ss.Index <= lr.markerIndex && ss.Index > 0 {
 			return ErrSnapshotOutOfDate
 		}
+		// The marker check alone is insufficient for CreateSnapshot: compaction
+		// retains CompactionOverhead entries below the snapshot, so markerIndex
+		// normally TRAILS the recorded snapshot index. Without this guard an ss
+		// with markerIndex < ss.Index < lr.snapshot.Index would be accepted and
+		// regress lr.snapshot (and overwrite lr.membership). Reject anything not
+		// strictly newer than the recorded snapshot. The legitimate advance
+		// (ApplySnapshot/CreateSnapshot to a higher index) has ss.Index >
+		// lr.snapshot.Index and passes.
+		if lr.snapshot.Index > 0 && ss.Index <= lr.snapshot.Index {
+			return ErrSnapshotOutOfDate
+		}
 	}
 	lr.membership = ss.Membership
 	lr.snapshot = ss

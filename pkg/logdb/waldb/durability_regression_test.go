@@ -376,14 +376,14 @@ func corruptSegmentBlock(t *testing.T, path string, blockSize int) {
 	}
 }
 
-// TestRecovery_OrphanRemoveFailureTruncatesAndAdvancesIDs is the H3
-// regression test. When recovery truncates at a corrupt segment and the
-// removal of a higher orphan segment fails, the orphan must be truncated to
-// zero length (so it replays to nothing), and nextSegmentID must be advanced
-// past every observed segment so new records can never reuse an orphan's ID
-// range — a lingering orphan ordered after fresh segments would replay LAST
-// and regress HardState term/vote.
-func TestRecovery_OrphanRemoveFailureTruncatesAndAdvancesIDs(t *testing.T) {
+// TestRecovery_NonFinalCorruptionDoesNotMutateDisk is the H3 regression test.
+// When recovery fails-stop on corruption in a non-final segment it must destroy
+// NOTHING on disk: the corrupt segment is not prefix-truncated and the
+// committed higher segments are not discarded. Any of those mutations would
+// throw away committed entries and regress HardState (term/vote), the exact
+// data loss the fail-stop exists to prevent. The operator restores from
+// snapshot/peers with the on-disk WAL still fully intact for forensics.
+func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
 	const shardID = uint64(1)
@@ -401,71 +401,61 @@ func TestRecovery_OrphanRemoveFailureTruncatesAndAdvancesIDs(t *testing.T) {
 	if err := db.SaveNodeState(shardID, 1, logdb.State{Term: 9, Vote: 3, Commit: 1}); err != nil {
 		t.Fatalf("SaveNodeState seg2: %v", err)
 	}
+	seg0Path := segmentPath(db, shardID, 0)
 	seg1Path := segmentPath(db, shardID, 1)
 	seg2Path := segmentPath(db, shardID, 2)
-	seg0Path := segmentPath(db, shardID, 0)
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Corrupt segment 0 mid-file: recovery truncates there and segments 1-2
-	// become unreachable orphans.
+	// Corrupt segment 0 mid-file: segments 1-2 above hold committed state.
 	corruptSegmentBlock(t, seg0Path, blockSize)
 
-	// Orphan removal fails; the truncate-to-zero fallback must succeed.
-	ffs := &faultFS{FS: defaultFS()}
-	ffs.arm(func(f *faultFS) {
-		f.failNames = map[string]bool{
-			segmentFilename(1): true,
-			segmentFilename(2): true,
-		}
-		f.failRemove = errors.New("simulated EBUSY on unlink")
-	})
-	db2, err := Open(dir, WithFS(ffs), WithBlockSize(blockSize), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open after corruption with failing Remove: %v", err)
-	}
-	defer db2.Close()
-
-	// The orphans must be empty on disk so they can never replay.
-	for _, p := range []string{seg1Path, seg2Path} {
+	// Capture the on-disk sizes AFTER corruption; a fail-stop recovery must
+	// leave every one of them byte-for-byte unchanged.
+	sizeBefore := func(p string) int64 {
 		fi, err := defaultFS().Stat(p)
 		if err != nil {
 			t.Fatalf("Stat %s: %v", p, err)
 		}
-		if fi.Size() != 0 {
-			t.Fatalf("orphan %s not truncated: size=%d, want 0", p, fi.Size())
-		}
+		return fi.Size()
+	}
+	want0, want1, want2 := sizeBefore(seg0Path), sizeBefore(seg1Path), sizeBefore(seg2Path)
+
+	_, err = Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
+	if err == nil {
+		t.Fatal("Open: expected fatal RecoveryError on non-final segment corruption")
+	}
+	if !errors.Is(err, ErrNonFinalSegmentCorruption) {
+		t.Fatalf("Open error = %v, want ErrNonFinalSegmentCorruption", err)
 	}
 
-	// The orphaned HardState must not have been replayed.
-	if _, err := db2.GetState(shardID, 1); err == nil {
-		st, _ := db2.GetState(shardID, 1)
-		if st.Term != 0 {
-			t.Fatalf("orphaned HardState replayed: %+v", st)
+	// Nothing on disk may have been truncated or discarded.
+	if got := sizeBefore(seg0Path); got != want0 {
+		t.Fatalf("corrupt segment 0 was mutated: size=%d, want %d (must not be prefix-truncated)", got, want0)
+	}
+	for _, tc := range []struct {
+		path string
+		want int64
+	}{{seg1Path, want1}, {seg2Path, want2}} {
+		fi, err := defaultFS().Stat(tc.path)
+		if err != nil {
+			t.Fatalf("committed segment %s was discarded or unreadable: %v", tc.path, err)
 		}
-	}
-
-	// New segments must be ordered after every observed segment ID, so even
-	// a resurrected orphan could never replay after fresh records.
-	shard := db2.getShard(shardID)
-	shard.mu.Lock()
-	nextID := shard.nextSegmentID
-	activeID := shard.activeSegmentID
-	shard.mu.Unlock()
-	if activeID <= 2 {
-		t.Fatalf("active segment ID = %d, want > 2 (must not reuse orphan ID range)", activeID)
-	}
-	if nextID <= 3 {
-		t.Fatalf("nextSegmentID = %d, want > 3", nextID)
+		if fi.Size() != tc.want {
+			t.Fatalf("committed segment %s was mutated: size=%d, want %d", tc.path, fi.Size(), tc.want)
+		}
 	}
 }
 
-// TestRecovery_OrphanDiscardTotalFailureIsFatal verifies the H3 fail-stop
-// rule: when an orphan segment can be neither removed nor truncated to zero,
-// recovery must fail with a RecoveryError instead of leaving an intact orphan
-// whose stale records would replay on a later restart.
-func TestRecovery_OrphanDiscardTotalFailureIsFatal(t *testing.T) {
+// TestRecovery_NonFinalCorruptionIsFatal verifies the H3 fail-stop rule:
+// corruption in a segment that is NOT the highest-numbered one is bit rot /
+// a lying fsync / tampering, never a torn tail — a lower segment was fully
+// fdatasynced before any higher one was created, so everything above it is
+// committed. Recovery must fail with a RecoveryError wrapping
+// ErrNonFinalSegmentCorruption instead of silently prefix-truncating segment 0
+// and discarding the committed higher segment (which would regress term/vote).
+func TestRecovery_NonFinalCorruptionIsFatal(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
 	const shardID = uint64(1)
@@ -484,24 +474,22 @@ func TestRecovery_OrphanDiscardTotalFailureIsFatal(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
+	// Corrupt segment 0 mid-file; segment 1 above it holds committed state.
 	corruptSegmentBlock(t, seg0Path, blockSize)
 
-	ffs := &faultFS{FS: defaultFS()}
-	ffs.arm(func(f *faultFS) {
-		f.failNames = map[string]bool{segmentFilename(1): true}
-		f.failRemove = errors.New("simulated EBUSY on unlink")
-		f.failOpenFile = errors.New("simulated EIO on open")
-	})
-	_, err = Open(dir, WithFS(ffs), WithBlockSize(blockSize), WithMaxFileSize(64*1024))
+	_, err = Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
 	if err == nil {
-		t.Fatal("Open: expected fatal RecoveryError when orphan discard fails entirely")
+		t.Fatal("Open: expected fatal RecoveryError on non-final segment corruption")
 	}
 	var recErr *RecoveryError
 	if !errors.As(err, &recErr) {
 		t.Fatalf("Open error = %v, want RecoveryError", err)
 	}
-	if recErr.SegmentID != 1 {
-		t.Fatalf("RecoveryError.SegmentID = %d, want 1", recErr.SegmentID)
+	if recErr.SegmentID != 0 {
+		t.Fatalf("RecoveryError.SegmentID = %d, want 0 (the corrupt non-final segment)", recErr.SegmentID)
+	}
+	if !errors.Is(err, ErrNonFinalSegmentCorruption) {
+		t.Fatalf("Open error = %v, want ErrNonFinalSegmentCorruption", err)
 	}
 }
 
