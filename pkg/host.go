@@ -5513,8 +5513,44 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return saveErr
 	}
 	// Recorded: the directory is now the shard's snapshot and the rollback above
-	// must not run.
+	// must not run. This is set BEFORE the compaction below so a compaction
+	// error cannot trip the deferred discardImportDir into removing a snapshot
+	// directory the LogDB already points at.
 	published = false
+
+	// Advance the log compaction floor to the imported snapshot index, removing
+	// every entry at or below it.
+	//
+	// A snapshot subsumes all log entries up to its index, so any entry that
+	// survives below it is dead weight — but here it is worse than dead weight.
+	// The offline disaster-recovery flow bootstraps the shard (StartShard) so an
+	// unrecorded shard can be imported into (ImportSnapshot refuses ErrShardNotFound
+	// otherwise), and that bootstrap writes an initial configuration entry at
+	// index 1. Importing an artifact whose snapshot index is higher then records
+	// the snapshot WITHOUT displacing that orphaned index-1 entry. The shard runs
+	// on from the snapshot, appends new entries, and — because the default
+	// CompactionOverhead (5000) far exceeds the entry count of a freshly restored
+	// node — the running snapshotter's compaction never fires to clean it up. On
+	// the next restart, log recovery rebuilds the entry index as
+	// {1, ...post-restore-tail} whose span (last-first+1) exceeds the entry count,
+	// which EntryRange correctly reports as ErrLogGapDetected, and host init fails
+	// closed. The node is then unrecoverable without wiping and restoring again.
+	//
+	// A normal InstallSnapshot advances the compaction floor with the snapshot
+	// (see internal/engine snapshot compaction); an import must do the same. The
+	// shard is stopped here (an ImportSnapshot precondition), so there is no live
+	// LogReader to advance — the LogDB removal is sufficient, and the LogReader is
+	// rebuilt from the compacted LogDB on the next StartShard. Unlike the running
+	// snapshotter, this retains no CompactionOverhead: a freshly imported node has
+	// no follower depending on its pre-snapshot log tail (a follower behind the
+	// snapshot is caught up via InstallSnapshot), so entries below the imported
+	// snapshot index serve no purpose.
+	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, header.Index); rmErr != nil {
+		return rmErr
+	}
+	if compactErr := h.logdb.Compact(shardID, replicaID); compactErr != nil {
+		return compactErr
+	}
 	return nil
 }
 

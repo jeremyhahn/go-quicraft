@@ -60,19 +60,30 @@ type commitItem struct {
 // multi-node stalls that would occur if transport sends blocked the
 // tick/processReady loop.
 type stepWorker struct {
-	workerID          int
-	tickInterval      time.Duration
-	nodesMu           sync.RWMutex
-	nodes             map[uint64]*Node
-	sender            MessageSender
-	workSignal        *WorkSignal
-	commitSlots       map[uint64]*commitItem
-	commitC           chan *commitItem
-	callback          Callback
-	prevLeaders       map[uint64]uint64 // shardID -> last known leaderID
-	stopC             chan struct{}
-	inboxBuf          []proto.Message            // reusable buffer for draining node inboxes
-	proposeBuf        []proto.Entry              // reusable buffer for batching inbox proposals
+	workerID     int
+	tickInterval time.Duration
+	nodesMu      sync.RWMutex
+	nodes        map[uint64]*Node
+	sender       MessageSender
+	workSignal   *WorkSignal
+	commitSlots  map[uint64]*commitItem
+	commitC      chan *commitItem
+	callback     Callback
+	prevLeaders  map[uint64]uint64 // shardID -> last known leaderID
+	stopC        chan struct{}
+	inboxBuf     []proto.Message // reusable buffer for draining node inboxes
+	proposeBuf   []proto.Entry   // reusable buffer for batching inbox proposals
+	// commitProposeBuf is a SEPARATE reusable buffer for the commit-pending
+	// drain. It must not share proposeBuf: within one iteration the step worker
+	// drains proposals into proposeBuf and steps a Propose message that ALIASES
+	// that buffer (on a follower the message is forwarded, so the outbound copy
+	// happens later, in QUICTransport.Send). Handing the SAME buffer back to
+	// EntryQueue.Swap in the commit-pending drain makes it the queue's live write
+	// buffer again, so client Add calls overwrite entry structs the transport is
+	// still reading — a data race that corrupts forwarded proposals. Using a
+	// distinct buffer defers recycling to the NEXT iteration's first drain, by
+	// which point sendMessages has already copied.
+	commitProposeBuf  []proto.Entry
 	readKeyBuf        []uint64                   // reusable buffer for draining ReadIndex keys
 	heartbeatRespBuf  []proto.Message            // reusable buffer for HeartbeatResp separation
 	otherMsgBuf       []proto.Message            // reusable buffer for non-HeartbeatResp messages
@@ -124,6 +135,7 @@ func newStepWorker(
 		stopC:             stopC,
 		inboxBuf:          make([]proto.Message, 0, 64),
 		proposeBuf:        make([]proto.Entry, 0, 64),
+		commitProposeBuf:  make([]proto.Entry, 0, 64),
 		readKeyBuf:        make([]uint64, 0, 64),
 		freeOrderBuf:      make([]proto.Message, 0, 16),
 		orderedMsgBuf:     make([]proto.Message, 0, 16),
@@ -834,10 +846,10 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// Drain all queued operations from MPSC queues. The actual processing
 	// happens under raftMu to serialize with the commit worker.
-	w.proposeBuf = node.DrainProposals(w.proposeBuf)
+	w.commitProposeBuf = node.DrainProposals(w.commitProposeBuf)
 	w.readKeyBuf = node.DrainReadIndex(w.readKeyBuf)
 	w.inboxBuf = node.DrainInbox(w.inboxBuf)
-	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.proposeBuf) == 0 {
+	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.commitProposeBuf) == 0 {
 		return
 	}
 
@@ -855,7 +867,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// inbox. The buffer is re-injected into the inbox when commitPending
 	// clears and the normal processReady path runs.
 	w.inboxBuf = w.filterSnapshots(shardID, w.inboxBuf)
-	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.proposeBuf) == 0 {
+	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.commitProposeBuf) == 0 {
 		return
 	}
 
@@ -968,7 +980,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 
 	// Phase 2: Process proposals and remaining inbox messages.
 	// These can proceed at lower priority since reads are done.
-	if len(w.proposeBuf) == 0 && len(otherMsgs) == 0 {
+	if len(w.commitProposeBuf) == 0 && len(otherMsgs) == 0 {
 		return
 	}
 
@@ -980,25 +992,25 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// will be included in the next update after commitPending clears.
 	// This reduces latency by eliminating the blocking window where
 	// proposals sit in the MPSC queue waiting for commit to complete.
-	if len(w.proposeBuf) > 0 {
+	if len(w.commitProposeBuf) > 0 {
 		if w.metrics != nil {
-			w.metrics.ObserveProposalBatchSize(shardID, len(w.proposeBuf))
+			w.metrics.ObserveProposalBatchSize(shardID, len(w.commitProposeBuf))
 		}
 		if err := node.peer.Handle(proto.Message{
 			Type:    proto.Propose,
-			Entries: w.proposeBuf,
+			Entries: w.commitProposeBuf,
 			Origin:  proto.OriginLocal,
 		}); err != nil {
 			slog.Warn("batched proposal failed (commitPending)",
 				"shard_id", shardID,
 				"replica_id", node.ReplicaID(),
-				"num_entries", len(w.proposeBuf),
+				"num_entries", len(w.commitProposeBuf),
 				"error", err,
 			)
 			// Notify the host so it can complete pending proposals
 			// with the error instead of leaving callers blocked.
 			if w.callback != nil {
-				w.callback.OnProposalFailed(shardID, w.proposeBuf, err)
+				w.callback.OnProposalFailed(shardID, w.commitProposeBuf, err)
 			}
 		}
 		// Update rate limiter cache after proposals are appended.
