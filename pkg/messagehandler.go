@@ -787,13 +787,27 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		// in between leaves the pre-existing shape (recoverable by the next
 		// successful receive or a local snapshot), whereas removing first would
 		// discard entries with no snapshot recorded to cover them.
+		// NON-FATAL, and the placement is the reason: this runs inside the block
+		// that precedes committed = true, so returning an error here would send
+		// the deferred rollback through RemoveAll on the very directory the
+		// SaveSnapshot one line above already durably recorded. That destroys a
+		// committed snapshot: the shard then cannot start (its LogDB record points
+		// at a deleted directory) and every leader re-send is refused by the dedup
+		// branch — a permanent wedge, the exact failure this floor advance exists
+		// to prevent.
+		//
+		// Failing to advance the floor is recoverable and self-healing: the
+		// snapshot is durably recorded, so the hole left below it is precisely the
+		// shape recoverLogReader repairs on the next start, and the next
+		// successful receive or local snapshot advances the floor anyway.
 		if rmErr := h.host.logdb.RemoveEntriesTo(shardID, replicaID, snapshotIndex); rmErr != nil {
-			return &SnapshotReceiveError{
-				ShardID:   shardID,
-				ReplicaID: replicaID,
-				Op:        "logdb_compact",
-				Err:       rmErr,
-			}
+			slog.Warn("snapshot recorded but the log floor advance failed; the entry "+
+				"index is left holed below the snapshot and will be repaired on the next "+
+				"recovery",
+				"shard", shardID,
+				"replica", replicaID,
+				"snapshot_index", snapshotIndex,
+				"error", rmErr)
 		}
 	}
 

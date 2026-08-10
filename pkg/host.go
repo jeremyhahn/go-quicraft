@@ -7758,7 +7758,12 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 			"subsumed prefix to repair recovery",
 			"shard_id", shardID, "replica_id", replicaID, "snapshot_index", ss.Index)
 		if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, ss.Index); rmErr != nil {
-			return false, err
+			// Report why the REPAIR failed, not the gap that prompted it.
+			// Returning the stale ErrLogGapDetected here would present a storage
+			// failure (a write-gate rejection, a failed fsync, a closed DB) as a
+			// permanent log hole, sending the operator after data corruption that
+			// did not happen while hiding the fault that actually blocked recovery.
+			return false, rmErr
 		}
 		firstIndex, entryCount, err = h.logdb.EntryRange(shardID, replicaID)
 		if err != nil {

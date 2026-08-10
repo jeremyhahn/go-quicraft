@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -199,5 +200,117 @@ func TestRecoverLogReader_FailsClosedOnGapWithNoSnapshot(t *testing.T) {
 	if _, err := h.recoverLogReader(lr, shardID, replicaID); err == nil {
 		t.Fatal("recovery ACCEPTED a log hole with no snapshot covering it: real data " +
 			"loss was silently repaired away instead of failing closed")
+	}
+}
+
+// repairFailLogDB presents a holed index (as a wedged replica does) but fails the
+// repair write, so a test can assert WHICH error recovery reports. Embedding the
+// concrete MemDB keeps every other method behaving normally.
+type repairFailLogDB struct {
+	*memdb.MemDB
+	rmErr error
+}
+
+func (d *repairFailLogDB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
+	return d.rmErr
+}
+
+// TestRecoverLogReader_ReportsRepairFailureNotTheGap pins the diagnostic: when
+// the self-heal write itself fails (a write-gate rejection, a failed fsync, a
+// closed DB), recovery must report THAT failure — not the ErrLogGapDetected that
+// prompted the repair. Reporting the gap sends an operator after data corruption
+// that did not happen while hiding the fault that actually blocked recovery.
+func TestRecoverLogReader_ReportsRepairFailureNotTheGap(t *testing.T) {
+	const shardID, replicaID = uint64(1), uint64(1)
+	const snapshotIndex = uint64(6000)
+	inner := memdb.New()
+	rmFail := errors.New("test: storage refused the compaction write")
+	db := &repairFailLogDB{MemDB: inner, rmErr: rmFail}
+
+	stale := []logdb.Entry{{Index: 1, Term: 1, Cmd: []byte("old")}, {Index: 2, Term: 1, Cmd: []byte("old")}}
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State: logdb.State{Term: 1, Commit: 2}, Entries: stale,
+	}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: snapshotIndex, Term: 2}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: shardID, ReplicaID: replicaID,
+		State:   logdb.State{Term: 2, Commit: snapshotIndex + 1},
+		Entries: []logdb.Entry{{Index: snapshotIndex + 1, Term: 2, Cmd: []byte("new")}},
+	}}); err != nil {
+		t.Fatalf("seed above snapshot: %v", err)
+	}
+
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	lr := logdb.NewLogReader(shardID, replicaID, db)
+	_, recErr := h.recoverLogReader(lr, shardID, replicaID)
+	if recErr == nil {
+		t.Fatal("recovery reported success although the repair write failed")
+	}
+	if !errors.Is(recErr, rmFail) {
+		t.Fatalf("recovery reported %v, want the underlying repair failure (%v): the real "+
+			"storage fault is hidden behind a log-hole symptom that did not cause it", recErr, rmFail)
+	}
+}
+
+// floorFailLogDB fails only the log-floor advance; every other operation
+// succeeds. It models a transient WAL write error on the RemoveEntriesTo the
+// snapshot receive path performs after recording the snapshot.
+type floorFailLogDB struct {
+	logdb.LogDB
+	err error
+}
+
+func (d *floorFailLogDB) RemoveEntriesTo(_, _, _ uint64) error { return d.err }
+
+// TestSnapshotReceive_FloorAdvanceFailureKeepsTheCommittedSnapshot pins the
+// invariant that the log-floor advance must never be able to destroy a snapshot
+// LogDB already durably references.
+//
+// The advance runs inside the block that precedes committed = true, so returning
+// an error from it would send the deferred rollback through RemoveAll on the very
+// directory SaveSnapshot just recorded: the shard could then not start (its LogDB
+// record points at a deleted directory) and every leader re-send would be refused
+// by the dedup branch — a permanent wedge, which is the exact failure the floor
+// advance exists to prevent.
+//
+// The advance is therefore non-fatal: the receive genuinely succeeded (the
+// snapshot is durable and installed), and the hole left below it is precisely
+// what recoverLogReader repairs on the next start.
+func TestSnapshotReceive_FloorAdvanceFailureKeepsTheCommittedSnapshot(t *testing.T) {
+	const index, term = uint64(3300), uint64(9)
+	payload := bytes.Repeat([]byte("state-machine-image"), 64)
+
+	f := newRecvFixture(t, createTestBarrier(t))
+	f.host.logdb = &floorFailLogDB{LogDB: f.ldb, err: errors.New("test: WAL refused the floor advance")}
+
+	if err := f.handler.HandleSnapshot(f.chunks(index, term, payload), authorizeAllSenders); err != nil {
+		t.Fatalf("HandleSnapshot failed on a NON-FATAL floor-advance error: %v; the "+
+			"snapshot is durably recorded and installed, so failing here makes the leader "+
+			"re-send work that already succeeded", err)
+	}
+
+	// The recorded snapshot must still exist on disk: LogDB references it.
+	snap, err := f.ldb.GetSnapshot(f.shardID, f.replicaID)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.Index != index {
+		t.Fatalf("recorded snapshot index = %d, want %d", snap.Index, index)
+	}
+	if _, ok := f.fs.liveBytes(f.dataPath(index)); !ok {
+		t.Fatalf("DATA LOSS: the failed floor advance deleted %s, which LogDB durably "+
+			"references (snapshot index %d): the shard cannot start and every leader "+
+			"re-send is refused by the dedup branch — a permanent wedge",
+			f.dataPath(index), snap.Index)
 	}
 }
