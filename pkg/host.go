@@ -1491,10 +1491,19 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 			ns.nodesMu.Unlock()
 			c.h.registry.Register(shardID, cc.ReplicaID, cc.Address)
 		case proto.RemoveNode:
+			// Capture the address BEFORE the registry entry is dropped: a
+			// RemoveNode config change carries no Address (RequestRemoveNode
+			// sets only ReplicaID), and membership tombstones are replica-ID
+			// keyed and address-free, so this is the last point at which the
+			// removed member's address is knowable.
+			removedAddr, addrErr := c.h.registry.Resolve(shardID, cc.ReplicaID)
 			ns.nodesMu.Lock()
 			delete(ns.nodes, cc.ReplicaID)
 			ns.nodesMu.Unlock()
 			c.h.registry.Remove(shardID, cc.ReplicaID)
+			if addrErr == nil && removedAddr != "" {
+				c.h.releaseRemovedMemberConn(shardID, cc.ReplicaID, removedAddr)
+			}
 		}
 		ns.configChangeIndex.Store(entry.Index)
 		c.h.logger.Info("membership changed",
@@ -7951,6 +7960,49 @@ func (e *HostInitError) Error() string {
 // Unwrap returns the underlying error.
 func (e *HostInitError) Unwrap() error {
 	return e.Err
+}
+
+// releaseRemovedMemberConn drops the outbound QUIC connection to a replica that
+// a COMMITTED configuration change has removed, once no other shard still needs
+// that peer.
+//
+// Without this the connection lives for the process lifetime: quic-go's
+// KeepAlivePeriod (10s) is below MaxIdleTimeout (30s), so the connection is
+// PINGed indefinitely and never idle-closes, and the transport's cleanup only
+// reaps connections whose context is already dead. A removed peer that keeps
+// running therefore pins a connection, its pooled streams, its epoch records,
+// and a 10s keep-alive heartbeat forever.
+//
+// Two conditions make this safe, and both are load-bearing:
+//
+//   - It is driven by a COMMITTED removal, never by a sweep over the registry.
+//     "No registry entry" does not mean "not a member": entries are legitimately
+//     absent under a live, healthy connection while a shard is being torn down
+//     and restarted, while a speculative pre-registration is rolled back, and
+//     while a joining replica has not yet learned its membership. A periodic
+//     sweep would close healthy connections in exactly those windows — including
+//     the rolling-restart window, where an extra handshake is most costly.
+//   - A connection is keyed by ADDRESS and multiplexed across shards (each shard
+//     is a stream index on the same connection), so it may only be closed when
+//     no other (shard, replica) still resolves to that address. CloseTarget
+//     additionally declines while a snapshot transfer is in flight.
+//
+// Shard teardown deliberately does NOT come here: stopping a shard locally says
+// nothing about the peer's membership elsewhere.
+func (h *Host) releaseRemovedMemberConn(shardID, replicaID uint64, address string) {
+	if h.transport == nil || address == "" {
+		return
+	}
+	if h.registry.AddressInUse(address) {
+		return
+	}
+	if h.transport.CloseTarget(address) {
+		h.logger.Info("released connection to removed replica",
+			"shard", shardID,
+			"replica", replicaID,
+			"address", address,
+		)
+	}
 }
 
 // updateNodeLeader updates the leader information for a node. This is
