@@ -392,7 +392,7 @@ func TestDiscardPending_ReReservesSpace(t *testing.T) {
 	if err := seg.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if err := seg.DiscardPending(0, 0); err != nil {
+	if err := seg.DiscardPending(0, 0, 0); err != nil {
 		t.Fatalf("DiscardPending: %v", err)
 	}
 

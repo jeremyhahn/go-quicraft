@@ -133,6 +133,67 @@ func decodeRecord(buf []byte) (data []byte, recordType byte, n int, err error) {
 	return data, recordType, totalLen, nil
 }
 
+// Positional context-AAD for encrypted WAL records.
+//
+// The barrier binds only the epoch into the AEAD AAD, so two records sealed
+// under the same DEK and epoch authenticate identically no matter where they
+// sit. An at-rest attacker with write access could therefore reorder, splice or
+// truncate same-epoch records without the authentication tag noticing. Every
+// encrypted WAL record additionally binds its POSITION — which WAL shard, which
+// segment, and which record ordinal within that segment — into the AAD, so a
+// record only authenticates at the exact place it was written.
+//
+// The layout is fixed-width and big-endian with no delimiters, so no two
+// distinct positions can produce the same bytes:
+//
+//	"QRWAL1" (6) || WALShardIdx (8) || SegmentID (8) || RecordSeq (8)  = 30 bytes
+//
+// WALShardIdx is REQUIRED, not decorative: each of the DefaultShardCount WAL
+// shards is its own directory with an INDEPENDENT %06d.log ID space, and all of
+// them share ONE barrier, so (SegmentID, RecordSeq) alone is not unique across
+// shards.
+//
+// The magic is a self-authenticating scheme tag. There is NO on-disk version
+// marker and NO epoch-only fallback: the scheme is chosen by code alone, and a
+// reader that fails to authenticate a record must NEVER retry without the
+// context — that retry would be the vulnerability. WALs written before this
+// scheme are not readable; see CHANGELOG ("Wipe existing data directories
+// before upgrading").
+const (
+	// walContextMagic tags the context-AAD scheme. Changing it invalidates
+	// every previously written encrypted WAL record by construction.
+	walContextMagic = "QRWAL1"
+
+	// walContextMagicSize is len(walContextMagic).
+	walContextMagicSize = 6
+
+	// walContextSize is the total fixed width of a record context.
+	walContextSize = walContextMagicSize + 8 + 8 + 8
+)
+
+// walRecordContext fills dst with the positional context-AAD of a single
+// logical WAL record and returns the filled prefix. It is the ONE place the
+// context bytes are constructed, used by both the encrypt and the decrypt side
+// so the two can never drift.
+//
+// dst must be at least walContextSize bytes; callers pass a reusable scratch
+// buffer because this sits on the WAL write hot path and must not allocate.
+//
+// recordSeq is the ordinal of the LOGICAL record within its segment, 0-based:
+// the number of logical records already committed to that segment. It is
+// exactly the index at which segment.ReadAll returns the record during
+// recovery, which is what lets the read side reproduce these bytes. Chunking a
+// record across blocks does not affect it — ReadAll assembles First/Middle/Last
+// chunks into one entry before appending.
+func walRecordContext(dst []byte, shardIdx, segID, recordSeq uint64) []byte {
+	_ = dst[walContextSize-1] // bounds check elimination hint
+	copy(dst[0:walContextMagicSize], walContextMagic)
+	binary.BigEndian.PutUint64(dst[6:14], shardIdx)
+	binary.BigEndian.PutUint64(dst[14:22], segID)
+	binary.BigEndian.PutUint64(dst[22:30], recordSeq)
+	return dst[:walContextSize]
+}
+
 // isValidRecordType returns true if the given byte is a recognized chunk type.
 // The accepted range is intentionally tight (RecordFull..RecordLast): a chunk
 // type outside it is treated as corruption, which stops recovery at the bad

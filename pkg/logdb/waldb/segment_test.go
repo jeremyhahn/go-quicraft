@@ -149,7 +149,7 @@ func TestMultipleWritesReadAll(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Write[%d]: unexpected error: %v", i, err)
 		}
-		if seq != uint32(i+1) {
+		if seq != uint64(i+1) {
 			t.Fatalf("Write[%d]: seq = %d, want %d", i, seq, i+1)
 		}
 	}
@@ -616,7 +616,7 @@ func TestSequenceNumberIncrement(t *testing.T) {
 	}
 	defer seg.Close()
 
-	for i := uint32(1); i <= 5; i++ {
+	for i := uint64(1); i <= 5; i++ {
 		seq, err := seg.Write([]byte("seq test"))
 		if err != nil {
 			t.Fatalf("Write[%d]: unexpected error: %v", i, err)
@@ -755,6 +755,7 @@ func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 	}
 	cleanFileOffset := seg.fileOffset
 	cleanBlockOffset := seg.blockOffset
+	cleanRecordCount := seg.RecordCount()
 
 	// Write additional records that remain unflushed (simulating batch mode).
 	record2 := []byte("ghost-record-two")
@@ -768,7 +769,7 @@ func TestDiscardPendingResetsBlockBuffer(t *testing.T) {
 	}
 
 	// Discard back to the checkpoint.
-	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset); err != nil {
+	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanRecordCount); err != nil {
 		t.Fatalf("DiscardPending: %v", err)
 	}
 
@@ -845,7 +846,7 @@ func TestDiscardPendingOnClosedSegment(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	err = seg.DiscardPending(0, 0)
+	err = seg.DiscardPending(0, 0, 0)
 	if err != ErrClosed {
 		t.Errorf("DiscardPending on closed segment: got %v, want ErrClosed", err)
 	}
@@ -865,6 +866,7 @@ func TestDiscardPendingNoTruncateNeeded(t *testing.T) {
 	// Capture initial state (fileOffset=0, blockOffset=0).
 	cleanFileOffset := seg.fileOffset
 	cleanBlockOffset := seg.blockOffset
+	cleanRecordCount := seg.RecordCount()
 
 	// Write a small record that stays in the block buffer (no flush to file).
 	if _, err := seg.Write([]byte("small")); err != nil {
@@ -875,7 +877,7 @@ func TestDiscardPendingNoTruncateNeeded(t *testing.T) {
 	}
 
 	// Discard back to initial state.
-	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset); err != nil {
+	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanRecordCount); err != nil {
 		t.Fatalf("DiscardPending: %v", err)
 	}
 
@@ -908,6 +910,7 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 	}
 	cleanFileOffset := seg.fileOffset
 	cleanBlockOffset := seg.blockOffset
+	cleanRecordCount := seg.RecordCount()
 
 	// Write a record larger than one block to force padAndFlushBlock.
 	bigRecord := make([]byte, blockSize*2)
@@ -924,7 +927,7 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 	}
 
 	// Discard back.
-	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset); err != nil {
+	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanRecordCount); err != nil {
 		t.Fatalf("DiscardPending: %v", err)
 	}
 

@@ -46,8 +46,18 @@ type segment struct {
 	fileOffset  int64  // block-aligned start offset of the current block
 	maxFileSize int64
 	noSync      bool
-	recordSeq   atomic.Uint32
-	closed      bool
+	// recordSeq counts the LOGICAL records (one per Write call, regardless of
+	// how many chunks the record is split into) committed to this segment. It
+	// is ROLLBACK-AWARE: DiscardPending rewinds it exactly as it rewinds
+	// fileOffset/blockOffset, so it always reflects records actually present in
+	// the file. That is what makes recordSeq usable as the record ordinal in
+	// the positional context-AAD (see walRecordContext): the write side's
+	// pre-write value equals the index segment.ReadAll returns the record at
+	// during recovery. Without the rewind, one rolled-back batch would
+	// desynchronize the two sides permanently and make the whole segment tail
+	// undecryptable at startup.
+	recordSeq atomic.Uint64
+	closed    bool
 	// stoppedAtCorruption is set by ReadAll when it halts at a corrupt/torn
 	// record (as opposed to a clean zero-filled EOF). Recovery uses it to stop
 	// replaying any HIGHER-numbered segment: a WAL is valid only as a prefix,
@@ -105,27 +115,12 @@ func createSegment(fs FS, dir string, id uint64, blockSize int, maxFileSize int6
 
 // Write writes a complete logical record to the segment. Large records are
 // automatically split across blocks using First/Middle/Last chunk types.
-// Returns the monotonically increasing record sequence number assigned.
-func (s *segment) Write(data []byte) (uint32, error) {
-	if s.closed {
-		return 0, ErrClosed
-	}
-
-	// Calculate the total bytes this record will consume (headers + data).
-	// Account for unflushed data in the block buffer (blockOffset).
-	needed := s.bytesNeeded(data)
-	// A record whose framed size (data + per-block headers + padding) exceeds
-	// the segment size limit can NEVER fit, even in a fresh segment. Return a
-	// distinct permanent error instead of ErrSegmentFull so the caller does not
-	// rotate to a new segment and retry forever (which would exhaust the
-	// SaveState retry budget and fail the node); the error tells the caller the
-	// record itself must be split.
-	if int64(needed) > s.maxFileSize {
-		return 0, ErrRecordTooLarge
-	}
-	logicalSize := s.fileOffset + int64(s.blockOffset) + int64(needed)
-	if logicalSize > s.maxFileSize {
-		return 0, ErrSegmentFull
+// Returns the monotonically increasing record sequence number assigned, which
+// is 1-based (the record's 0-based ordinal is RecordCount() sampled BEFORE the
+// call; that ordinal, not this sequence number, is what the context-AAD binds).
+func (s *segment) Write(data []byte) (uint64, error) {
+	if err := s.CanFit(len(data)); err != nil {
+		return 0, err
 	}
 
 	remaining := data
@@ -183,11 +178,59 @@ func (s *segment) Write(data []byte) (uint32, error) {
 	return seq, nil
 }
 
-// bytesNeeded calculates the total bytes a record will consume including all
-// chunk headers and any block padding needed for block transitions.
-func (s *segment) bytesNeeded(data []byte) int {
+// CanFit reports whether a logical record of dataLen bytes can still be
+// appended to this segment at its current position, WITHOUT writing anything.
+// It returns nil when the record fits, ErrSegmentFull when it does not (rotate
+// and retry), ErrRecordTooLarge when its framed size could not fit in any
+// segment (permanent; the caller must split the record) and ErrClosed on a
+// closed segment.
+//
+// Write applies exactly this predicate, so a caller that pre-checks with CanFit
+// and gets nil is guaranteed the following Write will not be refused. That is
+// what lets the encrypted write path resolve its LANDING segment — and with it
+// the record ordinal that goes into the context-AAD — BEFORE sealing the
+// record. See walShard.reserveLanding.
+//
+// bytesNeeded is monotonic non-decreasing in dataLen, so a caller that passes a
+// conservative UPPER bound on the eventual framed length (a plaintext length
+// plus the barrier's maximum envelope expansion) can only ever rotate early,
+// never overflow the segment.
+func (s *segment) CanFit(dataLen int) error {
+	if s.closed {
+		return ErrClosed
+	}
+	// Calculate the total bytes this record will consume (headers + data).
+	// Account for unflushed data in the block buffer (blockOffset).
+	needed := s.bytesNeeded(dataLen)
+	// A record whose framed size (data + per-block headers + padding) exceeds
+	// the segment size limit can NEVER fit, even in a fresh segment. Return a
+	// distinct permanent error instead of ErrSegmentFull so the caller does not
+	// rotate to a new segment and retry forever (which would exhaust the
+	// SaveState retry budget and fail the node); the error tells the caller the
+	// record itself must be split.
+	if int64(needed) > s.maxFileSize {
+		return ErrRecordTooLarge
+	}
+	if s.fileOffset+int64(s.blockOffset)+int64(needed) > s.maxFileSize {
+		return ErrSegmentFull
+	}
+	return nil
+}
+
+// RecordCount returns the number of logical records committed to this segment.
+// It is both the ordinal the NEXT record will be written at and the index
+// segment.ReadAll returns that record at during recovery. DiscardPending
+// rewinds it with the write offsets, so it never counts a rolled-back record.
+func (s *segment) RecordCount() uint64 {
+	return s.recordSeq.Load()
+}
+
+// bytesNeeded calculates the total bytes a record of dataLen bytes will consume
+// including all chunk headers and any block padding needed for block
+// transitions.
+func (s *segment) bytesNeeded(dataLen int) int {
 	total := 0
-	remaining := len(data)
+	remaining := dataLen
 	blockOff := s.blockOffset
 
 	for remaining > 0 {
@@ -478,10 +521,18 @@ func (s *segment) Close() error {
 // since the caller's saved checkpoint. It is used to roll back partial
 // batch writes when a later write in the batch fails.
 //
-// The caller must provide the fileOffset and blockOffset captured before
-// the batch began. The segment file is truncated to cleanFileOffset, the
-// write position is seeked back, and the block buffer is zeroed.
-func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int) error {
+// The caller must provide the fileOffset, blockOffset and record count
+// captured before the batch began. The segment file is truncated to
+// cleanFileOffset, the write position is seeked back, and the block buffer is
+// zeroed.
+//
+// cleanRecordCount rewinds the logical-record ordinal in lockstep with the
+// offsets. This is not bookkeeping: the ordinal is bound into every encrypted
+// record's context-AAD, so an ordinal left ahead of the file contents would
+// make every record written after the first rolled-back batch decrypt against
+// the wrong context and fail authentication at the next recovery — silently
+// losing the whole segment tail.
+func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int, cleanRecordCount uint64) error {
 	if s.closed {
 		return ErrClosed
 	}
@@ -534,6 +585,7 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int) er
 
 	s.fileOffset = cleanFileOffset
 	s.blockOffset = cleanBlockOffset
+	s.recordSeq.Store(cleanRecordCount)
 	return nil
 }
 
