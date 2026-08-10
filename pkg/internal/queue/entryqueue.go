@@ -94,8 +94,16 @@ func (q *EntryQueue[T]) Swap(buf []T) []T {
 	}
 	result := q.writeBuf
 	// Reuse the caller's buffer as the new write buffer. Reset length
-	// to 0 but keep the backing array to avoid allocation.
+	// to 0 but keep the backing array to avoid allocation. Zero the
+	// recycled backing array first: producers only overwrite the slots
+	// they append into, so if a later burst is shorter than a prior one
+	// the tail slots retain prior-generation values whose references
+	// (e.g. proto.Message.Entries -> Entry.Cmd aliasing per-frame bulk
+	// allocations) would stay reachable and pin that memory for the
+	// process lifetime. clear() releases those references for GC,
+	// matching the element-zeroing contract of proto.PutEntrySlice.
 	if cap(buf) > 0 {
+		clear(buf[:cap(buf)])
 		q.writeBuf = buf[:0]
 	} else {
 		q.writeBuf = make([]T, 0, cap(result))
