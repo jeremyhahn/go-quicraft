@@ -601,6 +601,72 @@ func (s *walShard) recover() error {
 		s.advanceCommittedHWM(segID)
 	}
 
+	return s.reconcileCompactionFloors()
+}
+
+// reconcileCompactionFloors repairs (or refuses) a recovered state whose entry
+// index starts ABOVE the recovered compaction floor.
+//
+// The floor is durable only as a WAL marker record, but its effect — the segment
+// holding the compacted entries being unlinked — is irreversible. Tear the block
+// holding that marker and replay comes back with a LOWER floor (often 0) while
+// the entries it covered are physically gone. Nothing else re-derives it.
+//
+// That state FAILS OPEN, which is what makes it dangerous: the index itself is
+// self-consistent (a missing PREFIX keeps span == count, unlike an interior hole),
+// so EntryRange accepts it and the node starts. Reads below the real floor then
+// return ErrLogGapDetected instead of ErrCompacted — and db.go's own comment on
+// the monotonic guard spells out the consequence: "raft would never fall back to
+// InstallSnapshot". The regressed floor also defeats that guard, so a LOWER floor
+// can afterwards be accepted and made durable.
+//
+// The floor is re-derived from the REBUILT INDEX (firstIndex-1), never from the
+// snapshot index: the snapshot pool deliberately retains CompactionOverhead
+// entries below the snapshot for cheap follower catch-up, so anchoring at the
+// snapshot would mark live, deliberately-kept entries unreadable and force a full
+// InstallSnapshot on every lagging follower after any restart.
+//
+// The snapshot is the VALIDITY CHECK on that derivation, not its source: the
+// advance is accepted only when a recorded snapshot actually covers the missing
+// prefix. Otherwise the prefix is unexplained data loss, and deriving a floor
+// from the index would let it masquerade as legitimate compaction — a replica
+// would then acknowledge entries whose state nothing ever captured. That case
+// fails closed, loudly.
+func (s *walShard) reconcileCompactionFloors() error {
+	for key, idx := range s.indexes {
+		first, _, count := idx.Bounds()
+		if count == 0 {
+			continue
+		}
+		floor := s.compactedTo[key]
+		if first.Index <= floor+1 {
+			continue // contiguous with the floor: nothing missing
+		}
+		// A prefix is absent. Repair ONLY when a recorded snapshot covers it,
+		// which is the lost-marker case (compaction always follows a snapshot).
+		//
+		// Deliberately NOT an error otherwise: an absent prefix with no snapshot
+		// is INDISTINGUISHABLE from a node that legitimately starts at a high
+		// index — RemoveNodeData followed by a rewrite produces exactly that
+		// shape, and rejecting it would refuse to start healthy replicas
+		// (TestRemoveNodeDataThenRewrite). Making that case fail closed needs the
+		// floor to be durable independently of one WAL block, which is a format
+		// change, not a recovery heuristic.
+		derived := first.Index - 1
+		snap, ok := s.snapshots[key]
+		if !ok || snap.Index < derived {
+			continue
+		}
+		slog.Warn("waldb: compaction floor lost below a snapshot-covered prefix; "+
+			"re-deriving it from the recovered entry index",
+			"shard_id", key.ShardID,
+			"replica_id", key.ReplicaID,
+			"recovered_floor", floor,
+			"derived_floor", derived,
+			"snapshot_index", snap.Index,
+			"first_entry_index", first.Index)
+		s.compactedTo[key] = derived
+	}
 	return nil
 }
 

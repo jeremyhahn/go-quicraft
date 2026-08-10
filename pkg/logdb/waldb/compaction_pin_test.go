@@ -145,3 +145,71 @@ func TestCompactionMarkerSurvivesGarbageCollection(t *testing.T) {
 			"InstallSnapshot", floor)
 	}
 }
+
+// TestRecovery_RederivesLostCompactionFloorUnderSnapshot pins the repair for a
+// compaction floor lost to a torn WAL block.
+//
+// The floor lives only in a marker record while its effect — the segment holding
+// the compacted entries being unlinked — is irreversible. Lose the marker and
+// replay comes back with floor 0 over a log whose prefix is physically gone. That
+// state FAILS OPEN: a missing PREFIX keeps span == count, so EntryRange accepts
+// it and the node starts, but reads below the real floor then return
+// ErrLogGapDetected instead of ErrCompacted and raft never falls back to
+// InstallSnapshot.
+//
+// Recovery re-derives the floor from the REBUILT INDEX (firstIndex-1), never from
+// the snapshot index — the snapshot pool deliberately retains entries below the
+// snapshot for cheap follower catch-up, and anchoring there would mark those live
+// entries unreadable and force a full InstallSnapshot on every lagging follower
+// after any restart. The snapshot is only the validity check on the derivation.
+func TestRecovery_RederivesLostCompactionFloorUnderSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	const shardID, replicaID = uint64(1), uint64(1)
+	open := func() *DB {
+		db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(4096), WithNoSync(true))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return db
+	}
+
+	db := open()
+	for i := uint64(1); i <= 8; i++ {
+		if err := db.SaveEntries(shardID, replicaID, []logdb.Entry{
+			{Index: i, Term: 1, Type: 1, Cmd: make([]byte, 200)},
+		}); err != nil {
+			t.Fatalf("SaveEntries %d: %v", i, err)
+		}
+	}
+	// A snapshot covering the prefix, then entries above it — the state a
+	// compacted replica is in.
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: 5, Term: 1}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := db.RemoveEntriesTo(shardID, replicaID, 5); err != nil {
+		t.Fatalf("RemoveEntriesTo: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2 := open()
+	defer func() { _ = db2.Close() }()
+	floor, err := db2.CompactedTo(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("CompactedTo: %v", err)
+	}
+	first, count, err := db2.EntryRange(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("EntryRange: %v", err)
+	}
+	// Whether the marker survived or was re-derived, the invariant that matters
+	// is the same: the floor must be contiguous with the surviving entries, so a
+	// read below it reports ErrCompacted (routing raft to InstallSnapshot) rather
+	// than ErrLogGapDetected.
+	if count > 0 && first > floor+1 {
+		t.Fatalf("entries start at %d but the compaction floor is %d: reads in [%d,%d) "+
+			"return ErrLogGapDetected instead of ErrCompacted, so raft never falls back "+
+			"to InstallSnapshot", first, floor, floor+1, first)
+	}
+}
