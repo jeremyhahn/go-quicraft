@@ -296,7 +296,15 @@ func (w *stepWorker) processReady() {
 		// Heartbeat, while Node.Deliver DISCARDED inbound messages once the
 		// inbox filled. Two replicas recovering at once therefore dissolved
 		// a five-replica shard's quorum with every node still up.
-		recovering := node.IsRecovering()
+		// Read at each use below rather than once here. The snapshot pool
+		// goroutine can RAISE this flag at any point during this iteration, and
+		// a value captured before that is stale exactly when it matters: the
+		// InstallSnapshot suppression in drainAndHandleInbox would then move the
+		// raft log's snapshot floor out from under a recovery that has already
+		// begun. The three decisions below guard independent actions and carry
+		// no invariant that they agree with each other, so each takes the
+		// freshest value. (The apply worker re-checks the gate itself, which is
+		// what keeps state-machine access safe regardless.)
 		// When commitPending is true, the commit/apply pipeline owns the
 		// Peer for write operations. However, incoming transport messages
 		// (HeartbeatResp, ReadIndexResp) can satisfy pending ReadIndex
@@ -326,7 +334,7 @@ func (w *stepWorker) processReady() {
 			// (ErrSystemBusy), which is the honest answer from a replica that
 			// cannot serve them yet. Raft protocol traffic below is a different
 			// matter and MUST keep flowing.
-			if !recovering {
+			if !node.IsRecovering() {
 				w.drainAndHandleProposals(shardID, node)
 				// Update the per-shard rate limiter cache immediately after
 				// proposals are appended to the in-memory log. On single-node
@@ -340,7 +348,7 @@ func (w *stepWorker) processReady() {
 				// accept them: not while a recovery is installing one.
 				w.redeliverDeferredSnapshots(shardID, node)
 			}
-			w.drainAndHandleInbox(shardID, node, recovering)
+			w.drainAndHandleInbox(shardID, node, node.IsRecovering())
 			node.peer.FlushReadIndex()
 		}
 		// commitC backpressure guard (WAL mode only). This worker is the
@@ -386,7 +394,7 @@ func (w *stepWorker) processReady() {
 		// the gate clears) instead of entering the commit/apply pipeline.
 		// Everything else in the update — hard state, entries to save,
 		// messages — is protocol-level and must keep flowing.
-		update, err := node.peer.GetUpdate(!recovering, lastApplied)
+		update, err := node.peer.GetUpdate(!node.IsRecovering(), lastApplied)
 		if err != nil {
 			node.handleError(err)
 			continue

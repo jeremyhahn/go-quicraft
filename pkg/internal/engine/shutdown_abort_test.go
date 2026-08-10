@@ -361,3 +361,90 @@ func TestEngine_Stop_SurvivesMalformedNodeEntry(t *testing.T) {
 		t.Fatal("Stop skipped the valid node after encountering a malformed entry")
 	}
 }
+
+// TestCommitWorker_SaveStateFailure_FailsUncommittedProposals pins the case the
+// batch-abandon path used to drop entirely: a proposal that has been accepted
+// into a batch but has NOT yet committed.
+//
+// On a leader this is where every client proposal first appears — in
+// EntriesToSave, with CommittedEntries empty until a later round. Reporting only
+// CommittedEntries meant the most common failure shape (SaveState fails on the
+// very batch carrying a fresh proposal) completed nothing, so the caller blocked
+// to its context deadline against a node that had already been marked
+// permanently failed and could never complete it.
+func TestCommitWorker_SaveStateFailure_FailsUncommittedProposals(t *testing.T) {
+	rig := newCommitTestRig(16)
+	rig.ldb.setSaveError(errors.New("wal fsync failed"))
+	rig.cw.retryHookForTest = func(attempt int) {
+		if attempt == 0 {
+			close(rig.stopC)
+		}
+	}
+
+	cfg := config.Config{ShardID: 7, ReplicaID: 3}
+	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node.commitPending.Store(true)
+
+	// An in-flight proposal: appended, not yet committed.
+	rig.cw.batch = append(rig.cw.batch[:0], proto.Update{
+		ShardID:       7,
+		ReplicaID:     3,
+		EntriesToSave: []proto.Entry{{Term: 1, Index: 4, Key: 0xBEEF, Cmd: []byte("p")}},
+	})
+	rig.cw.batchNodes = append(rig.cw.batchNodes[:0], node)
+
+	rig.cw.processBatch()
+
+	calls := rig.cb.getProposalFailedCalls()
+	if len(calls) != 1 {
+		t.Fatalf("OnProposalFailed calls = %d, want 1: the uncommitted proposal was "+
+			"never completed, so its caller blocks to its deadline on a node that is "+
+			"already permanently failed", len(calls))
+	}
+	var reported bool
+	for _, e := range calls[0].entries {
+		if e.Key == 0xBEEF {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("the uncommitted proposal (key 0xBEEF) was not among the failed "+
+			"entries: %+v", calls[0].entries)
+	}
+	var saveErr *SaveStateError
+	if !errors.As(calls[0].err, &saveErr) {
+		t.Fatalf("OnProposalFailed err = %v, want *SaveStateError", calls[0].err)
+	}
+}
+
+// TestFailBatchProposals_UnionsWithoutDoubleReporting pins the callback contract
+// on the overlap. A shard that commits in the same round it appends (a
+// single-node shard always does) carries the same entry in both sets. Callback
+// is an exported interface whose contract does not promise idempotence, so the
+// entry must be reported exactly once, in exactly one call.
+func TestFailBatchProposals_UnionsWithoutDoubleReporting(t *testing.T) {
+	cb := newTestCallback()
+	shared := proto.Entry{Term: 1, Index: 4, Key: 0xAAAA}
+	committedOnly := proto.Entry{Term: 1, Index: 3, Key: 0xBBBB}
+
+	failBatchProposals(cb, proto.Update{
+		ShardID:          7,
+		EntriesToSave:    []proto.Entry{shared},
+		CommittedEntries: []proto.Entry{committedOnly, shared},
+	}, errors.New("boom"))
+
+	calls := cb.getProposalFailedCalls()
+	if len(calls) != 1 {
+		t.Fatalf("OnProposalFailed calls = %d, want exactly 1", len(calls))
+	}
+	counts := map[uint64]int{}
+	for _, e := range calls[0].entries {
+		counts[e.Key]++
+	}
+	if counts[0xAAAA] != 1 {
+		t.Errorf("entry present in BOTH sets reported %d times, want 1", counts[0xAAAA])
+	}
+	if counts[0xBBBB] != 1 {
+		t.Errorf("committed-only entry reported %d times, want 1", counts[0xBBBB])
+	}
+}

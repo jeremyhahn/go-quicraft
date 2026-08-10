@@ -1,0 +1,106 @@
+// Copyright 2026 Jeremy Hahn
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package raft
+
+import (
+	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
+
+// newRateLimitedInMemory builds an in-memory log wired to a per-shard limiter
+// and the SHARED global limiter, the way newRaft wires them.
+func newRateLimitedInMemory(global *server.RateLimiter) *inMemory {
+	im := newInMemory(0)
+	im.rl = server.NewInMemRateLimiter(1 << 30)
+	im.globalRL = global
+	return &im
+}
+
+func rlEntries(first, count uint64) []proto.Entry {
+	entries := make([]proto.Entry, count)
+	for i := range entries {
+		entries[i] = proto.Entry{Term: 1, Index: first + uint64(i), Cmd: []byte("payload")}
+	}
+	return entries
+}
+
+// TestGlobalRateLimiter_IsSharedAndUpdatedByDelta pins the accounting model of
+// the global (cross-shard) limiter. It is ONE counter shared by every shard on
+// the host, so a shard may only ever apply DELTAS to it. Writing an absolute
+// size — which is correct for the per-shard limiter — silently overwrites every
+// other shard's contribution, so the host-wide total no longer reflects the
+// memory actually held and MaxTotalInMemLogSize stops applying backpressure.
+//
+// The snapshot-restore path is the sharpest case: one shard restoring would
+// zero the total for all of them.
+func TestGlobalRateLimiter_IsSharedAndUpdatedByDelta(t *testing.T) {
+	global := server.NewRateLimiter(1 << 30)
+	shardA := newRateLimitedInMemory(global)
+	shardB := newRateLimitedInMemory(global)
+
+	a := rlEntries(1, 4)
+	b := rlEntries(1, 6)
+	shardA.merge(a)
+	shardB.merge(b)
+
+	sizeA := getEntrySliceInMemSize(a)
+	sizeB := getEntrySliceInMemSize(b)
+	if got, want := global.Get(), sizeA+sizeB; got != want {
+		t.Fatalf("global size = %d, want %d (both shards' entries)", got, want)
+	}
+
+	// Shard B restores from a snapshot and drops its whole in-memory log.
+	// Shard A is untouched and must keep its share of the global total.
+	shardB.restore(proto.Snapshot{Index: 20, Term: 2})
+
+	if got := global.Get(); got != sizeA {
+		t.Fatalf("global size = %d after shard B restored, want %d (shard A's entries).\n"+
+			"A shard that restores from a snapshot wrote its own absolute size to the "+
+			"SHARED counter, discarding every other shard's contribution: the host-wide "+
+			"total now under-reports the memory actually held and MaxTotalInMemLogSize "+
+			"stops applying backpressure.", got, sizeA)
+	}
+
+	// Shard B refills; the total must again be the sum, not just B's share.
+	b2 := rlEntries(21, 3)
+	shardB.merge(b2)
+	if got, want := global.Get(), sizeA+getEntrySliceInMemSize(b2); got != want {
+		t.Fatalf("global size = %d after shard B refilled, want %d", got, want)
+	}
+}
+
+// TestGlobalRateLimiter_ShardCannotConsumeAnotherShardsShare pins the clamp on
+// the decrease path. A shard must never subtract more from the shared counter
+// than it put in; doing so drives the global total below the real footprint and
+// disables backpressure host-wide.
+func TestGlobalRateLimiter_ShardCannotConsumeAnotherShardsShare(t *testing.T) {
+	global := server.NewRateLimiter(1 << 30)
+	shardA := newRateLimitedInMemory(global)
+	shardB := newRateLimitedInMemory(global)
+
+	a := rlEntries(1, 5)
+	shardA.merge(a)
+	sizeA := getEntrySliceInMemSize(a)
+
+	// Shard B never contributed anything, so it can take nothing away.
+	shardB.subGlobalSize(sizeA)
+
+	if got := global.Get(); got != sizeA {
+		t.Fatalf("global size = %d, want %d: a shard subtracted another shard's "+
+			"share from the shared counter", got, sizeA)
+	}
+}

@@ -1208,6 +1208,14 @@ func (p *Peer) GetMembership() proto.Membership {
 // because IsMember reads it from the transport recv goroutine.
 func (p *Peer) MarkJoining() {
 	p.setJoining(true)
+	// Then immediately test whether this replica is joining AT ALL. join=true is
+	// a startup flag, not durable state: an operator restarting an established
+	// replica keeps it set, and NewPeer has already seeded the membership from
+	// the persisted NodeState. Without this evaluation the bypass would only ever
+	// be reconsidered by a config change or a snapshot, so a restarted replica in
+	// a quiescent shard — nothing joining, nothing leaving, no compaction — would
+	// authorize every replica ID for the entire lifetime of the process.
+	p.clearJoiningIfKnown()
 }
 
 // setJoining writes BOTH copies of the joining flag: the atomic one on Peer
@@ -1257,10 +1265,20 @@ func (p *Peer) setJoining(joining bool) {
 //	    membership changes, no later heartbeat would ever clear it.
 //
 // No signal fires too early: (a) only once the leader is authorizable, (b) only
-// once this replica is officially in the configuration, and (c) only once its
-// removal is committed. In the post-bootstrap-leader case all three are false
-// after the founding entry alone, so the bypass correctly persists until the
-// leader's AddNode arrives. A snapshot also clears joining unconditionally
+// once this replica is officially in the configuration ALONGSIDE somebody else,
+// and (c) only once its removal is committed. In the post-bootstrap-leader case
+// all three are false after the founding entry alone, so the bypass correctly
+// persists until the leader's AddNode arrives.
+//
+// (b) carries the extra hasMemberOtherThan test because self-membership alone is
+// not knowledge of the cluster. A replica whose configuration names only itself
+// — it applied an AddNode for itself without yet holding the entry that names
+// the rest of the shard — would clear the bypass and then reject the very leader
+// it needs to hear from, with no way left to learn more: a permanent wedge, not
+// a transient one. Requiring one other named member makes the configuration
+// actually usable for authorization before the bypass ends.
+//
+// A snapshot also clears joining unconditionally
 // (Handle's adopt branch), for the compacted case. A single-node bootstrap never
 // sets joining, so this is only ever reached by a replica added to an existing
 // cluster.
@@ -1270,7 +1288,7 @@ func (p *Peer) clearJoiningIfKnown() {
 	}
 	leaderID := p.r.leaderID
 	if (leaderID != noLeader && p.membership.isMember(leaderID)) ||
-		p.membership.isMember(p.replicaID) ||
+		(p.membership.isMember(p.replicaID) && p.membership.hasMemberOtherThan(p.replicaID)) ||
 		p.membership.isRemoved(p.replicaID) {
 		p.setJoining(false)
 	}

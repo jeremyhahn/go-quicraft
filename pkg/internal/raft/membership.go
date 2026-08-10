@@ -196,6 +196,30 @@ func (m *membership) isMember(replicaID uint64) bool {
 	return m.isVoter(replicaID) || m.isObserver(replicaID) || m.isWitness(replicaID)
 }
 
+// hasMemberOtherThan reports whether the configuration names an active member
+// that is not replicaID. It is the test for "this configuration can authorize
+// somebody besides me": a membership consisting solely of this replica carries
+// no information about who else may legitimately send to this shard, so it is
+// not sufficient to end the joining window.
+func (m *membership) hasMemberOtherThan(replicaID uint64) bool {
+	for id := range m.addresses {
+		if id != replicaID {
+			return true
+		}
+	}
+	for id := range m.observers {
+		if id != replicaID {
+			return true
+		}
+	}
+	for id := range m.witnesses {
+		if id != replicaID {
+			return true
+		}
+	}
+	return false
+}
+
 // isRemoved reports whether the replica carries a Removed tombstone — a
 // committed RemoveNode was applied for it. A tombstone is durable evidence that
 // this replica has learned the committed configuration (its own removal was

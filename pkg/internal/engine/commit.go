@@ -556,6 +556,64 @@ func (w *commitWorker) abandonBatchTail(start int) {
 	}
 }
 
+// failBatchProposals completes every pending proposal carried by a batch that
+// is being abandoned, so callers get an immediate error instead of blocking to
+// their context deadline.
+//
+// BOTH entry sets have to be reported, because the proposals waiting on them
+// are resolved at different stages and the abandoned batch strands both:
+//
+//   - EntriesToSave are freshly proposed entries. On a leader this is where a
+//     client's proposal FIRST appears; it is not yet committed, so it is absent
+//     from CommittedEntries. Reporting only committed entries therefore left the
+//     common case — a proposal accepted into a batch that then failed to persist
+//     — with no completion at all.
+//   - CommittedEntries are resolved on apply, which will never run for this
+//     batch.
+//
+// The node is marked permanently failed by both callers, so no later batch can
+// complete either set.
+//
+// The two sets overlap whenever a shard commits in the same round it appends (a
+// single-node shard always does), so they are unioned into ONE call rather than
+// reported separately. Callback is an exported interface: reporting the same
+// entry twice would silently require every external implementation to be
+// idempotent, which its contract does not promise. Entries are deduplicated on
+// (Index, Term), which identifies an entry uniquely within a single update.
+// The allocation is confined to this terminal path — the node is already failed.
+func failBatchProposals(callback Callback, u proto.Update, err error) {
+	if callback == nil {
+		return
+	}
+	switch {
+	case len(u.EntriesToSave) == 0 && len(u.CommittedEntries) == 0:
+		return
+	case len(u.EntriesToSave) == 0:
+		callback.OnProposalFailed(u.ShardID, u.CommittedEntries, err)
+		return
+	case len(u.CommittedEntries) == 0:
+		callback.OnProposalFailed(u.ShardID, u.EntriesToSave, err)
+		return
+	}
+
+	type entryID struct{ index, term uint64 }
+	all := make([]proto.Entry, 0, len(u.EntriesToSave)+len(u.CommittedEntries))
+	all = append(all, u.EntriesToSave...)
+	seen := make(map[entryID]struct{}, len(all))
+	for i := range all {
+		seen[entryID{all[i].Index, all[i].Term}] = struct{}{}
+	}
+	for i := range u.CommittedEntries {
+		id := entryID{u.CommittedEntries[i].Index, u.CommittedEntries[i].Term}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		all = append(all, u.CommittedEntries[i])
+	}
+	callback.OnProposalFailed(u.ShardID, all, err)
+}
+
 // failBatchSaveState handles a terminal SaveState failure (either the
 // retry budget was exhausted or shutdown fired during the retry backoff)
 // for the current batch. The batch's committed entries were already
@@ -587,9 +645,7 @@ func (w *commitWorker) failBatchSaveState(saveErr error) {
 			Err:       saveErr,
 		}
 		node.handleError(saveStateErr)
-		if w.callback != nil && len(u.CommittedEntries) > 0 {
-			w.callback.OnProposalFailed(u.ShardID, u.CommittedEntries, saveStateErr)
-		}
+		failBatchProposals(w.callback, u, saveStateErr)
 		// Return the pooled committed-entries slice after the callback (which
 		// must not retain them). clearBatch below only zeroes the slot, so
 		// without this every failed batch permanently removes a slice from
@@ -623,9 +679,7 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	node.failed.Store(true)
 	node.commitPending.Store(false)
 	node.handleError(commitErr)
-	if callback != nil && len(u.CommittedEntries) > 0 {
-		callback.OnProposalFailed(u.ShardID, u.CommittedEntries, commitErr)
-	}
+	failBatchProposals(callback, u, commitErr)
 	// Return the pooled slice only after the callback, which must not
 	// retain the entries beyond the call.
 	u.ReleaseCommittedEntries()

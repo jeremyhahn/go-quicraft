@@ -351,3 +351,89 @@ func TestJoiningClearsWhenReplayRemovesSelf(t *testing.T) {
 		t.Fatal("IsMember still authorizes an unknown replica after self-removal replay")
 	}
 }
+
+// configChangeEntry marshals cc into an EntryConfigChange log entry at index.
+func configChangeEntry(t *testing.T, index uint64, cc proto.ConfigChange) proto.Entry {
+	t.Helper()
+	buf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(buf); err != nil {
+		t.Fatalf("marshal config change: %v", err)
+	}
+	return proto.Entry{Index: index, Term: 1, Type: proto.EntryConfigChange, Cmd: buf}
+}
+
+// TestJoiningDoesNotClearOnSelfOnlyMembership covers the other end of the same
+// hazard as TestJoiningDoesNotClearBeforeLeaderIsKnown: a joiner that applies an
+// AddNode for ITSELF without yet holding the entry that names the rest of the
+// shard. Self-membership alone is not knowledge of the cluster. Clearing on it
+// would leave the replica with a configuration of exactly {self}, which
+// authorizes nobody — so it would reject the leader's next append and could
+// never learn more. Permanent, and self-inflicted.
+func TestJoiningDoesNotClearOnSelfOnlyMembership(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{}, proto.Membership{})
+	p.MarkJoining()
+	// No leader known yet — this replica has not been contacted by one.
+	p.r.leaderID = noLeader
+
+	// The only membership-bearing entry this replica has is its own addition.
+	p.processConfigChanges([]proto.Entry{configChangeEntry(t, 10, proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: 6,
+		Address:   "f",
+	})})
+
+	if !p.membership.isMember(6) {
+		t.Fatal("precondition: the AddNode for self should have applied")
+	}
+	if p.membership.hasMemberOtherThan(6) {
+		t.Fatal("precondition: the configuration should name only replica 6")
+	}
+	if !p.joining.Load() {
+		t.Fatal("the joiner cleared the auth bypass on a configuration naming ONLY " +
+			"itself: it can now authorize nobody, so it will reject the leader's next " +
+			"append and can never learn the rest of the membership")
+	}
+
+	// Once a second member is named, the configuration can authorize somebody
+	// and the bypass correctly ends.
+	p.processConfigChanges([]proto.Entry{configChangeEntry(t, 11, proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: 2,
+		Address:   "b",
+	})})
+	if p.joining.Load() {
+		t.Fatal("the bypass should end once the configuration names a member besides self")
+	}
+	if p.IsMember(999) {
+		t.Fatal("bypass still active: a non-member was authorized")
+	}
+}
+
+// TestMarkJoiningClearsWhenMembershipIsAlreadyKnown pins the restart hole.
+// join=true is a STARTUP FLAG, not durable state: an operator restarting an
+// established replica keeps it set. NewPeer has already seeded the membership
+// from the persisted NodeState, so this replica knows the whole shard — but if
+// MarkJoining only ever set the flag, nothing would reconsider it. In a
+// quiescent shard (no config change, no snapshot) the bypass would then
+// authorize every replica ID for the entire lifetime of the process.
+func TestMarkJoiningClearsWhenMembershipIsAlreadyKnown(t *testing.T) {
+	known := proto.Membership{
+		Addresses:      map[uint64]string{1: "a", 2: "b", 3: "c"},
+		ConfigChangeID: 7,
+	}
+	p := newTestPeer(t, testConfigWithID(1, 3), proto.State{}, known)
+
+	p.MarkJoining()
+
+	if p.joining.Load() {
+		t.Fatal("a restarted replica with a complete persisted membership is still " +
+			"marked joining: nothing else would reconsider the flag in a quiescent " +
+			"shard, so per-shard auth is bypassed permanently")
+	}
+	if p.IsMember(999) {
+		t.Fatal("auth bypass survived the restart: a non-member was authorized")
+	}
+	if !p.IsMember(2) {
+		t.Fatal("a real member was rejected after the restart")
+	}
+}

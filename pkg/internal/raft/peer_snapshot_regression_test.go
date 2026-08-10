@@ -395,8 +395,17 @@ func TestPeer_InstallSnapshot_WireDeliveredIsRefused(t *testing.T) {
 func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
-	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
+	// The seeded configuration names only this replica, which is the state in
+	// which a node is genuinely still joining: knowing itself ALONGSIDE another
+	// member ends the joining window (clearJoiningIfKnown), so seeding the full
+	// {1,2,3} configuration here would assert an unreachable state and the
+	// joining assertion below would fail for a reason unrelated to the forgery.
+	p := newTestPeer(t, cfg, proto.State{},
+		proto.Membership{Addresses: map[uint64]string{1: "addr1"}})
 	p.MarkJoining()
+	if !p.joining.Load() {
+		t.Fatal("fixture: the peer must actually be joining for this test to mean anything")
+	}
 	p.r.becomeFollower(9, 2)
 
 	forged := proto.Message{
@@ -413,8 +422,12 @@ func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
 	if err := p.Handle(forged); !errors.Is(err, ErrWireLocalMessage) {
 		t.Fatalf("expected ErrWireLocalMessage, got %v", err)
 	}
-	if len(p.membership.addresses) != 3 {
+	if _, forgedIn := p.membership.addresses[2]; forgedIn {
 		t.Fatalf("joining node adopted a wire membership: %v", p.membership.addresses)
+	}
+	if _, self := p.membership.addresses[1]; !self || len(p.membership.addresses) != 1 {
+		t.Fatalf("joining node's configuration was rewritten by a wire message: %v",
+			p.membership.addresses)
 	}
 	if !p.joining.Load() {
 		t.Fatal("a wire InstallSnapshot cleared the joining flag, re-enabling " +

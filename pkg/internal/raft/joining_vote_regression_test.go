@@ -38,10 +38,26 @@ import (
 // the state the bug needs: started with join=true, caught up by log replay, and
 // currently following leader 1. No snapshot has ever been delivered, so the
 // joining flag is still set.
+//
+// The seeded configuration names ONLY replica 3 — the replica applied the
+// AddNode for itself, but the entries naming the rest of the shard were
+// compacted away before it arrived and no snapshot has replaced them. That is
+// the state in which a replica is still genuinely joining, and it is chosen
+// deliberately over the two alternatives:
+//
+//   - The full {1,2,3} configuration is no longer compatible with joining at
+//     all: knowing itself alongside another member ends the bypass (see
+//     clearJoiningIfKnown), so a fixture asserting both would be asserting an
+//     unreachable state.
+//   - An EMPTY configuration would make the fixture VACUOUS. It sets
+//     selfRemoved, so startElection returns at its first gate and
+//     StillDoesNotCampaign below would pass without ever reaching the joining
+//     gate it exists to test.
 func newJoiningReplayCaughtUpPeer(t *testing.T) *Peer {
 	t.Helper()
 	p := newTestPeerWithLog(t, testConfigWithID(1, 3), contiguousEntries(5),
-		proto.State{Term: 1, Commit: 5}, threeNodeMembership())
+		proto.State{Term: 1, Commit: 5},
+		proto.Membership{Addresses: map[uint64]string{3: "addr3"}})
 	p.MarkJoining()
 
 	// The leader contacts the joining node, which becomes its follower. This

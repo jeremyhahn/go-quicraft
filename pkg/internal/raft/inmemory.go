@@ -86,6 +86,55 @@ type inMemory struct {
 	// globalRL is the global (cross-shard) rate limiter. Nil when global
 	// rate limiting is disabled (MaxTotalInMemLogSize == 0).
 	globalRL *server.RateLimiter
+	// globalContribution is the in-memory size this shard currently has
+	// counted in globalRL. The global limiter is SHARED by every shard on the
+	// host, so unlike the per-shard rl it can only ever be updated with
+	// DELTAS — an absolute Set would overwrite every other shard's
+	// contribution. This field is what turns the absolute sizes the log
+	// computes into those deltas. It is owned by the raft step goroutine, the
+	// only mutator of inMemory.
+	globalContribution uint64
+}
+
+// setGlobalSize reports sz as this shard's total contribution to the shared
+// global limiter, applying the change as a delta so the other shards' shares
+// are preserved.
+func (im *inMemory) setGlobalSize(sz uint64) {
+	if im.globalRL == nil {
+		return
+	}
+	switch {
+	case sz > im.globalContribution:
+		im.globalRL.Increase(sz - im.globalContribution)
+	case sz < im.globalContribution:
+		im.globalRL.Decrease(im.globalContribution - sz)
+	}
+	im.globalContribution = sz
+}
+
+// addGlobalSize adds sz to this shard's contribution to the global limiter.
+func (im *inMemory) addGlobalSize(sz uint64) {
+	if im.globalRL == nil {
+		return
+	}
+	im.globalRL.Increase(sz)
+	im.globalContribution += sz
+}
+
+// subGlobalSize removes sz from this shard's contribution to the global
+// limiter. The amount is clamped to what this shard actually contributed:
+// decreasing the shared counter by more than that would silently consume
+// another shard's share and drive the global total below the true in-memory
+// footprint, disabling backpressure exactly when it is needed.
+func (im *inMemory) subGlobalSize(sz uint64) {
+	if im.globalRL == nil {
+		return
+	}
+	if sz > im.globalContribution {
+		sz = im.globalContribution
+	}
+	im.globalRL.Decrease(sz)
+	im.globalContribution -= sz
 }
 
 // newInMemory creates an in-memory log starting after the given lastIndex.
@@ -273,9 +322,7 @@ func (im *inMemory) appliedLogTo(index uint64) {
 		appliedEntries := im.entries[:index+1-im.markerIndex]
 		sz := getEntrySliceInMemSize(appliedEntries)
 		im.rl.Decrease(sz)
-		if im.globalRL != nil {
-			im.globalRL.Decrease(sz)
-		}
+		im.subGlobalSize(sz)
 	}
 
 	newMarkerIndex := index + 1
@@ -301,9 +348,7 @@ func (im *inMemory) restore(ss proto.Snapshot) {
 	im.savedTo = ss.Index
 	if im.rl != nil {
 		im.rl.Set(0)
-		if im.globalRL != nil {
-			im.globalRL.Set(0)
-		}
+		im.setGlobalSize(0)
 	}
 }
 
@@ -325,9 +370,7 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		if im.rl != nil {
 			sz := getEntrySliceInMemSize(entries)
 			im.rl.Increase(sz)
-			if im.globalRL != nil {
-				im.globalRL.Increase(sz)
-			}
+			im.addGlobalSize(sz)
 		}
 
 	case firstNewIndex <= im.markerIndex:
@@ -340,9 +383,7 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		if im.rl != nil {
 			sz := getEntrySliceInMemSize(im.entries)
 			im.rl.Set(sz)
-			if im.globalRL != nil {
-				im.globalRL.Set(sz)
-			}
+			im.setGlobalSize(sz)
 		}
 
 	default:
@@ -378,9 +419,7 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		if im.rl != nil {
 			sz := getEntrySliceInMemSize(im.entries)
 			im.rl.Set(sz)
-			if im.globalRL != nil {
-				im.globalRL.Set(sz)
-			}
+			im.setGlobalSize(sz)
 		}
 	}
 	im.checkMarkerIndex()
