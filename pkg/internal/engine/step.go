@@ -960,12 +960,10 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// drains again for any messages it generates; DrainFreeOrderMessages only
 	// returns what is currently buffered, so there is no double-send.
 	//
-	// A RequestVoteResp stepped above can also drive this node all the way to
-	// becomeLeader, and a CheckQuorum step-down can drop it. Neither produces
-	// a proto.Update, so without publishing here the Host would keep serving a
-	// stale IsLeader through GetShardInfo — the flag clients route writes by.
-	w.publishLeaderChange(shardID, node)
-
+	// A CheckQuorum step-down driven by the HeartbeatResps stepped above
+	// produces no proto.Update at all, so without publishing it the Host would
+	// keep serving a stale IsLeader through GetShardInfo — the flag clients
+	// route writes by. The publish itself happens after the unlock below.
 	phase1FreeOrder := node.peer.DrainFreeOrderMessages()
 
 	// Extract ReadIndex completions immediately after processing
@@ -974,6 +972,14 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	readStates := node.peer.DrainReadStatesOnly()
 
 	node.raftMu.Unlock()
+
+	// Publish OUTSIDE raftMu. OnLeaderUpdated runs arbitrary user listener code
+	// (and the Host's failPendingRequests); running it under the lock stalls the
+	// commit worker's node.raftMu.Lock() for every shard that worker owns, for
+	// however long the user's listener takes. LeaderID/Term are atomics, so
+	// nothing here needs the lock. Placed before the early return below so both
+	// exits from this function publish.
+	w.publishLeaderChange(shardID, node)
 
 	// Send Phase 1 free-order messages outside the lock.
 	if len(phase1FreeOrder) > 0 {
@@ -1068,6 +1074,14 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	if w.callback != nil && len(additionalReadStates) > 0 {
 		w.callback.OnReadyToRead(shardID, additionalReadStates)
 	}
+
+	// Publish again after Phase 2, still outside the lock. This is the phase
+	// that can actually make this node a leader: RequestVoteResp is not a
+	// HeartbeatResp, so it is sorted into otherMsgs and stepped HERE — after the
+	// Phase 1 publish has already run. A node that won its election on a vote
+	// response delivered while commitPending was set would otherwise be reported
+	// as a follower by GetShardInfo until some later cycle happened to publish.
+	w.publishLeaderChange(shardID, node)
 }
 
 // sendMessages delivers outbound Raft messages via the transport layer.

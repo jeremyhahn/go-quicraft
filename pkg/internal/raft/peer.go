@@ -378,10 +378,23 @@ func (p *Peer) Handle(msg proto.Message) error {
 		)
 	}
 
-	// A locally injected snapshot whose term is behind ours is stale: the
+	// A locally injected snapshot whose MESSAGE term is behind ours is stale: the
 	// snapshot receive path can complete after this replica has moved on to a
 	// later term, and its membership is then older than what the log already
 	// applied.
+	//
+	// This is defence in depth, not the operative protection. Neither production
+	// injector (messagehandler's re-delivery of a persisted snapshot, and the
+	// post-receive install) sets Message.Term — they populate Snapshot.Term only
+	// — so msg.Term is 0 there and this never fires. It is deliberately NOT
+	// rewritten to compare Snapshot.Term: that is the term of the snapshot's last
+	// included entry, which is routinely far below the current term for a
+	// perfectly valid snapshot, and rejecting on it would refuse legitimate
+	// installs.
+	//
+	// What actually bounds this hazard is snapshotRejected below: a snapshot at
+	// or below the committed index cannot redefine membership. Index, not term,
+	// is the sound staleness test here.
 	staleTerm := msg.Type == proto.InstallSnapshot &&
 		msg.Term > 0 && msg.Term < termBefore
 	if staleTerm {

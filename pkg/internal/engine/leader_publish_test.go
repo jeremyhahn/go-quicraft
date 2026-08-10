@@ -216,18 +216,12 @@ func TestStepWorker_CommitPendingInbox_PublishesLeaderChange(t *testing.T) {
 			"(leaderID=%d)", peer.LeaderID())
 	}
 
-	// A subsequent commitPending cycle — here driven by an ordinary heartbeat,
-	// exactly as a live cluster would — must publish the new leadership.
-	if !node.Deliver(proto.Message{
-		Type: proto.Heartbeat,
-		From: 2,
-		To:   1,
-		Term: peer.Term(),
-	}) {
-		t.Fatal("inbox rejected the heartbeat")
-	}
-	sw.processCommitPendingInbox(1, node)
-
+	// The SAME cycle that won the election must publish it. RequestVoteResp is
+	// not a HeartbeatResp, so it is sorted into otherMsgs and stepped in phase
+	// 2 — after the phase 1 publish has already run. With publishing done only
+	// at the end of phase 1, this node stayed a real Raft leader that the Host
+	// reported as a follower until some later cycle happened to publish, and
+	// under sustained write load commitPending keeps that cycle from coming.
 	if got := lastLeader(cb); got != 1 {
 		t.Fatalf("leadership won under commitPending was never published "+
 			"(last published leader=%d, raft leaderID=%d): the Host reports this "+
@@ -255,5 +249,81 @@ func drainCommitC(commitC chan *commitItem) {
 		default:
 			return
 		}
+	}
+}
+
+// lockProbeCallback records whether OnLeaderUpdated was invoked while the
+// node's raftMu was held, by trying to take the lock from inside the callback.
+type lockProbeCallback struct {
+	Callback
+	node       *Node
+	calls      int
+	underLock  bool
+	lastLeader uint64
+}
+
+func (c *lockProbeCallback) OnLeaderUpdated(shardID, leaderID, term uint64) {
+	c.calls++
+	c.lastLeader = leaderID
+	// raftMu is not reentrant. If the caller still holds it, TryLock fails.
+	if c.node.raftMu.TryLock() {
+		c.node.raftMu.Unlock()
+	} else {
+		c.underLock = true
+	}
+}
+
+// TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu pins the contract
+// publishLeaderChange documents for itself: the callback never executes under
+// the node lock.
+//
+// OnLeaderUpdated runs arbitrary user listener code (and the Host's
+// failPendingRequests). Invoking it under raftMu blocks the commit worker's
+// node.raftMu.Lock() for EVERY shard that worker owns, for as long as the
+// user's listener takes — a head-of-line stall across unrelated shards, gated
+// on third-party code with no time bound.
+func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 64)
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	peer, lr := newTestVoterPeer(t, 1, 1, 3)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+
+	cb := &lockProbeCallback{Callback: newTestCallback(), node: node}
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+	sw.loadNode(node)
+
+	// Drive the node to leadership through the commitPending path.
+	for range 400 {
+		peer.Tick()
+		if err := peer.Handle(proto.Message{
+			Type: proto.RequestPreVoteResp, From: 2, To: 1, Term: peer.Term() + 1,
+		}); err != nil {
+			t.Fatalf("RequestPreVoteResp handle failed: %v", err)
+		}
+		if peer.Term() > 1 {
+			break
+		}
+	}
+	node.commitPending.Store(true)
+	if !node.Deliver(proto.Message{
+		Type: proto.RequestVoteResp, From: 2, To: 1, Term: peer.Term(),
+	}) {
+		t.Fatal("inbox rejected the vote response")
+	}
+	sw.processCommitPendingInbox(1, node)
+
+	if cb.calls == 0 {
+		t.Fatal("fixture: OnLeaderUpdated never fired, so the lock probe proved nothing")
+	}
+	if cb.underLock {
+		t.Fatalf("OnLeaderUpdated (leader=%d) ran while raftMu was held: arbitrary "+
+			"user listener code now stalls the commit worker for every shard it owns",
+			cb.lastLeader)
 	}
 }

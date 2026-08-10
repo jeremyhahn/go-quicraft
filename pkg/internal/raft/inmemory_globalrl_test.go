@@ -30,6 +30,14 @@ func newRateLimitedInMemory(global *server.RateLimiter) *inMemory {
 	return &im
 }
 
+// newGlobalOnlyInMemory builds an in-memory log with ONLY the host-wide limiter
+// configured (MaxTotalInMemLogSize set, MaxInMemLogSize left at its default 0).
+func newGlobalOnlyInMemory(global *server.RateLimiter) *inMemory {
+	im := newInMemory(0)
+	im.globalRL = global
+	return &im
+}
+
 func rlEntries(first, count uint64) []proto.Entry {
 	entries := make([]proto.Entry, count)
 	for i := range entries {
@@ -102,5 +110,36 @@ func TestGlobalRateLimiter_ShardCannotConsumeAnotherShardsShare(t *testing.T) {
 	if got := global.Get(); got != sizeA {
 		t.Fatalf("global size = %d, want %d: a shard subtracted another shard's "+
 			"share from the shared counter", got, sizeA)
+	}
+}
+
+// TestGlobalRateLimiter_WorksWithoutThePerShardLimiter pins that the two limits
+// are INDEPENDENT knobs. MaxInMemLogSize and MaxTotalInMemLogSize both default
+// to 0 and are not cross-validated, so configuring only the host-wide cap is
+// both legal and the documented way to enable it. Nesting the global accounting
+// inside the per-shard limiter's nil check meant that configuration allocated a
+// limiter that was consulted on every propose and permanently read zero — the
+// cap silently did nothing.
+func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
+	global := server.NewRateLimiter(1 << 30)
+	shard := newGlobalOnlyInMemory(global)
+	if shard.rl != nil {
+		t.Fatal("fixture: the per-shard limiter must be disabled")
+	}
+
+	entries := rlEntries(1, 4)
+	shard.merge(entries)
+
+	size := getEntrySliceInMemSize(entries)
+	if got := global.Get(); got != size {
+		t.Fatalf("global size = %d, want %d: with only MaxTotalInMemLogSize set, "+
+			"the host-wide limiter never saw the shard's in-memory log at all, so "+
+			"the configured cap applies no backpressure", got, size)
+	}
+
+	// And it comes back down as entries are applied.
+	shard.appliedLogTo(4)
+	if got := global.Get(); got != 0 {
+		t.Fatalf("global size = %d after applying every entry, want 0", got)
 	}
 }

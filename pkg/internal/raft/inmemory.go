@@ -317,11 +317,18 @@ func (im *inMemory) appliedLogTo(index uint64) {
 	im.appliedTo = entry.Index
 	im.appliedToTerm.Store(entry.Term)
 
-	// Decrease rate limiter sizes for applied entries.
-	if im.rl != nil {
+	// Decrease rate limiter sizes for applied entries. The per-shard and the
+	// global limiter are INDEPENDENT knobs (MaxInMemLogSize and
+	// MaxTotalInMemLogSize), so the global update must not be nested under the
+	// per-shard one: configuring only the host-wide cap — the documented way to
+	// enable it — would otherwise allocate a limiter that is consulted on every
+	// propose and permanently reads zero.
+	if im.rl != nil || im.globalRL != nil {
 		appliedEntries := im.entries[:index+1-im.markerIndex]
 		sz := getEntrySliceInMemSize(appliedEntries)
-		im.rl.Decrease(sz)
+		if im.rl != nil {
+			im.rl.Decrease(sz)
+		}
 		im.subGlobalSize(sz)
 	}
 
@@ -348,8 +355,8 @@ func (im *inMemory) restore(ss proto.Snapshot) {
 	im.savedTo = ss.Index
 	if im.rl != nil {
 		im.rl.Set(0)
-		im.setGlobalSize(0)
 	}
+	im.setGlobalSize(0)
 }
 
 // merge incorporates entries, handling three cases:
@@ -367,9 +374,11 @@ func (im *inMemory) merge(entries []proto.Entry) {
 	case firstNewIndex == im.markerIndex+uint64(len(im.entries)):
 		// Case 1: new entries are contiguous with existing entries.
 		im.entries = append(im.entries, entries...)
-		if im.rl != nil {
+		if im.rl != nil || im.globalRL != nil {
 			sz := getEntrySliceInMemSize(entries)
-			im.rl.Increase(sz)
+			if im.rl != nil {
+				im.rl.Increase(sz)
+			}
 			im.addGlobalSize(sz)
 		}
 
@@ -380,9 +389,11 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		im.wastedPrefix = 0
 		im.entries = im.newEntrySlice(entries)
 		im.savedTo = firstNewIndex - 1
-		if im.rl != nil {
+		if im.rl != nil || im.globalRL != nil {
 			sz := getEntrySliceInMemSize(im.entries)
-			im.rl.Set(sz)
+			if im.rl != nil {
+				im.rl.Set(sz)
+			}
 			im.setGlobalSize(sz)
 		}
 
@@ -416,9 +427,11 @@ func (im *inMemory) merge(entries []proto.Entry) {
 		if im.savedTo >= firstNewIndex {
 			im.savedTo = firstNewIndex - 1
 		}
-		if im.rl != nil {
+		if im.rl != nil || im.globalRL != nil {
 			sz := getEntrySliceInMemSize(im.entries)
-			im.rl.Set(sz)
+			if im.rl != nil {
+				im.rl.Set(sz)
+			}
 			im.setGlobalSize(sz)
 		}
 	}
