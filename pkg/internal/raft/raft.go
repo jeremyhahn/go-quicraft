@@ -2442,12 +2442,23 @@ func (r *raft) handleAppendResp(msg proto.Message) error {
 
 	if updated {
 		if r.tryCommit() {
-			// Commit index advanced. Broadcast the new commit index
-			// to all followers so they can advance their own commit
-			// and apply committed entries. Without this broadcast,
-			// followers whose MsgAppResp hasn't arrived yet would
-			// only learn about the commit via heartbeats, which
-			// carry min(match, committed) — useless if match is 0.
+			// Commit index advanced. Broadcast so followers can advance
+			// their own commit and apply committed entries.
+			//
+			// This reaches every peer that has entries outstanding, and every
+			// peer NOT in the steady replicate state (probe/snapshot), where
+			// sendAppend emits a message regardless. It does NOT reach a
+			// follower that is fully caught up in remoteReplicate: sendAppend
+			// returns early when there are no entries to send for such a peer,
+			// so no empty append is generated to carry the new commit index
+			// alone. Those followers learn the commit from the next heartbeat
+			// (one HeartbeatRTT, one tick by default) or the next real append.
+			//
+			// That early return is a deliberate volume tradeoff: emitting an
+			// empty append to every idle follower on every commit is a hot-path
+			// cost. etcd/raft makes the opposite choice. Revisiting it is a
+			// latency-vs-throughput decision to be benchmarked, not a
+			// correctness fix — commit propagation is bounded either way.
 			r.broadcastAppend()
 		}
 		// If leader transfer target is now caught up, send TimeoutNow.
