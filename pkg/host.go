@@ -5548,8 +5548,18 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, header.Index); rmErr != nil {
 		return rmErr
 	}
+	// Compact only garbage-collects segments the marker RemoveEntriesTo just
+	// wrote has already made obsolete, so by this point the restore is COMPLETE
+	// and durable: the snapshot is recorded and the compaction floor is set. A
+	// failure here reclaims no space but loses no correctness — and returning it
+	// would report a successful restore as failed, with no way to retry, because
+	// the snapshot index and directory now exist (a re-import of the same artifact
+	// is refused). Log it for the operator instead.
 	if compactErr := h.logdb.Compact(shardID, replicaID); compactErr != nil {
-		return compactErr
+		h.logger.Warn("imported snapshot recorded and log floor advanced, but WAL "+
+			"segment garbage collection failed; the restore is complete and the "+
+			"obsolete segments will be reclaimed by a later compaction",
+			"shard_id", shardID, "replica_id", replicaID, "error", compactErr)
 	}
 	return nil
 }
