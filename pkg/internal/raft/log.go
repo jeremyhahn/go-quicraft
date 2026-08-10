@@ -650,17 +650,45 @@ func (l *raftLog) firstNotAppliedIndex() uint64 {
 	return fi
 }
 
+// savedIndex returns the highest log index durably persisted to LogDB.
+// Committed entries above this marker are committed but not yet crash-safe:
+// the piggyback apply path must not apply them nor advertise a
+// HardState.Commit that covers them, or a crash could leave HardState.Commit
+// ahead of the last durable log entry (see GetPiggybackUpdate).
+func (l *raftLog) savedIndex() uint64 {
+	return l.inmem.savedTo
+}
+
 // entriesToApply returns committed but not yet processed entries,
 // limited to maxEntriesToApplySize bytes. Entries are copied into a
 // pooled slice to reduce GC pressure on the apply hot path. The
 // returned pooled pointer must be passed to proto.PutEntrySlice after
 // the entries are consumed.
 func (l *raftLog) entriesToApply() ([]proto.Entry, *[]proto.Entry, error) {
+	return l.entriesToApplyUpTo(l.committed)
+}
+
+// entriesToApplyUpTo returns committed but not yet processed entries whose
+// index does not exceed ceiling, limited to maxEntriesToApplySize bytes.
+// A ceiling below committed lets a caller withhold entries that are committed
+// but not yet durable (see savedIndex); the withheld tail is offered again on
+// a later cycle once it becomes durable. Ownership semantics match
+// entriesToApply: entries are copied into a pooled slice whose pointer must be
+// passed to proto.PutEntrySlice after the entries are consumed.
+func (l *raftLog) entriesToApplyUpTo(ceiling uint64) ([]proto.Entry, *[]proto.Entry, error) {
 	if !l.hasEntriesToApply() {
 		return nil, nil, nil
 	}
 	low := l.firstNotAppliedIndex()
 	high := l.committed + 1
+	if ceiling+1 < high {
+		high = ceiling + 1
+	}
+	if low >= high {
+		// Everything at or below the ceiling has already been applied;
+		// the remainder is committed but not yet eligible.
+		return nil, nil, nil
+	}
 	entries, err := l.entries(low, high, maxEntriesToApplySize)
 	if err != nil || len(entries) == 0 {
 		return entries, nil, err

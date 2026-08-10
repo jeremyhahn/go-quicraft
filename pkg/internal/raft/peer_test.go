@@ -3778,6 +3778,10 @@ func TestPeer_GetPiggybackUpdate_ReturnsCommittedEntries(t *testing.T) {
 		{Index: 3, Term: 1, Cmd: []byte("c")},
 	})
 	p.r.log.committed = 3
+	// Mark the entries durable. GetPiggybackUpdate clamps the applied range to
+	// the durable marker (savedTo); without this the piggyback would (correctly)
+	// withhold the not-yet-fsynced tail and return nothing.
+	p.r.log.inmem.savedTo = 3
 	// processed starts at 0 from newRaftLog, so hasEntriesToApply = true.
 
 	update, err := p.GetPiggybackUpdate(0)
@@ -3827,6 +3831,7 @@ func TestPeer_GetPiggybackUpdate_DrainsMessages(t *testing.T) {
 	// Merge 1 entry and set committed so there are entries to apply.
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
 	p.r.log.committed = 1
+	p.r.log.inmem.savedTo = 1 // durable, so the piggyback applies it (see H6 clamp)
 
 	// Add 2 outbound messages.
 	p.r.msgs = append(p.r.msgs, proto.Message{Type: proto.Heartbeat, From: 1})
@@ -3853,6 +3858,7 @@ func TestPeer_GetPiggybackUpdate_UpdatesPrevState(t *testing.T) {
 	p.r.term = 5
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 5}})
 	p.r.log.committed = 1
+	p.r.log.inmem.savedTo = 1   // durable, so the piggyback produces an update (see H6 clamp)
 	p.prevState = proto.State{} // zero
 
 	if !p.hasStateChanged() {
@@ -3901,6 +3907,7 @@ func TestPeer_GetPiggybackUpdate_DoesNotTouchReadStates(t *testing.T) {
 	// Merge 1 entry and set committed.
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
 	p.r.log.committed = 1
+	p.r.log.inmem.savedTo = 1 // durable, so the piggyback produces an update (see H6 clamp)
 
 	// Add a ReadyToRead state.
 	p.r.readStates = append(p.r.readStates, proto.ReadyToRead{Key: 42, Index: 1})

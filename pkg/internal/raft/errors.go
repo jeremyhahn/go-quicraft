@@ -161,6 +161,17 @@ var (
 	// snapshot delivers the bootstrap confState, so an election it wins
 	// would be decided by a quorum of one.
 	ErrJoiningNodeCannotCampaign = errors.New("raft: joining node cannot campaign with incomplete membership")
+
+	// ErrReservedEntryType is returned when a Propose carries an entry whose
+	// masked type is not one a client may propose. Only EntryNormal,
+	// EntryConfigChange, and EntryEncodedEntry originate from legitimate
+	// Host-side construction. EntryInitialMembership and EntryMetadata are
+	// produced only internally (bootstrap seeding and the leader's witness
+	// metadata path); a follower-forwarded wire Propose carrying one would
+	// otherwise wedge membership changes (an injected EntryInitialMembership
+	// keeps hasConfigChangeToApply true) or land a payload-less metadata entry
+	// in the durable log. The batch is rejected before any state mutation.
+	ErrReservedEntryType = errors.New("raft: proposed entry carries a reserved entry type")
 )
 
 // DecompressError wraps an underlying Snappy decode failure with context

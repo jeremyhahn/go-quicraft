@@ -906,8 +906,16 @@ func (r *raft) step(msg proto.Message) error {
 				}
 				r.becomeFollower(msg.Term, leaderID)
 			}
-		} else if msg.Term < r.term {
+		} else if msg.Term < r.term && msg.Type != proto.Propose && msg.Type != proto.ReadIndex {
 			// Stale message from an older term.
+			//
+			// Propose and ReadIndex are EXEMPT: a follower forwards them to the
+			// leader stamped with its own (older) term, and term carries no
+			// protocol meaning for a client request (etcd treats MsgProp and
+			// MsgReadIndex the same way). Dropping them here would hang the
+			// client to its deadline, so they fall through to the role handler
+			// below — stepLeader accepts them, stepFollower re-forwards Propose
+			// and serves ReadIndex, stepCandidate refuses safely.
 			if msg.Type == proto.Heartbeat || msg.Type == proto.Replicate || msg.Type == proto.InstallSnapshot {
 				// Send a corrective response so the stale sender learns the
 				// newer term (send() fills Term = r.term). Mark it Reject:true:
@@ -1826,10 +1834,35 @@ func (r *raft) resetVotes() {
 // Log replication
 // --------------------------------------------------------------------------
 
+// proposableEntryTypes is the allow-list of masked entry types a Propose may
+// carry. Only these three originate from legitimate Host-side construction:
+// EntryNormal (data), EntryConfigChange (membership), and EntryEncodedEntry
+// (session-managed). EntryInitialMembership and EntryMetadata are produced only
+// internally and must never enter the log through the wire-forwarded Propose
+// path (see ErrReservedEntryType).
+var proposableEntryTypes = map[uint64]struct{}{
+	proto.EntryNormal:       {},
+	proto.EntryConfigChange: {},
+	proto.EntryEncodedEntry: {},
+}
+
 // handleLeaderPropose handles a proposal on the leader.
 func (r *raft) handleLeaderPropose(msg proto.Message) error {
 	if r.transferTarget != noNode {
 		return ErrTransferInProgress
+	}
+
+	// Sanitize entry types before any state mutation. The leader assigns
+	// Term/Index but never inspected Type, so a follower-forwarded wire Propose
+	// could smuggle a reserved type into the log: an injected
+	// EntryInitialMembership keeps hasConfigChangeToApply true and wedges every
+	// legitimate config change with ErrPendingConfigChange, and an EntryMetadata
+	// would land a payload-less entry in the durable log. Reject the whole batch
+	// up front; this runs alongside the two-pass config-change validation below.
+	for i := range msg.Entries {
+		if _, ok := proposableEntryTypes[msg.Entries[i].Type&proto.EntryTypeMask]; !ok {
+			return ErrReservedEntryType
+		}
 	}
 
 	r.recordActivity()
@@ -3230,6 +3263,29 @@ func (r *raft) checkReadIndexQuorum() {
 			n++
 			continue
 		}
+		if pending.from != 0 && pending.from != r.replicaID {
+			// Forwarded from a follower; send response back.
+			r.send(proto.Message{
+				Type:     proto.ReadIndexResp,
+				To:       pending.from,
+				Hint:     pending.key,
+				LogIndex: pending.index,
+			})
+		} else if err := r.addReadState(proto.ReadyToRead{
+			Key:   pending.key,
+			Index: pending.index,
+		}); err != nil {
+			// Local request, but readStates is full (ErrReadIndexOverloaded).
+			// The result MUST NOT be dropped: a caller waiting without a
+			// deadline never receives its ReadyToRead and hangs forever.
+			// Retain the resolved request so it is retried on the next
+			// compaction pass, when readStates has drained. The loop is
+			// never blocked — the request simply stays pending.
+			r.pendingReadIndex[n] = r.pendingReadIndex[i]
+			n++
+			continue
+		}
+		// Delivered (forwarded response sent, or read state accepted).
 		resolvedCount++
 		slog.Debug("read index confirmed",
 			"shard", r.shardID,
@@ -3240,25 +3296,6 @@ func (r *raft) checkReadIndexQuorum() {
 			"ack_count", pending.ackCount,
 			"quorum", q,
 		)
-		if pending.from != 0 && pending.from != r.replicaID {
-			// Forwarded from a follower; send response back.
-			r.send(proto.Message{
-				Type:     proto.ReadIndexResp,
-				To:       pending.from,
-				Hint:     pending.key,
-				LogIndex: pending.index,
-			})
-		} else {
-			// Local request; add to read states. The cap check is
-			// best-effort here: we don't fail the quorum check if
-			// readStates is full, because the pending entry has already
-			// been resolved. Dropping the result is better than blocking
-			// the entire pendingReadIndex compaction loop.
-			_ = r.addReadState(proto.ReadyToRead{
-				Key:   pending.key,
-				Index: pending.index,
-			})
-		}
 	}
 	r.pendingReadIndex = r.pendingReadIndex[:n]
 	if resolvedCount > 0 {
