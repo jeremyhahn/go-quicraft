@@ -854,8 +854,24 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// Drain all queued operations from MPSC queues. The actual processing
 	// happens under raftMu to serialize with the commit worker.
-	w.commitProposeBuf = node.DrainProposals(w.commitProposeBuf)
-	w.readKeyBuf = node.DrainReadIndex(w.readKeyBuf)
+	//
+	// Client work — proposals and ReadIndex — stays QUEUED while a recovery
+	// owns the state machine, matching processReady's gate. This path is not a
+	// corner case during recovery, it is the steady state: the apply worker
+	// parks on the recovery gate WITHOUT clearing commitPending, so every cycle
+	// comes through here. Draining anyway defeated the documented backpressure
+	// entirely — neither a proposal nor a read can produce a result before the
+	// gate clears (the apply pipeline is stopped and lastApplied does not move),
+	// so accepting them buys nothing and denies the queues the chance to answer
+	// ErrSystemBusy, which is the honest reply from a replica that cannot serve
+	// them yet. Raft protocol traffic (the inbox) MUST keep flowing regardless.
+	if !node.IsRecovering() {
+		w.commitProposeBuf = node.DrainProposals(w.commitProposeBuf)
+		w.readKeyBuf = node.DrainReadIndex(w.readKeyBuf)
+	} else {
+		w.commitProposeBuf = w.commitProposeBuf[:0]
+		w.readKeyBuf = w.readKeyBuf[:0]
+	}
 	w.inboxBuf = node.DrainInbox(w.inboxBuf)
 	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.commitProposeBuf) == 0 {
 		return

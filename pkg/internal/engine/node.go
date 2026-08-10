@@ -203,11 +203,17 @@ type Node struct {
 	// RequestState in pendingReads before enqueuing the key.
 	readIndexQ *queue.EntryQueue[uint64]
 
-	// commitPending is set to true by the step worker after sending an
-	// Update to the commit channel, and cleared by the apply worker
-	// after applying committed entries. While true, the step worker
-	// skips this shard (re-enqueues it) to enforce single-owner
-	// semantics on the Peer.
+	// commitPending is set to true by the step worker BEFORE it sends the
+	// Update to the commit channel, and cleared by the apply worker after
+	// applying committed entries. The ordering is load-bearing, not incidental:
+	// the flag must already be visible when the commit worker picks the item
+	// up, or the step worker could extract a second Update for the same shard
+	// and the same entries could be applied twice.
+	//
+	// While true, the step worker does not run its normal cycle for this shard;
+	// it takes the processCommitPendingInbox path instead, which steps inbound
+	// protocol messages under raftMu so ReadIndex quorum and elections still
+	// make progress. Nothing is re-enqueued.
 	//
 	// Padded to 128 bytes to avoid false sharing with lastApplied.
 	commitPending struct {

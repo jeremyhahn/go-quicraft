@@ -327,3 +327,48 @@ func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
 			cb.lastLeader)
 	}
 }
+
+// TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering pins
+// the backpressure contract on the commitPending path.
+//
+// During a snapshot recovery the apply worker parks on the recovery gate
+// WITHOUT clearing commitPending, so processCommitPendingInbox is the steady
+// state, not a corner case. Draining proposals and ReadIndex requests there
+// took them off the queues that would otherwise answer ErrSystemBusy, while
+// nothing could complete them: the apply pipeline is stopped and lastApplied
+// does not move. Raft protocol traffic must keep flowing regardless.
+func TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 64)
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	cb := newTestCallback()
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+
+	peer, lr := newTestVoterPeer(t, 1, 1, 3)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	node.commitPending.Store(true)
+	node.SetRecovering(true)
+
+	if !node.DeliverProposal([]proto.Entry{{Term: 1, Key: 0x1234, Cmd: []byte("x")}}) {
+		t.Fatal("fixture: proposal queue rejected the entry")
+	}
+
+	sw.processCommitPendingInbox(1, node)
+
+	// The proposal must still be on the queue: a later drain has to find it.
+	node.SetRecovering(false)
+	drained := node.DrainProposals(nil)
+	if len(drained) != 1 || drained[0].Key != 0x1234 {
+		t.Fatalf("the proposal was consumed during recovery (drained %d entries): "+
+			"it can never complete while the apply pipeline is stopped, and taking "+
+			"it off the queue denies the caller the ErrSystemBusy backpressure the "+
+			"queue would otherwise apply", len(drained))
+	}
+}

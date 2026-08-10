@@ -35,9 +35,19 @@ var configChangeHandlers = map[uint64]configChangeHandler{
 // configChangeValidator is the function signature for read-only config change
 // validators. These check invariants without copying or mutating the
 // membership, including the shard's replicated witness policy (carried on
-// the membership itself). The deterministic apply path (configChangeHandlers)
-// never validates, so an already-committed change always replays — mirroring
-// how the 64-member cap is validate-only.
+// the membership itself). They run only on the LEADER's propose path, where a
+// refusal is safe because nothing has been committed yet.
+//
+// The apply path (configChangeHandlers) enforces its own, narrower set of
+// preconditions and can also refuse — handleAddNode returns ErrEmptyAddress,
+// ErrNodeRemoved and ErrNodeAlreadyExists; handleRemoveNode returns
+// ErrNodeNotFound, ErrRemoveLastFullReplica and ErrRemoveLastVoter — and
+// Peer.applyMembershipEntry then SKIPS the committed change and logs a warning.
+// So an already-committed change does not unconditionally replay. Every such
+// refusal is a pure function of the replicated membership and the entry, so it
+// is identical on every replica and cannot diverge; that determinism, not an
+// absence of checks, is what makes the apply path safe. The 64-member cap is
+// the genuinely validate-only rule.
 type configChangeValidator func(m *membership, cc proto.ConfigChange) error
 
 // configChangeValidators maps config change types to their read-only validation

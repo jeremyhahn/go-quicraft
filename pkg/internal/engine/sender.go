@@ -37,8 +37,13 @@ type MessageSender interface {
 	//
 	// On completion (success or failure), the implementation must
 	// deliver a SnapshotStatus message back to the sender's raft
-	// layer via the engine, carrying the snapshot index in Hint so
-	// the status can be matched to its transfer. The status drives
+	// layer via the engine, echoing the Hint from the InstallSnapshot
+	// message VERBATIM so the status can be matched to its transfer.
+	// Hint is a transfer sequence number (raft.snapshotSeq), NOT the
+	// snapshot index: the same index can be re-sent, and the leader
+	// discards any status whose Hint does not equal the sequence of the
+	// transfer currently in flight. An implementation that substitutes
+	// the snapshot index would have every status it sends discarded. The status drives
 	// the leader's snapshot ack/retry wait; see the raft package's
 	// remote.snapshotDone for the full protocol. Delivery should be
 	// retried on transient failure — the message is one-shot, and
