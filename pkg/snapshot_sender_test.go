@@ -591,8 +591,13 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 		logger:  slog.Default(),
 	}
 
+	// The identity must match the one the frames were sealed under: the send
+	// path reproduces the positional context from (ShardID, ReplicaID, Index).
 	msg := proto.Message{
+		ShardID:   testSnapShardID,
+		ReplicaID: testSnapReplicaID,
 		Snapshot: proto.Snapshot{
+			Index:    testSnapIndex,
 			Filepath: encPath,
 			FileSize: uint64(info.Size()),
 			Epoch:    b.CurrentEpoch(),
@@ -649,7 +654,7 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 	b := createTestBarrier(t)
 	plaintext := []byte("encrypted snapshot payload for chunk verification")
 	encPath := filepath.Join(tmpDir, "snapshot.dat")
-	writeEncryptedSnapshotFile(t, b, encPath, plaintext)
+	writeEncryptedSnapshotFileFor(t, b, encPath, plaintext, 1, 1, 100)
 
 	info, err := os.Stat(encPath)
 	if err != nil {
@@ -658,10 +663,11 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 
 	// Build a message with non-zero epoch referencing the encrypted file.
 	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
+		Type:      proto.InstallSnapshot,
+		ShardID:   1,
+		ReplicaID: 1,
+		From:      1,
+		To:        2,
 		Snapshot: proto.Snapshot{
 			Index:    100,
 			Term:     5,
@@ -733,8 +739,21 @@ func createTestBarrier(t *testing.T) *seal.Barrier {
 }
 
 // writeEncryptedSnapshotFile encrypts plaintext in the snapshot pool's frame
-// format: [4-byte LE length][encrypted chunk]... and writes it to path.
+// format: [4-byte LE length][encrypted chunk]... and writes it to path, using
+// the shared test artifact identity.
 func writeEncryptedSnapshotFile(t *testing.T, b Barrier, path string, plaintext []byte) {
+	t.Helper()
+	writeEncryptedSnapshotFileFor(t, b, path, plaintext,
+		testSnapShardID, testSnapReplicaID, testSnapIndex)
+}
+
+// writeEncryptedSnapshotFileFor is writeEncryptedSnapshotFile under an explicit
+// artifact identity, for tests whose artifact is later read back through a
+// production path that derives the identity from the shard/replica/index it
+// actually holds. Every frame carries the SAME positional context the
+// production encrypt loop stamps, so the two sides agree.
+func writeEncryptedSnapshotFileFor(t *testing.T, b Barrier, path string, plaintext []byte,
+	shardID, replicaID, index uint64) {
 	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {
@@ -746,15 +765,18 @@ func writeEncryptedSnapshotFile(t *testing.T, b Barrier, path string, plaintext 
 	const chunkSize = 64 * 1024
 	offset := 0
 	var frameBuf [4]byte
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, b.IsHardwareMode())
+	var seq uint64
 	for offset < len(plaintext) {
 		end := offset + chunkSize
 		if end > len(plaintext) {
 			end = len(plaintext)
 		}
-		encrypted, encErr := b.Encrypt(nil, plaintext[offset:end])
+		encrypted, _, encErr := b.EncryptWithEpochContext(nil, plaintext[offset:end], aad.Frame(seq))
 		if encErr != nil {
-			t.Fatalf("barrier.Encrypt: %v", encErr)
+			t.Fatalf("barrier.EncryptWithEpochContext: %v", encErr)
 		}
+		seq++
 		binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(encrypted)))
 		if _, err := f.Write(frameBuf[:]); err != nil {
 			t.Fatalf("write frame len: %v", err)
@@ -906,7 +928,7 @@ func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
 	b := createTestBarrier(t)
 	plaintext := []byte("test snapshot data for cleanup verification")
 	encPath := filepath.Join(tmpDir, "snapshot.dat")
-	writeEncryptedSnapshotFile(t, b, encPath, plaintext)
+	writeEncryptedSnapshotFileFor(t, b, encPath, plaintext, 1, 1, 100)
 
 	info, err := os.Stat(encPath)
 	if err != nil {
@@ -920,10 +942,11 @@ func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
 	}
 
 	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
+		Type:      proto.InstallSnapshot,
+		ShardID:   1,
+		ReplicaID: 1,
+		From:      1,
+		To:        2,
 		Snapshot: proto.Snapshot{
 			Index:    100,
 			Term:     5,

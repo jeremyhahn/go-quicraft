@@ -78,9 +78,15 @@ func (p *epochPinner) track(epoch uint64, alreadyPinned bool) {
 }
 
 // sealFrame encrypts one frame and pins the epoch it was sealed under.
-func (p *epochPinner) sealFrame(plain []byte) ([]byte, uint64, error) {
+//
+// contextAAD is the frame's positional context (see engine.SnapshotAAD); it is
+// folded into the AEAD AAD alongside the epoch so a frame cannot be replayed at
+// a different ordinal, snapshot index, replica or shard. A nil context is
+// byte-identical to the epoch-only binding and is what a hardware-mode barrier
+// requires.
+func (p *epochPinner) sealFrame(plain, contextAAD []byte) ([]byte, uint64, error) {
 	if p.hasAtom {
-		ct, epoch, err := p.atomic.EncryptWithEpochPinned(nil, plain)
+		ct, epoch, err := p.atomic.EncryptWithEpochPinnedContext(nil, plain, contextAAD)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -90,7 +96,7 @@ func (p *epochPinner) sealFrame(plain []byte) ([]byte, uint64, error) {
 	// Pin the current epoch before sealing so it cannot be purged in between,
 	// then pin the epoch actually used in case a rotation landed mid-call.
 	p.track(p.barrier.CurrentEpoch(), false)
-	ct, epoch, err := p.barrier.EncryptWithEpoch(nil, plain)
+	ct, epoch, err := p.barrier.EncryptWithEpochContext(nil, plain, contextAAD)
 	if err != nil {
 		return nil, 0, err
 	}

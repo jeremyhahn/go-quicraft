@@ -61,6 +61,12 @@ func newTestLogDB() *testLogDB {
 	return &testLogDB{}
 }
 
+// AtRestProtection declares this test LogDB non-durable: it accumulates updates
+// in memory and writes nothing to disk, so no durable encrypted record can be
+// stranded by a DEK purge. Silence would (correctly) be read as "durable and
+// possibly encrypted" and would suppress purging entirely (L23).
+func (t *testLogDB) AtRestProtection() logdb.AtRestProtection { return logdb.AtRestNonDurable }
+
 func (t *testLogDB) Name() string { return "test" }
 
 func (t *testLogDB) SaveState(updates []logdb.Update) error {

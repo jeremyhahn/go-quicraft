@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -452,4 +453,100 @@ func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
 		"dir", dir,
 	)
 	return 0, snapshotEpochUnknown
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot frame context-AAD (M3)
+// ---------------------------------------------------------------------------
+
+// snapshotAADMagic tags the context-AAD scheme. It is part of the authenticated
+// context rather than a byte on disk, so the scheme identifies ITSELF: a frame
+// sealed under a future layout can never authenticate against this one, and
+// there is no unauthenticated version marker for an attacker to rewrite.
+const snapshotAADMagic = "QRSNAP1"
+
+// SnapshotFrameAADLen is the exact length of the context every snapshot frame
+// is bound to: the magic followed by four big-endian uint64 fields. Every field
+// is fixed width, so no delimiter is needed and no two distinct identities can
+// produce the same bytes.
+//
+//	off  size  field
+//	  0     7  magic "QRSNAP1"
+//	  7     8  ShardID
+//	 15     8  ReplicaID
+//	 23     8  SnapshotIndex
+//	 31     8  ChunkSeq (0-based ordinal within snapshot.dat)
+const SnapshotFrameAADLen = len(snapshotAADMagic) + 4*8
+
+const (
+	snapshotAADShardOff   = len(snapshotAADMagic)
+	snapshotAADReplicaOff = snapshotAADShardOff + 8
+	snapshotAADIndexOff   = snapshotAADReplicaOff + 8
+	snapshotAADSeqOff     = snapshotAADIndexOff + 8
+)
+
+// hardwareModeAADOnce bounds the hardware-mode capability warning to a single
+// record per process. The condition is a DEPLOYMENT property (the barrier
+// delegates to a hardware encryptor for its whole life), not a per-artifact or
+// per-frame one, so repeating it per snapshot would say nothing new.
+var hardwareModeAADOnce sync.Once
+
+// SnapshotAAD builds the per-frame positional context every snapshot frame is
+// bound to. One SnapshotAAD belongs to one snapshot artifact; Frame stamps the
+// chunk ordinal into a reused scratch buffer, so a multi-gigabyte snapshot
+// costs exactly one allocation for the whole file rather than one per frame.
+//
+// The SAME builder type is used on the encrypt and the decrypt side, which is
+// what makes the two sets of bytes incapable of drifting apart.
+//
+// The context is UNCONDITIONAL: there is no on-disk version marker and no
+// weaker-AAD retry. A reader that fails to authenticate a frame fails — it
+// never falls back to an epoch-only AAD, because that fallback IS the
+// vulnerability the context closes (a frame could then be replayed at another
+// ordinal, another snapshot index, or another shard). The scheme is fixed by
+// code and artifact class alone.
+type SnapshotAAD struct {
+	buf      [SnapshotFrameAADLen]byte
+	suppress bool
+}
+
+// NewSnapshotAAD returns the context builder for one snapshot artifact,
+// identified by the shard, replica and snapshot index its frames belong to.
+//
+// hardwareMode reports whether the sealing barrier delegates to a hardware
+// encryptor. Such a barrier cannot accept caller context at all (it returns
+// seal.ErrHardwareMode for ANY non-empty context), so the builder suppresses
+// the context and the frames keep only the barrier's own epoch binding. That is
+// a documented capability limitation of hardware sealing, decided by the
+// deployment; it is NEVER selected per artifact and NEVER reached by way of a
+// decryption failure.
+func NewSnapshotAAD(shardID, replicaID, index uint64, hardwareMode bool) *SnapshotAAD {
+	a := &SnapshotAAD{suppress: hardwareMode}
+	if hardwareMode {
+		hardwareModeAADOnce.Do(func() {
+			slog.Warn("snapshot: hardware-mode barrier cannot bind caller context; " +
+				"snapshot frames are bound to their epoch only, without positional " +
+				"(shard/replica/index/ordinal) binding")
+		})
+		return a
+	}
+	copy(a.buf[:], snapshotAADMagic)
+	binary.BigEndian.PutUint64(a.buf[snapshotAADShardOff:], shardID)
+	binary.BigEndian.PutUint64(a.buf[snapshotAADReplicaOff:], replicaID)
+	binary.BigEndian.PutUint64(a.buf[snapshotAADIndexOff:], index)
+	return a
+}
+
+// Frame returns the context for the frame at 0-based ordinal seq. The returned
+// slice aliases the builder's scratch buffer and is only valid until the next
+// call; the barrier folds it into the AEAD AAD and never retains it.
+//
+// It returns nil in hardware mode, which is byte-identical to the epoch-only
+// binding the barrier applies with no context at all.
+func (a *SnapshotAAD) Frame(seq uint64) []byte {
+	if a.suppress {
+		return nil
+	}
+	binary.BigEndian.PutUint64(a.buf[snapshotAADSeqOff:], seq)
+	return a.buf[:]
 }

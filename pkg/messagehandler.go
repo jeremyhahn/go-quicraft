@@ -732,7 +732,10 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, sender
 		// this handler returns, which is past the SaveSnapshot that records the
 		// epoch, so a concurrent rotate+purge cannot orphan any frame's DEK.
 		var recvPins []uint64
-		recvEpoch, recvPins, writeErr = encryptSnapshotFrames(recvBarrier, plain, f)
+		// The frames are bound to (shardID, replicaID, snapshotIndex) plus their
+		// ordinal, the same identity recoverSnapshot reads them back under.
+		recvEpoch, recvPins, writeErr = encryptSnapshotFrames(
+			recvBarrier, shardID, replicaID, snapshotIndex, plain, f)
 		defer func() {
 			for _, e := range recvPins {
 				recvBarrier.DeregisterInFlightEpoch(e)

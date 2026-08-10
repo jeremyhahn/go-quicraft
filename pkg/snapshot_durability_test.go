@@ -135,13 +135,17 @@ func (f *recvFixture) dataPath(index uint64) string {
 
 // plaintextOf returns the snapshot payload a stored data file represents,
 // decrypting when the receiver holds a barrier.
-func plaintextOf(t *testing.T, barrier Barrier, stored []byte) []byte {
+// index identifies the artifact: the receive path binds every frame to
+// (shardID, replicaID, index) plus its ordinal, so the reader must reproduce
+// the same identity.
+func plaintextOf(t *testing.T, barrier Barrier, index uint64, stored []byte) []byte {
 	t.Helper()
 	if barrier == nil {
 		return stored
 	}
 	var out bytes.Buffer
-	if _, err := decryptSnapshotFrames(barrier, bytes.NewReader(stored), &out); err != nil {
+	if _, err := decryptSnapshotFrames(barrier, fixtureShardID, fixtureReplicaID, index,
+		bytes.NewReader(stored), &out); err != nil {
 		t.Fatalf("stored snapshot is not a complete, decryptable image: %v", err)
 	}
 	return out.Bytes()
@@ -182,7 +186,7 @@ func writeDurableFile(t *testing.T, fsys snapshotFS, path string, data []byte) {
 func encryptToBytes(t *testing.T, barrier Barrier, plaintext []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if _, _, err := encryptSnapshotFrames(barrier, bytes.NewReader(plaintext), &buf); err != nil {
+	if _, _, err := encryptSnapshotFrames(barrier, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plaintext), &buf); err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
 	return buf.Bytes()
@@ -265,7 +269,7 @@ func TestSnapshotReceive_AckImpliesDurable(t *testing.T) {
 				t.Fatalf("DURABILITY VIOLATION: %s is gone after crash although the receive "+
 					"was acked and LogDB records index %d", dataPath, index)
 			}
-			got := plaintextOf(t, barrier, stored)
+			got := plaintextOf(t, barrier, index, stored)
 			if !bytes.Equal(got, payload) {
 				t.Fatalf("DURABILITY VIOLATION: acked snapshot came back with %d of %d bytes "+
 					"after crash; an fsync is missing on the receive path", len(got), len(payload))
@@ -328,7 +332,7 @@ func TestSnapshotReceive_CrashDuringReceiveLeavesNoPartialSnapshot(t *testing.T)
 			// never a partial one a later read would accept as valid.
 			if stored, ok := f.fs.liveBytes(f.dataPath(index)); ok && len(stored) > 0 {
 				var out bytes.Buffer
-				if _, decErr := decryptSnapshotFrames(barrier, bytes.NewReader(stored), &out); decErr != nil {
+				if _, decErr := decryptSnapshotFrames(barrier, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(stored), &out); decErr != nil {
 					t.Fatalf("a partially written snapshot.dat survived the crash under the final name "+
 						"(%d bytes, not a decryptable image): %v", len(stored), decErr)
 				}
@@ -377,7 +381,7 @@ func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
 		if !ok {
 			t.Fatalf("no artifact at %s after a successful receive", f.dataPath(index))
 		}
-		if got := plaintextOf(t, barrier, stored); !bytes.Equal(got, payload) {
+		if got := plaintextOf(t, barrier, index, stored); !bytes.Equal(got, payload) {
 			t.Fatalf("artifact decrypts to %d bytes, want the %d-byte payload", len(got), len(payload))
 		}
 	})
@@ -559,7 +563,7 @@ func TestReencryptSnapshotFile_CrashAtEachStage(t *testing.T) {
 			writeDurableFile(t, cfs, dstPath, encryptToBytes(t, dstBarrier, original))
 
 			cfs.crashOn(stage.op, stage.match)
-			if _, err := reencryptSnapshotFile(cfs, srcPath, dstPath, srcBarrier, dstBarrier); err == nil {
+			if _, err := reencryptSnapshotFile(cfs, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier); err == nil {
 				t.Fatal("reencryptSnapshotFile reported success although power was lost mid-write")
 			}
 
@@ -569,7 +573,7 @@ func TestReencryptSnapshotFile_CrashAtEachStage(t *testing.T) {
 					"at stage %s; a crash must never lose the file being replaced", dstPath, stage.name)
 			}
 			var out bytes.Buffer
-			if _, err := decryptSnapshotFrames(dstBarrier, bytes.NewReader(stored), &out); err != nil {
+			if _, err := decryptSnapshotFrames(dstBarrier, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(stored), &out); err != nil {
 				t.Fatalf("DURABILITY VIOLATION: %s is not a complete image after a crash at stage %s "+
 					"(%d bytes): %v", dstPath, stage.name, len(stored), err)
 			}
@@ -606,7 +610,7 @@ func TestReencryptSnapshotFile_SuccessSurvivesCrash(t *testing.T) {
 	writeDurableFile(t, cfs, srcPath, encryptToBytes(t, srcBarrier, updated))
 	writeDurableFile(t, cfs, dstPath, encryptToBytes(t, dstBarrier, []byte("stale")))
 
-	if _, err := reencryptSnapshotFile(cfs, srcPath, dstPath, srcBarrier, dstBarrier); err != nil {
+	if _, err := reencryptSnapshotFile(cfs, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier); err != nil {
 		t.Fatalf("reencryptSnapshotFile: %v", err)
 	}
 	cfs.Crash()
@@ -616,7 +620,7 @@ func TestReencryptSnapshotFile_SuccessSurvivesCrash(t *testing.T) {
 		t.Fatalf("DURABILITY VIOLATION: %s is gone after a crash following a SUCCESSFUL migration", dstPath)
 	}
 	var out bytes.Buffer
-	if _, err := decryptSnapshotFrames(dstBarrier, bytes.NewReader(stored), &out); err != nil {
+	if _, err := decryptSnapshotFrames(dstBarrier, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(stored), &out); err != nil {
 		t.Fatalf("DURABILITY VIOLATION: %s is not a complete image after a crash following a "+
 			"successful migration (%d bytes): %v", dstPath, len(stored), err)
 	}
@@ -655,7 +659,7 @@ func TestReencryptSnapshotFile_FailurePropagation(t *testing.T) {
 			writeDurableFile(t, cfs, dstPath, encryptToBytes(t, dstBarrier, original))
 
 			cfs.failOnce(tc.op, tc.match, errInjected)
-			_, err := reencryptSnapshotFile(cfs, srcPath, dstPath, srcBarrier, dstBarrier)
+			_, err := reencryptSnapshotFile(cfs, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
 			if err == nil {
 				t.Fatalf("reencryptSnapshotFile reported SUCCESS although %s failed", tc.op)
 			}
@@ -673,7 +677,7 @@ func TestReencryptSnapshotFile_FailurePropagation(t *testing.T) {
 				t.Fatalf("%s was removed by a failed migration", dstPath)
 			}
 			var out bytes.Buffer
-			if _, decErr := decryptSnapshotFrames(dstBarrier, bytes.NewReader(stored), &out); decErr != nil {
+			if _, decErr := decryptSnapshotFrames(dstBarrier, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(stored), &out); decErr != nil {
 				t.Fatalf("%s was corrupted by a failed migration: %v", dstPath, decErr)
 			}
 			if !bytes.Equal(out.Bytes(), original) {

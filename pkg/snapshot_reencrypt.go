@@ -87,14 +87,23 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // It is the migration counterpart of the receive-side
 // reencryptReceivedSnapshot: that path encrypts just-received plaintext, this
 // path re-keys an already-sealed snapshot from one barrier to another.
-func ReencryptSnapshotFile(srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
-	return reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, srcBarrier, dstBarrier)
+// shardID, replicaID and index identify the SNAPSHOT both paths hold: the
+// migration re-keys one logical snapshot, so the source frames are read under
+// that identity and the destination frames are sealed under the same one. They
+// are required, not optional: snapshot frames are bound to their position
+// through the AEAD context AAD (see engine.NewSnapshotAAD) and there is no
+// weaker fallback for a caller that omits them.
+func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, error) {
+	return reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath,
+		shardID, replicaID, index, srcBarrier, dstBarrier)
 }
 
 // reencryptSnapshotFile is ReencryptSnapshotFile over an injectable
 // filesystem. The exported entry point pins the os-backed one; tests supply a
 // fault-injecting implementation to exercise the crash-safety sequence.
-func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier, dstBarrier Barrier) (uint64, error) {
+func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, error) {
 	// Refuse before opening anything. A CONFIGURED barrier that is sealed
 	// means encryption is temporarily unavailable, never that the side is
 	// plaintext. Treating a sealed srcBarrier as plaintext would read the
@@ -177,18 +186,18 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, srcBarrier,
 		// written to disk.
 		pr, pw := io.Pipe()
 		go func() {
-			_, decErr := decryptSnapshotFrames(srcBarrier, src, pw)
+			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
 			_ = pw.CloseWithError(decErr)
 		}()
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, pr, tmp)
+		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, tmp)
 		// Unblock the decrypt goroutine if the encrypt side stopped early.
 		_ = pr.CloseWithError(err)
 	case srcLive && !dstLive:
 		// Framed -> plaintext.
-		_, err = decryptSnapshotFrames(srcBarrier, src, tmp)
+		_, err = decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, tmp)
 	case !srcLive && dstLive:
 		// Plaintext -> framed.
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, src, tmp)
+		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, src, tmp)
 	default:
 		// Plaintext -> plaintext.
 		_, err = io.Copy(tmp, src)

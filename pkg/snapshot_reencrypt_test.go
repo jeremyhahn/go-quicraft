@@ -64,6 +64,14 @@ func (b *rotatingRecordBarrier) EncryptWithEpoch(_, pt []byte) ([]byte, uint64, 
 	return append([]byte(nil), pt...), e, nil
 }
 
+func (b *rotatingRecordBarrier) EncryptWithEpochContext(dst, pt, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, pt)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
 func (b *rotatingRecordBarrier) RegisterInFlightEpoch(e uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -85,7 +93,7 @@ func TestEncryptSnapshotFrames_PinsEveryFrameEpoch(t *testing.T) {
 	// Several 64KiB chunks -> several frames, each sealed under a new epoch.
 	plain := make([]byte, snapshotEncryptChunkSize*3+100)
 	var out bytes.Buffer
-	_, pinned, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &out)
+	_, pinned, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &out)
 	if err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
@@ -115,7 +123,7 @@ func TestSnapshotFrames_EncryptDecryptRoundTrip(t *testing.T) {
 	plain := snapshotPlaintext()
 
 	var enc bytes.Buffer
-	epoch, _, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &enc)
+	epoch, _, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &enc)
 	if err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
@@ -123,7 +131,7 @@ func TestSnapshotFrames_EncryptDecryptRoundTrip(t *testing.T) {
 		t.Fatal("recorded epoch = 0, want non-zero for an encrypted snapshot")
 	}
 	var dec bytes.Buffer
-	if _, err := decryptSnapshotFrames(b, &enc, &dec); err != nil {
+	if _, err := decryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &enc, &dec); err != nil {
 		t.Fatalf("decryptSnapshotFrames: %v", err)
 	}
 	if !bytes.Equal(dec.Bytes(), plain) {
@@ -158,7 +166,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open src: %v", err)
 	}
-	if _, err := decryptSnapshotFrames(nodeA, sf, wf); err != nil {
+	if _, err := decryptSnapshotFrames(nodeA, testSnapShardID, testSnapReplicaID, testSnapIndex, sf, wf); err != nil {
 		t.Fatalf("decrypt-for-send: %v", err)
 	}
 	_ = sf.Close()
@@ -172,7 +180,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	if err := os.WriteFile(recvPath, mustRead(t, wirePath), 0o600); err != nil {
 		t.Fatalf("write received plaintext: %v", err)
 	}
-	recvEpoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, nodeB)
+	recvEpoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nodeB)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot: %v", err)
 	}
@@ -187,7 +195,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	}
 	defer func() { _ = bf.Close() }()
 	var recovered bytes.Buffer
-	if _, err := decryptSnapshotFrames(nodeB, bf, &recovered); err != nil {
+	if _, err := decryptSnapshotFrames(nodeB, testSnapShardID, testSnapReplicaID, testSnapIndex, bf, &recovered); err != nil {
 		t.Fatalf("node B recover: %v", err)
 	}
 	if !bytes.Equal(recovered.Bytes(), plain) {
@@ -201,7 +209,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	}
 	defer func() { _ = bf2.Close() }()
 	var crossAttempt bytes.Buffer
-	if _, err := decryptSnapshotFrames(nodeA, bf2, &crossAttempt); err == nil && bytes.Equal(crossAttempt.Bytes(), plain) {
+	if _, err := decryptSnapshotFrames(nodeA, testSnapShardID, testSnapReplicaID, testSnapIndex, bf2, &crossAttempt); err == nil && bytes.Equal(crossAttempt.Bytes(), plain) {
 		t.Fatal("node A decrypted node B's snapshot — per-node keys are NOT isolated")
 	}
 }
@@ -216,7 +224,7 @@ func TestReceiveSnapshot_NilBarrierLeavesPlaintext(t *testing.T) {
 	if err := os.WriteFile(path, plain, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, nil)
+	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, nil)
 	if err != nil {
 		t.Fatalf("reencryptReceivedSnapshot(nil): %v", err)
 	}
@@ -245,7 +253,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	writeEncryptedSnapshotFile(t, barA, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	epoch, err := ReencryptSnapshotFile(srcPath, dstPath, barA, barB)
+	epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB)
 	if err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
@@ -260,7 +268,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	}
 	defer func() { _ = df.Close() }()
 	var recovered bytes.Buffer
-	if _, err := decryptSnapshotFrames(barB, df, &recovered); err != nil {
+	if _, err := decryptSnapshotFrames(barB, testSnapShardID, testSnapReplicaID, testSnapIndex, df, &recovered); err != nil {
 		t.Fatalf("barrier B recover: %v", err)
 	}
 	if !bytes.Equal(recovered.Bytes(), plain) {
@@ -274,7 +282,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	}
 	defer func() { _ = af.Close() }()
 	var cross bytes.Buffer
-	if _, err := decryptSnapshotFrames(barA, af, &cross); err == nil && bytes.Equal(cross.Bytes(), plain) {
+	if _, err := decryptSnapshotFrames(barA, testSnapShardID, testSnapReplicaID, testSnapIndex, af, &cross); err == nil && bytes.Equal(cross.Bytes(), plain) {
 		t.Fatal("barrier A decrypted barrier B's snapshot — keys not isolated")
 	}
 
@@ -285,7 +293,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	}
 	defer func() { _ = sf.Close() }()
 	var srcRecovered bytes.Buffer
-	if _, err := decryptSnapshotFrames(barA, sf, &srcRecovered); err != nil {
+	if _, err := decryptSnapshotFrames(barA, testSnapShardID, testSnapReplicaID, testSnapIndex, sf, &srcRecovered); err != nil {
 		t.Fatalf("source no longer decryptable under A — migration touched the source: %v", err)
 	}
 	if !bytes.Equal(srcRecovered.Bytes(), plain) {
@@ -306,7 +314,7 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyedDst := filepath.Join(dir, "keyed.dat")
-	epoch, err := ReencryptSnapshotFile(plainSrc, keyedDst, nil, bar)
+	epoch, err := ReencryptSnapshotFile(plainSrc, keyedDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, bar)
 	if err != nil {
 		t.Fatalf("plaintext->keyed: %v", err)
 	}
@@ -319,7 +327,7 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 	defer func() { _ = kf.Close() }()
 	var dec bytes.Buffer
-	if _, err := decryptSnapshotFrames(bar, kf, &dec); err != nil {
+	if _, err := decryptSnapshotFrames(bar, testSnapShardID, testSnapReplicaID, testSnapIndex, kf, &dec); err != nil {
 		t.Fatalf("recover keyed: %v", err)
 	}
 	if !bytes.Equal(dec.Bytes(), plain) {
@@ -327,7 +335,7 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 
 	plainDst := filepath.Join(dir, "back-to-plain.dat")
-	if _, err := ReencryptSnapshotFile(keyedDst, plainDst, bar, nil); err != nil {
+	if _, err := ReencryptSnapshotFile(keyedDst, plainDst, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
 		t.Fatalf("keyed->plaintext: %v", err)
 	}
 	if got := mustRead(t, plainDst); !bytes.Equal(got, plain) {
@@ -354,16 +362,19 @@ type pinRecordingBarrier struct {
 	sawEncryptBeforePin bool
 }
 
-// EncryptWithEpoch records whether a frame was ever encrypted BEFORE the first
-// in-flight epoch was pinned. A path that pins only AFTER its encrypt loop
+// EncryptWithEpochContext records whether a frame was ever encrypted BEFORE the
+// first in-flight epoch was pinned. A path that pins only AFTER its encrypt loop
 // (leaving the frames exposed to a concurrent rotate+purge mid-loop) trips this.
-func (p *pinRecordingBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error) {
+// It wraps the CONTEXT form because that is the one the snapshot encrypt loops
+// call; the plain form would never be reached and the assertion would go
+// vacuous.
+func (p *pinRecordingBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
 	p.mu.Lock()
 	if len(p.registered) == 0 {
 		p.sawEncryptBeforePin = true
 	}
 	p.mu.Unlock()
-	return p.Barrier.EncryptWithEpoch(dst, plaintext)
+	return p.Barrier.EncryptWithEpochContext(dst, plaintext, contextAAD)
 }
 
 func (p *pinRecordingBarrier) RegisterInFlightEpoch(epoch uint64) {
@@ -396,7 +407,7 @@ func TestReencryptSnapshotFile_PinsSourceEpochs(t *testing.T) {
 
 	rec := &pinRecordingBarrier{Barrier: barA}
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, rec, barB); err != nil {
+	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, rec, barB); err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
 
@@ -430,7 +441,7 @@ func TestSnapshotFrameEpochs_ScansHeadersWithoutDecrypting(t *testing.T) {
 	// Real frames produced by a live barrier scan to that barrier's epoch.
 	bar := createTestBarrier(t)
 	var enc bytes.Buffer
-	if _, _, err := encryptSnapshotFrames(bar, bytes.NewReader(snapshotPlaintext()), &enc); err != nil {
+	if _, _, err := encryptSnapshotFrames(bar, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(snapshotPlaintext()), &enc); err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
 	epochs, err := snapshotFrameEpochs(bytes.NewReader(enc.Bytes()))
@@ -493,7 +504,7 @@ func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
 	writeEncryptedSnapshotFile(t, bar, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "a", "b", "c", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, bar, nil); err != nil {
+	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
 		t.Fatalf("ReencryptSnapshotFile into nested destination: %v", err)
 	}
 	if got := mustRead(t, dstPath); !bytes.Equal(got, plain) {
@@ -530,7 +541,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barA.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed source "+
 				"must not have its ciphertext copied out as plaintext)", err)
 		}
@@ -546,7 +557,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barB.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed "+
 				"destination must not durably write plaintext)", err)
 		}
@@ -560,7 +571,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 	t.Run("nil destination still writes plaintext", func(t *testing.T) {
 		barA := createTestBarrier(t)
 		srcPath, dstPath := newSrc(t, barA)
-		epoch, err := ReencryptSnapshotFile(srcPath, dstPath, barA, nil)
+		epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
 		if err != nil {
 			t.Fatalf("ReencryptSnapshotFile: %v", err)
 		}

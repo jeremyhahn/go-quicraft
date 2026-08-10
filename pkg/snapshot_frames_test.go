@@ -72,7 +72,7 @@ func TestDecryptSnapshotFrames_RejectsCorruptFrameLength(t *testing.T) {
 	var out bytes.Buffer
 	// Only the 4-byte prefix is supplied: if the length were trusted, the
 	// decoder would allocate before discovering the body is missing.
-	n, err := decryptSnapshotFrames(b, bytes.NewReader(frameLen[:]), &out)
+	n, err := decryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(frameLen[:]), &out)
 	if !errors.Is(err, ErrSnapshotCorrupt) {
 		t.Fatalf("decryptSnapshotFrames error = %v, want ErrSnapshotCorrupt", err)
 	}
@@ -92,7 +92,7 @@ func TestDecryptSnapshotFrames_RejectsTruncatedFrame(t *testing.T) {
 	truncated := append(frameLen[:], make([]byte, 16)...)
 
 	var out bytes.Buffer
-	if _, err := decryptSnapshotFrames(b, bytes.NewReader(truncated), &out); err == nil {
+	if _, err := decryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(truncated), &out); err == nil {
 		t.Fatal("decryptSnapshotFrames accepted a truncated frame")
 	}
 	if out.Len() != 0 {
@@ -115,7 +115,7 @@ func TestDecryptSnapshotFrames_PropagatesSinkFailure(t *testing.T) {
 	}
 	defer func() { _ = src.Close() }()
 
-	n, err := decryptSnapshotFrames(b, src, failingWriter{})
+	n, err := decryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, src, failingWriter{})
 	if !errors.Is(err, errTestWriteRefused) {
 		t.Fatalf("decryptSnapshotFrames error = %v, want the sink error", err)
 	}
@@ -134,7 +134,7 @@ func TestDecryptSnapshotFrames_PropagatesSinkFailure(t *testing.T) {
 func TestEncryptSnapshotFrames_PropagatesSinkFailure(t *testing.T) {
 	b := createTestBarrier(t)
 
-	epoch, _, err := encryptSnapshotFrames(b, bytes.NewReader([]byte("payload")), failingWriter{})
+	epoch, _, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader([]byte("payload")), failingWriter{})
 	if !errors.Is(err, errTestWriteRefused) {
 		t.Fatalf("encryptSnapshotFrames error = %v, want the sink error", err)
 	}
@@ -150,7 +150,7 @@ func TestEncryptSnapshotFrames_PropagatesSourceFailure(t *testing.T) {
 	b := createTestBarrier(t)
 
 	var out bytes.Buffer
-	epoch, _, err := encryptSnapshotFrames(b, &failingReader{prefix: []byte("partial")}, &out)
+	epoch, _, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &failingReader{prefix: []byte("partial")}, &out)
 	if !errors.Is(err, errTestReadFailed) {
 		t.Fatalf("encryptSnapshotFrames error = %v, want the source error", err)
 	}
@@ -176,7 +176,7 @@ func TestReencryptReceivedSnapshot_FailsClosedWhenSealed(t *testing.T) {
 		t.Fatalf("seal: %v", err)
 	}
 
-	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, sealed)
+	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, sealed)
 	if !errors.Is(err, ErrSnapshotBarrierSealed) {
 		t.Fatalf("reencryptReceivedSnapshot error = %v, want ErrSnapshotBarrierSealed", err)
 	}
@@ -439,7 +439,7 @@ func TestReencryptSnapshotFile_FilesystemFailures(t *testing.T) {
 			}
 
 			dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-			epoch, err := reencryptSnapshotFile(tt.fsys, srcPath, dstPath, srcBarrier, dstBarrier)
+			epoch, err := reencryptSnapshotFile(tt.fsys, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("reencryptSnapshotFile error = %v, want %v", err, tt.wantErr)
 			}
@@ -457,5 +457,183 @@ func TestReencryptSnapshotFile_FilesystemFailures(t *testing.T) {
 				t.Fatal("failed rekey modified the source snapshot")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M3: positional context-AAD binding of snapshot frames
+//
+// Every frame is sealed against magic || ShardID || ReplicaID || SnapshotIndex
+// || ChunkSeq. These tests run over the REAL seal.Barrier, so they assert the
+// AEAD binding itself rather than a stand-in: a frame that is moved to another
+// ordinal, or read under another artifact identity, must fail to authenticate.
+// There is no weaker retry anywhere in the reader, by design — an epoch-only
+// fallback would readmit exactly the splicing this binding prevents.
+// ---------------------------------------------------------------------------
+
+// splitSnapshotFrames decomposes the on-disk framing
+// ([ChunkLen:4 LE][AEAD frame])* into its frames.
+func splitSnapshotFrames(t *testing.T, blob []byte) [][]byte {
+	t.Helper()
+	var frames [][]byte
+	for off := 0; off < len(blob); {
+		if off+4 > len(blob) {
+			t.Fatalf("truncated frame header at offset %d", off)
+		}
+		n := int(binary.LittleEndian.Uint32(blob[off : off+4]))
+		off += 4
+		if off+n > len(blob) {
+			t.Fatalf("truncated frame body at offset %d", off)
+		}
+		frames = append(frames, blob[off:off+n])
+		off += n
+	}
+	return frames
+}
+
+// joinSnapshotFrames is splitSnapshotFrames' inverse.
+func joinSnapshotFrames(frames [][]byte) []byte {
+	var out []byte
+	var lb [4]byte
+	for _, f := range frames {
+		binary.LittleEndian.PutUint32(lb[:], uint32(len(f)))
+		out = append(out, lb[:]...)
+		out = append(out, f...)
+	}
+	return out
+}
+
+// multiFramePlaintext is large enough to span several encrypt chunks, so
+// reordering is expressible.
+func multiFramePlaintext() []byte {
+	p := make([]byte, snapshotEncryptChunkSize*3+17)
+	for i := range p {
+		p[i] = byte(i*31 + 7)
+	}
+	return p
+}
+
+// TestSnapshotFrameAAD_RoundTripUnderMatchingContext is the positive case: the
+// encrypt and decrypt sides derive the same context from the same identity, so
+// the artifact round-trips byte for byte.
+func TestSnapshotFrameAAD_RoundTripUnderMatchingContext(t *testing.T) {
+	b := createTestBarrier(t)
+	plain := multiFramePlaintext()
+
+	var enc bytes.Buffer
+	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	if got := len(splitSnapshotFrames(t, enc.Bytes())); got < 3 {
+		t.Fatalf("fixture produced %d frames, want the multi-frame path", got)
+	}
+
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(enc.Bytes()), &dec); err != nil {
+		t.Fatalf("decryptSnapshotFrames under the matching context: %v", err)
+	}
+	if !bytes.Equal(dec.Bytes(), plain) {
+		t.Fatalf("round-trip mismatch: %d bytes back, want %d", dec.Len(), len(plain))
+	}
+}
+
+// TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt proves the ORDINAL half of
+// the binding. Two frames are swapped in place; the framing is still
+// structurally valid and every frame is still authentic under its own epoch, so
+// an epoch-only AAD would decrypt the file happily and hand the state machine a
+// silently reordered image.
+func TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt(t *testing.T) {
+	b := createTestBarrier(t)
+	plain := multiFramePlaintext()
+
+	var enc bytes.Buffer
+	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	frames := splitSnapshotFrames(t, enc.Bytes())
+	if len(frames) < 3 {
+		t.Fatalf("fixture produced %d frames, want at least 3", len(frames))
+	}
+	// Frames 0 and 1 are the same size (both full chunks), so the swap changes
+	// nothing but the ORDER.
+	frames[0], frames[1] = frames[1], frames[0]
+
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900,
+		bytes.NewReader(joinSnapshotFrames(frames)), &dec); err == nil {
+		t.Fatal("a reordered snapshot decrypted successfully: frames are not bound to " +
+			"their ordinal, so an at-rest attacker can permute the state machine image")
+	}
+}
+
+// TestSnapshotFrameAAD_TruncatedTailFailsWhenSpliced proves a frame lifted out
+// of one artifact cannot be pasted into another at a different ordinal: the
+// last frame of a 4-frame file is replayed as frame 0 of a 1-frame file.
+func TestSnapshotFrameAAD_ReplayedFrameAtAnotherOrdinalFails(t *testing.T) {
+	b := createTestBarrier(t)
+
+	var enc bytes.Buffer
+	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900,
+		bytes.NewReader(multiFramePlaintext()), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	frames := splitSnapshotFrames(t, enc.Bytes())
+	last := frames[len(frames)-1]
+
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900,
+		bytes.NewReader(joinSnapshotFrames([][]byte{last})), &dec); err == nil {
+		t.Fatal("a trailing frame authenticated as frame 0: the ordinal is not bound")
+	}
+}
+
+// TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt proves the
+// ARTIFACT half of the binding. The default barrier is host-wide and shared by
+// every shard, so shard/replica/index must be in the context or a frame could
+// be spliced between two shards holding a snapshot at the same index.
+func TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt(t *testing.T) {
+	b := createTestBarrier(t)
+	plain := multiFramePlaintext()
+
+	var enc bytes.Buffer
+	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name                      string
+		shardID, replicaID, index uint64
+	}{
+		{"other_shard", 5, 2, 900},
+		{"other_replica", 4, 3, 900},
+		{"other_snapshot_index", 4, 2, 901},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dec bytes.Buffer
+			if _, err := decryptSnapshotFrames(b, tc.shardID, tc.replicaID, tc.index,
+				bytes.NewReader(enc.Bytes()), &dec); err == nil {
+				t.Fatalf("frames sealed for (4,2,900) decrypted under (%d,%d,%d)",
+					tc.shardID, tc.replicaID, tc.index)
+			}
+		})
+	}
+}
+
+// TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected pins the ABSENCE of a
+// fallback. A frame sealed with NO context (the pre-M3 shape, and what a
+// downgrade attacker would supply) must not decrypt through the reader, which
+// never retries with a weaker AAD.
+func TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected(t *testing.T) {
+	b := createTestBarrier(t)
+
+	ct, err := b.Encrypt(nil, []byte("epoch-only frame with no positional binding"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900,
+		bytes.NewReader(joinSnapshotFrames([][]byte{ct})), &dec); err == nil {
+		t.Fatal("an epoch-only frame decrypted: the reader fell back to a weaker AAD")
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -287,6 +288,75 @@ func (b *mockBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, e
 func (b *mockBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error) {
 	return b.Decrypt(dst, ciphertext)
 }
+
+// ---------------------------------------------------------------------------
+// Context-AAD support for the test barriers (M3)
+//
+// The real seal.Barrier folds the caller context into the AEAD AAD, so a frame
+// sealed under one context cannot be opened under another. The pass-through
+// test barriers have no AEAD, so they stand in for that binding by appending a
+// fixed-width tag derived from the context and rejecting a frame whose tag does
+// not match the context offered at decryption.
+// ---------------------------------------------------------------------------
+
+// testSnapShardID/testSnapReplicaID/testSnapIndex are the artifact identity the
+// frame-level unit tests seal and open their snapshots under. Any triple works;
+// the point of the parameters is that the encrypt and decrypt sides MUST agree,
+// which is what the negative tests exploit.
+const (
+	testSnapShardID   uint64 = 7
+	testSnapReplicaID uint64 = 3
+	testSnapIndex     uint64 = 99
+)
+
+const testAADTagLen = 8
+
+func testAADTag(contextAAD []byte) [testAADTagLen]byte {
+	h := fnv.New64a()
+	_, _ = h.Write(contextAAD)
+	var out [testAADTagLen]byte
+	binary.BigEndian.PutUint64(out[:], h.Sum64())
+	return out
+}
+
+// appendTestAADTag binds ciphertext to contextAAD.
+func appendTestAADTag(ciphertext, contextAAD []byte) []byte {
+	tag := testAADTag(contextAAD)
+	return append(append([]byte(nil), ciphertext...), tag[:]...)
+}
+
+// stripTestAADTag verifies the binding and returns the framed ciphertext.
+func stripTestAADTag(ciphertext, contextAAD []byte) ([]byte, error) {
+	if len(ciphertext) < testAADTagLen {
+		return nil, errors.New("ciphertext too short for context tag")
+	}
+	body := ciphertext[:len(ciphertext)-testAADTagLen]
+	want := testAADTag(contextAAD)
+	if !bytes.Equal(ciphertext[len(body):], want[:]) {
+		return nil, errors.New("context AAD mismatch")
+	}
+	return body, nil
+}
+
+func (b *mockBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
+func (b *mockBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
+	body, err := stripTestAADTag(ciphertext, contextAAD)
+	if err != nil {
+		return nil, err
+	}
+	return b.Decrypt(dst, body)
+}
+
+// IsHardwareMode is false: the mock binds caller context, like the software
+// seal.Barrier it stands in for.
+func (b *mockBarrier) IsHardwareMode() bool { return false }
 
 func (b *mockBarrier) Rotate() (uint64, error) {
 	b.mu.Lock()
@@ -2928,6 +2998,16 @@ func (b *errorBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, 
 func (b *errorBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error) {
 	return nil, ErrBarrierSealed
 }
+
+func (b *errorBarrier) EncryptWithEpochContext(_, _, _ []byte) ([]byte, uint64, error) {
+	return nil, 0, ErrBarrierSealed
+}
+
+func (b *errorBarrier) DecryptWithContext(_, _, _ []byte) ([]byte, error) {
+	return nil, ErrBarrierSealed
+}
+
+func (b *errorBarrier) IsHardwareMode() bool { return false }
 
 func (b *errorBarrier) Rotate() (uint64, error)               { return 0, ErrBarrierSealed }
 func (b *errorBarrier) PurgeEpochsBefore(uint64) (int, error) { return 0, ErrBarrierSealed }
@@ -6099,6 +6179,24 @@ func (b *testHostBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) 
 	copy(out, ciphertext)
 	return out, nil
 }
+
+func (b *testHostBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
+func (b *testHostBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
+	body, err := stripTestAADTag(ciphertext, contextAAD)
+	if err != nil {
+		return nil, err
+	}
+	return b.Decrypt(dst, body)
+}
+
+func (b *testHostBarrier) IsHardwareMode() bool { return false }
 
 func (b *testHostBarrier) Rotate() (uint64, error) {
 	b.mu.Lock()
@@ -20082,7 +20180,7 @@ func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 	}
 	plaintext := []byte("the quick brown fox jumps over the lazy dog (encrypted at rest)")
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	writeEncryptedSnapshotFile(t, barrier, dataPath, plaintext)
+	writeEncryptedSnapshotFileFor(t, barrier, dataPath, plaintext, 1, 1, 700)
 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 700, Filepath: snapDir, Epoch: 1})
 
@@ -20109,18 +20207,21 @@ func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 	barrier := createTestBarrier(t)
 
+	// Both frames carry the positional context the decrypt side reproduces;
+	// only the EPOCH differs between them, which is the property under test.
+	aad := engine.NewSnapshotAAD(testSnapShardID, testSnapReplicaID, testSnapIndex, false)
 	p1 := []byte("frame-one-sealed-before-rotation")
-	c1, e1, err := barrier.EncryptWithEpoch(nil, p1)
+	c1, e1, err := barrier.EncryptWithEpochContext(nil, p1, aad.Frame(0))
 	if err != nil {
-		t.Fatalf("EncryptWithEpoch(1) failed: %v", err)
+		t.Fatalf("EncryptWithEpochContext(1) failed: %v", err)
 	}
 	if _, rotErr := barrier.Rotate(); rotErr != nil {
 		t.Fatalf("Rotate failed: %v", rotErr)
 	}
 	p2 := []byte("frame-two-sealed-after-rotation-at-a-higher-epoch")
-	c2, e2, err := barrier.EncryptWithEpoch(nil, p2)
+	c2, e2, err := barrier.EncryptWithEpochContext(nil, p2, aad.Frame(1))
 	if err != nil {
-		t.Fatalf("EncryptWithEpoch(2) failed: %v", err)
+		t.Fatalf("EncryptWithEpochContext(2) failed: %v", err)
 	}
 	if e1 == e2 {
 		t.Fatalf("expected distinct epochs across rotation, both = %d", e1)
@@ -20135,7 +20236,7 @@ func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 	}
 
 	var dst bytes.Buffer
-	if _, decErr := decryptSnapshotFrames(barrier, &src, &dst); decErr != nil {
+	if _, decErr := decryptSnapshotFrames(barrier, testSnapShardID, testSnapReplicaID, testSnapIndex, &src, &dst); decErr != nil {
 		t.Fatalf("decryptSnapshotFrames on a mixed-epoch snapshot failed: %v", decErr)
 	}
 	want := append(append([]byte{}, p1...), p2...)
@@ -20171,7 +20272,7 @@ func TestExportSnapshot_SealedBarrierEncryptedSnapshotErrors(t *testing.T) {
 	}
 	plaintext := []byte("ciphertext must not leak when the barrier is sealed")
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	writeEncryptedSnapshotFile(t, barrier, dataPath, plaintext)
+	writeEncryptedSnapshotFileFor(t, barrier, dataPath, plaintext, 1, 1, 800)
 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 800, Filepath: snapDir, Epoch: 1})
 
@@ -20201,7 +20302,7 @@ func exportShardSnapshotSetup(t *testing.T, db *mockLogDB, b Barrier, plaintext 
 	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
 		t.Fatalf("MkdirAll failed: %v", mkErr)
 	}
-	writeEncryptedSnapshotFile(t, b, filepath.Join(snapDir, "snapshot.dat"), plaintext)
+	writeEncryptedSnapshotFileFor(t, b, filepath.Join(snapDir, "snapshot.dat"), plaintext, 1, 1, 900)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: 1})
 }
 
@@ -20398,7 +20499,7 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", mkErr)
 	}
 	originalData := []byte("encrypted round-trip snapshot payload 0987654321")
-	writeEncryptedSnapshotFile(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData)
+	writeEncryptedSnapshotFileFor(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData, 1, 1, 1500)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1500, Filepath: snapDir, Epoch: 1})
 
 	// Export must yield an artifact whose data portion is plaintext. Decode
@@ -20452,8 +20553,11 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 	if bytes.Contains(importedData, originalData) {
 		t.Errorf("imported on-disk data contains plaintext %q; must be encrypted at rest", originalData)
 	}
+	// The import re-sealed the frames under the identity it actually stored:
+	// shard 1, replica 1 and the imported snapshot's own index.
 	var decrypted bytes.Buffer
-	if _, decErr := decryptSnapshotFrames(barrier, bytes.NewReader(importedData), &decrypted); decErr != nil {
+	if _, decErr := decryptSnapshotFrames(barrier, 1, 1, importedSnap.Index,
+		bytes.NewReader(importedData), &decrypted); decErr != nil {
 		t.Fatalf("decryptSnapshotFrames on imported artifact failed: %v", decErr)
 	}
 	if !bytes.Equal(decrypted.Bytes(), originalData) {
@@ -20489,7 +20593,7 @@ func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", mkErr)
 	}
 	originalData := []byte("must never land on disk while the barrier is sealed")
-	writeEncryptedSnapshotFile(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData)
+	writeEncryptedSnapshotFileFor(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData, 1, 1, 1600)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1600, Filepath: snapDir, Epoch: 1})
 
 	var exported bytes.Buffer

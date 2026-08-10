@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -93,6 +94,14 @@ func newSnapshotTestLogDB() *snapshotTestLogDB {
 	return &snapshotTestLogDB{
 		snapshots: make(map[uint64]logdb.Snapshot),
 	}
+}
+
+// AtRestProtection declares this test LogDB non-durable: it holds every record
+// in a map and writes nothing to disk, so no durable encrypted record can be
+// stranded by a DEK purge. The DECLARATION is what the purge floor keys on —
+// silence is read as "durable and possibly encrypted" and fails safe (L23).
+func (db *snapshotTestLogDB) AtRestProtection() logdb.AtRestProtection {
+	return logdb.AtRestNonDurable
 }
 
 func (db *snapshotTestLogDB) Name() string { return "snapshot-test" }
@@ -1099,6 +1108,47 @@ func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
 // Barrier/encryption test helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Context-AAD support for the test barriers (M3)
+//
+// The real seal.Barrier folds the caller context into the AEAD AAD, so a frame
+// sealed with one context cannot be opened with another. The XOR-based test
+// barriers have no AEAD, so they stand in for that binding by appending a
+// fixed-width tag derived from the context and rejecting a frame whose tag does
+// not match the context offered at decryption. That is what makes the negative
+// assertions (wrong ordinal / wrong index / wrong shard) meaningful here.
+// ---------------------------------------------------------------------------
+
+const testAADTagLen = 8
+
+// testAADTag folds a frame context into a fixed-width tag.
+func testAADTag(contextAAD []byte) [testAADTagLen]byte {
+	h := fnv.New64a()
+	_, _ = h.Write(contextAAD)
+	var out [testAADTagLen]byte
+	binary.BigEndian.PutUint64(out[:], h.Sum64())
+	return out
+}
+
+// appendTestAADTag binds ciphertext to contextAAD.
+func appendTestAADTag(ciphertext, contextAAD []byte) []byte {
+	tag := testAADTag(contextAAD)
+	return append(append([]byte(nil), ciphertext...), tag[:]...)
+}
+
+// stripTestAADTag verifies the binding and returns the framed ciphertext.
+func stripTestAADTag(ciphertext, contextAAD []byte) ([]byte, error) {
+	if len(ciphertext) < testAADTagLen {
+		return nil, errors.New("ciphertext too short for context tag")
+	}
+	body := ciphertext[:len(ciphertext)-testAADTagLen]
+	want := testAADTag(contextAAD)
+	if !bytes.Equal(ciphertext[len(body):], want[:]) {
+		return nil, errors.New("context AAD mismatch")
+	}
+	return body, nil
+}
+
 // testBarrier is a minimal SnapshotBarrier implementation for testing.
 // It XORs data with a fixed key per epoch (not cryptographically secure,
 // but deterministic and round-trip safe for tests).
@@ -1137,6 +1187,26 @@ func (b *testBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, e
 	return b.encryptForEpoch(plaintext, b.epoch), b.epoch, nil
 }
 
+func (b *testBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
+func (b *testBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
+	body, err := stripTestAADTag(ciphertext, contextAAD)
+	if err != nil {
+		return nil, err
+	}
+	return b.Decrypt(dst, body)
+}
+
+// IsHardwareMode is false: the test barrier binds context, like the software
+// seal.Barrier it stands in for.
+func (b *testBarrier) IsHardwareMode() bool { return false }
+
 func (b *testBarrier) encryptForEpoch(plaintext []byte, epoch uint64) []byte {
 	key := byte(epoch & 0xFF)
 	out := make([]byte, 8+len(plaintext))
@@ -1145,6 +1215,16 @@ func (b *testBarrier) encryptForEpoch(plaintext []byte, epoch uint64) []byte {
 		out[8+i] = v ^ key
 	}
 	return out
+}
+
+// sealFrameAt builds one snapshot frame exactly as encryptSnapshotFile would:
+// sealed at the given epoch and bound to the artifact identity
+// (shardID, replicaID, index) plus the frame's 0-based ordinal. Tests that
+// hand-assemble a snapshot.dat must use it, or the frames carry no positional
+// binding and the decrypt side correctly rejects them.
+func (b *testBarrier) sealFrameAt(plaintext []byte, epoch, shardID, replicaID, index, seq uint64) []byte {
+	aad := NewSnapshotAAD(shardID, replicaID, index, false)
+	return appendTestAADTag(b.encryptForEpoch(plaintext, epoch), aad.Frame(seq))
 }
 
 func (b *testBarrier) Decrypt(dst, ciphertext []byte) ([]byte, error) {
@@ -1258,6 +1338,14 @@ func (b *failAfterNBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uin
 		return nil, 0, err
 	}
 	return ct, b.testBarrier.epoch, nil
+}
+
+func (b *failAfterNBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
 }
 
 var _ SnapshotBarrier = (*failAfterNBarrier)(nil)
@@ -1467,7 +1555,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1478,7 +1566,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Decrypt to a sibling temp file; the source dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 3, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 3, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -1523,7 +1611,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
 		t.Fatalf("write test data failed: %v", err)
 	}
-	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -1537,7 +1625,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	}
 
 	// First decryption: must produce a distinct sibling containing the plaintext.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 7, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 7, barrier)
 	if err != nil {
 		t.Fatalf("first decrypt failed: %v", err)
 	}
@@ -1571,7 +1659,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	// Retry-safety: a second decrypt of the same (still encrypted) source must
 	// also succeed. Under the old in-place behavior the source would now be
 	// plaintext, so this second decrypt would fail.
-	plainPath2, err := p.decryptSnapshotToSibling(dataPath, 7, barrier)
+	plainPath2, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 7, barrier)
 	if err != nil {
 		t.Fatalf("second (retry) decrypt failed: %v", err)
 	}
@@ -1617,6 +1705,14 @@ func (b *rotateAfterNBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, u
 	return ct, epoch, nil
 }
 
+func (b *rotateAfterNBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
 var _ SnapshotBarrier = (*rotateAfterNBarrier)(nil)
 
 // TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames is the regression test
@@ -1640,8 +1736,8 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 	// Two distinct plaintext chunks; frame 1 sealed at epoch 5, frame 2 at 6.
 	chunk1 := bytes.Repeat([]byte{0xA1}, 128)
 	chunk2 := bytes.Repeat([]byte{0xB2}, 200)
-	enc1 := barrier.encryptForEpoch(chunk1, 5)
-	enc2 := barrier.encryptForEpoch(chunk2, 6)
+	enc1 := barrier.sealFrameAt(chunk1, 5, 1, 1, 1, 0)
+	enc2 := barrier.sealFrameAt(chunk2, 6, 1, 1, 1, 1)
 
 	dataPath := filepath.Join(tmpDir, snapshotDataFile)
 	var fileData []byte
@@ -1658,7 +1754,7 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 
 	// Decrypt using the MINIMUM recorded epoch (5). Per-frame embedded-epoch
 	// decryption must recover both frames despite frame 2 being at epoch 6.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 5, barrier)
 	if err != nil {
 		t.Fatalf("mixed-epoch decrypt failed (per-frame epoch not honored): %v", err)
 	}
@@ -1698,7 +1794,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 		t.Fatalf("write plaintext failed: %v", err)
 	}
 
-	minEpoch, _, err := p.encryptSnapshotFile(dataPath, barrier)
+	minEpoch, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
@@ -1712,7 +1808,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 	}
 
 	// The mixed-epoch file must round-trip using only the recorded min epoch.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, minEpoch, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, minEpoch, barrier)
 	if err != nil {
 		t.Fatalf("decrypt of mixed-epoch file failed: %v", err)
 	}
@@ -1748,7 +1844,7 @@ func TestSnapshotPool_EncryptFile_AtomicPreservesOriginalOnFailure(t *testing.T)
 	}
 
 	// Encrypt should fail on the second chunk.
-	_, _, err := p.encryptSnapshotFile(dataPath, barrier)
+	_, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail on second chunk")
 	}
@@ -1791,7 +1887,7 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 	for i := range chunk1 {
 		chunk1[i] = byte(i % 37)
 	}
-	enc1 := barrier.encryptForEpoch(chunk1, 1)
+	enc1 := barrier.sealFrameAt(chunk1, 1, 1, 1, 1, 0)
 	var frameBuf [4]byte
 	binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(enc1)))
 
@@ -1815,7 +1911,7 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 
 	// Decrypt should fail on the corrupt second frame and return an empty
 	// path (decryptSnapshotToSibling never mutates the source).
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected decrypt to fail on corrupt frame")
 	}
@@ -1858,7 +1954,7 @@ func TestSnapshotPool_EncryptFile_AtomicTempCleanup(t *testing.T) {
 	}
 
 	// Encrypt should fail because barrier is sealed.
-	_, _, err := p.encryptSnapshotFile(dataPath, barrier)
+	_, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected encrypt to fail with sealed barrier")
 	}
@@ -1887,7 +1983,7 @@ func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
 		t.Fatalf("write corrupt file failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for corrupt frame")
 	}
@@ -2348,8 +2444,9 @@ func TestSnapshotPool_PurgeOldEpochs_WALQueryError(t *testing.T) {
 }
 
 func TestSnapshotPool_PurgeOldEpochs_NonEpochAwareLogDB(t *testing.T) {
-	// Scenario: LogDB does not implement EpochAwareLogDB (e.g., MemDB).
-	// Should fall back to snapshot-only epoch floor.
+	// Scenario: LogDB does not implement EpochAwareLogDB and DECLARES itself
+	// non-durable (e.g., MemDB). No durable artifact means no DEK can be
+	// stranded, so the floor falls back to the snapshot-only epoch floor.
 	tmpDir := t.TempDir()
 	barrier := newTestBarrier(5)
 	stopC := make(chan struct{})
@@ -2378,6 +2475,83 @@ func TestSnapshotPool_PurgeOldEpochs_NonEpochAwareLogDB(t *testing.T) {
 	// Without EpochAwareLogDB, purge floor is snapshot min (2).
 	if barrier.PurgedBefore() != 2 {
 		t.Fatalf("purgedBefore = %d, want 2", barrier.PurgedBefore())
+	}
+}
+
+// durableEncryptedTestLogDB is a non-epoch-aware LogDB that DECLARES its
+// records durable and barrier-encrypted. It cannot report a WAL epoch floor, so
+// the purge floor has no way to know which DEKs its live records still need.
+type durableEncryptedTestLogDB struct {
+	snapshotTestLogDB
+}
+
+func (db *durableEncryptedTestLogDB) AtRestProtection() logdb.AtRestProtection {
+	return logdb.AtRestBarrierEncrypted
+}
+
+// unprotectedTestLogDB declares NOTHING. It embeds the logdb.LogDB INTERFACE
+// rather than the concrete store, so only the interface's methods are in its
+// method set and logdb.AtRestProtectedLogDB is not satisfied. Silence must read
+// as "durable, encrypted, forgot to declare" -- the exact hazard -- and block
+// the purge.
+type unprotectedTestLogDB struct {
+	logdb.LogDB
+}
+
+// TestSnapshotPool_PurgeOldEpochs_DurableNonEpochAwareLogDBBlocksPurge is the
+// L23 regression test. A non-nil LogDB that cannot report an epoch floor used to
+// contribute walMinEpoch=0 silently, letting the purge proceed on the snapshot
+// floor alone and IRREVERSIBLY destroying DEKs a durable, encrypted log may
+// still need. Only a positive AtRestNonDurable declaration proves otherwise;
+// anything else -- including AtRestUnprotected and total silence -- must fail
+// safe (ok == false, nothing purged).
+func TestSnapshotPool_PurgeOldEpochs_DurableNonEpochAwareLogDBBlocksPurge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ldb  logdb.LogDB
+	}{
+		{"barrier_encrypted", &durableEncryptedTestLogDB{
+			snapshotTestLogDB: snapshotTestLogDB{snapshots: make(map[uint64]logdb.Snapshot)}}},
+		{"undeclared", &unprotectedTestLogDB{LogDB: newSnapshotTestLogDB()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			barrier := newTestBarrier(5)
+			stopC := make(chan struct{})
+			p := newSnapshotPool(2, tc.ldb, barrier, nil, nil, stopC, nil)
+			wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
+
+			for _, info := range []struct {
+				index uint64
+				epoch uint64
+			}{
+				{100, 2},
+				{200, 5},
+			} {
+				dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
+				if err := os.MkdirAll(dir, 0o750); err != nil {
+					t.Fatalf("mkdir failed: %v", err)
+				}
+				if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch,
+					config.NoCompression); err != nil {
+					t.Fatalf("write metadata failed: %v", err)
+				}
+			}
+
+			if _, ok := p.globalSafePurgeFloor(); ok {
+				t.Fatal("globalSafePurgeFloor reported ok=true for a LogDB that neither " +
+					"reports an epoch floor nor declares its records non-durable")
+			}
+
+			p.purgeOldEpochs(tmpDir, 1, 1)
+			if barrier.PurgeCallCount() != 0 {
+				t.Fatalf("purge ran %d time(s); a durable non-epoch-aware LogDB must "+
+					"suppress it", barrier.PurgeCallCount())
+			}
+			if barrier.PurgedBefore() != 0 {
+				t.Fatalf("purgedBefore = %d, want 0", barrier.PurgedBefore())
+			}
+		})
 	}
 }
 
@@ -2842,7 +3016,7 @@ func TestSnapshotPool_DecryptFile_EmptyFile(t *testing.T) {
 	}
 
 	// Decrypting an empty source should succeed and yield an empty sibling.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt empty file failed: %v", err)
 	}
@@ -3140,7 +3314,7 @@ func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
 	}
 
 	// Encrypt.
-	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
 
@@ -3155,7 +3329,7 @@ func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
 
 	// Decrypt to a sibling and verify round-trip integrity. The source
 	// dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 5, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 5, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3196,10 +3370,10 @@ func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3231,10 +3405,10 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	if _, _, err := p.encryptSnapshotFile(dataPath, barrier); err != nil {
+	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 2, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 2, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3261,7 +3435,7 @@ func TestSnapshotPool_EncryptFile_MissingFile(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	_, _, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", barrier)
+	_, _, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -3282,7 +3456,7 @@ func TestSnapshotPool_DecryptFile_MissingFile(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	plainPath, err := p.decryptSnapshotToSibling("/nonexistent/path/snapshot.dat", 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling("/nonexistent/path/snapshot.dat", 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -3313,7 +3487,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameHeader(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame header")
 	}
@@ -3347,7 +3521,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameData(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, barrier)
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame data")
 	}
@@ -4788,6 +4962,174 @@ func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
 		}
 		if len(p.requestC) != 0 {
 			t.Fatal("a request was left on requestC after every worker exited")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// M3: positional context-AAD for snapshot frames
+// ---------------------------------------------------------------------------
+
+// TestSnapshotAAD_Layout pins the wire-order of the context. It is not stored
+// anywhere, so it can only be reproduced from code — which makes an accidental
+// field reorder a silent, total loss of every existing encrypted snapshot.
+func TestSnapshotAAD_Layout(t *testing.T) {
+	got := NewSnapshotAAD(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, false).
+		Frame(0x3132333435363738)
+	want := append([]byte("QRSNAP1"),
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38)
+	if len(want) != SnapshotFrameAADLen {
+		t.Fatalf("fixture is %d bytes, SnapshotFrameAADLen = %d", len(want), SnapshotFrameAADLen)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("context = %x, want %x", got, want)
+	}
+}
+
+// TestSnapshotAAD_DistinctPerPosition asserts no two positions collide, which
+// is what the fixed-width, delimiter-free encoding buys.
+func TestSnapshotAAD_DistinctPerPosition(t *testing.T) {
+	seen := map[string]string{}
+	for _, tc := range []struct {
+		name                      string
+		shardID, replicaID, index uint64
+		seq                       uint64
+	}{
+		{"base", 1, 2, 3, 4},
+		{"shard", 2, 2, 3, 4},
+		{"replica", 1, 3, 3, 4},
+		{"index", 1, 2, 4, 4},
+		{"seq", 1, 2, 3, 5},
+		// The classic delimiter-free ambiguity: adjacent fields borrowing a
+		// digit from one another. Fixed-width fields make it impossible.
+		{"shift", 1, 2, 30, 4},
+	} {
+		key := string(NewSnapshotAAD(tc.shardID, tc.replicaID, tc.index, false).Frame(tc.seq))
+		if prev, dup := seen[key]; dup {
+			t.Fatalf("%s and %s produce identical context bytes", tc.name, prev)
+		}
+		seen[key] = tc.name
+	}
+}
+
+// TestSnapshotAAD_HardwareModeSuppressesContext pins the documented capability
+// limitation: a hardware barrier rejects ANY non-empty context, so the frames it
+// seals keep the epoch binding only. The decision belongs to the deployment and
+// is taken at builder construction — never per artifact, and never as a reaction
+// to a decryption failure.
+func TestSnapshotAAD_HardwareModeSuppressesContext(t *testing.T) {
+	if ctx := NewSnapshotAAD(1, 2, 3, true).Frame(4); ctx != nil {
+		t.Fatalf("hardware mode produced a %d-byte context; the barrier would reject it "+
+			"with ErrHardwareMode and every snapshot save would fail", len(ctx))
+	}
+}
+
+// TestSnapshotAAD_FrameReusesScratchBuffer pins the no-per-frame-allocation
+// property of the bulk encrypt/decrypt path.
+func TestSnapshotAAD_FrameReusesScratchBuffer(t *testing.T) {
+	aad := NewSnapshotAAD(1, 2, 3, false)
+	first := aad.Frame(0)
+	second := aad.Frame(1)
+	if &first[0] != &second[0] {
+		t.Fatal("Frame allocated a new buffer per call; the snapshot bulk path would " +
+			"allocate once per frame")
+	}
+}
+
+// TestSnapshotPool_FrameContext_RejectsSplicedArtifact drives the file-level
+// encrypt/decrypt pair. A snapshot.dat that decrypts under its OWN identity must
+// not decrypt under any other, and a frame moved to a different ordinal must
+// fail — with no fallback to a weaker AAD anywhere in the reader.
+func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
+	const (
+		shardID   = uint64(4)
+		replicaID = uint64(2)
+		index     = uint64(900)
+	)
+	tmpDir := t.TempDir()
+	barrier := newTestBarrier(3)
+	stopC := make(chan struct{})
+	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
+
+	original := make([]byte, snapshotEncryptChunkSize*3+21)
+	for i := range original {
+		original[i] = byte(i*13 + 2)
+	}
+	dataPath := filepath.Join(tmpDir, snapshotDataFile)
+	if err := os.WriteFile(dataPath, original, 0o600); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if _, _, err := p.encryptSnapshotFile(dataPath, shardID, replicaID, index, barrier); err != nil {
+		t.Fatalf("encryptSnapshotFile: %v", err)
+	}
+
+	// Positive: the artifact's own identity opens it.
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, shardID, replicaID, index, 3, barrier)
+	if err != nil {
+		t.Fatalf("decrypt under the matching identity: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(plainPath) })
+	round, readErr := os.ReadFile(plainPath)
+	if readErr != nil {
+		t.Fatalf("read decrypted sibling: %v", readErr)
+	}
+	if !bytes.Equal(round, original) {
+		t.Fatalf("round-trip mismatch: %d bytes back, want %d", len(round), len(original))
+	}
+
+	// Negative: a foreign artifact identity.
+	for _, tc := range []struct {
+		name                      string
+		shardID, replicaID, index uint64
+	}{
+		{"other_shard", 5, replicaID, index},
+		{"other_replica", shardID, 3, index},
+		{"other_index", shardID, replicaID, index + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, decErr := p.decryptSnapshotToSibling(
+				dataPath, tc.shardID, tc.replicaID, tc.index, 3, barrier); decErr == nil {
+				t.Fatalf("snapshot sealed for (%d,%d,%d) decrypted as (%d,%d,%d)",
+					shardID, replicaID, index, tc.shardID, tc.replicaID, tc.index)
+			}
+		})
+	}
+
+	// Negative: the same frames, reordered on disk.
+	t.Run("reordered_frames", func(t *testing.T) {
+		blob, rdErr := os.ReadFile(dataPath)
+		if rdErr != nil {
+			t.Fatalf("read artifact: %v", rdErr)
+		}
+		var frames [][]byte
+		for off := 0; off < len(blob); {
+			n := int(binary.LittleEndian.Uint32(blob[off : off+4]))
+			off += 4
+			frames = append(frames, blob[off:off+n])
+			off += n
+		}
+		if len(frames) < 3 {
+			t.Fatalf("fixture produced %d frames, want at least 3", len(frames))
+		}
+		frames[0], frames[1] = frames[1], frames[0]
+
+		var swapped []byte
+		var lb [4]byte
+		for _, f := range frames {
+			binary.LittleEndian.PutUint32(lb[:], uint32(len(f)))
+			swapped = append(swapped, lb[:]...)
+			swapped = append(swapped, f...)
+		}
+		swappedPath := filepath.Join(t.TempDir(), snapshotDataFile)
+		if wrErr := os.WriteFile(swappedPath, swapped, 0o600); wrErr != nil {
+			t.Fatalf("write swapped artifact: %v", wrErr)
+		}
+		if _, decErr := p.decryptSnapshotToSibling(
+			swappedPath, shardID, replicaID, index, 3, barrier); decErr == nil {
+			t.Fatal("a reordered artifact decrypted: frames are not bound to their ordinal")
 		}
 	})
 }
