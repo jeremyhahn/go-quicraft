@@ -89,8 +89,8 @@ type stepWorker struct {
 	// read only on the step-worker goroutine (recovery runs on it during the
 	// panic unwind), so no synchronization is required.
 	enqueuingNode *Node
-	inboxBuf     []proto.Message // reusable buffer for draining node inboxes
-	proposeBuf   []proto.Entry   // reusable buffer for batching inbox proposals
+	inboxBuf      []proto.Message // reusable buffer for draining node inboxes
+	proposeBuf    []proto.Entry   // reusable buffer for batching inbox proposals
 	// commitProposeBuf is a SEPARATE reusable buffer for the commit-pending
 	// drain. It must not share proposeBuf: within one iteration the step worker
 	// drains proposals into proposeBuf and steps a Propose message that ALIASES
