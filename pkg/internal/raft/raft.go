@@ -985,6 +985,28 @@ func stepFollower(r *raft, msg proto.Message) error {
 		// normal speed while proposals are in flight.
 		r.recordActivity()
 		// Forward to leader.
+		//
+		// COPY the entries first: msg.Entries aliases the step worker's REUSABLE
+		// proposal batch buffer, and a forwarded Propose is an ORDERED message, so
+		// it sits in the outbound buffer until a GetUpdate cycle — which cannot run
+		// while commitPending is true. The step worker meanwhile hands that same
+		// buffer back to the proposal queue on its next drain, and the queue writes
+		// new client proposals straight into the entry structs this message still
+		// points at, Key included. The result is deterministic (not a race):
+		// forwarded proposals are silently REPLACED — one proposal never reaches
+		// the leader and blocks to its caller's deadline, while another is
+		// forwarded twice and, having no session dedup, commits twice.
+		//
+		// Copying here rather than at the drain is what actually closes it: this is
+		// the one point where a reference to the buffer escapes the step worker's
+		// own iteration. The entry structs are copied; Cmd is shared, which is safe
+		// because the queue only ever overwrites the Entry structs it owns and
+		// never mutates the caller's command bytes.
+		if len(msg.Entries) > 0 {
+			forwarded := make([]proto.Entry, len(msg.Entries))
+			copy(forwarded, msg.Entries)
+			msg.Entries = forwarded
+		}
 		msg.To = r.leaderID
 		r.send(msg)
 		return nil
