@@ -2287,6 +2287,15 @@ func authorizationRig(t *testing.T, ms proto.Membership) (*engine.Engine, *hostM
 	return eng, &hostMessageHandler{engine: eng, host: h}, node
 }
 
+// authorizationRigJoining is authorizationRig for a replica that is still
+// joining: started with join=true and holding no configuration yet.
+func authorizationRigJoining(t *testing.T, ms proto.Membership) (*engine.Engine, *hostMessageHandler, *engine.Node) {
+	t.Helper()
+	eng, handler, node := authorizationRig(t, ms)
+	node.Peer().MarkJoining()
+	return eng, handler, node
+}
+
 // TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration is the
 // regression for the wedge the member allow-list caused.
 //
@@ -2356,5 +2365,83 @@ func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 	if node.DiagState().InboxLen != before {
 		t.Fatal("a message from a replica with a committed Removed tombstone was " +
 			"delivered to raft")
+	}
+}
+
+// TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress is the regression
+// for the bootstrap deadlock a strict membership gate on address learning
+// causes.
+//
+// A replica joining a shard starts with an EMPTY configuration, so IsMember is
+// false for everyone -- including the leader. If it cannot record the leader's
+// address it cannot route its ReplicateResp back, so it never acks, the leader's
+// match index never advances, and the join never completes. Every membership
+// change and add-node integration test times out at exactly this point.
+func TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress(t *testing.T) {
+	_, handler, node := authorizationRigJoining(t, proto.Membership{})
+
+	if node.IsMember(1) {
+		t.Fatal("fixture: a joining replica must know no members")
+	}
+	if !node.IsJoining() {
+		t.Fatal("fixture: the replica must be marked joining")
+	}
+
+	batch := proto.MessageBatch{
+		SourceAddress: "127.0.0.1:5001",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 1, To: 1, Type: proto.Replicate, Term: 3},
+		},
+	}
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+
+	got, err := handler.host.registry.Resolve(1, 1)
+	if err != nil || got != "127.0.0.1:5001" {
+		t.Fatalf("joining replica did not record the leader's address "+
+			"(resolved %q, err %v): it cannot send its ReplicateResp back, so it "+
+			"never acks and the join never completes", got, err)
+	}
+}
+
+// TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress pins the
+// other half. First contact may fill in a mapping; nothing outside the committed
+// configuration may REPLACE one. Otherwise any authenticated peer could re-point
+// an established member's traffic at itself.
+func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testing.T) {
+	_, handler, _ := authorizationRig(t, proto.Membership{
+		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+	})
+	handler.host.registry.Register(1, 2, "127.0.0.1:5002")
+
+	// Replica 42 is not in the configuration and claims to be replica 2.
+	batch := proto.MessageBatch{
+		SourceAddress: "127.0.0.1:6666",
+		Requests: []proto.Message{
+			{ShardID: 1, From: 2, To: 1, Type: proto.Replicate, Term: 3},
+		},
+	}
+	// A member MAY overwrite (recovery at a new address), so to isolate the
+	// non-member path this shard's configuration is edited to drop replica 2.
+	_, handler2, _ := authorizationRig(t, proto.Membership{
+		Addresses: map[uint64]string{1: "127.0.0.1:5001"},
+	})
+	handler2.host.registry.Register(1, 2, "127.0.0.1:5002")
+	if err := handler2.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if got, _ := handler2.host.registry.Resolve(1, 2); got != "127.0.0.1:5002" {
+		t.Fatalf("a replica outside the configuration re-pointed replica 2's "+
+			"address to %q: shard traffic for replica 2 now goes to it", got)
+	}
+
+	// And a MEMBER may still overwrite, which recovery at a new address needs.
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if got, _ := handler.host.registry.Resolve(1, 2); got != "127.0.0.1:6666" {
+		t.Fatalf("a member could not update its own address (got %q): a replica "+
+			"recovering at a new address stays unreachable during quorum loss", got)
 	}
 }

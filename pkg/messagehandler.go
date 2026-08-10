@@ -215,17 +215,36 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 		// replicaID in From cannot be verified as a real member until the shard
 		// is loaded with its configured membership.
 		//
-		// Learning is gated on IsMember, NOT on the deny-list that gates message
-		// ACCEPTANCE above. The two are deliberately different predicates:
-		// accepting a message is a read that raft's own term and log rules then
-		// validate, and it must tolerate a stale configuration or a lagging
-		// replica wedges itself. Learning an address MUTATES this host's routing
-		// state, so it takes the strict test — only a replica the committed
-		// configuration actually names may rewrite where this host sends. A
-		// sender we have never heard of has nothing to route to anyway.
-		if node != nil && node.IsMember(msg.From) &&
-			batch.SourceAddress != "" && senderAuthorized(batch.SourceAddress) {
-			h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress)
+		// Learning MUTATES this host's routing state, so it is gated more
+		// tightly than message acceptance above — but not on membership alone,
+		// which would break the case the whole deny-list exists to serve. A
+		// replica joining a shard starts with an EMPTY configuration: it does
+		// not yet know the leader is a member, and if it cannot record the
+		// leader's address it cannot send its ReplicateResp back, so it never
+		// acks, the leader never advances its match index, and the join never
+		// completes.
+		//
+		// The rule that satisfies both:
+		//
+		//   - A replica the committed configuration NAMES may register and
+		//     OVERWRITE its address. The overwrite is required so a member that
+		//     recovers at a new address becomes reachable again, including
+		//     during quorum loss when no leader can propagate a config change.
+		//   - Otherwise an address is learned only while THIS replica's own
+		//     configuration is incomplete (it is still joining), and even then
+		//     only to fill a mapping that does not exist yet.
+		//
+		// The second clause is deliberately about the LOCAL replica, not the
+		// sender: the legitimate first-contact case is "I do not know who the
+		// members are yet", not "the sender claims to be someone". That keeps an
+		// established replica from recording addresses for arbitrary replica IDs
+		// a peer invents — unbounded registry growth — while still letting a
+		// joiner record the leader it must ack.
+		if node != nil && batch.SourceAddress != "" && senderAuthorized(batch.SourceAddress) {
+			isMember := node.IsMember(msg.From)
+			if isMember || node.IsJoining() {
+				h.learnSourceAddress(msg.ShardID, msg.From, batch.SourceAddress, isMember)
+			}
 		}
 
 		// DeliverMessage (not DeliverLocal) stamps the message OriginRemote.
@@ -264,9 +283,27 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 // mTLS membership and would require replicaID-bound certificates to close
 // fully; committed-membership config changes remain the authoritative source
 // and overwrite the registry directly.
-func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, address string) {
+func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, address string, mayOverwrite bool) {
 	if address == "" || h.host == nil || h.host.registry == nil {
 		return
+	}
+	// A sender the committed configuration does not name may establish a
+	// mapping, but must never REPLACE one. That keeps first contact working for
+	// a joining replica (which knows no members yet, and must record the
+	// leader's address to ack at all) while denying any authenticated peer the
+	// ability to re-point an established member's traffic at itself.
+	if !mayOverwrite {
+		if existing, err := h.host.registry.Resolve(shardID, replicaID); err == nil && existing != "" {
+			if existing != address {
+				slog.Warn("ignoring address change from a replica outside the configuration",
+					"shard", shardID,
+					"replica", replicaID,
+					"registered", existing,
+					"offered", address,
+				)
+			}
+			return
+		}
 	}
 	h.host.registry.Register(shardID, replicaID, address)
 }

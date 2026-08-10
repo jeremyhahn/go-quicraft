@@ -1374,6 +1374,16 @@ func (p *Peer) IsMember(replicaID uint64) bool {
 	return snap.isMember(replicaID)
 }
 
+// IsJoining reports whether THIS replica's configuration is known-incomplete —
+// it was started with join=true and has not yet replayed the entries naming the
+// rest of the shard. It is a statement about the local replica, never about a
+// peer, and it is not an authorization bypass. See the joining field.
+//
+// Safe for concurrent access from any goroutine.
+func (p *Peer) IsJoining() bool {
+	return p.joining.Load()
+}
+
 // IsRemoved reports whether replicaID carries a committed Removed tombstone in
 // this shard's configuration. It is the per-shard authorization predicate for
 // INBOUND messages, and it is a DENY-list on purpose.

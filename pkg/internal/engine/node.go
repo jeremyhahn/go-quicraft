@@ -707,6 +707,17 @@ func (n *Node) IsMember(replicaID uint64) bool {
 	return n.peer.IsMember(replicaID)
 }
 
+// IsJoining reports whether this node's own configuration is known-incomplete
+// (started with join=true and not yet caught up to the entries naming the
+// shard). Used by the transport handler to decide whether first-contact address
+// learning is legitimate. False when the peer is nil.
+func (n *Node) IsJoining() bool {
+	if n.peer == nil {
+		return false
+	}
+	return n.peer.IsJoining()
+}
+
 // IsRemoved reports whether replicaID carries a committed Removed tombstone for
 // this shard. This is the per-shard authorization predicate the transport
 // message handler enforces on inbound messages: a DENY-list, because a
