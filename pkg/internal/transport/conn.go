@@ -494,7 +494,11 @@ func (t *QUICTransport) reapPeerIncarnations(now time.Time) {
 // the pool and closes it with the given reason. If no connection exists for
 // the target, this is a no-op. The close is performed outside the lock to
 // avoid holding connMu during I/O.
-func (t *QUICTransport) removeAndCloseConnection(target string, reason string) {
+//
+// It reports whether a pooled entry existed for target and was therefore
+// removed. Callers that only tear a suspect connection down ignore the result;
+// CloseTarget uses it to decide whether there was anything to close at all.
+func (t *QUICTransport) removeAndCloseConnection(target string, reason string) bool {
 	t.connMu.Lock()
 	conn, ok := t.conns[target]
 	delete(t.conns, target)
@@ -509,6 +513,99 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) {
 			)
 		}
 	}
+	return ok
+}
+
+// CloseTarget tears down the outbound connection to address and every piece of
+// address-keyed state that hangs off it: the pooled connection and its epoch
+// stamp (conns/connEpoch), every pooled stream opened on it, the per-target
+// send queue, and the peer's incarnation record. It reports whether a
+// connection was actually cached and therefore closed.
+//
+// It exists because nothing else ever closes an outbound to a peer that is
+// simply GONE. KeepAlivePeriod is below MaxIdleTimeout, so quic-go PINGs the
+// connection indefinitely and it never idle-closes; cleanStaleConnections only
+// reaps connections whose context is ALREADY dead, and a removed-but-still-
+// running member answers keep-alives forever. Without an explicit teardown the
+// connection, its streams, its epoch records and its keep-alive traffic persist
+// for the process lifetime.
+//
+// This is EVENT-DRIVEN teardown for a COMMITTED membership removal, and it is
+// deliberately not a sweep: a "not in the registry, so close it" scan would
+// tear down live, healthy connections, because registry entries legitimately
+// vanish (or have not appeared yet) under a healthy connection — a shard
+// teardown that precedes its own restart, a rolled-back speculative
+// pre-register, a joining replica with empty membership, bootstrap-snapshot
+// authorization by address, and multi-minute in-flight snapshot streams.
+//
+// CALLER CONTRACT: one connection is keyed by ADDRESS and multiplexed across
+// every shard that talks to that host (see conns and streamIndexFor, which maps
+// distinct shards onto stream indices of the SAME connection). The caller MUST
+// have established that no other shard still resolves a replica to this address
+// — registry.AddressInUse is that check — before calling. Closing on behalf of
+// one shard while another still uses the peer tears down healthy traffic.
+//
+// A snapshot transfer in flight vetoes the teardown and CloseTarget returns
+// false without mutating anything: snapshot sends run over the same cached
+// connection (SendSnapshot calls getConnection), and aborting a multi-minute
+// stream to reclaim one connection is a bad trade. The check uses the same
+// snapshotTracker that Stop consults, which counts transfers process-wide
+// rather than per target, so the veto is conservative: any snapshot anywhere
+// defers this teardown. The caller may retry; the veto is transient.
+//
+// bool rather than error is the right result type here: there is no failure to
+// report. Either state was reclaimed or there was none to reclaim (unknown
+// address) or a snapshot deferred it — none of which is an error the caller can
+// or should act on beyond retrying later. Connection close errors are
+// diagnostic only and are logged, exactly as on every other teardown path.
+//
+// CloseTarget is idempotent and safe on an unknown address: it mutates nothing
+// and returns false.
+func (t *QUICTransport) CloseTarget(address string) bool {
+	if address == "" {
+		return false
+	}
+
+	if inflight := t.snapshotTracker.InFlight(); inflight > 0 {
+		slog.Info("deferring removed-peer connection teardown: snapshot transfer in flight",
+			"target", address,
+			"in_flight", inflight,
+		)
+		return false
+	}
+
+	// Nothing cached: leave every other structure untouched so a call for an
+	// address this transport never dialed cannot disturb state that a live
+	// shard may still be using.
+	if !t.removeAndCloseConnection(address, "peer removed from membership") {
+		return false
+	}
+
+	// Locks are taken in the established order and never nested: connMu is
+	// released by removeAndCloseConnection before the stream shard locks, and
+	// sendQueuesMu and peerEpochMu are independent of both.
+	t.evictStreamsForTarget(address)
+	t.retireSendQueue(address)
+	t.forgetPeerIncarnation(address)
+
+	slog.Info("closed connection to removed peer", "target", address)
+	return true
+}
+
+// forgetPeerIncarnation drops target's incarnation record outright.
+//
+// Every other teardown path deliberately KEEPS the record, because removing a
+// connection there is the first half of a re-dial and the record is what the
+// replacement outbound is stamped with (see removeConnection). A committed
+// membership removal is the one case where no re-dial is coming: the peer is
+// gone, and holding its epoch, superseded ring and eviction budget only grows
+// the map across membership churn. Should the address ever be re-added, the
+// cost of having forgotten is the ordinary first-contact eviction, which
+// converges after a single re-dial.
+func (t *QUICTransport) forgetPeerIncarnation(target string) {
+	t.peerEpochMu.Lock()
+	delete(t.peerEpoch, target)
+	t.peerEpochMu.Unlock()
 }
 
 // getStream returns a pooled QUIC stream for the given target. Heartbeats

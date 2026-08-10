@@ -3733,3 +3733,232 @@ func TestDialConnection_ReusesCachedWinner(t *testing.T) {
 	default:
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CloseTarget: explicit teardown on a committed membership removal
+// ---------------------------------------------------------------------------
+
+// peerEpochKnown reports whether the transport holds an incarnation record for
+// target. Reads under peerEpochMu so it is safe alongside the receive path.
+func peerEpochKnown(tr *QUICTransport, target string) bool {
+	tr.peerEpochMu.Lock()
+	defer tr.peerEpochMu.Unlock()
+	_, ok := tr.peerEpoch[target]
+	return ok
+}
+
+// connEpochKnown reports whether the transport holds a dial-epoch stamp for
+// target. Reads under connMu.
+func connEpochKnown(tr *QUICTransport, target string) bool {
+	tr.connMu.RLock()
+	defer tr.connMu.RUnlock()
+	_, ok := tr.connEpoch[target]
+	return ok
+}
+
+// sendQueueKnown reports whether the transport holds a send queue for target.
+func sendQueueKnown(tr *QUICTransport, target string) bool {
+	tr.sendQueuesMu.RLock()
+	defer tr.sendQueuesMu.RUnlock()
+	_, ok := tr.sendQueues[target]
+	return ok
+}
+
+// TestCloseTargetUnknownAddressIsNoOp verifies CloseTarget on an address this
+// transport never dialed reports false, does not panic, and mutates nothing.
+func TestCloseTargetUnknownAddressIsNoOp(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	// Establish a live connection to a DIFFERENT target so the no-op case can
+	// be shown not to disturb unrelated state.
+	target := t2.Addr().String()
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+	handler2.waitBatch(t, 10*time.Second)
+
+	streamsBefore := t1.StreamCount()
+
+	if t1.CloseTarget("127.0.0.1:1") {
+		t.Fatal("CloseTarget reported a close for an address that was never dialed")
+	}
+	if t1.CloseTarget("") {
+		t.Fatal("CloseTarget reported a close for the empty address")
+	}
+
+	if n := t1.ConnectionCount(); n != 1 {
+		t.Fatalf("unrelated connection disturbed: expected 1 connection, got %d", n)
+	}
+	if n := t1.StreamCount(); n != streamsBefore {
+		t.Fatalf("unrelated streams disturbed: had %d, now %d", streamsBefore, n)
+	}
+	if !sendQueueKnown(t1, target) {
+		t.Fatal("unrelated send queue was retired by a no-op CloseTarget")
+	}
+	if !connEpochKnown(t1, target) {
+		t.Fatal("unrelated dial-epoch stamp was dropped by a no-op CloseTarget")
+	}
+}
+
+// TestCloseTargetClosesConnectionAndEvictsState verifies CloseTarget closes the
+// cached connection and clears every parallel address-keyed structure —
+// conns, connEpoch, the pooled streams, the send queue and the peer incarnation
+// record — and that a later send re-dials the peer successfully.
+func TestCloseTargetClosesConnectionAndEvictsState(t *testing.T) {
+	t1, t2, handler1, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	target := t2.Addr().String()
+
+	// Take the inbound batch from t2 FIRST: that is what creates t1's
+	// incarnation record for the target, and dialing afterwards stamps the
+	// outbound with the epoch already known, so the receive path's
+	// restart-eviction never fires on the connection under test.
+	t2.Send([]proto.Message{{Type: proto.ReplicateResp, ShardID: 1, From: 2, To: 1, Term: 1}})
+	handler1.waitBatch(t, 10*time.Second)
+	pollUntil(t, 5*time.Second, 10*time.Millisecond,
+		"no incarnation record recorded for the peer",
+		func() bool { return peerEpochKnown(t1, target) })
+
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+	handler2.waitBatch(t, 10*time.Second)
+	pollUntil(t, 5*time.Second, 10*time.Millisecond,
+		"no pooled stream for the target",
+		func() bool { return t1.StreamCount() > 0 })
+
+	t1.connMu.RLock()
+	conn := t1.conns[target]
+	t1.connMu.RUnlock()
+	if conn == nil {
+		t.Fatal("no cached connection for the target")
+	}
+
+	if !t1.CloseTarget(target) {
+		t.Fatal("CloseTarget did not report closing the cached connection")
+	}
+
+	if n := t1.ConnectionCount(); n != 0 {
+		t.Fatalf("expected 0 cached connections, got %d", n)
+	}
+	if connEpochKnown(t1, target) {
+		t.Fatal("connEpoch stamp survived CloseTarget")
+	}
+	if n := t1.StreamCount(); n != 0 {
+		t.Fatalf("expected all pooled streams evicted, got %d", n)
+	}
+	if sendQueueKnown(t1, target) {
+		t.Fatal("send queue survived CloseTarget")
+	}
+	if peerEpochKnown(t1, target) {
+		t.Fatal("peer incarnation record survived CloseTarget")
+	}
+	waitForChan(t, conn.Context().Done(), 5*time.Second,
+		"closed connection's context was never cancelled")
+
+	// Idempotent: nothing left to close.
+	if t1.CloseTarget(target) {
+		t.Fatal("second CloseTarget reported a close with nothing cached")
+	}
+
+	// A subsequent send must re-dial and be delivered.
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+	if n := t1.ConnectionCount(); n != 1 {
+		t.Fatalf("expected the peer to be re-dialed, got %d connections", n)
+	}
+}
+
+// TestCloseTargetRefusesDuringSnapshotTransfer verifies an in-flight snapshot
+// transfer vetoes the teardown: the cached connection (which SendSnapshot
+// streams over) and all its state must survive, and the teardown must succeed
+// once the transfer completes.
+func TestCloseTargetRefusesDuringSnapshotTransfer(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	target := t2.Addr().String()
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+	handler2.waitBatch(t, 10*time.Second)
+
+	streamsBefore := t1.StreamCount()
+
+	// Occupy a snapshot slot exactly as SendSnapshot does.
+	if !t1.snapshotTracker.TryAdd() {
+		t.Fatal("snapshotTracker refused an operation on a running transport")
+	}
+
+	if t1.CloseTarget(target) {
+		t.Fatal("CloseTarget aborted a connection with a snapshot transfer in flight")
+	}
+	if n := t1.ConnectionCount(); n != 1 {
+		t.Fatalf("connection torn down despite the snapshot veto: %d connections", n)
+	}
+	if n := t1.StreamCount(); n != streamsBefore {
+		t.Fatalf("streams evicted despite the snapshot veto: had %d, now %d", streamsBefore, n)
+	}
+	if !sendQueueKnown(t1, target) {
+		t.Fatal("send queue retired despite the snapshot veto")
+	}
+
+	// Transfer completes: the teardown is no longer vetoed.
+	t1.snapshotTracker.Done()
+
+	if !t1.CloseTarget(target) {
+		t.Fatal("CloseTarget refused after the snapshot transfer completed")
+	}
+	if n := t1.ConnectionCount(); n != 0 {
+		t.Fatalf("expected 0 cached connections, got %d", n)
+	}
+}
+
+// TestCloseTargetSendQueueRetirementSurvivesWorkerPrune verifies the retired
+// queue is replaced by a fresh one on the next send, and that the retired
+// worker's own idle prune cannot delete that replacement.
+func TestCloseTargetSendQueueRetirementSurvivesWorkerPrune(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	target := t2.Addr().String()
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+	handler2.waitBatch(t, 10*time.Second)
+
+	t1.sendQueuesMu.RLock()
+	retired := t1.sendQueues[target]
+	t1.sendQueuesMu.RUnlock()
+	if retired == nil {
+		t.Fatal("no send queue for the target")
+	}
+
+	if !t1.CloseTarget(target) {
+		t.Fatal("CloseTarget did not report closing the cached connection")
+	}
+	if !retired.closed.Load() {
+		t.Fatal("retired send queue was removed from the map without being marked closed")
+	}
+
+	// The next send creates a fresh queue rather than reusing the retired one.
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+
+	t1.sendQueuesMu.RLock()
+	fresh := t1.sendQueues[target]
+	t1.sendQueuesMu.RUnlock()
+	if fresh == nil {
+		t.Fatal("no send queue was created after the retirement")
+	}
+	if fresh == retired {
+		t.Fatal("send after retirement reused the retired queue")
+	}
+
+	// Simulate the retired worker reaching its idle prune: it must not delete
+	// the live replacement.
+	t1.sendQueuesMu.Lock()
+	retired.closed.Store(true)
+	if cur, ok := t1.sendQueues[target]; ok && cur == retired {
+		delete(t1.sendQueues, target)
+	}
+	t1.sendQueuesMu.Unlock()
+
+	if !sendQueueKnown(t1, target) {
+		t.Fatal("retired worker's idle prune deleted the live replacement queue")
+	}
+}

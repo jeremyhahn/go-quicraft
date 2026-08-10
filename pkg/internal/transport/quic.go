@@ -55,7 +55,8 @@ const sendWriteDeadline = 2 * time.Second
 // gone quiet (including one removed from membership but still running) is kept
 // alive by keep-alive traffic until it is torn down explicitly (a peer restart
 // via evictStaleOutboundOnRecv, a dead-context sweep in cleanStaleConnections,
-// or transport Stop). The 60s value simply frees the idle worker promptly.
+// a committed membership removal via CloseTarget, or transport Stop). The 60s
+// value simply frees the idle worker promptly.
 const sendQueueIdleTimeout = 60 * time.Second
 
 // snapshotChunkWriteDeadline is the maximum time for a single chunk write
@@ -941,6 +942,26 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 	return sq
 }
 
+// retireSendQueue removes the per-target send queue for target, following the
+// worker's own prune protocol exactly: mark the queue closed and delete the map
+// entry under sendQueuesMu, so a producer that already holds this *sendQueue
+// observes closed=true after its channel send and re-enqueues into a fresh
+// queue instead of orphaning the message.
+//
+// The worker goroutine is NOT stopped here — its channels may still hold
+// messages, and closing a channel a producer may be sending on would panic. It
+// drains what is buffered, finds the queue idle, and retires itself; the
+// identity check on its own prune keeps it from deleting a queue created after
+// this one was retired.
+func (t *QUICTransport) retireSendQueue(target string) {
+	t.sendQueuesMu.Lock()
+	if sq, ok := t.sendQueues[target]; ok {
+		sq.closed.Store(true)
+		delete(t.sendQueues, target)
+	}
+	t.sendQueuesMu.Unlock()
+}
+
 // sendQueueWorker is the per-target sender goroutine. It drains the send
 // queue channels, batches messages, and delivers them via sendToTarget.
 // The goroutine exits when stopC is closed or after sendQueueIdleTimeout
@@ -1079,8 +1100,17 @@ func (t *QUICTransport) sendQueueWorkerOnce(target string, sq *sendQueue) (panic
 			// queue. Both the flag set and the map delete happen under
 			// sendQueuesMu, and the producer's closed-check runs after its
 			// channel send, establishing the happens-before edge.
+			//
+			// Delete only while the map still points at OUR queue: an explicit
+			// retirement (retireSendQueue, on a committed member removal) may
+			// already have removed this entry and a later Send created a fresh
+			// queue and worker at the same key. Deleting unconditionally would
+			// evict that live queue from the map without marking it closed,
+			// leaving two workers draining two channels for one target.
 			sq.closed.Store(true)
-			delete(t.sendQueues, target)
+			if cur, ok := t.sendQueues[target]; ok && cur == sq {
+				delete(t.sendQueues, target)
+			}
 			t.sendQueuesMu.Unlock()
 			slog.Debug("send queue idle pruned", "target", target)
 			return
