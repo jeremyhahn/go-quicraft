@@ -1702,3 +1702,71 @@ func TestMembership_PolicySurvivesSnapshotRoundTrip(t *testing.T) {
 			restored.maxWitnesses, restored.requireFullReplicaMajority)
 	}
 }
+
+// TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied pins the
+// one-config-change-at-a-time invariant (PhD thesis 4.1) against the way it was
+// silently lost.
+//
+// Peer.Commit clears pendingConfigChange for every committed EntryConfigChange
+// it applies, without asking whether a LATER config change is still unapplied --
+// and a catching-up follower legitimately applies a batch containing several.
+// handleLeaderPropose then re-derived the flag from the authoritative bound only
+// when it was ALREADY true, so a wrongly-cleared flag was never repaired and the
+// next config change was accepted while one was outstanding.
+//
+// Beyond overlapping configurations, the propose-time validators
+// (ErrRemoveLastFullReplica, ErrRemoveLastVoter, ErrBreaksFullReplicaMajority)
+// then run against a membership that excludes the pending change -- i.e. they
+// vet the wrong configuration.
+func TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied(t *testing.T) {
+	cfg := testConfig()
+	p := newTestPeerWithLog(t, cfg, contiguousEntries(200),
+		proto.State{Term: 1, Commit: 150}, threeNodeMembership())
+
+	// The log holds an unapplied config change high in the tail (index 200) and
+	// the apply frontier is far behind it -- the ordinary state of a replica
+	// that just won an election while still catching up on apply.
+	p.r.log.confChangeIndex = 200
+	p.r.log.processed = 50
+
+	p.r.becomeCandidate()
+	p.r.becomeLeader()
+	if !p.r.pendingConfigChange {
+		t.Fatalf("fixture: becomeLeader must arm the flag (confChangeIndex=%d processed=%d)",
+			p.r.log.confChangeIndex, p.r.log.processed)
+	}
+
+	// The apply pipeline now applies a batch [51..150] that contains an EARLIER
+	// committed config change. This is what Peer.Commit does for each one.
+	p.r.pendingConfigChange = false
+	p.r.log.processed = 150
+
+	// The authoritative bound still says a config change is outstanding.
+	if !p.r.hasConfigChangeToApply() {
+		t.Fatalf("fixture: a config change at 200 must still be unapplied "+
+			"(confChangeIndex=%d processed=%d)",
+			p.r.log.confChangeIndex, p.r.log.processed)
+	}
+
+	// The operator retries the membership change against the new leader.
+	cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 3}
+	buf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(buf); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	err := p.r.step(proto.Message{
+		Type:    proto.Propose,
+		From:    1,
+		Origin:  proto.OriginLocal,
+		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: buf}},
+	})
+
+	if !errors.Is(err, ErrPendingConfigChange) {
+		t.Fatalf("leader ACCEPTED a second config change (err=%v) while the one at "+
+			"index %d is still unapplied (processed=%d). The single-pending "+
+			"invariant handleLeaderPropose documents is not enforced: Peer.Commit "+
+			"cleared the flag on an EARLIER change and handleLeaderPropose only "+
+			"re-derives it from hasConfigChangeToApply() when it is already true.",
+			err, p.r.log.confChangeIndex, p.r.log.processed)
+	}
+}

@@ -390,6 +390,13 @@ func (w *applyWorker) discardItem(item *applyItem) {
 	item.update.ReleaseCommittedEntries()
 	if item.node != nil {
 		item.node.commitPending.Store(false)
+		// Deliberately does NOT notify the step worker, unlike the normal
+		// apply completion and abandonBatchTail. All three callers here are
+		// terminal for the shard -- it has been unloaded, its channel is
+		// closed, or the host is shutting down -- so waking it buys nothing
+		// and only adds a spurious wakeup on a path that is already tearing
+		// down. Clearing commitPending is what matters: it stops the node
+		// being wedged mid-pipeline if it is ever reloaded.
 	}
 	releaseApplyItem(w.applyPool, item)
 }

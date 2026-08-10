@@ -35,6 +35,23 @@ type File interface {
 	Close() error
 }
 
+// FileMetadataSyncer is optionally implemented by File implementations whose
+// Sync deliberately omits metadata. On Linux Sync is fdatasync, chosen for the
+// data path where only the written bytes and the file size must reach disk.
+//
+// A DIRECTORY sync has the opposite requirement: what must become durable is
+// precisely the metadata — the dirent creates, deletes and renames. fdatasync
+// is specified to skip metadata not needed to retrieve the file's data, and a
+// dirent removal frequently does not change the directory's size, so on XFS the
+// log force can be skipped entirely where ext4 happens to journal it anyway.
+// Directory syncs must therefore go through SyncMetadata, never Sync.
+//
+// Implementations whose Sync already covers metadata (the non-Linux osFile, and
+// in-memory test filesystems) need not implement this.
+type FileMetadataSyncer interface {
+	SyncMetadata() error
+}
+
 // FilePreAllocator is optionally implemented by File implementations that
 // support pre-allocating disk space without changing the visible file size.
 // On Linux this maps to fallocate(2); other platforms fall back to
@@ -131,8 +148,16 @@ func (o *osFile) Close() error { return o.f.Close() }
 
 // Sync flushes file data to durable storage using fdatasync on Linux
 // (data only, ~10-30% faster) or fsync on other platforms (data + metadata).
+// Not sufficient for a directory: see SyncMetadata.
 func (o *osFile) Sync() error {
 	return fdatasync(o.f)
+}
+
+// SyncMetadata flushes data AND metadata with a full fsync. It implements
+// FileMetadataSyncer and is what directory syncs use, because the dirent
+// changes they exist to make durable are exactly the metadata Sync omits.
+func (o *osFile) SyncMetadata() error {
+	return o.f.Sync()
 }
 
 // PreAllocate pre-allocates disk space using fallocate on Linux or

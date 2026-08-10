@@ -373,7 +373,8 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// the step worker's nodesMu write lock first would instead make this call
 	// wait behind that parked send, and the apply-side wait below would stall
 	// behind the gated apply.
-	if node := e.GetNode(shardID); node != nil {
+	node := e.GetNode(shardID)
+	if node != nil {
 		node.Stop()
 	}
 
@@ -397,6 +398,27 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// unload is skipped entirely.
 	if e.started.Load() {
 		<-e.applyWorkers[workerID].requestUnload(shardID)
+	}
+
+	// Return this shard's share of the SHARED host-wide in-memory rate limiter.
+	// Each shard tracks its own contribution so it can apply deltas without
+	// disturbing the others, and that contribution lives on the raft log and
+	// dies with the Peer — so without this, a stopped shard's bytes stay counted
+	// against a shard that no longer exists and every StartShard/StopShard cycle
+	// leaks more, until the accumulated orphans cross MaxTotalInMemLogSize and
+	// every propose on the host fails ErrSystemBusy with no memory held.
+	//
+	// It happens HERE, last, and under raftMu — not in stepWorker.unloadNode.
+	// That runs before the commit worker has been told to skip Peer.Commit, so
+	// an in-flight Commit could still be inside appliedTo -> subGlobalSize,
+	// mutating the very same accounting: a data race, and one that also corrupts
+	// the shared counter. By this point the step worker has dropped the node,
+	// the commit worker skips it, and the apply goroutine has exited; raftMu
+	// then serialises against any Commit still unwinding.
+	if node != nil && node.peer != nil {
+		node.raftMu.Lock()
+		node.peer.ReleaseGlobalRateLimit()
+		node.raftMu.Unlock()
 	}
 
 	e.allNodes.Delete(shardID)

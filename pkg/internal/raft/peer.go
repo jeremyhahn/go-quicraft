@@ -414,24 +414,31 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// only committed entries mutate membership, log truncation on
 	// conflict can never remove an applied config change, so no
 	// membership rollback/rebuild is needed here.
-	// raft REJECTS a snapshot at or below the committed index and returns nil
-	// (handleSnapshot's first branch), so a nil error does not mean the snapshot
-	// was installed. Membership must never come from a snapshot raft refused:
-	// its configuration is older than what this replica has already committed,
-	// and adopting it rolls the voting set backwards. This mirrors
-	// handleSnapshot's own test against the PRE-step committed index, because
-	// an accepted snapshot advances committed past its own index.
+	// A nil error from step does NOT mean raft installed the snapshot. Two
+	// distinct paths return nil without installing anything, and membership --
+	// the very set quorum() is computed over -- must never come from either:
 	//
-	// The joining branch below deliberately bypasses the ConfigChangeID
-	// staleness test, so without this gate a joining replica adopted the
-	// membership of EVERY rejected retransmission — including ones that do not
-	// name it at all, which leaves it self-removed, unelectable, and computing
-	// quorum over a stale configuration. The non-joining path was reachable too,
-	// via a rejected snapshot carrying a higher ConfigChangeID.
-	snapshotRejected := msg.Type == proto.InstallSnapshot &&
-		msg.Snapshot.Index <= committedBefore
+	//   - handleSnapshot REJECTS a snapshot at or below the committed index and
+	//     returns nil. Its configuration is older than what this replica has
+	//     already committed, so adopting it rolls the voting set backwards. The
+	//     joining branch below deliberately bypasses the ConfigChangeID
+	//     staleness test, so it adopted EVERY rejected retransmission --
+	//     including configurations that do not name this replica, leaving it
+	//     self-removed, unelectable, and computing quorum over a stale set.
+	//   - stepLeader has NO InstallSnapshot case at all, so on a leader the
+	//     message is silently ignored and step returns nil. The leader then
+	//     adopted a configuration no committed entry ever established.
+	//
+	// Both are covered by one positive test: did raft actually take the
+	// snapshot? Every accepting path in handleSnapshot -- the log-matching
+	// fast-forward and the full restore alike -- advances the committed index
+	// to the snapshot's index, and it can only get there from ss.Index >
+	// committed. Neither rejection nor the leader's silent drop touches it.
+	// step processes exactly this one message, so the advance is attributable.
+	snapshotProcessed := msg.Type == proto.InstallSnapshot &&
+		p.r.log.committed > committedBefore
 	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm && !wireOrigin &&
-		!snapshotRejected {
+		snapshotProcessed {
 		// Adopt the snapshot's membership on BOTH branches, gated on it
 		// not being older than what we already have.
 		//
@@ -1324,6 +1331,24 @@ func (p *Peer) clearJoiningIfKnown() {
 		p.membership.isRemoved(p.replicaID) {
 		p.setJoining(false)
 	}
+}
+
+// ReleaseGlobalRateLimit returns this shard's entire contribution to the SHARED
+// host-wide in-memory limiter. It must be called exactly once when the shard is
+// torn down.
+//
+// The global limiter is one counter for every shard on the host, and each shard
+// tracks its own share (inMemory.globalContribution) so it can apply deltas
+// without disturbing the others. That share lives on the raft log and dies with
+// the Peer, so a shard that simply stops leaves its bytes counted against a
+// shard that no longer exists. Repeated StartShard/StopShard cycles accumulate
+// those orphans until the total crosses MaxTotalInMemLogSize, at which point
+// every propose on the host fails with ErrSystemBusy, permanently and with no
+// memory actually held.
+//
+// Idempotent: the contribution is zeroed, so a second call releases nothing.
+func (p *Peer) ReleaseGlobalRateLimit() {
+	p.r.log.inmem.setGlobalSize(0)
 }
 
 // IsMember returns true if the given replicaID is a known member of

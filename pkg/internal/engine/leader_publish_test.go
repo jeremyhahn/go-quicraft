@@ -328,6 +328,55 @@ func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
 	}
 }
 
+// TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu is the PHASE 1
+// half of the lock contract. It is a separate test because the two publish
+// sites need different fixtures and each is otherwise invisible to the other:
+// the phase-2 test wins leadership in phase 2, so the phase-1 publish is a
+// no-op there and its lock probe never fires. Without this test, moving the
+// phase-1 publish back inside raftMu — the exact defect that motivated the
+// change — passes the entire suite.
+//
+// A HeartbeatResp at a higher term forces becomeFollower in phase 1, and since
+// HeartbeatResp is the only type routed to phase 1, phase 2 early-returns.
+func TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 64)
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	peer, lr := newTestVoterPeer(t, 1, 1, 3)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+
+	cb := &lockProbeCallback{Callback: newTestCallback(), node: node}
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+	sw.loadNode(node)
+
+	driveToLeader(t, peer, 1, 2)
+	sw.processReady()
+	drainCommitC(commitC)
+	callsBefore := cb.calls
+
+	node.commitPending.Store(true)
+	if !node.Deliver(proto.Message{
+		Type: proto.HeartbeatResp, From: 2, To: 1, Term: peer.Term() + 5,
+	}) {
+		t.Fatal("inbox rejected the heartbeat response")
+	}
+	sw.processCommitPendingInbox(1, node)
+
+	if cb.calls == callsBefore {
+		t.Fatal("fixture: the phase-1 step-down published nothing, so the lock " +
+			"probe proved nothing about the phase-1 site")
+	}
+	if cb.underLock {
+		t.Fatalf("the PHASE 1 OnLeaderUpdated (leader=%d) ran while raftMu was held",
+			cb.lastLeader)
+	}
+}
+
 // TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering pins
 // the backpressure contract on the commitPending path.
 //
@@ -370,5 +419,52 @@ func TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering(t *
 			"it can never complete while the apply pipeline is stopped, and taking "+
 			"it off the queue denies the caller the ErrSystemBusy backpressure the "+
 			"queue would otherwise apply", len(drained))
+	}
+}
+
+func TestCommitPendingInbox_Phase1OnlyStepDownIsPublished(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 64)
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	cb := newTestCallback()
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+
+	peer, lr := newTestVoterPeer(t, 1, 1, 3)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	driveToLeader(t, peer, 1, 2)
+	sw.processReady()
+	drainCommitC(commitC)
+	if got := lastLeader(cb); got != 1 {
+		t.Fatalf("fixture: leadership not published as 1, got %d", got)
+	}
+
+	// A HeartbeatResp at a HIGHER term forces becomeFollower(term, noLeader).
+	// HeartbeatResp is the ONLY type routed to phase 1, so phase 2 early-returns.
+	node.commitPending.Store(true)
+	if !node.Deliver(proto.Message{
+		Type: proto.HeartbeatResp,
+		From: 2,
+		To:   1,
+		Term: peer.Term() + 5,
+	}) {
+		t.Fatal("inbox rejected the heartbeat response")
+	}
+	sw.processCommitPendingInbox(1, node)
+
+	if peer.LeaderID() == 1 {
+		t.Fatalf("fixture: peer did not step down (leaderID=%d, term=%d)",
+			peer.LeaderID(), peer.Term())
+	}
+	if got := lastLeader(cb); got == 1 {
+		t.Fatalf("step-down in PHASE 1 was never published (last published leader=%d, "+
+			"raft leaderID=%d): Host.GetShardInfo().IsLeader keeps reporting this node "+
+			"as leader", got, peer.LeaderID())
 	}
 }

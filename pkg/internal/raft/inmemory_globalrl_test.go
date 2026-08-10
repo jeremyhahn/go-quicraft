@@ -143,3 +143,34 @@ func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
 		t.Fatalf("global size = %d after applying every entry, want 0", got)
 	}
 }
+
+// TestGlobalRateLimiter_ReleasedOnShardTeardown pins the teardown half of the
+// shared-counter contract. Each shard tracks its own share so it can apply
+// deltas without disturbing the others, but that share lives on the raft log
+// and dies with the Peer. Without an explicit release, a stopped shard's bytes
+// stay counted against a shard that no longer exists, and every
+// StartShard/StopShard cycle leaks a little more until the accumulated orphan
+// total crosses MaxTotalInMemLogSize — at which point every propose on the host
+// fails with ErrSystemBusy, permanently, with no memory actually held.
+func TestGlobalRateLimiter_ReleasedOnShardTeardown(t *testing.T) {
+	global := server.NewRateLimiter(1 << 30)
+	survivor := newRateLimitedInMemory(global)
+	survivorEntries := rlEntries(1, 3)
+	survivor.merge(survivorEntries)
+	survivorSize := getEntrySliceInMemSize(survivorEntries)
+
+	const cycles = 20
+	for range cycles {
+		shard := newRateLimitedInMemory(global)
+		shard.merge(rlEntries(1, 8))
+		// Teardown: the engine releases the shard's share before the peer is
+		// dropped (stepWorker.unloadNode -> Peer.ReleaseGlobalRateLimit).
+		shard.setGlobalSize(0)
+	}
+
+	if got := global.Get(); got != survivorSize {
+		t.Fatalf("global size = %d after %d shard start/stop cycles, want %d "+
+			"(only the surviving shard): stopped shards left their bytes in the "+
+			"shared counter", got, cycles, survivorSize)
+	}
+}

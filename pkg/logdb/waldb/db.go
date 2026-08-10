@@ -2007,12 +2007,25 @@ func itoa(n int) string {
 // syncDirFS fsyncs a directory using the provided FS to make metadata
 // changes (file creates, deletes, renames) durable. Returns a DirSyncError
 // if the directory cannot be opened or synced.
+//
+// This uses SyncMetadata, NOT Sync. On Linux File.Sync is fdatasync, which is
+// specified to skip metadata not needed to retrieve the data — and for a
+// directory the metadata IS the point. A dirent removal often leaves the
+// directory size unchanged, so XFS can skip the log force that ext4 happens to
+// perform anyway, which is why no test catches the difference. The paths that
+// depend on this are rollback segment deletion, orphan discard (whose own
+// comment cites voting twice in one term) and GC — all of them Raft durability.
 func syncDirFS(filesystem FS, dir string) error {
 	d, err := filesystem.Open(dir)
 	if err != nil {
 		return &DirSyncError{Dir: dir, Err: err}
 	}
-	syncErr := d.Sync()
+	var syncErr error
+	if ms, ok := d.(FileMetadataSyncer); ok {
+		syncErr = ms.SyncMetadata()
+	} else {
+		syncErr = d.Sync()
+	}
 	closeErr := d.Close()
 	if syncErr != nil {
 		return &DirSyncError{Dir: dir, Err: syncErr}

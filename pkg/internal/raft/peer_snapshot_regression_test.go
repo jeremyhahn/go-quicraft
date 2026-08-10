@@ -517,3 +517,71 @@ func TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership(t *testi
 		}
 	})
 }
+
+// TestPeer_InstallSnapshot_LeaderDoesNotAdoptUnprocessedMembership covers the
+// second way raft.step returns nil without installing a snapshot: stepLeader has
+// NO InstallSnapshot case at all, so on a leader the message is silently
+// dropped. The wire-origin and stale-term gates both pass for a locally injected
+// snapshot above the committed index, so the adopt branch ran on a snapshot raft
+// never touched -- letting a leader compute quorum over a configuration no
+// committed entry ever established, and one that need not even contain itself.
+//
+// The gate is a POSITIVE test that raft took the snapshot (the committed index
+// advanced), which covers this and the rejection path together.
+func TestPeer_InstallSnapshot_LeaderDoesNotAdoptUnprocessedMembership(t *testing.T) {
+	cfg := testConfig()
+	cfg.PreVote = config.BoolPtr(false)
+	p := newTestPeerWithLog(t, cfg, contiguousEntries(10),
+		proto.State{Term: 5, Commit: 10},
+		proto.Membership{
+			Addresses:      map[uint64]string{1: "a", 2: "b", 3: "c"},
+			ConfigChangeID: 4,
+		})
+
+	p.r.becomeCandidate()
+	p.r.becomeLeader()
+	if p.r.state != leader {
+		t.Fatalf("fixture: expected leader, got %v", p.r.state)
+	}
+	committedBefore := p.r.log.committed
+	lastBefore := p.r.log.lastIndex()
+
+	// A locally injected InstallSnapshot (Term 0, OriginLocal -- exactly what
+	// hostMessageHandler.HandleSnapshot builds after a snapshot stream is
+	// received and persisted) carrying a configuration of the sender's choosing.
+	err := p.Handle(proto.Message{
+		Type: proto.InstallSnapshot, From: 2, To: 1, ShardID: 1,
+		Origin: proto.OriginLocal,
+		Snapshot: proto.Snapshot{
+			Index: committedBefore + 100, Term: 5,
+			Membership: proto.Membership{
+				Addresses:      map[uint64]string{7: "attacker"},
+				ConfigChangeID: 1 << 62,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// raft did nothing: no restore, no commit advance, no pending snapshot.
+	if p.r.log.committed != committedBefore {
+		t.Fatalf("committed moved to %d (raft DID process it)", p.r.log.committed)
+	}
+	if p.r.log.pendingSnapshot() != nil {
+		t.Fatal("a snapshot became pending (raft DID process it)")
+	}
+	if p.r.log.lastIndex() != lastBefore {
+		t.Fatalf("log changed (raft DID process it): last=%d", p.r.log.lastIndex())
+	}
+
+	if _, adopted := p.membership.addresses[7]; adopted {
+		t.Fatalf("LEADER adopted membership %v from an InstallSnapshot that raft "+
+			"never processed (stepLeader has no InstallSnapshot case, so step "+
+			"returned nil). configChangeID=%d, selfRemoved=%v, remotes=%v -- the "+
+			"leader now computes quorum over a configuration no committed entry "+
+			"ever established, and it is no longer in it.",
+			p.membership.addresses, p.membership.configChangeID,
+			p.r.selfRemoved, p.DiagRemotes())
+	}
+}

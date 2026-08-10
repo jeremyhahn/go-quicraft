@@ -1800,9 +1800,16 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 	// has to be released as the tail is applied — otherwise a leader elected
 	// straight after a restart would reject every membership change for the
 	// whole term. Re-reading the bound is O(1), so this runs unconditionally.
-	if r.pendingConfigChange {
-		r.pendingConfigChange = r.hasConfigChangeToApply()
-	}
+	//
+	// UNCONDITIONALLY, not `if r.pendingConfigChange` — the guarded form could
+	// only ever RELAX the flag, never restore it. Peer.Commit clears the flag
+	// for every committed EntryConfigChange it applies without asking whether a
+	// LATER config change is still unapplied, so a catch-up batch containing an
+	// earlier change cleared it while one was genuinely outstanding, and nothing
+	// repaired it. The bound (confChangeIndex > processed) is a complete
+	// standalone test, raised by l.append on both the propose and the
+	// follower-append path; the boolean only ever contributed false negatives.
+	r.pendingConfigChange = r.hasConfigChangeToApply()
 
 	// Per PhD thesis 4.1: reject config change if one is already pending.
 	// Validate the entire batch before mutating state. If a batch contains
