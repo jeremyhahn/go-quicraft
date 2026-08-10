@@ -4723,3 +4723,95 @@ func TestApply_BatchExceedsMaxResponses(t *testing.T) {
 			cs.applies[string(makeCmd("c", "3"))])
 	}
 }
+
+// TestStateMachineApply_ExpiryBatchShapeInvariant is the C1 regression test:
+// session expiry must be a pure function of the committed entry SEQUENCE, never
+// of how a replica groups those entries into Apply batches. It replays the SAME
+// committed log in three batch shapes (one big batch, per-entry batches, and an
+// arbitrary split) and asserts every replica ends with byte-for-byte identical
+// session state AND returns the identical result for a late proposal against the
+// (possibly expired) session.
+//
+// The scenario is chosen to expose the pre-fix bug directly: session 42 is
+// registered at index 1 and left idle, and a session op for 42 lands at index
+// 21. With the OLD per-batch expiry, the one-big-batch replica evaluated expiry
+// only at index 21 — AFTER the loop had already admitted the op against the
+// still-live session — so 42 survived and the op applied; the per-entry replica
+// expired 42 at an intermediate batch boundary (index >= 12), so the op was
+// rejected SESSION_EXPIRED. Same log, divergent state, every Raft invariant
+// intact. The fix evaluates expiry at fixed index checkpoints regardless of
+// batching, so all shapes now agree.
+func TestStateMachineApply_ExpiryBatchShapeInvariant(t *testing.T) {
+	const threshold = 10
+
+	// register 42 @1, filler up to @20, then a session op for 42 @21.
+	entries := []proto.Entry{
+		{Index: 1, ClientID: 42, SeriesID: proto.SessionSeriesIDForRegister, Type: proto.EntryNormal},
+	}
+	for idx := uint64(2); idx <= 20; idx++ {
+		entries = append(entries, proto.Entry{Index: idx, Cmd: makeCmd("f", "v")})
+	}
+	entries = append(entries, proto.Entry{Index: 21, ClientID: 42, SeriesID: 1, Cmd: makeCmd("k", "v")})
+
+	// applyShape replays entries in the requested per-Apply groupings against a
+	// fresh state machine and returns whether 42 stayed registered and the
+	// result Value of the index-21 op (the last entry).
+	applyShape := func(t *testing.T, groups [][]proto.Entry) (bool, uint64) {
+		t.Helper()
+		createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine { return newTestKV() })
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, threshold, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
+		}
+		defer rsm.Close()
+		var lastResult uint64
+		for _, g := range groups {
+			results := make([]sm.Result, len(g))
+			if err := rsm.Apply(g, results); err != nil {
+				t.Fatalf("Apply(%d entries) = %v", len(g), err)
+			}
+			lastResult = results[len(results)-1].Value
+		}
+		return rsm.Sessions().IsRegistered(42), lastResult
+	}
+
+	// Shape A: one Apply call carrying every entry.
+	oneBatch := [][]proto.Entry{entries}
+
+	// Shape B: one Apply call per entry.
+	perEntry := make([][]proto.Entry, 0, len(entries))
+	for i := range entries {
+		perEntry = append(perEntry, entries[i:i+1])
+	}
+
+	// Shape C: an arbitrary split that straddles both checkpoints (10 and 20).
+	splits := [][]proto.Entry{
+		entries[0:3],
+		entries[3:11],
+		entries[11:19],
+		entries[19:],
+	}
+
+	aReg, aRes := applyShape(t, oneBatch)
+	bReg, bRes := applyShape(t, perEntry)
+	cReg, cRes := applyShape(t, splits)
+
+	// Determinism: identical final session state AND identical op result across
+	// all batch shapes.
+	if aReg != bReg || aReg != cReg {
+		t.Fatalf("batch-shape divergence on IsRegistered(42): A:%v B:%v C:%v", aReg, bReg, cReg)
+	}
+	if aRes != bRes || aRes != cRes {
+		t.Fatalf("batch-shape divergence on index-21 op result: A:%d B:%d C:%d", aRes, bRes, cRes)
+	}
+
+	// Expected outcome under the deterministic-checkpoint rule: 42 is expired at
+	// checkpoint 20 (idle since index 1, 20-1 > threshold), so the index-21 op is
+	// rejected SESSION_EXPIRED and 42 is not registered.
+	if aReg {
+		t.Errorf("session 42 should be expired at checkpoint 20 (idle since index 1, threshold %d)", threshold)
+	}
+	if aRes != sm.ResultSessionExpired {
+		t.Errorf("index-21 op result = %d, want ResultSessionExpired (%d)", aRes, sm.ResultSessionExpired)
+	}
+}

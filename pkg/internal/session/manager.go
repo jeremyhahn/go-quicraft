@@ -371,16 +371,20 @@ func (m *Manager) UnmarshalFrom(r io.Reader) error {
 		}
 	}
 
-	// Clear existing sessions and pre-allocate.
-	m.sessions = make(map[uint64]*clientSession, numSessions)
-
+	// Parse into a staging map and swap it in only after the full stream
+	// parses cleanly. Populating m.sessions incrementally would, on a
+	// mid-stream failure, leave the live node with a hybrid of new sessions
+	// and whatever the caller does after the error — inconsistent with the
+	// pre-recovery user-SM state. Building aside keeps recovery atomic.
+	staged := make(map[uint64]*clientSession, numSessions)
 	for i := uint32(0); i < numSessions; i++ {
 		sess, err := unmarshalSession(r, m.maxResponses)
 		if err != nil {
 			return err
 		}
-		m.sessions[sess.clientID] = sess
+		staged[sess.clientID] = sess
 	}
+	m.sessions = staged
 	return nil
 }
 

@@ -247,6 +247,47 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, senderAutho
 			}
 		}
 
+		// Bind msg.From — the replica ID raft counts toward election/commit
+		// quorum — to the authenticated peer. From travels in-band and is
+		// otherwise trusted verbatim, so without this any authenticated cluster
+		// node (even one that was NEVER a member of this shard) could send a
+		// ReplicateResp or RequestVoteResp carrying another member's From and
+		// manufacture a false quorum: the deny-list (IsRemoved) and the msg.To
+		// check above do not bind From to identity, and the node certificate
+		// binds the ADDRESS, not the replicaID.
+		//
+		// By the time a batch reaches this handler the transport has already
+		// CLEARED any SourceAddress the sender's verified certificate does not
+		// cover (see recv.go), so a non-empty batch.SourceAddress here is
+		// cert-bound to the sender. The registry maps (shard, From) -> the
+		// member's address. When From is a KNOWN member, require the registered
+		// address to equal the cert-bound source address; a mismatch is a forged
+		// From from a peer speaking under a different (or cleared) identity — drop
+		// it. This runs AFTER learnSourceAddress on purpose: a member that
+		// legitimately recovered at a new address has just had its registry entry
+		// relearned to that (cert-bound) address, so the equality still holds and
+		// the recovered-at-new-address path is preserved. A From with no registry
+		// entry yet is the first-contact/joining case and is left to the learn
+		// gate above. The residual an authenticated member CAN still reach — its
+		// own cert-valid address under another replicaID's From — is the bounded,
+		// self-healing insider redirect documented on learnSourceAddress, and
+		// closing it fully would require replicaID-bound certificates.
+		if node != nil && h.host != nil && h.host.registry != nil {
+			if regAddr, rerr := h.host.registry.Resolve(msg.ShardID, msg.From); rerr == nil && regAddr != "" && regAddr != batch.SourceAddress {
+				slog.Warn("rejected message with source address not matching the registered member",
+					"shard", msg.ShardID,
+					"from", msg.From,
+					"registered", regAddr,
+					"source", batch.SourceAddress,
+					"type", proto.MessageTypeName(msg.Type),
+				)
+				if h.host.metrics != nil {
+					h.host.metrics.IncUnauthorizedMessageDropped(msg.ShardID, msg.From)
+				}
+				continue
+			}
+		}
+
 		// DeliverMessage (not DeliverLocal) stamps the message OriginRemote.
 		// The shard inbox is shared with the in-process injectors — the
 		// snapshot receive path's InstallSnapshot, the transport's

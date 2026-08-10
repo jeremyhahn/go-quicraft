@@ -106,12 +106,13 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	type kvPair struct {
 		key   string
 		value []byte
+		idx   int // index into entries/results for this pair
 	}
 	pairs := make([]kvPair, 0, len(entries))
-	for _, e := range entries {
-		key, value := c.extractKV(e.Cmd)
+	for i := range entries {
+		key, value := c.extractKV(entries[i].Cmd)
 		if key != "" {
-			pairs = append(pairs, kvPair{key: key, value: value})
+			pairs = append(pairs, kvPair{key: key, value: value, idx: i})
 			c.cache.Delete(key)
 		}
 	}
@@ -123,6 +124,14 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	}
 
 	for _, p := range pairs {
+		// Do not cache the new value for an entry the inner SM rejected. A
+		// ResultInvalidCommand means the store state was left unchanged for
+		// that entry, so caching the (would-be) value would let Lookup return
+		// a value the store never held. The key was already invalidated above,
+		// so a later Lookup correctly falls through to the inner SM.
+		if results[p.idx].Value == ResultInvalidCommand {
+			continue
+		}
 		value := p.value
 		// Copy the value before caching. extractKV may return a sub-slice
 		// of e.Cmd, which under ZeroCopyEntryCmd aliases an internal buffer

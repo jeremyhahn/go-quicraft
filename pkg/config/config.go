@@ -420,14 +420,32 @@ func (c *Config) validateTiming() error {
 	if c.ElectionRTT < 5 {
 		return newValidationError("ElectionRTT", "must be >= 5 (10 recommended)")
 	}
+	// Bound both RTTs to math.MaxInt32. The raft layer narrows these uint64
+	// values to int (int(cfg.ElectionRTT)) and feeds ElectionRTT into
+	// rng.Intn(electionTimeout). A value >= 2^63 narrows to a NEGATIVE int and
+	// panics StartShard; a value in (2^62, 2^63) survives the narrowing but
+	// produces an electionTimeout so large the shard never elects. Capping at
+	// MaxInt32 keeps every downstream int conversion and arithmetic
+	// (including 2*HeartbeatRTT below) safely in range. Real deployments use
+	// tick multiples in the tens; two billion is far beyond any legitimate value.
+	if c.HeartbeatRTT > math.MaxInt32 {
+		return newValidationError("HeartbeatRTT",
+			"must be <= 2147483647 (raft narrows the tick multiple to int)")
+	}
+	if c.ElectionRTT > math.MaxInt32 {
+		return newValidationError("ElectionRTT",
+			"must be <= 2147483647 (raft narrows the tick multiple to int)")
+	}
 	// Require a comfortable margin between the election timeout and the
 	// heartbeat interval. Raft needs the election timeout to span several
 	// heartbeat intervals so a healthy leader's heartbeats reliably reset
 	// follower election timers; a ratio barely above 1 (e.g. Heartbeat=4,
 	// Election=5) passes "Election > Heartbeat" yet causes spurious elections
 	// and leadership churn under normal latency jitter. Enforce at least 2x
-	// (10x recommended: HeartbeatRTT=1, ElectionRTT=10).
-	if c.ElectionRTT < 2*c.HeartbeatRTT {
+	// (10x recommended: HeartbeatRTT=1, ElectionRTT=10). Compare as
+	// ElectionRTT/2 < HeartbeatRTT so the check cannot wrap: 2*HeartbeatRTT
+	// would overflow uint64 for a large HeartbeatRTT and spuriously pass.
+	if c.ElectionRTT/2 < c.HeartbeatRTT {
 		return newValidationError("ElectionRTT",
 			"must be >= 2*HeartbeatRTT (10*HeartbeatRTT recommended)")
 	}
