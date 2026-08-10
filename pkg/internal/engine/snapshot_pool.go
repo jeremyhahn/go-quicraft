@@ -1369,7 +1369,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 	}()
 
 	dir := filepath.Dir(path)
-	tmpFile, err := os.CreateTemp(dir, ".encrypt-*.tmp")
+	tmpFile, err := os.CreateTemp(dir, SaveEncryptTempPattern)
 	if err != nil {
 		return 0, nil, &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
@@ -2041,6 +2041,17 @@ const (
 	// CIPHERTEXT.
 	ReencryptTempPrefix = ".reencrypt-snapshot-"
 
+	// SaveEncryptTempPrefix is the prefix for the scratch file saveSnapshot
+	// encrypts a freshly captured snapshot into before renaming it over
+	// snapshot.dat. It holds CIPHERTEXT, so an orphan is a disk leak rather than
+	// a confidentiality one — but it is the same unswept-name class, and the
+	// invariant that makes the sweeper trustworthy is that a name which can be
+	// CREATED is by construction a name that can be RECLAIMED.
+	SaveEncryptTempPrefix = ".encrypt-"
+
+	// SaveEncryptTempPattern is the os.CreateTemp pattern for that scratch file.
+	SaveEncryptTempPattern = SaveEncryptTempPrefix + "*" + ScratchTempSuffix
+
 	// RecoverDecryptTempPattern is the os.CreateTemp pattern for a recovery
 	// decrypt scratch file.
 	RecoverDecryptTempPattern = RecoverDecryptTempPrefix + "*" + ScratchTempSuffix
@@ -2066,6 +2077,7 @@ var snapshotScratchTempPrefixes = [...]string{
 	SendDecryptTempPrefix,
 	RecvEncryptTempPrefix,
 	ReencryptTempPrefix,
+	SaveEncryptTempPrefix,
 }
 
 // IsSnapshotScratchTemp reports whether a directory entry name is a snapshot

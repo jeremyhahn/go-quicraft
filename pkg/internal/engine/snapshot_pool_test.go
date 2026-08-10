@@ -2568,6 +2568,11 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 	stale := []string{
 		".decrypt-123.tmp", ".decrypt-abcdef.tmp",
 		".send-decrypt-123.tmp", ".send-decrypt-abcdef.tmp",
+		// The save path's encrypt scratch holds a full CIPHERTEXT copy of the
+		// snapshot. It was previously created from a hardcoded literal that no
+		// prefix in the swept set matched, so a crash inside the encrypt loop
+		// orphaned it until the whole snapshot directory rolled off.
+		".encrypt-999.tmp",
 	}
 	for _, name := range stale {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
@@ -2579,7 +2584,6 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 	keep := []string{
 		snapshotDataFile,     // snapshot.dat
 		snapshotMetadataFile, // snapshot.meta
-		".encrypt-999.tmp",   // encrypt scratch is a different pattern
 		"decrypt-noprefix.tmp",
 		".decrypt-missing-suffix",
 	}
@@ -2669,7 +2673,7 @@ func TestIsSnapshotScratchTemp(t *testing.T) {
 		{"decrypt-123.tmp", false},
 		{".decrypt-123", false},
 		{".recv-encrypt-123", false},
-		{".encrypt-123.tmp", false},
+		{".encrypt-123.tmp", true},
 		{snapshotDataFile, false},
 		{snapshotMetadataFile, false},
 	}
