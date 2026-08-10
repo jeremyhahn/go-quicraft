@@ -173,6 +173,14 @@ func (b *rotatingMockBarrier) EncryptWithEpoch(_, pt []byte) ([]byte, uint64, er
 	return append([]byte(nil), pt...), e, nil
 }
 
+func (b *rotatingMockBarrier) EncryptWithEpochContext(dst, pt, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, pt)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
 var _ Barrier = (*rotatingMockBarrier)(nil)
 
 // pinErrWriter fails the Nth Write, so both dst.Write error returns of
@@ -239,7 +247,7 @@ func TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch(t
 
 	plain := make([]byte, snapshotEncryptChunkSize*3+100)
 	var out bytes.Buffer
-	_, pins, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &out)
+	_, pins, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &out)
 	if err != nil {
 		t.Fatalf("encryptSnapshotFrames: %v", err)
 	}
@@ -284,14 +292,14 @@ type atomicPinCountingBarrier struct {
 	epoch       uint64
 }
 
-func (b *atomicPinCountingBarrier) EncryptWithEpochPinned(_, pt []byte) ([]byte, uint64, error) {
+func (b *atomicPinCountingBarrier) EncryptWithEpochPinnedContext(_, pt, contextAAD []byte) ([]byte, uint64, error) {
 	b.frames++
 	if b.rotateEvery > 0 && b.frames%b.rotateEvery == 0 {
 		b.epoch++
 	}
 	// The barrier takes the reference itself, atomically with the seal.
 	b.RegisterInFlightEpoch(b.epoch)
-	return append([]byte(nil), pt...), b.epoch, nil
+	return appendTestAADTag(append([]byte(nil), pt...), contextAAD), b.epoch, nil
 }
 
 // TestPinBalance_AtomicPath_BalancesAndDedups covers the ATOMIC seal-and-pin
@@ -314,7 +322,7 @@ func TestPinBalance_AtomicPath_BalancesAndDedups(t *testing.T) {
 
 			var out bytes.Buffer
 			plain := make([]byte, snapshotEncryptChunkSize*3+11) // several frames
-			_, pins, err := encryptSnapshotFrames(b, bytes.NewReader(plain), &out)
+			_, pins, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &out)
 			if err != nil {
 				t.Fatalf("encryptSnapshotFrames: %v", err)
 			}
@@ -360,14 +368,14 @@ func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 			run: func(b Barrier) (uint64, []uint64, error) {
 				var out bytes.Buffer
 				plain := make([]byte, snapshotEncryptChunkSize*2+10)
-				return encryptSnapshotFrames(b, bytes.NewReader(plain), &out)
+				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &out)
 			},
 		},
 		{
 			name: "write_frame_length_error",
 			run: func(b Barrier) (uint64, []uint64, error) {
 				plain := make([]byte, snapshotEncryptChunkSize*2+10)
-				return encryptSnapshotFrames(b, bytes.NewReader(plain),
+				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain),
 					&pinErrWriter{failOn: 1, err: errInjected})
 			},
 		},
@@ -375,7 +383,7 @@ func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 			name: "write_ciphertext_error",
 			run: func(b Barrier) (uint64, []uint64, error) {
 				plain := make([]byte, snapshotEncryptChunkSize*2+10)
-				return encryptSnapshotFrames(b, bytes.NewReader(plain),
+				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain),
 					&pinErrWriter{failOn: 2, err: errInjected})
 			},
 		},
@@ -383,8 +391,7 @@ func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 			name: "read_error",
 			run: func(b Barrier) (uint64, []uint64, error) {
 				var out bytes.Buffer
-				return encryptSnapshotFrames(b,
-					&pinErrReader{remaining: snapshotEncryptChunkSize, err: errInjected}, &out)
+				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &pinErrReader{remaining: snapshotEncryptChunkSize, err: errInjected}, &out)
 			},
 		},
 	}
@@ -454,7 +461,7 @@ func TestPinBalance_ReencryptReceivedSnapshot_PostEncryptFailuresRelease(t *test
 			b := newCountingBarrier(newRotatingMockBarrier(4, true))
 			path := writePlainSnapshot(t, t.TempDir())
 
-			_, pins, err := reencryptReceivedSnapshot(tc.fsys, path, b)
+			_, pins, err := reencryptReceivedSnapshot(tc.fsys, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("error = %v, want %v", err, tc.want)
 			}
@@ -480,7 +487,7 @@ func TestPinBalance_ReencryptImportPinned(t *testing.T) {
 		b := newCountingBarrier(newRotatingMockBarrier(11, true))
 		path := writePlainSnapshot(t, t.TempDir())
 
-		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, b)
+		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
 		if err != nil {
 			t.Fatalf("reencryptImportPinned: %v", err)
 		}
@@ -503,7 +510,7 @@ func TestPinBalance_ReencryptImportPinned(t *testing.T) {
 		b := newCountingBarrier(newRotatingMockBarrier(11, true))
 		path := writePlainSnapshot(t, t.TempDir())
 
-		_, cleanup, err := reencryptImportPinned(renameFailFS{}, path, b)
+		_, cleanup, err := reencryptImportPinned(renameFailFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
 		if !errors.Is(err, errTestRenameRefused) {
 			t.Fatalf("error = %v, want %v", err, errTestRenameRefused)
 		}
@@ -516,7 +523,7 @@ func TestPinBalance_ReencryptImportPinned(t *testing.T) {
 
 	t.Run("nil_barrier_is_a_noop", func(t *testing.T) {
 		path := writePlainSnapshot(t, t.TempDir())
-		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, nil)
+		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, nil)
 		if err != nil {
 			t.Fatalf("nil barrier: %v", err)
 		}
@@ -542,7 +549,7 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 		srcPath := writePlainSnapshot(t, dir)
 		dstPath := filepath.Join(dir, "out", "snapshot.dat")
 
-		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, nil, dst); err != nil {
+		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, dst); err != nil {
 			t.Fatalf("reencryptSnapshotFile: %v", err)
 		}
 		if dst.registrations() < 2 {
@@ -558,7 +565,7 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 		srcPath := writePlainSnapshot(t, dir)
 		dstPath := filepath.Join(dir, "out", "snapshot.dat")
 
-		_, err := reencryptSnapshotFile(renameFailFS{}, srcPath, dstPath, nil, dst)
+		_, err := reencryptSnapshotFile(renameFailFS{}, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, dst)
 		if !errors.Is(err, errTestRenameRefused) {
 			t.Fatalf("error = %v, want %v", err, errTestRenameRefused)
 		}
@@ -580,7 +587,7 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 		srcPath := writePlainSnapshot(t, dir)
 		dstPath := filepath.Join(dir, "out", "snapshot.dat")
 
-		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, nil, dst); err == nil {
+		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, dst); err == nil {
 			t.Fatal("expected the injected seal failure")
 		}
 		if dst.registrations() == 0 {
@@ -598,7 +605,7 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 		writeEncryptedSnapshotFile(t, src, srcPath, plain)
 		dstPath := filepath.Join(dir, "out", "snapshot.dat")
 
-		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, src, dst); err != nil {
+		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, src, dst); err != nil {
 			t.Fatalf("reencryptSnapshotFile: %v", err)
 		}
 		src.assertBalanced(t, "reencryptSnapshotFile framed->framed src")
@@ -618,7 +625,7 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 		writeEncryptedSnapshotFile(t, src, srcPath, plain)
 		dstPath := filepath.Join(dir, "out", "snapshot.dat")
 
-		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, src, nil); err != nil {
+		if _, err := reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, src, nil); err != nil {
 			t.Fatalf("reencryptSnapshotFile: %v", err)
 		}
 		got, err := os.ReadFile(dstPath)

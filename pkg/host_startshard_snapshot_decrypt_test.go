@@ -125,7 +125,8 @@ func (v snapshotVariant) fileBytes(t *testing.T, payload []byte) []byte {
 // writeSnapshotArtifact writes snapshot.dat into dir exactly as saveSnapshot
 // would for this variant and returns the epoch the LogDB record must carry
 // (0 when the artifact is plaintext).
-func (v snapshotVariant) writeSnapshotArtifact(t *testing.T, dir string, barrier Barrier, payload []byte) uint64 {
+func (v snapshotVariant) writeSnapshotArtifact(t *testing.T, dir string, barrier Barrier,
+	shardID, replicaID, index uint64, payload []byte) uint64 {
 	t.Helper()
 	path := filepath.Join(dir, "snapshot.dat")
 	data := v.fileBytes(t, payload)
@@ -138,7 +139,7 @@ func (v snapshotVariant) writeSnapshotArtifact(t *testing.T, dir string, barrier
 	if barrier == nil {
 		t.Fatal("encrypted snapshot variant requires a barrier")
 	}
-	writeEncryptedSnapshotFile(t, barrier, path, data)
+	writeEncryptedSnapshotFileFor(t, barrier, path, data, shardID, replicaID, index)
 	return barrier.CurrentEpoch()
 }
 
@@ -150,7 +151,7 @@ func seedLocalSnapshot(t *testing.T, db *mockLogDB, v snapshotVariant, barrier B
 	shardID, replicaID, index, term uint64, payload []byte) string {
 	t.Helper()
 	dir := t.TempDir()
-	epoch := v.writeSnapshotArtifact(t, dir, barrier, payload)
+	epoch := v.writeSnapshotArtifact(t, dir, barrier, shardID, replicaID, index, payload)
 	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
 		Index:       index,
 		Term:        term,

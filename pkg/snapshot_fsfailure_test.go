@@ -159,7 +159,7 @@ func TestDecryptSnapshotToTemp_FilesystemFailures(t *testing.T) {
 				t.Fatalf("read snapshot: %v", err)
 			}
 
-			tmpPath, size, err := decryptSnapshotToTemp(tt.fsys, path, sendDecryptTempPattern, b.CurrentEpoch(), b)
+			tmpPath, size, err := decryptSnapshotToTemp(tt.fsys, path, sendDecryptTempPattern, testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("decryptSnapshotToTemp error = %v, want %v", err, tt.wantErr)
 			}
@@ -197,7 +197,7 @@ func TestDecryptSnapshotToTemp_ScratchRemovalFailureStillReportsError(t *testing
 	writeEncryptedSnapshotFile(t, b, path, []byte("snapshot payload"))
 
 	fsys := faultySnapshotFS{failSync: true, failRemove: true}
-	tmpPath, size, err := decryptSnapshotToTemp(fsys, path, sendDecryptTempPattern, b.CurrentEpoch(), b)
+	tmpPath, size, err := decryptSnapshotToTemp(fsys, path, sendDecryptTempPattern, testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
 	if !errors.Is(err, errTestSyncFailed) {
 		t.Fatalf("decryptSnapshotToTemp error = %v, want the sync failure", err)
 	}
@@ -258,7 +258,7 @@ func TestReencryptReceivedSnapshot_FilesystemFailures(t *testing.T) {
 			}
 			b := createTestBarrier(t)
 
-			epoch, _, err := reencryptReceivedSnapshot(tt.fsys, path, b)
+			epoch, _, err := reencryptReceivedSnapshot(tt.fsys, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("reencryptReceivedSnapshot error = %v, want %v", err, tt.wantErr)
 			}

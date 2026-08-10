@@ -90,12 +90,29 @@ type Barrier interface {
 	// ciphertext prefix and the corresponding DEK is used.
 	Decrypt(dst, ciphertext []byte) ([]byte, error)
 
+	// DecryptWithContext decrypts ciphertext that was sealed with the same
+	// caller context folded into the AAD. A different context — or none where
+	// one was present — fails authentication, and there is deliberately no
+	// weaker retry: the fallback is the vulnerability.
+	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
+
 	// EncryptWithEpoch encrypts plaintext and returns both the ciphertext
 	// and the epoch used for encryption.
 	EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error)
 
+	// EncryptWithEpochContext is EncryptWithEpoch with a caller-supplied
+	// context folded into the AAD alongside the epoch. An empty context is
+	// byte-identical to EncryptWithEpoch.
+	EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+
 	// DecryptForEpoch decrypts ciphertext using a specific epoch's DEK.
 	DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
+
+	// IsHardwareMode reports whether the barrier delegates sealing to a
+	// hardware encryptor. Such a barrier cannot bind caller context at all, so
+	// snapshot frames it seals carry the epoch binding only — a documented
+	// capability limitation of hardware sealing, fixed by the deployment.
+	IsHardwareMode() bool
 
 	// Rotate increments the epoch, derives a new DEK, and installs it
 	// as the current cipher. Returns the new epoch number.
@@ -139,7 +156,7 @@ type Barrier interface {
 // The caller must DeregisterInFlightEpoch the returned epoch once the artifact's
 // epoch is durably recorded, exactly as for a manual RegisterInFlightEpoch.
 type atomicEpochPinner interface {
-	EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64, error)
+	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 }
 
 // hostOptions holds optional dependencies injected via HostOption functions.
@@ -657,9 +674,14 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 // temporary file for network transfer. The encrypted format is a
 // sequence of frames: [4-byte LE length][encrypted chunk]...
 // Returns the temp file path and the plaintext file size.
+// The artifact was sealed by THIS node's snapshot pool under
+// (msg.ShardID, msg.ReplicaID, msg.Snapshot.Index) — msg.ReplicaID is the
+// sending replica, stamped by raft.send — so those identify the frames'
+// positional context.
 func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barrier) (string, uint64, error) {
 	return decryptSnapshotToTemp(s.snapshotFsys(), msg.Snapshot.Filepath,
-		sendDecryptTempPattern, msg.Snapshot.Epoch, barrier)
+		sendDecryptTempPattern, msg.ShardID, msg.ReplicaID, msg.Snapshot.Index,
+		msg.Snapshot.Epoch, barrier)
 }
 
 // sendDecryptTempPattern names the scratch file the send path decrypts into,
@@ -724,7 +746,8 @@ func shardSnapshotBaseDir(nodeHostDir, dataDir string, shardID uint64) string {
 //
 // Shared by the transport send path (decryptSnapshotForSend) and StartShard's
 // local-snapshot recovery so both consume identical plaintext.
-func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string, epoch uint64, barrier Barrier) (string, uint64, error) {
+func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string,
+	shardID, replicaID, index, epoch uint64, barrier Barrier) (string, uint64, error) {
 	barrier.RegisterInFlightEpoch(epoch)
 	defer barrier.DeregisterInFlightEpoch(epoch)
 
@@ -775,7 +798,7 @@ func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string, epoch uint6
 	}()
 
 	// Read and decrypt each frame.
-	totalSize, err := decryptSnapshotFrames(barrier, srcFile, tmpFile)
+	totalSize, err := decryptSnapshotFrames(barrier, shardID, replicaID, index, srcFile, tmpFile)
 	if err != nil {
 		return "", 0, err
 	}
@@ -827,19 +850,31 @@ func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string, epoch uint6
 // rotations landed mid-loop), which would leave the snapshot undecryptable. The
 // caller MUST DeregisterInFlightEpoch every returned epoch once its durable
 // record exists. On error, all pins this call took are released before return.
-func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint64, []uint64, error) {
+//
+// Every frame is additionally bound to its POSITION — the artifact's
+// (shardID, replicaID, index) plus the frame's 0-based ordinal — through the
+// AEAD context AAD (engine.NewSnapshotAAD), so a frame cannot be replayed at
+// another ordinal, another snapshot index, or another shard sharing the
+// host-wide barrier. The binding is unconditional and has no weaker fallback.
+func encryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
+	src io.Reader, dst io.Writer) (uint64, []uint64, error) {
 	chunkBuf := make([]byte, snapshotEncryptChunkSize)
 	var frameLenBuf [4]byte
 	var minEpoch uint64
 	pins := newEpochPinner(barrier)
+	// One builder for the whole artifact; Frame reuses its scratch buffer, so
+	// the AAD costs no per-frame allocation on this bulk path.
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	var seq uint64
 	for {
 		n, readErr := src.Read(chunkBuf)
 		if n > 0 {
-			ct, epoch, encErr := pins.sealFrame(chunkBuf[:n])
+			ct, epoch, encErr := pins.sealFrame(chunkBuf[:n], aad.Frame(seq))
 			if encErr != nil {
 				pins.releaseAll()
 				return 0, nil, encErr
 			}
+			seq++
 			if minEpoch == 0 || epoch < minEpoch {
 				minEpoch = epoch
 			}
@@ -895,11 +930,12 @@ func encryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 // The caller MUST defer the returned cleanup so the pin covers the SaveSnapshot
 // that records the epoch. On error the cleanup has already run and the returned
 // func is a no-op.
-func reencryptImportPinned(fsys snapshotFS, path string, barrier Barrier) (uint64, func(), error) {
+func reencryptImportPinned(fsys snapshotFS, path string, shardID, replicaID, index uint64,
+	barrier Barrier) (uint64, func(), error) {
 	// encryptSnapshotFrames (inside reencryptReceivedSnapshot) pins every epoch it
 	// seals a frame under and returns them; the import must hold those pins until
 	// its SaveSnapshot records the epoch, so release them on THIS caller's return.
-	epoch, pinned, err := reencryptReceivedSnapshot(fsys, path, barrier)
+	epoch, pinned, err := reencryptReceivedSnapshot(fsys, path, shardID, replicaID, index, barrier)
 	cleanup := func() {
 		for _, e := range pinned {
 			barrier.DeregisterInFlightEpoch(e)
@@ -911,7 +947,8 @@ func reencryptImportPinned(fsys snapshotFS, path string, barrier Barrier) (uint6
 	return epoch, cleanup, nil
 }
 
-func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (uint64, []uint64, error) {
+func reencryptReceivedSnapshot(fsys snapshotFS, path string, shardID, replicaID, index uint64,
+	barrier Barrier) (uint64, []uint64, error) {
 	if barrier == nil {
 		return 0, nil, nil
 	}
@@ -937,7 +974,7 @@ func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (u
 		}
 	}()
 
-	epoch, pinned, err := encryptSnapshotFrames(barrier, src, tmp)
+	epoch, pinned, err := encryptSnapshotFrames(barrier, shardID, replicaID, index, src, tmp)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -968,9 +1005,17 @@ func reencryptReceivedSnapshot(fsys snapshotFS, path string, barrier Barrier) (u
 	return epoch, pinned, nil
 }
 
-func decryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint64, error) {
+// decryptSnapshotFrames reproduces the positional context the encrypt side
+// stamped into every frame. Frames are read strictly sequentially from offset
+// 0, so the ordinal is simply the count; shardID/replicaID/index MUST be the
+// identity the artifact was sealed under. A mismatch fails authentication and
+// is never retried with a weaker (epoch-only) AAD.
+func decryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
+	src io.Reader, dst io.Writer) (uint64, error) {
 	var frameLenBuf [4]byte
 	var totalSize uint64
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	var seq uint64
 	for {
 		_, readErr := io.ReadFull(src, frameLenBuf[:])
 		if readErr == io.EOF {
@@ -991,10 +1036,11 @@ func decryptSnapshotFrames(barrier Barrier, src io.Reader, dst io.Writer) (uint6
 			return 0, readErr
 		}
 
-		plaintext, decErr := barrier.Decrypt(nil, frame)
+		plaintext, decErr := barrier.DecryptWithContext(nil, frame, aad.Frame(seq))
 		if decErr != nil {
 			return 0, decErr
 		}
+		seq++
 
 		if _, writeErr := dst.Write(plaintext); writeErr != nil {
 			return 0, writeErr
@@ -3113,7 +3159,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 					}
 				}
 				plainPath, _, decErr := decryptSnapshotToTemp(
-					h.snapshotFsys(), dataPath, recoverDecryptTempPattern, ss.Epoch, barrier,
+					h.snapshotFsys(), dataPath, recoverDecryptTempPattern,
+					cfg.ShardID, cfg.ReplicaID, ss.Index, ss.Epoch, barrier,
 				)
 				if decErr != nil {
 					return &HostInitError{Field: "snapshot_decrypt", Err: decErr}
@@ -5114,7 +5161,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		defer barrier.DeregisterInFlightEpoch(logdbSnap.Epoch)
 
 		hw := &deferredHeaderWriter{w: w, header: headerBytes}
-		if _, err = decryptSnapshotFrames(barrier, f, hw); err != nil {
+		if _, err = decryptSnapshotFrames(barrier, shardID, ns.replicaID, logdbSnap.Index, f, hw); err != nil {
 			return err
 		}
 		// A frameless (empty-data) stream never triggered a write; the
@@ -5440,7 +5487,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		discardImportDir(fsys, shardID, stageDir)
 		return barrierErr
 	}
-	epoch, unpin, encErr := reencryptImportPinned(fsys, dataPath, importBarrier)
+	epoch, unpin, encErr := reencryptImportPinned(fsys, dataPath, shardID, replicaID, header.Index, importBarrier)
 	// The pin must live until SaveSnapshot below records the epoch, so it is
 	// released on THIS function's return, not the helper's.
 	defer unpin()

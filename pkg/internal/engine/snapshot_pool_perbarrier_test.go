@@ -83,6 +83,26 @@ func (b *tenantBarrier) EncryptWithEpoch(_, plaintext []byte) ([]byte, uint64, e
 	return b.seal(plaintext, b.epoch), b.epoch, nil
 }
 
+func (b *tenantBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpoch(dst, plaintext)
+	if err != nil {
+		return nil, 0, err
+	}
+	return appendTestAADTag(ct, contextAAD), epoch, nil
+}
+
+func (b *tenantBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
+	body, err := stripTestAADTag(ciphertext, contextAAD)
+	if err != nil {
+		return nil, err
+	}
+	return b.Decrypt(dst, body)
+}
+
+// IsHardwareMode is false: this barrier binds caller context, like the software
+// seal.Barrier it stands in for.
+func (b *tenantBarrier) IsHardwareMode() bool { return false }
+
 func (b *tenantBarrier) Decrypt(_, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < 9 {
 		return nil, errors.New("ciphertext too short")
@@ -721,11 +741,11 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 
 	// --- cross-barrier isolation: BarrierB cannot decrypt BarrierA's snapshot ---
 	dataPathA := snapshotSaveDir(baseDir, 5, 1, 200) + "/" + snapshotDataFile
-	if _, err := p2.decryptSnapshotToSibling(dataPathA, 2, bB); err == nil {
+	if _, err := p2.decryptSnapshotToSibling(dataPathA, 5, 1, 200, 2, bB); err == nil {
 		t.Fatal("BarrierB decrypted BarrierA's snapshot — per-tenant isolation breached")
 	}
 	// And BarrierA still decrypts its own snapshot correctly post-rotation.
-	plainA, err := p2.decryptSnapshotToSibling(dataPathA, 2, bA)
+	plainA, err := p2.decryptSnapshotToSibling(dataPathA, 5, 1, 200, 2, bA)
 	if err != nil {
 		t.Fatalf("BarrierA failed to decrypt its own snapshot post-rotation: %v", err)
 	}

@@ -171,7 +171,7 @@ func TestPinBalance_EncryptSnapshotFile_SuccessHandsOffExactlyOnePinPerEpoch(t *
 	dataPath := filepath.Join(dir, snapshotDataFile)
 	writeMultiChunkPlaintext(t, dataPath, 3)
 
-	minEpoch, pins, err := p.encryptSnapshotFile(dataPath, barrier)
+	minEpoch, pins, err := p.encryptSnapshotFile(dataPath, 2, 1, 42, barrier)
 	if err != nil {
 		t.Fatalf("encryptSnapshotFile: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestPinBalance_EncryptSnapshotFile_ErrorReleasesEverythingAndReturnsNoPins(
 	dataPath := filepath.Join(dir, snapshotDataFile)
 	writeMultiChunkPlaintext(t, dataPath, 3)
 
-	_, pins, err := p.encryptSnapshotFile(dataPath, barrier)
+	_, pins, err := p.encryptSnapshotFile(dataPath, 2, 1, 42, barrier)
 	if err == nil {
 		t.Fatal("encryptSnapshotFile: expected the injected encrypt failure")
 	}

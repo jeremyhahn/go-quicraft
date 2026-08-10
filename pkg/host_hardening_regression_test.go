@@ -390,7 +390,7 @@ func TestExportSnapshot_PinsInFlightEpoch(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", mkErr)
 	}
 	plaintext := []byte("export must pin the epoch it is decrypting under")
-	writeEncryptedSnapshotFile(t, pinning, filepath.Join(snapDir, "snapshot.dat"), plaintext)
+	writeEncryptedSnapshotFileFor(t, pinning, filepath.Join(snapDir, "snapshot.dat"), plaintext, 1, 1, 900)
 
 	const recordedEpoch = uint64(1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: recordedEpoch})
@@ -454,8 +454,8 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
 		t.Fatalf("MkdirAll: %v", mkErr)
 	}
-	writeEncryptedSnapshotFile(t, pinning, filepath.Join(snapDir, "snapshot.dat"),
-		[]byte("import must pin the epoch it seals under"))
+	writeEncryptedSnapshotFileFor(t, pinning, filepath.Join(snapDir, "snapshot.dat"),
+		[]byte("import must pin the epoch it seals under"), 1, 1, 1700)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1700, Filepath: snapDir, Epoch: 1})
 
 	var exported bytes.Buffer
@@ -471,10 +471,13 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	delete(db.snapshots, mockNodeKey{1, 1})
 	db.mu.Unlock()
 
-	// Only observe the import's pinning, not the export's.
+	// Only observe the import's pinning, not the export's -- nor the fixture
+	// write above, which seals frames through this same recording barrier
+	// before any pin exists and would otherwise arm sawEncryptBeforePin.
 	pinning.mu.Lock()
 	pinning.registered = nil
 	pinning.deregistered = nil
+	pinning.sawEncryptBeforePin = false
 	pinning.mu.Unlock()
 
 	if importErr := h.ImportSnapshot(context.Background(), 1, bytes.NewReader(exported.Bytes())); importErr != nil {

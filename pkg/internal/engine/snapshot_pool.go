@@ -49,12 +49,30 @@ type SnapshotBarrier interface {
 	// EncryptWithEpoch encrypts and returns both ciphertext and the epoch used.
 	EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error)
 
+	// EncryptWithEpochContext is EncryptWithEpoch with a caller-supplied
+	// context folded into the AEAD AAD alongside the epoch. An empty context
+	// is byte-identical to EncryptWithEpoch. Snapshot frames always supply the
+	// positional context built by NewSnapshotAAD.
+	EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+
 	// Decrypt decrypts ciphertext using the epoch embedded in the ciphertext
 	// prefix. Returns the plaintext.
 	Decrypt(dst, ciphertext []byte) ([]byte, error)
 
+	// DecryptWithContext decrypts ciphertext that was sealed with the same
+	// caller context. Supplying a different context — or omitting one that was
+	// present at encryption time — fails authentication. There is deliberately
+	// no weaker retry: the fallback is the vulnerability.
+	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
+
 	// DecryptForEpoch decrypts ciphertext using the DEK for the given epoch.
 	DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
+
+	// IsHardwareMode reports whether the barrier delegates sealing to a
+	// hardware encryptor, which cannot accept caller context at all. Snapshot
+	// frames sealed by such a barrier carry the epoch binding only; see
+	// NewSnapshotAAD.
+	IsHardwareMode() bool
 
 	// CurrentEpoch returns the current key rotation epoch.
 	CurrentEpoch() uint64
@@ -86,7 +104,7 @@ type SnapshotBarrier interface {
 // encryptSnapshotFile uses it when available and falls back to
 // pin-before + pin-after otherwise.
 type atomicEpochPinner interface {
-	EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64, error)
+	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 }
 
 // snapshotRequest is sent to the snapshot pool to request a snapshot
@@ -837,7 +855,8 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		// before the snapshot's recorded epoch becomes durable and visible to the
 		// snapshot-floor scan. Pinning every epoch (not just the pre-read) closes
 		// the intermediate-frame-epoch gap a mid-loop rotation opens.
-		minEpoch, encPins, encryptErr := p.encryptSnapshotFile(dataPath, barrier)
+		minEpoch, encPins, encryptErr := p.encryptSnapshotFile(
+			dataPath, req.shardID, req.replicaID, snapshotIndex, barrier)
 		defer func() {
 			for _, e := range encPins {
 				barrier.DeregisterInFlightEpoch(e)
@@ -1219,9 +1238,17 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 
 	// Determine snapshot directory. Prefer the filepath stored in LogDB
 	// metadata; fall back to discovering the latest directory on disk.
+	//
+	// artifactIndex tracks the index of the directory ACTUALLY being read, not
+	// the one LogDB recorded. The two agree on the recorded-filepath branch
+	// (the directory is named snapshot-<Index>), but the discovery branch picks
+	// the newest directory on disk, which may be a different index — and that
+	// directory's frames were sealed under ITS OWN index. Using logdbSnap.Index
+	// as the frame context there would fail authentication on a valid artifact.
 	snapshotDir := logdbSnap.Filepath
+	artifactIndex := logdbSnap.Index
 	if snapshotDir == "" {
-		dir, _, dirErr := latestSnapshotDir(node.SnapshotDir(), req.shardID, req.replicaID)
+		dir, dirIndex, dirErr := latestSnapshotDir(node.SnapshotDir(), req.shardID, req.replicaID)
 		if dirErr != nil {
 			return &SnapshotError{
 				ShardID:   req.shardID,
@@ -1231,6 +1258,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 			}
 		}
 		snapshotDir = dir
+		artifactIndex = dirIndex
 	}
 
 	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
@@ -1295,7 +1323,8 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}
 	if logdbSnap.Epoch > 0 {
-		plainPath, decryptErr := p.decryptSnapshotToSibling(dataPath, logdbSnap.Epoch, barrier)
+		plainPath, decryptErr := p.decryptSnapshotToSibling(
+			dataPath, req.shardID, req.replicaID, artifactIndex, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
 			return &SnapshotError{
 				ShardID:   req.shardID,
@@ -1416,7 +1445,16 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 // Atomic write: output goes to a temporary file in the same directory,
 // synced to disk, then renamed over the original. If any step fails the
 // temp file is removed and the original is preserved intact.
-func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier) (uint64, []uint64, error) {
+//
+// Every frame is additionally bound to its POSITION — the artifact's
+// (shardID, replicaID, index) plus the frame's 0-based ordinal — through the
+// AEAD context AAD (see NewSnapshotAAD). Frames are written strictly
+// sequentially from offset 0, so the decrypt side reconstructs the same
+// ordinals by counting. Without the shard and replica the binding would be
+// ambiguous: the default barrier is host-wide and shared across shards, so two
+// shards can hold a snapshot at the same index and a frame could be spliced
+// from one into the other.
+func (p *snapshotPool) encryptSnapshotFile(path string, shardID, replicaID, index uint64, barrier SnapshotBarrier) (uint64, []uint64, error) {
 	// Open the plaintext file for streaming reads. Only one chunk
 	// (snapshotEncryptChunkSize = 64KB) is held in memory at a time,
 	// avoiding OOM on large snapshot files.
@@ -1477,13 +1515,18 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 		pins.releaseAll()
 		return &SnapshotEncryptError{Op: op, Err: e}
 	}
+	// One builder for the whole artifact; Frame stamps the ordinal into its
+	// reused scratch buffer, so the AAD costs no per-frame allocation.
+	aad := NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	var seq uint64
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
 		if n > 0 {
-			encrypted, frameEpoch, encErr := pins.sealFrame(chunkBuf[:n])
+			encrypted, frameEpoch, encErr := pins.sealFrame(chunkBuf[:n], aad.Frame(seq))
 			if encErr != nil {
 				return 0, nil, encErrOf("encrypt", encErr)
 			}
+			seq++
 			if minEpoch == 0 || frameEpoch < minEpoch {
 				minEpoch = frameEpoch
 			}
@@ -1544,10 +1587,17 @@ func (p *snapshotPool) encryptSnapshotFile(path string, barrier SnapshotBarrier)
 // safe for large snapshots.
 //
 // The epoch parameter is advisory: each frame is decrypted with the epoch
-// embedded in its own ciphertext header (via barrier.Decrypt), not with this
-// value. It is retained only for log context. The caller uses the recorded
-// epoch solely to decide whether decryption is needed at all (Epoch>0).
-func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barrier SnapshotBarrier) (string, error) {
+// embedded in its own ciphertext header (via barrier.DecryptWithContext), not
+// with this value. It is retained only for log context. The caller uses the
+// recorded epoch solely to decide whether decryption is needed at all
+// (Epoch>0).
+//
+// shardID/replicaID/index identify the artifact and MUST be the identity the
+// frames were sealed under; together with the frame ordinal they reproduce the
+// positional context AAD (see NewSnapshotAAD). A mismatch fails authentication
+// and there is no weaker retry: an epoch-only fallback would readmit exactly
+// the frame-splicing this binding exists to prevent.
+func (p *snapshotPool) decryptSnapshotToSibling(path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (string, error) {
 	srcFile, err := os.Open(path)
 	if err != nil {
 		return "", &SnapshotEncryptError{Op: "read", Err: err}
@@ -1592,6 +1642,10 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barri
 	// empty source yields an immediate EOF and an empty plaintext temp file,
 	// which RecoverFromSnapshot treats as a no-op — matching the prior behavior.
 	var frameLenBuf [4]byte
+	// Frames are read strictly sequentially from offset 0, so the ordinal the
+	// encrypt loop stamped into each frame's context is simply the count.
+	aad := NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	var seq uint64
 	for {
 		_, readErr := io.ReadFull(srcFile, frameLenBuf[:])
 		if readErr == io.EOF {
@@ -1625,10 +1679,15 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, epoch uint64, barri
 		// epoch parameter is advisory only (it gates whether decryption is
 		// attempted at all, and pins the DEK-purge floor at the minimum frame
 		// epoch so no frame's DEK is purged while the snapshot is retained).
-		plaintext, decErr := barrier.Decrypt(nil, frame)
+		//
+		// The frame's positional context is required, unconditionally: a frame
+		// that authenticates only under a different ordinal or a different
+		// artifact identity is rejected, never retried with a weaker AAD.
+		plaintext, decErr := barrier.DecryptWithContext(nil, frame, aad.Frame(seq))
 		if decErr != nil {
 			return "", &SnapshotEncryptError{Op: "decrypt", Err: decErr}
 		}
+		seq++
 
 		if _, err := tmpFile.Write(plaintext); err != nil {
 			return "", &SnapshotEncryptError{Op: "write", Err: err}
@@ -1857,6 +1916,26 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 			)
 			return 0, false
 		}
+	} else if p.logdb != nil {
+		// L23: a NON-NIL LogDB that cannot report an epoch floor contributed 0
+		// and let the purge proceed on the snapshot floor alone — irreversibly
+		// destroying DEKs a durable, encrypted LogDB may still need. Only a
+		// POSITIVE AtRestNonDurable declaration proves otherwise: no durable
+		// artifact means no record can be stranded. Silence (an implementation
+		// that does not declare, or declares the AtRestUnprotected zero value)
+		// also covers "durable, encrypted, forgot to declare" — the exact
+		// hazard — so it fails safe. The cost of silence is keyring growth,
+		// which is recoverable; the cost of guessing wrong is DEK destruction,
+		// which is not. perBarrierSafePurgeFloor already fails safe on the
+		// analogous unsupported-LogDB case; a NIL LogDB (memory mode) is not a
+		// store at all and stays a 0 contribution in both.
+		if protection := engineLogDBAtRestProtection(p.logdb); protection != logdb.AtRestNonDurable {
+			slog.Warn("epoch purge suppressed: LogDB reports no epoch floor and does not "+
+				"declare its records non-durable; a purge could destroy a DEK the log still needs",
+				"at_rest_protection", protection.String(),
+			)
+			return 0, false
+		}
 	}
 
 	// Combine the two floors. Either may be zero (no encrypted snapshots, or
@@ -1870,6 +1949,21 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 		return 0, false // nothing encrypted retained, nothing to purge
 	}
 	return floor, true
+}
+
+// engineLogDBAtRestProtection reports a LogDB's declared at-rest guarantee. A
+// LogDB that does not implement logdb.AtRestProtectedLogDB declares nothing,
+// which reads as UNPROTECTED so every caller fails closed on silence.
+//
+// It is the engine-local twin of the host's logDBAtRestProtection: this package
+// deliberately does not import the quicraft package (that import runs the other
+// way), so the two-line assertion is duplicated rather than the dependency.
+func engineLogDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
+	p, ok := db.(logdb.AtRestProtectedLogDB)
+	if !ok {
+		return logdb.AtRestUnprotected
+	}
+	return p.AtRestProtection()
 }
 
 // loadedSnapshotTreeAccounted reports whether every shard/replica directory that
@@ -2690,7 +2784,8 @@ func (p *snapshotPool) exportSnapshotBackup(saveDir, exportPath string, barrier 
 		}
 	}
 	dataPath := filepath.Join(saveDir, snapshotDataFile)
-	plainPath, decErr := p.decryptSnapshotToSibling(dataPath, meta.Epoch, barrier)
+	plainPath, decErr := p.decryptSnapshotToSibling(
+		dataPath, meta.ShardID, meta.ReplicaID, meta.Index, meta.Epoch, barrier)
 	if decErr != nil {
 		return &SnapshotExportError{
 			ExportPath: filepath.Clean(exportPath),
