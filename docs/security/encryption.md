@@ -312,6 +312,42 @@ func epochAAD(epoch uint64) []byte {
 
 Both `encryptLocked` and `decryptLocked` pass this AAD to `aead.Seal()` and `aead.Open()` respectively. The AAD prevents cross-epoch ciphertext splicing attacks — an attacker cannot take a ciphertext encrypted under epoch N and present it as epoch M, because the AAD embedded in the authentication tag will not match.
 
+**Baseline binding is epoch-only.** The default `Encrypt`/`Decrypt` (and `EncryptWithEpoch`, `EncryptWithEpochPinned`, `DecryptForEpoch`) bind ONLY the epoch. Within a single epoch, two frames sealed under the same DEK authenticate identically regardless of their position or artifact, so epoch-only AAD does **not** by itself defeat same-epoch reorder/splice/truncation by an at-rest attacker. Positional protection is provided by the optional context-AAD below, and only when a caller opts into it.
+
+### Optional Context-AAD (positional binding)
+
+The barrier exposes an additive, backward-compatible API that folds a caller-supplied **context** into the AAD alongside the epoch:
+
+```go
+func (b *Barrier) EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
+func (b *Barrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+func (b *Barrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+func (b *Barrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
+func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, contextAAD []byte) ([]byte, error)
+```
+
+The AAD is composed by `aadForEpoch(epoch, contextAAD)`:
+
+```go
+// AAD = [epoch:8 (little-endian)] || contextAAD
+func aadForEpoch(epoch uint64, contextAAD []byte) []byte {
+    if len(contextAAD) == 0 {
+        return epochAAD(epoch) // exactly the epoch-only AAD
+    }
+    aad := make([]byte, 8+len(contextAAD))
+    binary.LittleEndian.PutUint64(aad[:8], epoch)
+    copy(aad[8:], contextAAD)
+    return aad
+}
+```
+
+Because the epoch always occupies the fixed 8-byte prefix and the context is appended after it, the epoch/context boundary is unambiguous: no context value can shift or alias the epoch bytes.
+
+- **Opt-in only.** A nil/empty context yields byte-identical, epoch-only AAD, so `EncryptWithContext(_, _, nil)` and `Encrypt` are interoperable and all existing ciphertext and callers are unaffected. Positional binding exists **only** when the caller passes a context that uniquely identifies the frame.
+- **The context is not stored** in the ciphertext (the wire format is unchanged). The caller must reproduce the exact same context bytes at decrypt time; a mismatched or omitted context fails authentication with the generic `ErrDecryptionFailed`.
+- **Intended contexts.** Snapshot chunks pass `SnapshotIndex || ChunkSeq`; WAL records pass `SegmentID || RecordSeq`. When threaded, this binds each frame to its position and artifact, so same-epoch reorder, splice, and truncation fail authentication.
+- **Hardware mode.** The hardware `SymmetricEncrypter` takes no AAD, so a non-empty context returns `ErrHardwareMode` (fail-closed) rather than silently dropping the binding; a nil/empty context is delegated unchanged.
+
 ## Encrypt / Decrypt
 
 **Source:** `pkg/seal/barrier.go`
@@ -333,9 +369,16 @@ The `atomic.Bool` pre-filter avoids `RLock` contention when the barrier is seale
 
 ### Nonce Generation
 
-The barrier generates nonces for AES-GCM using `crypto/rand.Reader`. Each `Encrypt` call reads 12 bytes of cryptographic randomness for the nonce.
+Every ciphertext frame uses a **fresh random nonce**, not a deterministic counter. `encryptLocked` reads the AEAD's full nonce size (12 bytes for the AES-GCM/ChaCha20 algorithms, 24 for XChaCha20-Poly1305) directly from `crypto/rand.Reader` on every call. There is no `[SegmentID|WriteEpoch|RecordSeq]` or `[AttemptSalt|ChunkSeq]` construction anywhere in the barrier, the WAL, or the snapshot pipeline — those layers call `barrier.Encrypt`/`EncryptWithEpoch`, which produce random nonces.
 
 If `crypto/rand.Read` fails (entropy exhaustion), encryption returns an error rather than falling back to a weaker source. This fail-closed behavior prevents encrypting with a predictable nonce.
+
+Random 96-bit nonces make nonce collision — not a repeated counter — the safety concern, so the barrier bounds invocations per DEK:
+
+- **NIST SP 800-38D invocation cap.** `InvocationCounter` counts `Encrypt` calls per epoch and returns `ErrInvocationLimitExceeded` once the limit (`DefaultInvocationLimit` = 2^32 for random 96-bit nonces) would be exceeded, failing closed until the key is rotated. This is a hard collision-safety bound, not advisory; `Unseal` seeds it pessimistically after a restart (see the StatePersister section).
+- **Nonce-reuse tracker.** When enabled, every generated nonce is recorded and a repeat is rejected outright (see below).
+
+Because a rotated epoch derives a fresh DEK that has never been used with any nonce, the `(DEK, nonce)` pair is unique across epochs even if a random nonce were ever to repeat within the 2^32 budget.
 
 ### Nonce-Reuse Detection
 
@@ -445,63 +488,41 @@ Decryption failures are fatal — silently skipping records would cause undetect
 
 ### Nonce Construction in WAL
 
-The WAL layer provides its own nonce construction separate from the barrier's random nonces:
+The WAL does **not** construct its own nonces. `writeRecord` calls `barrier.Encrypt` (above), so each record's 12-byte nonce is fresh `crypto/rand` output produced by the barrier, and the `Nonce:12` in the encrypted-record layout is that random nonce. There is no `[SegmentID | WriteEpoch | RecordSeq]` deterministic-counter scheme in the write path.
 
-```
-[SegmentID:4 | WriteEpoch:4 | RecordSeq:4]
-```
+Crash-recovery nonce safety therefore does not rely on a per-segment counter: because every nonce is random, a recovered segment that resumes appending cannot reproduce a pre-crash nonce by construction. Collision safety is instead bounded by the barrier's per-DEK NIST SP 800-38D invocation cap (2^32) and, when enabled, the nonce-reuse tracker — see [Nonce Generation](#nonce-generation). A `Rotate()` further guarantees uniqueness across epochs: the new DEK has never been used with any nonce.
 
-| Field | Size | Purpose | Overflow bound |
-|-------|------|---------|---------------|
-| `SegmentID` | 4 bytes | WAL segment file number (monotonic) | ~4B segments = ~256 EB at 64MB/seg |
-| `WriteEpoch` | 4 bytes | Per-segment open counter | ~4B crash-recovery cycles per segment |
-| `RecordSeq` | 4 bytes | Record sequence within (SegmentID, WriteEpoch) pair | ~4B records per segment-epoch |
+### Positional binding for WAL records (optional)
 
-### Crash-Recovery Nonce Safety
-
-The critical invariant: **a (DEK, nonce) pair is never reused.**
-
-Crash recovery threatens this because a recovered segment retains its `SegmentID` and in-memory `RecordSeq` resets. Without `WriteEpoch`, post-recovery writes could produce the same nonce as pre-crash writes, breaking AES-GCM.
-
-Recovery sequence:
-1. Open segment file, read `WriteEpoch` from header
-2. Scan forward to find last valid record → determine recovered `RecordSeq`
-3. Increment `WriteEpoch` in header, fsync header
-4. Resume appending from `RecordSeq + 1` with new `WriteEpoch`
-
-**WriteEpoch crash atomicity:** The segment header stores `WriteEpoch` at two independent offsets (0 and 512), each with its own CRC32. These reside in different 512-byte disk sectors. Under single-sector-torn-write assumptions, at most one copy can be corrupted. Recovery uses `max(primary, backup)`.
-
-### Key Rotation Safety
-
-When `Rotate()` creates a new epoch, the new DEK has never been used with any nonce. Even if `RecordSeq` values repeat across epochs, the (DEK, nonce) pair is unique.
+Random nonces and epoch-only AAD do not, on their own, bind a WAL record to its position, so an at-rest attacker could in principle reorder or splice same-epoch records. To bind position, the WAL write/read path can pass a per-record context — `SegmentID || RecordSeq` — to the barrier's context-AAD API (`EncryptWithEpochContext` / `DecryptForEpochContext`; see [Optional Context-AAD](#optional-context-aad-positional-binding)). This is opt-in: it protects records only once the WAL threads that context on both encrypt and decrypt.
 
 ## Snapshot Encryption
 
-Snapshots are encrypted as a stream of 64KB chunks:
+Snapshots are encrypted as a stream of 64KB chunks. Each chunk is a standard barrier ciphertext frame produced by `barrier.Encrypt`/`EncryptWithEpoch`:
 
 ```
-Chunk: [Epoch:8 | ChunkSeq:4 | Nonce:12 | Ciphertext:N | Tag:16]
+Chunk: [Epoch:8 | AlgID:1 | Nonce:N | Ciphertext:N | Tag:16]
 ```
 
-### Nonce Construction (12 bytes)
+### Nonce Construction
 
-```
-[AttemptSalt:8 | ChunkSeq:4]
-```
-
-- `AttemptSalt`: 8 bytes of `crypto/rand` randomness per snapshot encryption attempt. Birthday bound: ~2^32 (~4 billion) attempts before >1% collision risk.
-- `ChunkSeq`: monotonic chunk counter within attempt. 4 bytes = 4 billion chunks = ~256 TB at 64KB/chunk.
+Each chunk's nonce is a **fresh random nonce** from the barrier (12 bytes for AES-GCM), exactly as for any other `Encrypt` call. There is no `[AttemptSalt | ChunkSeq]` deterministic construction; the snapshot pipeline does not synthesize nonces. Collision safety is bounded by the barrier's per-DEK invocation cap and reuse tracker — see [Nonce Generation](#nonce-generation).
 
 ### AAD (Additional Authenticated Data)
 
+By default each chunk binds **only its epoch** (`epochAAD`). Epoch-only AAD does not bind a chunk to its position, so an at-rest attacker could in principle reorder chunks, substitute chunks from another snapshot at the same epoch, or truncate the stream without failing per-chunk authentication.
+
+To bind position, the snapshot path can pass a per-chunk context — `SnapshotIndex || ChunkSeq` — to the barrier's context-AAD API (`EncryptWithEpochPinnedContext` / `DecryptForEpochContext`; see [Optional Context-AAD](#optional-context-aad-positional-binding)):
+
 ```
-[Epoch:8 | SnapshotIndex:8 | ChunkSeq:4]
+context = [SnapshotIndex:8 | ChunkSeq:4]   →   AAD = [Epoch:8] || context
 ```
 
-AAD binds each chunk to its epoch and snapshot context, preventing:
-- **Chunk reordering** — wrong `ChunkSeq` causes auth failure
-- **Cross-snapshot substitution** — wrong `SnapshotIndex` causes auth failure
-- **Truncation attacks** — receiver verifies `TotalChunkCount` agreement across all chunks
+When threaded on both encrypt and decrypt, this makes:
+- **Chunk reordering** — a wrong `ChunkSeq` fails authentication.
+- **Cross-snapshot substitution** — a wrong `SnapshotIndex` fails authentication.
+
+This binding is opt-in and exists only where the caller supplies the context. Stream **truncation** is additionally guarded at the application layer by verifying `TotalChunkCount` agreement across all chunks.
 
 ### Snapshot Encryption: Atomic Write Pattern
 
@@ -1093,8 +1114,9 @@ Snapshot trigger (appliedIndex > lastSnapshotIndex + interval)
   → 64KB chunks read from snapshot file
   → For each chunk:
       → barrier.EncryptWithEpoch() → (ciphertext, epoch)
-      → Nonce = [AttemptSalt:8 | ChunkSeq:4]
-      → AAD = [Epoch:8 | SnapshotIndex:8 | ChunkSeq:4]
+      → Nonce = fresh crypto/rand (random 96-bit)
+      → AAD = [Epoch:8]   (epoch-only by default; optional
+              context-AAD binds [SnapshotIndex | ChunkSeq])
   → Encrypted chunks written to snapshot file (at-rest)
 ```
 
