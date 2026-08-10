@@ -505,13 +505,20 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 
 // crashTearSegment damages one block of the WAL the killed writer left behind,
 // reproducing what a power loss adds on top of the process death: a partially
-// persisted block whose record no longer passes CRC. The highest segment with
-// a usable tear point is chosen, so any segment above it becomes an orphan
-// recovery must also discard. Returns the torn segment's path and the offset
-// recovery must truncate it back to.
+// persisted block whose record no longer passes CRC.
+//
+// A torn tail is only ever valid in the FINAL segment: recovery fails-stop on
+// corruption in any lower segment (a lower segment was fully fdatasynced before
+// a higher one was created, so its corruption is bit rot, not a torn tail).
+// The kill can leave a higher, incompletely written active segment with no
+// complete record to tear; those higher segments are deleted here so the torn
+// segment becomes the genuine final one — the only place prefix-truncation
+// recovery is valid. Returns the torn segment's path and the offset recovery
+// must truncate it back to.
 func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 	t.Helper()
-	for _, segID := range crashSegmentIDs(t, shardDir) {
+	segIDs := crashSegmentIDs(t, shardDir) // highest first
+	for i, segID := range segIDs {
 		path := filepath.Join(shardDir, segmentFilename(segID))
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -520,6 +527,12 @@ func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 		tearAt := crashTearPoint(t, data)
 		if tearAt < 0 {
 			continue
+		}
+		// Delete every higher segment so the torn one is genuinely final.
+		for _, higher := range segIDs[:i] {
+			if err := os.Remove(filepath.Join(shardDir, segmentFilename(higher))); err != nil {
+				t.Fatalf("remove higher orphan segment %d: %v", higher, err)
+			}
 		}
 		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 		if err != nil {

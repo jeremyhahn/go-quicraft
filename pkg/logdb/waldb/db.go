@@ -559,8 +559,23 @@ func (s *walShard) recover() error {
 		cleanEnd, err := s.replaySegment(segID)
 		if err != nil {
 			if errors.Is(err, errRecoveryTruncated) {
-				// Corruption hit: this segment's clean prefix is recovered;
-				// do NOT replay higher segments (prefix-validity rule).
+				// Prefix-truncation is correct ONLY for a torn tail, which can
+				// exist only in the HIGHEST-numbered segment: rotateSegment
+				// fdatasyncs a segment in full before any higher one is created,
+				// so a non-final segment was already durably acked end to end.
+				// Corruption there is bit rot / a lying fsync / tampering — NOT a
+				// torn tail — and every segment above it holds committed entries
+				// and hard state. Truncating it and discarding the higher
+				// segments would silently lose committed data and regress
+				// term/vote (two votes in one term). Fail-stop instead and let
+				// the operator restore from snapshot/peers, the same posture
+				// WALDecryptError and ErrUnknownPayloadType already take.
+				if i != len(segIDs)-1 {
+					return &RecoveryError{SegmentID: segID, Err: ErrNonFinalSegmentCorruption}
+				}
+				// Corruption in the FINAL segment is a legal torn tail: this
+				// segment's clean prefix is recovered; do NOT replay higher
+				// segments (prefix-validity rule).
 				//
 				// Repair the corrupt segment on disk FIRST by truncating it to
 				// the recovered clean end. Without this the corrupt tail is
@@ -882,6 +897,14 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 // to and including this segment is recovered; no higher segment is replayed.
 var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 
+// ErrNonFinalSegmentCorruption is returned (wrapped in a RecoveryError) when
+// recovery finds corruption in a segment that is NOT the highest-numbered one.
+// A torn tail can only exist in the final segment — a lower segment was fully
+// fdatasynced before any higher one was created and everything above it is
+// committed — so prefix-truncating it would silently destroy committed entries
+// and regress term/vote. Recovery fails-stop; restore from snapshot/peers.
+var ErrNonFinalSegmentCorruption = errors.New("waldb: corruption in a non-final WAL segment; committed data above it would be lost — restore from snapshot/peers")
+
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
 	// payloadTypeEntriesV1 is the legacy entry format (44-byte header,
@@ -1086,6 +1109,21 @@ const maxCmdLen = 8 * 1024 * 1024 // 8 MB
 // that is irrelevant because the caller fails the whole recovery.
 func (s *walShard) replayEntries(data []byte, segID uint64) error {
 	pos := 0
+	// Track the batch's node key and index span so a leader-overwrite (the
+	// first replayed index already present in the entry map) can prune the
+	// now-orphaned higher indices after the batch is stored — mirroring the
+	// write path (applyTo). idx.Append already truncates the superseded index
+	// suffix, but the entry MAP would otherwise retain indices above the
+	// overwrite's last index (memory-only, unreachable via the index-driven
+	// range) until compaction. All entries in one record share a single node
+	// key (writeEntryChunk writes one key's batch), so the first entry is
+	// representative.
+	var (
+		batchKey      nodeKey
+		batchStarted  bool
+		overwrite     bool
+		lastRaftIndex uint64
+	)
 	for pos < len(data) {
 		if len(data)-pos < entryRecordHeaderSize {
 			slog.Error("waldb: truncated entry header during replay",
@@ -1160,6 +1198,14 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 			nodeEntries = make(map[uint64]logdb.Entry)
 			s.entries[key] = nodeEntries
 		}
+		// Detect a leader-overwrite once, on the first replayed index: if it is
+		// already present the batch supersedes an earlier one at the same node.
+		if !batchStarted {
+			batchKey = key
+			_, overwrite = nodeEntries[raftIndex]
+			batchStarted = true
+		}
+		lastRaftIndex = raftIndex
 		nodeEntries[raftIndex] = logdb.Entry{
 			Index:       raftIndex,
 			Term:        term,
@@ -1172,6 +1218,18 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 		}
 
 		pos += totalSize
+	}
+	// Prune entries above the overwrite's last index. idx.Append already
+	// truncated the superseded index suffix; this keeps the entry map in sync
+	// so a stale range (e.g. entries 61-100 left after a 50-60 conflict
+	// rewrite) does not linger in memory. Runs only on an actual overwrite.
+	if overwrite {
+		nodeEntries := s.entries[batchKey]
+		for k := range nodeEntries {
+			if k > lastRaftIndex {
+				delete(nodeEntries, k)
+			}
+		}
 	}
 	return nil
 }

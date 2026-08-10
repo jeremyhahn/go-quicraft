@@ -161,7 +161,18 @@ func (dm *DiskMonitor) MaybeCheck() error {
 	}
 
 	count := dm.writeCount.Add(1)
-	if count%dm.checkEvery != 0 {
+
+	// Once check() has tripped the full state, bypass the sample throttle and
+	// re-check on EVERY call. Otherwise the next checkEvery-1 writes are
+	// admitted UNCHECKED into an already-full disk: a follower's replication
+	// writes reach here through DB.SaveState -> MaybeCheck (the host-level
+	// diskFullFlag gates only client Propose/ReadIndex), so it would keep
+	// accepting up-to-64MB batches until fdatasync hits hard ENOSPC and poisons
+	// the DB. check() keeps returning ErrDiskFull until usage drops below the
+	// threshold, and fires the recovery transition/callback on the way down —
+	// after which lastFull is false and normal throttling resumes. The extra
+	// syscall cost is confined to the already-degraded full state.
+	if count%dm.checkEvery != 0 && !dm.lastFull.Load() {
 		return nil
 	}
 
