@@ -16,6 +16,7 @@ package config
 
 import (
 	"log/slog"
+	"math"
 	"path/filepath"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -391,6 +392,17 @@ func (c *Config) validateIdentity() error {
 	}
 	if c.ReplicaID == 0 {
 		return newValidationError("ReplicaID", "must be > 0")
+	}
+	// The host packs the replica ID into the high bits of each proposal key so
+	// the key is unique across the SHARD rather than just across one host --
+	// without it every replica mints the same keys and an applied entry can
+	// complete another replica's unrelated pending request. Bounding the ID here
+	// is what keeps that packing exact instead of silently truncating. Replica
+	// IDs are small operator-assigned ordinals; four billion is far beyond any
+	// real deployment.
+	if c.ReplicaID > math.MaxUint32 {
+		return newValidationError("ReplicaID",
+			"must be <= 4294967295 (the proposal key packs the replica ID)")
 	}
 	if c.IsObserver && c.IsWitness {
 		return newValidationError("IsObserver", "IsObserver and IsWitness are mutually exclusive")

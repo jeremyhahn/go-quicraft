@@ -436,3 +436,46 @@ func TestMarkJoiningClearsWhenMembershipIsAlreadyKnown(t *testing.T) {
 		t.Fatal("a real member was rejected after the restart")
 	}
 }
+
+// TestInitialMembershipOutsideBootstrapIndexIsRefused pins the index check on
+// the founding configuration.
+//
+// Applying an EntryInitialMembership REPLACES the membership wholesale rather
+// than amending it, so one accepted at any index above bootstrap would discard
+// every config change committed since — rolling the voting set back to the
+// founding members, a configuration no live replica shares, while this replica
+// went on computing quorum over it.
+func TestInitialMembershipOutsideBootstrapIndexIsRefused(t *testing.T) {
+	// An established shard: founded as {1,2,3}, replicas 4 and 5 added since.
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, proto.Membership{
+		Addresses:      map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"},
+		ConfigChangeID: 40,
+	})
+
+	founding, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+	})
+	if err != nil {
+		t.Fatalf("BuildInitialMembershipEntry: %v", err)
+	}
+
+	// The same entry, but replicated at a later index.
+	stray := founding
+	stray.Index = 500
+	if applied := p.applyMembershipEntry(stray); applied {
+		t.Fatal("an initial-membership entry above the bootstrap index was applied")
+	}
+	for _, id := range []uint64{4, 5} {
+		if !p.membership.isMember(id) {
+			t.Fatalf("replica %d was dropped from the configuration by a stray "+
+				"initial-membership entry: this replica now computes quorum over "+
+				"the FOUNDING set, which no live replica shares (membership=%v)",
+				id, p.membership.addresses)
+		}
+	}
+
+	// At the bootstrap index it is of course still applied.
+	if applied := p.applyMembershipEntry(founding); !applied {
+		t.Fatal("the founding entry at the bootstrap index was refused")
+	}
+}

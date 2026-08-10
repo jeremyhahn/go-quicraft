@@ -2110,7 +2110,7 @@ type Host struct {
 	diskFull              *atomic.Bool // set by disk full callback in buildWALOptions
 	id                    string
 	stopOnce              sync.Once
-	proposalKeySeq        atomic.Uint64 // monotonic key generator for proposal tracking
+	proposalKeySeq        atomic.Uint64 // sequence half of the proposal key; see nextProposalKey
 	readKeySeq            atomic.Uint64 // monotonic key generator for read request tracking
 	snapshotKeySeq        atomic.Uint64 // monotonic key generator for snapshot request tracking
 	pendingOps            atomic.Int64  // tracks outstanding pending operations for drain
@@ -3813,6 +3813,34 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 // ProposeWithSession, and proposeSession. It handles rate limiting,
 // engine node validation, key generation, pending map registration,
 // delivery, and queue-full cleanup.
+// proposalKeySeqBits is the width of the sequence half of a proposal key. The
+// remaining high bits carry the proposing replica's ID.
+const proposalKeySeqBits = 32
+
+// nextProposalKey mints a proposal key that is unique across the SHARD, not just
+// across this host.
+//
+// entry.Key is how an applied entry is matched back to the pending RequestState
+// that proposed it (hostEngineCallback.OnApplied), and the entry carries the key
+// through the raft log to every replica. A per-host counter therefore collides
+// by construction: every host in the shard mints 1, 2, 3, ... so replica B, with
+// its own request pending under key 7, would complete that caller the moment it
+// applied replica A's unrelated entry that also carries key 7 -- handing B's
+// client a success and A's RESULT VALUE for an operation it never issued, while
+// B's real entry later finds no pending proposal at all.
+//
+// The replica ID is the shard-local identity that makes the key unique: it is
+// distinct for every replica in the shard by definition, so (replicaID,
+// sequence) cannot collide between hosts. The sequence occupies the low
+// proposalKeySeqBits and may wrap; that is harmless, because a key only has to
+// be unique among the proposals CURRENTLY pending on this host, and every
+// pending proposal carries a context deadline. Config validation bounds
+// ReplicaID so the two halves cannot overlap.
+func (h *Host) nextProposalKey(replicaID uint64) uint64 {
+	seq := h.proposalKeySeq.Add(1) & (1<<proposalKeySeqBits - 1)
+	return replicaID<<proposalKeySeqBits | seq
+}
+
 func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, entry proto.Entry) (*RequestState, error) {
 	// Check global rate limiter.
 	if globalRL := h.engine.GlobalRateLimiter(); globalRL != nil && globalRL.RateLimited() {
@@ -3840,7 +3868,7 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// the commit/apply pipeline. The key is set on the entry before
 	// delivery and preserved through the raft log, so the OnApplied
 	// callback can match applied entries back to pending RequestStates.
-	proposalKey := h.proposalKeySeq.Add(1)
+	proposalKey := h.nextProposalKey(ns.replicaID)
 	entry.Key = proposalKey
 
 	// Create request state with deadline from context.
@@ -7251,7 +7279,7 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		return nil, &HostInitError{Field: "config_change_marshal", Err: marshalErr}
 	}
 
-	proposalKey := h.proposalKeySeq.Add(1)
+	proposalKey := h.nextProposalKey(ns.replicaID)
 
 	deadline, _ := ctx.Deadline()
 	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)

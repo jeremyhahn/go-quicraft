@@ -622,3 +622,58 @@ func TestNewHost_ExportedTransportDisabledSkipsTransport(t *testing.T) {
 		t.Fatal("transport was created despite TransportConfig.TransportDisabled")
 	}
 }
+
+// TestProposalKeysAreUniqueAcrossTheShard pins the identity of a proposal key.
+//
+// entry.Key is how an applied entry is matched back to the pending RequestState
+// that proposed it, and the key travels through the raft log to every replica.
+// A per-host counter collides by construction: every replica minted 1, 2, 3, so
+// replica B -- with its own request pending under key 7 -- completed that caller
+// the moment it applied replica A's unrelated entry also carrying key 7. B's
+// client received a success and A's RESULT VALUE for an operation it never
+// issued, and B's real entry later found no pending proposal at all.
+func TestProposalKeysAreUniqueAcrossTheShard(t *testing.T) {
+	hostA, hostB := &Host{}, &Host{}
+	const replicaA, replicaB = uint64(1), uint64(2)
+
+	seen := map[uint64]string{}
+	for range 64 {
+		ka := hostA.nextProposalKey(replicaA)
+		kb := hostB.nextProposalKey(replicaB)
+		for id, key := range map[string]uint64{"A": ka, "B": kb} {
+			if prev, dup := seen[key]; dup {
+				t.Fatalf("replicas %s and %s both minted proposal key %d: an entry "+
+					"proposed by one completes the other's unrelated pending request",
+					prev, id, key)
+			}
+			seen[key] = id
+		}
+	}
+
+	// The replica ID must be recoverable, which is what makes the halves
+	// non-overlapping rather than merely unlikely to collide.
+	if got := hostA.nextProposalKey(replicaA) >> proposalKeySeqBits; got != replicaA {
+		t.Fatalf("replica ID half = %d, want %d", got, replicaA)
+	}
+
+	// A wrapped sequence stays within its own replica's half, so it can never
+	// collide with another replica no matter how long the host runs.
+	hostA.proposalKeySeq.Store(1<<proposalKeySeqBits - 1)
+	wrapped := hostA.nextProposalKey(replicaA)
+	if got := wrapped >> proposalKeySeqBits; got != replicaA {
+		t.Fatalf("a wrapped sequence escaped its replica's half: key %d has replica "+
+			"half %d, want %d", wrapped, got, replicaA)
+	}
+}
+
+// TestConfigRejectsReplicaIDThatWouldTruncateTheProposalKey pins the bound that
+// keeps the packing exact. Without it a replica ID above 2^32 would silently
+// overlap the sequence half and reintroduce the collision.
+func TestConfigRejectsReplicaIDThatWouldTruncateTheProposalKey(t *testing.T) {
+	cfg := testShardConfig(1, 1)
+	cfg.ReplicaID = 1 << 32
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a ReplicaID that overlaps the proposal key's sequence half was " +
+			"accepted: its keys silently collide with another replica's")
+	}
+}

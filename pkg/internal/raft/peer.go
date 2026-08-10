@@ -87,6 +87,19 @@ type Peer struct {
 	// leadership change, and the raft struct is not thread-safe.
 	term atomic.Uint64
 
+	// leaderSeq makes leaderID and term readable as a CONSISTENT PAIR via
+	// LeaderAndTerm. They are two independent words, so a reader that loads them
+	// separately can observe a (leaderID, term) combination that never existed —
+	// syncLeaderID may land between the two loads. Reporting such a pair through
+	// OnLeaderUpdated tells a listener that a replica led in a term it never led.
+	//
+	// This is a seqlock: syncLeaderID (the only writer, always serialised by
+	// raftMu) makes the counter ODD for the duration of the update and EVEN once
+	// the pair is settled, so a reader that sees the same even value before and
+	// after its loads knows no write interleaved. Writers never block; readers
+	// retry, and the write window is two stores.
+	leaderSeq atomic.Uint64
+
 	// shardID and replicaID identify this peer. Cached from cfg for
 	// fast access without going through raft.
 	shardID   uint64
@@ -787,6 +800,24 @@ func (p *Peer) checkLeaderSelfRemoval() {
 func (p *Peer) applyMembershipEntry(e proto.Entry) bool {
 	switch e.Type & proto.EntryTypeMask {
 	case proto.EntryInitialMembership:
+		// The founding configuration is defined to live at exactly
+		// BootstrapMembershipIndex. Applying one anywhere else would REPLACE the
+		// membership wholesale — discarding every config change committed since
+		// bootstrap and rolling the voting set back to the founding members,
+		// which is a configuration no live replica shares. Only index 1 can
+		// legitimately carry it, so anything else is malformed and is refused.
+		//
+		// The refusal is a pure function of the entry's index, so every replica
+		// reaches the identical decision and the membership cannot diverge.
+		if e.Index != BootstrapMembershipIndex {
+			slog.Error("refusing initial-membership entry outside the bootstrap index",
+				"shard_id", p.shardID,
+				"replica_id", p.replicaID,
+				"entry_index", e.Index,
+				"bootstrap_index", BootstrapMembershipIndex,
+			)
+			return false
+		}
 		ms, err := initialMembershipFromEntry(e)
 		if err != nil {
 			slog.Error("initial membership entry unmarshal failed",
@@ -1544,8 +1575,33 @@ func (p *Peer) LogMarkers() (committed, processed uint64) {
 // but the atomic leaderID on Peer provides safe concurrent reads for
 // LeaderID() and IsLeader().
 func (p *Peer) syncLeaderID() {
+	// Odd for the duration of the update, even once settled: see leaderSeq.
+	p.leaderSeq.Add(1)
 	p.leaderID.Store(p.r.leaderID)
 	p.term.Store(p.r.term)
+	p.leaderSeq.Add(1)
+}
+
+// LeaderAndTerm returns the leader ID and the term TOGETHER, as a pair that
+// actually co-existed. Callers that report both — OnLeaderUpdated and anything
+// deriving a leadership event — must use this rather than LeaderID() and Term()
+// separately, which can straddle a syncLeaderID and yield a combination that
+// never held.
+//
+// Safe for concurrent access from any goroutine.
+func (p *Peer) LeaderAndTerm() (uint64, uint64) {
+	for {
+		before := p.leaderSeq.Load()
+		if before&1 != 0 {
+			// A write is in flight; its window is two stores.
+			continue
+		}
+		leaderID := p.leaderID.Load()
+		term := p.term.Load()
+		if p.leaderSeq.Load() == before {
+			return leaderID, term
+		}
+	}
 }
 
 // Term returns the current raft term. Safe for concurrent access; kept in

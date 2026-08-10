@@ -698,25 +698,20 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 // publish anything. The result was a real Raft leader that the public API
 // reported as a follower, and a stepped-down node that kept reporting itself
 // leader — clients route writes by exactly this flag.
-// KNOWN RESIDUAL: LeaderID() and Term() are two independent atomics, synced
-// together by Peer.syncLeaderID but read separately here, so a concurrent
-// Peer.Commit landing between the two loads can produce a (leaderID, term) pair
-// that never co-existed. All three publish sites now run outside raftMu, so all
-// three share this. The consequence is confined to the TERM reported through
-// OnLeaderUpdated (GetShardInfo/EventListener); routing decisions read leaderID
-// alone, and leaderID itself is never torn. Closing it needs a seqlock or a
-// packed value on syncLeaderID, which is on the per-message hot path — a
-// deliberate deferral, not an oversight.
+// The leader and term are read as a PAIR (Peer.LeaderAndTerm). All three publish
+// sites run outside raftMu, so reading the two mirrors separately could report a
+// combination that never co-existed — telling a listener a replica led in a term
+// it never led.
 func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 	if w.callback == nil || node.peer == nil {
 		return
 	}
-	currentLeader := node.peer.LeaderID()
+	currentLeader, term := node.peer.LeaderAndTerm()
 	if currentLeader == w.prevLeaders[shardID] {
 		return
 	}
 	w.prevLeaders[shardID] = currentLeader
-	w.callback.OnLeaderUpdated(shardID, currentLeader, node.peer.Term())
+	w.callback.OnLeaderUpdated(shardID, currentLeader, term)
 }
 
 // processCallbacks detects leader changes, delivers ReadyToRead notifications,

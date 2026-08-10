@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -5351,4 +5353,55 @@ func TestPeer_ValidateConfigChange_Valid(t *testing.T) {
 	if err := p.ValidateConfigChange(cc); err != nil {
 		t.Fatalf("ValidateConfigChange(valid add) = %v, want nil", err)
 	}
+}
+
+// TestLeaderAndTermIsAConsistentPair pins that the leader and term are readable
+// together as a combination that actually held.
+//
+// They are two independent atomic words. A reader loading them separately can
+// straddle a syncLeaderID and observe a (leaderID, term) pair that never
+// existed, which reported through OnLeaderUpdated tells a listener that a
+// replica led in a term it never led. The seqlock on syncLeaderID is what makes
+// the pair atomic.
+func TestLeaderAndTermIsAConsistentPair(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
+
+	// Every leadership change advances BOTH fields together: leader N holds
+	// term N here, so any mismatch is a torn read.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := uint64(1); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.r.leaderID = i
+			p.r.term = i
+			p.syncLeaderID()
+		}
+	}()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var reads int
+	for time.Now().Before(deadline) {
+		leaderID, term := p.LeaderAndTerm()
+		reads++
+		if leaderID != term {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("torn read: leader=%d with term=%d, a pair that never "+
+				"co-existed (every update sets both to the same value)",
+				leaderID, term)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if reads == 0 {
+		t.Fatal("fixture: no reads were performed")
+	}
+	t.Logf("%d consistent pair reads under a concurrent writer", reads)
 }

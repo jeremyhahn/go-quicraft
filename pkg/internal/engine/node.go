@@ -707,6 +707,15 @@ func (n *Node) IsMember(replicaID uint64) bool {
 	return n.peer.IsMember(replicaID)
 }
 
+// LeaderAndTerm returns the leader ID and term as a consistent pair. Use this,
+// not LeaderID() and Term() separately, whenever both are reported together.
+func (n *Node) LeaderAndTerm() (uint64, uint64) {
+	if n.peer == nil {
+		return 0, 0
+	}
+	return n.peer.LeaderAndTerm()
+}
+
 // IsJoining reports whether this node's own configuration is known-incomplete
 // (started with join=true and not yet caught up to the entries naming the
 // shard). Used by the transport handler to decide whether first-contact address
