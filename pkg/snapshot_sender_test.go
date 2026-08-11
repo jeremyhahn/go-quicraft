@@ -765,7 +765,7 @@ func writeEncryptedSnapshotFileFor(t *testing.T, b Barrier, path string, plainte
 	const chunkSize = 64 * 1024
 	offset := 0
 	var frameBuf [4]byte
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, b.IsHardwareMode())
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, b)
 	var seq uint64
 	for offset < len(plaintext) {
 		end := offset + chunkSize

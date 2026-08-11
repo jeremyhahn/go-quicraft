@@ -103,6 +103,9 @@ func (b *tenantBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) (
 // seal.Barrier it stands in for.
 func (b *tenantBarrier) IsHardwareMode() bool { return false }
 
+// SupportsContextAAD is true: this barrier authenticates the caller context.
+func (b *tenantBarrier) SupportsContextAAD() bool { return true }
+
 func (b *tenantBarrier) Decrypt(_, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < 9 {
 		return nil, errors.New("ciphertext too short")

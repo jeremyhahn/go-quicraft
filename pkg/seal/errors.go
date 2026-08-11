@@ -146,6 +146,17 @@ var (
 	// hardware encryptor that manages its own key material.
 	ErrHardwareMode = errors.New("quicraft/seal: operation not supported in hardware encryptor mode")
 
+	// ErrContextAADUnsupported is returned by Initialize and Unseal when
+	// BarrierConfig.RequireContextAAD is set but the constructed barrier cannot
+	// authenticate a caller-supplied context: either the strategy delegates to
+	// an encryptor that does not implement AADSymmetricEncrypter, or the
+	// strategy is StrategyNone, which performs no encryption at all and
+	// therefore has no AEAD that could bind a position. The barrier fails closed
+	// at setup rather than on the first context-bearing write.
+	ErrContextAADUnsupported = errors.New(
+		"quicraft/seal: barrier cannot authenticate caller context but RequireContextAAD is set " +
+			"(delegated encryptor does not implement AADSymmetricEncrypter, or no-encryption mode is selected)")
+
 	// ErrShamirThresholdInvalid is returned when the Shamir threshold is
 	// less than 2 or greater than the total number of shares.
 	ErrShamirThresholdInvalid = errors.New("quicraft/seal: shamir threshold must be >= 2 and <= total shares")

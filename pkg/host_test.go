@@ -358,6 +358,9 @@ func (b *mockBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]
 // seal.Barrier it stands in for.
 func (b *mockBarrier) IsHardwareMode() bool { return false }
 
+// SupportsContextAAD is true: the mock authenticates the caller context.
+func (b *mockBarrier) SupportsContextAAD() bool { return true }
+
 func (b *mockBarrier) Rotate() (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -3007,7 +3010,8 @@ func (b *errorBarrier) DecryptWithContext(_, _, _ []byte) ([]byte, error) {
 	return nil, ErrBarrierSealed
 }
 
-func (b *errorBarrier) IsHardwareMode() bool { return false }
+func (b *errorBarrier) IsHardwareMode() bool     { return false }
+func (b *errorBarrier) SupportsContextAAD() bool { return true }
 
 func (b *errorBarrier) Rotate() (uint64, error)               { return 0, ErrBarrierSealed }
 func (b *errorBarrier) PurgeEpochsBefore(uint64) (int, error) { return 0, ErrBarrierSealed }
@@ -6197,6 +6201,9 @@ func (b *testHostBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte)
 }
 
 func (b *testHostBarrier) IsHardwareMode() bool { return false }
+
+// SupportsContextAAD is true: the fake authenticates the caller context.
+func (b *testHostBarrier) SupportsContextAAD() bool { return true }
 
 func (b *testHostBarrier) Rotate() (uint64, error) {
 	b.mu.Lock()
@@ -20209,7 +20216,7 @@ func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 
 	// Both frames carry the positional context the decrypt side reproduces;
 	// only the EPOCH differs between them, which is the property under test.
-	aad := engine.NewSnapshotAAD(testSnapShardID, testSnapReplicaID, testSnapIndex, false)
+	aad := engine.NewSnapshotAAD(testSnapShardID, testSnapReplicaID, testSnapIndex, barrier)
 	p1 := []byte("frame-one-sealed-before-rotation")
 	c1, e1, err := barrier.EncryptWithEpochContext(nil, p1, aad.Frame(0))
 	if err != nil {

@@ -134,7 +134,40 @@ type NonceTrackerProvider interface {
 // encryption to hardware (keys never leave the hardware boundary).
 // Software strategies return nil from BarrierEncryptor(), causing the barrier
 // to use its own epoch-based HKDF DEK encryption.
+//
+// The signature carries no AAD, so a delegated encryptor that implements only
+// this interface cannot authenticate the caller's positional context. Implement
+// AADSymmetricEncrypter as well to declare that capability.
 type SymmetricEncrypter interface {
 	Encrypt(plaintext []byte) ([]byte, error)
 	Decrypt(ciphertext []byte) ([]byte, error)
+}
+
+// AADSymmetricEncrypter is the OPTIONAL capability a delegated (hardware,
+// KMS, enclave) encryptor implements to DECLARE that it authenticates
+// caller-supplied additional authenticated data end to end.
+//
+// A barrier in delegated mode bypasses its own AEAD entirely, so the positional
+// binding the software path folds into the AAD (a snapshot frame's
+// shard/replica/index/ordinal, a WAL record's shard/segment/ordinal) exists only
+// if the delegated encryptor carries it. Implementing this interface is that
+// promise: the aad bytes passed to EncryptWithAAD MUST be authenticated such
+// that DecryptWithAAD fails when a different aad is supplied at decrypt time.
+//
+// DO NOT implement this interface on an encryptor that merely ACCEPTS an aad
+// argument and drops it. Advertising a binding that does not exist is strictly
+// worse than not advertising one: the barrier reports SupportsContextAAD, every
+// caller stops suppressing its context, RequireContextAAD passes at startup, and
+// the deployment believes it has splice/reorder protection it does not have. An
+// encryptor that cannot bind AAD must implement only SymmetricEncrypter, which
+// makes the barrier refuse non-empty contexts with ErrHardwareMode.
+type AADSymmetricEncrypter interface {
+	SymmetricEncrypter
+
+	// EncryptWithAAD seals plaintext, authenticating aad without storing it.
+	EncryptWithAAD(plaintext, aad []byte) ([]byte, error)
+
+	// DecryptWithAAD opens a ciphertext sealed under the same aad. A different
+	// aad — or none where one was present — must fail authentication.
+	DecryptWithAAD(ciphertext, aad []byte) ([]byte, error)
 }

@@ -137,7 +137,12 @@ const (
 // Hardware mode: When a SealingStrategy provides a BarrierEncryptor, the barrier
 // delegates all encryption/decryption to the hardware-backed encryptor and skips
 // epoch-based DEK derivation. In this mode, Rotate and PurgeEpochsBefore return
-// ErrHardwareMode.
+// ErrHardwareMode. Delegation is total: the epoch DEK/header, the nonce-reuse
+// tracker and the NIST SP 800-38D invocation counter are all bypassed because
+// the delegated encryptor owns its own key and nonce management (see the
+// hwEncryptor field). A caller-supplied context is authenticated only when that
+// encryptor implements AADSymmetricEncrypter; see ContextBinding,
+// SupportsContextAAD and BarrierConfig.RequireContextAAD.
 //
 // Concurrency: Encrypt and Decrypt use a two-phase fast path:
 //  1. Atomic check of b.unsealed (no contention).
@@ -174,10 +179,40 @@ type Barrier struct {
 	// the barrier can be re-sealed without requiring the strategy.
 	sealed *SealedRootKey
 
-	// hwEncryptor is non-nil when a hardware-backed strategy provides its
-	// own symmetric encryptor. In this mode, the barrier delegates all
-	// encrypt/decrypt operations to the hardware and skips DEK derivation.
+	// hwEncryptor is non-nil when a strategy provides its own symmetric
+	// encryptor. In this mode, the barrier delegates all encrypt/decrypt
+	// operations to that encryptor and skips DEK derivation.
+	//
+	// EVERY encrypt/decrypt path returns early here, so delegated mode bypasses
+	// more than the cipher. It also bypasses, by design and not by accident:
+	//
+	//   - epoch DEK derivation and the [epoch:8][algID:1] ciphertext header;
+	//   - the nonce-reuse tracker (NonceTrackerProvider);
+	//   - the NIST SP 800-38D invocation counter (InvocationCounter);
+	//   - the epoch AAD, unless the encryptor implements AADSymmetricEncrypter.
+	//
+	// The delegated encryptor owns its own key and nonce management, so
+	// duplicating those safeguards here would count invocations against a key
+	// the barrier does not control. This is stated rather than changed;
+	// logDelegatedMode reports it at WARN at every barrier setup.
+	//
+	// Caller context is carried through only when the encryptor implements
+	// AADSymmetricEncrypter; otherwise the *Context methods fail closed with
+	// ErrHardwareMode. See ContextBinding.
 	hwEncryptor SymmetricEncrypter
+
+	// plaintextMode records that the installed hwEncryptor belongs to
+	// StrategyNone, whose "encryptor" is an identity pass-through. It separates
+	// "nothing is encrypted, so there is nothing to bind" from "an encryptor is
+	// protecting this data but cannot bind it" — two states IsHardwareMode
+	// reports identically. Set at Initialize/Unseal, cleared by seal().
+	plaintextMode bool
+
+	// strategyID and strategyHardwareBacked record the identity of the strategy
+	// that produced the current encryptor, for the delegated-mode warning and
+	// for operator-facing diagnostics. Set at Initialize/Unseal.
+	strategyID             StrategyID
+	strategyHardwareBacked bool
 
 	// aeadProvider creates cipher.AEAD instances for each epoch's DEK. Defaults
 	// to SoftwareAEADProvider; may be replaced with a hardware-backed provider
@@ -365,6 +400,22 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 		return hwErr
 	}
 
+	// Resolve the context-binding capability BEFORE any state transition, so a
+	// deployment that requires positional binding is refused at setup rather
+	// than on its first context-bearing write.
+	binding := contextBindingFor(hwEnc, strategy.ID() == StrategyNone)
+	if err := b.checkContextAADPolicy(binding); err != nil {
+		wipeBytes(rootKey)
+		return err
+	}
+	b.strategyID = strategy.ID()
+	b.strategyHardwareBacked = strategy.HardwareBacked()
+	// Derived from the binding, not from the strategy ID alone: a strategy that
+	// names itself "none" but supplies no encryptor takes the real epoch-AEAD
+	// path, and reporting it as plaintext would be a lie in the direction that
+	// hides an actual capability.
+	b.plaintextMode = binding == ContextBindingPlaintext
+
 	if hwEnc != nil {
 		// Hardware mode: skip DEK derivation, use hardware encryptor.
 		b.hwEncryptor = hwEnc
@@ -375,7 +426,8 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 		b.sealed = sealed
 		b.state = barrierUnsealed
 		b.unsealed.Store(true)
-		slog.Info("barrier initialized (hardware mode)", "epoch", initialEpoch)
+		b.logDelegatedMode("initialize", binding)
+		slog.Info("barrier initialized (hardware mode)", "epoch", initialEpoch, "context_binding", binding.String())
 		return nil
 	}
 
@@ -488,6 +540,15 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		if hwEnc == nil {
 			return ErrNoBarrierEncryptor
 		}
+		// No-encryption mode can never satisfy a demand for authenticated
+		// positional binding: there is no AEAD to bind anything to.
+		binding := contextBindingFor(hwEnc, true)
+		if err := b.checkContextAADPolicy(binding); err != nil {
+			return err
+		}
+		b.strategyID = strategy.ID()
+		b.strategyHardwareBacked = strategy.HardwareBacked()
+		b.plaintextMode = true
 		b.hwEncryptor = hwEnc
 		// Mirror Initialize's epoch assignment so CurrentEpoch() is symmetric
 		// across Initialize and restart-via-Unseal. The value is cosmetic in
@@ -501,7 +562,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		b.failedAttempts = 0
 		b.lastFailedAt = time.Time{}
 		b.persistBackoffState()
-		slog.Info("barrier unsealed (no-encryption mode)")
+		b.logDelegatedMode("unseal", binding)
+		slog.Info("barrier unsealed (no-encryption mode)", "context_binding", binding.String())
 		return nil
 	}
 
@@ -520,6 +582,17 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		return hwErr
 	}
 
+	// Resolve the context-binding capability BEFORE any state transition; a
+	// deployment that requires positional binding must be refused at setup.
+	binding := contextBindingFor(hwEnc, false)
+	if err := b.checkContextAADPolicy(binding); err != nil {
+		wipeBytes(rootKey)
+		return err
+	}
+	b.strategyID = strategy.ID()
+	b.strategyHardwareBacked = strategy.HardwareBacked()
+	b.plaintextMode = false
+
 	if hwEnc != nil {
 		// Hardware mode: skip DEK re-derivation, use hardware encryptor.
 		b.hwEncryptor = hwEnc
@@ -529,7 +602,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		b.failedAttempts = 0
 		b.lastFailedAt = time.Time{}
 		b.persistBackoffState()
-		slog.Info("barrier unsealed (hardware mode)", "epoch", b.epoch)
+		b.logDelegatedMode("unseal", binding)
+		slog.Info("barrier unsealed (hardware mode)", "epoch", b.epoch, "context_binding", binding.String())
 		return nil
 	}
 
@@ -692,6 +766,11 @@ func (b *Barrier) seal() error {
 	// limitation (GC-bounded) and is the only key material not wiped here.
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.hwEncryptor = nil
+	// The encryptor is gone, so the capability it carried is gone with it. A
+	// subsequent Unseal re-derives all three from the strategy it is given.
+	b.plaintextMode = false
+	b.strategyID = ""
+	b.strategyHardwareBacked = false
 	b.state = barrierSealed
 	b.unsealed.Store(false)
 
@@ -839,10 +918,12 @@ func (b *Barrier) EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64,
 // Positional binding is opt-in: it exists ONLY when the caller passes a context.
 // The wire format is unchanged; see Encrypt for dst/overlap requirements.
 //
-// Hardware mode does not support context-AAD (the hardware encryptor takes no
-// AAD): a non-empty context returns ErrHardwareMode rather than silently dropping
-// the binding, so a caller never believes it has positional protection it lacks.
-// A nil/empty context is delegated to the hardware encryptor unchanged.
+// In delegated (hardware) mode the context is carried through to the encryptor
+// when it implements AADSymmetricEncrypter, using the same [epoch][context] AAD
+// the software path builds. An encryptor WITHOUT that capability takes no AAD at
+// all, so a non-empty context returns ErrHardwareMode rather than silently
+// dropping the binding — a caller never believes it has positional protection it
+// lacks. A nil/empty context is delegated to the encryptor unchanged.
 func (b *Barrier) EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error) {
 	if !b.unsealed.Load() {
 		return nil, ErrBarrierSealed
@@ -856,10 +937,7 @@ func (b *Barrier) EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte,
 	}
 
 	if b.hwEncryptor != nil {
-		if len(contextAAD) != 0 {
-			return nil, ErrHardwareMode
-		}
-		return b.hwEncryptor.Encrypt(plaintext)
+		return b.delegatedEncrypt(plaintext, contextAAD)
 	}
 
 	return b.encryptLocked(dst, plaintext, b.epoch, b.cipher, contextAAD)
@@ -883,10 +961,7 @@ func (b *Barrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]
 	}
 
 	if b.hwEncryptor != nil {
-		if len(contextAAD) != 0 {
-			return nil, 0, ErrHardwareMode
-		}
-		ct, err := b.hwEncryptor.Encrypt(plaintext)
+		ct, err := b.delegatedEncrypt(plaintext, contextAAD)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -919,10 +994,7 @@ func (b *Barrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byt
 	}
 
 	if b.hwEncryptor != nil {
-		if len(contextAAD) != 0 {
-			return nil, 0, ErrHardwareMode
-		}
-		ct, err := b.hwEncryptor.Encrypt(plaintext)
+		ct, err := b.delegatedEncrypt(plaintext, contextAAD)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1144,8 +1216,11 @@ func (b *Barrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte,
 // reproduces the epoch-only AAD, so ciphertext produced by Encrypt decrypts
 // unchanged.
 //
-// Hardware mode does not support context-AAD: a non-empty context returns
-// ErrHardwareMode; a nil/empty context is delegated to the hardware encryptor.
+// In delegated (hardware) mode the context is carried through to an encryptor
+// that implements AADSymmetricEncrypter, under the current epoch's AAD (see
+// delegatedDecrypt). An encryptor without that capability returns
+// ErrHardwareMode for a non-empty context; a nil/empty context is delegated
+// unchanged.
 func (b *Barrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
 	if !b.unsealed.Load() {
 		return nil, ErrBarrierSealed
@@ -1159,10 +1234,7 @@ func (b *Barrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte
 	}
 
 	if b.hwEncryptor != nil {
-		if len(contextAAD) != 0 {
-			return nil, ErrHardwareMode
-		}
-		return b.hwEncryptor.Decrypt(ciphertext)
+		return b.delegatedDecrypt(ciphertext, contextAAD, b.epoch)
 	}
 
 	// Minimum: epoch(8) + algID(1) + smallest nonce(12) + tag(16) = 37
@@ -1199,10 +1271,7 @@ func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, c
 	}
 
 	if b.hwEncryptor != nil {
-		if len(contextAAD) != 0 {
-			return nil, ErrHardwareMode
-		}
-		return b.hwEncryptor.Decrypt(ciphertext)
+		return b.delegatedDecrypt(ciphertext, contextAAD, epoch)
 	}
 
 	// Minimum: epoch(8) + algID(1) + smallest nonce(12) + tag(16) = 37
@@ -1574,8 +1643,15 @@ func (b *Barrier) IsInitialized() bool {
 	return b.state != barrierUninitialized
 }
 
-// IsHardwareMode returns true if the barrier is using a hardware-backed
-// encryptor for all encrypt/decrypt operations.
+// IsHardwareMode returns true if the barrier is using a delegated encryptor for
+// all encrypt/decrypt operations.
+//
+// It is deliberately COARSE and is kept as-is for compatibility: it is also true
+// for no-encryption mode (StrategyNone installs an identity pass-through
+// encryptor) and it says nothing about whether that encryptor can authenticate a
+// caller-supplied context. Use SupportsContextAAD to decide whether to pass a
+// positional context, IsPlaintextMode to tell no-encryption apart from real
+// delegation, and ContextBinding for the full classification.
 func (b *Barrier) IsHardwareMode() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

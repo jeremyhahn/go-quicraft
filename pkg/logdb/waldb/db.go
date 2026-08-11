@@ -114,8 +114,27 @@ type walContextBarrier interface {
 	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
 
 	// IsHardwareMode reports whether the barrier delegates to a hardware-backed
-	// encryptor, which takes no AAD at all.
+	// encryptor. It says nothing about whether that encryptor carries AAD;
+	// SupportsContextAAD is the question the WAL actually needs answered.
 	IsHardwareMode() bool
+
+	// SupportsContextAAD reports whether the barrier can ACTUALLY authenticate
+	// the per-record context. It is true for a software barrier and for a
+	// delegated encryptor that carries AAD end to end; false for a delegated
+	// encryptor that cannot, and in no-encryption mode. Records are bound to
+	// their (shard, segment, ordinal) position exactly when it is true.
+	SupportsContextAAD() bool
+}
+
+// plaintextModeReporter is an OPTIONAL capability a barrier may implement to
+// distinguish the two reasons it cannot bind a record's position:
+// no-encryption mode, where there is no AEAD and so nothing a position could be
+// bound to, versus a delegated encryptor that IS protecting the records but
+// cannot authenticate where they belong. Only the second is a security
+// limitation; only the Open-time warning differs. A barrier that does not
+// implement this is reported as the latter, the conservative reading.
+type plaintextModeReporter interface {
+	IsPlaintextMode() bool
 }
 
 // maxCiphertextExpansion is the largest number of bytes the seal barrier's
@@ -133,6 +152,14 @@ type walContextBarrier interface {
 // Over-estimating is safe by construction: segment.CanFit is monotonic in the
 // length it is given, so a slightly generous bound can only rotate a segment a
 // few bytes early, never overflow one.
+//
+// DELEGATED BARRIERS: an encryptor that owns its own envelope (hardware, KMS)
+// is not bound by this figure. Under-estimating it cannot corrupt anything —
+// a record that no longer fits its reserved landing fails closed with
+// ErrLandingSegmentOverflow rather than being written at a position its
+// context-AAD does not name — but a delegated encryptor whose envelope exceeds
+// this bound will surface as that error on records near a segment boundary.
+// Such an encryptor should be paired with a segment size that leaves headroom.
 const maxCiphertextExpansion = 8 + 1 + 24 + 16
 
 // LogDBMetrics is the metrics interface consumed by the WAL DB for write
@@ -334,12 +361,13 @@ type walShard struct {
 	// exactly when barrier is nil; openWALShard fails closed otherwise.
 	sealer walContextBarrier
 
-	// hwMode records that the barrier delegates to a hardware encryptor, which
-	// accepts no AAD. Records are then bound to their epoch only. It is a
-	// DEPLOYMENT-time capability limitation decided once at open and logged
-	// once — never a per-record decision, and never entered because a decrypt
-	// failed.
-	hwMode bool
+	// noContextBinding records that the configured barrier cannot authenticate
+	// a caller context — a delegated encryptor without that capability, or
+	// no-encryption mode — so records are sealed and opened with no context.
+	// It is a DEPLOYMENT-time capability limitation resolved once at open and
+	// logged once: never a per-record decision, and never entered because a
+	// decrypt failed.
+	noContextBinding bool
 
 	// ctxBuf is the reusable scratch buffer for walRecordContext, so building a
 	// record's context-AAD allocates nothing on the write hot path. The write
@@ -491,13 +519,21 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		if !ok {
 			return nil, ErrBarrierContextUnsupported
 		}
-		if cb.IsHardwareMode() {
-			slog.Warn("waldb: barrier is in hardware mode; WAL records are bound "+
-				"to their epoch only, not to their segment and position. An "+
-				"at-rest attacker with write access can reorder or splice "+
-				"same-epoch records undetected.",
-				"dir", dir,
-			)
+		if !cb.SupportsContextAAD() {
+			if pm, isPlain := cb.(plaintextModeReporter); isPlain && pm.IsPlaintextMode() {
+				slog.Warn("waldb: barrier performs no encryption (plaintext mode); "+
+					"WAL records carry no positional binding because there is no "+
+					"authentication to bind it to.",
+					"dir", dir,
+				)
+			} else {
+				slog.Warn("waldb: barrier cannot authenticate caller context; WAL "+
+					"records are bound to their epoch only, not to their segment and "+
+					"position. An at-rest attacker with write access can reorder or "+
+					"splice same-epoch records undetected.",
+					"dir", dir,
+				)
+			}
 		}
 	}
 
@@ -590,7 +626,7 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 			return nil, ErrBarrierContextUnsupported
 		}
 		s.sealer = cb
-		s.hwMode = cb.IsHardwareMode()
+		s.noContextBinding = !cb.SupportsContextAAD()
 	}
 
 	// If the directory exists, recover any existing data. ONLY ErrNotExist may
@@ -963,12 +999,12 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 			// authentication failure — fatal, as an undecryptable record
 			// always has been.
 			//
-			// hwMode mirrors the write side exactly: the hardware encryptor
-			// takes no AAD, so those records were sealed with no context and
-			// must be opened with none. That is the SAME open-time decision the
+			// noContextBinding mirrors the write side exactly: a barrier that
+			// cannot authenticate a context sealed these records with none and
+			// must open them with none. That is the SAME open-time decision the
 			// writer made, not a reaction to a failure.
 			var contextAAD []byte
-			if !s.hwMode {
+			if !s.noContextBinding {
 				contextAAD = s.recordContext(segID, uint64(i))
 			}
 			decrypted, derr := s.sealer.DecryptWithContext(nil, rec, contextAAD)
@@ -2133,11 +2169,12 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	var writeEpoch uint64
 	var positional bool
 	if s.barrier != nil {
-		// In hardware mode the encryptor takes no AAD at all, so the record is
-		// bound to its epoch only. That is decided once at open (see hwMode),
-		// never per record and never because something failed.
+		// A barrier that cannot authenticate a caller context seals the record
+		// with none, keeping only whatever binding it applies on its own. That
+		// is decided once at open (see noContextBinding), never per record and
+		// never because something failed.
 		var contextAAD []byte
-		if !s.hwMode {
+		if !s.noContextBinding {
 			contextAAD = s.recordContext(s.activeSegmentID, s.activeSegment.RecordCount())
 			positional = true
 		}

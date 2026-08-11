@@ -650,6 +650,10 @@ func TestSealBarrierSatisfiesContextCapability(t *testing.T) {
 	if barrier.IsHardwareMode() {
 		t.Fatal("software test barrier reports hardware mode")
 	}
+	if !barrier.SupportsContextAAD() {
+		t.Fatal("software test barrier reports it cannot bind caller context; " +
+			"every WAL record would be written without positional binding")
+	}
 }
 
 // newBenchBarrier is newTestBarrier for a benchmark: a real seal.Barrier with
