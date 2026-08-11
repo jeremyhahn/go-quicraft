@@ -108,11 +108,18 @@ type Barrier interface {
 	// DecryptForEpoch decrypts ciphertext using a specific epoch's DEK.
 	DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
 
-	// IsHardwareMode reports whether the barrier delegates sealing to a
-	// hardware encryptor. Such a barrier cannot bind caller context at all, so
-	// snapshot frames it seals carry the epoch binding only — a documented
-	// capability limitation of hardware sealing, fixed by the deployment.
+	// IsHardwareMode reports whether the barrier delegates sealing to an
+	// external encryptor. It says nothing about whether that encryptor can
+	// authenticate caller context — use SupportsContextAAD for that.
 	IsHardwareMode() bool
+
+	// SupportsContextAAD reports whether the barrier can ACTUALLY authenticate
+	// the caller context snapshot frames are bound to: true for a software
+	// barrier and for a delegated encryptor that carries AAD end to end, false
+	// for a delegated encryptor that cannot and in no-encryption mode. When it
+	// is false, frames carry only the barrier's own binding — a capability
+	// limitation of the deployment's barrier, never a per-artifact choice.
+	SupportsContextAAD() bool
 
 	// Rotate increments the epoch, derives a new DEK, and installs it
 	// as the current cipher. Returns the new epoch number.
@@ -864,7 +871,7 @@ func encryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 	pins := newEpochPinner(barrier)
 	// One builder for the whole artifact; Frame reuses its scratch buffer, so
 	// the AAD costs no per-frame allocation on this bulk path.
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier)
 	var seq uint64
 	for {
 		n, readErr := src.Read(chunkBuf)
@@ -1014,7 +1021,7 @@ func decryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, error) {
 	var frameLenBuf [4]byte
 	var totalSize uint64
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier)
 	var seq uint64
 	for {
 		_, readErr := io.ReadFull(src, frameLenBuf[:])

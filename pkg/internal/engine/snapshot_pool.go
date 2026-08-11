@@ -68,11 +68,18 @@ type SnapshotBarrier interface {
 	// DecryptForEpoch decrypts ciphertext using the DEK for the given epoch.
 	DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
 
-	// IsHardwareMode reports whether the barrier delegates sealing to a
-	// hardware encryptor, which cannot accept caller context at all. Snapshot
-	// frames sealed by such a barrier carry the epoch binding only; see
-	// NewSnapshotAAD.
+	// IsHardwareMode reports whether the barrier delegates sealing to an
+	// external encryptor. It says nothing about whether that encryptor can
+	// authenticate caller context — use SupportsContextAAD for that.
 	IsHardwareMode() bool
+
+	// SupportsContextAAD reports whether the barrier can ACTUALLY authenticate
+	// the caller context snapshot frames are bound to. It is true for a
+	// software barrier and for a delegated encryptor that carries AAD end to
+	// end; false for a delegated encryptor that cannot, and in no-encryption
+	// mode. Frames are bound to their position exactly when it is true; see
+	// NewSnapshotAAD.
+	SupportsContextAAD() bool
 
 	// CurrentEpoch returns the current key rotation epoch.
 	CurrentEpoch() uint64
@@ -1517,7 +1524,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string, shardID, replicaID, inde
 	}
 	// One builder for the whole artifact; Frame stamps the ordinal into its
 	// reused scratch buffer, so the AAD costs no per-frame allocation.
-	aad := NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	aad := NewSnapshotAAD(shardID, replicaID, index, barrier)
 	var seq uint64
 	for {
 		n, readErr := srcFile.Read(chunkBuf)
@@ -1644,7 +1651,7 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, shardID, replicaID,
 	var frameLenBuf [4]byte
 	// Frames are read strictly sequentially from offset 0, so the ordinal the
 	// encrypt loop stamped into each frame's context is simply the count.
-	aad := NewSnapshotAAD(shardID, replicaID, index, barrier.IsHardwareMode())
+	aad := NewSnapshotAAD(shardID, replicaID, index, barrier)
 	var seq uint64
 	for {
 		_, readErr := io.ReadFull(srcFile, frameLenBuf[:])

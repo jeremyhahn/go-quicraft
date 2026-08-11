@@ -112,6 +112,36 @@ type BarrierConfig struct {
 	// AEADProvider allows injection of a custom cipher.AEAD factory.
 	// Nil = default SoftwareAEADProvider.
 	AEADProvider AEADProvider
+
+	// RequireContextAAD declares that this deployment REQUIRES positional
+	// binding of at-rest ciphertext: every frame the embedder seals with a
+	// caller context (a snapshot frame's shard/replica/index/ordinal, a WAL
+	// record's shard/segment/ordinal) must have that context authenticated, so
+	// a same-epoch frame cannot be moved, spliced, or truncated undetected.
+	//
+	// When true, Initialize and Unseal FAIL CLOSED with ErrContextAADUnsupported
+	// if the constructed barrier cannot provide the binding. The check runs at
+	// barrier setup — not at the first encrypt — so a misconfigured deployment
+	// is refused before it writes a single unbound byte. Per mode:
+	//
+	//   - Software (the strategy supplies no BarrierEncryptor): satisfied. The
+	//     barrier folds the context into its own AEAD AAD.
+	//   - Delegated/hardware whose encryptor implements AADSymmetricEncrypter:
+	//     satisfied. The context is authenticated by the encryptor.
+	//   - Delegated/hardware whose encryptor implements only SymmetricEncrypter:
+	//     REFUSED. There is no way to carry the context, and a non-empty context
+	//     would fail with ErrHardwareMode on every write.
+	//   - StrategyNone (no encryption at all): REFUSED. None mode stores
+	//     plaintext, so there is no AEAD, no tag, and nothing that could
+	//     authenticate a position. Requiring authenticated positional binding
+	//     while selecting no encryption is a misconfiguration, not a
+	//     satisfiable request, and it is rejected rather than silently treated
+	//     as "nothing to bind".
+	//
+	// Default false preserves the historical behavior: a barrier that cannot
+	// bind context is constructed normally and callers suppress their context
+	// (see Barrier.SupportsContextAAD and Barrier.ContextBinding).
+	RequireContextAAD bool
 }
 
 // DefaultBarrierConfig returns a BarrierConfig with sensible defaults:

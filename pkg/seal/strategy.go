@@ -21,6 +21,25 @@
 // (PKCS#11, TPM2, AWS/GCP/Azure KMS, Vault) live in go-xkms; the Shamir
 // strategy lives in go-qrdb. This package defines only StrategyPassphrase and
 // StrategyNone.
+//
+// # Delegated (hardware) mode
+//
+// When a strategy returns a BarrierEncryptor, the barrier hands that encryptor
+// the WHOLE data path and keeps none of its own: epoch DEK derivation, the
+// [epoch][algID] ciphertext header, the nonce-reuse tracker and the NIST
+// SP 800-38D invocation counter are all bypassed, because the delegated
+// encryptor owns its key and nonce management and the barrier cannot count
+// invocations against a key it does not control. Rotate and PurgeEpochsBefore
+// return ErrHardwareMode for the same reason. Every barrier setup logs this at
+// WARN, naming what is delegated.
+//
+// A delegated encryptor authenticates the caller's positional context only if it
+// implements AADSymmetricEncrypter; otherwise the barrier's *Context methods
+// fail closed with ErrHardwareMode rather than drop the binding. Callers ask
+// Barrier.SupportsContextAAD before building a context, and a deployment that
+// requires the binding sets BarrierConfig.RequireContextAAD so an incapable
+// encryptor — or the no-encryption strategy — is refused at setup instead of at
+// the first write.
 package seal
 
 import (
@@ -91,6 +110,12 @@ type SealingStrategy interface {
 	// BarrierEncryptor returns a SymmetricEncrypter for hardware-backed strategies
 	// where keys should never leave the hardware boundary. Software strategies
 	// return (nil, nil) to indicate the barrier should use epoch-based HKDF DEKs.
+	//
+	// The returned encryptor should ALSO implement AADSymmetricEncrypter when it
+	// can authenticate caller-supplied AAD end to end; that is what lets the
+	// barrier keep the positional binding of snapshot frames and WAL records in
+	// delegated mode. It must NOT implement that interface if it would ignore
+	// the AAD.
 	BarrierEncryptor(ctx context.Context, rootKey []byte) (SymmetricEncrypter, error)
 
 	// Close releases strategy-held resources (PKCS#11 sessions, TPM2 handles,

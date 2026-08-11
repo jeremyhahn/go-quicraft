@@ -1207,6 +1207,9 @@ func (b *testBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]
 // seal.Barrier it stands in for.
 func (b *testBarrier) IsHardwareMode() bool { return false }
 
+// SupportsContextAAD is true: this barrier authenticates the caller context.
+func (b *testBarrier) SupportsContextAAD() bool { return true }
+
 func (b *testBarrier) encryptForEpoch(plaintext []byte, epoch uint64) []byte {
 	key := byte(epoch & 0xFF)
 	out := make([]byte, 8+len(plaintext))
@@ -1223,7 +1226,7 @@ func (b *testBarrier) encryptForEpoch(plaintext []byte, epoch uint64) []byte {
 // hand-assemble a snapshot.dat must use it, or the frames carry no positional
 // binding and the decrypt side correctly rejects them.
 func (b *testBarrier) sealFrameAt(plaintext []byte, epoch, shardID, replicaID, index, seq uint64) []byte {
-	aad := NewSnapshotAAD(shardID, replicaID, index, false)
+	aad := NewSnapshotAAD(shardID, replicaID, index, aadCapability{supports: true})
 	return appendTestAADTag(b.encryptForEpoch(plaintext, epoch), aad.Frame(seq))
 }
 
@@ -4970,11 +4973,24 @@ func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
 // M3: positional context-AAD for snapshot frames
 // ---------------------------------------------------------------------------
 
+// aadCapability is a minimal contextAADBarrier stand-in for the SnapshotAAD
+// builder tests: it answers only the two capability questions the builder asks,
+// so a test can pin "binds context", "cannot bind" and "plaintext mode"
+// independently of any full barrier fake.
+type aadCapability struct {
+	supports  bool
+	plaintext bool
+}
+
+func (c aadCapability) SupportsContextAAD() bool { return c.supports }
+
+func (c aadCapability) IsPlaintextMode() bool { return c.plaintext }
+
 // TestSnapshotAAD_Layout pins the wire-order of the context. It is not stored
 // anywhere, so it can only be reproduced from code — which makes an accidental
 // field reorder a silent, total loss of every existing encrypted snapshot.
 func TestSnapshotAAD_Layout(t *testing.T) {
-	got := NewSnapshotAAD(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, false).
+	got := NewSnapshotAAD(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, aadCapability{supports: true}).
 		Frame(0x3132333435363738)
 	want := append([]byte("QRSNAP1"),
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -5007,7 +5023,7 @@ func TestSnapshotAAD_DistinctPerPosition(t *testing.T) {
 		// digit from one another. Fixed-width fields make it impossible.
 		{"shift", 1, 2, 30, 4},
 	} {
-		key := string(NewSnapshotAAD(tc.shardID, tc.replicaID, tc.index, false).Frame(tc.seq))
+		key := string(NewSnapshotAAD(tc.shardID, tc.replicaID, tc.index, aadCapability{supports: true}).Frame(tc.seq))
 		if prev, dup := seen[key]; dup {
 			t.Fatalf("%s and %s produce identical context bytes", tc.name, prev)
 		}
@@ -5015,22 +5031,42 @@ func TestSnapshotAAD_DistinctPerPosition(t *testing.T) {
 	}
 }
 
-// TestSnapshotAAD_HardwareModeSuppressesContext pins the documented capability
-// limitation: a hardware barrier rejects ANY non-empty context, so the frames it
-// seals keep the epoch binding only. The decision belongs to the deployment and
-// is taken at builder construction — never per artifact, and never as a reaction
-// to a decryption failure.
-func TestSnapshotAAD_HardwareModeSuppressesContext(t *testing.T) {
-	if ctx := NewSnapshotAAD(1, 2, 3, true).Frame(4); ctx != nil {
-		t.Fatalf("hardware mode produced a %d-byte context; the barrier would reject it "+
-			"with ErrHardwareMode and every snapshot save would fail", len(ctx))
+// TestSnapshotAAD_UnbindableBarrierSuppressesContext pins the documented
+// capability limitation: a barrier that cannot authenticate caller AAD rejects
+// ANY non-empty context, so the frames it seals keep only its own binding. The
+// decision belongs to the deployment and is taken at builder construction —
+// never per artifact, and never as a reaction to a decryption failure.
+func TestSnapshotAAD_UnbindableBarrierSuppressesContext(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		barrier aadCapability
+	}{
+		{"delegated encryptor without AAD", aadCapability{}},
+		{"plaintext mode", aadCapability{plaintext: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ctx := NewSnapshotAAD(1, 2, 3, tc.barrier).Frame(4); ctx != nil {
+				t.Fatalf("produced a %d-byte context; the barrier would reject it "+
+					"with ErrHardwareMode and every snapshot save would fail", len(ctx))
+			}
+		})
+	}
+}
+
+// TestSnapshotAAD_CapableBarrierBindsContext is the other half: a barrier that
+// CAN authenticate caller AAD gets the positional binding regardless of whether
+// it encrypts in software or delegates to hardware.
+func TestSnapshotAAD_CapableBarrierBindsContext(t *testing.T) {
+	ctx := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true}).Frame(4)
+	if len(ctx) != SnapshotFrameAADLen {
+		t.Fatalf("context = %d bytes, want %d", len(ctx), SnapshotFrameAADLen)
 	}
 }
 
 // TestSnapshotAAD_FrameReusesScratchBuffer pins the no-per-frame-allocation
 // property of the bulk encrypt/decrypt path.
 func TestSnapshotAAD_FrameReusesScratchBuffer(t *testing.T) {
-	aad := NewSnapshotAAD(1, 2, 3, false)
+	aad := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true})
 	first := aad.Frame(0)
 	second := aad.Frame(1)
 	if &first[0] != &second[0] {

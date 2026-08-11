@@ -485,11 +485,31 @@ const (
 	snapshotAADSeqOff     = snapshotAADIndexOff + 8
 )
 
-// hardwareModeAADOnce bounds the hardware-mode capability warning to a single
-// record per process. The condition is a DEPLOYMENT property (the barrier
-// delegates to a hardware encryptor for its whole life), not a per-artifact or
-// per-frame one, so repeating it per snapshot would say nothing new.
-var hardwareModeAADOnce sync.Once
+// noContextAADOnce bounds the capability warning to a single record per
+// process. The condition is a DEPLOYMENT property (the barrier delegates to an
+// encryptor that cannot bind context, or encrypts nothing at all, for its whole
+// life), not a per-artifact or per-frame one, so repeating it per snapshot would
+// say nothing new.
+var noContextAADOnce sync.Once
+
+// contextAADBarrier is the capability NewSnapshotAAD asks of the sealing
+// barrier: can it ACTUALLY authenticate a caller-supplied context? A barrier
+// that cannot must not be handed one — it fails the write closed rather than
+// silently dropping the binding.
+type contextAADBarrier interface {
+	SupportsContextAAD() bool
+}
+
+// plaintextModeReporter is an OPTIONAL capability a barrier may implement to
+// distinguish the two reasons it cannot bind a context: no-encryption mode,
+// where there is no AEAD and therefore nothing a position could be bound to,
+// versus a delegated encryptor that IS protecting the data but cannot
+// authenticate where it belongs. Only the second is a security limitation, and
+// only the warning text differs. A barrier that does not implement this is
+// reported as the latter, which is the conservative reading.
+type plaintextModeReporter interface {
+	IsPlaintextMode() bool
+}
 
 // SnapshotAAD builds the per-frame positional context every snapshot frame is
 // bound to. One SnapshotAAD belongs to one snapshot artifact; Frame stamps the
@@ -513,19 +533,32 @@ type SnapshotAAD struct {
 // NewSnapshotAAD returns the context builder for one snapshot artifact,
 // identified by the shard, replica and snapshot index its frames belong to.
 //
-// hardwareMode reports whether the sealing barrier delegates to a hardware
-// encryptor. Such a barrier cannot accept caller context at all (it returns
-// seal.ErrHardwareMode for ANY non-empty context), so the builder suppresses
-// the context and the frames keep only the barrier's own epoch binding. That is
-// a documented capability limitation of hardware sealing, decided by the
-// deployment; it is NEVER selected per artifact and NEVER reached by way of a
-// decryption failure.
-func NewSnapshotAAD(shardID, replicaID, index uint64, hardwareMode bool) *SnapshotAAD {
-	a := &SnapshotAAD{suppress: hardwareMode}
-	if hardwareMode {
-		hardwareModeAADOnce.Do(func() {
-			slog.Warn("snapshot: hardware-mode barrier cannot bind caller context; " +
-				"snapshot frames are bound to their epoch only, without positional " +
+// barrier decides whether the context is built at all. A barrier that cannot
+// authenticate caller-supplied AAD — a delegated encryptor that does not
+// implement seal.AADSymmetricEncrypter, or no-encryption mode — returns
+// seal.ErrHardwareMode for ANY non-empty context, so the builder suppresses the
+// context and the frames keep only whatever binding the barrier applies on its
+// own. That is a capability of the DEPLOYMENT's barrier, resolved once here; it
+// is NEVER selected per artifact and NEVER reached by way of a decryption
+// failure. A barrier that CAN bind context gets the positional binding whether
+// it encrypts in software or delegates to hardware.
+func NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier) *SnapshotAAD {
+	suppress := barrier == nil || !barrier.SupportsContextAAD()
+	a := &SnapshotAAD{suppress: suppress}
+	if suppress {
+		plaintext := false
+		if pm, ok := barrier.(plaintextModeReporter); ok {
+			plaintext = pm.IsPlaintextMode()
+		}
+		noContextAADOnce.Do(func() {
+			if plaintext {
+				slog.Warn("snapshot: barrier performs no encryption (plaintext mode); " +
+					"snapshot frames carry no positional binding because there is no " +
+					"authentication to bind it to")
+				return
+			}
+			slog.Warn("snapshot: barrier cannot authenticate caller context; " +
+				"snapshot frames keep only the barrier's own binding, without positional " +
 				"(shard/replica/index/ordinal) binding")
 		})
 		return a
@@ -541,8 +574,8 @@ func NewSnapshotAAD(shardID, replicaID, index uint64, hardwareMode bool) *Snapsh
 // slice aliases the builder's scratch buffer and is only valid until the next
 // call; the barrier folds it into the AEAD AAD and never retains it.
 //
-// It returns nil in hardware mode, which is byte-identical to the epoch-only
-// binding the barrier applies with no context at all.
+// It returns nil when the barrier cannot bind context, which is byte-identical
+// to what that barrier does with no context at all.
 func (a *SnapshotAAD) Frame(seq uint64) []byte {
 	if a.suppress {
 		return nil
