@@ -102,12 +102,45 @@ type StateMachine struct {
 	shardID     uint64
 	replicaID   uint64
 
-	// sessionExpiryEntries is the inactivity threshold in number of
-	// applied log entries. Sessions that have not been active within
-	// this many entries are expired. A value of 0 disables automatic
-	// session expiry (default). This is deterministic across replicas
-	// because it is driven by log index, not wall-clock time.
-	sessionExpiryEntries uint64
+	// sessionPolicy is the session configuration the apply path is CURRENTLY
+	// evaluating: the expiry threshold and the two session-manager limits.
+	// It is the shard's replicated policy whenever one is known, and
+	// localPolicy otherwise; refreshSessionPolicy maintains that.
+	//
+	// It is read and written only from the apply goroutine (Apply) and from
+	// snapshot recovery, which the engine quiesces applies around, so it
+	// needs no synchronization of its own.
+	sessionPolicy proto.SessionPolicy
+
+	// localPolicy is this node's own configuration, used only while the shard
+	// has no replicated policy: a shard bootstrapped before the policy became
+	// replicated state, or a join=true replica that has not yet received the
+	// shard's configuration. It is never preferred over a replicated value —
+	// that preference is exactly the divergence the replication closes.
+	localPolicy proto.SessionPolicy
+
+	// sessionPolicyFn returns the shard's replicated session policy, or a
+	// policy reporting IsSet false when none is known yet. It is
+	// raft.Peer.SessionPolicy in production and nil in tests that drive the
+	// state machine directly.
+	//
+	// It is consulted at the START of each Apply rather than at construction
+	// because a replica can learn its configuration after its state machine
+	// exists (a joiner replicating the shard's EntryInitialMembership, or
+	// adopting an InstallSnapshot), and it must converge without a restart.
+	//
+	// DETERMINISM CONTRACT. This is safe only because the replicated policy is
+	// BOOTSTRAP-ONLY: nothing changes it after the shard's initial membership
+	// commits, so the value this observes is the same on every replica no
+	// matter how far the apply path trails commit. If a config change that
+	// alters the policy is ever added, this function must be replaced by
+	// adoption from the apply stream itself — decoding the policy out of the
+	// committed entry that carries it, at the exact log index where it applies
+	// — because commit-time adoption plus a lagging apply path would otherwise
+	// let two replicas switch policies at different points in the log. That is
+	// the same class of bug as batching-dependent expiry, and it would be
+	// just as silent.
+	sessionPolicyFn func() proto.SessionPolicy
 
 	// zeroCopyEntryCmd controls whether Entry.Cmd aliases the internal
 	// buffer (zero-copy, zero-alloc) or is copied for the state machine.
@@ -126,12 +159,14 @@ type StateMachine struct {
 	indexMapBuf []int
 
 	// readGuard serializes read access (Lookup/NALookup/NALookupBuf) against
-	// Close. Readers hold RLock for the duration of their access — including
-	// the lifetime of a pooled NALookupBuf buffer, released via its release
-	// func — so the underlying state machine is never closed out from under a
-	// reader. Close takes the write lock, which blocks until all in-flight
-	// readers and outstanding buffers drain. Apply is NOT guarded here: the
-	// engine stops the apply worker before Close, so Apply never races Close.
+	// Close. Readers hold RLock for the duration of the call into the
+	// underlying state machine — and no longer, so no caller-held resource can
+	// pin it — which is what keeps the SM from being closed mid-lookup. Close
+	// takes the write lock, which blocks until all in-flight readers drain.
+	// A pooled NALookupBuf buffer outlives the guard: its contents are a COPY
+	// (see the sm.NALookupInto contract), so it stays valid after Close.
+	// Apply is NOT guarded here: the engine stops the apply worker before
+	// Close, so Apply never races Close.
 	readGuard sync.RWMutex
 	// closed is set under readGuard.Lock by Close so that any reader which was
 	// blocked acquiring RLock observes the closed state and returns ErrClosed
@@ -145,16 +180,28 @@ type StateMachine struct {
 // ConcurrentStateMachine, or DiskStateMachine. Returns ErrInvalidSMType
 // if the returned type does not match any known interface.
 //
-// sessionExpiryEntries controls automatic session expiry: sessions
-// inactive for more than this many log entries are cleaned up. Set to 0
-// to disable (default). When enabled, all replicas expire the same
-// sessions at the same log index, preserving determinism.
+// The session policy governs apply: the expiry threshold segments the apply
+// path's checkpoint walk, and the two limits decide which registrations and
+// cached responses are admitted. All three must therefore be identical on
+// every replica, which is why the shard REPLICATES them (proto.SessionPolicy)
+// and why the two arguments here are asymmetric:
+//
+//   - local is this node's own configuration. It is used only while the shard
+//     has no replicated policy of its own.
+//   - replicated returns the shard's committed policy and always wins over
+//     local. It may be nil, which pins the state machine to local — the shape
+//     tests want, and never what a live shard wants.
+//
+// Passing the policy as one value also removes a hazard the previous signature
+// had: it took the two limits as adjacent uint64 parameters, and transposing
+// them compiled cleanly while silently capping a shard at MaxSessionsPerClient
+// clients and letting one client pin MaxTotalSessions cached results.
 func NewStateMachine(
 	shardID, replicaID uint64,
 	createFn sm.CreateFunc,
 	snapshotDir string,
-	maxSessions, maxResponses uint64,
-	sessionExpiryEntries uint64,
+	local proto.SessionPolicy,
+	replicated func() proto.SessionPolicy,
 	zeroCopyEntryCmd bool,
 ) (*StateMachine, error) {
 	raw := createFn(shardID, replicaID)
@@ -162,16 +209,91 @@ func NewStateMachine(
 	if err != nil {
 		return nil, err
 	}
-	return &StateMachine{
-		sm:                   wrapper,
-		smType:               st,
-		sessions:             session.NewManager(maxSessions, maxResponses),
-		snapshotDir:          snapshotDir,
-		shardID:              shardID,
-		replicaID:            replicaID,
-		sessionExpiryEntries: sessionExpiryEntries,
-		zeroCopyEntryCmd:     zeroCopyEntryCmd,
-	}, nil
+	s := &StateMachine{
+		sm:               wrapper,
+		smType:           st,
+		snapshotDir:      snapshotDir,
+		shardID:          shardID,
+		replicaID:        replicaID,
+		localPolicy:      local,
+		sessionPolicy:    local,
+		sessionPolicyFn:  replicated,
+		zeroCopyEntryCmd: zeroCopyEntryCmd,
+	}
+	// Resolve before the manager exists so a shard that already knows its
+	// replicated policy — every restart, and every bootstrap — never builds a
+	// session manager with limits it is about to replace.
+	s.sessionPolicy = s.effectiveSessionPolicy()
+	s.sessions = session.NewManager(
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient)
+	s.logPolicyDisagreement(local, s.sessionPolicy)
+	return s, nil
+}
+
+// effectiveSessionPolicy returns the policy the apply path must use: the
+// shard's replicated policy when one is known, this node's configuration
+// otherwise.
+//
+// The replicated value wins even when it is the LOOSER of the two. That is not
+// a preference, it is the only choice that terminates: the alternative — a
+// replica that enforces its own stricter limit — is a replica that refuses
+// registrations its peers admit, and from then on answers ResultSessionExpired
+// for entries the rest of the shard applies normally. A local limit cannot be
+// honoured by one replica alone; it can only be proposed, at bootstrap.
+func (s *StateMachine) effectiveSessionPolicy() proto.SessionPolicy {
+	if s.sessionPolicyFn == nil {
+		return s.localPolicy
+	}
+	if replicated := s.sessionPolicyFn(); replicated.IsSet() {
+		return replicated
+	}
+	return s.localPolicy
+}
+
+// refreshSessionPolicy adopts the shard's replicated session policy if it has
+// changed since the last call.
+//
+// It runs on the apply goroutine (and during snapshot recovery, which the
+// engine quiesces applies around), so it may mutate the session manager's
+// limits directly. In steady state the shard's policy never changes, so this
+// is one atomic load and a three-field comparison per Apply batch.
+func (s *StateMachine) refreshSessionPolicy() {
+	effective := s.effectiveSessionPolicy()
+	if effective == s.sessionPolicy {
+		return
+	}
+	previous := s.sessionPolicy
+	s.sessionPolicy = effective
+	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxSessionsPerClient)
+	s.logPolicyDisagreement(previous, effective)
+}
+
+// logPolicyDisagreement records, loudly, that the policy the apply path uses is
+// not the one this node is configured with.
+//
+// The shard's value governs and there is no way for one replica to opt out, so
+// this is a warning and not an error — but it is never silent. MaxTotalSessions
+// and MaxSessionsPerClient bound this process's memory, so a replicated value
+// above the local one is an operator-visible resource decision that was taken
+// elsewhere (at bootstrap, by the founders) and must be discoverable from this
+// node's logs rather than only by reading the shard's membership.
+func (s *StateMachine) logPolicyDisagreement(previous, effective proto.SessionPolicy) {
+	if effective == s.localPolicy {
+		return
+	}
+	slog.Warn("rsm: applying the shard's replicated session policy, which differs "+
+		"from this node's configuration; the replicated value governs and cannot "+
+		"be overridden locally",
+		"shardID", s.shardID,
+		"replicaID", s.replicaID,
+		"previous_expiry_entries", previous.ExpiryEntries,
+		"expiry_entries", effective.ExpiryEntries,
+		"local_expiry_entries", s.localPolicy.ExpiryEntries,
+		"max_total_sessions", effective.MaxTotalSessions,
+		"local_max_total_sessions", s.localPolicy.MaxTotalSessions,
+		"max_sessions_per_client", effective.MaxSessionsPerClient,
+		"local_max_sessions_per_client", s.localPolicy.MaxSessionsPerClient,
+	)
 }
 
 // wrapStateMachine performs the one-time type switch to determine the
@@ -230,13 +352,20 @@ func (s *StateMachine) IsOnDisk() bool {
 // replicas that batch differently expire a session at different points and
 // diverge permanently while every Raft invariant still holds. Apply therefore
 // evaluates expiry only at fixed log-index checkpoints — multiples of the
-// inactivity threshold sessionExpiryEntries, so expiry is checked once per
-// inactivity window — splitting the incoming entries at those checkpoints so
-// each expiry runs against the session state as of exactly the entries at or
-// below the checkpoint index. The threshold is replicated config, identical on
-// every replica, so the checkpoint set and the resulting expiry sequence are
-// identical everywhere regardless of batching. When expiry is disabled (the
-// default) the whole batch is applied in one shot with no segmentation overhead.
+// inactivity threshold, so expiry is checked once per inactivity window —
+// splitting the incoming entries at those checkpoints so each expiry runs
+// against the session state as of exactly the entries at or below the
+// checkpoint index. When expiry is disabled the whole batch is applied in one
+// shot with no segmentation overhead.
+//
+// The threshold comes from the shard's REPLICATED session policy
+// (proto.SessionPolicy), refreshed at the top of this function, and so does
+// every other limit the session lifecycle below enforces. That is what makes
+// the checkpoint set and the resulting expiry sequence identical on every
+// replica: a threshold taken from local configuration would be a second,
+// invisible input to apply, and two replicas configured differently would
+// expire different sessions at different indexes with nothing in the protocol
+// able to notice.
 func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// Defence in depth: the engine's synchronous UnloadNode guarantees no
 	// Apply is in flight when Close runs, but a misordered caller must get a
@@ -252,11 +381,17 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 		return nil
 	}
 
+	// Adopt the shard's replicated policy before a single entry is classified,
+	// so the limits this batch is evaluated against are the shard's and not
+	// this node's. See sessionPolicyFn for why it is read here rather than
+	// captured once at construction.
+	s.refreshSessionPolicy()
+
 	lastIndex := entries[len(entries)-1].Index
 
-	// Fast path: expiry disabled — apply the whole batch in one shot. This is
-	// the default and keeps the hot path free of any segmentation overhead.
-	if s.sessionExpiryEntries == 0 {
+	// Fast path: expiry disabled — apply the whole batch in one shot. This
+	// keeps the hot path free of any segmentation overhead.
+	if s.sessionPolicy.ExpiryEntries == 0 {
 		if err := s.applyBatch(entries, results); err != nil {
 			return err
 		}
@@ -271,7 +406,7 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// each checkpoint we first flush every not-yet-applied entry at or below
 	// the checkpoint index, then run expiry — so expiry always observes a
 	// consistent, fully-applied session state as of that exact index.
-	interval := s.sessionExpiryEntries
+	interval := s.sessionPolicy.ExpiryEntries
 	prevIndex := s.lastApplied.Load()
 	firstK := prevIndex/interval + 1
 	lastK := lastIndex / interval
@@ -288,7 +423,7 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 			}
 			segStart = i
 		}
-		s.sessions.ExpireSessions(boundary, s.sessionExpiryEntries, defaultMaxExpirePerCheckpoint)
+		s.sessions.ExpireSessions(boundary, interval, defaultMaxExpirePerCheckpoint)
 	}
 	// Flush the trailing segment above the last checkpoint (indices in
 	// (lastK*interval, lastIndex]); its checkpoint is reached in a future Apply.
@@ -703,15 +838,17 @@ func (s *StateMachine) NALookup(key []byte) ([]byte, bool, error) {
 // Returns (nil, nopRelease, false, nil) when the SM supports neither
 // NALookupInto nor NALookup for []byte keys.
 func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), supported bool, err error) {
-	// Hold the read guard for the duration of the lookup AND, on the pooled
-	// fast path, until the caller releases the returned buffer (the buffer may
-	// alias SM-owned memory). The releaseOnce guard ensures RUnlock happens
-	// exactly once across every exit path / the returned release func.
+	// The read guard is held for the LOOKUP ONLY — never for the lifetime of
+	// the returned buffer. release() is called by APPLICATION code (the buffer
+	// is handed out through Host.SyncReadBuf/StaleReadBuf), so a caller that
+	// never releases would pin the read lock forever: Close blocks on the write
+	// lock, and once Close queues as a writer every subsequent Lookup on the
+	// shard queues behind it. Holding it that long is also unnecessary — the
+	// sm.NALookupInto contract requires implementations to COPY the value into
+	// dst, so the returned slice does not alias SM-owned memory.
 	s.readGuard.RLock()
-	var releaseOnce sync.Once
-	unlock := func() { releaseOnce.Do(s.readGuard.RUnlock) }
 	if s.closed {
-		unlock()
+		s.readGuard.RUnlock()
 		return nil, nopRelease, false, ErrClosed
 	}
 
@@ -719,20 +856,26 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 	poolBuf := lookupBufPool.Get().(*[]byte)
 	filled, ok, lookupErr := s.sm.NALookupInto(key, *poolBuf)
 	if ok {
+		s.readGuard.RUnlock()
 		if lookupErr != nil {
 			// Return the pool buffer unused on error.
 			*poolBuf = (*poolBuf)[:0]
 			lookupBufPool.Put(poolBuf)
-			unlock()
 			return nil, nopRelease, true, lookupErr
 		}
 		// The SM may have grown the buffer via append; update the pool entry to
 		// track the (possibly larger) backing array so it is reused on Put.
 		*poolBuf = filled[:cap(filled)]
+		// releaseOnce covers the WHOLE release body, Put included. Guarding only
+		// part of it lets a double release put the same pointer into the pool
+		// twice, after which two goroutines are handed the same buffer and
+		// silently overwrite each other's read results.
+		var releaseOnce sync.Once
 		rel := func() {
-			*poolBuf = (*poolBuf)[:0]
-			lookupBufPool.Put(poolBuf)
-			unlock() // release the read guard once the caller is done with buf
+			releaseOnce.Do(func() {
+				*poolBuf = (*poolBuf)[:0]
+				lookupBufPool.Put(poolBuf)
+			})
 		}
 		return filled, rel, true, nil
 	}
@@ -742,7 +885,7 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 
 	// Slow path: fall back to standard NALookup (allocates).
 	result2, ok2, err2 := s.sm.NALookup(key)
-	unlock()
+	s.readGuard.RUnlock()
 	if ok2 {
 		return result2, nopRelease, true, err2
 	}
@@ -825,6 +968,15 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	default:
 	}
 
+	// Adopt the shard's replicated policy before reading the session table.
+	// UnmarshalFrom bounds-checks the table against the manager's limits, and
+	// the table was written by a replica applying the SHARD's policy: checking
+	// it against this node's configuration instead would reject a snapshot the
+	// rest of the shard considers well-formed, and the reject is fatal to
+	// recovery. For a replica bootstrapped by an InstallSnapshot this is also
+	// the first point at which a policy is known at all.
+	s.refreshSessionPolicy()
+
 	// Recover session state first.
 	if err := s.sessions.UnmarshalFrom(r); err != nil {
 		return err
@@ -837,10 +989,9 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 // Close releases resources held by both the session manager and the
 // user state machine.
 func (s *StateMachine) Close() error {
-	// Acquire the write lock to block until all in-flight reads and any
-	// outstanding NALookupBuf buffers release, then mark closed so a reader
-	// that was blocked acquiring RLock returns ErrClosed instead of touching
-	// the now-closed SM.
+	// Acquire the write lock to block until all in-flight reads release, then
+	// mark closed so a reader that was blocked acquiring RLock returns
+	// ErrClosed instead of touching the now-closed SM.
 	s.readGuard.Lock()
 	s.closed = true
 	s.readGuard.Unlock()

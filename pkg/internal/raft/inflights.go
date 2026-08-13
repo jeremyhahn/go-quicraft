@@ -84,6 +84,31 @@ func (in *inflights) freeTo(index uint64) {
 	}
 }
 
+// freeFirstOne frees the oldest in-flight slot WITHOUT the acknowledgement
+// that would normally retire it. It exists for one situation: a peer whose
+// in-flight messages were delivered to a PREVIOUS incarnation of that peer.
+// Those acknowledgements can never arrive, and freeTo only frees records at
+// or below an acknowledged index, so every later ack from the restarted peer
+// (which reports a position BELOW the window) frees nothing. The window would
+// stay full forever, and a full window is exactly what makes isPaused report
+// true, so the leader would never send that peer another entry.
+//
+// Releasing one slot per heartbeat response bounds that: the peer is known to
+// be alive, so let exactly one message through. Either it is acknowledged
+// (the window was merely busy) or it is rejected (the peer restarted), and
+// the rejection drives the normal backtracking that repairs the peer's
+// position. This mirrors etcd/raft's MsgHeartbeatResp handling.
+func (in *inflights) freeFirstOne() {
+	if in.count == 0 {
+		return
+	}
+	in.count--
+	in.start++
+	if in.start >= in.size {
+		in.start -= in.size
+	}
+}
+
 // full returns true if the in-flight window is at capacity.
 func (in *inflights) full() bool {
 	return in.count >= in.size

@@ -124,6 +124,50 @@ type walContextBarrier interface {
 	// encryptor that cannot, and in no-encryption mode. Records are bound to
 	// their (shard, segment, ordinal) position exactly when it is true.
 	SupportsContextAAD() bool
+
+	// ContextBindingResolved reports whether SupportsContextAAD is currently an
+	// ANSWER rather than the absence of one. It is false while the barrier is
+	// sealed or uninitialized: no encryptor is installed then, so the
+	// capability does not exist yet.
+	//
+	// The WAL resolves the capability ONCE, at open, and every record it writes
+	// for the life of the process depends on that answer. SupportsContextAAD
+	// alone cannot be cached, because false collapses "cannot bind" and "cannot
+	// say yet" into one bit — and caching the second as the first is precisely
+	// how a node that starts sealed ends up writing epoch-only records forever,
+	// even after being unsealed with a fully AAD-capable barrier. The WAL
+	// therefore refuses to latch anything until this is true; see
+	// ErrBarrierContextUnresolved.
+	ContextBindingResolved() bool
+}
+
+// legacyContextBarrier is the method set walContextBarrier had BEFORE
+// ContextBindingResolved was added to it. It exists only to make the assertion
+// failure diagnosable.
+//
+// The assertion is on the dynamic type, so an out-of-tree barrier that
+// satisfied the old set — which is every embedder that wrote one against the
+// previous release — now fails it and gets a hard startup failure. "Barrier
+// does not support context-bound encryption" is actively misleading in that
+// case: the barrier supports it perfectly well and is missing one reporting
+// method. Naming the method turns a mystifying refusal to boot into a one-line
+// fix. See docs/operations/compatibility.md.
+type legacyContextBarrier interface {
+	EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
+	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
+	IsHardwareMode() bool
+	SupportsContextAAD() bool
+}
+
+// barrierContextAssertionError explains why a configured barrier failed the
+// walContextBarrier assertion, distinguishing a barrier that is simply not
+// context-capable from one that only lacks the newly required
+// ContextBindingResolved method.
+func barrierContextAssertionError(barrier WALBarrier) error {
+	if _, ok := barrier.(legacyContextBarrier); ok {
+		return ErrBarrierContextBindingUnreportable
+	}
+	return ErrBarrierContextUnsupported
 }
 
 // plaintextModeReporter is an OPTIONAL capability a barrier may implement to
@@ -369,6 +413,13 @@ type walShard struct {
 	// decrypt failed.
 	noContextBinding bool
 
+	// bindingDriftLogged keeps verifyBindingUnchanged's Error line to one per
+	// shard. The drift it reports is permanent once it starts, and the check
+	// runs on every write, so logging each time would bury the first line —
+	// the only one that carries new information — under the rest.
+	// Protected by mu, like every other write-path field.
+	bindingDriftLogged bool
+
 	// ctxBuf is the reusable scratch buffer for walRecordContext, so building a
 	// record's context-AAD allocates nothing on the write hot path. The write
 	// side uses it under mu; the read side uses it only from recover(), which
@@ -413,6 +464,16 @@ type walShard struct {
 	// Set of all segment IDs that have ever been created in this shard.
 	// Segment file state: protected by mu.
 	knownSegments map[uint64]bool
+
+	// openCreatedSegment names the segment ensureActiveSegment created during
+	// openWALShard, and openCreatedSegmentValid says whether there is one. If
+	// the Open as a whole then fails, that segment is a brand-new empty file
+	// nobody will ever read; closeAfterFailedOpen unlinks it so repeated failed
+	// opens — the expected experience while an operator works through a
+	// fail-closed condition — do not accumulate one dead file per attempt.
+	// Segment file state: protected by mu.
+	openCreatedSegment      uint64
+	openCreatedSegmentValid bool
 
 	// minWriteEpoch tracks the minimum barrier encryption epoch across
 	// all live (non-garbage-collected) records in this shard. It is
@@ -478,63 +539,239 @@ type walShard struct {
 // Compile-time interface check.
 var _ logdb.LogDB = (*DB)(nil)
 
+// validateOpenOptions checks the functional-option values against the same
+// invariants as Options.Validate, before any of them can reach a segment.
+//
+// The block-size check is load bearing beyond hygiene: an unchecked block size
+// smaller than a record header makes segment.bytesNeeded compute a negative
+// payload and loop forever, hanging the commit worker inside SaveState.
+//
+// A segment must also span at least two blocks, or maxRecordPayload is zero and
+// no record can ever be written. Beyond that the geometry is the operator's to
+// choose: a large BATCH is split across records, and a lone entry too big for
+// any record surfaces at the write as the permanent ErrRecordTooLarge.
+// Requiring room for a theoretical maxCmdLen entry here would reject
+// small-segment deployments that never write one.
+func validateOpenOptions(dir string, o dbOptions) error {
+	if dir == "" {
+		return ErrEmptyWALDir
+	}
+	if o.blockSize < recordHeaderSize+1 || !isPowerOfTwo(o.blockSize) {
+		return ErrInvalidBlockSize
+	}
+	if o.maxFileSize <= 0 {
+		return ErrInvalidMaxFileSize
+	}
+	if o.maxFileSize/int64(o.blockSize) < 2 {
+		return ErrSegmentTooSmallForEntry
+	}
+	return nil
+}
+
+// resolveBarrierContextBinding settles, once for the whole DB, whether a
+// configured barrier can positionally bind the records it is about to seal, and
+// announces the answer when it is a limitation.
+//
+// Every encrypted WAL record is positionally bound via context-AAD, so a
+// configured barrier MUST be able to carry a context. This fails closed rather
+// than degrading to epoch-only binding, and emits the hardware-mode warning
+// exactly once per DB instead of once per shard.
+//
+// Called by Open BEFORE any shard is opened, because openWALShard LATCHES the
+// capability into every shard it builds; the refusals below must therefore
+// happen while there is still nothing to latch.
+func resolveBarrierContextBinding(dir string, barrier WALBarrier) error {
+	if barrier == nil {
+		return nil
+	}
+	cb, ok := barrier.(walContextBarrier)
+	if !ok {
+		return barrierContextAssertionError(barrier)
+	}
+	// A sealed barrier has no encryptor and therefore no capability to report.
+	// Refuse before anything is resolved or announced: latching "cannot bind"
+	// here would silently downgrade every record the node ever writes, and the
+	// warning below would fire against a barrier whose answer is simply not
+	// available yet — noise that teaches operators to ignore the one line that
+	// reports a real limitation.
+	if !cb.ContextBindingResolved() {
+		return ErrBarrierContextUnresolved
+	}
+	if cb.SupportsContextAAD() {
+		return nil
+	}
+	if pm, isPlain := cb.(plaintextModeReporter); isPlain && pm.IsPlaintextMode() {
+		slog.Warn("waldb: barrier performs no encryption (plaintext mode); "+
+			"WAL records carry no positional binding because there is no "+
+			"authentication to bind it to.",
+			"dir", dir,
+		)
+		return nil
+	}
+	slog.Warn("waldb: barrier cannot authenticate caller context; WAL "+
+		"records are bound to their epoch only, not to their segment and "+
+		"position. An at-rest attacker with write access can reorder or "+
+		"splice same-epoch records undetected.",
+		"dir", dir,
+	)
+	return nil
+}
+
+// createWALRoot creates the WAL root directory and makes the directory entry of
+// EVERY level MkdirAll created durable.
+//
+// POSIX durability requires fsyncing the parent of each newly created
+// directory, and MkdirAll may create several levels: fsyncing only the root's
+// immediate parent leaves the intermediate dirents un-durable, so a crash after
+// an acked SaveState can take the whole tree with it (the node then boots with
+// no term and no vote). The deepest PRE-EXISTING ancestor is recorded first so
+// the sync walk covers exactly the created chain. Idempotent for an existing
+// WAL.
+//
+// Under noSync the directory is left to be created lazily on first write, which
+// is why a fresh noSync database may have no root to stamp geometry into yet.
+func createWALRoot(o dbOptions, dir string) error {
+	if o.noSync {
+		return nil
+	}
+	existing := deepestExistingDir(o.fs, dir)
+	if err := o.fs.MkdirAll(dir, 0o700); err != nil {
+		return &DBOpenError{Dir: dir, Err: err}
+	}
+	if err := syncDirChainFS(o.fs, dir, existing); err != nil {
+		return &DBOpenError{Dir: dir, Err: err}
+	}
+	return nil
+}
+
+// establishWALFormat settles what on-disk format a directory without a marker is
+// in, BEFORE this Open writes anything into it. It is called only when Open
+// found no marker.
+//
+// Two outcomes, and no third:
+//
+//   - The directory holds segments. Those bytes were written by a build that
+//     predates the marker, and therefore predates the durability sequence in the
+//     chunk header, so this build cannot parse them. Refuse
+//     (ErrWALFormatMissing). This is a change of posture from when the marker
+//     recorded only the block size: an unmarked populated directory used to be
+//     adopted once recovery had proved its geometry, because being unmarked was
+//     merely the status quo ante. It no longer is — guessing the record framing
+//     wrong does not produce a detectable mismatch, it produces an empty clean
+//     prefix that the torn-tail repair truncates the whole log to.
+//   - The directory holds no segments. This process defines its format, so the
+//     marker is written NOW, before the first segment exists.
+//
+// The ordering is the point. Stamping after the shards were opened left a window
+// — a crash, or merely a failed stamp — in which segments existed with no marker
+// above them, which the rule above then reads as a pre-marker directory and
+// refuses FOREVER. Writing the marker first closes it: either the marker is
+// there and segments may follow, or nothing was written at all.
+//
+// A stamp failure is fatal for the same reason. It used to be logged and ignored,
+// on the grounds that refusing an otherwise healthy WAL over a 16-byte metadata
+// file was the worse outcome. With the marker also recording the record framing
+// that trade reverses: proceeding would create segments this build could never
+// prove the format of, bricking the directory on the next Open with no record of
+// why. Failing here leaves the directory empty and names the cause.
+//
+// Under noSync (tests only) createWALRoot leaves the root to be created lazily by
+// the first write, so the directory may not exist yet. The root is created here
+// rather than skipping the stamp: skipping it means a noSync directory carries no
+// format for its whole first life. Only the root is created; the shard
+// directories stay lazy.
+func establishWALFormat(o dbOptions, dir string) error {
+	populated, err := walDirHoldsSegments(o.fs, dir)
+	if err != nil {
+		return &DBOpenError{Dir: dir, Err: err}
+	}
+	if populated {
+		slog.Error("waldb: refusing to open a WAL directory that holds segments "+
+			"but records no on-disk format; it was written by a build that predates "+
+			"the format marker and cannot be parsed by this one",
+			"dir", dir)
+		return &DBOpenError{Dir: dir, Err: ErrWALFormatMissing}
+	}
+	if _, statErr := o.fs.Stat(dir); statErr != nil {
+		if !errors.Is(statErr, fs.ErrNotExist) {
+			return &DBOpenError{Dir: dir, Err: statErr}
+		}
+		if mkErr := o.fs.MkdirAll(dir, 0o700); mkErr != nil {
+			return &DBOpenError{Dir: dir, Err: mkErr}
+		}
+	}
+	if wErr := writeWALFormat(o.fs, dir, o.blockSize, o.noSync); wErr != nil {
+		return &DBOpenError{Dir: dir, Err: wErr}
+	}
+	return nil
+}
+
+// walDirHoldsSegments reports whether any shard directory under dir contains a
+// %06d.log segment file. A WAL root that does not exist, or a shard directory
+// that does not, holds nothing; any OTHER error is returned rather than read as
+// absence, because mistaking an unreadable directory for an empty one is exactly
+// how a populated WAL would get stamped with the wrong format.
+func walDirHoldsSegments(filesystem FS, dir string) (bool, error) {
+	for i := 0; i < DefaultShardCount; i++ {
+		entries, err := filesystem.ReadDir(filepath.Join(dir, shardDirName(i)))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		for _, de := range entries {
+			if de.IsDir() {
+				continue
+			}
+			if _, ok := parseSegmentFilename(de.Name()); ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // Open creates or opens a WAL database at the given directory. The directory
 // structure contains 16 sub-directories (shard-0 through shard-15), each
 // holding its own WAL segment files.
+//
+// The order of the steps below is part of the contract, not an accident: the
+// geometry check runs before any segment is touched, and the barrier's
+// context-binding capability is resolved before any shard exists to latch it
+// into. Both are fixes, not incidental sequencing — see the geometry comment
+// inline below and resolveBarrierContextBinding.
 func Open(dir string, opts ...Option) (*DB, error) {
 	o := defaultDBOptions()
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	if dir == "" {
-		return nil, ErrEmptyWALDir
-	}
-	// Validate the functional-option values against the same invariants as
-	// Options.Validate. An unchecked block size smaller than a record header
-	// makes segment.bytesNeeded compute a negative payload and loop forever,
-	// hanging the commit worker inside SaveState.
-	if o.blockSize < recordHeaderSize+1 || !isPowerOfTwo(o.blockSize) {
-		return nil, ErrInvalidBlockSize
-	}
-	if o.maxFileSize <= 0 {
-		return nil, ErrInvalidMaxFileSize
-	}
-	// A segment must span at least two blocks, or maxRecordPayload is zero and
-	// no record can ever be written. Beyond that the geometry is the
-	// operator's to choose: a large BATCH is split across records, and a lone
-	// entry too big for any record surfaces at the write as the permanent
-	// ErrRecordTooLarge. Requiring room for a theoretical maxCmdLen entry here
-	// would reject small-segment deployments that never write one.
-	if o.maxFileSize/int64(o.blockSize) < 2 {
-		return nil, ErrSegmentTooSmallForEntry
+	if err := validateOpenOptions(dir, o); err != nil {
+		return nil, err
 	}
 
-	// Every encrypted WAL record is positionally bound via context-AAD, so a
-	// configured barrier MUST be able to carry a context. Fail closed here
-	// rather than degrade to epoch-only binding, and announce the hardware-mode
-	// limitation exactly once for the whole DB.
-	if o.barrier != nil {
-		cb, ok := o.barrier.(walContextBarrier)
-		if !ok {
-			return nil, ErrBarrierContextUnsupported
-		}
-		if !cb.SupportsContextAAD() {
-			if pm, isPlain := cb.(plaintextModeReporter); isPlain && pm.IsPlaintextMode() {
-				slog.Warn("waldb: barrier performs no encryption (plaintext mode); "+
-					"WAL records carry no positional binding because there is no "+
-					"authentication to bind it to.",
-					"dir", dir,
-				)
-			} else {
-				slog.Warn("waldb: barrier cannot authenticate caller context; WAL "+
-					"records are bound to their epoch only, not to their segment and "+
-					"position. An at-rest attacker with write access can reorder or "+
-					"splice same-epoch records undetected.",
-					"dir", dir,
-				)
-			}
-		}
+	// Refuse a block size, or an on-disk format version, that differs from the
+	// one this directory was written with, BEFORE touching a single segment.
+	// Neither is recorded in the segments themselves, so getting either wrong
+	// makes ReadAll misparse; that surfaces as CRC failures, and the repair
+	// paths would then either fail-stop or truncate a healthy log. Naming the
+	// real cause here is the difference between a one-line configuration fix (or
+	// a documented upgrade) and a restore-from-peers. See format.go.
+	recordedBlockSize, formatPresent, err := readWALFormat(o.fs, dir)
+	if err != nil {
+		return nil, &DBOpenError{Dir: dir, Err: err}
+	}
+	if formatPresent && recordedBlockSize != o.blockSize {
+		return nil, &DBOpenError{Dir: dir, Err: &WALGeometryMismatchError{
+			Dir:        dir,
+			Recorded:   recordedBlockSize,
+			Configured: o.blockSize,
+		}}
+	}
+
+	if err := resolveBarrierContextBinding(dir, o.barrier); err != nil {
+		return nil, err
 	}
 
 	db := &DB{
@@ -549,21 +786,16 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		db.diskMon = NewDiskMonitor(dir, o.diskMonMaxBytes, o.diskMonOpts...)
 	}
 
-	// Create the WAL root directory and make the directory entry of EVERY
-	// level MkdirAll created durable. POSIX durability requires fsyncing the
-	// parent of each newly created directory, and MkdirAll may create several
-	// levels: fsyncing only the root's immediate parent leaves the
-	// intermediate dirents un-durable, so a crash after an acked SaveState can
-	// take the whole tree with it (the node then boots with no term and no
-	// vote). The deepest PRE-EXISTING ancestor is recorded first so the sync
-	// walk covers exactly the created chain. Idempotent for an existing WAL.
-	if !o.noSync {
-		existing := deepestExistingDir(o.fs, dir)
-		if err := o.fs.MkdirAll(dir, 0o700); err != nil {
-			return nil, &DBOpenError{Dir: dir, Err: err}
-		}
-		if err := syncDirChainFS(o.fs, dir, existing); err != nil {
-			return nil, &DBOpenError{Dir: dir, Err: err}
+	if err := createWALRoot(o, dir); err != nil {
+		return nil, err
+	}
+
+	// Settle the on-disk format before a single segment is created: either this
+	// directory already records one (checked above), or it is empty and this
+	// process records one for it now. See establishWALFormat.
+	if !formatPresent {
+		if err := establishWALFormat(o, dir); err != nil {
+			return nil, err
 		}
 	}
 
@@ -571,15 +803,10 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		shardDir := filepath.Join(dir, shardDirName(i))
 		shard, err := openWALShard(i, shardDir, o, o.barrier, o.metrics)
 		if err != nil {
-			// Close any shards we already opened.
+			// Close any shards we already opened, and unlink the empty segment
+			// each of them created for a DB that will never exist.
 			for j := 0; j < i; j++ {
-				if closeErr := db.shards[j].close(); closeErr != nil {
-					slog.Debug("waldb: shard close failed during cleanup",
-						"shard_index", j,
-						"dir", db.shards[j].dir,
-						"error", closeErr,
-					)
-				}
+				db.shards[j].closeAfterFailedOpen()
 			}
 			return nil, err
 		}
@@ -623,7 +850,15 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 	if barrier != nil {
 		cb, ok := barrier.(walContextBarrier)
 		if !ok {
-			return nil, ErrBarrierContextUnsupported
+			return nil, barrierContextAssertionError(barrier)
+		}
+		// Never latch an unresolved capability. Open already refused a sealed
+		// barrier for the whole DB; this repeats the guard because the shard is
+		// where the answer is actually recorded, and a caller reaching
+		// openWALShard by another route must not be able to pin "no binding"
+		// from a barrier that has not been unsealed yet.
+		if !cb.ContextBindingResolved() {
+			return nil, ErrBarrierContextUnresolved
 		}
 		s.sealer = cb
 		s.noContextBinding = !cb.SupportsContextAAD()
@@ -645,6 +880,11 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 			if err := s.ensureActiveSegment(); err != nil {
 				return nil, err
 			}
+			// Remember what this open created, so a failure in a LATER shard
+			// can unlink it instead of leaving an empty segment behind. See
+			// closeAfterFailedOpen.
+			s.openCreatedSegment = s.activeSegmentID
+			s.openCreatedSegmentValid = true
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, &DBOpenError{Dir: dir, Err: err}
@@ -653,6 +893,27 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 	// will be created on first write via ensureActiveSegment.
 
 	return s, nil
+}
+
+// corruptionError attaches this shard's identity and the segment's clean-prefix
+// end to a fail-closed corruption sentinel, and logs the repair triple at Error
+// so it is in the node's log even if the caller only prints errors.Is results.
+// See SegmentCorruptionError.
+func (s *walShard) corruptionError(segID uint64, cleanEnd int64, sentinel error) error {
+	err := &SegmentCorruptionError{
+		ShardIndex: int(s.shardIdx),
+		SegmentID:  segID,
+		CleanEnd:   cleanEnd,
+		Err:        sentinel,
+	}
+	slog.Error("waldb: refusing to open a WAL whose corruption is not a torn tail",
+		"dir", s.dir,
+		"shard_index", err.ShardIndex,
+		"segment_id", segID,
+		"clean_end", cleanEnd,
+		"reason", sentinel.Error(),
+	)
+	return err
 }
 
 // recover scans the shard directory for existing segment files and replays
@@ -701,6 +962,22 @@ func (s *walShard) recover() error {
 	for i, segID := range segIDs {
 		cleanEnd, err := s.replaySegment(segID)
 		if err != nil {
+			// Bytes above the damage that this writer cannot have produced.
+			// Checked first: it is not a claim about which of this node's
+			// records were lost, so it must not be reported as one.
+			if errors.Is(err, errRecordSequenceRegression) {
+				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
+					segID, cleanEnd, ErrRecordSequenceRegression)}
+			}
+			// Corruption below records that a completed fdatasync already
+			// acknowledged is never an interrupted write, not even in the final
+			// segment. Handled before the truncation path below so the
+			// "highest-numbered segment" test cannot license destroying data
+			// that provably reached the medium.
+			if errors.Is(err, errMidSegmentCorruption) {
+				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
+					segID, cleanEnd, ErrMidSegmentCorruption)}
+			}
 			if errors.Is(err, errRecoveryTruncated) {
 				// Prefix-truncation is correct ONLY for a torn tail, which can
 				// exist only in the HIGHEST-numbered segment: rotateSegment
@@ -714,11 +991,13 @@ func (s *walShard) recover() error {
 				// the operator restore from snapshot/peers, the same posture
 				// WALDecryptError and ErrUnknownPayloadType already take.
 				if i != len(segIDs)-1 {
-					return &RecoveryError{SegmentID: segID, Err: ErrNonFinalSegmentCorruption}
+					return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
+						segID, cleanEnd, ErrNonFinalSegmentCorruption)}
 				}
-				// Corruption in the FINAL segment is a legal torn tail: this
-				// segment's clean prefix is recovered; do NOT replay higher
-				// segments (prefix-validity rule).
+				// Corruption in the FINAL segment with NOTHING decodable after
+				// it (the mid-segment case was rejected above) is a legal torn
+				// tail: this segment's clean prefix is recovered; do NOT replay
+				// higher segments (prefix-validity rule).
 				//
 				// Repair the corrupt segment on disk FIRST by truncating it to
 				// the recovered clean end. Without this the corrupt tail is
@@ -1044,10 +1323,31 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 		)
 	}
 
+	// A durability generation above the corruption that is lower than the clean
+	// prefix's is not a state any writer of this segment can produce. Reported
+	// on its own sentinel, ahead of the acknowledged-data case, because the
+	// remedy differs: the bytes are foreign, so the question is what put them
+	// there, not which of this node's records were lost.
+	if readSeg.sequenceRegression {
+		return cleanEnd, errRecordSequenceRegression
+	}
+
+	// The records ABOVE the corruption span a completed fdatasync, so they were
+	// acknowledged. The corruption is not this segment's interrupted tail;
+	// signal recover() to fail-stop rather than repair, exactly as for a
+	// non-final segment. Checked before the plain stoppedAtCorruption case
+	// because it is the stricter reading of it.
+	if readSeg.ackedDataAfterCorruption {
+		return cleanEnd, errMidSegmentCorruption
+	}
+
 	// If ReadAll halted at a corrupt/torn record, this segment's clean prefix
 	// has been replayed but everything after the corruption — INCLUDING all
 	// higher-numbered segments — must NOT be replayed (a WAL is valid only as
-	// a prefix). Signal recover() to stop the segment loop here.
+	// a prefix). Signal recover() to stop the segment loop here. Reaching this
+	// point means the durability generations either found nothing above the
+	// damage or placed everything there in the segment's final unsynced batch,
+	// so the truncation recover() performs discards no acknowledged record.
 	if readSeg.stoppedAtCorruption {
 		slog.Warn("waldb: halting recovery after corruption; later segments skipped",
 			"segment_id", segID)
@@ -1062,6 +1362,18 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 // to and including this segment is recovered; no higher segment is replayed.
 var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 
+// errMidSegmentCorruption signals that replaySegment halted at a corrupt
+// record above which the surviving records span a completed fdatasync, so they
+// were acknowledged. recover() turns it into ErrNonFinalSegmentCorruption's
+// sibling, ErrMidSegmentCorruption, and fails the open.
+var errMidSegmentCorruption = errors.New("waldb: corruption with acknowledged data after it")
+
+// errRecordSequenceRegression signals that replaySegment found, above a
+// corruption, a record whose durability generation is LOWER than one already
+// replayed from the clean prefix. recover() turns it into
+// ErrRecordSequenceRegression and fails the open.
+var errRecordSequenceRegression = errors.New("waldb: record durability sequence regressed")
+
 // ErrNonFinalSegmentCorruption is returned (wrapped in a RecoveryError) when
 // recovery finds corruption in a segment that is NOT the highest-numbered one.
 // A torn tail can only exist in the final segment — a lower segment was fully
@@ -1069,6 +1381,75 @@ var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 // committed — so prefix-truncating it would silently destroy committed entries
 // and regress term/vote. Recovery fails-stop; restore from snapshot/peers.
 var ErrNonFinalSegmentCorruption = errors.New("waldb: corruption in a non-final WAL segment; committed data above it would be lost — restore from snapshot/peers")
+
+// ErrMidSegmentCorruption is returned (wrapped in a RecoveryError) when
+// recovery finds corruption that is followed, in the SAME segment, by records
+// that still decode. Being in the highest-numbered segment is not enough to
+// call corruption a torn tail: a torn write leaves nothing readable behind it,
+// so decodable bytes further down are records the medium accepted and the node
+// acknowledged — bit rot, a misdirected write, a lying fsync or tampering hit
+// the middle of a live segment. Truncating to the clean prefix would discard
+// every one of them plus the newest HardState, so the node would boot with a
+// shorter log than it acknowledged (Log Matching / Leader Completeness) and a
+// stale term/vote it could then cast again (Election Safety). Recovery
+// fail-stops instead; restore from snapshot/peers.
+var ErrMidSegmentCorruption = errors.New("waldb: WAL corruption with acknowledged records after it; not an interrupted write — committed data would be lost — restore from snapshot/peers")
+
+// ErrRecordSequenceRegression is returned (wrapped in a RecoveryError) when
+// recovery finds, above a corruption, a record whose durability generation is
+// LOWER than one already replayed below it. A segment's generation counter only
+// ever rises, so no writer of this WAL produced that layout: the bytes are a
+// misdirected write from elsewhere on the device, a partial restore of an older
+// file over a newer one, or deliberate tampering. Recovery cannot classify the
+// damage and refuses to guess — truncating could destroy acknowledged records,
+// and replaying could admit records this node never wrote. Restore from
+// snapshot/peers, or authorize the loss explicitly with Repair.
+var ErrRecordSequenceRegression = errors.New("waldb: WAL record durability sequence goes backwards; these bytes were not written by this log — restore from snapshot/peers")
+
+// SegmentCorruptionError carries the exact location of a corruption that
+// recovery refused to repair on its own, so the operator has every value Repair
+// needs without having to find them by hand.
+//
+// This exists because "restore from snapshot/peers" is not a complete answer: on
+// a single-node deployment there are no peers to restore from. The node must
+// therefore be told precisely which shard, which segment and which offset, so
+// that an operator who decides the loss is acceptable can authorize exactly that
+// truncation and nothing wider. It unwraps to the sentinel it was built with, so
+// errors.Is checks against ErrMidSegmentCorruption,
+// ErrNonFinalSegmentCorruption and ErrRecordSequenceRegression all work.
+//
+// It used to be reachable from an ordinary power loss, because a torn
+// multi-block write and rot below acknowledged data were indistinguishable. The
+// durability sequence separated them, and the torn write now repairs itself, so
+// reaching this error means damage that an interrupted write does not explain.
+type SegmentCorruptionError struct {
+	// ShardIndex is the WAL shard directory holding the segment.
+	ShardIndex int
+
+	// SegmentID is the corrupt segment's numeric ID.
+	SegmentID uint64
+
+	// CleanEnd is the byte offset the segment's uncorrupted prefix ends at,
+	// and the only offset Repair will accept for this segment.
+	CleanEnd int64
+
+	// Err is ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption or
+	// ErrRecordSequenceRegression.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *SegmentCorruptionError) Error() string {
+	return e.Err.Error() + " (shard " + itoa(e.ShardIndex) + ", segment " +
+		itoa(int(e.SegmentID)) + ", clean prefix ends at " + itoa(int(e.CleanEnd)) +
+		"); if the loss is acceptable, authorize it with waldb.Repair"
+}
+
+// Unwrap returns the sentinel so errors.Is against ErrMidSegmentCorruption or
+// ErrNonFinalSegmentCorruption holds.
+func (e *SegmentCorruptionError) Unwrap() error {
+	return e.Err
+}
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
@@ -1435,20 +1816,62 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumRemoved:4]{ [ReplicaID:8] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
-// membershipSectionVersion is the layout revision of the membership section
-// of a snapshot record, written as its first byte and required to match
-// exactly on replay. It mirrors the proto.Membership version byte and moves
-// in lockstep with payloadTypeSnapshot: the payload type discriminates
-// records, this byte discriminates the section within a record.
-const membershipSectionVersion byte = 3
+// membershipSectionVersion is the layout revision this binary WRITES for the
+// membership section of a snapshot record, stored as the section's first byte.
+// It mirrors the proto.Membership version byte and moves in lockstep with
+// payloadTypeSnapshot: the payload type discriminates records, this byte
+// discriminates the section within a record.
+//
+// v4 appends the Identities map after Removed, then the replicated session
+// policy. Identities is the receive-side quorum gate's ONLY authorization input
+// where it is present, so a snapshot that drops it silently downgrades every
+// member it describes back to the address check — which is the hole node
+// identities exist to close. The session policy drives the deterministic apply
+// path, so a snapshot that drops it returns the recovering replica to expiring
+// sessions on local configuration, which diverges its state machine.
+const membershipSectionVersion byte = membershipSectionV4
+
+// Membership section layout revisions. Replay accepts the whole range;
+// only membershipSectionVersion is ever written.
+const (
+	// membershipSectionV3 is the pre-identity layout: fixed region, then
+	// Addresses, Observers, Witnesses, Removed.
+	membershipSectionV3 byte = 3
+
+	// membershipSectionV4 appends Identities after Removed, followed by the
+	// replicated session policy.
+	//
+	// The policy is a TAIL here and part of the FIXED region in
+	// proto.Membership. The two layouts are independent by design (this
+	// section carries PolicyFlags as one byte where proto spends eight), and a
+	// tail is what keeps v3 replay reading its maps at the offsets it always
+	// did: growing this section's fixed region would give the two versions
+	// different map offsets, and this decoder — unlike proto's — parses
+	// straight-line rather than through a per-version entry point.
+	membershipSectionV4 byte = 4
+
+	// minMembershipSectionVersion is the oldest layout this binary replays.
+	// Accepting a RANGE rather than requiring an exact match is what keeps a
+	// version bump from making every existing WAL unreplayable: the sections
+	// on disk were written by whichever binary wrote them, and a snapshot
+	// record is not rewritten in place.
+	minMembershipSectionVersion byte = membershipSectionV3
+)
 
 // membershipFixedSize is the size of the membership section's fixed region:
 // Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1).
 const membershipFixedSize = 1 + 8 + 8 + 1 // 18 bytes
 
-// minMembershipSize is the smallest well-formed membership section: the
-// fixed region plus the four map count headers, all empty.
-const minMembershipSize = membershipFixedSize + 4*4 // 34 bytes
+// minMembershipSize is the smallest well-formed membership section this binary
+// can REPLAY: the fixed region plus v3's four map count headers, all empty.
+//
+// It is deliberately the v3 minimum, not the v4 one that membershipSize now
+// returns. This is the length guard replay applies BEFORE reading the version
+// byte, so raising it to the v4 size would reject every v3 section on disk as
+// truncated without ever reaching the version check that knows how to read it.
+// The two numbers differ by design: this is the floor for what may be READ,
+// membershipSize is the exact size of what is WRITTEN.
+const minMembershipSize = membershipFixedSize + 4*4 // 34 bytes (v3)
 
 // membershipAddrMapSize returns the total serialized size for an address map:
 // [NumEntries:4] + for each entry: [ReplicaID:8][AddrLen:4][Addr:N].
@@ -1466,13 +1889,21 @@ func membershipRemovedMapSize(m map[uint64]bool) int {
 	return 4 + len(m)*8
 }
 
+// membershipSessionPolicySize is the size of the v4 session-policy tail:
+// SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxSessionsPerClient(8).
+const membershipSessionPolicySize = 3 * 8 // 24 bytes
+
 // membershipSize returns the total serialized size of a logdb.Membership.
 func membershipSize(m logdb.Membership) int {
 	return membershipFixedSize +
 		membershipAddrMapSize(m.Addresses) +
 		membershipAddrMapSize(m.Observers) +
 		membershipAddrMapSize(m.Witnesses) +
-		membershipRemovedMapSize(m.Removed)
+		membershipRemovedMapSize(m.Removed) +
+		// v4 tail, always written (see the marshal site): the size and the
+		// writer must agree exactly or the record overruns its buffer.
+		membershipAddrMapSize(m.Identities) +
+		membershipSessionPolicySize
 }
 
 // marshalAddrMap serializes an address map into buf at the given offset.
@@ -1659,9 +2090,11 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	// Defense in depth behind the payload-type gate: a section version this
 	// binary does not write means the record is corrupt or was produced by
 	// a skewed format, and its fields must not be interpreted.
-	if data[pos] != membershipSectionVersion {
+	sectionVersion := data[pos]
+	if sectionVersion < minMembershipSectionVersion || sectionVersion > membershipSectionVersion {
 		slog.Error("waldb: snapshot record membership section has unsupported version",
-			"segment_id", segID, "version", data[pos], "expected", membershipSectionVersion)
+			"segment_id", segID, "version", sectionVersion,
+			"minimum", minMembershipSectionVersion, "maximum", membershipSectionVersion)
 		return ErrUnsupportedMembershipVersion
 	}
 	pos++
@@ -1696,6 +2129,35 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 		return ErrTruncatedSnapshotRecord
 	}
 	pos = ok
+
+	// Identities exist only from v4. A v3 section ends at Removed, so reading
+	// here would consume whatever follows — which is why the version gate above
+	// accepts a range rather than ignoring trailing bytes: a v3 record with
+	// leftover data is corruption, not an old layout, and must still be caught
+	// by the check below.
+	membership.Identities = make(map[uint64]string)
+	if sectionVersion >= membershipSectionV4 {
+		membership.Identities, ok = unmarshalAddrMap(data, pos)
+		if ok == -1 {
+			return ErrTruncatedSnapshotRecord
+		}
+		pos = ok
+
+		// The session policy closes the v4 tail. Its length is checked
+		// explicitly: minMembershipSize is deliberately the v3 floor, so
+		// nothing upstream guarantees these 24 bytes are present, and the
+		// fixed-width reads below would slice past the record without it.
+		if len(data)-pos < membershipSessionPolicySize {
+			slog.Error("waldb: snapshot record membership section is missing its session policy",
+				"segment_id", segID, "remaining", len(data)-pos,
+				"required", membershipSessionPolicySize)
+			return ErrTruncatedSnapshotRecord
+		}
+		membership.SessionExpiryEntries = binary.LittleEndian.Uint64(data[pos:])
+		membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
+		membership.MaxSessionsPerClient = binary.LittleEndian.Uint64(data[pos+16:])
+		pos += membershipSessionPolicySize
+	}
 
 	// The membership is the final field; any leftover bytes mean the
 	// record did not parse cleanly (corruption).
@@ -2099,6 +2561,51 @@ func (s *walShard) recordContext(segID, recordSeq uint64) []byte {
 	return walRecordContext(s.ctxBuf[:], s.shardIdx, segID, recordSeq)
 }
 
+// verifyBindingUnchanged detects ONE direction of capability drift: a shard
+// that latched "cannot bind context" at open, against a barrier that now says
+// it can. It is called only from that branch of writeRecord and deliberately
+// guards nothing else.
+//
+// The capability is a deployment property, but it is only VALID WHILE THE
+// BARRIER STAYS UNSEALED: Host.EmergencySeal can seal the barrier at runtime,
+// and an operator can unseal it again — potentially under a different strategy
+// with a different capability. A latched "cannot bind" would then keep
+// suppressing the context against a barrier that would have authenticated it,
+// which is a downgrade no error surfaces on its own. That is the entire reason
+// this exists.
+//
+// The OPPOSITE direction — a shard writing WITH context whose barrier stops
+// being able to authenticate one — needs no check here and does not get one:
+// that shard passes a non-empty contextAAD to EncryptWithContext, and a barrier
+// that cannot authenticate a context it was handed fails the call rather than
+// dropping it. The write fails closed on its own, at the only place that could
+// have silently discarded the binding. Adding a symmetric probe would put a
+// barrier interface call on the hot path of every correctly configured
+// deployment to re-detect something already fatal.
+//
+// A barrier that is currently sealed reports nothing (not resolved) and is left
+// to the encrypt call, which fails closed on its own; only a RESOLVED answer
+// that contradicts the latch is treated as drift.
+func (s *walShard) verifyBindingUnchanged() error {
+	if s.sealer == nil || !s.sealer.ContextBindingResolved() {
+		return nil
+	}
+	if !s.sealer.SupportsContextAAD() {
+		return nil
+	}
+	// Log once. The condition is permanent for the life of the shard and this
+	// runs on every subsequent write, so logging unconditionally turns one
+	// diagnosis into a flood that buries it. The returned error carries the
+	// same information to every caller regardless.
+	if !s.bindingDriftLogged {
+		s.bindingDriftLogged = true
+		slog.Error("waldb: barrier now authenticates caller context but the WAL "+
+			"resolved it as unable to at open; refusing to write further unbound records",
+			"dir", s.dir)
+	}
+	return ErrBarrierContextBindingChanged
+}
+
 // reserveLanding makes the active segment the one a record of framedLen bytes
 // will actually land in, rotating first when the record no longer fits. After
 // it returns nil, s.activeSegmentID and s.activeSegment.RecordCount() name the
@@ -2177,6 +2684,15 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 		if !s.noContextBinding {
 			contextAAD = s.recordContext(s.activeSegmentID, s.activeSegment.RecordCount())
 			positional = true
+		} else if err := s.verifyBindingUnchanged(); err != nil {
+			// Suppressing the context is the only direction the barrier cannot
+			// catch for us. The opposite drift — latched "binds" against a
+			// barrier that no longer can — is already fail-closed, because
+			// EncryptWithContext refuses a non-empty context it cannot
+			// authenticate. So the re-check runs ONLY on this branch, which
+			// keeps it off the hot path of every correctly configured
+			// (software or AAD-capable) deployment.
+			return recordLanding{}, &WALEncryptError{Err: err}
 		}
 		encrypted, err := s.sealer.EncryptWithContext(nil, data, contextAAD)
 		if err != nil {
@@ -2280,6 +2796,57 @@ func (s *walShard) close() error {
 		return err
 	}
 	return nil
+}
+
+// closeAfterFailedOpen closes a shard that was opened successfully as part of a
+// DB open that then failed, and unlinks the segment this open created if it
+// holds no records.
+//
+// Without the unlink, every failed Open leaves one empty segment file per shard
+// that got that far, and recovery counts it: nextSegmentID advances past it, so
+// the files accumulate rather than being reused. That was tolerable while a
+// failed Open was rare, but the fail-closed conditions this package now raises
+// (a geometry mismatch, an unresolved barrier binding, mid-segment corruption)
+// are all conditions an operator retries against while diagnosing, which makes
+// repeated failed opens the EXPECTED path rather than the exceptional one.
+//
+// Only a segment created by THIS open and holding zero records is removed, so
+// there is no way for this to touch a segment that carries data. Every failure
+// is logged and swallowed: the DB open is already failing, and a leftover file
+// is a far smaller problem than masking the error the caller needs to see.
+func (s *walShard) closeAfterFailedOpen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	remove := s.openCreatedSegmentValid &&
+		s.activeSegment != nil &&
+		s.activeSegment.ID() == s.openCreatedSegment &&
+		s.activeSegment.RecordCount() == 0
+	segID := s.openCreatedSegment
+
+	s.closed = true
+	if s.activeSegment != nil {
+		if err := s.activeSegment.Close(); err != nil {
+			slog.Debug("waldb: shard close failed during failed-open cleanup",
+				"shard_index", s.shardIdx, "dir", s.dir, "error", err)
+		}
+		s.activeSegment = nil
+	}
+	if !remove {
+		return
+	}
+	if err := s.fs.Remove(filepath.Join(s.dir, segmentFilename(segID))); err != nil {
+		slog.Debug("waldb: removing the empty segment left by a failed open failed",
+			"shard_index", s.shardIdx, "dir", s.dir, "segment_id", segID, "error", err)
+		return
+	}
+	if !s.opts.noSync {
+		if err := syncDirFS(s.fs, s.dir); err != nil {
+			slog.Debug("waldb: syncing the shard directory after removing an "+
+				"empty segment failed",
+				"shard_index", s.shardIdx, "dir", s.dir, "error", err)
+		}
+	}
 }
 
 // shardDirName returns the directory name for the given shard index.
@@ -3300,6 +3867,14 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalAddrMap(buf, pos, ss.Membership.Observers)
 	pos = marshalAddrMap(buf, pos, ss.Membership.Witnesses)
 	pos = marshalRemovedMap(buf, pos, ss.Membership.Removed)
+	// v4 tail. Written unconditionally so the section length always matches
+	// membershipSize; an empty map is four zero bytes, not an absent field,
+	// and an unset session policy is 24 zero bytes rather than an absent one.
+	pos = marshalAddrMap(buf, pos, ss.Membership.Identities)
+	binary.LittleEndian.PutUint64(buf[pos:], ss.Membership.SessionExpiryEntries)
+	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
+	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxSessionsPerClient)
+	pos += membershipSessionPolicySize
 
 	landing, err := s.writeRecord(buf[:pos])
 	if err != nil {

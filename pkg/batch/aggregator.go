@@ -40,6 +40,13 @@ const (
 	// the queue is full, Submit returns a QueueFullError immediately
 	// rather than blocking.
 	DefaultQueueSize = 10000
+
+	// DefaultProposeTimeout bounds one batch's SyncPropose when the caller
+	// supplied no deadline of its own. It is generous — a propose that has to
+	// wait out an election legitimately takes seconds — but finite: the flush
+	// goroutine is single, so an unbounded propose stops every shard's flush
+	// and wedges Close (see proposeContext).
+	DefaultProposeTimeout = 30 * time.Second
 )
 
 // Flush reason labels for the flushReasonTotal metric.
@@ -77,14 +84,20 @@ type Config struct {
 
 	// QueueSize is the capacity of the proposal channel.
 	QueueSize int
+
+	// ProposeTimeout bounds a single batch's SyncPropose when the submitting
+	// callers supplied no deadline of their own. A caller's own deadline is
+	// always honored as-is and never shortened by this value.
+	ProposeTimeout time.Duration
 }
 
 // DefaultConfig returns a Config with production-ready default values.
 func DefaultConfig() Config {
 	return Config{
-		MaxBatchSize:  DefaultMaxBatchSize,
-		FlushInterval: DefaultFlushInterval,
-		QueueSize:     DefaultQueueSize,
+		MaxBatchSize:   DefaultMaxBatchSize,
+		FlushInterval:  DefaultFlushInterval,
+		QueueSize:      DefaultQueueSize,
+		ProposeTimeout: DefaultProposeTimeout,
 	}
 }
 
@@ -103,6 +116,9 @@ func WithConfig(cfg Config) Option {
 		}
 		if cfg.QueueSize > 0 {
 			a.cfg.QueueSize = cfg.QueueSize
+		}
+		if cfg.ProposeTimeout > 0 {
+			a.cfg.ProposeTimeout = cfg.ProposeTimeout
 		}
 	}
 }
@@ -436,11 +452,21 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	}
 	encoded := EncodeBatch(cmds)
 
-	// Use the first non-canceled context for the propose call. If all
-	// contexts are already canceled, use a background context to avoid
-	// losing the batch entirely. The proposer will return quickly if
-	// the Raft layer rejects the stale proposal.
-	ctx := a.pickContext(proposals)
+	// Every waiting caller has already given up: there is nobody left to
+	// receive a result, and proposing anyway would replicate a batch whose
+	// outcome no one observes while occupying the flush goroutine for the
+	// whole propose. Report the cancellation to the (already departed)
+	// waiters and move on.
+	ctx, cancel, ok := a.proposeContext(proposals)
+	if !ok {
+		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
+		flushErr := &FlushError{ShardID: shardID, Err: context.Canceled, Indeterminate: false}
+		for _, p := range proposals {
+			p.resultCh <- flushErr
+		}
+		return
+	}
+	defer cancel()
 
 	start := time.Now()
 	err := a.proposer.SyncPropose(ctx, shardID, encoded)
@@ -478,16 +504,37 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	}
 }
 
-// pickContext returns the first non-canceled context from the proposal
-// list. If all contexts are already done, it returns context.Background()
-// to ensure the batch can still be submitted.
-func (a *Aggregator) pickContext(proposals []*proposal) context.Context {
+// proposeContext returns the context a batch's SyncPropose runs under, a
+// cancel func the caller must invoke, and whether the batch should be
+// proposed at all.
+//
+// It reports false when EVERY proposal context is already done. That case used
+// to fall back to context.Background(), which is unbounded: Host.SyncPropose
+// selects on the result channel and ctx.Done(), so with a Background context
+// neither arm can ever fire and the propose blocks forever. It blocks on the
+// SINGLE flush goroutine, so the aggregator then stops flushing entirely —
+// the queue fills, every later Submit returns QueueFullError, and Close hangs
+// on wg.Wait with nothing left to release it. The trigger is worse than
+// incidental: all contexts being cancelled at once is what mass caller
+// cancellation looks like, which is what quorum loss produces, which is
+// precisely when the propose cannot complete. There is also no caller left to
+// receive the result, so the batch is dropped rather than proposed blind.
+//
+// The chosen context is bounded when it carries no deadline of its own. A
+// caller's own deadline is never shortened — it is already a bound, and
+// overriding it would silently change the contract Submit was called under.
+func (a *Aggregator) proposeContext(proposals []*proposal) (context.Context, context.CancelFunc, bool) {
 	for _, p := range proposals {
-		if p.ctx.Err() == nil {
-			return p.ctx
+		if p.ctx.Err() != nil {
+			continue
 		}
+		if _, hasDeadline := p.ctx.Deadline(); hasDeadline {
+			return p.ctx, func() {}, true
+		}
+		ctx, cancel := context.WithTimeout(p.ctx, a.cfg.ProposeTimeout)
+		return ctx, cancel, true
 	}
-	return context.Background()
+	return nil, nil, false
 }
 
 // initMetrics creates and registers Prometheus metrics. Uses sync.Once

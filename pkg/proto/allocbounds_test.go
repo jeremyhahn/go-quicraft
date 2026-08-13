@@ -122,9 +122,9 @@ func TestMessage_UnmarshalFrom_EntryCountExceedsBuffer(t *testing.T) {
 // version byte and the given Addresses map count, supplying no map entry
 // bytes.
 func craftedMembership(count uint32) []byte {
-	buf := make([]byte, membershipFixedSize+4)
-	buf[0] = membershipWireVersion
-	putUint32(buf[membershipFixedSize:], count)
+	buf := make([]byte, membershipFixedSizeV4+4)
+	buf[0] = membershipFormatVersion
+	putUint32(buf[membershipFixedSizeV4:], count)
 	return buf
 }
 
@@ -133,8 +133,9 @@ func craftedMembership(count uint32) []byte {
 // cross-check this 29-byte payload allocated ~437 KB.
 func TestMembership_UnmarshalFrom_MapCountExceedsBuffer(t *testing.T) {
 	buf := craftedMembership(maxMembershipEntries)
-	if len(buf) != 29 {
-		t.Fatalf("crafted membership = %d bytes, want 29", len(buf))
+	if len(buf) != membershipFixedSizeV4+4 {
+		t.Fatalf("crafted membership = %d bytes, want %d",
+			len(buf), membershipFixedSizeV4+4)
 	}
 	var m Membership
 	if _, err := m.UnmarshalFrom(buf); !errors.Is(err, ErrBufferTooSmall) {

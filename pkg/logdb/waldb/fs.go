@@ -63,6 +63,13 @@ type FilePreAllocator interface {
 // FS abstracts filesystem operations used by the WAL database. Production
 // code uses osFS which delegates to the os package. Test code can provide
 // alternative implementations for error injection and fault simulation.
+//
+// Rename is REQUIRED, not optional: the WAL format marker is published by
+// writing a temporary file, fsyncing it and renaming it into place, which is
+// the only construction under which a reader can never observe a
+// partially-written marker. Making it an optional interface with an in-place
+// fallback would reintroduce exactly the torn-write state the rename exists to
+// remove, so an FS that cannot rename cannot host a WAL. See writeWALFormat.
 type FS interface {
 	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
 	Open(name string) (File, error)
@@ -70,6 +77,7 @@ type FS interface {
 	ReadDir(name string) ([]fs.DirEntry, error)
 	Stat(name string) (fs.FileInfo, error)
 	Remove(name string) error
+	Rename(oldpath, newpath string) error
 }
 
 // osFS implements FS using the standard os package.
@@ -111,6 +119,12 @@ func (osFS) Stat(name string) (fs.FileInfo, error) {
 // Remove removes the named file or empty directory.
 func (osFS) Remove(name string) error {
 	return os.Remove(name)
+}
+
+// Rename atomically replaces newpath with oldpath. Both must live in the same
+// directory for the atomicity the marker publication depends on.
+func (osFS) Rename(oldpath, newpath string) error {
+	return os.Rename(oldpath, newpath)
 }
 
 // osFile implements File by wrapping *os.File with platform-optimized sync.

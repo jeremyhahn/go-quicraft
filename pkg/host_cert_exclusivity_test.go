@@ -25,6 +25,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,4 +270,158 @@ func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 		t.Fatalf("RequestAddNode rejected a co-located replica: %v", addErr)
 	}
 	rs.Release()
+}
+
+// ---------------------------------------------------------------------------
+// One address may name only one member of a shard
+// ---------------------------------------------------------------------------
+
+// TestStartShard_RejectsDuplicateMemberAddress covers quorum forgery that needs
+// no forged message and no certificate abuse at all.
+//
+// Inbound authorization is replica ID -> committed address -> certificate. Seed
+// two replica IDs at ONE address and the single host behind it legitimately
+// authenticates as both: it sends ReplicateResp{From: 2} and
+// ReplicateResp{From: 3}, both pass every check, both advance a remote match
+// index, and tryCommit counts them as two independent replicas. It also casts
+// two votes. The same rule is enforced on the config-change path by
+// raft.membership.addressHolder; this is the seeding path.
+func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
+	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{
+		1: "node-a.raft.test:5000",
+		2: "node-b.raft.test:5000",
+		3: "node-b.raft.test:5000", // the same host, seeded twice
+	}
+	startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
+	if startErr == nil {
+		t.Fatal("StartShard accepted two replica IDs at one address: the single host " +
+			"behind it authenticates as both, so it holds two votes and two match " +
+			"indices in a quorum that believes they are independent")
+	}
+	if !errors.Is(startErr, ErrInvalidMember) {
+		t.Fatalf("StartShard error = %v, want ErrInvalidMember", startErr)
+	}
+}
+
+// TestStartShard_AllowsColocatedRepliasOnDistinctPorts is the liveness half:
+// two replicas on ONE machine at different ports are a supported deployment and
+// stay supported. The comparison is on the whole address, not the host —
+// co-located replicas are already indistinguishable to a certificate (see
+// transport.isCoLocatedCertHost) but they are still distinct endpoints.
+func TestStartShard_AllowsColocatedRepliasOnDistinctPorts(t *testing.T) {
+	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{
+		1: "127.0.0.1:5000",
+		2: "127.0.0.1:5001",
+		3: "127.0.0.1:5002",
+	}
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard rejected co-located replicas on distinct ports: %v", startErr)
+	}
+}
+
+// TestStartShard_RejectsSpellingVariantDuplicateAddress closes the residual the
+// literal string compare left in the seeding path.
+//
+// "node-b.raft.test:5000" and "NODE-B.RAFT.TEST:5000" are two distinct strings
+// and ONE host to x509.VerifyHostname, which is what the receive-side gate
+// ultimately matches on. Seeding both is the same quorum forgery as seeding the
+// identical spelling twice — one host, two committed replica IDs, two votes —
+// and the seeding path must refuse it for the same reason
+// raft.membership.addressHolder refuses the config-change form.
+func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
+	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{
+		1: "node-a.raft.test:5000",
+		2: "node-b.raft.test:5000",
+		3: "NODE-B.RAFT.TEST:5000", // the same endpoint, spelled differently
+	}
+	startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
+	if startErr == nil {
+		t.Fatal("StartShard accepted two spellings of one address: the certificate " +
+			"cannot tell the two replica IDs apart, so the single host behind them " +
+			"holds two votes and two match indices")
+	}
+	if !errors.Is(startErr, ErrInvalidMember) {
+		t.Fatalf("StartShard error = %v, want ErrInvalidMember", startErr)
+	}
+}
+
+// TestHostNodeIdentity_ReportsThisNodesOwnIdentity pins the operator-facing end
+// of the migration: the value a node reports must be the value its PEERS will
+// see on its connections and therefore the value they must commit. If the two
+// were derived differently, committing what a node reports would produce a
+// permanent identity_mismatch on every message it sends.
+func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
+	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
+
+	h, err := NewHost(cfg, WithMemoryLogDB())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	identity := h.NodeIdentity()
+	if identity == "" {
+		t.Fatal("NodeIdentity is empty for a host with a transport; an operator has " +
+			"nothing to commit and the strict mode can never be satisfied")
+	}
+	if !strings.HasPrefix(identity, "spki:") {
+		t.Fatalf("NodeIdentity = %q, want an spki:-tagged value", identity)
+	}
+
+	// It must be derived from THIS host's own leaf, which is the certificate
+	// peers verify on its connections.
+	leaf := leafOfPEM(t, cfg.TransportConfig.MTLSConfig.Cert)
+	if want := transport.NodeIdentityFromCertificate(leaf); identity != want {
+		t.Fatalf("NodeIdentity = %q, but this host's leaf yields %q: a peer that "+
+			"committed the reported value would reject every message this node sends",
+			identity, want)
+	}
+
+	// A host with no transport has no certificate and therefore no identity.
+	noTransport, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost(WithoutTransport) failed: %v", err)
+	}
+	defer noTransport.Close()
+	if got := noTransport.NodeIdentity(); got != "" {
+		t.Fatalf("NodeIdentity on a transportless host = %q, want empty", got)
+	}
+}
+
+// leafOfPEM parses the end-entity certificate out of a PEM block.
+func leafOfPEM(t *testing.T, certPEM []byte) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("PEM decode of leaf certificate failed")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse leaf certificate: %v", err)
+	}
+	return leaf
 }

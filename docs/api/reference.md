@@ -664,6 +664,55 @@ Creates a Membership with all maps initialized to empty.
 
 ## Error Types
 
+### Classification helpers
+
+Do not re-derive "is this retryable?" from the sentinel list — every consumer
+that does will disagree with the others. Two helpers answer it:
+
+```go
+func Temporary(err error) bool
+func NotLeader(err error) (replicaID uint64, ok bool)
+```
+
+`Temporary` reports whether the IDENTICAL request, unchanged, can succeed on
+retry once a transient condition clears with no operator or caller
+intervention. It is true for `ErrBusy`, `ErrSystemBusy`, `ErrTimeout`,
+`ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`,
+`ErrNotLeader`, `ErrReadIndexNotReady`, `ErrRotateInProgress` and
+`ErrSnapshotInProgress`.
+
+**Everything else is permanent, including errors this package never produced.**
+Retrying a permanent failure forever turns one bad request into sustained load
+and hides the real fault. Some exclusions are deliberate and worth knowing:
+`ErrStaleConfigChange` is permanent because the identical request fails forever
+— re-read membership with `SyncGetShardMembership` and build a NEW request;
+`ErrDraining` is a one-way transition into shutdown, so retry a different host;
+`ErrCanceled` is the caller's own decision, whereas a deadline that elapses
+server-side surfaces as `ErrTimeout`.
+
+`NotLeader` returns `ok == true` for any not-leader error — the bare
+`ErrNotLeader` sentinel or a `*NotLeaderError` — and `replicaID` is the leader
+this replica believes is current, or **0 when the leader is unknown**. Treat
+`(0, true)` as "retry, but discover the leader yourself". Every not-leader
+error is also `Temporary`, so gate a retry loop on `Temporary` and use
+`NotLeader` only to pick a target.
+
+Both use `errors.Is`/`errors.As`, so a wrapped error and the typed errors'
+`Is` methods classify correctly.
+
+```go
+for {
+    err := host.SyncPropose(ctx, session, cmd)
+    if err == nil || !quicraft.Temporary(err) {
+        return err
+    }
+    if leaderID, ok := quicraft.NotLeader(err); ok && leaderID != 0 {
+        redirect(leaderID)
+    }
+    // back off, then retry
+}
+```
+
 ### Sentinel Errors
 
 All sentinel errors use the `"quicraft:"` prefix. Check with `errors.Is()`.
@@ -958,33 +1007,43 @@ All 17 methods are no-ops. Embed and override selectively to avoid implementing 
 
 ```go
 func NewPrometheusMetricsCollector() *PrometheusMetricsCollector
+func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *PrometheusMetricsCollector
 ```
 
 Production implementation using `prometheus/client_golang`. All metrics are registered on a dedicated `prometheus.Registry` (exposed as `collector.Registry`) to avoid polluting the global default.
 
-**Prometheus metric names:**
+`NewPrometheusMetricsCollector` uses the zero `config.MetricsConfig`, so **`PerShardMetrics` is off** and the volume-and-latency telemetry aggregates to one host-level series per metric. Use `NewPrometheusMetricsCollectorWithConfig` to opt in to a `shard_id` breakdown. The mode is fixed at construction and cannot be changed afterwards.
+
+**Prometheus metric names.** `shard_id*` marks a label present only when `PerShardMetrics` is enabled. See [operations/deployment.md](../operations/deployment.md#metrics-cardinality) for the cardinality budget, the alerting-safe subset, and the full reference including the drop and security counters.
 
 | Subsystem   | Metric Name                               | Type      | Labels                    |
 |-------------|-------------------------------------------|-----------|---------------------------|
-| `raft`      | `quicraft_raft_proposal_latency_seconds`  | Histogram | `shard_id`                |
-| `raft`      | `quicraft_raft_commit_latency_seconds`    | Histogram | `shard_id`                |
-| `raft`      | `quicraft_raft_apply_latency_seconds`     | Histogram | `shard_id`                |
+| `raft`      | `quicraft_raft_proposal_latency_seconds`  | Histogram | `shard_id*`               |
+| `raft`      | `quicraft_raft_commit_latency_seconds`    | Histogram | `shard_id*`               |
+| `raft`      | `quicraft_raft_apply_latency_seconds`     | Histogram | `shard_id*`               |
+| `raft`      | `quicraft_raft_read_index_latency_seconds`| Histogram | `shard_id*`               |
+| `raft`      | `quicraft_raft_proposal_batch_size`       | Histogram | `shard_id*`               |
+| `raft`      | `quicraft_raft_snapshots_total`           | Counter   | `shard_id*`               |
+| `raft`      | `quicraft_raft_piggyback_commits_total`   | Counter   | `shard_id*`               |
 | `raft`      | `quicraft_raft_proposals_dropped_total`   | Counter   | `shard_id`                |
-| `raft`      | `quicraft_raft_proposal_batch_size`       | Histogram | `shard_id`                |
-| `raft`      | `quicraft_raft_commit_batch_size`         | Histogram | --                        |
 | `raft`      | `quicraft_raft_elections_total`           | Counter   | `shard_id`                |
-| `raft`      | `quicraft_raft_snapshots_total`           | Counter   | `shard_id`                |
+| `raft`      | `quicraft_raft_commit_batch_size`         | Histogram | --                        |
 | `logdb`     | `quicraft_logdb_write_latency_seconds`    | Histogram | --                        |
 | `logdb`     | `quicraft_logdb_fsync_latency_seconds`    | Histogram | --                        |
 | `logdb`     | `quicraft_logdb_compaction_latency_seconds` | Histogram | --                      |
 | `logdb`     | `quicraft_logdb_write_bytes_total`        | Counter   | --                        |
 | `transport` | `quicraft_transport_send_latency_seconds` | Histogram | --                        |
-| `transport` | `quicraft_transport_messages_sent_total`  | Counter   | `shard_id`, `to`, `msg_type` |
-| `transport` | `quicraft_transport_messages_received_total` | Counter | `shard_id`, `from`, `msg_type` |
-| `transport` | `quicraft_transport_snapshots_sent_total` | Counter   | `shard_id`                |
-| `transport` | `quicraft_transport_snapshots_sent_bytes` | Histogram | `shard_id`                |
-| `transport` | `quicraft_transport_snapshots_received_total` | Counter | `shard_id`              |
-| `transport` | `quicraft_transport_snapshots_received_bytes` | Histogram | `shard_id`            |
+| `transport` | `quicraft_transport_messages_sent_total`  | Counter   | --                        |
+| `transport` | `quicraft_transport_messages_received_total` | Counter | --                       |
+| `transport` | `quicraft_transport_snapshots_sent_total` | Counter   | `shard_id*`               |
+| `transport` | `quicraft_transport_snapshots_sent_bytes` | Histogram | `shard_id*`               |
+| `transport` | `quicraft_transport_snapshots_received_total` | Counter | `shard_id*`             |
+| `transport` | `quicraft_transport_snapshots_received_bytes` | Histogram | `shard_id*`           |
+| `transport` | `quicraft_transport_messages_dropped_total` | Counter | `shard_id`, `reason`      |
+| `transport` | `quicraft_transport_snapshots_rejected_total` | Counter | `shard_id`, `reason`    |
+| `security`  | `quicraft_security_unauthorized_messages_dropped_total` | Counter | `shard_id`, `reason` |
+| `security`  | `quicraft_security_unauthorized_snapshots_dropped_total` | Counter | `shard_id`        |
+| `metrics`   | `quicraft_metrics_per_shard_enabled`      | Gauge     | --                        |
 
 Latency buckets: 100us to 10s. Batch size buckets: 1 to 1024 (powers of 2). Snapshot byte buckets: 1KB to 1GB.
 
@@ -1031,19 +1090,20 @@ Source: `pkg/config/config.go`
 | `ReplicaID`             | `uint64`          | (required) | Unique replica ID within the shard       |
 | `IsObserver`            | `bool`            | `false`    | Non-voting learner                       |
 | `IsWitness`             | `bool`            | `false`    | Voting member, no state machine          |
-| `CheckQuorum`           | `bool`            | `true`     | Leader step-down on quorum loss          |
-| `PreVote`               | `bool`            | `true`     | Pre-vote protocol extension              |
-| `OrderedConfigChange`   | `bool`            | `true`     | Serialize membership changes             |
+| `CheckQuorum`           | `*bool`           | `nil` = on | Leader step-down on quorum loss          |
+| `PreVote`               | `*bool`           | `nil` = on | Pre-vote protocol extension              |
+| `OrderedConfigChange`   | `*bool`           | `nil` = on | Serialize membership changes             |
 | `ElectionRTT`           | `uint64`          | `10`       | Election timeout in RTT multiples        |
 | `HeartbeatRTT`          | `uint64`          | `1`        | Heartbeat interval in RTT multiples      |
 | `SnapshotEntries`       | `uint64`          | `0`        | Auto-snapshot interval (0 = disabled)    |
 | `CompactionOverhead`    | `uint64`          | `5000`     | Entries retained after compaction        |
 | `MaxInMemLogSize`       | `uint64`          | `0`        | Per-shard rate limit threshold (bytes)   |
 | `MaxEntrySize`          | `uint64`          | `8 MB`     | Maximum proposal payload                 |
-| `MaxApplyEntrySize`     | `uint64`          | `64 MB`    | Max batch size per SM.Update call        |
+| `MaxApplyEntrySize`     | `uint64`          | `16711672` | Max batch size per SM.Update call (`MaxReplicationPayloadBytes`, ~15.9 MiB) |
 | `MaxSnapshotSize`       | `uint64`          | `4 GB`     | Maximum snapshot file size               |
-| `MaxSessionsPerClient`  | `uint64`          | `128`      | Per-client session limit                 |
-| `MaxTotalSessions`      | `uint64`          | `16384`    | Per-shard total session limit            |
+| `MaxSessionsPerClient`  | `uint64`          | `128`      | Cached responses retained per session (bootstrap seed; replicated) |
+| `MaxTotalSessions`      | `uint64`          | `16384`    | Per-shard total session limit (bootstrap seed; replicated) |
+| `SessionExpiryEntries`  | `uint64`          | `100000`   | Session inactivity threshold in log entries (bootstrap seed; replicated). `config.SessionExpiryDisabled` turns expiry off |
 | `Quiesce`               | `bool`            | `false`    | Quiescence for idle shards               |
 | `ZeroCopyEntryCmd`      | `bool`            | `false`    | Zero-copy Entry.Cmd (unsafe if retained) |
 | `LeaseRead`             | `bool`            | `false`    | Enable lease-based reads (PhD 6.4)       |
@@ -1268,11 +1328,23 @@ type ConnectionInfo struct {
 type ShardHealth uint8
 ```
 
-Indicates shard health status:
+Indicates shard health status. `String()` and `MarshalJSON` render the value as
+the lowercase name in the third column; `UnmarshalJSON` accepts those names and
+falls back to `ShardHealthy` for anything else.
 
-- `ShardHealthUnknown` -- Initial state
-- `ShardHealthNormal` -- Healthy
-- `ShardHealthError` -- SM failure or too many apply retries
+| Constant | JSON / `String()` | Meaning |
+|---|---|---|
+| `ShardHealthy` | `healthy` | Known leader, apply pipeline running. Zero value. |
+| `ShardNoLeader` | `no-leader` | No leader known — election or partition |
+| `ShardLagging` | `lagging` | Apply index significantly behind the commit index |
+| `ShardUnloaded` | `unloaded` | Shard is not loaded on this host |
+| `ShardError` | `error` | Fatal state machine or LogDB failure |
+| `ShardRecovering` | `recovering` | `RecoverFromSnapshot` in progress: the replica still votes and replicates but applies nothing and serves no up-to-date local read |
+| `ShardSnapshotting` | `snapshotting` | Snapshot capture in progress; applies are quiesced |
+
+`ShardHealthy` is the zero value, so a `ShardInfo` you never populated reports
+healthy — check `ShardUnloaded` explicitly rather than testing against the zero
+value.
 
 ### ShardInfo
 

@@ -33,6 +33,48 @@ const (
 	DefaultMaxSnapshotSize      uint64 = 4 * 1024 * 1024 * 1024
 	DefaultMaxSessionsPerClient uint64 = 128
 	DefaultMaxTotalSessions     uint64 = 16384
+
+	// DefaultSessionExpiryEntries is the session inactivity threshold, in
+	// applied log entries, that a shard bootstraps with unless the operator
+	// chooses otherwise.
+	//
+	// It is non-zero because zero — the previous default — leaks: a client
+	// that registers a session and dies without CloseSession leaves an entry
+	// that is never removed, is serialized into every subsequent snapshot, and
+	// counts against MaxTotalSessions forever, until the shard refuses new
+	// registrations outright. Nothing else reclaims it.
+	//
+	// The value is 1000x the floor Validate enforces (100), which is set where
+	// it is because a threshold that short expires sessions faster than a slow
+	// client can round-trip. Expiry is measured in LOG ENTRIES, not time, so
+	// the wall-clock window it buys scales inversely with shard throughput —
+	// generous on a quiet shard, and on a shard sustaining 10k entries/s still
+	// ten seconds of client silence before a session is reclaimed. Erring
+	// upward is the right direction: an over-long threshold costs a bounded
+	// amount of session table (MaxTotalSessions caps it regardless), while an
+	// over-short one expires live clients, and a client whose session is
+	// expired mid-retry loses its at-most-once guarantee for that retry.
+	//
+	// It could only become a default once the value was REPLICATED. As
+	// node-local configuration, changing it would have made a mixed-version
+	// cluster — old binary on one replica, new on another — expire different
+	// sessions at different log indexes and diverge silently. It is now seeded
+	// into the shard's membership at bootstrap, so an upgraded replica adopts
+	// whatever its shard committed and this default applies only to shards
+	// bootstrapped by this binary.
+	DefaultSessionExpiryEntries uint64 = 100000
+
+	// SessionExpiryDisabled turns automatic session expiry off. Assign it to
+	// Config.SessionExpiryEntries; leaving that field zero now selects
+	// DefaultSessionExpiryEntries instead, because an unset field cannot mean
+	// both "I did not choose" and "never expire anything".
+	//
+	// It needs no special case anywhere: it is an inactivity threshold no log
+	// can reach, so the apply path's checkpoint walk finds no checkpoint and
+	// no session is ever old enough to expire. Choosing it means accepting
+	// that a client which dies without CloseSession leaks a session entry
+	// permanently — see SessionExpiryEntries.
+	SessionExpiryDisabled uint64 = math.MaxUint64
 )
 
 // MaxReplicationPayloadBytes bounds MaxApplyEntrySize, which raft uses as the
@@ -149,6 +191,35 @@ type Config struct {
 	// in replicated membership state; see WitnessConfig.
 	Witness WitnessConfig
 
+	// MemberIdentities seeds the shard's replicated NODE IDENTITIES at
+	// bootstrap, mapping replica ID to the identity value that node reports
+	// through Host.NodeIdentity. It is the bootstrap counterpart of the
+	// identity argument on Host.RequestAddNodeWithIdentity, and the same
+	// lifecycle applies: this is the ONLY point where it enters the shard, and
+	// from here on it lives in replicated membership state (log, snapshot, WAL)
+	// and changes only through committed config changes.
+	//
+	// Its effect is on the RECEIVE-SIDE SENDER GATE. A replica named here is
+	// authorized by its identity — a value derived from its keypair, which no
+	// other holder of a valid cluster certificate can present — instead of by
+	// its committed address, which a wildcard or shared-SAN certificate covers
+	// for every member at once. A replica NOT named here falls back to the
+	// address check, or is refused outright when
+	// TransportConfig.RequireMemberIdentity is set.
+	//
+	// Every FOUNDING member (join=false) must be given an IDENTICAL map. The
+	// bootstrap entry at log index 1 is built from it, byte-identically on each
+	// founder, and founders that disagree produce a divergent index-1 entry
+	// that Log Matching never reconciles — the same rule that already applies
+	// to the members map and to Witness.
+	//
+	// Leaving it nil is the pre-identity behaviour and is fully supported. It
+	// cannot be populated automatically: an identity has to be collected from
+	// each node out of band, because learning it from the peer's own connection
+	// would let a promiscuous-certificate holder register itself as any replica
+	// — the very attack identities close.
+	MemberIdentities map[uint64]string
+
 	// CheckQuorum enables the leader to step down if it cannot reach a
 	// quorum within an election timeout. Defaults to true when nil.
 	// Set to BoolPtr(false) to explicitly disable for benchmarking
@@ -225,8 +296,13 @@ type Config struct {
 	// Default: 4 GB.
 	MaxSnapshotSize uint64
 
-	// MaxSessionsPerClient is the maximum number of concurrent sessions per
-	// client ID within a shard. Default: 128.
+	// MaxSessionsPerClient is the maximum number of cached RESPONSES retained
+	// per registered session — the depth of the at-most-once dedup cache, not a
+	// count of sessions. Default: 128.
+	//
+	// The name predates the wiring and is kept for compatibility: it is passed
+	// to rsm.NewStateMachine as maxResponses, while MaxTotalSessions is the
+	// limit on how many sessions a shard admits.
 	MaxSessionsPerClient uint64
 
 	// MaxTotalSessions is the maximum total sessions per shard across all
@@ -260,11 +336,42 @@ type Config struct {
 
 	// SessionExpiryEntries controls automatic cleanup of abandoned client
 	// sessions. Sessions that have not been active within this many applied
-	// log entries are expired during the apply path. This is deterministic
-	// across all replicas because it is driven by log index, not wall-clock
-	// time. Set to 0 to disable automatic expiry (default). When disabled,
-	// sessions are only removed via explicit unregister or when the
-	// MaxTotalSessions limit forces rejection of new registrations.
+	// log entries are expired during the apply path. Expiry is driven by log
+	// index rather than wall-clock time, so replicas that agree on this value
+	// expire exactly the same sessions at exactly the same log index.
+	//
+	// It is load-bearing for apply determinism: StateMachine.Apply derives its
+	// expiry checkpoints from it (multiples of the threshold), and
+	// Manager.ExpireSessions uses it as the inactivity bound. Two replicas
+	// evaluating different values expire different sessions, after which one
+	// replica answers a session-managed proposal from its response cache while
+	// the other reports the session expired — a permanent state-machine
+	// divergence that no Raft invariant detects.
+	//
+	// It is therefore REPLICATED, and this field is only the SEED. A founding
+	// replica writes it into the shard's initial membership at bootstrap
+	// (proto.SessionPolicy, alongside MaxTotalSessions and
+	// MaxSessionsPerClient); from then on the apply path reads the committed
+	// value and this field governs nothing. All founders must supply the same
+	// value or their index-1 entries differ; a replica whose configuration
+	// disagrees with what its shard committed logs the disagreement at startup
+	// and applies the shard's value. There is currently no config change that
+	// alters the committed policy, so it is fixed for the life of the shard.
+	//
+	// Set to 0 to disable automatic expiry. Disabling is an explicit,
+	// replicated choice, not an absent one. When disabled, sessions are only
+	// removed via explicit unregister or when the MaxTotalSessions limit
+	// forces rejection of new registrations, so a client that registers a
+	// session and dies without CloseSession leaks an entry that is serialized
+	// into every subsequent snapshot and counts against MaxTotalSessions
+	// forever. That leak is why the default is non-zero — see
+	// DefaultSessionExpiryEntries for the choice of value.
+	//
+	// Keep it at or below a non-zero SnapshotEntries — Validate warns
+	// otherwise — so that expiry runs at least once per snapshot interval and
+	// the session table cannot grow unboundedly between snapshots. Values
+	// below 100 are rejected by Validate, because a threshold that short
+	// expires sessions faster than a slow client can round-trip.
 	SessionExpiryEntries uint64
 
 	// LeaseRead enables lease-based linearizable reads. When the leader has
@@ -339,6 +446,13 @@ func (c *Config) SetDefaults() {
 	}
 	if c.MaxTotalSessions == 0 {
 		c.MaxTotalSessions = DefaultMaxTotalSessions
+	}
+	// An unset expiry threshold takes the default rather than meaning
+	// "disabled": with expiry off, a session whose client dies without
+	// CloseSession is never reclaimed. Disabling is still available, but it
+	// has to be asked for — see SessionExpiryDisabled.
+	if c.SessionExpiryEntries == 0 {
+		c.SessionExpiryEntries = DefaultSessionExpiryEntries
 	}
 }
 

@@ -48,6 +48,48 @@ type Membership struct {
 	// full-replica-majority witness policy. Changed via
 	// Host.RequestUpdateWitnessPolicy.
 	RequireFullReplicaMajority bool
+
+	// SessionExpiryEntries, MaxTotalSessions and MaxSessionsPerClient are the
+	// shard's replicated SESSION POLICY: the three limits the deterministic
+	// apply path reads. They are seeded at bootstrap from the founder's
+	// Config (Config.SessionExpiryEntries, Config.MaxTotalSessions,
+	// Config.MaxSessionsPerClient) and are replicated because a replica that
+	// evaluated them from its own configuration would expire different
+	// sessions at different log indexes and diverge its state machine
+	// silently.
+	//
+	// They are exposed here so an operator can read what a shard actually
+	// committed rather than what any one node is configured with — the two
+	// differ exactly when someone edited a node's Config after bootstrap, in
+	// which case the shard's value is the one that governs and the node logs
+	// the disagreement at startup.
+	//
+	// A shard bootstrapped before the policy was replicated reports all three
+	// as zero: it has no committed policy and every replica is still running
+	// on its own configuration. There is currently NO config change that
+	// alters these after bootstrap.
+	SessionExpiryEntries uint64
+	// MaxTotalSessions is the replicated cap on concurrently registered
+	// sessions. Zero means the shard committed no session policy at all.
+	MaxTotalSessions uint64
+	// MaxSessionsPerClient is the replicated cap on responses cached per
+	// session.
+	MaxSessionsPerClient uint64
+
+	// Identities maps replicaID to the stable node identity the shard has
+	// COMMITTED for it — the value that node reports from Host.NodeIdentity.
+	// It is the key every peer authorizes that replica's quorum-bearing
+	// messages with, in place of its address.
+	//
+	// It is SPARSE. A replica absent from it has no committed identity and is
+	// authorized by its committed address instead, or refused outright when
+	// TransportConfig.RequireMemberIdentity is set. Reading it is how an
+	// operator verifies a migration is complete before tightening that
+	// setting: every entry in Nodes, Observers and Witnesses must appear here.
+	//
+	// Seeded at bootstrap from Config.MemberIdentities; changed via
+	// Host.RequestAddNodeWithIdentity and its observer/witness variants.
+	Identities map[uint64]string
 }
 
 // ConfigChangeIndex returns the ConfigChangeID. This alias exists for
@@ -62,9 +104,10 @@ func (m *Membership) ConfigChangeIndex() uint64 {
 // This prevents nil map dereference when adding entries.
 func NewMembership() *Membership {
 	return &Membership{
-		Nodes:     make(map[uint64]string),
-		Observers: make(map[uint64]string),
-		Witnesses: make(map[uint64]string),
-		Removed:   make(map[uint64]struct{}),
+		Nodes:      make(map[uint64]string),
+		Observers:  make(map[uint64]string),
+		Witnesses:  make(map[uint64]string),
+		Removed:    make(map[uint64]struct{}),
+		Identities: make(map[uint64]string),
 	}
 }

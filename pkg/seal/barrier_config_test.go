@@ -146,32 +146,29 @@ func TestBarrierConfig_Algorithm_Selection(t *testing.T) {
 }
 
 // TestBarrierConfigValidate_ExportedForRuntimeConfigs asserts the validation
-// NewBarrier panics on is reachable as an error, so an embedder assembling a
-// config at runtime can reject it instead of crashing the process.
+// is reachable as an error, so an embedder assembling a config at runtime can
+// reject it at admission time.
 func TestBarrierConfigValidate_ExportedForRuntimeConfigs(t *testing.T) {
 	valid := DefaultBarrierConfig(1)
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("default config rejected: %v", err)
 	}
 
-	// An unknown algorithm is exactly what NewBarrier would panic on.
+	// An unknown algorithm is exactly what NewBarrier rejects.
 	bad := DefaultBarrierConfig(1)
 	bad.Algorithm = SymmetricAlgorithm(0xFE)
 	if err := bad.Validate(); !errors.Is(err, ErrUnsupportedAlgorithm) {
 		t.Fatalf("Validate() = %v, want ErrUnsupportedAlgorithm", err)
 	}
 
-	// And the caller can act on it rather than dying: this is the pattern the
-	// doc comment on NewBarrier directs runtime-config embedders to use.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Errorf("validating first should avoid the panic, got %v", r)
-			}
-		}()
-		if err := bad.Validate(); err != nil {
-			return // rejected cleanly, NewBarrier never called
-		}
-		_ = NewBarrier(bad)
-	}()
+	// NewBarrier applies the same rule and returns the same error identity, so
+	// Validate is an admission-time convenience rather than a safety
+	// requirement the caller can forget.
+	b, err := NewBarrier(bad)
+	if !errors.Is(err, ErrUnsupportedAlgorithm) {
+		t.Fatalf("NewBarrier(bad) err = %v, want ErrUnsupportedAlgorithm", err)
+	}
+	if b != nil {
+		t.Fatal("NewBarrier(bad) must return a nil Barrier")
+	}
 }

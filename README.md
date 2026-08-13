@@ -1,7 +1,7 @@
 <img src="assets/logo.svg" width="600">
 
 
-[![Go](https://img.shields.io/badge/Go-1.26.1-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.26.5-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.1.0--alpha-orange.svg)](VERSION)
 
@@ -203,7 +203,7 @@ val, err := host.SyncRead(ctx, shardID, []byte("mykey"))
 shardCfg := config.Config{
     ShardID:   1,
     ReplicaID: 1,
-    LeaseRead: true, // Requires CheckQuorum (enabled by default)
+    LeaseRead: true, // Requires CheckQuorum, which is on by default (CheckQuorum is a *bool; nil = enabled)
 }
 // SyncRead is the same call -- LeaseRead is transparent to the caller.
 val, err = host.SyncRead(ctx, shardID, []byte("mykey"))
@@ -316,24 +316,32 @@ QuicRaft encrypts WAL entries and snapshots at rest using a barrier/seal/unseal 
 ```go
 import (
     "context"
+    "encoding/json"
     "log"
+    "os"
 
     quicraft "github.com/jeremyhahn/go-quicraft/pkg"
     "github.com/jeremyhahn/go-quicraft/pkg/config"
     "github.com/jeremyhahn/go-quicraft/pkg/seal"
-    "github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 )
 
 func main() {
-    // Create barrier with AES-256-GCM
-    barrier := seal.NewBarrier(seal.BarrierConfig{
+    // Create barrier with AES-256-GCM. NewBarrier returns an error for an
+    // invalid config (unknown algorithm, non-FIPS cipher under FIPS mode);
+    // seal.MustNewBarrier is the panicking form for compile-time constants.
+    barrier, err := seal.NewBarrier(seal.BarrierConfig{
         Algorithm:     seal.AlgAES256GCM,
         DeploymentID:  1,
         NonceTracking: true,
     })
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    // Software sealing strategy -- derives wrapping key from passphrase via Argon2id
-    strategy, err := seal.NewSoftwareStrategy([]byte("operator-passphrase"))
+    // Software sealing strategy -- derives wrapping key from passphrase via Argon2id.
+    // The passphrase is a []byte, not a string, so it can be wiped after use.
+    passphrase := []byte("operator-passphrase")
+    strategy, err := seal.NewSoftwareStrategy(passphrase)
     if err != nil {
         log.Fatal(err)
     }
@@ -341,14 +349,20 @@ func main() {
     // Initialize generates the root key, derives epoch 1 DEK, and seals
     // the root key for persistent storage. Call once per cluster.
     if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{
-        Secret: "operator-passphrase",
+        Secret: passphrase,
     }); err != nil {
         log.Fatal(err)
     }
 
-    // Persist the sealed root key (caller's responsibility)
-    sealed := barrier.SealedRootKeyData()
-    // json.Marshal(sealed) → write to disk, Vault, KMS, etc.
+    // Persist the sealed root key -- the caller's responsibility. Lose it and
+    // the data directory can never be unsealed again.
+    blob, err := json.Marshal(barrier.SealedRootKeyData())
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := os.WriteFile("/var/data/quicraft/sealed-root-key.json", blob, 0o600); err != nil {
+        log.Fatal(err)
+    }
 
     // Create host with barrier -- WAL and snapshots are now encrypted
     host, err := quicraft.NewHost(config.HostConfig{
@@ -370,38 +384,58 @@ func main() {
 **ChaCha20-Poly1305** -- constant-time on all platforms, no hardware dependency. Preferred on ARM or when AES-NI is unavailable:
 
 ```go
-barrier := seal.NewBarrier(seal.BarrierConfig{
+barrier, err := seal.NewBarrier(seal.BarrierConfig{
     Algorithm:     seal.AlgChaCha20Poly1305,
     DeploymentID:  1,
     NonceTracking: true,
 })
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 **Auto-select** -- let QuicRaft choose the optimal algorithm based on hardware detection:
 
 ```go
-barrier := seal.NewBarrier(seal.BarrierConfig{
+barrier, err := seal.NewBarrier(seal.BarrierConfig{
     Algorithm:     seal.SelectOptimalAlgorithm(false), // AES-256-GCM if AES-NI, else ChaCha20
     DeploymentID:  1,
     NonceTracking: true,
 })
+if err != nil {
+    log.Fatal(err)
+}
 
-// Or use the convenience constructor:
-barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+// Or use the convenience constructor. MustNewBarrier panics instead of
+// returning an error, which is appropriate only for a compile-time config.
+barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
 ```
 
 **Unseal on restart** -- load the persisted sealed root key and unseal the barrier before starting the host:
 
 ```go
-// Load sealed root key from persistent storage
-// sealed := json.Unmarshal(...) → *seal.SealedRootKey
+// Load the sealed root key written at Initialize time.
+blob, err := os.ReadFile("/var/data/quicraft/sealed-root-key.json")
+if err != nil {
+    log.Fatal(err)
+}
+sealed := new(seal.SealedRootKey)
+if err := json.Unmarshal(blob, sealed); err != nil {
+    log.Fatal(err)
+}
 
-barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
-barrier.SetSealedRootKey(sealed)
+barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
+if err := barrier.SetSealedRootKey(sealed); err != nil {
+    log.Fatal(err)
+}
 
-strategy, _ := seal.NewSoftwareStrategy([]byte("operator-passphrase"))
+passphrase := []byte("operator-passphrase")
+strategy, err := seal.NewSoftwareStrategy(passphrase)
+if err != nil {
+    log.Fatal(err)
+}
 if err := barrier.Unseal(context.Background(), strategy, seal.Credentials{
-    Secret: "operator-passphrase",
+    Secret: passphrase,
 }); err != nil {
     log.Fatal(err) // Wrong passphrase, corrupted key, or brute-force backoff
 }
@@ -412,11 +446,20 @@ host, _ := quicraft.NewHost(hostCfg, quicraft.WithBarrier(barrier))
 **Key rotation** -- rotate the DEK without re-encrypting existing data. Old epochs remain readable until purged:
 
 ```go
-newEpoch, err := barrier.Rotate()   // Derive new DEK for epoch N+1
-barrier.PurgeEpochsBefore(oldEpoch)  // Drop DEKs older than oldEpoch
+newEpoch, err := barrier.Rotate() // Derive new DEK for epoch N+1
+if err != nil {
+    log.Fatal(err)
+}
+purged, err := barrier.PurgeEpochsBefore(newEpoch) // Drop DEKs older than newEpoch
+if err != nil {
+    log.Fatal(err)
+}
+log.Printf("rotated to epoch %d, purged %d old DEKs", newEpoch, purged)
 ```
 
-Available sealing strategies: `SoftwareStrategy` (Argon2id / PBKDF2-FIPS), with pluggable `SealingStrategy` interface for TPM2, PKCS#11, AWS KMS, GCP KMS, Azure Key Vault, HashiCorp Vault, and Shamir secret sharing.
+Purge only up to an epoch no live WAL segment or snapshot still needs — a purged DEK is not recoverable. See [Encryption](docs/security/encryption.md) for how the host computes that floor.
+
+This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPassphrase`, Argon2id / PBKDF2-FIPS) and `StrategyNone`. `SealingStrategy` is a pluggable interface, and the hardware and cloud backends that implement it — TPM2, PKCS#11, AWS KMS, GCP KMS, Azure Key Vault, HashiCorp Vault — live in **go-xkms**; Shamir secret sharing and share custody live in **go-qrdb**. The consensus engine never persists Shamir shares. Strategy selection is always explicit; there is no preference order and no auto-ranking.
 
 ## Build
 

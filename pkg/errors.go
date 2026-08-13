@@ -150,6 +150,15 @@ var (
 	// ErrLogDBWrite is returned when a write to the log database fails.
 	ErrLogDBWrite = errors.New("quicraft: logdb write failed")
 
+	// ErrRecoveredTermUnknown is returned when StartShard cannot resolve the
+	// Raft term of the index an on-disk state machine recovered to. Seeding
+	// term 0 would stamp it on the next snapshot record, and a follower that
+	// installs that snapshot reports lastTerm() == 0 — which makes isUpToDate
+	// grant a vote to EVERY candidate, including one missing entries this
+	// replica holds committed. That is a Leader Completeness violation, so an
+	// unresolvable term must fail the shard start rather than seed a sentinel.
+	ErrRecoveredTermUnknown = errors.New("quicraft: recovered applied index has no resolvable raft term")
+
 	// ErrShutdownTimeout is returned when Host.Close() exceeds the
 	// configured ShutdownTimeout waiting for graceful shutdown.
 	ErrShutdownTimeout = errors.New("quicraft: shutdown timeout exceeded")
@@ -870,4 +879,122 @@ func (e *ImportSnapshotDirExistsError) Error() string {
 // Is reports whether target matches the sentinel ErrImportSnapshotDirExists.
 func (e *ImportSnapshotDirExistsError) Is(target error) bool {
 	return target == ErrImportSnapshotDirExists
+}
+
+// temporaryErrors is the complete set of sentinels Temporary reports true for.
+//
+// Membership is decided per sentinel, never by pattern: an error belongs here
+// only when re-submitting the IDENTICAL request, unchanged, can succeed once a
+// transient condition clears without any operator or caller intervention.
+// Every other sentinel in this package is permanent by construction — see
+// Temporary's doc comment for why the default falls that way.
+//
+// Sentinels deliberately excluded, with the reason, because each one looks
+// retryable at a glance:
+//
+//   - ErrCanceled: the caller cancelled. Nothing on this host will change; a
+//     retry is the caller's own decision, not a property of the error. A
+//     deadline that elapses server-side surfaces as ErrTimeout, which IS
+//     temporary.
+//   - ErrDraining: drain is a one-way transition into shutdown. Retrying this
+//     host never succeeds; the request must go to a different host.
+//   - ErrStaleConfigChange: the request carries a ConfigChangeID that is now
+//     stale, so the identical request fails forever. The caller must re-read
+//     membership via SyncGetShardMembership and build a NEW request.
+//   - ErrSessionLimitExceeded: the shard is at its session cap. Whether that
+//     ever clears depends on Config.SessionExpiryEntries and on clients
+//     closing sessions; a retry loop against a client that leaks sessions
+//     spins forever.
+//   - ErrBarrierSealed: clearing it requires an operator unseal ceremony.
+//   - ErrShardBarrierUnresolved: a resolver miss can mean "tenant not
+//     provisioned yet" (clears) or "shard is misconfigured" (never clears),
+//     and the error cannot tell the two apart, so it fails fast.
+//   - ErrDiskFull, ErrLogDBWrite: storage faults that need operator action.
+//     Retrying writes into a full or failing volume makes the incident worse.
+//   - ErrShardFailed: the state-machine circuit breaker latched after repeated
+//     apply failures and does not reset on its own.
+var temporaryErrors = [...]error{
+	// Rate limiting and backpressure. ErrSystemBusy is a *BusyError that
+	// matches ErrBusy, so the global limiter is covered by the same entry.
+	ErrBusy,
+	// Deadline elapsed; the shard may simply have been slow.
+	ErrTimeout,
+	// Interrupted by an internal state transition such as a leadership
+	// change. The next attempt runs against the new state.
+	ErrAborted,
+	// Queue overflow. If the drop was caused by shutdown instead, the retry
+	// gets the permanent ErrClosed and the caller stops.
+	ErrDropped,
+	// Shard is loaded but still initializing; it becomes ready on its own.
+	ErrShardNotStarted,
+	ErrShardNotReady,
+	// Wrong replica. NotLeader reports where to go instead.
+	ErrNotLeader,
+	// The leader has not yet committed an entry in its current term
+	// (Raft PhD 6.4). It will, within one heartbeat interval.
+	ErrReadIndexNotReady,
+	// Another rotation or snapshot holds the single-flight slot.
+	ErrRotateInProgress,
+	ErrSnapshotInProgress,
+}
+
+// Temporary reports whether err represents a transient condition that may
+// succeed on retry. A nil error is not temporary.
+//
+// Temporary is true only for the conditions that clear on their own: rate
+// limiting (ErrBusy, ErrSystemBusy), an elapsed deadline (ErrTimeout), an
+// interrupted operation (ErrAborted, ErrDropped), a shard that is still
+// coming up (ErrShardNotStarted, ErrShardNotReady), a request that reached
+// the wrong replica (ErrNotLeader), a leader that has not yet committed in
+// its term (ErrReadIndexNotReady), and a single-flight slot that is already
+// taken (ErrRotateInProgress, ErrSnapshotInProgress).
+//
+// EVERY other error is reported as permanent, including errors this package
+// did not produce. That default is deliberate: retrying a permanent failure
+// forever is worse than failing fast, because it converts one bad request
+// into sustained load and hides the real fault. A caller that needs a
+// different answer for its own error type should test that type first and
+// fall back to Temporary.
+//
+// Wrapped errors classify correctly: Temporary uses errors.Is, so an error
+// wrapped with %w, or a typed error whose Is method matches a sentinel
+// (*BusyError, *NotLeaderError), is recognised.
+func Temporary(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, t := range temporaryErrors {
+		if errors.Is(err, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// NotLeader reports whether err indicates this replica is not the leader,
+// and returns the known leader's replica ID when the error carries one.
+//
+// ok is true for any not-leader error, whether it is the bare ErrNotLeader
+// sentinel or a *NotLeaderError. replicaID is the leader this replica
+// believes is current, or 0 when the leader is unknown — an election in
+// progress, or a bare sentinel that carries no identity. Callers must
+// therefore treat (0, true) as "retry, but discover the leader yourself"
+// rather than as an address to redirect to.
+//
+// A nil error returns (0, false).
+//
+// Every not-leader error is also Temporary, so a retry loop can gate on
+// Temporary and use NotLeader only to pick a target.
+func NotLeader(err error) (replicaID uint64, ok bool) {
+	if err == nil {
+		return 0, false
+	}
+	var notLeader *NotLeaderError
+	if errors.As(err, &notLeader) {
+		return notLeader.LeaderID, true
+	}
+	if errors.Is(err, ErrNotLeader) {
+		return 0, true
+	}
+	return 0, false
 }

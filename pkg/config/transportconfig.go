@@ -263,6 +263,41 @@ type TransportConfig struct {
 	// purpose: skipping the mTLS check without also disabling the transport
 	// would be exactly backwards.
 	TransportDisabled bool
+
+	// RequireMemberIdentity makes the receive-side sender gate refuse every
+	// quorum-bearing message from a replica whose COMMITTED MEMBERSHIP records
+	// no node identity, instead of falling back to the committed-ADDRESS check.
+	//
+	// The two postures, stated plainly so the choice is an informed one:
+	//
+	//   - false (the default). A member with a committed identity is still
+	//     authorized on that identity and nothing else — the fallback is
+	//     per-replica, not a global downgrade. A member WITHOUT one is
+	//     authorized on its committed address, which means a peer holding a
+	//     wildcard or shared-SAN certificate can still assert that member's
+	//     msg.From and have forged ReplicateResp / RequestVoteResp counted
+	//     toward quorum. What the operator gives up is exactly the attack
+	//     identities exist to close, and only for members that have not been
+	//     given one yet.
+	//   - true. That residual is closed: an identity-less member's
+	//     quorum-bearing traffic is dropped outright (drop reason
+	//     "missing_identity"). What the operator gives up is availability
+	//     during migration — a shard whose members have not all had identities
+	//     committed will lose quorum, because the responses of the members
+	//     without one stop being counted. It is safe to enable ONLY after every
+	//     member of every shard on this host has a committed identity.
+	//
+	// The default is false, and that is a deliberate compatibility choice for
+	// a pre-1.0 library rather than a security preference. An identity cannot
+	// be inferred, discovered, or learned from a connection (learning it from
+	// the peer is unsound in precisely the threat model it addresses — see
+	// Host.RequestAddNodeWithIdentity); it must be supplied by an operator and
+	// committed through a config change. Defaulting to true would therefore
+	// brick every existing cluster on upgrade and every new cluster whose
+	// operator has not yet learned the field exists — a fail-closed default
+	// that is guaranteed to be switched off rather than satisfied. The
+	// migration is documented in docs/operations/compatibility.md.
+	RequireMemberIdentity bool
 }
 
 // SetDefaults fills zero-valued fields with their documented defaults.

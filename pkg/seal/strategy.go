@@ -170,6 +170,27 @@ type SealedRootKey struct {
 	// blob predates the field and must derive with the v1 layout.
 	HKDFVersion HKDFVersion `json:"hkdf_version,omitempty"`
 
+	// Algorithm records the data-path AEAD this deployment's epoch DEKs were
+	// derived for and encrypted with. Stamped by Initialize from
+	// BarrierConfig.Algorithm; SetSealedRootKey rejects a blob whose Algorithm
+	// disagrees with the barrier's configuration (AlgorithmMismatchError).
+	//
+	// It is recorded because the algorithm is NOT recoverable from the data:
+	// under HKDFV2 it is an HKDF domain separator, under HKDFV1 it is not
+	// bound at all (so the identical DEK would be used as an AES-256-GCM key
+	// on one host and a ChaCha20-Poly1305 key on another), and Decrypt selects
+	// the AEAD by EPOCH rather than from the ciphertext header's algID. Without
+	// this field, a data directory restored onto a host whose CPU makes
+	// SelectOptimalAlgorithm choose differently reads back as ErrDecryptionFailed
+	// with nothing on disk naming the algorithm that would work.
+	//
+	// A zero value means "unrecorded" — a blob written before this field
+	// existed. It loads without complaint under whatever algorithm the barrier
+	// is configured with, which is exactly the pre-existing behavior; such a
+	// deployment keeps carrying the original risk and should pin
+	// BarrierConfig.Algorithm explicitly rather than rely on auto-selection.
+	Algorithm SymmetricAlgorithm `json:"algorithm,omitempty"`
+
 	// Nonce is the AES-GCM nonce used during sealing, when stored separately
 	// from the ciphertext (hardware strategies may store nonce externally).
 	Nonce []byte `json:"nonce,omitempty"`

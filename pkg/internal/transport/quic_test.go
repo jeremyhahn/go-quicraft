@@ -65,7 +65,7 @@ func newTestHandler() *testHandler {
 	}
 }
 
-func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ func(string) bool) error {
+func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ PeerAuth) error {
 	if h.handleErr != nil {
 		return h.handleErr
 	}
@@ -90,7 +90,7 @@ func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ func(string) boo
 	return nil
 }
 
-func (h *testHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ func(string) bool) error {
+func (h *testHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ PeerAuth) error {
 	if h.snapshotErr != nil {
 		return h.snapshotErr
 	}

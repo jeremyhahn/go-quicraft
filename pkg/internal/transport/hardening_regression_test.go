@@ -86,7 +86,7 @@ func TestSnapshotBudgetChargesRetainedChunkHeaders(t *testing.T) {
 	sr.metrics = rec
 
 	reader := &testChunkReader{data: buildChunkFrames(t, chunks)}
-	sr.receiveChunks(reader, hdr, nil, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
 
 	if handler.snapshotCount.Load() != 0 {
 		t.Fatalf("transfer of %d minimal chunks needs %d bytes resident against a %d byte budget and must be refused",
@@ -115,7 +115,7 @@ func TestSnapshotBudgetRestoredAfterCompleteTransfer(t *testing.T) {
 	sr := newSnapshotReceiver(4, budget, 0, 0, handler)
 
 	reader := &testChunkReader{data: buildChunkFrames(t, chunks)}
-	sr.receiveChunks(reader, hdr, nil, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
 
 	if handler.snapshotCount.Load() != 1 {
 		t.Fatalf("complete transfer not delivered: snapshots = %d", handler.snapshotCount.Load())

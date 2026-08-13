@@ -669,7 +669,7 @@ func newBenchBarrier(tb testing.TB) *seal.Barrier {
 	}
 	tb.Cleanup(func() { strategy.Close() })
 
-	barrier := seal.NewBarrier(testBarrierConfig(1))
+	barrier := seal.MustNewBarrier(testBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		tb.Fatalf("barrier.Initialize: %v", err)
 	}
@@ -715,5 +715,173 @@ func BenchmarkDBSaveStateEncrypted(b *testing.B) {
 		if err := db.SaveState(updates); err != nil {
 			b.Fatalf("SaveState: %v", err)
 		}
+	}
+}
+
+// newSealableTestBarrier returns an initialized software barrier together with
+// the strategy it was initialized under, so the caller can seal and unseal it.
+// newTestBarrier closes its strategy at cleanup, which makes it unusable for a
+// later Unseal.
+func newSealableTestBarrier(t *testing.T) (*seal.Barrier, seal.SealingStrategy) {
+	t.Helper()
+	_ = seal.AllowWeakKDFParams()
+	strategy, err := seal.NewSoftwareStrategyWithParams(
+		[]byte("test-passphrase"), 1, 64*1024, 1,
+	)
+	if err != nil {
+		t.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+	}
+	barrier := seal.MustNewBarrier(testBarrierConfig(7))
+	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
+		t.Fatalf("barrier.Initialize: %v", err)
+	}
+	t.Cleanup(func() { strategy.Close() })
+	return barrier, strategy
+}
+
+// TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding is the regression
+// test for the silent context-AAD downgrade on a sealed start.
+//
+// A sealed barrier has no encryptor, so it reports no context-binding
+// capability — the ABSENCE of an answer, not an answer of "no". The WAL
+// resolves that capability exactly once, at open, and writes every record of
+// the process against it. Latching the sealed barrier's "false" would make a
+// node that starts sealed (the Vault-style start-then-unseal flow this stack
+// targets) write epoch-only records FOREVER, including after the operator
+// unseals it with a fully AAD-capable barrier: no error, no log line, and every
+// record spliceable and reorderable at rest.
+//
+// waldb.Open therefore fails closed with ErrBarrierContextUnresolved.
+//
+// The ASSERTION IS ON OPEN, and that is the whole point of the test. An earlier
+// version asserted only that a later write failed, which the pre-fix code
+// satisfied too: it latched the sealed barrier's "false", and the writes were
+// then rejected by EncryptWithContext anyway because the barrier was still
+// sealed. The test passed against the very bug it was written for. Open
+// returning ErrBarrierContextUnresolved is the one observable that distinguishes
+// failing closed from latching a downgrade, so it is the one asserted here.
+// TestUnsealedBarrierBindsRecordsPositionally carries the positive half.
+func TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding(t *testing.T) {
+	barrier, _ := newSealableTestBarrier(t)
+	dir := t.TempDir()
+
+	if err := barrier.Seal(); err != nil {
+		t.Fatalf("barrier.Seal: %v", err)
+	}
+	if barrier.SupportsContextAAD() {
+		t.Fatal("fixture: a sealed barrier must not report context-AAD support")
+	}
+	if barrier.ContextBindingResolved() {
+		t.Fatal("fixture: a sealed barrier's binding must be unresolved")
+	}
+
+	db, err := Open(dir,
+		WithBlockSize(aadTestBlockSize),
+		WithMaxFileSize(aadTestMaxFileSize),
+		WithBarrier(barrier),
+	)
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open accepted a sealed barrier: the WAL just latched 'cannot bind " +
+			"context' from a barrier that had not been unsealed yet, so every record " +
+			"this node ever writes is epoch-only bound even after the operator " +
+			"unseals an AAD-capable barrier")
+	}
+	if !errors.Is(err, ErrBarrierContextUnresolved) {
+		t.Fatalf("Open error = %v, want ErrBarrierContextUnresolved", err)
+	}
+
+	// Nothing was created that could hold a latched capability.
+	if _, statErr := os.Stat(filepath.Join(dir, shardDirName(1))); statErr == nil {
+		t.Fatal("Open built shard state before refusing the sealed barrier; the " +
+			"capability must be resolved while there is still nothing to latch it into")
+	}
+}
+
+// TestUnsealedBarrierBindsRecordsPositionally is the positive half: once the
+// operator unseals, the WAL must actually use the capability the barrier now
+// reports, and the bytes on disk must carry the binding.
+//
+// Split out from the refusal test deliberately. Bundled together, a failure
+// here reads as a failure of the fail-closed guard, and — worse — the pair
+// could be satisfied by a WAL that refused the sealed barrier for the wrong
+// reason and then wrote unbound records anyway.
+func TestUnsealedBarrierBindsRecordsPositionally(t *testing.T) {
+	barrier, strategy := newSealableTestBarrier(t)
+	dir := t.TempDir()
+
+	if err := barrier.Seal(); err != nil {
+		t.Fatalf("barrier.Seal: %v", err)
+	}
+	// Unsealed, the same barrier binds context, and the WAL must use it.
+	if err := barrier.Unseal(context.Background(), strategy, seal.Credentials{}); err != nil {
+		t.Fatalf("barrier.Unseal: %v", err)
+	}
+	if !barrier.SupportsContextAAD() {
+		t.Fatal("fixture: the unsealed software barrier must support context AAD")
+	}
+
+	db := openAADTestDB(t, dir, barrier)
+	const shardID, replicaID = uint64(1), uint64(1)
+	if err := db.SaveEntries(shardID, replicaID, makeEntries(1, 2, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+	shard := db.getShard(shardID)
+	if shard.noContextBinding {
+		t.Fatal("the WAL suppressed the positional context against an AAD-capable " +
+			"barrier: the capability was latched from the sealed barrier")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The bytes on disk carry the binding: the record opens under its own
+	// (shard, segment, ordinal) context and under no other.
+	records := readSegmentRecords(t, walShardDir(dir, shardID), 0)
+	if len(records) == 0 {
+		t.Fatal("no records written")
+	}
+	shardIdx := shardID % DefaultShardCount
+	var ctxBuf [walContextSize]byte
+	for i, rec := range records {
+		want := walRecordContext(ctxBuf[:], shardIdx, 0, uint64(i))
+		if _, err := barrier.DecryptWithContext(nil, rec, want); err != nil {
+			t.Fatalf("record %d does not open under its own position: %v", i, err)
+		}
+		if _, err := barrier.DecryptWithContext(nil, rec, nil); err == nil {
+			t.Fatalf("record %d opens with NO context: it was written unbound, so an "+
+				"at-rest attacker can reorder or splice it undetected", i)
+		}
+	}
+}
+
+// TestWriteRefusesBindingCapabilityGainedAfterOpen covers the other half of the
+// latch: the capability is only valid while the barrier stays unsealed, and
+// Host.EmergencySeal plus a later unseal can change it underneath a running
+// WAL. A shard that resolved "cannot bind" at open must not keep writing
+// unbound records once the barrier reports that it can.
+func TestWriteRefusesBindingCapabilityGainedAfterOpen(t *testing.T) {
+	barrier := newTestBarrier(t)
+	dir := t.TempDir()
+	db := openAADTestDB(t, dir, barrier)
+	defer db.Close()
+
+	const shardID, replicaID = uint64(1), uint64(1)
+	if err := db.SaveEntries(shardID, replicaID, makeEntries(1, 1, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	// Simulate the drift: the shard behaves as if it had resolved "cannot bind"
+	// while the barrier reports that it can.
+	shard := db.getShard(shardID)
+	shard.mu.Lock()
+	shard.noContextBinding = true
+	shard.mu.Unlock()
+
+	err := db.SaveEntries(shardID, replicaID, makeEntries(2, 1, 1))
+	if !errors.Is(err, ErrBarrierContextBindingChanged) {
+		t.Fatalf("SaveEntries after the capability changed = %v, want "+
+			"ErrBarrierContextBindingChanged; the WAL kept writing unbound records "+
+			"against a barrier that would have authenticated their position", err)
 	}
 }

@@ -105,6 +105,20 @@ var (
 	// sealed key whose KnownEpochs does not contain the current Epoch.
 	ErrInvalidSealedEpochs = errors.New("quicraft/seal: sealed root key KnownEpochs missing current epoch")
 
+	// ErrTooManyKnownEpochs is returned when SetSealedRootKey receives a sealed
+	// key naming more than MaxKnownEpochs epochs. KnownEpochs is plaintext,
+	// unauthenticated metadata and Unseal derives one HKDF DEK, one AEAD and
+	// one mlock'd enclave per entry, so an inflated set is a durable
+	// denial-of-service against every subsequent start — no passphrase needed.
+	ErrTooManyKnownEpochs = errors.New("quicraft/seal: sealed root key names too many known epochs")
+
+	// ErrKnownEpochAboveCurrent is returned when SetSealedRootKey receives a
+	// sealed key whose KnownEpochs contains an epoch greater than its Epoch.
+	// Epochs only ever advance, and the blob records the highest one reached,
+	// so a larger entry can never be legitimate — it is either corruption or a
+	// forged blob padding the derivation set.
+	ErrKnownEpochAboveCurrent = errors.New("quicraft/seal: sealed root key names an epoch above its current epoch")
+
 	// ErrKDFUnsupportedVersion is returned when DeriveKey receives an
 	// unknown KDFVersion value.
 	ErrKDFUnsupportedVersion = errors.New("quicraft/seal: unsupported KDF version")
@@ -241,6 +255,36 @@ func (e *StatePersistError) Error() string {
 // Unwrap returns the underlying error.
 func (e *StatePersistError) Unwrap() error {
 	return e.Err
+}
+
+// AlgorithmMismatchError is returned by SetSealedRootKey when the sealed blob
+// records a data-path algorithm different from the one this barrier is
+// configured with.
+//
+// It exists because the algorithm is not a preference but part of the key
+// derivation: it is an HKDFV2 domain separator AND the cipher Decrypt selects
+// by epoch (never from the ciphertext header's algID). Loading a blob under the
+// wrong algorithm therefore produces a different DEK, or the same DEK used as a
+// key for a different primitive, and every read fails with the deliberately
+// generic ErrDecryptionFailed — indistinguishable from tampering.
+//
+// The message names BOTH algorithms so the operator can pin the right one
+// explicitly via BarrierConfig.Algorithm rather than guessing (the usual cause
+// is a restore onto a host whose CPU makes SelectOptimalAlgorithm choose
+// differently; see its documentation).
+type AlgorithmMismatchError struct {
+	// Sealed is the algorithm recorded in the persisted sealed root key.
+	Sealed SymmetricAlgorithm
+	// Configured is the algorithm this barrier was constructed with.
+	Configured SymmetricAlgorithm
+}
+
+// Error returns a human-readable description of the algorithm mismatch.
+func (e *AlgorithmMismatchError) Error() string {
+	return fmt.Sprintf(
+		"quicraft/seal: sealed root key was written with %s but this barrier is configured for %s; "+
+			"set BarrierConfig.Algorithm to %s to read this data",
+		e.Sealed.String(), e.Configured.String(), e.Sealed.String())
 }
 
 // KeyDerivationError is returned when HKDF key derivation fails.

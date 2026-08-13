@@ -25,6 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -378,10 +379,17 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 	}
 }
 
-// authorizeAllSenders is a senderAuthorized callback that authorizes any
-// address. Used by tests that exercise behavior past the TLS identity
-// binding check.
-func authorizeAllSenders(string) bool { return true }
+// authorizeAllSenders is a PeerAuth that authorizes any address. Used by tests
+// that exercise behaviour PAST the sender-binding check.
+//
+// It carries no Identity, which is deliberate: a membership with committed
+// identities is not authorized by address at all, so a test that wants the
+// permissive fixture must also use a membership with no identities. Giving it a
+// blanket identity would silently satisfy the identity gate for every replica
+// and turn these tests vacuous the moment identities are involved.
+var authorizeAllSenders = transport.PeerAuth{
+	AuthorizesAddress: func(string) bool { return true },
+}
 
 // authorizeSnapshotPath wires everything HandleSnapshot's fail-closed
 // authorization needs to admit a test sender: it loads an engine node for
@@ -482,7 +490,7 @@ func TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound(t *testing.T) 
 	}
 
 	// Certificate does not cover the claimed sender's address.
-	denyAll := func(string) bool { return false }
+	denyAll := transport.PeerAuth{AuthorizesAddress: func(string) bool { return false }}
 	err := handler.HandleSnapshot(chunks, denyAll)
 	var authErr *UnauthorizedMessageError
 	if !errors.As(err, &authErr) {
@@ -490,25 +498,28 @@ func TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound(t *testing.T) 
 	}
 
 	// A nil senderAuthorized callback must also be treated as unauthorized.
-	err = handler.HandleSnapshot(chunks, nil)
+	err = handler.HandleSnapshot(chunks, transport.PeerAuth{})
 	if !errors.As(err, &authErr) {
 		t.Fatalf("expected UnauthorizedMessageError for nil callback, got %T: %v", err, err)
 	}
 
-	// An unknown sender address (not in the registry) must be rejected too.
-	chunksFromUnregistered := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 1, From: 1, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
+	// A sender the COMMITTED MEMBERSHIP does not name must be rejected too,
+	// however permissive the certificate is. Authorization comes from the
+	// configuration, not from the routing registry inbound traffic writes.
+	chunksFromStranger := []proto.SnapshotChunk{
+		{ShardID: 1, ReplicaID: 1, From: 99, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
 	}
-	err = handler.HandleSnapshot(chunksFromUnregistered, authorizeAllSenders)
+	err = handler.HandleSnapshot(chunksFromStranger, authorizeAllSenders)
 	if !errors.As(err, &authErr) {
-		t.Fatalf("expected UnauthorizedMessageError for unknown sender address, got %T: %v", err, err)
+		t.Fatalf("expected UnauthorizedMessageError for a sender outside the committed "+
+			"membership, got %T: %v", err, err)
 	}
 }
 
 func TestHostMessageHandler_HandleSnapshot_NilChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
 
-	err := handler.HandleSnapshot(nil, nil)
+	err := handler.HandleSnapshot(nil, transport.PeerAuth{})
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
 	}
@@ -517,7 +528,7 @@ func TestHostMessageHandler_HandleSnapshot_NilChunks(t *testing.T) {
 func TestHostMessageHandler_HandleSnapshot_EmptyChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
 
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{}, nil)
+	err := handler.HandleSnapshot([]proto.SnapshotChunk{}, transport.PeerAuth{})
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
 	}
@@ -1384,7 +1395,7 @@ func TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned(t *testin
 	}
 
 	// Cert does not authorize the address: it must NOT be learned.
-	denyAll := func(string) bool { return false }
+	denyAll := transport.PeerAuth{AuthorizesAddress: func(string) bool { return false }}
 	if err := handler.HandleMessage(batch, denyAll); err != nil {
 		t.Fatalf("HandleMessage error: %v", err)
 	}
@@ -1393,7 +1404,7 @@ func TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned(t *testin
 	}
 
 	// A nil callback must be treated as unauthorized too.
-	if err := handler.HandleMessage(batch, nil); err != nil {
+	if err := handler.HandleMessage(batch, transport.PeerAuth{}); err != nil {
 		t.Fatalf("HandleMessage(nil authorizer) error: %v", err)
 	}
 	if addr, err := reg.Resolve(1, 10); err == nil {

@@ -105,7 +105,11 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 	// decode path — the v1 layout (pre-witness-policy Membership inside
 	// snapshot messages) cannot be parsed by this decoder, so batches from
 	// both older AND newer binaries are rejected with a clear signal
-	// instead of being misparsed.
+	// instead of being misparsed. Correct here because MessageBatch is
+	// transport-only: a batch lives for one frame and is never persisted,
+	// so a rejection costs one connection rather than stranding data at
+	// rest (contrast the persisted Membership section, which accepts a
+	// range — see the package comment's compatibility contract).
 	if mb.BinVer != WireVersion {
 		return 0, ErrUnsupportedVersion
 	}

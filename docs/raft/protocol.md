@@ -282,7 +282,8 @@ messages.
 
 The `sendAppend` method bounds each `Replicate` message using
 `maxReplicationPayload` (`raft.go:160-163`), set from
-`Config.MaxApplyEntrySize` (default 64 MB, matching dragonboat).
+`Config.MaxApplyEntrySize`, whose default is `config.MaxReplicationPayloadBytes`
+= 16,711,672 bytes (~15.9 MiB).
 
 ```go
 entries, err := r.log.entries(rm.next, r.log.lastIndex()+1, r.maxReplicationPayload)
@@ -301,10 +302,14 @@ catches up in bounded increments without requiring explicit chunking
 state.
 
 When `maxReplicationPayload` is 0, entries are unlimited (not
-recommended for production). The default 64 MB aligns with
-`MaxApplyEntrySize` (apply batch limit) and `MaxMessageBatchSize`
-(transport batch limit), ensuring a single Replicate message fits
-within the transport's send buffer.
+recommended for production). The default is derived from the transport
+rather than chosen for roundness: `MaxReplicationPayloadBytes` is
+`transport.MaxFrameSize` minus frame and batch framing overhead, so a
+single Replicate message always fits in one frame. A batch that does not
+is rejected at marshal time and DROPPED, and because the follower's next
+index never advances, raft rebuilds the identical oversized batch forever
+— the follower can never catch up and there is no snapshot fallback,
+since the entries still exist.
 
 ### Witness Replication Behavior
 
@@ -375,6 +380,20 @@ with match >= snapshotIndex) or countdown expiry — see Section 7,
 Circular buffer tracking in-flight entry indices. Lazily allocated on
 first `add()`. `freeTo(index)` frees all entries with index <= the
 given value. `full()` returns true when `count >= size`.
+
+The window therefore drains only from ABOVE, which a peer RESTART can
+make impossible: the outstanding messages went to the peer's previous
+incarnation, and every ack the returning peer can send reports a
+position BELOW the window, so it frees nothing. Since a full window is
+what makes `isPaused` true, the peer would never be sent another entry.
+`handleHeartbeatResp` breaks that cycle with `freeFirstOne()`, which
+releases the oldest slot without its ack: the heartbeat response proves
+the peer is alive, so exactly one message is let through — acked
+normally if the window was merely busy, rejected if the peer restarted,
+and the rejection drives `declineFrom` back to `match + 1`. This
+mirrors etcd/raft's `MsgHeartbeatResp` handling. The stall is not
+detectable from leader state alone: a busy peer and a wedged one have
+the same match, next and window shape.
 
 ### declineFrom (remote.go:190)
 
@@ -1352,7 +1371,9 @@ Lease timeout is set to `ElectionRTT - 2 ticks` (default election timeout
 minus 2), providing a safety margin. Requires:
 
 1. `Config.LeaseRead = true` (opt-in).
-2. `Config.CheckQuorum = true` (leader must periodically verify quorum).
+2. CheckQuorum enabled (leader must periodically verify quorum). It is a
+   `*bool` whose nil zero value means enabled, so this holds unless it was
+   explicitly disabled with `config.BoolPtr(false)`.
 3. Monotonic system clocks (no clock skew).
 
 ### Flow

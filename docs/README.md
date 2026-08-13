@@ -59,6 +59,7 @@ New to QuicRaft? Start here:
 | [Public API Reference](api/reference.md) | Host methods, RequestState, Session API, error types |
 | [Deployment Guide](operations/deployment.md) | Configuration, monitoring, tuning, operational practices |
 | [Lifecycle Management](operations/lifecycle.md) | Startup, shutdown, crash recovery, WAL replay |
+| [Compatibility and Upgrades](operations/compatibility.md) | Pre-1.0 stability guarantee, version discriminators, upgrade and downgrade path |
 
 ## Performance & Testing
 

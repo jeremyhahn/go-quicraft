@@ -136,6 +136,13 @@ var (
 	// every term comparison in step().
 	ErrZeroTermMessage = errors.New("raft: protocol message carries no term")
 
+	// ErrTermCeilingExceeded is returned when a wire message names a term in
+	// the reserved band at the top of the uint64 range. Adopting one would let
+	// becomeCandidate's increment wrap the term to 0 — a regression that lets
+	// this replica vote a second time in a term it has already voted in — or
+	// strand it at a term it can never advance past. See maxAdoptableTerm.
+	ErrTermCeilingExceeded = errors.New("raft: protocol message term is in the reserved ceiling range")
+
 	// ErrWireLocalMessage is returned when a message type that is only ever
 	// injected in-process (InstallSnapshot, SnapshotStatus, Unreachable,
 	// LeaderTransfer) arrives stamped proto.OriginRemote, i.e. it was decoded
@@ -161,6 +168,45 @@ var (
 	// snapshot delivers the bootstrap confState, so an election it wins
 	// would be decided by a quorum of one.
 	ErrJoiningNodeCannotCampaign = errors.New("raft: joining node cannot campaign with incomplete membership")
+
+	// ErrStaleConfigCannotCampaign is returned when a TimeoutNow reaches a
+	// replica whose committed configuration tail could not be folded into its
+	// membership. Membership is config-in-log: a restart recovers a BASE
+	// configuration and learns every later change by re-applying committed
+	// entries, so until that tail is folded the replica's voting set is a
+	// superseded one and any quorum computed over it is the wrong denominator.
+	// The condition is transient — the fold is retried on the next election
+	// timeout — and it only arises when the local log cannot be read.
+	ErrStaleConfigCannotCampaign = errors.New("raft: configuration tail unresolved, cannot campaign on a stale voting set")
+
+	// ErrDuplicateMemberAddress is returned when a config change would add a
+	// replica at an address another ACTIVE member of the shard already holds.
+	// The inbound authorization chain is replica ID -> committed address ->
+	// certificate, so two replicas at one address let the single host behind it
+	// speak as both: two votes and two match indices in a quorum that believes
+	// they are independent. See membership.addressHolder.
+	ErrDuplicateMemberAddress = errors.New("raft: address already held by another member of this shard")
+
+	// ErrDuplicateMemberIdentity is returned when a config change would bind a
+	// node identity another ACTIVE member of the shard already holds.
+	//
+	// The identity IS the authorization key the receive-side gate compares
+	// against, so one identity naming two replica IDs collapses the gate the
+	// same way one address naming two collapsed the address gate: the single
+	// keypair behind it authenticates as both, and holds two votes and two
+	// match indices in a quorum that believes they are independent. Unlike
+	// addresses there is no co-location exception — two replicas on one machine
+	// still need distinct keypairs. See membership.identityHolder.
+	ErrDuplicateMemberIdentity = errors.New("raft: node identity already held by another member of this shard")
+
+	// ErrReadIndexRespNotFromLeader is returned when a ReadIndexResp arrives
+	// from a replica that is not this shard's current leader. The message is
+	// the wire form of a completed heartbeat-quorum round and its correlation
+	// key is a monotonic counter, so accepting one from anywhere else resolves
+	// a pending linearizable read at an index the sender chose, with no quorum
+	// behind it. A follower only ever forwards ReadIndex to r.leaderID, so a
+	// response from anyone else answers nothing this replica asked.
+	ErrReadIndexRespNotFromLeader = errors.New("raft: read index response from a replica that is not the leader")
 
 	// ErrReservedEntryType is returned when a Propose carries an entry whose
 	// masked type is not one a client may propose. Only EntryNormal,

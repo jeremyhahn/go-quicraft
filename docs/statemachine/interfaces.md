@@ -353,7 +353,7 @@ Safe because `Apply()` runs on a single apply goroutine per shard.
 
 ## Session Expiry Integration
 
-`Config.SessionExpiryEntries` controls automatic cleanup of abandoned client sessions. Sessions inactive for this many applied log entries are expired during the apply path. Default 0 (disabled).
+`Config.SessionExpiryEntries` controls automatic cleanup of abandoned client sessions. Sessions inactive for this many applied log entries are expired during the apply path. Default 100,000; `config.SessionExpiryDisabled` turns expiry off. The field is only the bootstrap SEED: the threshold is replicated in `proto.Membership` and the apply path reads the committed value, so replicas cannot disagree about it. A node whose local value differs from the shard's applies the shard's and logs a warning.
 
 This is deterministic across all replicas because it's driven by log index, not wall-clock time. All replicas process the same entries, so they expire the same sessions at the same log point.
 
@@ -379,10 +379,10 @@ A session is expired when `currentIndex - lastActiveIndex > inactivityThreshold`
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ZeroCopyEntryCmd` | `bool` | `false` | When true, `Entry.Cmd` aliases internal buffer. SM must copy if retaining. |
-| `SessionExpiryEntries` | `uint64` | `0` (disabled) | Sessions inactive for this many entries are expired. Deterministic across replicas. |
-| `MaxSessionsPerClient` | `uint64` | `128` | Maximum cached responses per session. |
-| `MaxTotalSessions` | `uint64` | `16,384` | Maximum concurrent sessions per shard. |
-| `MaxApplyEntrySize` | `uint64` | `64 MB` | Maximum total bytes of entries in a single `Update()` call. |
+| `SessionExpiryEntries` | `uint64` | `100,000` | Bootstrap seed for the shard's replicated expiry threshold. Sessions inactive for this many entries are expired. |
+| `MaxSessionsPerClient` | `uint64` | `128` | Bootstrap seed for the shard's replicated cap on cached responses per session. |
+| `MaxTotalSessions` | `uint64` | `16,384` | Bootstrap seed for the shard's replicated cap on concurrent sessions per shard. |
+| `MaxApplyEntrySize` | `uint64` | `16,711,672` (~15.9 MiB) | Maximum total bytes of entries in a single `Update()` call. The default is `config.MaxReplicationPayloadBytes`. |
 | `MaxEntrySize` | `uint64` | `8 MB` | Maximum proposal payload size. Proposals exceeding this are rejected. |
 
 ## Error Types

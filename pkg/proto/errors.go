@@ -39,6 +39,10 @@ var (
 	// MaxAddressLength bytes during unmarshal.
 	ErrAddressTooLong = errors.New("proto: address exceeds MaxAddressLength")
 
+	// ErrNodeIdentityTooLong is returned when a committed node identity
+	// string exceeds MaxNodeIdentityLength bytes during unmarshal.
+	ErrNodeIdentityTooLong = errors.New("proto: node identity exceeds MaxNodeIdentityLength")
+
 	// ErrEntrySizeLimitExceeded is returned when an Entry.Cmd length
 	// exceeds MaxEntrySize during unmarshal.
 	ErrEntrySizeLimitExceeded = errors.New("proto: entry size exceeds MaxEntrySize")
@@ -67,9 +71,17 @@ var (
 	ErrInvalidConfigChangeType = errors.New("proto: invalid config change type")
 
 	// ErrUnsupportedVersion is returned when a version stamp in the buffer
-	// (MessageBatch.BinVer, SnapshotChunk.BinVer, or the Membership
-	// section's leading version byte) does not equal the current
-	// WireVersion, or when a payload matches a legacy fixed layout.
+	// does not name a layout this build can decode, or when a payload
+	// matches a legacy fixed layout (ConfigChange). It covers both version
+	// namespaces described in the package comment:
+	//
+	//   - transport-scoped, exact match: MessageBatch.BinVer and
+	//     SnapshotChunk.BinVer must equal WireVersion.
+	//   - persisted-scoped, range match: the Membership section's leading
+	//     version byte must fall in [minSupportedMembershipVersion,
+	//     membershipFormatVersion]. That case returns the richer
+	//     *UnsupportedMembershipVersionError, which matches this sentinel
+	//     under errors.Is.
 	ErrUnsupportedVersion = errors.New("proto: unsupported wire version")
 
 	// ErrFilepathTooLong is returned when a filepath string exceeds
@@ -99,6 +111,32 @@ var (
 	// Use errors.Is to match.
 	ErrInvalidSnapshotType = errors.New("proto: invalid snapshot state machine type")
 )
+
+// UnsupportedMembershipVersionError is returned when a persisted Membership
+// section's leading version byte falls outside the window this build can
+// decode. It names the version found and the supported range so an operator
+// reading a log line can tell a downgrade (found < min: the data was written
+// by a newer binary than the one reading it, or support was dropped) from an
+// upgrade (found > current: this binary is older than the writer) without
+// consulting the source.
+type UnsupportedMembershipVersionError struct {
+	// Found is the version byte read from the buffer.
+	Found uint8
+}
+
+// Error returns a human-readable description naming the version found and
+// the supported range.
+func (e *UnsupportedMembershipVersionError) Error() string {
+	return fmt.Sprintf(
+		"proto: unsupported membership format version %d (supported: %d-%d)",
+		e.Found, minSupportedMembershipVersion, membershipFormatVersion)
+}
+
+// Is reports whether target matches the sentinel ErrUnsupportedVersion error,
+// so existing errors.Is checks on the wire-version sentinel keep working.
+func (e *UnsupportedMembershipVersionError) Is(target error) bool {
+	return target == ErrUnsupportedVersion
+}
 
 // InvalidSnapshotTypeError is returned when a Snapshot.Type field does
 // not match any known state machine type constant (RegularStateMachine,

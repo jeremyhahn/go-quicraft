@@ -274,6 +274,14 @@ func (efs *ErrorFS) Remove(name string) error {
 	return efs.delegate.Remove(name)
 }
 
+// Rename implements waldb.FS.
+func (efs *ErrorFS) Rename(oldpath, newpath string) error {
+	if err := efs.tick("Rename"); err != nil {
+		return err
+	}
+	return efs.delegate.Rename(oldpath, newpath)
+}
+
 // ErrorFile wraps a waldb.File and routes every I/O operation through the
 // parent ErrorFS counter. When the shared counter reaches the configured
 // threshold the operation returns an *InjectedError without touching the

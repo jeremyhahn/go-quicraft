@@ -2333,6 +2333,9 @@ func TestRaft_ReadIndex_FollowerWithNoLeader(t *testing.T) {
 func TestRaft_ReadIndexResp_PopulatesReadStates(t *testing.T) {
 	r := atTerm(newTestRaft(1), 1)
 	r.readStates = nil
+	// A follower only ever forwards ReadIndex to its leader, so the answer is
+	// accepted only from that leader; see handleReadIndexResp.
+	r.leaderID = 2
 
 	err := r.step(proto.Message{
 		Type:     proto.ReadIndexResp,

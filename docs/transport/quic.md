@@ -581,7 +581,7 @@ type RevocationConfig struct {
     OCSPTimeoutSeconds int          // OCSP HTTP timeout (default 5)
     CheckInterval     time.Duration // CRL reload interval (default 60s)
     Mode              string        // "crl" | "ocsp" | "both" | "any" (default "any")
-    EnforceRevocation bool          // fail-closed on unknown status (default false)
+    AllowSoftFail     bool          // admit peers whose status is UNKNOWN (default false = fail closed)
     OnCertRevoked     func(serial string)
     // ... see config.RevocationConfig
 }
@@ -624,10 +624,20 @@ revocation is still enforced on session resumption.
   result to "good" or "revoked". Its TTL is far shorter than the positive-result
   cache (`OCSPCacheSeconds`, default 300 s) so the responder is retried promptly
   once it recovers.
-- **Fail-closed mode:** With `EnforceRevocation = true`, an unknown revocation
-  status (OCSP unreachable, no CRL configured) rejects the connection. The
-  default (`false`) is soft-fail: connections are allowed when status cannot be
-  determined.
+- **Fail closed by default:** an unknown revocation status — OCSP responder
+  unreachable, CRL stale or unreadable, no revocation source configured —
+  **rejects** the connection. The knob is `RevocationConfig.AllowSoftFail`, and
+  its zero value (`false`) is the fail-closed posture, so a `RevocationConfig`
+  you never touch enforces revocation. Set `AllowSoftFail: true` only when the
+  availability tradeoff is understood: it admits peers whose status cannot be
+  determined, which lets an attacker keep using a revoked certificate simply by
+  making the responder look unreachable. A definitive "revoked" verdict rejects
+  either way.
+
+  The internal `revocation.Config` carries the inverted field
+  (`EnforceRevocation`), which the host derives as
+  `EnforceRevocation: !rc.AllowSoftFail`. It is not reachable from
+  `pkg/config` — do not write it into a `config.RevocationConfig` literal.
 
 All nodes in a cluster must share the same CA certificate for mutual
 verification.
@@ -669,13 +679,49 @@ invisible from a running cluster, the operator has no signal to act on, and the
 only remediation — re-issued certificates — has to happen before the cluster
 carries data.
 
+`StartShard`'s check is a **misconfiguration detector**, not an attack control:
+it inspects the LOCAL node's own certificate against addresses an operator
+handed the local API, so a malicious joiner never runs it. The enforcing
+counterpart is on the receive path.
+
+**Inbound peers with a promiscuous certificate are refused at accept.**
+`refuseInboundPromiscuousCert` runs on every accepted connection — including
+resumed TLS sessions, since `Accept` yields every inbound connection regardless
+— and closes it with `QUICErrPromiscuousCert` (`0x5`) when the peer's verified
+leaf **also covers this node's own host**. A certificate that covers this member
+covers every member, so its holder can satisfy the address binding for any
+replica of any shard. This node cannot enumerate the other members here (the
+transport has no shard membership) and does not need to: it is itself a member,
+so "covers me" is a sound proxy for "covers everyone", checkable against nothing
+but its own configured address.
+
+It runs **once per connection**, deliberately. The per-message alternative —
+probing each member address through the `PeerAuth` callback — thrashes the
+4-slot per-connection decision cache and trips its 16-distinct-miss fail-closed
+cap (`inboundAuthorizedForCached`), which would permanently kill every
+connection on any shard with five or more members. A certificate is fixed for
+the life of a connection, so once is also sufficient.
+
 **Known limitation — co-located replicas.** A certificate is matched on its
 HOST only; the port is not part of the decision. Replicas separated only by port
 (`127.0.0.1:5000`, `127.0.0.1:5001`) are therefore indistinguishable to all
-three controls, and no certificate policy can separate them. The startup check
-skips peers sharing this node's own host, since flagging them would fail every
-single-machine deployment while offering nothing actionable. **Deployments that
-need these controls must give each replica its own host.**
+three controls, and no certificate policy can separate them. Both the startup
+check and the receive-side refusal skip peers sharing this node's own host — the
+same host under any spelling, or any loopback address (`isCoLocatedCertHost`) —
+since flagging them would fail every single-machine deployment while offering
+nothing actionable. **Deployments that need these controls must give each
+replica its own host.**
+
+**What supersedes all of this for `msg.From`.** The address-based binding above
+still governs `SourceAddress` learning and epoch-driven eviction, but the replica
+ID Raft counts toward quorum is no longer authorized by address at all wherever
+committed membership records a **node identity** for it. The identity is
+`sha256(leaf.RawSubjectPublicKeyInfo)` (`NodeIdentityFromCertificate`, rendered
+`spki:<hex>`) — derived from the peer's public key rather than matched against
+its SANs, so a wildcard certificate proves nothing about it, and unchanged by
+certificate renewal on the same keypair. It reaches membership only through
+consensus and is supplied by an operator, never captured from a connection. See
+[Compatibility](../operations/compatibility.md#node-identities-and-requirememberidentity).
 
 The internal transport builds separate server and client `tls.Config`
 instances from the provided PEM material. The `ServerName` field on the client

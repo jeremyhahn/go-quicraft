@@ -2460,12 +2460,19 @@ func TestMembershipSizeHelper(t *testing.T) {
 		// All nil maps.
 	}
 	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1) +
-	// 4 map count headers * 4 bytes each = 18 + 16 = 34.
-	if got := membershipSize(m); got != 34 {
-		t.Fatalf("membershipSize(empty)=%d, want 34", got)
+	// 5 map count headers * 4 bytes each + the 24-byte session policy
+	// = 18 + 20 + 24 = 62. The fifth map is Identities and the session policy
+	// closes the section; both are appended by the v4 layout.
+	if got := membershipSize(m); got != 62 {
+		t.Fatalf("membershipSize(empty)=%d, want 62", got)
 	}
-	if got := membershipSize(m); got != minMembershipSize {
-		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize=%d", got, minMembershipSize)
+	// membershipSize is what this binary WRITES (v4); minMembershipSize is the
+	// floor for what it will READ, which is still the v3 size so that sections
+	// written before Identities existed are not rejected as truncated before
+	// the version byte is even examined. They are expected to differ by exactly
+	// the v4 tail: one map count header plus the session policy.
+	if got, want := membershipSize(m), minMembershipSize+4+membershipSessionPolicySize; got != want {
+		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize+4+policy=%d", got, want)
 	}
 }
 

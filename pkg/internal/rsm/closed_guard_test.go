@@ -27,7 +27,7 @@ import (
 func newClosedGuardSM(t *testing.T) *StateMachine {
 	t.Helper()
 	createFn := func(_, _ uint64) interface{} { return newTestKV() }
-	machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine failed: %v", err)
 	}

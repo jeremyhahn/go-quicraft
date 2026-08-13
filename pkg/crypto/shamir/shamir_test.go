@@ -1046,3 +1046,146 @@ func TestWipe(t *testing.T) {
 	}
 	wipe(nil) // must not panic
 }
+
+// TestCombine_NilShareIsRejectedNotDereferenced is the panic regression:
+// combine read shares[0].Threshold before validating anything, and
+// (*Share).Validate dereferenced its receiver unconditionally, so a nil element
+// crashed the process. Custody lives above this package and necessarily decodes
+// operator-submitted shares — json.Unmarshal of a list containing null into a
+// []*Share yields exactly these inputs — so one malformed submission during an
+// unseal ceremony must be an error, not a crash.
+func TestCombine_NilShareIsRejectedNotDereferenced(t *testing.T) {
+	valid, err := Split([]byte("root key material"), 2, 3)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		shares []*Share
+	}{
+		{"all nil", []*Share{nil, nil}},
+		{"leading nil", []*Share{nil, valid[0]}},
+		{"trailing nil", []*Share{valid[0], nil}},
+		{"single nil", []*Share{nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Combine(tc.shares)
+			if err == nil {
+				t.Fatalf("Combine(%s) succeeded, want error", tc.name)
+			}
+			if got != nil {
+				t.Errorf("Combine(%s) returned %d secret bytes alongside an error", tc.name, len(got))
+			}
+			var cerr *CombineError
+			if !errors.As(err, &cerr) {
+				t.Fatalf("Combine(%s) error is %T, want *CombineError", tc.name, err)
+			}
+		})
+	}
+
+	// The same input through the JSON path the ceremony actually uses.
+	var decoded []*Share
+	if err := json.Unmarshal([]byte(`[null, null]`), &decoded); err != nil {
+		t.Fatalf("test premise broken, Unmarshal: %v", err)
+	}
+	if _, err := CombineUnverified(decoded); err == nil {
+		t.Fatal("CombineUnverified of a decoded [null,null] succeeded, want error")
+	}
+}
+
+// TestValidate_NilReceiver pins that a nil share reports a validation failure
+// rather than panicking, for both entry points that reach it.
+func TestValidate_NilReceiver(t *testing.T) {
+	var nilShare *Share
+	if err := nilShare.Validate(); err == nil {
+		t.Fatal("(*Share)(nil).Validate() returned nil, want a validation error")
+	} else {
+		var verr *ValidationError
+		if !errors.As(err, &verr) {
+			t.Fatalf("error is %T, want *ValidationError", err)
+		}
+	}
+
+	if err := VerifyShare(nil, nil); err == nil {
+		t.Fatal("VerifyShare(nil, nil) returned nil, want a validation error")
+	}
+
+	valid, err := Split([]byte("root key material"), 2, 3)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	if err := VerifyShare(valid[0], []*Share{nil}); err == nil {
+		t.Fatal("VerifyShare with a nil other-share returned nil, want a validation error")
+	}
+}
+
+// TestSplitBytes_RoundTripsThroughCombineBytes pins the wipeable generation
+// path: SplitBytes hands back caller-owned buffers that CombineBytes consumes
+// directly, so share material never has to become an un-wipeable Go string.
+func TestSplitBytes_RoundTripsThroughCombineBytes(t *testing.T) {
+	secret := []byte("32-byte-ish root key material...")
+	values, err := SplitBytes(secret, 3, 5)
+	if err != nil {
+		t.Fatalf("SplitBytes: %v", err)
+	}
+	if len(values) != 5 {
+		t.Fatalf("SplitBytes returned %d values, want 5", len(values))
+	}
+
+	got, err := CombineBytes([][]byte{values[4], values[1], values[2]}, 3)
+	if err != nil {
+		t.Fatalf("CombineBytes: %v", err)
+	}
+	if !bytes.Equal(got, secret) {
+		t.Fatalf("reconstructed %q, want %q", got, secret)
+	}
+
+	// values[i] must be exactly the value of share Index i+1, so the two
+	// generation paths are interchangeable.
+	for i, v := range values {
+		raw, derr := base64.StdEncoding.DecodeString(string(v))
+		if derr != nil {
+			t.Fatalf("value %d is not base64: %v", i, derr)
+		}
+		if raw[0] != shareFormatVersion {
+			t.Errorf("value %d has format version %d, want %d", i, raw[0], shareFormatVersion)
+		}
+		if int(raw[1]) != i+1 {
+			t.Errorf("value %d carries x-coordinate %d, want %d", i, raw[1], i+1)
+		}
+	}
+
+	// The caller owns them and can wipe them.
+	for _, v := range values {
+		wipe(v)
+		for _, b := range v {
+			if b != 0 {
+				t.Fatal("SplitBytes returned a buffer that could not be wiped")
+			}
+		}
+	}
+}
+
+// TestSplitBytes_RejectsInvalidParameters keeps the parameter contract
+// identical to Split's, which now delegates to it.
+func TestSplitBytes_RejectsInvalidParameters(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		secret    []byte
+		threshold int
+		total     int
+	}{
+		{"threshold below 2", []byte("s"), 1, 3},
+		{"total below threshold", []byte("s"), 3, 2},
+		{"threshold above 255", []byte("s"), 256, 300},
+		{"total above 255", []byte("s"), 2, 256},
+		{"empty secret", nil, 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := SplitBytes(tc.secret, tc.threshold, tc.total); err == nil {
+				t.Fatal("SplitBytes accepted invalid parameters")
+			}
+		})
+	}
+}

@@ -72,7 +72,9 @@ func TestValidateValid(t *testing.T) {
 // TestValidateVariousBlockSizes verifies that valid power-of-two block sizes
 // pass validation while invalid ones fail.
 func TestValidateVariousBlockSizes(t *testing.T) {
-	validSizes := []int{8, 16, 32, 64, 128, 256, 512, 1024, 4096, 32768}
+	// The smallest legal block is recordHeaderSize+1 = 12 bytes, so the first
+	// power of two that can hold a chunk header plus one payload byte is 16.
+	validSizes := []int{16, 32, 64, 128, 256, 512, 1024, 4096, 32768}
 	for _, bs := range validSizes {
 		o := &Options{
 			WALDir:       "/tmp/wal",

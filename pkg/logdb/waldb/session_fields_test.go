@@ -144,6 +144,11 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
+		// Record the on-disk format the way a real first Open does, so the
+		// legacy PAYLOAD type is what fails the open rather than the missing
+		// marker. The two are different compatibility ladders: the marker
+		// covers the chunk framing, the payload byte covers what is inside it.
+		writeTestWALFormat(t, dir, 4096)
 		seg, _, err := createSegment(defaultFS(), shardDir, 1, 4096, 64*1024)
 		if err != nil {
 			t.Fatalf("createSegment: %v", err)

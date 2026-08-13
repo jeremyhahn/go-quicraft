@@ -50,7 +50,7 @@ func testBarrierConfig(deploymentID uint64) BarrierConfig {
 // testInitializedBarrier returns a barrier that has been initialized and is unsealed.
 func testInitializedBarrier(t *testing.T) (*Barrier, *SoftwareStrategy) {
 	t.Helper()
-	b := NewBarrier(testBarrierConfig(1))
+	b := MustNewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
@@ -61,7 +61,7 @@ func testInitializedBarrier(t *testing.T) (*Barrier, *SoftwareStrategy) {
 // --- NewBarrier ---
 
 func TestNewBarrier(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	if b == nil {
 		t.Fatal("NewBarrier returned nil")
 	}
@@ -82,7 +82,7 @@ func TestNewBarrier(t *testing.T) {
 // --- Initialize ---
 
 func TestBarrier_Initialize(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -311,7 +311,7 @@ func TestBarrier_Unseal(t *testing.T) {
 }
 
 func TestBarrier_UnsealNotInitialized(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -756,7 +756,7 @@ func TestBarrier_RotateAndDecryptOldData(t *testing.T) {
 // --- Full Lifecycle ---
 
 func TestBarrier_FullLifecycle(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -994,7 +994,7 @@ func TestBarrier_MultipleInFlightRegistrations(t *testing.T) {
 // --- Brute-Force Protection ---
 
 func TestBarrier_BruteForceBackoff(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -1062,7 +1062,7 @@ func TestBarrier_BruteForceBackoff(t *testing.T) {
 // indefinitely. The clamp must treat a non-monotonic clock as satisfying the
 // delay and re-anchor lastFailedAt to now.
 func TestBarrier_BackoffBackwardClockStep(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -1097,7 +1097,7 @@ func TestBarrier_BackoffBackwardClockStep(t *testing.T) {
 }
 
 func TestBarrier_BackoffDelay(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	tests := []struct {
 		name     string
@@ -1243,12 +1243,12 @@ func TestBarrier_ConcurrentEncryptAndRotate(t *testing.T) {
 
 func TestBarrier_SetSealedRootKey(t *testing.T) {
 	// Simulate loading persisted sealed key data.
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
 	// Create a second barrier that was initialized.
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
@@ -1288,7 +1288,7 @@ func TestBarrier_SetSealedRootKey(t *testing.T) {
 }
 
 func TestBarrier_SetSealedRootKeyValid(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// SetSealedRootKey with valid fields should succeed.
 	err := b.SetSealedRootKey(&SealedRootKey{
@@ -1306,7 +1306,7 @@ func TestBarrier_SetSealedRootKeyValid(t *testing.T) {
 // --- SealedRootKeyData ---
 
 func TestBarrier_SealedRootKeyDataNotInitialized(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	if sealed := b.SealedRootKeyData(); sealed != nil {
 		t.Fatal("expected nil SealedRootKeyData for uninitialized barrier")
 	}
@@ -1535,14 +1535,14 @@ func TestHKDFZeroDeploymentID(t *testing.T) {
 // verification of the HKDF cluster binding.
 func TestBarrierDeploymentIDIsolation(t *testing.T) {
 	// Create two barriers with different deployment IDs.
-	b1 := NewBarrier(DefaultBarrierConfig(100))
+	b1 := MustNewBarrier(DefaultBarrierConfig(100))
 	s1 := testStrategy(t)
 	defer s1.Close()
 	if err := b1.Initialize(context.Background(), s1, Credentials{}); err != nil {
 		t.Fatalf("b1 Initialize failed: %v", err)
 	}
 
-	b2 := NewBarrier(DefaultBarrierConfig(200))
+	b2 := MustNewBarrier(DefaultBarrierConfig(200))
 	s2 := testStrategy(t)
 	defer s2.Close()
 	if err := b2.Initialize(context.Background(), s2, Credentials{}); err != nil {
@@ -1632,11 +1632,11 @@ func TestCipherError(t *testing.T) {
 // --- Cross-Barrier Isolation ---
 
 func TestBarrier_CrossBarrierIsolation(t *testing.T) {
-	b1 := NewBarrier(DefaultBarrierConfig(1))
+	b1 := MustNewBarrier(DefaultBarrierConfig(1))
 	s1 := testStrategy(t)
 	defer s1.Close()
 
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	s2 := testStrategy(t)
 	defer s2.Close()
 
@@ -1877,7 +1877,7 @@ func TestBarrier_DecryptForEpochCorruptCiphertext(t *testing.T) {
 // TestBarrier_UnsealInvalidRootKeySize tests the path where Unseal gets an
 // incorrect-size root key from the strategy.
 func TestBarrier_UnsealInvalidRootKeySize(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// Use a mock-like strategy that returns a short root key.
 	shortKeyStrategy := &fixedKeyStrategy{
@@ -1934,7 +1934,7 @@ func (f *fixedKeyStrategy) Close() error {
 
 // TestBarrier_BruteForceLogging verifies that the error-level threshold is hit.
 func TestBarrier_BruteForceHighFailureCount(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2022,7 +2022,7 @@ func (r *errReader) Read(p []byte) (int, error) {
 // TestBarrier_InitializeRandFailRootKey tests that Initialize handles rand failure
 // during root key generation.
 func TestBarrier_InitializeRandFailRootKey(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	b.randReader = &errReader{remaining: 0, err: io.ErrUnexpectedEOF}
 
 	s := testStrategy(t)
@@ -2044,7 +2044,7 @@ func TestBarrier_InitializeRandFailRootKey(t *testing.T) {
 // TestBarrier_InitializeRandFailSalt tests that Initialize handles rand failure
 // during salt generation (root key succeeds but salt fails).
 func TestBarrier_InitializeRandFailSalt(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	// Provide enough bytes for root key (32) but fail on salt.
 	b.randReader = &errReader{remaining: rootKeySize, err: io.ErrUnexpectedEOF}
 
@@ -2102,7 +2102,7 @@ func (f *failingSealStrategy) Close() error { return nil }
 
 // TestBarrier_InitializeStrategyFails verifies Initialize handles strategy.Seal failure.
 func TestBarrier_InitializeStrategyFails(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	err := b.Initialize(context.Background(), &failingSealStrategy{}, Credentials{})
 	if err == nil {
 		t.Fatal("expected error from Initialize with failing strategy")
@@ -2171,7 +2171,7 @@ func TestBarrier_EncryptWithEpochRandNonceFail(t *testing.T) {
 // --- Unseal brute-force failure below threshold (no warn/error) ---
 
 func TestBarrier_UnsealFailBelowThreshold(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2210,7 +2210,7 @@ func TestBarrier_UnsealFailBelowThreshold(t *testing.T) {
 // --- Unseal brute-force: exactly at threshold triggers Warn logging ---
 
 func TestBarrier_UnsealFailAtThresholdTriggersWarn(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2245,7 +2245,7 @@ func TestBarrier_UnsealFailAtThresholdTriggersWarn(t *testing.T) {
 // --- Unseal brute-force: above error threshold triggers Error logging ---
 
 func TestBarrier_UnsealFailAboveErrorThreshold(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2348,7 +2348,7 @@ func TestBarrier_InitializeOnSealedBarrier(t *testing.T) {
 // --- Multiple seal/unseal cycles ---
 
 func TestBarrier_MultipleSealUnsealCycles(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2384,7 +2384,7 @@ func TestBarrier_MultipleSealUnsealCycles(t *testing.T) {
 // --- Rotate + Seal/Unseal + DecryptForEpoch cross-epoch ---
 
 func TestBarrier_RotateSealUnsealDecryptForEpoch(t *testing.T) {
-	b := NewBarrier(testBarrierConfig(1))
+	b := MustNewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2673,7 +2673,7 @@ func TestBarrier_RotateUpdatesSealedEpoch_WhenSealed(t *testing.T) {
 
 func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
 	// Phase 1: Initialize, rotate twice (epochs 1, 2, 3), encrypt data at each epoch.
-	b1 := NewBarrier(testBarrierConfig(1))
+	b1 := MustNewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2721,7 +2721,7 @@ func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
 	}
 
 	// Phase 2: Simulate restart - create a fresh barrier, load persisted state, unseal.
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey failed: %v", err)
 	}
@@ -2769,7 +2769,7 @@ func TestBarrier_SetSealedRootKey_RejectsEmptyKnownEpochs(t *testing.T) {
 	// not contain the current epoch. This prevents loading structurally
 	// invalid data that would cause Unseal to miss re-deriving the DEK
 	// for the active epoch.
-	b1 := NewBarrier(DefaultBarrierConfig(1))
+	b1 := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2782,7 +2782,7 @@ func TestBarrier_SetSealedRootKey_RejectsEmptyKnownEpochs(t *testing.T) {
 	// Remove KnownEpochs to simulate legacy or corrupted data.
 	sealed.KnownEpochs = nil
 
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	err := b2.SetSealedRootKey(sealed)
 	if !errors.Is(err, ErrInvalidSealedEpochs) {
 		t.Fatalf("expected ErrInvalidSealedEpochs, got %v", err)
@@ -2915,7 +2915,7 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 	// Verify that brute-force backoff state is persisted to the sealed key
 	// and restored on SetSealedRootKey, preventing attackers from resetting
 	// the backoff counter by restarting the process.
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
@@ -2951,7 +2951,7 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 	}
 
 	// Simulate restart: create a new barrier, load persisted state.
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	b2.timeNow = func() time.Time { return now }
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey failed: %v", err)
@@ -2982,12 +2982,12 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 func TestBarrier_BackoffPersistenceZeroValuesBackwardCompat(t *testing.T) {
 	// Verify that a v1 sealed key (zero FailedAttempts/LastFailedUnixNano)
 	// results in no backoff, preserving backward compatibility.
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
 	// Initialize a source barrier to get valid sealed data.
-	src := NewBarrier(DefaultBarrierConfig(1))
+	src := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := src.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
@@ -3087,7 +3087,7 @@ func TestSoftwareStrategy_SealUnsealRoundTripWithAAD(t *testing.T) {
 // --- M2-sec: Epoch monotonicity validation in SetSealedRootKey ---
 
 func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	err := b.SetSealedRootKey(&SealedRootKey{
 		Strategy:    StrategyPassphrase,
@@ -3102,7 +3102,7 @@ func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
 }
 
 func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// Salt too short.
 	err := b.SetSealedRootKey(&SealedRootKey{
@@ -3142,7 +3142,7 @@ func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
 }
 
 func TestBarrier_SetSealedRootKey_RejectsMissingCurrentEpoch(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// KnownEpochs does not contain the current epoch (3).
 	err := b.SetSealedRootKey(&SealedRootKey{
@@ -3158,7 +3158,7 @@ func TestBarrier_SetSealedRootKey_RejectsMissingCurrentEpoch(t *testing.T) {
 }
 
 func TestBarrier_SetSealedRootKey_AcceptsValidMultiEpoch(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	err := b.SetSealedRootKey(&SealedRootKey{
 		Strategy:    StrategyPassphrase,
@@ -3225,7 +3225,7 @@ func TestBarrier_RootKey(t *testing.T) {
 	})
 
 	t.Run("ReturnsErrorWhenUninitialized", func(t *testing.T) {
-		b := NewBarrier(DefaultBarrierConfig(1))
+		b := MustNewBarrier(DefaultBarrierConfig(1))
 
 		_, err := b.RootKey()
 		if !errors.Is(err, ErrBarrierSealed) {
@@ -3431,7 +3431,7 @@ func TestBarrier_CustomInvocationCounter(t *testing.T) {
 	mock := &mockInvocationCounter{enabled: true}
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = mock
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if b.InvocationCounter() != mock {
 		t.Fatal("InvocationCounter() should return the injected counter")
@@ -3451,7 +3451,7 @@ func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mock
 	cfg.NonceTracking = false
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3511,7 +3511,7 @@ func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
 	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
 	cfg := testBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3564,7 +3564,7 @@ func TestBarrier_CustomNonceTrackerProvider(t *testing.T) {
 	mock := &mockNonceTracker{enabled: true}
 	cfg := DefaultBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if b.NonceTracker() != mock {
 		t.Fatal("NonceTracker() should return the injected provider")
@@ -3582,7 +3582,7 @@ func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 	cfg := testBarrierConfig(1)
 	cfg.NonceTrackerProvider = mock
 	cfg.InvocationLimit = -1 // disable invocation counter so only the nonce tracker is exercised
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3612,7 +3612,7 @@ func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 // are set, the barrier creates default InMemory implementations.
 func TestBarrier_DefaultProvidersWhenNil(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	ic := b.InvocationCounter()
 	if ic == nil {
@@ -3643,7 +3643,7 @@ func TestBarrier_ProviderOverridesTrackingFlag(t *testing.T) {
 	cfg.NonceTracking = false // would normally mean no tracker
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if b.InvocationCounter() != mockIC {
 		t.Fatal("custom InvocationCounter should override InvocationLimit=-1")
@@ -3660,7 +3660,7 @@ func TestBarrier_ProviderOverridesTrackingFlag(t *testing.T) {
 func TestBarrier_Config(t *testing.T) {
 	t.Parallel()
 	cfg := DefaultBarrierConfig(42)
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	got := b.Config()
 	if got.DeploymentID != 42 {
@@ -3684,7 +3684,7 @@ func TestBarrier_Config_DifferentDeploymentIDs(t *testing.T) {
 	ids := []uint64{0, 1, 100, ^uint64(0)}
 	for _, id := range ids {
 		cfg := DefaultBarrierConfig(id)
-		b := NewBarrier(cfg)
+		b := MustNewBarrier(cfg)
 		if got := b.Config().DeploymentID; got != id {
 			t.Fatalf("Config().DeploymentID = %d, want %d", got, id)
 		}
@@ -3703,7 +3703,7 @@ func TestBarrier_RotateResetsBothTrackers(t *testing.T) {
 	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3753,7 +3753,7 @@ func TestBarrier_RotateResetsBothTrackers_VerifyEncryptAfterRotate(t *testing.T)
 	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3791,7 +3791,7 @@ func TestBarrier_EncryptWithNonceTrackerError(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
 	cfg.NonceTrackerProvider = mockNT
 	cfg.InvocationLimit = -1
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3815,7 +3815,7 @@ func TestBarrier_EncryptWithNonceTrackerError_NilCheckSucceeds(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
 	cfg.NonceTrackerProvider = mockNT
 	cfg.InvocationLimit = -1
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3842,7 +3842,7 @@ func TestBarrier_EncryptWithInvocationCounterError(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTracking = false
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3866,7 +3866,7 @@ func TestBarrier_EncryptWithInvocationCounterError_NilCheckSucceeds(t *testing.T
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTracking = false
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -3882,9 +3882,66 @@ func TestBarrier_EncryptWithInvocationCounterError_NilCheckSucceeds(t *testing.T
 	}
 }
 
-// --- NewBarrier panic on invalid config ---
+// --- NewBarrier rejects an invalid config; MustNewBarrier panics on it ---
 
-func TestNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
+// TestNewBarrier_ReturnsErrorOnInvalidAlgorithm pins the reason NewBarrier's
+// signature changed: pkg/seal is embedded in other products' processes, and an
+// invalid algorithm — the normal outcome of a config read from a file or an
+// API request — must be a recoverable error, never a process-killing panic.
+func TestNewBarrier_ReturnsErrorOnInvalidAlgorithm(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		alg  SymmetricAlgorithm
+	}{
+		{"unknown algorithm", SymmetricAlgorithm(0xFF)},
+		{"zero value algorithm", SymmetricAlgorithm(0x00)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var b *Barrier
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("NewBarrier must not panic on an invalid config, got %v", r)
+					}
+				}()
+				b, err = NewBarrier(BarrierConfig{Algorithm: tc.alg, DeploymentID: 1})
+			}()
+
+			if !errors.Is(err, ErrUnsupportedAlgorithm) {
+				t.Fatalf("NewBarrier err = %v, want ErrUnsupportedAlgorithm", err)
+			}
+			if b != nil {
+				t.Fatal("NewBarrier must return a nil Barrier alongside the error")
+			}
+		})
+	}
+}
+
+// TestNewBarrier_ValidConfig asserts the success path returns a usable barrier
+// and a nil error, so the two-value signature is not merely error-shaped.
+func TestNewBarrier_ValidConfig(t *testing.T) {
+	t.Parallel()
+
+	b, err := NewBarrier(DefaultBarrierConfig(1))
+	if err != nil {
+		t.Fatalf("NewBarrier on the default config: %v", err)
+	}
+	if b == nil {
+		t.Fatal("NewBarrier returned a nil Barrier with a nil error")
+	}
+	if b.state != barrierUninitialized {
+		t.Fatalf("new barrier state = %v, want uninitialized", b.state)
+	}
+}
+
+// TestMustNewBarrier_PanicsOnInvalidAlgorithm pins the MustXxx half of the
+// pair: the panic still exists, but only behind the name that advertises it.
+func TestMustNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
 	t.Parallel()
 
 	defer func() {
@@ -3896,8 +3953,8 @@ func TestNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected string panic, got %T: %v", r, r)
 		}
-		if !bytes.Contains([]byte(msg), []byte("seal.NewBarrier")) {
-			t.Fatalf("panic message should contain 'seal.NewBarrier', got %q", msg)
+		if !bytes.Contains([]byte(msg), []byte("seal.MustNewBarrier")) {
+			t.Fatalf("panic message should contain 'seal.MustNewBarrier', got %q", msg)
 		}
 		if !bytes.Contains([]byte(msg), []byte("unsupported")) {
 			t.Fatalf("panic message should reference unsupported algorithm, got %q", msg)
@@ -3908,10 +3965,10 @@ func TestNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
 		Algorithm:    SymmetricAlgorithm(0xFF), // invalid
 		DeploymentID: 1,
 	}
-	NewBarrier(cfg)
+	MustNewBarrier(cfg)
 }
 
-func TestNewBarrier_PanicsOnZeroAlgorithm(t *testing.T) {
+func TestMustNewBarrier_PanicsOnZeroAlgorithm(t *testing.T) {
 	t.Parallel()
 
 	defer func() {
@@ -3925,7 +3982,17 @@ func TestNewBarrier_PanicsOnZeroAlgorithm(t *testing.T) {
 		Algorithm:    SymmetricAlgorithm(0x00), // zero value, not registered
 		DeploymentID: 1,
 	}
-	NewBarrier(cfg)
+	MustNewBarrier(cfg)
+}
+
+// TestMustNewBarrier_ValidConfig asserts the Must form returns the barrier
+// rather than only being defined for its panic.
+func TestMustNewBarrier_ValidConfig(t *testing.T) {
+	t.Parallel()
+
+	if b := MustNewBarrier(DefaultBarrierConfig(1)); b == nil {
+		t.Fatal("MustNewBarrier returned nil for a valid config")
+	}
 }
 
 // --- persistBackoffState with nil sealed ---
@@ -3935,7 +4002,7 @@ func TestBarrier_PersistBackoffState_NilSealed(t *testing.T) {
 
 	// A barrier that has never been initialized has sealed == nil.
 	// persistBackoffState must return without panic.
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// Simulate failed unseal state: increment counters directly.
 	b.failedAttempts = 3
@@ -3963,7 +4030,7 @@ func TestBarrier_PersistBackoffState_NilSealed(t *testing.T) {
 func TestBarrier_ShouldRotateKey_DisabledCounter(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationLimit = -1 // -1 disables counting
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if b.ShouldRotateKey() {
 		t.Error("ShouldRotateKey should return false when invocation tracking is disabled")
@@ -3978,7 +4045,7 @@ func TestBarrier_ShouldRotateKey_BelowThreshold(t *testing.T) {
 	counter.Seed(500)
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = counter
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if b.ShouldRotateKey() {
 		t.Error("ShouldRotateKey should return false when below the rotation threshold")
@@ -3993,7 +4060,7 @@ func TestBarrier_ShouldRotateKey_AtThreshold(t *testing.T) {
 	counter.Seed(950)
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = counter
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 
 	if !b.ShouldRotateKey() {
 		t.Error("ShouldRotateKey should return true when invocation count reaches the threshold")
@@ -4074,7 +4141,7 @@ func TestBarrier_UnsealSeedsInvocationCounterAfterRestart(t *testing.T) {
 
 	// Simulate a process restart: a brand-new barrier restored from the
 	// persisted sealed root key, with a fresh in-memory counter.
-	b2 := NewBarrier(testBarrierConfig(1))
+	b2 := MustNewBarrier(testBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
@@ -4146,7 +4213,7 @@ func TestBarrier_UnsealTrustsInjectedCounter(t *testing.T) {
 
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = custom
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -4156,7 +4223,7 @@ func TestBarrier_UnsealTrustsInjectedCounter(t *testing.T) {
 	cfg2 := DefaultBarrierConfig(1)
 	custom2 := NewInvocationCounter(true, 0, 0)
 	cfg2.InvocationCounter = custom2
-	b2 := NewBarrier(cfg2)
+	b2 := MustNewBarrier(cfg2)
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}

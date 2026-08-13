@@ -168,7 +168,7 @@ func TestNewBarrierWarnsOnUnrotatableNonceTracking(t *testing.T) {
 	if !cfg.NonceTracking || cfg.StatePersister != nil || cfg.InvocationCounter != nil {
 		t.Fatalf("DefaultBarrierConfig no longer produces the unrotatable combination: %+v", cfg)
 	}
-	_ = NewBarrier(cfg)
+	_ = MustNewBarrier(cfg)
 
 	if !logs.find(slog.LevelWarn, "the epoch cannot rotate") {
 		t.Fatal("a barrier that cannot rotate with nonce tracking on must be reported")
@@ -182,7 +182,7 @@ func TestNewBarrierQuietWhenRotatable(t *testing.T) {
 
 	cfg := DefaultBarrierConfig(7)
 	cfg.StatePersister = func(*SealedRootKey) error { return nil }
-	_ = NewBarrier(cfg)
+	_ = MustNewBarrier(cfg)
 
 	if logs.find(slog.LevelWarn, "the epoch cannot rotate") {
 		t.Fatal("a barrier with a StatePersister must not be reported as unrotatable")

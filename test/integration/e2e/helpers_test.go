@@ -1086,7 +1086,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 	for i := range numNodes {
 		// Create and initialize a barrier for this node.
 		_ = seal.AllowWeakKDFParams()
-		b := seal.NewBarrier(testBarrierConfig(1))
+		b := seal.MustNewBarrier(testBarrierConfig(1))
 		s, err := seal.NewSoftwareStrategyWithParams(
 			[]byte(fmt.Sprintf("test-passphrase-%d", i)), 1, 64*1024, 1)
 		if err != nil {
@@ -1143,7 +1143,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 func newBarrierForNode(t *testing.T) *seal.Barrier {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
-	b := seal.NewBarrier(testBarrierConfig(1))
+	b := seal.MustNewBarrier(testBarrierConfig(1))
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("replacement-passphrase"), 1, 64*1024, 1)
 	if err != nil {

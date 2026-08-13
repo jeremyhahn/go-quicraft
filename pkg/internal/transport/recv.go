@@ -16,7 +16,10 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -200,6 +203,35 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 		)
 		if closeErr := conn.CloseWithError(QUICErrIPLimitReached, "per-IP connection limit reached"); closeErr != nil {
 			slog.Debug("transport: connection close failed after IP limit reached",
+				"ip", ip,
+				"error", closeErr,
+			)
+		}
+		return
+	}
+
+	// Refuse a peer whose certificate ALSO covers this node's host, before the
+	// connection is allowed to occupy a global slot or open a single stream.
+	//
+	// This is the one exclusivity check an attacker cannot decline to run: the
+	// two in Host (StartShard, requestConfigChange) inspect the LOCAL node's own
+	// certificate against operator-supplied addresses, so they detect a
+	// misconfigured deployment but never see a malicious joiner. See
+	// refuseInboundPromiscuousCert for why "covers me" is the right question and
+	// why it is answered once per connection rather than per message.
+	//
+	// The handshake has completed by the time Accept returns, so the peer
+	// certificate is verified and present here, and this runs on RESUMED
+	// sessions too — Accept yields every inbound connection regardless of
+	// whether its TLS session was resumed.
+	if err := t.refuseInboundPromiscuousCert(conn); err != nil {
+		slog.Warn("refusing inbound connection: peer certificate is not exclusive",
+			"remote", conn.RemoteAddr().String(),
+			"error", err,
+		)
+		ipTracker.release(ip)
+		if closeErr := conn.CloseWithError(QUICErrPromiscuousCert, "peer certificate covers this node's address"); closeErr != nil {
+			slog.Debug("transport: connection close failed after promiscuous-certificate refusal",
 				"ip", ip,
 				"error", closeErr,
 			)
@@ -930,13 +962,18 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		}
 	}
 
-	// Bind the in-band batch SourceAddress to the connection's verified
-	// certificate (same hook the snapshot path uses), so the handler only
-	// learns a return-path address the sender's cert actually covers.
-	senderAuthorized := func(address string) bool {
-		return t.inboundAuthorizedForCached(inboundConn, address)
+	// Bind the batch's in-band claims to the connection that carried them: the
+	// peer's authenticated NODE IDENTITY (which msg.From is checked against
+	// wherever committed membership records one) and the certificate's address
+	// coverage (the fallback binding, and what gates learning a return-path
+	// address). Both are read from the inbound connection, never from the batch.
+	peer := PeerAuth{
+		Identity: peerNodeIdentity(inboundConn),
+		AuthorizesAddress: func(address string) bool {
+			return t.inboundAuthorizedForCached(inboundConn, address)
+		},
 	}
-	handleErr := t.handler.HandleMessage(*batch, senderAuthorized)
+	handleErr := t.handler.HandleMessage(*batch, peer)
 	if !recvStart.IsZero() && len(batch.Requests) > 0 {
 		slog.Debug("message batch received",
 			"source", batch.SourceAddress,
@@ -1035,10 +1072,13 @@ func (t *QUICTransport) processSnapshotHeader(inboundConn *quic.Conn, r io.Reade
 	// mechanism used for MessageBatch.SourceAddress. A nil inboundConn
 	// yields "unauthorized" for every address (fail closed).
 	if qStream, ok := r.(*quic.Stream); ok {
-		senderAuthorized := func(address string) bool {
-			return t.inboundAuthorizedForCached(inboundConn, address)
+		peer := PeerAuth{
+			Identity: peerNodeIdentity(inboundConn),
+			AuthorizesAddress: func(address string) bool {
+				return t.inboundAuthorizedForCached(inboundConn, address)
+			},
 		}
-		t.snapshotRecv.receiveSnapshot(qStream, &hdr, remoteAddrOf(inboundConn), senderAuthorized, t.stopC)
+		t.snapshotRecv.receiveSnapshot(qStream, &hdr, snapshotFairnessKey(inboundConn), peer, t.stopC)
 	} else {
 		slog.Warn("snapshot header received on non-QUIC stream, snapshot dropped",
 			"reader_type", fmt.Sprintf("%T", r))
@@ -1052,6 +1092,115 @@ func remoteAddrOf(conn *quic.Conn) string {
 		return "<unknown>"
 	}
 	return conn.RemoteAddr().String()
+}
+
+// snapshotFairnessKey returns the identity a peer's concurrent snapshot
+// receives are accounted against.
+//
+// It must be something the peer CANNOT VARY, because it is the only thing
+// standing between one host and the entire host-global snapshot budget. The
+// previous key was conn.RemoteAddr().String(), which includes the client-chosen
+// SOURCE PORT: one authenticated host simply opened MaxConnectionsPerIP (16 by
+// default) connections, presented 16 distinct keys, and became entitled to
+// 16 * maxPerPeer slots against a host-global budget of only
+// MaxConcurrentSnapshotRecv (4). Holding all four while trickling bytes made
+// every legitimate InstallSnapshot fail — and a follower that has fallen below
+// the leader's compaction floor cannot be repaired by replication either, so
+// the shard runs below its configured replica count indefinitely.
+//
+// The key is the SHA-256 of the peer leaf certificate's
+// RawSubjectPublicKeyInfo — the peer's authenticated identity under the
+// mandatory mTLS handshake. It is preferred over the peer IP because it is
+// exactly as unforgeable (the handshake proves possession of the private key)
+// while additionally surviving NAT, multi-homing and address changes: a peer
+// that reconnects from a second interface is still one peer, and two replicas
+// behind one NAT are still two peers. The SPKI rather than the whole
+// certificate so a routine certificate RENEWAL on the same keypair does not
+// silently reset the peer's accounting mid-transfer.
+//
+// The peer IP is the fallback for a connection with no verified leaf. Mandatory
+// mTLS means that combination should not reach here, but if it ever does the
+// fallback still keys on something the client cannot choose per connection —
+// never on the source port.
+//
+// A nil connection (unit-test paths with no connection at all) yields the empty
+// key, which acquirePeerSlot does not account.
+func snapshotFairnessKey(conn *quic.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	if identity := peerNodeIdentity(conn); identity != "" {
+		return identity
+	}
+	return "ip:" + extractIP(conn.RemoteAddr())
+}
+
+// peerNodeIdentity returns the authenticated NODE IDENTITY of a connection's
+// peer, or "" when the connection presents no verified leaf.
+//
+// It is the same value NodeIdentityFromCertificate derives, and it is what the
+// receive-side sender gate compares against the identity committed membership
+// assigns msg.From. Deriving it here — from the leaf the mTLS handshake
+// verified, on the connection the message actually arrived on — is what makes
+// it unassertable: possession of the matching private key was proved during the
+// handshake, and nothing in the message body can influence it.
+//
+// The SPKI rather than the whole certificate, and rather than the serial or the
+// fingerprint, so a routine certificate RENEWAL on the same keypair keeps the
+// same identity. An identity that changed on every renewal would have to be
+// re-committed through a config change on every renewal, which for a
+// short-lived cluster PKI is a config change per node per rotation period — an
+// operational burden that guarantees the strict mode gets turned off.
+//
+// It is deliberately NOT a SAN URI of the form quicraft://<deployment>/<id>,
+// which would bind the replica ID directly and be a stronger statement. Four
+// downstream products issue these certificates; requiring a new SAN would make
+// this control undeployable until every one of them shipped a PKI change, and
+// an undeployed control is worth nothing. The SPKI needs no issuance change at
+// all — it is a property every certificate already has. What it costs is that
+// the certificate does not SAY which replica it is, so the replica ID -> SPKI
+// mapping has to be established out of band, through the operator-supplied
+// identity on the config-change path. See Host.RequestAddNodeWithIdentity.
+func peerNodeIdentity(conn *quic.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	certs := conn.ConnectionState().TLS.PeerCertificates
+	if len(certs) == 0 {
+		return ""
+	}
+	return NodeIdentityFromCertificate(certs[0])
+}
+
+// NodeIdentityFromCertificate returns the stable node identity a leaf
+// certificate carries: the SHA-256 of its RawSubjectPublicKeyInfo, prefixed
+// "spki:".
+//
+// The prefix is a scheme tag, not decoration. It leaves room for a future
+// identity form (a SAN URI, say) to coexist in the same committed field, and it
+// makes a mis-supplied value — a bare fingerprint, a hostname — visibly not an
+// identity rather than a value that silently never matches.
+//
+// A nil certificate yields "", which every caller treats as "no identity".
+func NodeIdentityFromCertificate(leaf *x509.Certificate) string {
+	if leaf == nil {
+		return ""
+	}
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	return "spki:" + hex.EncodeToString(sum[:])
+}
+
+// LocalNodeIdentity returns this node's OWN node identity, derived from the
+// leaf certificate it presents to peers. It is what an operator collects from
+// each node and hands to the config-change API so the shard can commit it.
+//
+// It returns "" when no leaf is available, which NewQUICTransport makes
+// unreachable (an unparsable leaf fails construction).
+func (t *QUICTransport) LocalNodeIdentity() string {
+	if t.tlsPair == nil {
+		return ""
+	}
+	return NodeIdentityFromCertificate(t.tlsPair.leaf)
 }
 
 // discardFrameBody consumes a frame payload that will not be processed so the

@@ -1000,7 +1000,7 @@ func TestSubmit_DataIntegrity(t *testing.T) {
 	}
 }
 
-func TestPickContext_AllCanceled(t *testing.T) {
+func TestProposeContext_AllCanceled(t *testing.T) {
 	t.Parallel()
 
 	mp := &mockProposer{}
@@ -1028,13 +1028,20 @@ func TestPickContext_AllCanceled(t *testing.T) {
 		{ctx: ctx2, shardID: 1, data: []byte("b"), resultCh: make(chan error, 1)},
 	}
 
-	picked := agg.pickContext(proposals)
-	if picked.Err() != nil {
-		t.Error("pickContext with all canceled should return context.Background() (non-canceled)")
+	// Every caller has already given up, so there is nobody left to receive a
+	// result. The batch must be skipped rather than proposed on an unbounded
+	// context, which is what wedged the single flush goroutine.
+	ctx, cancel, ok := agg.proposeContext(proposals)
+	if ok {
+		cancel()
+		t.Fatal("proposeContext with all contexts canceled should report ok=false")
+	}
+	if ctx != nil || cancel != nil {
+		t.Error("proposeContext must return a nil context and cancel when ok=false")
 	}
 }
 
-func TestPickContext_FirstNonCanceled(t *testing.T) {
+func TestProposeContext_FirstNonCanceled(t *testing.T) {
 	t.Parallel()
 
 	mp := &mockProposer{}
@@ -1061,9 +1068,19 @@ func TestPickContext_FirstNonCanceled(t *testing.T) {
 		{ctx: liveCtx, shardID: 1, data: []byte("b"), resultCh: make(chan error, 1)},
 	}
 
-	picked := agg.pickContext(proposals)
-	if picked.Err() != nil {
-		t.Error("pickContext should return the first non-canceled context")
+	ctx, cancel, ok := agg.proposeContext(proposals)
+	if !ok {
+		t.Fatal("proposeContext should select the first non-canceled context")
+	}
+	defer cancel()
+	if ctx.Err() != nil {
+		t.Error("proposeContext should return a live context")
+	}
+	// liveCtx carries no deadline of its own, so the aggregator must supply
+	// one: an unbounded propose on the single flush goroutine stalls every
+	// other shard and hangs Close.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		t.Error("proposeContext must bound a deadline-less caller context")
 	}
 }
 

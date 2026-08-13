@@ -97,7 +97,7 @@ func (h *hwStrategy) Close() error { return nil }
 // --- Initialize hardware mode ---
 
 func TestBarrier_Initialize_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -130,7 +130,7 @@ func TestBarrier_Initialize_HardwareMode(t *testing.T) {
 }
 
 func TestBarrier_Initialize_HardwareMode_EncryptorError(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	hwErr := errors.New("hw init failed")
 	s := &hwStrategy{hwEnc: nil, hwErr: hwErr}
 
@@ -147,7 +147,7 @@ func TestBarrier_Initialize_HardwareMode_EncryptorError(t *testing.T) {
 // --- Unseal hardware mode ---
 
 func TestBarrier_Unseal_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -177,7 +177,7 @@ func TestBarrier_Unseal_HardwareMode(t *testing.T) {
 }
 
 func TestBarrier_Unseal_HardwareMode_EncryptorError(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	// First, initialize with a software strategy.
 	swStrategy := testStrategy(t)
 	defer swStrategy.Close()
@@ -233,7 +233,7 @@ func (h *hwUnsealErrorStrategy) Close() error { return nil }
 // --- Encrypt/Decrypt in hardware mode ---
 
 func TestBarrier_Encrypt_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -263,7 +263,7 @@ func TestBarrier_Encrypt_HardwareMode(t *testing.T) {
 }
 
 func TestBarrier_Encrypt_HardwareMode_EncryptError(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	encErr := errors.New("encrypt failed")
 	enc := &mockHWEncryptor{encryptErr: encErr}
 	s := &hwStrategy{hwEnc: enc}
@@ -279,7 +279,7 @@ func TestBarrier_Encrypt_HardwareMode_EncryptError(t *testing.T) {
 }
 
 func TestBarrier_Decrypt_HardwareMode_DecryptError(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	decErr := errors.New("decrypt failed")
 	enc := &mockHWEncryptor{decryptErr: decErr}
 	s := &hwStrategy{hwEnc: enc}
@@ -297,7 +297,7 @@ func TestBarrier_Decrypt_HardwareMode_DecryptError(t *testing.T) {
 // --- EncryptWithEpoch in hardware mode ---
 
 func TestBarrier_EncryptWithEpoch_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -319,7 +319,7 @@ func TestBarrier_EncryptWithEpoch_HardwareMode(t *testing.T) {
 }
 
 func TestBarrier_EncryptWithEpoch_HardwareMode_Error(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	encErr := errors.New("hw encrypt failed")
 	enc := &mockHWEncryptor{encryptErr: encErr}
 	s := &hwStrategy{hwEnc: enc}
@@ -337,7 +337,7 @@ func TestBarrier_EncryptWithEpoch_HardwareMode_Error(t *testing.T) {
 // --- DecryptForEpoch in hardware mode ---
 
 func TestBarrier_DecryptForEpoch_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -363,7 +363,7 @@ func TestBarrier_DecryptForEpoch_HardwareMode(t *testing.T) {
 }
 
 func TestBarrier_DecryptForEpoch_HardwareMode_Error(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	decErr := errors.New("hw decrypt failed")
 	enc := &mockHWEncryptor{decryptErr: decErr}
 	s := &hwStrategy{hwEnc: enc}
@@ -381,7 +381,7 @@ func TestBarrier_DecryptForEpoch_HardwareMode_Error(t *testing.T) {
 // --- Rotate returns ErrHardwareMode ---
 
 func TestBarrier_Rotate_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -398,7 +398,7 @@ func TestBarrier_Rotate_HardwareMode(t *testing.T) {
 // --- PurgeEpochsBefore returns ErrHardwareMode ---
 
 func TestBarrier_PurgeEpochsBefore_HardwareMode(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -424,7 +424,7 @@ func TestBarrier_IsHardwareMode_False(t *testing.T) {
 }
 
 func TestBarrier_IsHardwareMode_True(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -438,7 +438,7 @@ func TestBarrier_IsHardwareMode_True(t *testing.T) {
 }
 
 func TestBarrier_IsHardwareMode_ClearedAfterSeal(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
 	s := &hwStrategy{hwEnc: enc}
 
@@ -464,7 +464,7 @@ func TestBarrier_IsHardwareMode_ClearedAfterSeal(t *testing.T) {
 func TestEpochBarrier_IsAlias(t *testing.T) {
 	// EpochBarrier is a type alias for Barrier.
 	// Creating one via NewEpochBarrier should produce a valid barrier.
-	b := NewEpochBarrier(DefaultBarrierConfig(42))
+	b := MustNewEpochBarrier(DefaultBarrierConfig(42))
 	if b == nil {
 		t.Fatal("NewEpochBarrier returned nil")
 	}
@@ -479,7 +479,7 @@ func TestEpochBarrier_IsAlias(t *testing.T) {
 
 func TestNewEpochBarrier_Functional(t *testing.T) {
 	// Full functional test: create via alias, initialize, encrypt, decrypt.
-	b := NewEpochBarrier(DefaultBarrierConfig(1))
+	b := MustNewEpochBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 

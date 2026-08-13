@@ -147,9 +147,7 @@ Atomic flag blocks step worker from concurrent Peer access during commit/apply p
 
 **Notify fast path**: Atomic pre-filter `notified[workerID]` avoids ~10-15ns channel send when worker already notified (most calls hit this). Only sends to channel when transitioning from non-notified → notified state.
 
-**ReadyMap (64-bucket sharded)**: Double-buffered set with atomic pointer swap. Writers target active set, consumer targets swap set. Three-map rotation (O0 optimization) achieves zero steady-state allocations: map returned 2 swaps ago is guaranteed unreachable, recycled as drain target for current swap.
-
-**spinMutex per bucket**: CAS loop with `runtime.Gosched()` on contention, optimized for sub-100ns critical sections (single map insert). Per-bucket locking scales to 64+ writers without sync.Mutex overhead.
+**ReadyMap (double-buffered)**: One `sync.Mutex` over one live map, plus a two-map rotation (`maps [2]`). `Set()` holds the lock for a single map insert; `Swap()` clears the alternate map outside the lock, then holds it only to exchange pointers, and returns the map that was live. Two-map rotation keeps the swap path at zero steady-state allocations. The returned map is owned by the caller only until the next `Swap()`, which recycles it.
 
 **HasWork() utility**: Returns atomic load of WorkSignal state, ~1ns check for poll-based optimization.
 

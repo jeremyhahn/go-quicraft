@@ -149,8 +149,8 @@ Source: `pkg/config/config.go`
 | `ReplicaID` | uint64 | (set by StartShard) | Replica identifier (caller-provided) |
 | `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Join-only: never list it in the `StartShard` members map — see below |
 | `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only). Join-only: never list it in the `StartShard` members map — see below |
-| `CheckQuorum` | bool | `true` | Leader steps down on quorum loss (safety-critical) |
-| `PreVote` | bool | `true` | Pre-vote prevents disruptive elections (safety-critical) |
+| `CheckQuorum` | *bool | `nil` = enabled | Leader steps down on quorum loss (safety-critical). Set with `config.BoolPtr(false)` to disable |
+| `PreVote` | *bool | `nil` = enabled | Pre-vote prevents disruptive elections (safety-critical). Set with `config.BoolPtr(false)` to disable |
 | `ElectionRTT` | uint64 | `10` | Election timeout in RTT multiples (must be >= 5) |
 | `HeartbeatRTT` | uint64 | `1` | Heartbeat interval in RTT multiples |
 | `SnapshotEntries` | uint64 | `0` (disabled) | Entries between auto-snapshots |
@@ -158,16 +158,16 @@ Source: `pkg/config/config.go`
 | `MaxInMemLogSize` | uint64 | `0` (disabled) | Per-shard in-memory log rate limit (bytes) |
 | `MaxProposalPayloadSize` | uint64 | `8 MB` | Max individual proposal size |
 | `MaxEntrySize` | uint64 | `8 MB` | Max entry size in log |
-| `MaxApplyEntrySize` | uint64 | `64 MB` | Max batch size per SM.Update call (replication chunk size) |
+| `MaxApplyEntrySize` | uint64 | `16,711,672` (~15.9 MiB) | Max batch size per SM.Update call (replication chunk size) |
 | `MaxSnapshotSize` | uint64 | `4 GB` | Max snapshot file size |
-| `MaxSessionsPerClient` | uint64 | `128` | Per-client session limit |
-| `MaxTotalSessions` | uint64 | `16384` | Per-shard total session limit |
+| `MaxSessionsPerClient` | uint64 | `128` | Cached responses retained per session (bootstrap seed; replicated) |
+| `MaxTotalSessions` | uint64 | `16384` | Per-shard total session limit (bootstrap seed; replicated) |
 | `SnapshotCompressionType` | CompressionType | `NoCompression` | Snapshot compression: `NoCompression` or `Snappy` |
 | `EntryCompressionType` | CompressionType | `NoCompression` | Entry compression: `NoCompression` or `Snappy` |
 | `Quiesce` | bool | `false` | Quiescence for idle shards |
-| `OrderedConfigChange` | bool | `true` | Serialize membership changes (required for safety) |
+| `OrderedConfigChange` | *bool | `nil` = enabled | Serialize membership changes (required for safety). Set with `config.BoolPtr(false)` to disable |
 | `ZeroCopyEntryCmd` | bool | `false` | Zero-copy entry data (SM must copy if retained) |
-| `SessionExpiryEntries` | uint64 | `0` (disabled) | Expire sessions inactive for this many log entries |
+| `SessionExpiryEntries` | uint64 | `100000` | Bootstrap seed for the shard's replicated expiry threshold; `config.SessionExpiryDisabled` turns expiry off |
 | `LeaseRead` | bool | `false` | Lease-based reads (no heartbeat RTT, requires CheckQuorum) |
 
 #### Starting a witness or an observer
@@ -239,7 +239,7 @@ type RevocationConfig struct {
     OCSPTimeoutSeconds int           // Default: 5
     CheckInterval      time.Duration // Default: 60s
     Mode               string        // "crl"/"ocsp"/"both"/"any"
-    EnforceRevocation  bool          // Reject if revocation status unknown
+    AllowSoftFail      bool          // ADMIT peers whose status is unknown (default false)
     OnCertRevoked      func(...)     // Callback when cert is revoked
 }
 ```
@@ -250,7 +250,7 @@ Enables certificate revocation checking via CRL and/or OCSP. Optional; used only
 
 - **Leaf-only checks:** Only the peer's leaf (end-entity) certificate is revocation-checked, not the full presented chain. The leaf is what gets revoked when a node is decommissioned or compromised; the CA chain is governed by the CA's own lifecycle. This avoids per-handshake OCSP latency for rarely-changing intermediate/root certificates. Checks run via the TLS `VerifyConnection` callback, so they also apply to resumed TLS sessions.
 - **OCSP negative cache:** When an OCSP responder is unreachable (down, timeout, network error), the failure is cached for a short 10 s window. During that window, reconnect handshakes do not re-query the dead responder, so they avoid adding the full `OCSPTimeoutSeconds` to every handshake while the responder is down. The negative cache only suppresses re-queries — it never reports a cert as "good" or "revoked" — and its TTL is far shorter than the positive-result cache (`OCSPCacheSeconds`, default 300 s), so the responder is retried promptly once it recovers.
-- **Fail-closed:** With `EnforceRevocation: true`, peers are rejected when revocation status cannot be determined (responder down, no CRL). The default (`false`) is soft-fail.
+- **Fail-closed by default:** peers are rejected when revocation status cannot be determined (responder down, CRL stale or unreadable, no revocation source configured). The knob is `AllowSoftFail`, and its zero value (`false`) is the fail-closed posture — a `RevocationConfig` you never touch enforces revocation. Setting `AllowSoftFail: true` inverts that and admits unknown-status peers, so an attacker whose certificate was revoked can keep connecting by making the responder appear unreachable. A definitive "revoked" verdict rejects either way. (There is an `EnforceRevocation` field on the transport's internal `revocation.Config`, derived as `!AllowSoftFail`; it is not settable from `pkg/config`.)
 
 ## Monitoring
 
@@ -270,21 +270,68 @@ http.Handle("/metrics", promhttp.HandlerFor(collector.Registry, promhttp.Handler
 
 All metrics use the `quicraft` namespace and are registered on a dedicated `prometheus.Registry` (not the global default).
 
+Call `RegisterShard` when a shard starts and `UnregisterShard` when it stops. `UnregisterShard` deletes the shard's child series, so a host that starts and stops shards over time does not accumulate series forever.
+
+#### Metrics cardinality
+
+**The default aggregates most metrics to host level.** `NewPrometheusMetricsCollector` uses the zero `config.MetricsConfig`, in which `PerShardMetrics` is `false`. Opt in to a per-shard breakdown with:
+
+```go
+collector := quicraft.NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{
+    PerShardMetrics: true,
+})
+```
+
+The mode is fixed when the collector is built — a Prometheus vector's label set is decided at construction — so it cannot be changed on a running host, and it is deliberately not a `HostConfig` field.
+
+Why the default is off: a histogram child is one series per bucket plus `_sum` and `_count`, so the per-shard cost is much larger than the number of shard-labelled metric names suggests. Measured:
+
+| Mode | Series per active shard | 10,000 shards on one host |
+|------|------------------------:|--------------------------:|
+| `PerShardMetrics: false` (default) | 6 | ~60,000 |
+| `PerShardMetrics: true` | 113 | ~1,130,000 |
+
+A million active series from a single host is enough to destabilise a shared Prometheus, and that failure lands on every other tenant of it. Enable per-shard metrics for small deployments, or temporarily while bisecting one shard's latency.
+
+**Turning it off never costs an alert.** These keep their `shard_id` label in *both* modes, because the shard is what makes the page actionable:
+
+- `quicraft_raft_elections_total` (leader change)
+- `quicraft_raft_proposals_dropped_total`
+- `quicraft_transport_messages_dropped_total`
+- `quicraft_transport_snapshots_rejected_total`
+- `quicraft_security_unauthorized_messages_dropped_total`
+- `quicraft_security_unauthorized_snapshots_dropped_total`
+
+What aggregates is volume-and-latency telemetry, whose per-shard breakdown is a debugging aid rather than an alerting input.
+
+**Reading the mode from the scrape.** Aggregated series keep the *same metric name* and drop only the `shard_id` label, so a rule written as `sum without(shard_id) (...)` is correct in both modes. Their `# HELP` text states that they are aggregated, and the mode is also exported directly:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `quicraft_metrics_per_shard_enabled` | Gauge | -- | 1 when per-shard labels are on, 0 when aggregated |
+
+A dashboard can branch on that gauge instead of reading the host config.
+
+#### Metric reference
+
+In the tables below, `shard_id*` marks a label present **only** when `PerShardMetrics` is enabled.
+
 **Raft metrics** (`quicraft_raft_*`):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `proposal_latency_seconds` | Histogram | `shard_id` | End-to-end proposal latency |
-| `commit_latency_seconds` | Histogram | `shard_id` | Proposal-to-commit latency |
-| `apply_latency_seconds` | Histogram | `shard_id` | Commit-to-apply latency |
+| `proposal_latency_seconds` | Histogram | `shard_id*` | End-to-end proposal latency |
+| `commit_latency_seconds` | Histogram | `shard_id*` | Proposal-to-commit latency |
+| `apply_latency_seconds` | Histogram | `shard_id*` | Commit-to-apply latency |
+| `read_index_latency_seconds` | Histogram | `shard_id*` | ReadIndex latency |
+| `proposal_batch_size` | Histogram | `shard_id*` | Proposals per Raft append |
+| `snapshots_total` | Counter | `shard_id*` | Snapshot count |
+| `piggyback_commits_total` | Counter | `shard_id*` | Commits that skipped a second pipeline cycle |
 | `proposals_dropped_total` | Counter | `shard_id` | Dropped proposals |
-| `proposal_batch_size` | Histogram | `shard_id` | Proposals per Raft append |
-| `commit_batch_size` | Histogram | -- | Entries per commit batch |
 | `elections_total` | Counter | `shard_id` | Election count |
-| `snapshots_total` | Counter | `shard_id` | Snapshot count |
-| `readindex_latency_seconds` | Histogram | `shard_id` | ReadIndex latency |
+| `commit_batch_size` | Histogram | -- | Entries per commit batch |
 
-**LogDB metrics** (`quicraft_logdb_*`):
+**LogDB metrics** (`quicraft_logdb_*`) — never per-shard:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -298,12 +345,27 @@ All metrics use the `quicraft` namespace and are registered on a dedicated `prom
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `send_latency_seconds` | Histogram | -- | Message send latency |
-| `messages_sent_total` | Counter | `shard_id`, `to`, `msg_type` | Messages sent |
-| `messages_received_total` | Counter | `shard_id`, `from`, `msg_type` | Messages received |
-| `snapshots_sent_total` | Counter | `shard_id` | Snapshots sent |
-| `snapshots_sent_bytes` | Histogram | `shard_id` | Bytes per snapshot send |
-| `snapshots_received_total` | Counter | `shard_id` | Snapshots received |
-| `snapshots_received_bytes` | Histogram | `shard_id` | Bytes per snapshot receive |
+| `messages_sent_total` | Counter | -- | Messages sent (aggregate) |
+| `messages_received_total` | Counter | -- | Messages received (aggregate) |
+| `messages_sent_detailed_total` | Counter | `shard_id`, `to`, `msg_type` | Messages sent, only when `EnablePerMessageMetrics` |
+| `messages_received_detailed_total` | Counter | `shard_id`, `from`, `msg_type` | Messages received, only when `EnablePerMessageMetrics` |
+| `snapshots_sent_total` | Counter | `shard_id*` | Snapshots sent |
+| `snapshots_sent_bytes` | Histogram | `shard_id*` | Bytes per snapshot send |
+| `snapshots_received_total` | Counter | `shard_id*` | Snapshots received |
+| `snapshots_received_bytes` | Histogram | `shard_id*` | Bytes per snapshot receive |
+| `messages_dropped_total` | Counter | `shard_id`, `reason` | Raft messages discarded by the transport |
+| `snapshots_rejected_total` | Counter | `shard_id`, `reason` | Inbound snapshot transfers discarded |
+
+`EnablePerMessageMetrics` is a separate switch, also off by default, and it is the highest-cardinality option here: its label set is shard x target replica x message type. Enable it only for short debugging sessions.
+
+**Security metrics** (`quicraft_security_*`) — always per-shard, low frequency by design; every increment is a rejected message:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `unauthorized_messages_dropped_total` | Counter | `shard_id`, `reason` | Inbound Raft messages failing shard-membership authorization |
+| `unauthorized_snapshots_dropped_total` | Counter | `shard_id` | Inbound snapshots failing authorization or TLS identity binding |
+
+The sender's replica id is deliberately **not** a label on the security and drop counters: it arrives unauthenticated in the inbound message, so an attacker could emit arbitrarily many distinct values and create unbounded, never-reclaimed series. It is recorded in the corresponding log line instead.
 
 Latency buckets: 100us to 10s. Batch size buckets: 1 to 1024 (powers of two). Snapshot byte buckets: 1KB to 1GB.
 
@@ -485,9 +547,9 @@ Source: `pkg/config/config.go`, `pkg/internal/rsm/statemachine.go`
 
 Client sessions provide at-most-once delivery semantics. Sessions are registered and unregistered through Raft proposals (not local-only), ensuring all replicas agree on the set of active sessions.
 
-**Session limits:** `MaxSessionsPerClient` (default 128) limits concurrent sessions per client ID. `MaxTotalSessions` (default 16384) limits the total number of sessions per shard. When either limit is reached, new session registrations are rejected with `ErrSessionLimitExceeded`.
+**Session limits:** `MaxTotalSessions` (default 16384) limits the number of sessions a shard admits; a registration past it is rejected with `ErrSessionLimitExceeded`. `MaxSessionsPerClient` (default 128) does NOT limit sessions despite its name — it is the depth of the per-session response cache, and an over-limit response is rejected with `ErrResponseLimitExceeded`. Both are bootstrap seeds for the shard's REPLICATED session policy, not per-node settings: see the note below.
 
-**Automatic session expiry:** `SessionExpiryEntries` controls deterministic cleanup of abandoned sessions. Sessions that have not been active within this many applied log entries are expired during the apply path. This is driven by log index (not wall-clock time), so all replicas expire the same sessions at the same point in the log, preserving determinism.
+**Automatic session expiry:** `SessionExpiryEntries` controls deterministic cleanup of abandoned sessions. Sessions that have not been active within this many applied log entries are expired during the apply path. Expiry is driven by log index, not wall-clock time, and the threshold is replicated, so every replica expires the same sessions at the same point in the log. The default is 100,000 entries.
 
 ```go
 shardCfg := config.Config{
@@ -495,7 +557,17 @@ shardCfg := config.Config{
 }
 ```
 
-Set `SessionExpiryEntries` to 0 (default) to disable automatic expiry. When disabled, sessions are only removed via explicit unregister or when `MaxTotalSessions` forces rejection of new registrations.
+> **The three session limits are REPLICATED, and the `Config` fields are only the bootstrap seed.** `SessionExpiryEntries`, `MaxTotalSessions` and `MaxSessionsPerClient` all drive the deterministic apply path — the expiry checkpoints are multiples of the threshold, registrations are refused past `MaxTotalSessions`, and the response cache is bounded by `MaxSessionsPerClient` — so two replicas evaluating different values expire different sessions or disagree on whether a session exists at all. One then answers a session-managed proposal from its response cache while the other reports the session expired: a permanent state-machine divergence that no Raft invariant detects, because the log, the commit index and the applied index are identical on both sides.
+>
+> A founding replica therefore writes all three into the shard's initial membership, and every replica applies the committed values. What this means operationally:
+>
+> - **All founders must supply the same values.** A differing value produces a different index-1 entry, exactly as it does for the witness policy.
+> - **A node whose configuration disagrees with its shard applies the shard's values** and logs the disagreement at WARN, naming both. It does not refuse to start: the committed value can only be changed through consensus, so refusing would strand the node. Grep for `applying the shard's replicated session policy` after a config change to see whether a node's edit actually took effect.
+> - **`Host.GetShardMembership` reports the committed policy** (`SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`), which is the value that governs.
+> - **There is no config change for these yet.** The committed policy is fixed for the life of the shard, so `MaxTotalSessions` cannot be raised on a running shard. Size it at bootstrap.
+> - **A shard bootstrapped by an earlier build carries no policy** and its replicas keep using local configuration; for those shards the old rule — set the values identically on every replica, and nothing enforces it — still applies.
+
+Set `SessionExpiryEntries` to `config.SessionExpiryDisabled` to turn automatic expiry off; leaving it zero selects the default instead. With expiry disabled, sessions are only removed via explicit unregister or when `MaxTotalSessions` forces rejection of new registrations — so a client that registers a session and dies without `CloseSession` leaks an entry that is serialized into every subsequent snapshot and counts against `MaxTotalSessions` forever. Keep the threshold at or below a non-zero `SnapshotEntries` so expiry runs at least once per snapshot interval; `Validate` warns when it does not.
 
 ### Connection Limits
 
@@ -538,8 +610,16 @@ When either rate limiter triggers, the caller should back off and retry. The `Bu
 ### Barrier Setup
 
 ```go
-strategy := seal.NewSoftwareStrategy([]byte("passphrase"))
-barrier := seal.NewBarrier()
+strategy, err := seal.NewSoftwareStrategy([]byte("passphrase"))
+if err != nil {
+    log.Fatal(err)
+}
+// NewBarrier returns (*Barrier, error): an invalid config is an error, never a
+// panic. seal.MustNewBarrier is the panicking form for compile-time constants.
+barrier, err := seal.NewBarrier(seal.DefaultBarrierConfig(deploymentID))
+if err != nil {
+    log.Fatal(err)
+}
 
 // First boot: generate root key, derive epoch-1 DEK, seal root key
 barrier.Initialize(strategy)
@@ -551,7 +631,7 @@ host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 On subsequent boots, load the persisted `SealedRootKey` and unseal:
 
 ```go
-barrier := seal.NewBarrier()
+barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(deploymentID))
 if err := barrier.SetSealedRootKey(loadedSealedKey); err != nil {
     log.Fatalf("invalid sealed key: %v", err)
 }
@@ -701,7 +781,7 @@ host.RequestLeaderTransfer(ctx, shardID, targetReplicaID)
 > re-issuing the config change. (A periodic self-advertisement for non-voting
 > members is a planned post-v1.0 enhancement.)
 
-`OrderedConfigChange: true` (default) serializes membership changes so only one is in-flight at a time, as required by the Raft specification.
+`OrderedConfigChange` serializes membership changes so only one is in-flight at a time, as required by the Raft specification. It is a `*bool` whose nil zero value means enabled, so the default needs no configuration; disabling it is `OrderedConfigChange: config.BoolPtr(false)` and is UNSAFE.
 
 ### Membership Queries
 
@@ -759,7 +839,7 @@ Increase `ElectionRTT` if experiencing spurious elections due to GC pauses or di
 
 **`SendBatchMaxSize` (64KB default):** When the send buffer reaches this size, it is flushed immediately.
 
-**`MaxApplyEntrySize` (64MB default):** Controls replication chunk size. Each Replicate message carries at most this many bytes of entries. Also used as the maximum batch size for `SM.Update()` calls.
+**`MaxApplyEntrySize` (16,711,672 bytes, ~15.9 MiB, default):** Controls replication chunk size. Each Replicate message carries at most this many bytes of entries. Also used as the maximum batch size for `SM.Update()` calls. The default is `config.MaxReplicationPayloadBytes` — `transport.MaxFrameSize` minus frame and batch framing overhead — not a round number, because a batch the transport cannot frame is dropped at marshal time and the follower's next index never advances, so raft rebuilds the identical oversized batch forever.
 
 **`CommitCBufferSize` (64 default):** Buffer depth between step and commit workers. Increase for write-heavy workloads where commit latency is consistently higher than step latency.
 
@@ -814,7 +894,7 @@ Set `ZeroCopyEntryCmd: true` to avoid copying `Entry.Cmd` during unmarshal. The 
 
 ### LeaseRead
 
-Enable `LeaseRead: true` on a shard config to use lease-based reads (PhD 6.4 optimization). Lease reads skip the heartbeat round-trip required by normal linearizable reads, reducing read latency to zero (serving from local committed state). Requires `CheckQuorum: true`. Not compatible with witness replicas.
+Enable `LeaseRead: true` on a shard config to use lease-based reads (PhD 6.4 optimization). Lease reads skip the heartbeat round-trip required by normal linearizable reads, reducing read latency to zero (serving from local committed state). Requires CheckQuorum, which is on by default — `CheckQuorum` is a `*bool` whose nil zero value means enabled, so leave it unset rather than writing `CheckQuorum: true` (that does not compile; the compiling form is `config.BoolPtr(true)`). `Config.Validate` returns `*LeaseReadRequiresCheckQuorumError` when LeaseRead is set with CheckQuorum explicitly disabled, and LeaseRead also requires `ElectionRTT >= 5`. Not compatible with witness replicas.
 
 ## Build and CI
 

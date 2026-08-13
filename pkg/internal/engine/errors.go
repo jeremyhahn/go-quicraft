@@ -96,6 +96,14 @@ var (
 	ErrUnsupportedSnapshotCompression = errors.New(
 		"quicraft: snapshot declares an unsupported compression algorithm")
 
+	// ErrSnapshotIndexNotAdvanced is returned when a snapshot EXPORT is
+	// requested at an index the durable snapshot already covers. The save is a
+	// no-op — re-saving would truncate the artifact LogDB records — but an
+	// export caller asked for a directory that the no-op cannot produce, so the
+	// request fails instead of reporting a success with nothing exported.
+	ErrSnapshotIndexNotAdvanced = errors.New(
+		"engine: snapshot index has not advanced since the last snapshot")
+
 	// ErrApplyGap is returned when a committed batch does not start at
 	// lastApplied+1. The missing range can never be re-offered (Raft's
 	// processed marker already advanced past it), so the shard is failed

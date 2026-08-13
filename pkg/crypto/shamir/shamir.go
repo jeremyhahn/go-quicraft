@@ -53,7 +53,47 @@ var randReader io.Reader = rand.Reader
 // where x is the share's field coordinate (equal to Share.Index) and y
 // has one byte per secret byte. The x-coordinate embedded in the value is
 // authoritative for reconstruction, so a share string is self-contained.
+//
+// Share.Value is a Go STRING and therefore immortal: it cannot be zeroed, and
+// every share stays readable in the heap until the GC reclaims it. Split wipes
+// the byte buffer it encoded from, but the string it hands back is the one copy
+// it cannot take away. A ceremony holds all N shares at once, so this is the
+// point of widest exposure in the whole scheme — callers that can keep share
+// material in wipeable buffers should use SplitBytes and feed CombineBytes.
 func Split(secret []byte, threshold, total int) ([]*Share, error) {
+	values, err := SplitBytes(secret, threshold, total)
+	if err != nil {
+		return nil, err
+	}
+	shares := make([]*Share, total)
+	for i, v := range values {
+		shares[i] = &Share{
+			Index:     i + 1,
+			Threshold: threshold,
+			Total:     total,
+			Value:     string(v),
+			Metadata:  make(map[string]string),
+		}
+		// string(v) copied the bytes, so the buffer SplitBytes allocated is
+		// now redundant share material. Wipe it; the string copy is the only
+		// one that must survive, and the only one that cannot be wiped.
+		wipe(v)
+	}
+	return shares, nil
+}
+
+// SplitBytes divides a secret into N share VALUES — the base64-encoded
+// [version:1][x:1][y...] payloads that are exactly the bytes of Share.Value,
+// returned in Index order, so values[i] is the value of share Index i+1.
+//
+// It is the generation-side counterpart of CombineBytes: the returned buffers
+// are owned by the caller and are wipeable, so share material can be carried in
+// memory-locked buffers from the moment it exists and zeroed the moment it is
+// distributed, never becoming an un-wipeable Go string. Split is a thin wrapper
+// that encodes these into Share structs and wipes them.
+//
+// The caller MUST wipe the returned buffers when done with them.
+func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	if threshold < 2 {
 		return nil, &SplitError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
 	}
@@ -91,7 +131,7 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 	// is an offline oracle that defeats information-theoretic secrecy for
 	// low-entropy secrets. Integrity is verified out-of-band by the caller (see
 	// Combine).
-	shares := make([]*Share, total)
+	values := make([][]byte, total)
 	coeffs := make([]byte, threshold) // [secret byte, c1..c_{t-1}]
 	for i := 0; i < total; i++ {
 		x := byte(i + 1) // non-zero x-coordinate
@@ -103,23 +143,19 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 			copy(coeffs[1:], randCoeffs[b*(threshold-1):(b+1)*(threshold-1)])
 			raw[rawShareOverhead+b] = gfPolyEval(coeffs, x)
 		}
-		shares[i] = &Share{
-			Index:     i + 1,
-			Threshold: threshold,
-			Total:     total,
-			Value:     base64.StdEncoding.EncodeToString(raw),
-			Metadata:  make(map[string]string),
-		}
-		// raw holds this share's y-values; the base64 string is the only
-		// copy that must survive.
+		enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
+		base64.StdEncoding.Encode(enc, raw)
+		// raw holds this share's y-values; the encoded buffer is the only
+		// copy that must survive, and it is the caller's to wipe.
 		wipe(raw)
+		values[i] = enc
 	}
 
 	// Wipe the secret-derived scratch material.
 	wipe(coeffs)
 	wipe(randCoeffs)
 
-	return shares, nil
+	return values, nil
 }
 
 // Combine reconstructs the original secret from M (== threshold) or more shares
@@ -155,6 +191,18 @@ func CombineUnverified(shares []*Share) ([]byte, error) {
 // combine performs the shared validation and GF(2^8) Lagrange
 // interpolation at x=0. Digest policy is applied by the callers.
 func combine(shares []*Share) ([]byte, error) {
+	// Reject nil elements BEFORE any dereference, including the shares[0]
+	// reads below. A nil *Share is not an exotic input: custody lives above
+	// this package and necessarily decodes operator-submitted shares, and
+	// json.Unmarshal of `[null]` into a []*Share produces exactly this. One
+	// malformed submission must not panic the process running an unseal
+	// ceremony.
+	for i, share := range shares {
+		if share == nil {
+			return nil, &CombineError{Reason: fmt.Sprintf("share %d is nil", i)}
+		}
+	}
+
 	threshold := shares[0].Threshold
 	total := shares[0].Total
 
@@ -323,12 +371,17 @@ func wipe(b []byte) {
 }
 
 // VerifyShare checks if a share is valid and consistent with other shares.
+// A nil share — or a nil element of otherShares — is reported as a validation
+// error naming its position, never dereferenced (see combine).
 func VerifyShare(share *Share, otherShares []*Share) error {
 	if err := share.Validate(); err != nil {
 		return err
 	}
 
 	for i, other := range otherShares {
+		if other == nil {
+			return &ValidationError{Field: "share", Reason: fmt.Sprintf("other share %d is nil", i)}
+		}
 		if other.Threshold != share.Threshold {
 			return &ValidationError{Field: "threshold", Reason: fmt.Sprintf("mismatch with share %d: %d != %d", i, other.Threshold, share.Threshold)}
 		}

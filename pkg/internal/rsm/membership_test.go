@@ -33,7 +33,7 @@ func TestMembership_RegisterViaApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -65,7 +65,7 @@ func TestMembership_RegisterViaApply(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -96,7 +96,7 @@ func TestMembership_UnregisterViaApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -137,7 +137,7 @@ func TestMembership_UnregisterViaApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -168,7 +168,7 @@ func TestMembership_DuplicateRegistrationRejected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -218,7 +218,7 @@ func TestMembership_ReRegisterAfterUnregister(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -266,7 +266,7 @@ func TestMembership_SessionLimitEnforced(t *testing.T) {
 			return newTestKV()
 		})
 		// maxSessions = 2.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 2, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(2, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -317,7 +317,7 @@ func TestMembership_MixedBatchOperations(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -402,7 +402,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 			return newTestKV()
 		})
 		// sessionExpiryEntries = 100.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -433,7 +433,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 			return newTestKV()
 		})
 		// sessionExpiryEntries = 100.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -477,7 +477,7 @@ func TestMembership_SessionPreservedAcrossSnapshotWithExpiry(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 1000, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 1000), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -507,7 +507,7 @@ func TestMembership_SessionPreservedAcrossSnapshotWithExpiry(t *testing.T) {
 		}
 
 		// Restore.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 1000, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 1000), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -542,7 +542,7 @@ func TestMembership_MultipleClientRegistrations(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -586,7 +586,7 @@ func TestMembership_DedupAfterSnapshotRecovery(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -613,7 +613,7 @@ func TestMembership_DedupAfterSnapshotRecovery(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -656,7 +656,7 @@ func TestMembership_RespondedToAdvancement(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -715,7 +715,7 @@ func TestMembership_SessionDeepCopy(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -740,7 +740,7 @@ func TestMembership_SessionDeepCopy(t *testing.T) {
 		}
 
 		// Restore.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -771,7 +771,7 @@ func TestMembership_ApplyNonSessionEntriesLeavesSessionsUnchanged(t *testing.T) 
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -815,7 +815,7 @@ func TestMembership_LastAppliedTracking(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -856,7 +856,7 @@ func TestMembership_LastAppliedTracking(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -882,7 +882,7 @@ func TestMembership_ExpiredSessionEntryRejected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 50, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 50), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -930,7 +930,7 @@ func TestMembership_ConcurrentLastAppliedRead(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -983,7 +983,7 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1043,7 +1043,7 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 			return newTestKV()
 		})
 		// maxResponses = 3.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 3, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 3, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1097,7 +1097,7 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 			return newTestKV()
 		})
 		// maxResponses = 3.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 3, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 3, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1141,7 +1141,7 @@ func TestMembership_HighRespondedToEvictsMultiple(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1196,7 +1196,7 @@ func TestMembership_RegisterUnregisterInSameBatch(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1254,7 +1254,7 @@ func TestMembership_SessionManagedEntryNonExistentSession(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1277,7 +1277,7 @@ func TestMembership_SessionManagedEntryNonExistentSession(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1309,7 +1309,7 @@ func TestMembership_ZeroClientIDBypassesSession(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1346,7 +1346,7 @@ func TestMembership_ZeroClientIDBypassesSession(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}

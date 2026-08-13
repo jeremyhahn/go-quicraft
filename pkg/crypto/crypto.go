@@ -20,3 +20,6 @@ type SealedRootKey = seal.SealedRootKey
 
 // NewBarrier re-exports seal.NewBarrier.
 var NewBarrier = seal.NewBarrier
+
+// MustNewBarrier re-exports seal.MustNewBarrier.
+var MustNewBarrier = seal.MustNewBarrier

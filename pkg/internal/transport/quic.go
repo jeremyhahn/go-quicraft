@@ -230,8 +230,19 @@ type QUICTransport struct {
 	// regular message path, which otherwise has no aggregate cap (OOM DoS).
 	msgRecvBudget atomic.Int64
 
-	stopC           chan struct{}
-	stopped         atomic.Bool
+	stopC   chan struct{}
+	stopped atomic.Bool
+
+	// stopOnce guards the teardown so exactly one caller runs it, and
+	// stopDone is closed when that teardown has finished. Stop documents that
+	// every goroutine has finished when it returns, so a second or concurrent
+	// caller must block on stopDone rather than returning into a transport
+	// that is still mid-teardown. stopDone is closed from a defer inside the
+	// once: sync.Once treats a PANICKING f as done, and without the defer a
+	// panicking teardown would strand every later caller forever.
+	stopOnce sync.Once
+	stopDone chan struct{}
+
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	wg              sync.WaitGroup
@@ -465,6 +476,7 @@ func NewQUICTransport(
 		peerEpoch:      make(map[string]*peerIncarnation),
 		sendQueues:     make(map[string]*sendQueue),
 		stopC:          make(chan struct{}),
+		stopDone:       make(chan struct{}),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 		bufPool: sync.Pool{
@@ -618,10 +630,23 @@ func (t *QUICTransport) SetShardEpochTrackers(fn func(shardID uint64) EpochTrack
 // sender goroutines to exit via stopC, waits for them to drain, stops
 // the accept loop, waits for in-flight snapshot transfers, closes all
 // connections, and waits for all goroutines to finish.
+//
+// Stop is idempotent and safe to call concurrently: exactly one caller runs
+// the teardown and every other caller BLOCKS until it has completed. Returning
+// early on the second call would contradict the guarantee above — the caller
+// would be told every goroutine had finished while the first Stop was still
+// closing connections and draining the WaitGroup.
 func (t *QUICTransport) Stop() error {
-	if !t.stopped.CompareAndSwap(false, true) {
-		return nil
-	}
+	t.stopOnce.Do(t.stop)
+	<-t.stopDone
+	return nil
+}
+
+// stop performs the one-shot teardown behind Stop's sync.Once.
+func (t *QUICTransport) stop() {
+	defer close(t.stopDone)
+
+	t.stopped.Store(true)
 	close(t.stopC)
 	t.shutdownCancel()
 
@@ -689,7 +714,6 @@ func (t *QUICTransport) Stop() error {
 	}
 
 	t.wg.Wait()
-	return nil
 }
 
 // Addr returns the local address the transport is listening on.

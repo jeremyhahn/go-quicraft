@@ -693,6 +693,54 @@ func TestConfig_Validate_MaxProposalPayloadSize(t *testing.T) {
 	})
 }
 
+// TestConfig_SetDefaults_SessionExpiryEntries pins the default that replicating
+// the threshold made safe.
+//
+// This test previously asserted the OPPOSITE: that SetDefaults must leave the
+// field at 0, because a defaulted threshold in node-local configuration would
+// make a cluster with one un-upgraded replica expire different sessions and
+// diverge silently. The threshold is now seeded into the shard's replicated
+// membership at bootstrap and read from there by the apply path
+// (proto.SessionPolicy), so a replica adopts what its shard committed rather
+// than what its binary defaults to, and the default is the fix for the leak an
+// unexpiring session table represents.
+//
+// The third case is the one that would otherwise be lost: zero can no longer
+// mean "disabled", so disabling has to remain expressible.
+func TestConfig_SetDefaults_SessionExpiryEntries(t *testing.T) {
+	t.Run("SetDefaults fills the documented default", func(t *testing.T) {
+		var c Config
+		c.SetDefaults()
+		if c.SessionExpiryEntries != DefaultSessionExpiryEntries {
+			t.Fatalf("SetDefaults left SessionExpiryEntries = %d, want %d: an unset "+
+				"threshold means the session table is never reclaimed",
+				c.SessionExpiryEntries, DefaultSessionExpiryEntries)
+		}
+	})
+
+	t.Run("an explicit value survives SetDefaults", func(t *testing.T) {
+		c := validConfig()
+		c.SessionExpiryEntries = 5000
+		c.SetDefaults()
+		if c.SessionExpiryEntries != 5000 {
+			t.Fatalf("SetDefaults overwrote an explicit SessionExpiryEntries: got %d, want 5000",
+				c.SessionExpiryEntries)
+		}
+	})
+
+	t.Run("expiry can still be disabled explicitly", func(t *testing.T) {
+		c := validConfig()
+		c.SessionExpiryEntries = SessionExpiryDisabled
+		c.SetDefaults()
+		if c.SessionExpiryEntries != SessionExpiryDisabled {
+			t.Fatalf("SetDefaults overwrote SessionExpiryDisabled: got %d", c.SessionExpiryEntries)
+		}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate(SessionExpiryDisabled) = %v, want nil", err)
+		}
+	})
+}
+
 func TestConfig_Validate_SessionExpiryEntries(t *testing.T) {
 	t.Run("zero is valid (disabled)", func(t *testing.T) {
 		c := validConfig()

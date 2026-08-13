@@ -133,9 +133,12 @@ func TestConfigChangeBufferTooSmallUnmarshalInitialize(t *testing.T) {
 	cc := ConfigChange{Address: "x"}
 	buf := make([]byte, cc.Size())
 	cc.MarshalTo(buf)
-	// Truncate to cut off Initialize field
+	// Truncate to cut INTO the witness-policy fields. The cut is 6 bytes, not
+	// 4: the layout now ends with a 4-byte NodeIdentity length prefix, and a
+	// payload ending exactly where that prefix begins is the legitimate
+	// pre-identity layout, which decodes rather than erroring.
 	var cc2 ConfigChange
-	_, err := cc2.UnmarshalFrom(buf[:cc.Size()-4])
+	_, err := cc2.UnmarshalFrom(buf[:cc.Size()-6])
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("UnmarshalFrom: got %v, want ErrBufferTooSmall", err)
 	}
@@ -162,9 +165,9 @@ func TestConfigChangeSize(t *testing.T) {
 		addr string
 		want int
 	}{
-		{"empty address", "", configChangeFixedSize},
-		{"short address", "a:1", configChangeFixedSize + 3},
-		{"typical", "192.168.1.100:5000", configChangeFixedSize + 18},
+		{"empty address", "", configChangeFixedSize + 4},
+		{"short address", "a:1", configChangeFixedSize + 3 + 4},
+		{"typical", "192.168.1.100:5000", configChangeFixedSize + 18 + 4},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

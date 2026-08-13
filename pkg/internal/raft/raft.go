@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	mathrand "math/rand"
 	"slices"
 	"time"
@@ -58,6 +59,21 @@ func (s roleState) String() string {
 // maxVotingMembers is the maximum number of voting members (remotes +
 // witnesses + self) supported by the ReadIndex ackBits bitfield. The
 // bitfield is a uint64, so positions 0..63 are available.
+// maxAdoptableTerm is the exclusive upper bound on a term this replica will
+// adopt from the wire. Terms at or above it are refused.
+//
+// The headroom exists so that r.term++ in becomeCandidate can never wrap.
+// Nothing bounds Term in the wire encoding — it is a plain uint64 — so without
+// this a peer naming a term near the ceiling either wraps this node's term to 0
+// on its next campaign (a term REGRESSION: it can then vote a second time in a
+// term it already voted in) or parks it at a term it can never advance past,
+// removing a voter permanently. One message, either way.
+//
+// A term advances by one per election, so no cluster reaches this range by
+// running. The reserved band is wide enough that arithmetic near it stays
+// obviously safe rather than exactly safe.
+const maxAdoptableTerm = math.MaxUint64 - 1024
+
 const maxVotingMembers = 64
 
 // maxInflightMsgs is the default maximum number of in-flight append
@@ -385,6 +401,17 @@ type raft struct {
 	// onCampaign is called when an election starts. Set by Peer. Nil-safe.
 	onCampaign func(shardID, replicaID, term uint64)
 
+	// resolveStaleConfig folds the committed configuration tail this replica
+	// recovered with into the membership and reports whether the configuration
+	// is now current. Set by NewPeer; see Peer.staleConfigThrough.
+	//
+	// It is NIL on a bare raft, which is the correct answer there rather than a
+	// missing check: membership under config-in-log is owned by the Peer, and a
+	// raft constructed without one has no recovered base to be stale relative
+	// to and no tail to fold. Nil therefore means "no gate", never "assume
+	// stale" — assuming stale is the shape that suppresses elections outright.
+	resolveStaleConfig func() bool
+
 	// Function pointers set on role transition for zero-branch dispatch.
 	stepFunc func(r *raft, msg proto.Message) error
 	tickFunc func(r *raft)
@@ -676,7 +703,20 @@ func (r *raft) becomeCandidate() {
 	r.stepFunc = stepCandidate
 	r.tickFunc = tickCandidate
 	r.state = candidate
-	r.term++
+	// Defence in depth behind the wire ceiling in step(): the increment is the
+	// operation that would wrap, so it is guarded where it happens rather than
+	// only where the input arrives. A term this high is unreachable by running
+	// (one increment per election), so refusing to advance costs no real
+	// cluster anything, while wrapping to 0 would let this replica vote twice
+	// in one term.
+	if r.term < maxAdoptableTerm {
+		r.term++
+	} else {
+		slog.Error("refusing to advance term at the ceiling; replica cannot campaign",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term)
+	}
 	r.vote = r.replicaID
 	r.leaderID = noLeader
 	r.transferTarget = noNode
@@ -813,13 +853,35 @@ func (r *raft) becomeLeader() {
 
 // dropHighTermVote reports whether a higher-term RequestVote should be
 // dropped under the CheckQuorum rule: the node has a known leader and has
-// heard from it within the last election timeout. Transfer-hinted votes
-// (Hint == From) are never dropped.
+// heard from it within the last election timeout.
+//
+// Transfer-hinted votes (Hint == From) are exempt, because the outgoing leader
+// asked for the election and its own lease must not veto it — but only at
+// exactly r.term+1. The exemption is a value the SENDER chooses: RequestVote is
+// not bound to committed membership on the receive path (a member that
+// recovered at a new address has to be able to campaign during quorum loss), so
+// any host with a valid cluster certificate can set Hint = From. Unbounded, a
+// forged RequestVote{Hint: From, Term: r.term + 1000} walks past the lease,
+// forces becomeFollower at an arbitrary term on every recipient, and steps the
+// live leader down — repeatably, for as long as the sender keeps sending.
+//
+// r.term+1 is not a heuristic: the exemption only ever MATTERS while a leader
+// lease is live, and a replica hearing from a live leader is at that leader's
+// term, so a legitimate transferee — which campaigns at leader term + 1 —
+// arrives at exactly r.term+1. A peer far enough behind for a larger gap has by
+// definition not heard from the leader within the election timeout, so the
+// lease clause below is already false and the vote is not dropped anyway.
+//
+// What this does NOT close: a plain RequestVote (Hint != From) still forces a
+// term advance whenever no leader lease is live, which is the common case
+// during an election. Bounding that means binding RequestVote to committed
+// membership — which costs the quorum-loss recovery path — or replica-ID-bound
+// certificates. The cap here removes the amplification, not the disruption.
 func (r *raft) dropHighTermVote(msg proto.Message) bool {
 	if msg.Type != proto.RequestVote || !r.checkQuorum || msg.Term <= r.term {
 		return false
 	}
-	if msg.Hint == msg.From {
+	if msg.Hint == msg.From && msg.Term == r.term+1 {
 		return false
 	}
 	return r.leaderID != noLeader && r.electionTick < r.electionTimeout
@@ -870,6 +932,30 @@ func (r *raft) step(msg proto.Message) error {
 			"type", proto.MessageTypeName(msg.Type),
 			"term", r.term)
 		return ErrZeroTermMessage
+	}
+
+	// Refuse a term within the reserved headroom at the top of the range.
+	// Nothing bounds Term on the wire, so a peer can name any uint64, and
+	// adopting one near the ceiling is unrecoverable in two ways at once:
+	// becomeCandidate does term++, so a node parked at the maximum WRAPS to
+	// term 0 on its next campaign — a term regression, after which it can
+	// vote a second time in a term it has already voted in, and Election
+	// Safety is gone. Even without the wrap, a node driven to the ceiling can
+	// never campaign again, so one message permanently removes a voter.
+	//
+	// Terms advance by one per election. A cluster cannot reach this range by
+	// running, only by being told to, so refusing it costs nothing real.
+	// Checked here rather than at the codec because Term is a legitimate
+	// uint64 field — this is a protocol bound, not a parse error.
+	if msg.Term >= maxAdoptableTerm && !msg.Origin.IsLocal() {
+		slog.Warn("dropped message with a term in the reserved ceiling range",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"type", proto.MessageTypeName(msg.Type),
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrTermCeilingExceeded
 	}
 
 	// CheckQuorum guard (Raft paper §6 last paragraph, thesis p.42): drop
@@ -1335,6 +1421,28 @@ func (r *raft) hasConfigChangeToApply() bool {
 	return r.log.confChangeIndex > r.log.processed
 }
 
+// configCurrentForCampaign resolves the committed configuration tail recovered
+// at startup and reports whether this replica may campaign against the voting
+// set it currently holds.
+//
+// Both campaign entry points — startElection and handleTimeoutNow — call it,
+// for the same reason they both check selfRemoved, roleMismatch and joining:
+// each of those is a statement about the configuration, and TimeoutNow bypasses
+// startElection entirely.
+//
+// This is NOT hasConfigChangeToApply. That bound is deliberately conservative
+// and covers UNCOMMITTED entries, and blocking elections on uncommitted log
+// content is a liveness violation the Raft specification calls out explicitly
+// (see startElection). This asks a narrower and answerable question: has this
+// replica folded the config changes its own log already COMMITTED? It resolves
+// that question by doing the work, not by waiting for someone else to.
+func (r *raft) configCurrentForCampaign() bool {
+	if r.resolveStaleConfig == nil {
+		return true
+	}
+	return r.resolveStaleConfig()
+}
+
 // startElection starts a new election. Uses PreVote if enabled.
 //
 // Per the Raft specification (Section 5.2, Section 6, Figure 4), elections
@@ -1365,6 +1473,42 @@ func (r *raft) startElection() {
 		// replica still answers RequestVote, so a stale leaderID here makes
 		// them deny PreVotes and silently drop higher-term RequestVotes,
 		// which can hold a shard with an otherwise-healthy quorum leaderless.
+		r.leaderID = noLeader
+		return
+	}
+	// Fold the committed configuration tail before deciding anything else.
+	//
+	// Membership is config-in-log and is rebuilt asynchronously after a
+	// restart, so up to this point the voting set may still be the BASE
+	// configuration — the snapshot's, or the founding one at index 1 — while
+	// the committed log has moved on. Campaigning there computes quorum over
+	// the wrong denominator, and a replica whose base is smaller than the
+	// current configuration wins on a minority of the real voting set, in a
+	// term the real configuration can elect in as well.
+	//
+	// It runs BEFORE the three gates below because folding the tail is exactly
+	// what can turn any of them on or off: a committed RemoveNode for self sets
+	// selfRemoved, a committed AddWitness sets roleMismatch, and learning any
+	// member other than self clears joining. Deciding those against the base
+	// configuration would answer them for a configuration the shard has left.
+	//
+	// This never latches. It resolves by reading THIS replica's own log — no
+	// leader, no peer, no state machine and no external call is involved — and
+	// a read failure suppresses only the current timeout.
+	if !r.configCurrentForCampaign() {
+		// Same stale-leaderID hazard as every other refusing branch here:
+		// tickFollower has already zeroed electionTick, so leaving leaderID set
+		// keeps the shared leader-lease test true and this replica would deny
+		// PreVotes and drop higher-term RequestVotes while it is not itself
+		// campaigning.
+		r.leaderID = noLeader
+		return
+	}
+	// Re-check self-removal against the configuration that fold just
+	// established. The pre-fold test above ran against the base membership, so
+	// a RemoveNode for this replica committed since the base was written would
+	// have been invisible to it.
+	if r.selfRemoved {
 		r.leaderID = noLeader
 		return
 	}
@@ -2713,13 +2857,36 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	//
 	//     Falling back to probe resets next=match+1 and clears inflights,
 	//     allowing the leader to resend from the follower's actual position.
+	//   - Replicate with a FULL window: the peer is paused purely because the
+	//     window is full, and the window can only drain from ABOVE (freeTo
+	//     frees records at or below an acknowledged index). If those messages
+	//     went to a previous incarnation of the peer — it restarted — every
+	//     ack it can still send reports a position BELOW the window and frees
+	//     nothing, so the peer stays paused forever with the leader alive and
+	//     committing. Release one slot so exactly one message gets through:
+	//     if the window was merely busy it is acked normally, and if the peer
+	//     restarted it is rejected, which backtracks next to the peer's real
+	//     position and resumes replication. This is etcd/raft's
+	//     MsgHeartbeatResp behavior; the primitive it needs (freeFirstOne)
+	//     had been dropped here as unused.
 	// sendAppend internally checks isPaused() and skips if appropriate.
-	if rm.state == remoteProbe {
+	//
+	// forceSend records that a slot was released so the send below is not
+	// skipped for a ReadIndex heartbeat: under sustained ReadIndex load every
+	// heartbeat carries a context (broadcastHeartbeat), so a Hint==0 response
+	// may never arrive, and a slot released without a message to fill it is
+	// window capacity silently leaked.
+	forceSend := false
+	switch {
+	case rm.state == remoteProbe:
 		rm.probeSent = false
-	} else if rm.state == remoteReplicate &&
+	case rm.state == remoteReplicate &&
 		rm.next > r.log.lastIndex() &&
-		rm.inflights.Count() > 0 {
+		rm.inflights.Count() > 0:
 		rm.becomeProbe()
+	case rm.state == remoteReplicate && rm.inflights.full():
+		rm.inflights.freeFirstOne()
+		forceSend = true
 	}
 
 	// Skip sendAppend for ReadIndex heartbeats when the follower is caught
@@ -2734,7 +2901,7 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	//
 	// Witnesses receive metadata-only entries via sendWitnessAppend, not
 	// full entries via sendAppend. This matches broadcastAppend behavior.
-	if msg.Hint == 0 || rm.state != remoteReplicate {
+	if msg.Hint == 0 || rm.state != remoteReplicate || forceSend {
 		if _, isWitness := r.witnesses[msg.From]; isWitness {
 			r.sendWitnessAppend(msg.From)
 		} else {
@@ -3224,7 +3391,38 @@ func (r *raft) handleFollowerReadIndex(msg proto.Message) error {
 }
 
 // handleReadIndexResp handles a read index response forwarded from leader.
+//
+// It is the WIRE ENCODING of a completed heartbeat-quorum round: the resulting
+// ReadyToRead resolves a pending linearizable read at msg.LogIndex, and the
+// correlation key is a plain monotonic counter (Host.readKeySeq), so it is
+// guessable. A response from anyone but the leader this replica actually asked
+// therefore serves a read at an index of the sender's choosing with no quorum
+// ever run. handleFollowerReadIndex only ever forwards to r.leaderID, so
+// requiring the answer to come from r.leaderID rejects exactly the messages
+// that answer nothing.
+//
+// msg.LogIndex is NOT checked against r.log.committed, and must not be. The
+// leader answers with ITS committed index, which is by construction at or ahead
+// of this follower's — that gap is the whole point of ReadIndex, and the
+// follower waits for lastApplied to reach the returned index before serving the
+// read (see hostEngineCallback.OnReadyToRead). Rejecting LogIndex >
+// r.log.committed would refuse the common case: every read taken while the
+// follower is even one entry behind.
+//
+// The gate is in addition to, not instead of, the transport-layer sender
+// binding: ReadIndexResp is a gated message type there, so msg.From is already
+// tied to the address committed membership assigns it.
 func (r *raft) handleReadIndexResp(msg proto.Message) error {
+	if msg.From != r.leaderID || r.leaderID == noLeader {
+		slog.Warn("dropped ReadIndexResp from a replica that is not this shard's leader",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"leader", r.leaderID,
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrReadIndexRespNotFromLeader
+	}
 	return r.addReadState(proto.ReadyToRead{
 		Key:   msg.Hint,
 		Index: msg.LogIndex,
@@ -3396,6 +3594,20 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 	// a replica whose local role contradicts the replicated configuration —
 	// TimeoutNow is the campaign entry point that bypasses startElection.
 	if r.isObserver || r.isWitness || r.selfRemoved {
+		return nil
+	}
+	// TimeoutNow campaigns IMMEDIATELY and bypasses PreVote, so a stale voting
+	// set here is decided in a single round. Fold the committed configuration
+	// tail first, for the reasons startElection spells out; a transferee is
+	// caught up on the LOG by definition (the leader only transfers to a
+	// matched replica) but that says nothing about whether it has folded the
+	// config changes that log contains.
+	if !r.configCurrentForCampaign() {
+		return ErrStaleConfigCannotCampaign
+	}
+	// The fold may have applied a committed RemoveNode for this replica that
+	// the base configuration did not carry.
+	if r.selfRemoved {
 		return nil
 	}
 	if r.roleMismatch {

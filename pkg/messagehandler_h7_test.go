@@ -19,6 +19,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -43,28 +44,30 @@ func (r *recordingDeliverer) RequestSnapshotRecovery(_, _ uint64, _ *engine.Node
 
 // TestHostMessageHandler_HandleMessage_ForgedFromDropped is the H7 regression
 // test: msg.From is the replica ID raft counts toward election/commit quorum,
-// so it must be bound to the authenticated peer. When From names a KNOWN member
-// but the cert-bound batch SourceAddress does not match that member's registered
-// address, the message is a forged-From injection and must be dropped BEFORE it
-// reaches the engine inbox — otherwise any authenticated cluster node could
-// manufacture a false quorum with another member's ReplicateResp/RequestVoteResp.
+// so it must be bound to the authenticated peer. A forged-From injection must be
+// dropped BEFORE it reaches the engine inbox — otherwise any authenticated
+// cluster node could manufacture a false quorum with another member's
+// ReplicateResp/RequestVoteResp.
+//
+// The senderAuthorized closure is per inbound CONNECTION: it answers for the
+// leaf certificate of the peer that opened it. The forger therefore holds its
+// OWN certificate, which is what an authenticated-but-compromised cluster node
+// has. A closure that answers true for the victim's address models an attacker
+// in possession of the victim's private key, which no receive-side check can
+// defend against and which would make this test vacuous.
 func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
-	const registeredAddr = "127.0.0.1:5002"
+	const memberAddr = "127.0.0.1:5002"
+	const forgerAddr = "10.0.0.9:9999"
 
 	// Membership {1, 2} for shard 1; local replica is 1, so From=2 is a member.
 	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
 		1: "127.0.0.1:5001",
-		2: registeredAddr,
+		2: memberAddr,
 	})
-
-	// senderAuthorized models the transport's cert binding: only the member's
-	// genuinely registered address is covered by the sender's certificate.
-	// A spoofed source address is not, so learnSourceAddress cannot relearn it.
-	onlyRegistered := func(addr string) bool { return addr == registeredAddr }
 
 	newRig := func() (*recordingDeliverer, *hostMessageHandler) {
 		reg := registry.NewRegistry()
-		reg.Register(1, 2, registeredAddr)
+		reg.Register(1, 2, memberAddr)
 		eng := &recordingDeliverer{node: node}
 		h := &Host{registry: reg}
 		return eng, &hostMessageHandler{engine: eng, host: h}
@@ -80,7 +83,7 @@ func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
 				{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp},
 			},
 		}
-		if err := handler.HandleMessage(batch, onlyRegistered); err != nil {
+		if err := handler.HandleMessage(batch, certCovering(forgerAddr)); err != nil {
 			t.Fatalf("HandleMessage = %v", err)
 		}
 		if len(eng.delivered) != 0 {
@@ -88,15 +91,15 @@ func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
 		}
 	})
 
-	t.Run("forged From from a non-registered source address is dropped", func(t *testing.T) {
+	t.Run("forged From from a peer holding its own certificate is dropped", func(t *testing.T) {
 		eng, handler := newRig()
 		batch := proto.MessageBatch{
-			SourceAddress: "10.0.0.9:9999", // not the member's registered address
+			SourceAddress: forgerAddr,
 			Requests: []proto.Message{
 				{ShardID: 1, From: 2, To: 1, Type: proto.RequestVoteResp},
 			},
 		}
-		if err := handler.HandleMessage(batch, onlyRegistered); err != nil {
+		if err := handler.HandleMessage(batch, certCovering(forgerAddr)); err != nil {
 			t.Fatalf("HandleMessage = %v", err)
 		}
 		if len(eng.delivered) != 0 {
@@ -104,15 +107,32 @@ func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
 		}
 	})
 
-	t.Run("genuine member with matching source address is delivered", func(t *testing.T) {
+	t.Run("nil senderAuthorized drops every quorum-bearing message", func(t *testing.T) {
 		eng, handler := newRig()
 		batch := proto.MessageBatch{
-			SourceAddress: registeredAddr,
+			SourceAddress: memberAddr,
 			Requests: []proto.Message{
 				{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp},
 			},
 		}
-		if err := handler.HandleMessage(batch, onlyRegistered); err != nil {
+		if err := handler.HandleMessage(batch, transport.PeerAuth{}); err != nil {
+			t.Fatalf("HandleMessage = %v", err)
+		}
+		if len(eng.delivered) != 0 {
+			t.Fatalf("a message was delivered (%d) with no way to check the peer "+
+				"certificate, want dropped", len(eng.delivered))
+		}
+	})
+
+	t.Run("genuine member under its own certificate is delivered", func(t *testing.T) {
+		eng, handler := newRig()
+		batch := proto.MessageBatch{
+			SourceAddress: memberAddr,
+			Requests: []proto.Message{
+				{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp},
+			},
+		}
+		if err := handler.HandleMessage(batch, certCovering(memberAddr)); err != nil {
 			t.Fatalf("HandleMessage = %v", err)
 		}
 		if len(eng.delivered) != 1 {

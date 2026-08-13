@@ -17,6 +17,7 @@ package raft
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -5328,23 +5329,26 @@ func TestPeer_ValidateConfigChange_RemoveLastVoter(t *testing.T) {
 // accepted at the cap.
 func TestPeer_ValidateConfigChange_ExceedsCap(t *testing.T) {
 	cfg := testConfig()
+	// Distinct addresses per member: one address may name only one member of a
+	// shard (see membership.addressHolder), so a fixture that reuses one string
+	// would be rejected for THAT reason and prove nothing about the cap.
 	addrs := make(map[uint64]string, maxVotingMembers)
 	for id := uint64(1); id <= maxVotingMembers; id++ {
-		addrs[id] = "addr"
+		addrs[id] = fmt.Sprintf("addr%d", id)
 	}
 	p := newTestPeer(t, cfg, proto.State{}, proto.Membership{Addresses: addrs})
 
-	addNode := proto.ConfigChange{Type: proto.AddNode, ReplicaID: maxVotingMembers + 1, Address: "addr"}
+	addNode := proto.ConfigChange{Type: proto.AddNode, ReplicaID: maxVotingMembers + 1, Address: "addr-new-voter"}
 	if err := p.ValidateConfigChange(addNode); !errors.Is(err, ErrTooManyVotingMembers) {
 		t.Fatalf("ValidateConfigChange(AddNode over cap) = %v, want ErrTooManyVotingMembers", err)
 	}
 
-	addWitness := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: maxVotingMembers + 2, Address: "addr"}
+	addWitness := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: maxVotingMembers + 2, Address: "addr-new-witness"}
 	if err := p.ValidateConfigChange(addWitness); !errors.Is(err, ErrTooManyVotingMembers) {
 		t.Fatalf("ValidateConfigChange(AddWitness over cap) = %v, want ErrTooManyVotingMembers", err)
 	}
 
-	addObserver := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: maxVotingMembers + 3, Address: "addr"}
+	addObserver := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: maxVotingMembers + 3, Address: "addr-new-observer"}
 	if err := p.ValidateConfigChange(addObserver); err != nil {
 		t.Fatalf("ValidateConfigChange(AddNonVoting over cap) = %v, want nil", err)
 	}

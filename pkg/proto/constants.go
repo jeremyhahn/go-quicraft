@@ -20,15 +20,60 @@
 // use a 4-byte uint32 length prefix followed by raw data. Maps are encoded
 // with a 4-byte count prefix and entries sorted by key ascending for
 // deterministic output.
+//
+// # Compatibility contract
+//
+// The package carries two INDEPENDENT version namespaces. Neither may be
+// derived from the other, and a bump to one must never change how the other
+// is read:
+//
+//   - TRANSPORT-scoped: WireVersion. Stamped into MessageBatch.BinVer and
+//     SnapshotChunk.BinVer, and mirrored by the frame header byte in
+//     internal/transport. Both ends of a QUIC connection are live processes,
+//     so a mismatch costs one rejected connection and nothing durable.
+//     Gated on EXACT equality: a peer speaking another dialect is refused
+//     outright rather than misparsed, and the operator upgrades both ends.
+//     Supported window: WireVersion only.
+//
+//   - PERSISTED-scoped: membershipFormatVersion (see membership.go). Stamped
+//     as the leading byte of every Membership section, which is written to
+//     the WAL, into snapshot records and exported snapshot artifacts, and
+//     into the EntryInitialMembership entry at log index 1. Those bytes
+//     outlive the process — and the binary — that wrote them, so the decoder
+//     accepts a RANGE, [minSupportedMembershipVersion,
+//     membershipFormatVersion], with one decode path per version. Supported
+//     window: 3-3 (degenerate: v3 is the only released layout).
+//
+// The distinction is not stylistic. Membership is the bootstrap
+// configuration at log index 1, so if the persisted version were derived
+// from WireVersion, bumping WireVersion for any transport-only reason would
+// simultaneously make every existing node unable to replay its own log —
+// with no dual-read path and no migration, a permanently unstartable
+// cluster. Persisted formats widen their read window; transport formats do
+// not have to.
+//
+// Two other version discriminators exist outside this package and follow the
+// same rule: internal/transport.WireVersion (transport-scoped, range-checked
+// on read) and logdb/waldb.membershipSectionVersion (persisted-scoped, pinned
+// independently for waldb's own snapshot-record layout).
 package proto
 
 import "fmt"
 
-// WireVersion is the current binary wire format version. It is written as
-// the first 8 bytes of on-disk structures. Receivers validate the version
-// before unmarshaling; a mismatch is reported as ErrUnsupportedVersion.
+// WireVersion is the current TRANSPORT wire format version. It is written
+// as the first 8 bytes of MessageBatch and into SnapshotChunk.BinVer.
+// Receivers validate it for exact equality before unmarshaling; a mismatch
+// is reported as ErrUnsupportedVersion.
 //
-// Version history:
+// Scope: transport only. Nothing stamped with WireVersion is read back off
+// disk, so it may be bumped freely for a transport-layer change. It is NOT
+// the version of any persisted structure — in particular, the persisted
+// Membership section carries its own membershipFormatVersion, which this
+// constant must never be substituted for or derived into. See the
+// compatibility contract in the package comment for why.
+//
+// Version history (entries below predate the split, when a single number
+// identified both namespaces):
 //
 //	v1: original layout (Membership base 8 bytes, ConfigChange fixed 36 bytes).
 //	v2: replicated witness policy — Membership gained MaxWitnesses and
@@ -58,6 +103,13 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 // in membership changes and config change proposals. Enforced during
 // UnmarshalFrom to prevent unbounded allocation from crafted payloads.
 const MaxAddressLength = 256
+
+// MaxNodeIdentityLength is the maximum byte length of a committed node
+// identity string. The identity this build produces is "spki:" plus a 64-char
+// SHA-256 hex digest — 69 bytes — so the bound is generous headroom for a
+// future scheme (a SAN URI, say) while still refusing an unbounded allocation
+// from a crafted payload.
+const MaxNodeIdentityLength = 256
 
 // MaxFilepathLen is the maximum byte length of a filepath string in
 // snapshot and snapshot file metadata. Enforced during UnmarshalFrom

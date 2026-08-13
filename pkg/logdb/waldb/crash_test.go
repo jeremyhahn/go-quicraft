@@ -180,7 +180,7 @@ func crashBarrier(sealPath string) (*seal.Barrier, error) {
 	cfg.StatePersister = func(s *seal.SealedRootKey) error {
 		return crashWriteSealed(sealPath, s)
 	}
-	b := seal.NewBarrier(cfg)
+	b := seal.MustNewBarrier(cfg)
 
 	data, readErr := os.ReadFile(sealPath)
 	switch {
@@ -489,7 +489,7 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 			best = int64(blockStart)
 		}
 		for pos := 0; pos+recordHeaderSize < len(block) && block[pos] != 0; {
-			_, recType, n, err := decodeRecord(block[pos:])
+			_, recType, _, n, err := decodeRecord(block[pos:])
 			if err != nil {
 				t.Fatalf("segment already corrupt at offset %d before tearing: %v",
 					blockStart+pos, err)
@@ -538,8 +538,25 @@ func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 		if err != nil {
 			t.Fatalf("open segment for tearing: %v", err)
 		}
-		torn := []byte{data[tearAt+recordHeaderSize] ^ 0xff}
-		if _, err := f.WriteAt(torn, tearAt+recordHeaderSize); err != nil {
+		// Destroy the block from the tear point to its end, not a single byte
+		// inside the first record. A torn tail is a block the medium did not
+		// finish taking, so NOTHING below the tear survives; flipping one byte
+		// and leaving the records after it intact models interior rot instead —
+		// bytes that reached the medium and passed CRC — which recovery must
+		// refuse rather than truncate (ErrMidSegmentCorruption). That case has
+		// its own test; this one must stay a genuine torn tail.
+		//
+		// tearAt is a block start and crashTearPoint returns the LAST
+		// data-bearing block, so this fills exactly the final live block. 0xff
+		// is deterministic and cannot decode (0xff is not a valid record type)
+		// and is not zero, so it is read as corruption rather than as the
+		// pre-allocated zero tail or a write hole.
+		tearEnd := tearAt + int64(crashBlockSize)
+		if tearEnd > int64(len(data)) {
+			tearEnd = int64(len(data))
+		}
+		torn := bytes.Repeat([]byte{0xff}, int(tearEnd-tearAt))
+		if _, err := f.WriteAt(torn, tearAt); err != nil {
 			t.Fatalf("tear write: %v", err)
 		}
 		if err := f.Sync(); err != nil {

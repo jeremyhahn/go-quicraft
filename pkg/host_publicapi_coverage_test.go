@@ -217,7 +217,7 @@ func TestQueryRaftLog_RangeErrors(t *testing.T) {
 		// An engine node exists but carries no log reader — the window
 		// during shard construction before the reader is attached.
 		h := newTestHost(t)
-		h.engine.LoadNode(newMinimalEngineNode(9, 1))
+		h.engine.LoadNode(newMinimalEngineNode(t, 9, 1))
 		t.Cleanup(func() { h.engine.UnloadNode(9) })
 
 		if _, err := h.QueryRaftLog(context.Background(), 9, 1, 2, 1<<20); !errors.Is(err, ErrShardNotFound) {

@@ -75,6 +75,20 @@ const (
 
 	// bruteForceErrorThreshold is the number of failures that triggers ERROR-level logging.
 	bruteForceErrorThreshold = 20
+
+	// MaxKnownEpochs bounds SealedRootKey.KnownEpochs at load time. Unseal
+	// re-derives one HKDF DEK, one AEAD and one mlock'd enclave per entry, and
+	// the set is plaintext, unauthenticated metadata, so without a bound an
+	// attacker with write access to the persisted blob turns every start into
+	// an unbounded derivation and mlock storm.
+	//
+	// The value is far above any legitimate deployment: epochs are retired by
+	// PurgeEpochsBefore once no WAL segment or snapshot still references them,
+	// so the live set tracks retention, not the lifetime rotation count. A
+	// cluster rotating hourly and purging daily holds tens; 4096 leaves four
+	// orders of magnitude of headroom while capping the work an attacker can
+	// force to milliseconds.
+	MaxKnownEpochs = 4096
 )
 
 // HKDFVersion identifies the layout of the HKDF info string used to derive
@@ -122,6 +136,11 @@ const (
 // within a deployment is not supported and a mismatch fails closed via AEAD
 // authentication (ErrDecryptionFailed). The embedded algID exists for
 // nonce-sizing and forensic/diagnostic purposes, not for runtime negotiation.
+// Because that one algorithm is a property of the DATA and not of the host,
+// Initialize records it in SealedRootKey.Algorithm and SetSealedRootKey refuses
+// a blob that disagrees with BarrierConfig.Algorithm, so a data directory moved
+// to a host whose CPU would auto-select differently is rejected by name rather
+// than read back as ErrDecryptionFailed on every record.
 //
 // Wire format (v2):
 //
@@ -252,18 +271,19 @@ type EpochBarrier = Barrier
 // The config.Algorithm selects the symmetric encryption algorithm. Both AEAD
 // safety trackers (InvocationCounter and NonceTracker) are initialized from config.
 //
-// Panics if the configuration is invalid — an unknown algorithm, or a
-// non-FIPS-approved cipher while FIPS mode is active. That is appropriate for
-// a config built from compile-time constants, where an invalid value is a
-// programmer error that should never reach production.
+// It returns the error from BarrierConfig.Validate when the configuration is
+// invalid — an unknown algorithm, or a non-FIPS-approved cipher while FIPS
+// mode is active — and never panics. This package is embedded in other
+// products' processes, where a config assembled at RUNTIME from a file, an API
+// request, or per-tenant settings is the normal case; an operator's bad
+// algorithm must surface as an error the embedder can reject, not as a crash
+// of the host process.
 //
-// A config assembled at RUNTIME — from a file, an API request, or per-tenant
-// settings — should be checked with BarrierConfig.Validate first, so an
-// operator's bad algorithm surfaces as an error instead of taking down the
-// embedding process.
-func NewBarrier(config BarrierConfig) *Barrier {
+// Use MustNewBarrier for a config built entirely from compile-time constants,
+// where an invalid value is a programmer error.
+func NewBarrier(config BarrierConfig) (*Barrier, error) {
 	if err := config.Validate(); err != nil {
-		panic("seal.NewBarrier: " + err.Error())
+		return nil, err
 	}
 
 	var ic InvocationCounter
@@ -279,8 +299,8 @@ func NewBarrier(config BarrierConfig) *Barrier {
 	// either, nothing else can release the tracked set, so this combination
 	// provably cannot rotate and the tracker grows for the process lifetime.
 	// Reported rather than rejected: it is what DefaultBarrierConfig produces,
-	// and NewBarrier's only rejection mechanism is a panic. The tracker itself
-	// fails safe at DefaultMaxTrackedNonces.
+	// so rejecting it would fail the default. The tracker itself fails safe at
+	// DefaultMaxTrackedNonces.
 	if config.NonceTracking && config.InvocationCounter == nil && config.StatePersister == nil {
 		slog.Warn("quicraft/seal: barrier configured with nonce tracking but no StatePersister and no InvocationCounter; the epoch cannot rotate, so tracked nonces are never released",
 			"deployment_id", config.DeploymentID,
@@ -315,12 +335,33 @@ func NewBarrier(config BarrierConfig) *Barrier {
 		aeadProvider:   ap,
 		timeNow:        time.Now,
 		randReader:     rand.Reader,
+	}, nil
+}
+
+// MustNewBarrier is NewBarrier for a configuration known to be valid at
+// compile time. It panics when the configuration is invalid, following the
+// regexp.MustCompile precedent: it is for package-level variables and
+// constant configs, where a bad value is a programmer error that must never
+// reach production.
+//
+// Never call it on a config assembled at runtime from a file, an API request,
+// or per-tenant settings. Use NewBarrier there so the operator's mistake is an
+// error the embedder can reject, not a crash of the embedding process.
+func MustNewBarrier(config BarrierConfig) *Barrier {
+	b, err := NewBarrier(config)
+	if err != nil {
+		panic("seal.MustNewBarrier: " + err.Error())
 	}
+	return b
 }
 
 // NewEpochBarrier is an alias for NewBarrier. Use this name in new code to
 // distinguish from go-qrdb's NewStorageBarrier.
 var NewEpochBarrier = NewBarrier
+
+// MustNewEpochBarrier is an alias for MustNewBarrier, completing the
+// EpochBarrier alias set.
+var MustNewEpochBarrier = MustNewBarrier
 
 // InvocationCounter returns the barrier's AEAD invocation counter, or nil if
 // invocation counting is disabled.
@@ -392,6 +433,12 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// Record the DEK-derivation layout so a future version can still derive
 	// this deployment's keys after the layout changes again.
 	sealed.HKDFVersion = b.hkdfVersion
+	// Record the data-path AEAD. It is a derivation input (HKDFV2 domain
+	// separator) and the cipher Decrypt selects by epoch, and nothing else on
+	// disk names it, so a blob that does not carry it cannot be moved to a host
+	// whose CPU makes SelectOptimalAlgorithm choose differently without every
+	// read failing as ErrDecryptionFailed. See SealedRootKey.Algorithm.
+	sealed.Algorithm = b.config.Algorithm
 
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
@@ -1566,9 +1613,25 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	}
 
 	for _, epoch := range purgeable {
-		// Actively zero the purged DEK's enclave rather than letting the
-		// GC/finalizer eventually reclaim it: a purged epoch's key must
-		// not linger in memory.
+		// Drop the purged epoch's key enclave and its AEAD.
+		//
+		// What this actually guarantees, stated the same way seal() states it:
+		// ProtectedKey.Clear() releases the enclave reference so the DEK can no
+		// longer be OPENED — it does not zero the enclave's ciphertext, because
+		// memguard exposes no API to do so. Deleting b.ciphers[epoch] likewise
+		// only drops a reference to a cipher.AEAD that still holds a verbatim
+		// copy of the DEK in its key schedule (x/crypto's ChaCha20-Poly1305
+		// keeps `key [32]byte`; AES-GCM keeps the expanded round keys, from
+		// which the key is recoverable), and neither stdlib nor x/crypto offers
+		// a key-wipe API.
+		//
+		// So purge is a CAPABILITY revocation, not crypto-shredding: after it
+		// returns the barrier can no longer decrypt the epoch, but DEK
+		// confidentiality against memory disclosure (a core dump, a live
+		// process read) remains GC-bounded, not enclave-bounded. Callers that
+		// need the stronger property must bound it outside this process.
+		// Restructuring the cipher cache to hold wipeable key material is a
+		// hot-path change and is deliberately not made here.
 		if dek := b.deks[epoch]; dek != nil {
 			dek.Clear()
 		}
@@ -1713,6 +1776,7 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 		LastFailedUnixNano: src.LastFailedUnixNano,
 		KDFVersion:         src.KDFVersion,
 		HKDFVersion:        src.HKDFVersion,
+		Algorithm:          src.Algorithm,
 		ShamirThreshold:    src.ShamirThreshold,
 		ShamirTotal:        src.ShamirTotal,
 		CreatedAt:          src.CreatedAt,
@@ -1746,7 +1810,21 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 // Validation ensures that the sealed data is structurally sound:
 //   - Epoch must be greater than zero.
 //   - Salt must have the expected HKDF salt length (32 bytes).
-//   - KnownEpochs must contain the current Epoch.
+//   - KnownEpochs must contain the current Epoch, must name no epoch above it,
+//     and must hold at most MaxKnownEpochs entries.
+//   - Algorithm, when recorded, must match the barrier's configured algorithm.
+//
+// The structural bounds are load-bearing, not tidiness: the blob is plaintext,
+// unauthenticated metadata (only the root-key ciphertext is protected, and its
+// AAD is a constant), so every field here is attacker-controlled under the same
+// write-access model the sealing strategies already defend against. Unseal
+// derives one HKDF DEK, one AEAD and one mlock'd enclave per KnownEpochs entry,
+// so an unbounded set is a durable, passphrase-free denial of service against
+// every subsequent start.
+//
+// The argument is COPIED. The barrier retains the copy and writes backoff state
+// into it, so an embedder may reuse or mutate its decode buffer afterwards
+// without silently changing the HKDF salt out from under every DEK derivation.
 //
 // Brute-force backoff state (FailedAttempts, LastFailedUnixNano) is restored
 // from the persisted sealed key, preventing attackers from resetting the
@@ -1771,12 +1849,26 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return ErrInvalidSealedSalt
 	}
 
-	// Validate that KnownEpochs contains the current epoch.
+	// Bound the derivation work Unseal will do before doing any of it.
+	if len(sealed.KnownEpochs) > MaxKnownEpochs {
+		slog.Error("quicraft/seal: sealed root key rejected; KnownEpochs exceeds the derivation bound",
+			"known_epochs", len(sealed.KnownEpochs),
+			"limit", MaxKnownEpochs,
+			"epoch", sealed.Epoch,
+		)
+		return ErrTooManyKnownEpochs
+	}
+
+	// Validate that KnownEpochs contains the current epoch and nothing above
+	// it. Epochs only advance and Epoch is the highest one reached, so a larger
+	// entry is corruption or padding — never a legitimate historical DEK.
 	epochFound := false
 	for _, ep := range sealed.KnownEpochs {
+		if ep > sealed.Epoch {
+			return ErrKnownEpochAboveCurrent
+		}
 		if ep == sealed.Epoch {
 			epochFound = true
-			break
 		}
 	}
 	if !epochFound {
@@ -1789,6 +1881,18 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return ErrUnsupportedHKDFVersion
 	}
 
+	// Reject a data-path algorithm this barrier is not configured for. Without
+	// this the mismatch surfaces only as ErrDecryptionFailed on every read,
+	// which is indistinguishable from tampering and names nothing the operator
+	// could act on. A zero Algorithm is a blob written before the field existed
+	// and is accepted as "unrecorded".
+	if sealed.Algorithm != 0 && sealed.Algorithm != b.config.Algorithm {
+		return &AlgorithmMismatchError{Sealed: sealed.Algorithm, Configured: b.config.Algorithm}
+	}
+
+	// Copy before retaining: b.salt would otherwise alias the caller's slice,
+	// and persistBackoffState would write into the caller's live struct.
+	sealed = cloneSealedRootKey(sealed)
 	b.sealed = sealed
 	b.salt = sealed.Salt
 	b.epoch = sealed.Epoch

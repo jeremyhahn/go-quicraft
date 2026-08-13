@@ -122,7 +122,29 @@ type TransportMetrics interface {
 type SecurityMetrics interface {
 	// IncUnauthorizedMessageDropped counts inbound Raft messages dropped
 	// because the sender failed shard-membership authorization.
-	IncUnauthorizedMessageDropped(shardID, from uint64)
+	//
+	// reason comes from a closed set defined by the message handler:
+	// "removed_replica", "misrouted", "unknown_member", "address_mismatch",
+	// "shared_address", "identity_mismatch", "missing_identity". The split is
+	// operational, not cosmetic — one aggregate counter cannot tell a rolling
+	// membership change from an attack:
+	//
+	//   - "unknown_member" is the benign config-change window (a voter added
+	//     by a change this replica has not applied yet). It rises and falls on
+	//     its own.
+	//   - "identity_mismatch" is the strongest signal here. Committed
+	//     membership records a node identity for the claimed replica and the
+	//     connection presented a different one, so the sender does not hold
+	//     that replica's private key. It is a forged From or a stale identity
+	//     after a key rotation; it is never routine.
+	//   - "missing_identity" means the shard records no identity for a replica
+	//     and RequireMemberIdentity is set. It is a migration gap, not an
+	//     attack: commit the identity (Host.RequestAddNodeWithIdentity).
+	//   - "address_mismatch" and "shared_address" are the fallback path's two
+	//     failures, for replicas with no committed identity — a certificate
+	//     that does not cover the committed address, and a configuration that
+	//     gives one address to two active members.
+	IncUnauthorizedMessageDropped(shardID, from uint64, reason string)
 
 	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped
 	// because the sender failed authorization or TLS identity binding.
@@ -233,7 +255,7 @@ func (NoOpMetricsCollector) IncMessagesDropped(uint64, uint64, string) {}
 // SecurityMetrics no-ops.
 
 // IncUnauthorizedMessageDropped is a no-op.
-func (NoOpMetricsCollector) IncUnauthorizedMessageDropped(uint64, uint64) {}
+func (NoOpMetricsCollector) IncUnauthorizedMessageDropped(uint64, uint64, string) {}
 
 // IncUnauthorizedSnapshotDropped is a no-op.
 func (NoOpMetricsCollector) IncUnauthorizedSnapshotDropped(uint64, uint64) {}

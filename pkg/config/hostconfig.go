@@ -95,6 +95,43 @@ func (lc *LogConfig) Validate() error {
 	return nil
 }
 
+// MetricsConfig controls the label cardinality of the metrics a host exports.
+//
+// It is deliberately NOT a HostConfig field. A Prometheus vector's label set is
+// fixed when the vector is constructed, and the collector is built by the
+// embedder and handed to the host through WithMetrics — by the time a host sees
+// its HostConfig the label sets already exist. The knob therefore belongs to
+// collector construction, where it can still take effect; see
+// quicraft.NewPrometheusMetricsCollectorWithConfig. A HostConfig field would be
+// inert and would imply a control the host does not have.
+//
+// The zero value is the safe value: metrics aggregate to host level and only
+// the shard-scoped signals an operator pages on keep a shard_id label.
+type MetricsConfig struct {
+	// PerShardMetrics labels the full metric set with shard_id, giving a
+	// per-shard breakdown of latency, batch size and snapshot volume.
+	//
+	// It defaults to false because the cost is far higher than the count of
+	// shard-labelled metric NAMES suggests: a Prometheus histogram child is
+	// one series per bucket plus _sum and _count, so a shard's handful of
+	// latency histograms expand into dozens of series. Measured (see
+	// TestPrometheusMetrics_AggregatedModeSeriesBudget), each active shard
+	// costs 113 series with PerShardMetrics on and 6 with it off. At the
+	// 10,000-shard scale this library is designed for that is 1.13M active
+	// series from a single host versus 60k — enough to destabilise a shared
+	// Prometheus, a failure that lands on every other tenant of that
+	// Prometheus and not only on the operator who enabled it.
+	//
+	// Disabling it never costs an alert. The signals worth paging on keep
+	// their shard_id in BOTH modes: elections (leader change), dropped
+	// proposals, transport message and snapshot drops, and every security
+	// counter. What aggregates is the volume-and-latency telemetry, whose
+	// per-shard breakdown is a debugging luxury rather than an alerting
+	// input. Enable it for small deployments or when bisecting a specific
+	// shard's latency.
+	PerShardMetrics bool
+}
+
 // EventListener holds per-type optional event callbacks. Only non-nil
 // callbacks are invoked. Callbacks are called synchronously on engine
 // worker goroutines and must not block. See the package-level

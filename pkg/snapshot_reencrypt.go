@@ -5,9 +5,52 @@ package quicraft
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"path/filepath"
 )
+
+// SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
+// destination is COMMITTED but not yet DURABLE: the rename succeeded, so
+// dstPath already holds the migrated artifact sealed at Epoch, and only the
+// directory fsync that makes the rename survive a crash failed.
+//
+// It exists because the (epoch, error) pair ReencryptSnapshotFile returns is
+// unenforceable on its own. Every caller writes `if err != nil { return 0, err
+// }`, which drops exactly the epoch this case delivers — and once the caller
+// records no epoch, ReencryptSnapshotFile's deferred deregister releases the
+// in-flight pin and the next PurgeEpochsBefore destroys the DEK the migrated
+// artifact needs. Carrying the epoch INSIDE the error means errors.As recovers
+// it however the caller handles err:
+//
+//	var nd *SnapshotCommittedNotDurableError
+//	if errors.As(err, &nd) {
+//		recordEpoch(nd.Epoch) // then re-verify Path before trusting it
+//	}
+//
+// A caller that recovers Epoch must record it and treat the artifact at Path as
+// unverified until it re-checks the destination.
+type SnapshotCommittedNotDurableError struct {
+	// Path is the destination artifact, which already holds the migration.
+	Path string
+	// Epoch is the destination artifact's minimum at-rest epoch, 0 for a
+	// plaintext destination. It is the value ReencryptSnapshotFile would have
+	// returned on success.
+	Epoch uint64
+	// Err is the underlying durability failure.
+	Err error
+}
+
+// Error returns a human-readable description of the durability failure.
+func (e *SnapshotCommittedNotDurableError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: snapshot re-encryption to %s is committed at epoch %d but not durable: %v",
+		e.Path, e.Epoch, e.Err,
+	)
+}
+
+// Unwrap returns the underlying durability failure.
+func (e *SnapshotCommittedNotDurableError) Unwrap() error { return e.Err }
 
 // snapshotFrameEpochs scans the framed snapshot ciphertext at src and returns
 // the distinct epochs embedded in the frames' headers, in first-seen order,
@@ -61,6 +104,13 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // plus the rename's directory entry) is fsynced before success is reported;
 // on any failure before the rename the temp file is removed and
 // srcPath/dstPath are left untouched.
+//
+// The ONE failure that does NOT leave dstPath untouched is a directory-fsync
+// failure AFTER the rename: dstPath already holds the new artifact, so the
+// error is returned together with the real epoch (committed, not yet durable).
+// A caller that receives a non-zero epoch alongside an error must record that
+// epoch — dropping it lets the next DEK purge orphan the artifact's key — and
+// treat the migration as unverified until it re-checks the destination.
 //
 // It returns the destination's MINIMUM at-rest epoch across the written frames,
 // which the host records as the migrated snapshot's Epoch so the DEK-purge
@@ -185,13 +235,20 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		// an in-memory pipe into the encrypt side, so no plaintext is ever
 		// written to disk.
 		pr, pw := io.Pipe()
+		decDone := make(chan struct{})
 		go func() {
+			defer close(decDone)
 			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
 			_ = pw.CloseWithError(decErr)
 		}()
 		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, tmp)
-		// Unblock the decrypt goroutine if the encrypt side stopped early.
+		// Unblock the decrypt goroutine if the encrypt side stopped early, then
+		// JOIN it: it reads from src and holds srcBarrier epoch pins, both of
+		// which this function's deferred cleanup tears down on return. Returning
+		// while it still runs would close src and deregister the pins underneath
+		// a live decrypt.
 		_ = pr.CloseWithError(err)
+		<-decDone
 	case srcLive && !dstLive:
 		// Framed -> plaintext.
 		_, err = decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, tmp)
@@ -215,13 +272,36 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	if err := fsys.Rename(tmpPath, dstPath); err != nil {
 		return 0, err
 	}
+	// The rename SUCCEEDED: dstPath now holds the migrated artifact sealed at
+	// `epoch`, so the write is committed from here on even if the fsync below
+	// fails. Flip committed before attempting it so the deferred cleanup can
+	// never remove (a temp file that no longer exists at) a path that is now
+	// the destination.
+	committed = true
+
 	// Make the rename (and any directories MkdirAll created) durable before
 	// reporting success: without the directory fsync a crash could leave the
 	// caller's durably-recorded migration pointing at a directory entry that
 	// no longer exists (same hazard HandleSnapshot closes with SyncDirChain).
+	//
+	// A failure here is a DURABILITY error, not a "nothing happened" error, and
+	// it returns the real epoch alongside it. Returning 0 would tell the caller
+	// the artifact is plaintext: it would record no epoch, the deferred
+	// deregister would drop this epoch's in-flight pin, and the next
+	// PurgeEpochsBefore would destroy the DEK the migrated snapshot needs —
+	// permanently undecryptable, the exact outcome the pinning machinery exists
+	// to prevent. The caller must record the epoch and then treat the artifact
+	// as not yet durable.
+	//
+	// The epoch also travels INSIDE the error, because the return-value contract
+	// alone cannot survive `if err != nil { return 0, err }`: see
+	// SnapshotCommittedNotDurableError.
 	if err := syncDirChain(fsys, dstDir, syncRoot); err != nil {
-		return 0, err
+		return epoch, &SnapshotCommittedNotDurableError{
+			Path:  dstPath,
+			Epoch: epoch,
+			Err:   err,
+		}
 	}
-	committed = true
 	return epoch, nil
 }

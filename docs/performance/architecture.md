@@ -51,7 +51,7 @@ Source: `pkg/internal/engine/node.go`
 
 ### Transport Buffer Pools
 
-The QUIC transport uses `sync.Pool` for frame marshal buffers. The `getBuf()` and `putBuf()` methods manage pooled `*[]byte` pointers. Buffers exceeding 256 KB (`maxPoolBufSize`) are not returned to the pool to prevent unbounded pool growth. A separate `groupedPool` recycles the `map[string][]proto.Message` used by `Send()` to group messages by target address. The inner slices are reset to `[:0]` to retain their backing arrays across calls.
+The QUIC transport uses `sync.Pool` for frame marshal buffers. The `getBuf()` and `putBuf()` methods manage pooled `*[]byte` pointers. Buffers exceeding 256 KB (`maxPoolBufSize`) are not returned to the pool to prevent unbounded pool growth. `Send()` no longer groups by target into a pooled map — grouping moved into the per-target send queues (see [Send Path](#send-path)).
 
 Source: `pkg/internal/transport/quic.go`
 
@@ -174,30 +174,43 @@ Source: `pkg/internal/engine/step.go`, `pkg/internal/raft/peer.go`
 
 ## Replication Chunking
 
-`sendAppend()` bounds the total entry bytes in a single Replicate message using `maxReplicationPayload`, set from `Config.MaxApplyEntrySize` (default 64 MB). This prevents unbounded message sizes when a follower is far behind. The follower acknowledges each batch via `ReplicateResp`, which triggers the leader to send the next chunk via `sendAppend()` in `handleAppendResp()`. This provides natural flow control without explicit windowing.
+`sendAppend()` bounds the total entry bytes in a single Replicate message using `maxReplicationPayload`, set from `Config.MaxApplyEntrySize` (default `config.MaxReplicationPayloadBytes` = 16,711,672 bytes, ~15.9 MiB). This prevents unbounded message sizes when a follower is far behind. The follower acknowledges each batch via `ReplicateResp`, which triggers the leader to send the next chunk via `sendAppend()` in `handleAppendResp()`. This provides natural flow control without explicit windowing.
 
 **Configuration**:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `Config.MaxApplyEntrySize` | 64 MB | Maximum Replicate message payload size |
+| `Config.MaxApplyEntrySize` | 16,711,672 (~15.9 MiB) | Maximum Replicate message payload size |
 | `Config.MaxEntrySize` | 8 MB | Maximum single entry payload size |
 
 Source: `pkg/internal/raft/raft.go`
 
-## Sharded ReadyMap
+## ReadyMap
 
-The `ReadyMap` is a double-buffered, sharded notification map that signals which shards have pending work. It is designed for 10K+ shard scalability with minimal lock contention.
+The `ReadyMap` is a double-buffered notification map that signals which shards
+have pending work.
 
 ### Structure
 
-The map is sharded across 64 buckets (`readySetBuckets = 64`). Each bucket holds its own spin lock and data map. Two `readySet` instances are maintained for double-buffered swap. `Set()` routes to a bucket via `shardID % 64`, acquires only the per-bucket spin lock, and inserts. Concurrent `Set()` calls for different shards rarely contend because they target different buckets.
+One `sync.Mutex` guards one live map, `ready`. `maps [2]` holds the two maps that
+alternate as the live one; `index` says which of the pair is currently live.
 
-`Swap()` atomically swaps the active and swap readySets via `atomic.Pointer.Swap()`, then drains all 64 buckets from the old active set into a flat result map. The result map is reused via `clear()` for zero allocation in steady state.
+`Set(shardID)` takes the mutex, inserts, and releases it. The critical section is
+a single map insert, which is why one lock suffices: contention is on the *lock*,
+not the map, and the hold time is short enough that the mutex never becomes the
+bottleneck.
 
-The buckets use a custom `spinMutex` (CAS-based spin lock with `runtime.Gosched()` yield) instead of `sync.Mutex`. This avoids goroutine park/unpark overhead for the sub-100ns critical section of a map insert.
+`Swap()` clears the alternate map outside the lock (the caller owns it), then
+takes the lock only long enough to exchange the two pointers, and returns the
+map that was live. This is O(1) — the caller iterates the returned map with no
+lock held. `Swap()` is NOT safe for concurrent use: it must be called from the
+single owning step worker.
 
-Source: `pkg/internal/engine/ready.go`, `pkg/internal/engine/spinmutex.go`, `pkg/internal/engine/signal.go`
+The map returned by `Swap()` is owned by the caller only until the NEXT `Swap()`,
+which recycles it via `clear()`. Retaining it past that point reads a map another
+goroutine is refilling.
+
+Source: `pkg/internal/engine/ready.go`, `pkg/internal/engine/signal.go`
 
 ## Cache-Line Padding
 
@@ -227,7 +240,11 @@ When a write fails, `evictStreamsForTarget()` removes and closes all streams for
 
 ### Send Path
 
-`Send()` groups messages by target address using a pooled `map[string][]proto.Message`. Inner slices are reset to `[:0]` to retain backing arrays across calls, and the map itself is recycled via `sync.Pool`. Each batch is framed (`FrameHeaderSize` + payload), optionally Snappy compressed, and written to the pooled stream in a single write call.
+`Send()` does not group or fan out. It walks the messages once, deep-copies each message's entries and snapshot references (breaking the alias with the step worker's reusable `proposeBuf`), resolves the target address from the registry, and enqueues the message on that target's `sendQueue` — a non-blocking hand-off to a per-target channel pair (data, cap 2048; heartbeat, cap 64).
+
+Batching happens in the per-target `sendQueueWorker` goroutine, which drains its queues and coalesces up to 16 heartbeats or 256 data messages into one batch. Heartbeats are drained before data by a non-blocking priority select, so a replication backlog cannot delay heartbeats past the election timeout. Each batch is framed (`FrameHeaderSize` + payload), optionally Snappy compressed, and written to the pooled stream in a single write call. A worker exits after `sendQueueIdleTimeout` of inactivity, so removed peers do not leak goroutines.
+
+See [QUIC Transport: Send Path](../transport/quic.md#send-path) for the full sequence.
 
 Source: `pkg/internal/transport/quic.go`, `pkg/internal/transport/conn.go`
 
@@ -268,9 +285,9 @@ The `inMemory` struct in the raft log tracks entries pending persistence and app
 
 Source: `pkg/internal/raft/inmemory.go`
 
-### P2: ReadyMap Three-Map Rotation
+### P2: ReadyMap Two-Map Rotation
 
-The `ReadyMap.Swap()` method returns a `map[uint64]struct{}` of notified shards. A `prevResult` field provides three-map rotation: the map returned two swaps ago (guaranteed no longer held by any caller) is recycled as the new drain target. This achieves zero steady-state allocations for the Swap path.
+The `ReadyMap.Swap()` method returns a `map[uint64]struct{}` of notified shards. Two maps (`maps [2]`) alternate as the live one: the map handed to the caller last swap is `clear()`ed and installed as the new drain target on the next swap. This achieves zero steady-state allocations for the Swap path, at the cost of a one-swap ownership window on the returned map.
 
 Source: `pkg/internal/engine/ready.go`
 
@@ -296,7 +313,7 @@ Source: `pkg/internal/raft/raft.go`
 
 ### Parallel Per-Target Sends (O17)
 
-When messages target multiple peers (multi-node clusters), `Send()` spawns goroutines to parallelize `sendBatch` calls across targets. For a 5-node cluster, the leader sends to 4 followers concurrently instead of sequentially. This reduces the send phase from `sum(latencies)` to `max(latencies)`. Single-target sends (heartbeats, single-node clusters) skip goroutine creation entirely for zero overhead on the common path.
+Sends to different peers proceed concurrently. The mechanism is no longer a goroutine spawned per `Send()` call: each target has a long-lived `sendQueueWorker` goroutine draining its own queue, so `Send()` only enqueues and returns, and the send phase costs `max(latencies)` rather than `sum(latencies)` without any per-call goroutine creation. A worker is created on first use for a target and retired after `sendQueueIdleTimeout` of inactivity.
 
 Source: `pkg/internal/transport/quic.go`
 

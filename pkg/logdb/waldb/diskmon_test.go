@@ -691,3 +691,66 @@ func TestDiskMonitorRecoveryRepeated(t *testing.T) {
 		t.Errorf("recovery count = %d, want 3", got)
 	}
 }
+
+// TestWithCheckEveryZeroDoesNotDivideByZero pins the sampling-interval guard.
+//
+// MaybeCheck samples with count%checkEvery, so a zero interval used to panic
+// the commit worker on the very first monitored write: waldb.Open accepted
+// WithCheckEvery(0) without complaint and SaveState then died inside the
+// runtime with an integer divide by zero. A configuration typo must not be a
+// runtime outage.
+func TestWithCheckEveryZeroDoesNotDivideByZero(t *testing.T) {
+	var usedBytes atomic.Uint64
+	usedBytes.Store(10)
+
+	dm := NewDiskMonitor("/tmp/test-wal", 1000,
+		WithCheckEvery(0),
+		WithDiskUsageFunc(mockDiskUsage(&usedBytes)),
+	)
+	if dm.checkEvery != DefaultCheckEvery {
+		t.Fatalf("checkEvery = %d after WithCheckEvery(0), want the default %d",
+			dm.checkEvery, DefaultCheckEvery)
+	}
+	for i := 0; i < 3; i++ {
+		if err := dm.MaybeCheck(); err != nil {
+			t.Fatalf("MaybeCheck: %v", err)
+		}
+	}
+
+	// An option that zeroes the field by another route is normalized too, so
+	// the divisor can never reach MaybeCheck at zero.
+	bare := NewDiskMonitor("/tmp/test-wal", 1000,
+		DiskMonitorOption(func(dm *DiskMonitor) { dm.checkEvery = 0 }),
+		WithDiskUsageFunc(mockDiskUsage(&usedBytes)),
+	)
+	if bare.checkEvery == 0 {
+		t.Fatal("NewDiskMonitor left checkEvery at zero; the first MaybeCheck " +
+			"divides by zero on the commit worker")
+	}
+	if err := bare.MaybeCheck(); err != nil {
+		t.Fatalf("MaybeCheck on a normalized monitor: %v", err)
+	}
+
+	// The full path through the DB must survive it as well.
+	dir := t.TempDir()
+	db, err := Open(dir,
+		WithNoSync(true),
+		WithBlockSize(1024),
+		WithMaxFileSize(64*1024),
+		WithDiskMonitorOpts(1000,
+			WithCheckEvery(0),
+			WithDiskUsageFunc(mockDiskUsage(&usedBytes)),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.SaveState([]logdb.Update{{
+		ShardID:   1,
+		ReplicaID: 1,
+		State:     logdb.State{Term: 1, Vote: 1, Commit: 0},
+	}}); err != nil {
+		t.Fatalf("SaveState with WithCheckEvery(0): %v", err)
+	}
+}

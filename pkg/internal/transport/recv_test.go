@@ -307,7 +307,7 @@ func TestSnapshotReceiverConcurrencyLimit(t *testing.T) {
 
 	// A second receive attempt should be dropped (default case).
 	stopC := make(chan struct{})
-	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, "", nil, stopC)
+	sr.receiveSnapshot(nil, &SnapshotHeader{ChunkCount: 0}, "", PeerAuth{}, stopC)
 
 	// Release semaphore.
 	<-sr.sem

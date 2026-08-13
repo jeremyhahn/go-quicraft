@@ -67,6 +67,26 @@ type Membership struct {
 	// RequireFullReplicaMajority is the shard's replicated
 	// full-replica-majority witness policy.
 	RequireFullReplicaMajority bool
+	// SessionExpiryEntries, MaxTotalSessions and MaxSessionsPerClient are the
+	// shard's replicated SESSION POLICY (see proto.SessionPolicy). They must
+	// survive this round-trip for the same reason Identities must: they enter
+	// membership through the log — the EntryInitialMembership at index 1 — so
+	// a replica that rebuilds its configuration from a SNAPSHOT whose log has
+	// been compacted past that entry has only this record to relearn them
+	// from.
+	//
+	// A backend that drops them does not fail. The replica comes back with an
+	// unset policy, falls back to its own Config, and expires sessions on a
+	// schedule its peers do not share — a state-machine divergence with every
+	// Raft invariant intact and no error raised anywhere.
+	SessionExpiryEntries uint64
+	// MaxTotalSessions is the replicated cap on registered sessions. It is
+	// non-zero in every committed policy and is therefore the field that says
+	// whether a policy was recorded at all: see proto.SessionPolicy.IsSet.
+	MaxTotalSessions uint64
+	// MaxSessionsPerClient is the replicated cap on responses cached per
+	// session.
+	MaxSessionsPerClient uint64
 	// Addresses maps replica IDs to their network addresses for
 	// full voting members.
 	Addresses map[uint64]string
@@ -78,6 +98,25 @@ type Membership struct {
 	Witnesses map[uint64]string
 	// Removed tracks replica IDs that have been removed from the cluster.
 	Removed map[uint64]bool
+	// Identities maps replica IDs to the committed cryptographic node
+	// identity the receive-side gate authorizes a claimed msg.From against
+	// (see proto.Membership.Identities). It is a single map spanning every
+	// role, and it is SPARSE: a replica with no entry falls back to the
+	// committed-address check, or is refused outright under
+	// TransportConfig.RequireMemberIdentity.
+	//
+	// It MUST survive the snapshot-metadata round-trip, for the same reason
+	// the session fields on Entry must survive the WAL one. Identities reach
+	// membership through the log — the EntryInitialMembership at index 1 and
+	// every EntryConfigChange — so a replica that rebuilds its configuration
+	// from a SNAPSHOT whose log has been compacted past those entries has
+	// only this record to learn them from. A backend that drops the field
+	// therefore does not fail; it comes back with an identity-free
+	// configuration and silently downgrades every member to address-based
+	// authorization, which is exactly the forgery the identity binding
+	// closes. Under the strict posture the same replica instead drops all
+	// quorum-bearing traffic and the shard stops making progress.
+	Identities map[uint64]string
 }
 
 // Snapshot represents persisted snapshot metadata.

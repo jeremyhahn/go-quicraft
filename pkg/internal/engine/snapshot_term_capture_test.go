@@ -260,8 +260,9 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 		t.Fatalf("node.LastApplied() = %d after recovery, want 100", got)
 	}
 
-	// Phase 3: a save requested right after recovery must record the
-	// RECOVERED index, not the stale pre-recovery counter.
+	// Phase 3: a save requested right after recovery, before anything is
+	// applied, is a NO-OP — the recovered snapshot at index 100 is the very
+	// artifact a re-save would truncate. It must leave the record untouched.
 	if err := p.requestSnapshot(snapshotRequest{
 		shardID: 33, replicaID: 1, node: node, save: true,
 	}); err != nil {
@@ -272,19 +273,42 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 		if result.err != nil {
 			t.Fatalf("post-recovery save failed: %v", result.err)
 		}
-		if result.index != 100 {
-			t.Fatalf("post-recovery save index = %d, want 100: snapshot "+
-				"records a stale index against recovered state", result.index)
+		if result.index != 0 {
+			t.Fatalf("save at the recovered index = %d, want 0 (no-op): re-saving "+
+				"truncates the artifact the recovery just read", result.index)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-recovery save did not complete within timeout")
+	}
+
+	// Phase 4: once applies advance past the recovered index, the save records
+	// the ADVANCED index against recovered state — never the stale
+	// pre-recovery counter (40), which is what H8 guards.
+	recoverer.lastApplied.Store(150)
+	recoverer.state.Store(150)
+	if err := p.requestSnapshot(snapshotRequest{
+		shardID: 33, replicaID: 1, node: node, save: true,
+	}); err != nil {
+		t.Fatalf("requestSnapshot(advanced save) failed: %v", err)
+	}
+	select {
+	case result := <-p.CompletedC():
+		if result.err != nil {
+			t.Fatalf("advanced save failed: %v", result.err)
+		}
+		if result.index != 150 {
+			t.Fatalf("advanced save index = %d, want 150: snapshot "+
+				"records a stale index against recovered state", result.index)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("advanced save did not complete within timeout")
 	}
 
 	snap, err := ldb.GetSnapshot(33, 1)
 	if err != nil {
 		t.Fatalf("GetSnapshot failed: %v", err)
 	}
-	if snap.Index != 100 || snap.Term != 2 {
-		t.Fatalf("post-recovery logdb snapshot = (index=%d, term=%d), want (100, 2)", snap.Index, snap.Term)
+	if snap.Index != 150 || snap.Term != 2 {
+		t.Fatalf("post-recovery logdb snapshot = (index=%d, term=%d), want (150, 2)", snap.Index, snap.Term)
 	}
 }

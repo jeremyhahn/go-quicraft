@@ -194,6 +194,21 @@ func HasAESNI() bool {
 // CPUs without hardware AES acceleration where ChaCha20 is constant-time and
 // significantly faster.
 //
+// WARNING — do NOT use this to pick the DATA-PATH algorithm of any deployment
+// whose data outlives the host that wrote it. The choice depends on the local
+// CPU (AES-NI present or masked by the hypervisor), and the algorithm is both an
+// HKDFV2 domain separator and the cipher Decrypt selects by epoch: restore the
+// same sealed root key or data directory onto a host that chooses differently
+// and every read fails with the generic ErrDecryptionFailed. Under HKDFV1 it is
+// worse — the info string omits the algorithm, so the IDENTICAL DEK would be
+// used as an AES-256-GCM key on one host and a ChaCha20-Poly1305 key on another.
+// Pin BarrierConfig.Algorithm explicitly for anything persistent, and for a
+// mixed-generation cluster pin the SAME value on every node.
+// SealedRootKey.Algorithm records the choice so a later mismatch is refused at
+// load (AlgorithmMismatchError) instead of surfacing as unreadable data; it
+// cannot help a blob written before that field existed. This function remains
+// appropriate for ephemeral, single-host uses (a transport or session cipher).
+//
 // Under FIPS 140 mode the data-path cipher MUST be FIPS-approved:
 // AES-256-GCM is returned unconditionally, even on CPUs without AES-NI.
 // ChaCha20-Poly1305 is not an approved algorithm, and a "FIPS"

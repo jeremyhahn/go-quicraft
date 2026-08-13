@@ -51,10 +51,19 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 	// state, not local config: dropping them here would persist every
 	// snapshot with a zeroed witness policy, so a restarted replica would
 	// compute a different witness quorum than its peers.
+	//
+	// The session policy is replicated state for the same reason and is
+	// dropped just as silently. A snapshot persisted without it comes back
+	// unset, the recovering replica falls back to its own Config, and it
+	// expires sessions at log indexes its peers do not — a state-machine
+	// divergence, not a recoverable error. See proto.SessionPolicy.
 	result := logdb.Membership{
 		ConfigChangeID:             m.ConfigChangeID,
 		MaxWitnesses:               m.MaxWitnesses,
 		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
+		SessionExpiryEntries:       m.SessionExpiryEntries,
+		MaxTotalSessions:           m.MaxTotalSessions,
+		MaxSessionsPerClient:       m.MaxSessionsPerClient,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))
@@ -78,6 +87,17 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 		result.Removed = make(map[uint64]bool, len(m.Removed))
 		for k, v := range m.Removed {
 			result.Removed[k] = v
+		}
+	}
+	// Identities is the WRITE side of the snapshot-metadata round-trip: this
+	// is the conversion a replica's own snapshot save goes through, so
+	// dropping it here leaves nothing for recovery to read back and the
+	// reloaded configuration silently authorizes by address alone. See
+	// logdb.Membership.Identities.
+	if len(m.Identities) > 0 {
+		result.Identities = make(map[uint64]string, len(m.Identities))
+		for k, v := range m.Identities {
+			result.Identities[k] = v
 		}
 	}
 	return result

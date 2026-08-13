@@ -250,15 +250,15 @@ See `pkg/config/hostconfig.go`.
 
 - `ElectionRTT` (10) — Election timeout as multiples of RTTMillisecond
 - `HeartbeatRTT` (1) — Heartbeat interval as multiples of RTTMillisecond
-- `CheckQuorum` (true) — Leader steps down if quorum becomes unavailable
-- `PreVote` (true) — Use pre-vote extension to prevent disruptive elections
-- `OrderedConfigChange` (true) — Serialize membership changes (no concurrent config changes)
+- `CheckQuorum` (`*bool`, nil = enabled) — Leader steps down if quorum becomes unavailable
+- `PreVote` (`*bool`, nil = enabled) — Use pre-vote extension to prevent disruptive elections
+- `OrderedConfigChange` (`*bool`, nil = enabled) — Serialize membership changes (no concurrent config changes)
 - `SnapshotEntries` (0 = disabled) — Auto-snapshot trigger interval
 - `CompactionOverhead` (5000) — Entries retained after compaction
 - `MaxEntrySize` (8 MB) — Maximum single proposal size
-- `MaxApplyEntrySize` (64 MB) — Maximum batch size per SM.Update call
+- `MaxApplyEntrySize` (`MaxReplicationPayloadBytes` = 16,711,672 bytes, ~15.9 MiB) — Maximum batch size per SM.Update call
 - `MaxSnapshotSize` (4 GB) — Maximum snapshot file size
-- `MaxSessionsPerClient` (128) — Per-client session limit
+- `MaxSessionsPerClient` (128) — Cached responses retained per session
 - `MaxTotalSessions` (16384) — Per-shard total session limit
 - `Quiesce` (false) — Enable quiescence for idle shards (leader sends fewer heartbeats)
 

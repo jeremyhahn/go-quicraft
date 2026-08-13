@@ -35,6 +35,16 @@ type StatePersister func(*SealedRootKey) error
 type BarrierConfig struct {
 	// Algorithm selects the symmetric encryption algorithm used for barrier
 	// data encryption. Default: auto-selected via SelectOptimalAlgorithm().
+	//
+	// PIN THIS EXPLICITLY for any deployment whose at-rest data outlives the
+	// host that wrote it. The default is derived from the local CPU, and the
+	// algorithm is part of the key derivation (an HKDFV2 domain separator) as
+	// well as the cipher Decrypt selects by epoch — a data directory restored
+	// onto a host without AES-NI, or a node added to a mixed-generation
+	// cluster, otherwise reads back as ErrDecryptionFailed. Initialize records
+	// the choice in SealedRootKey.Algorithm and SetSealedRootKey refuses a
+	// mismatch (AlgorithmMismatchError) so the failure names the algorithm that
+	// would work; see SelectOptimalAlgorithm.
 	Algorithm SymmetricAlgorithm
 
 	// DeploymentID is bound into the HKDF info parameter to ensure that two
@@ -146,6 +156,11 @@ type BarrierConfig struct {
 
 // DefaultBarrierConfig returns a BarrierConfig with sensible defaults:
 // auto-selected algorithm, nonce tracking enabled, invocation limit at 2^32.
+//
+// The auto-selected algorithm is a property of the LOCAL CPU, so a deployment
+// whose data outlives one host must override Algorithm with an explicit,
+// cluster-wide value rather than take this default. See BarrierConfig.Algorithm
+// and SelectOptimalAlgorithm.
 func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 	return BarrierConfig{
 		Algorithm:     SelectOptimalAlgorithm(false),
@@ -159,11 +174,12 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 // ErrAlgorithmNotFIPSApproved when FIPS mode is active and the configured
 // cipher is not FIPS-approved.
 //
-// NewBarrier PANICS on an invalid configuration, which is appropriate for a
-// compile-time-constant config but not for one assembled at runtime from a
-// file, an API request, or per-tenant settings. Embedders building a config
-// dynamically should call Validate first and surface the error, rather than
-// letting a bad algorithm take the process down.
+// NewBarrier applies exactly these rules and returns this error, so calling
+// Validate first is an optimization, not a safety requirement. It is useful
+// when a config is validated at admission time — an operator's bad algorithm
+// can be rejected where it was entered, before anything tries to build a
+// barrier from it. MustNewBarrier turns the same error into a panic and is
+// only for compile-time-constant configs.
 func (c *BarrierConfig) Validate() error {
 	if !c.Algorithm.Valid() {
 		return ErrUnsupportedAlgorithm

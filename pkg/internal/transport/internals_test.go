@@ -1425,7 +1425,7 @@ func TestReceiveChunksHappyPath(t *testing.T) {
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 2}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 1 {
@@ -1454,7 +1454,7 @@ func TestReceiveChunksStopDuringLoop(t *testing.T) {
 	stopC := make(chan struct{})
 	close(stopC) // Stop immediately.
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	// No chunks should be delivered.
 	snaps := handler.getSnapshots()
@@ -1476,7 +1476,7 @@ func TestReceiveChunksSetReadDeadlineError(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 1}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 0 {
@@ -1502,7 +1502,7 @@ func TestReceiveChunksReadFrameHeaderEOF(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 2} // Expect 2 but only 1 available.
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	// The truncated transfer must be discarded: no snapshot committed.
 	snaps := handler.getSnapshots()
@@ -1525,7 +1525,7 @@ func TestReceiveChunksReadFrameHeaderNonEOFError(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 1}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 0 {
@@ -1561,7 +1561,7 @@ func TestReceiveChunksZeroLengthChunk(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 2}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	// Only 1 chunk collected (zero-length skipped) but 2 expected: incomplete.
 	snaps := handler.getSnapshots()
@@ -1587,7 +1587,7 @@ func TestReceiveChunksMemoryBudgetExceeded(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 1}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	// Should have been rejected due to budget.
 	snaps := handler.getSnapshots()
@@ -1621,7 +1621,7 @@ func TestReceiveChunksReadFullError(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 1}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 0 {
@@ -1647,7 +1647,7 @@ func TestReceiveChunksUnmarshalError(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 1}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) != 0 {
@@ -1675,7 +1675,7 @@ func TestReceiveChunksRateLimitWithStop(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sr.receiveChunks(reader, hdr, nil, stopC)
+		sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 	}()
 
 	// Close stopC after a short delay to interrupt rate limiting.
@@ -1698,7 +1698,7 @@ func TestReceiveChunksEmptyChunkCount(t *testing.T) {
 	hdr := &SnapshotHeader{ChunkCount: 0}
 	stopC := make(chan struct{})
 
-	sr.receiveChunks(reader, hdr, nil, stopC)
+	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
 
 	// With 0 chunks, handler should not be called.
 	snaps := handler.getSnapshots()

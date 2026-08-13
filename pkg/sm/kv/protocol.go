@@ -29,6 +29,30 @@ const (
 	// OpDelete removes a key.
 	OpDelete byte = 3
 
+	// OpPutIfAbsent stores a key-value pair only when the key is absent.
+	//
+	// The condition is evaluated inside Update, on every replica, against the
+	// replicated state at that log position. That is what makes it safe: the
+	// decision is a pure function of committed state, so every replica reaches
+	// the same answer and none diverge. Evaluating it on the proposer instead
+	// — read, decide, then propose a plain Put — would be a different operation
+	// with a window between the read and the commit, in which a second proposer
+	// can interleave and both writes succeed.
+	//
+	// The result carries the outcome: ResultStored when this entry created the
+	// key, ResultNotStored when it was already present. Both are successful
+	// applications; "not stored" is an answer, not an error, so it must not
+	// stall consensus.
+	OpPutIfAbsent byte = 4
+
+	// ResultStored is the Result.Value for a conditional write that took
+	// effect.
+	ResultStored uint64 = 1
+
+	// ResultNotStored is the Result.Value for a conditional write that was
+	// correctly declined because the key already existed.
+	ResultNotStored uint64 = 0
+
 	// headerSize is 1 byte op + 2 bytes keyLen (little-endian).
 	headerSize = 3
 
@@ -69,6 +93,25 @@ func EncodePut(key, value []byte) ([]byte, error) {
 	}
 	buf := make([]byte, headerSize+len(key)+len(value))
 	buf[0] = OpPut
+	binary.LittleEndian.PutUint16(buf[1:3], uint16(len(key)))
+	copy(buf[headerSize:], key)
+	copy(buf[headerSize+len(key):], value)
+	return buf, nil
+}
+
+// EncodePutIfAbsent creates a binary conditional-put command:
+// [op:1][keyLen:2 LE][key][value].
+//
+// The wire shape is identical to Put — only the opcode differs — so the decoder
+// needs no new parsing path and an older reader rejects it as an unknown op
+// rather than misreading it as a Put, which would silently turn a conditional
+// write into an unconditional one.
+func EncodePutIfAbsent(key, value []byte) ([]byte, error) {
+	if len(key) > MaxKeyLength {
+		return nil, &KeyTooLongError{Length: len(key)}
+	}
+	buf := make([]byte, headerSize+len(key)+len(value))
+	buf[0] = OpPutIfAbsent
 	binary.LittleEndian.PutUint16(buf[1:3], uint16(len(key)))
 	copy(buf[headerSize:], key)
 	copy(buf[headerSize+len(key):], value)
@@ -119,7 +162,7 @@ func DecodeCommand(data []byte) (Command, error) {
 		return Command{}, &InvalidCommandError{Reason: "data too short"}
 	}
 	op := data[0]
-	if op < OpPut || op > OpDelete {
+	if op < OpPut || op > OpPutIfAbsent {
 		return Command{}, &InvalidCommandError{Reason: "unknown op"}
 	}
 	keyLen := binary.LittleEndian.Uint16(data[1:3])
