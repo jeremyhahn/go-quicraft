@@ -258,3 +258,67 @@ func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionExpiry_DisabledSentinelAppliesEverything pins the claim
+// config.SessionExpiryDisabled rests on: that a threshold no log can reach
+// needs no special case in the apply path.
+//
+// Zero can no longer mean "disabled" — it is the default's absence marker — so
+// disabling is expressed as math.MaxUint64. That value takes Apply's SEGMENTED
+// path rather than its expiry-disabled fast path, and the segmented path is the
+// one with a loop that must find no checkpoint and a trailing flush that must
+// still apply every entry. A regression here does not expire anything early; it
+// silently drops entries.
+func TestSessionExpiry_DisabledSentinelAppliesEverything(t *testing.T) {
+	const clientID = 7
+	kv := newTestKV()
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return kv
+	})
+	// math.MaxUint64 is config.SessionExpiryDisabled; rsm does not import
+	// config, so the value is spelled out.
+	policy := proto.SessionPolicy{
+		ExpiryEntries:        ^uint64(0),
+		MaxTotalSessions:     100,
+		MaxSessionsPerClient: 100,
+	}
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), policy, nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	entries := []proto.Entry{
+		{Index: 1, ClientID: clientID, SeriesID: proto.SessionSeriesIDForRegister,
+			Type: proto.EntryNormal},
+		{Index: 2, Cmd: makeCmd("a", "1")},
+		{Index: 3, Cmd: makeCmd("b", "2")},
+	}
+	results := make([]sm.Result, len(entries))
+	if err := rsm.Apply(entries, results); err != nil {
+		t.Fatalf("Apply = %v", err)
+	}
+	if got, want := rsm.lastApplied.Load(), uint64(3); got != want {
+		t.Fatalf("lastApplied = %d, want %d", got, want)
+	}
+	for _, key := range []string{"a", "b"} {
+		got, err := kv.Lookup(context.Background(), key)
+		if err != nil {
+			t.Fatalf("Lookup(%q): %v", key, err)
+		}
+		if val, _ := got.(string); val == "" {
+			t.Fatalf("entry for key %q was not applied; the segmented path must "+
+				"still flush every entry when no checkpoint falls in the batch", key)
+		}
+	}
+
+	// A far-future index must not expire the session either: the threshold is
+	// unreachable by construction, not merely large.
+	far := []proto.Entry{{Index: 1 << 40, Cmd: makeCmd("c", "3")}}
+	if err := rsm.Apply(far, make([]sm.Result, 1)); err != nil {
+		t.Fatalf("Apply(far) = %v", err)
+	}
+	if !rsm.Sessions().IsRegistered(clientID) {
+		t.Fatal("session expired under config.SessionExpiryDisabled")
+	}
+}
