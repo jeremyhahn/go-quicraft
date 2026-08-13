@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
 // Compile-time interface compliance check.
@@ -95,7 +97,15 @@ type PrometheusMetricsCollector struct {
 	// per-shard histogram series with a single map key.
 	unregisteredShards sync.Map // map[uint64]struct{}
 
-	// Raft metric vectors (for registration and pre-binding).
+	// perShard mirrors config.MetricsConfig.PerShardMetrics. It selects which
+	// of each aggregatable metric's two representations below is populated:
+	// when true the *Vec field is built and the host-level field is nil, and
+	// when false the reverse. Exactly one of the pair is ever registered, so a
+	// metric name never carries a shard_id label in one scrape and not another.
+	perShard bool
+
+	// Raft metric vectors (for registration and pre-binding). The aggregatable
+	// ones are nil when perShard is false; see the host-level block below.
 	proposalLatencyVec   *prometheus.HistogramVec
 	commitLatencyVec     *prometheus.HistogramVec
 	applyLatencyVec      *prometheus.HistogramVec
@@ -106,6 +116,27 @@ type PrometheusMetricsCollector struct {
 	electionsVec         *prometheus.CounterVec
 	snapshotsVec         *prometheus.CounterVec
 	piggybackCommitsVec  *prometheus.CounterVec
+
+	// Host-level aggregates, populated only when perShard is false. They carry
+	// the SAME metric names as the vectors they replace, minus the shard_id
+	// label, so a recording rule written as sum without(shard_id)(...) is
+	// correct in both modes. Their Help text states that they are aggregated,
+	// and quicraft_metrics_per_shard_enabled reports the mode as a gauge so a
+	// dashboard can detect it without reading the config.
+	proposalLatencyHost    prometheus.Histogram
+	commitLatencyHost      prometheus.Histogram
+	applyLatencyHost       prometheus.Histogram
+	readIndexLatencyHost   prometheus.Histogram
+	proposalBatchSizeHost  prometheus.Histogram
+	snapshotsHost          prometheus.Counter
+	piggybackCommitsHost   prometheus.Counter
+	snapshotsSentHost      prometheus.Counter
+	snapshotsBytesSentHost prometheus.Histogram
+	snapshotsReceivedHost  prometheus.Counter
+	snapshotsBytesRecvHost prometheus.Histogram
+
+	// perShardEnabled exposes the cardinality mode in the scrape itself.
+	perShardEnabled prometheus.Gauge
 
 	// LogDB metrics (not per-shard, no pre-binding needed).
 	writeLatency      prometheus.Histogram
@@ -141,66 +172,100 @@ type PrometheusMetricsCollector struct {
 	unauthorizedSnapshotsVec *prometheus.CounterVec
 }
 
+// aggregatedHelp annotates a Help string for a metric whose per-shard
+// breakdown has been collapsed into a single host-level series, so the
+// scrape itself records that the shard_id label is absent by configuration
+// rather than missing by accident.
+func aggregatedHelp(help string) string {
+	return help + " Aggregated across all shards on this host; enable MetricsConfig.PerShardMetrics for a shard_id breakdown."
+}
+
+// newHostHistogram builds a label-free host-level histogram in the quicraft
+// namespace, used in place of a per-shard HistogramVec when PerShardMetrics
+// is disabled.
+func newHostHistogram(subsystem, name, help string, buckets []float64) prometheus.Histogram {
+	return prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "quicraft",
+		Subsystem: subsystem,
+		Name:      name,
+		Help:      aggregatedHelp(help),
+		Buckets:   buckets,
+	})
+}
+
+// newHostCounter builds a label-free host-level counter in the quicraft
+// namespace, used in place of a per-shard CounterVec when PerShardMetrics
+// is disabled.
+func newHostCounter(subsystem, name, help string) prometheus.Counter {
+	return prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "quicraft",
+		Subsystem: subsystem,
+		Name:      name,
+		Help:      aggregatedHelp(help),
+	})
+}
+
+// newShardHistogramVec builds a shard_id-labelled histogram in the quicraft
+// namespace.
+func newShardHistogramVec(subsystem, name, help string, buckets []float64) *prometheus.HistogramVec {
+	return prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "quicraft",
+		Subsystem: subsystem,
+		Name:      name,
+		Help:      help,
+		Buckets:   buckets,
+	}, []string{"shard_id"})
+}
+
+// newShardCounterVec builds a shard_id-labelled counter in the quicraft
+// namespace.
+func newShardCounterVec(subsystem, name, help string) *prometheus.CounterVec {
+	return prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "quicraft",
+		Subsystem: subsystem,
+		Name:      name,
+		Help:      help,
+	}, []string{"shard_id"})
+}
+
 // NewPrometheusMetricsCollector creates a PrometheusMetricsCollector with all
 // metrics registered on a dedicated prometheus.Registry. The caller should
 // expose the Registry via promhttp.HandlerFor for scraping.
+//
+// It uses the zero config.MetricsConfig, so per-shard metrics are OFF and the
+// volume-and-latency telemetry aggregates to host level. Use
+// NewPrometheusMetricsCollectorWithConfig to opt in to a shard_id breakdown.
 //
 // By default, per-message transport metrics are disabled for performance.
 // Set EnablePerMessageMetrics=true after creation to enable detailed
 // per-shard/target/type message metrics.
 func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
+	return NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{})
+}
+
+// NewPrometheusMetricsCollectorWithConfig creates a PrometheusMetricsCollector
+// whose label cardinality follows cfg. See config.MetricsConfig for the cost of
+// PerShardMetrics and for which metrics keep a shard_id label regardless.
+//
+// The mode is fixed for the life of the collector: a Prometheus vector's label
+// set is decided when the vector is built, so it cannot be changed afterwards.
+func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *PrometheusMetricsCollector {
 	reg := prometheus.NewRegistry()
 
 	c := &PrometheusMetricsCollector{
 		Registry: reg,
+		perShard: cfg.PerShardMetrics,
 
-		// --- Raft metrics ---
-		proposalLatencyVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "proposal_latency_seconds",
-			Help:      "End-to-end proposal latency from Propose to Result.",
-			Buckets:   latencyBuckets,
-		}, []string{"shard_id"}),
+		// --- Raft metrics that keep shard_id in BOTH modes ---
+		// A dropped proposal is a per-shard fault an operator alerts on, and
+		// an election identifies WHICH shard changed leader. Aggregating
+		// either would remove the only label that makes the alert actionable,
+		// and both are one series per shard, not one per histogram bucket.
+		proposalDroppedVec: newShardCounterVec("raft", "proposals_dropped_total",
+			"Total number of dropped proposals."),
 
-		commitLatencyVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "commit_latency_seconds",
-			Help:      "Latency from proposal submission to commit confirmation.",
-			Buckets:   latencyBuckets,
-		}, []string{"shard_id"}),
-
-		applyLatencyVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "apply_latency_seconds",
-			Help:      "Latency from commit to state machine apply.",
-			Buckets:   latencyBuckets,
-		}, []string{"shard_id"}),
-
-		readIndexLatencyVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "read_index_latency_seconds",
-			Help:      "End-to-end ReadIndex latency from submission to read confirmation.",
-			Buckets:   latencyBuckets,
-		}, []string{"shard_id"}),
-
-		proposalDroppedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "proposals_dropped_total",
-			Help:      "Total number of dropped proposals.",
-		}, []string{"shard_id"}),
-
-		proposalBatchSizeVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "proposal_batch_size",
-			Help:      "Number of proposals batched in a single Raft append.",
-			Buckets:   batchSizeBuckets,
-		}, []string{"shard_id"}),
+		electionsVec: newShardCounterVec("raft", "elections_total",
+			"Total number of elections triggered."),
 
 		commitBatchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: "quicraft",
@@ -210,26 +275,12 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 			Buckets:   batchSizeBuckets,
 		}),
 
-		electionsVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+		perShardEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "elections_total",
-			Help:      "Total number of elections triggered.",
-		}, []string{"shard_id"}),
-
-		snapshotsVec: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "snapshots_total",
-			Help:      "Total number of snapshots taken.",
-		}, []string{"shard_id"}),
-
-		piggybackCommitsVec: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "quicraft",
-			Subsystem: "raft",
-			Name:      "piggyback_commits_total",
-			Help:      "Total number of piggyback commits that eliminated a second pipeline cycle.",
-		}, []string{"shard_id"}),
+			Subsystem: "metrics",
+			Name:      "per_shard_enabled",
+			Help:      "1 when per-shard metric labels are enabled, 0 when metrics are aggregated to host level.",
+		}),
 
 		// --- LogDB metrics ---
 		writeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -302,37 +353,6 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 			Help:      "Total messages received per shard, source, and message type (detailed, optional).",
 		}, []string{"shard_id", "from", "msg_type"}),
 
-		// Snapshot metrics.
-		snapshotsSentVec: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "quicraft",
-			Subsystem: "transport",
-			Name:      "snapshots_sent_total",
-			Help:      "Total snapshots sent per shard.",
-		}, []string{"shard_id"}),
-
-		snapshotsBytesSentVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "transport",
-			Name:      "snapshots_sent_bytes",
-			Help:      "Snapshot bytes sent per transfer.",
-			Buckets:   snapshotBytesBuckets,
-		}, []string{"shard_id"}),
-
-		snapshotsReceivedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "quicraft",
-			Subsystem: "transport",
-			Name:      "snapshots_received_total",
-			Help:      "Total snapshots received per shard.",
-		}, []string{"shard_id"}),
-
-		snapshotsBytesRecvVec: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: "quicraft",
-			Subsystem: "transport",
-			Name:      "snapshots_received_bytes",
-			Help:      "Snapshot bytes received per transfer.",
-			Buckets:   snapshotBytesBuckets,
-		}, []string{"shard_id"}),
-
 		// Transport drop counters. The reason label is a closed set fixed by
 		// the transport (see TransportMetrics), so its cardinality is bounded.
 		// The dropped message's target replica id is deliberately NOT a label:
@@ -368,7 +388,7 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 			Subsystem: "security",
 			Name:      "unauthorized_messages_dropped_total",
 			Help:      "Inbound Raft messages dropped for failing shard-membership authorization.",
-		}, []string{"shard_id"}),
+		}, []string{"shard_id", "reason"}),
 
 		unauthorizedSnapshotsVec: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "quicraft",
@@ -378,19 +398,12 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 		}, []string{"shard_id"}),
 	}
 
-	// Register all collectors with the custom registry.
-	reg.MustRegister(
+	// Collectors present in both modes.
+	collectors := []prometheus.Collector{
 		// Raft
-		c.proposalLatencyVec,
-		c.commitLatencyVec,
-		c.applyLatencyVec,
-		c.readIndexLatencyVec,
 		c.proposalDroppedVec,
-		c.proposalBatchSizeVec,
 		c.commitBatchSize,
 		c.electionsVec,
-		c.snapshotsVec,
-		c.piggybackCommitsVec,
 		// LogDB
 		c.writeLatency,
 		c.fsyncLatency,
@@ -402,16 +415,98 @@ func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 		c.messagesReceivedTotal,
 		c.messagesSentVec,
 		c.messagesReceivedVec,
-		c.snapshotsSentVec,
-		c.snapshotsBytesSentVec,
-		c.snapshotsReceivedVec,
-		c.snapshotsBytesRecvVec,
 		c.snapshotsRejectedVec,
 		c.messagesDroppedVec,
 		// Security
 		c.unauthorizedMessagesVec,
 		c.unauthorizedSnapshotsVec,
-	)
+		// Self-description
+		c.perShardEnabled,
+	}
+
+	// The aggregatable metrics exist in exactly one of two shapes. Building
+	// both and registering one would be wasteful but harmless; building only
+	// the selected shape keeps the nil *Vec fields as the single source of
+	// truth the fallback helpers branch on.
+	if c.perShard {
+		c.perShardEnabled.Set(1)
+
+		c.proposalLatencyVec = newShardHistogramVec("raft", "proposal_latency_seconds",
+			"End-to-end proposal latency from Propose to Result.", latencyBuckets)
+		c.commitLatencyVec = newShardHistogramVec("raft", "commit_latency_seconds",
+			"Latency from proposal submission to commit confirmation.", latencyBuckets)
+		c.applyLatencyVec = newShardHistogramVec("raft", "apply_latency_seconds",
+			"Latency from commit to state machine apply.", latencyBuckets)
+		c.readIndexLatencyVec = newShardHistogramVec("raft", "read_index_latency_seconds",
+			"End-to-end ReadIndex latency from submission to read confirmation.", latencyBuckets)
+		c.proposalBatchSizeVec = newShardHistogramVec("raft", "proposal_batch_size",
+			"Number of proposals batched in a single Raft append.", batchSizeBuckets)
+		c.snapshotsVec = newShardCounterVec("raft", "snapshots_total",
+			"Total number of snapshots taken.")
+		c.piggybackCommitsVec = newShardCounterVec("raft", "piggyback_commits_total",
+			"Total number of piggyback commits that eliminated a second pipeline cycle.")
+		c.snapshotsSentVec = newShardCounterVec("transport", "snapshots_sent_total",
+			"Total snapshots sent per shard.")
+		c.snapshotsBytesSentVec = newShardHistogramVec("transport", "snapshots_sent_bytes",
+			"Snapshot bytes sent per transfer.", snapshotBytesBuckets)
+		c.snapshotsReceivedVec = newShardCounterVec("transport", "snapshots_received_total",
+			"Total snapshots received per shard.")
+		c.snapshotsBytesRecvVec = newShardHistogramVec("transport", "snapshots_received_bytes",
+			"Snapshot bytes received per transfer.", snapshotBytesBuckets)
+
+		collectors = append(collectors,
+			c.proposalLatencyVec,
+			c.commitLatencyVec,
+			c.applyLatencyVec,
+			c.readIndexLatencyVec,
+			c.proposalBatchSizeVec,
+			c.snapshotsVec,
+			c.piggybackCommitsVec,
+			c.snapshotsSentVec,
+			c.snapshotsBytesSentVec,
+			c.snapshotsReceivedVec,
+			c.snapshotsBytesRecvVec,
+		)
+	} else {
+		c.proposalLatencyHost = newHostHistogram("raft", "proposal_latency_seconds",
+			"End-to-end proposal latency from Propose to Result.", latencyBuckets)
+		c.commitLatencyHost = newHostHistogram("raft", "commit_latency_seconds",
+			"Latency from proposal submission to commit confirmation.", latencyBuckets)
+		c.applyLatencyHost = newHostHistogram("raft", "apply_latency_seconds",
+			"Latency from commit to state machine apply.", latencyBuckets)
+		c.readIndexLatencyHost = newHostHistogram("raft", "read_index_latency_seconds",
+			"End-to-end ReadIndex latency from submission to read confirmation.", latencyBuckets)
+		c.proposalBatchSizeHost = newHostHistogram("raft", "proposal_batch_size",
+			"Number of proposals batched in a single Raft append.", batchSizeBuckets)
+		c.snapshotsHost = newHostCounter("raft", "snapshots_total",
+			"Total number of snapshots taken.")
+		c.piggybackCommitsHost = newHostCounter("raft", "piggyback_commits_total",
+			"Total number of piggyback commits that eliminated a second pipeline cycle.")
+		c.snapshotsSentHost = newHostCounter("transport", "snapshots_sent_total",
+			"Total snapshots sent.")
+		c.snapshotsBytesSentHost = newHostHistogram("transport", "snapshots_sent_bytes",
+			"Snapshot bytes sent per transfer.", snapshotBytesBuckets)
+		c.snapshotsReceivedHost = newHostCounter("transport", "snapshots_received_total",
+			"Total snapshots received.")
+		c.snapshotsBytesRecvHost = newHostHistogram("transport", "snapshots_received_bytes",
+			"Snapshot bytes received per transfer.", snapshotBytesBuckets)
+
+		collectors = append(collectors,
+			c.proposalLatencyHost,
+			c.commitLatencyHost,
+			c.applyLatencyHost,
+			c.readIndexLatencyHost,
+			c.proposalBatchSizeHost,
+			c.snapshotsHost,
+			c.piggybackCommitsHost,
+			c.snapshotsSentHost,
+			c.snapshotsBytesSentHost,
+			c.snapshotsReceivedHost,
+			c.snapshotsBytesRecvHost,
+		)
+	}
+
+	reg.MustRegister(collectors...)
 
 	return c
 }
@@ -432,20 +527,39 @@ func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 	// series RegisterShard is about to bind, rather than being dropped.
 	c.unregisteredShards.Delete(shardID)
 
+	// proposals_dropped_total and elections_total keep a shard_id label in
+	// both modes, so they are bound per shard unconditionally.
 	sm := &shardMetrics{
-		proposalLatency:    c.proposalLatencyVec.WithLabelValues(sid),
-		commitLatency:      c.commitLatencyVec.WithLabelValues(sid),
-		applyLatency:       c.applyLatencyVec.WithLabelValues(sid),
-		readIndexLatency:   c.readIndexLatencyVec.WithLabelValues(sid),
-		proposalDropped:    c.proposalDroppedVec.WithLabelValues(sid),
-		proposalBatchSize:  c.proposalBatchSizeVec.WithLabelValues(sid),
-		elections:          c.electionsVec.WithLabelValues(sid),
-		snapshots:          c.snapshotsVec.WithLabelValues(sid),
-		piggybackCommits:   c.piggybackCommitsVec.WithLabelValues(sid),
-		snapshotsSent:      c.snapshotsSentVec.WithLabelValues(sid),
-		snapshotsBytesSent: c.snapshotsBytesSentVec.WithLabelValues(sid),
-		snapshotsReceived:  c.snapshotsReceivedVec.WithLabelValues(sid),
-		snapshotsBytesRecv: c.snapshotsBytesRecvVec.WithLabelValues(sid),
+		proposalDropped: c.proposalDroppedVec.WithLabelValues(sid),
+		elections:       c.electionsVec.WithLabelValues(sid),
+	}
+
+	if c.perShard {
+		sm.proposalLatency = c.proposalLatencyVec.WithLabelValues(sid)
+		sm.commitLatency = c.commitLatencyVec.WithLabelValues(sid)
+		sm.applyLatency = c.applyLatencyVec.WithLabelValues(sid)
+		sm.readIndexLatency = c.readIndexLatencyVec.WithLabelValues(sid)
+		sm.proposalBatchSize = c.proposalBatchSizeVec.WithLabelValues(sid)
+		sm.snapshots = c.snapshotsVec.WithLabelValues(sid)
+		sm.piggybackCommits = c.piggybackCommitsVec.WithLabelValues(sid)
+		sm.snapshotsSent = c.snapshotsSentVec.WithLabelValues(sid)
+		sm.snapshotsBytesSent = c.snapshotsBytesSentVec.WithLabelValues(sid)
+		sm.snapshotsReceived = c.snapshotsReceivedVec.WithLabelValues(sid)
+		sm.snapshotsBytesRecv = c.snapshotsBytesRecvVec.WithLabelValues(sid)
+	} else {
+		// Every shard shares the one host-level series, so the pre-bound
+		// cache still gives the hot path an O(1) hit with no branch.
+		sm.proposalLatency = c.proposalLatencyHost
+		sm.commitLatency = c.commitLatencyHost
+		sm.applyLatency = c.applyLatencyHost
+		sm.readIndexLatency = c.readIndexLatencyHost
+		sm.proposalBatchSize = c.proposalBatchSizeHost
+		sm.snapshots = c.snapshotsHost
+		sm.piggybackCommits = c.piggybackCommitsHost
+		sm.snapshotsSent = c.snapshotsSentHost
+		sm.snapshotsBytesSent = c.snapshotsBytesSentHost
+		sm.snapshotsReceived = c.snapshotsReceivedHost
+		sm.snapshotsBytesRecv = c.snapshotsBytesRecvHost
 	}
 
 	c.shardMetrics.Store(shardID, sm)
@@ -468,22 +582,32 @@ func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
 	c.shardMetrics.Delete(shardID)
 
 	sid := strconv.FormatUint(shardID, 10)
-	c.proposalLatencyVec.DeleteLabelValues(sid)
-	c.commitLatencyVec.DeleteLabelValues(sid)
-	c.applyLatencyVec.DeleteLabelValues(sid)
-	c.readIndexLatencyVec.DeleteLabelValues(sid)
+
+	// Always shard-labelled.
 	c.proposalDroppedVec.DeleteLabelValues(sid)
-	c.proposalBatchSizeVec.DeleteLabelValues(sid)
 	c.electionsVec.DeleteLabelValues(sid)
-	c.snapshotsVec.DeleteLabelValues(sid)
-	c.piggybackCommitsVec.DeleteLabelValues(sid)
-	c.snapshotsSentVec.DeleteLabelValues(sid)
-	c.snapshotsBytesSentVec.DeleteLabelValues(sid)
-	c.snapshotsReceivedVec.DeleteLabelValues(sid)
-	c.snapshotsBytesRecvVec.DeleteLabelValues(sid)
+
+	// Shard-labelled only when PerShardMetrics is on. In the aggregated mode
+	// these vectors do not exist; the host-level series they were replaced by
+	// outlive every shard and must NOT be deleted, or a host that stops one
+	// shard would reset counters that describe all the others.
+	if c.perShard {
+		c.proposalLatencyVec.DeleteLabelValues(sid)
+		c.commitLatencyVec.DeleteLabelValues(sid)
+		c.applyLatencyVec.DeleteLabelValues(sid)
+		c.readIndexLatencyVec.DeleteLabelValues(sid)
+		c.proposalBatchSizeVec.DeleteLabelValues(sid)
+		c.snapshotsVec.DeleteLabelValues(sid)
+		c.piggybackCommitsVec.DeleteLabelValues(sid)
+		c.snapshotsSentVec.DeleteLabelValues(sid)
+		c.snapshotsBytesSentVec.DeleteLabelValues(sid)
+		c.snapshotsReceivedVec.DeleteLabelValues(sid)
+		c.snapshotsBytesRecvVec.DeleteLabelValues(sid)
+	}
+
 	// Drop counters carry a reason label, so every reason's child series for
 	// this shard must go; DeleteLabelValues can only address one full label
-	// set at a time.
+	// set at a time. They keep shard_id in both modes.
 	c.snapshotsRejectedVec.DeletePartialMatch(prometheus.Labels{"shard_id": sid})
 	c.messagesDroppedVec.DeletePartialMatch(prometheus.Labels{"shard_id": sid})
 }
@@ -506,6 +630,24 @@ func (c *PrometheusMetricsCollector) fallbackAllowed(shardID uint64) bool {
 	return !tombstoned
 }
 
+// observerFor returns the observer a sample from an unregistered shard should
+// use. A nil vec means PerShardMetrics is off and the metric was built as a
+// single host-level series, so there is no child series to look up.
+func observerFor(vec *prometheus.HistogramVec, host prometheus.Observer, shardID uint64) prometheus.Observer {
+	if vec == nil {
+		return host
+	}
+	return vec.WithLabelValues(strconv.FormatUint(shardID, 10))
+}
+
+// counterFor is observerFor for counters.
+func counterFor(vec *prometheus.CounterVec, host prometheus.Counter, shardID uint64) prometheus.Counter {
+	if vec == nil {
+		return host
+	}
+	return vec.WithLabelValues(strconv.FormatUint(shardID, 10))
+}
+
 // ---------------------------------------------------------------------------
 // RaftMetrics
 // ---------------------------------------------------------------------------
@@ -521,7 +663,7 @@ func (c *PrometheusMetricsCollector) ObserveProposalLatency(shardID uint64, d ti
 		return
 	}
 	// Fallback for unregistered shards (slow path).
-	c.proposalLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
+	observerFor(c.proposalLatencyVec, c.proposalLatencyHost, shardID).Observe(d.Seconds())
 }
 
 // ObserveCommitLatency records the commit latency for the given shard.
@@ -533,7 +675,7 @@ func (c *PrometheusMetricsCollector) ObserveCommitLatency(shardID uint64, d time
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.commitLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
+	observerFor(c.commitLatencyVec, c.commitLatencyHost, shardID).Observe(d.Seconds())
 }
 
 // ObserveApplyLatency records the apply latency for the given shard.
@@ -545,7 +687,7 @@ func (c *PrometheusMetricsCollector) ObserveApplyLatency(shardID uint64, d time.
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.applyLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
+	observerFor(c.applyLatencyVec, c.applyLatencyHost, shardID).Observe(d.Seconds())
 }
 
 // ObserveReadIndexLatency records the end-to-end ReadIndex latency for the
@@ -558,7 +700,7 @@ func (c *PrometheusMetricsCollector) ObserveReadIndexLatency(shardID uint64, d t
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.readIndexLatencyVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(d.Seconds())
+	observerFor(c.readIndexLatencyVec, c.readIndexLatencyHost, shardID).Observe(d.Seconds())
 }
 
 // IncProposalDropped increments the dropped proposal counter for the given
@@ -584,7 +726,7 @@ func (c *PrometheusMetricsCollector) ObserveProposalBatchSize(shardID uint64, si
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.proposalBatchSizeVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Observe(float64(size))
+	observerFor(c.proposalBatchSizeVec, c.proposalBatchSizeHost, shardID).Observe(float64(size))
 }
 
 // ObserveCommitBatchSize records the number of entries committed in a single
@@ -614,7 +756,7 @@ func (c *PrometheusMetricsCollector) IncSnapshot(shardID uint64) {
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.snapshotsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
+	counterFor(c.snapshotsVec, c.snapshotsHost, shardID).Inc()
 }
 
 // IncPiggybackCommit increments the piggyback commit counter for the given shard.
@@ -626,7 +768,7 @@ func (c *PrometheusMetricsCollector) IncPiggybackCommit(shardID uint64) {
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	c.piggybackCommitsVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
+	counterFor(c.piggybackCommitsVec, c.piggybackCommitsHost, shardID).Inc()
 }
 
 // ---------------------------------------------------------------------------
@@ -705,9 +847,8 @@ func (c *PrometheusMetricsCollector) IncSnapshotsSent(shardID uint64, bytes int6
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	shard := strconv.FormatUint(shardID, 10)
-	c.snapshotsSentVec.WithLabelValues(shard).Inc()
-	c.snapshotsBytesSentVec.WithLabelValues(shard).Observe(float64(bytes))
+	counterFor(c.snapshotsSentVec, c.snapshotsSentHost, shardID).Inc()
+	observerFor(c.snapshotsBytesSentVec, c.snapshotsBytesSentHost, shardID).Observe(float64(bytes))
 }
 
 // IncSnapshotsReceived records a snapshot received for the given shard,
@@ -721,9 +862,8 @@ func (c *PrometheusMetricsCollector) IncSnapshotsReceived(shardID uint64, bytes 
 	if !c.fallbackAllowed(shardID) {
 		return
 	}
-	shard := strconv.FormatUint(shardID, 10)
-	c.snapshotsReceivedVec.WithLabelValues(shard).Inc()
-	c.snapshotsBytesRecvVec.WithLabelValues(shard).Observe(float64(bytes))
+	counterFor(c.snapshotsReceivedVec, c.snapshotsReceivedHost, shardID).Inc()
+	observerFor(c.snapshotsBytesRecvVec, c.snapshotsBytesRecvHost, shardID).Observe(float64(bytes))
 }
 
 // IncSnapshotsRejected counts an inbound snapshot transfer discarded before it
@@ -749,11 +889,14 @@ func (c *PrometheusMetricsCollector) IncMessagesDropped(shardID, _ uint64, reaso
 }
 
 // IncUnauthorizedMessageDropped counts an inbound Raft message dropped for
-// failing shard-membership authorization. The from replica id is intentionally
-// NOT used as a metric label (unbounded attacker-controlled cardinality); it is
-// retained in the parameter list for the interface and logged by the caller.
-func (c *PrometheusMetricsCollector) IncUnauthorizedMessageDropped(shardID, _ uint64) {
-	c.unauthorizedMessagesVec.WithLabelValues(strconv.FormatUint(shardID, 10)).Inc()
+// failing shard-membership authorization, bucketed by the handler's fixed
+// reason set. The from replica id is intentionally NOT used as a metric label
+// (unbounded attacker-controlled cardinality); it is retained in the parameter
+// list for the interface and logged by the caller. reason is safe as a label
+// for the opposite reason: it is a closed set the handler chooses, never a
+// value the sender supplies.
+func (c *PrometheusMetricsCollector) IncUnauthorizedMessageDropped(shardID, _ uint64, reason string) {
+	c.unauthorizedMessagesVec.WithLabelValues(strconv.FormatUint(shardID, 10), reason).Inc()
 }
 
 // IncUnauthorizedSnapshotDropped counts an inbound snapshot dropped for

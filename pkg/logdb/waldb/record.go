@@ -14,10 +14,13 @@
 
 // Package waldb implements write-ahead log storage for the quicraft Raft engine.
 //
-// WAL records use a CRC32 + length + type + data format within fixed-size blocks,
-// following the LevelDB/Pebble log format. Records that do not fit within a single
-// block are split into multiple chunks (First, Middle, Last). CRC32 uses the
-// Castagnoli polynomial for hardware acceleration on amd64.
+// WAL records use a CRC32 + length + type + durability-sequence + data format
+// within fixed-size blocks, following the LevelDB/Pebble log format. Records
+// that do not fit within a single block are split into multiple chunks (First,
+// Middle, Last). CRC32 uses the Castagnoli polynomial for hardware acceleration
+// on amd64. The durability sequence is what lets recovery tell an interrupted
+// write from corruption of acknowledged data; see the durability-sequence
+// commentary below and segment.ReadAll.
 package waldb
 
 import (
@@ -38,9 +41,61 @@ const (
 	RecordLast byte = 4
 )
 
+// The durability sequence carried by every chunk.
+//
+// Recovery has to answer one question about any damage it finds: would
+// truncating to the clean prefix destroy a record this node already
+// ACKNOWLEDGED? The framing alone cannot answer it. A batch larger than one
+// block issues one WriteAt per block before a single fdatasync, and writeback
+// may persist an arbitrary subset of those pages, so an ordinary power loss can
+// leave decodable records sitting above a CRC failure. That is physically a
+// torn write — nothing above the damage was ever acknowledged — yet it is
+// byte-for-byte indistinguishable from bit rot in the middle of a live segment,
+// where everything above the damage WAS acknowledged. Without a discriminator
+// recovery must assume the worst and refuse to start, which is what it did.
+//
+// durSeq is that discriminator. It is the number of Syncs the segment has
+// COMPLETED at the moment the chunk is encoded, so it partitions the segment
+// into durability generations:
+//
+//   - A record with durSeq g was written before Sync #(g+1) was called.
+//   - The writer only writes a durSeq g+1 record AFTER Sync #(g+1) returned.
+//   - Therefore the existence on disk of ANY record with durSeq > g PROVES that
+//     Sync #(g+1) completed, which proves every durSeq <= g record was durable
+//     and acknowledged.
+//
+// The contrapositive is the whole fix: records carrying the segment's HIGHEST
+// durSeq have no such proof behind them — they belong to the one batch that was
+// still in flight — so discarding them destroys nothing that was acknowledged.
+// A torn write is exactly a suffix of that final generation; interior rot leaves
+// records of EARLIER generations above the damage, and those are acknowledged.
+// See segment.ReadAll.
+//
+// Granularity is per CHUNK rather than per block. A block is filled by many
+// independent batches (a 32 KiB block holds hundreds of 48-byte HardState
+// records, each with its own fdatasync), so a per-block generation would be
+// stamped once at the top of the block and be wrong for everything after it —
+// it cannot resolve a boundary that lies inside a block, which is where both the
+// damage and the batch boundary usually are. Per chunk also survives losing the
+// batch's leading page: every record carries its own generation, so the evidence
+// does not depend on any single record surviving. The cost is measured, not
+// assumed; see docs/storage/wal.md.
+const (
+	// recordSeqSize is the width of the durability sequence on disk.
+	recordSeqSize = 4
+
+	// maxDurabilitySeq is the largest durability sequence a chunk can carry.
+	// segment.CanFit refuses to write past it so the counter can never wrap and
+	// present an OLD generation as the newest one, which would invert the proof
+	// above. Reaching it takes 2^32 fdatasyncs into a single segment, roughly
+	// three orders of magnitude more than the record count any legal segment
+	// size admits, so the guard is a proof obligation rather than a live path.
+	maxDurabilitySeq = uint32(1<<32 - 1)
+)
+
 // recordHeaderSize is the fixed overhead per chunk:
-// [CRC32:4] [Length:2] [Type:1] = 7 bytes.
-const recordHeaderSize = 7
+// [CRC32:4] [Length:2] [Type:1] [DurSeq:4] = 11 bytes.
+const recordHeaderSize = 7 + recordSeqSize
 
 // maxRecordDataLen is the maximum payload length per chunk, limited by the
 // 2-byte length field.
@@ -68,10 +123,16 @@ const maxRecordDataLen = (1 << 16) - 1
 var crc32Table = crc32.MakeTable(crc32.Castagnoli)
 
 // encodeRecord writes a single chunk to buf.
-// Format: [CRC32:4][Length:2][Type:1][Data:N]
-// CRC32 covers [Type:1][Data:N].
+// Format: [CRC32:4][Length:2][Type:1][DurSeq:4][Data:N]
+// CRC32 covers [Type:1][DurSeq:4][Data:N].
 // Returns the number of bytes written and any error.
-func encodeRecord(buf []byte, recordType byte, data []byte) (int, error) {
+//
+// The durability sequence sits INSIDE the checksummed region deliberately: it is
+// the value recovery uses to decide whether truncating is safe, so a flipped bit
+// in it must invalidate the chunk rather than silently move the chunk into
+// another generation. It is placed after the type byte so the covered region
+// stays one contiguous slice and the CRC is still computed in a single pass.
+func encodeRecord(buf []byte, recordType byte, durSeq uint32, data []byte) (int, error) {
 	dataLen := len(data)
 	totalLen := recordHeaderSize + dataLen
 
@@ -85,13 +146,15 @@ func encodeRecord(buf []byte, recordType byte, data []byte) (int, error) {
 		return 0, ErrInvalidRecordType
 	}
 
-	// Write type byte first so we can compute CRC over [type][data].
+	// Write type and sequence first so we can compute CRC over
+	// [type][durSeq][data] as one range.
 	buf[6] = recordType
+	binary.LittleEndian.PutUint32(buf[7:recordHeaderSize], durSeq)
 
 	// Copy payload.
 	copy(buf[recordHeaderSize:], data)
 
-	// CRC32 covers type byte and payload: buf[6..6+1+dataLen).
+	// CRC32 covers type byte, durability sequence and payload.
 	checksum := crc32.Checksum(buf[6:recordHeaderSize+dataLen], crc32Table)
 	binary.LittleEndian.PutUint32(buf[0:4], checksum)
 
@@ -103,10 +166,11 @@ func encodeRecord(buf []byte, recordType byte, data []byte) (int, error) {
 
 // decodeRecord reads a single chunk from buf.
 // Returns the payload data (a sub-slice of buf, not a copy), the chunk type,
-// the total number of bytes consumed, and any error.
-func decodeRecord(buf []byte) (data []byte, recordType byte, n int, err error) {
+// the chunk's durability sequence, the total number of bytes consumed, and any
+// error.
+func decodeRecord(buf []byte) (data []byte, recordType byte, durSeq uint32, n int, err error) {
 	if len(buf) < recordHeaderSize {
-		return nil, 0, 0, ErrCorruptedRecord
+		return nil, 0, 0, 0, ErrCorruptedRecord
 	}
 
 	// Parse header fields.
@@ -116,21 +180,22 @@ func decodeRecord(buf []byte) (data []byte, recordType byte, n int, err error) {
 
 	totalLen := recordHeaderSize + dataLen
 	if totalLen > len(buf) {
-		return nil, 0, 0, ErrCorruptedRecord
+		return nil, 0, 0, 0, ErrCorruptedRecord
 	}
 
 	if !isValidRecordType(recordType) {
-		return nil, 0, 0, ErrInvalidRecordType
+		return nil, 0, 0, 0, ErrInvalidRecordType
 	}
 
-	// Verify CRC over [type][data].
+	// Verify CRC over [type][durSeq][data].
 	computed := crc32.Checksum(buf[6:totalLen], crc32Table)
 	if computed != storedCRC {
-		return nil, 0, 0, ErrCorruptedRecord
+		return nil, 0, 0, 0, ErrCorruptedRecord
 	}
 
+	durSeq = binary.LittleEndian.Uint32(buf[7:recordHeaderSize])
 	data = buf[recordHeaderSize:totalLen]
-	return data, recordType, totalLen, nil
+	return data, recordType, durSeq, totalLen, nil
 }
 
 // Positional context-AAD for encrypted WAL records.

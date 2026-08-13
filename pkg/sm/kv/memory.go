@@ -32,9 +32,10 @@ type opHandlerFunc func(m *MemoryStore, cmd Command) sm.Result
 
 // opHandlers maps operation codes to their handler functions for O(1) dispatch.
 var opHandlers = map[byte]opHandlerFunc{
-	OpPut:    handlePut,
-	OpGet:    handleGetNoop,
-	OpDelete: handleDelete,
+	OpPut:         handlePut,
+	OpGet:         handleGetNoop,
+	OpDelete:      handleDelete,
+	OpPutIfAbsent: handlePutIfAbsent,
 }
 
 func handlePut(m *MemoryStore, cmd Command) sm.Result {
@@ -42,6 +43,23 @@ func handlePut(m *MemoryStore, cmd Command) sm.Result {
 	copy(val, cmd.Value)
 	m.data[string(cmd.Key)] = val
 	return sm.Result{Value: uint64(len(cmd.Value))}
+}
+
+// handlePutIfAbsent stores the value only when the key is absent.
+//
+// The existence check runs here, inside Update, so it is evaluated against the
+// replicated state at this log position on every replica — the same input
+// producing the same decision everywhere, which is what keeps the replicas
+// identical. Declining is a normal outcome reported through Result.Value, not
+// an error: a caller losing the race has received a correct answer.
+func handlePutIfAbsent(m *MemoryStore, cmd Command) sm.Result {
+	if _, exists := m.data[string(cmd.Key)]; exists {
+		return sm.Result{Value: ResultNotStored}
+	}
+	val := make([]byte, len(cmd.Value))
+	copy(val, cmd.Value)
+	m.data[string(cmd.Key)] = val
+	return sm.Result{Value: ResultStored}
 }
 
 func handleGetNoop(_ *MemoryStore, _ Command) sm.Result {

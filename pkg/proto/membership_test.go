@@ -128,7 +128,7 @@ func TestMembershipBufferTooSmallUnmarshal(t *testing.T) {
 	// Correct version byte, then too short for the fixed region plus the
 	// first map count.
 	buf := make([]byte, 8)
-	buf[0] = membershipWireVersion
+	buf[0] = membershipFormatVersion
 	var m Membership
 	_, err := m.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrBufferTooSmall) {
@@ -177,12 +177,12 @@ func TestMembershipPolicyRoundTrip(t *testing.T) {
 
 func TestMembershipTooManyEntries(t *testing.T) {
 	// Craft a buffer with Addresses count = maxMembershipEntries + 1
-	buf := make([]byte, membershipFixedSize+4)
-	buf[0] = membershipWireVersion
-	putUint64(buf[1:], 0)                                        // ConfigChangeID
-	putUint64(buf[9:], 0)                                        // MaxWitnesses
-	putBool(buf[17:], false)                                     // RequireFullReplicaMajority
-	putUint32(buf[membershipFixedSize:], maxMembershipEntries+1) // Addresses count
+	buf := make([]byte, membershipFixedSizeV4+4)
+	buf[0] = membershipFormatVersion
+	putUint64(buf[1:], 0)                                          // ConfigChangeID
+	putUint64(buf[9:], 0)                                          // MaxWitnesses
+	putBool(buf[17:], false)                                       // RequireFullReplicaMajority
+	putUint32(buf[membershipFixedSizeV4:], maxMembershipEntries+1) // Addresses count
 	var m Membership
 	_, err := m.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {
@@ -235,6 +235,13 @@ func assertMembershipEqual(t *testing.T, want, got *Membership) {
 	t.Helper()
 	if got.ConfigChangeID != want.ConfigChangeID {
 		t.Fatalf("ConfigChangeID: got %d, want %d", got.ConfigChangeID, want.ConfigChangeID)
+	}
+	// The session policy is compared here, not in the individual tests, so
+	// every round-trip in the package pins it. It is read by the apply path:
+	// a codec that drops it does not fail, it silently returns the replicas to
+	// expiring sessions on per-node configuration.
+	if got.SessionPolicy() != want.SessionPolicy() {
+		t.Fatalf("SessionPolicy: got %+v, want %+v", got.SessionPolicy(), want.SessionPolicy())
 	}
 	assertStringMapEqual(t, "Addresses", want.Addresses, got.Addresses)
 	assertStringMapEqual(t, "Observers", want.Observers, got.Observers)

@@ -121,17 +121,19 @@ for all systems.
 
 ## Performance Summary
 
-### vs Dragonboat Head-to-Head
+**The head-to-head win counts that used to appear here have been removed.** They
+were undated, carried no commit SHA, and could not be reconciled with the
+project's own recorded measurements — the last set recorded, from 2026-02-26/27,
+is QuicRaft 7/17 vs Dragonboat, 8/16 vs etcd and 5/16 vs OpenRaft, with
+Dragonboat ahead by 3-22x on 3-node and 5-node propose/commit. A summary line
+that disagrees with the measurement it summarizes is worse than no summary.
 
-QuicRaft wins **17** / 18 | Dragonboat wins **0** | Ties: **1**
-
-### vs etcd Head-to-Head
-
-QuicRaft wins **14** / 16 | etcd wins **2** | Ties: **0**
-
-### vs OpenRaft Head-to-Head
-
-QuicRaft wins **11** / 16 | OpenRaft wins **4** | Ties: **1**
+Read the per-scenario tables above and the pairwise documents below instead, and
+treat any number here as indicative only: the tables are a single run per system
+on one machine, not a statistical comparison. `make bench-compare` (interleaved
+baseline-vs-current with benchstat, see `docs/performance/benchmarking.md`) is
+the regression gate; regenerate this file with `make perf-docs` and record the
+date and commit alongside it.
 
 ### Pairwise Ratio Tables
 

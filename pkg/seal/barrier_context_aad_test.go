@@ -149,7 +149,7 @@ func TestBarrier_ContextAADEpochVariants(t *testing.T) {
 // set was merged into the existing map, so the union {1,2,3} survived reloading
 // a reduced {1,3}.
 func TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 
 	// First load names epochs {1,2,3}.
 	if err := b.SetSealedRootKey(&SealedRootKey{

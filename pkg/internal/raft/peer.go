@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -129,6 +130,40 @@ type Peer struct {
 	// any other entry) or any config change that names a member other than
 	// itself; a snapshot adopt also clears it, for the compacted case.
 	joining atomic.Bool
+
+	// staleConfigThrough is the commit index this replica RECOVERED with, held
+	// until every committed config change at or below it has been folded into
+	// membership. Zero means the configuration is current.
+	//
+	// It exists because membership is config-in-log and is reconstructed
+	// ASYNCHRONOUSLY. A restart recovers only a BASE configuration — the
+	// snapshot record's membership, or the EntryInitialMembership at index 1
+	// (Host.reconstructShardMembership reads exactly that one entry) — and
+	// learns every change above it by re-applying committed entries through the
+	// ordinary pipeline (Peer.Commit -> processConfigChanges). The replica is
+	// live and TICKING throughout that replay, so its election timer can fire
+	// while its voting set is still the superseded one: it then computes quorum
+	// over the wrong denominator, solicits votes from replicas the
+	// configuration removed, and fails to solicit from ones it added. A replica
+	// restarted against a 3-voter base while the committed log says 5 wins on 2
+	// votes, in a term the real 5-voter configuration can elect in as well.
+	//
+	// The watermark makes that window OBSERVABLE to the campaign gates. It is
+	// resolved by whichever of these happens first, and every one of them is
+	// driven by state this replica already holds:
+	//
+	//   - the commit pipeline reaching it (processConfigChanges), which is the
+	//     free and overwhelmingly common case;
+	//   - replayConfigChangesTo covering it (SetProcessedIndex, for an on-disk
+	//     state machine whose durable marker outruns the snapshot);
+	//   - resolveStaleStartupConfig folding the remainder on demand, which is
+	//     what the campaign gates call.
+	//
+	// Deliberately NOT a "wait until the state machine catches up" gate. Tying
+	// campaigning to apply progress makes election liveness a function of state
+	// machine throughput, and it cannot self-clear on a replica whose apply
+	// pipeline is not running at all.
+	staleConfigThrough uint64
 }
 
 // NewPeer creates a new Peer for the given shard configuration and log
@@ -161,9 +196,73 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 		shardID:    cfg.ShardID,
 		replicaID:  cfg.ReplicaID,
 	}
+
+	// Arm the config-in-log staleness watermark and install the resolver the
+	// campaign gates consult. Both happen HERE, together, so the two halves can
+	// never be half-configured: a bare raft (the adversarial harness, the
+	// state-machine unit tests) has no Peer, therefore no resolver, therefore
+	// no gate at all — it also has no membership to fold, so there is nothing
+	// for the gate to protect there.
+	//
+	// The window exists only when the recovered log commits PAST the
+	// configuration the recovered membership describes. ms.ConfigChangeID is
+	// the index of the last config change that base already accounts for, so
+	// anything at or below it is folded by construction, and a commit index of
+	// zero (a genuine first start) has no tail at all.
+	if r.log.committed > ms.ConfigChangeID {
+		p.staleConfigThrough = r.log.committed
+	}
+	r.resolveStaleConfig = p.resolveStaleStartupConfig
+
 	p.publishMembership()
 	p.syncLeaderID()
 	return p, nil
+}
+
+// resolveStaleStartupConfig folds the committed configuration tail recovered at
+// construction into the membership, and reports whether the configuration is
+// now current through the recovered commit index.
+//
+// It is the on-demand half of the staleConfigThrough watermark and is called
+// from the raft campaign gates (startElection, handleTimeoutNow) — nowhere
+// else. That placement is the whole point of the design:
+//
+//   - On the happy path it never runs. A replica that restarts into a shard
+//     with a live leader is heartbeated long before its election timer fires,
+//     and the commit pipeline clears the watermark for free in the meantime.
+//   - It runs only when this replica is about to campaign, which means the
+//     shard is already leaderless. Paying one bounded read of the local log
+//     there is strictly better than campaigning against a voting set the
+//     configuration has moved past.
+//
+// The scan starts just above the PROCESSED marker, not at the first index.
+// Everything at or below processed has already been offered to
+// applyMembershipEntry — by processConfigChanges on the commit path, by
+// SetProcessedIndex's replay, or by the snapshot adopt in Handle, which is what
+// covers the log-matching fast-forward that advances processed without emitting
+// CommittedEntries. So the residual shrinks as the restart's own replay
+// proceeds, and by the first election timeout it is usually empty.
+//
+// Returning false suppresses the campaign for THIS timeout only. It happens
+// solely when the local log cannot be read, and the caller retries on the next
+// one, exactly like the unreadable-last-log-term gate beside it.
+func (p *Peer) resolveStaleStartupConfig() bool {
+	if p.staleConfigThrough == 0 {
+		return true
+	}
+	if !p.replayConfigChangesFrom(p.r.log.processed+1, p.staleConfigThrough) {
+		slog.Warn("configuration tail unresolved: refusing to campaign against a "+
+			"possibly superseded voting set",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"processed", p.r.log.processed,
+			"stale_through", p.staleConfigThrough,
+			"config_change_id", p.membership.configChangeID,
+		)
+		return false
+	}
+	p.staleConfigThrough = 0
+	return true
 }
 
 // publishMembership creates an immutable snapshot of the current mutable
@@ -222,13 +321,33 @@ func (p *Peer) SetProcessedIndex(index uint64) uint64 {
 // are skipped by the replay guard, so only the (snapshotIndex, index] window
 // has any effect. index must not exceed p.r.log.committed; callers clamp it.
 func (p *Peer) replayConfigChangesTo(index uint64) {
-	first := p.r.log.firstIndex()
-	if first > index {
-		return
+	p.replayConfigChangesFrom(p.r.log.firstIndex(), index)
+}
+
+// replayConfigChangesFrom folds committed config changes in [low, index] into
+// the membership and reports whether it REACHED index — that is, whether the
+// membership can now be trusted to describe the configuration as of index.
+//
+// low is raised to the log's first available index, so a caller may pass any
+// lower bound it can justify; see resolveStaleStartupConfig for why the
+// processed marker is one.
+//
+// A compacted floor counts as reached: every index below it is subsumed by the
+// snapshot whose membership this replica recovered, which is precisely the base
+// the replay builds on. Any OTHER read failure does not, because the entries it
+// could not read may carry config changes and the caller must not treat an
+// unread window as an empty one.
+func (p *Peer) replayConfigChangesFrom(low, index uint64) bool {
+	if first := p.r.log.firstIndex(); low < first {
+		low = first
+	}
+	if low > index {
+		return true
 	}
 	changed := false
+	complete := true
 	const chunk uint64 = 1024
-	for low := first; low <= index; {
+	for low <= index {
 		high := low + chunk
 		if high > index+1 {
 			high = index + 1
@@ -242,20 +361,25 @@ func (p *Peer) replayConfigChangesTo(index uint64) {
 		// entry.
 		entries, err := p.r.log.entries(low, high, p.r.maxReplicationPayload)
 		if err != nil || len(entries) == 0 {
-			// Compacted or unreadable: the snapshot membership already
-			// covers everything below the compaction floor.
+			// Compacted: the snapshot membership already covers everything
+			// below the compaction floor, so the replay is COMPLETE at this
+			// point rather than merely stopped. Any other outcome leaves a
+			// window this replica has not read, and reporting that as complete
+			// is what would let a campaign run against a superseded voting set.
+			complete = errors.Is(err, ErrCompacted)
 			slog.Debug("config change replay stopped",
 				"shard", p.shardID,
 				"replica", p.replicaID,
 				"low", low,
+				"complete", complete,
 				"error", err,
 			)
 			break
 		}
 		for i := range entries {
 			// applyMembershipEntry folds both the bootstrap EntryInitialMembership
-			// at index 1 (which is the first entry replayed, since the loop starts
-			// at firstIndex) and every incremental EntryConfigChange above it. It
+			// at index 1 (which is the first entry replayed when the scan starts at
+			// firstIndex) and every incremental EntryConfigChange above it. It
 			// converges on the committed role and logs any deterministic refusal.
 			if p.applyMembershipEntry(entries[i]) {
 				changed = true
@@ -268,6 +392,7 @@ func (p *Peer) replayConfigChangesTo(index uint64) {
 		p.syncRaftRemotes()
 		p.clearJoiningIfKnown()
 	}
+	return complete
 }
 
 // SetOnCampaign sets the callback that fires when the raft state machine
@@ -877,6 +1002,17 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) {
 			needsSync = true
 		}
 	}
+	// The ordinary commit pipeline reaching the startup staleness watermark
+	// resolves the recovered configuration for FREE: every committed entry at
+	// or below it has now been offered to applyMembershipEntry, which is the
+	// same fold resolveStaleStartupConfig would perform by reading the log
+	// back. This is the branch that keeps a restart into a healthy shard from
+	// ever paying for that read. It is deliberately outside the needsSync test:
+	// a tail that contained NO config change resolves the watermark just as
+	// conclusively as one that did.
+	if n := len(entries); n > 0 && entries[n-1].Index >= p.staleConfigThrough {
+		p.staleConfigThrough = 0
+	}
 	if needsSync {
 		// Publish immutable snapshot for concurrent readers.
 		p.publishMembership()
@@ -1415,6 +1551,69 @@ func (p *Peer) IsMember(replicaID uint64) bool {
 		return false
 	}
 	return snap.isMember(replicaID)
+}
+
+// MemberBinding is everything this shard's COMMITTED configuration authorizes
+// one replica ID with. It is the input to the receive-side sender gate, and its
+// fields are ranked: Identity supersedes Address wherever it is present.
+type MemberBinding struct {
+	// Identity is the committed cryptographic node identity, or "" when the
+	// configuration holds none for this replica (a shard bootstrapped before
+	// identities existed, or by an operator who supplied none).
+	//
+	// Where it is present it is the ONLY authorization input the gate needs.
+	// It is derived from the peer's public key rather than matched against
+	// certificate SANs, so — unlike the address — a wildcard or shared-SAN
+	// certificate does not let its holder present it, and it survives the
+	// holder moving to a new address.
+	Identity string
+	// Address is the committed network address. It remains the authorization
+	// input only for a replica with no committed Identity, and is otherwise
+	// pure routing metadata.
+	Address string
+	// Exclusive reports whether Address identifies this replica and no other
+	// active member. A certificate is matched on the address alone, so two
+	// active replicas at one address let the single host behind it speak as
+	// BOTH. It is meaningless once Identity is present — identities are
+	// checked for duplication at config-change time and are not matched on an
+	// address at all — but it is reported unconditionally so a caller that
+	// falls back to the address never has to ask a second question.
+	Exclusive bool
+}
+
+// MemberBinding returns what this shard's COMMITTED configuration authorizes
+// replicaID with, and whether the replica is in the configuration at all.
+//
+// Unlike IsMember, this IS usable as an authorization input, and it is what the
+// inbound message path binds a claimed msg.From to. The distinction is the
+// direction of the failure: IsMember as an allow-list makes a LAGGING replica
+// reject a legitimate peer (see IsRemoved), whereas requiring the claimed
+// sender to match what the configuration committed for it can only ever refuse
+// a peer this replica has not yet been told about — and a replica that has not
+// been told about a peer has, by construction, never sent that peer a request
+// for it to be answering. Everything here arrived through Raft consensus (a
+// committed EntryInitialMembership or ConfigChange), which is what makes it a
+// source no inbound message can forge.
+//
+// It allocates nothing, unlike GetMembership, because it is read once per
+// inbound quorum-bearing message, and it takes ONE snapshot load so the
+// identity and the address it returns can never straddle a membership change.
+// Safe for concurrent access from any goroutine: it reads an atomic pointer to
+// an immutable snapshot.
+func (p *Peer) MemberBinding(replicaID uint64) (MemberBinding, bool) {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return MemberBinding{}, false
+	}
+	addr, found := snap.memberAddress(replicaID)
+	if !found {
+		return MemberBinding{}, false
+	}
+	return MemberBinding{
+		Identity:  snap.memberIdentity(replicaID),
+		Address:   addr,
+		Exclusive: snap.addressIsExclusive(addr),
+	}, true
 }
 
 // IsJoining reports whether THIS replica's configuration is known-incomplete —

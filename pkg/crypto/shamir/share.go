@@ -79,8 +79,14 @@ func (s *Share) String() string {
 		s.Index, s.Threshold, s.Total)
 }
 
-// Validate checks if the share has valid parameters.
+// Validate checks if the share has valid parameters. It is safe to call on a
+// nil receiver: a nil share is a validation failure, not a panic. Callers
+// deserialize shares from operator input (a JSON null in a submitted share list
+// decodes to a nil *Share), and that must not take down the process.
 func (s *Share) Validate() error {
+	if s == nil {
+		return &ValidationError{Field: "share", Reason: "share is nil"}
+	}
 	if s.Index < 1 {
 		return &ValidationError{Field: "index", Reason: fmt.Sprintf("must be >= 1, got %d", s.Index)}
 	}

@@ -214,7 +214,7 @@ func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 
 	// Only the address the snapshot claims for the sender is covered by the
 	// connection certificate: authorization stays bound to the QUIC peer.
-	certCovers := func(addr string) bool { return addr == leaderAddr }
+	certCovers := certCovering(leaderAddr)
 
 	if err := f.handler.HandleSnapshot(chunks, certCovers); err != nil {
 		t.Fatalf("joining replica rejected its own bootstrap snapshot: %v", err)
@@ -230,12 +230,16 @@ func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_NonJoiningShardStillRequiresRegistry pins the negative:
-// the relaxed path is reachable ONLY for a shard the Host marked joining. A
-// normally started shard whose sender has no registry entry is still rejected,
-// even when the snapshot claims an address its certificate covers.
-func TestHandleSnapshot_NonJoiningShardStillRequiresRegistry(t *testing.T) {
-	const leaderAddr = "127.0.0.1:7001"
+// TestHandleSnapshot_NonJoiningShardRequiresCommittedMembership pins the
+// negative: taking the sender's address from the snapshot's OWN membership is
+// reachable ONLY for a shard the Host marked joining and that raft also
+// considers incomplete. On a normally started shard, a sender the COMMITTED
+// membership does not name is rejected even though the snapshot claims an
+// address the connection's certificate covers — otherwise every established
+// replica would accept a state-machine replacement from any certificate holder
+// willing to name itself in the membership it ships.
+func TestHandleSnapshot_NonJoiningShardRequiresCommittedMembership(t *testing.T) {
+	const leaderAddr, strangerAddr = "127.0.0.1:7001", "127.0.0.1:7009"
 
 	f := newSnapshotReceiveFixture(t, nil)
 	node := newEngineNodeWithMembership(t, 1, 2, map[uint64]string{
@@ -244,12 +248,16 @@ func TestHandleSnapshot_NonJoiningShardStillRequiresRegistry(t *testing.T) {
 	})
 	f.engine.LoadNode(node)
 	t.Cleanup(func() { f.engine.UnloadNode(1) })
-	// No registry entry for the sender and no join marker.
+	// Replica 3 is not in the committed configuration, and there is no join
+	// marker, so nothing can vouch for the address it claims for itself.
+	if _, ok := node.MemberBinding(3); ok {
+		t.Fatal("fixture: replica 3 must not be in the committed configuration")
+	}
 
-	chunks := snapshotChunkFor(1, 2, 1, 500, 10,
-		map[uint64]string{1: leaderAddr, 2: "127.0.0.1:7002"}, []byte("data"))
+	chunks := snapshotChunkFor(1, 2, 3, 500, 10,
+		map[uint64]string{2: "127.0.0.1:7002", 3: strangerAddr}, []byte("data"))
 
-	err := f.handler.HandleSnapshot(chunks, func(addr string) bool { return addr == leaderAddr })
+	err := f.handler.HandleSnapshot(chunks, certCovering(strangerAddr))
 	var authErr *UnauthorizedMessageError
 	if !errors.As(err, &authErr) {
 		t.Fatalf("HandleSnapshot error = %T (%v), want *UnauthorizedMessageError", err, err)

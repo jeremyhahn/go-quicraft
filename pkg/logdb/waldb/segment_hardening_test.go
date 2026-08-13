@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"bytes"
+	iofs "io/fs"
 	"testing"
 )
 
@@ -308,5 +309,185 @@ func TestSegment_ZeroTailIsNotAHole(t *testing.T) {
 	}
 	if rs.stoppedAtCorruption {
 		t.Fatal("clean segment must not be flagged as corrupt")
+	}
+}
+
+// writeRecordingFS records every WriteAt issued against segment files so a test
+// can assert what the flush path actually puts on the medium.
+type writeRecordingFS struct {
+	FS
+	writes *[]writeRange
+}
+
+// OpenFile wraps the opened file so its WriteAt calls are recorded.
+func (w writeRecordingFS) OpenFile(name string, flag int, perm iofs.FileMode) (File, error) {
+	f, err := w.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &writeRecordingFile{File: f, writes: w.writes}, nil
+}
+
+// writeRange is one recorded WriteAt: where it started and how many bytes it
+// carried.
+type writeRange struct {
+	off int64
+	n   int
+}
+
+// writeRecordingFile records each WriteAt before delegating.
+type writeRecordingFile struct {
+	File
+	writes *[]writeRange
+}
+
+// WriteAt records the range and delegates to the wrapped file.
+func (w *writeRecordingFile) WriteAt(p []byte, off int64) (int, error) {
+	*w.writes = append(*w.writes, writeRange{off: off, n: len(p)})
+	return w.File.WriteAt(p, off)
+}
+
+// TestSegment_FlushWritesOnlyNewBytes pins the flush watermark.
+//
+// flushBlock used to write the open block FROM BYTE 0 on every Sync. That is a
+// durability defect before it is a performance one: bytes an earlier fdatasync
+// already made durable — a HardState carrying a vote grant, say — were put back
+// in flight inside the next batch's write, so a power loss during that rewrite
+// could destroy a record the caller had already been told was durable. It is
+// also quadratic: filling one block over n syncs wrote ~n^2*recSize/2 bytes.
+//
+// The assertion is the durability one: no byte is ever written twice. The
+// amplification bound follows from it.
+func TestSegment_FlushWritesOnlyNewBytes(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		blockSize = 1024
+		records   = 200
+		recSize   = 48
+	)
+	var writes []writeRange
+	fsys := writeRecordingFS{FS: defaultFS(), writes: &writes}
+
+	seg, _, err := createSegment(fsys, dir, 9, blockSize, 1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	seg.noSync = true // the fsync itself is not what is under test
+
+	var want [][]byte
+	for i := range records {
+		p := bytes.Repeat([]byte{byte(i%250 + 1)}, recSize)
+		if _, err := seg.Write(p); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		// One Sync per record is the WAL's actual non-batched write pattern.
+		if err := seg.Sync(); err != nil {
+			t.Fatalf("Sync %d: %v", i, err)
+		}
+		want = append(want, p)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// No write may revisit a region an earlier write already covered.
+	var total int
+	var high int64
+	for i, w := range writes {
+		if w.off < high {
+			t.Fatalf("write %d covers [%d,%d), which re-writes bytes already made "+
+				"durable up to %d: an acknowledged record is back in flight and a "+
+				"power loss during this write can destroy it",
+				i, w.off, w.off+int64(w.n), high)
+		}
+		high = w.off + int64(w.n)
+		total += w.n
+	}
+
+	// With the watermark, the bytes written are the bytes stored (plus block
+	// padding). Without it the same workload wrote orders of magnitude more.
+	logicalSize := int(seg.Size())
+	if total > logicalSize+blockSize {
+		t.Fatalf("wrote %d bytes to persist a %d-byte segment (%.1fx amplification)",
+			total, logicalSize, float64(total)/float64(logicalSize))
+	}
+
+	// The block grid must be intact: recovery reads every record back.
+	got := reopenReadOnly(t, dir, 9, blockSize)
+	if len(got) != len(want) {
+		t.Fatalf("recovery loss: wrote %d records, recovered %d", len(want), len(got))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("record %d mismatch after incremental flushing", i)
+		}
+	}
+}
+
+// TestSegment_DiscardPendingResetsFlushWatermark verifies a rollback rewinds
+// the flush watermark with the offsets. If it did not, the next flush would
+// either skip bytes the rollback restored (leaving a hole the recovery scanner
+// stops at) or re-write durable ones.
+func TestSegment_DiscardPendingResetsFlushWatermark(t *testing.T) {
+	dir := t.TempDir()
+	const blockSize = 1024
+	seg, _, err := createSegment(defaultFS(), dir, 10, blockSize, 1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	seg.noSync = true
+
+	keep := bytes.Repeat([]byte{0xa1}, 100)
+	if _, err := seg.Write(keep); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	cleanFileOffset, cleanBlockOffset := seg.fileOffset, seg.blockOffset
+	cleanCount := seg.RecordCount()
+
+	// A failed batch appends into the open block, FLUSHES (so the watermark
+	// genuinely advances past the checkpoint), and is rolled back.
+	//
+	// The flush is what gives this test its teeth. Without it the batch's bytes
+	// never leave blockBuf, so flushed is still sitting at cleanBlockOffset when
+	// DiscardPending runs and the rewind it is supposed to prove has nothing to
+	// undo — the assertion below then holds whether or not the code rewinds
+	// anything at all.
+	if _, err := seg.Write(bytes.Repeat([]byte{0xb2}, 100)); err != nil {
+		t.Fatalf("Write (batch): %v", err)
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync (batch): %v", err)
+	}
+	if seg.flushed <= cleanBlockOffset {
+		t.Fatalf("fixture: flush watermark %d is not ahead of the checkpoint %d, "+
+			"so the rewind under test is unobservable", seg.flushed, cleanBlockOffset)
+	}
+	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanCount); err != nil {
+		t.Fatalf("DiscardPending: %v", err)
+	}
+	if seg.flushed != cleanBlockOffset {
+		t.Fatalf("flush watermark = %d after rollback, want the restored block "+
+			"offset %d", seg.flushed, cleanBlockOffset)
+	}
+
+	// Writes resume and must land contiguously after the kept record.
+	after := bytes.Repeat([]byte{0xc3}, 100)
+	if _, err := seg.Write(after); err != nil {
+		t.Fatalf("Write (after rollback): %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got := reopenReadOnly(t, dir, 10, blockSize)
+	if len(got) != 2 {
+		t.Fatalf("recovered %d records after rollback, want 2", len(got))
+	}
+	if !bytes.Equal(got[0], keep) || !bytes.Equal(got[1], after) {
+		t.Fatal("rolled-back segment did not replay the kept record followed by the " +
+			"post-rollback one")
 	}
 }

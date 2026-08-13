@@ -37,7 +37,7 @@ func TestSnapshot_DataIntegrityRoundTrip(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 1000, 1000, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(1000, 1000, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -69,7 +69,7 @@ func TestSnapshot_DataIntegrityRoundTrip(t *testing.T) {
 		}
 
 		// Restore into a fresh SM.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 1000, 1000, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(1000, 1000, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -107,7 +107,7 @@ func TestSnapshot_DataIntegrityRoundTrip(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -120,7 +120,7 @@ func TestSnapshot_DataIntegrityRoundTrip(t *testing.T) {
 		}
 		h1 := sha256.Sum256(buf1.Bytes())
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -150,7 +150,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -177,7 +177,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		corrupted[0] ^= 0xFF
 		corrupted[1] ^= 0xFF
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -193,7 +193,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -224,7 +224,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		copy(corrupted, data)
 		corrupted[mid] ^= 0x01
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -261,7 +261,7 @@ func TestSnapshot_MultipleSessionsMultipleResponses(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -307,7 +307,7 @@ func TestSnapshot_MultipleSessionsMultipleResponses(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -365,7 +365,7 @@ func TestSnapshot_ConcurrentSaveAndRestore(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -418,7 +418,7 @@ func TestSnapshot_ConcurrentSaveAndRestore(t *testing.T) {
 
 		// Restore each snapshot independently and verify.
 		for i := 0; i < numGoroutines; i++ {
-			restored, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+			restored, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 			if err != nil {
 				t.Fatalf("NewStateMachine(%d) = %v", i, err)
 			}
@@ -448,7 +448,7 @@ func TestSnapshot_SessionExpiryStatePreserved(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 500, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 500), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -479,7 +479,7 @@ func TestSnapshot_SessionExpiryStatePreserved(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 500, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 500), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -520,7 +520,7 @@ func TestSnapshot_ResultDataPreserved(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -546,7 +546,7 @@ func TestSnapshot_ResultDataPreserved(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -579,7 +579,7 @@ func TestSnapshot_ConcurrentSMType(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return newTestConcurrentKV()
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -609,7 +609,7 @@ func TestSnapshot_ConcurrentSMType(t *testing.T) {
 		}
 
 		// Restore into a new concurrent SM.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -642,7 +642,7 @@ func TestSnapshot_OnDiskSMType(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return newTestOnDiskKV()
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -669,7 +669,7 @@ func TestSnapshot_OnDiskSMType(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -701,7 +701,7 @@ func TestSnapshot_UnregisteredSessionExcluded(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -735,7 +735,7 @@ func TestSnapshot_UnregisteredSessionExcluded(t *testing.T) {
 		}
 
 		// Restore.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -769,7 +769,7 @@ func TestSnapshot_MultipleSequentialCycles(t *testing.T) {
 			return newTestKV()
 		})
 
-		current, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		current, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -800,7 +800,7 @@ func TestSnapshot_MultipleSequentialCycles(t *testing.T) {
 			current.Close()
 
 			// Restore into a new SM.
-			current, err = NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+			current, err = NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 			if err != nil {
 				t.Fatalf("cycle %d: NewStateMachine = %v", cycle, err)
 			}
@@ -858,7 +858,7 @@ func TestSnapshot_SaveWithFailingWriter(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -894,7 +894,7 @@ func TestSnapshot_ZeroCopyEntryCmd(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, true)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -921,7 +921,7 @@ func TestSnapshot_ZeroCopyEntryCmd(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -966,7 +966,7 @@ func TestSnapshot_HasherSMRoundTrip(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return &testHasherSM{testKV: testKV{data: make(map[string]string)}}
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -995,7 +995,7 @@ func TestSnapshot_HasherSMRoundTrip(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1024,7 +1024,7 @@ func TestSnapshot_NALookupAfterRestore(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return &testHasherSM{testKV: testKV{data: make(map[string]string)}}
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1044,7 +1044,7 @@ func TestSnapshot_NALookupAfterRestore(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1077,7 +1077,7 @@ func TestSnapshot_LargeSessionCount(t *testing.T) {
 			return newTestKV()
 		})
 		const numSessions = 100
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), uint64(numSessions+10), 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(uint64(numSessions+10), 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1095,7 +1095,7 @@ func TestSnapshot_LargeSessionCount(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), uint64(numSessions+10), 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(uint64(numSessions+10), 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1125,7 +1125,7 @@ func TestSnapshot_ConcurrentSMWriteThenSnapshot(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return newTestConcurrentKV()
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1150,7 +1150,7 @@ func TestSnapshot_ConcurrentSMWriteThenSnapshot(t *testing.T) {
 		}
 
 		// Restore and verify.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1190,7 +1190,7 @@ func TestSnapshot_OnDiskSMSyncPrepareFlow(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1252,7 +1252,7 @@ func TestSnapshot_ZeroCopyModeRoundTrip(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, true)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1273,7 +1273,7 @@ func TestSnapshot_ZeroCopyModeRoundTrip(t *testing.T) {
 		}
 
 		// Restore with zeroCopy false (should be compatible).
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1298,7 +1298,7 @@ func TestSnapshot_EmptyCmdEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1321,7 +1321,7 @@ func TestSnapshot_EmptyCmdEntries(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1352,7 +1352,7 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 		})
 
 		// First SM: register session 10, apply data.
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(1) = %v", err)
 		}
@@ -1377,7 +1377,7 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 		}
 
 		// Second SM: register session 99 and apply different data.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -1427,7 +1427,7 @@ func TestSnapshot_StopperCancellationMidOperation(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1447,7 +1447,7 @@ func TestSnapshot_StopperCancellationMidOperation(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1472,7 +1472,7 @@ func TestSnapshot_CorruptedPayloadRejected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1492,7 +1492,7 @@ func TestSnapshot_CorruptedPayloadRejected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1515,7 +1515,7 @@ func TestSnapshot_TruncatedSnapshotRejected(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1548,7 +1548,7 @@ func TestSnapshot_TruncatedSnapshotRejected(t *testing.T) {
 			cutPoint := len(fullData) * pct / 100
 			truncated := fullData[:cutPoint]
 
-			rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+			rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 			if err != nil {
 				t.Fatalf("NewStateMachine = %v", err)
 			}
@@ -1571,7 +1571,7 @@ func TestSnapshot_EmptyStateMachineRoundTrip(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1586,7 +1586,7 @@ func TestSnapshot_EmptyStateMachineRoundTrip(t *testing.T) {
 			t.Fatal("empty SM snapshot should still have header data")
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -1611,7 +1611,7 @@ func TestSnapshot_SessionOnlyState(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1638,7 +1638,7 @@ func TestSnapshot_SessionOnlyState(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -1669,7 +1669,7 @@ func TestSnapshot_RecoverFromCorruptedMiddleBytes(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1708,7 +1708,7 @@ func TestSnapshot_RecoverFromCorruptedMiddleBytes(t *testing.T) {
 			corrupted[i] = 0
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -1752,7 +1752,7 @@ func TestSnapshot_SaveWithCancelledStopper(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1778,7 +1778,7 @@ func TestSnapshot_RecoverWithCancelledStopper(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}

@@ -31,7 +31,7 @@ import (
 // records.
 func buildValidRecord(recordType byte, payload []byte) []byte {
 	buf := make([]byte, recordHeaderSize+len(payload))
-	n, err := encodeRecord(buf, recordType, payload)
+	n, err := encodeRecord(buf, recordType, 0, payload)
 	if err != nil {
 		panic("buildValidRecord: " + err.Error())
 	}
@@ -88,12 +88,12 @@ func FuzzRecordRoundTrip(f *testing.F) {
 		for _, rt := range types {
 			buf := make([]byte, recordHeaderSize+len(payload))
 
-			n, err := encodeRecord(buf, rt, payload)
+			n, err := encodeRecord(buf, rt, 0, payload)
 			if err != nil {
 				t.Fatalf("encodeRecord(type=%d, len=%d): %v", rt, len(payload), err)
 			}
 
-			decoded, recType, consumed, err := decodeRecord(buf[:n])
+			decoded, recType, _, consumed, err := decodeRecord(buf[:n])
 			if err != nil {
 				t.Fatalf("decodeRecord(type=%d): %v", rt, err)
 			}
@@ -143,7 +143,7 @@ func FuzzRecordDecodeCrash(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Must never panic. Errors are expected and acceptable.
-		decoded, recType, consumed, err := decodeRecord(data)
+		decoded, recType, _, consumed, err := decodeRecord(data)
 		if err != nil {
 			// Error is the expected path for most fuzz inputs.
 			return
@@ -206,13 +206,13 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 
 		// Encode as a WAL record.
 		buf := make([]byte, recordHeaderSize+payloadSize)
-		n, err := encodeRecord(buf, RecordFull, payload)
+		n, err := encodeRecord(buf, RecordFull, 0, payload)
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}
 
 		// Decode the WAL record.
-		decoded, recType, _, err := decodeRecord(buf[:n])
+		decoded, recType, _, _, err := decodeRecord(buf[:n])
 		if err != nil {
 			t.Fatalf("decodeRecord: %v", err)
 		}
@@ -390,12 +390,12 @@ func FuzzStateRecordRoundTrip(f *testing.F) {
 		binary.LittleEndian.PutUint64(payload[33:], commit)
 
 		buf := make([]byte, recordHeaderSize+len(payload))
-		n, err := encodeRecord(buf, RecordFull, payload)
+		n, err := encodeRecord(buf, RecordFull, 0, payload)
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}
 
-		decoded, recType, _, err := decodeRecord(buf[:n])
+		decoded, recType, _, _, err := decodeRecord(buf[:n])
 		if err != nil {
 			t.Fatalf("decodeRecord: %v", err)
 		}
@@ -482,13 +482,13 @@ func FuzzBootstrapRecordRoundTrip(f *testing.F) {
 
 		// Encode as WAL record.
 		buf := make([]byte, recordHeaderSize+totalSize)
-		n, err := encodeRecord(buf, RecordFull, payload[:pos])
+		n, err := encodeRecord(buf, RecordFull, 0, payload[:pos])
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}
 
 		// Decode.
-		decoded, recType, _, err := decodeRecord(buf[:n])
+		decoded, recType, _, _, err := decodeRecord(buf[:n])
 		if err != nil {
 			t.Fatalf("decodeRecord: %v", err)
 		}

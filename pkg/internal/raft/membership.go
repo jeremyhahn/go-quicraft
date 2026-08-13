@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -72,6 +73,10 @@ type membershipSnapshot struct {
 	// requireFullReplicaMajority is the shard's replicated
 	// full-replica-majority witness policy.
 	requireFullReplicaMajority bool
+	// sessionPolicy is the shard's replicated session policy. It is carried
+	// through the snapshot so the state machine can read it off the published
+	// pointer from the apply goroutine; see proto.SessionPolicy.
+	sessionPolicy proto.SessionPolicy
 	// addresses maps replica IDs to network addresses for full voting members.
 	addresses map[uint64]string
 	// observers maps replica IDs to network addresses for non-voting observers.
@@ -80,8 +85,14 @@ type membershipSnapshot struct {
 	witnesses map[uint64]string
 	// removed tracks replica IDs that have been removed from the cluster.
 	removed map[uint64]bool
+	// identities maps replica IDs to their committed cryptographic node
+	// identity. Sparse: see proto.Membership.Identities.
+	identities map[uint64]string
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
+	// sharedAddresses holds every address more than one ACTIVE member claims,
+	// and is nil for a correctly configured shard. See membership.sharedAddresses.
+	sharedAddresses map[string]struct{}
 }
 
 // isMember returns true if the replica is in any active role (voter,
@@ -98,6 +109,51 @@ func (s *membershipSnapshot) isMember(replicaID uint64) bool {
 	return ok
 }
 
+// memberAddress returns the address this configuration holds for replicaID in
+// any active role, and whether the replica is present at all.
+//
+// It reads the SAME three maps as isMember, in the same order, so the two can
+// never disagree: every replica isMember reports has an address here, and
+// nothing else does. Safe for concurrent reads because the snapshot maps are
+// never modified after construction.
+func (s *membershipSnapshot) memberAddress(replicaID uint64) (string, bool) {
+	if addr, ok := s.addresses[replicaID]; ok {
+		return addr, true
+	}
+	if addr, ok := s.observers[replicaID]; ok {
+		return addr, true
+	}
+	addr, ok := s.witnesses[replicaID]
+	return addr, ok
+}
+
+// memberIdentity returns the committed node identity this configuration holds
+// for replicaID, or "" when it holds none.
+//
+// Unlike the address, the identity is stored in ONE map covering every role, so
+// a role change (observer promoted to voter, voter demoted to witness) carries
+// it across without the handlers having to move it. Safe for concurrent reads
+// because the snapshot maps are never modified after construction.
+func (s *membershipSnapshot) memberIdentity(replicaID uint64) string {
+	return s.identities[replicaID]
+}
+
+// addressIsExclusive reports whether address identifies exactly one active
+// member of this configuration. Safe for concurrent reads because the snapshot
+// maps are never modified after construction.
+//
+// The lookup key is canonicalised because sharedAddresses is keyed that way:
+// comparing the raw spelling here would miss a duplicate recorded under a
+// different but equivalent spelling, which is precisely the case the canonical
+// form exists to catch.
+func (s *membershipSnapshot) addressIsExclusive(address string) bool {
+	if len(s.sharedAddresses) == 0 {
+		return true
+	}
+	_, shared := s.sharedAddresses[netaddr.Canonical(address)]
+	return !shared
+}
+
 // isRemoved reports whether the replica carries a Removed tombstone. Safe for
 // concurrent reads because the snapshot maps are never modified after
 // construction.
@@ -112,10 +168,14 @@ func (s *membershipSnapshot) toProto() proto.Membership {
 		ConfigChangeID:             s.configChangeID,
 		MaxWitnesses:               s.maxWitnesses,
 		RequireFullReplicaMajority: s.requireFullReplicaMajority,
+		SessionExpiryEntries:       s.sessionPolicy.ExpiryEntries,
+		MaxTotalSessions:           s.sessionPolicy.MaxTotalSessions,
+		MaxSessionsPerClient:       s.sessionPolicy.MaxSessionsPerClient,
 		Addresses:                  copyStringMap(s.addresses),
 		Observers:                  copyStringMap(s.observers),
 		Witnesses:                  copyStringMap(s.witnesses),
 		Removed:                    copyBoolMap(s.removed),
+		Identities:                 copyStringMap(s.identities),
 	}
 }
 
@@ -137,6 +197,18 @@ type membership struct {
 	witnesses map[uint64]string
 	// removed tracks replica IDs that have been removed from the cluster.
 	removed map[uint64]bool
+	// identities maps replica IDs to their committed cryptographic node
+	// identity — the value the receive-side gate compares the AUTHENTICATED
+	// identity of a connection against. It is sparse (see
+	// proto.Membership.Identities) and, unlike the address maps, it is a single
+	// map spanning every role so a promotion or demotion carries the identity
+	// across untouched.
+	//
+	// Every write to it originates in a COMMITTED config change or a committed
+	// initial membership. No inbound message field ever reaches it — that is
+	// the property the whole gate rests on, and the reason cc.NodeIdentity is
+	// the only input the handlers read.
+	identities map[uint64]string
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
 
@@ -150,6 +222,16 @@ type membership struct {
 	// full-replica-majority witness policy. Same lifecycle as
 	// maxWitnesses.
 	requireFullReplicaMajority bool
+
+	// sessionPolicy is the shard's replicated session policy: the three
+	// limits the deterministic apply path reads (see proto.SessionPolicy).
+	// It is seeded at bootstrap from config.Config and, unlike the witness
+	// policy, has no config change that alters it — nothing in this package
+	// writes it after newMembership. That immutability is load-bearing: the
+	// state machine reads the published value on the APPLY goroutine, which
+	// trails commit, so a value that changed mid-log would be observed at a
+	// replica-local point in the log. See rsm.StateMachine.sessionPolicyFn.
+	sessionPolicy proto.SessionPolicy
 }
 
 // newMembership creates a membership from a proto.Membership. The maps are
@@ -160,9 +242,11 @@ func newMembership(m proto.Membership) *membership {
 		observers:                  copyStringMap(m.Observers),
 		witnesses:                  copyStringMap(m.Witnesses),
 		removed:                    copyBoolMap(m.Removed),
+		identities:                 copyStringMap(m.Identities),
 		configChangeID:             m.ConfigChangeID,
 		maxWitnesses:               m.MaxWitnesses,
 		requireFullReplicaMajority: m.RequireFullReplicaMajority,
+		sessionPolicy:              m.SessionPolicy(),
 	}
 }
 
@@ -176,10 +260,72 @@ func (m *membership) snapshot() *membershipSnapshot {
 		observers:                  copyStringMap(m.observers),
 		witnesses:                  copyStringMap(m.witnesses),
 		removed:                    copyBoolMap(m.removed),
+		identities:                 copyStringMap(m.identities),
 		configChangeID:             m.configChangeID,
 		maxWitnesses:               m.maxWitnesses,
 		requireFullReplicaMajority: m.requireFullReplicaMajority,
+		sessionPolicy:              m.sessionPolicy,
+		sharedAddresses:            m.sharedAddresses(),
 	}
+}
+
+// SessionPolicy returns the shard's replicated session policy from the
+// published membership snapshot. It is a pointer load and three field reads,
+// safe from any goroutine, which is what lets the apply path consult it per
+// batch (see rsm.StateMachine.refreshSessionPolicy).
+//
+// A peer whose membership has not been published yet — a replica started with
+// join=true that has not replicated the shard's configuration — returns the
+// zero policy, whose IsSet reports false. The state machine reads that as "no
+// replicated policy known" and stays on its local configuration until one
+// arrives, which is the only window in which local configuration can still
+// drive apply.
+func (p *Peer) SessionPolicy() proto.SessionPolicy {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return proto.SessionPolicy{}
+	}
+	return snap.sessionPolicy
+}
+
+// sharedAddresses returns the set of addresses held by MORE THAN ONE active
+// member, or nil when every address is exclusive — which is every correctly
+// configured shard, so the common result is a nil map and the reader's lookup
+// is free.
+//
+// It is computed once per membership change rather than scanned per inbound
+// message because the inbound sender binding consults it on the hot path
+// (ReplicateResp and HeartbeatResp arrive at replication rate), and because a
+// scan there would be O(members) on messages that are otherwise O(1).
+//
+// validateAddNode and friends refuse to CREATE a duplicate, so a non-empty
+// result means the configuration predates that validation, was seeded through
+// StartShard, or arrived in a snapshot's membership. Authorization must still
+// fail closed on it: the whole point is that the host behind a shared address
+// cannot be told apart from the replica it claims to be.
+//
+// Keys are netaddr.Canonical, so two SPELLINGS of one endpoint collapse onto a
+// single key and are recognised as the duplicate they are.
+func (m *membership) sharedAddresses() map[string]struct{} {
+	var shared map[string]struct{}
+	seen := make(map[string]uint64, len(m.addresses)+len(m.witnesses)+len(m.observers))
+	for _, group := range []map[uint64]string{m.addresses, m.witnesses, m.observers} {
+		for id, addr := range group {
+			if addr == "" {
+				continue
+			}
+			key := netaddr.Canonical(addr)
+			if other, dup := seen[key]; dup && other != id {
+				if shared == nil {
+					shared = make(map[string]struct{}, 1)
+				}
+				shared[key] = struct{}{}
+				continue
+			}
+			seen[key] = id
+		}
+	}
+	return shared
 }
 
 // numVotingMembers returns the total number of voting members including
@@ -211,6 +357,112 @@ func (m *membership) isWitness(replicaID uint64) bool {
 // observer, or witness).
 func (m *membership) isMember(replicaID uint64) bool {
 	return m.isVoter(replicaID) || m.isObserver(replicaID) || m.isWitness(replicaID)
+}
+
+// addressHolder returns the replica an ACTIVE role already holds address for,
+// and whether one does. Removed replicas do not count: their tombstone denies
+// them regardless, so reusing a departed replica's address is legitimate — it
+// is how a machine is recycled into a new replica ID.
+//
+// A configuration is not allowed to name one address twice, because the inbound
+// authorization chain is replica ID -> committed address -> certificate. Two
+// active replicas at ONE address collapse that chain: the single host behind
+// the address is authorized to speak as BOTH, so it holds two votes and two
+// match indices in a quorum that believes they are independent. That is quorum
+// forgery reachable through the ordinary admin API, with no forged message and
+// no certificate abuse anywhere.
+//
+// Comparison is on the whole address, not on the host, and that is deliberate:
+// two replicas on one MACHINE at different ports are a supported deployment
+// (see transport.isCoLocatedCertHost) and are separated by nothing else either,
+// so refusing them would break single-machine clusters. Two replicas at the
+// same host AND port are one endpoint and cannot be distinct replicas at all.
+//
+// Comparison is on the CANONICAL form (netaddr.Canonical), so two spellings of
+// one endpoint — "NODE-B:5001" and "node-b:5001", "[::1]:5001" and
+// "[0:0:0:0:0:0:0:1]:5001" — are recognised as the duplicate they are. The
+// certificate match this chain ends in is done by x509.VerifyHostname, which
+// already treats them as one host, so a raw string compare here would call two
+// members distinct that the certificate cannot tell apart — the exact gap the
+// duplicate check exists to close.
+//
+// It canonicalises SPELLING ONLY and never resolves DNS: this runs inside
+// config-change validation, which is replicated logic that must produce the
+// same answer on every replica and on every replay. A hostname and the IP it
+// currently resolves to therefore remain distinct, and that residual is
+// deliberate — see netaddr.
+func (m *membership) addressHolder(address string) (uint64, bool) {
+	want := netaddr.Canonical(address)
+	for _, group := range []map[uint64]string{m.addresses, m.witnesses, m.observers} {
+		for id, addr := range group {
+			if netaddr.Canonical(addr) == want {
+				return id, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// recordIdentity binds the committed node identity an add carries to its target
+// replica. An add that carries NO identity leaves any existing binding alone.
+//
+// "Leaves alone" rather than "clears" is the load-bearing choice. An add is
+// replayed on restart and re-applied by followers, and Host.StartShard seeds a
+// membership from the operator's members map; every one of those paths can
+// produce an AddNode with an empty NodeIdentity for a replica whose identity
+// WAS committed earlier. Clearing on empty would silently demote that replica
+// back to address-only authorization — a downgrade an attacker could induce by
+// getting any identity-less config change committed for the victim. Removing
+// an identity therefore requires removing the member (handleRemoveNode).
+//
+// The value comes from cc.NodeIdentity and from nowhere else. cc is the
+// COMMITTED config-change entry, so nothing an inbound message carries in its
+// own header can reach this map — which is the property the receive-side gate
+// depends on and the mistake the whole campaign exists to undo.
+func (m *membership) recordIdentity(cc proto.ConfigChange) {
+	if cc.NodeIdentity == "" {
+		return
+	}
+	if m.identities == nil {
+		m.identities = make(map[uint64]string)
+	}
+	m.identities[cc.ReplicaID] = cc.NodeIdentity
+}
+
+// identityHolder returns the replica an ACTIVE role already holds identity for,
+// and whether one does.
+//
+// One identity naming two replica IDs is the same forgery as one address naming
+// two: the identity IS the authorization key, so a single keypair authorized as
+// both replicas holds two votes and two match indices in a quorum that believes
+// they are independent. Unlike the address case there is no co-location
+// exception — two replicas on one machine still need distinct keypairs, and
+// giving them one is exactly the promiscuous-certificate shape identities exist
+// to defeat.
+//
+// Removed replicas do not count: identities are deleted with the member, so a
+// tombstoned ID holds none.
+func (m *membership) identityHolder(identity string) (uint64, bool) {
+	if identity == "" {
+		return 0, false
+	}
+	for id, known := range m.identities {
+		if known == identity {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// validateMemberIdentity refuses a config change whose identity is already
+// bound to a DIFFERENT active replica of this shard. It is validate-only, like
+// every other shape rule: refusing an already-committed entry on the apply path
+// would make replicas diverge.
+func validateMemberIdentity(m *membership, cc proto.ConfigChange) error {
+	if holder, dup := m.identityHolder(cc.NodeIdentity); dup && holder != cc.ReplicaID {
+		return ErrDuplicateMemberIdentity
+	}
+	return nil
 }
 
 // hasMemberOtherThan reports whether the configuration names an active member
@@ -372,6 +624,7 @@ func handleAddNode(m *membership, cc proto.ConfigChange) error {
 		m.addresses = make(map[uint64]string)
 	}
 	m.addresses[cc.ReplicaID] = cc.Address
+	m.recordIdentity(cc)
 	return nil
 }
 
@@ -397,6 +650,12 @@ func handleRemoveNode(m *membership, cc proto.ConfigChange) error {
 	delete(m.addresses, cc.ReplicaID)
 	delete(m.observers, cc.ReplicaID)
 	delete(m.witnesses, cc.ReplicaID)
+	// The identity goes with the member. Leaving it behind would let a
+	// removed replica's identity linger as an authorization fact for a
+	// replica ID the tombstone already denies, and it would make a later
+	// re-add of that ID (which the tombstone refuses anyway) inherit a
+	// binding nobody re-established.
+	delete(m.identities, cc.ReplicaID)
 	if m.removed == nil {
 		m.removed = make(map[uint64]bool)
 	}
@@ -427,6 +686,7 @@ func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 		m.observers = make(map[uint64]string)
 	}
 	m.observers[cc.ReplicaID] = cc.Address
+	m.recordIdentity(cc)
 	return nil
 }
 
@@ -456,6 +716,7 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 		m.witnesses = make(map[uint64]string)
 	}
 	m.witnesses[cc.ReplicaID] = cc.Address
+	m.recordIdentity(cc)
 	return nil
 }
 
@@ -476,6 +737,15 @@ func validateAddNode(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.numVotingMembers() >= maxVotingMembers {
 		return ErrTooManyVotingMembers
+	}
+	// An address already held by another ACTIVE replica would give one host two
+	// committed identities in this shard; see addressHolder. Promotion of an
+	// observer keeps its own address, so it is exempt.
+	if holder, dup := m.addressHolder(cc.Address); dup && holder != cc.ReplicaID {
+		return ErrDuplicateMemberAddress
+	}
+	if err := validateMemberIdentity(m, cc); err != nil {
+		return err
 	}
 	// Observer promotion is allowed, so no error for isObserver.
 	return nil
@@ -524,7 +794,10 @@ func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	if m.isMember(cc.ReplicaID) {
 		return ErrNodeAlreadyExists
 	}
-	return nil
+	if _, dup := m.addressHolder(cc.Address); dup {
+		return ErrDuplicateMemberAddress
+	}
+	return validateMemberIdentity(m, cc)
 }
 
 // validateAddWitness checks whether adding a witness would succeed without
@@ -543,6 +816,12 @@ func validateAddWitness(m *membership, cc proto.ConfigChange) error {
 	}
 	if m.numVotingMembers() >= maxVotingMembers {
 		return ErrTooManyVotingMembers
+	}
+	if _, dup := m.addressHolder(cc.Address); dup {
+		return ErrDuplicateMemberAddress
+	}
+	if err := validateMemberIdentity(m, cc); err != nil {
+		return err
 	}
 	newWitnessCount := len(m.witnesses) + 1
 	if m.maxWitnesses > 0 && uint64(newWitnessCount) > m.maxWitnesses {

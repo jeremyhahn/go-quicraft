@@ -41,6 +41,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -88,17 +89,77 @@ func (m *mockLogDB) AtRestProtection() logdb.AtRestProtection {
 	return logdb.AtRestNonDurable
 }
 
+// SaveState MERGES each update into the node's stored log the way a real LogDB
+// appends to it: entries at new indexes are added, an entry at an index already
+// held is replaced (the raft overwrite rule), and a non-zero hard state
+// supersedes the previous one.
+//
+// Replacing the whole Update wholesale made only the LAST call's entries
+// retrievable, so a test that seeded a log in two calls silently lost the first
+// half — a log with holes no real implementation can produce.
 func (m *mockLogDB) SaveState(updates []logdb.Update) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, u := range updates {
-		m.states[mockNodeKey{u.ShardID, u.ReplicaID}] = u
+		key := mockNodeKey{u.ShardID, u.ReplicaID}
+		stored, ok := m.states[key]
+		if !ok {
+			stored = logdb.Update{ShardID: u.ShardID, ReplicaID: u.ReplicaID}
+		}
+		if u.State.Term != 0 || u.State.Commit != 0 || u.State.Vote != 0 {
+			stored.State = u.State
+		}
+		for _, e := range u.Entries {
+			// An append at index I discards everything at or above I, exactly
+			// as the raft log does on a conflicting append.
+			cut := len(stored.Entries)
+			for i, held := range stored.Entries {
+				if held.Index >= e.Index {
+					cut = i
+					break
+				}
+			}
+			stored.Entries = append(stored.Entries[:cut:cut], e)
+		}
+		m.states[key] = stored
 	}
 	return nil
 }
 
+// IterateEntries serves the entries a test actually persisted through
+// SaveState, in [low, high). Returning nothing unconditionally made every
+// recovered node look like one whose log had vanished — no entry, and
+// therefore no TERM, could be read back for an index the same fixture
+// declared committed and applied. Recovery is entitled to resolve the term of
+// an applied index from the log, so the stub turned a faithful, fail-closed
+// recovery into an apparent bug.
+//
+// maxSize is honoured with the interface's rule: 0 means unlimited, the first
+// entry is always admitted, and iteration otherwise stops BEFORE the entry that
+// would push the cumulative size past the budget. Ignoring it let this fixture
+// serve batches no real LogDB would, hiding every caller that depends on the
+// budget being respected.
 func (m *mockLogDB) IterateEntries(entries []logdb.Entry, size uint64, shardID, replicaID, low, high, maxSize uint64) ([]logdb.Entry, uint64, error) {
-	return entries, 0, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.states[mockNodeKey{shardID, replicaID}]
+	if !ok {
+		return entries, size, nil
+	}
+	admitted := 0
+	for _, e := range u.Entries {
+		if e.Index < low || e.Index >= high {
+			continue
+		}
+		entrySize := logdb.EntryOverheadBytes + uint64(len(e.Cmd))
+		if maxSize > 0 && admitted > 0 && size+entrySize > maxSize {
+			break
+		}
+		entries = append(entries, e)
+		size += entrySize
+		admitted++
+	}
+	return entries, size, nil
 }
 
 // ReadState returns the hard state SaveState persisted, so a test can describe
@@ -5031,7 +5092,16 @@ func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 // OnLeaderUpdated - snapshot cleanup
 // ---------------------------------------------------------------------------
 
-func TestOnLeaderUpdated_FailsPendingSnapshots(t *testing.T) {
+// TestOnLeaderUpdated_LeavesPendingSnapshotsAlone asserts that a leadership
+// change does NOT complete an in-flight snapshot request.
+//
+// This test previously asserted the opposite. Saving a snapshot is purely
+// LOCAL — it reads this replica's own state machine and writes its own disk —
+// so an election completing the caller with NotLeaderError while the save kept
+// running only produced a retry that hit ErrSnapshotInProgress. Teardown
+// (StopShard/Close), where the save really is abandoned, still fails it; see
+// failPendingRequests vs failPendingClientRequests.
+func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
 	if err != nil {
@@ -5048,10 +5118,19 @@ func TestOnLeaderUpdated_FailsPendingSnapshots(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 70, time.Time{}, true)
-	ns.pendingSnapshotsMu.Lock()
-	ns.pendingSnapshots[70] = rs
-	ns.pendingSnapshotsMu.Unlock()
+	// Register exactly as RequestSnapshot does: the completion path releases
+	// the pin and the pending-op count it takes here.
+	registerSnapshot := func(key uint64) *RequestState {
+		rs := newRequestState(pool, key, time.Time{}, true)
+		rs.acquireRef()
+		h.addPendingOp()
+		ns.pendingSnapshotsMu.Lock()
+		ns.pendingSnapshots[key] = rs
+		ns.pendingSnapshotsMu.Unlock()
+		return rs
+	}
+
+	rs := registerSnapshot(70)
 
 	// First establish this node as leader so the loss is detected.
 	ns.isLeader.Store(true)
@@ -5062,14 +5141,42 @@ func TestOnLeaderUpdated_FailsPendingSnapshots(t *testing.T) {
 
 	select {
 	case result := <-rs.ResultC():
-		if !errors.Is(result.Err, ErrNotLeader) {
-			t.Errorf("result.Err = %v, want NotLeaderError", result.Err)
-		}
+		t.Fatalf("pending snapshot completed with %v on a leadership change", result.Err)
 	default:
-		t.Fatal("pending snapshot RS should have been completed with NotLeaderError")
 	}
 
+	// Surviving the election is not the whole contract: an implementation that
+	// simply LEAKED the entry would satisfy the check above and block the caller
+	// forever. The save must still be able to complete it normally, with the
+	// real snapshot index.
+	cb.OnSnapshotCompleted(1, 512, nil)
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			t.Fatalf("snapshot completion after an election: err = %v, want nil", result.Err)
+		}
+		if result.Value != 512 {
+			t.Errorf("snapshot result.Value = %d, want 512 (the snapshot index)", result.Value)
+		}
+	default:
+		t.Fatal("the snapshot that survived the election never completed; the caller " +
+			"blocks until its deadline on a save that succeeded")
+	}
 	rs.Release()
+
+	// Teardown, where the save really IS abandoned, does fail a pending entry.
+	torn := registerSnapshot(71)
+	h.failPendingRequests(testLoadNode(h, 1), ErrClosed)
+	select {
+	case result := <-torn.ResultC():
+		if !errors.Is(result.Err, ErrClosed) {
+			t.Errorf("result.Err = %v, want ErrClosed", result.Err)
+		}
+	default:
+		t.Fatal("teardown must complete the pending snapshot RS")
+	}
+
+	torn.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -19531,7 +19638,7 @@ func TestLoadOrGenerateHostID_OverrideID(t *testing.T) {
 
 func TestHandleSnapshot_EmptyChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot(nil, nil)
+	err := handler.HandleSnapshot(nil, transport.PeerAuth{})
 	if err != nil {
 		t.Errorf("expected nil error for empty chunks, got: %v", err)
 	}
@@ -19539,7 +19646,7 @@ func TestHandleSnapshot_EmptyChunks(t *testing.T) {
 
 func TestHandleSnapshot_NilHost(t *testing.T) {
 	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}}, nil)
+	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}}, transport.PeerAuth{})
 	if err != nil {
 		t.Errorf("expected nil error for nil host, got: %v", err)
 	}
@@ -20766,10 +20873,14 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	// with no HardState describes a state production cannot reach, and
 	// recovery legitimately refuses to trust an applied marker that runs
 	// past the commit index it can prove.
+	// The entry the SM's durable marker names must exist in the log: a
+	// replica that applied index 100 necessarily persisted it, and recovery
+	// resolves the TERM of the recovered index from there.
 	db.SaveState([]logdb.Update{{
 		ShardID:   1,
 		ReplicaID: 1,
 		State:     logdb.State{Term: 1, Vote: 1, Commit: 100},
+		Entries:   []logdb.Entry{{Index: 100, Term: 1}},
 	}})
 
 	diskSM := &recordingOnDiskSM{openLastApplied: 100}
@@ -20857,6 +20968,9 @@ func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
 		ShardID:   1,
 		ReplicaID: 1,
 		State:     logdb.State{Term: 1, Vote: 1, Commit: 75},
+		// See the note in TestStartShard_OnDiskSM_NoSnapshotRollback: the
+		// applied index must be an entry the log actually holds.
+		Entries: []logdb.Entry{{Index: 75, Term: 1}},
 	}})
 
 	diskSM := &recordingOnDiskSM{openLastApplied: 75}

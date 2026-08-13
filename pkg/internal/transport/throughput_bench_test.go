@@ -146,7 +146,7 @@ func (s *benchSink) delivered() int64 {
 	return s.received
 }
 
-func (s *benchSink) HandleMessage(batch proto.MessageBatch, _ func(string) bool) error {
+func (s *benchSink) HandleMessage(batch proto.MessageBatch, _ PeerAuth) error {
 	var n int64
 	for i := range batch.Requests {
 		for j := range batch.Requests[i].Entries {
@@ -164,7 +164,7 @@ func (s *benchSink) HandleMessage(batch proto.MessageBatch, _ func(string) bool)
 	return nil
 }
 
-func (s *benchSink) HandleSnapshot([]proto.SnapshotChunk, func(string) bool) error {
+func (s *benchSink) HandleSnapshot([]proto.SnapshotChunk, PeerAuth) error {
 	return nil
 }
 

@@ -158,3 +158,128 @@ func TestSubmit_DefiniteRejectionIsNotIndeterminate(t *testing.T) {
 		t.Error("the proposer's error is not reachable through errors.Is")
 	}
 }
+
+// ctxBoundProposer blocks until its context is done, exactly as Host.SyncPropose
+// does while a proposal is outstanding: it selects on the result channel and on
+// ctx.Done(), so a context that can never fire is a permanent block. It records
+// whether it was entered at all.
+type ctxBoundProposer struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (p *ctxBoundProposer) SyncPropose(ctx context.Context, _ uint64, _ []byte) error {
+	p.once.Do(func() { close(p.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestFlush_AllCallersCanceledSkipsPropose is the regression test for the
+// context.Background() fallback in pickContext. When every proposal context is
+// already cancelled — which is what mass caller cancellation under quorum loss
+// looks like — the batch used to be proposed on context.Background(). Nothing
+// can cancel that, so SyncPropose blocked forever ON THE SINGLE FLUSH
+// GOROUTINE: no later batch flushed, the queue filled to QueueSize, every
+// subsequent Submit returned QueueFullError, and Close hung on wg.Wait.
+func TestFlush_AllCallersCanceledSkipsPropose(t *testing.T) {
+	p := &ctxBoundProposer{entered: make(chan struct{})}
+	// An hour-long flush interval keeps the background loop's timer out of the
+	// way so this test drives flush directly and deterministically.
+	agg, err := NewAggregator(p,
+		WithConfig(Config{MaxBatchSize: 100, FlushInterval: time.Hour, QueueSize: 100}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel1()
+	cancel2()
+
+	p1 := &proposal{ctx: ctx1, shardID: 1, data: []byte("a"), resultCh: make(chan error, 1)}
+	p2 := &proposal{ctx: ctx2, shardID: 1, data: []byte("b"), resultCh: make(chan error, 1)}
+	agg.mu.Lock()
+	agg.currentBatch = append(agg.currentBatch, p1, p2)
+	agg.mu.Unlock()
+
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		agg.flush(flushReasonTime)
+	}()
+	select {
+	case <-flushed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush blocked: a batch with no live caller was proposed on an uncancellable context")
+	}
+
+	select {
+	case <-p.entered:
+		t.Error("a batch whose callers have all gone away must not be proposed")
+	default:
+	}
+
+	for i, pr := range []*proposal{p1, p2} {
+		select {
+		case res := <-pr.resultCh:
+			var flushErr *FlushError
+			if !errors.As(res, &flushErr) {
+				t.Fatalf("proposal %d: result = %T (%v), want *FlushError", i, res, res)
+			}
+			if flushErr.Indeterminate {
+				t.Errorf("proposal %d: a batch that was never proposed is a definite failure", i)
+			}
+		default:
+			t.Errorf("proposal %d: no result delivered", i)
+		}
+	}
+
+	// Close must still return: the flush goroutine was never wedged.
+	closed := make(chan error, 1)
+	go func() { closed <- agg.Close() }()
+	select {
+	case closeErr := <-closed:
+		if closeErr != nil {
+			t.Fatalf("Close: %v", closeErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung on wg.Wait behind a wedged flush goroutine")
+	}
+}
+
+// TestFlush_DeadlinelessCallerContextIsBounded pins the other half of the fix.
+// A caller that submits with a context carrying no deadline (context.Background
+// is the common case) must not be able to park the single flush goroutine
+// indefinitely: the aggregator supplies ProposeTimeout as the ceiling.
+func TestFlush_DeadlinelessCallerContextIsBounded(t *testing.T) {
+	p := &ctxBoundProposer{entered: make(chan struct{})}
+	agg, err := NewAggregator(p,
+		WithConfig(Config{
+			MaxBatchSize:   1,
+			FlushInterval:  5 * time.Millisecond,
+			QueueSize:      10,
+			ProposeTimeout: 100 * time.Millisecond,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	defer func() { _ = agg.Close() }()
+
+	done := make(chan error, 1)
+	go func() { done <- agg.Submit(context.Background(), 1, []byte("write")) }()
+
+	select {
+	case submitErr := <-done:
+		if !errors.Is(submitErr, context.DeadlineExceeded) {
+			t.Fatalf("Submit error = %v, want context.DeadlineExceeded", submitErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a deadline-less caller context left the propose unbounded")
+	}
+}

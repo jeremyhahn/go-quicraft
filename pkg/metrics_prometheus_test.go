@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -22,11 +23,21 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// newPerShardTestCollector builds a collector with PerShardMetrics enabled.
+// Most of the assertions in this file predate the cardinality switch and read
+// per-shard child series by shard_id, which only exist in that mode; the
+// default (aggregated) mode has its own tests further down.
+func newPerShardTestCollector() *PrometheusMetricsCollector {
+	return NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: true})
+}
 
 // gatherMetric gathers a single metric family by name from the registry.
 func gatherMetric(t *testing.T, reg *prometheus.Registry, name string) *dto.MetricFamily {
@@ -241,7 +252,7 @@ func TestNewPrometheusMetricsCollector_RegistryNotNil(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveProposalLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveProposalLatency(42, 5*time.Millisecond)
 	c.ObserveProposalLatency(42, 15*time.Millisecond)
 
@@ -259,7 +270,7 @@ func TestPrometheusMetricsCollector_ObserveProposalLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveProposalLatency_MultipleShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveProposalLatency(1, time.Millisecond)
 	c.ObserveProposalLatency(2, 2*time.Millisecond)
 	c.ObserveProposalLatency(2, 3*time.Millisecond)
@@ -278,7 +289,7 @@ func TestPrometheusMetricsCollector_ObserveProposalLatency_MultipleShard(t *test
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveCommitLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCommitLatency(10, 50*time.Millisecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_commit_latency_seconds")
@@ -293,7 +304,7 @@ func TestPrometheusMetricsCollector_ObserveCommitLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveCommitLatency_ZeroDuration(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCommitLatency(1, 0)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_commit_latency_seconds")
@@ -307,7 +318,7 @@ func TestPrometheusMetricsCollector_ObserveCommitLatency_ZeroDuration(t *testing
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveApplyLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveApplyLatency(7, 100*time.Microsecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_apply_latency_seconds")
@@ -317,7 +328,7 @@ func TestPrometheusMetricsCollector_ObserveApplyLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveApplyLatency_LargeShardID(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveApplyLatency(18446744073709551615, time.Second)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_apply_latency_seconds")
@@ -331,7 +342,7 @@ func TestPrometheusMetricsCollector_ObserveApplyLatency_LargeShardID(t *testing.
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveReadIndexLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveReadIndexLatency(42, 5*time.Millisecond)
 	c.ObserveReadIndexLatency(42, 15*time.Millisecond)
 
@@ -349,7 +360,7 @@ func TestPrometheusMetricsCollector_ObserveReadIndexLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveReadIndexLatency_MultipleShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveReadIndexLatency(1, time.Millisecond)
 	c.ObserveReadIndexLatency(2, 2*time.Millisecond)
 	c.ObserveReadIndexLatency(2, 3*time.Millisecond)
@@ -364,7 +375,7 @@ func TestPrometheusMetricsCollector_ObserveReadIndexLatency_MultipleShard(t *tes
 }
 
 func TestPrometheusMetricsCollector_ObserveReadIndexLatency_ZeroDuration(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveReadIndexLatency(1, 0)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_read_index_latency_seconds")
@@ -374,7 +385,7 @@ func TestPrometheusMetricsCollector_ObserveReadIndexLatency_ZeroDuration(t *test
 }
 
 func TestPrometheusMetricsCollector_ObserveReadIndexLatency_LargeShardID(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveReadIndexLatency(18446744073709551615, time.Second)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_read_index_latency_seconds")
@@ -388,7 +399,7 @@ func TestPrometheusMetricsCollector_ObserveReadIndexLatency_LargeShardID(t *test
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncProposalDropped(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncProposalDropped(5)
 	c.IncProposalDropped(5)
 	c.IncProposalDropped(5)
@@ -401,7 +412,7 @@ func TestPrometheusMetricsCollector_IncProposalDropped(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncProposalDropped_MultipleShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncProposalDropped(1)
 	c.IncProposalDropped(2)
 	c.IncProposalDropped(2)
@@ -420,7 +431,7 @@ func TestPrometheusMetricsCollector_IncProposalDropped_MultipleShard(t *testing.
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveProposalBatchSize(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveProposalBatchSize(3, 16)
 	c.ObserveProposalBatchSize(3, 32)
 
@@ -436,7 +447,7 @@ func TestPrometheusMetricsCollector_ObserveProposalBatchSize(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveProposalBatchSize_Zero(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveProposalBatchSize(1, 0)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_batch_size")
@@ -450,7 +461,7 @@ func TestPrometheusMetricsCollector_ObserveProposalBatchSize_Zero(t *testing.T) 
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveCommitBatchSize(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCommitBatchSize(100)
 	c.ObserveCommitBatchSize(200)
 
@@ -465,7 +476,7 @@ func TestPrometheusMetricsCollector_ObserveCommitBatchSize(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveCommitBatchSize_Single(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCommitBatchSize(1)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_commit_batch_size")
@@ -479,7 +490,7 @@ func TestPrometheusMetricsCollector_ObserveCommitBatchSize_Single(t *testing.T) 
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncElection(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncElection(99)
 	c.IncElection(99)
 
@@ -490,7 +501,7 @@ func TestPrometheusMetricsCollector_IncElection(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncElection_MultipleShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncElection(1)
 	c.IncElection(2)
 
@@ -508,7 +519,7 @@ func TestPrometheusMetricsCollector_IncElection_MultipleShard(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncSnapshot(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshot(50)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_snapshots_total")
@@ -518,7 +529,7 @@ func TestPrometheusMetricsCollector_IncSnapshot(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncSnapshot_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	for i := range 5 {
 		c.IncSnapshot(uint64(i))
 	}
@@ -537,7 +548,7 @@ func TestPrometheusMetricsCollector_IncSnapshot_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncPiggybackCommit(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncPiggybackCommit(60)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_piggyback_commits_total")
@@ -547,7 +558,7 @@ func TestPrometheusMetricsCollector_IncPiggybackCommit(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncPiggybackCommit_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	for range 3 {
 		c.IncPiggybackCommit(10)
 	}
@@ -563,7 +574,7 @@ func TestPrometheusMetricsCollector_IncPiggybackCommit_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveWriteLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveWriteLatency(2 * time.Millisecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_write_latency_seconds")
@@ -577,7 +588,7 @@ func TestPrometheusMetricsCollector_ObserveWriteLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveWriteLatency_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveWriteLatency(time.Millisecond)
 	c.ObserveWriteLatency(3 * time.Millisecond)
 	c.ObserveWriteLatency(5 * time.Millisecond)
@@ -593,7 +604,7 @@ func TestPrometheusMetricsCollector_ObserveWriteLatency_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveFsyncLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveFsyncLatency(10 * time.Millisecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_fsync_latency_seconds")
@@ -603,7 +614,7 @@ func TestPrometheusMetricsCollector_ObserveFsyncLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveFsyncLatency_SubMicrosecond(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveFsyncLatency(500 * time.Nanosecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_fsync_latency_seconds")
@@ -617,7 +628,7 @@ func TestPrometheusMetricsCollector_ObserveFsyncLatency_SubMicrosecond(t *testin
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveCompactionLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCompactionLatency(500 * time.Millisecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_compaction_latency_seconds")
@@ -627,7 +638,7 @@ func TestPrometheusMetricsCollector_ObserveCompactionLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveCompactionLatency_Large(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveCompactionLatency(30 * time.Second)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_compaction_latency_seconds")
@@ -642,7 +653,7 @@ func TestPrometheusMetricsCollector_ObserveCompactionLatency_Large(t *testing.T)
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncWriteBytes(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncWriteBytes(4096)
 	c.IncWriteBytes(8192)
 
@@ -654,7 +665,7 @@ func TestPrometheusMetricsCollector_IncWriteBytes(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncWriteBytes_Zero(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncWriteBytes(0)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_write_bytes_total")
@@ -669,7 +680,7 @@ func TestPrometheusMetricsCollector_IncWriteBytes_Zero(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ObserveSendLatency(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.ObserveSendLatency(250 * time.Microsecond)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_transport_send_latency_seconds")
@@ -679,7 +690,7 @@ func TestPrometheusMetricsCollector_ObserveSendLatency(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ObserveSendLatency_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	for range 10 {
 		c.ObserveSendLatency(time.Millisecond)
 	}
@@ -695,7 +706,7 @@ func TestPrometheusMetricsCollector_ObserveSendLatency_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncMessagesSent(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.EnablePerMessageMetrics = true // Enable detailed per-message metrics
 	c.IncMessagesSent(1, 2, 3)
 	c.IncMessagesSent(1, 2, 3)
@@ -715,7 +726,7 @@ func TestPrometheusMetricsCollector_IncMessagesSent(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncMessagesSent_DifferentLabels(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.EnablePerMessageMetrics = true // Enable detailed per-message metrics
 	c.IncMessagesSent(1, 2, 3)
 	c.IncMessagesSent(1, 3, 3) // different target
@@ -745,7 +756,7 @@ func TestPrometheusMetricsCollector_IncMessagesSent_DifferentLabels(t *testing.T
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncMessagesReceived(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.EnablePerMessageMetrics = true // Enable detailed per-message metrics
 	c.IncMessagesReceived(10, 20, 5)
 
@@ -764,7 +775,7 @@ func TestPrometheusMetricsCollector_IncMessagesReceived(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncMessagesReceived_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.EnablePerMessageMetrics = true // Enable detailed per-message metrics
 	for range 7 {
 		c.IncMessagesReceived(1, 2, 0)
@@ -789,7 +800,7 @@ func TestPrometheusMetricsCollector_IncMessagesReceived_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncSnapshotsSent(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshotsSent(1, 1048576, 5*time.Second)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_sent_total")
@@ -809,7 +820,7 @@ func TestPrometheusMetricsCollector_IncSnapshotsSent(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncSnapshotsSent_Multiple(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshotsSent(1, 1024, time.Second)
 	c.IncSnapshotsSent(1, 2048, 2*time.Second)
 
@@ -830,7 +841,7 @@ func TestPrometheusMetricsCollector_IncSnapshotsSent_Multiple(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncSnapshotsReceived(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshotsReceived(2, 2097152, 10*time.Second)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_received_total")
@@ -845,7 +856,7 @@ func TestPrometheusMetricsCollector_IncSnapshotsReceived(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_IncSnapshotsReceived_MultipleShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshotsReceived(1, 512, time.Second)
 	c.IncSnapshotsReceived(2, 1024, time.Second)
 
@@ -863,7 +874,7 @@ func TestPrometheusMetricsCollector_IncSnapshotsReceived_MultipleShard(t *testin
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_LatencyBuckets(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	// Observe 1ms - should land in the 0.001 bucket.
 	c.ObserveProposalLatency(1, time.Millisecond)
 
@@ -884,7 +895,7 @@ func TestPrometheusMetricsCollector_LatencyBuckets(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_BatchSizeBuckets(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	// Observe batch size of 8 - should land in bucket 8.
 	c.ObserveCommitBatchSize(8)
 
@@ -906,7 +917,7 @@ func TestPrometheusMetricsCollector_BatchSizeBuckets(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_ConcurrentAccess(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const goroutines = 100
 	const iterations = 100
 
@@ -952,7 +963,7 @@ func TestPrometheusMetricsCollector_ConcurrentAccess(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_ConcurrentGather(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const goroutines = 50
 
 	var wg sync.WaitGroup
@@ -986,8 +997,8 @@ func TestPrometheusMetricsCollector_ConcurrentGather(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_RegistryIsolation(t *testing.T) {
-	c1 := NewPrometheusMetricsCollector()
-	c2 := NewPrometheusMetricsCollector()
+	c1 := newPerShardTestCollector()
+	c2 := newPerShardTestCollector()
 
 	c1.IncElection(1)
 	c1.IncElection(1)
@@ -1007,7 +1018,7 @@ func TestPrometheusMetricsCollector_RegistryIsolation(t *testing.T) {
 
 func TestPrometheusMetricsCollector_RegistryIsolation_NoGlobalPollution(t *testing.T) {
 	// Creating a collector should NOT register anything in the default registry.
-	_ = NewPrometheusMetricsCollector()
+	_ = newPerShardTestCollector()
 
 	families, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
@@ -1034,7 +1045,7 @@ func BenchmarkNoOpMetricsCollector_IncElection(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_IncElection(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	b.ResetTimer()
 	for b.Loop() {
 		c.IncElection(1)
@@ -1042,7 +1053,7 @@ func BenchmarkPrometheusMetricsCollector_IncElection(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_IncElection_PreBound(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.RegisterShard(1)
 	b.ResetTimer()
 	for b.Loop() {
@@ -1060,7 +1071,7 @@ func BenchmarkNoOpMetricsCollector_ObserveProposalLatency(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_ObserveProposalLatency(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	d := time.Millisecond
 	b.ResetTimer()
 	for b.Loop() {
@@ -1069,7 +1080,7 @@ func BenchmarkPrometheusMetricsCollector_ObserveProposalLatency(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_ObserveProposalLatency_PreBound(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.RegisterShard(1)
 	d := time.Millisecond
 	b.ResetTimer()
@@ -1079,7 +1090,7 @@ func BenchmarkPrometheusMetricsCollector_ObserveProposalLatency_PreBound(b *test
 }
 
 func BenchmarkPrometheusMetricsCollector_IncMessagesSent(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	b.ResetTimer()
 	for b.Loop() {
 		c.IncMessagesSent(1, 2, 3)
@@ -1087,7 +1098,7 @@ func BenchmarkPrometheusMetricsCollector_IncMessagesSent(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_ObserveReadIndexLatency(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	d := time.Millisecond
 	b.ResetTimer()
 	for b.Loop() {
@@ -1096,7 +1107,7 @@ func BenchmarkPrometheusMetricsCollector_ObserveReadIndexLatency(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_ObserveWriteLatency(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	d := time.Millisecond
 	b.ResetTimer()
 	for b.Loop() {
@@ -1105,7 +1116,7 @@ func BenchmarkPrometheusMetricsCollector_ObserveWriteLatency(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_AllRaftMetrics(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	d := time.Millisecond
 	b.ResetTimer()
 	for b.Loop() {
@@ -1122,7 +1133,7 @@ func BenchmarkPrometheusMetricsCollector_AllRaftMetrics(b *testing.B) {
 }
 
 func BenchmarkPrometheusMetricsCollector_AllRaftMetrics_PreBound(b *testing.B) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.RegisterShard(1)
 	d := time.Millisecond
 	b.ResetTimer()
@@ -1144,7 +1155,7 @@ func BenchmarkPrometheusMetricsCollector_AllRaftMetrics_PreBound(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_RegisterShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.RegisterShard(42)
 
 	// After registration, metrics should use pre-bound metric references.
@@ -1160,7 +1171,7 @@ func TestPrometheusMetricsCollector_RegisterShard(t *testing.T) {
 }
 
 func TestPrometheusMetricsCollector_RegisterShard_MultipleTimes(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 
 	// Registering the same shard multiple times should not panic and
 	// should overwrite the previous registration.
@@ -1182,7 +1193,7 @@ func TestPrometheusMetricsCollector_RegisterShard_MultipleTimes(t *testing.T) {
 // would resurrect the series permanently and reinstate the cardinality leak
 // UnregisterShard exists to close.
 func TestPrometheusMetricsCollector_UnregisterShard(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.RegisterShard(99)
 	c.ObserveProposalLatency(99, time.Millisecond)
 	if !shardSeriesExists(t, c.Registry, "quicraft_raft_proposal_latency_seconds", "99") {
@@ -1230,7 +1241,7 @@ func TestPrometheusMetricsCollector_UnregisterShard(t *testing.T) {
 // tombstoned. An embedder that never calls RegisterShard must still be
 // metered through the fallback rather than silently unmetered.
 func TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 
 	c.ObserveProposalLatency(7, time.Millisecond)
 
@@ -1241,14 +1252,14 @@ func TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords(t *testing.
 }
 
 func TestPrometheusMetricsCollector_UnregisterShard_NeverRegistered(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	// Unregistering a never-registered shard should not panic.
 	c.UnregisterShard(123)
 	c.UnregisterShard(456)
 }
 
 func TestPrometheusMetricsCollector_RegisterUnregisterCycle(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 
 	// Full lifecycle: register, use, unregister, re-register. UnregisterShard
 	// DELETES the per-shard series (bounding Prometheus cardinality under shard
@@ -1272,7 +1283,7 @@ func TestPrometheusMetricsCollector_RegisterUnregisterCycle(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewSampledMetricsCollector(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 10)
 
 	if s == nil {
@@ -1287,7 +1298,7 @@ func TestNewSampledMetricsCollector(t *testing.T) {
 }
 
 func TestNewSampledMetricsCollector_ZeroRate(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 0)
 
 	// Zero rate should default to 100.
@@ -1303,7 +1314,7 @@ func TestSampledMetricsCollector_ImplementsMetricsCollector(t *testing.T) {
 }
 
 func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 10) // 1 in 10
 
 	// Record 100 observations; only 10 should be recorded.
@@ -1319,7 +1330,7 @@ func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
 }
 
 func TestSampledMetricsCollector_ObserveApplyLatency_Sampling(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 5) // 1 in 5
 
 	// Record 50 observations; only 10 should be recorded.
@@ -1339,7 +1350,7 @@ func TestSampledMetricsCollector_ObserveApplyLatency_Sampling(t *testing.T) {
 // prometheus.Counter.Inc() makes *_total under-report by SampleRate, so
 // every rate()/increase() built on it is off by orders of magnitude.
 func TestSampledMetricsCollector_IncMessagesSent_Unsampled(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 20)
 
 	// Record 100 messages; ALL 100 must be recorded (counters are exact).
@@ -1357,7 +1368,7 @@ func TestSampledMetricsCollector_IncMessagesSent_Unsampled(t *testing.T) {
 // TestSampledMetricsCollector_IncMessagesReceived_Unsampled is the L11
 // regression test for the receive counter; see IncMessagesSent_Unsampled.
 func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 25)
 
 	// Record 100 messages; ALL 100 must be recorded (counters are exact).
@@ -1380,7 +1391,7 @@ func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
 // counters guarantee each metric records 1 in SampleRate of its own
 // observations regardless of interleaving.
 func TestSampledMetricsCollector_InterleavedSamplingIndependent(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 2) // 1 in 2
 
 	for range 10 {
@@ -1400,7 +1411,7 @@ func TestSampledMetricsCollector_InterleavedSamplingIndependent(t *testing.T) {
 }
 
 func TestSampledMetricsCollector_PassThroughMethods(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 1000)
 
 	// Non-sampled methods should always pass through.
@@ -1425,7 +1436,7 @@ func TestSampledMetricsCollector_PassThroughMethods(t *testing.T) {
 }
 
 func TestSampledMetricsCollector_ConcurrentSampling(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 100)
 
 	const goroutines = 10
@@ -1462,7 +1473,7 @@ func TestSampledMetricsCollector_ConcurrentSampling(t *testing.T) {
 }
 
 func TestSampledMetricsCollector_SampleRateOne(t *testing.T) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 1) // Every observation
 
 	for range 10 {
@@ -1477,7 +1488,7 @@ func TestSampledMetricsCollector_SampleRateOne(t *testing.T) {
 }
 
 func BenchmarkSampledMetricsCollector_ObserveCommitLatency(b *testing.B) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 100)
 	d := time.Millisecond
 	b.ResetTimer()
@@ -1487,7 +1498,7 @@ func BenchmarkSampledMetricsCollector_ObserveCommitLatency(b *testing.B) {
 }
 
 func BenchmarkSampledMetricsCollector_IncMessagesSent(b *testing.B) {
-	inner := NewPrometheusMetricsCollector()
+	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 100)
 	b.ResetTimer()
 	for b.Loop() {
@@ -1523,24 +1534,53 @@ func shardSeriesExists(t *testing.T, reg *prometheus.Registry, name, shardID str
 // regression test: the security drop counter must not key on the attacker
 // controlled "from" replica id, or it accumulates unbounded child series.
 func TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const shard = uint64(7)
 	for from := uint64(1); from <= 500; from++ {
-		c.IncUnauthorizedMessageDropped(shard, from)
+		c.IncUnauthorizedMessageDropped(shard, from, dropUnknownMember)
 		c.IncUnauthorizedSnapshotDropped(shard, from)
 	}
 
-	for _, name := range []string{
-		"quicraft_security_unauthorized_messages_dropped_total",
-		"quicraft_security_unauthorized_snapshots_dropped_total",
-	} {
-		mf := gatherMetric(t, c.Registry, name)
-		if got := len(mf.GetMetric()); got != 1 {
-			t.Fatalf("%s has %d series, want 1 (the attacker-controlled 'from' must not be a label)", name, got)
-		}
-		if v := counterValue(t, mf, map[string]string{"shard_id": "7"}); v != 500 {
-			t.Fatalf("%s shard 7 counter = %v, want 500", name, v)
-		}
+	// One series per (shard, reason) — the reason is a closed set the handler
+	// picks, so it adds a fixed, small number of series. The "from" is not a
+	// label on either counter.
+	mf := gatherMetric(t, c.Registry, "quicraft_security_unauthorized_messages_dropped_total")
+	if got := len(mf.GetMetric()); got != 1 {
+		t.Fatalf("unauthorized_messages_dropped_total has %d series, want 1 "+
+			"(the attacker-controlled 'from' must not be a label)", got)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "7", "reason": dropUnknownMember}); v != 500 {
+		t.Fatalf("unauthorized_messages_dropped_total shard 7 counter = %v, want 500", v)
+	}
+
+	mf = gatherMetric(t, c.Registry, "quicraft_security_unauthorized_snapshots_dropped_total")
+	if got := len(mf.GetMetric()); got != 1 {
+		t.Fatalf("unauthorized_snapshots_dropped_total has %d series, want 1", got)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "7"}); v != 500 {
+		t.Fatalf("unauthorized_snapshots_dropped_total shard 7 counter = %v, want 500", v)
+	}
+}
+
+// TestPrometheus_UnauthorizedMessageMetric_ReasonsAreSeparateSeries pins the
+// operational split. "unknown_member" is the benign config-change window and
+// "address_mismatch" is a sender the configuration names arriving behind the
+// wrong certificate; an operator alerting on the second must not have the first
+// summed into it.
+func TestPrometheus_UnauthorizedMessageMetric_ReasonsAreSeparateSeries(t *testing.T) {
+	c := newPerShardTestCollector()
+	const shard = uint64(3)
+	c.IncUnauthorizedMessageDropped(shard, 2, dropUnknownMember)
+	c.IncUnauthorizedMessageDropped(shard, 2, dropUnknownMember)
+	c.IncUnauthorizedMessageDropped(shard, 9, dropAddressMismatch)
+
+	mf := gatherMetric(t, c.Registry, "quicraft_security_unauthorized_messages_dropped_total")
+	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": dropUnknownMember}); v != 2 {
+		t.Fatalf("unknown_member counter = %v, want 2", v)
+	}
+	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": dropAddressMismatch}); v != 1 {
+		t.Fatalf("address_mismatch counter = %v, want 1: a forged From is being summed "+
+			"into the benign config-change window", v)
 	}
 }
 
@@ -1548,7 +1588,7 @@ func TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality(t *testing.T) {
 // UnregisterShard must delete the underlying per-shard Prometheus child series,
 // not just the local cache entry, so shard churn does not leak series forever.
 func TestPrometheus_UnregisterShard_DeletesSeries(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const shard = uint64(42)
 	const name = "quicraft_raft_elections_total"
 
@@ -1568,7 +1608,7 @@ func TestPrometheus_UnregisterShard_DeletesSeries(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrometheusMetricsCollector_IncSnapshotsRejected(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	c.IncSnapshotsRejected(1, "malformed")
 	c.IncSnapshotsRejected(1, "malformed")
 	c.IncSnapshotsRejected(1, "liveness")
@@ -1591,7 +1631,7 @@ func TestPrometheusMetricsCollector_IncSnapshotsRejected(t *testing.T) {
 // the drop counter keys on shard and reason only: the target replica id must
 // not multiply the series count by the shard's membership size.
 func TestPrometheusMetricsCollector_IncMessagesDropped_BoundedCardinality(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const shard = uint64(3)
 	for to := uint64(1); to <= 100; to++ {
 		c.IncMessagesDropped(shard, to, "queue_full")
@@ -1611,7 +1651,7 @@ func TestPrometheusMetricsCollector_IncMessagesDropped_BoundedCardinality(t *tes
 // DeleteLabelValues (which addresses one full label set), so a missed
 // DeletePartialMatch would leak one series per reason per stopped shard.
 func TestPrometheus_UnregisterShard_DeletesDropSeries(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
+	c := newPerShardTestCollector()
 	const shard = uint64(11)
 
 	c.RegisterShard(shard)
@@ -1651,5 +1691,264 @@ func TestPrometheus_UnregisterShard_DeletesDropSeries(t *testing.T) {
 		if shardSeriesExists(t, c.Registry, name, "11") {
 			t.Fatalf("%s series re-created by a post-unregister sample", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics cardinality: MetricsConfig.PerShardMetrics
+// ---------------------------------------------------------------------------
+
+// aggregatableFamilies are the metric families whose shard_id label the
+// aggregated mode removes.
+var aggregatableFamilies = []string{
+	"quicraft_raft_proposal_latency_seconds",
+	"quicraft_raft_commit_latency_seconds",
+	"quicraft_raft_apply_latency_seconds",
+	"quicraft_raft_read_index_latency_seconds",
+	"quicraft_raft_proposal_batch_size",
+	"quicraft_raft_snapshots_total",
+	"quicraft_raft_piggyback_commits_total",
+	"quicraft_transport_snapshots_sent_total",
+	"quicraft_transport_snapshots_sent_bytes",
+	"quicraft_transport_snapshots_received_total",
+	"quicraft_transport_snapshots_received_bytes",
+}
+
+// alertableFamilies keep a shard_id label in BOTH modes: an operator pages on
+// them and the shard is the only thing that makes the page actionable.
+var alertableFamilies = []string{
+	"quicraft_raft_elections_total",
+	"quicraft_raft_proposals_dropped_total",
+	"quicraft_transport_messages_dropped_total",
+	"quicraft_transport_snapshots_rejected_total",
+	"quicraft_security_unauthorized_messages_dropped_total",
+	"quicraft_security_unauthorized_snapshots_dropped_total",
+}
+
+// exerciseAllShardMetrics drives every shard-scoped metric method once.
+func exerciseAllShardMetrics(c *PrometheusMetricsCollector, shardID uint64) {
+	c.ObserveProposalLatency(shardID, time.Millisecond)
+	c.ObserveCommitLatency(shardID, time.Millisecond)
+	c.ObserveApplyLatency(shardID, time.Millisecond)
+	c.ObserveReadIndexLatency(shardID, time.Millisecond)
+	c.ObserveProposalBatchSize(shardID, 4)
+	c.IncProposalDropped(shardID)
+	c.IncElection(shardID)
+	c.IncSnapshot(shardID)
+	c.IncPiggybackCommit(shardID)
+	c.IncSnapshotsSent(shardID, 1024, time.Second)
+	c.IncSnapshotsReceived(shardID, 2048, time.Second)
+	c.IncSnapshotsRejected(shardID, "policy")
+	c.IncMessagesDropped(shardID, 2, "queue_full")
+	c.IncUnauthorizedMessageDropped(shardID, 2, "misrouted")
+	c.IncUnauthorizedSnapshotDropped(shardID, 2)
+}
+
+// labelNames returns the sorted label names carried by a family's first child.
+func labelNames(mf *dto.MetricFamily) []string {
+	metrics := mf.GetMetric()
+	if len(metrics) == 0 {
+		return nil
+	}
+	var names []string
+	for _, lp := range metrics[0].GetLabel() {
+		names = append(names, lp.GetName())
+	}
+	sort.Strings(names)
+	return names
+}
+
+func hasLabel(mf *dto.MetricFamily, name string) bool {
+	for _, n := range labelNames(mf) {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPrometheusMetrics_DefaultIsAggregated pins the DEFAULT down: the
+// zero-value config must collapse the volume-and-latency telemetry to one
+// host-level series with no shard_id, and samples from different shards must
+// land in that single series rather than in one series each.
+func TestPrometheusMetrics_DefaultIsAggregated(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	c.RegisterShard(1)
+	c.RegisterShard(2)
+	exerciseAllShardMetrics(c, 1)
+	exerciseAllShardMetrics(c, 2)
+
+	for _, name := range aggregatableFamilies {
+		mf := gatherMetric(t, c.Registry, name)
+		if got := len(mf.GetMetric()); got != 1 {
+			t.Errorf("%s: got %d series across 2 shards, want 1 aggregated series", name, got)
+		}
+		if hasLabel(mf, "shard_id") {
+			t.Errorf("%s: carries a shard_id label in the aggregated default (labels=%v)",
+				name, labelNames(mf))
+		}
+	}
+
+	// Both shards' samples must be present in the single series.
+	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
+	if got := histogramCount(t, mf, nil); got != 2 {
+		t.Errorf("aggregated proposal latency count = %d, want 2 (one per shard)", got)
+	}
+	snaps := gatherMetric(t, c.Registry, "quicraft_raft_snapshots_total")
+	if got := counterValue(t, snaps, nil); got != 2 {
+		t.Errorf("aggregated snapshots_total = %v, want 2 (one per shard)", got)
+	}
+}
+
+// TestPrometheusMetrics_AlertableSeriesKeepShardID checks that turning the
+// cardinality switch off does not cost an alert: every page-worthy signal
+// still identifies its shard.
+func TestPrometheusMetrics_AlertableSeriesKeepShardID(t *testing.T) {
+	for _, perShard := range []bool{false, true} {
+		c := NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: perShard})
+		c.RegisterShard(7)
+		exerciseAllShardMetrics(c, 7)
+
+		for _, name := range alertableFamilies {
+			mf := gatherMetric(t, c.Registry, name)
+			if !hasLabel(mf, "shard_id") {
+				t.Errorf("PerShardMetrics=%v: %s lost its shard_id label (labels=%v)",
+					perShard, name, labelNames(mf))
+			}
+		}
+	}
+}
+
+// TestPrometheusMetrics_PerShardModeSplitsByShard is the counterpart to
+// TestPrometheusMetrics_DefaultIsAggregated: opting in must actually restore
+// the per-shard breakdown rather than being silently ignored.
+func TestPrometheusMetrics_PerShardModeSplitsByShard(t *testing.T) {
+	c := newPerShardTestCollector()
+	c.RegisterShard(1)
+	c.RegisterShard(2)
+	exerciseAllShardMetrics(c, 1)
+	exerciseAllShardMetrics(c, 2)
+
+	for _, name := range aggregatableFamilies {
+		mf := gatherMetric(t, c.Registry, name)
+		if !hasLabel(mf, "shard_id") {
+			t.Errorf("PerShardMetrics=true: %s has no shard_id label", name)
+		}
+		if got := len(mf.GetMetric()); got != 2 {
+			t.Errorf("PerShardMetrics=true: %s has %d series, want 2 (one per shard)", name, got)
+		}
+	}
+}
+
+// TestPrometheusMetrics_PerShardEnabledGauge checks the mode is discoverable
+// from the scrape itself, so a dashboard does not have to read the host config
+// to know whether shard_id will be present.
+func TestPrometheusMetrics_PerShardEnabledGauge(t *testing.T) {
+	for _, tc := range []struct {
+		perShard bool
+		want     float64
+	}{{false, 0}, {true, 1}} {
+		c := NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: tc.perShard})
+		mf := gatherMetric(t, c.Registry, "quicraft_metrics_per_shard_enabled")
+		metrics := mf.GetMetric()
+		if len(metrics) != 1 {
+			t.Fatalf("PerShardMetrics=%v: got %d gauge series, want 1", tc.perShard, len(metrics))
+		}
+		if got := metrics[0].GetGauge().GetValue(); got != tc.want {
+			t.Errorf("PerShardMetrics=%v: gauge = %v, want %v", tc.perShard, got, tc.want)
+		}
+	}
+}
+
+// TestPrometheusMetrics_AggregatedFallbackNeverPanics drives every metric
+// method for a shard that was never registered while aggregation is on. That
+// path has no pre-bound entry, so it reaches the fallback, where the per-shard
+// vectors do not exist. Without a mode-aware fallback this is a nil-pointer
+// dereference on the first observation.
+func TestPrometheusMetrics_AggregatedFallbackNeverPanics(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	exerciseAllShardMetrics(c, 99999) // never registered
+
+	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
+	if got := histogramCount(t, mf, nil); got != 1 {
+		t.Errorf("fallback sample not recorded: count = %d, want 1", got)
+	}
+}
+
+// TestPrometheusMetrics_UnregisterShardKeepsHostAggregates guards the
+// invariant that stopping one shard must not reset telemetry describing all
+// the others. In aggregated mode the host-level series outlive every shard.
+func TestPrometheusMetrics_UnregisterShardKeepsHostAggregates(t *testing.T) {
+	c := NewPrometheusMetricsCollector()
+	c.RegisterShard(1)
+	c.RegisterShard(2)
+	exerciseAllShardMetrics(c, 1)
+	exerciseAllShardMetrics(c, 2)
+
+	c.UnregisterShard(1)
+
+	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
+	if got := histogramCount(t, mf, nil); got != 2 {
+		t.Errorf("host aggregate lost samples after UnregisterShard: count = %d, want 2", got)
+	}
+	snaps := gatherMetric(t, c.Registry, "quicraft_raft_snapshots_total")
+	if got := counterValue(t, snaps, nil); got != 2 {
+		t.Errorf("host aggregate counter reset by UnregisterShard: got %v, want 2", got)
+	}
+
+	// The still-running shard keeps its own alertable series.
+	elections := gatherMetric(t, c.Registry, "quicraft_raft_elections_total")
+	if got := counterValue(t, elections, map[string]string{"shard_id": "2"}); got != 1 {
+		t.Errorf("surviving shard elections_total = %v, want 1", got)
+	}
+}
+
+// TestPrometheusMetrics_AggregatedModeSeriesBudget is the reason the switch
+// exists. It counts the series a single registered shard adds and asserts the
+// aggregated mode keeps that number flat as shards are added, while the
+// per-shard mode grows it by roughly a hundred per shard.
+func TestPrometheusMetrics_AggregatedModeSeriesBudget(t *testing.T) {
+	countSeries := func(c *PrometheusMetricsCollector) int {
+		families, err := c.Registry.Gather()
+		if err != nil {
+			t.Fatalf("Gather() failed: %v", err)
+		}
+		total := 0
+		for _, mf := range families {
+			for _, m := range mf.GetMetric() {
+				switch {
+				case m.GetHistogram() != nil:
+					// bucket series + _sum + _count
+					total += len(m.GetHistogram().GetBucket()) + 2
+				default:
+					total++
+				}
+			}
+		}
+		return total
+	}
+
+	grow := func(perShard bool, shards int) int {
+		c := NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: perShard})
+		for i := 1; i <= shards; i++ {
+			c.RegisterShard(uint64(i))
+			exerciseAllShardMetrics(c, uint64(i))
+		}
+		return countSeries(c)
+	}
+
+	aggOne, aggTen := grow(false, 1), grow(false, 10)
+	perOne, perTen := grow(true, 1), grow(true, 10)
+
+	aggPerShard := float64(aggTen-aggOne) / 9
+	perPerShard := float64(perTen-perOne) / 9
+	t.Logf("series per additional shard: aggregated=%.1f per-shard=%.1f", aggPerShard, perPerShard)
+
+	if aggPerShard > 15 {
+		t.Errorf("aggregated mode grows %.1f series per shard, want <= 15", aggPerShard)
+	}
+	if perPerShard < 5*aggPerShard {
+		t.Errorf("per-shard mode grows %.1f series per shard vs aggregated %.1f; "+
+			"the switch is not saving cardinality", perPerShard, aggPerShard)
 	}
 }

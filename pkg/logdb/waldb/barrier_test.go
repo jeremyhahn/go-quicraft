@@ -53,7 +53,7 @@ func newTestBarrier(t *testing.T) *seal.Barrier {
 	}
 	t.Cleanup(func() { strategy.Close() })
 
-	barrier := seal.NewBarrier(testBarrierConfig(1))
+	barrier := seal.MustNewBarrier(testBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)
 	}
@@ -914,7 +914,7 @@ func newTestBarrierWithPassphrase(t *testing.T, passphrase string) *seal.Barrier
 	}
 	t.Cleanup(func() { strategy.Close() })
 
-	barrier := seal.NewBarrier(testBarrierConfig(1))
+	barrier := seal.MustNewBarrier(testBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)
 	}
@@ -1237,7 +1237,7 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 	t.Cleanup(func() { strategy.Close() })
 
 	// DefaultBarrierConfig leaves StatePersister nil.
-	barrier := seal.NewBarrier(seal.DefaultBarrierConfig(1))
+	barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)
 	}

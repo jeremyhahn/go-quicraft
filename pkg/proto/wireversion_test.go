@@ -15,7 +15,14 @@
 package proto
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -23,15 +30,379 @@ import (
 // top of the v2 witness-policy fields) and the per-field over-limit
 // sentinels.
 
-// TestWireVersionIsThree pins the current wire version. The v1 and v2
-// layouts have no legacy decode path, so any change here must ship with
+// TestWireVersionIsThree pins the current TRANSPORT wire version. The v1 and
+// v2 layouts have no legacy decode path, so any change here must ship with
 // matching encoder/decoder changes across all consumers.
+//
+// It deliberately does NOT tie WireVersion to membershipFormatVersion: the
+// two namespaces are independent (see the package comment), and asserting
+// equality would re-impose the coupling that made a transport-only bump
+// unreplayable at log index 1.
 func TestWireVersionIsThree(t *testing.T) {
 	if WireVersion != 3 {
 		t.Fatalf("WireVersion = %d, want 3", WireVersion)
 	}
-	if uint64(membershipWireVersion) != WireVersion {
-		t.Fatalf("membershipWireVersion = %d, want %d", membershipWireVersion, WireVersion)
+}
+
+// TestPersistedMembershipVersionPinned pins the persisted Membership format
+// window. These values describe BYTES ALREADY ON DISK in every deployed
+// cluster — the WAL, snapshot records, exported artifacts, and the
+// EntryInitialMembership entry at log index 1.
+//
+// membershipFormatVersion may only be raised together with a new decode case
+// in Membership.UnmarshalFrom, and minSupportedMembershipVersion may only be
+// raised after the migration window that retired the old layout. Neither may
+// track WireVersion. If this test fails, the change under review is a
+// persisted format change and needs a migration story, not a version bump.
+func TestPersistedMembershipVersionPinned(t *testing.T) {
+	if membershipFormatVersion != 4 {
+		t.Fatalf("membershipFormatVersion = %d, want 4", membershipFormatVersion)
+	}
+	if minSupportedMembershipVersion != 3 {
+		t.Fatalf("minSupportedMembershipVersion = %d, want 3", minSupportedMembershipVersion)
+	}
+	if minSupportedMembershipVersion > membershipFormatVersion {
+		t.Fatalf("empty supported window: min %d > current %d",
+			minSupportedMembershipVersion, membershipFormatVersion)
+	}
+}
+
+// TestMembershipVersionNotDerivedFromWireVersion is a source-level guard: it
+// parses membership.go and asserts that neither version constant is defined
+// in terms of WireVersion.
+//
+// A value check cannot catch this — both namespaces are 3 today, so a
+// contributor who "simplifies" the constant back to uint8(WireVersion) leaves
+// every runtime assertion green while re-arming the original defect: the next
+// transport-only WireVersion bump would silently change the version byte
+// expected at log index 1 and leave the cluster unable to replay its own log.
+func TestMembershipVersionNotDerivedFromWireVersion(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "membership.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse membership.go: %v", err)
+	}
+	// membershipV3 is guarded too: the constants above are defined in terms
+	// of it, so re-deriving IT from WireVersion would reintroduce the
+	// coupling one level down.
+	guarded := map[string]bool{
+		"membershipV3":                  false,
+		"membershipFormatVersion":       false,
+		"minSupportedMembershipVersion": false,
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range spec.Names {
+			if _, watched := guarded[name.Name]; !watched {
+				continue
+			}
+			guarded[name.Name] = true
+			if i >= len(spec.Values) {
+				continue
+			}
+			ast.Inspect(spec.Values[i], func(v ast.Node) bool {
+				id, ok := v.(*ast.Ident)
+				if ok && id.Name == "WireVersion" {
+					t.Errorf("%s is defined in terms of WireVersion; the persisted "+
+						"Membership format version must stay independent of the "+
+						"transport wire version", name.Name)
+				}
+				return true
+			})
+		}
+		return true
+	})
+	for name, seen := range guarded {
+		if !seen {
+			t.Fatalf("constant %s not found in membership.go; update this guard", name)
+		}
+	}
+}
+
+// TestMembershipVersionWindow exercises the accept-a-range decode gate: the
+// current version decodes, anything below the floor or above the current
+// version is refused with the typed error, and the message names both the
+// version found and the supported range.
+func TestMembershipVersionWindow(t *testing.T) {
+	m := Membership{
+		ConfigChangeID:             9,
+		MaxWitnesses:               2,
+		RequireFullReplicaMajority: true,
+		Addresses:                  map[uint64]string{1: "n1:9000"},
+	}
+	buf := make([]byte, m.Size())
+	if _, err := m.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+
+	// Every version in the supported window decodes. Degenerate today
+	// (3..3); the loop is what a future v4 extends.
+	for v := minSupportedMembershipVersion; v <= membershipFormatVersion; v++ {
+		probe := append([]byte{}, buf...)
+		probe[0] = v
+		var got Membership
+		if _, err := got.UnmarshalFrom(probe); err != nil {
+			t.Fatalf("UnmarshalFrom(version %d): unexpected error %v", v, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		version uint8
+	}{
+		{"below floor", minSupportedMembershipVersion - 1},
+		{"zero", 0},
+		{"above current", membershipFormatVersion + 1},
+		{"max", 0xFF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := append([]byte{}, buf...)
+			probe[0] = tc.version
+			var got Membership
+			_, err := got.UnmarshalFrom(probe)
+			if !errors.Is(err, ErrUnsupportedVersion) {
+				t.Fatalf("UnmarshalFrom(version %d): got %v, want ErrUnsupportedVersion",
+					tc.version, err)
+			}
+			var verr *UnsupportedMembershipVersionError
+			if !errors.As(err, &verr) {
+				t.Fatalf("UnmarshalFrom(version %d): got %T, want *UnsupportedMembershipVersionError",
+					tc.version, err)
+			}
+			if verr.Found != tc.version {
+				t.Fatalf("Found = %d, want %d", verr.Found, tc.version)
+			}
+			// The message must let an operator diagnose the mismatch
+			// without reading the source: found value and window bounds.
+			msg := err.Error()
+			for _, want := range []string{
+				strconv.Itoa(int(tc.version)),
+				strconv.Itoa(int(minSupportedMembershipVersion)),
+				strconv.Itoa(int(membershipFormatVersion)),
+			} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q does not name %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+// membershipGoldenFixedV3 is the fixed region v3 and v4 share, and v4 leaves
+// byte-identical: ConfigChangeID through RequireFullReplicaMajority. v4
+// appends the session policy AFTER it, which is why the shared region and the
+// map region are separate constants — they are no longer adjacent.
+const membershipGoldenFixedV3 = "0807060504030201" + // ConfigChangeID
+	"0200000000000000" + // MaxWitnesses
+	"0100000000000000" // RequireFullReplicaMajority
+
+// membershipGoldenSessionPolicyV4 is what v4 inserts between the v3 fixed
+// fields and the map region: the replicated session policy the apply path
+// reads. The values are goldenMembershipSessionPolicy.
+const membershipGoldenSessionPolicyV4 = "a086010000000000" + // SessionExpiryEntries = 100000
+	"0040000000000000" + // MaxTotalSessions = 16384
+	"8000000000000000" // MaxSessionsPerClient = 128
+
+// membershipGoldenMapsV3V4 is the four-map region v3 and v4 share. It is a
+// single constant so the two goldens below cannot drift apart in the region
+// they are supposed to agree on.
+const membershipGoldenMapsV3V4 = "02000000" + // Addresses count
+	"0100000000000000" + "03000000" + "613a31" + // 1 -> "a:1"
+	"0200000000000000" + "03000000" + "623a32" + // 2 -> "b:2"
+	"01000000" + // Observers count
+	"0300000000000000" + "03000000" + "633a33" + // 3 -> "c:3"
+	"01000000" + // Witnesses count
+	"0400000000000000" + "03000000" + "643a34" + // 4 -> "d:4"
+	"01000000" + // Removed count
+	"0500000000000000" + "0100000000000000" // 5 -> true
+
+// goldenMembershipSessionPolicy is the policy membershipGoldenSessionPolicyV4
+// spells out in bytes. It is v4-only: a v3 section has nowhere to put it.
+func goldenMembershipSessionPolicy() SessionPolicy {
+	return SessionPolicy{
+		ExpiryEntries:        100000,
+		MaxTotalSessions:     16384,
+		MaxSessionsPerClient: 128,
+	}
+}
+
+// goldenMembershipFixture is the membership both goldens describe, minus the
+// v4-only Identities map and session policy.
+func goldenMembershipFixture() Membership {
+	return Membership{
+		ConfigChangeID:             0x0102030405060708,
+		MaxWitnesses:               2,
+		RequireFullReplicaMajority: true,
+		Addresses:                  map[uint64]string{2: "b:2", 1: "a:1"},
+		Observers:                  map[uint64]string{3: "c:3"},
+		Witnesses:                  map[uint64]string{4: "d:4"},
+		Removed:                    map[uint64]bool{5: true},
+	}
+}
+
+// TestMembershipGoldenEncodingV4 asserts the exact bytes a current binary
+// writes. These bytes go into the WAL, into snapshot records and exported
+// artifacts, and into the EntryInitialMembership entry at log index 1, where
+// they outlive the process that wrote them — so an accidental change here is a
+// persisted format change, not a refactor.
+//
+// The v4 layout is the v3 fixed fields, then the session policy, then the four
+// v3 maps, then the Identities map, with the version byte raised. The golden is
+// spelled as those pieces so the claim that v4 preserves the v3 fields and map
+// region is checked by construction rather than asserted in a comment.
+func TestMembershipGoldenEncodingV4(t *testing.T) {
+	m := goldenMembershipFixture()
+	m.SetSessionPolicy(goldenMembershipSessionPolicy())
+	m.Identities = map[uint64]string{1: "spki:aa"}
+
+	const golden = "04" + // version byte
+		membershipGoldenFixedV3 +
+		membershipGoldenSessionPolicyV4 +
+		membershipGoldenMapsV3V4 +
+		"01000000" + // Identities count
+		"0100000000000000" + "07000000" + "73706b693a6161" // 1 -> "spki:aa"
+
+	buf := make([]byte, m.Size())
+	n, err := m.MarshalTo(buf)
+	if err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	if got := hex.EncodeToString(buf[:n]); got != golden {
+		t.Fatalf("encoding changed:\n got %s\nwant %s", got, golden)
+	}
+
+	raw, err := hex.DecodeString(golden)
+	if err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	var got Membership
+	consumed, err := got.UnmarshalFrom(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalFrom(golden): %v", err)
+	}
+	if consumed != len(raw) {
+		t.Fatalf("consumed %d bytes, want %d", consumed, len(raw))
+	}
+	assertMembershipEqual(t, &m, &got)
+	if got.Identities[1] != "spki:aa" {
+		t.Fatalf("Identities lost in round trip: %+v", got.Identities)
+	}
+	if got.MaxWitnesses != m.MaxWitnesses || !got.RequireFullReplicaMajority {
+		t.Fatalf("policy fields lost: %+v", got)
+	}
+	if got.SessionPolicy() != goldenMembershipSessionPolicy() {
+		t.Fatalf("session policy lost in round trip: %+v", got.SessionPolicy())
+	}
+}
+
+// TestMembershipV3GoldenStillDecodes is the compatibility half: the exact
+// bytes a PRE-IDENTITY binary wrote must still decode, because they are
+// already on disk in every deployed cluster — at log index 1, in every
+// snapshot record, and in the WAL membership section. A node that could not
+// read them could not replay its own log.
+//
+// The distinguishing assertions are that Identities comes back EMPTY and the
+// session policy comes back UNSET, not that the decode merely succeeded. Empty
+// identities are what makes the receive-side gate fall back to the
+// committed-address check (or refuse, under RequireMemberIdentity); an unset
+// session policy is what makes the apply path fall back to local configuration
+// for a shard bootstrapped before the policy was replicated. A decoder that
+// left stale values in place would hand a v3 configuration state it never
+// contained — and for the session policy that state drives apply, so the
+// replicas would diverge over bytes that were never on disk.
+//
+// The v3 fixed region is 25 bytes and v4's is 49, so this also pins that the
+// decoder picks its map offset from the VERSION rather than from a single
+// shared constant: reading v3's maps at the v4 offset consumes the first map
+// count as policy and fails, or worse, succeeds on a crafted buffer.
+func TestMembershipV3GoldenStillDecodes(t *testing.T) {
+	const goldenV3 = "03" + membershipGoldenFixedV3 + membershipGoldenMapsV3V4
+
+	raw, err := hex.DecodeString(goldenV3)
+	if err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	// Pre-populate Identities and the session policy so a decoder that forgets
+	// to clear them is caught rather than passing on a zero value that happened
+	// to be zero already.
+	got := Membership{Identities: map[uint64]string{9: "spki:stale"}}
+	got.SetSessionPolicy(SessionPolicy{
+		ExpiryEntries:        777,
+		MaxTotalSessions:     999,
+		MaxSessionsPerClient: 111,
+	})
+	consumed, err := got.UnmarshalFrom(raw)
+	if err != nil {
+		t.Fatalf("UnmarshalFrom(v3 golden): %v", err)
+	}
+	if consumed != len(raw) {
+		t.Fatalf("consumed %d bytes, want %d", consumed, len(raw))
+	}
+	want := goldenMembershipFixture()
+	assertMembershipEqual(t, &want, &got)
+	if len(got.Identities) != 0 {
+		t.Fatalf("v3 decode left identities behind: %+v", got.Identities)
+	}
+	if policy := got.SessionPolicy(); policy.IsSet() {
+		t.Fatalf("v3 decode reported a committed session policy %+v; a v3 "+
+			"section carries none, and IsSet is what the apply path uses to "+
+			"decide whether to trust it over local configuration", policy)
+	}
+}
+
+// TestSnapshotGoldenEncodingUnchanged pins the bytes of the two embedding
+// types, so the byte-identical claim covers Membership as it actually ships:
+// nested inside a Snapshot (persisted metadata) and a SnapshotChunk (wire).
+func TestSnapshotGoldenEncodingUnchanged(t *testing.T) {
+	memb := Membership{ConfigChangeID: 7, Addresses: map[uint64]string{1: "a:1"}}
+
+	s := Snapshot{ShardID: 1, ReplicaID: 2, Index: 3, Term: 4, Membership: memb}
+	sbuf := make([]byte, s.Size())
+	sn, err := s.MarshalTo(sbuf)
+	if err != nil {
+		t.Fatalf("Snapshot.MarshalTo: %v", err)
+	}
+	const snapGolden = "0100000000000000" + "0200000000000000" +
+		"0300000000000000" + "0400000000000000" + // ShardID, ReplicaID, Index, Term
+		"04" + "0700000000000000" + "0000000000000000" + "0000000000000000" + // membership fixed (v3 fields)
+		"0000000000000000" + "0000000000000000" + "0000000000000000" + // membership fixed (session policy)
+		"01000000" + "0100000000000000" + "03000000" + "613a31" + // Addresses
+		"00000000" + "00000000" + "00000000" + "00000000" + // Observers, Witnesses, Removed, Identities
+		"00000000" + // Filepath length
+		"0000000000000000" + // FileSize
+		"00000000" + // Checksum length
+		"0000000000000000" + "0000000000000000" + // Type, Imported
+		"0000000000000000" + "0000000000000000" + // OnDiskIndex, Witness
+		"0000000000000000" // Epoch
+	if got := hex.EncodeToString(sbuf[:sn]); got != snapGolden {
+		t.Fatalf("Snapshot encoding changed:\n got %s\nwant %s", got, snapGolden)
+	}
+
+	sc := SnapshotChunk{ShardID: 1, BinVer: WireVersion, Membership: memb}
+	cbuf := make([]byte, sc.Size())
+	cn, err := sc.MarshalTo(cbuf)
+	if err != nil {
+		t.Fatalf("SnapshotChunk.MarshalTo: %v", err)
+	}
+	// The membership section sits between HasFileInfo and OnDiskIndex; the
+	// version byte must be at that exact offset and unchanged.
+	membOffset := 72 + 4 + 8 + 8 + 8
+	membBuf := make([]byte, memb.Size())
+	if _, err := memb.MarshalTo(membBuf); err != nil {
+		t.Fatalf("Membership.MarshalTo: %v", err)
+	}
+	if got := cbuf[membOffset : membOffset+len(membBuf)]; !bytes.Equal(got, membBuf) {
+		t.Fatalf("chunk membership section = %x, want %x", got, membBuf)
+	}
+	var sc2 SnapshotChunk
+	if _, err := sc2.UnmarshalFrom(cbuf[:cn]); err != nil {
+		t.Fatalf("SnapshotChunk.UnmarshalFrom: %v", err)
+	}
+	if sc2.Membership.ConfigChangeID != 7 || sc2.Membership.Addresses[1] != "a:1" {
+		t.Fatalf("chunk membership round trip: %+v", sc2.Membership)
 	}
 }
 
@@ -103,16 +474,39 @@ func TestConfigChangeRejectsLegacyLayout(t *testing.T) {
 		t.Fatalf("UnmarshalFrom(v1 layout): got %v, want ErrUnsupportedVersion", err)
 	}
 
-	// A genuinely truncated v2 payload (cut inside the policy fields) must
-	// still surface ErrBufferTooSmall.
+	// A genuinely truncated payload (cut INSIDE the policy fields) must still
+	// surface ErrBufferTooSmall. The cut is 6 bytes, not 4: the current layout
+	// ends with a 4-byte NodeIdentity length prefix, and a payload that ends
+	// exactly where that prefix begins is the legitimate pre-identity layout,
+	// which decodes with an empty identity rather than erroring.
 	cc2 := ConfigChange{ConfigChangeID: 7, Type: AddNode, ReplicaID: 42, Address: addr}
 	buf := make([]byte, cc2.Size())
 	if _, err := cc2.MarshalTo(buf); err != nil {
 		t.Fatalf("MarshalTo: %v", err)
 	}
 	var cc3 ConfigChange
-	if _, err := cc3.UnmarshalFrom(buf[:len(buf)-4]); !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("UnmarshalFrom(truncated v2): got %v, want ErrBufferTooSmall", err)
+	if _, err := cc3.UnmarshalFrom(buf[:len(buf)-6]); !errors.Is(err, ErrBufferTooSmall) {
+		t.Fatalf("UnmarshalFrom(truncated policy fields): got %v, want ErrBufferTooSmall", err)
+	}
+
+	// The pre-identity layout — everything up to and including the policy
+	// fields, with no trailing identity — must decode cleanly with an empty
+	// NodeIdentity. This is the payload every already-committed
+	// EntryConfigChange in a deployed cluster contains, so failing it would
+	// make an upgraded node unable to replay its own log.
+	var cc4 ConfigChange
+	n, err := cc4.UnmarshalFrom(buf[:len(buf)-4])
+	if err != nil {
+		t.Fatalf("UnmarshalFrom(pre-identity layout): %v", err)
+	}
+	if n != len(buf)-4 {
+		t.Fatalf("consumed %d bytes, want %d", n, len(buf)-4)
+	}
+	if cc4.NodeIdentity != "" {
+		t.Fatalf("NodeIdentity = %q, want empty for a pre-identity payload", cc4.NodeIdentity)
+	}
+	if cc4.Address != addr || cc4.ReplicaID != 42 {
+		t.Fatalf("pre-identity payload decoded wrong: %+v", cc4)
 	}
 }
 
@@ -228,8 +622,8 @@ func TestMembershipVersionByteOnWire(t *testing.T) {
 		if n != m.Size() {
 			t.Fatalf("shape %d: MarshalTo wrote %d, Size() = %d", i, n, m.Size())
 		}
-		if buf[0] != membershipWireVersion {
-			t.Fatalf("shape %d: wire byte 0 = %d, want %d", i, buf[0], membershipWireVersion)
+		if buf[0] != membershipFormatVersion {
+			t.Fatalf("shape %d: wire byte 0 = %d, want %d", i, buf[0], membershipFormatVersion)
 		}
 		var got Membership
 		n2, err := got.UnmarshalFrom(buf)
@@ -241,8 +635,8 @@ func TestMembershipVersionByteOnWire(t *testing.T) {
 		}
 
 		// Any other version byte must be rejected before a field is read.
-		for _, bad := range []byte{0, 1, 2, membershipWireVersion + 1, 0xFF} {
-			if bad == membershipWireVersion {
+		for _, bad := range []byte{0, 1, 2, membershipFormatVersion + 1, 0xFF} {
+			if bad == membershipFormatVersion {
 				continue
 			}
 			corrupt := append([]byte{}, buf...)

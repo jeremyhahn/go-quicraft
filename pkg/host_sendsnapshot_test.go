@@ -162,7 +162,7 @@ func newSnapshotSendFixture(t *testing.T, barrier Barrier) *snapshotSendFixture 
 	eng.Start()
 	t.Cleanup(eng.Stop)
 
-	node := newMinimalEngineNode(1, 1)
+	node := newMinimalEngineNode(t, 1, 1)
 	eng.LoadNode(node)
 	t.Cleanup(func() { eng.UnloadNode(1) })
 

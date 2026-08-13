@@ -89,7 +89,7 @@ var (
 // hwBarrier initializes a barrier in delegated mode with enc installed.
 func hwBarrier(t *testing.T, cfg BarrierConfig, enc SymmetricEncrypter) (*Barrier, error) {
 	t.Helper()
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	return b, b.Initialize(context.Background(), &hwStrategy{hwEnc: enc}, Credentials{})
 }
 
@@ -286,7 +286,7 @@ func TestBarrier_SupportsContextAAD_PerMode(t *testing.T) {
 		t.Fatalf("Initialize (incapable hw) failed: %v", err)
 	}
 
-	none := NewBarrier(testBarrierConfig(1))
+	none := MustNewBarrier(testBarrierConfig(1))
 	if err := none.Initialize(context.Background(), NewNoneStrategy(), Credentials{}); err != nil {
 		t.Fatalf("Initialize (none) failed: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestBarrier_SupportsContextAAD_PerMode(t *testing.T) {
 // strategy it is given rather than from a stale field.
 func TestBarrier_ContextBinding_ClearedAfterSeal(t *testing.T) {
 	strategy := &hwStrategy{hwEnc: &mockHWEncryptor{prefix: []byte("HW:")}}
-	b := NewBarrier(testBarrierConfig(1))
+	b := MustNewBarrier(testBarrierConfig(1))
 	if err := b.Initialize(context.Background(), strategy, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
@@ -349,9 +349,11 @@ func TestBarrier_ContextBinding_ClearedAfterSeal(t *testing.T) {
 	if err := b.Seal(); err != nil {
 		t.Fatalf("Seal failed: %v", err)
 	}
-	if b.ContextBinding() != ContextBindingBarrier {
+	// A sealed barrier has NO encryptor, so it has no capability to report --
+	// not the software one. See TestBarrier_ContextBinding_UnresolvedUntilUnsealed.
+	if b.ContextBinding() != ContextBindingUnresolved {
 		t.Fatalf("sealed barrier reports binding %v, want %v",
-			b.ContextBinding(), ContextBindingBarrier)
+			b.ContextBinding(), ContextBindingUnresolved)
 	}
 	if b.IsPlaintextMode() {
 		t.Fatal("sealed barrier still reports plaintext mode")
@@ -370,6 +372,7 @@ func TestBarrier_ContextBinding_ClearedAfterSeal(t *testing.T) {
 // binding it thinks it has.
 func TestContextBinding_String(t *testing.T) {
 	for binding, want := range map[ContextBinding]string{
+		ContextBindingUnresolved:  "unresolved",
 		ContextBindingBarrier:     "barrier",
 		ContextBindingDelegated:   "delegated",
 		ContextBindingUnsupported: "unsupported",
@@ -395,7 +398,7 @@ func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
 	}
 
 	t.Run("software satisfies", func(t *testing.T) {
-		b := NewBarrier(requiring())
+		b := MustNewBarrier(requiring())
 		s := testStrategy(t)
 		defer func() { _ = s.Close() }()
 		if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -427,7 +430,7 @@ func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
 	})
 
 	t.Run("no-encryption refused", func(t *testing.T) {
-		b := NewBarrier(requiring())
+		b := MustNewBarrier(requiring())
 		err := b.Initialize(context.Background(), NewNoneStrategy(), Credentials{})
 		if !errors.Is(err, ErrContextAADUnsupported) {
 			t.Fatalf("Initialize (none): got %v want ErrContextAADUnsupported", err)
@@ -446,7 +449,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 		strategy := &hwStrategy{hwEnc: &mockHWEncryptor{prefix: []byte("HW:")}}
 		// Initialize WITHOUT the requirement so the barrier exists, then seal
 		// and unseal a barrier that does require it — the restart shape.
-		b := NewBarrier(testBarrierConfig(1))
+		b := MustNewBarrier(testBarrierConfig(1))
 		if err := b.Initialize(context.Background(), strategy, Credentials{}); err != nil {
 			t.Fatalf("Initialize failed: %v", err)
 		}
@@ -457,7 +460,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 
 		cfg := testBarrierConfig(1)
 		cfg.RequireContextAAD = true
-		restarted := NewBarrier(cfg)
+		restarted := MustNewBarrier(cfg)
 		restarted.sealed = sealed
 		restarted.state = barrierSealed
 		if err := restarted.Unseal(context.Background(), strategy, Credentials{}); !errors.Is(err, ErrContextAADUnsupported) {
@@ -470,7 +473,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 
 	t.Run("no-encryption refused", func(t *testing.T) {
 		none := NewNoneStrategy()
-		b := NewBarrier(testBarrierConfig(1))
+		b := MustNewBarrier(testBarrierConfig(1))
 		if err := b.Initialize(context.Background(), none, Credentials{}); err != nil {
 			t.Fatalf("Initialize (none) failed: %v", err)
 		}
@@ -481,7 +484,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 
 		cfg := testBarrierConfig(1)
 		cfg.RequireContextAAD = true
-		restarted := NewBarrier(cfg)
+		restarted := MustNewBarrier(cfg)
 		if err := restarted.SetSealedRootKey(sealedKey); err != nil {
 			t.Fatalf("SetSealedRootKey failed: %v", err)
 		}
@@ -497,7 +500,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 		strategy := &hwStrategy{hwEnc: newMockAADEncryptor(t)}
 		cfg := testBarrierConfig(1)
 		cfg.RequireContextAAD = true
-		b := NewBarrier(cfg)
+		b := MustNewBarrier(cfg)
 		if err := b.Initialize(context.Background(), strategy, Credentials{}); err != nil {
 			t.Fatalf("Initialize (capable hw) failed: %v", err)
 		}
@@ -517,7 +520,7 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 		defer func() { _ = s.Close() }()
 		cfg := testBarrierConfig(1)
 		cfg.RequireContextAAD = true
-		b := NewBarrier(cfg)
+		b := MustNewBarrier(cfg)
 		if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 			t.Fatalf("Initialize (software) failed: %v", err)
 		}
@@ -540,7 +543,7 @@ func TestBarrier_RequireContextAAD_DefaultOff(t *testing.T) {
 	if _, err := hwBarrier(t, testBarrierConfig(1), &mockHWEncryptor{prefix: []byte("HW:")}); err != nil {
 		t.Fatalf("Initialize with RequireContextAAD unset failed: %v", err)
 	}
-	none := NewBarrier(testBarrierConfig(1))
+	none := MustNewBarrier(testBarrierConfig(1))
 	if err := none.Initialize(context.Background(), NewNoneStrategy(), Credentials{}); err != nil {
 		t.Fatalf("Initialize (none) with RequireContextAAD unset failed: %v", err)
 	}

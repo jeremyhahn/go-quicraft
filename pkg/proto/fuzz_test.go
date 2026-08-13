@@ -684,8 +684,8 @@ func checkMembershipRoundTrip(t *testing.T, m *Membership) {
 	if n != m.Size() {
 		t.Fatalf("MarshalTo wrote %d bytes, expected %d", n, m.Size())
 	}
-	if buf[0] != membershipWireVersion {
-		t.Fatalf("wire byte 0 = %d, want version %d", buf[0], membershipWireVersion)
+	if buf[0] != membershipFormatVersion {
+		t.Fatalf("wire byte 0 = %d, want version %d", buf[0], membershipFormatVersion)
 	}
 
 	var m2 Membership

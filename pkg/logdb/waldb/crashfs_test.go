@@ -345,6 +345,39 @@ func (c *crashFS) Remove(name string) error {
 	return nil
 }
 
+// Rename implements FS. It models rename(2)'s atomicity: the destination name
+// refers to the source's node, or to whatever it referred to before, and never
+// to anything in between. The moved node's ENTRY durability is reset, because
+// the new dirent is exactly as unfsynced as a freshly created one — which is
+// what makes a crash between a rename and the parent fsync lose the new name
+// and restore the old, the behaviour the WAL format marker is published under.
+func (c *crashFS) Rename(oldpath, newpath string) error {
+	from, to := filepath.Clean(oldpath), filepath.Clean(newpath)
+	gen := c.generation()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gen != c.gen {
+		return errCrashedFS
+	}
+	n, ok := c.nodes[from]
+	if !ok {
+		return &fs.PathError{Op: "rename", Path: oldpath, Err: fs.ErrNotExist}
+	}
+	if _, perr := c.dirLocked(filepath.Dir(to)); perr != nil {
+		return &fs.PathError{Op: "rename", Path: newpath, Err: perr}
+	}
+	if prev, exists := c.nodes[to]; exists && prev.entryDurable {
+		// The replaced node's own removal is only durable once the directory
+		// is fsynced, exactly as for Remove.
+		c.tombs[to] = prev
+	}
+	delete(c.nodes, from)
+	delete(c.tombs, to)
+	n.entryDurable = false
+	c.nodes[to] = n
+	return nil
+}
+
 // syncDirLocked makes every pending directory entry in dir durable: pending
 // creations survive a crash from here on, and pending removals become final.
 func (c *crashFS) syncDirLocked(dir string) {

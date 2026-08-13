@@ -131,7 +131,7 @@ func TestPurgeEpochsBefore_SyncsSealedKnownEpochs(t *testing.T) {
 	// Restart simulation: a fresh barrier restored from the persisted
 	// sealed state must not resurrect the purged epochs after Unseal.
 	strategy2 := testStrategy(t)
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
@@ -264,7 +264,7 @@ func testPersistingBarrier(t *testing.T) (*Barrier, *SoftwareStrategy, *recordin
 	p := &recordingPersister{}
 	cfg := DefaultBarrierConfig(1)
 	cfg.StatePersister = p.persist
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -378,7 +378,7 @@ func TestRotate_PersisterFailureAbortsRotation(t *testing.T) {
 // TestRotate_WithoutPersisterFailsClosed verifies that an unconfigured
 // deployment gets a loud recurring error instead of silent data loss.
 func TestRotate_WithoutPersisterFailsClosed(t *testing.T) {
-	b := NewBarrier(DefaultBarrierConfig(1)) // no StatePersister
+	b := MustNewBarrier(DefaultBarrierConfig(1)) // no StatePersister
 	s := testStrategy(t)
 	defer s.Close()
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
@@ -423,7 +423,7 @@ func TestRotate_DataSurvivesRestartFromPersistedBlob(t *testing.T) {
 
 	// Restart: only the persisted blob crosses the process boundary.
 	persisted, _ := p.snapshot()
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(persisted); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestUnseal_StrategyFieldDowngradeRejected(t *testing.T) {
 	// Attacker flips the plaintext strategy field.
 	sealed.Strategy = StrategyNone
 
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
@@ -573,7 +573,7 @@ func TestUnseal_NoneStrategyWithoutEncryptorFailsClosed(t *testing.T) {
 		t.Fatalf("SealRootKey: %v", err)
 	}
 
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
@@ -659,7 +659,7 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 	legacy := b.SealedRootKeyData()
 	legacy.HKDFVersion = 0 // pre-versioning blob
 
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(legacy); err != nil {
 		t.Fatalf("SetSealedRootKey(legacy): %v", err)
 	}
@@ -687,7 +687,7 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 
 	unknown := b.SealedRootKeyData()
 	unknown.HKDFVersion = currentHKDFVersion + 1
-	b3 := NewBarrier(DefaultBarrierConfig(1))
+	b3 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b3.SetSealedRootKey(unknown); !errors.Is(err, ErrUnsupportedHKDFVersion) {
 		t.Fatalf("SetSealedRootKey(unknown version) = %v, want ErrUnsupportedHKDFVersion", err)
 	}
@@ -732,4 +732,269 @@ func TestSoftwareStrategy_CloseRacesSealUnseal(t *testing.T) {
 		_ = s.Close()
 	}()
 	wg.Wait()
+}
+
+// --- context-binding capability is unanswerable before it exists ---
+
+// TestBarrier_ContextBinding_UnresolvedBeforeUnseal is the regression for a
+// barrier that ANSWERED a question it had no basis to answer: the capability
+// was classified from b.hwEncryptor alone, and seal() sets that to nil, so an
+// uninitialized or sealed barrier reported the SOFTWARE binding and
+// SupportsContextAAD returned true.
+//
+// That mattered because the capability is latched by consumers. A node may
+// start sealed and be unsealed later, so a WAL opened at start would pin
+// "records are positionally bound" against a barrier that had not yet chosen a
+// strategy — and then be unsealed with a delegated encryptor that fails every
+// context-bearing write with ErrHardwareMode, with the deliberate fail-closed
+// refusal at open having been a no-op because the capability lied.
+//
+// The fix makes the pre-unseal state its own answer: Binds() is false for it,
+// AND it is distinguishable from an unsealed barrier that genuinely cannot bind.
+func TestBarrier_ContextBinding_UnresolvedBeforeUnseal(t *testing.T) {
+	// (a) Uninitialized: no strategy has been chosen, so there is no answer.
+	fresh := MustNewBarrier(testBarrierConfig(1))
+	if got := fresh.ContextBinding(); got != ContextBindingUnresolved {
+		t.Errorf("uninitialized barrier reports binding %v, want %v", got, ContextBindingUnresolved)
+	}
+	if fresh.SupportsContextAAD() {
+		t.Error("uninitialized barrier claims it can authenticate caller context")
+	}
+	if fresh.ContextBindingResolved() {
+		t.Error("uninitialized barrier reports its capability as resolved")
+	}
+
+	// (b) Sealed: the encryptor is gone, and the capability with it.
+	b, s := testInitializedBarrier(t)
+	if got := b.ContextBinding(); got != ContextBindingBarrier {
+		t.Fatalf("test premise broken: unsealed software barrier reports %v, want %v",
+			got, ContextBindingBarrier)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if got := b.ContextBinding(); got != ContextBindingUnresolved {
+		t.Errorf("sealed barrier reports binding %v, want %v", got, ContextBindingUnresolved)
+	}
+	if b.SupportsContextAAD() {
+		t.Error("sealed barrier claims it can authenticate caller context")
+	}
+	if b.ContextBindingResolved() {
+		t.Error("sealed barrier reports its capability as resolved")
+	}
+
+	// (c) Unsealed but incapable: a real answer of NO, which a consumer must be
+	// able to tell apart from (a)/(b)'s absence of an answer.
+	incapable, err := hwBarrier(t, testBarrierConfig(1), &mockHWEncryptor{prefix: []byte("HW:")})
+	if err != nil {
+		t.Fatalf("Initialize (incapable hw): %v", err)
+	}
+	if got := incapable.ContextBinding(); got != ContextBindingUnsupported {
+		t.Errorf("incapable delegated barrier reports binding %v, want %v",
+			got, ContextBindingUnsupported)
+	}
+	if !incapable.ContextBindingResolved() {
+		t.Error("unsealed delegated barrier reports its capability as unresolved")
+	}
+	if incapable.ContextBinding() == b.ContextBinding() {
+		t.Fatal("\"cannot bind\" is indistinguishable from \"cannot answer yet\": " +
+			"a consumer that latches the capability cannot fail closed")
+	}
+	if incapable.SupportsContextAAD() != b.SupportsContextAAD() {
+		t.Fatal("test premise broken: the bare predicate already separates the two states")
+	}
+
+	// (d) Unsealing restores a real answer, from the strategy it is given.
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if got := b.ContextBinding(); got != ContextBindingBarrier {
+		t.Errorf("re-unsealed software barrier reports binding %v, want %v",
+			got, ContextBindingBarrier)
+	}
+	if !b.ContextBindingResolved() {
+		t.Error("re-unsealed barrier reports its capability as unresolved")
+	}
+}
+
+// --- SetSealedRootKey structural bounds ---
+
+// TestSetSealedRootKey_BoundsKnownEpochs is the DoS regression: KnownEpochs is
+// plaintext, unauthenticated metadata, and Unseal derives one HKDF DEK, one
+// AEAD and one mlock'd enclave PER ENTRY. An attacker with write access to the
+// persisted blob — the same attacker the sealing strategies already defend
+// against — could rewrite it to millions of epochs and hang or OOM the node on
+// every start, with no passphrase required.
+func TestSetSealedRootKey_BoundsKnownEpochs(t *testing.T) {
+	src, _ := testInitializedBarrier(t)
+	base := src.SealedRootKeyData()
+	if base == nil {
+		t.Fatal("SealedRootKeyData returned nil")
+	}
+
+	epochsUpTo := func(n uint64) []uint64 {
+		eps := make([]uint64, 0, n)
+		for ep := uint64(1); ep <= n; ep++ {
+			eps = append(eps, ep)
+		}
+		return eps
+	}
+
+	for _, tc := range []struct {
+		name        string
+		epoch       uint64
+		knownEpochs []uint64
+		want        error
+	}{
+		{
+			name:        "at the bound",
+			epoch:       MaxKnownEpochs,
+			knownEpochs: epochsUpTo(MaxKnownEpochs),
+			want:        nil,
+		},
+		{
+			name:        "one over the bound",
+			epoch:       MaxKnownEpochs + 1,
+			knownEpochs: epochsUpTo(MaxKnownEpochs + 1),
+			want:        ErrTooManyKnownEpochs,
+		},
+		{
+			// The forged shape from the report: a small current epoch padded
+			// with millions of derivations. Rejected on size before a single
+			// DEK is derived.
+			name:        "inflated set on epoch 1",
+			epoch:       1,
+			knownEpochs: epochsUpTo(MaxKnownEpochs + 5000),
+			want:        ErrTooManyKnownEpochs,
+		},
+		{
+			// Epochs only advance and Epoch is the highest reached, so an
+			// entry above it is corruption or padding, never history.
+			name:        "epoch above current",
+			epoch:       2,
+			knownEpochs: []uint64{1, 2, 3},
+			want:        ErrKnownEpochAboveCurrent,
+		},
+		{
+			name:        "current epoch missing",
+			epoch:       7,
+			knownEpochs: []uint64{1, 2},
+			want:        ErrInvalidSealedEpochs,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blob := cloneSealedRootKey(base)
+			blob.Epoch = tc.epoch
+			blob.KnownEpochs = tc.knownEpochs
+
+			b := MustNewBarrier(testBarrierConfig(1))
+			err := b.SetSealedRootKey(blob)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("SetSealedRootKey = %v, want %v", err, tc.want)
+			}
+			if tc.want == nil {
+				return
+			}
+			// A rejected blob must leave nothing behind for a later Unseal to
+			// derive from.
+			if b.CurrentEpoch() != 0 {
+				t.Errorf("rejected blob still set epoch %d", b.CurrentEpoch())
+			}
+			if n := len(b.knownEpochs); n != 0 {
+				t.Errorf("rejected blob still installed %d known epochs", n)
+			}
+		})
+	}
+}
+
+// TestSetSealedRootKey_RejectsAlgorithmMismatch pins that a blob written under
+// one data-path AEAD is refused by a barrier configured for another, naming
+// both. Without the check the mismatch surfaces only as the deliberately
+// generic ErrDecryptionFailed on every read — indistinguishable from tampering,
+// with nothing on disk naming the algorithm that would work. This is the
+// restore-onto-a-host-without-AES-NI case, which SelectOptimalAlgorithm makes
+// silent by default.
+func TestSetSealedRootKey_RejectsAlgorithmMismatch(t *testing.T) {
+	writerCfg := testBarrierConfig(1)
+	writerCfg.Algorithm = AlgAES256GCM
+	writer := MustNewBarrier(writerCfg)
+	strategy := testStrategy(t)
+	if err := writer.Initialize(context.Background(), strategy, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	blob := writer.SealedRootKeyData()
+	if blob.Algorithm != AlgAES256GCM {
+		t.Fatalf("Initialize did not record the data-path algorithm: got %v", blob.Algorithm)
+	}
+
+	readerCfg := testBarrierConfig(1)
+	readerCfg.Algorithm = AlgChaCha20Poly1305
+	if err := readerCfg.Validate(); err != nil {
+		t.Skipf("ChaCha20-Poly1305 unavailable in this build: %v", err)
+	}
+	reader := MustNewBarrier(readerCfg)
+	err := reader.SetSealedRootKey(cloneSealedRootKey(blob))
+	var mismatch *AlgorithmMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("SetSealedRootKey = %v, want *AlgorithmMismatchError", err)
+	}
+	if mismatch.Sealed != AlgAES256GCM || mismatch.Configured != AlgChaCha20Poly1305 {
+		t.Errorf("mismatch = {sealed:%v configured:%v}, want {AES-256-GCM ChaCha20-Poly1305}",
+			mismatch.Sealed, mismatch.Configured)
+	}
+
+	// Back-compatibility: a blob persisted before the field existed carries no
+	// algorithm and must still load, under whatever the barrier is configured
+	// with. Dev clusters hold exactly such blobs.
+	legacy := cloneSealedRootKey(blob)
+	legacy.Algorithm = 0
+	if err := MustNewBarrier(readerCfg).SetSealedRootKey(legacy); err != nil {
+		t.Fatalf("unrecorded-algorithm blob rejected: %v", err)
+	}
+}
+
+// TestSetSealedRootKey_ClonesCallerBlob pins that the barrier neither aliases
+// nor mutates the caller's *SealedRootKey. b.salt used to alias the caller's
+// slice, so an embedder reusing its decode buffer silently changed the HKDF
+// salt and every derived DEK with it — surfacing as ErrDecryptionFailed on data
+// that was written correctly.
+func TestSetSealedRootKey_ClonesCallerBlob(t *testing.T) {
+	src, strategy := testInitializedBarrier(t)
+	ciphertext, err := src.Encrypt(nil, []byte("data written before the restart"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	blob := src.SealedRootKeyData()
+	blob.FailedAttempts = 3 // below bruteForceThreshold: no backoff, but observable
+
+	b := MustNewBarrier(testBarrierConfig(1))
+	if err := b.SetSealedRootKey(blob); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+
+	// The embedder reuses its decode buffer, as it is entitled to.
+	for i := range blob.Salt {
+		blob.Salt[i] ^= 0xFF
+	}
+
+	if err := b.Unseal(context.Background(), strategy, Credentials{}); err != nil {
+		t.Fatalf("Unseal after caller reused its buffer: %v", err)
+	}
+	plaintext, err := b.Decrypt(nil, ciphertext)
+	if err != nil {
+		t.Fatalf("Decrypt after caller reused its buffer: %v "+
+			"(the barrier derived DEKs from the caller's mutated salt)", err)
+	}
+	if !bytes.Equal(plaintext, []byte("data written before the restart")) {
+		t.Fatal("round-trip mismatch after restore")
+	}
+
+	// The other direction: a successful Unseal resets the backoff counters
+	// through persistBackoffState, which must not reach into the caller's
+	// struct.
+	if blob.FailedAttempts != 3 {
+		t.Errorf("barrier mutated the caller's blob: FailedAttempts = %d, want 3",
+			blob.FailedAttempts)
+	}
 }

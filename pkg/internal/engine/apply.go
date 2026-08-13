@@ -37,6 +37,14 @@ import (
 var errApplyDispatcherPanic = errors.New(
 	"engine: apply dispatcher panicked, committed batch discarded")
 
+// errApplyItemDiscarded marks a committed batch the dispatcher dropped without
+// applying it: the shard was unloaded, its per-shard channel was closed
+// underneath the dispatcher, or the engine is shutting down. The batch's
+// proposals are completed with it so callers observe a terminal result instead
+// of blocking until their context deadline.
+var errApplyItemDiscarded = errors.New(
+	"engine: committed batch discarded before apply (shard unloaded or engine stopping)")
+
 // defaultShardChanBuffer is the per-shard channel buffer size for the
 // apply worker's fan-out pattern. Sized to absorb commit pipeline
 // bursts (piggyback commits, batched SaveState flushes) without
@@ -466,13 +474,28 @@ func chanClosed(c <-chan struct{}) bool {
 }
 
 // discardItem releases a committed batch that will never be applied. It
-// returns the pooled committed-entries slice, clears commitPending so the
-// shard's pipeline does not stall waiting for an apply that will not happen,
-// and returns the applyItem to the pool.
+// completes the batch's pending proposals with a typed error, returns the
+// pooled committed-entries slice, clears commitPending so the shard's pipeline
+// does not stall waiting for an apply that will not happen, and returns the
+// applyItem to the pool.
 func (w *applyWorker) discardItem(item *applyItem) {
+	node := item.node
+	// Report the proposals BEFORE the pooled entries are released below.
+	// Nothing else completes them: the item never reaches a state machine, so
+	// no OnApplied follows, and the engine.Callback contract requires every
+	// registered proposal to be resolved — failInFlightItem and failApply do
+	// the same for their own terminal batches.
+	if node != nil && w.callback != nil {
+		w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries,
+			&ApplyError{
+				ShardID:   node.shardID,
+				ReplicaID: node.replicaID,
+				Err:       errApplyItemDiscarded,
+			})
+	}
 	item.update.ReleaseCommittedEntries()
-	if item.node != nil {
-		item.node.commitPending.Store(false)
+	if node != nil {
+		node.commitPending.Store(false)
 		// Deliberately does NOT notify the step worker, unlike the normal
 		// apply completion and abandonBatchTail. All three callers here are
 		// terminal for the shard -- it has been unloaded, its channel is
@@ -550,13 +573,24 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 						"panic", fmt.Sprint(r),
 						"stack", string(stack),
 					)
-					node.failed.Store(true)
-					node.handleError(&SMPanicError{
+					panicErr := &SMPanicError{
 						ShardID:   node.shardID,
 						ReplicaID: node.replicaID,
 						Value:     r,
 						Stack:     stack,
-					})
+					}
+					// Complete the batch's pending proposals before the outer
+					// defer releases the pooled entries. The panic aborted the
+					// apply, so no OnApplied will ever resolve them; without
+					// this a caller with a deadline-less context blocks until
+					// StopShard/Close and the host's pendingOps never drops, so
+					// Drain always times out. failApply and failInFlightItem
+					// handle their own terminal batches the same way.
+					if w.callback != nil {
+						w.callback.OnProposalFailed(node.shardID, entries, panicErr)
+					}
+					node.failed.Store(true)
+					node.handleError(panicErr)
 				}
 			}()
 

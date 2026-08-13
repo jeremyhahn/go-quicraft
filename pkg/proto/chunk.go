@@ -59,7 +59,8 @@ type SnapshotChunk struct {
 	OnDiskIndex uint64
 	// DeploymentID identifies the deployment.
 	DeploymentID uint64
-	// BinVer is the wire format version.
+	// BinVer is the transport wire format version. Senders stamp
+	// WireVersion; receivers require exact equality (see UnmarshalFrom).
 	BinVer uint64
 	// Epoch is the barrier encryption epoch used when the snapshot was
 	// saved. Zero indicates no encryption (plaintext snapshot). The
@@ -193,12 +194,22 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	sc.DeploymentID = getUint64(buf[offset:])
 	offset += 8
 	sc.BinVer = getUint64(buf[offset:])
-	// Exact-equality gate, mirroring MessageBatch.UnmarshalFrom. A chunk
-	// from any other binary — newer or older — encodes the embedded
-	// Membership differently, so it is rejected outright instead of being
-	// misparsed. BinVer is a required field: senders stamp WireVersion,
-	// and an unstamped chunk (BinVer 0) is indistinguishable from a v1
-	// sender's chunk.
+	// Exact-equality gate, mirroring MessageBatch.UnmarshalFrom. This is a
+	// DELIBERATE choice, not the persisted-format oversight fixed in
+	// Membership: SnapshotChunk is transport-only. Its encoding exists
+	// solely between MarshalTo on the sending QUIC stream and UnmarshalFrom
+	// on the receiving one — the receiver keeps only chunk.Data (written to
+	// snapshot.dat) and re-derives the metadata into a logdb.Snapshot record
+	// with waldb's own layout, so no marshaled SnapshotChunk, and no BinVer
+	// byte, is ever written to disk or read back after a restart. Both ends
+	// are live processes, so rejecting a foreign dialect costs one snapshot
+	// transfer that the leader retries after the upgrade, and admitting one
+	// would mean parsing an embedded Membership whose layout this build
+	// cannot know. A widened range here would buy nothing and would have to
+	// carry a decode path per version for a format nothing persists.
+	//
+	// BinVer is a required field: senders stamp WireVersion, and an
+	// unstamped chunk (BinVer 0) is indistinguishable from a v1 sender's.
 	if sc.BinVer != WireVersion {
 		return 0, ErrUnsupportedVersion
 	}

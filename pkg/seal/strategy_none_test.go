@@ -107,7 +107,7 @@ func TestNoneStrategy_BarrierRestartCycle(t *testing.T) {
 	s := NewNoneStrategy()
 	defer s.Close()
 
-	b := NewBarrier(DefaultBarrierConfig(1))
+	b := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b.Initialize(ctx, s, Credentials{}); err != nil {
 		t.Fatalf("Initialize(None): %v", err)
 	}
@@ -120,7 +120,7 @@ func TestNoneStrategy_BarrierRestartCycle(t *testing.T) {
 	// Persist the marker an operator would store, then simulate a restart.
 	sealed := b.SealedRootKeyData()
 
-	b2 := NewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
 	if err := b2.SetSealedRootKey(sealed); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}

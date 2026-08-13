@@ -554,6 +554,13 @@ func (n *Node) LastApplied() uint64 {
 	return n.lastApplied.Load()
 }
 
+// LastAppliedTerm returns the Raft term of the entry at LastApplied. It is the
+// term the next snapshot records, which is why the pair must be recovered
+// together: see SeedLastApplied.
+func (n *Node) LastAppliedTerm() uint64 {
+	return n.lastAppliedTerm.Load()
+}
+
 // SeedLastApplied initializes the node's applied markers to a recovered
 // (index, term) on restart, before the node is loaded into the engine pipeline.
 // lastApplied, lastAppliedTerm, and lastSnapshotIndex are set so that follower
@@ -705,6 +712,26 @@ func (n *Node) IsMember(replicaID uint64) bool {
 		return true
 	}
 	return n.peer.IsMember(replicaID)
+}
+
+// MemberBinding returns what this shard's COMMITTED configuration authorizes
+// replicaID with — its node identity, its address, and whether that address
+// identifies replicaID exclusively — plus whether the replica is in the
+// configuration at all. It is the authorization input the transport message
+// handler binds a claimed msg.From to; see raft.Peer.MemberBinding for why this
+// — and not IsMember — is safe to enforce on the receive path, and for how the
+// two fields rank.
+//
+// It FAILS CLOSED when the peer is nil (e.g. during initialization): with no
+// replicated configuration there is nothing committed to authorize against, and
+// answering "unknown" would let the caller admit a message the shard cannot
+// vouch for. Note this is the opposite convention to IsMember, which reports
+// true when nothing is known — IsMember is a view, this is a gate.
+func (n *Node) MemberBinding(replicaID uint64) (raft.MemberBinding, bool) {
+	if n.peer == nil {
+		return raft.MemberBinding{}, false
+	}
+	return n.peer.MemberBinding(replicaID)
 }
 
 // LeaderAndTerm returns the leader ID and term as a consistent pair. Use this,

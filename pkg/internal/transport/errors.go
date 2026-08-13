@@ -77,6 +77,13 @@ var (
 	// SharedPeerCertificateError, for errors.Is() matching.
 	ErrSharedPeerCertificate = errors.New("transport: local certificate covers peer addresses")
 
+	// ErrPromiscuousPeerCertificate is the sentinel for
+	// PromiscuousPeerCertificateError, for errors.Is() matching. It is the
+	// RECEIVE-side counterpart of ErrSharedPeerCertificate: an inbound peer
+	// whose certificate also covers this node's host holds a certificate that
+	// authorizes it to speak for every member, so the connection is refused.
+	ErrPromiscuousPeerCertificate = errors.New("transport: peer certificate covers this node's address")
+
 	// ErrNoLocalCertificate is returned when an operation needs this node's own
 	// leaf certificate and it is unavailable. NewQUICTransport rejects an
 	// unparsable leaf, so this only guards against a future construction path
@@ -118,6 +125,11 @@ const (
 	// connection cache, so the loser is closed instead of leaking alive
 	// on keep-alives outside the cache's bookkeeping.
 	QUICErrDuplicateDial quic.ApplicationErrorCode = 0x4
+
+	// QUICErrPromiscuousCert indicates the inbound peer's certificate also
+	// covers this node's own host, so it cannot be told apart from any other
+	// member. See refuseInboundPromiscuousCert.
+	QUICErrPromiscuousCert quic.ApplicationErrorCode = 0x5
 )
 
 // Stream-level QUIC error codes, sent in STOP_SENDING / RESET_STREAM frames
@@ -673,4 +685,37 @@ func (e *SharedPeerCertificateError) Error() string {
 // Is reports whether target matches the sentinel ErrSharedPeerCertificate.
 func (e *SharedPeerCertificateError) Is(target error) bool {
 	return target == ErrSharedPeerCertificate
+}
+
+// PromiscuousPeerCertificateError reports that an INBOUND peer's verified leaf
+// certificate also covers THIS node's own host.
+//
+// It is the mirror image of SharedPeerCertificateError and the enforcing half
+// of the same precondition. SharedPeerCertificateError is raised by the local
+// node about its OWN certificate at startup and at config-change time — a
+// misconfiguration detector an attacker simply declines to run. This one is
+// raised on the receive path about a certificate the peer actually presented,
+// which is why it, and not the startup check, is what stops a wildcard-cert
+// holder from asserting another member's replica ID.
+type PromiscuousPeerCertificateError struct {
+	// PeerAddress is the QUIC remote address the connection arrived from.
+	PeerAddress string
+	// SelfHost is this node's own canonical host, which the peer's leaf
+	// should not have covered.
+	SelfHost string
+}
+
+// Error returns a human-readable description of the overlap.
+func (e *PromiscuousPeerCertificateError) Error() string {
+	return fmt.Sprintf(
+		"transport: peer %s presented a certificate that also covers this "+
+			"node's host %s; per-node certificate SANs are required (a "+
+			"wildcard or shared certificate lets its holder assert any "+
+			"replica's identity)",
+		e.PeerAddress, e.SelfHost)
+}
+
+// Is reports whether target matches the sentinel ErrPromiscuousPeerCertificate.
+func (e *PromiscuousPeerCertificateError) Is(target error) bool {
+	return target == ErrPromiscuousPeerCertificate
 }

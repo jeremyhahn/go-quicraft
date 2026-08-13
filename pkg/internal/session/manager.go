@@ -53,6 +53,29 @@ func NewManager(maxTotal, maxResponses uint64) *Manager {
 	}
 }
 
+// SetLimits replaces the manager's limits. Both are load-bearing for apply
+// determinism — Register refuses past maxTotal and the response cache is
+// bounded by maxResponses, and a replica that refuses what its peers admit
+// diverges — so they are the shard's REPLICATED values, and this exists for
+// the one moment a replica learns them: a state machine created before its
+// shard's configuration was known (see rsm.StateMachine.refreshSessionPolicy).
+//
+// A zero is ignored for the same reason NewManager substitutes a default for
+// it: no caller can mean "admit nothing".
+//
+// Existing sessions are left alone. Lowering maxTotal below the current count
+// therefore does not evict anyone; it stops further registrations, which is
+// the same rule Register already applies to a table that filled up. Callers
+// must invoke this from the apply goroutine, like every other Manager method.
+func (m *Manager) SetLimits(maxTotal, maxResponses uint64) {
+	if maxTotal != 0 {
+		m.maxTotal = maxTotal
+	}
+	if maxResponses != 0 {
+		m.maxResponses = maxResponses
+	}
+}
+
 // Register creates a new session for the given client ID. The index
 // parameter is the log index of the register entry, used as the
 // initial activity marker for deterministic expiry. Returns

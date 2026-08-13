@@ -23,7 +23,7 @@ import (
 // benchBarrier creates a barrier initialized with fast Argon2id params.
 func benchBarrier(b *testing.B) *Barrier {
 	b.Helper()
-	barrier := NewBarrier(DefaultBarrierConfig(1))
+	barrier := MustNewBarrier(DefaultBarrierConfig(1))
 	s, err := NewSoftwareStrategyWithParams([]byte("bench-passphrase"), 1, 64*1024, 1)
 	if err != nil {
 		b.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)

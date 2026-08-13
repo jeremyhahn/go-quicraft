@@ -26,7 +26,7 @@ func TestEncodeDecodeSmallRecord(t *testing.T) {
 	data := []byte("hello world")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, data)
+	n, err := encodeRecord(buf, RecordFull, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestEncodeDecodeSmallRecord(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize+len(data))
 	}
 
-	decoded, recType, consumed, err := decodeRecord(buf)
+	decoded, recType, _, consumed, err := decodeRecord(buf)
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -58,12 +58,12 @@ func TestEncodeDecodeLargeRecord(t *testing.T) {
 	}
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, data)
+	n, err := encodeRecord(buf, RecordFull, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
 
-	decoded, recType, consumed, err := decodeRecord(buf[:n])
+	decoded, recType, _, consumed, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestEncodeBufferTooSmall(t *testing.T) {
 	data := []byte("too big for this buffer")
 	buf := make([]byte, recordHeaderSize) // no room for data
 
-	_, err := encodeRecord(buf, RecordFull, data)
+	_, err := encodeRecord(buf, RecordFull, 0, data)
 	if err != ErrBufferTooSmall {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrBufferTooSmall)
 	}
@@ -101,7 +101,7 @@ func TestEncodeBufferExactFit(t *testing.T) {
 	data := []byte("exact")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, data)
+	n, err := encodeRecord(buf, RecordFull, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestEncodeBufferExactFit(t *testing.T) {
 func TestEncodeEmptyData(t *testing.T) {
 	buf := make([]byte, recordHeaderSize)
 
-	n, err := encodeRecord(buf, RecordFull, nil)
+	n, err := encodeRecord(buf, RecordFull, 0, nil)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestEncodeEmptyData(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
 	}
 
-	decoded, recType, consumed, err := decodeRecord(buf[:n])
+	decoded, recType, _, consumed, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestEncodeEmptyData(t *testing.T) {
 func TestEncodeEmptySliceData(t *testing.T) {
 	buf := make([]byte, recordHeaderSize)
 
-	n, err := encodeRecord(buf, RecordFull, []byte{})
+	n, err := encodeRecord(buf, RecordFull, 0, []byte{})
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestEncodeEmptySliceData(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
 	}
 
-	decoded, _, _, err := decodeRecord(buf[:n])
+	decoded, _, _, _, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -177,12 +177,12 @@ func TestAllRecordTypes(t *testing.T) {
 			data := []byte("type test")
 			buf := make([]byte, recordHeaderSize+len(data))
 
-			n, err := encodeRecord(buf, tc.typ, data)
+			n, err := encodeRecord(buf, tc.typ, 0, data)
 			if err != nil {
 				t.Fatalf("encodeRecord(%s): unexpected error: %v", tc.name, err)
 			}
 
-			_, recType, _, err := decodeRecord(buf[:n])
+			_, recType, _, _, err := decodeRecord(buf[:n])
 			if err != nil {
 				t.Fatalf("decodeRecord(%s): unexpected error: %v", tc.name, err)
 			}
@@ -199,17 +199,17 @@ func TestInvalidRecordType(t *testing.T) {
 	buf := make([]byte, recordHeaderSize+10)
 	data := []byte("bad type")
 
-	_, err := encodeRecord(buf, 0, data)
+	_, err := encodeRecord(buf, 0, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 
-	_, err = encodeRecord(buf, 6, data)
+	_, err = encodeRecord(buf, 6, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 
-	_, err = encodeRecord(buf, 255, data)
+	_, err = encodeRecord(buf, 255, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
@@ -220,7 +220,7 @@ func TestInvalidRecordType(t *testing.T) {
 func TestDecodeBufferTooSmall(t *testing.T) {
 	buf := make([]byte, recordHeaderSize-1)
 
-	_, _, _, err := decodeRecord(buf)
+	_, _, _, _, err := decodeRecord(buf)
 	if err != ErrCorruptedRecord {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrCorruptedRecord)
 	}
@@ -233,13 +233,13 @@ func TestDecodePayloadTruncated(t *testing.T) {
 	data := []byte("truncated")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	_, err := encodeRecord(buf, RecordFull, data)
+	_, err := encodeRecord(buf, RecordFull, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
 
 	// Truncate the buffer so the payload is incomplete.
-	_, _, _, err = decodeRecord(buf[:recordHeaderSize+len(data)-3])
+	_, _, _, _, err = decodeRecord(buf[:recordHeaderSize+len(data)-3])
 	if err != ErrCorruptedRecord {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrCorruptedRecord)
 	}
@@ -263,17 +263,22 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf[0:4], crc)
 	binary.LittleEndian.PutUint16(buf[4:6], uint16(len(data)))
 
-	_, _, _, err := decodeRecord(buf)
+	_, _, _, _, err := decodeRecord(buf)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 }
 
 // TestRecordHeaderSize confirms the header size constant matches the spec:
-// [CRC32:4] + [Length:2] + [Type:1] = 7 bytes.
+// [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] = 11 bytes.
+//
+// The constant is pinned rather than derived because it IS the on-disk format:
+// changing it silently would leave every previously written segment unreadable
+// with no version bump beside it. If this test needs updating, walFormatVersion
+// needs updating in the same commit.
 func TestRecordHeaderSize(t *testing.T) {
-	if recordHeaderSize != 7 {
-		t.Fatalf("recordHeaderSize = %d, want 7", recordHeaderSize)
+	if recordHeaderSize != 11 {
+		t.Fatalf("recordHeaderSize = %d, want 11", recordHeaderSize)
 	}
 }
 

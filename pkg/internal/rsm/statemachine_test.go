@@ -28,6 +28,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
+// testPolicy builds a session policy from the three limits NewStateMachine
+// used to take as adjacent parameters, in the order it took them. It exists so
+// the existing tests keep reading the way they did; production code builds the
+// policy from a Config or reads it from the shard's membership.
+func testPolicy(maxTotalSessions, maxResponses, expiryEntries uint64) proto.SessionPolicy {
+	return proto.SessionPolicy{
+		ExpiryEntries:        expiryEntries,
+		MaxTotalSessions:     maxTotalSessions,
+		MaxSessionsPerClient: maxResponses,
+	}
+}
+
 // testKV is a simple in-memory key-value store implementing StateMachine.
 type testKV struct {
 	mu   sync.Mutex
@@ -435,7 +447,7 @@ func TestApply_ZeroCopySessionResultIsDeepCopied(t *testing.T) {
 		return aliasingSM{}
 	})
 	// zeroCopyEntryCmd = true (last argument).
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, true)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -481,7 +493,7 @@ func TestNewStateMachine(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -498,7 +510,7 @@ func TestNewStateMachine(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -512,7 +524,7 @@ func TestNewStateMachine(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -526,7 +538,7 @@ func TestNewStateMachine(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return "not a state machine"
 		}
-		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if !errors.Is(err, ErrInvalidSMType) {
 			t.Errorf("NewStateMachine = %v, want ErrInvalidSMType", err)
 		}
@@ -538,7 +550,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -568,7 +580,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -616,7 +628,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -640,7 +652,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -658,7 +670,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -680,7 +692,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -702,7 +714,7 @@ func TestStateMachineApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -732,7 +744,7 @@ func TestStateMachineLookup(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -759,7 +771,7 @@ func TestStateMachineLookup(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -780,7 +792,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -806,7 +818,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		}
 
 		// Recover into a new SM.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -847,7 +859,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -867,7 +879,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -890,7 +902,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -910,7 +922,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 			t.Fatalf("SaveSnapshot = %v", err)
 		}
 
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -933,7 +945,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -952,7 +964,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -973,7 +985,7 @@ func TestStateMachineClose(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -986,7 +998,7 @@ func TestStateMachineClose(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1001,7 +1013,7 @@ func TestStateMachineSessions(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1020,7 +1032,7 @@ func TestStateMachineSessions(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1085,7 +1097,7 @@ func TestStateMachineNALookup(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1107,7 +1119,7 @@ func TestStateMachineNALookup(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return &testHasherSMError{testKV: testKV{data: make(map[string]string)}}
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1132,7 +1144,7 @@ func TestStateMachineGetHash(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1154,7 +1166,7 @@ func TestStateMachineGetHash(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return &testHasherSMError{testKV: testKV{data: make(map[string]string)}}
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1179,7 +1191,7 @@ func TestStateMachineApply_BufferReuse(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1228,7 +1240,7 @@ func TestStateMachineApply_BufferReuse(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1270,7 +1282,7 @@ func TestStateMachineLookup_NALookupFastPath(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1314,7 +1326,7 @@ func TestApply_ZeroCopyFalse_CopiesCmd(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,7 +1363,7 @@ func TestApply_ZeroCopyTrue_AliasesCmd(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, true)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1376,7 +1388,7 @@ func TestApply_ZeroCopyFalse_EmptyCmd(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1399,7 +1411,7 @@ func TestApply_ZeroCopyFalse_EmptyCmd(t *testing.T) {
 func TestApply_SessionRegister(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1427,7 +1439,7 @@ func TestApply_SessionRegister(t *testing.T) {
 func TestApply_SessionRegister_AlreadyExists(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1463,7 +1475,7 @@ func TestApply_SessionRegister_AlreadyExists(t *testing.T) {
 func TestApply_SessionUnregister(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1503,7 +1515,7 @@ func TestApply_SessionUnregister(t *testing.T) {
 func TestApply_SessionUnregister_NotFound(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1529,7 +1541,7 @@ func TestApply_SessionUnregister_NotFound(t *testing.T) {
 func TestApply_MixedSessionAndNormal(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1588,7 +1600,7 @@ func TestStateMachineOpen(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1613,7 +1625,7 @@ func TestStateMachineOpen(t *testing.T) {
 				lastApplied:  100,
 			}
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1637,7 +1649,7 @@ func TestStateMachineOpen(t *testing.T) {
 				testOnDiskKV: *newTestOnDiskKV(),
 			}
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1659,7 +1671,7 @@ func TestStateMachineIsOnDisk(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1674,7 +1686,7 @@ func TestStateMachineIsOnDisk(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1689,7 +1701,7 @@ func TestStateMachineIsOnDisk(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1707,7 +1719,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1750,7 +1762,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1797,7 +1809,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -1836,13 +1848,13 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 		})
 
 		// Two replicas with same config.
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(1) = %v", err)
 		}
 		defer rsm1.Close()
 
-		rsm2, err := NewStateMachine(1, 2, createFn, t.TempDir(), 100, 100, 100, false)
+		rsm2, err := NewStateMachine(1, 2, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -1897,7 +1909,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 func TestApply_UnregisteredSessionManagedEntry(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 100, 100, 0, false)
+	}, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1951,7 +1963,7 @@ func TestApply_UnregisteredSessionManagedEntry(t *testing.T) {
 func TestApply_UnregisteredSessionMixedBatch(t *testing.T) {
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return newTestKV()
-	}, t.TempDir(), 100, 100, 0, false)
+	}, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2024,7 +2036,7 @@ func TestApply_BatchedOnDiskEntries(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2058,7 +2070,7 @@ func TestApply_BatchedOnDiskEntries(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2089,7 +2101,7 @@ func TestApply_CompressedEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2127,7 +2139,7 @@ func TestApply_CompressedEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2168,7 +2180,7 @@ func TestApply_OnDiskIdempotency(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2208,7 +2220,7 @@ func TestApply_OnDiskIdempotency(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2241,7 +2253,7 @@ func TestApply_AllocationTracking(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2280,7 +2292,7 @@ func TestApply_AllocationTracking(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2311,7 +2323,7 @@ func TestApply_ConfigChangeEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2348,7 +2360,7 @@ func TestApply_ConfigChangeEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2386,7 +2398,7 @@ func TestApply_MetadataEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2414,7 +2426,7 @@ func TestApply_MetadataEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2451,7 +2463,7 @@ func TestStateMachine_LastAppliedNeverDecreases(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2488,7 +2500,7 @@ func TestStateMachine_LastAppliedNeverDecreases(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2520,7 +2532,7 @@ func TestApply_EmptyEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2538,7 +2550,7 @@ func TestApply_EmptyEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2558,7 +2570,7 @@ func TestApply_EmptyEntries(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2594,7 +2606,7 @@ func TestStateMachine_OpenError(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return &testOnDiskKVOpenError{testOnDiskKV: *newTestOnDiskKV()}
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2614,7 +2626,7 @@ func TestStateMachine_OpenError(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return &testOnDiskKVOpenError{testOnDiskKV: *newTestOnDiskKV()}
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2645,7 +2657,7 @@ func TestStateMachine_ConcurrentSMSaveSnapshotFlow(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2690,7 +2702,7 @@ func TestStateMachine_OnDiskSMSaveSnapshotFlow(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2725,7 +2737,7 @@ func TestStateMachine_OnDiskSMSaveSnapshotFlow(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2754,7 +2766,7 @@ func TestStateMachine_CloseErrorPropagation(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2780,7 +2792,7 @@ func TestStateMachine_LookupNAFastPath(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2802,7 +2814,7 @@ func TestStateMachine_LookupNAFastPath(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2829,7 +2841,7 @@ func TestStateMachine_GetHashSupported(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2852,7 +2864,7 @@ func TestStateMachine_GetHashSupported(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2877,7 +2889,7 @@ func TestApply_MixedBatchWithDedup(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2953,7 +2965,7 @@ func TestApply_SessionExpiryDisabled(t *testing.T) {
 			return newTestKV()
 		})
 		// sessionExpiryEntries = 0 (disabled).
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -2986,7 +2998,7 @@ func TestApply_MultipleSessionsInBatch(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3044,7 +3056,7 @@ func TestSnapshot_OnDiskSMWithOpenRecovery(t *testing.T) {
 		createFn1 := func(shardID, replicaID uint64) interface{} {
 			return kv1
 		}
-		rsm1, err := NewStateMachine(1, 1, createFn1, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn1, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3077,7 +3089,7 @@ func TestSnapshot_OnDiskSMWithOpenRecovery(t *testing.T) {
 		createFn2 := func(shardID, replicaID uint64) interface{} {
 			return newTestOnDiskKVWithState(0)
 		}
-		rsm2, err := NewStateMachine(1, 1, createFn2, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn2, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine(2) = %v", err)
 		}
@@ -3102,7 +3114,7 @@ func TestStateMachine_ConcurrentAccessors(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3143,7 +3155,7 @@ func TestStateMachine_SaveSnapshotUserSMError(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3168,7 +3180,7 @@ func TestStateMachine_RecoverSnapshotUserSMError(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3184,7 +3196,7 @@ func TestStateMachine_RecoverSnapshotUserSMError(t *testing.T) {
 		createFn2 := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm2, err := NewStateMachine(1, 1, createFn2, t.TempDir(), 100, 100, 0, false)
+		rsm2, err := NewStateMachine(1, 1, createFn2, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3385,7 +3397,7 @@ func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 10, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 10), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3433,7 +3445,7 @@ func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 10, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 10), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3486,7 +3498,7 @@ func TestStateMachine_ApplyMixedSessionAndNonSessionEntries(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -3576,7 +3588,7 @@ func TestStateMachine_SaveSnapshotDeterministic(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		s, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		s, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3636,7 +3648,7 @@ func TestStateMachine_CloseDelegatesToSM(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return tracker
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3656,7 +3668,7 @@ func TestStateMachine_CloseDelegatesToSM(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return &closeFailingKV{data: make(map[string]string)}
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3676,7 +3688,7 @@ func TestNewStateMachine_InvalidSMType(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return nil
 		}
-		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if !errors.Is(err, ErrInvalidSMType) {
 			t.Errorf("NewStateMachine(nil) = %v, want ErrInvalidSMType", err)
 		}
@@ -3686,7 +3698,7 @@ func TestNewStateMachine_InvalidSMType(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return struct{ Name string }{Name: "not a SM"}
 		}
-		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		_, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if !errors.Is(err, ErrInvalidSMType) {
 			t.Errorf("NewStateMachine(struct) = %v, want ErrInvalidSMType", err)
 		}
@@ -3929,7 +3941,7 @@ func TestOnDiskSM_OpenSetsLastApplied(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3952,7 +3964,7 @@ func TestOnDiskSM_OpenSetsLastApplied(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -3982,7 +3994,7 @@ func TestOnDiskSM_AlreadyAppliedEntryTreatedAsNoOp(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4015,7 +4027,7 @@ func TestOnDiskSM_AlreadyAppliedEntryTreatedAsNoOp(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4051,7 +4063,7 @@ func TestApply_UserSMUpdateErrorPropagatesWithSessionEntries(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4088,7 +4100,7 @@ func TestApply_LargeResultData(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4130,7 +4142,7 @@ func TestApply_SingleEntryBatch(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4155,7 +4167,7 @@ func TestApply_SingleEntryBatch(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4187,7 +4199,7 @@ func TestApply_AllSessionDuplicatesBatch(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
 			return kv
 		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4236,7 +4248,7 @@ func TestApply_SessionManagedEntryWithEmptyCmd(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4278,7 +4290,7 @@ func TestStateMachine_OpenRegularReturnsZero(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4297,7 +4309,7 @@ func TestStateMachine_OpenRegularReturnsZero(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4322,7 +4334,7 @@ func TestStateMachine_SMTypeAccessorAllTypes(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4336,7 +4348,7 @@ func TestStateMachine_SMTypeAccessorAllTypes(t *testing.T) {
 		createFn := sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
 			return newTestConcurrentKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4350,7 +4362,7 @@ func TestStateMachine_SMTypeAccessorAllTypes(t *testing.T) {
 		createFn := sm.NewDiskCreateFunc(func(shardID, replicaID uint64) sm.DiskStateMachine {
 			return newTestOnDiskKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4370,7 +4382,7 @@ func TestStateMachine_SessionsAccessorNotNil(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4385,7 +4397,7 @@ func TestStateMachine_SessionsAccessorNotNil(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
 		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
@@ -4419,7 +4431,7 @@ func TestStateMachine_NALookupBuf_NotSupported(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4444,7 +4456,7 @@ func TestStateMachine_NALookupBuf_Supported(t *testing.T) {
 	createFn := func(shardID, replicaID uint64) interface{} {
 		return kv
 	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4469,7 +4481,7 @@ func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {
 	createFn := func(shardID, replicaID uint64) interface{} {
 		return kv
 	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4499,7 +4511,7 @@ func TestStateMachine_NALookupBuf_FallsBackToNALookup(t *testing.T) {
 	createFn := func(shardID, replicaID uint64) interface{} {
 		return kv
 	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4529,7 +4541,7 @@ func TestStateMachine_NALookupBuf_PoolReuse(t *testing.T) {
 	createFn := func(shardID, replicaID uint64) interface{} {
 		return kv
 	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4610,7 +4622,7 @@ func TestApply_InBatchDuplicateAppliedOnce(t *testing.T) {
 	createFn := func(shardID, replicaID uint64) interface{} {
 		return cs
 	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4679,7 +4691,7 @@ func TestApply_BatchExceedsMaxResponses(t *testing.T) {
 		return cs
 	}
 	// maxResponses = 2: the third distinct new series in the batch overflows.
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 2, 0, false)
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 2, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -4759,7 +4771,7 @@ func TestStateMachineApply_ExpiryBatchShapeInvariant(t *testing.T) {
 	applyShape := func(t *testing.T, groups [][]proto.Entry) (bool, uint64) {
 		t.Helper()
 		createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine { return newTestKV() })
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), 100, 100, threshold, false)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, threshold), nil, false)
 		if err != nil {
 			t.Fatalf("NewStateMachine = %v", err)
 		}

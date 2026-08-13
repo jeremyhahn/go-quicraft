@@ -252,10 +252,20 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 		idx := round % numNodes
 		before := totalOps.Load()
 
+		roundStart := time.Now()
 		cluster.stopNode(idx)
+		stoppedAt := time.Now()
 		cluster.waitForClusterLeader(shardID, failoverTimeout)
+		electedAt := time.Now()
 		cluster.restartNode(idx, shardID)
+		restartedAt := time.Now()
 		leaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
+		t.Logf("round %d node[%d]: stop=%v elect=%v restart=%v elect2=%v (leader=%d)",
+			round, idx,
+			stoppedAt.Sub(roundStart).Round(time.Millisecond),
+			electedAt.Sub(stoppedAt).Round(time.Millisecond),
+			restartedAt.Sub(electedAt).Round(time.Millisecond),
+			time.Since(restartedAt).Round(time.Millisecond), leaderIdx)
 
 		// Wait for the restarted replica to CATCH UP before taking the next
 		// one down. A real rolling upgrade does the same, and skipping it
@@ -263,7 +273,10 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 		// one node down and one still replaying its WAL, every commit needs
 		// all three remaining healthy nodes, so the cluster stalls for
 		// reasons that have nothing to do with a defect.
+		catchStart := time.Now()
 		waitForCatchUp(t, cluster, shardID, idx, leaderIdx, failoverTimeout)
+		t.Logf("round %d node[%d]: catchup=%v ops=%d", round, idx,
+			time.Since(catchStart).Round(time.Millisecond), totalOps.Load())
 		rounds++
 
 		// Track the longest window with no committed operation. A stall
@@ -308,7 +321,16 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 	// replica to be within a bounded window of the leader rather than exactly
 	// equal, which a moving target would never satisfy.
 	const maxLag = 50
-	waitForCondition(t, timeout, "restarted replica catches up", func() bool {
+
+	start := time.Now()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	diag := time.NewTicker(500 * time.Millisecond)
+	defer diag.Stop()
+
+	caught := func() bool {
 		cluster.hostsMu.RLock()
 		defer cluster.hostsMu.RUnlock()
 		if cluster.stopped[idx].Load() || cluster.stopped[leaderIdx].Load() {
@@ -323,7 +345,61 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 			return false
 		}
 		return self.LastApplied+maxLag >= leader.LastApplied
-	})
+	}
+
+	for {
+		if caught() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Logf("catchup[node=%d leader=%d] TIMEOUT after %v; final state:", idx, leaderIdx, timeout)
+			dumpClusterState(t, cluster, shardID)
+			t.Fatalf("timed out after %v waiting for condition: restarted replica catches up", timeout)
+			return
+		case <-diag.C:
+			// Only start dumping once the wait is clearly abnormal, so a
+			// healthy rolling restart stays quiet.
+			if time.Since(start) > 2*time.Second {
+				t.Logf("catchup[node=%d leader=%d] waiting %v:", idx, leaderIdx, time.Since(start).Round(100*time.Millisecond))
+				dumpClusterState(t, cluster, shardID)
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
+// dumpClusterState logs a one-line-per-node view of every live replica's raft
+// and apply state. It is the instrumentation the catch-up assertion needs: the
+// assertion only sees two LastApplied numbers, which cannot distinguish "the
+// replica is not being sent entries" from "the replica has them and is not
+// applying them".
+func dumpClusterState(t *testing.T, cluster *testCluster, shardID uint64) {
+	t.Helper()
+	cluster.hostsMu.RLock()
+	defer cluster.hostsMu.RUnlock()
+	for i, h := range cluster.hosts {
+		if cluster.stopped[i].Load() {
+			t.Logf("  node[%d]: STOPPED", i)
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			t.Logf("  node[%d]: GetShardInfo: %v", i, err)
+			continue
+		}
+		term, committed, processed, lastIdx, msgs, state, rerr := h.DiagRaftState(shardID)
+		recovering, saving, inFlight, gerr := h.DiagShardGates(shardID)
+		commitPending, propQ, inbox, pending, perr := h.DiagPipelineState(shardID)
+		remotes, _ := h.DiagRemotes(shardID)
+		t.Logf("  node[%d] applied=%d leader=%d term=%d isLeader=%v health=%v | raft{term=%d committed=%d processed=%d last=%d msgs=%d state=%s err=%v} "+
+			"gates{recovering=%v saving=%v inflight=%d err=%v} pipe{commitPending=%v propQ=%d inbox=%d pending=%d err=%v} remotes=%s",
+			i, info.LastApplied, info.LeaderID, info.Term, info.IsLeader, info.Health,
+			term, committed, processed, lastIdx, msgs, state, rerr,
+			recovering, saving, inFlight, gerr,
+			commitPending, propQ, inbox, pending, perr,
+			remotes)
+	}
 }
 
 // TestSoak_LeaderCloseDoesNotStallWrites measures the write outage caused by

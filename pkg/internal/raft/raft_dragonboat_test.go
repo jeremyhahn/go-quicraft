@@ -256,10 +256,15 @@ func TestDragonboat_LeaderTransferReceiveHigherTermVote(t *testing.T) {
 	// Receive a transfer-initiated RequestVote with a higher term from
 	// node 3 (Hint == From marks a leadership-transfer election, which
 	// bypasses the CheckQuorum higher-term-vote guard).
+	//
+	// r.term+1 is the only term a real transferee can campaign at: it takes
+	// its term from the leader's own TimeoutNow and becomeCandidate adds one.
+	// The exemption is capped there, so a larger jump is dropped — see
+	// dropHighTermVote and TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm.
 	err = r.step(proto.Message{
 		Type:     proto.RequestVote,
 		From:     3,
-		Term:     r.term + 2,
+		Term:     r.term + 1,
 		LogIndex: r.log.lastIndex(),
 		LogTerm:  mustLastTerm(t, r),
 		Hint:     3,

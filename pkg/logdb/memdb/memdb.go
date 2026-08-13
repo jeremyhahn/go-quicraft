@@ -152,13 +152,18 @@ func (m *MemDB) applyUpdate(nd *nodeData, u *logdb.Update) {
 	}
 }
 
-// copyMembership returns a deep copy of m: the four maps are cloned so the
+// copyMembership returns a deep copy of m: the five maps are cloned so the
 // stored membership never aliases the caller's. A nil map stays nil so a
 // round-trip does not manufacture empty maps where the caller had none.
+//
+// Identities is cloned like the rest, and dropping it here would be worse
+// than an aliasing bug: it is the authorization key a replica recovering
+// from a snapshot has no other source for. See logdb.Membership.Identities.
 func copyMembership(m logdb.Membership) logdb.Membership {
 	m.Addresses = copyAddrMap(m.Addresses)
 	m.Observers = copyAddrMap(m.Observers)
 	m.Witnesses = copyAddrMap(m.Witnesses)
+	m.Identities = copyAddrMap(m.Identities)
 	if m.Removed != nil {
 		removed := make(map[uint64]bool, len(m.Removed))
 		for k, v := range m.Removed {

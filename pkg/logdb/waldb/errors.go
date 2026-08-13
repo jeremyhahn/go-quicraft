@@ -44,6 +44,62 @@ var (
 	ErrBarrierContextUnsupported = errors.New(
 		"waldb: barrier does not support context-bound encryption")
 
+	// ErrBarrierContextBindingUnreportable is returned by Open for a barrier
+	// that DOES implement context-bound encryption but not
+	// ContextBindingResolved, the method walContextBarrier gained so the WAL
+	// can tell "cannot bind" apart from "cannot say yet".
+	//
+	// This is a BREAKING change for embedders: the interface is asserted on the
+	// dynamic type, so a barrier written against the previous release compiles
+	// unchanged and then fails at Open. It gets its own error because the
+	// generic one — "does not support context-bound encryption" — is false here
+	// and sends the reader looking for a missing capability instead of a
+	// missing method. See docs/operations/compatibility.md.
+	ErrBarrierContextBindingUnreportable = errors.New(
+		"waldb: barrier is missing ContextBindingResolved() bool, required since the " +
+			"WAL must distinguish a barrier that cannot bind context from one that is " +
+			"merely still sealed; add the method (return true whenever the barrier is " +
+			"unsealed and its encryptor is installed)")
+
+	// ErrBarrierContextUnresolved is returned by Open when a barrier is
+	// configured but is not unsealed, so its context-AAD capability has no
+	// answer yet (see walContextBarrier.ContextBindingResolved).
+	//
+	// The WAL resolves that capability once and writes every record of the
+	// process against it, so it must not be resolved against a barrier that has
+	// merely not been unsealed: a node started sealed would latch "cannot bind"
+	// and keep writing epoch-only records after the operator unseals, with no
+	// error and no log line — a silent, permanent downgrade of exactly the
+	// positional binding this package fails closed to obtain.
+	//
+	// SCOPE, precisely: that downgrade is NOT a bug the older seal package had.
+	// A sealed software barrier used to report ContextBindingBarrier — Binds()
+	// was true — so the WAL would have latched "can bind", not "cannot". The
+	// silent downgrade becomes REACHABLE only alongside the new
+	// ContextBindingUnresolved state, which is what finally distinguishes "no"
+	// from "cannot say yet". The two changes are therefore a matched pair: this
+	// guard closes a hole that the seal change opens, and reverting
+	// pkg/seal/barrier_binding.go on its own — leaving this guard in place —
+	// makes every encrypted WAL refuse to open. Ship them together.
+	//
+	// Fail closed at setup instead. A sealed barrier cannot serve the WAL
+	// anyway: replay decrypts every record at open and encryption fails on
+	// every write, so the only case this refuses is a fresh directory that
+	// would have been downgraded. Unseal the barrier before opening the WAL.
+	ErrBarrierContextUnresolved = errors.New(
+		"waldb: barrier is not unsealed, so its context-binding capability cannot be resolved; unseal before opening the WAL")
+
+	// ErrBarrierContextBindingChanged is returned when a barrier that was
+	// resolved at open as UNABLE to authenticate a caller context later reports
+	// that it can. The capability is a deployment property the WAL latches
+	// once, so the change means the barrier was sealed and unsealed underneath
+	// it with a different strategy. Continuing would keep writing unbound
+	// records against a barrier that would bind them — a silent downgrade —
+	// while the segment's earlier records are bound differently. Fail closed
+	// and let the operator restart the process against the intended strategy.
+	ErrBarrierContextBindingChanged = errors.New(
+		"waldb: barrier context-binding capability changed after open; restart required")
+
 	// ErrLandingSegmentOverflow is returned when a record that was pre-fitted
 	// to its landing segment nevertheless overflows it. It signals a broken
 	// invariant between segment.CanFit and segment.Write, never a condition a
@@ -229,6 +285,25 @@ func (e *WALDecryptError) Error() string {
 
 // Unwrap returns the underlying error.
 func (e *WALDecryptError) Unwrap() error {
+	return e.Err
+}
+
+// SegmentReadError is returned when reading a block of a WAL segment fails
+// during recovery. It carries the file offset of the failed read so an
+// operator can locate the bad region on the medium. It is always wrapped in a
+// RecoveryError, which supplies the segment ID.
+type SegmentReadError struct {
+	Offset int64
+	Err    error
+}
+
+// Error implements the error interface.
+func (e *SegmentReadError) Error() string {
+	return "waldb: read failed at offset " + itoa(int(e.Offset)) + ": " + e.Err.Error()
+}
+
+// Unwrap returns the underlying error.
+func (e *SegmentReadError) Unwrap() error {
 	return e.Err
 }
 

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -580,4 +581,158 @@ func TestAllowEviction_BudgetIsPerPeerAddress(t *testing.T) {
 	if tr.allowEviction(healthy, now) {
 		t.Fatal("rolling one peer's window refreshed another peer's budget")
 	}
+}
+
+// TestPeerCertificateExclusivity_RefusesWildcardPeer is the RECEIVE-side half
+// of the promiscuous-certificate control, and it is the half that is an attack
+// control at all.
+//
+// The startup checks (TestVerifyPeerAddressExclusivity_* and the two in Host)
+// inspect the LOCAL node's own certificate against addresses an operator handed
+// the local API. A malicious joiner never calls them — it simply connects. Only
+// a check on what ARRIVES can refuse it, and this is that check.
+//
+// What makes the case concrete: the peer presents a *.raft.example.com
+// certificate, which covers this node's own host. A certificate that covers
+// THIS member covers every member, so its holder can satisfy the
+// committed-address binding for any replica of any shard and have forged
+// quorum-bearing responses counted. The connection is refused before it can
+// open a single stream.
+func TestPeerCertificateExclusivity_RefusesWildcardPeer(t *testing.T) {
+	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
+	perNode := leafOf(t, sharedSANMTLSConfig(t, "node-b.raft.example.com"))
+
+	const selfAddr = "node-a.raft.example.com:5001"
+	const peerAddr = "10.20.30.40:41000"
+
+	err := peerCertificateExclusivity(wildcard, selfAddr, peerAddr)
+	if !errors.Is(err, ErrPromiscuousPeerCertificate) {
+		t.Fatalf("peerCertificateExclusivity(wildcard) = %v, want ErrPromiscuousPeerCertificate: "+
+			"a certificate that covers this node's host covers every member's host, "+
+			"so its holder can assert any replica's msg.From", err)
+	}
+	var promiscuous *PromiscuousPeerCertificateError
+	if !errors.As(err, &promiscuous) {
+		t.Fatalf("error is not a *PromiscuousPeerCertificateError: %T", err)
+	}
+	if promiscuous.SelfHost != "node-a.raft.example.com" {
+		t.Fatalf("SelfHost = %q, want node-a.raft.example.com", promiscuous.SelfHost)
+	}
+
+	// The correctly-issued peer certificate — per-node SANs, covering only its
+	// OWN host — is admitted. Without this the test would pass against a
+	// production hunk that refused every connection.
+	if err := peerCertificateExclusivity(perNode, selfAddr, peerAddr); err != nil {
+		t.Fatalf("peerCertificateExclusivity(per-node cert) = %v, want nil: "+
+			"a certificate scoped to its own host is exactly the required deployment", err)
+	}
+}
+
+// TestPeerCertificateExclusivity_ExemptsCoLocatedPeers pins the exemption the
+// refusal must keep, using the SAME predicate the startup check uses
+// (isCoLocatedCertHost). A certificate is matched on host alone, so a peer
+// sharing this machine cannot be issued one that excludes this node's host.
+// Refusing it would break every single-machine and every loopback deployment —
+// including the test suite — while telling the operator nothing they could act
+// on.
+func TestPeerCertificateExclusivity_ExemptsCoLocatedPeers(t *testing.T) {
+	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
+
+	tests := []struct {
+		name     string
+		selfAddr string
+		peerAddr string
+	}{
+		{"peer on the same host", "node-a.raft.example.com:5001", "node-a.raft.example.com:5002"},
+		{"peer on loopback", "node-a.raft.example.com:5001", "127.0.0.1:41000"},
+		{"self on loopback", "127.0.0.1:5001", "127.0.0.1:41000"},
+		{"no self address configured", "", "10.20.30.40:41000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := peerCertificateExclusivity(wildcard, tt.selfAddr, tt.peerAddr); err != nil {
+				t.Fatalf("peerCertificateExclusivity = %v, want nil: co-located peers "+
+					"cannot be separated by any certificate policy", err)
+			}
+		})
+	}
+}
+
+// TestNodeIdentityFromCertificate_StableAcrossRenewal pins the property that
+// made SPKI the identity rather than a certificate fingerprint or serial: two
+// certificates issued over the SAME keypair — a routine renewal — yield the
+// SAME identity, so a renewal does not require a config change to re-commit it.
+// Two DIFFERENT keypairs yield different identities, which is what makes the
+// value an identity at all.
+func TestNodeIdentityFromCertificate_StableAcrossRenewal(t *testing.T) {
+	original := sharedSANMTLSConfig(t, "node-a.raft.example.com")
+	leaf := leafOf(t, original)
+
+	renewed := renewLeafOnSameKey(t, original)
+
+	identity := NodeIdentityFromCertificate(leaf)
+	if identity == "" {
+		t.Fatal("NodeIdentityFromCertificate returned empty for a valid leaf")
+	}
+	if !strings.HasPrefix(identity, "spki:") {
+		t.Fatalf("identity %q lacks the spki: scheme tag", identity)
+	}
+	if got := NodeIdentityFromCertificate(renewed); got != identity {
+		t.Fatalf("renewal on the same keypair changed the identity:\n old %s\n new %s\n"+
+			"an identity that changes on renewal needs a config change per rotation, "+
+			"which guarantees the strict mode is turned off", identity, got)
+	}
+
+	other := leafOf(t, sharedSANMTLSConfig(t, "node-a.raft.example.com"))
+	if NodeIdentityFromCertificate(other) == identity {
+		t.Fatal("a distinct keypair produced the same identity; the value identifies nothing")
+	}
+	if NodeIdentityFromCertificate(nil) != "" {
+		t.Fatal("a nil certificate must yield no identity, never a usable one")
+	}
+}
+
+// renewLeafOnSameKey issues a second certificate over the private key in mtls,
+// with a different serial and validity window — the shape of a routine
+// certificate renewal.
+func renewLeafOnSameKey(t testing.TB, mtls *MTLSConfig) *x509.Certificate {
+	t.Helper()
+
+	keyBlock, _ := pem.Decode(mtls.Key)
+	if keyBlock == nil {
+		t.Fatal("PEM decode of leaf key failed")
+	}
+	leafKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse leaf key: %v", err)
+	}
+	caBlock, _ := pem.Decode(mtls.CACert)
+	if caBlock == nil {
+		t.Fatal("PEM decode of CA certificate failed")
+	}
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse CA certificate: %v", err)
+	}
+	// The renewal is self-signed by the leaf key: the test only reads the
+	// SubjectPublicKeyInfo, and issuing under the original CA key would need
+	// that key, which the fixture does not retain.
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               caCert.Subject,
+		DNSNames:              []string{"node-a.raft.example.com"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(2 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &leafKey.PublicKey, leafKey)
+	if err != nil {
+		t.Fatalf("create renewed cert: %v", err)
+	}
+	renewed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse renewed cert: %v", err)
+	}
+	return renewed
 }

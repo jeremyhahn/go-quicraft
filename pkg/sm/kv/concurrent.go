@@ -104,7 +104,7 @@ func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results
 			continue
 		}
 		switch cmd.Op {
-		case OpPut, OpGet, OpDelete:
+		case OpPut, OpGet, OpDelete, OpPutIfAbsent:
 		default:
 			// Unreachable while DecodeCommand validates the opcode
 			// range; kept so a future opcode gap stays deterministic.
@@ -138,6 +138,19 @@ func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results
 			copy(val, cmd.Value)
 			b.data[string(cmd.Key)] = val
 			results[i] = sm.Result{Value: uint64(len(cmd.Value))}
+		case OpPutIfAbsent:
+			// Evaluated here, under the bucket lock and against replicated
+			// state, so every replica reaches the same decision. See
+			// handlePutIfAbsent in memory.go for why the check cannot live on
+			// the proposer.
+			if _, exists := b.data[string(cmd.Key)]; exists {
+				results[i] = sm.Result{Value: ResultNotStored}
+				break
+			}
+			val := make([]byte, len(cmd.Value))
+			copy(val, cmd.Value)
+			b.data[string(cmd.Key)] = val
+			results[i] = sm.Result{Value: ResultStored}
 		case OpDelete:
 			delete(b.data, string(cmd.Key))
 			results[i] = sm.Result{Value: 1}

@@ -25,8 +25,31 @@ import (
 // cache. Returning a non-empty key with a nil value signals a cache delete.
 type EntryKeyFunc func(cmd []byte) (key string, value []byte)
 
+// EntryAppliedFunc reports whether a committed entry actually took effect on
+// the inner state machine, given the command bytes and the Result the state
+// machine produced for it. Returning false suppresses caching for that entry.
+//
+// It takes the command as well as the Result because a result code alone is
+// often ambiguous: a conditional write that was declined and an unconditional
+// write that happened to return the same code are indistinguishable from the
+// Result. The command says which operation was asked for.
+type EntryAppliedFunc func(cmd []byte, result Result) bool
+
 // CacheConfig configures the write-through LRU cache for a
 // CachedDiskStateMachine.
+//
+// # Conditional writes
+//
+// The cache is populated from the value ExtractKV pulls out of the COMMAND,
+// not from the store. For an unconditional write those agree. For a
+// CONDITIONAL write — compare-and-set, put-if-absent, delete-if-match — they
+// do not: the command carries a value the store may have declined to take,
+// and caching it would let a later Lookup return a value the store never held.
+//
+// A state machine with conditional operations MUST therefore set EntryApplied.
+// Nothing here can infer the answer, because the outcome encoding is the state
+// machine's own (`kv.OpPutIfAbsent`, for instance, reports its verdict as
+// `kv.ResultStored` vs `kv.ResultNotStored`, both successful applications).
 type CacheConfig struct {
 	// MaxEntries is the maximum number of entries in the LRU cache.
 	// When exceeded, the least recently used entry is evicted.
@@ -36,6 +59,17 @@ type CacheConfig struct {
 	// ExtractKV extracts cache key/value from entry Cmd bytes.
 	// Required -- without this the cache cannot know what to store.
 	ExtractKV EntryKeyFunc
+
+	// EntryApplied reports whether an entry took effect, and is consulted
+	// before the extracted value is cached. Optional: nil caches every entry
+	// whose result is not the reserved ResultInvalidCommand, which is correct
+	// only when every operation ExtractKV names is unconditional.
+	//
+	// ResultInvalidCommand is excluded whether or not this is set. It is a
+	// reserved sentinel meaning the payload could not be decoded and the store
+	// was left unchanged, so caching such an entry is never correct and a
+	// predicate cannot opt back into it.
+	EntryApplied EntryAppliedFunc
 }
 
 // validate checks that the CacheConfig is valid.
@@ -60,9 +94,10 @@ func (cfg *CacheConfig) validate() error {
 // LRU cache. The cache sits in front of disk reads, converting expensive
 // disk I/O into memory lookups on cache hit.
 type CachedDiskStateMachine struct {
-	inner     DiskStateMachine
-	cache     *lruCache
-	extractKV EntryKeyFunc
+	inner        DiskStateMachine
+	cache        *lruCache
+	extractKV    EntryKeyFunc
+	entryApplied EntryAppliedFunc
 }
 
 // NewCachedDiskStateMachine creates a CachedDiskStateMachine wrapping the
@@ -72,9 +107,10 @@ func NewCachedDiskStateMachine(inner DiskStateMachine, cfg CacheConfig) (*Cached
 		return nil, err
 	}
 	return &CachedDiskStateMachine{
-		inner:     inner,
-		cache:     newLRUCache(cfg.MaxEntries),
-		extractKV: cfg.ExtractKV,
+		inner:        inner,
+		cache:        newLRUCache(cfg.MaxEntries),
+		extractKV:    cfg.ExtractKV,
+		entryApplied: cfg.EntryApplied,
 	}, nil
 }
 
@@ -124,12 +160,13 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	}
 
 	for _, p := range pairs {
-		// Do not cache the new value for an entry the inner SM rejected. A
-		// ResultInvalidCommand means the store state was left unchanged for
-		// that entry, so caching the (would-be) value would let Lookup return
-		// a value the store never held. The key was already invalidated above,
-		// so a later Lookup correctly falls through to the inner SM.
-		if results[p.idx].Value == ResultInvalidCommand {
+		// Do not cache the new value for an entry that did not take effect --
+		// a rejected payload, or a conditional write the store declined. In
+		// either case the store state was left unchanged, so caching the
+		// would-be value would let Lookup return a value the store never held.
+		// The key was already invalidated above, so a later Lookup correctly
+		// falls through to the inner SM.
+		if !c.applied(entries[p.idx].Cmd, results[p.idx]) {
 			continue
 		}
 		value := p.value
@@ -146,6 +183,20 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 		c.cache.Put(p.key, value)
 	}
 	return nil
+}
+
+// applied reports whether an entry took effect and its extracted value may
+// therefore be cached. ResultInvalidCommand is refused unconditionally: it is
+// the reserved sentinel for a payload that could not be decoded, so the store
+// was left unchanged no matter what a configured predicate believes.
+func (c *CachedDiskStateMachine) applied(cmd []byte, result Result) bool {
+	if result.Value == ResultInvalidCommand {
+		return false
+	}
+	if c.entryApplied == nil {
+		return true
+	}
+	return c.entryApplied(cmd, result)
 }
 
 // Lookup checks the cache first, then falls back to the inner SM on miss.

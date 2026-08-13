@@ -920,6 +920,11 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 		return false
 	case <-w.stopC:
 		node.commitPending.Store(false)
+		// Return the pooled committed-entries slice BEFORE the item:
+		// releaseApplyItem clears the update with a plain struct assignment, so
+		// dropping the item without this call leaks the slice out of the pool.
+		// Every other drop site pairs the two (commit.go, applyWorker).
+		ai.update.ReleaseCommittedEntries()
 		releaseApplyItem(w.applyPool, ai)
 		w.enqueuingNode = nil
 		return true

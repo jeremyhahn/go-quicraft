@@ -127,19 +127,30 @@ func (db *snapshotTestLogDB) RemoveEntriesTo(_, _ uint64, index uint64) error {
 
 func (db *snapshotTestLogDB) Compact(_, _ uint64) error { return nil }
 
+// SaveSnapshot mirrors memdb and waldb: a snapshot whose index does not ADVANCE
+// past the stored one is rejected with ErrSnapshotOutOfDate. Accepting it made
+// the fixture disagree with every real implementation and let a test claim that
+// a non-advancing export "already failed" when it in fact succeeded.
 func (db *snapshotTestLogDB) SaveSnapshot(shardID, _ uint64, snap logdb.Snapshot) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if existing, ok := db.snapshots[shardID]; ok && snap.Index <= existing.Index {
+		return logdb.ErrSnapshotOutOfDate
+	}
 	db.snapshots[shardID] = snap
 	return nil
 }
 
+// GetSnapshot mirrors memdb and waldb: no record is ErrNoSnapshot, NOT a zero
+// Snapshot with a nil error. Returning (zero, nil) made "no record yet" and "a
+// record at index 0" indistinguishable, so no test ever reached the production
+// first-save branch that has to tell them apart.
 func (db *snapshotTestLogDB) GetSnapshot(shardID, _ uint64) (logdb.Snapshot, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	snap, ok := db.snapshots[shardID]
 	if !ok {
-		return logdb.Snapshot{}, nil
+		return logdb.Snapshot{}, logdb.ErrNoSnapshot
 	}
 	return snap, nil
 }
@@ -4249,7 +4260,7 @@ func TestSnapshotPool_SaveSnapshot_NoPartialFileOnError(t *testing.T) {
 	// Verify the snapshot was NOT recorded in LogDB. A partial snapshot
 	// must never be treated as a valid recovery point.
 	snap, err := ldb.GetSnapshot(10, 1)
-	if err != nil {
+	if err != nil && !errors.Is(err, logdb.ErrNoSnapshot) {
 		t.Fatalf("GetSnapshot failed: %v", err)
 	}
 	if snap.Index != 0 {

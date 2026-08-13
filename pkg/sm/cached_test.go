@@ -1528,3 +1528,196 @@ func TestCachedDiskStateMachine_UpdateInvalidatesBeforeInnerWrite(t *testing.T) 
 		t.Fatalf("Lookup after Update = %q, want %q", got, "new")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Conditional writes and the EntryApplied predicate
+// ---------------------------------------------------------------------------
+
+// Result codes for condKVDiskSM. Both are SUCCESSFUL applications: a declined
+// conditional write is an answer, not an error, so neither may be reported as
+// ResultInvalidCommand.
+const (
+	condStored   uint64 = 1
+	condDeclined uint64 = 2
+)
+
+// condKVDiskSM applies "key=value" commands with put-if-absent semantics: a
+// write to a key that already exists is DECLINED and leaves the store
+// untouched. It is the shape of every conditional operation — compare-and-set,
+// put-if-absent, delete-if-match — where the command carries a value the store
+// may never take.
+type condKVDiskSM struct {
+	*kvDiskSM
+}
+
+func newCondKVDiskSM() *condKVDiskSM {
+	return &condKVDiskSM{kvDiskSM: newKVDiskSM()}
+}
+
+func (c *condKVDiskSM) Update(_ context.Context, entries []Entry, results []Result) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, e := range entries {
+		key, val := kvExtract(e.Cmd)
+		if key == "" {
+			results[i] = Result{Value: ResultInvalidCommand}
+			continue
+		}
+		if _, exists := c.state[key]; exists {
+			results[i] = Result{Value: condDeclined}
+			continue
+		}
+		cp := make([]byte, len(val))
+		copy(cp, val)
+		c.state[key] = cp
+		results[i] = Result{Value: condStored}
+	}
+	return nil
+}
+
+var _ DiskStateMachine = (*condKVDiskSM)(nil)
+
+// condApplied is the EntryApplied predicate matching condKVDiskSM.
+func condApplied(_ []byte, result Result) bool { return result.Value == condStored }
+
+// TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached is the
+// cache-poisoning regression test. A declined conditional write leaves the
+// store holding its ORIGINAL value while the command carries a different one.
+// Caching the command's value would make Lookup report a value the store never
+// held — and, because the cache is checked first, it would keep reporting it.
+func TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached(t *testing.T) {
+	inner := newCondKVDiskSM()
+	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+		MaxEntries:   16,
+		ExtractKV:    kvExtract,
+		EntryApplied: condApplied,
+	})
+	if err != nil {
+		t.Fatalf("NewCachedDiskStateMachine: %v", err)
+	}
+	ctx := context.Background()
+
+	results := make([]Result, 1)
+	if err := cached.Update(ctx, []Entry{{Index: 1, Cmd: []byte("k=first")}}, results); err != nil {
+		t.Fatalf("first Update: %v", err)
+	}
+	if results[0].Value != condStored {
+		t.Fatalf("first write result = %d, want condStored", results[0].Value)
+	}
+
+	// Second write to the same key is declined; the store keeps "first".
+	results = make([]Result, 1)
+	if err := cached.Update(ctx, []Entry{{Index: 2, Cmd: []byte("k=second")}}, results); err != nil {
+		t.Fatalf("second Update: %v", err)
+	}
+	if results[0].Value != condDeclined {
+		t.Fatalf("second write result = %d, want condDeclined", results[0].Value)
+	}
+
+	got, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if string(got.([]byte)) != "first" {
+		t.Fatalf("Lookup = %q, want %q: the declined write's value was cached, "+
+			"so the cache reports a value the store never held", got, "first")
+	}
+
+	// The inner SM must agree — proving the read above came from a source that
+	// matches the store, not from a cache that happened to be empty.
+	direct, err := inner.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("inner Lookup: %v", err)
+	}
+	if string(direct.([]byte)) != "first" {
+		t.Fatalf("inner store = %q, want %q", direct, "first")
+	}
+}
+
+// TestCachedDiskStateMachine_NilEntryAppliedCachesEveryAppliedEntry pins the
+// documented default: a nil EntryApplied caches every entry whose result is not
+// ResultInvalidCommand. That is correct only for unconditional operations, and
+// is why CacheConfig documents the predicate as REQUIRED for a state machine
+// with conditional writes.
+func TestCachedDiskStateMachine_NilEntryAppliedCachesEveryAppliedEntry(t *testing.T) {
+	inner := newKVDiskSM()
+	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+		MaxEntries: 16,
+		ExtractKV:  kvExtract,
+	})
+	if err != nil {
+		t.Fatalf("NewCachedDiskStateMachine: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := cached.Update(ctx, []Entry{{Index: 1, Cmd: []byte("k=v")}}, make([]Result, 1)); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	hitsBefore, _ := cached.CacheStats()
+	got, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if string(got.([]byte)) != "v" {
+		t.Fatalf("Lookup = %q, want %q", got, "v")
+	}
+	if hitsAfter, _ := cached.CacheStats(); hitsAfter != hitsBefore+1 {
+		t.Fatalf("cache hits = %d, want %d: an unconditional write must populate the cache",
+			hitsAfter, hitsBefore+1)
+	}
+}
+
+// TestCachedDiskStateMachine_InvalidCommandRefusedDespitePredicate asserts the
+// ResultInvalidCommand floor: the sentinel means the payload could not be
+// decoded and the store was left unchanged, so a predicate that returns true
+// for it must not be able to re-open the cache-poisoning hole.
+func TestCachedDiskStateMachine_InvalidCommandRefusedDespitePredicate(t *testing.T) {
+	inner := newCondKVDiskSM()
+	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+		MaxEntries: 16,
+		// Extract a key even from a command the inner SM cannot decode, so the
+		// entry reaches the caching step at all.
+		ExtractKV: func(cmd []byte) (string, []byte) {
+			if key, val := kvExtract(cmd); key != "" {
+				return key, val
+			}
+			return "k", cmd
+		},
+		EntryApplied: func([]byte, Result) bool { return true },
+	})
+	if err != nil {
+		t.Fatalf("NewCachedDiskStateMachine: %v", err)
+	}
+	ctx := context.Background()
+
+	results := make([]Result, 1)
+	if err := cached.Update(ctx, []Entry{{Index: 1, Cmd: []byte("undecodable")}}, results); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if results[0].Value != ResultInvalidCommand {
+		t.Fatalf("result = %d, want ResultInvalidCommand", results[0].Value)
+	}
+
+	got, err := cached.Lookup(ctx, "k")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("Lookup = %v, want nil: an undecodable command left the store "+
+			"unchanged, so nothing may be cached for it", got)
+	}
+}
+
+// TestCacheConfig_EntryAppliedOptional asserts the predicate is optional: a
+// config without it still validates.
+func TestCacheConfig_EntryAppliedOptional(t *testing.T) {
+	cfg := CacheConfig{MaxEntries: 4, ExtractKV: kvExtract}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate with nil EntryApplied: %v", err)
+	}
+	cfg.EntryApplied = condApplied
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate with EntryApplied set: %v", err)
+	}
+}

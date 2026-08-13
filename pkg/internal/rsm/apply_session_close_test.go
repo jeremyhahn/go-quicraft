@@ -37,7 +37,7 @@ func TestApply_SessionEntryAndCloseInSameBatch(t *testing.T) {
 	kv := newTestKV()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return kv
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -89,7 +89,7 @@ func TestApply_CloseBeforeSessionEntryInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -127,7 +127,7 @@ func TestApply_CloseOfDifferentClientInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -181,7 +181,7 @@ func TestApply_OneSessionClosedOneOpenInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -241,7 +241,7 @@ func TestApply_CloseThenReRegisterSameClientInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -290,7 +290,7 @@ func TestApply_InBatchDuplicateWithCloseInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 0, false)
+	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
@@ -326,7 +326,7 @@ func TestApply_SessionExpiryCannotDropSessionMidBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
 		return cs
-	}, t.TempDir(), 0, 0, 100, false)
+	}, t.TempDir(), testPolicy(0, 0, 100), nil, false)
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}

@@ -82,6 +82,29 @@ func (r *Registry) Register(shardID, replicaID uint64, address string) {
 	}
 }
 
+// RegisterIfAbsent records address for (shardID, replicaID) only when no entry
+// exists yet. It returns the address the entry holds afterwards — the one just
+// stored, or the pre-existing one that was kept — and whether this call is what
+// stored it.
+//
+// It is the ATOMIC form of Resolve-then-Register. The message handler's address
+// learning did those as two separate sync.Map operations, which does not
+// actually enforce the invariant it was written for: a sender the committed
+// configuration does not name may ESTABLISH a mapping but must never REPLACE
+// one. Two concurrent receives for the same (shard, replica) both observe no
+// entry and both Register, so the loser's address silently replaces the
+// winner's — the exact hijack the check exists to deny. LoadOrStore closes the
+// window, leaving Register and CompareAndRegister as the only paths that can
+// replace an established mapping.
+func (r *Registry) RegisterIfAbsent(shardID, replicaID uint64, address string) (string, bool) {
+	key := NodeInfo{ShardID: shardID, ReplicaID: replicaID}
+	actual, loaded := r.addresses.LoadOrStore(key, address)
+	if !loaded {
+		r.count.Add(1)
+	}
+	return actual.(string), !loaded
+}
+
 // Remove deletes the address entry for the given (shardID, replicaID)
 // pair. If the node does not exist, Remove is a no-op.
 func (r *Registry) Remove(shardID, replicaID uint64) {

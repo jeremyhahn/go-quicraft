@@ -90,8 +90,21 @@ func WithFullPercent(pct float64) DiskMonitorOption {
 }
 
 // WithCheckEvery sets the number of writes between disk usage checks.
+//
+// Zero is rejected, not honored: MaybeCheck samples with count%checkEvery, so a
+// zero interval divides by zero and panics the commit worker on the first
+// monitored write — a configuration typo would take the node down at runtime
+// rather than at setup. It is not read as "check every write" either; that is
+// WithCheckEvery(1), and silently turning a typo into a statfs on every WAL
+// write would be its own outage. Zero falls back to DefaultCheckEvery.
 func WithCheckEvery(n uint64) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
+		if n == 0 {
+			slog.Warn("waldb: WithCheckEvery(0) is not a valid sampling interval; "+
+				"using the default",
+				"check_every", DefaultCheckEvery)
+			n = DefaultCheckEvery
+		}
 		dm.checkEvery = n
 	}
 }
@@ -145,6 +158,13 @@ func NewDiskMonitor(dir string, maxBytes uint64, opts ...DiskMonitorOption) *Dis
 	}
 	for _, opt := range opts {
 		opt(dm)
+	}
+	// Defence in depth for the divisor MaybeCheck relies on: WithCheckEvery
+	// already refuses zero, but any future option (or a hand-built monitor)
+	// that leaves the field at its zero value must not turn the first
+	// monitored write into a division by zero on the commit worker.
+	if dm.checkEvery == 0 {
+		dm.checkEvery = DefaultCheckEvery
 	}
 	return dm
 }

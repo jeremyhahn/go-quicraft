@@ -57,12 +57,18 @@ func collectSnapshotChunks(msg proto.Message) ([]proto.SnapshotChunk, error) {
 // newMinimalEngineNode creates a minimal engine.Node for tests that only need
 // inbox delivery. Passes nil for peer, sm, logReader, snapshotter, and listener
 // since the test only exercises message delivery.
-func newMinimalEngineNode(shardID, replicaID uint64) *engine.Node {
+//
+// The snapshot root is t.TempDir(), never "". An empty root makes
+// Node.SnapshotSaveDir return the RELATIVE path "shard-<N>/replica-<M>/
+// snapshot-<index>", so anything that touches it writes into the package
+// source directory and leaves committed-looking artifacts behind.
+func newMinimalEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node {
+	t.Helper()
 	cfg := config.Config{
 		ShardID:   shardID,
 		ReplicaID: replicaID,
 	}
-	return engine.NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	return engine.NewNode(nil, nil, nil, cfg, 100, nil, t.TempDir(), nil)
 }
 
 // TestSplitSnapshotMessage_EmptySnapshot verifies that an InstallSnapshot
@@ -468,7 +474,7 @@ func TestTransportSender_NotifySnapshotStatus_Rejected(t *testing.T) {
 	defer eng.Stop()
 
 	// Create a node and load it so DeliverMessage succeeds.
-	node := newMinimalEngineNode(1, 1)
+	node := newMinimalEngineNode(t, 1, 1)
 	eng.LoadNode(node)
 	defer eng.UnloadNode(1)
 
@@ -521,7 +527,7 @@ func TestTransportSender_NotifySnapshotStatus_Accepted(t *testing.T) {
 	eng.Start()
 	defer eng.Stop()
 
-	node := newMinimalEngineNode(1, 1)
+	node := newMinimalEngineNode(t, 1, 1)
 	eng.LoadNode(node)
 	defer eng.UnloadNode(1)
 
@@ -726,7 +732,7 @@ func createTestBarrier(t *testing.T) *seal.Barrier {
 	_ = seal.AllowWeakKDFParams()
 	cfg := seal.DefaultBarrierConfig(1)
 	cfg.StatePersister = func(*seal.SealedRootKey) error { return nil }
-	b := seal.NewBarrier(cfg)
+	b := seal.MustNewBarrier(cfg)
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("test-snapshot-sender"), 1, 64*1024, 1)
 	if err != nil {

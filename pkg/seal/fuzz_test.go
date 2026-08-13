@@ -47,7 +47,7 @@ func newFuzzBarrier(t testing.TB) *Barrier {
 		NonceTracking: false,
 	}
 
-	barrier := NewBarrier(config)
+	barrier := MustNewBarrier(config)
 
 	strategy, err := NewSoftwareStrategyWithParams(fuzzPassphrase, 1, 64*1024, 1)
 	if err != nil {

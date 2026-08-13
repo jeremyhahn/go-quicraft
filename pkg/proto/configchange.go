@@ -18,7 +18,13 @@ package proto
 // as the Cmd payload of an EntryConfigChange entry. The wire format is:
 //
 //	[ConfigChangeID:8][Type:8][ReplicaID:8][Address:len+data][Initialize:8]
-//	[MaxWitnesses:8][RequireFullReplicaMajority:8]
+//	[MaxWitnesses:8][RequireFullReplicaMajority:8][NodeIdentity:len+data]
+//
+// NodeIdentity is a TRAILING field and its absence is meaningful: a payload
+// that ends after RequireFullReplicaMajority was written by a binary that had
+// no identity concept, and decodes with an empty NodeIdentity. See
+// UnmarshalFrom for why the tail can be discriminated here but not in
+// Membership.
 type ConfigChange struct {
 	// ConfigChangeID is the log index that identifies this config change.
 	ConfigChangeID uint64
@@ -39,6 +45,19 @@ type ConfigChange struct {
 	// RequireFullReplicaMajority is the new full-replica-majority policy
 	// for UpdateWitnessPolicy changes. Ignored for other types.
 	RequireFullReplicaMajority bool
+	// NodeIdentity is the stable cryptographic node identity to commit for
+	// the replica being added — the value quicraft.NodeIdentity derives from
+	// that node's leaf certificate. Empty for RemoveNode and
+	// UpdateWitnessPolicy, and empty for an add whose caller supplied none
+	// (the pre-identity behaviour).
+	//
+	// It travels through consensus alongside Address so the receive-side gate
+	// reads a value no inbound message can write. It is supplied by the
+	// OPERATOR through the Host API, never captured from a connection: see the
+	// "Considered and rejected" note on Host.RequestAddNodeWithIdentity for why
+	// learning it from the joiner's own connection is unsound in exactly the
+	// threat model identities exist to close.
+	NodeIdentity string
 }
 
 // configChangeFixedSize is the wire size of the fixed fields:
@@ -47,9 +66,15 @@ type ConfigChange struct {
 // plus the 4-byte address string length prefix.
 const configChangeFixedSize = 6*8 + 4 // 52 bytes
 
+// configChangeIdentitySize is the wire size the trailing NodeIdentity field
+// adds: its own 4-byte length prefix plus the bytes.
+func (cc *ConfigChange) configChangeIdentitySize() int {
+	return 4 + len(cc.NodeIdentity)
+}
+
 // Size returns the total marshaled size of the config change in bytes.
 func (cc *ConfigChange) Size() int {
-	return configChangeFixedSize + len(cc.Address)
+	return configChangeFixedSize + len(cc.Address) + cc.configChangeIdentitySize()
 }
 
 // MarshalTo writes the config change into buf and returns bytes written.
@@ -71,6 +96,7 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 	offset += 8
 	putBool(buf[offset:], cc.RequireFullReplicaMajority)
 	offset += 8
+	offset += putString(buf[offset:], cc.NodeIdentity)
 	return offset, nil
 }
 
@@ -115,6 +141,23 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	offset += 8
 	cc.RequireFullReplicaMajority = getBool(buf[offset:])
 	offset += 8
+	// NodeIdentity is a trailing field, and a payload that ENDS here was
+	// written before identities existed. Unlike Membership — which is embedded
+	// in a larger buffer and therefore has no readable end, which is why it
+	// carries an explicit version byte — a ConfigChange is exactly one
+	// Entry.Cmd, so "the buffer ended" is an unambiguous in-band discriminator
+	// and needs no version byte of its own. It decodes with no identity, which
+	// is the compatibility state the receive-side gate handles explicitly.
+	if len(buf) == offset {
+		cc.NodeIdentity = ""
+		return offset, nil
+	}
+	identity, n, err := getString(buf[offset:], MaxNodeIdentityLength, ErrNodeIdentityTooLong)
+	if err != nil {
+		return 0, err
+	}
+	cc.NodeIdentity = identity
+	offset += n
 	return offset, nil
 }
 
@@ -127,4 +170,5 @@ func (cc *ConfigChange) Reset() {
 	cc.Initialize = false
 	cc.MaxWitnesses = 0
 	cc.RequireFullReplicaMajority = false
+	cc.NodeIdentity = ""
 }

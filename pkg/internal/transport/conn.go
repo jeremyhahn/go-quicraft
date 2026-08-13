@@ -23,11 +23,11 @@ import (
 	"net"
 	"runtime/debug"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
 	"github.com/quic-go/quic-go"
 )
 
@@ -379,24 +379,37 @@ func (p *peerIncarnation) retire(epoch uint64) {
 // connection's verified certificate covers may create or advance a record.
 // An unauthorized claim returns true so the caller's own (identical)
 // certificate gate keeps deciding the eviction, exactly as before.
+//
+// The authorization gate runs OUTSIDE peerEpochMu. peerEpochMu is
+// process-wide, while inboundAuthorizedForCached reads the connection's TLS
+// state and, on a cache miss, runs an x509 VerifyHostname: holding the lock
+// across it serialised every peer's first contact and every epoch change
+// behind one certificate verification. Nothing in that decision reads the
+// incarnation map, so it is computed between two critical sections and the
+// record checks are REPEATED under the second one — a concurrent receive for
+// the same target may have advanced or retired the record in the gap, and
+// acting on the stale first read would re-open the flapping the superseded
+// ring exists to prevent.
 func (t *QUICTransport) observePeerEpoch(target string, srcEpoch uint64, inbound *quic.Conn) bool {
 	now := time.Now()
-	t.peerEpochMu.Lock()
-	defer t.peerEpochMu.Unlock()
 
-	rec, known := t.peerEpoch[target]
-	if known {
-		rec.lastSeen = now
-		if rec.epoch == srcEpoch {
-			return true
-		}
-		if rec.isSuperseded(srcEpoch) {
-			return false
-		}
+	t.peerEpochMu.Lock()
+	allow, decided := t.recordedEpochDecision(target, srcEpoch, now)
+	t.peerEpochMu.Unlock()
+	if decided {
+		return allow
 	}
+
 	if !t.inboundAuthorizedForCached(inbound, target) {
 		return true
 	}
+
+	t.peerEpochMu.Lock()
+	defer t.peerEpochMu.Unlock()
+	if allow, decided := t.recordedEpochDecision(target, srcEpoch, now); decided {
+		return allow
+	}
+	rec, known := t.peerEpoch[target]
 	if !known {
 		rec = &peerIncarnation{}
 		t.peerEpoch[target] = rec
@@ -405,6 +418,28 @@ func (t *QUICTransport) observePeerEpoch(target string, srcEpoch uint64, inbound
 	rec.epoch = srcEpoch
 	rec.lastSeen = now
 	return true
+}
+
+// recordedEpochDecision reports the verdict reachable from target's existing
+// incarnation record alone, refreshing its lastSeen stamp. decided is false
+// when the record cannot settle the question — the peer is unknown, or it
+// claims an epoch that is neither the current one nor a retired one — and the
+// caller must run the authorization gate before mutating anything.
+//
+// The caller must hold peerEpochMu.
+func (t *QUICTransport) recordedEpochDecision(target string, srcEpoch uint64, now time.Time) (allow, decided bool) {
+	rec, known := t.peerEpoch[target]
+	if !known {
+		return false, false
+	}
+	rec.lastSeen = now
+	if rec.epoch == srcEpoch {
+		return true, true
+	}
+	if rec.isSuperseded(srcEpoch) {
+		return false, true
+	}
+	return false, false
 }
 
 // allowEviction charges one epoch-driven eviction against target's budget and
@@ -608,85 +643,100 @@ func (t *QUICTransport) forgetPeerIncarnation(target string) {
 	t.peerEpochMu.Unlock()
 }
 
+// cachedStream is getStream's fast path: it returns the pooled stream for
+// (target, shardID, isHeartbeat) and reports whether it is usable as-is.
+//
+// The connection behind a pooled stream must be verified alive before the
+// stream is handed out. Without that check a cached stream on a dead
+// connection blocks for the full write deadline (5s) before failing, which is
+// long enough for the peer to time out and start an unnecessary election.
+//
+// When the cached entry is unusable this evicts exactly as much state as the
+// failure warrants — see the three cases below — and reports false, leaving
+// the caller to open a fresh stream.
+func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat bool) (*quic.Stream, bool) {
+	idx := t.streamIndexFor(shardID, isHeartbeat)
+	shard := &t.streamShards[idx&(streamShardCount-1)]
+	key := streamKey{target: target, idx: idx}
+
+	shard.mu.RLock()
+	stream, ok := shard.streams[key]
+	owner := shard.owners[key]
+	shard.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+
+	t.connMu.RLock()
+	conn, connOK := t.conns[target]
+	t.connMu.RUnlock()
+
+	switch {
+	case owner != nil:
+		// Judge the pooled stream by its OWN connection, and require that
+		// connection to be the one currently cached for the target.
+		switch {
+		case connOK && conn == owner && owner.Context().Err() == nil:
+			// Live and current. Re-verify the stream is still the cached
+			// entry after the conn read: a concurrent evict may have
+			// removed or replaced it, in which case the local variable
+			// holds a stale (closed) stream that would block for the full
+			// write deadline before failing.
+			shard.mu.RLock()
+			cached, stillCached := shard.streams[key]
+			shard.mu.RUnlock()
+			if stillCached && cached == stream {
+				return stream, true
+			}
+			// Evicted or replaced between reads: fall through.
+		case connOK && conn == owner:
+			// The stream's owner IS the cached conn, but it is dead: evict
+			// the whole connection and its streams, then reconnect.
+			t.removeConnection(target)
+			t.evictStreamsForTarget(target)
+		default:
+			// The stream was opened on a connection that is no longer the
+			// one cached for this target (a superseded conn from a peer
+			// restart / re-dial) or no conn is cached at all. Drop just
+			// this stale stream so the slow path opens a fresh one on the
+			// current connection — WITHOUT tearing down the cached conn,
+			// which may be a healthy replacement.
+			t.evictStream(target, shardID, isHeartbeat, stream)
+		}
+	case connOK:
+		// Owner unknown (only manually-constructed test transports inject a
+		// raw stream). Preserve the original cached-conn liveness check.
+		select {
+		case <-conn.Context().Done():
+			// Connection is dead. Evict all streams and reconnect.
+			t.removeConnection(target)
+			t.evictStreamsForTarget(target)
+		default:
+			shard.mu.RLock()
+			_, stillCached := shard.streams[key]
+			shard.mu.RUnlock()
+			if stillCached {
+				return stream, true
+			}
+			// Stream was evicted between reads. Fall through to
+			// the slow path to open a fresh stream.
+		}
+	}
+	return nil, false
+}
+
 // getStream returns a pooled QUIC stream for the given target. Heartbeats
 // use stream index 0, data messages use (shardID % (poolSize-1)) + 1.
 // The stream pool is sharded across streamShardCount buckets to reduce
 // lock contention.
 func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat bool) (*quic.Stream, error) {
-	idx := t.streamIndexFor(shardID, isHeartbeat)
-
-	shardIdx := idx & (streamShardCount - 1)
-	shard := &t.streamShards[shardIdx]
-	key := streamKey{target: target, idx: idx}
-
-	// Fast path: existing stream. Verify the underlying connection is
-	// still alive to avoid sending to stale streams after a peer restart.
-	// Without this check, a cached stream on a dead connection blocks
-	// for the full write deadline (5s) before failing, causing the peer
-	// to timeout and start unnecessary elections.
-	shard.mu.RLock()
-	stream, ok := shard.streams[key]
-	owner := shard.owners[key]
-	shard.mu.RUnlock()
-	if ok {
-		t.connMu.RLock()
-		conn, connOK := t.conns[target]
-		t.connMu.RUnlock()
-
-		switch {
-		case owner != nil:
-			// Judge the pooled stream by its OWN connection, and require that
-			// connection to be the one currently cached for the target.
-			switch {
-			case connOK && conn == owner && owner.Context().Err() == nil:
-				// Live and current. Re-verify the stream is still the cached
-				// entry after the conn read: a concurrent evict may have
-				// removed or replaced it, in which case the local variable
-				// holds a stale (closed) stream that would block for the full
-				// write deadline before failing.
-				shard.mu.RLock()
-				cached, stillCached := shard.streams[key]
-				shard.mu.RUnlock()
-				if stillCached && cached == stream {
-					return stream, nil
-				}
-				// Evicted or replaced between reads: fall through.
-			case connOK && conn == owner:
-				// The stream's owner IS the cached conn, but it is dead: evict
-				// the whole connection and its streams, then reconnect.
-				t.removeConnection(target)
-				t.evictStreamsForTarget(target)
-			default:
-				// The stream was opened on a connection that is no longer the
-				// one cached for this target (a superseded conn from a peer
-				// restart / re-dial) or no conn is cached at all. Drop just
-				// this stale stream so the slow path opens a fresh one on the
-				// current connection — WITHOUT tearing down the cached conn,
-				// which may be a healthy replacement.
-				t.evictStream(target, shardID, isHeartbeat, stream)
-			}
-		case connOK:
-			// Owner unknown (only manually-constructed test transports inject a
-			// raw stream). Preserve the original cached-conn liveness check.
-			select {
-			case <-conn.Context().Done():
-				// Connection is dead. Evict all streams and reconnect.
-				t.removeConnection(target)
-				t.evictStreamsForTarget(target)
-			default:
-				shard.mu.RLock()
-				_, stillCached := shard.streams[key]
-				shard.mu.RUnlock()
-				if stillCached {
-					return stream, nil
-				}
-				// Stream was evicted between reads. Fall through to
-				// the slow path to open a fresh stream.
-			}
-		}
-		// No usable cached stream: fall through to the slow path which
-		// will dial a fresh connection if needed.
+	if stream, ok := t.cachedStream(target, shardID, isHeartbeat); ok {
+		return stream, nil
 	}
+
+	idx := t.streamIndexFor(shardID, isHeartbeat)
+	shard := &t.streamShards[idx&(streamShardCount-1)]
+	key := streamKey{target: target, idx: idx}
 
 	// Slow path: open a new stream.
 	conn, err := t.getConnection(target)
@@ -881,6 +931,16 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 // broken streams, causing repeated write failures until the stream is
 // individually evicted by sendBatch. It also reaps the incarnation records of
 // peers that are neither connected nor talking.
+//
+// Nothing but map surgery happens under connMu. connMu is the transport's
+// hottest lock — every outbound message on every shard reads it through
+// getStream/getConnection — and the OnConnectionFailed callback is USER code
+// of unbounded duration. Firing it inside the write section stalled every
+// heartbeat host-wide for as long as the listener ran, which is enough to time
+// out elections on shards that have nothing to do with the dead peer, and a
+// listener that re-entered transport teardown (Stop, CloseTarget) deadlocked
+// outright, since sync.RWMutex is not reentrant. The dial path has always
+// fired the same callback outside any lock (see dialConnection).
 func (t *QUICTransport) cleanStaleConnections() {
 	var deadTargets []string
 
@@ -888,10 +948,6 @@ func (t *QUICTransport) cleanStaleConnections() {
 	for addr, conn := range t.conns {
 		select {
 		case <-conn.Context().Done():
-			slog.Info("peer disconnected", "target", addr)
-			if t.eventListener != nil && t.eventListener.OnConnectionFailed != nil {
-				t.eventListener.OnConnectionFailed(config.ConnectionInfo{Address: addr})
-			}
 			delete(t.conns, addr)
 			delete(t.connEpoch, addr)
 			deadTargets = append(deadTargets, addr)
@@ -900,8 +956,9 @@ func (t *QUICTransport) cleanStaleConnections() {
 	}
 	t.connMu.Unlock()
 
-	// Evict all pooled streams belonging to dead connections. This must happen
-	// outside connMu to avoid lock ordering issues with shard locks.
+	// Evict all pooled streams belonging to dead connections, and notify the
+	// listener. This must happen outside connMu to avoid lock ordering issues
+	// with shard locks and to keep user callbacks off the send path's lock.
 	//
 	// The dead targets' incarnation records are deliberately NOT dropped here:
 	// a connection found dead is re-dialed, and the re-dial is stamped from
@@ -909,7 +966,11 @@ func (t *QUICTransport) cleanStaleConnections() {
 	// reapPeerIncarnations instead, which only forgets an address that has
 	// been both disconnected and silent for a long window.
 	for _, target := range deadTargets {
+		slog.Info("peer disconnected", "target", target)
 		t.evictStreamsForTarget(target)
+		if t.eventListener != nil && t.eventListener.OnConnectionFailed != nil {
+			t.eventListener.OnConnectionFailed(config.ConnectionInfo{Address: target})
+		}
 	}
 
 	t.reapPeerIncarnations(time.Now())
@@ -1094,44 +1155,16 @@ func (t *QUICTransport) inboundAuthorizedFor(conn *quic.Conn, target string) boo
 // characterises exactly the same matching the gate performs — including the fact
 // that the PORT is not part of the decision.
 func certAuthHost(target string) string {
-	host, _, err := net.SplitHostPort(target)
-	if err != nil {
-		// target may be a bare host with no port; fall back to it verbatim.
-		return target
-	}
-	return host
+	return netaddr.Host(target)
 }
 
 // canonicalCertHost normalises a host the way x509.VerifyHostname compares it,
-// so two spellings of the SAME host are recognised as one.
-//
-// VerifyHostname lower-cases DNS names, tolerates a single trailing dot (the
-// absolute-FQDN form), and parses an IP literal before matching it against the
-// IPAddresses SANs. Any check that decides "is this the same host?" with a raw
-// string compare while the MATCH is done by VerifyHostname is inconsistent by
-// construction: it will call two names different that the certificate calls
-// the same. That inconsistency is what made the exclusivity check reject
-// legitimate deployments — N1.EXAMPLE.COM against n1.example.com, the FQDN
-// form against the relative one, ::1 against 0:0:0:0:0:0:0:1.
-//
-// IP literals are canonicalised through net.IP.String(), which also collapses
-// the IPv4-mapped IPv6 form (::ffff:127.0.0.1) onto its IPv4 spelling. An
-// empty host stays empty; callers treat that as "no host to check".
+// so two spellings of the SAME host are recognised as one. See
+// netaddr.CanonicalHost for the rules and for why they live in a package below
+// this one: raft's duplicate-address validation must answer "is this the same
+// endpoint?" identically, and it cannot import the transport.
 func canonicalCertHost(host string) string {
-	host = strings.ToLower(strings.TrimSpace(host))
-	// A single trailing dot marks an absolute FQDN and is not part of the
-	// name for matching purposes.
-	if len(host) > 1 && strings.HasSuffix(host, ".") {
-		host = host[:len(host)-1]
-	}
-	// Bracketed IPv6 literals reach here when the address had no port.
-	if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
-		host = host[1 : len(host)-1]
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
-	}
-	return host
+	return netaddr.CanonicalHost(host)
 }
 
 // isCoLocatedCertHost reports whether a peer host must be treated as sharing
@@ -1221,6 +1254,91 @@ func verifyCertificateExclusivity(leaf *x509.Certificate, selfAddr string, peers
 	}
 	sort.Strings(covered)
 	return &SharedPeerCertificateError{SelfAddress: selfAddr, CoveredPeers: covered}
+}
+
+// refuseInboundPromiscuousCert reports the reason to refuse an inbound
+// connection whose verified leaf ALSO authorizes this node's own host, and nil
+// when the peer may be admitted.
+//
+// This is the CONNECTION-LEVEL half of the promiscuous-certificate control, and
+// it is the only half that is an attack control. Host.StartShard and
+// Host.requestConfigChange also run an exclusivity check
+// (VerifyPeerAddressExclusivity), but those inspect the LOCAL node's OWN
+// certificate against the addresses an operator handed the local API: they
+// catch a misconfigured deployment before it starts, and a malicious joiner
+// never executes them at all — it simply does not call them. Only a check on
+// what arrives can refuse a peer that did not cooperate.
+//
+// The rule, and why it is the right one: every in-band authorization the
+// transport and the message handler perform reduces to "does the sender's
+// certificate cover this address". A leaf that covers this node's host covers
+// every OTHER member's host too under the certificate shapes that produce it —
+// a wildcard SAN (*.raft.example.com) or one shared certificate carrying every
+// node's SAN. Its holder can therefore assert any member's msg.From and have
+// forged ReplicateResp and RequestVoteResp counted toward quorum. This node
+// cannot enumerate the other members here (the transport has no shard
+// membership), but it does not need to: it is itself a member, so "covers me"
+// is a sound proxy for "covers everyone", and it is a fact this node can check
+// against nothing but its own configured address.
+//
+// It is done ONCE PER CONNECTION, deliberately. The per-message alternative —
+// probing each member address through senderAuthorized — thrashes the
+// 4-slot-per-connection decision cache and trips its 16-distinct-miss
+// fail-closed cap (see inboundAuthorizedForCached), which would permanently
+// kill every connection on any shard with five or more members. A certificate
+// is fixed for the life of a connection, so once is also sufficient.
+//
+// Co-located peers are exempt, using the same predicate the startup check uses.
+// A certificate is matched on HOST alone, so a peer on this machine cannot be
+// given a certificate that excludes this node's host — refusing it would break
+// every single-machine deployment while telling the operator nothing they could
+// act on. peerHost comes from the QUIC remote address, which is the one thing
+// about the peer that is not in-band: a sender cannot choose the source address
+// its packets arrive from and still complete a handshake.
+func (t *QUICTransport) refuseInboundPromiscuousCert(conn *quic.Conn) error {
+	if conn == nil || t.tlsPair == nil {
+		return nil
+	}
+	selfHost := canonicalCertHost(certAuthHost(t.localAddr()))
+	if selfHost == "" {
+		return nil
+	}
+	certs := conn.ConnectionState().TLS.PeerCertificates
+	if len(certs) == 0 {
+		// Mandatory mTLS makes this unreachable; admitting it here would be a
+		// latent fail-open, so refuse.
+		return ErrNoPeerCertificate
+	}
+	return peerCertificateExclusivity(certs[0], t.localAddr(), conn.RemoteAddr().String())
+}
+
+// peerCertificateExclusivity is refuseInboundPromiscuousCert over explicit
+// values, so the rule is testable without a live connection — which matters
+// more here than usual, because the co-location exemption makes the rule a
+// no-op for every loopback deployment and therefore for every test that could
+// stand up two real transports on one machine.
+//
+// selfAddr is this node's advertised Raft address; peerAddr is the transport
+// address the connection arrived from, which is the one thing about the peer
+// that is not in-band.
+func peerCertificateExclusivity(peerLeaf *x509.Certificate, selfAddr, peerAddr string) error {
+	selfHost := canonicalCertHost(certAuthHost(selfAddr))
+	if selfHost == "" || peerLeaf == nil {
+		return nil
+	}
+	if isCoLocatedCertHost(selfHost, canonicalCertHost(certAuthHost(peerAddr))) {
+		return nil
+	}
+	// VerifyHostname returning nil is the REFUSAL case: a nil error means the
+	// peer's certificate covers this node's host, which is the promiscuous
+	// shape. A non-nil error is the required per-node scoping and admits the
+	// connection, so the predicate is spelled as a boolean rather than passing
+	// an error through.
+	coversSelf := peerLeaf.VerifyHostname(selfHost) == nil
+	if !coversSelf {
+		return nil
+	}
+	return &PromiscuousPeerCertificateError{PeerAddress: peerAddr, SelfHost: selfHost}
 }
 
 // inboundAuthorizedForCached is the per-connection-cached form of

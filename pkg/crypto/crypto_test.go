@@ -87,7 +87,7 @@ func TestNewBarrierReexport(t *testing.T) {
 	cfg := BarrierConfig{
 		Algorithm: seal.AlgAES256GCM,
 	}
-	b := NewBarrier(cfg)
+	b := MustNewBarrier(cfg)
 	if b == nil {
 		t.Fatal("NewBarrier returned nil")
 	}
@@ -96,15 +96,33 @@ func TestNewBarrierReexport(t *testing.T) {
 	}
 }
 
-// TestNewBarrierReexport_InvalidConfig verifies that NewBarrier with an
-// invalid (zero-value) config panics due to unsupported algorithm,
-// confirming that validation is enforced through the re-exported function.
+// TestNewBarrierReexport_InvalidConfig verifies that the re-exported
+// NewBarrier returns an error — never a panic — for an invalid (zero-value)
+// config, and that MustNewBarrier is the form that panics. The re-export is a
+// var holding the function value, so this also pins that it tracks the real
+// signature rather than an older one.
 func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("NewBarrier with empty config should panic")
+	t.Run("NewBarrier returns an error", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("re-exported NewBarrier must not panic, got %v", r)
+			}
+		}()
+		b, err := NewBarrier(BarrierConfig{})
+		if err == nil {
+			t.Fatal("NewBarrier with an empty config should return an error")
 		}
-	}()
-	NewBarrier(BarrierConfig{})
+		if b != nil {
+			t.Fatal("NewBarrier must return a nil Barrier alongside the error")
+		}
+	})
+
+	t.Run("MustNewBarrier panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("MustNewBarrier with an empty config should panic")
+			}
+		}()
+		MustNewBarrier(BarrierConfig{})
+	})
 }
