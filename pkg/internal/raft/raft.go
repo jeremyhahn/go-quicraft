@@ -2857,13 +2857,36 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	//
 	//     Falling back to probe resets next=match+1 and clears inflights,
 	//     allowing the leader to resend from the follower's actual position.
+	//   - Replicate with a FULL window: the peer is paused purely because the
+	//     window is full, and the window can only drain from ABOVE (freeTo
+	//     frees records at or below an acknowledged index). If those messages
+	//     went to a previous incarnation of the peer — it restarted — every
+	//     ack it can still send reports a position BELOW the window and frees
+	//     nothing, so the peer stays paused forever with the leader alive and
+	//     committing. Release one slot so exactly one message gets through:
+	//     if the window was merely busy it is acked normally, and if the peer
+	//     restarted it is rejected, which backtracks next to the peer's real
+	//     position and resumes replication. This is etcd/raft's
+	//     MsgHeartbeatResp behavior; the primitive it needs (freeFirstOne)
+	//     had been dropped here as unused.
 	// sendAppend internally checks isPaused() and skips if appropriate.
-	if rm.state == remoteProbe {
+	//
+	// forceSend records that a slot was released so the send below is not
+	// skipped for a ReadIndex heartbeat: under sustained ReadIndex load every
+	// heartbeat carries a context (broadcastHeartbeat), so a Hint==0 response
+	// may never arrive, and a slot released without a message to fill it is
+	// window capacity silently leaked.
+	forceSend := false
+	switch {
+	case rm.state == remoteProbe:
 		rm.probeSent = false
-	} else if rm.state == remoteReplicate &&
+	case rm.state == remoteReplicate &&
 		rm.next > r.log.lastIndex() &&
-		rm.inflights.Count() > 0 {
+		rm.inflights.Count() > 0:
 		rm.becomeProbe()
+	case rm.state == remoteReplicate && rm.inflights.full():
+		rm.inflights.freeFirstOne()
+		forceSend = true
 	}
 
 	// Skip sendAppend for ReadIndex heartbeats when the follower is caught
@@ -2878,7 +2901,7 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	//
 	// Witnesses receive metadata-only entries via sendWitnessAppend, not
 	// full entries via sendAppend. This matches broadcastAppend behavior.
-	if msg.Hint == 0 || rm.state != remoteReplicate {
+	if msg.Hint == 0 || rm.state != remoteReplicate || forceSend {
 		if _, isWitness := r.witnesses[msg.From]; isWitness {
 			r.sendWitnessAppend(msg.From)
 		} else {

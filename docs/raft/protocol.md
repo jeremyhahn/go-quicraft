@@ -381,6 +381,20 @@ Circular buffer tracking in-flight entry indices. Lazily allocated on
 first `add()`. `freeTo(index)` frees all entries with index <= the
 given value. `full()` returns true when `count >= size`.
 
+The window therefore drains only from ABOVE, which a peer RESTART can
+make impossible: the outstanding messages went to the peer's previous
+incarnation, and every ack the returning peer can send reports a
+position BELOW the window, so it frees nothing. Since a full window is
+what makes `isPaused` true, the peer would never be sent another entry.
+`handleHeartbeatResp` breaks that cycle with `freeFirstOne()`, which
+releases the oldest slot without its ack: the heartbeat response proves
+the peer is alive, so exactly one message is let through — acked
+normally if the window was merely busy, rejected if the peer restarted,
+and the rejection drives `declineFrom` back to `match + 1`. This
+mirrors etcd/raft's `MsgHeartbeatResp` handling. The stall is not
+detectable from leader state alone: a busy peer and a wedged one have
+the same match, next and window shape.
+
 ### declineFrom (remote.go:190)
 
 Handles rejected appends with index-based backtracking:

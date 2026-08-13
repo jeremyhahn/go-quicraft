@@ -19,20 +19,6 @@ import (
 	"testing"
 )
 
-// freeFirstOneForTest is a test helper that frees the oldest in-flight entry.
-// This was previously a method on inflights but was removed as unused in
-// production code.
-func freeFirstOneForTest(in *inflights) {
-	if in.count == 0 {
-		return
-	}
-	in.start++
-	if in.start >= in.size {
-		in.start -= in.size
-	}
-	in.count--
-}
-
 // mustAdd is a test helper that calls add and fails the test on error.
 func mustAdd(t *testing.T, in *inflights, index uint64) {
 	t.Helper()
@@ -208,7 +194,7 @@ func TestInflightsFreeFirstOneFreesOldest(t *testing.T) {
 	mustAdd(t, in, 100)
 	mustAdd(t, in, 101)
 	mustAdd(t, in, 102)
-	freeFirstOneForTest(in)
+	in.freeFirstOne()
 	if in.Count() != 2 {
 		t.Errorf("expected count 2, got %d", in.Count())
 	}
@@ -220,7 +206,7 @@ func TestInflightsFreeFirstOneFreesOldest(t *testing.T) {
 
 func TestInflightsFreeFirstOneNoopWhenEmpty(t *testing.T) {
 	in := newInflights(5)
-	freeFirstOneForTest(in) // should not panic
+	in.freeFirstOne() // should not panic
 	if in.Count() != 0 {
 		t.Errorf("expected count 0, got %d", in.Count())
 	}
@@ -319,7 +305,7 @@ func TestInflightsCountReturnsCorrectValue(t *testing.T) {
 	if in.Count() != 3 {
 		t.Errorf("expected 3, got %d", in.Count())
 	}
-	freeFirstOneForTest(in)
+	in.freeFirstOne()
 	if in.Count() != 2 {
 		t.Errorf("expected 2, got %d", in.Count())
 	}
@@ -343,7 +329,7 @@ func TestInflightsMultipleAddFreeCycles(t *testing.T) {
 	// Cycle 2: partial fill, partial drain
 	mustAdd(t, in, 4)
 	mustAdd(t, in, 5)
-	freeFirstOneForTest(in)
+	in.freeFirstOne()
 	if in.Count() != 1 {
 		t.Errorf("expected 1 after cycle 2, got %d", in.Count())
 	}
@@ -394,13 +380,13 @@ func TestInflightsFreeFirstOneWrapsStart(t *testing.T) {
 	mustAdd(t, in, 2)
 	mustAdd(t, in, 3)
 	// Free first two via freeFirstOne to position start at 2
-	freeFirstOneForTest(in)
-	freeFirstOneForTest(in)
+	in.freeFirstOne()
+	in.freeFirstOne()
 	// Add two more to wrap
 	mustAdd(t, in, 4)
 	mustAdd(t, in, 5)
 	// Now start=2, count=3, entries at positions 2,0,1
-	freeFirstOneForTest(in) // frees position 2, start becomes 0
+	in.freeFirstOne() // frees position 2, start becomes 0
 	if in.start != 0 {
 		t.Errorf("expected start 0 after wrap, got %d", in.start)
 	}
