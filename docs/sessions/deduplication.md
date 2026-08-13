@@ -300,9 +300,21 @@ No-op sessions have a fixed `clientID` of 0. Entries with `clientID == 0` skip d
 |-----------|---------|---------|
 | `MaxSessionsPerClient` | 128 | Maximum cached responses per session |
 | `MaxTotalSessions` | 16,384 | Maximum concurrent sessions per shard |
-| `SessionExpiryEntries` | 0 (disabled) | Index-based TTL for automatic session expiry |
+| `SessionExpiryEntries` | 100,000 | Index-based TTL for automatic session expiry (`config.SessionExpiryDisabled` turns it off) |
 
-**Note:** `MaxSessionsPerClient` limits the per-session response cache; `MaxTotalSessions` limits the total number of active sessions. Set `SessionExpiryEntries` to a positive value to enable deterministic session expiry (e.g., 10000 means expire idle sessions every 10K applied entries).
+**Note:** `MaxSessionsPerClient` limits the per-session response cache; `MaxTotalSessions` limits the total number of active sessions.
+
+**All three are SEEDS, not the values the apply path uses.** They are replicated: a founding replica writes them into the shard's initial membership at bootstrap (`proto.SessionPolicy`, carried in `proto.Membership` alongside the witness policy), and from then on every replica applies the COMMITTED values. That is what makes expiry deterministic in practice and not merely in principle — the apply path derives its expiry checkpoints from the threshold and refuses registrations past `MaxTotalSessions`, so two replicas evaluating different values expire different sessions or disagree on whether a session exists, and diverge permanently with every Raft invariant intact.
+
+Consequences for an operator:
+
+- All founders must supply the same three values, for the same reason they must supply the same witness policy: a differing value produces a different index-1 entry.
+- A node whose `Config` disagrees with what its shard committed applies the shard's values and logs the disagreement at WARN. It does not refuse to start — the committed value can only be changed through consensus.
+- `Host.GetShardMembership` reports the committed policy, which is how you check what a shard is actually running.
+- There is no config change for these yet: the committed policy is fixed for the life of the shard. Raising `MaxTotalSessions` on a running shard is not currently possible.
+- A shard bootstrapped by an earlier build has no committed policy (its membership decodes as v3); those replicas keep using local configuration, so the cluster-wide agreement rule still applies to them.
+
+See `docs/operations/deployment.md`.
 
 ## Thread Safety and Concurrency
 

@@ -669,7 +669,7 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
     }
 
     for _, epoch := range purgeable {
-        b.deks[epoch].Clear()  // explicit zeroing
+        b.deks[epoch].Clear()  // drops the enclave reference (see below)
         delete(b.deks, epoch)
         delete(b.ciphers, epoch)
         delete(b.knownEpochs, epoch)
@@ -685,6 +685,8 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 - The reduced `KnownEpochs` is **persisted before any key is dropped**
 
 **Persist-then-drop.** A purge shrinks `KnownEpochs`, which is persisted state: were the reduced set not written durably, a restart would resurrect the purged epochs and re-derive the DEKs the purge floor retired. `PurgeEpochsBefore` therefore persists through `StatePersister` before dropping anything, and fails closed with `ErrNoStatePersister` when there is something to purge and no persister is configured. A purge that would drop nothing needs no persister and returns `(0, nil)`. A persister error aborts the purge — every DEK stays usable — and returns `(0, *StatePersistError{Op: "purge"})`. Crash safety follows from the order: dying after the persist leaves a blob that simply omits the epochs the purge had already decided to retire.
+
+**A purge revokes capability; it is not crypto-shredding.** `ProtectedKey.Clear()` releases the enclave reference so the DEK can no longer be *opened* — it does not zero the enclave's ciphertext (memguard exposes no API to do so). Deleting the entry from `b.ciphers` likewise only drops a reference to a `cipher.AEAD` that still holds a copy of the DEK in its key schedule: `x/crypto`'s ChaCha20-Poly1305 — the default on any host without AES-NI — keeps a verbatim, un-`mlock`'d `key [32]byte`, and AES-GCM keeps the expanded round keys, from which the key is recoverable. Neither the standard library nor `x/crypto` offers a key-wipe API. So after a purge returns, the barrier can no longer decrypt the epoch, but **DEK confidentiality against memory disclosure (a core dump, a live process read) is GC-bounded, not enclave-bounded** — the same caveat `seal()` documents for the ciphers it drops. A deployment that needs the stronger property must bound it outside the process.
 
 ### In-Flight Epoch Protection
 
@@ -708,7 +710,7 @@ WAL compaction deletes old segments, which eventually allows old DEKs to be purg
 4. Scan remaining segments → find minWALEpoch
 5. Scan snapshot directory → find minSnapshotEpoch
 6. PurgeEpochsBefore(min(minWALEpoch, minSnapshotEpoch))
-7. Old DEKs zeroed and removed from memory
+7. Old DEKs dropped: enclave references released and ciphers removed (GC-bounded, see PurgeEpochsBefore)
 ```
 
 **No re-encryption during compaction.** Old segments encrypted with epoch N are deleted, not re-encrypted with the current epoch. This is a deliberate design choice:
@@ -722,23 +724,73 @@ WAL compaction deletes old segments, which eventually allows old DEKs to be purg
 
 ### Interface
 
+This is the interface go-xkms (hardware/cloud backends) and go-qrdb (Shamir)
+implement, so it is reproduced here in full and verbatim:
+
 ```go
 type SealingStrategy interface {
-    Seal(rootKey []byte) (*SealedRootKey, error)
-    Unseal(sealed *SealedRootKey) ([]byte, error)
-    Close() error  // release resources (PKCS#11 sessions, TPM2 handles, KMS connections)
+    // ID returns a unique identifier for this strategy.
+    ID() StrategyID
+
+    // Available reports whether this strategy can be used on the current system
+    // (e.g. a TPM2 strategy returns false when no TPM device is accessible).
+    Available() bool
+
+    // HardwareBacked reports whether key protection uses an HSM or external KMS.
+    HardwareBacked() bool
+
+    // SealRootKey wraps the root key for persistence.
+    SealRootKey(ctx context.Context, rootKey []byte, creds Credentials) (*SealedRootKey, error)
+
+    // UnsealRootKey unwraps it. The returned slice is owned by the caller and
+    // must be zeroed after use.
+    UnsealRootKey(ctx context.Context, sealed *SealedRootKey, creds Credentials) ([]byte, error)
+
+    // BarrierEncryptor returns a SymmetricEncrypter for hardware-backed
+    // strategies whose keys must never leave the hardware boundary. Software
+    // strategies return (nil, nil), which tells the barrier to use epoch-based
+    // HKDF DEKs. Implement AADSymmetricEncrypter as well when — and only when —
+    // the backend authenticates caller-supplied AAD end to end.
+    BarrierEncryptor(ctx context.Context, rootKey []byte) (SymmetricEncrypter, error)
+
+    // Close releases strategy-held resources (PKCS#11 sessions, TPM2 handles,
+    // KMS client connections). Must be idempotent.
+    Close() error
 }
 
+type Credentials struct {
+    Secret []byte // NOT a string: []byte so the caller can wipe it after use
+}
+```
+
+Every method takes `Credentials` by value and a `context.Context` where it can
+block on an external device, which is what distinguishes this from a plain
+`Seal`/`Unseal` pair.
+
+```go
 type SealedRootKey struct {
-    Strategy    string       // "software", "pkcs11", "tpm2", "cloudkms"
+    Strategy    StrategyID   // NOT a string; see below
+    Version     int          // sealed-blob format version
     Epoch       uint64       // key rotation epoch at time of sealing
     Salt        []byte       // 32-byte HKDF salt
     Ciphertext  []byte       // encrypted root key
     Metadata    []byte       // strategy-specific (key ID, KMS ARN, etc.)
     KnownEpochs []uint64     // all epoch numbers for DEK re-derivation
+    KDFVersion  int          // KDF used when sealing (survives a FIPS-mode change)
     HKDFVersion HKDFVersion  // DEK info layout; 0 = pre-versioning, derives as v1
+    Algorithm   SymmetricAlgorithm // data-path AEAD the epoch DEKs were derived for
+    // ... plus brute-force backoff state and hardware/Shamir fields; see
+    //     pkg/seal/strategy.go for the authoritative list
 }
 ```
+
+`Strategy` is a `StrategyID`, not a `string`. **Layer 1 defines the `StrategyID`
+type but only two values:** `StrategyPassphrase` (`"passphrase"`) and
+`StrategyNone` (`"none"`). `"tpm2"`, `"pkcs11"`, `"awskms"`, `"gcpkms"`,
+`"azurekv"` and `"vault"` belong to go-xkms; `"shamir"` belongs to go-qrdb,
+which owns the `StrategyID` namespace and the barrier registry. There is no
+implicit preference order and no auto-ranking: the strategy is chosen
+explicitly at barrier or tenant setup.
 
 The `SealingStrategy` ONLY protects the root key. It does not participate in data encryption. Any backend that can wrap/unwrap 32 bytes can serve as a sealing strategy.
 
@@ -899,7 +951,9 @@ host, _ := quicraft.NewHost(cfg)
 strategy, _ := seal.NewSoftwareStrategy([]byte("passphrase"))
 bcfg := seal.DefaultBarrierConfig(deploymentID)
 bcfg.StatePersister = saveSealedBlob // REQUIRED for Rotate / PurgeEpochsBefore
-barrier := seal.NewBarrier(bcfg)
+barrier, err := seal.NewBarrier(bcfg) // returns an error for an invalid config;
+                                      // seal.MustNewBarrier panics instead, for
+                                      // compile-time-constant configs only
 barrier.Initialize(ctx, strategy, seal.Credentials{})
 saveSealedBlob(barrier.SealedRootKeyData()) // bootstrap blob: persisted by the embedder
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
@@ -977,6 +1031,7 @@ The barrier uses [memguard](https://github.com/awnuber/memguard) for hardware-as
 
 - **Root key** (`enclave.ProtectedKey`, wrapping a `memguard.Enclave`): Encrypted at-rest in process memory. Opened into a temporary guarded buffer only when needed (e.g. DEK derivation), then immediately released.
 - **DEKs** (`enclave.ProtectedKey` each): Every epoch's DEK is individually protected. `Seal()` and `PurgeEpochsBefore()` drop them via `ProtectedKey.Clear()`, which releases the reference — it does not zero the enclave's own ciphertext, which persists until garbage collection.
+- **Live AEADs** (`cipher.AEAD` per epoch): each holds its own copy of the DEK in its key schedule and cannot be wiped (no stdlib/`x/crypto` API). Dropping the barrier's reference on seal or purge makes it GC-eligible, and that is the only bound: a core dump taken before collection contains every live and recently purged epoch DEK.
 - **Passphrase** (`SoftwareStrategy`): Stored in a `LockedBuffer`, destroyed on `Close()`.
 
 ### Zeroing
@@ -1028,13 +1083,13 @@ func zeroBytes(b []byte) {
 
 ## Certificate Revocation (Transport Layer)
 
-**Source:** `pkg/transport/`
+**Source:** `pkg/config/transportconfig.go`, `pkg/internal/transport/revocation/`
 
 - RevocationConfig on TransportConfig
 - CRL file hot-reload (SHA-256 hash comparison)
 - OCSP responder support with caching
 - Modes: "crl", "ocsp", "both", "any"
-- EnforceRevocation for hard-fail on unknown status
+- Unknown status fails CLOSED by default; `AllowSoftFail: true` opts out
 - OnCertRevoked callback
 
 ## Security Considerations
