@@ -27,14 +27,26 @@ GOLINT        := golangci-lint
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 
-# gosec exclusions (documented):
-#   G103: unsafe calls (low-level binary encoding)
-#   G104: unhandled errors (false positive on hash.Write)
-#   G115: integer overflow conversions (protocol-spec bounded)
-#   G301: directory permissions (0755 standard for data dirs)
-#   G304: file path via variable (all paths constructed internally)
-#   G306: file write permissions (0644 standard for data files)
-#   G404: weak random (election jitter, not security-sensitive)
+# gosec exclusions. Keep this list identical to the -exclude flag in
+# .github/workflows/ci.yml, and keep the reasons here so the next person does
+# not have to re-derive them:
+#   G103: unsafe calls — the proto codec is a fixed-layout zero-copy encoding
+#   G104: unhandled errors — false positive on hash.Write, which returns none
+#   G115: integer overflow on conversion — the flagged conversions sit behind an
+#         explicit bounds check on the same value (frame and entry sizes are
+#         validated against MaxFrameSize / MaxReplicationPayloadBytes first).
+#         This is NOT a blanket acceptance of overflow: a new narrowing
+#         conversion without a preceding bound is a real finding this exclusion
+#         hides, so review narrowing conversions by hand
+#   G301: directory permissions — 0755 is the intended posture for data dirs
+#   G304: file path via variable — snapshot/WAL paths are built internally from
+#         (shard, replica, index), never from a request
+#   G306: file write permissions — 0644 for data files; secret material is
+#         written 0600 explicitly
+#   G404: weak random — false positive. The only math/rand use is election
+#         jitter in pkg/internal/raft/raft.go, whose PRNG newRaft seeds from
+#         crypto/rand. Jitter desynchronizes campaigns; it is not a security
+#         primitive
 GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 
 # Trivy
@@ -726,6 +738,10 @@ security: gosec vuln trivy
 	@echo "All security scans passed"
 
 .PHONY: gosec
+# Deliberately scans MORE than the CI job does. ci.yml excludes test/, and
+# contrib/ wholesale; this excludes only test/performance (separate modules
+# that never ship). A finding here that CI would not report is still a real
+# finding — do not narrow this to match CI.
 gosec:
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
 

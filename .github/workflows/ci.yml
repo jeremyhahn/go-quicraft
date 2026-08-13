@@ -58,6 +58,29 @@ jobs:
 
       # Writes SARIF (uploaded below) and still exits non-zero on findings to
       # gate the build. Tests, examples and contrib adapters are excluded.
+      #
+      # Every -exclude rule below was checked against the code; record the
+      # reason here so the next person does not have to re-derive it. Keep this
+      # list identical to GOSEC_EXCLUDE in the Makefile.
+      #   G103 unsafe: the proto codec is a fixed-layout zero-copy encoding.
+      #   G104 unhandled error: fires on hash.Write, which never returns one.
+      #   G115 integer overflow on conversion: the conversions it flags sit
+      #        behind an explicit bounds check on the same value (frame and
+      #        entry sizes are validated against MaxFrameSize /
+      #        MaxReplicationPayloadBytes before the narrowing conversion).
+      #        NOT a blanket "we accept overflow" — a NEW conversion without a
+      #        preceding bound is a real finding this exclusion will hide, so
+      #        review narrowing conversions by hand.
+      #   G301/G306 file and directory permissions: 0755/0644 on data
+      #        directories and data files is the intended posture; secret
+      #        material is written 0600 explicitly.
+      #   G304 file inclusion via variable: every snapshot/WAL path is
+      #        constructed internally from (shard, replica, index), never from
+      #        a request.
+      #   G404 weak random: false positive. The only math/rand use is election
+      #        jitter in pkg/internal/raft/raft.go, and newRaft seeds it from
+      #        crypto/rand. Jitter must be fast and unpredictable-enough to
+      #        desynchronize campaigns; it is not a security primitive.
       - name: Run gosec
         run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
 

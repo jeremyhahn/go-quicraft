@@ -11,6 +11,14 @@ test/performance/openraft/target/
 test/performance/perfcompare
 test/performance/profiles/
 
+# Snapshot trees a test accidentally rooted at the package directory instead of
+# t.TempDir(). Ignored so they can never be committed again; a test that needs
+# one must create it under t.TempDir().
+pkg/shard-*/
+
+# AI session handoff notes
+resume.txt
+
 .serena
 .claude
 CLAUDE.md
