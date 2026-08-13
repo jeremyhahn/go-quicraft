@@ -261,7 +261,11 @@ integration-test-e2e:
 # (30s waits) flake. Every package is stable standalone.
 .PHONY: _integration-test
 _integration-test:
-	$(GOTEST) -tags=integration -timeout=300s -p 1 $(INT_TEST_DIR)/...
+	# 900s, not 300s: the linearizability package alone runs ~305s now that it
+	# carries the rolling-restart catch-up probe, and -p 1 means every package
+	# shares one deadline. A 300s cap failed the suite with a timeout panic and
+	# zero test failures, which reads as a product bug rather than a budget.
+	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/...
 
 .PHONY: _integration-test-raft
 _integration-test-raft:
