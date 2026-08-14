@@ -975,6 +975,9 @@ help:
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
 SUBMODULE_TAGS := 
+# Builds never resolve through a workspace: modules come from Gitea tags
+# (dependency-resolution.md §2). Immunizes against stray go.work files.
+export GOWORK=off
 
 # ---- dependency-resolution.md targets (2026-08-13 cutover) ----
 # SUBMODULE_TAGS lists nested modules tagged in lockstep with the root
