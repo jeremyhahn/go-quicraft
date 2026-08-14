@@ -85,7 +85,8 @@ jobs:
         run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
 
       - name: Upload gosec SARIF
-        if: always()
+        # Gitea has no code-scanning API; the upload 404s and fails the job.
+        if: always() && github.server_url == 'https://github.com'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gosec.sarif
@@ -110,6 +111,9 @@ jobs:
       # NOTE: do NOT image-scan the .devcontainer dev image into code scanning;
       # that surfaces base-OS/toolchain CVEs that are not go-quicraft source vulns.
       - name: Trivy scan (SARIF for code scanning)
+        # trivy-action's setup checks out aquasecurity/trivy from github.com
+        # with the runner token, which a Gitea token cannot authenticate.
+        if: github.server_url == 'https://github.com'
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -122,13 +126,14 @@ jobs:
           trivyignores: .trivyignore
 
       - name: Upload Trivy SARIF
-        if: always()
+        if: always() && github.server_url == 'https://github.com'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
           category: trivy-fs
 
       - name: Trivy gate (fail on CRITICAL/HIGH)
+        if: github.server_url == 'https://github.com'
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -139,6 +144,16 @@ jobs:
           format: table
           skip-dirs: test,examples,contrib
           trivyignores: .trivyignore
+
+      # Same gate on Gitea, via the trivy CLI installed from the release
+      # tarball (anonymous download — no github.com auth involved).
+      - name: Install Trivy (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Trivy gate (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
 
   build:
     name: Build

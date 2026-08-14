@@ -3516,7 +3516,18 @@ func BenchmarkDBIterateEntries(b *testing.B) {
 // write fails mid-way through processing updates, previously buffered
 // records from successful shards are discarded. This prevents ghost records
 // from being fsynced on the next successful SaveState call.
+// skipIfRoot skips tests that depend on read-only directory permissions
+// being enforced; root (the euid in CI job containers) bypasses permission
+// bits, so the write the test expects to fail would succeed.
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("read-only directory semantics do not apply to root")
+	}
+}
+
 func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
+	skipIfRoot(t)
 	dir := t.TempDir()
 	// Use sync disabled so we can observe buffer behavior without I/O noise.
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(2*1024))
@@ -3635,6 +3646,7 @@ func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 // write fails and discard succeeds, the original write error is returned
 // unwrapped (not wrapped in BatchWriteError).
 func TestSaveStatePartialWriteReturnsOriginalError(t *testing.T) {
+	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(2*1024))
 	if err != nil {
@@ -3783,6 +3795,7 @@ func TestRotateSegmentNoSyncMode(t *testing.T) {
 // readable. This tests the two-phase in-memory update design: in-memory
 // maps are only updated after all WAL writes and sync succeed.
 func TestSaveStateMidBatchFailureNoPhantomEntries(t *testing.T) {
+	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
@@ -3890,6 +3903,7 @@ func TestSaveStateMidBatchFailureNoPhantomEntries(t *testing.T) {
 // metadata from a successful shard is not visible when a later shard
 // in the same batch fails.
 func TestSaveStateMidBatchFailureNoPhantomSnapshots(t *testing.T) {
+	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
@@ -3954,6 +3968,7 @@ func TestSaveStateMidBatchFailureNoPhantomSnapshots(t *testing.T) {
 // later shard in the batch fails, the newly created segment's data is
 // properly rolled back via the checkpoint captured after segment creation.
 func TestSaveStateLazyShardCheckpointOnFailure(t *testing.T) {
+	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
