@@ -5363,6 +5363,33 @@ func poolRoundTrips(put func(), observe func() bool) bool {
 // Send drop observability (quic.go Send)
 // ---------------------------------------------------------------------------
 
+// syncBuffer is a bytes.Buffer safe for concurrent use.
+//
+// slog.SetDefault installs a sink for the whole process, not for the calling
+// test, so every goroutine alive at that moment logs into it -- including
+// transport goroutines still serving connections started by earlier tests. A
+// bare bytes.Buffer there is a data race, and the detector caught it in CI:
+// a snapshot receiver's rejectSnapshot write against this test's String()
+// read. The other two tests in this package that redirect the default logger
+// (adversarial_test.go, failpath_test.go) send it to io.Discard, which is
+// already safe; this is the one that needed to keep the output.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestSend_UnresolvedTargetLogsDrop verifies that a message dropped because
 // its target address cannot be resolved emits a structured log record
 // instead of vanishing silently.
@@ -5377,7 +5404,7 @@ func TestSend_UnresolvedTargetLogsDrop(t *testing.T) {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
