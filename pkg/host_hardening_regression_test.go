@@ -127,11 +127,29 @@ func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
 	const shardID, localReplicaID, newReplicaID = uint64(1), uint64(1), uint64(3)
 	const newAddr = "127.0.0.1:7003"
 
+	// CheckQuorum=false: the single live voter must keep the lease for the
+	// test's duration rather than stepping down on lost quorum.
+	scfg := testShardConfig(shardID, localReplicaID)
+	scfg.CheckQuorum = config.BoolPtr(false)
+
 	if err := h.StartShard(map[uint64]string{localReplicaID: "127.0.0.1:5000"},
-		false, testCreateFunc, testShardConfig(shardID, localReplicaID)); err != nil {
+		false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard: %v", err)
 	}
 	waitForLeader(t, h, shardID)
+
+	// Commit a second voter so quorum becomes 2. This entry commits under
+	// the OLD single-voter config, but from here on nothing else can commit:
+	// replica 2 does not exist, so no further entry ever reaches quorum.
+	// That makes "appended but never committed" DETERMINISTIC — without it
+	// the shard is single-node and the add below can commit before
+	// failPendingRequests runs (observed flaking in CI). Mirrors the
+	// sibling promotion-rollback test above.
+	seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer seedCancel()
+	if err := h.SyncRequestAddNode(seedCtx, shardID, 2, "127.0.0.1:7001", 0); err != nil {
+		t.Fatalf("seeding a second voter: %v", err)
+	}
 
 	if _, resolveErr := h.registry.Resolve(shardID, newReplicaID); resolveErr == nil {
 		t.Fatal("precondition: the new replica must have no registry entry")
@@ -142,6 +160,15 @@ func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
 	rs, err := h.RequestAddNode(ctx, shardID, newReplicaID, newAddr, 0)
 	if err != nil {
 		t.Fatalf("RequestAddNode: %v", err)
+	}
+
+	// Guard the premise: the entry must still be uncommitted, or the
+	// rollback path under test is not the one being exercised.
+	select {
+	case <-rs.ResultC():
+		t.Fatal("config change resolved before the rollback could run; " +
+			"the quorum-blocking premise of this test no longer holds")
+	default:
 	}
 
 	h.failPendingRequests(testLoadNode(h, shardID), &NotLeaderError{ShardID: shardID})
