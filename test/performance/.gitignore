@@ -1,2 +1,6 @@
 results/
-perfcompare
+# Anchored. `go build ./cmd/perfcompare` from this directory drops the binary
+# at test/performance/perfcompare, which is what this pattern is for. Written
+# bare, it also matched the cmd/perfcompare/ DIRECTORY, so that package's
+# main.go was invisible to `git add .` and was never committed.
+/perfcompare
