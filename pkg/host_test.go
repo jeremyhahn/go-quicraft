@@ -12840,21 +12840,25 @@ func TestDiagPipelineState_Success(t *testing.T) {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	commitPending, proposalQLen, inboxLen, pendingProposals, err := h.DiagPipelineState(1)
-	if err != nil {
-		t.Fatalf("DiagPipelineState failed: %v", err)
-	}
-	if commitPending {
-		t.Error("expected commitPending=false for new shard")
-	}
-	if proposalQLen != 0 {
-		t.Errorf("expected proposalQLen=0, got %d", proposalQLen)
-	}
-	if inboxLen != 0 {
-		t.Errorf("expected inboxLen=0, got %d", inboxLen)
-	}
-	if pendingProposals != 0 {
-		t.Errorf("expected pendingProposals=0, got %d", pendingProposals)
+	// The founding leader's bootstrap and no-op entries flow through the
+	// pipeline asynchronously after StartShard, and commitPending clears
+	// only after the applies land — sample until the pipeline reaches the
+	// quiescent state a new shard settles into, then assert on it.
+	waitForLeader(t, h, 1)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		commitPending, proposalQLen, inboxLen, pendingProposals, err := h.DiagPipelineState(1)
+		if err != nil {
+			t.Fatalf("DiagPipelineState failed: %v", err)
+		}
+		if !commitPending && proposalQLen == 0 && inboxLen == 0 && pendingProposals == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pipeline never quiesced: commitPending=%v proposalQLen=%d inboxLen=%d pendingProposals=%d",
+				commitPending, proposalQLen, inboxLen, pendingProposals)
+		}
+		runtime.Gosched()
 	}
 }
 
