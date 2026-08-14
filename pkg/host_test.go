@@ -2314,6 +2314,10 @@ func TestNodeState_LastApplied_SetsField(t *testing.T) {
 	}
 
 	ns := testLoadNode(h, 1)
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(500)
 
 	info, err := h.GetShardInfo(1)
@@ -4165,6 +4169,10 @@ func TestOnReadyToRead_CompletesReadWhenApplied(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	// Set lastApplied to 10 so the read index (5) is already covered.
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(10)
 
 	// Manually register a pending read with key 100.
@@ -4211,6 +4219,10 @@ func TestOnReadyToRead_WaitsForApplyThenCompletes(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	// Set lastApplied to 3, which is below the read index of 10.
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(3)
 
 	// Manually register a pending read with key 200.
@@ -4297,6 +4309,10 @@ func TestOnReadyToRead_UnknownKeyIgnored(t *testing.T) {
 
 	ns := testLoadNode(h, 1)
 
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(100)
 
 	// Simulate OnReadyToRead with a key that has no pendingRead registered.
@@ -4328,6 +4344,10 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 
 	ns := testLoadNode(h, 1)
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(50)
 
 	// Create pending reads for batchKey (300) and aliases (301, 302, 303).
@@ -4399,6 +4419,10 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 
 	ns := testLoadNode(h, 1)
+	// The founding leader's bootstrap and no-op entries apply
+	// asynchronously after StartShard and would overwrite lastApplied;
+	// wait for startup applies to finish before pinning a value.
+	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(50)
 
 	// Create pending reads for batchKey and aliases.
