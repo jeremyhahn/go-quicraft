@@ -22,13 +22,41 @@ import (
 // Callback receives notifications from engine workers about
 // applied entries, leadership changes, and confirmed read indices.
 //
-// IMPORTANT: All Callback methods are invoked synchronously from engine
-// worker goroutines (step workers, apply workers, snapshot pool workers).
-// Implementations MUST be non-blocking. Blocking a callback stalls the
-// entire worker, preventing progress for all shards assigned to that
-// worker. If an implementation must acquire locks, it should use
-// fine-grained per-shard locks (not a global lock) and hold them for
-// the minimum duration necessary.
+// # Callback guidelines
+//
+// This is the contract config.HostConfig's EventListener documentation refers
+// to. It applies transitively: a Host implementation of this interface that
+// fans a method out to a user EventListener inherits the method's rules.
+//
+// Every method MUST be non-blocking, and there are two reasons rather than one:
+//
+//  1. Throughput. A method invoked inline stalls its worker, and a worker owns
+//     a whole partition of shards (shardID % numWorkers), so a slow
+//     implementation stops unrelated shards from ticking, committing or
+//     applying. If an implementation must lock, it should use fine-grained
+//     per-shard locks, never a global one.
+//  2. Reentrancy. Methods invoked INLINE run on a worker goroutine that already
+//     holds engine state — the step worker holds stepWorker.nodesMu.RLock for
+//     the whole of tick()/processReady(); a per-shard apply goroutine is what a
+//     synchronous Engine.UnloadNode joins on. Calling back into a synchronous
+//     Host API that unloads a shard (Host.StopShard) from one of those is a
+//     PERMANENT deadlock, not a stall: sync.RWMutex is not reentrant, and a
+//     goroutine cannot join itself.
+//
+// Which methods are inline is therefore part of the contract:
+//
+//   - Delivered by the listener dispatcher, on a goroutine holding no engine
+//     lock, in FIFO production order: OnLeaderUpdated, OnCampaignLaunched, and
+//     the node-level EventListener.OnShardFailed. These may call any Host API,
+//     including StopShard. They are NOT ordered relative to the inline methods.
+//   - Invoked INLINE on the producing worker: OnApplied, OnCommitted,
+//     OnReadyToRead, OnProposalFailed, OnReadIndexBatched, OnReadIndexFailed,
+//     OnSnapshotCompleted, OnSnapshotRejected, OnCampaignSkipped. These resolve
+//     registered client requests and carry happens-before requirements with
+//     raft.Peer.Handle (see OnReadIndexBatched), so they cannot be queued behind
+//     user code. Implementations must not call back into a synchronous Host API
+//     from them, and must not fan them out to user code without dispatching
+//     that fan-out themselves.
 //
 // Implementations must be safe for concurrent use from multiple
 // worker goroutines.
@@ -45,8 +73,12 @@ type Callback interface {
 	// MUST be non-blocking.
 	OnCommitted(shardID uint64, entries []proto.Entry)
 
-	// OnLeaderUpdated is called by the step worker when a leader
-	// change is detected for a shard. MUST be non-blocking.
+	// OnLeaderUpdated is called when the step worker detects a leader change
+	// for a shard, and is DELIVERED BY THE LISTENER DISPATCHER rather than on
+	// the step worker. The (leaderID, term) pair is the state at detection
+	// time. Deliveries are never dropped: a refused dispatch leaves the step
+	// worker's published-leader bookkeeping uncommitted, so the change is
+	// re-published on the next tick. MUST be non-blocking.
 	OnLeaderUpdated(shardID uint64, leaderID uint64, term uint64)
 
 	// OnReadyToRead is called by the step worker when read index
@@ -60,9 +92,13 @@ type Callback interface {
 	// snapshot log index on success, or 0 on error. MUST be non-blocking.
 	OnSnapshotCompleted(shardID uint64, index uint64, err error)
 
-	// OnCampaignLaunched is called by the step worker when the raft state
-	// machine starts an election (pre-vote or real vote). This is a COLD
-	// path -- elections are seconds apart. MUST be non-blocking.
+	// OnCampaignLaunched is called when the raft state machine starts an
+	// election (pre-vote or real vote), and is DELIVERED BY THE LISTENER
+	// DISPATCHER rather than on the step worker. This is a COLD path --
+	// elections are seconds apart -- so a full notification queue drops it
+	// (counted and logged at ERROR) rather than reporting the election at the
+	// wrong time later. The election metric is incremented inline regardless,
+	// so the counter stays exact. MUST be non-blocking.
 	OnCampaignLaunched(shardID, replicaID, term uint64)
 
 	// OnCampaignSkipped is called by the step worker when an election is

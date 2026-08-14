@@ -93,6 +93,15 @@ func TestConfigChangeMarshalUnmarshalAddWitness(t *testing.T) {
 	assertConfigChangeEqual(t, &cc, &cc2)
 }
 
+// TestConfigChangeAddressTooLong pins the address bound at BOTH ends.
+//
+// The read half is the original assertion. The write half is what makes the two
+// agree: MarshalTo used to emit this payload happily, and a ConfigChange is
+// marshaled into an Entry.Cmd and COMMITTED, so an over-length operator-supplied
+// address produced a committed entry every replica then faulted on
+// (peer.applyMembershipEntry -> ErrCorruptConfigEntry). The buffer for the read
+// half is therefore built by hand rather than by marshaling, because the encoder
+// now refuses to produce it — which is the point.
 func TestConfigChangeAddressTooLong(t *testing.T) {
 	longAddr := strings.Repeat("x", MaxAddressLength+1)
 	cc := ConfigChange{
@@ -103,9 +112,20 @@ func TestConfigChangeAddressTooLong(t *testing.T) {
 		Initialize:     false,
 	}
 	buf := make([]byte, cc.Size())
-	cc.MarshalTo(buf)
+	if _, err := cc.MarshalTo(buf); !errors.Is(err, ErrAddressTooLong) {
+		t.Fatalf("MarshalTo: got %v, want ErrAddressTooLong: the encoder must not "+
+			"produce a payload its own decoder refuses, because this one is committed",
+			err)
+	}
+
+	// Hand-built: the fixed prefix, then an oversized address length prefix.
+	raw := make([]byte, 24+4+len(longAddr))
+	putUint64(raw[0:], 1)
+	putUint64(raw[8:], AddNode)
+	putUint64(raw[16:], 1)
+	putString(raw[24:], longAddr)
 	var cc2 ConfigChange
-	_, err := cc2.UnmarshalFrom(buf)
+	_, err := cc2.UnmarshalFrom(raw)
 	if !errors.Is(err, ErrAddressTooLong) {
 		t.Fatalf("UnmarshalFrom: got %v, want ErrAddressTooLong", err)
 	}
@@ -132,15 +152,20 @@ func TestConfigChangeBufferTooSmallUnmarshalHeader(t *testing.T) {
 func TestConfigChangeBufferTooSmallUnmarshalInitialize(t *testing.T) {
 	cc := ConfigChange{Address: "x"}
 	buf := make([]byte, cc.Size())
-	cc.MarshalTo(buf)
-	// Truncate to cut INTO the witness-policy fields. The cut is 6 bytes, not
-	// 4: the layout now ends with a 4-byte NodeIdentity length prefix, and a
-	// payload ending exactly where that prefix begins is the legitimate
-	// pre-identity layout, which decodes rather than erroring.
-	var cc2 ConfigChange
-	_, err := cc2.UnmarshalFrom(buf[:cc.Size()-6])
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrBufferTooSmall", err)
+	if _, err := cc.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	// Cut INTO the witness-policy fields. There is one layout and every field
+	// in it is mandatory, so any prefix is a truncation — including the cut at
+	// -4, which used to land on the NodeIdentity length prefix and decode
+	// cleanly as a shorter layout. TestConfigChangeRejectsEveryStrictPrefix
+	// sweeps all of them; these two are the boundaries that moved.
+	for _, cut := range []int{4, 6} {
+		var cc2 ConfigChange
+		_, err := cc2.UnmarshalFrom(buf[:cc.Size()-cut])
+		if !errors.Is(err, ErrBufferTooSmall) {
+			t.Fatalf("UnmarshalFrom(-%d bytes): got %v, want ErrBufferTooSmall", cut, err)
+		}
 	}
 }
 
@@ -201,41 +226,45 @@ func TestConfigChangeUpdateWitnessPolicyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestConfigChangeUnmarshalInvalidType pins the type bound at BOTH ends: the
+// encoder refuses an unknown type, and a buffer that carries one anyway — which
+// is now only reachable by patching the bytes, i.e. by corruption or tampering,
+// exactly the case the decoder check exists for — is refused on read.
 func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
-	t.Run("type beyond UpdateWitnessPolicy is rejected", func(t *testing.T) {
-		cc := ConfigChange{
-			ConfigChangeID: 1,
-			Type:           UpdateWitnessPolicy + 1, // one beyond the last valid type
-			ReplicaID:      1,
-			Address:        "addr:5000",
-			Initialize:     false,
-		}
-		buf := make([]byte, cc.Size())
-		cc.MarshalTo(buf)
+	for _, tc := range []struct {
+		name    string
+		badType uint64
+	}{
+		{"type beyond UpdateWitnessPolicy is rejected", UpdateWitnessPolicy + 1},
+		{"large invalid type is rejected", 999},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cc := ConfigChange{
+				ConfigChangeID: 1,
+				Type:           tc.badType,
+				ReplicaID:      1,
+				Address:        "addr:5000",
+			}
+			buf := make([]byte, cc.Size())
+			if _, err := cc.MarshalTo(buf); !errors.Is(err, ErrInvalidConfigChangeType) {
+				t.Fatalf("MarshalTo: got %v, want ErrInvalidConfigChangeType", err)
+			}
 
-		var cc2 ConfigChange
-		_, err := cc2.UnmarshalFrom(buf)
-		if !errors.Is(err, ErrInvalidConfigChangeType) {
-			t.Fatalf("UnmarshalFrom: got %v, want ErrInvalidConfigChangeType", err)
-		}
-	})
+			// Marshal a VALID type, then patch the type field, so the rest of the
+			// payload is well formed and the decoder is judged on the type alone.
+			cc.Type = AddNode
+			if _, err := cc.MarshalTo(buf); err != nil {
+				t.Fatalf("MarshalTo(valid): %v", err)
+			}
+			putUint64(buf[8:], tc.badType)
 
-	t.Run("large invalid type is rejected", func(t *testing.T) {
-		cc := ConfigChange{
-			ConfigChangeID: 1,
-			Type:           999,
-			ReplicaID:      1,
-			Address:        "addr:5000",
-		}
-		buf := make([]byte, cc.Size())
-		cc.MarshalTo(buf)
-
-		var cc2 ConfigChange
-		_, err := cc2.UnmarshalFrom(buf)
-		if !errors.Is(err, ErrInvalidConfigChangeType) {
-			t.Fatalf("UnmarshalFrom: got %v, want ErrInvalidConfigChangeType", err)
-		}
-	})
+			var cc2 ConfigChange
+			_, err := cc2.UnmarshalFrom(buf)
+			if !errors.Is(err, ErrInvalidConfigChangeType) {
+				t.Fatalf("UnmarshalFrom: got %v, want ErrInvalidConfigChangeType", err)
+			}
+		})
+	}
 }
 
 func TestConfigChangeUnmarshalValidTypes(t *testing.T) {

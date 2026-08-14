@@ -658,8 +658,15 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 
 	legacy := b.SealedRootKeyData()
 	legacy.HKDFVersion = 0 // pre-versioning blob
+	// A blob old enough to predate HKDFVersion also predates the metadata MAC,
+	// so it carries none — and loading one requires the explicit opt-in, which
+	// is the documented migration path. Keeping the MAC here while rewriting a
+	// field it covers would (correctly) be rejected as tampering.
+	legacy.StateMAC = nil
 
-	b2 := MustNewBarrier(DefaultBarrierConfig(1))
+	legacyCfg := DefaultBarrierConfig(1)
+	legacyCfg.AllowUnauthenticatedSealedState = true
+	b2 := MustNewBarrier(legacyCfg)
 	if err := b2.SetSealedRootKey(legacy); err != nil {
 		t.Fatalf("SetSealedRootKey(legacy): %v", err)
 	}

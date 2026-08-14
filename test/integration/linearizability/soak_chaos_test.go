@@ -66,9 +66,17 @@ func soakSeed(t *testing.T) int64 {
 // asserted, not assumed.
 func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 	const (
-		numNodes    = 5
-		numClients  = 8
-		numKeys     = 32
+		numNodes   = 5
+		numClients = 8
+		// The fault schedule is randomized, so the share of operations that
+		// end INDETERMINATE varies a lot between seeds. Those are what make
+		// the porcupine search expensive — the model is nondeterministic, so
+		// each one doubles the states its key's partition must explore — and a
+		// seed that parks two nodes for a while can pile enough of them onto
+		// one key to exhaust the whole check budget. Spreading the same
+		// operations over more keys shortens each partition without dropping
+		// any of them from the check. See TestSoak_RollingRestartUnderLoad.
+		numKeys     = 64
 		shardID     = 1
 		maxDownNode = 2 // (5-1)/2 — quorum always survives
 	)
@@ -86,8 +94,15 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	warmupCluster(t, cluster, shardID)
 
+	// Kill-and-restart under sustained load is the workload most likely to
+	// produce two leaders in one term, and this test had no check for it at
+	// all: it stops and restarts nodes for the whole run while asserting only
+	// throughput and linearizability. The guard samples every host, including
+	// ones the harness believes are down, and fails the instant two replicas
+	// claim the same term.
+	startLeaderTermGuard(t, cluster, shardID)
+
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
@@ -95,7 +110,7 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, duration, recorder, &totalOps, done)
+			clientWorker(t, cluster, shardID, clientID, numKeys, duration, recorder, done)
 		}(i)
 	}
 
@@ -109,7 +124,7 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 	var (
 		down         = make(map[int]bool)
 		faults       int
-		progressAt   = totalOps.Load()
+		progressAt   = recorder.completed()
 		stalledSince time.Time
 	)
 
@@ -129,7 +144,7 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 		// out its own 5s deadline before retrying. Measuring elapsed time
 		// rather than counting intervals keeps this from firing on a single
 		// slow failover, while still catching a cluster that never comes back.
-		now := totalOps.Load()
+		now := recorder.completed()
 		if now == progressAt {
 			if stalledSince.IsZero() {
 				stalledSince = time.Now()
@@ -191,7 +206,7 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 	wg.Wait()
 	close(done)
 
-	ops := totalOps.Load()
+	ops := recorder.completed()
 	t.Logf("soak complete: %d faults injected, %d operations committed", faults, ops)
 	if faults == 0 {
 		t.Fatal("no faults were injected; the soak exercised nothing")
@@ -200,7 +215,10 @@ func TestSoak_ChaosUnderSustainedLoad(t *testing.T) {
 		t.Fatal("no operations completed during the soak")
 	}
 
-	checkLinearizability(t, recorder, ops)
+	// Chaos deliberately removes up to two of five voters at a time, so only
+	// a fraction of the nominal rate is expected; the floor still fails a run
+	// whose throughput collapsed rather than merely dipped.
+	checkLinearizability(t, recorder, floorFor(numClients, duration/4))
 }
 
 // TestSoak_RollingRestartUnderLoad restarts every node in sequence, one at a
@@ -214,8 +232,22 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 	const (
 		numNodes   = 5
 		numClients = 6
-		numKeys    = 16
-		shardID    = 1
+		// A rolling restart kills the leader every round, so a large share of
+		// this run's operations end INDETERMINATE (the client's request was in
+		// flight to a host that went away). The porcupine model is deliberately
+		// nondeterministic, so each indeterminate write doubles the states its
+		// key's partition has to explore: at 16 keys a run with ~900
+		// indeterminate operations puts ~58 of them on one key and the check
+		// stops being decidable inside its budget, which the harness then
+		// reports as a failure it never actually found.
+		//
+		// Spreading the SAME operations over more keys shortens each partition
+		// without dropping a single one from the check -- porcupine verifies
+		// per-key partitions independently either way. Per-key contention depth
+		// is not what this test is for; TestLinearizability_3Node_SingleKeyContention
+		// and the chaos soak cover that.
+		numKeys = 64
+		shardID = 1
 	)
 
 	duration := soakDuration(t)
@@ -228,16 +260,21 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	warmupCluster(t, cluster, shardID)
 
+	// Every round takes a node down and brings it back while clients write, so
+	// this is a first-class opportunity for a restarted replica to claim a term
+	// that is already led. Nothing in the test looked for that before.
+	startLeaderTermGuard(t, cluster, shardID)
+
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
 	done := make(chan struct{})
 
+	clientsStartedAt := time.Now()
 	var wg sync.WaitGroup
 	for i := range numClients {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, duration, recorder, &totalOps, done)
+			clientWorker(t, cluster, shardID, clientID, numKeys, duration, recorder, done)
 		}(i)
 	}
 
@@ -245,12 +282,23 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 	// is the harness's own bound on how long a new leader may take.
 	maxStall := 3 * failoverTimeout
 
+	// workloadActive reports whether the clients are still submitting. The
+	// catch-up wait below demands that the LEADER make progress, which only
+	// means anything while somebody is writing: a round that starts near the
+	// end of the run can outlive the clients, and then it is waiting for
+	// progress that nothing is going to produce. Both the round loop and
+	// waitForCatchUp consult this, so the absolute progress requirement stays
+	// honest instead of being traded away for a lag window that a dead cluster
+	// also satisfies.
+	workloadEnds := clientsStartedAt.Add(duration)
+	workloadActive := func() bool { return time.Now().Before(workloadEnds.Add(-2 * time.Second)) }
+
 	deadline := time.Now().Add(duration - 5*time.Second)
 	rounds := 0
 	var stalledSince time.Time
-	for round := 0; time.Now().Before(deadline); round++ {
+	for round := 0; time.Now().Before(deadline) && workloadActive(); round++ {
 		idx := round % numNodes
-		before := totalOps.Load()
+		before := recorder.completed()
 
 		roundStart := time.Now()
 		cluster.stopNode(idx)
@@ -274,9 +322,9 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 		// all three remaining healthy nodes, so the cluster stalls for
 		// reasons that have nothing to do with a defect.
 		catchStart := time.Now()
-		waitForCatchUp(t, cluster, shardID, idx, leaderIdx, failoverTimeout)
+		waitForCatchUp(t, cluster, shardID, idx, leaderIdx, failoverTimeout, workloadActive)
 		t.Logf("round %d node[%d]: catchup=%v ops=%d", round, idx,
-			time.Since(catchStart).Round(time.Millisecond), totalOps.Load())
+			time.Since(catchStart).Round(time.Millisecond), recorder.completed())
 		rounds++
 
 		// Track the longest window with no committed operation. A stall
@@ -284,7 +332,7 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 		// leader, so demanding progress in every single round would assert
 		// more than the protocol promises. What must not happen is a stall
 		// that outlasts failover: that is a wedged cluster, not an election.
-		if after := totalOps.Load(); after == before {
+		if after := recorder.completed(); after == before {
 			if stalledSince.IsZero() {
 				stalledSince = time.Now()
 			} else if stalled := time.Since(stalledSince); stalled > maxStall {
@@ -304,23 +352,47 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 	wg.Wait()
 	close(done)
 
-	ops := totalOps.Load()
+	ops := recorder.completed()
 	t.Logf("rolling restart complete: %d node restarts, %d operations", rounds, ops)
 	if rounds == 0 {
 		t.Fatalf("no restart rounds completed in %v; increase %s", duration, soakDurationEnv)
 	}
-	checkLinearizability(t, recorder, ops)
+	checkLinearizability(t, recorder, floorFor(numClients, duration/4))
 }
 
 // waitForCatchUp blocks until the replica at idx has applied close to what the
-// leader has, so a rolling restart proceeds only once the cluster is genuinely
-// healthy again rather than merely having elected someone.
-func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, leaderIdx int, timeout time.Duration) {
+// leader has AND the cluster has actually made forward progress, so a rolling
+// restart proceeds only once the cluster is genuinely healthy again rather than
+// merely having elected someone.
+//
+// minProgress is the absolute half of the predicate and it is not optional. The
+// original condition was purely RELATIVE -- self + maxLag >= leader -- which a
+// WEDGED leader satisfies trivially: if the leader stops committing, the
+// restarted replica draws level with a stationary target and the harness reads
+// a dead cluster as "caught up", then takes the next node down. Requiring the
+// leader's applied index to have ADVANCED past where it was when the wait
+// started makes a stall fail here instead of being laundered into the next
+// round.
+//
+// workloadActive reports whether the clients are still submitting. The absolute
+// requirement is conditional on it for a reason that is not a loophole: with no
+// client writing, the leader's applied index is not SUPPOSED to move, and
+// demanding that it does turns the end of the run into a guaranteed failure.
+// When the workload has ended the predicate tightens instead of relaxing — the
+// replica must reach the leader's index EXACTLY, with no lag window at all,
+// which an idle healthy cluster satisfies immediately and a lagging one does
+// not.
+func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, leaderIdx int,
+	timeout time.Duration, workloadActive func() bool) {
 	t.Helper()
 	// A small lag is normal on a live cluster taking writes; require the
 	// replica to be within a bounded window of the leader rather than exactly
 	// equal, which a moving target would never satisfy.
 	const maxLag = 50
+	// How far the leader must move while this wait is in progress. Clients are
+	// writing continuously and quorum is intact, so a healthy cluster clears
+	// this in well under a second; a wedged one never does.
+	const minProgress = 5
 
 	start := time.Now()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -329,6 +401,12 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 	defer deadline.Stop()
 	diag := time.NewTicker(500 * time.Millisecond)
 	defer diag.Stop()
+
+	// Baseline the leader's applied index, so "progress" is measured from the
+	// moment the restarted replica rejoined rather than from zero.
+	var baseline uint64
+	var haveBaseline bool
+	var lastSelf, lastLeader uint64
 
 	caught := func() bool {
 		cluster.hostsMu.RLock()
@@ -344,18 +422,40 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 		if err != nil {
 			return false
 		}
+		if !haveBaseline {
+			baseline = leader.LastApplied
+			haveBaseline = true
+		}
+		lastSelf, lastLeader = self.LastApplied, leader.LastApplied
+		if !workloadActive() {
+			// Nobody is writing any more, so the leader is not going to move.
+			// Require exact catch-up rather than progress: strictly stronger
+			// than the lag window, and achievable on an idle cluster.
+			return self.LastApplied >= leader.LastApplied
+		}
+		if leader.LastApplied < baseline+minProgress {
+			// The cluster has not committed anything since the restart. Being
+			// level with a stationary leader is not being caught up.
+			return false
+		}
 		return self.LastApplied+maxLag >= leader.LastApplied
 	}
 
 	for {
 		if caught() {
+			t.Logf("catchup[node=%d leader=%d] applied=%d leader=%d (advanced %d from %d) in %v",
+				idx, leaderIdx, lastSelf, lastLeader, lastLeader-baseline, baseline,
+				time.Since(start).Round(time.Millisecond))
 			return
 		}
 		select {
 		case <-deadline.C:
 			t.Logf("catchup[node=%d leader=%d] TIMEOUT after %v; final state:", idx, leaderIdx, timeout)
 			dumpClusterState(t, cluster, shardID)
-			t.Fatalf("timed out after %v waiting for condition: restarted replica catches up", timeout)
+			t.Fatalf("timed out after %v waiting for the restarted replica to catch up: "+
+				"node[%d] applied=%d, leader node[%d] applied=%d (baseline %d, needed +%d "+
+				"progress and lag <= %d)",
+				timeout, idx, lastSelf, leaderIdx, lastLeader, baseline, minProgress, maxLag)
 			return
 		case <-diag.C:
 			// Only start dumping once the wait is clearly abnormal, so a
@@ -434,8 +534,12 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	warmupCluster(t, cluster, shardID)
 
+	// The leader is closed mid-write and a new one takes over: exactly the
+	// hand-off during which a stale leader that has not stepped down would
+	// overlap the new one in the same term.
+	startLeaderTermGuard(t, cluster, shardID)
+
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
@@ -443,21 +547,21 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, 20*time.Second, recorder, &totalOps, done)
+			clientWorker(t, cluster, shardID, clientID, numKeys, 20*time.Second, recorder, done)
 		}(i)
 	}
 
 	// Let the cluster reach steady state so the measurement is not dominated
 	// by warmup.
 	time.Sleep(2 * time.Second)
-	if totalOps.Load() == 0 {
+	if recorder.completed() == 0 {
 		close(done)
 		wg.Wait()
 		t.Fatal("no operations committed before the leader was closed")
 	}
 
 	// Close the leader and measure how long writes are unavailable.
-	before := totalOps.Load()
+	before := recorder.completed()
 	closeStart := time.Now()
 	cluster.stopNode(leaderIdx)
 	closeElapsed := time.Since(closeStart)
@@ -468,11 +572,32 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	// aggregate number cannot distinguish them.
 	// electedAt is written by the election watcher and read by the log line
 	// below while that goroutine may still be running, so it has to be atomic.
+	//
+	// The watcher polls findLeader itself instead of calling
+	// waitForClusterLeader. waitForClusterLeader ends in t.Fatalf, and t.Fatalf
+	// on a NON-TEST goroutine only runs runtime.Goexit on that goroutine: the
+	// test keeps going, electedAt stays 0, and the failure is reported as the
+	// nonsense "new leader after 0s" -- with a real risk of the deferred
+	// failure landing after the test has finished. Errorf is the correct
+	// primitive off the test goroutine (see helpers_test.go leaderTermGuard).
 	var electedAt atomic.Int64
+	electionWatcherDone := make(chan struct{})
 	go func() {
+		defer close(electionWatcherDone)
 		es := time.Now()
-		cluster.waitForClusterLeader(shardID, failoverTimeout)
-		electedAt.Store(int64(time.Since(es)))
+		deadline := time.Now().Add(failoverTimeout)
+		for time.Now().Before(deadline) {
+			if cluster.findLeader(shardID) >= 0 {
+				electedAt.Store(int64(time.Since(es)))
+				return
+			}
+			select {
+			case <-done:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		t.Errorf("no leader was elected within %v of closing the leader", failoverTimeout)
 	}()
 
 	// Require SUSTAINED recovery, not a single completion. An operation that
@@ -483,7 +608,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	outage := time.Duration(0)
 	deadline := time.Now().Add(maxOutage + 10*time.Second)
 	for time.Now().Before(deadline) {
-		if totalOps.Load() >= before+recoveredOps {
+		if recorder.completed() >= before+recoveredOps {
 			outage = time.Since(closeStart)
 			break
 		}
@@ -492,9 +617,17 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 
 	close(done)
 	wg.Wait()
+	// Join the watcher before reading electedAt so the log line reports a
+	// settled value rather than racing the goroutine that fills it in.
+	<-electionWatcherDone
+
+	elected := time.Duration(electedAt.Load())
+	if elected == 0 {
+		t.Errorf("the election watcher never observed a new leader after the old one was closed")
+	}
 
 	t.Logf("leader close took %v; new leader after %v; %d sustained ops committed after %v (%d total)",
-		closeElapsed, time.Duration(electedAt.Load()), recoveredOps, outage, totalOps.Load())
+		closeElapsed, elected, recoveredOps, outage, recorder.completed())
 
 	if outage == 0 {
 		t.Fatalf("writes never resumed within %v of closing the leader", maxOutage+5*time.Second)
@@ -505,7 +638,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 			"leadership was not handed off before draining", outage, maxOutage)
 	}
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, 20*time.Second/4))
 }
 
 // waitForLeaderOrDump waits for a leader and, on timeout, dumps every live

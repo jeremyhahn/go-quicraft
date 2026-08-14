@@ -68,25 +68,34 @@ NewHost(cfg, opts...)
   |     - transportSender.engine = eng
   |     - barrier epoch tracker set on transport
   |
-  | 10. Start transport
-  |     - tr.Start() begins accepting QUIC connections
-  |     - Must happen after engine exists (inbound messages need a destination)
-  |
-  | 11. Build Host struct
+  | 10. Build Host struct
   |     - All fields initialized, closed=false
+  |     - msgHandler.host = h
   |
-  | 12. Wire engine callback
+  | 11. Wire engine callback and import locker
   |     - eng.SetCallback(&hostEngineCallback{h})
   |     - Routes OnApplied, OnLeaderUpdated, OnReadyToRead, OnSnapshotCompleted
+  |     - eng.SetImportLocker(h.tryAcquireImportLock)
   |
-  | 13. Start engine
+  | 12. Start engine
   |     - eng.Start() launches all worker goroutines (see below)
   |
-  | 14. Start key rotation (if barrier + interval configured)
+  | 13. Start transport -- LAST
+  |     - tr.Start() begins accepting QUIC connections
+  |     - On failure: eng.Stop(), then tr.Stop(), return HostInitError
+  |
+  | 14. Start key rotation (if barrier configured)
   |     - Background goroutine: periodic barrier.Rotate()
   |
   | 15. Return *Host
 ```
+
+**The transport starts LAST, after every other wiring step.** The moment it
+starts, its receive goroutines can call `HandleMessage`/`HandleSnapshot`,
+which read `msgHandler.host` (registry, config, LogDB) and
+`msgHandler.engine`. Starting the transport before those fields are set is a
+data race between the receive goroutine reading them and `NewHost` writing
+them -- not merely a matter of inbound messages having somewhere to go.
 
 ### Engine Start Worker Launch Order
 
@@ -295,8 +304,8 @@ When you see the clamp's `ERROR` line, treat the replica as having lost its
 identity, not merely its data:
 
 1. Stop the replica.
-2. `RequestDeleteNode` to remove it from the configuration, and wait for that
-   change to commit.
+2. `RequestRemoveNode` (or `SyncRequestDeleteNode`) to remove it from the
+   configuration, and wait for that change to commit.
 3. Wipe its data directory.
 4. Re-add it under a **new replica ID** (`RequestAddNode`), so the cluster
    never counts the amnesiac identity's vote again.
@@ -387,38 +396,62 @@ Host.Close()
   |  1. Set closed flag (atomic CAS, prevents new operations)
   |
   |  2. Drain in-flight work
-  |     h.Drain() -> sets draining flag, polls allPendingDrained()
+  |     h.Drain() -> sets draining flag, waits on drainC
   |       Rejects new Propose/ReadIndex with ErrDraining
-  |       Waits up to ShutdownTimeout for pending maps to empty
-  |       Returns ErrShutdownTimeout if deadline exceeded (non-fatal)
+  |       Waits up to ShutdownTimeout for pending operations to complete
+  |       On timeout: logged AND joined into Close's returned error
   |
   |  3. Stop key rotation goroutine
   |     close(keyRotStopC) -> wait <-keyRotDone
   |
-  |  4. Stop transport
+  |  4. Stop pending-proposal sweeper
+  |     close(sweepStopC) -> wait <-sweepDone
+  |
+  |  5. Stop engine (ordered tier-by-tier shutdown, see below) -- FIRST
+  |     engine.Stop()
+  |       - Step workers are the only producers of snapshot sends
+  |       - After this, no new snapshotWg.Add(1) can occur
+  |
+  |  6. Drain in-flight snapshot sends
+  |     transportSender.Wait()
+  |       - Joins sends the step workers launched before exiting
+  |       - Transport is still up, so these complete normally
+  |
+  |  7. Stop transport -- LAST
   |     transport.Stop()
   |       - Stop accepting new QUIC connections
   |       - Close all active connections
-  |       - No new inbound messages after this point
   |
-  |  5. Stop engine (ordered tier-by-tier shutdown, see below)
-  |     engine.Stop()
-  |
-  |  6. Drain pending requests with ErrClosed
+  |  8. Drain pending requests with ErrClosed
   |     For each shard in h.nodes:
-  |       ns.stopped = true
+  |       ns.stopped = true (claimed via CompareAndSwap, so a concurrent
+  |                          StopShard cannot tear the same shard down twice)
   |       ns.health = ShardUnloaded
+  |       close(ns.openStopper) to cancel an in-progress DiskStateMachine.Open()
   |       For each pending proposal: rs.complete(ErrClosed)
   |       For each pending read: pr.rs.complete(ErrClosed)
   |       For each pending snapshot: rs.complete(ErrClosed)
   |       Delete from h.nodes map
   |
-  |  7. Close LogDB
+  |  9. Close LogDB
   |     logdb.Close() -> flush, fsync, close file handles
   |
-  |  8. Seal barrier (if configured)
+  | 10. Seal barrier (if configured)
   |     barrier.Seal() -> zero root key and DEKs from memory
 ```
+
+**The engine stops BEFORE the transport, and the transport stops LAST.** The
+engine's step workers are the only producers of snapshot sends, and each send
+does `snapshotWg.Add(1)`. `engine.Stop()` closes `stepStopC` and joins the
+step workers, after which no new `Add` can occur -- so the subsequent
+`Wait()` races with no concurrent `Add`. Stopping the transport first would
+reintroduce the illegal "`WaitGroup.Add` concurrent with `Wait`" pattern and
+would also leave send goroutines touching a torn-down transport.
+
+`Close` returns an `error`: a drain that timed out is reported rather than
+swallowed, because returning nil after abandoning in-flight work tells the
+embedding application its shutdown was clean when proposals it accepted were
+dropped.
 
 ### Engine.Stop() -- Ordered Per-Tier Shutdown
 

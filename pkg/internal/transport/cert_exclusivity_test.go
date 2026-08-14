@@ -36,7 +36,7 @@ import (
 // DNS SANs in addition to loopback. This is the shape of a cluster issued one
 // wildcard certificate, or one certificate carrying every node's SAN: both are
 // routine operational practice and both validate perfectly against the CA.
-func sharedSANMTLSConfig(t testing.TB, dnsNames ...string) *MTLSConfig {
+func sharedSANMTLSConfig(t *testing.T, dnsNames ...string) *MTLSConfig {
 	t.Helper()
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -92,7 +92,7 @@ func sharedSANMTLSConfig(t testing.TB, dnsNames ...string) *MTLSConfig {
 }
 
 // leafOf parses the leaf certificate out of an MTLSConfig.
-func leafOf(t testing.TB, mtls *MTLSConfig) *x509.Certificate {
+func leafOf(t *testing.T, mtls *MTLSConfig) *x509.Certificate {
 	t.Helper()
 	block, _ := pem.Decode(mtls.Cert)
 	if block == nil {
@@ -695,7 +695,7 @@ func TestNodeIdentityFromCertificate_StableAcrossRenewal(t *testing.T) {
 // renewLeafOnSameKey issues a second certificate over the private key in mtls,
 // with a different serial and validity window — the shape of a routine
 // certificate renewal.
-func renewLeafOnSameKey(t testing.TB, mtls *MTLSConfig) *x509.Certificate {
+func renewLeafOnSameKey(t *testing.T, mtls *MTLSConfig) *x509.Certificate {
 	t.Helper()
 
 	keyBlock, _ := pem.Decode(mtls.Key)

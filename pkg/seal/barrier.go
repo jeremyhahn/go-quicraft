@@ -17,12 +17,12 @@ package seal
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
 	"log/slog"
-	"math"
 	"runtime"
 	"slices"
 	"sync"
@@ -227,6 +227,13 @@ type Barrier struct {
 	// reports identically. Set at Initialize/Unseal, cleared by seal().
 	plaintextMode bool
 
+	// binding is the context-AAD capability of the installed encryptor, resolved
+	// once by Initialize/Unseal (which is where the behavioural probe in
+	// contextBindingFor runs) and read back by ContextBinding. Reset to
+	// ContextBindingUnresolved by seal(), because the capability belongs to the
+	// encryptor and the encryptor is gone.
+	binding ContextBinding
+
 	// strategyID and strategyHardwareBacked record the identity of the strategy
 	// that produced the current encryptor, for the delegated-mode warning and
 	// for operator-facing diagnostics. Set at Initialize/Unseal.
@@ -241,6 +248,20 @@ type Barrier struct {
 	// AEAD safety trackers (interface types for IoC).
 	invocations  InvocationCounter    // per-epoch AEAD invocation counter
 	nonceTracker NonceTrackerProvider // per-epoch nonce reuse detection
+
+	// invocationsAuthoritative records that b.invocations reflects the TRUE
+	// number of AEAD invocations performed under b.epoch, and is the whole
+	// basis on which Unseal decides whether it may keep encrypting under the
+	// loaded epoch. It is true only for an epoch this process itself started
+	// from zero: Initialize and Rotate set it, and seal() leaves it alone so an
+	// in-process seal/unseal cycle keeps its accurate count. SetSealedRootKey
+	// clears it, because a blob loaded from disk describes an epoch some
+	// EARLIER process encrypted under for an unknown number of invocations.
+	//
+	// A plain "is the count zero" test cannot express this: zero is both "never
+	// encrypted" and "fresh process, counter not yet seeded", and reading the
+	// second as the first is what re-granted the NIST budget on every restart.
+	invocationsAuthoritative bool
 
 	// Brute-force protection state.
 	failedAttempts int64
@@ -301,7 +322,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 	// Reported rather than rejected: it is what DefaultBarrierConfig produces,
 	// so rejecting it would fail the default. The tracker itself fails safe at
 	// DefaultMaxTrackedNonces.
-	if config.NonceTracking && config.InvocationCounter == nil && config.StatePersister == nil {
+	if config.GetNonceTracking() && config.InvocationCounter == nil && config.StatePersister == nil {
 		slog.Warn("quicraft/seal: barrier configured with nonce tracking but no StatePersister and no InvocationCounter; the epoch cannot rotate, so tracked nonces are never released",
 			"deployment_id", config.DeploymentID,
 			"remedy", "configure StatePersister (and a rotation loop), inject an InvocationCounter, or disable NonceTracking",
@@ -311,7 +332,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 	var nt NonceTrackerProvider
 	if config.NonceTrackerProvider != nil {
 		nt = config.NonceTrackerProvider
-	} else if config.NonceTracking {
+	} else if config.GetNonceTracking() {
 		nt = NewNonceTracker(true)
 	}
 
@@ -439,6 +460,19 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// whose CPU makes SelectOptimalAlgorithm choose differently without every
 	// read failing as ErrDecryptionFailed. See SealedRootKey.Algorithm.
 	sealed.Algorithm = b.config.Algorithm
+	// Authenticate the metadata just written. Everything above this line is
+	// plaintext beside the root-key ciphertext and covered by nothing; the MAC
+	// is what makes Epoch and KnownEpochs unforgeable to anyone who does not
+	// hold the root key. StrategyNone keeps no root key, so it has no MAC and
+	// none is expected of it (see SealedRootKey.StateMAC).
+	if strategy.ID() != StrategyNone {
+		mac, macErr := sealedStateMAC(rootKey, b.config.DeploymentID, sealed)
+		if macErr != nil {
+			wipeBytes(rootKey)
+			return macErr
+		}
+		sealed.StateMAC = mac
+	}
 
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
@@ -450,11 +484,12 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// Resolve the context-binding capability BEFORE any state transition, so a
 	// deployment that requires positional binding is refused at setup rather
 	// than on its first context-bearing write.
-	binding := contextBindingFor(hwEnc, strategy.ID() == StrategyNone)
+	binding := contextBindingFor(hwEnc, strategy.ID() == StrategyNone, b.randReader)
 	if err := b.checkContextAADPolicy(binding); err != nil {
 		wipeBytes(rootKey)
 		return err
 	}
+	b.binding = binding
 	b.strategyID = strategy.ID()
 	b.strategyHardwareBacked = strategy.HardwareBacked()
 	// Derived from the binding, not from the strategy ID alone: a strategy that
@@ -500,6 +535,9 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	b.sealed = sealed
 	b.state = barrierUnsealed
 	b.unsealed.Store(true)
+	// This process created the epoch, so its counter starts at a known zero and
+	// stays authoritative until a blob describing some other lifetime is loaded.
+	b.invocationsAuthoritative = true
 
 	slog.Info("barrier initialized", "epoch", initialEpoch, "algorithm", b.config.Algorithm.String())
 	return nil
@@ -519,6 +557,19 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 // Brute-force protection: After 5 consecutive failed attempts, an exponential
 // backoff delay is enforced (1s, 2s, 4s, ... capped at 60s). The counter
 // resets on successful unseal.
+//
+// Unseal AUTHENTICATES the persisted metadata (SealedRootKey.StateMAC) against
+// the recovered root key before deriving anything from it, and fails with
+// ErrSealedStateUnauthenticated if the Epoch, KnownEpochs, Salt, HKDFVersion or
+// Algorithm were edited by something that does not hold that key.
+//
+// Unseal also ROTATES when it restores a blob this process did not create — one
+// epoch per restart — because the loaded epoch's spent invocation budget is
+// unknowable; see resolveInvocationBudget. Two consequences follow. The
+// StatePersister is called from here, under the write lock. And KnownEpochs
+// grows by one per restart until PurgeEpochsBefore retires the old epochs, so a
+// deployment that never purges walks toward MaxKnownEpochs; the engine's
+// retention-driven purge is what keeps the set bounded.
 func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Credentials) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -589,10 +640,11 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		}
 		// No-encryption mode can never satisfy a demand for authenticated
 		// positional binding: there is no AEAD to bind anything to.
-		binding := contextBindingFor(hwEnc, true)
+		binding := contextBindingFor(hwEnc, true, b.randReader)
 		if err := b.checkContextAADPolicy(binding); err != nil {
 			return err
 		}
+		b.binding = binding
 		b.strategyID = strategy.ID()
 		b.strategyHardwareBacked = strategy.HardwareBacked()
 		b.plaintextMode = true
@@ -622,6 +674,19 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		return ErrInvalidRootKeySize
 	}
 
+	// Authenticate the persisted metadata BEFORE deriving a single DEK from it.
+	// The passphrase (or HSM) has just proved the ciphertext is genuine; this
+	// proves that the Epoch, KnownEpochs, Salt, HKDFVersion and Algorithm
+	// standing next to it belong to that ciphertext and were not edited by an
+	// attacker with write access to the blob. It is deliberately NOT counted as
+	// a failed unseal attempt: the credential was correct, the STATE is not,
+	// and driving the brute-force backoff from a file an attacker can write
+	// would hand them a lockout primitive.
+	if err := b.verifySealedStateMAC(rootKey); err != nil {
+		wipeBytes(rootKey)
+		return err
+	}
+
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
 	if hwErr != nil {
@@ -631,11 +696,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 
 	// Resolve the context-binding capability BEFORE any state transition; a
 	// deployment that requires positional binding must be refused at setup.
-	binding := contextBindingFor(hwEnc, false)
+	binding := contextBindingFor(hwEnc, false, b.randReader)
 	if err := b.checkContextAADPolicy(binding); err != nil {
 		wipeBytes(rootKey)
 		return err
 	}
+	b.binding = binding
 	b.strategyID = strategy.ID()
 	b.strategyHardwareBacked = strategy.HardwareBacked()
 	b.plaintextMode = false
@@ -708,58 +774,100 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	b.lastFailedAt = time.Time{}
 	b.persistBackoffState()
 
-	// Enforce the NIST SP 800-38D invocation budget ACROSS process
-	// lifetimes. The default in-memory counter does not survive restarts,
-	// so after an unseal the number of AEAD invocations already performed
-	// under the current epoch is unknown — and with random 96-bit nonces
-	// the 2^32 budget per DEK is a hard nonce-collision safety bound, not
-	// advisory. Unless the embedder owns seeding (injected counter) or
-	// has already seeded this one, seed the counter pessimistically to
-	// the rotation threshold so ShouldRotate fires immediately and the
-	// epoch is rotated to a fresh DEK with a known-zero count. The
-	// headroom between threshold and hard limit (default 5% ≈ 2×10^8
-	// invocations) covers encryption traffic until rotation completes.
-	b.seedInvocationsAfterUnseal()
+	// Enforce the NIST SP 800-38D invocation budget ACROSS process lifetimes.
+	// See resolveInvocationBudget: the loaded epoch's spent budget is
+	// unknowable, so the barrier either moves to a fresh epoch or refuses to
+	// encrypt under the loaded one.
+	b.resolveInvocationBudget()
 
 	slog.Info("barrier unsealed", "epoch", b.epoch, "algorithm", b.config.Algorithm.String())
 	return nil
 }
 
-// seedInvocationsAfterUnseal pessimistically seeds the AEAD invocation
-// counter after an unseal when the true per-epoch count is unknown. See
-// the call site in Unseal for the rationale. The caller must hold b.mu.
-func (b *Barrier) seedInvocationsAfterUnseal() {
+// resolveInvocationBudget re-establishes a SOUND NIST SP 800-38D invocation
+// budget after an unseal whose epoch this process did not create. The caller
+// must hold b.mu.
+//
+// The problem it solves: with random 96-bit nonces the 2^32 invocations per DEK
+// is a hard nonce-collision bound (probability below 2^-32), not advice, and the
+// default in-memory counter does not survive a restart. After loading a
+// persisted blob the count already spent under that epoch is not merely unknown
+// — it is UNKNOWABLE, because nothing on disk records it.
+//
+// The previous behaviour seeded the counter to the rotation threshold (95%),
+// leaving 5% — over 2x10^8 encryptions — of headroom "until rotation
+// completes". That headroom was re-granted in full on EVERY restart against the
+// SAME DEK, so ~20 restarts of a deployment that never rotates (and one with no
+// StatePersister provably cannot rotate: Rotate fails closed with
+// ErrNoStatePersister) push the DEK past 2^32 invocations. A GCM nonce collision
+// there yields keystream XOR and recovery of the GHASH authentication key, i.e.
+// arbitrary forgery of at-rest records.
+//
+// An unprovable budget therefore buys nothing, and the barrier takes one of two
+// sound paths instead:
+//
+//   - A fresh epoch, when it can be made durable. Rotating derives a new DEK
+//     whose count genuinely starts at zero, which is the only way to keep
+//     encrypting with a bound anyone can defend. The rotation is performed HERE,
+//     inside Unseal and under the same write lock, rather than left to the
+//     embedder's rotation loop: a loop that reacts a tick later leaves a window
+//     in which writes land on the exhausted DEK, and an embedder without such a
+//     loop leaves it open forever.
+//   - Otherwise, fail closed. The counter is seeded to the FULL limit, so every
+//     Encrypt returns ErrInvocationLimitExceeded until the epoch is rotated,
+//     while Decrypt keeps working — a node with no persister can still read and
+//     serve its data, it just cannot add to a key whose remaining budget it
+//     cannot prove.
+func (b *Barrier) resolveInvocationBudget() {
 	if b.invocations == nil || !b.invocations.IsEnabled() {
+		// Counting is off by configuration (InvocationLimit == -1). The
+		// embedder has explicitly opted out of the bound; nothing to enforce.
 		return
 	}
 	if b.config.InvocationCounter != nil {
 		// The embedder injected its own counter and owns persistence and
-		// seeding (the documented contract of
-		// BarrierConfig.InvocationCounter). Trust its state.
+		// seeding (the documented contract of BarrierConfig.InvocationCounter).
+		// Trust its state.
 		return
 	}
-	if b.invocations.Count() > 0 {
-		// Already seeded — e.g. a seal/unseal cycle within one process,
-		// where the in-memory count is still accurate, or an explicit
-		// Seed() by the embedder before Unseal.
+	if b.invocationsAuthoritative {
+		// This process created the epoch (Initialize or Rotate) and the counter
+		// has tracked every invocation since; a seal/unseal cycle within one
+		// process lands here and must NOT be disturbed.
 		return
 	}
 	limit := b.invocations.Limit()
 	if limit <= 0 {
 		return
 	}
-	// Ceil so the seeded usage is AT the threshold (a floor would land
-	// fractionally below it and ShouldRotate would not fire).
-	seed := int64(math.Ceil(float64(limit) * b.invocations.GetRotationThreshold() / 100.0))
-	if seed <= 0 || seed >= limit {
-		seed = limit - 1
+
+	if b.config.StatePersister != nil {
+		newEpoch, err := b.rotateLocked()
+		if err == nil {
+			slog.Warn("AEAD invocation count for the loaded epoch is unrecoverable; "+
+				"rotated to a fresh epoch with a known-zero count",
+				"from_epoch", newEpoch-1,
+				"epoch", newEpoch,
+				"limit", limit,
+			)
+			return
+		}
+		slog.Error("AEAD invocation count for the loaded epoch is unrecoverable and the rotation "+
+			"that would restore a provable budget failed; encryption is now refused",
+			"epoch", b.epoch,
+			"error", err,
+		)
 	}
-	b.invocations.Seed(seed)
-	slog.Warn("AEAD invocation count for current epoch unknown after restart; "+
-		"seeded counter to rotation threshold to force prompt key rotation",
+
+	b.invocations.Seed(limit)
+	slog.Error("AEAD invocation budget for the current epoch is unrecoverable after restart and the "+
+		"epoch cannot rotate; encryption is refused until it does (decryption is unaffected)",
 		"epoch", b.epoch,
-		"seeded_count", seed,
+		"seeded_count", limit,
 		"limit", limit,
+		"cause", ErrInvocationBudgetUnknown.Error(),
+		"remedy", "configure BarrierConfig.StatePersister so the epoch can rotate, or inject an "+
+			"InvocationCounter that persists its own count across restarts",
 	)
 }
 
@@ -808,13 +916,16 @@ func (b *Barrier) seal() error {
 	// Caveat: each cipher.AEAD below holds a COPY of its DEK inside its internal
 	// key schedule (AES expanded key / ChaCha key). Go's stdlib and x/crypto
 	// AEADs expose no key-wipe API, so dropping these references cannot zero
-	// that copy — it lingers in freed heap until GC reclaims it. The enclave
-	// DEKs above ARE actively zeroed; this AEAD-resident copy is a known stdlib
-	// limitation (GC-bounded) and is the only key material not wiped here.
+	// that copy — it lingers in freed heap until GC reclaims it. Neither is the
+	// enclave copy above actively zeroed: Clear only drops the reference (see
+	// the comment on the Clear calls). What seal() guarantees is that no DEK can
+	// be OPENED afterwards; both remaining copies are GC-bounded, and the
+	// enclave one is additionally useless without memguard's session coffer key.
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.hwEncryptor = nil
 	// The encryptor is gone, so the capability it carried is gone with it. A
 	// subsequent Unseal re-derives all three from the strategy it is given.
+	b.binding = ContextBindingUnresolved
 	b.plaintextMode = false
 	b.strategyID = ""
 	b.strategyHardwareBacked = false
@@ -954,9 +1065,21 @@ func (b *Barrier) EncryptWithEpochPinned(dst, plaintext []byte) ([]byte, uint64,
 // EncryptWithContext behaves like Encrypt but ADDITIONALLY folds a caller-supplied
 // context into the AEAD AAD alongside the epoch. When the context uniquely
 // identifies the frame's position or artifact (e.g. a WAL segment's
-// SegmentID||RecordSeq or a snapshot's SnapshotIndex||ChunkSeq), it prevents an
-// at-rest attacker from reordering, splicing, or truncating same-epoch frames:
-// authentication fails unless the exact same context is supplied at decrypt time.
+// SegmentID||RecordSeq or a snapshot's SnapshotIndex||ChunkSeq), authentication
+// fails unless the exact same context is supplied at decrypt time.
+//
+// WHAT THAT DOES AND DOES NOT DELIVER. It is a per-frame binding, so it defeats
+// REORDERING (frame k opened at position j fails) and SPLICING (a frame from
+// another artifact, shard or index fails). It does NOT defeat TAIL TRUNCATION:
+// nothing in the AAD names the number of frames or the total length, so every
+// surviving frame of a shortened artifact still authenticates perfectly and a
+// reader that stops at EOF sees a complete, shorter artifact. Detecting a
+// removed tail requires a count or a terminal marker that the reader can check
+// against, and only the caller — which owns the frame loop and the artifact
+// header — is in a position to supply one: fold the total frame count into
+// every frame's context, or distinguish the final frame's context from all
+// others, so a truncated artifact fails to authenticate rather than merely
+// ending early.
 //
 // The context is NOT stored in the ciphertext; the caller must reproduce the same
 // bytes when decrypting. Passing a nil/empty context is equivalent to Encrypt and
@@ -1449,7 +1572,13 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 func (b *Barrier) Rotate() (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.rotateLocked()
+}
 
+// rotateLocked is Rotate's body. It is factored out because Unseal must also be
+// able to rotate — see resolveInvocationBudget — while already holding b.mu.
+// The caller must hold the exclusive write lock.
+func (b *Barrier) rotateLocked() (uint64, error) {
 	if b.state != barrierUnsealed {
 		return 0, ErrBarrierSealed
 	}
@@ -1471,12 +1600,20 @@ func (b *Barrier) Rotate() (uint64, error) {
 
 	// Step 1: derive the new DEK and cipher. Open the root key enclave
 	// temporarily for HKDF derivation.
+	//
+	// The Destroy is DEFERRED rather than placed after the derivation call:
+	// deriveEpochCipher runs the caller-injected BarrierConfig.AEADProvider,
+	// i.e. arbitrary third-party code, on the plaintext root key. A panic there
+	// that some caller recovers would otherwise strand an mlock'd LockedBuffer
+	// holding the root key in the clear for the life of the process — and leaked
+	// locked buffers also consume RLIMIT_MEMLOCK, which memguard answers by
+	// aborting the process.
 	rootBuf, err := b.rootKey.Open()
 	if err != nil {
 		return 0, err
 	}
+	defer rootBuf.Destroy()
 	dek, aead, err := b.deriveEpochCipher(rootBuf.Bytes(), b.salt, newEpoch)
-	rootBuf.Destroy()
 	if err != nil {
 		// Nothing committed yet; the old epoch remains active. deriveEpochCipher
 		// already zeroed any partial key material on its own error path, but the
@@ -1492,6 +1629,13 @@ func (b *Barrier) Rotate() (uint64, error) {
 	candidate := cloneSealedRootKey(b.sealed)
 	candidate.Epoch = newEpoch
 	candidate.KnownEpochs = sortedEpochsWith(b.knownEpochs, newEpoch)
+	// Re-authenticate the metadata: Epoch and KnownEpochs both changed, and a
+	// blob whose MAC still covered the OLD values would be rejected by the next
+	// Unseal (correctly — it would be indistinguishable from an edited one).
+	if macErr := b.restampStateMACLocked(rootBuf.Bytes(), candidate); macErr != nil {
+		wipeBytes(dek)
+		return 0, macErr
+	}
 	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
 		wipeBytes(dek)
 		slog.Error("key rotation aborted: sealed state not persisted; previous epoch remains active",
@@ -1515,6 +1659,11 @@ func (b *Barrier) Rotate() (uint64, error) {
 	// Adopt the state that was just persisted, so SealedRootKeyData() and the
 	// durable blob agree exactly.
 	b.sealed = candidate
+
+	// The new DEK has performed zero invocations and this process knows it, so
+	// the counter reset below is a TRUE count again — including for an epoch
+	// that was loaded from disk a moment ago (see resolveInvocationBudget).
+	b.invocationsAuthoritative = true
 
 	// Step 4: reset the AEAD safety trackers for the new epoch. These run AFTER
 	// the commit and never revert it. A failure here is fail-safe (see the doc
@@ -1606,6 +1755,12 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	}
 	candidate := cloneSealedRootKey(b.sealed)
 	candidate.KnownEpochs = sortedEpochsWithout(b.knownEpochs, retire)
+	// KnownEpochs is covered by the metadata MAC, so a purge must re-stamp it
+	// for the same reason Rotate does: otherwise the reduced blob fails its own
+	// authentication on the next Unseal.
+	if macErr := b.restampStateMACFromEnclaveLocked(candidate); macErr != nil {
+		return 0, macErr
+	}
 	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
 		slog.Error("epoch purge aborted: reduced sealed state not persisted; DEKs retained",
 			"min_epoch", minEpoch, "error", perr)
@@ -1724,6 +1879,13 @@ func (b *Barrier) IsHardwareMode() bool {
 // RootKey returns a copy of the decrypted root key. The barrier must be
 // unsealed. The returned slice is owned by the caller and should be zeroed
 // after use.
+//
+// The copy lands on the ORDINARY Go heap: it is not mlock'd, so it can be
+// swapped to disk and it appears verbatim in a core dump, and a caller that
+// forgets to zero it leaves the key resident until the GC reclaims the backing
+// array. Prefer RootKeyProtected, which hands back the same material inside a
+// memory-locked, guard-paged buffer. This form stays for callers that must pass
+// a plain []byte to an API they do not control.
 func (b *Barrier) RootKey() ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1739,10 +1901,36 @@ func (b *Barrier) RootKey() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Deferred rather than sequential: the copy below cannot panic today, but a
+	// stranded LockedBuffer holds the PLAINTEXT root key mlock'd for the life of
+	// the process and consumes RLIMIT_MEMLOCK, which memguard answers by
+	// aborting. The cleanup of key material must not depend on the happy path.
+	defer buf.Destroy()
 	keyCopy := make([]byte, buf.Size())
 	copy(keyCopy, buf.Bytes())
-	buf.Destroy()
 	return keyCopy, nil
+}
+
+// RootKeyProtected returns the decrypted root key inside a memory-locked,
+// guard-paged ProtectedBuffer. The barrier must be unsealed. The caller OWNS
+// the buffer and MUST Destroy it when done, which zeroes the memory
+// deterministically.
+//
+// It is the form to prefer over RootKey for anything that keeps the key for
+// more than a statement: the returned memory is excluded from core dumps and
+// never paged to disk, and Destroy is a real wipe rather than a request to the
+// garbage collector. Returns ErrNoRootKeyAvailable in no-encryption mode, which
+// holds no root key at all.
+func (b *Barrier) RootKeyProtected() (*enclave.ProtectedBuffer, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.state != barrierUnsealed {
+		return nil, ErrBarrierSealed
+	}
+	if b.rootKey == nil {
+		return nil, ErrNoRootKeyAvailable
+	}
+	return b.rootKey.Open()
 }
 
 // CurrentEpoch returns the current key rotation epoch. Returns 0 if the
@@ -1785,6 +1973,10 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 	copy(cp.Salt, src.Salt)
 	cp.Ciphertext = make([]byte, len(src.Ciphertext))
 	copy(cp.Ciphertext, src.Ciphertext)
+	if src.StateMAC != nil {
+		cp.StateMAC = make([]byte, len(src.StateMAC))
+		copy(cp.StateMAC, src.StateMAC)
+	}
 	if src.Metadata != nil {
 		cp.Metadata = make([]byte, len(src.Metadata))
 		copy(cp.Metadata, src.Metadata)
@@ -1804,6 +1996,152 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 	return cp
 }
 
+// sealedStateMACInfo is the HKDF info string that separates the metadata
+// authentication key from every epoch DEK derived from the same root key. The
+// two derivations share a root key and must never share an output.
+const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
+
+// sealedStateMACVersion is the version byte of the canonical encoding the MAC
+// is computed over. It is the first byte fed to the HMAC, so extending the
+// covered field set later produces unrelated tags rather than an ambiguous
+// re-parse of the same bytes.
+const sealedStateMACVersion byte = 1
+
+// sealedStateMAC computes the metadata authentication tag for a sealed root
+// key: HMAC-SHA256, keyed by HKDF-SHA256(rootKey, info=sealedStateMACInfo),
+// over a canonical encoding of the fields that decide how the barrier will use
+// the key.
+//
+// Every variable-length field is length-prefixed with a fixed 8-byte big-endian
+// count, so no concatenation of one field's contents can imitate the boundary
+// of another (a Salt ending in what looks like a length header cannot shift the
+// KnownEpochs that follow).
+//
+// COVERED: Strategy, Version, DeploymentID, Epoch, Salt, KnownEpochs,
+// HKDFVersion, Algorithm, Ciphertext, Metadata, Nonce, HardwarePayload. The
+// ciphertext is included even though it authenticates itself, so that genuine
+// metadata from one blob cannot be paired with a genuine ciphertext from
+// another. Metadata carries the KDF version byte, which selects the unwrapping
+// KDF and is otherwise unauthenticated.
+//
+// NOT COVERED, deliberately: FailedAttempts and LastFailedUnixNano, which
+// persistBackoffState writes after a FAILED unseal — the point at which no root
+// key is available to re-MAC with; CreatedAt, ShamirThreshold and ShamirTotal,
+// which are higher-layer custody bookkeeping this package neither reads nor
+// acts on (go-qrdb owns them and may legitimately rewrite them).
+func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]byte, error) {
+	macKey := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, rootKey, nil, []byte(sealedStateMACInfo)), macKey); err != nil {
+		return nil, &Error{Strategy: "state-mac", Err: err}
+	}
+	defer wipeBytes(macKey)
+
+	mac := hmac.New(sha256.New, macKey)
+	var scratch [8]byte
+	putUint := func(v uint64) {
+		binary.BigEndian.PutUint64(scratch[:], v)
+		mac.Write(scratch[:])
+	}
+	putBytes := func(p []byte) {
+		putUint(uint64(len(p)))
+		mac.Write(p)
+	}
+
+	mac.Write([]byte{sealedStateMACVersion})
+	putBytes([]byte(s.Strategy))
+	putUint(uint64(s.Version))
+	putUint(deploymentID)
+	putUint(s.Epoch)
+	putBytes(s.Salt)
+	putUint(uint64(len(s.KnownEpochs)))
+	for _, ep := range s.KnownEpochs {
+		putUint(ep)
+	}
+	putUint(uint64(s.HKDFVersion))
+	putUint(uint64(s.Algorithm))
+	putBytes(s.Ciphertext)
+	putBytes(s.Metadata)
+	putBytes(s.Nonce)
+	putBytes(s.HardwarePayload)
+
+	runtime.KeepAlive(rootKey)
+	return mac.Sum(nil), nil
+}
+
+// verifySealedStateMAC checks b.sealed's metadata tag against the root key just
+// recovered by the sealing strategy. The caller must hold b.mu and must have
+// verified that rootKey is real key material (no-encryption mode has none and
+// never reaches here).
+//
+// A blob with NO tag is a blob written before the barrier authenticated its own
+// metadata. Accepting it unconditionally would make the whole mechanism
+// optional at the attacker's discretion — strip the field, keep the forgery —
+// so it is refused unless the deployment opts in through
+// BarrierConfig.AllowUnauthenticatedSealedState.
+func (b *Barrier) verifySealedStateMAC(rootKey []byte) error {
+	if b.sealed == nil {
+		return ErrNilSealedData
+	}
+	if len(b.sealed.StateMAC) == 0 {
+		if b.config.AllowUnauthenticatedSealedState {
+			slog.Warn("quicraft/seal: sealed root key carries no metadata MAC; its epoch and known-epoch "+
+				"set are unauthenticated and an attacker with write access to the blob can rewrite them",
+				"epoch", b.sealed.Epoch,
+				"deployment_id", b.config.DeploymentID,
+				"remedy", "re-persist SealedRootKeyData() from this process to stamp a MAC, then clear "+
+					"BarrierConfig.AllowUnauthenticatedSealedState",
+			)
+			return nil
+		}
+		slog.Error("quicraft/seal: unseal refused; sealed root key carries no metadata MAC",
+			"epoch", b.sealed.Epoch,
+			"deployment_id", b.config.DeploymentID,
+			"remedy", "set BarrierConfig.AllowUnauthenticatedSealedState once to migrate a pre-MAC blob",
+		)
+		return ErrSealedStateUnauthenticated
+	}
+	want, err := sealedStateMAC(rootKey, b.config.DeploymentID, b.sealed)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(want, b.sealed.StateMAC) {
+		slog.Error("quicraft/seal: unseal refused; sealed root key metadata failed authentication",
+			"epoch", b.sealed.Epoch,
+			"deployment_id", b.config.DeploymentID,
+		)
+		return ErrSealedStateUnauthenticated
+	}
+	return nil
+}
+
+// restampStateMACLocked recomputes s.StateMAC from a plaintext root key. It is
+// called by every operation that changes a covered field. The caller must hold
+// b.mu.
+func (b *Barrier) restampStateMACLocked(rootKey []byte, s *SealedRootKey) error {
+	mac, err := sealedStateMAC(rootKey, b.config.DeploymentID, s)
+	if err != nil {
+		return err
+	}
+	s.StateMAC = mac
+	return nil
+}
+
+// restampStateMACFromEnclaveLocked is restampStateMACLocked for callers that do
+// not already hold the root key open. The caller must hold b.mu and the barrier
+// must be unsealed in software mode (the delegated paths never reach here: both
+// Rotate and PurgeEpochsBefore refuse with ErrHardwareMode).
+func (b *Barrier) restampStateMACFromEnclaveLocked(s *SealedRootKey) error {
+	if b.rootKey == nil {
+		return ErrNoRootKeyAvailable
+	}
+	rootBuf, err := b.rootKey.Open()
+	if err != nil {
+		return err
+	}
+	defer rootBuf.Destroy()
+	return b.restampStateMACLocked(rootBuf.Bytes(), s)
+}
+
 // SetSealedRootKey sets the sealed root key data for subsequent Unseal calls.
 // This is used when loading persisted sealed key data during node startup.
 //
@@ -1813,6 +2151,22 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 //   - KnownEpochs must contain the current Epoch, must name no epoch above it,
 //     and must hold at most MaxKnownEpochs entries.
 //   - Algorithm, when recorded, must match the barrier's configured algorithm.
+//   - Epoch must not go BACKWARDS: it must be at least BarrierConfig.MinEpoch
+//     and, on a barrier that already holds state, at least the epoch it already
+//     holds.
+//
+// The epoch floor is not tidiness either, and it is not made redundant by
+// SealedRootKey.StateMAC. The MAC proves the metadata was written by something
+// holding the root key; it cannot prove the blob is the LATEST such state, so
+// an attacker who keeps a copy of the persisted blob from epoch 2 and restores
+// it over epoch 5 presents a perfectly authentic older state. Accepting it
+// resurrects epoch 2's already-spent DEK together with a zeroed invocation
+// counter and an empty nonce tracker — two independent random-nonce sequences
+// under one key, which is exactly the condition the invocation cap bounds.
+// Detecting that requires state the attacker cannot roll back in the same step,
+// which lives in the embedder (the highest epoch any live WAL segment or
+// retained snapshot still references), not here; BarrierConfig.MinEpoch is
+// where it is supplied.
 //
 // The structural bounds are load-bearing, not tidiness: the blob is plaintext,
 // unauthenticated metadata (only the root-key ciphertext is protected, and its
@@ -1842,6 +2196,24 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	// Validate epoch is non-zero.
 	if sealed.Epoch == 0 {
 		return ErrInvalidSealedEpoch
+	}
+
+	// Reject an epoch that goes backwards. floor is the strongest lower bound
+	// available: the embedder's declared minimum live epoch, raised to whatever
+	// epoch this barrier already holds — reloading a state older than the one
+	// in hand is a rollback whether or not the embedder configured a floor.
+	floor := b.config.MinEpoch
+	if b.state != barrierUninitialized && b.epoch > floor {
+		floor = b.epoch
+	}
+	if sealed.Epoch < floor {
+		slog.Error("quicraft/seal: sealed root key rejected; its epoch is below the rollback floor",
+			"blob_epoch", sealed.Epoch,
+			"floor", floor,
+			"configured_min_epoch", b.config.MinEpoch,
+			"deployment_id", b.config.DeploymentID,
+		)
+		return ErrSealedEpochRollback
 	}
 
 	// Validate salt length.
@@ -1896,6 +2268,11 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	b.sealed = sealed
 	b.salt = sealed.Salt
 	b.epoch = sealed.Epoch
+
+	// The blob describes an epoch some EARLIER process encrypted under, for an
+	// unknown number of invocations. Whatever the in-memory counter holds, it is
+	// no longer a count of this epoch's usage. See resolveInvocationBudget.
+	b.invocationsAuthoritative = false
 
 	// A blob persisted before the version field existed carries 0 and must
 	// keep deriving with the v1 info layout.

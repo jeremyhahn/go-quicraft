@@ -223,9 +223,15 @@ func TestPeer_NewPeer_Success(t *testing.T) {
 	if p.r.term != 5 {
 		t.Fatalf("expected term 5, got %d", p.r.term)
 	}
-	// Vote is reset to 0 by becomeFollower in newRaft.
-	// This is correct: the raft spec resets vote on term transitions,
-	// and newRaft calls becomeFollower which resets vote.
+	// The persisted vote is restored too, and is NOT reset. becomeFollower
+	// clears the vote only on term ADVANCEMENT (Raft Figure 2), and newRaft
+	// calls it with the term it just restored, so the term does not change and
+	// the vote survives. Preserving it is what stops a replica that restarts
+	// inside a term from voting a second time in that term. See
+	// persisted_vote_regression_test.go for the double-vote scenario.
+	if p.r.vote != 2 {
+		t.Fatalf("expected persisted vote 2 to be restored, got %d", p.r.vote)
+	}
 }
 
 func TestPeer_NewPeer_InvalidConfig(t *testing.T) {
@@ -3527,30 +3533,78 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 	}
 }
 
-func TestPeer_processConfigChanges_ContinuesAfterErrors(t *testing.T) {
+// TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard pins the runtime
+// decode site as fail-CLOSED.
+//
+// It used to be the opposite: an undecodable committed config entry was logged
+// and skipped, and the scan carried on with the entries after it. That is not a
+// tolerant no-op — a config change that commits and is then dropped on one
+// replica leaves that replica computing quorum over a membership the rest of the
+// shard does not hold, and a peer that catches up by SNAPSHOT instead of by log
+// replay gets the change, so the two genuinely diverge. Recovery already refuses
+// these bytes (ReconstructMembership / bootstrap.go); the runtime failing open
+// while recovery failed closed over the same input is the inconsistency.
+func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) {
 	cfg := testConfigWithID(1, 1)
 	ms := singleNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
 
-	// Create a valid config change.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 7,
-		Address:   "addr7",
-	}
-	ccBuf := make([]byte, cc.Size())
-	_, _ = cc.MarshalTo(ccBuf)
-
-	// Mix corrupt and valid entries. The corrupt entry at the beginning
-	// must not prevent the valid entry from being applied.
+	// A valid change AFTER the corrupt one, so the test can also show the scan
+	// stops rather than folding past a membership it cannot reconstruct.
+	ccBuf := marshalConfigChange(t, proto.ConfigChange{
+		Type: proto.AddNode, ReplicaID: 7, Address: "addr7",
+	})
 	entries := []proto.Entry{
 		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: []byte{0xFF}},
 		{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: ccBuf},
 	}
-	p.processConfigChanges(entries)
+	err := p.processConfigChanges(entries)
+	if !errors.Is(err, ErrCorruptConfigEntry) {
+		t.Fatalf("processConfigChanges returned %v, want ErrCorruptConfigEntry: an "+
+			"undecodable COMMITTED config entry must fault the shard, not be skipped",
+			err)
+	}
+	if p.IsMember(7) {
+		t.Fatal("the scan folded a config change ABOVE the entry it could not " +
+			"decode: every change after the corrupt one is defined relative to a " +
+			"membership this replica cannot build")
+	}
+}
 
-	if !p.IsMember(7) {
-		t.Fatal("replica 7 should be a member despite earlier corrupt entry")
+// TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored is the
+// control. The fault above must key on the DECODE, not on "membership.apply
+// returned an error": an apply refusal is evaluated identically by every replica
+// (a Removed tombstone re-add here), so it is agreement rather than corruption,
+// and faulting on it would kill shards over an outcome the whole cluster shares.
+func TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored(t *testing.T) {
+	cfg := testConfigWithID(1, 1)
+	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+
+	add7 := marshalConfigChange(t, proto.ConfigChange{
+		Type: proto.AddNode, ReplicaID: 7, Address: "addr7",
+	})
+	remove7 := marshalConfigChange(t, proto.ConfigChange{
+		Type: proto.RemoveNode, ReplicaID: 7,
+	})
+	add9 := marshalConfigChange(t, proto.ConfigChange{
+		Type: proto.AddNode, ReplicaID: 9, Address: "addr9",
+	})
+
+	if err := p.processConfigChanges([]proto.Entry{
+		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: add7},
+		{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: remove7},
+		// Refused: replica 7 carries a Removed tombstone now.
+		{Index: 4, Term: 1, Type: proto.EntryConfigChange, Cmd: add7},
+		{Index: 5, Term: 1, Type: proto.EntryConfigChange, Cmd: add9},
+	}); err != nil {
+		t.Fatalf("processConfigChanges returned %v for a deterministic apply "+
+			"refusal: only an undecodable payload may fault the shard", err)
+	}
+	if p.IsMember(7) {
+		t.Fatal("the Removed tombstone was overridden by a re-add")
+	}
+	if !p.IsMember(9) {
+		t.Fatal("the scan stopped at a deterministic refusal instead of continuing")
 	}
 }
 
@@ -3570,6 +3624,29 @@ func TestPeer_processConfigChanges_SkipsEmptyCmd(t *testing.T) {
 	if len(m.Addresses) != 1 {
 		t.Fatalf("expected 1 member, got %d", len(m.Addresses))
 	}
+}
+
+// testConfigChangeCmd returns a VALID marshaled ConfigChange payload, for tests
+// whose subject is the propose-time bookkeeping (pendingConfigChange, batch
+// rejection, entry-type masking) rather than the change itself.
+//
+// It exists because handleLeaderPropose now REJECTS a config-change payload that
+// does not decode (raft.validateProposedConfigChange). It used to warn and pass
+// one through, which let a wire-forwarded Propose put a membership change nobody
+// had validated into the log of every replica, so these tests could get away
+// with placeholder bytes like []byte("cc1"). They cannot any more, and that is
+// the point.
+func testConfigChangeCmd(replicaID uint64) []byte {
+	cc := proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: replicaID,
+		Address:   fmt.Sprintf("cc-addr-%d", replicaID),
+	}
+	buf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(buf); err != nil {
+		panic(err)
+	}
+	return buf
 }
 
 // marshalConfigChange is a test helper that marshals a ConfigChange to bytes.
@@ -4803,14 +4880,17 @@ func TestPeer_NewPeer_VolatileStateReinitialized(t *testing.T) {
 	}
 
 	// Persisted state: term and vote are restored from stable storage.
-	// Note: becomeFollower resets vote when term changes, but since
-	// newRaft sets r.term from state first, then calls becomeFollower
-	// with the same term, vote is preserved only if term doesn't change.
-	// However, becomeFollower(term, noLeader) is called with the SAME
-	// term that was just set, so vote is NOT cleared. Let's verify term
-	// is correctly restored.
+	// newRaft sets r.term from state first, then calls becomeFollower with the
+	// SAME term, and becomeFollower clears the vote only on term advancement
+	// (Raft Figure 2), so the vote is NOT cleared. Both halves are asserted:
+	// asserting only the term is what let a mutation of the vote-recovery line
+	// pass the whole suite.
 	if p.r.term != 5 {
 		t.Fatalf("expected persisted term 5 to be restored, got %d", p.r.term)
+	}
+	if p.r.vote != 2 {
+		t.Fatalf("expected persisted vote 2 to be restored, got %d: a forgotten "+
+			"votedFor lets this replica vote twice in term 5", p.r.vote)
 	}
 
 	// The raft state machine should start as follower regardless of

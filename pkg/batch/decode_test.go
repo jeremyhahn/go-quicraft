@@ -20,9 +20,22 @@ import (
 	"testing"
 )
 
+// mustEncodeBatch encodes cmds and fails the test if the batch format cannot
+// represent them. EncodeBatch reports that as an error rather than emitting a
+// payload the decoder would reject; every command in these tests is well
+// within the format's limits, so an error here is a test failure.
+func mustEncodeBatch(t *testing.T, cmds [][]byte) []byte {
+	t.Helper()
+	encoded, err := EncodeBatch(cmds)
+	if err != nil {
+		t.Fatalf("EncodeBatch: unexpected error: %v", err)
+	}
+	return encoded
+}
+
 func TestEncodeBatch_NilSlice(t *testing.T) {
 	t.Parallel()
-	result := EncodeBatch(nil)
+	result := mustEncodeBatch(t, nil)
 	if len(result) != 0 {
 		t.Errorf("EncodeBatch(nil) produced %d bytes, want 0", len(result))
 	}
@@ -30,7 +43,7 @@ func TestEncodeBatch_NilSlice(t *testing.T) {
 
 func TestEncodeBatch_EmptySlice(t *testing.T) {
 	t.Parallel()
-	result := EncodeBatch([][]byte{})
+	result := mustEncodeBatch(t, [][]byte{})
 	if len(result) != 0 {
 		t.Errorf("EncodeBatch(empty) produced %d bytes, want 0", len(result))
 	}
@@ -39,7 +52,7 @@ func TestEncodeBatch_EmptySlice(t *testing.T) {
 func TestEncodeBatch_SingleCommand(t *testing.T) {
 	t.Parallel()
 	cmd := []byte("hello")
-	result := EncodeBatch([][]byte{cmd})
+	result := mustEncodeBatch(t, [][]byte{cmd})
 
 	// Expected: 4 bytes length prefix + 5 bytes data = 9 bytes
 	if len(result) != 9 {
@@ -66,7 +79,7 @@ func TestEncodeBatch_MultipleCommands(t *testing.T) {
 		[]byte("GET key2"),
 		[]byte("DELETE key3"),
 	}
-	result := EncodeBatch(cmds)
+	result := mustEncodeBatch(t, cmds)
 
 	// Expected: 3 * 4 (prefixes) + 13 + 8 + 11 (data) = 12 + 32 = 44 bytes
 	expectedLen := 3*lengthPrefixSize + 13 + 8 + 11
@@ -82,7 +95,7 @@ func TestEncodeBatch_EmptyCommands(t *testing.T) {
 		{},
 		{},
 	}
-	result := EncodeBatch(cmds)
+	result := mustEncodeBatch(t, cmds)
 
 	// Each empty command still gets a 4-byte zero length prefix.
 	expectedLen := 3 * lengthPrefixSize
@@ -111,7 +124,7 @@ func TestEncodeBatch_LargeCommand(t *testing.T) {
 		large[i] = byte(i % 256)
 	}
 	cmds := [][]byte{large}
-	result := EncodeBatch(cmds)
+	result := mustEncodeBatch(t, cmds)
 
 	expectedLen := lengthPrefixSize + len(large)
 	if len(result) != expectedLen {
@@ -234,7 +247,7 @@ func TestDecodeBatch_Garbage(t *testing.T) {
 func TestRoundTrip_SingleCommand(t *testing.T) {
 	t.Parallel()
 	original := [][]byte{[]byte("raft-proposal-data")}
-	encoded := EncodeBatch(original)
+	encoded := mustEncodeBatch(t, original)
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)
@@ -256,7 +269,7 @@ func TestRoundTrip_MultipleCommands(t *testing.T) {
 		[]byte(""),
 		[]byte("cmd5-with-binary-\x00\x01\x02"),
 	}
-	encoded := EncodeBatch(original)
+	encoded := mustEncodeBatch(t, original)
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)
@@ -274,7 +287,7 @@ func TestRoundTrip_MultipleCommands(t *testing.T) {
 func TestRoundTrip_EmptyCommands(t *testing.T) {
 	t.Parallel()
 	original := [][]byte{{}, {}, {}}
-	encoded := EncodeBatch(original)
+	encoded := mustEncodeBatch(t, original)
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)
@@ -292,7 +305,7 @@ func TestRoundTrip_BinaryData(t *testing.T) {
 		cmd[i] = byte(i)
 	}
 	original := [][]byte{cmd}
-	encoded := EncodeBatch(original)
+	encoded := mustEncodeBatch(t, original)
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)
@@ -310,7 +323,7 @@ func TestRoundTrip_ManyCommands(t *testing.T) {
 	for i := range original {
 		original[i] = []byte{byte(i & 0xFF), byte((i >> 8) & 0xFF)}
 	}
-	encoded := EncodeBatch(original)
+	encoded := mustEncodeBatch(t, original)
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)

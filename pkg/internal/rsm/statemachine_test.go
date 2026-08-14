@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -1746,7 +1747,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 			{Index: 200, Cmd: makeCmd("k", "v")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -1785,7 +1786,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 			{Index: 50, ClientID: 42, SeriesID: 1, Cmd: makeCmd("k", "v")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply session entry = %v", err)
 		}
 
@@ -1794,7 +1795,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 			{Index: 120, Cmd: makeCmd("k2", "v2")},
 		}
 		results2 := make([]sm.Result, 1)
-		if err := rsm.Apply(entries2, results2); err != nil {
+		if err := applyContiguous(t, rsm, entries2, results2); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -1832,7 +1833,7 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 			{Index: 1000000, Cmd: makeCmd("k", "v")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -1882,10 +1883,10 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 		}
 		results1 := make([]sm.Result, 1)
 		results2 := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results1); err != nil {
+		if err := applyContiguous(t, rsm1, entries, results1); err != nil {
 			t.Fatalf("rsm1.Apply = %v", err)
 		}
-		if err := rsm2.Apply(entries, results2); err != nil {
+		if err := applyContiguous(t, rsm2, entries, results2); err != nil {
 			t.Fatalf("rsm2.Apply = %v", err)
 		}
 
@@ -1942,7 +1943,7 @@ func TestApply_UnregisteredSessionManagedEntry(t *testing.T) {
 	}
 
 	// The entry should NOT have been applied to the user SM.
-	val, err := rsm.Lookup(nil, "foo")
+	val, err := rsm.Lookup(t.Context(), "foo")
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -2014,7 +2015,7 @@ func TestApply_UnregisteredSessionMixedBatch(t *testing.T) {
 	}
 
 	// "baz" should NOT be in the KV (expired session entry was skipped).
-	val, err := rsm.Lookup(nil, "baz")
+	val, err := rsm.Lookup(t.Context(), "baz")
 	if err != nil {
 		t.Fatalf("Lookup(baz): %v", err)
 	}
@@ -2514,7 +2515,7 @@ func TestStateMachine_LastAppliedNeverDecreases(t *testing.T) {
 			{Index: 7, Cmd: makeCmd("c", "3")},
 		}
 		results := make([]sm.Result, 3)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 		if rsm.LastApplied() != 7 {
@@ -2980,7 +2981,7 @@ func TestApply_SessionExpiryDisabled(t *testing.T) {
 			{Index: 999999, Cmd: makeCmd("x", "y")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 		if !rsm.Sessions().IsRegistered(10) {
@@ -3369,9 +3370,14 @@ func TestSMType_TypeCode(t *testing.T) {
 	})
 
 	t.Run("TypeCode returns uint64 for serialization", func(t *testing.T) {
-		// Verify the return type is uint64 by attempting assignment
-		var code uint64 = SMTypeRegular.TypeCode()
-		if code != 0 {
+		// The type code is serialized as a uint64; a narrower return type
+		// would truncate it on the wire. The reflected kind is the assertion —
+		// a `var code uint64 = ...` declaration proves the same thing but
+		// reads as a redundant type annotation.
+		if got := reflect.TypeOf(SMTypeRegular.TypeCode()); got.Kind() != reflect.Uint64 {
+			t.Fatalf("TypeCode() returns %v (kind %v), want a uint64", got, got.Kind())
+		}
+		if code := SMTypeRegular.TypeCode(); code != 0 {
 			t.Errorf("code = %d, want 0", code)
 		}
 	})
@@ -3423,7 +3429,7 @@ func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
 			{Index: 20, ClientID: 0, Cmd: makeCmd("advance", "val")},
 		}
 		advanceResults := make([]sm.Result, 1)
-		if err := rsm.Apply(advanceEntries, advanceResults); err != nil {
+		if err := applyContiguous(t, rsm, advanceEntries, advanceResults); err != nil {
 			t.Fatalf("Apply advance = %v", err)
 		}
 
@@ -3465,7 +3471,7 @@ func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
 			{Index: 5, ClientID: 42, SeriesID: 1, Cmd: makeCmd("k1", "v1")},
 		}
 		useResults := make([]sm.Result, 1)
-		if err := rsm.Apply(useEntries, useResults); err != nil {
+		if err := applyContiguous(t, rsm, useEntries, useResults); err != nil {
 			t.Fatalf("Apply use = %v", err)
 		}
 
@@ -3476,7 +3482,7 @@ func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
 			{Index: 12, ClientID: 0, Cmd: makeCmd("advance", "val")},
 		}
 		advanceResults := make([]sm.Result, 1)
-		if err := rsm.Apply(advanceEntries, advanceResults); err != nil {
+		if err := applyContiguous(t, rsm, advanceEntries, advanceResults); err != nil {
 			t.Fatalf("Apply advance = %v", err)
 		}
 
@@ -3837,22 +3843,6 @@ func (kv *failingUpdateKV) Update(ctx context.Context, entries []sm.Entry, resul
 	return nil
 }
 
-// corruptingWriter writes data then corrupts it by flipping the last byte.
-type corruptingWriter struct {
-	buf bytes.Buffer
-}
-
-func (w *corruptingWriter) Write(p []byte) (int, error) {
-	return w.buf.Write(p)
-}
-
-func (w *corruptingWriter) corrupt() {
-	data := w.buf.Bytes()
-	if len(data) > 0 {
-		data[len(data)-1] ^= 0xFF
-	}
-}
-
 // testOnDiskKVWithState simulates persistent state for recovery testing.
 type testOnDiskKVWithState struct {
 	mu          sync.RWMutex
@@ -4124,7 +4114,7 @@ func TestApply_LargeResultData(t *testing.T) {
 			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("big", "DIFFERENT")},
 		}
 		dupResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dupEntries, dupResults); err != nil {
+		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
 			t.Fatalf("Apply(dup) = %v", err)
 		}
 		if dupResults[0].Value != originalValue {
@@ -4226,7 +4216,7 @@ func TestApply_AllSessionDuplicatesBatch(t *testing.T) {
 			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("k", "v")},
 		}
 		dupResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dupEntries, dupResults); err != nil {
+		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
 			t.Fatalf("Apply(dup) = %v", err)
 		}
 		if dupResults[0].Value != originalValue {
@@ -4272,7 +4262,7 @@ func TestApply_SessionManagedEntryWithEmptyCmd(t *testing.T) {
 			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("ignored", "data")},
 		}
 		dupResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dupEntries, dupResults); err != nil {
+		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
 			t.Fatalf("Apply(dup) = %v", err)
 		}
 		if dupResults[0].Value != results[0].Value {

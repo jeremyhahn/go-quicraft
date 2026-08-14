@@ -31,6 +31,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -716,6 +717,95 @@ func dbKVCreateFunc() (dbSM.CreateStateMachineFunc, *dbSMTracker) {
 }
 
 // ---------------------------------------------------------------------------
+// Gated KV State Machine
+// ---------------------------------------------------------------------------
+
+// gateKeyPrefix marks a proposal that dbGatedKVStateMachine.Update must block
+// on until the test releases it.
+const gateKeyPrefix = "gate-"
+
+// decodeKVPutKey extracts the key from a command produced by encodeKVPut.
+func decodeKVPutKey(cmd []byte) (string, bool) {
+	if len(cmd) < 3 || cmd[0] != opPut {
+		return "", false
+	}
+	keyLen := binary.BigEndian.Uint16(cmd[1:3])
+	if int(keyLen)+3 > len(cmd) {
+		return "", false
+	}
+	return string(cmd[3 : 3+keyLen]), true
+}
+
+// dbGatedKVStateMachine is a dbKVStateMachine whose Update parks on any entry
+// whose key carries gateKeyPrefix until the shared release channel is closed.
+//
+// It exists to hold a replica's APPLIED index below an appended config-change
+// entry. raft.hasConfigChangeToApply is `log.confChangeIndex > log.processed`,
+// and processed only advances as the state machine drains committed entries,
+// so parking the state machine keeps the leader's pendingConfigChange latch
+// armed for as long as the test needs rather than for the few milliseconds a
+// config change normally takes to apply. That turns "submit two config changes
+// and hope they overlap" into a deterministic overlap.
+type dbGatedKVStateMachine struct {
+	*dbKVStateMachine
+	entered   chan struct{}
+	enterOnce sync.Once
+	release   <-chan struct{}
+}
+
+// Update parks on a gate entry, then delegates to the embedded KV store.
+func (kv *dbGatedKVStateMachine) Update(entry dbSM.Entry) (dbSM.Result, error) {
+	if key, ok := decodeKVPutKey(entry.Cmd); ok && strings.HasPrefix(key, gateKeyPrefix) {
+		kv.enterOnce.Do(func() { close(kv.entered) })
+		<-kv.release
+	}
+	return kv.dbKVStateMachine.Update(entry)
+}
+
+// Compile-time assertion.
+var _ dbSM.IStateMachine = (*dbGatedKVStateMachine)(nil)
+
+// dbGatedSMTracker tracks dbGatedKVStateMachine instances so a test can wait
+// for a replica's apply loop to actually reach the gate.
+type dbGatedSMTracker struct {
+	mu       sync.Mutex
+	machines map[dbSMKey]*dbGatedKVStateMachine
+}
+
+func (t *dbGatedSMTracker) Get(shardID, replicaID uint64) *dbGatedKVStateMachine {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.machines[dbSMKey{shardID, replicaID}]
+}
+
+// dbGatedKVCreateFunc returns a factory producing gated KV state machines that
+// all park on the supplied release channel. Two trackers come back: a plain
+// dbSMTracker holding the embedded KV stores, so every existing helper
+// (proposeAndWait, waitForReplication, verifyAllData) works unchanged, and a
+// gated tracker exposing the per-replica gate.
+func dbGatedKVCreateFunc(release <-chan struct{}) (dbSM.CreateStateMachineFunc, *dbSMTracker, *dbGatedSMTracker) {
+	plain := &dbSMTracker{machines: make(map[dbSMKey]*dbKVStateMachine)}
+	gated := &dbGatedSMTracker{machines: make(map[dbSMKey]*dbGatedKVStateMachine)}
+	createFn := func(shardID, replicaID uint64) dbSM.IStateMachine {
+		inner := newDBKVStateMachine()
+		machine := &dbGatedKVStateMachine{
+			dbKVStateMachine: inner,
+			entered:          make(chan struct{}),
+			release:          release,
+		}
+		key := dbSMKey{shardID, replicaID}
+		plain.mu.Lock()
+		plain.machines[key] = inner
+		plain.mu.Unlock()
+		gated.mu.Lock()
+		gated.machines[key] = machine
+		gated.mu.Unlock()
+		return machine
+	}
+	return createFn, plain, gated
+}
+
+// ---------------------------------------------------------------------------
 // mTLS Helpers
 // ---------------------------------------------------------------------------
 
@@ -967,7 +1057,9 @@ func (c *dbTestCluster) startShard(shardID uint64) []*dbSMTracker {
 		}
 	}
 
+	c.hostsMu.Lock()
 	c.trackers = trackers
+	c.hostsMu.Unlock()
 	return trackers
 }
 
@@ -997,8 +1089,49 @@ func (c *dbTestCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID,
 		}
 	}
 
+	c.hostsMu.Lock()
 	c.trackers = trackers
+	c.hostsMu.Unlock()
 	return trackers
+}
+
+// startGatedShard starts a shard on all nodes using gated KV state machines
+// that park on release. It returns the plain trackers (usable with every
+// existing helper) alongside the gated trackers.
+func (c *dbTestCluster) startGatedShard(
+	shardID uint64,
+	release <-chan struct{},
+	cfgFn func(shardID, replicaID uint64) dbConfig.Config,
+) ([]*dbSMTracker, []*dbGatedSMTracker) {
+	c.t.Helper()
+
+	members := make(map[uint64]dragonboat.Target, len(c.hosts))
+	for i, addr := range c.addrs {
+		replicaID := uint64(i + 1)
+		members[replicaID] = addr
+	}
+
+	trackers := make([]*dbSMTracker, len(c.hosts))
+	gated := make([]*dbGatedSMTracker, len(c.hosts))
+	for i, nh := range c.hosts {
+		if c.stopped[i].Load() {
+			continue
+		}
+		replicaID := uint64(i + 1)
+		createFn, plainTracker, gatedTracker := dbGatedKVCreateFunc(release)
+		trackers[i] = plainTracker
+		gated[i] = gatedTracker
+
+		cfg := cfgFn(shardID, replicaID)
+		if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
+			c.t.Fatalf("StartReplica[%d] shard=%d failed: %v", i, shardID, err)
+		}
+	}
+
+	c.hostsMu.Lock()
+	c.trackers = trackers
+	c.hostsMu.Unlock()
+	return trackers, gated
 }
 
 // startConcurrentShard starts a shard on all nodes using the concurrent
@@ -1058,13 +1191,19 @@ func (c *dbTestCluster) startOnDiskShard(shardID uint64) []*dbOnDiskSMTracker {
 }
 
 // close shuts down all hosts in the cluster.
+//
+// NodeHost.Close returns nothing: the dragonboat API it mirrors has a void
+// Stop(), so the adapter demotes the error quicraft's Host.Close now returns
+// to an slog.Warn (contrib/dragonboat/nodehost.go). There is therefore no
+// shutdown failure for this helper to assert on.
 func (c *dbTestCluster) close() {
 	c.hostsMu.Lock()
 	defer c.hostsMu.Unlock()
 	for i, nh := range c.hosts {
-		if !c.stopped[i].Load() {
-			nh.Close()
+		if c.stopped[i].Load() {
+			continue
 		}
+		nh.Close()
 	}
 }
 
@@ -1150,29 +1289,97 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// waitForReplication waits for a key to appear in all live nodes' state
-// machines with the expected value.
+// liveNodes returns the indices of every node in the cluster that has not
+// been stopped.
+func (c *dbTestCluster) liveNodes() []int {
+	c.hostsMu.RLock()
+	numNodes := len(c.hosts)
+	c.hostsMu.RUnlock()
+
+	live := make([]int, 0, numNodes)
+	for i := range numNodes {
+		if !c.stopped[i].Load() {
+			live = append(live, i)
+		}
+	}
+	return live
+}
+
+// resolveStateMachine returns the state machine for node i on the given shard.
+//
+// The cluster's own tracker slice is consulted FIRST because it is the live
+// one: startShard/startShardWithConfig overwrite it whenever a shard is
+// (re)started, while a trackers slice a test captured earlier is a snapshot
+// that may point at state machines which no longer run. The caller's slice is
+// the fallback, which covers a shard whose trackers were never stored on the
+// cluster (startConcurrentShard, per-shard trackers in multi-shard tests).
+func resolveStateMachine(cluster *dbTestCluster, trackers []*dbSMTracker, shardID uint64, i int) *dbKVStateMachine {
+	replicaID := uint64(i + 1)
+
+	cluster.hostsMu.RLock()
+	live := make([]*dbSMTracker, len(cluster.trackers))
+	copy(live, cluster.trackers)
+	cluster.hostsMu.RUnlock()
+
+	if i < len(live) && live[i] != nil {
+		if machine := live[i].Get(shardID, replicaID); machine != nil {
+			return machine
+		}
+	}
+	if i < len(trackers) && trackers[i] != nil {
+		if machine := trackers[i].Get(shardID, replicaID); machine != nil {
+			return machine
+		}
+	}
+	return nil
+}
+
+// waitForReplication waits for a key to appear with the expected value in the
+// state machine of EVERY live node, and fails if it did not actually check
+// every one of them.
+//
+// The count is the point. The previous version skipped any node whose index
+// was past the end of the caller's trackers slice and any node whose state
+// machine had not registered yet, silently and without a word in the log. A
+// nil tracker entry means the engine never invoked the state-machine factory
+// for that replica, which is a startup or recovery failure — exactly the thing
+// a replication assertion exists to catch — so it is a condition to wait for
+// and then fail on, never one to skip.
 func waitForReplication(t *testing.T, cluster *dbTestCluster, trackers []*dbSMTracker, shardID uint64, key, expectedVal string, timeout time.Duration) {
 	t.Helper()
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-		if i >= len(trackers) || trackers[i] == nil {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		sm := trackers[i].Get(shardID, replicaID)
-		if sm == nil {
-			continue
+
+	live := cluster.liveNodes()
+	if len(live) == 0 {
+		t.Fatalf("waitForReplication(key=%q): no live nodes to verify", key)
+	}
+
+	verified := 0
+	for _, i := range live {
+		machine := resolveStateMachine(cluster, trackers, shardID, i)
+		if machine == nil {
+			// The shard may not have registered its state machine yet; that
+			// is a condition to wait for, not one to skip.
+			waitForCondition(t, timeout,
+				fmt.Sprintf("node[%d] registers a state machine for shard %d", i, shardID),
+				func() bool {
+					machine = resolveStateMachine(cluster, trackers, shardID, i)
+					return machine != nil
+				},
+			)
 		}
 		waitForCondition(t, timeout,
 			fmt.Sprintf("node[%d] replicates key=%q", i, key),
 			func() bool {
-				val, ok := sm.Get(key)
+				val, ok := machine.Get(key)
 				return ok && val == expectedVal
 			},
 		)
+		verified++
+	}
+
+	if verified < len(live) {
+		t.Fatalf("waitForReplication(key=%q): verified %d nodes but %d are live",
+			key, verified, len(live))
 	}
 }
 
@@ -1237,8 +1444,14 @@ func proposeNEntries(
 	return expected
 }
 
-// verifyAllData verifies all KV pairs from expected are present on all
-// live nodes' state machines.
+// verifyAllData verifies all KV pairs from expected are present on EVERY
+// live node's state machine, and fails if it did not actually check every
+// one of them.
+//
+// Same defect as waitForReplication had: a nil tracker entry means the engine
+// never created a state machine for that replica, which is a startup or
+// recovery failure. Skipping it removed the node from every data assertion
+// while the caller still reported the data verified.
 func verifyAllData(
 	t *testing.T,
 	cluster *dbTestCluster,
@@ -1248,14 +1461,22 @@ func verifyAllData(
 ) {
 	t.Helper()
 
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() || i >= len(trackers) || trackers[i] == nil {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		nodeSM := trackers[i].Get(shardID, replicaID)
+	live := cluster.liveNodes()
+	if len(live) == 0 {
+		t.Fatal("verifyAllData: no live nodes to verify")
+	}
+
+	verified := 0
+	for _, i := range live {
+		nodeSM := resolveStateMachine(cluster, trackers, shardID, i)
 		if nodeSM == nil {
-			continue
+			waitForCondition(t, defaultTimeout,
+				fmt.Sprintf("node[%d] registers a state machine for shard %d", i, shardID),
+				func() bool {
+					nodeSM = resolveStateMachine(cluster, trackers, shardID, i)
+					return nodeSM != nil
+				},
+			)
 		}
 		for key, val := range expected {
 			waitForCondition(t, defaultTimeout,
@@ -1266,5 +1487,10 @@ func verifyAllData(
 				},
 			)
 		}
+		verified++
+	}
+
+	if verified < len(live) {
+		t.Fatalf("verifyAllData: verified %d nodes but %d are live", verified, len(live))
 	}
 }

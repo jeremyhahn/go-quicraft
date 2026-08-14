@@ -165,9 +165,16 @@ func crashWriteSealed(path string, sealed *seal.SealedRootKey) error {
 }
 
 // crashBarrier initializes the barrier at sealPath on first call and restores
-// it on every later call. Rotate is never invoked, but the config still
-// carries a StatePersister: barriers fail closed with seal.ErrNoStatePersister
-// without one.
+// it on every later call. The config carries a StatePersister because barriers
+// fail closed with seal.ErrNoStatePersister without one — and because RESTORING
+// one rotates: the spent AEAD invocation budget of the loaded epoch cannot be
+// known across a restart, so the barrier moves to a fresh epoch rather than
+// reuse a counter it cannot bound.
+//
+// That makes every barrier built from this blob a point-in-time view. Two live
+// barriers over one blob go stale against each other the moment either restores
+// or rotates, so a caller that holds one across a child process's lifetime must
+// re-load it afterwards rather than reuse the object.
 func crashBarrier(sealPath string) (*seal.Barrier, error) {
 	_ = seal.AllowWeakKDFParams()
 	strategy, err := seal.NewSoftwareStrategyWithParams(
@@ -419,8 +426,20 @@ func redactCmd(e logdb.Entry) logdb.Entry {
 }
 
 // TestWALCrashConsistency SIGKILLs a real WAL writer at several points in the
-// write pipeline and asserts the reopened WAL keeps every durability promise
-// the killed process made.
+// write pipeline and asserts the reopened WAL keeps every promise the killed
+// process made.
+//
+// PROCESS death, not power loss, and the difference is the whole limitation:
+// SIGKILL destroys the process and leaves the page cache untouched, so every
+// byte the child handed to write(2) is still readable afterwards whether or
+// not it was ever fsynced. This test therefore cannot detect a deleted flush —
+// stub osFile.Sync to return nil and all of it still passes. It tests the
+// property its name states, crash CONSISTENCY: that what survives is a valid
+// prefix and that recovery neither loses nor invents records around the tear.
+// Durability across a real power loss is asserted elsewhere, by
+// TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss (which models the
+// medium) and TestOSFileSyncIssuesRealSyscall (which proves the flush is a
+// syscall).
 func TestWALCrashConsistency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns writer subprocesses; skipped under -short")
@@ -720,7 +739,7 @@ func runCrashChildProcess(t *testing.T, walDir, ackPath, sealPath string, minAck
 		crashSealEnv+"="+sealPath,
 	)
 	var out bytes.Buffer
-	cmd := exec.Command(os.Args[0], "-test.run=^"+crashChildTest+"$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^"+crashChildTest+"$")
 	cmd.Env = env
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -778,6 +797,28 @@ func runCrashIteration(t *testing.T, delay time.Duration, encrypted bool) {
 	}
 
 	ack := runCrashChildProcess(t, walDir, ackPath, sealPath, 1, delay)
+
+	if encrypted {
+		// Re-load the barrier from the sealed state the CHILD left behind.
+		// The parent stands in for a RESTARTING process here, and a restarting
+		// process re-reads that state — holding the pre-child barrier object
+		// instead assumes no other process ever moved the epoch on.
+		//
+		// That assumption is now false, and was always fragile: restoring a
+		// barrier rotates, because the spent AEAD invocation budget of the
+		// loaded epoch is unknowable across a restart and reusing it would
+		// silently erode the 2^-32 nonce-collision bound. So the child writes
+		// its records under an epoch the parent's stale object has never held a
+		// DEK for, and every record fails to decrypt. Reverting seal to before
+		// the rotation reproduces the identical failure the moment anything
+		// calls Rotate — including the host's own rotation threshold — so this
+		// is the harness modelling a restart incorrectly, not a WAL defect.
+		b, berr := crashBarrier(sealPath)
+		if berr != nil {
+			t.Fatalf("crashBarrier (post-child reload): %v", berr)
+		}
+		barrier = b
+	}
 
 	// Invariant 4a: a crash mid-write must not produce an unopenable WAL.
 	db, err := crashOpenDB(walDir, barrier)

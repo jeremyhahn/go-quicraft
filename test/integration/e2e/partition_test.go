@@ -17,7 +17,6 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -264,18 +263,12 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 	// replacement nodes. This simulates the partition healing process
 	// where isolated nodes rejoin (or are replaced) and catch up via
 	// Raft log replication or snapshot transfer.
-	leaderHost := cluster.hosts[activeLeaderIdx]
 
 	for idx, stoppedIdx := range stoppedNodes {
 		oldReplicaID := uint64(stoppedIdx + 1)
 
 		// Remove the stopped node from membership.
-		ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-		if err := leaderHost.SyncRequestDeleteNode(ctx, 1, oldReplicaID, 0); err != nil {
-			cancel()
-			t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", oldReplicaID, err)
-		}
-		cancel()
+		syncDeleteNode(t, cluster, 1, oldReplicaID, membershipTimeout)
 
 		t.Logf("removed stopped node[%d] (replica=%d) from membership", stoppedIdx, oldReplicaID)
 
@@ -292,11 +285,16 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 	}
 
 	// Wait for the replacement nodes to catch up with all data.
-	// Verify every node in the reconverged cluster has all expected data.
+	// Verify every node in the reconverged cluster has all expected data, and
+	// count them: a node that is live but contributes no assertion is the
+	// failure this loop exists to report, not a node to pass over.
+	liveCount := 0
+	verified := 0
 	for i := range cluster.hosts {
 		if cluster.stopped[i].Load() {
 			continue
 		}
+		liveCount++
 
 		replicaID := uint64(i + 1)
 		// For replacement nodes (indices >= 5), look up the correct
@@ -307,13 +305,16 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 
 		tracker := cluster.trackers[i]
 		if tracker == nil {
-			// Original trackers may be nil for stopped nodes; skip.
-			continue
+			// A live node with no tracker means startShard/addNodeToCluster
+			// never registered one for it, which is a harness or startup
+			// failure — not a reason to leave the node unchecked.
+			t.Fatalf("node[%d] (replica=%d) is live but has no state machine tracker", i, replicaID)
 		}
 
 		nodeSM := tracker.Get(1, replicaID)
 		if nodeSM == nil {
-			// SM may not be registered yet; wait for it.
+			// SM may not be registered yet; wait for it. Failing to register
+			// is a startup failure, so the wait fatals rather than skipping.
 			waitForCondition(t, membershipTimeout,
 				fmt.Sprintf("node[%d] replica=%d SM registered", i, replicaID),
 				func() bool {
@@ -332,6 +333,10 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 				},
 			)
 		}
+		verified++
+	}
+	if verified < liveCount {
+		t.Fatalf("reconvergence check verified %d nodes but %d are live", verified, liveCount)
 	}
 
 	// Write post-heal data to confirm the reconverged cluster is fully

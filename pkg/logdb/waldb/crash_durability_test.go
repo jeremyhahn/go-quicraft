@@ -300,13 +300,24 @@ func (h *crashDurHarness) shardDir(shardID uint64) string {
 	return filepath.Join(h.dir, shardDirName(int(shardID%DefaultShardCount)))
 }
 
-// TestWALCrashDurability_AckedWritesSurvivePowerLoss is the durability
+// TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss is the durability
 // regression test the error-injection doubles cannot express. crashFS keeps a
 // durable image that only File.Sync advances, so a write the WAL acked without
 // flushing is GONE after Crash — the exact and only symptom of a missing
 // fsync, which neither error injection (no failing call exists) nor a SIGKILL
 // crash test (page-cache data survives process death) can detect.
-func TestWALCrashDurability_AckedWritesSurvivePowerLoss(t *testing.T) {
+//
+// MODELLED is not a hedge, it is the boundary. Power loss here is a property
+// of crashFS, which is entirely in memory and defines durability as "File.Sync
+// returned": no disk is written, no fsync(2) is issued, and the test is
+// therefore blind to whether the production osFile.Sync issues one either.
+// Stub osFile.Sync to return nil and every case below still passes. What it
+// does prove — that the WAL calls Sync on the right file before it
+// acknowledges, and that recovery keeps every acknowledgement afterwards — is
+// the half of durability that lives in this package. The other half, that the
+// call reaches the medium, is asserted by TestOSFileSyncIssuesRealSyscall in
+// fs_sync_test.go, and neither test is sufficient without the other.
+func TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss(t *testing.T) {
 	cases := []struct {
 		name      string
 		encrypted bool

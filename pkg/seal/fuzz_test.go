@@ -38,13 +38,21 @@ var fuzzPassphrase = []byte("fuzz-test-passphrase-32bytes!!")
 // SoftwareStrategy with Argon2id at minimal parameters to keep fuzz
 // iterations fast. The barrier uses AES-256-GCM with nonce tracking disabled
 // for speed.
+//
+// The no-op StatePersister is REQUIRED, not decoration: Rotate fails closed
+// with ErrNoStatePersister without one — a new epoch that is not durably
+// recorded makes every record written under it unreadable after a restart — so
+// FuzzBarrierDecryptWrongEpoch failed on all five of its own seeds without it.
+// The fixture, not the production requirement, was what needed fixing; CI now
+// runs these targets, which is why nothing caught it before.
 func newFuzzBarrier(t testing.TB) *Barrier {
 	t.Helper()
 
 	config := BarrierConfig{
-		Algorithm:     AlgAES256GCM,
-		DeploymentID:  42,
-		NonceTracking: false,
+		Algorithm:      AlgAES256GCM,
+		DeploymentID:   42,
+		NonceTracking:  BoolPtr(false),
+		StatePersister: func(*SealedRootKey) error { return nil },
 	}
 
 	barrier := MustNewBarrier(config)

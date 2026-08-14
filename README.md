@@ -1,17 +1,32 @@
 <img src="assets/logo.svg" width="600">
 
 
-[![Go](https://img.shields.io/badge/Go-1.26.5-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.26.6-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.1.0--alpha-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.3.1--alpha-orange.svg)](VERSION)
 
 A multi-group Raft consensus library for Go with QUIC transport and at-rest encryption.
 
-QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/) with full spec compliance against both the [extended Raft paper](docs/references/raft.pdf) and the [Ongaro PhD thesis](docs/references/OngaroPhD.pdf). The implementation is verified by 5,400+ tests across 27 packages, all above 91% coverage, including a Porcupine-based linearizability test suite.
+QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/) with full spec compliance against both the [extended Raft paper](docs/references/raft.pdf) and the [Ongaro PhD thesis](docs/references/OngaroPhD.pdf). The implementation is verified by 5,400+ tests across 27 packages at 91.5% aggregate coverage, including a Porcupine-based linearizability test suite. Per-package coverage varies -- see [Test Coverage](#test-coverage) for the packages that sit below the aggregate.
+
+## Installation
+
+```sh
+go get github.com/jeremyhahn/go-quicraft
+```
+
+Requires Go 1.26.6 or later. The public API lives under
+`github.com/jeremyhahn/go-quicraft/pkg`.
+
+> **Alpha software.** This is a `0.x` release. The on-disk and on-wire formats
+> are not yet stable and have broken across releases; see
+> [CHANGELOG.md](CHANGELOG.md) and
+> [docs/operations/compatibility.md](docs/operations/compatibility.md) before
+> upgrading.
 
 ## Features
 
-- **Multi-group Raft** -- Thousands of independent Raft groups per process with a sharded ReadyMap (64 buckets) for O(1) shard dispatch
+- **Multi-group Raft** -- Thousands of independent Raft groups per process with a double-buffered ReadyMap for O(1) shard dispatch
 - **Minimal dependencies** -- No external or embedded database dependencies for Raft log storage
 - **QUIC transport** -- Built on [quic-go](https://github.com/quic-go/quic-go) with mTLS, multiplexed streams, and 0-RTT reconnection
 - **Custom binary wire format** -- Fixed-layout little-endian encoding with zero-copy semantics; no protobuf dependency
@@ -22,7 +37,7 @@ QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/) with
 - **Three state machine types** -- `StateMachine`, `ConcurrentStateMachine`, and `DiskStateMachine` interfaces for different workload profiles
 - **Cluster primitives** -- explicit per-shard member maps via StartShard; discovery and bootstrap orchestration live in go-qrdb
 - **Observability** -- Prometheus metrics for proposals, commits, elections, snapshots, transport, and WAL operations
-- **Lock-free hot paths** -- Atomics and lock-free algorithms over mutexes on performance-critical paths
+- **Atomics-first hot paths** -- Atomics and `sync.Map` over mutexes where the access pattern allows it (shard lookup, leader/membership snapshots, the rate limiter's CAS loop); the proposal and read-index queues use a briefly-held mutex amortized over a batched drain
 - **Batch proposal/read coalescing** -- ReadIndex requests are batched to amortize heartbeat quorum rounds
 - **Encrypted snapshot transfer** -- Snapshots decrypted before transport (per-node barriers), QUIC provides in-transit encryption
 
@@ -467,14 +482,33 @@ This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPa
 make build      # Compile all packages
 make test       # Run unit tests with race detector
 make lint       # Run golangci-lint
-make coverage   # Generate coverage report (minimum: 91%)
+make coverage   # Generate coverage report
 make ci         # Full CI: fmt, vet, lint, gosec, vuln, trivy, nancy, build, test
 make build-fips # Build with GOFIPS140=v1.0.0
 ```
 
 ## Testing
 
-QuicRaft has 5,400+ tests across 27 packages, all enforcing a 91% minimum coverage threshold.
+QuicRaft has 5,400+ tests across 27 packages.
+
+### Test Coverage
+
+Aggregate coverage is **91.5%**. Per-package coverage is enforced by the
+Makefile against per-package thresholds, and four packages currently sit
+below the aggregate:
+
+| Package | Coverage |
+|---------|----------|
+| `pkg/logdb` | 85.2% |
+| `pkg/logdb/waldb` | 88.3% |
+| `pkg/internal/transport` | 89.2% |
+| `pkg/internal/engine` | 90.4% |
+| **Aggregate** | **91.5%** |
+
+These are the durability and transport layers, which is worth stating plainly
+rather than rounding away: the packages furthest from the aggregate are the
+ones whose failure modes are hardest to recover from. Raising them is tracked
+work, not a settled state.
 
 ```bash
 # Unit tests (run on host)

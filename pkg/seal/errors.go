@@ -119,6 +119,50 @@ var (
 	// forged blob padding the derivation set.
 	ErrKnownEpochAboveCurrent = errors.New("quicraft/seal: sealed root key names an epoch above its current epoch")
 
+	// ErrSealedStateUnauthenticated is returned by Unseal when the persisted
+	// SealedRootKey's metadata does not authenticate under the root key: either
+	// the StateMAC does not match the metadata, or the blob carries no StateMAC
+	// at all and BarrierConfig.AllowUnauthenticatedSealedState is not set.
+	//
+	// Only the root-key CIPHERTEXT is covered by the wrapping AEAD; Epoch,
+	// KnownEpochs, Salt, HKDFVersion, Algorithm and Strategy sit beside it in
+	// plaintext. The MAC is what binds them to the key they describe, so a
+	// mismatch means the state was edited by something that does not hold the
+	// root key.
+	ErrSealedStateUnauthenticated = errors.New(
+		"quicraft/seal: sealed root key metadata failed authentication (StateMAC mismatch or absent)")
+
+	// ErrSealedEpochRollback is returned by SetSealedRootKey when the blob's
+	// Epoch is below BarrierConfig.MinEpoch. Authentication cannot detect the
+	// REPLAY of an older, genuinely authenticated blob; only a floor the
+	// embedder derives from data the attacker would have to roll back in the
+	// same step can. Resurrecting a retired epoch re-runs a spent DEK under a
+	// fresh invocation counter and an empty nonce tracker.
+	ErrSealedEpochRollback = errors.New("quicraft/seal: sealed root key epoch is below the configured rollback floor")
+
+	// ErrInvocationBudgetUnknown is logged (not returned) when a restart cannot
+	// establish how much of the current epoch's NIST SP 800-38D invocation
+	// budget has already been spent AND cannot rotate to a fresh epoch. It is
+	// defined so tests and embedders can name the condition; the barrier's
+	// observable behaviour is that Encrypt fails with
+	// ErrInvocationLimitExceeded until the epoch is rotated.
+	ErrInvocationBudgetUnknown = errors.New(
+		"quicraft/seal: AEAD invocation budget for the current epoch is unrecoverable and the epoch cannot rotate")
+
+	// ErrFIPSUnavailable is returned by BarrierConfig.Validate when
+	// RequireFIPS is set but FIPSEnabled() is false — the binary was not built
+	// with the FIPS 140-3 module and GOFIPS140 is unset. Without this the two
+	// states "FIPS not requested" and "FIPS requested but unavailable" are
+	// indistinguishable and the second fails open.
+	ErrFIPSUnavailable = errors.New("quicraft/seal: RequireFIPS is set but the FIPS 140-3 module is not active")
+
+	// ErrKDFNotFIPSApproved is returned by DeriveKey (and by the software
+	// strategy constructors) when Argon2id is selected while FIPS mode is
+	// active. Argon2id is not a FIPS-approved KDF, and wrapping the root key
+	// with it in a "FIPS" deployment is exactly the silent non-compliance the
+	// mode exists to prevent.
+	ErrKDFNotFIPSApproved = errors.New("quicraft/seal: KDF is not FIPS-approved (Argon2id) while FIPS mode is active")
+
 	// ErrKDFUnsupportedVersion is returned when DeriveKey receives an
 	// unknown KDFVersion value.
 	ErrKDFUnsupportedVersion = errors.New("quicraft/seal: unsupported KDF version")
@@ -170,6 +214,18 @@ var (
 	ErrContextAADUnsupported = errors.New(
 		"quicraft/seal: barrier cannot authenticate caller context but RequireContextAAD is set " +
 			"(delegated encryptor does not implement AADSymmetricEncrypter, or no-encryption mode is selected)")
+
+	// ErrAADProbeRoundTrip reports that a delegated encryptor claiming
+	// AADSymmetricEncrypter could not even round-trip a probe under the SAME
+	// aad — it is broken, not merely unbinding.
+	ErrAADProbeRoundTrip = errors.New("quicraft/seal: AAD probe did not round-trip under the same AAD")
+
+	// ErrAADProbeNotBound reports that a delegated encryptor claiming
+	// AADSymmetricEncrypter DECRYPTED a probe under a different aad than it was
+	// sealed with: the aad argument is accepted and dropped, so the positional
+	// binding the interface promises does not exist.
+	ErrAADProbeNotBound = errors.New(
+		"quicraft/seal: AAD is not authenticated (ciphertext opened under a different AAD than it was sealed with)")
 
 	// ErrShamirThresholdInvalid is returned when the Shamir threshold is
 	// less than 2 or greater than the total number of shares.
@@ -285,6 +341,28 @@ func (e *AlgorithmMismatchError) Error() string {
 		"quicraft/seal: sealed root key was written with %s but this barrier is configured for %s; "+
 			"set BarrierConfig.Algorithm to %s to read this data",
 		e.Sealed.String(), e.Configured.String(), e.Sealed.String())
+}
+
+// AADBindingProbeError reports why the one-shot behavioural probe of a
+// delegated encryptor's AAD binding did not hold. The barrier classifies such
+// an encryptor as ContextBindingUnsupported rather than trusting its declared
+// AADSymmetricEncrypter method set; see verifyAADBinding.
+type AADBindingProbeError struct {
+	// Stage is the step that failed: "probe-entropy", "encrypt",
+	// "decrypt-matching-aad", or "decrypt-wrong-aad".
+	Stage string
+	// Err is the underlying cause.
+	Err error
+}
+
+// Error returns a human-readable description of the probe failure.
+func (e *AADBindingProbeError) Error() string {
+	return fmt.Sprintf("quicraft/seal: delegated AAD binding probe failed at %s: %v", e.Stage, e.Err)
+}
+
+// Unwrap returns the underlying error.
+func (e *AADBindingProbeError) Unwrap() error {
+	return e.Err
 }
 
 // KeyDerivationError is returned when HKDF key derivation fails.

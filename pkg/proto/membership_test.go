@@ -136,6 +136,15 @@ func TestMembershipBufferTooSmallUnmarshal(t *testing.T) {
 	}
 }
 
+// TestMembershipAddressTooLong pins the address bound at BOTH ends.
+//
+// The read half is the original assertion. The write half is what closes the
+// DURABLE hole: Host.StartShard copies the caller's members map straight into
+// Addresses and commits the marshaled result as the EntryInitialMembership at
+// log index 1, so an encoder that emitted this produced a bootstrap entry the
+// next start could not decode — and StartShard then aborted forever, on data the
+// shard itself wrote. The buffer for the read half is built by hand because the
+// encoder now refuses to produce it, which is exactly the fix.
 func TestMembershipAddressTooLong(t *testing.T) {
 	longAddr := strings.Repeat("x", MaxAddressLength+1)
 	m := Membership{
@@ -145,9 +154,20 @@ func TestMembershipAddressTooLong(t *testing.T) {
 		Removed:   map[uint64]bool{},
 	}
 	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
+	if _, err := m.MarshalTo(buf); !errors.Is(err, ErrAddressTooLong) {
+		t.Fatalf("MarshalTo: got %v, want ErrAddressTooLong: the encoder must not "+
+			"produce a membership its own decoder refuses, because this one is "+
+			"committed at log index 1", err)
+	}
+
+	// Hand-built v5 section: the fixed region, then an Addresses map whose one
+	// value is over the limit. Everything after it is unreachable, so it is
+	// omitted; the decoder must fail before it gets there.
+	raw := make([]byte, membershipFixedSize+4+8+4+len(longAddr))
+	raw[0] = membershipFormatVersion
+	putMap(raw[membershipFixedSize:], map[uint64]string{1: longAddr})
 	var m2 Membership
-	_, err := m2.UnmarshalFrom(buf)
+	_, err := m2.UnmarshalFrom(raw)
 	if !errors.Is(err, ErrAddressTooLong) {
 		t.Fatalf("UnmarshalFrom: got %v, want ErrAddressTooLong", err)
 	}
@@ -176,13 +196,13 @@ func TestMembershipPolicyRoundTrip(t *testing.T) {
 }
 
 func TestMembershipTooManyEntries(t *testing.T) {
-	// Craft a buffer with Addresses count = maxMembershipEntries + 1
-	buf := make([]byte, membershipFixedSizeV4+4)
+	// Craft a buffer with Addresses count = MaxMembershipEntries + 1
+	buf := make([]byte, membershipFixedSize+4)
 	buf[0] = membershipFormatVersion
-	putUint64(buf[1:], 0)                                          // ConfigChangeID
-	putUint64(buf[9:], 0)                                          // MaxWitnesses
-	putBool(buf[17:], false)                                       // RequireFullReplicaMajority
-	putUint32(buf[membershipFixedSizeV4:], maxMembershipEntries+1) // Addresses count
+	putUint64(buf[1:], 0)                                        // ConfigChangeID
+	putUint64(buf[9:], 0)                                        // MaxWitnesses
+	putBool(buf[17:], false)                                     // RequireFullReplicaMajority
+	putUint32(buf[membershipFixedSize:], MaxMembershipEntries+1) // Addresses count
 	var m Membership
 	_, err := m.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {
@@ -247,6 +267,13 @@ func assertMembershipEqual(t *testing.T, want, got *Membership) {
 	assertStringMapEqual(t, "Observers", want.Observers, got.Observers)
 	assertStringMapEqual(t, "Witnesses", want.Witnesses, got.Witnesses)
 	assertBoolMapEqual(t, "Removed", want.Removed, got.Removed)
+	// The two authorization maps are compared here for the same reason the
+	// session policy is: a codec that drops either does not fail, it silently
+	// changes who this shard authorizes. Identities is the receive-side quorum
+	// gate's only input where it is present; RemovedIdentities is the half of
+	// the removal deny-list a removed replica cannot evade by renaming itself.
+	assertStringMapEqual(t, "Identities", want.Identities, got.Identities)
+	assertStringMapEqual(t, "RemovedIdentities", want.RemovedIdentities, got.RemovedIdentities)
 }
 
 func assertStringMapEqual(t *testing.T, name string, want, got map[uint64]string) {

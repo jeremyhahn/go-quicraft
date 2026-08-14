@@ -377,7 +377,7 @@ func TestSafety_SinglePendingConfigChange(t *testing.T) {
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
-			Cmd:  []byte("add-node-4"),
+			Cmd:  testConfigChangeCmd(4),
 		}},
 	})
 	if err != nil {
@@ -392,7 +392,7 @@ func TestSafety_SinglePendingConfigChange(t *testing.T) {
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
-			Cmd:  []byte("add-node-5"),
+			Cmd:  testConfigChangeCmd(5),
 		}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -440,7 +440,7 @@ func TestSafety_ConfigChangeRecoveryAfterRestart(t *testing.T) {
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
-			Cmd:  []byte("new-cc"),
+			Cmd:  testConfigChangeCmd(6),
 		}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -720,7 +720,7 @@ func TestSafety_LeaderTransferBlocksProposals(t *testing.T) {
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{{
 			Type: proto.EntryConfigChange,
-			Cmd:  []byte("cc"),
+			Cmd:  testConfigChangeCmd(7),
 		}},
 	})
 	if !errors.Is(err, ErrTransferInProgress) {
@@ -1272,8 +1272,8 @@ func TestSafety_BatchWithTwoConfigChangesRejected(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)},
 		},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {

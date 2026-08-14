@@ -1706,9 +1706,10 @@ func TestRaft_HeartbeatResp_StalledReplicateFallsBackToProbe(t *testing.T) {
 			break
 		}
 	}
-	if found {
-		// In probe mode, probeSent is set after sendAppend, so a message
-		// is sent. This is the recovery path.
+	if !found {
+		t.Fatalf("no Replicate sent to replica 2 after the probe fallback; "+
+			"got %d Replicate messages, want a resend from match+1=%d",
+			len(apps), rm.match+1)
 	}
 }
 
@@ -6163,7 +6164,7 @@ func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
 		},
 	})
 	if err != nil {
@@ -6178,7 +6179,7 @@ func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
 	err = r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)},
 		},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -6196,7 +6197,7 @@ func TestRaft_PendingConfigChange_ClearedOnBecomeFollower(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
 		},
 	})
 	if err != nil {
@@ -6226,7 +6227,7 @@ func TestRaft_BecomeLeader_ScansUncommittedConfigChange(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
 		},
 	})
 	if err != nil {
@@ -6278,7 +6279,7 @@ func TestRaft_BecomeLeader_ScansUncommittedConfigChange(t *testing.T) {
 	err = r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)},
 		},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -6339,7 +6340,7 @@ func TestRaft_BecomeLeader_NoUncommittedConfigChange_AllowsProposal(t *testing.T
 	err = r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc-new")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(13)},
 		},
 	})
 	if err != nil {
@@ -12818,7 +12819,7 @@ func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: compressedCC, Cmd: []byte("cc-compressed")},
+			{Type: compressedCC, Cmd: testConfigChangeCmd(15)},
 		},
 	})
 	if err != nil {
@@ -13032,8 +13033,8 @@ func TestRaft_BatchConfigChange_DoesNotStickPendingFlag(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)},
 		},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
@@ -13057,8 +13058,8 @@ func TestRaft_BatchConfigChange_SubsequentSingleSucceeds(t *testing.T) {
 	_ = r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)},
 		},
 	})
 
@@ -13066,7 +13067,7 @@ func TestRaft_BatchConfigChange_SubsequentSingleSucceeds(t *testing.T) {
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
 		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: []byte("cc-single")},
+			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(14)},
 		},
 	})
 	if err != nil {

@@ -195,6 +195,14 @@ func TestSegment_StopsAtFirstCorruption(t *testing.T) {
 // block N+1 reached the medium) terminates recovery at the hole instead
 // of resurrecting post-hole records, and marks the segment as stopped at
 // corruption so higher-numbered segments are not replayed either.
+//
+// Every record here is written before the ONE trailing Sync, so the whole
+// segment is a single durability generation and nothing in it was ever
+// acknowledged. That is deliberate — it is the interrupted-write half of the
+// property — and the evidence flags are asserted rather than ignored, so this
+// test also fails if the generation check ever starts refusing a WAL that a
+// power loss legitimately produces. The acknowledged half lives in
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable.
 func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 4 * 1024
@@ -259,6 +267,20 @@ func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
 	}
 	if !rs.stoppedAtCorruption {
 		t.Fatal("stoppedAtCorruption must be set so higher segments are not replayed")
+	}
+	// Every record in this segment shares generation 0, so no completed
+	// fdatasync sits above the hole and the truncation destroys nothing that was
+	// acknowledged. Asserting it keeps the evidence check from being inert here:
+	// a change that set either flag for a single-generation hole would turn an
+	// ordinary power loss into a WAL the node refuses to open.
+	if rs.ackedDataAfterCorruption {
+		t.Fatal("ackedDataAfterCorruption is set for a hole whose surviving records " +
+			"all carry the segment's only generation: recovery would fail-stop on an " +
+			"ordinary interrupted write")
+	}
+	if rs.sequenceRegression {
+		t.Fatal("sequenceRegression is set for a single-generation segment; no " +
+			"generation in it can be below any other")
 	}
 }
 
@@ -489,5 +511,206 @@ func TestSegment_DiscardPendingResetsFlushWatermark(t *testing.T) {
 	if !bytes.Equal(got[0], keep) || !bytes.Equal(got[1], after) {
 		t.Fatal("rolled-back segment did not replay the kept record followed by the " +
 			"post-rollback one")
+	}
+}
+
+// writeHoleFixture builds a segment whose records are written one per Sync
+// (syncPerRecord) or all under a single trailing Sync, zeroes one whole block in
+// the middle of it, and returns the pristine record set alongside the reopened
+// segment's scan.
+//
+// syncPerRecord is the whole variable under test. Every completed Sync closes a
+// durability generation and stamps the next record with a higher one, so
+// syncPerRecord=true produces a segment where recovery can PROVE each record was
+// acknowledged, and syncPerRecord=false one where it can prove none of them was.
+// The identical byte damage means opposite things in the two, and the returned
+// segment carries the verdict in its flags.
+func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, holeBlock int, syncPerRecord bool) (want [][]byte, got [][]byte, cleanEnd int64, rs *segment) {
+	t.Helper()
+	seg, _, err := createSegment(defaultFS(), dir, id, blockSize, 8*1024*1024)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	for i := 0; i < records; i++ {
+		p := bytes.Repeat([]byte{byte(i%251 + 1)}, 200)
+		if _, err := seg.Write(p); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		want = append(want, p)
+		if syncPerRecord {
+			if err := seg.Sync(); err != nil {
+				t.Fatalf("Sync %d: %v", i, err)
+			}
+		}
+	}
+	if !syncPerRecord {
+		if err := seg.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Sanity: the intact segment reads back every record, byte for byte.
+	intact := reopenReadOnly(t, dir, id, blockSize)
+	if len(intact) != records {
+		t.Fatalf("fixture: intact segment recovered %d records, want %d", len(intact), records)
+	}
+	for i := range intact {
+		if !bytes.Equal(intact[i], want[i]) {
+			t.Fatalf("fixture: intact record %d differs from what was written", i)
+		}
+	}
+
+	path := dir + "/" + segmentFilename(id)
+	rw, err := defaultFS().OpenFile(path, 2 /* os.O_RDWR */, 0600)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	fi, err := rw.Stat()
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if blocks := fi.Size() / int64(blockSize); blocks < int64(holeBlock)+2 {
+		t.Fatalf("fixture: segment has %d blocks, need at least %d so data follows the hole",
+			blocks, holeBlock+2)
+	}
+	if _, err := rw.WriteAt(make([]byte, blockSize), int64(holeBlock*blockSize)); err != nil {
+		t.Fatalf("zero block %d: %v", holeBlock, err)
+	}
+	if err := rw.Sync(); err != nil {
+		t.Fatalf("sync hole: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	f, err := defaultFS().Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	rs = &segment{f: f, id: id, dir: dir, blockSize: blockSize, blockBuf: make([]byte, blockSize)}
+	got, cleanEnd, err = rs.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	return want, got, cleanEnd, rs
+}
+
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable is the segment-level
+// regression test for the asymmetric damage classifier.
+//
+// ReadAll had two classifiers and only one of them consulted the durability
+// generations. A failed CRC swept the rest of the file, found that the surviving
+// records spanned a completed fdatasync, and refused to truncate. A zero-filled
+// hole returned on the spot, with ackedDataAfterCorruption and
+// sequenceRegression both left false — so replaySegment reported an ordinary
+// torn tail, recovery truncated the file to the clean prefix and deleted every
+// segment above it, and acknowledged committed entries were destroyed while Open
+// returned nil.
+//
+// A crash cannot produce this layout. Writes are strictly ascending in file
+// offset, so a block sitting below a later generation was covered by that
+// generation's fdatasync and its pages cannot revert to zeros. A zeroed sector
+// under acknowledged data is a medium failure, a partially restored file or
+// tampering, and the only safe verdict is the one the CRC path already gave.
+func TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable(t *testing.T) {
+	const (
+		blockSize = 1024
+		records   = 60
+		holeBlock = 3
+	)
+	dir := t.TempDir()
+	want, got, cleanEnd, rs := writeHoleFixture(t, dir, 4, blockSize, records, holeBlock, true)
+
+	if !rs.stoppedAtCorruption {
+		t.Fatal("a zeroed block with data above it was not reported as corruption at all")
+	}
+	if !rs.ackedDataAfterCorruption {
+		t.Fatalf("ackedDataAfterCorruption is false for a hole at offset %d whose "+
+			"surviving records span %d completed fdatasyncs: recovery will read this "+
+			"as an interrupted write, truncate the segment to %d bytes and delete "+
+			"every segment above it, destroying %d acknowledged records and rolling "+
+			"the commit index backwards — with Open returning nil",
+			holeBlock*blockSize, records, cleanEnd, records-len(got))
+	}
+	if rs.sequenceRegression {
+		t.Fatal("sequenceRegression must stay false: the generations above the hole " +
+			"are higher than the prefix's, not lower")
+	}
+	if cleanEnd != int64(holeBlock*blockSize) {
+		t.Fatalf("clean end = %d, want the hole offset %d", cleanEnd, holeBlock*blockSize)
+	}
+
+	// The prefix ReadAll returns must be the ORIGINAL records, byte for byte,
+	// with nothing missing below the hole and nothing resurrected above it. A
+	// count-only assertion would accept a recovery that dropped acknowledged
+	// records BELOW the damage.
+	if len(got) == 0 {
+		t.Fatal("no clean prefix survived; the hole is above several full blocks")
+	}
+	if len(got) >= records {
+		t.Fatalf("recovered %d of %d records: records above the hole were replayed",
+			len(got), records)
+	}
+	for i := range got {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("recovered record %d is not the record that was written at "+
+				"ordinal %d: the surviving prefix is not the original prefix", i, i)
+		}
+	}
+	// And the ones above the hole are absent, not merely uncounted.
+	for i := len(got); i < records; i++ {
+		for _, rec := range got {
+			if bytes.Equal(rec, want[i]) {
+				t.Fatalf("record %d, which sits at or above the hole, was replayed", i)
+			}
+		}
+	}
+}
+
+// TestSegment_ZeroHoleInsideOneGenerationStillTruncates is the other half of the
+// same property, and the guard against over-tightening it.
+//
+// A batch spanning several blocks issues one WriteAt per block before a single
+// fdatasync, and writeback may persist any subset of those pages. Losing an
+// interior page while a later one survives leaves exactly a zero hole with
+// decodable records above it — but every one of those records carries the
+// segment's in-flight generation, so no completed fdatasync sits above the
+// damage and nothing there was ever acknowledged. That is an ordinary
+// interrupted write, and recovery must still truncate and boot.
+func TestSegment_ZeroHoleInsideOneGenerationStillTruncates(t *testing.T) {
+	const (
+		blockSize = 1024
+		records   = 60
+		holeBlock = 3
+	)
+	dir := t.TempDir()
+	want, got, cleanEnd, rs := writeHoleFixture(t, dir, 5, blockSize, records, holeBlock, false)
+
+	if !rs.stoppedAtCorruption {
+		t.Fatal("a zeroed block with data above it was not reported as corruption")
+	}
+	if rs.ackedDataAfterCorruption {
+		t.Fatal("ackedDataAfterCorruption is set for a hole whose survivors all " +
+			"belong to ONE unsynced generation: recovery now refuses to open a WAL " +
+			"that an ordinary power loss produces and that used to boot")
+	}
+	if rs.sequenceRegression {
+		t.Fatal("sequenceRegression is set for a single-generation segment")
+	}
+	if cleanEnd != int64(holeBlock*blockSize) {
+		t.Fatalf("clean end = %d, want the hole offset %d", cleanEnd, holeBlock*blockSize)
+	}
+	if len(got) == 0 || len(got) >= records {
+		t.Fatalf("recovered %d of %d records, want a non-empty proper prefix",
+			len(got), records)
+	}
+	for i := range got {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("recovered record %d diverged from the original", i)
+		}
 	}
 }

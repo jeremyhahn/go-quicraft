@@ -462,6 +462,40 @@ func (e *SnapshotReceiveError) Unwrap() error {
 	return e.Err
 }
 
+// CorruptConfigEntryError reports a COMMITTED config-carrying entry whose
+// payload this binary cannot decode, detected by the Host's routing mirror of
+// the membership fold. It is terminal: the shard's circuit breaker is tripped
+// and the error is delivered through EventListener.OnShardFailed.
+//
+// The bytes are replicated state every peer can read and this replica cannot,
+// so there is no local repair. It is the host-side counterpart of
+// raft.ErrCorruptConfigEntry, and recovery has always treated the same input the
+// same way (ReconstructMembership returns it and StartShard aborts).
+type CorruptConfigEntryError struct {
+	// ShardID is the shard whose committed entry failed to decode.
+	ShardID uint64
+	// Index is the log index of that entry.
+	Index uint64
+	// Kind names which payload it was — "config change" or "bootstrap
+	// membership" — because the two have different remedies.
+	Kind string
+	// Err is the decode failure from pkg/proto.
+	Err error
+}
+
+// Error returns a human-readable description of the corrupt committed entry.
+func (e *CorruptConfigEntryError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: committed %s entry at index %d of shard %d does not decode: %v",
+		e.Kind, e.Index, e.ShardID, e.Err,
+	)
+}
+
+// Unwrap returns the underlying decode error.
+func (e *CorruptConfigEntryError) Unwrap() error {
+	return e.Err
+}
+
 // UnauthorizedMessageError is returned when a message is received from
 // a replica that is not a member of the target shard. This prevents
 // compromised nodes from injecting messages into shards they do not

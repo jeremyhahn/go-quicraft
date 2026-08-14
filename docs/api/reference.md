@@ -1070,7 +1070,7 @@ Source: `pkg/config/hostconfig.go`
 | `MaxApplyRetries`       | `uint64`        | `100`                | Reserved; apply errors are fail-fast (see note) |
 | `MaxTotalInMemLogSize`  | `uint64`        | `0` (disabled)       | Global rate limiter threshold (bytes)    |
 | `KeyRotationInterval`   | `time.Duration` | `0` (disabled)       | Barrier key rotation interval            |
-| `EnableMetrics`         | `bool`          | `false`              | Enable metrics collection                |
+| `MaxRetainedEpochs`     | `uint64`        | `0` (retain all)     | Barrier epochs retained after compaction |
 | `NotifyCommit`          | `bool`          | `false`              | Early WAL-durable notifications          |
 | `EventListener`         | `*EventListener`| `nil`                | Event callbacks                          |
 | `TransportConfig`       | `TransportConfig`| (see below)         | Transport tuning                         |

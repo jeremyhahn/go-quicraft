@@ -1,0 +1,93 @@
+name: Fuzz
+
+# Mutation fuzzing, deliberately separated from ci.yml.
+#
+# `go test -fuzz` is unbounded and nondeterministic: it explores until the
+# clock runs out, and a crash it finds is a property of the RNG schedule, not
+# of the commit under test. Putting it on a PR would fail unrelated pull
+# requests at random and train everyone to re-run the job, which is how a gate
+# stops being a gate. So the PR gate in ci.yml (`fuzz-seeds`) runs the targets
+# against their seeds and the committed corpus only — deterministic — and the
+# actual searching happens here on a schedule, where a discovery becomes a bug
+# report rather than a merge blocker.
+#
+# The committed corpora under pkg/*/testdata/fuzz/ are what carry findings from
+# here back into the PR gate: promote an interesting input by committing it.
+
+on:
+  schedule:
+    # 04:00 UTC daily. Nothing downstream reads this, so the time only needs to
+    # be outside working hours for the runner pool.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Per-target fuzzing budget (go -fuzztime syntax)"
+        required: false
+        default: "60s"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.6"
+  # Same rationale as ci.yml: never resolve through a stray workspace.
+  GOWORK: "off"
+  FUZZTIME: ${{ inputs.fuzztime || '60s' }}
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    # 11 targets in pkg/proto at 60s each, plus build and corpus minimisation.
+    timeout-minutes: 60
+    strategy:
+      # A crash in one package must not cancel the search in the others.
+      fail-fast: false
+      matrix:
+        # The six packages carrying `quicraft_fuzz` targets. One job per package
+        # rather than one per target: `go test -fuzz` accepts exactly one target
+        # per invocation, so the targets are enumerated inside the step instead
+        # (a new FuzzXxx is then picked up with no workflow edit).
+        package:
+          - ./pkg/proto
+          - ./pkg/internal/transport
+          - ./pkg/internal/session
+          - ./pkg/internal/raft
+          - ./pkg/logdb/waldb
+          - ./pkg/seal
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Fuzz every target in the package
+        run: |
+          set -euo pipefail
+          TARGETS="$(go test -tags=quicraft_fuzz -list='^Fuzz' '${{ matrix.package }}' | grep '^Fuzz' || true)"
+          if [ -z "${TARGETS}" ]; then
+            echo "FAIL: no fuzz targets found in ${{ matrix.package }} — the build tag or the package path is wrong"
+            exit 1
+          fi
+          echo "Targets: ${TARGETS}"
+          for target in ${TARGETS}; do
+            echo "==> ${target} (${FUZZTIME})"
+            # -run='^$' suppresses the unit tests so the whole budget is spent
+            # mutating. The seed pass is already covered by ci.yml's fuzz-seeds.
+            go test -tags=quicraft_fuzz -count=1 -run='^$' \
+              -fuzz="^${target}\$" -fuzztime="${FUZZTIME}" '${{ matrix.package }}'
+          done
+
+      # A crash writes its reproducer to testdata/fuzz/<Target>/ in the working
+      # tree, where it would otherwise be discarded with the runner. Preserving
+      # it is the entire deliverable of a failed fuzzing run: commit the file
+      # and ci.yml's fuzz-seeds job turns it into a permanent regression test.
+      - name: Preserve crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers-${{ strategy.job-index }}
+          path: pkg/**/testdata/fuzz/**
+          if-no-files-found: ignore

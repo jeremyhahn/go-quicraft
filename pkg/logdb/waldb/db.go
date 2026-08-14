@@ -263,9 +263,23 @@ func WithNoSync(noSync bool) Option {
 	}
 }
 
-// WithBarrier enables at-rest encryption for all WAL records. When set,
-// records are encrypted before writing and decrypted during recovery.
-// The barrier must be initialized and unsealed before any WAL operations.
+// WithBarrier routes every WAL record through the given barrier: sealed before
+// writing, opened during recovery. The barrier must be initialized and unsealed
+// before any WAL operations.
+//
+// It does NOT, on its own, mean the records are encrypted. A barrier running
+// StrategyNone installs an identity pass-through, and the records reach the
+// medium as plaintext. That configuration is deliberately still ACCEPTED here
+// rather than refused: no-encryption mode is a supported barrier mode (Open
+// already resolves and announces it -- see resolveBarrierContextBinding), the
+// WAL is not the layer that decides whether a deployment requires at-rest
+// encryption, and refusing it would break every caller that wires one barrier
+// through unconditionally and selects the strategy elsewhere.
+//
+// What the WAL owes such a caller is the truth, not a refusal: AtRestProtection
+// reports AtRestUnprotected for a plaintext-mode barrier, which is what lets the
+// host's at-rest requirement fail closed at the layer that actually holds the
+// policy.
 func WithBarrier(b WALBarrier) Option {
 	return func(o *dbOptions) {
 		o.barrier = b
@@ -999,30 +1013,56 @@ func (s *walShard) recover() error {
 				// tail: this segment's clean prefix is recovered; do NOT replay
 				// higher segments (prefix-validity rule).
 				//
-				// Repair the corrupt segment on disk FIRST by truncating it to
-				// the recovered clean end. Without this the corrupt tail is
-				// frozen forever: every later restart re-detects it, and the
-				// discard below then deletes every segment written since the
+				// The repair runs HIGH TO LOW, and the order is a crash-safety
+				// requirement, not a preference.
+				//
+				// Any higher-numbered segments are unreachable under the
+				// prefix-validity rule, so delete them FIRST (and fsync the
+				// directory, which discardSegmentsAbove does and now reports the
+				// failure of). Only then truncate the corrupt segment to its
+				// recovered clean end, with its own fsync last. Every
+				// intermediate crash state is then a valid prefix: the corrupt
+				// segment still carries its damaged tail, so the next recovery
+				// stops at exactly the same offset and repeats exactly the same
+				// repair.
+				//
+				// Truncating first is what a crash cannot survive. Segment K cut
+				// back to the clean end ends at a record boundary — no damage
+				// left to detect — so a restart before the higher segments were
+				// deleted replays K in full and then K+1..N, resurrecting the
+				// very records the prefix rule had just decided must never come
+				// back, with a hole where the cut region was.
+				//
+				// Truncating at all is what stops the corrupt tail being frozen
+				// forever: without it every later restart re-detects the damage,
+				// and the discard deletes every segment written since the
 				// previous restart — committed entries, hard state (term/vote
 				// regression, i.e. a double vote), snapshot metadata and
 				// compaction markers all lost, recurring on every boot.
 				//
-				// Any higher-numbered segments are now unreachable — delete
-				// them so the on-disk state matches the recovered prefix and
-				// they cannot confuse later Compact/GarbageCollect accounting
-				// or waste disk until the next restart. A discard failure is
-				// fatal: an intact orphan left behind would replay its stale
-				// records on the next restart.
-				if tErr := s.truncateCorruptSegment(segID, cleanEnd); tErr != nil {
-					return &RecoveryError{SegmentID: segID, Err: tErr}
-				}
+				// A discard failure is fatal: an intact orphan left behind would
+				// replay its stale records on the next restart.
+				//
+				// NOTE: reaching here means i == len(segIDs)-1 (the non-final
+				// check above returned otherwise), so segIDs[i+1:] is always
+				// EMPTY and this discard is a no-op today. It is kept because the
+				// prefix rule and the discard are separate invariants: whatever
+				// set of segments recovery decides is unreachable must be gone
+				// before the low segment is cut, and encoding that here means a
+				// future relaxation of the non-final rule cannot silently skip
+				// it. Repair, which shares this code, does pass a non-empty set.
 				if dErr := s.discardSegmentsAbove(segIDs[i+1:]); dErr != nil {
 					return dErr
 				}
-				// The truncation and the deletions are only durable once the
-				// directory entry updates are fsynced. Same rationale as the
-				// orphan discard: an unproven repair replays as corruption
-				// again on the next restart.
+				if tErr := s.truncateCorruptSegment(segID, cleanEnd); tErr != nil {
+					return &RecoveryError{SegmentID: segID, Err: tErr}
+				}
+				// The deletions are made durable by discardSegmentsAbove's own
+				// directory fsync and the truncation by the file fsync inside
+				// truncateCorruptSegment, so this is belt and braces rather than
+				// the only proof. It is kept because an unproven repair replays
+				// as corruption again on the next restart, and a second fsync of
+				// an already-clean directory costs one syscall once per boot.
 				if sErr := syncDirFS(s.fs, s.dir); sErr != nil {
 					return &RecoveryError{SegmentID: segID, Err: sErr}
 				}
@@ -1147,9 +1187,19 @@ func (s *walShard) discardSegmentsAbove(orphans []uint64) error {
 			return &RecoveryError{SegmentID: segID, Err: tErr}
 		}
 	}
+	// The unlinks are not durable until the directory entry updates are, and
+	// this failure is FATAL rather than a warning. recover() happens to repeat
+	// the directory fsync fatally a few lines later, but Repair does not: it
+	// would return a RepairResult naming the segments it deleted while a crash
+	// could still resurrect their directory entries — segments holding CRC-valid
+	// records ABOVE the offset the operator authorized truncating at, which is
+	// the term/vote regression (a node voting twice in one term) that the
+	// directory fsync exists to prevent. Reporting it lets both callers stop.
 	if err := syncDirFS(s.fs, s.dir); err != nil {
-		slog.Warn("waldb: failed to fsync dir after discarding orphaned segments",
-			"dir", s.dir, "error", err)
+		slog.Error("waldb: could not make the discard of orphaned WAL segments "+
+			"durable; their deletion may not survive a crash",
+			"dir", s.dir, "orphans", orphans, "error", err)
+		return err
 	}
 	return nil
 }
@@ -1814,64 +1864,58 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumObservers:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumWitnesses:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumRemoved:4]{ [ReplicaID:8] }...
+// [NumIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
+// [SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+// [NumRemovedIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
-// membershipSectionVersion is the layout revision this binary WRITES for the
-// membership section of a snapshot record, stored as the section's first byte.
-// It mirrors the proto.Membership version byte and moves in lockstep with
-// payloadTypeSnapshot: the payload type discriminates records, this byte
-// discriminates the section within a record.
+// membershipSectionV1 is the one layout revision this binary reads or writes
+// for the membership section of a snapshot record.
 //
-// v4 appends the Identities map after Removed, then the replicated session
-// policy. Identities is the receive-side quorum gate's ONLY authorization input
-// where it is present, so a snapshot that drops it silently downgrades every
-// member it describes back to the address check — which is the hole node
-// identities exist to close. The session policy drives the deterministic apply
-// path, so a snapshot that drops it returns the recovering replica to expiring
-// sessions on local configuration, which diverges its state machine.
-const membershipSectionVersion byte = membershipSectionV4
+// It is 1 because the project is PRE-RELEASE and every format in the repository
+// is pinned at 1 until the first production release: a layout change is made in
+// place, the consuming repos are rebuilt to match, and development clusters are
+// wiped and re-synced rather than migrated. Earlier development commits wrote
+// other layouts under other numbers; those bytes are gone with the clusters that
+// held them. See the compatibility contract in the proto package comment.
+const membershipSectionV1 byte = 1
 
-// Membership section layout revisions. Replay accepts the whole range;
-// only membershipSectionVersion is ever written.
-const (
-	// membershipSectionV3 is the pre-identity layout: fixed region, then
-	// Addresses, Observers, Witnesses, Removed.
-	membershipSectionV3 byte = 3
-
-	// membershipSectionV4 appends Identities after Removed, followed by the
-	// replicated session policy.
-	//
-	// The policy is a TAIL here and part of the FIXED region in
-	// proto.Membership. The two layouts are independent by design (this
-	// section carries PolicyFlags as one byte where proto spends eight), and a
-	// tail is what keeps v3 replay reading its maps at the offsets it always
-	// did: growing this section's fixed region would give the two versions
-	// different map offsets, and this decoder — unlike proto's — parses
-	// straight-line rather than through a per-version entry point.
-	membershipSectionV4 byte = 4
-
-	// minMembershipSectionVersion is the oldest layout this binary replays.
-	// Accepting a RANGE rather than requiring an exact match is what keeps a
-	// version bump from making every existing WAL unreplayable: the sections
-	// on disk were written by whichever binary wrote them, and a snapshot
-	// record is not rewritten in place.
-	minMembershipSectionVersion byte = membershipSectionV3
-)
+// membershipSectionVersion is the layout revision this binary WRITES for the
+// membership section of a snapshot record, stored as the section's first byte,
+// and — replay gating on exact equality — the only one it READS. It mirrors the
+// proto.Membership version byte and moves in lockstep with payloadTypeSnapshot:
+// the payload type discriminates records, this byte discriminates the section
+// within a record.
+//
+// The byte is retained through the pinned period rather than dropped, for the
+// reason the proto package comment gives: a format with no in-band
+// discriminator cannot be superseded at 1.0, and a section that skipped it
+// would begin at ConfigChangeID, whose low byte is indistinguishable from a
+// version. Refusing anything that is not this value turns a commit skew into a
+// clean recovery failure instead of fields read at the wrong offsets.
+const membershipSectionVersion byte = membershipSectionV1
 
 // membershipFixedSize is the size of the membership section's fixed region:
 // Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1).
+//
+// The replicated session policy is a TAIL here and part of the FIXED region in
+// proto.Membership. The two layouts are independent by design (this section
+// carries PolicyFlags as one byte where proto spends eight), and the difference
+// is deliberate: this decoder parses straight-line from a fixed offset, so
+// growing the fixed region moves every map, while appending to the tail does
+// not.
 const membershipFixedSize = 1 + 8 + 8 + 1 // 18 bytes
 
-// minMembershipSize is the smallest well-formed membership section this binary
-// can REPLAY: the fixed region plus v3's four map count headers, all empty.
+// minMembershipSize is the smallest well-formed membership section: the fixed
+// region, six empty map count headers and the session policy. It is the length
+// guard replay applies BEFORE reading the version byte, so that a section too
+// short to hold the layout is reported as a torn record rather than being read
+// past its own end.
 //
-// It is deliberately the v3 minimum, not the v4 one that membershipSize now
-// returns. This is the length guard replay applies BEFORE reading the version
-// byte, so raising it to the v4 size would reject every v3 section on disk as
-// truncated without ever reaching the version check that knows how to read it.
-// The two numbers differ by design: this is the floor for what may be READ,
-// membershipSize is the exact size of what is WRITTEN.
-const minMembershipSize = membershipFixedSize + 4*4 // 34 bytes (v3)
+// It equals membershipSize of an empty membership, and must: there is one
+// layout, every field is written unconditionally, and the read floor and the
+// written size are therefore the same number by construction.
+const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 66 bytes
 
 // membershipAddrMapSize returns the total serialized size for an address map:
 // [NumEntries:4] + for each entry: [ReplicaID:8][AddrLen:4][Addr:N].
@@ -1889,21 +1933,22 @@ func membershipRemovedMapSize(m map[uint64]bool) int {
 	return 4 + len(m)*8
 }
 
-// membershipSessionPolicySize is the size of the v4 session-policy tail:
+// membershipSessionPolicySize is the size of the session-policy tail:
 // SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxSessionsPerClient(8).
 const membershipSessionPolicySize = 3 * 8 // 24 bytes
 
-// membershipSize returns the total serialized size of a logdb.Membership.
+// membershipSize returns the total serialized size of a logdb.Membership. Every
+// field is unconditional: the size and the marshal site must agree exactly, or
+// the record overruns its buffer.
 func membershipSize(m logdb.Membership) int {
 	return membershipFixedSize +
 		membershipAddrMapSize(m.Addresses) +
 		membershipAddrMapSize(m.Observers) +
 		membershipAddrMapSize(m.Witnesses) +
 		membershipRemovedMapSize(m.Removed) +
-		// v4 tail, always written (see the marshal site): the size and the
-		// writer must agree exactly or the record overruns its buffer.
 		membershipAddrMapSize(m.Identities) +
-		membershipSessionPolicySize
+		membershipSessionPolicySize +
+		membershipAddrMapSize(m.RemovedIdentities)
 }
 
 // marshalAddrMap serializes an address map into buf at the given offset.
@@ -1936,7 +1981,7 @@ func marshalRemovedMap(buf []byte, pos int, m map[uint64]bool) int {
 // maxMembershipMapEntries caps the declared entry count of any WAL
 // membership or bootstrap address/removed map before allocation. A
 // membership map can never exceed the cluster size, which is far below
-// this bound; this mirrors proto.maxMembershipEntries (10000) and prevents
+// this bound; this mirrors proto.MaxMembershipEntries (10000) and prevents
 // a corrupted or tampered count prefix from forcing a multi-GB allocation
 // during recovery. A record whose declared count exceeds this cap is
 // treated as corrupt. The plaintext WAL path relies on this guard because
@@ -1951,7 +1996,14 @@ func checkMembershipSize(m logdb.Membership) error {
 	if len(m.Addresses) > maxMembershipMapEntries ||
 		len(m.Observers) > maxMembershipMapEntries ||
 		len(m.Witnesses) > maxMembershipMapEntries ||
-		len(m.Removed) > maxMembershipMapEntries {
+		len(m.Removed) > maxMembershipMapEntries ||
+		// Identities and RemovedIdentities are written by the same encoder and
+		// read back through the same per-map cap, so omitting them here broke
+		// the symmetry this function exists to hold: an oversized map produced
+		// a snapshot record that was durable and then rejected as corrupt on
+		// replay.
+		len(m.Identities) > maxMembershipMapEntries ||
+		len(m.RemovedIdentities) > maxMembershipMapEntries {
 		return ErrMembershipTooLarge
 	}
 	return nil
@@ -2075,26 +2127,27 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	fp := string(data[snapshotRecordBaseSize : snapshotRecordBaseSize+int(fpLen)])
 	pos := snapshotRecordBaseSize + int(fpLen)
 
-	// Deserialize membership. The V3 writer ALWAYS emits the section, whose
-	// minimum well-formed size is the fixed region plus the four map count
-	// headers. Anything shorter — including a wholly absent section — is a
-	// torn record (the chunk CRC should already have rejected it; this is
-	// defense in depth) and must NOT be silently accepted as an empty
-	// membership.
+	// Deserialize membership. The writer ALWAYS emits the section, whose
+	// minimum well-formed size is the fixed region plus the six map count
+	// headers and the session policy. Anything shorter — including a wholly
+	// absent section — is a torn record (the chunk CRC should already have
+	// rejected it; this is defense in depth) and must NOT be silently accepted
+	// as an empty membership.
 	var membership logdb.Membership
 	if len(data)-pos < minMembershipSize {
 		slog.Error("waldb: snapshot record missing membership section during replay",
 			"segment_id", segID, "remaining", len(data)-pos, "minimum", minMembershipSize)
 		return ErrTruncatedSnapshotRecord
 	}
-	// Defense in depth behind the payload-type gate: a section version this
-	// binary does not write means the record is corrupt or was produced by
-	// a skewed format, and its fields must not be interpreted.
+	// Defense in depth behind the payload-type gate, on EXACT equality: a
+	// section version other than the one this binary writes means the record is
+	// corrupt or was produced by a binary built from a different pre-release
+	// commit, and its fields must not be interpreted at this layout's offsets.
 	sectionVersion := data[pos]
-	if sectionVersion < minMembershipSectionVersion || sectionVersion > membershipSectionVersion {
+	if sectionVersion != membershipSectionVersion {
 		slog.Error("waldb: snapshot record membership section has unsupported version",
 			"segment_id", segID, "version", sectionVersion,
-			"minimum", minMembershipSectionVersion, "maximum", membershipSectionVersion)
+			"supported", membershipSectionVersion)
 		return ErrUnsupportedMembershipVersion
 	}
 	pos++
@@ -2130,34 +2183,41 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	}
 	pos = ok
 
-	// Identities exist only from v4. A v3 section ends at Removed, so reading
-	// here would consume whatever follows — which is why the version gate above
-	// accepts a range rather than ignoring trailing bytes: a v3 record with
-	// leftover data is corruption, not an old layout, and must still be caught
-	// by the check below.
-	membership.Identities = make(map[uint64]string)
-	if sectionVersion >= membershipSectionV4 {
-		membership.Identities, ok = unmarshalAddrMap(data, pos)
-		if ok == -1 {
-			return ErrTruncatedSnapshotRecord
-		}
-		pos = ok
-
-		// The session policy closes the v4 tail. Its length is checked
-		// explicitly: minMembershipSize is deliberately the v3 floor, so
-		// nothing upstream guarantees these 24 bytes are present, and the
-		// fixed-width reads below would slice past the record without it.
-		if len(data)-pos < membershipSessionPolicySize {
-			slog.Error("waldb: snapshot record membership section is missing its session policy",
-				"segment_id", segID, "remaining", len(data)-pos,
-				"required", membershipSessionPolicySize)
-			return ErrTruncatedSnapshotRecord
-		}
-		membership.SessionExpiryEntries = binary.LittleEndian.Uint64(data[pos:])
-		membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
-		membership.MaxSessionsPerClient = binary.LittleEndian.Uint64(data[pos+16:])
-		pos += membershipSessionPolicySize
+	// Identities is the receive-side quorum gate's only authorization input
+	// where it is present, so a section that lost it would silently downgrade
+	// every member it describes back to the address check.
+	membership.Identities, ok = unmarshalAddrMap(data, pos)
+	if ok == -1 {
+		return ErrTruncatedSnapshotRecord
 	}
+	pos = ok
+
+	// The session policy. Its length is checked explicitly rather than leaned
+	// on minMembershipSize, which bounds the section as a whole and not the
+	// remainder at this offset: a record whose maps consumed more than their
+	// share would leave fewer than 24 bytes here, and the fixed-width reads
+	// below would slice past the record.
+	if len(data)-pos < membershipSessionPolicySize {
+		slog.Error("waldb: snapshot record membership section is missing its session policy",
+			"segment_id", segID, "remaining", len(data)-pos,
+			"required", membershipSessionPolicySize)
+		return ErrTruncatedSnapshotRecord
+	}
+	membership.SessionExpiryEntries = binary.LittleEndian.Uint64(data[pos:])
+	membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
+	membership.MaxSessionsPerClient = binary.LittleEndian.Uint64(data[pos+16:])
+	pos += membershipSessionPolicySize
+
+	// RemovedIdentities closes the section. It is the deny-list the receive
+	// gate evaluates against the AUTHENTICATED connection identity, so a
+	// snapshot that lost it would not merely lose information — it would revoke
+	// a revocation, and the replica would come back having forgotten which
+	// keypairs it ejected.
+	membership.RemovedIdentities, ok = unmarshalAddrMap(data, pos)
+	if ok == -1 {
+		return ErrTruncatedSnapshotRecord
+	}
+	pos = ok
 
 	// The membership is the final field; any leftover bytes mean the
 	// record did not parse cleanly (corruption).
@@ -3341,10 +3401,13 @@ func (db *DB) commitPendingEpochs(pending *[DefaultShardCount]pendingMemUpdates)
 // Rotation case: a write hit ErrSegmentFull mid-batch and rotateSegment
 // installed one or more new segments (the old ones were sync+closed with
 // batch data). DiscardPending with the old checkpoint offsets would truncate
-// the WRONG (new) segment. Instead we: (1) truncate the checkpoint segment
-// back to its pre-batch durable boundary, (2) delete any intermediate
-// segments created entirely from batch data, and (3) empty the current active
-// segment. This guarantees recovery replays only the pre-batch prefix.
+// the WRONG (new) segment. Instead we work HIGH TO LOW: (1) delete any
+// intermediate segments created entirely from batch data, (2) empty the
+// current active segment, (3) fsync the directory, and only then (4) truncate
+// the checkpoint segment back to its pre-batch durable boundary. This
+// guarantees recovery replays only the pre-batch prefix, and — because the low
+// segment is cut last — that a crash at any point in between leaves a valid
+// prefix rather than a hole. See the ordering note in the body.
 func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 	// Nothing was written against a known position, so there is nothing to
 	// undo. An absent active segment is NOT such a case: rotateSegment drops
@@ -3375,12 +3438,21 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		return ds.activeSegment.DiscardPending(cp.fileOffset, cp.blockOffset, cp.recordCount)
 	}
 
-	// Rotation occurred. Roll back the checkpoint segment on disk (it is
-	// closed) by truncating to its pre-batch durable end.
+	// Rotation occurred. The rollback runs HIGH TO LOW — intermediates deleted,
+	// active segment emptied, directory fsynced, and only then the checkpoint
+	// segment truncated — so that every crash state in between is a valid
+	// prefix of the pre-batch log.
+	//
+	// The reverse order is not: truncating the checkpoint segment first leaves
+	// it ending cleanly at a record boundary with the higher segments still
+	// holding their (fsynced, CRC-valid) batch records, so a crash there is
+	// followed by a recovery that replays the checkpoint segment in full and
+	// then every segment above it — resurrecting the batch records the caller
+	// was told had FAILED, with a hole where the truncated ones were. Crashing
+	// under the order below can only leave batch records in the checkpoint
+	// segment's own tail, which is an ordinary interrupted write and is exactly
+	// what a crash one instruction earlier would have left anyway.
 	cleanEnd := cp.fileOffset + int64(cp.blockOffset)
-	if err := truncateClosedSegment(ds, cp.segID, cleanEnd); err != nil {
-		return err
-	}
 
 	// Delete intermediate segments that contain only batch data.
 	for id := cp.segID + 1; id < ds.activeSegmentID; id++ {
@@ -3421,20 +3493,27 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		}
 	}
 
-	// Make the segment-file deletions/truncation durable. Without a directory
-	// fsync a crash right after rollback could resurrect a deleted
-	// intermediate segment's directory entry, and recovery would replay its
-	// (CRC-valid) batch records that were supposed to be discarded —
-	// resurrecting writes the caller was told had failed. A directory-fsync
-	// failure here is therefore fail-stop, exactly like the data-fsync
-	// failures in syncSegment/writeRecord: the rollback cannot be proven
-	// durable, so the DB is poisoned and the error is surfaced through
+	// Make the segment-file deletions durable BEFORE the checkpoint segment is
+	// cut. Without a directory fsync a crash right after rollback could
+	// resurrect a deleted intermediate segment's directory entry, and recovery
+	// would replay its (CRC-valid) batch records that were supposed to be
+	// discarded — resurrecting writes the caller was told had failed. A
+	// directory-fsync failure here is therefore fail-stop, exactly like the
+	// data-fsync failures in syncSegment/writeRecord: the rollback cannot be
+	// proven durable, so the DB is poisoned and the error is surfaced through
 	// rollbackBatch to the SaveState caller.
 	if err := syncDirFS(ds.fs, ds.dir); err != nil {
 		if ds.poison != nil {
 			ds.poison(err)
 		}
 		return errors.Join(ErrDBPoisoned, err)
+	}
+
+	// The checkpoint segment last: it is the LOW segment, and until it is cut
+	// the on-disk state is still a valid (longer) prefix. truncateClosedSegment
+	// fsyncs the file, so the cut is durable on return.
+	if err := truncateClosedSegment(ds, cp.segID, cleanEnd); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3867,14 +3946,16 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalAddrMap(buf, pos, ss.Membership.Observers)
 	pos = marshalAddrMap(buf, pos, ss.Membership.Witnesses)
 	pos = marshalRemovedMap(buf, pos, ss.Membership.Removed)
-	// v4 tail. Written unconditionally so the section length always matches
-	// membershipSize; an empty map is four zero bytes, not an absent field,
-	// and an unset session policy is 24 zero bytes rather than an absent one.
+	// Every remaining field is written unconditionally, so the section length
+	// always matches membershipSize: an empty map is four zero bytes, not an
+	// absent field, and an unset session policy is 24 zero bytes rather than an
+	// absent one.
 	pos = marshalAddrMap(buf, pos, ss.Membership.Identities)
 	binary.LittleEndian.PutUint64(buf[pos:], ss.Membership.SessionExpiryEntries)
 	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
 	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxSessionsPerClient)
 	pos += membershipSessionPolicySize
+	pos = marshalAddrMap(buf, pos, ss.Membership.RemovedIdentities)
 
 	landing, err := s.writeRecord(buf[:pos])
 	if err != nil {
@@ -4774,17 +4855,34 @@ func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err
 // AtRestProtection reports whether this DB's on-disk records are encrypted.
 //
 // A waldb.DB writes every record it accepts to a WAL segment on disk, so the
-// answer is decided entirely by whether it was opened WithBarrier: with a
-// barrier every record is sealed before it reaches a segment
-// (AtRestBarrierEncrypted); without one every record -- and therefore every
-// user command inside every Raft log entry -- lands on disk in cleartext
-// (AtRestUnprotected).
+// answer turns on whether the configured barrier ACTUALLY ENCRYPTS -- not on
+// whether one was configured. Without a barrier every record, and therefore
+// every user command inside every Raft log entry, lands on disk in cleartext.
 //
-// This is deliberately NOT answerable by a type assertion: *DB implements
-// PerBarrierEpochAwareLogDB in BOTH cases, so a caller that treats the
-// interface as evidence of encryption accepts the plaintext store.
+// A barrier running StrategyNone lands them there too. Its "encryptor" is an
+// identity pass-through, so `db.barrier != nil` says nothing about the bytes on
+// the medium: the records are byte-for-byte their plaintext, and a grep over a
+// segment file finds the commands. Answering AtRestBarrierEncrypted for it made
+// the presence of an OBJECT stand in for the presence of ENCRYPTION and handed
+// the host's requireEncryptedLogDB gate -- whose entire purpose is to refuse
+// rather than silently downgrade -- exactly the store it exists to refuse. The
+// barrier already knows the answer and reports it through plaintextModeReporter;
+// this asks.
+//
+// A barrier that does not implement plaintextModeReporter is read as
+// encrypting. That is the conservative direction for THIS question: the
+// optional interface exists to declare an absence of encryption, so its own
+// absence cannot be evidence of one, and treating every barrier that predates
+// the interface as plaintext would refuse working encrypted deployments.
+//
+// This is deliberately NOT answerable by a type assertion on the LogDB: *DB
+// implements PerBarrierEpochAwareLogDB in ALL of these cases, so a caller that
+// treats the interface as evidence of encryption accepts the plaintext store.
 func (db *DB) AtRestProtection() logdb.AtRestProtection {
 	if db.barrier == nil {
+		return logdb.AtRestUnprotected
+	}
+	if pm, ok := db.barrier.(plaintextModeReporter); ok && pm.IsPlaintextMode() {
 		return logdb.AtRestUnprotected
 	}
 	return logdb.AtRestBarrierEncrypted

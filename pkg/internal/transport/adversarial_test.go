@@ -182,11 +182,18 @@ func runMessageFrameCase(tb testing.TB, tr *QUICTransport, handler *testHandler,
 	}
 }
 
-// assertNoBufferAliasing pins the zero-copy detach: Entry.Cmd and
-// Snapshot.Checksum alias the POOLED receive buffer after unmarshal, and the
-// buffer is recycled as soon as the frame is dispatched. A surviving alias is
-// read by the step worker after the buffer has been handed to another frame,
-// so the raft layer sees another peer's bytes as its own entry payload.
+// assertNoBufferAliasing pins the zero-copy detach: Entry.Cmd aliases the
+// POOLED receive buffer after unmarshal, and the buffer is recycled as soon as
+// the frame is dispatched. A surviving alias is read by the step worker after
+// the buffer has been handed to another frame, so the raft layer sees another
+// peer's bytes as its own entry payload.
+//
+// Entry.Cmd is the only such alias on a decoded Message. Snapshot.Checksum was
+// the other one and was covered here too; it left the wire format in an
+// earlier pre-release layout (never computed, never verified — see the
+// proto.Snapshot type doc), so there is no field left to alias. Every other reference field on a
+// decoded Snapshot — Filepath and the membership maps — is copied by its own
+// decoder and never aliased the pool at all.
 //
 // The check is generic rather than example-based: whatever a frame delivered,
 // push a second frame of the same size through to recycle the buffer, then
@@ -222,11 +229,6 @@ func assertNoBufferAliasing(tb testing.TB, tr *QUICTransport, handler *testHandl
 				want := make([]byte, len(cmd))
 				copy(want, cmd)
 				records = append(records, record{label: "Entry.Cmd", want: want, got: &m.Entries[j].Cmd})
-			}
-			if sum := m.Snapshot.Checksum; len(sum) > 0 {
-				want := make([]byte, len(sum))
-				copy(want, sum)
-				records = append(records, record{label: "Snapshot.Checksum", want: want, got: &m.Snapshot.Checksum})
 			}
 		}
 	}
@@ -309,13 +311,12 @@ func adversarialFrameSeeds(tb testing.TB) []frameSeed {
 		},
 	}))
 
-	// An InstallSnapshot carrying a full Membership and a checksum: the exact
-	// shape of the forged-snapshot finding, arriving as wire bytes.
+	// An InstallSnapshot carrying a full Membership: the exact shape of the
+	// forged-snapshot finding, arriving as wire bytes.
 	add("install-snapshot-with-membership", base(proto.Message{
 		Type: proto.InstallSnapshot, ShardID: 1, From: 2, To: 1, Term: 0,
 		Snapshot: proto.Snapshot{
 			ShardID: 1, Index: 99, Term: 5,
-			Checksum: bytes.Repeat([]byte{0xAB}, 32),
 			Membership: proto.Membership{
 				ConfigChangeID: ^uint64(0),
 				MaxWitnesses:   7,

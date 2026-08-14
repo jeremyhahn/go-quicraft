@@ -18,7 +18,6 @@ package linearizability_test
 
 import (
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,17 +73,21 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	warmupCluster(t, cluster, shardID)
 
+	// The probe restarts one replica five times under sustained load and only
+	// ever looks at the applied-index gap. A restarted replica that rejoined
+	// still believing it leads the current term would satisfy that gap check
+	// and go unnoticed, so the election-safety invariant is asserted alongside.
+	startLeaderTermGuard(t, cluster, shardID)
+
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range numClients {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys,
-				buildUp+cycles*(downtime+catchUpBudget+settle+5*time.Second),
-				recorder, &totalOps, done)
+			clientWorker(t, cluster, shardID, clientID, numKeys, buildUp+cycles*(downtime+catchUpBudget+settle+5*time.Second),
+				recorder, done)
 		}(i)
 	}
 	defer func() {
@@ -151,10 +154,10 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 			dumpClusterState(t, cluster, shardID)
 			t.Fatalf("restarted replica node[%d] was never sent entries again: "+
 				"lag %d after %v with the leader alive and committing "+
-				"(cycle %d, %d ops)", victim, lastGap, catchUpBudget, cycle, totalOps.Load())
+				"(cycle %d, %d ops)", victim, lastGap, catchUpBudget, cycle, recorder.completed())
 		}
 		t.Logf("cycle %d: node[%d] caught up in %v (leader node[%d], %d ops)",
-			cycle, victim, caughtUp.Round(time.Millisecond), leaderIdx, totalOps.Load())
+			cycle, victim, caughtUp.Round(time.Millisecond), leaderIdx, recorder.completed())
 		time.Sleep(settle)
 	}
 }

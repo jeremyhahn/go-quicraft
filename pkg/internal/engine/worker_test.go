@@ -2490,14 +2490,6 @@ func (m *testRaftMetrics) getApplyLatencyCount(shardID uint64) int {
 	return int(v.(*atomic.Int64).Load())
 }
 
-func (m *testRaftMetrics) getSnapshotCount(shardID uint64) int64 {
-	v, ok := m.snapshots.Load(shardID)
-	if !ok {
-		return 0
-	}
-	return v.(*atomic.Int64).Load()
-}
-
 func (m *testRaftMetrics) getPiggybackCommitCount(shardID uint64) int64 {
 	v, ok := m.piggybackCommits.Load(shardID)
 	if !ok {

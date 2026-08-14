@@ -650,12 +650,13 @@ func BenchmarkHeartbeatSlowPath_Serialize(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		// Recompute size (sendBatch does this every call)
+		// Recompute the size the way sendBatch does on every call, and use it
+		// to bound the payload slice so the measurement covers the same work.
 		mb.Requests[0] = msg
-		sz = mb.Size()
+		msgSize := mb.Size()
 
 		// Marshal MessageBatch
-		payloadBuf := buf[FrameHeaderSize:]
+		payloadBuf := buf[FrameHeaderSize : FrameHeaderSize+msgSize]
 		n, _ := mb.MarshalTo(payloadBuf)
 
 		// Marshal frame header

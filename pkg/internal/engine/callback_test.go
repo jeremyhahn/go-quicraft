@@ -202,14 +202,6 @@ func (c *testCallback) OnCampaignSkipped(shardID, replicaID, term uint64) {
 	c.mu.Unlock()
 }
 
-func (c *testCallback) getCampaignSkippedCalls() []campaignCall {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]campaignCall, len(c.campaignSkippedCalls))
-	copy(result, c.campaignSkippedCalls)
-	return result
-}
-
 func (c *testCallback) OnSnapshotRejected(_, _ uint64) {
 	c.snapshotRejected.Add(1)
 }
@@ -285,27 +277,11 @@ func (c *testCallback) getSnapshotCalls() []snapshotCall {
 	return result
 }
 
-func (c *testCallback) getReadyToReadCalls() []readyToReadCall {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]readyToReadCall, len(c.readyToReadKeys))
-	copy(result, c.readyToReadKeys)
-	return result
-}
-
 func (c *testCallback) getAppliedCalls() []appliedCall {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	result := make([]appliedCall, len(c.appliedCalls))
 	copy(result, c.appliedCalls)
-	return result
-}
-
-func (c *testCallback) getCommittedCalls() []committedCall {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]committedCall, len(c.committedCalls))
-	copy(result, c.committedCalls)
 	return result
 }
 

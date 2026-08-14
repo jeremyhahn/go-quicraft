@@ -92,7 +92,37 @@ integration-test:
 
 .PHONY: _integration-test
 _integration-test:
-	$(GOTEST) -tags=integration -timeout=300s $(INT_TEST_DIR)/...
+	$(GOTEST) -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+
+# ============================================================================
+# CI entry points
+#
+# These are what .github/workflows/ci.yml invokes, and they run on the HOST
+# rather than in the devcontainer because that is what a CI runner does. The
+# `test` and `integration-test` targets above stay as they are: the former is
+# the verbose dev loop, the latter the devcontainer path with tuned UDP
+# buffers.
+#
+# The differences from those targets are deliberate and must not be
+# "harmonised" away, and they match the same reasoning as the root Makefile's
+# ci-integration:
+#   no -v          CI logs are already large.
+#   -p 1           every integration package starts multi-node QUIC clusters
+#                  under -race; running them concurrently starves runner CPU
+#                  and flakes the tests with 30s waits.
+#   -timeout=1800s a shared CI runner is slower than a dev box, and -p 1 makes
+#                  every package share the one deadline.
+#
+# Keep each command byte-identical to the matching step in ci.yml.
+# ============================================================================
+
+.PHONY: ci-test
+ci-test:
+	$(GO) test -race -count=1 -timeout=900s ./...
+
+.PHONY: ci-integration
+ci-integration:
+	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 
 # ============================================================================
 # Benchmarks
@@ -248,6 +278,10 @@ help:
 	@echo ""
 	@echo "Integration Tests (run in devcontainer):"
 	@echo "  integration-test       Run all integration tests in devcontainer"
+	@echo ""
+	@echo "CI entry points (run on the host, as CI does):"
+	@echo "  ci-test                Run unit tests the way ci.yml does"
+	@echo "  ci-integration         Run integration tests the way ci.yml does"
 	@echo ""
 	@echo "Benchmarks:"
 	@echo "  bench                  Run all benchmarks"

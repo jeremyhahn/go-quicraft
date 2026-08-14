@@ -155,10 +155,27 @@ func TestIntegration_DB_LinearizableRead_FollowerWithoutExplicitWait(t *testing.
 	// waited for SM catch-up) or return an error (timeout / not-ready).
 	// Returning empty string with nil error means the read bypassed consensus.
 	if err != nil {
-		// An error is acceptable: it proves the follower attempted the
-		// ReadIndex protocol rather than serving stale local state.
-		t.Logf("SyncRead from follower returned error (acceptable): %v", err)
-		t.Logf("this confirms the follower attempted consensus rather than serving stale data")
+		// An error on the IMMEDIATE read is acceptable: it proves the follower
+		// attempted the ReadIndex protocol rather than serving stale local
+		// state. It is not, however, a licence to stop asserting — a follower
+		// whose reads ALWAYS fail would otherwise pass this test. Require the
+		// value to become readable within the timeout.
+		t.Logf("SyncRead from follower returned error on the immediate read (acceptable): %v", err)
+		waitForCondition(t, defaultTimeout,
+			fmt.Sprintf("follower node[%d] eventually serves the committed value", followerIdx),
+			func() bool {
+				retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer retryCancel()
+				retryResult, retryErr := followerHost.SyncRead(retryCtx, shardID, encodeKVGet("follower-lin-key"))
+				if retryErr != nil {
+					return false
+				}
+				retryVal, isStr := retryResult.(string)
+				return isStr && retryVal == "follower-lin-value"
+			},
+		)
+		t.Logf("follower node[%d] served the committed value on retry, confirming the read "+
+			"went through consensus rather than returning stale local state", followerIdx)
 		return
 	}
 
@@ -310,8 +327,21 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 
 	const testDuration = 3 * time.Second
 
+	// minSuccessfulReads is the floor below which this test asserts nothing.
+	// The reader's monotonicity and non-empty checks only execute on a read
+	// that actually returned, so without a floor a run in which every single
+	// SyncRead errored — the reader spinning on `continue` for three seconds —
+	// reached the end of the test green. On a quiet machine the reader
+	// completes on the order of a thousand reads in the window; 50 is a floor
+	// that a working implementation clears by a wide margin and a broken one
+	// cannot.
+	const minSuccessfulReads = 50
+
 	var (
 		writeCounter atomic.Int64
+		readCount    atomic.Int64
+		readErrCount atomic.Int64
+		lastSeenRead atomic.Int64
 		writeErr     atomic.Value
 		readErr      atomic.Value
 		wg           sync.WaitGroup
@@ -356,12 +386,12 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 		defer wg.Done()
 
 		var lastSeen int64
-		var readCount int64
 
 		for {
 			select {
 			case <-stopCh:
-				t.Logf("reader completed %d reads, last seen value: %d", readCount, lastSeen)
+				t.Logf("reader completed %d successful reads (%d errored), last seen value: %d",
+					readCount.Load(), readErrCount.Load(), lastSeen)
 				return
 			default:
 			}
@@ -371,8 +401,11 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 			cancel()
 
 			if err != nil {
-				// Transient errors during concurrent writes are expected.
-				// Only record persistent errors.
+				// Transient errors during concurrent writes are expected, but
+				// they are COUNTED: the caller asserts that successful reads
+				// outnumber failed ones, so a reader that only ever errors can
+				// no longer reach the end of the test green.
+				readErrCount.Add(1)
 				select {
 				case <-stopCh:
 					return
@@ -391,7 +424,7 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 				readErr.Store(fmt.Errorf(
 					"SyncRead returned empty string with nil error after %d reads (last seen: %d); "+
 						"this indicates reads bypass the ReadIndex protocol",
-					readCount, lastSeen))
+					readCount.Load(), lastSeen))
 				return
 			}
 
@@ -410,7 +443,8 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 			}
 
 			lastSeen = num
-			readCount++
+			lastSeenRead.Store(num)
+			readCount.Add(1)
 		}
 	}()
 
@@ -429,10 +463,66 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 		t.Fatalf("reader error: %v", stored)
 	}
 
-	// Final assertion: at least some writes and reads completed.
+	// Final assertions. Each one exists because without it the test passes on
+	// a run that did no useful work.
 	finalCount := writeCounter.Load()
 	if finalCount == 0 {
 		t.Fatal("writer goroutine did not complete any proposals")
 	}
-	t.Logf("concurrent test completed: %d writes proposed", finalCount)
+
+	reads := readCount.Load()
+	readFailures := readErrCount.Load()
+	if reads < minSuccessfulReads {
+		t.Fatalf("reader completed only %d successful linearizable reads in %v (want at least %d); "+
+			"%d reads returned an error. The monotonicity and non-empty checks only run on a read "+
+			"that returned, so a run this thin asserts nothing about linearizability",
+			reads, testDuration, minSuccessfulReads, readFailures)
+	}
+	if readFailures >= reads {
+		t.Fatalf("linearizable reads failed more often than they succeeded: %d errors vs %d successes; "+
+			"a leader serving a settled shard must complete the overwhelming majority of ReadIndex reads",
+			readFailures, reads)
+	}
+
+	// Value assertion, not merely an absence-of-error assertion: the reads must
+	// have observed values the writer produced DURING the concurrent phase. The
+	// seed is "0", so a highest-observed value of 0 means every read returned
+	// the pre-phase state and never saw a concurrent write.
+	highest := lastSeenRead.Load()
+	if highest <= 0 {
+		t.Fatalf("reads never observed a value written during the concurrent phase "+
+			"(highest observed counter = %d after %d successful reads, %d writes proposed); "+
+			"reads that never advance past the seed are not observing the committed log",
+			highest, reads, finalCount)
+	}
+
+	// A final linearizable read after the writer has stopped must return the
+	// settled counter: at least the highest value already observed, and never
+	// a value the writer never proposed.
+	finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer finalCancel()
+	finalResult, finalErr := leaderHost.SyncRead(finalCtx, shardID, encodeKVGet("counter"))
+	if finalErr != nil {
+		t.Fatalf("final SyncRead after the concurrent phase failed: %v", finalErr)
+	}
+	finalVal, ok := finalResult.(string)
+	if !ok {
+		t.Fatalf("final SyncRead returned type %T, want string", finalResult)
+	}
+	finalNum, parseErr := strconv.ParseInt(finalVal, 10, 64)
+	if parseErr != nil {
+		t.Fatalf("final SyncRead returned unparseable counter %q: %v", finalVal, parseErr)
+	}
+	if finalNum < highest {
+		t.Fatalf("final SyncRead returned %d, which is BEHIND the highest value already read (%d); "+
+			"a linearizable read must never go backwards", finalNum, highest)
+	}
+	if finalNum > finalCount {
+		t.Fatalf("final SyncRead returned %d but the writer only ever proposed up to %d; "+
+			"the state machine holds a value that was never proposed", finalNum, finalCount)
+	}
+
+	t.Logf("concurrent test completed: %d writes proposed, %d successful reads (%d errored), "+
+		"highest value read %d, settled value %d",
+		finalCount, reads, readFailures, highest, finalNum)
 }

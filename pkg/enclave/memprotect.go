@@ -20,9 +20,7 @@ package enclave
 
 import (
 	"fmt"
-	"os"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/awnumar/memguard"
 )
@@ -164,9 +162,15 @@ func (p *ProtectedKey) Open() (*ProtectedBuffer, error) {
 // buffer: memguard.Enclave has no API to zero its internal ciphertext, so an
 // open-then-destroy would only wipe the freshly DECRYPTED copy — briefly
 // re-materializing the plaintext in memory for no benefit — while leaving the
-// enclave's own ciphertext untouched either way. The ciphertext is useless
-// without memguard's session coffer key and is reclaimed by the enclave
-// finalizer once unreferenced.
+// enclave's own ciphertext untouched either way.
+//
+// What remains after Clear is therefore the enclave's ciphertext, on the
+// ordinary heap, until the garbage collector reclaims it. Nothing wipes it:
+// memguard v0.23.0 registers NO finalizer on Enclave (only its own tests do),
+// so an earlier claim that "the finalizer reclaims it" was wrong. The security
+// argument that survives is the other one — the ciphertext is useless without
+// memguard's per-process session coffer key, which lives in a locked buffer
+// this process never writes out.
 func (p *ProtectedKey) Clear() {
 	p.enclave.Store(nil)
 }
@@ -195,10 +199,25 @@ func WipeBytes(b []byte) {
 	memguard.WipeBytes(b)
 }
 
-// InitMemguard initializes the memguard library. Should be called once at startup.
-// This sets up signal handlers for secure cleanup on SIGTERM/SIGINT. The callback
-// receives the signal for logging; memguard internally wipes all protected memory
-// before the process terminates.
-func InitMemguard() {
-	memguard.CatchSignal(func(_ os.Signal) {}, syscall.SIGTERM, syscall.SIGINT)
-}
+// NOTE — there is deliberately no InitMemguard here.
+//
+// An earlier InitMemguard called memguard.CatchSignal(SIGTERM, SIGINT). It had
+// no callers, and wiring it up would have been actively harmful in an embedded
+// consensus engine:
+//
+//   - memguard.CatchSignal calls signal.Reset() with NO arguments, which
+//     detaches EVERY signal handler in the process — including the embedding
+//     application's own, and including handlers this library knows nothing
+//     about.
+//   - Its handler then calls core.Exit(1). SIGTERM stops being a graceful
+//     shutdown and becomes an immediate exit: no engine quiesce, no Host.Close,
+//     no barrier seal, no WAL flush. Trading a durable shutdown for a memory
+//     wipe is the wrong trade for a database's consensus layer, where the WAL
+//     is the thing that must survive.
+//   - It would not have bought much: memguard already wipes LockedBuffers on
+//     Destroy, and the enclave ciphertext it cannot wipe is useless without the
+//     session coffer key, which dies with the process either way. Nothing
+//     catches SIGKILL, so the protection could never have been complete.
+//
+// An embedder that wants signal-triggered wiping must install it in its own
+// main, alongside — not instead of — its graceful shutdown path.

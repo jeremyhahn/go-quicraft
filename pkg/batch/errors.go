@@ -41,6 +41,10 @@ var (
 
 	// ErrDecode is returned when batch decoding encounters malformed data.
 	ErrDecode = errors.New("quicraft/batch: decode failed")
+
+	// ErrEncode is returned when a command cannot be represented in the
+	// batch wire format.
+	ErrEncode = errors.New("quicraft/batch: encode failed")
 )
 
 // ClosedError is returned when an operation is attempted on a closed
@@ -139,4 +143,20 @@ func (e *DecodeError) Error() string {
 // Is reports whether target matches the sentinel ErrDecode error.
 func (e *DecodeError) Is(target error) bool {
 	return target == ErrDecode
+}
+
+// EncodeError is returned when a command cannot be represented in the batch
+// wire format. It carries the specific reason for the encode failure.
+type EncodeError struct {
+	Reason string
+}
+
+// Error returns a human-readable description of the encode failure.
+func (e *EncodeError) Error() string {
+	return fmt.Sprintf("quicraft/batch: encode failed: %s", e.Reason)
+}
+
+// Is reports whether target matches the sentinel ErrEncode error.
+func (e *EncodeError) Is(target error) bool {
+	return target == ErrEncode
 }

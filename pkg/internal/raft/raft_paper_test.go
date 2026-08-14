@@ -71,38 +71,10 @@ func newPaperRaftWithLog(replicaID uint64, entries []proto.Entry) *raft {
 	return r
 }
 
-// newPaperRaftWithLogN creates a raft node in an N-node cluster with
-// pre-existing log entries and PreVote disabled.
-func newPaperRaftWithLogN(replicaID uint64, n int, entries []proto.Entry) *raft {
-	members := make(map[uint64]string, n)
-	for i := uint64(1); i <= uint64(n); i++ {
-		members[i] = "addr" + string(rune('0'+i))
-	}
-	cfg := raftTestCfgPreVote(1, replicaID, false)
-	logdb := newTestLogReader(entries, proto.State{})
-	logdb.membership = proto.Membership{Addresses: members}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		panic("newPaperRaftWithLogN failed: " + err.Error())
-	}
-	return r
-}
-
 // electPaperLeader transitions the node to leader state by granting
 // votes from a majority of peers. Drains all messages afterward.
 func electPaperLeader(r *raft) {
 	electLeader(r)
-}
-
-// countMsgsOfType counts messages of the given type in r.msgs.
-func countMsgsOfType(r *raft, msgType uint64) int {
-	count := 0
-	for _, m := range r.msgs {
-		if m.Type == msgType {
-			count++
-		}
-	}
-	return count
 }
 
 // ==========================================================================

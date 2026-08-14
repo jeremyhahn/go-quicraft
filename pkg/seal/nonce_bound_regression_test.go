@@ -165,7 +165,7 @@ func TestNewBarrierWarnsOnUnrotatableNonceTracking(t *testing.T) {
 	logs := captureLogs(t)
 
 	cfg := DefaultBarrierConfig(7)
-	if !cfg.NonceTracking || cfg.StatePersister != nil || cfg.InvocationCounter != nil {
+	if !cfg.GetNonceTracking() || cfg.StatePersister != nil || cfg.InvocationCounter != nil {
 		t.Fatalf("DefaultBarrierConfig no longer produces the unrotatable combination: %+v", cfg)
 	}
 	_ = MustNewBarrier(cfg)

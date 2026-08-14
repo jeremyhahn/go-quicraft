@@ -52,11 +52,29 @@ func SyncDirChain(leaf, stopAt string) error {
 // the supplied function instead of SyncDir. It exists so a caller that routes
 // its file I/O through its own filesystem abstraction syncs directories
 // through that same abstraction; the walk itself must not be duplicated.
+//
+// Containment is decided by filepath.Rel, NOT by a string prefix. The prefix
+// form broke for exactly the two values deepestExistingAncestor returns when
+// nothing above the leaf pre-exists: stopAt "/" builds the prefix "//" and
+// stopAt "." builds "./", and neither prefixes a CLEANED leaf. Both silently
+// degraded to a leaf-only fsync, skipping every ancestor MkdirAll had just
+// created — reachable with a relative NodeHostDir (only DataDir must be
+// absolute) or with an absolute path whose entire tree is new. Rel handles both
+// roots correctly and reports non-containment as a ".." prefix.
+//
+// The emptiness test runs BEFORE Clean because filepath.Clean("") is ".", which
+// is a legitimate stopAt (the working directory) rather than "no stop point".
 func SyncDirChainWith(syncDir func(string) error, leaf, stopAt string) error {
+	if stopAt == "" {
+		return syncDir(filepath.Clean(leaf))
+	}
 	leaf = filepath.Clean(leaf)
 	stopAt = filepath.Clean(stopAt)
-	sep := string(filepath.Separator)
-	if stopAt == "" || !strings.HasPrefix(leaf+sep, stopAt+sep) {
+	rel, err := filepath.Rel(stopAt, leaf)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// Not under stopAt (or the two are not comparable, e.g. one absolute
+		// and one relative): sync the leaf alone, which is all that is known
+		// to exist along a chain this function cannot walk.
 		return syncDir(leaf)
 	}
 	for dir := leaf; ; dir = filepath.Dir(dir) {

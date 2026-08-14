@@ -312,7 +312,7 @@ Consequences for an operator:
 - A node whose `Config` disagrees with what its shard committed applies the shard's values and logs the disagreement at WARN. It does not refuse to start — the committed value can only be changed through consensus.
 - `Host.GetShardMembership` reports the committed policy, which is how you check what a shard is actually running.
 - There is no config change for these yet: the committed policy is fixed for the life of the shard. Raising `MaxTotalSessions` on a running shard is not currently possible.
-- A shard bootstrapped by an earlier build has no committed policy (its membership decodes as v3); those replicas keep using local configuration, so the cluster-wide agreement rule still applies to them.
+- A shard bootstrapped by a pre-policy build has no committed policy, and its membership section does not decode at all under this build — every format is pinned at version 1 and gated on exact equality, so a section written before the session policy existed is refused rather than read at the wrong offsets. Wipe the data directory and re-sync; see [Compatibility](../operations/compatibility.md).
 
 See `docs/operations/deployment.md`.
 

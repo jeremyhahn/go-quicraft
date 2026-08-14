@@ -198,7 +198,10 @@ func TestSetProcessedIndex_FoldsCommittedConfigChangeInSkippedWindow(t *testing.
 		t.Fatalf("fixture: expected a 3-voter quorum of 2, got %d", quorumBefore)
 	}
 
-	applied := p.SetProcessedIndex(5)
+	applied, foldErr := p.SetProcessedIndex(5)
+	if foldErr != nil {
+		t.Fatalf("the fold reported a corrupt committed config entry: %v", foldErr)
+	}
 	if applied != 5 {
 		t.Fatalf("expected the processed marker to settle at 5, got %d", applied)
 	}

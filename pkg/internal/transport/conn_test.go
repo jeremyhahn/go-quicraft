@@ -3378,11 +3378,6 @@ func TestGetStream_ConcurrentDedupReturnsCachedStream(t *testing.T) {
 	}
 }
 
-type streamResult struct {
-	stream interface{}
-	err    error
-}
-
 // TestGetStream_StaleDedup_ConnRemovedDuringSlowPath exercises the stale
 // dedup path by racing removeConnection against getStream. When the
 // connection is removed between getConnection (line 273) and the dedup

@@ -249,6 +249,18 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 	t.Logf("concurrent writers completed: %d successful, %d transient errors",
 		numSuccessful, writeErrors.Load())
 
+	// A membership addition does not disturb leadership, so nearly every write
+	// should land; measured at HEAD it is 30 of 30. Without a floor the whole
+	// concurrent phase can contribute ZERO writes and the test still passes,
+	// because every later assertion is over the set of writes that happened to
+	// succeed. Two thirds leaves room for an unlucky election without
+	// admitting a run that wrote nothing.
+	const concurrentWriteFloor = numWriters * writesPerWriter * 2 / 3
+	if numSuccessful < concurrentWriteFloor {
+		t.Fatalf("only %d of %d concurrent writes committed during the membership change (floor %d, %d transient errors)",
+			numSuccessful, numWriters*writesPerWriter, concurrentWriteFloor, writeErrors.Load())
+	}
+
 	// Wait for membership to reach 4.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
@@ -404,8 +416,26 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 		shardResults[r.shardIdx] = r
 	}
 
+	totalSuccess := 0
 	for _, r := range shardResults {
 		t.Logf("shard %d: %d successful writes, %d errors", r.shardID, len(r.success), r.errors)
+		// Every shard has to have committed SOMETHING. A shard that committed
+		// nothing contributes an empty expected-set to the consistency check
+		// below, which then verifies nothing for that shard.
+		if len(r.success) == 0 {
+			t.Fatalf("shard %d committed none of its %d writes while under load", r.shardID, writesPerShard)
+		}
+		totalSuccess += len(r.success)
+	}
+	// Killing the leader host mid-flight legitimately loses the in-flight
+	// window on the shards it led, so the aggregate floor is deliberately
+	// modest; measured at HEAD it is 14-16 of 30. What it rules out is a run
+	// whose writers achieved almost nothing, which every downstream assertion
+	// here would otherwise report as success.
+	const totalWriteFloor = numShards * writesPerShard / 4
+	if totalSuccess < totalWriteFloor {
+		t.Fatalf("only %d of %d writes committed across %d shards under load (floor %d)",
+			totalSuccess, numShards*writesPerShard, numShards, totalWriteFloor)
 	}
 
 	// Wait for all shards to elect new leaders.
@@ -422,15 +452,16 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 		key := fmt.Sprintf("shard%d-recovery", sid)
 		proposeAndWait(t, cluster, shardTrackers[i], sid, key, "recovered")
 
-		// Verify on all surviving nodes.
+		// Verify on all surviving nodes. A live node whose state machine never
+		// registered is a startup failure, not a node to pass over: skipping
+		// it removes the only broken replica from the assertion.
 		for nodeIdx := range cluster.hosts {
 			if cluster.stopped[nodeIdx].Load() {
 				continue
 			}
-			replicaID := uint64(nodeIdx + 1)
-			nodeSM := shardTrackers[i][nodeIdx].Get(sid, replicaID)
+			nodeSM := resolveStateMachine(cluster, shardTrackers[i], sid, nodeIdx)
 			if nodeSM == nil {
-				continue
+				t.Fatalf("shard %d node[%d] is live but has no state machine", sid, nodeIdx)
 			}
 			waitForCondition(t, defaultTimeout,
 				fmt.Sprintf("shard %d node[%d] has recovery key", sid, nodeIdx),
@@ -455,14 +486,16 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 		recoveryKey := fmt.Sprintf("shard%d-recovery", sid)
 		allExpected[recoveryKey] = "recovered"
 
+		verified := 0
+		live := 0
 		for nodeIdx := range cluster.hosts {
 			if cluster.stopped[nodeIdx].Load() {
 				continue
 			}
-			replicaID := uint64(nodeIdx + 1)
-			nodeSM := shardTrackers[i][nodeIdx].Get(sid, replicaID)
+			live++
+			nodeSM := resolveStateMachine(cluster, shardTrackers[i], sid, nodeIdx)
 			if nodeSM == nil {
-				continue
+				t.Fatalf("shard %d node[%d] is live but has no state machine", sid, nodeIdx)
 			}
 			for key, val := range allExpected {
 				waitForCondition(t, membershipTimeout,
@@ -473,6 +506,10 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 					},
 				)
 			}
+			verified++
+		}
+		if verified < live {
+			t.Fatalf("shard %d: verified %d nodes but %d are live", sid, verified, live)
 		}
 	}
 
@@ -600,9 +637,49 @@ func TestE2E_LeaderTransfer_DuringConcurrentWrites(t *testing.T) {
 	t.Logf("writers completed: %d successful, %d transient errors",
 		numSuccessful, writeErrors.Load())
 
-	// Wait for leadership to stabilize. The transfer target should
-	// ideally become the new leader, but any stable leader is acceptable.
-	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
+	// The transfer blocks proposals for its whole duration, so most writes
+	// legitimately fail here; measured at HEAD 6-9 of 45 commit. The floor
+	// exists only to rule out a run where the writers committed NOTHING, which
+	// would leave every later consistency assertion ranging over an empty set.
+	const transferWriteFloor = 3
+	if numSuccessful < transferWriteFloor {
+		t.Fatalf("only %d of %d writes committed across the leadership transfer (floor %d, %d transient errors)",
+			numSuccessful, numWriters*writesPerWriter, transferWriteFloor, writeErrors.Load())
+	}
+
+	// Leadership must actually MOVE TO THE REQUESTED TARGET. This used to
+	// accept "any stable leader", which is satisfied by the old leader simply
+	// keeping the job -- the exact outcome a broken transfer produces, and the
+	// outcome observed at HEAD when the sample is taken too early. A transfer
+	// racing an in-flight election is legitimately refused, so the request is
+	// re-issued until the cluster is able to honour it or the budget expires.
+	transferDeadline := time.Now().Add(failoverTimeout)
+	landed := false
+	for time.Now().Before(transferDeadline) {
+		curIdx := cluster.findLeader(shardID)
+		if curIdx == targetIdx {
+			landed = true
+			break
+		}
+		if curIdx >= 0 {
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), defaultTimeout)
+			retryErr := cluster.hosts[curIdx].RequestLeaderTransfer(retryCtx, shardID, targetReplicaID)
+			retryCancel()
+			if retryErr != nil && !isTransientLeadershipError(retryErr) {
+				t.Fatalf("RequestLeaderTransfer to replica %d failed unexpectedly: %v",
+					targetReplicaID, retryErr)
+			}
+		}
+		retryTimer := time.NewTimer(100 * time.Millisecond)
+		<-retryTimer.C
+		retryTimer.Stop()
+	}
+	if !landed {
+		t.Fatalf("leadership never transferred to the requested target node[%d] (replica=%d) "+
+			"within %v; leader is node[%d] (was node[%d])",
+			targetIdx, targetReplicaID, failoverTimeout, cluster.findLeader(shardID), oldLeaderIdx)
+	}
+	newLeaderIdx := targetIdx
 	t.Logf("leader after transfer: node[%d] (was node[%d], target was node[%d])",
 		newLeaderIdx, oldLeaderIdx, targetIdx)
 

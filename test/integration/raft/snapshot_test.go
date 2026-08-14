@@ -17,17 +17,24 @@
 package raft_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
-
-	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
 // TestIntegration_Snapshot_MultiNode_ConsistentState creates a 3-node
-// cluster, writes entries to the leader, waits for replication, requests
-// a snapshot on the leader, and verifies all nodes have the same number
-// of entries in their state machines.
+// cluster, writes entries to the leader, waits for replication, takes a
+// snapshot on the leader, and verifies all nodes hold identical state.
+//
+// The snapshot itself is verified, not merely requested: RequestSnapshot is
+// asynchronous, so the result is awaited and required to report a non-zero
+// index that covers the applied state, and the durable snapshot.dat artifact
+// is required to exist on disk. Without those checks the whole test reduces
+// to "the nodes replicated some keys", which plain log replay satisfies
+// equally and which no snapshot code path is needed for.
+//
+// Automatic snapshots cannot interfere: Config.SnapshotEntries has no default
+// (SetDefaults never assigns it) and testShardConfig leaves it at 0, so the
+// only snapshot in this test is the one requested below.
 func TestIntegration_Snapshot_MultiNode_ConsistentState(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -36,18 +43,12 @@ func TestIntegration_Snapshot_MultiNode_ConsistentState(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Write entries via the leader.
+	// Write entries via the leader, awaiting apply on each.
 	numEntries := 10
 	for i := 0; i < numEntries; i++ {
-		cmd := encodeKVPut(fmt.Sprintf("consistent-key-%d", i), fmt.Sprintf("consistent-val-%d", i))
-		rs, propErr := leaderHost.Propose(ctx, 1, cmd)
-		if propErr != nil {
-			t.Fatalf("Propose[%d] to leader failed: %v", i, propErr)
-		}
-		rs.Release()
+		proposeCommitted(t, leaderHost, 1,
+			fmt.Sprintf("consistent-key-%d", i), fmt.Sprintf("consistent-val-%d", i),
+			defaultTimeout)
 	}
 
 	// Wait for replication to all nodes.
@@ -67,15 +68,19 @@ func TestIntegration_Snapshot_MultiNode_ConsistentState(t *testing.T) {
 		)
 	}
 
-	// Request snapshot on the leader.
-	rs, err := leaderHost.RequestSnapshot(ctx, 1, quicraft.SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot on leader failed: %v", err)
+	// Take a snapshot on the leader and prove it happened: the result must
+	// carry a non-zero index at or above what the leader had applied, and a
+	// non-empty snapshot.dat must exist under the leader's NodeHostDir.
+	snapshotIndex := awaitSnapshot(t, leaderHost, cluster.nodeHostDirs[leaderIdx],
+		1, uint64(leaderIdx+1))
+
+	// The snapshot must cover every entry written above. Each put consumes
+	// one log index and the engine consumes more for the initial-membership
+	// and no-op entries, so the applied index is always at least numEntries.
+	if snapshotIndex < uint64(numEntries) {
+		t.Fatalf("snapshot index %d is below the %d entries committed before it",
+			snapshotIndex, numEntries)
 	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
-	}
-	rs.Release()
 
 	// Verify all nodes have the same number of entries.
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
@@ -105,7 +110,7 @@ func TestIntegration_Snapshot_MultiNode_ConsistentState(t *testing.T) {
 			replicaID := uint64(nodeIdx + 1)
 			nodeSM := trackers[nodeIdx].Get(1, replicaID)
 			if nodeSM == nil {
-				continue
+				t.Fatalf("node[%d] state machine not found", nodeIdx)
 			}
 			val, ok := nodeSM.Get(key)
 			if !ok {

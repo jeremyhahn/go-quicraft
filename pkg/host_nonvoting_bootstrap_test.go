@@ -331,12 +331,15 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 
 			// The durable state of a CAUGHT-UP replica that has never
 			// snapshotted: a bootstrap record, a hard state and log entries —
-			// and, by construction, no membership anywhere in the LogDB.
+			// and, by construction, no membership record anywhere in the LogDB
+			// (both backends write one only alongside a snapshot).
 			//
-			// Entry 2 is the COMMITTED config change that gave this replica its
-			// non-voting role. Without it the fixture cannot exercise the
-			// repair the seeded membership depends on, and the subtest would
-			// pass over a membership nobody looked at.
+			// Entry 1 is the shard's founding configuration, which
+			// config-in-log commits before any other entry; entry 2 is the
+			// COMMITTED config change that gave this replica its non-voting
+			// role. Without entry 2 the fixture cannot exercise the repair the
+			// seeded membership depends on, and the subtest would pass over a
+			// membership nobody looked at.
 			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
 				Addresses: map[uint64]string{1: voterAddr},
 			}); bsErr != nil {
@@ -356,7 +359,7 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 				ReplicaID: replicaID,
 				State:     logdb.State{Term: 7, Vote: 1, Commit: 2},
 				Entries: []logdb.Entry{
-					{Index: 1, Term: 7},
+					bootstrapLogEntry(t, 7, map[uint64]string{1: voterAddr}),
 					{Index: 2, Term: 7, Type: proto.EntryConfigChange, Cmd: ccCmd},
 				},
 			}}); stErr != nil {

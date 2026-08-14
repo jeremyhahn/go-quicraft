@@ -65,23 +65,29 @@ const (
 	walFormatMagic = "QRWALFMT"
 
 	// walFormatVersion is the version of the WAL on-disk format as a whole
-	// (block framing plus record framing). Bump it when a change makes
-	// previously written segments unreadable, so the mismatch is reported here
-	// instead of surfacing as corruption during replay.
+	// (block framing plus record framing). It is PINNED at 1 for the whole
+	// pre-release period, like every other format in this repository: a layout
+	// change is made IN PLACE at version 1, the consuming repositories are
+	// updated in the same change, and development data directories are wiped
+	// and re-synced rather than migrated. See docs/operations/compatibility.md
+	// and the compatibility contract in the pkg/proto package comment.
 	//
-	// Version history:
+	// The number is 1 because the project is pre-release, not because the
+	// framing is the first one ever written: earlier development commits wrote
+	// a 7-byte chunk header under other numbers, and those bytes are gone with
+	// the dev directories that held them. Today's framing is the 11-byte header
+	// [CRC32:4][Len:2][Type:1][DurSeq:4].
 	//
-	//	1 — 7-byte chunk header: CRC32, length, type.
-	//	2 — 11-byte chunk header: CRC32, length, type, durability sequence.
-	//
-	// The bump is not cosmetic. Under version 2's parser a version 1 segment
-	// misparses from its very first chunk, every chunk fails CRC, the clean
-	// prefix is empty, and — with nothing decodable above the damage — the
-	// torn-tail path would truncate the whole file to zero and delete every
-	// segment above it. That is the one unacceptable outcome, a silent
-	// misparse presented as a repair, so the version is checked before a single
-	// segment byte is read. See checkWALFormat.
-	walFormatVersion uint32 = 2
+	// The CHECK is what matters, not the value, and it is retained in full
+	// force. A directory written under any other framing misparses from its
+	// very first chunk, every chunk fails CRC, the clean prefix is empty, and —
+	// with nothing decodable above the damage — the torn-tail path would
+	// truncate the whole file to zero and delete every segment above it. That
+	// is the one unacceptable outcome, a silent misparse presented as a repair,
+	// so the version is compared for EXACT equality before a single segment
+	// byte is read. The pinning ends at the first production release, and this
+	// gate is the mechanism that bump will use.
+	walFormatVersion uint32 = 1
 
 	// walFormatSize is the exact on-disk length of the marker.
 	walFormatSize = 8 + 4 + 4

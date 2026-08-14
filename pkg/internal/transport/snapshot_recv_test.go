@@ -100,7 +100,7 @@ func TestRateLimitChunkSleep_Capped(t *testing.T) {
 
 	// The 64 KB/s floor (MinMaxSnapshotReceiveRate equivalent) with a max
 	// frame-sized chunk must stay at or below the cap.
-	if got := rateLimitChunkSleep(uint32(MaxFrameSize), 64*1024); got > maxRateLimitChunkSleep {
+	if got := rateLimitChunkSleep(MaxFrameSize, 64*1024); got > maxRateLimitChunkSleep {
 		t.Fatalf("floor rate: got %v exceeds cap %v", got, maxRateLimitChunkSleep)
 	}
 }
@@ -154,7 +154,7 @@ type stopAfterReader struct {
 
 func (r *stopAfterReader) Read(p []byte) (int, error) {
 	n, err := r.testChunkReader.Read(p)
-	if r.testChunkReader.pos >= r.after {
+	if r.pos >= r.after {
 		r.once.Do(func() { close(r.stopC) })
 	}
 	return n, err
@@ -1018,15 +1018,12 @@ func TestSendSnapshot_ShutdownCancelsStreamOpen(t *testing.T) {
 		t.Fatal("Stop() blocked too long; snapshot stream not cancelled by shutdownCtx")
 	}
 
-	// The SendSnapshot should have returned an error (context cancelled
-	// or connection failure).
+	// SendSnapshot must RETURN. Its result is deliberately not asserted:
+	// racing the tracker shutdown it may finish cleanly, and it may equally
+	// fail with a cancelled context or a closed stream. The property under
+	// test is that it does not stay parked past Stop().
 	select {
-	case err := <-sendDone:
-		if err == nil {
-			// SendSnapshot might succeed in a race condition if the
-			// tracker was shut down first, returning ErrStreamClosed.
-			// Either nil or error is acceptable as long as Stop() returned.
-		}
+	case <-sendDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("SendSnapshot did not return after Stop()")
 	}

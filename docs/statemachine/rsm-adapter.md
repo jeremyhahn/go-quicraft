@@ -87,16 +87,24 @@ type smWrapper interface {
     Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error)
     Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error
     Lookup(ctx context.Context, query interface{}) (interface{}, error)
-    NALookup(key []byte) ([]byte, bool, error)
-    GetHash() (uint64, bool, error)
+    NALookup(key []byte) ([]byte, bool, error)          // (result, supported, error)
+    NALookupInto(key, dst []byte) ([]byte, bool, error) // (result, supported, error)
+    GetHash() (uint64, bool, error)                     // (hash, supported, error)
     SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
+    saveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
     RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
     Close(ctx context.Context) error
-    Type() smType
+    Type() SMType
 }
 ```
 
 The type switch happens once at construction. All subsequent calls go through direct method calls on the concrete wrapper, eliminating interface dispatch overhead on the hot path.
+
+`saveSnapshotGated` writes the user SM snapshot and invokes `afterCapture` (when non-nil) exactly once after the point-in-time is captured and before the potentially-long streaming begins. For regular in-memory state machines the whole save *is* the capture, so it fires at the end; for concurrent and on-disk state machines it fires after `PrepareSnapshot`, so the caller can release the apply gate while the immutable snapshot streams.
+
+> **This is an INTERNAL interface, not the contract you implement.** `smWrapper` is unexported and lives in `pkg/internal/rsm`, so it is not importable. The three-value `(value, supported, error)` shape belongs to the wrapper: the `bool` reports whether the *user's* state machine implemented the optional interface, and it is supplied by the wrapper's own type assertion.
+>
+> The interfaces a user state machine implements are **two-value** — `sm.Hasher` is `GetHash() (uint64, error)` and `sm.NALookup` is `BytesLookup(key []byte) ([]byte, error)`. Implementing the three-value form satisfies nothing, produces no compile error, and leaves the optional path silently never invoked. See [State Machine Interfaces](interfaces.md).
 
 ## Apply Pipeline
 

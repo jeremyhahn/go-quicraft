@@ -16,6 +16,7 @@ package proto
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -553,10 +554,14 @@ func TestMessageBatchUnmarshalFromCraftedOffsetBeyondBuffer(t *testing.T) {
 func TestMessageBatchUnmarshalFromMaxBatchSizeIsUint64(t *testing.T) {
 	// Verify the MaxBatchSize constant is typed as uint64. This prevents
 	// accidental regression to uint32 which would reintroduce the H9
-	// truncation vulnerability.
-	var check uint64 = MaxBatchSize
-	if check != 64*1024*1024 {
-		t.Fatalf("MaxBatchSize: got %d, want %d", check, 64*1024*1024)
+	// truncation vulnerability. The reflected kind is the assertion: a
+	// `var check uint64 = MaxBatchSize` declaration says the same thing, but
+	// reads as a redundant type annotation rather than as the check it is.
+	if got := reflect.TypeOf(MaxBatchSize); got.Kind() != reflect.Uint64 {
+		t.Fatalf("MaxBatchSize is %v (kind %v), want a uint64", got, got.Kind())
+	}
+	if MaxBatchSize != 64*1024*1024 {
+		t.Fatalf("MaxBatchSize: got %d, want %d", MaxBatchSize, uint64(64*1024*1024))
 	}
 }
 

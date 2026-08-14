@@ -161,6 +161,17 @@ func DefaultFIPSKDFParams() KDFParams {
 	}
 }
 
+// checkKDFFIPS reports whether the KDF version may be used under the current
+// FIPS policy. It is the single place the rule lives, so DeriveKey and the
+// strategy constructors cannot drift apart on which KDFs a FIPS deployment may
+// derive with.
+func checkKDFFIPS(version KDFVersion) error {
+	if version == KDFArgon2id && FIPSEnabled() {
+		return ErrKDFNotFIPSApproved
+	}
+	return nil
+}
+
 // DefaultKDFVersion returns KDFPbkdf2SHA256 when FIPS mode is enabled,
 // or KDFArgon2id otherwise. This allows callers to transparently select
 // the appropriate algorithm based on the runtime FIPS policy.
@@ -174,6 +185,20 @@ func DefaultKDFVersion() KDFVersion {
 // DeriveKey derives a cryptographic key from a passphrase and salt using
 // the specified KDF version and parameters. The returned key length is
 // determined by params.KeyLen.
+//
+// FIPS: when FIPSEnabled() reports the module active, KDFArgon2id is REFUSED
+// with ErrKDFNotFIPSApproved. Argon2id is not a FIPS-approved KDF, and the
+// wrapping key it produces protects the root key that protects everything else,
+// so deriving one in a deployment that declares FIPS is the silent
+// non-compliance the mode exists to prevent — it is refused rather than logged.
+//
+// CONSEQUENCE for existing data: a blob wrapped under Argon2id cannot be
+// unsealed while FIPS mode is active, because unsealing re-derives the same
+// wrapping key. That is not a regression introduced here so much as the first
+// point at which the deployment is told; migrate by unsealing once with FIPS
+// off and re-sealing with NewSoftwareStrategyFIPS (PBKDF2-SHA256), which stamps
+// KDFPbkdf2SHA256 into SealedRootKey.Metadata and unseals identically in either
+// mode.
 func DeriveKey(passphrase, salt []byte, version KDFVersion, params KDFParams) ([]byte, error) {
 	if len(passphrase) == 0 {
 		return nil, ErrKDFInvalidPassphrase
@@ -185,6 +210,10 @@ func DeriveKey(passphrase, salt []byte, version KDFVersion, params KDFParams) ([
 	deriver, ok := kdfDispatchers[version]
 	if !ok {
 		return nil, ErrKDFUnsupportedVersion
+	}
+
+	if err := checkKDFFIPS(version); err != nil {
+		return nil, err
 	}
 
 	if err := validateKDFParams(version, params); err != nil {

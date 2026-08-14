@@ -467,7 +467,7 @@ func TestSnapshot_SessionExpiryStatePreserved(t *testing.T) {
 			{Index: 400, ClientID: 10, SeriesID: 1, Cmd: makeCmd("act", "ive")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm1, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 		// Session 20 remains at lastActiveIndex=0 (stale).
@@ -788,7 +788,7 @@ func TestSnapshot_MultipleSequentialCycles(t *testing.T) {
 				{Index: uint64(cycle*10 + 1), ClientID: 10, SeriesID: uint64(cycle + 1), Cmd: makeCmd(key, val)},
 			}
 			results := make([]sm.Result, 1)
-			if err := current.Apply(entries, results); err != nil {
+			if err := applyContiguous(t, current, entries, results); err != nil {
 				t.Fatalf("cycle %d: Apply = %v", cycle, err)
 			}
 

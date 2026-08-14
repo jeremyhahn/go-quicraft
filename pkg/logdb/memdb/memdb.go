@@ -164,6 +164,7 @@ func copyMembership(m logdb.Membership) logdb.Membership {
 	m.Observers = copyAddrMap(m.Observers)
 	m.Witnesses = copyAddrMap(m.Witnesses)
 	m.Identities = copyAddrMap(m.Identities)
+	m.RemovedIdentities = copyAddrMap(m.RemovedIdentities)
 	if m.Removed != nil {
 		removed := make(map[uint64]bool, len(m.Removed))
 		for k, v := range m.Removed {

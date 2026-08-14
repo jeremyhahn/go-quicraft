@@ -710,72 +710,26 @@ func TestEngine_RequestSnapshotRecovery_Success(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// drainCommitC and clearBatchCommitPending
+// step-worker panic recovery and clearBatchCommitPending
 // ---------------------------------------------------------------------------
 
-func TestEngine_DrainCommitC(t *testing.T) {
-	t.Run("drains all items and clears commitPending", func(t *testing.T) {
-		cfg := newTestHostConfig()
-		ldb := newTestLogDB()
-		sender := newTestSender()
-		e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-
-		commitC := make(chan *commitItem, 16)
-
-		// Create nodes and enqueue commit items.
-		nodes := make([]*Node, 3)
-		for i := range nodes {
-			nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-			nodes[i] = NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
-			nodes[i].commitPending.Store(true)
-			e.LoadNode(nodes[i])
-
-			commitC <- &commitItem{
-				node: nodes[i],
-			}
-		}
-
-		// Drain all items.
-		e.drainCommitC(commitC)
-
-		// Verify all commitPending flags are cleared.
-		for i, n := range nodes {
-			if n.commitPending.Load() {
-				t.Errorf("node %d commitPending should be false after drain", i+1)
-			}
-		}
-
-		// Verify channel is empty.
-		select {
-		case <-commitC:
-			t.Fatal("commitC should be empty after drain")
-		default:
-		}
-	})
-
-	t.Run("drain on empty channel returns immediately", func(t *testing.T) {
-		cfg := newTestHostConfig()
-		ldb := newTestLogDB()
-		sender := newTestSender()
-		e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-
-		commitC := make(chan *commitItem, 16)
-
-		// Should return immediately without blocking.
-		done := make(chan struct{})
-		go func() {
-			e.drainCommitC(commitC)
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// Expected: returned immediately.
-		case <-time.After(time.Second):
-			t.Fatal("drainCommitC blocked on empty channel")
-		}
-	})
-}
+// The two tests that lived here, TestEngine_DrainCommitC and
+// TestEngine_DrainCommitC_NotifiesWorkSignal, asserted that a step-worker panic
+// DRAINS commitC and clears commitPending on every item it wins.
+//
+// That behaviour was the defect, not the contract. commitC is the channel the
+// LIVE commit worker consumes, and it holds up to CommitCBufferSize (64) items
+// belonging to OTHER shards, so a single panic on one shard permanently failed
+// up to 64 unrelated healthy shards — and which ones was a race against the
+// consumer. Engine.drainCommitC is gone; see the rationale on the recovery in
+// runStepWorkerOnce for why the slot-reuse hazard it claimed to prevent is
+// unreachable.
+//
+// These tests are deleted rather than inverted because an inverted version must
+// drive a REAL panic through runStepWorkerOnce to mean anything, and asserting
+// on a hand-rolled stand-in is how a test ends up proving only itself. The
+// behavioural replacement — an unrelated shard's queued item survives a genuine
+// step-worker panic — belongs with the recovery change.
 
 func TestCommitWorker_ClearBatchCommitPending(t *testing.T) {
 	t.Run("clears commitPending for the batch only", func(t *testing.T) {
@@ -982,17 +936,9 @@ func TestEngine_RunCommitWorkerOnce_NormalExit(t *testing.T) {
 // Panic recovery path tests using panicking commit workers
 // ---------------------------------------------------------------------------
 
-// panicOnFirstCommit creates a commit worker whose run() panics when it
-// receives the first commitItem. This exercises the full panic recovery
-// path in runCommitWorkerOnce: recover, log, clearCommitPending, drainCommitC.
-type panicCommitWorkerHook struct {
-	*commitWorker
-	panickOnce sync.Once
-}
-
 // TestEngine_RunCommitWorkerOnce_PanicPath verifies that when a commit
 // worker panics, runCommitWorkerOnce recovers and returns panicked=true.
-// Also verifies clearCommitPending and drainCommitC are called.
+// Also verifies clearBatchCommitPending unwedges the batch's nodes.
 func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 	logBuf, restore := captureLogOutput(t)
 	defer restore()
@@ -1011,7 +957,9 @@ func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 	node.commitPending.Store(true)
 	e.LoadNode(node)
 
-	// Put a stale item in the commitC channel to exercise drainCommitC.
+	// Queue an item ahead of the panicking one. run() takes it as the batch's
+	// first item and drainCommitC folds the second in, so BOTH end up in
+	// w.batch and both must be unwedged by clearBatchCommitPending.
 	cw.commitC <- &commitItem{node: node}
 
 	// Inject a panic via retryHookForTest: SaveState returns an error,
@@ -1045,9 +993,18 @@ func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 		t.Fatalf("expected panic log message, got: %s", logOutput)
 	}
 
-	// Verify commitPending was cleared on node 0 (from clearCommitPending).
+	// Verify commitPending was cleared on both batch nodes.
 	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared by clearCommitPending after panic")
+		t.Fatal("commitPending should be cleared by clearBatchCommitPending after panic")
+	}
+	if node2.commitPending.Load() {
+		t.Fatal("commitPending should be cleared by clearBatchCommitPending after panic")
+	}
+	// A commit-worker panic must not FAIL the batch's shards. The batch's
+	// entries were never persisted, but nothing was extracted past stable
+	// storage either — the restarted worker re-derives them.
+	if node.IsFailed() || node2.IsFailed() {
+		t.Fatal("a commit worker panic must unwedge its batch's shards, not fail them")
 	}
 }
 
@@ -1356,41 +1313,6 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 	}
 	if !enqueueing.commitPending.Load() {
 		t.Fatal("commitPending was stolen from a node whose enqueue is still in flight")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DrainCommitC with work signal notification
-// ---------------------------------------------------------------------------
-
-// TestEngine_DrainCommitC_NotifiesWorkSignal verifies that drainCommitC
-// sends a work signal notification for each drained shard, enabling
-// immediate step worker re-processing.
-func TestEngine_DrainCommitC_NotifiesWorkSignal(t *testing.T) {
-	cfg := newTestHostConfig()
-	cfg.NumWorkers = 1
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-
-	commitC := make(chan *commitItem, 16)
-
-	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
-	node.commitPending.Store(true)
-	e.LoadNode(node)
-
-	commitC <- &commitItem{node: node}
-
-	e.drainCommitC(commitC)
-
-	// Verify commitPending was cleared.
-	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared after drain")
-	}
-
-	// Verify work signal was sent for shard 7.
-	ws := e.WorkSignal()
-	if !ws.HasWork(int(7 % uint64(e.NumWorkers()))) {
-		t.Fatal("expected work signal notification for shard 7")
 	}
 }
 

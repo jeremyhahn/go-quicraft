@@ -31,6 +31,31 @@ import (
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+)
+
+// ---------------------------------------------------------------------------
+// Client Timeouts
+// ---------------------------------------------------------------------------
+
+const (
+	// proposeTimeout bounds a single client write.
+	proposeTimeout = 5 * time.Second
+
+	// readTimeout bounds a single linearizable read.
+	readTimeout = 5 * time.Second
+
+	// checkTimeout bounds the porcupine search. A history the checker cannot
+	// decide within this budget fails the test: "Unknown" is not "Ok".
+	//
+	// The budget is generous because the search cost is exponential in the
+	// number of INDETERMINATE operations that land on one key without an
+	// intervening successful read, and a fault-injection run can produce an
+	// unlucky pile-up even with maxAttemptsPerOp bounding each client's chain.
+	// A decided history takes milliseconds here; the budget only matters for
+	// the tail, and spending it is preferable to reporting Unknown as though a
+	// violation had been found.
+	checkTimeout = 300 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -39,65 +64,127 @@ import (
 
 // kvInput describes an operation submitted to the KV store.
 type kvInput struct {
-	Op    string // "put" or "get"
+	Op    string // "put", "append" or "get"
 	Key   string
-	Value string // for put only
+	Value string // written value (put) or appended token (append)
 }
 
 // kvOutput describes the result of a KV store operation.
+//
+// Unknown marks an INDETERMINATE outcome: the client never learned whether
+// the operation took effect. A Raft proposal that times out, is dropped, or
+// is aborted may still commit and apply afterwards, so the checker must be
+// free to place its effect anywhere at or after the call. This is the Jepsen
+// :info case, and it is the only way a timed-out-but-actually-applied write
+// becomes visible to the checker at all.
 type kvOutput struct {
-	Value string // for get only
-	Ok    bool   // always true for successful put
+	Value   string // resulting value: the read value (get) or the accumulated value (append)
+	Ok      bool   // the write definitely took effect
+	Unknown bool   // the outcome is unknown
 }
 
-// kvModel returns a porcupine.Model for a linearizable KV store.
-// The state is map[string]string representing the current KV contents.
-// Operations are partitioned by key for parallel checking.
+// appendValue returns the value that results from appending token to current.
+func appendValue(current, token string) string {
+	if current == "" {
+		return token
+	}
+	return current + appendSep + token
+}
+
+// partitionByKey splits an event history into one partition per key. Call
+// events carry the key in their input; return events are matched back to
+// their call by Id, which is why the recorder emits calls before returns.
+func partitionByKey(history []porcupine.Event) [][]porcupine.Event {
+	keyOf := make(map[int]string, len(history))
+	partitions := make(map[string][]porcupine.Event)
+	for _, ev := range history {
+		var key string
+		if ev.Kind == porcupine.CallEvent {
+			key = ev.Value.(kvInput).Key
+			keyOf[ev.Id] = key
+		} else {
+			matched, ok := keyOf[ev.Id]
+			if !ok {
+				// A return with no preceding call is unmatchable. The
+				// recorder never produces one.
+				continue
+			}
+			key = matched
+		}
+		partitions[key] = append(partitions[key], ev)
+	}
+
+	keys := make([]string, 0, len(partitions))
+	for k := range partitions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	result := make([][]porcupine.Event, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, partitions[k])
+	}
+	return result
+}
+
+// kvModel returns a porcupine.Model for a linearizable KV store. Per-partition
+// state is the current value of one key (empty string = missing).
+//
+// The specification is deliberately NONDETERMINISTIC: an indeterminate write
+// has two legal successor states — applied and not applied — and porcupine's
+// power set construction explores both. A deterministic model would have to
+// pick one, and either choice turns a real lost write into a pass.
 func kvModel() porcupine.Model {
-	return porcupine.Model{
-		Partition: func(history []porcupine.Operation) [][]porcupine.Operation {
-			partitions := make(map[string][]porcupine.Operation)
-			for _, op := range history {
-				inp := op.Input.(kvInput)
-				partitions[inp.Key] = append(partitions[inp.Key], op)
-			}
-			result := make([][]porcupine.Operation, 0, len(partitions))
-			// Sort keys for deterministic partition ordering.
-			keys := make([]string, 0, len(partitions))
-			for k := range partitions {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				result = append(result, partitions[k])
-			}
-			return result
+	nm := porcupine.NondeterministicModel{
+		PartitionEvent: partitionByKey,
+		Init: func() []interface{} {
+			return []interface{}{""}
 		},
-		Init: func() interface{} {
-			// Per-partition state is a single string value (empty = missing).
-			return ""
-		},
-		Step: func(state interface{}, input interface{}, output interface{}) (bool, interface{}) {
+		Step: func(state interface{}, input interface{}, output interface{}) []interface{} {
+			val := state.(string)
 			inp := input.(kvInput)
 			out := output.(kvOutput)
-			val := state.(string)
 
 			switch inp.Op {
 			case "put":
-				// A put always succeeds and updates the value.
-				if !out.Ok {
-					return false, val
+				switch {
+				case out.Unknown:
+					// The write may or may not have been applied.
+					return []interface{}{val, inp.Value}
+				case out.Ok:
+					return []interface{}{inp.Value}
+				default:
+					// The write definitely did not take effect.
+					return []interface{}{val}
 				}
-				return true, inp.Value
+			case "append":
+				applied := appendValue(val, inp.Value)
+				switch {
+				case out.Unknown:
+					return []interface{}{val, applied}
+				case out.Ok:
+					// A successful append must return the exact accumulated
+					// value. A DOUBLE apply yields a value carrying the token
+					// twice, which no state reachable in this model produces —
+					// which is the whole point of using a non-idempotent
+					// operation for the session workload.
+					if out.Value != applied {
+						return nil
+					}
+					return []interface{}{applied}
+				default:
+					return []interface{}{val}
+				}
 			case "get":
-				// A get must return the current value. Empty string
-				// means key not found, which is also the initial state.
-				if out.Value == val {
-					return true, val
+				if out.Unknown {
+					return []interface{}{val}
 				}
-				return false, val
+				if out.Value != val {
+					return nil
+				}
+				return []interface{}{val}
 			default:
-				return false, val
+				return nil
 			}
 		},
 		Equal: func(state1, state2 interface{}) bool {
@@ -106,10 +193,14 @@ func kvModel() porcupine.Model {
 		DescribeOperation: func(input interface{}, output interface{}) string {
 			inp := input.(kvInput)
 			out := output.(kvOutput)
-			switch inp.Op {
-			case "put":
+			switch {
+			case out.Unknown:
+				return fmt.Sprintf("%s(%s, %s) -> unknown", inp.Op, inp.Key, inp.Value)
+			case inp.Op == "put":
 				return fmt.Sprintf("Put(%s, %s) -> ok=%v", inp.Key, inp.Value, out.Ok)
-			case "get":
+			case inp.Op == "append":
+				return fmt.Sprintf("Append(%s, %s) -> %q", inp.Key, inp.Value, out.Value)
+			case inp.Op == "get":
 				return fmt.Sprintf("Get(%s) -> %q", inp.Key, out.Value)
 			default:
 				return fmt.Sprintf("Unknown(%v) -> %v", inp, out)
@@ -123,40 +214,201 @@ func kvModel() porcupine.Model {
 			return fmt.Sprintf("%q", val)
 		},
 	}
+	return nm.ToModel()
 }
 
 // ---------------------------------------------------------------------------
 // Operation Recorder
 // ---------------------------------------------------------------------------
 
-// opRecorder safely collects porcupine.Operation entries from concurrent
-// goroutines. Each operation is assigned a monotonic timestamp pair to
-// establish a real-time ordering for the linearizability checker.
+// opRecord is one client operation as observed from outside the cluster.
+type opRecord struct {
+	id          int
+	clientID    int
+	input       kvInput
+	output      kvOutput
+	callSeq     int64
+	returnSeq   int64
+	determinate bool
+	err         error
+}
+
+// opRecorder collects EVERY operation a client issues: the ones that
+// succeeded, the ones that definitely failed, and the ones whose outcome the
+// client never learned. Nothing is dropped.
+//
+// An operation that never reaches the history cannot be checked, and a
+// per-key history containing no operations is trivially linearizable. A
+// recorder that skips failed operations therefore reports "Ok" for a cluster
+// that is losing writes, which is precisely how this harness used to pass
+// while 50% of committed entries were being discarded.
 type opRecorder struct {
-	mu  sync.Mutex
-	ops []porcupine.Operation
+	mu         sync.Mutex
+	seq        int64
+	ops        []*opRecord
+	violations []string
+	errCensus  map[string]int
+	// done counts determinately completed operations. It is atomic so a
+	// running test can watch progress without taking the recorder lock.
+	done atomic.Int64
 }
 
-// record appends an operation to the history.
-func (r *opRecorder) record(clientID int, input kvInput, output kvOutput, callTime, returnTime int64) {
-	r.mu.Lock()
-	r.ops = append(r.ops, porcupine.Operation{
-		ClientId: clientID,
-		Input:    input,
-		Output:   output,
-		Call:     callTime,
-		Return:   returnTime,
-	})
-	r.mu.Unlock()
+// completed returns the number of operations that have completed
+// determinately so far. Safe to call while clients are running.
+func (r *opRecorder) completed() int64 {
+	return r.done.Load()
 }
 
-// history returns a copy of the recorded operations.
-func (r *opRecorder) history() []porcupine.Operation {
+// begin registers a call and returns its record. Every begin MUST be followed
+// by exactly one finish or indeterminate.
+func (r *opRecorder) begin(clientID int, input kvInput) *opRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	result := make([]porcupine.Operation, len(r.ops))
-	copy(result, r.ops)
-	return result
+	r.seq++
+	rec := &opRecord{
+		id:       len(r.ops),
+		clientID: clientID,
+		input:    input,
+		callSeq:  r.seq,
+	}
+	r.ops = append(r.ops, rec)
+	return rec
+}
+
+// finish records a determinate outcome and stamps the return.
+func (r *opRecorder) finish(rec *opRecord, output kvOutput) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seq++
+	rec.output = output
+	rec.returnSeq = r.seq
+	rec.determinate = true
+	r.done.Add(1)
+}
+
+// indeterminate records an operation whose outcome is unknown. The record
+// stays in the history; events() emits its return at the very end.
+func (r *opRecorder) indeterminate(rec *opRecord, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec.err = err
+	rec.determinate = false
+	if err == nil {
+		return
+	}
+	if r.errCensus == nil {
+		r.errCensus = make(map[string]int)
+	}
+	r.errCensus[err.Error()]++
+}
+
+// violation records a protocol breach that the model cannot express, such as
+// a proposal that reports success while the state machine returns a result
+// for an entry it never applied. Any violation fails the test.
+func (r *opRecorder) violation(format string, args ...interface{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.violations = append(r.violations, fmt.Sprintf(format, args...))
+}
+
+// stats returns the recorded totals: all operations, those that completed
+// determinately, and the determinate writes and reads separately.
+func (r *opRecorder) stats() (total, determinate, writes, reads int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	total = len(r.ops)
+	for _, rec := range r.ops {
+		if !rec.determinate {
+			continue
+		}
+		determinate++
+		if rec.input.Op == "get" {
+			reads++
+		} else {
+			writes++
+		}
+	}
+	return total, determinate, writes, reads
+}
+
+// events converts the recorded history into porcupine's Event representation.
+//
+// The Event form is required because an indeterminate operation has no
+// meaningful return timestamp: its effect may land at any later point. Calls
+// and determinate returns are emitted in the real-time order in which they
+// happened; the return of an indeterminate operation is emitted at the very
+// END of the history, carrying Unknown, which leaves the checker free to
+// linearize its effect anywhere at or after the call.
+//
+// The unknown return is emitted rather than left out because porcupine
+// (v1.1.0) requires every call to have a matching return: makeLinkedEntries
+// resolves a call's match from a map keyed by Id and checkSingle assumes
+// len(history)/2 pairs, so a genuinely unmatched CallEvent panics the checker.
+// A trailing Unknown return is the same thing semantically and is exactly the
+// encoding porcupine's own Jepsen :info fixtures use.
+func (r *opRecorder) events() []porcupine.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	type stamped struct {
+		seq   int64
+		event porcupine.Event
+	}
+
+	timed := make([]stamped, 0, 2*len(r.ops))
+	pending := make([]porcupine.Event, 0, 16)
+
+	for _, rec := range r.ops {
+		timed = append(timed, stamped{
+			seq: rec.callSeq,
+			event: porcupine.Event{
+				ClientId: rec.clientID,
+				Kind:     porcupine.CallEvent,
+				Value:    rec.input,
+				Id:       rec.id,
+			},
+		})
+		if rec.determinate {
+			timed = append(timed, stamped{
+				seq: rec.returnSeq,
+				event: porcupine.Event{
+					ClientId: rec.clientID,
+					Kind:     porcupine.ReturnEvent,
+					Value:    rec.output,
+					Id:       rec.id,
+				},
+			})
+			continue
+		}
+		pending = append(pending, porcupine.Event{
+			ClientId: rec.clientID,
+			Kind:     porcupine.ReturnEvent,
+			Value:    kvOutput{Unknown: true},
+			Id:       rec.id,
+		})
+	}
+
+	sort.Slice(timed, func(i, j int) bool { return timed[i].seq < timed[j].seq })
+
+	events := make([]porcupine.Event, 0, len(timed)+len(pending))
+	for _, s := range timed {
+		events = append(events, s.event)
+	}
+	return append(events, pending...)
+}
+
+// report returns the recorded violations and the census of client-visible
+// errors, for diagnostics.
+func (r *opRecorder) report() (violations []string, census map[string]int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	violations = make([]string, len(r.violations))
+	copy(violations, r.violations)
+	census = make(map[string]int, len(r.errCensus))
+	for k, v := range r.errCensus {
+		census[k] = v
+	}
+	return violations, census
 }
 
 // ---------------------------------------------------------------------------
@@ -166,17 +418,172 @@ func (r *opRecorder) history() []porcupine.Operation {
 // LinearizabilityViolationError is returned when porcupine detects a
 // linearizability violation in the recorded operation history.
 type LinearizabilityViolationError struct {
-	Result   porcupine.CheckResult
-	NumOps   int
-	Duration time.Duration
+	Result        porcupine.CheckResult
+	NumOps        int
+	Indeterminate int
+	Duration      time.Duration
 }
 
-// Error returns a description of the linearizability violation.
+// Error returns a description of the failed check.
+//
+// porcupine.Unknown and porcupine.Illegal are reported differently because they
+// mean different things and calling both "a linearizability violation" sends
+// the reader looking for a bug the checker never found. Illegal is a proof that
+// no linearization exists. Unknown is the search budget running out, which on
+// this harness is driven by the INDETERMINATE operation count: the model is
+// deliberately nondeterministic, so each indeterminate write doubles the states
+// a partition's search has to explore. Both still fail the test — an
+// undecidable history is not a passing one — but only one of them is evidence
+// of a defect.
 func (e *LinearizabilityViolationError) Error() string {
+	if e.Result == porcupine.Unknown {
+		return fmt.Sprintf(
+			"linearizability check did not finish within %v: result=%s, ops=%d, "+
+				"indeterminate=%d. This is the search budget expiring, not a proof "+
+				"of a violation; the cost is exponential in the indeterminate count "+
+				"per key, so treat it as an intractable history rather than a defect",
+			e.Duration, e.Result, e.NumOps, e.Indeterminate,
+		)
+	}
 	return fmt.Sprintf(
-		"linearizability violation: result=%s, ops=%d, duration=%v",
-		e.Result, e.NumOps, e.Duration,
+		"linearizability violation: result=%s, ops=%d, indeterminate=%d, duration=%v",
+		e.Result, e.NumOps, e.Indeterminate, e.Duration,
 	)
+}
+
+// ---------------------------------------------------------------------------
+// Throughput Floors
+// ---------------------------------------------------------------------------
+
+// baselineWritesPerClientSecond is the MEASURED completed-write rate of a
+// single client worker on this harness. It comes from a full baseline run of
+// this file (go test -race -tags=integration, 96-core dev machine), taking
+// completed writes over the run's serving window:
+//
+//	3Node_Normal              8 clients /  5s -> 1030 writes  25.8 /client-s
+//	3Node_SnapshotDuringLoad  8 clients / 10s -> 1832 writes  22.9 /client-s
+//	3Node_FollowerRestart     4 clients / 10s ->  905 writes  22.6 /client-s
+//	5Node_RollingRestart      4 clients / 16s -> 1146 writes  17.9 /client-s
+//	4Node_ElectionSafety      4 clients /  8s ->  605 writes  18.9 /client-s
+//	3Node_LeaderRestart       4 clients /  8s ->  525 writes  16.4 /client-s
+//	3Node_SingleKeyContention 8 clients /  5s ->  595 writes  14.9 /client-s
+//	5Node_MultipleFailovers   4 clients / 11s ->  627 writes  14.3 /client-s
+//	5Node_Normal              8 clients /  5s ->  536 writes  13.4 /client-s
+//	5Node_MinorityDown        8 clients /  7s ->  740 writes  13.2 /client-s
+//	3Node_LeaderFailover      4 clients /  3s ->  144 writes  12.0 /client-s
+//	5Node_MembershipAddRemove 4 clients / 13s ->  590 writes  11.3 /client-s
+//	3Node_SessionProposal     4 clients /  4s ->  129 writes   8.1 /client-s
+//	3Node_LeaseRead           8 clients /  5s ->  265 writes   6.6 /client-s
+//	5Node_HighThroughput     16 clients / 30s -> 2632 writes   5.5 /client-s
+//
+// The floor is anchored at the SLOWEST observation (5.5), not the average, so
+// that the same formula is safe for every test in the file.
+const baselineWritesPerClientSecond = 5.4
+
+// floorFraction is the share of that baseline a run must reach. At 0.30 a run
+// has to complete roughly a third of the slowest measured rate: the tightest
+// test in the table above (5Node_HighThroughput) still has a 3.3x margin,
+// while every mutation that collapses throughput lands one to three orders of
+// magnitude below the floor.
+const floorFraction = 0.30
+
+// opsFloor is the minimum work a run must actually perform for its
+// linearizability verdict to mean anything. A history that is empty, or that
+// contains only writes, or only reads, is trivially linearizable.
+type opsFloor struct {
+	writes int
+	reads  int
+}
+
+// floorFor derives an operation floor from the shape of a run. active is the
+// portion of the run during which the cluster is expected to be serving:
+// chaos tests pass a reduced value because elections and catch-up legitimately
+// stall the clients. Reads and writes alternate, so the same floor applies to
+// both sides.
+func floorFor(numClients int, active time.Duration) opsFloor {
+	perSide := int(float64(numClients) * active.Seconds() * baselineWritesPerClientSecond * floorFraction)
+	if perSide < 1 {
+		perSide = 1
+	}
+	return opsFloor{writes: perSide, reads: perSide}
+}
+
+// ---------------------------------------------------------------------------
+// Linearizability Check Helper
+// ---------------------------------------------------------------------------
+
+// checkLinearizability runs porcupine on the recorded history and fails the
+// test if the result is not Ok, if the run recorded fewer operations than the
+// floor, or if any client observed a protocol violation.
+func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
+	t.Helper()
+
+	total, determinate, writes, reads := recorder.stats()
+	violations, census := recorder.report()
+
+	t.Logf("history: %d operations recorded, %d completed (%d writes, %d reads), %d indeterminate",
+		total, determinate, writes, reads, total-determinate)
+	if len(census) > 0 {
+		keys := make([]string, 0, len(census))
+		for k := range census {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var sb strings.Builder
+		for _, k := range keys {
+			fmt.Fprintf(&sb, "\n  %dx %s", census[k], k)
+		}
+		t.Logf("client-visible errors:%s", sb.String())
+	}
+
+	if len(violations) > 0 {
+		shown := violations
+		if len(shown) > 20 {
+			shown = shown[:20]
+		}
+		t.Errorf("protocol violations observed by clients (%d total):\n  %s",
+			len(violations), strings.Join(shown, "\n  "))
+	}
+
+	// A collapsed history is trivially linearizable, so throughput is part of
+	// the correctness assertion, not a nice-to-have statistic.
+	if writes < floor.writes {
+		t.Fatalf("write throughput collapsed: %d completed writes, floor is %d", writes, floor.writes)
+	}
+	if reads < floor.reads {
+		t.Fatalf("read throughput collapsed: %d completed reads, floor is %d", reads, floor.reads)
+	}
+
+	events := recorder.events()
+	model := kvModel()
+	checkStart := time.Now()
+	result := porcupine.CheckEventsTimeout(model, events, checkTimeout)
+	checkDuration := time.Since(checkStart)
+
+	t.Logf("porcupine result: %s (checked %d events in %v)", result, len(events), checkDuration)
+
+	if result != porcupine.Ok {
+		sampleSize := len(events)
+		if sampleSize > 20 {
+			sampleSize = 20
+		}
+		var sb strings.Builder
+		for i := 0; i < sampleSize; i++ {
+			ev := events[i]
+			kind := "call"
+			if ev.Kind == porcupine.ReturnEvent {
+				kind = "return"
+			}
+			fmt.Fprintf(&sb, "  client=%d id=%d %s %v\n", ev.ClientId, ev.Id, kind, ev.Value)
+		}
+		t.Logf("first %d events:\n%s", sampleSize, sb.String())
+		t.Fatalf("%v", &LinearizabilityViolationError{
+			Result:        result,
+			NumOps:        total,
+			Indeterminate: total - determinate,
+			Duration:      checkDuration,
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +604,27 @@ func isRetryableError(err error) bool {
 		errors.Is(err, quicraft.ErrDraining) ||
 		errors.Is(err, quicraft.ErrReadIndexNotReady) ||
 		errors.Is(err, quicraft.ErrRejected)
+}
+
+// retryBackoff returns how long a client waits before retrying after err.
+// Every error is retried; the classification only controls the pause. No
+// error path drops the operation, because a dropped operation is invisible to
+// the checker.
+func retryBackoff(err error) time.Duration {
+	if isRetryableError(err) {
+		return 5 * time.Millisecond
+	}
+	return 25 * time.Millisecond
+}
+
+// pause sleeps for d, returning early if the run is being torn down.
+func pause(d time.Duration, done <-chan struct{}) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 // findAnyLiveHost returns a live host from the cluster, preferring the leader.
@@ -223,22 +651,51 @@ func findAnyLiveHost(cluster *testCluster, shardID uint64) *quicraft.Host {
 // Client Worker
 // ---------------------------------------------------------------------------
 
+// maxAttemptsPerOp bounds how many times a client retries ONE logical
+// operation before giving up on it and moving to the next.
+//
+// It exists to keep the checker decidable, not to hide failures: every attempt
+// is still recorded, and an abandoned attempt is still an indeterminate
+// operation in the history. What it bounds is the length of an UNBROKEN run of
+// indeterminate writes on a single key. The porcupine model is deliberately
+// nondeterministic — an indeterminate write has two legal successor states — so
+// a chain of k of them on one key costs 2^k to search, and a leader outage that
+// lasts several seconds produces chains long enough for the search to exhaust
+// its whole budget. The checker then returns Unknown, which the harness
+// correctly refuses to treat as a pass, and the test fails having found
+// nothing.
+//
+// Moving on collapses the blow-up because the very next operation on that key
+// is a GET, and a successful read pins the state, cutting the chain. A healthy
+// run never reaches the cap: attempt resets to 0 on every success.
+const maxAttemptsPerOp = 10
+
 // clientWorker runs Put and Get operations against the cluster for the given
-// duration. Operations alternate between Put and Get on a shared key space.
-// All operations (including failed ones that are retried) are recorded in
-// the opRecorder with accurate timestamps for linearizability checking.
+// duration. Every operation is recorded, whether it succeeded, failed, or
+// timed out with an unknown outcome.
 func clientWorker(
+	t *testing.T,
 	cluster *testCluster,
 	shardID uint64,
 	clientID int,
 	numKeys int,
 	duration time.Duration,
 	recorder *opRecorder,
-	opsCount *atomic.Int64,
 	done <-chan struct{},
 ) {
 	deadline := time.Now().Add(duration)
 	opIdx := 0
+	attempt := 0
+	completed := 0
+
+	// A client that ran its full window without completing a single operation
+	// is a wedge, not slow progress. The aggregate floor can be met by the
+	// other clients while one is stuck, so each client asserts for itself.
+	defer func() {
+		if completed == 0 && time.Now().After(deadline) {
+			t.Errorf("client %d completed no operations in %v", clientID, duration)
+		}
+	}()
 
 	for time.Now().Before(deadline) {
 		select {
@@ -247,69 +704,99 @@ func clientWorker(
 		default:
 		}
 
-		key := fmt.Sprintf("key-%d", opIdx%numKeys)
+		// The key advances every OTHER operation so that the put at opIdx and
+		// the get at opIdx+1 target the SAME key. Deriving the key from opIdx
+		// directly makes the put and get key sets DISJOINT whenever numKeys is
+		// even, leaving every partition either write-only or read-only — and a
+		// write-only history is linearizable no matter what the cluster does
+		// with the writes.
+		key := fmt.Sprintf("key-%d", (opIdx/2)%numKeys)
 		host := findAnyLiveHost(cluster, shardID)
 		if host == nil {
-			noHostTimer := time.NewTimer(10 * time.Millisecond)
-			<-noHostTimer.C
-			noHostTimer.Stop()
+			pause(10*time.Millisecond, done)
 			continue
 		}
 
 		if opIdx%2 == 0 {
-			// Put operation.
-			value := fmt.Sprintf("v-%d-%d", clientID, opIdx)
-			input := kvInput{Op: "put", Key: key, Value: value}
+			// Every retry writes a DISTINCT value. Re-proposing the identical
+			// byte string would make a lost write indistinguishable from an
+			// idempotent rewrite, masking the very loss being retried.
+			value := fmt.Sprintf("v-%d-%d-%d", clientID, opIdx, attempt)
+			rec := recorder.begin(clientID, kvInput{Op: "put", Key: key, Value: value})
 
-			callTime := time.Now().UnixNano()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, err := host.SyncPropose(ctx, shardID, encodeKVPut(key, value))
-			returnTime := time.Now().UnixNano()
+			ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+			result, err := host.SyncPropose(ctx, shardID, encodeKVPut(key, value))
 			cancel()
 
 			if err != nil {
-				if isRetryableError(err) {
-					retryTimer := time.NewTimer(5 * time.Millisecond)
-					<-retryTimer.C
-					retryTimer.Stop()
-					continue
+				recorder.indeterminate(rec, err)
+				attempt++
+				pause(retryBackoff(err), done)
+				if attempt >= maxAttemptsPerOp {
+					// Give up on this write and move on. The attempts stay in
+					// the history as indeterminate operations; only the chain
+					// is cut. See maxAttemptsPerOp.
+					opIdx++
+					attempt = 0
 				}
-				// Non-retryable error: skip this operation.
 				continue
 			}
 
-			recorder.record(clientID, input, kvOutput{Ok: true}, callTime, returnTime)
-			opsCount.Add(1)
-		} else {
-			// Get operation via SyncRead (linearizable).
-			input := kvInput{Op: "get", Key: key}
+			// Assert on the REAL state machine result. kvStateMachine returns
+			// the length of the stored value; anything else means the entry
+			// never reached the state machine even though the proposal
+			// reported success.
+			if want := uint64(len(value)); result.Value != want {
+				recorder.violation(
+					"put(%s,%q) reported success but the state machine returned Value=%d, want %d",
+					key, value, result.Value, want)
+				recorder.indeterminate(rec, nil)
+				attempt++
+				pause(5*time.Millisecond, done)
+				continue
+			}
 
-			callTime := time.Now().UnixNano()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			recorder.finish(rec, kvOutput{Value: value, Ok: true})
+		} else {
+			rec := recorder.begin(clientID, kvInput{Op: "get", Key: key})
+
+			ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 			result, err := host.SyncRead(ctx, shardID, encodeKVGet(key))
-			returnTime := time.Now().UnixNano()
 			cancel()
 
 			if err != nil {
-				if isRetryableError(err) {
-					retryTimer := time.NewTimer(5 * time.Millisecond)
-					<-retryTimer.C
-					retryTimer.Stop()
-					continue
+				recorder.indeterminate(rec, err)
+				attempt++
+				pause(retryBackoff(err), done)
+				if attempt >= maxAttemptsPerOp {
+					opIdx++
+					attempt = 0
 				}
 				continue
 			}
 
 			val := ""
 			if result != nil {
-				val, _ = result.(string)
+				var ok bool
+				val, ok = result.(string)
+				if !ok {
+					recorder.violation("get(%s) returned %T, want string", key, result)
+					recorder.indeterminate(rec, nil)
+					attempt++
+					if attempt >= maxAttemptsPerOp {
+						opIdx++
+						attempt = 0
+					}
+					continue
+				}
 			}
 
-			recorder.record(clientID, input, kvOutput{Value: val}, callTime, returnTime)
-			opsCount.Add(1)
+			recorder.finish(rec, kvOutput{Value: val})
 		}
 
+		completed++
 		opIdx++
+		attempt = 0
 	}
 }
 
@@ -317,66 +804,40 @@ func clientWorker(
 // Session Client Worker
 // ---------------------------------------------------------------------------
 
-// sessionClientWorker is like clientWorker but uses session-managed proposals
-// (ProposeWithSession) for at-most-once delivery semantics. Each client gets
-// its own session. Reads still use SyncRead (linearizable).
+// sessionDupEvery is how often the session worker deliberately re-proposes the
+// SAME (clientID, seriesID) pair without advancing the session, exercising the
+// at-most-once dedup path directly.
+const sessionDupEvery = 8
+
+// sessionClientWorker drives the session (at-most-once) path with a
+// NON-IDEMPOTENT workload: it appends a unique token to a key rather than
+// overwriting it. The model state is therefore the sequence of applied
+// appends, so applying one entry twice produces a value the model forbids.
+//
+// This matters because a last-write-wins register cannot expose a duplicate
+// apply at all: writing "v-3-12" twice leaves exactly the same state as
+// writing it once, so a dedup layer that never dedups is invisible by
+// construction.
 func sessionClientWorker(
+	t *testing.T,
 	cluster *testCluster,
 	shardID uint64,
 	clientID int,
 	numKeys int,
 	duration time.Duration,
 	recorder *opRecorder,
-	opsCount *atomic.Int64,
 	done <-chan struct{},
 ) {
 	deadline := time.Now().Add(duration)
 
-	// Get a session from any live host.
-	var session *quicraft.Session
-	sessionTicker := time.NewTicker(10 * time.Millisecond)
-	sessionDeadline := time.NewTimer(time.Until(deadline))
-	sessionObtained := false
-	for !sessionObtained {
-		host := findAnyLiveHost(cluster, shardID)
-		if host == nil {
-			select {
-			case <-sessionDeadline.C:
-				sessionTicker.Stop()
-				sessionDeadline.Stop()
-				return
-			case <-sessionTicker.C:
-			}
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		var err error
-		session, err = host.GetNewSession(ctx, shardID)
-		cancel()
-		if err != nil {
-			if isRetryableError(err) {
-				select {
-				case <-sessionDeadline.C:
-					sessionTicker.Stop()
-					sessionDeadline.Stop()
-					return
-				case <-sessionTicker.C:
-				}
-				continue
-			}
-			sessionTicker.Stop()
-			sessionDeadline.Stop()
-			return // non-retryable error getting session
-		}
-		sessionObtained = true
-	}
-	sessionTicker.Stop()
-	sessionDeadline.Stop()
+	session := acquireSession(cluster, shardID, deadline, done)
 	if session == nil {
+		t.Errorf("client %d: could not obtain a session before the deadline", clientID)
 		return
 	}
 
 	opIdx := 0
+
 	for time.Now().Before(deadline) {
 		select {
 		case <-done:
@@ -384,109 +845,163 @@ func sessionClientWorker(
 		default:
 		}
 
-		key := fmt.Sprintf("key-%d", opIdx%numKeys)
+		key := fmt.Sprintf("sess-key-%d", (opIdx/2)%numKeys)
 		host := findAnyLiveHost(cluster, shardID)
 		if host == nil {
-			noHostTimer := time.NewTimer(10 * time.Millisecond)
-			<-noHostTimer.C
-			noHostTimer.Stop()
+			pause(10*time.Millisecond, done)
 			continue
 		}
 
 		if opIdx%2 == 0 {
-			// Put via session-managed proposal.
-			value := fmt.Sprintf("v-%d-%d", clientID, opIdx)
-			input := kvInput{Op: "put", Key: key, Value: value}
+			// The token is FIXED across retries, unlike the plain put path.
+			// A session retry keeps the same series ID, so it is the same
+			// logical operation: the engine is entitled to answer it from the
+			// dedup cache with the ORIGINAL result. Varying the payload while
+			// reusing the series ID would be a client protocol error and would
+			// make the cached response look like a mismatch.
+			token := fmt.Sprintf("t%d-%d", clientID, opIdx)
+			rec := recorder.begin(clientID, kvInput{Op: "append", Key: key, Value: token})
 
-			callTime := time.Now().UnixNano()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, err := host.SyncProposeWithSession(ctx, session, encodeKVPut(key, value))
-			returnTime := time.Now().UnixNano()
-			cancel()
-
+			// Every sessionDupEvery-th append is issued TWICE under the same
+			// seriesID to prove the dedup cache actually dedups.
+			retrySameSeries := opIdx%(2*sessionDupEvery) == 0
+			value, err := proposeAppend(host, session, key, token, retrySameSeries, recorder)
 			if err != nil {
-				if isRetryableError(err) {
-					retryTimer := time.NewTimer(5 * time.Millisecond)
-					<-retryTimer.C
-					retryTimer.Stop()
-					continue
+				recorder.indeterminate(rec, err)
+				// A rejected or invalid session cannot be retried: the series
+				// is gone, so a fresh one has to be registered before the
+				// client can make progress again.
+				if errors.Is(err, quicraft.ErrRejected) || errors.Is(err, quicraft.ErrInvalidSession) {
+					if fresh := acquireSession(cluster, shardID, deadline, done); fresh != nil {
+						session = fresh
+					}
 				}
+				pause(retryBackoff(err), done)
 				continue
 			}
 
-			recorder.record(clientID, input, kvOutput{Ok: true}, callTime, returnTime)
-			opsCount.Add(1)
+			recorder.finish(rec, kvOutput{Value: value, Ok: true})
 		} else {
-			// Get via linearizable read (same as normal clientWorker).
-			input := kvInput{Op: "get", Key: key}
+			rec := recorder.begin(clientID, kvInput{Op: "get", Key: key})
 
-			callTime := time.Now().UnixNano()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 			result, err := host.SyncRead(ctx, shardID, encodeKVGet(key))
-			returnTime := time.Now().UnixNano()
 			cancel()
 
 			if err != nil {
-				if isRetryableError(err) {
-					retryTimer := time.NewTimer(5 * time.Millisecond)
-					<-retryTimer.C
-					retryTimer.Stop()
-					continue
-				}
+				recorder.indeterminate(rec, err)
+				pause(retryBackoff(err), done)
 				continue
 			}
 
 			val := ""
 			if result != nil {
-				val, _ = result.(string)
+				var ok bool
+				val, ok = result.(string)
+				if !ok {
+					recorder.violation("get(%s) returned %T, want string", key, result)
+					recorder.indeterminate(rec, nil)
+					continue
+				}
 			}
 
-			recorder.record(clientID, input, kvOutput{Value: val}, callTime, returnTime)
-			opsCount.Add(1)
+			recorder.finish(rec, kvOutput{Value: val})
 		}
 
 		opIdx++
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Linearizability Check Helper
-// ---------------------------------------------------------------------------
+// acquireSession obtains a session from any live host, retrying until the
+// deadline. Returns nil if no session could be obtained.
+func acquireSession(cluster *testCluster, shardID uint64, deadline time.Time, done <-chan struct{}) *quicraft.Session {
+	for time.Now().Before(deadline) {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
 
-// checkLinearizability runs porcupine on the recorded history and fails the
-// test if the result is not Ok. Logs detailed diagnostics on failure.
-func checkLinearizability(t *testing.T, recorder *opRecorder, totalOps int64) {
-	t.Helper()
+		host := findAnyLiveHost(cluster, shardID)
+		if host == nil {
+			pause(10*time.Millisecond, done)
+			continue
+		}
 
-	ops := recorder.history()
-	t.Logf("checking linearizability: %d operations recorded, %d total completed", len(ops), totalOps)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		session, err := host.GetNewSession(ctx, shardID)
+		cancel()
+		if err == nil {
+			return session
+		}
+		pause(retryBackoff(err), done)
+	}
+	return nil
+}
 
-	if len(ops) == 0 {
-		t.Fatal("no operations recorded; cannot verify linearizability")
+// proposeAppend issues one session-managed append and returns the accumulated
+// value the state machine reported.
+//
+// When retrySameSeries is set, the SAME (clientID, seriesID) pair is proposed
+// a second time after the first has completed, without advancing the session.
+// The engine must recognise the retry as a duplicate and return the cached
+// response byte-for-byte; applying the append a second time would both change
+// the returned value and corrupt the key. ProposeWithSession is used instead
+// of SyncProposeWithSession precisely because the latter advances the session
+// on success, which would make the second proposal a new series.
+func proposeAppend(
+	host *quicraft.Host,
+	session *quicraft.Session,
+	key, token string,
+	retrySameSeries bool,
+	recorder *opRecorder,
+) (string, error) {
+	cmd := encodeKVAppend(key, token)
+
+	first, err := proposeOnce(host, session, cmd)
+	if err != nil {
+		return "", err
 	}
 
-	model := kvModel()
-	checkStart := time.Now()
-	result := porcupine.CheckOperationsTimeout(model, ops, 30*time.Second)
-	checkDuration := time.Since(checkStart)
-
-	t.Logf("porcupine result: %s (checked %d ops in %v)", result, len(ops), checkDuration)
-
-	if result != porcupine.Ok {
-		// Log a sample of operations for debugging.
-		sampleSize := len(ops)
-		if sampleSize > 20 {
-			sampleSize = 20
+	if retrySameSeries {
+		seriesID := session.SeriesID()
+		second, retryErr := proposeOnce(host, session, cmd)
+		switch {
+		case retryErr != nil:
+			// The retry itself is allowed to fail transiently; the original
+			// already succeeded, so the operation's outcome stands.
+		case string(second.Data) != string(first.Data) || second.Value != first.Value:
+			recorder.violation(
+				"session retry of clientID=%d seriesID=%d was applied again: first result (Value=%d, Data=%q), retry result (Value=%d, Data=%q)",
+				session.ClientID(), seriesID,
+				first.Value, string(first.Data), second.Value, string(second.Data))
 		}
-		var sb strings.Builder
-		for i := 0; i < sampleSize; i++ {
-			op := ops[i]
-			sb.WriteString(fmt.Sprintf("  client=%d input=%v output=%v call=%d return=%d\n",
-				op.ClientId, op.Input, op.Output, op.Call, op.Return))
+	}
+
+	session.ProposalCompleted()
+	return string(first.Data), nil
+}
+
+// proposeOnce submits one session proposal and waits for its apply result
+// WITHOUT advancing the session's series ID.
+func proposeOnce(host *quicraft.Host, session *quicraft.Session, cmd []byte) (sm.Result, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+	defer cancel()
+
+	rs, err := host.ProposeWithSession(ctx, session, cmd)
+	if err != nil {
+		return sm.Result{}, err
+	}
+	defer rs.Release()
+
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			return sm.Result{}, result.Err
 		}
-		t.Logf("first %d operations:\n%s", sampleSize, sb.String())
-		t.Fatalf("linearizability check failed: result=%s, ops=%d, duration=%v",
-			result, len(ops), checkDuration)
+		return sm.Result{Value: result.Value, Data: result.Data}, nil
+	case <-ctx.Done():
+		return sm.Result{}, quicraft.ErrTimeout
 	}
 }
 
@@ -509,10 +1024,13 @@ func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 	for i := range 3 {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 		key := fmt.Sprintf("warmup-%d", i)
-		_, err := leader.SyncPropose(ctx, shardID, encodeKVPut(key, "ok"))
+		result, err := leader.SyncPropose(ctx, shardID, encodeKVPut(key, "ok"))
 		cancel()
 		if err != nil {
 			t.Fatalf("warmup proposal %d failed: %v", i, err)
+		}
+		if result.Value != uint64(len("ok")) {
+			t.Fatalf("warmup proposal %d returned Value=%d, want %d", i, result.Value, len("ok"))
 		}
 	}
 
@@ -526,6 +1044,32 @@ func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 	val, ok := result.(string)
 	if !ok || val != "ok" {
 		t.Fatalf("warmup read returned unexpected value: %v", result)
+	}
+}
+
+// runClients launches numClients clientWorker goroutines and returns a
+// function that waits for them and releases the done channel.
+func runClients(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	numClients, numKeys int,
+	duration time.Duration,
+	recorder *opRecorder,
+) func() {
+	t.Helper()
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range numClients {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+			clientWorker(t, cluster, shardID, clientID, numKeys, duration, recorder, done)
+		}(i)
+	}
+	return func() {
+		wg.Wait()
+		close(done)
 	}
 }
 
@@ -552,25 +1096,14 @@ func TestLinearizability_3Node_Normal(t *testing.T) {
 
 	cluster.startShard(shardID)
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }
 
 // TestLinearizability_3Node_LeaderFailover verifies that linearizability is
@@ -584,6 +1117,7 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 		numClients = 4
 		numKeys    = 10
 		shardID    = 1
+		testDur    = 5 * time.Second
 	)
 
 	cluster := newTestCluster(t, numNodes)
@@ -591,21 +1125,11 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	// Launch clients that run for the full test duration (5s).
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, 5*time.Second, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// After 2 seconds of normal operation, kill the leader.
 	chaosTimer := time.NewTimer(2 * time.Second)
@@ -618,12 +1142,11 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("new leader elected: node[%d]", newLeaderIdx)
 
-	// Let clients continue for the remaining duration (handled by their
-	// own deadline in clientWorker).
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	// One election is expected to stall the clients, so only the serving
+	// portion of the run counts toward the floor.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
 }
 
 // TestLinearizability_5Node_Normal verifies linearizability on a 5-node
@@ -644,25 +1167,72 @@ func TestLinearizability_5Node_Normal(t *testing.T) {
 
 	cluster.startShard(shardID)
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
+}
 
-	wg.Wait()
-	close(done)
+// TestLinearizability_4Node_ElectionSafety exercises the election-safety
+// invariant on an EVEN-sized shard. Even N is where an off-by-one in the
+// quorum computation shows up: quorumOf(4) must be 3, and a quorum of 2 would
+// let two candidates each collect a "majority" and lead the same term. The
+// leader/term guard samples every host on every poll and fails immediately if
+// that ever happens, including while the killed leader is rejoining.
+func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
+	const (
+		numNodes   = 4
+		numClients = 4
+		numKeys    = 10
+		shardID    = 1
+		testDur    = 12 * time.Second
+	)
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	cluster := newTestCluster(t, numNodes)
+	defer cluster.close()
+
+	cluster.startShard(shardID)
+	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
+	warmupCluster(t, cluster, shardID)
+
+	recorder := &opRecorder{}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+
+	// Kill the leader at 3s: the surviving 3 of 4 replicas are exactly the
+	// quorum, so the new term must be won unanimously.
+	killTimer := time.NewTimer(3 * time.Second)
+	<-killTimer.C
+	killTimer.Stop()
+	t.Logf("stopping leader node[%d]", leaderIdx)
+	cluster.stopNode(leaderIdx)
+
+	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
+	t.Logf("new leader elected: node[%d]", newLeaderIdx)
+
+	// Restart the old leader at 7s. It comes back believing it led its old
+	// term; the guard keeps watching it as it rejoins.
+	restartTimer := time.NewTimer(4 * time.Second)
+	<-restartTimer.C
+	restartTimer.Stop()
+	t.Logf("restarting old leader node[%d]", leaderIdx)
+	cluster.restartNode(leaderIdx, shardID)
+
+	waitForCondition(t, failoverTimeout, "old leader rejoins", func() bool {
+		cluster.hostsMu.RLock()
+		h := cluster.hosts[leaderIdx]
+		cluster.hostsMu.RUnlock()
+		_, err := h.GetShardInfo(shardID)
+		return err == nil
+	})
+
+	wait()
+
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
 }
 
 // TestLinearizability_5Node_MultipleLeaderFailovers stresses repeated leader
@@ -684,20 +1254,11 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// First leader kill at 3s.
 	firstKillTimer := time.NewTimer(3 * time.Second)
@@ -719,10 +1280,10 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 	finalLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("final leader elected: node[%d]", finalLeaderIdx)
 
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	// Two elections are expected to stall the clients.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
 }
 
 // TestLinearizability_5Node_MinorityDown verifies that a 5-node cluster
@@ -743,20 +1304,11 @@ func TestLinearizability_5Node_MinorityDown(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// At 2s, stop 2 follower nodes (not the leader).
 	minorityTimer := time.NewTimer(2 * time.Second)
@@ -778,10 +1330,10 @@ func TestLinearizability_5Node_MinorityDown(t *testing.T) {
 	// Confirm leader is still alive with degraded quorum.
 	cluster.waitForClusterLeader(shardID, failoverTimeout)
 
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	// The leader is never killed here, so the cluster serves throughout.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-1*time.Second))
 }
 
 // TestLinearizability_3Node_SingleKeyContention tests serialization correctness
@@ -802,25 +1354,14 @@ func TestLinearizability_3Node_SingleKeyContention(t *testing.T) {
 
 	cluster.startShard(shardID)
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }
 
 // TestLinearizability_3Node_FollowerRestart verifies that WAL recovery and
@@ -842,6 +1383,7 @@ func TestLinearizability_3Node_FollowerRestart(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	// Pick a follower to stop/restart (not the leader).
@@ -854,17 +1396,7 @@ func TestLinearizability_3Node_FollowerRestart(t *testing.T) {
 	}
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// At 2s, stop the follower.
 	stopTimer := time.NewTimer(2 * time.Second)
@@ -885,15 +1417,18 @@ func TestLinearizability_3Node_FollowerRestart(t *testing.T) {
 		if cluster.stopped[followerIdx].Load() {
 			return false
 		}
-		_, err := cluster.hosts[followerIdx].GetShardInfo(shardID)
+		cluster.hostsMu.RLock()
+		h := cluster.hosts[followerIdx]
+		cluster.hostsMu.RUnlock()
+		_, err := h.GetShardInfo(shardID)
 		return err == nil
 	})
 	t.Logf("follower node[%d] has rejoined the cluster", followerIdx)
 
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	// The leader is never killed, so only follower churn slows the clients.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
 }
 
 // TestLinearizability_5Node_RollingRestart simulates a rolling deployment by
@@ -916,6 +1451,7 @@ func TestLinearizability_5Node_RollingRestart(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	// Collect follower indices (skip the leader).
@@ -927,76 +1463,36 @@ func TestLinearizability_5Node_RollingRestart(t *testing.T) {
 	}
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
+	for round, followerIdx := range followers[:3] {
+		stopTimer := time.NewTimer(3 * time.Second)
+		<-stopTimer.C
+		stopTimer.Stop()
+		t.Logf("round %d: stopping follower node[%d]", round, followerIdx)
+		cluster.stopNode(followerIdx)
+
+		restartTimer := time.NewTimer(3 * time.Second)
+		<-restartTimer.C
+		restartTimer.Stop()
+		t.Logf("round %d: restarting follower node[%d]", round, followerIdx)
+		cluster.restartNode(followerIdx, shardID)
+
+		waitForCondition(t, failoverTimeout,
+			fmt.Sprintf("follower node[%d] catches up", followerIdx),
+			func() bool {
+				cluster.hostsMu.RLock()
+				h := cluster.hosts[followerIdx]
+				cluster.hostsMu.RUnlock()
+				_, err := h.GetShardInfo(shardID)
+				return err == nil
+			})
+		t.Logf("round %d: follower node[%d] has rejoined", round, followerIdx)
 	}
 
-	// Rolling restart: stop follower[0] at 3s, restart at 6s.
-	rollingTimer0 := time.NewTimer(3 * time.Second)
-	<-rollingTimer0.C
-	rollingTimer0.Stop()
-	t.Logf("stopping follower node[%d]", followers[0])
-	cluster.stopNode(followers[0])
+	wait()
 
-	restartTimer0 := time.NewTimer(3 * time.Second)
-	<-restartTimer0.C
-	restartTimer0.Stop()
-	t.Logf("restarting follower node[%d]", followers[0])
-	cluster.restartNode(followers[0], shardID)
-	waitForCondition(t, failoverTimeout, "follower[0] catches up", func() bool {
-		_, err := cluster.hosts[followers[0]].GetShardInfo(shardID)
-		return err == nil
-	})
-	t.Logf("follower node[%d] has rejoined", followers[0])
-
-	// Rolling restart: stop follower[1] at 9s, restart at 12s.
-	rollingTimer1 := time.NewTimer(3 * time.Second)
-	<-rollingTimer1.C
-	rollingTimer1.Stop()
-	t.Logf("stopping follower node[%d]", followers[1])
-	cluster.stopNode(followers[1])
-
-	restartTimer1 := time.NewTimer(3 * time.Second)
-	<-restartTimer1.C
-	restartTimer1.Stop()
-	t.Logf("restarting follower node[%d]", followers[1])
-	cluster.restartNode(followers[1], shardID)
-	waitForCondition(t, failoverTimeout, "follower[1] catches up", func() bool {
-		_, err := cluster.hosts[followers[1]].GetShardInfo(shardID)
-		return err == nil
-	})
-	t.Logf("follower node[%d] has rejoined", followers[1])
-
-	// Rolling restart: stop follower[2] at 15s, restart at 18s.
-	rollingTimer2 := time.NewTimer(3 * time.Second)
-	<-rollingTimer2.C
-	rollingTimer2.Stop()
-	t.Logf("stopping follower node[%d]", followers[2])
-	cluster.stopNode(followers[2])
-
-	restartTimer2 := time.NewTimer(3 * time.Second)
-	<-restartTimer2.C
-	restartTimer2.Stop()
-	t.Logf("restarting follower node[%d]", followers[2])
-	cluster.restartNode(followers[2], shardID)
-	waitForCondition(t, failoverTimeout, "follower[2] catches up", func() bool {
-		_, err := cluster.hosts[followers[2]].GetShardInfo(shardID)
-		return err == nil
-	})
-	t.Logf("follower node[%d] has rejoined", followers[2])
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
 }
 
 // TestLinearizability_3Node_SnapshotDuringLoad verifies that automatic
@@ -1028,25 +1524,14 @@ func TestLinearizability_3Node_SnapshotDuringLoad(t *testing.T) {
 		return c
 	})
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }
 
 // TestLinearizability_3Node_LeaderRestart verifies that restarting a former
@@ -1068,20 +1553,11 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// At 2s, stop the leader.
 	stopLeaderTimer := time.NewTimer(2 * time.Second)
@@ -1105,15 +1581,17 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 		if cluster.stopped[leaderIdx].Load() {
 			return false
 		}
-		_, err := cluster.hosts[leaderIdx].GetShardInfo(shardID)
+		cluster.hostsMu.RLock()
+		h := cluster.hosts[leaderIdx]
+		cluster.hostsMu.RUnlock()
+		_, err := h.GetShardInfo(shardID)
 		return err == nil
 	})
 	t.Logf("old leader node[%d] has rejoined the cluster", leaderIdx)
 
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
 }
 
 // TestLinearizability_5Node_MembershipAddRemove verifies that dynamic
@@ -1135,20 +1613,11 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 
 	cluster.startShard(shardID)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
 	// At 3s, add a 6th node.
 	addNodeTimer := time.NewTimer(3 * time.Second)
@@ -1184,17 +1653,18 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 	// Confirm the cluster still has a leader after removal.
 	cluster.waitForClusterLeader(shardID, failoverTimeout)
 
-	wg.Wait()
-	close(done)
+	wait()
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
 }
 
 // TestLinearizability_3Node_SessionProposal verifies that session-managed
-// proposals (ProposeWithSession) produce a linearizable history. Sessions
-// provide at-most-once delivery semantics, ensuring duplicate proposals
-// are deduplicated by the state machine. This test exercises the session
-// registration, proposal, and series ID advancement paths.
+// proposals produce a linearizable history under a NON-IDEMPOTENT workload.
+// Sessions provide at-most-once delivery, so a duplicate apply must be
+// impossible; the append workload makes such a duplicate observable, and
+// every eighth operation is deliberately re-proposed under the same series ID
+// to check that the engine hands back the cached response instead of applying
+// the entry a second time.
 func TestLinearizability_3Node_SessionProposal(t *testing.T) {
 	const (
 		numNodes   = 3
@@ -1209,10 +1679,10 @@ func TestLinearizability_3Node_SessionProposal(t *testing.T) {
 
 	cluster.startShard(shardID)
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
 	done := make(chan struct{})
 
 	var wg sync.WaitGroup
@@ -1220,14 +1690,16 @@ func TestLinearizability_3Node_SessionProposal(t *testing.T) {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
-			sessionClientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
+			sessionClientWorker(t, cluster, shardID, clientID, numKeys, testDur, recorder, done)
 		}(i)
 	}
 
 	wg.Wait()
 	close(done)
 
-	checkLinearizability(t, recorder, totalOps.Load())
+	// Session proposals are slower than raw proposals: every eighth write
+	// costs an extra round trip, and session registration eats into the run.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-1*time.Second))
 }
 
 // TestLinearizability_3Node_LeaseRead verifies that lease-based reads
@@ -1258,25 +1730,14 @@ func TestLinearizability_3Node_LeaseRead(t *testing.T) {
 		return c
 	})
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }
 
 // TestLinearizability_5Node_HighThroughput is a sustained high-throughput
@@ -1297,23 +1758,12 @@ func TestLinearizability_5Node_HighThroughput(t *testing.T) {
 
 	cluster.startShard(shardID)
 	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
 	recorder := &opRecorder{}
-	var totalOps atomic.Int64
-	done := make(chan struct{})
+	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
+	wait()
 
-	var wg sync.WaitGroup
-	for i := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			clientWorker(cluster, shardID, clientID, numKeys, testDur, recorder, &totalOps, done)
-		}(i)
-	}
-
-	wg.Wait()
-	close(done)
-
-	checkLinearizability(t, recorder, totalOps.Load())
+	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }

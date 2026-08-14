@@ -289,7 +289,13 @@ type Config struct {
 	MaxEntrySize uint64
 
 	// MaxApplyEntrySize is the maximum total bytes of entries in a single
-	// SM.Update() call. Default: 64 MB.
+	// SM.Update() call. It also bounds the leader's replication payload, so it
+	// can never exceed MaxReplicationPayloadBytes.
+	//
+	// Default: MaxReplicationPayloadBytes (16711672 bytes, ~15.94 MB). NOT
+	// 64 MB — validateSizeLimits refuses anything above the replication bound,
+	// so 64 MB is not merely a stale figure, it is a value this field cannot
+	// legally hold.
 	MaxApplyEntrySize uint64
 
 	// MaxSnapshotSize is the maximum snapshot file size in bytes.
@@ -358,7 +364,10 @@ type Config struct {
 	// and applies the shard's value. There is currently no config change that
 	// alters the committed policy, so it is fixed for the life of the shard.
 	//
-	// Set to 0 to disable automatic expiry. Disabling is an explicit,
+	// Assign SessionExpiryDisabled to disable automatic expiry. Zero does NOT
+	// disable it — SetDefaults reads an unset field as "I did not choose" and
+	// substitutes DefaultSessionExpiryEntries, because one value cannot mean
+	// both that and "never expire anything". Disabling is an explicit,
 	// replicated choice, not an absent one. When disabled, sessions are only
 	// removed via explicit unregister or when the MaxTotalSessions limit
 	// forces rejection of new registrations, so a client that registers a

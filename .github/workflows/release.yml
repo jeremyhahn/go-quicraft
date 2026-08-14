@@ -17,12 +17,22 @@ permissions:
 
 env:
   GO_VERSION: "1.26.6"
+  # Same rationale as the GOWORK=off inside the tag validation below, applied
+  # to every job: nothing here may resolve through a workspace.
+  GOWORK: "off"
 
 jobs:
-  release:
-    name: Validate and publish
+  # Split out of the old single `release` job so that a malformed tag fails in
+  # seconds instead of after the ~10 minutes of gates below it. The step bodies
+  # are unchanged — this is the same semver / VERSION / CHANGELOG / v2-suffix
+  # validation, just hoisted into a job the gates and the publish depend on.
+  validate:
+    name: Validate tag
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,10 +86,145 @@ jobs:
             exit 1
           fi
 
-      # Smoke check only. The full gate (lint, gosec, govulncheck, trivy,
-      # -race tests, coverage threshold) runs in ci.yml on the commit this tag
-      # points at; repeating it here would double a 30-minute pipeline. What
-      # this catches is a tag placed on a commit that does not build.
+  # ==========================================================================
+  # Release gates
+  #
+  # The old comment here said the full gate "runs in ci.yml on the commit this
+  # tag points at". That was an assumption, not a guarantee: ci.yml triggers on
+  # pushes and pull requests against master/main/develop, never on a tag, so a
+  # tag placed on any other commit — a release branch, a cherry-pick, a commit
+  # that was force-pushed away — published with nothing but this job's smoke
+  # check behind it. And even a tag on main had only the UNTAGGED suite behind
+  # it, because until now that was all ci.yml ran.
+  #
+  # A module tag cannot be retracted, so these run here, on the exact tagged
+  # tree, and `release` cannot start until every one of them is green. They are
+  # the same commands as the corresponding ci.yml jobs; keep them in step.
+  # ==========================================================================
+
+  integration:
+    name: Gate - integration suite
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      # -p 1: see the identical step in ci.yml. Concurrent multi-node QUIC
+      # packages under -race starve the runner and flake snapshot catch-up.
+      - name: Run integration suite
+        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
+  errfs:
+    name: Gate - errfs injection
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run errfs suite
+        run: go test -race -count=1 -tags=quicraft_errfs ./test/errfs/...
+
+  fuzz:
+    name: Gate - fuzz ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - ./pkg/proto
+          - ./pkg/internal/transport
+          - ./pkg/internal/session
+          - ./pkg/internal/raft
+          - ./pkg/logdb/waldb
+          - ./pkg/seal
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Two passes with different jobs to do. The seed pass is the gate: it is
+      # deterministic, it covers every target, and it must pass. The bounded
+      # mutation pass afterwards is a last look for a crash that the committed
+      # corpus does not already encode — 10s per target, not a real fuzzing
+      # budget (that is fuzz.yml's nightly schedule), but a release is the one
+      # moment where spending a couple of extra minutes is obviously correct.
+      - name: Seed and committed-corpus pass
+        run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
+
+      - name: Bounded mutation pass
+        run: |
+          set -euo pipefail
+          TARGETS="$(go test -tags=quicraft_fuzz -list='^Fuzz' '${{ matrix.package }}' | grep '^Fuzz' || true)"
+          if [ -z "${TARGETS}" ]; then
+            echo "FAIL: no fuzz targets found in ${{ matrix.package }}"
+            exit 1
+          fi
+          for target in ${TARGETS}; do
+            echo "==> ${target}"
+            go test -tags=quicraft_fuzz -count=1 -run='^$' \
+              -fuzz="^${target}\$" -fuzztime=10s '${{ matrix.package }}'
+          done
+
+  modules:
+    name: Gate - sibling modules build
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # ci.yml fans these out across a matrix for parallelism; a release runs
+      # rarely enough that a serial loop is not worth a second discovery job.
+      # Discovered rather than listed for the same reason as there: a go.mod
+      # nobody remembered to enrol is precisely the failure being prevented.
+      - name: Build and vet every module in the tree
+        run: |
+          set -euo pipefail
+          for dir in $(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort); do
+            echo "==> ${dir}"
+            (cd "${dir}" && go build ./... && go vet ./...)
+          done
+
+  release:
+    name: Publish
+    runs-on: ubuntu-latest
+    # Nothing publishes until every gate above is green. This is the whole
+    # point of the restructuring: the tag is the artifact, and it is permanent.
+    needs: [validate, integration, errfs, fuzz, modules]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Smoke check only; the gate jobs above carry the real weight. What this
+      # still catches on its own is a tag placed on a commit that does not
+      # build at all.
       - name: Build
         run: go build ./...
 
@@ -97,7 +242,7 @@ jobs:
       # which are the whole upgrade procedure for this project today.
       - name: Extract changelog section
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           awk -v ver="$VERSION" '
@@ -124,6 +269,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: v${{ steps.meta.outputs.version }}
-          prerelease: ${{ steps.meta.outputs.prerelease }}
+          name: v${{ needs.validate.outputs.version }}
+          prerelease: ${{ needs.validate.outputs.prerelease }}
           body_path: release-notes.md

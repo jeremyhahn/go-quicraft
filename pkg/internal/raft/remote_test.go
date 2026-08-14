@@ -603,9 +603,15 @@ func TestSnapshotDoneStaysPausedUntilAck(t *testing.T) {
 	if !r.isPaused() {
 		t.Fatal("expected peer to stay paused after snapshotDone")
 	}
-	// Countdown: expires exactly on the waitTicks-th tick.
-	if r.tickSnapshotWait() || r.tickSnapshotWait() {
-		t.Fatal("countdown must not expire before waitTicks ticks")
+	// Countdown: expires exactly on the waitTicks-th tick. Each call IS one
+	// tick, so the pre-expiry ticks are asserted one statement at a time —
+	// folding them into a single `||` would hide which tick expired early
+	// behind short-circuit evaluation.
+	if r.tickSnapshotWait() {
+		t.Fatal("countdown expired on tick 1, before waitTicks ticks")
+	}
+	if r.tickSnapshotWait() {
+		t.Fatal("countdown expired on tick 2, before waitTicks ticks")
 	}
 	if !r.tickSnapshotWait() {
 		t.Fatal("countdown must expire on the final tick")

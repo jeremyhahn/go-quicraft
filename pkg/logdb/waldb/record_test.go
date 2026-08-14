@@ -273,9 +273,12 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 // [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] = 11 bytes.
 //
 // The constant is pinned rather than derived because it IS the on-disk format:
-// changing it silently would leave every previously written segment unreadable
-// with no version bump beside it. If this test needs updating, walFormatVersion
-// needs updating in the same commit.
+// changing it leaves every previously written segment unreadable. Under the
+// pre-release pinning policy that is a permitted change and walFormatVersion
+// does NOT move for it — the framing changes in place at version 1 and every
+// dev directory is wiped. What this test protects is that the change is
+// deliberate: an accidental edit to recordHeaderSize would silently make this
+// build unable to read segments it wrote an hour ago.
 func TestRecordHeaderSize(t *testing.T) {
 	if recordHeaderSize != 11 {
 		t.Fatalf("recordHeaderSize = %d, want 11", recordHeaderSize)

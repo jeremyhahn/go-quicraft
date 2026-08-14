@@ -30,7 +30,7 @@ const boolMapEntryBytes = 8 + 8
 
 // maxMapSizeHint bounds the capacity hint passed to make(map...) when the
 // entry count comes off the wire. The count is bounded by
-// maxMembershipEntries and cross-checked against the remaining buffer, but
+// MaxMembershipEntries and cross-checked against the remaining buffer, but
 // a hint is honoured before a single entry is parsed, so it is clamped
 // independently: memberships are small, and a larger map grows on demand.
 const maxMapSizeHint = 64
@@ -88,8 +88,8 @@ func putBytes(buf []byte, data []byte) int {
 // Returns the data slice (aliased into buf for zero-copy), total bytes
 // consumed, and any error. Returns nil data for zero-length payloads.
 // errOverLimit is returned when the length prefix exceeds maxLen, so each
-// call site reports its own sentinel (ErrChecksumTooLong, ErrMetadataTooLong,
-// ErrChunkDataTooLong, ...) and errors.Is matching works per field.
+// call site reports its own sentinel (ErrMetadataTooLong, ErrChunkDataTooLong,
+// ...) and errors.Is matching works per field.
 func getBytes(buf []byte, maxLen uint32, errOverLimit error) ([]byte, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
@@ -206,7 +206,7 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 		return nil, 0, ErrBufferTooSmall
 	}
 	count := binary.LittleEndian.Uint32(buf)
-	if count > maxMembershipEntries {
+	if count > MaxMembershipEntries {
 		return nil, 0, ErrTooManyMembershipEntries
 	}
 	offset := 4
@@ -246,6 +246,35 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 	return m, offset, nil
 }
 
+// checkWritableMap mirrors getMap's limits on the WRITE side: the entry count
+// against MaxMembershipEntries and every value against MaxAddressLength.
+//
+// Without it putMap narrows len(m) with uint32(len(m)) against no preceding
+// bound, and emits values getMap will refuse — bytes that are durable and
+// unreadable. It reports the SAME sentinels getMap does, because the whole
+// point is that a value either round-trips or is refused identically at both
+// ends.
+func checkWritableMap(m map[uint64]string) error {
+	if len(m) > MaxMembershipEntries {
+		return ErrTooManyMembershipEntries
+	}
+	for _, v := range m {
+		if len(v) > MaxAddressLength {
+			return ErrAddressTooLong
+		}
+	}
+	return nil
+}
+
+// checkWritableBoolMap mirrors getBoolMap's entry-count limit on the write
+// side. A bool map has no per-value length, so the count is the whole check.
+func checkWritableBoolMap(m map[uint64]bool) error {
+	if len(m) > MaxMembershipEntries {
+		return ErrTooManyMembershipEntries
+	}
+	return nil
+}
+
 // boolMapSize returns the encoded size of a map[uint64]bool:
 // [count:4] + count * [key:8][value:8].
 func boolMapSize(m map[uint64]bool) int {
@@ -277,7 +306,7 @@ func getBoolMap(buf []byte) (map[uint64]bool, int, error) {
 		return nil, 0, ErrBufferTooSmall
 	}
 	count := binary.LittleEndian.Uint32(buf)
-	if count > maxMembershipEntries {
+	if count > MaxMembershipEntries {
 		return nil, 0, ErrTooManyMembershipEntries
 	}
 	offset := 4

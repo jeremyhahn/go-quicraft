@@ -230,7 +230,6 @@ func TestPendingRegistration_CloseRace_CallerNeverOrphaned(t *testing.T) {
 			func() (*RequestState, error) { return h.ReadIndex(ctx, 1) },
 		}
 		for _, op := range ops {
-			op := op
 			wg.Add(1)
 			go func() {
 				defer wg.Done()

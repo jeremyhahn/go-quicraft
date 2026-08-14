@@ -122,9 +122,9 @@ func TestMessage_UnmarshalFrom_EntryCountExceedsBuffer(t *testing.T) {
 // version byte and the given Addresses map count, supplying no map entry
 // bytes.
 func craftedMembership(count uint32) []byte {
-	buf := make([]byte, membershipFixedSizeV4+4)
+	buf := make([]byte, membershipFixedSize+4)
 	buf[0] = membershipFormatVersion
-	putUint32(buf[membershipFixedSizeV4:], count)
+	putUint32(buf[membershipFixedSize:], count)
 	return buf
 }
 
@@ -132,10 +132,10 @@ func craftedMembership(count uint32) []byte {
 // the remaining buffer cannot hold is rejected before make(map...). Before the
 // cross-check this 29-byte payload allocated ~437 KB.
 func TestMembership_UnmarshalFrom_MapCountExceedsBuffer(t *testing.T) {
-	buf := craftedMembership(maxMembershipEntries)
-	if len(buf) != membershipFixedSizeV4+4 {
+	buf := craftedMembership(MaxMembershipEntries)
+	if len(buf) != membershipFixedSize+4 {
 		t.Fatalf("crafted membership = %d bytes, want %d",
-			len(buf), membershipFixedSizeV4+4)
+			len(buf), membershipFixedSize+4)
 	}
 	var m Membership
 	if _, err := m.UnmarshalFrom(buf); !errors.Is(err, ErrBufferTooSmall) {
@@ -155,7 +155,7 @@ func TestMembership_UnmarshalFrom_MapCountExceedsBuffer(t *testing.T) {
 // same cross-check (16 bytes per entry).
 func TestGetBoolMap_CountExceedsBuffer(t *testing.T) {
 	buf := make([]byte, 4+8) // count prefix plus a partial entry
-	putUint32(buf, maxMembershipEntries)
+	putUint32(buf, MaxMembershipEntries)
 	if _, _, err := getBoolMap(buf); !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getBoolMap = %v, want ErrBufferTooSmall", err)
 	}

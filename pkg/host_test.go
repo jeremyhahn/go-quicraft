@@ -3424,7 +3424,6 @@ func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 
 	startC := make(chan struct{})
 	for i := 0; i < numProposals; i++ {
-		i := i
 		go func() {
 			<-startC
 			rs := newRequestState(pool, uint64(i+1000), time.Time{}, true)
@@ -7267,13 +7266,6 @@ func TestHealthCheck_DiskFull(t *testing.T) {
 	h.diskFull.Store(true)
 
 	status := h.HealthCheck()
-	if !status.DiskOK {
-		// DiskOK should be false since we set diskFull to true. But wait,
-		// the code reads diskFull as !diskFull.Load() for DiskOK.
-		// So if diskFull is true, DiskOK should be false.
-		// This is what we expect. But the status itself might still be "ok"
-		// since DiskOK doesn't affect the status string.
-	}
 	if status.DiskOK {
 		t.Error("DiskOK should be false when disk is full")
 	}

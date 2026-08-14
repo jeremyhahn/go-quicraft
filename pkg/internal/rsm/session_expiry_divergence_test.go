@@ -95,7 +95,7 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		}
 		for i, entries := range steps {
 			results := make([]sm.Result, len(entries))
-			if err := replica.Apply(entries, results); err != nil {
+			if err := applyContiguous(t, replica, entries, results); err != nil {
 				t.Fatalf("Apply step %d = %v", i, err)
 			}
 		}
@@ -315,7 +315,7 @@ func TestSessionExpiry_DisabledSentinelAppliesEverything(t *testing.T) {
 	// A far-future index must not expire the session either: the threshold is
 	// unreachable by construction, not merely large.
 	far := []proto.Entry{{Index: 1 << 40, Cmd: makeCmd("c", "3")}}
-	if err := rsm.Apply(far, make([]sm.Result, 1)); err != nil {
+	if err := applyContiguous(t, rsm, far, make([]sm.Result, 1)); err != nil {
 		t.Fatalf("Apply(far) = %v", err)
 	}
 	if !rsm.Sessions().IsRegistered(clientID) {

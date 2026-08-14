@@ -145,15 +145,9 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 	t.Logf("majority partition (leader + 1 follower) committed %d entries", len(expected))
 
 	// Heal partition: remove stopped node and add a replacement.
-	leaderHost := cluster.hosts[activeLeaderIdx]
 	partitionedReplicaID := uint64(partitionedIdx + 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, partitionedReplicaID, 0); err != nil {
-		cancel()
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", partitionedReplicaID, err)
-	}
-	cancel()
+	syncDeleteNode(t, cluster, shardID, partitionedReplicaID, membershipTimeout)
 
 	t.Logf("removed partitioned node[%d] (replica=%d) from membership",
 		partitionedIdx, partitionedReplicaID)
@@ -402,18 +396,12 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 	// Heal partition: remove stopped nodes from membership and add
 	// replacements. This simulates the old leader stepping down and
 	// rejoining as a follower (via replacement).
-	newLeaderHost := cluster.hosts[newLeaderIdx]
 	stoppedNodes := []int{oldLeaderIdx, additionalPartitionIdx}
 
 	for idx, stoppedIdx := range stoppedNodes {
 		oldReplicaID := uint64(stoppedIdx + 1)
 
-		ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-		if err := newLeaderHost.SyncRequestDeleteNode(ctx, shardID, oldReplicaID, 0); err != nil {
-			cancel()
-			t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", oldReplicaID, err)
-		}
-		cancel()
+		syncDeleteNode(t, cluster, shardID, oldReplicaID, membershipTimeout)
 
 		t.Logf("removed stopped node[%d] (replica=%d) from membership",
 			stoppedIdx, oldReplicaID)
@@ -492,9 +480,22 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 
 // TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommit
 // is the error-path companion to TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority.
-// It verifies that the old leader, once isolated from the majority, cannot
-// commit new proposals (it has lost quorum). Meanwhile the majority must
-// elect a new leader and continue serving.
+// It verifies that the old leader, once cut off from the majority, cannot
+// commit new proposals.
+//
+// The proposal now goes to the OLD LEADER, which stays RUNNING. The previous
+// version stopped (closed) the old leader and then proposed to the NEW one, so
+// the only thing it established was that a healthy leader can commit — the
+// named property, that an isolated old leader cannot, was never exercised at
+// all, and the test passed on a build with no quorum rule.
+//
+// The harness has no per-link filtering (see the file header), so isolation is
+// produced the only way it can be: three of the five nodes are stopped, leaving
+// the old leader in a live minority of two. That is a real loss of quorum for a
+// live leader, which is the condition under test. The companion assertion — a
+// majority electing a new leader and continuing to serve — cannot coexist with
+// it here (a running old leader is reachable by everyone, so no rival majority
+// can form) and is covered by TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority.
 func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommit(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -510,58 +511,67 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommi
 
 	t.Logf("old leader: node[%d]", oldLeaderIdx)
 
-	// Find one additional follower to partition with the leader.
-	additionalIdx := -1
+	// Positive control: this leader commits without difficulty while it holds
+	// a majority. Without it, a build that cannot commit anything at all would
+	// satisfy the negative assertion below for entirely the wrong reason.
+	proposeAndWait(t, cluster, trackers, shardID, "quorum-intact", "committed")
+	waitForReplication(t, cluster, trackers, shardID, "quorum-intact", "committed", defaultTimeout)
+
+	// Cut the leader off from the majority by stopping three of the four
+	// followers. The leader itself keeps running with one follower: 2 of 5.
+	stopped := 0
 	for i := range cluster.hosts {
-		if i == oldLeaderIdx {
+		if i == oldLeaderIdx || stopped >= 3 {
 			continue
 		}
-		additionalIdx = i
-		break
+		cluster.stopNode(i)
+		stopped++
 	}
-
-	// Stop old leader and one follower (minority partition).
-	cluster.stopNode(oldLeaderIdx)
-	cluster.stopNode(additionalIdx)
-
-	if cluster.liveNodes() != 3 {
-		t.Fatalf("expected 3 live nodes, got %d", cluster.liveNodes())
+	if stopped != 3 {
+		t.Fatalf("expected to stop 3 followers, stopped %d", stopped)
 	}
-
-	// The 3-node majority must elect a new leader.
-	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
-
-	if newLeaderIdx == oldLeaderIdx || cluster.stopped[newLeaderIdx].Load() {
-		t.Fatalf("invalid new leader: node[%d] (old=%d)", newLeaderIdx, oldLeaderIdx)
+	if cluster.liveNodes() != 2 {
+		t.Fatalf("expected 2 live nodes (old leader + 1 follower), got %d", cluster.liveNodes())
 	}
-
-	// The new leader must be able to commit proposals.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("majority-only", "committed")
-	rs, err := cluster.hosts[newLeaderIdx].Propose(ctx, shardID, cmd)
-	if err != nil {
-		t.Fatalf("Propose through new leader failed: %v", err)
+	if cluster.stopped[oldLeaderIdx].Load() {
+		t.Fatalf("the old leader node[%d] must stay running for this test", oldLeaderIdx)
 	}
-	rs.Release()
+	t.Logf("old leader node[%d] left running in a 2-of-5 minority", oldLeaderIdx)
 
-	// Verify the proposal was applied on the new leader.
-	newLeaderReplicaID := uint64(newLeaderIdx + 1)
-	newLeaderSM := trackers[newLeaderIdx].Get(shardID, newLeaderReplicaID)
-	if newLeaderSM == nil {
-		t.Fatal("new leader state machine not found")
+	// Propose through the still-running old leader. Accepting the proposal
+	// into its log is legal; reporting it committed is not.
+	const isolatedKey = "isolated-leader-write"
+	const isolatedVal = "must-never-commit"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rs, err := cluster.hosts[oldLeaderIdx].Propose(ctx, shardID, encodeKVPut(isolatedKey, isolatedVal))
+	if err == nil {
+		_, resErr := rs.Result()
+		rs.Release()
+		if resErr == nil {
+			cancel()
+			t.Fatalf("the isolated old leader node[%d] reported %q as committed with only "+
+				"%d of 5 nodes alive", oldLeaderIdx, isolatedKey, cluster.liveNodes())
+		}
+		t.Logf("old leader node[%d]: proposal accepted but never committed: %v", oldLeaderIdx, resErr)
+	} else {
+		t.Logf("old leader node[%d]: Propose rejected outright: %v", oldLeaderIdx, err)
 	}
-	waitForCondition(t, defaultTimeout,
-		"new leader applies majority-only key",
-		func() bool {
-			val, ok := newLeaderSM.Get("majority-only")
-			return ok && val == "committed"
-		},
+	cancel()
+
+	// The decisive assertion: the value must not have been applied anywhere.
+	assertKeyAbsentEverywhere(t, cluster, trackers, shardID, isolatedKey, 2*time.Second)
+
+	// The pre-partition data must still be intact on the minority side; losing
+	// quorum must not lose committed state.
+	waitForReplication(t, cluster, trackers, shardID, "quorum-intact", "committed", defaultTimeout)
+
+	// And the isolated leader must eventually step down rather than keep
+	// claiming leadership it can no longer support.
+	waitForCondition(t, failoverTimeout,
+		"isolated old leader steps down",
+		func() bool { return cluster.findLeader(shardID) < 0 },
 	)
-
-	t.Logf("new leader node[%d] committed proposal while old leader node[%d] is partitioned",
-		newLeaderIdx, oldLeaderIdx)
+	t.Logf("isolated old leader node[%d] stepped down; no leader in the minority", oldLeaderIdx)
 }
 
 // TestE2E_AsymmetricPartition_FollowerIsolated verifies that when a single
@@ -655,14 +665,8 @@ func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 
 	// Heal: remove the isolated follower and add a replacement that
 	// must catch up via log replication or snapshot transfer.
-	activeLeaderHost := cluster.hosts[activeLeaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	if err := activeLeaderHost.SyncRequestDeleteNode(ctx, shardID, isolatedReplicaID, 0); err != nil {
-		cancel()
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", isolatedReplicaID, err)
-	}
-	cancel()
+	syncDeleteNode(t, cluster, shardID, isolatedReplicaID, membershipTimeout)
 
 	t.Logf("removed isolated follower node[%d] (replica=%d) from membership",
 		isolatedIdx, isolatedReplicaID)
@@ -803,14 +807,8 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	t.Logf("wrote 20 entries during isolation (expected snapshot compaction)")
 
 	// Heal: replace the isolated follower.
-	activeLeaderHost := cluster.hosts[activeLeaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	if err := activeLeaderHost.SyncRequestDeleteNode(ctx, shardID, isolatedReplicaID, 0); err != nil {
-		cancel()
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", isolatedReplicaID, err)
-	}
-	cancel()
+	syncDeleteNode(t, cluster, shardID, isolatedReplicaID, membershipTimeout)
 
 	newReplicaID := uint64(10)
 	result := addNodeToCluster(t, cluster, shardID, newReplicaID, cfgFn)
@@ -821,6 +819,13 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	// the log entries before compaction are no longer available.
 	// Verify it has all expected data.
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
+
+	// ...and verify the recovery path itself. This test exists to exercise
+	// "snapshot-based recovery path rather than log replication", and the key
+	// set cannot tell the two apart: both leave the same data behind. The
+	// state machine's own RecoverFromSnapshot count can.
+	assertCaughtUpViaSnapshot(t, result.tracker, shardID, newReplicaID, membershipTimeout)
+	assertSnapshotTaken(t, cluster, activeLeaderIdx)
 
 	// Write one more entry to confirm the cluster is fully operational
 	// after snapshot-based recovery.

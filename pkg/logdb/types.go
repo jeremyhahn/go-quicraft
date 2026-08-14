@@ -117,6 +117,26 @@ type Membership struct {
 	// closes. Under the strict posture the same replica instead drops all
 	// quorum-bearing traffic and the shard stops making progress.
 	Identities map[uint64]string
+	// RemovedIdentities maps a REMOVED replica ID to the identity the
+	// configuration held for it when the removal committed (see
+	// proto.Membership.RemovedIdentities). It is the deny-list the receive-side
+	// gate evaluates against the AUTHENTICATED connection identity, rather than
+	// against the claimed msg.From that a removed replica can simply change.
+	//
+	// It must survive this round-trip for a sharper reason than Identities. A
+	// dropped Identities map degrades authorization to the address check; a
+	// dropped RemovedIdentities map REVOKES A REVOCATION. The replica comes
+	// back having forgotten which keypairs it ejected, so a decommissioned node
+	// that still holds its certificate is readmitted — silently, with no error
+	// anywhere, and precisely on the restart an operator performs after
+	// removing it. Certificate revocation is the only remaining control at that
+	// point, and it is opt-in.
+	//
+	// Its key set is a strict subset of Removed's: an entry appears only when a
+	// removal commits for a member that had a committed identity. A backend
+	// that persists Removed and drops this map is therefore internally
+	// inconsistent, not merely lossy.
+	RemovedIdentities map[uint64]string
 }
 
 // Snapshot represents persisted snapshot metadata.

@@ -32,4 +32,14 @@ var (
 	// ErrClosed is returned by read operations (Lookup/NALookup/NALookupBuf)
 	// when the state machine has been closed.
 	ErrClosed = errors.New("rsm: state machine is closed")
+
+	// ErrApplyGap is returned by Apply when the offered batch does not
+	// continue exactly where the previous one stopped. It mirrors the
+	// engine-level ErrApplyGap one layer down and exists because the state
+	// machine keeps its OWN applied counter: a batch that starts above
+	// lastApplied+1 means either committed entries were dropped or the
+	// counter was never seeded from the recovered index, and both make the
+	// session expiry checkpoint walk run against a different entry sequence
+	// than every other replica ran it against.
+	ErrApplyGap = errors.New("rsm: committed entry gap before apply")
 )

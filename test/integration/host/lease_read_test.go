@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -152,7 +154,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 
 	const shardID uint64 = 1
 
-	_ = cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
+	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
@@ -178,6 +180,19 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 	var writerWg, readerWg sync.WaitGroup
 	errCh := make(chan error, (numWriters*numWrites)+(numReaders*100))
 
+	// pollKey is the key the readers poll: the last key writer 0 writes.
+	pollKey := fmt.Sprintf("writer-0-%03d", numWrites-1)
+	pollVal := fmt.Sprintf("val-0-%03d", numWrites-1)
+
+	// pollKeyWritten is set once writer 0's SyncPropose for pollKey has
+	// returned successfully, which means the entry is committed and applied.
+	// From that instant a linearizable read of pollKey MUST return its value.
+	var pollKeyWritten atomic.Bool
+
+	// written records every value a writer committed, for the final check.
+	var writtenMu sync.Mutex
+	written := make(map[string]string, numWriters*numWrites)
+
 	// Launch writers.
 	for w := range numWriters {
 		writerWg.Add(1)
@@ -191,32 +206,60 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 				_, wErr := leaderHost.SyncPropose(wCtx, shardID, encodeKVPut(key, value))
 				wCancel()
 				if wErr != nil {
+					// Errorf-style reporting via errCh, not t.Fatal: this
+					// runs on a non-test goroutine, where t.Fatal would only
+					// stop this goroutine and let the test continue.
 					errCh <- fmt.Errorf("writer %d entry %d: %w", workerID, i, wErr)
 					return
+				}
+				writtenMu.Lock()
+				written[key] = value
+				writtenMu.Unlock()
+				if key == pollKey {
+					pollKeyWritten.Store(true)
 				}
 			}
 		}(w)
 	}
 
-	// Launch readers that perform SyncRead on the leader. Each reader
-	// reads a fixed key that writer-0 will have written, verifying that
-	// once a value is read, subsequent reads never return an empty string
-	// (no stale/regression).
+	// Launch readers that perform SyncRead on the leader. Each reader reads a
+	// fixed key that writer-0 will have written, verifying that a read issued
+	// after that key was committed never comes back empty and that values
+	// never regress.
 	for r := range numReaders {
 		readerWg.Add(1)
 		go func(readerID int) {
 			defer readerWg.Done()
 			lastSeen := ""
 			for !writesDone.Load() {
-				key := fmt.Sprintf("writer-0-%03d", numWrites-1)
+				// Sampled BEFORE the read: if the key was already committed
+				// when this read STARTED, a linearizable read must observe
+				// it, so an empty value is a stale read and not a race.
+				committedBeforeRead := pollKeyWritten.Load()
+
 				rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
-				result, rErr := leaderHost.SyncRead(rCtx, shardID, key)
+				result, rErr := leaderHost.SyncRead(rCtx, shardID, pollKey)
 				rCancel()
 				if rErr != nil {
 					continue
 				}
 				val, ok := result.(string)
-				if !ok || val == "" {
+				if !ok {
+					errCh <- fmt.Errorf("reader %d: SyncRead(%q) returned %T, want string",
+						readerID, pollKey, result)
+					return
+				}
+				if val == "" {
+					// An empty value is what a MISSING key returns. Skipping
+					// it as noise — the previous behaviour — discarded
+					// exactly the stale read this test exists to detect.
+					if committedBeforeRead {
+						errCh <- fmt.Errorf(
+							"reader %d: stale read on key %q: the key was committed before "+
+								"this read started, but the read returned an empty value "+
+								"(what a missing key returns)", readerID, pollKey)
+						return
+					}
 					continue
 				}
 				// Once we've seen a non-empty value, it must never regress.
@@ -241,6 +284,24 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 	for e := range errCh {
 		t.Errorf("concurrent error: %v", e)
 	}
+
+	// Every write that was accepted must be present with its own value on
+	// every node: the reader loop alone asserts nothing about the writes that
+	// were not polled.
+	writtenMu.Lock()
+	finalWritten := make(map[string]string, len(written))
+	for k, v := range written {
+		finalWritten[k] = v
+	}
+	writtenMu.Unlock()
+
+	if len(finalWritten) != numWriters*numWrites {
+		t.Fatalf("only %d of %d writes were accepted", len(finalWritten), numWriters*numWrites)
+	}
+	if got := finalWritten[pollKey]; got != pollVal {
+		t.Fatalf("poll key %q recorded value %q, want %q", pollKey, got, pollVal)
+	}
+	verifyAllData(t, cluster, trackers, shardID, finalWritten)
 }
 
 // TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover verifies that
@@ -430,6 +491,14 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 	// maxWritten tracks the highest sequence number written per key.
 	maxWritten := make([]atomic.Int64, totalKeys)
 
+	// keyWritten records that a key has at least one COMMITTED value. It is
+	// what turns an empty read into a provable stale read: before the first
+	// write a missing key legitimately reads back as "".
+	keyWritten := make([]atomic.Bool, totalKeys)
+
+	// totalWrites counts committed proposals across all writers.
+	var totalWrites atomic.Int64
+
 	// Launch writers. Each writer writes to its own set of keys with
 	// monotonically increasing sequence numbers encoded in the value.
 	for w := range numWriters {
@@ -460,7 +529,11 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 					return
 				}
 
-				// Update the max written tracker.
+				totalWrites.Add(1)
+
+				// Update the max written tracker before publishing the key as
+				// written, so a reader that sees keyWritten also sees a
+				// maxWritten it can compare the read value against.
 				for {
 					cur := maxWritten[keyIdx].Load()
 					newVal := int64(seq)
@@ -471,6 +544,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 						break
 					}
 				}
+				keyWritten[keyIdx].Store(true)
 				seq++
 			}
 		}(w)
@@ -488,6 +562,12 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 			for !writesDone.Load() {
 				for keyIdx := range totalKeys {
 					key := fmt.Sprintf("conc-key-%d", keyIdx)
+					// Sampled BEFORE the read: a key already committed when
+					// this read STARTS must be visible to a linearizable
+					// read, so an empty result is a stale read rather than a
+					// race with the writer.
+					committedBeforeRead := keyWritten[keyIdx].Load()
+
 					rCtx, rCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					result, rErr := leaderHost.SyncRead(rCtx, shardID, key)
 					rCancel()
@@ -497,7 +577,25 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 						continue
 					}
 					val, valOK := result.(string)
-					if !valOK || val == "" {
+					if !valOK {
+						errCh <- fmt.Errorf("reader %d: SyncRead(%q) returned %T, want string",
+							readerID, key, result)
+						return
+					}
+					if val == "" {
+						// An empty value is exactly what a MISSING key
+						// returns. Discarding it as noise — the previous
+						// behaviour — threw away the stale read this test
+						// exists to detect.
+						if committedBeforeRead {
+							errCh <- &StaleReadError{
+								ReaderID: readerID,
+								Key:      key,
+								Expected: fmt.Sprintf("a committed value (seq >= %d)", maxWritten[keyIdx].Load()),
+								Got:      "",
+							}
+							return
+						}
 						continue
 					}
 					// Monotonicity check: string comparison works
@@ -529,28 +627,96 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 		t.Errorf("concurrent error: %v", e)
 	}
 
-	// Verify final reads match the committed state. The SM on the
-	// leader must reflect all successfully proposed values.
+	// The writers must actually have written something. A time-boxed writer
+	// loop that produced no committed proposals would otherwise leave every
+	// read below trivially satisfiable.
+	if got := totalWrites.Load(); got < int64(totalKeys) {
+		t.Fatalf("writers committed only %d proposals in %v, want at least %d "+
+			"(one per key)", got, testDur, totalKeys)
+	}
+	for keyIdx := range totalKeys {
+		if !keyWritten[keyIdx].Load() {
+			t.Fatalf("key conc-key-%d was never written, so nothing below verifies it", keyIdx)
+		}
+	}
+
+	// Verify final reads match the committed state. Every key must read back
+	// the value its own writer produced, at a sequence number at least as
+	// high as the last one that writer saw committed. The previous version
+	// only logged the value, so a read returning an empty string, a foreign
+	// writer's value, or a rolled-back sequence number all passed.
+	//
+	// The read is retried against the CURRENT leader: sustained write load can
+	// move leadership, and a read that fails because this host is no longer
+	// leader says nothing about the value.
 	leaderSM := trackers[leaderIdx].Get(shardID, uint64(leaderIdx+1))
 	if leaderSM == nil {
 		t.Fatal("leader state machine not found")
 	}
 	for keyIdx := range totalKeys {
 		key := fmt.Sprintf("conc-key-%d", keyIdx)
-		finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		result, readErr := leaderHost.SyncRead(finalCtx, shardID, key)
-		finalCancel()
-		if readErr != nil {
-			t.Errorf("final read key=%q failed: %v", key, readErr)
+		wantWriter := uint64(keyIdx / numKeys)
+		wantSeq := uint64(maxWritten[keyIdx].Load())
+
+		var lastVal string
+		var lastErr error
+		ok := waitForConditionNoFatal(failoverTimeout, func() bool {
+			readerIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+			finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
+			result, readErr := cluster.hosts[readerIdx].SyncRead(finalCtx, shardID, key)
+			finalCancel()
+			if readErr != nil {
+				lastErr = readErr
+				return false
+			}
+			val, valOK := result.(string)
+			if !valOK {
+				lastErr = fmt.Errorf("SyncRead returned %T, want string", result)
+				return false
+			}
+			lastVal = val
+			gotWriter, gotKeyIdx, gotSeq, parseErr := parseConcValue(val)
+			if parseErr != nil {
+				lastErr = parseErr
+				return false
+			}
+			if gotWriter != wantWriter || gotKeyIdx != uint64(keyIdx) {
+				lastErr = fmt.Errorf("value %q belongs to writer %d key %d, want writer %d key %d",
+					val, gotWriter, gotKeyIdx, wantWriter, keyIdx)
+				return false
+			}
+			if gotSeq < wantSeq {
+				lastErr = fmt.Errorf("value %q has seq %d, want >= %d (the last committed write)",
+					val, gotSeq, wantSeq)
+				return false
+			}
+			lastErr = nil
+			return true
+		})
+		if !ok {
+			t.Errorf("final read key=%q: got %q, last error: %v", key, lastVal, lastErr)
 			continue
 		}
-		val, valOK := result.(string)
-		if !valOK {
-			t.Errorf("final read key=%q returned unexpected type: %T", key, result)
-			continue
-		}
-		t.Logf("final read key=%q value=%q (maxWritten seq=%d)", key, val, maxWritten[keyIdx].Load())
+		t.Logf("final read key=%q value=%q (maxWritten seq=%d)", key, lastVal, wantSeq)
 	}
+}
+
+// parseConcValue decodes a value written by the concurrent lease-read writers:
+// "%08d-%04d-%06d" of writer id, key index and sequence number.
+func parseConcValue(val string) (writerID, keyIdx, seq uint64, err error) {
+	parts := strings.Split(val, "-")
+	if len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("value %q is not a writer-key-seq triple", val)
+	}
+	fields := [3]uint64{}
+	for i, p := range parts {
+		v, parseErr := strconv.ParseUint(p, 10, 64)
+		if parseErr != nil {
+			return 0, 0, 0, fmt.Errorf("value %q has an unparsable field %q: %w", val, p, parseErr)
+		}
+		fields[i] = v
+	}
+	return fields[0], fields[1], fields[2], nil
 }
 
 // TestHostAPI_LeaseRead_ReadAfterLeaderTransfer verifies that leadership
@@ -617,23 +783,22 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	targetReplicaID := uint64(targetIdx + 1)
 	t.Logf("requesting leadership transfer to node[%d] (replicaID=%d)", targetIdx, targetReplicaID)
 
-	// Request leadership transfer.
-	transferCtx, transferCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	transferErr := leaderHost.RequestLeaderTransfer(transferCtx, shardID, targetReplicaID)
-	transferCancel()
-	if transferErr != nil {
-		t.Fatalf("RequestLeaderTransfer failed: %v", transferErr)
-	}
+	// Request leadership transfer and require that it lands on the REQUESTED
+	// target rather than on whoever happens to lead next.
+	transferLeadershipTo(t, cluster, shardID, targetIdx, failoverTimeout)
 
-	// Wait for the target to become leader.
-	waitForCondition(t, failoverTimeout, "target becomes leader after transfer", func() bool {
-		info, infoErr := cluster.hosts[targetIdx].GetShardInfo(shardID)
-		if infoErr != nil {
-			return false
-		}
-		return info.IsLeader
-	})
-	t.Logf("leadership transferred to node[%d]", targetIdx)
+	targetInfo, targetErr := cluster.hosts[targetIdx].GetShardInfo(shardID)
+	if targetErr != nil {
+		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, targetErr)
+	}
+	if !targetInfo.IsLeader {
+		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
+	}
+	if targetInfo.ReplicaID != targetReplicaID {
+		t.Fatalf("transfer target node[%d] ReplicaID = %d, want %d",
+			targetIdx, targetInfo.ReplicaID, targetReplicaID)
+	}
+	t.Logf("leadership transferred to node[%d] (replica=%d)", targetIdx, targetReplicaID)
 
 	newLeaderHost := cluster.hosts[targetIdx]
 

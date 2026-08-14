@@ -69,11 +69,24 @@ type LogDB interface {
 
 The `logdb` package defines storage-layer types separate from proto types to maintain a clean abstraction boundary.
 
+These lists are **complete**. `logdb.LogDB` is a supported extension point,
+and an alternative backend that persists only a subset of these fields
+compiles cleanly and fails silently at runtime — see the notes below each
+type for what breaks.
+
 **Entry** - represents a single Raft log entry:
 - `Index` (uint64) - log position
 - `Term` (uint64) - Raft term when created
 - `Type` (uint64) - entry type (normal, config change, etc.)
+- `Key` (uint64) - caller-assigned completion key for this proposal
+- `ClientID` (uint64) - client session that proposed this entry; 0 means not session-managed
+- `SeriesID` (uint64) - per-session sequence number used for deduplication
+- `RespondedTo` (uint64) - highest responded-to series for this client
 - `Cmd` ([]byte) - serialized command payload
+
+`Key`, `ClientID`, `SeriesID` and `RespondedTo` **must** be persisted. A
+backend that drops them silently disables session deduplication (breaking
+at-most-once delivery across a restart) and downgrades sender authorization.
 
 **State** - persisted Raft hard state:
 - `Term` (uint64) - current Raft term
@@ -82,10 +95,27 @@ The `logdb` package defines storage-layer types separate from proto types to mai
 
 **Membership** - Raft cluster membership configuration:
 - `ConfigChangeID` (uint64) - log index of the configuration change
+- `MaxWitnesses` (uint64) - replicated witness cap (0 = no explicit cap)
+- `RequireFullReplicaMajority` (bool) - replicated full-replica-majority witness policy
+- `SessionExpiryEntries` (uint64) - replicated session expiry threshold, in applied entries
+- `MaxTotalSessions` (uint64) - replicated cap on registered sessions
+- `MaxSessionsPerClient` (uint64) - replicated cap on responses cached per session
 - `Addresses` (map[uint64]string) - full voting member addresses
 - `Observers` (map[uint64]string) - non-voting observer addresses
 - `Witnesses` (map[uint64]string) - witness-only member addresses
 - `Removed` (map[uint64]bool) - removed replica IDs
+- `Identities` (map[uint64]string) - committed cryptographic node identity per replica; SPARSE
+- `RemovedIdentities` (map[uint64]string) - identity a removed replica held when its removal committed; the deny-list evaluated against the authenticated connection identity. Key set is a subset of `Removed`'s
+
+`MaxTotalSessions` is non-zero in every committed policy, which is what makes
+it the discriminator for "was a session policy recorded at all". That is what
+lets `SessionExpiryEntries == 0` keep its own meaning (expiry explicitly
+disabled cluster-wide) rather than being read as an absent policy.
+
+The witness and session policy fields are **replicated state**, not local
+configuration: the deterministic apply path reads them, so a replica that
+evaluates a different value diverges its state machine with every Raft
+invariant intact.
 
 **Snapshot** - persisted snapshot metadata:
 - `Index` (uint64) - last included log index
@@ -95,11 +125,25 @@ The `logdb` package defines storage-layer types separate from proto types to mai
 - `FileSize` (uint64) - size of snapshot data file in bytes
 - `OnDiskIndex` (uint64) - index tracked for on-disk state machines
 - `Epoch` (uint64) - barrier encryption epoch (0 for plaintext)
+- `Compression` (config.CompressionType) - algorithm the data file was written through
+
+`Compression` describes the **artifact**, not the writer's configuration.
+Every recovery path must build its reader chain from this field and not from
+`Config.SnapshotCompressionType`, or an artifact written before a config
+change is decoded through the wrong reader. The zero value is
+`config.NoCompression`.
 
 **Bootstrap** - initial cluster configuration:
 - `Addresses` (map[uint64]string) - initial replica addresses
 - `Join` (bool) - whether joining existing cluster
 - `Type` (uint64) - state machine type
+- `DataDir` (string) - the shard's `Config.DataDir`; empty when the shard roots under the host's `NodeHostDir`
+- `DataDirRecorded` (bool) - whether the persisted record actually carried `DataDir`, as opposed to predating the field
+
+`DataDirRecorded` is a property of the **record**, not of the request: a
+value passed to `SaveBootstrap` is ignored. It exists so a reader can tell
+"this shard was recorded as rooting under NodeHostDir" from "this record was
+written before DataDir existed and says nothing about it".
 
 **Update** - batch of state changes for a single shard:
 - `ShardID` (uint64) - Raft shard ID
@@ -396,19 +440,68 @@ at-most-once delivery survives crash recovery; the legacy 44-byte format
 **Snapshot metadata** (`payloadTypeSnapshot`):
 
 ```
-[PayloadType:1][ShardID:8][ReplicaID:8][Index:8][Term:8][FileSize:8][OnDiskIndex:8][Epoch:8][FilePathLen:4][FilePath:N][Membership...]
-                |<----------------- 60 bytes base ------------------>|
+[ShardID:8][ReplicaID:8][Index:8][Term:8][FileSize:8][OnDiskIndex:8][Epoch:8][Compression:2][FilePathLen:4][FilePath:N][Membership...]
+ |<------------------------ 62 bytes base (snapshotRecordBaseSize) ---------------------->|
 ```
 
-The base size is 60 bytes (1+8+8+8+8+8+8+4). The `Epoch` field stores the encryption key rotation epoch associated with the snapshot.
+The base size is `snapshotRecordBaseSize = 62` bytes
+(8+8+8+8+8+8+8+2+4), measured from the start of the record payload -- the
+`payloadType` byte is part of the record framing, not the base. `Epoch`
+stores the encryption key rotation epoch associated with the snapshot;
+`Compression` is a 2-byte `config.CompressionType`.
 
-Membership is serialized after the filepath as a variable-length structure:
+Membership is serialized after the filepath as a variable-length structure.
+It carries its own version byte, `membershipSectionVersion`, pinned at **1**
+and gated on **exact equality**: every wire and persisted format in this
+repository stays at version 1 until the first production release, and a
+layout change is made in place with dev clusters wiped and re-synced rather
+than migrated (see
+[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)).
+A section stamped with anything else was written by a binary built from a
+different pre-release commit and is refused with
+`ErrUnsupportedMembershipVersion` rather than read at these offsets. The
+section is:
 
 ```
-[ConfigChangeID:8][NumAddresses:4]{[ReplicaID:8][AddrLen:4][Addr:N]...}[NumObservers:4]{...}[NumWitnesses:4]{...}[NumRemoved:4]{[ReplicaID:8]...}
+[MembershipVersion:1][ConfigChangeID:8][MaxWitnesses:8][PolicyFlags:1]
+[NumAddresses:4]{[ReplicaID:8][AddrLen:4][Addr:N]...}
+[NumObservers:4]{...}
+[NumWitnesses:4]{...}
+[NumRemoved:4]{[ReplicaID:8]...}
+[NumIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]...}
+[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+[NumRemovedIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]...}
 ```
 
-The snapshot record structure was hardened in 2026-02-19 to persist full Membership data (previously only Epoch was added). This ensures cluster membership is recoverable from the latest snapshot even if the log is completely replayed. `ReadState(shardID, replicaID)` returns the hard state and the `Membership` from the latest stored snapshot. If no snapshot has been saved, the returned Membership is an empty `logdb.Membership{}`.
+Fixed region: `membershipFixedSize = 18` bytes (1+8+8+1). The smallest
+section this binary will **replay** is `minMembershipSize = 66` bytes -- the
+fixed region, six empty map count headers and the session policy. That floor
+is applied *before* the version byte is read, so a section too short to hold
+the layout is reported as a torn record rather than being read past its own
+end. It equals `membershipSize` of an empty membership, and must: there is
+one layout, every field is written unconditionally, so the read floor and the
+written size are the same number by construction.
+
+Note that this section is **not** the same layout as `proto.Membership`,
+and deliberately so. Here `RequireFullReplicaMajority` is packed into a
+one-byte `PolicyFlags` where proto spends eight, and the session policy is
+a **tail** where proto keeps it inside the fixed region. That placement is
+what keeps the section growable from the end: this decoder parses
+straight-line from a fixed offset, so growing the fixed region moves every
+map, while appending to the tail does not.
+
+Persisting the full membership means cluster membership is recoverable from
+the latest snapshot even if the log is completely replayed.
+`ReadState(shardID, replicaID)` returns the hard state and the `Membership`
+from the latest stored snapshot. If no snapshot has been saved, the returned
+Membership is an empty `logdb.Membership{}`.
+
+A snapshot that drops `Identities` silently downgrades every member it
+describes back to the address check. A snapshot that drops
+`RemovedIdentities` does not merely lose information -- it revokes a
+revocation, and the replica comes back having forgotten which keypairs it
+ejected, readmitting a decommissioned node holding a still-valid certificate
+on exactly the restart an operator performs after removing it.
 
 **Bootstrap info** (`payloadTypeBootstrap`):
 
@@ -594,10 +687,21 @@ if len(e.Cmd) > 0 {
     cmdCopy = make([]byte, len(e.Cmd))
     copy(cmdCopy, e.Cmd)
 }
-nodeEntries[e.Index] = logdb.Entry{
-    Index: e.Index, Term: e.Term, Type: e.Type, Cmd: cmdCopy,
-}
+stagedEntries = append(stagedEntries, logdb.Entry{
+    Index:       e.Index,
+    Term:        e.Term,
+    Type:        e.Type,
+    Key:         e.Key,
+    ClientID:    e.ClientID,
+    SeriesID:    e.SeriesID,
+    RespondedTo: e.RespondedTo,
+    Cmd:         cmdCopy,
+})
 ```
+
+Every field is carried, the four session fields included. Dropping them here
+is not a lossy optimization — it silently disables session deduplication
+across a restart.
 
 ## Group Commit Optimization
 
@@ -1046,7 +1150,7 @@ Nothing found by either probe is ever replayed. The only output is the classific
 |---|---|---|
 | `ErrWALGeometryMismatch` (`*WALGeometryMismatchError`) | Configured `BlockSize` differs from the `WALFORMAT` marker | Restore the original `BlockSize`. The error names both values |
 | `ErrWALFormatMalformed` | The marker exists with non-zero bytes that are not our format | Investigate the file. An empty or all-zero marker is read as ABSENT and never raises this |
-| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | The marker records an on-disk format version this build does not read | Wipe the data directory and re-sync. The error names both versions. See [Compatibility](../operations/compatibility.md#4-walformat-marker-version--2--persisted-exact-match-checked-first) |
+| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | The marker records an on-disk format version this build does not read | Wipe the data directory and re-sync. The error names both versions. See [Compatibility](../operations/compatibility.md#4-walformat-marker-version--1--persisted-exact-match-checked-first) |
 | `ErrWALFormatMissing` | The directory holds segments but no marker, so it predates the marker (and the durability sequence) | Wipe the data directory and re-sync. Opening anyway would misparse every chunk and truncate the log to zero |
 | `ErrRecordSequenceRegression` (`*SegmentCorruptionError`) | A record above the damage carries a durability generation lower than the clean prefix — bytes this WAL cannot have written | Re-sync from peers, or authorize `waldb.Repair`. Treat the device as suspect |
 | `ErrMidSegmentCorruption` (`*SegmentCorruptionError`) | Damage below records that a completed `fdatasync` had already acknowledged (they span more than one durability generation) | Re-sync from peers, or authorize `waldb.Repair` — see below |

@@ -512,7 +512,6 @@ func TestSession_SaveRestoreLargeResponseData(t *testing.T) {
 	for i, b := range result.Data {
 		if b != byte(i%256) {
 			t.Fatalf("Data[%d] = %d, want %d", i, b, byte(i%256))
-			break
 		}
 	}
 }

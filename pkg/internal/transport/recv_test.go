@@ -17,6 +17,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1677,32 +1678,10 @@ func TestHandleMessageFrame_TooManyMessages(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	// Build a batch with > proto.MaxMessagesPerBatch messages.
-	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
-	for i := range msgs {
-		msgs[i] = proto.Message{
-			Type:    proto.Replicate,
-			ShardID: 1,
-			From:    1,
-			To:      2,
-			Term:    1,
-		}
-	}
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:1234",
-		Requests:      msgs,
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
+	payload := overLimitMessageCountPayload(t, "127.0.0.1:1234")
 
-	reader := bytes.NewReader(payload[:n])
-	err = tr.handleMessageFrame(nil, reader, uint32(n), FlagNone)
+	reader := bytes.NewReader(payload)
+	err = tr.handleMessageFrame(nil, reader, uint32(len(payload)), FlagNone)
 	if !errors.Is(err, proto.ErrTooManyMessages) {
 		t.Fatalf("expected ErrTooManyMessages, got %v", err)
 	}
@@ -2414,25 +2393,7 @@ func TestHandleMessageFrame_CompressedTooManyMessages(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
-	for i := range msgs {
-		msgs[i] = proto.Message{
-			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-		}
-	}
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:1234",
-		Requests:      msgs,
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-	payload = payload[:n]
+	payload := overLimitMessageCountPayload(t, "127.0.0.1:1234")
 
 	compressed := snappy.Encode(nil, payload)
 	reader := bytes.NewReader(compressed)
@@ -2466,31 +2427,14 @@ func TestHandleMessageFrame_UncompressedTooManyMessagesWithBufCleanup(t *testing
 	}
 	defer tr.Stop()
 
-	// Build a batch with > proto.MaxMessagesPerBatch messages, uncompressed.
+	// Build a frame declaring > proto.MaxMessagesPerBatch messages, uncompressed.
 	// The key difference from TestHandleMessageFrame_TooManyMessages is
 	// that this verifies buf cleanup on the uncompressed path.
-	msgs := make([]proto.Message, proto.MaxMessagesPerBatch+1)
-	for i := range msgs {
-		msgs[i] = proto.Message{
-			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-		}
-	}
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:1234",
-		Requests:      msgs,
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
+	payload := overLimitMessageCountPayload(t, "127.0.0.1:1234")
 
 	// Uncompressed path - buf is non-nil in the cleanup.
-	reader := bytes.NewReader(payload[:n])
-	err = tr.handleMessageFrame(nil, reader, uint32(n), FlagNone)
+	reader := bytes.NewReader(payload)
+	err = tr.handleMessageFrame(nil, reader, uint32(len(payload)), FlagNone)
 	if !errors.Is(err, proto.ErrTooManyMessages) {
 		t.Fatalf("expected ErrTooManyMessages, got %v", err)
 	}
@@ -3577,4 +3521,36 @@ func TestPerConnectionMsgRecvBudgetBoundsOnePeer(t *testing.T) {
 	if _, ok := t1.connMsgBudget.Load(conn); ok {
 		t.Fatal("expected the per-connection budget entry to be removed")
 	}
+}
+
+// overLimitMessageCountPayload builds a MessageBatch frame whose declared
+// request COUNT exceeds proto.MaxMessagesPerBatch.
+//
+// It is assembled rather than marshaled because proto.MessageBatch.MarshalTo now
+// REFUSES to emit an over-limit batch — the write side mirrors the read side, so
+// a producer cannot build a frame every peer would reject. That is the correct
+// production behaviour and it is exactly what makes this helper necessary: the
+// decoder's own limit still has to be pinned, and the only way such a frame can
+// now reach a receiver is corruption or a hostile encoder, which is the case the
+// decoder check exists for. So the count prefix is patched directly, and the
+// message bodies are omitted: UnmarshalFrom validates the count BEFORE it reads
+// a single message, and this asserts that ordering as much as the limit.
+//
+// Layout: [BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][count:4].
+func overLimitMessageCountPayload(t *testing.T, sourceAddress string) []byte {
+	t.Helper()
+	mb := proto.MessageBatch{
+		BinVer:        proto.WireVersion,
+		DeploymentID:  42,
+		SourceAddress: sourceAddress,
+	}
+	payload := make([]byte, mb.Size())
+	n, err := mb.MarshalTo(payload)
+	if err != nil {
+		t.Fatalf("MarshalTo(empty batch): %v", err)
+	}
+	payload = payload[:n]
+	countOffset := 24 + 4 + len(sourceAddress)
+	binary.LittleEndian.PutUint32(payload[countOffset:], proto.MaxMessagesPerBatch+1)
+	return payload
 }

@@ -279,15 +279,25 @@ func TestVerifyConnectionRejectsMissingPeerCertificate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Zero-copy detach of Snapshot.Checksum (recv.go handleMessageFrame)
+// Receive-buffer detach of snapshot metadata (recv.go handleMessageFrame)
 // ---------------------------------------------------------------------------
 
-// TestSnapshotChecksumDetachedFromReceiveBuffer pins the second half of the
-// bulk-copy detach. Snapshot.Checksum aliases the pooled receive buffer after a
-// zero-copy unmarshal; the buffer is recycled as soon as the frame is
-// dispatched, so a surviving alias is read after the buffer was handed to
-// another frame. Only the Entry.Cmd half of this loop was covered.
-func TestSnapshotChecksumDetachedFromReceiveBuffer(t *testing.T) {
+// TestSnapshotMetadataDetachedFromReceiveBuffer pins that nothing on a decoded
+// Snapshot still points into the POOLED receive buffer once the frame has been
+// dispatched. The buffer is recycled immediately, so a surviving alias is read
+// by the step worker after the buffer has been handed to another frame — and a
+// Snapshot is the worst possible place for that, because raft adopts its
+// Membership wholesale.
+//
+// This test used to cover Snapshot.Checksum, which was the one field here that
+// DID alias the pool and had to be bulk-copied out. Checksum left the wire
+// format in an earlier pre-release layout (never computed, never verified — see the
+// proto.Snapshot type doc), so the assertion is retargeted rather than dropped:
+// Filepath and every membership map are copied by their own decoders
+// (getString, getMap) and must stay that way. A future "zero-copy Filepath" or
+// a membership map aliased into the buffer would reintroduce exactly the class
+// of bug the original test was written for, and this is what catches it.
+func TestSnapshotMetadataDetachedFromReceiveBuffer(t *testing.T) {
 	handler := newTestHandler()
 	tr, err := NewQUICTransport(Config{
 		ListenAddress: ":0",
@@ -298,7 +308,7 @@ func TestSnapshotChecksumDetachedFromReceiveBuffer(t *testing.T) {
 		t.Fatalf("NewQUICTransport: %v", err)
 	}
 
-	checksum := bytes.Repeat([]byte{0xAB}, 32)
+	const wantPath = "/var/lib/quicraft/shard-1/snapshot-77"
 	batch := proto.MessageBatch{
 		BinVer:       proto.WireVersion,
 		DeploymentID: 42,
@@ -312,7 +322,14 @@ func TestSnapshotChecksumDetachedFromReceiveBuffer(t *testing.T) {
 				ShardID:  1,
 				Index:    77,
 				Term:     9,
-				Checksum: checksum,
+				Filepath: wantPath,
+				Membership: proto.Membership{
+					ConfigChangeID:    4,
+					Addresses:         map[uint64]string{1: "node-1:5000", 2: "node-2:5000"},
+					Removed:           map[uint64]bool{3: true},
+					Identities:        map[uint64]string{1: "spki:aaaaaaaa"},
+					RemovedIdentities: map[uint64]string{3: "spki:cccccccc"},
+				},
 			},
 		}},
 	}
@@ -340,10 +357,28 @@ func TestSnapshotChecksumDetachedFromReceiveBuffer(t *testing.T) {
 	if len(batches) == 0 {
 		t.Fatal("no batch delivered")
 	}
-	got := batches[0].Requests[0].Snapshot.Checksum
-	if !bytes.Equal(got, checksum) {
-		t.Fatalf("Snapshot.Checksum = %x, want %x: the checksum still aliased the recycled receive buffer",
-			got, checksum)
+	got := batches[0].Requests[0].Snapshot
+	if got.Filepath != wantPath {
+		t.Fatalf("Snapshot.Filepath = %q, want %q: it still aliased the recycled receive buffer",
+			got.Filepath, wantPath)
+	}
+	if got.Membership.Addresses[1] != "node-1:5000" || got.Membership.Addresses[2] != "node-2:5000" {
+		t.Fatalf("Snapshot.Membership.Addresses = %v: it still aliased the recycled receive buffer",
+			got.Membership.Addresses)
+	}
+	if !got.Membership.Removed[3] {
+		t.Fatalf("Snapshot.Membership.Removed = %v: it still aliased the recycled receive buffer",
+			got.Membership.Removed)
+	}
+	if got.Membership.Identities[1] != "spki:aaaaaaaa" {
+		t.Fatalf("Snapshot.Membership.Identities = %v: it still aliased the recycled "+
+			"receive buffer, so the receive-side quorum gate would authorize against "+
+			"another frame's bytes", got.Membership.Identities)
+	}
+	if got.Membership.RemovedIdentities[3] != "spki:cccccccc" {
+		t.Fatalf("Snapshot.Membership.RemovedIdentities = %v: it still aliased the "+
+			"recycled receive buffer, so the removal deny-list would be evaluated "+
+			"against another frame's bytes", got.Membership.RemovedIdentities)
 	}
 }
 

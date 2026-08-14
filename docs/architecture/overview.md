@@ -66,7 +66,7 @@ each with its own state machine, log, and membership. It provides:
 - `pkg/internal/rsm/` — Replicated state machine adapter, session routing
 - `pkg/internal/session/` — Client session manager (at-most-once delivery)
 - `pkg/internal/registry/` — (shardID, replicaID) → address mapping
-- `pkg/internal/queue/` — Lock-free MPSC queues, ReadyMap
+- `pkg/internal/queue/` — Double-buffered MPSC queues, ReadyMap
 - `pkg/internal/stopper/` — Graceful shutdown coordination
 - `pkg/internal/server/` — Global rate limiter
 - `pkg/internal/invariant/` — Debug assertions
@@ -169,7 +169,10 @@ Fixed header sizes:
 |--------------|--------|----------------------|
 | Entry        | 60     | Cmd (variable)       |
 | Message      | 88     | Entries + Snapshot   |
-| MessageBatch | 16     | Address + Messages   |
+| MessageBatch | 24     | Address + Messages   |
+
+The MessageBatch header is `BinVer:8`, `DeploymentID:8` and `SourceEpoch:8`.
+See [Wire Format](../protocol/wire-format.md) for the full field tables.
 
 ### QUIC-Only Transport
 
@@ -226,6 +229,12 @@ Ordered shutdown: step → commit → apply → snapshot, drain at each stage.
 - `Host.nodes`: sync.Map (lock-free reads for shard lookup)
 - `engine.registry`: sync.Map for (shardID, replicaID) → address
 - `Barrier.unsealed`: atomic.Bool fast-path before RWMutex acquisition
+
+Not on this list, deliberately: the `EntryQueue` behind `proposalQ`, `inboxQ`
+and `readIndexQ` is **mutex-guarded**. Producers hold a `sync.Mutex` for a
+slice append and the consumer takes it once per drain cycle; the design goal
+is amortizing acquisitions over a batch, not eliminating them. Nor is the
+per-node `raftMu`, which serializes `Peer.Tick()` against `Peer.Commit()`.
 
 ## Configuration
 
@@ -348,15 +357,44 @@ sm.NewDiskCreateFunc(fn)        // DiskStateMachine
 
 ### Optional Interfaces
 
-Detected via type assertion on the SM:
+Detected via type assertion on the SM. **These are the signatures your state
+machine must implement** — two return values, not three:
 
-- `Hasher` — `GetHash() (uint64, bool, error)` for cross-replica consistency checks
-- `NALookup` — `BytesLookup(key []byte) ([]byte, bool, error)` for zero-alloc reads
+```go
+// Cross-replica consistency checks.
+type Hasher interface {
+    GetHash() (uint64, error)
+}
 
-The RSM adapter uses a `(value, supported, error)` pattern:
-- If SM implements the interface: return (result, true, error)
-- If SM does not implement: return (zero, false, nil)
+// Zero-alloc reads.
+type NALookup interface {
+    BytesLookup(key []byte) ([]byte, error)
+}
+
+// Zero-alloc reads into a caller-supplied buffer.
+type NALookupInto interface {
+    NALookup
+    BytesLookupInto(key, dst []byte) ([]byte, error)
+}
+```
+
+Because detection is by type assertion, an implementation with the wrong
+signature does not satisfy the interface, produces **no compile error**, and
+is simply never invoked — hash verification or the zero-alloc path silently
+does not run. Match these signatures exactly.
+
+Internally, the RSM adapter wraps each of these behind a
+`(value, supported, error)` shape, where the `bool` reports whether the user
+SM implemented the optional interface at all:
+
+- SM implements the interface: `(result, true, error)`
+- SM does not implement it: `(zero, false, nil)`
 - SM errors are always propagated to the caller
+
+That three-value form is an **internal** wrapper (`pkg/internal/rsm`). It is
+not importable and is not the contract you implement. See
+[State Machine Interfaces](../statemachine/interfaces.md) and
+[RSM Adapter](../statemachine/rsm-adapter.md).
 
 ## Cluster Formation (lives in go-qrdb)
 

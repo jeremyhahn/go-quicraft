@@ -100,6 +100,23 @@ type ConcurrentStateMachine interface {
 //
 // On-disk state machines may receive entries that were already applied before
 // a crash. The implementation MUST handle this idempotently.
+//
+// # Client sessions are not available
+//
+// A shard backed by a DiskStateMachine supports NO-OP sessions only. Every
+// session-managed entry point on the host — GetNewSession, RegisterSession,
+// ProposeWithSession, SyncProposeWithSession, CloseSession — refuses the shard
+// with ErrSessionsUnsupportedOnDisk, and idempotent operations proposed through
+// a no-op session are the supported substitute.
+//
+// The reason is Open. The session table is replicated state that travels only
+// inside the snapshot stream, so it is restored by RecoverFromSnapshot — and a
+// DiskStateMachine that reports a non-zero applied index from Open never takes
+// that path on restart, because recovering would replace its database files and
+// roll it back to the snapshot index. The replica would come up with the right
+// data and no sessions at all, then answer ResultSessionExpired for entries its
+// peers apply normally: a permanent, silent divergence. The same constraint
+// applies to dragonboat's IOnDiskStateMachine.
 type DiskStateMachine interface {
 	// Open initializes the state machine and returns the last applied index.
 	// If this is a fresh start, returns 0. The initialDir is the working

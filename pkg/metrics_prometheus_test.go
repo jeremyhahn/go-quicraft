@@ -173,9 +173,10 @@ func TestNewPrometheusMetricsCollector(t *testing.T) {
 		t.Fatal("Registry is nil")
 	}
 
-	// Verify all expected metric families are registered by gathering.
-	families, err := c.Registry.Gather()
-	if err != nil {
+	// Verify all expected metric families are registered by gathering. The
+	// families themselves are inspected after the observations below; a fresh
+	// registry may legitimately report none yet, so only the error matters.
+	if _, err := c.Registry.Gather(); err != nil {
 		t.Fatalf("Gather() failed: %v", err)
 	}
 	// Before any observations, gather may return empty for some metric types.
@@ -199,7 +200,7 @@ func TestNewPrometheusMetricsCollector(t *testing.T) {
 	c.IncSnapshotsSent(1, 1024, time.Second)
 	c.IncSnapshotsReceived(1, 2048, time.Second)
 
-	families, err = c.Registry.Gather()
+	families, err := c.Registry.Gather()
 	if err != nil {
 		t.Fatalf("Gather() after observations failed: %v", err)
 	}

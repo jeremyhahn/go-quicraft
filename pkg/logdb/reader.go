@@ -172,8 +172,6 @@ func (r *termRingBuffer) clear() {
 }
 
 // len returns the number of valid entries in the ring buffer.
-//
-//nolint:unused // used by tests for assertion readability
 func (r *termRingBuffer) len() int {
 	return r.count
 }

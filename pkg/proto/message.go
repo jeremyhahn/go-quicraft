@@ -118,9 +118,16 @@ func (m *Message) Size() int {
 }
 
 // MarshalTo writes the message into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, or ErrTooManyMessages if Entries exceeds MaxEntriesPerMessage — the
+// read side's bound applied on write, so a producer learns at the SENDER that
+// its message is unparseable instead of having every peer silently reject the
+// frame (a rejection the sender cannot tell from a broken connection; see
+// MaxEntriesPerMessage).
 func (m *Message) MarshalTo(buf []byte) (int, error) {
+	if len(m.Entries) > MaxEntriesPerMessage {
+		return 0, ErrTooManyMessages
+	}
 	required := m.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall

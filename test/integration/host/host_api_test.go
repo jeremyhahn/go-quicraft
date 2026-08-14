@@ -184,7 +184,15 @@ func TestHostAPI_Session_Lifecycle_ThreeNode(t *testing.T) {
 	rs.Release()
 }
 
-// TestHostAPI_Snapshot_LeaderRequest requests a snapshot on the leader.
+// TestHostAPI_Snapshot_LeaderRequest requests a snapshot on the leader and
+// verifies a snapshot actually happened: the request resolves with a non-zero
+// index, a snapshot artifact for that index exists on disk, and a second
+// request after more writes reports a HIGHER index.
+//
+// The previous version released the RequestState without ever reading its
+// result. RequestSnapshot is asynchronous, so the test neither waited for the
+// snapshot nor noticed a failed or skipped one — an engine that never wrote an
+// artifact passed.
 func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -212,14 +220,36 @@ func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 		return leaderSM.Len() >= 5
 	})
 
-	rs, err := leaderHost.RequestSnapshot(ctx, 1, quicraft.SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot failed: %v", err)
+	// This shard uses testShardConfig, whose SnapshotEntries stays 0 —
+	// config.SetDefaults never assigns it — so the engine takes NO automatic
+	// snapshot here and every artifact below comes from an explicit request.
+	snapshotDir := cluster.nodeHostDirs[leaderIdx]
+	firstIndex := requestSnapshotIndex(t, leaderHost, 1)
+	assertSnapshotArtifact(t, snapshotDir, firstIndex, defaultTimeout)
+	t.Logf("first snapshot taken at index %d", firstIndex)
+
+	// Write more entries and snapshot again: the second snapshot must cover
+	// the new entries, which is only true if a snapshot really happened.
+	for i := 5; i < 10; i++ {
+		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+			fmt.Sprintf("snap-key-%d", i),
+			fmt.Sprintf("snap-val-%d", i),
+		))
+		if err != nil {
+			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
+		}
 	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
+	waitForCondition(t, defaultTimeout, "10 entries applied", func() bool {
+		return leaderSM.Len() >= 10
+	})
+
+	secondIndex := requestSnapshotIndex(t, leaderHost, 1)
+	if secondIndex <= firstIndex {
+		t.Fatalf("second snapshot index = %d, want > %d (the snapshot did not advance)",
+			secondIndex, firstIndex)
 	}
-	rs.Release()
+	assertSnapshotArtifact(t, snapshotDir, secondIndex, defaultTimeout)
+	t.Logf("second snapshot taken at index %d", secondIndex)
 }
 
 // TestHostAPI_ReadIndex_ThreeNode verifies ReadIndex on leader.
@@ -245,12 +275,17 @@ func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 }
 
 // TestHostAPI_LeaderTransfer_ThreeNode requests leadership transfer to a
-// specific target and verifies the request completes without error.
+// specific target and verifies that leadership actually moved to THAT target.
+//
+// The previous version only checked that RequestLeaderTransfer returned nil
+// and that GetShardInfo still reported ShardID == 1 — a value the test itself
+// passed in, so it could never be wrong. An engine that ignored the requested
+// target, or never transferred at all, passed.
 func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
 
-	cluster.startShard(1)
+	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 
@@ -258,16 +293,46 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 	targetIdx := cluster.waitForFollower(1, leaderElectionTimeout)
 	targetReplicaID := uint64(targetIdx + 1)
 
+	// A transfer target must have an up-to-date log before the leader will
+	// hand over, so replicate one entry everywhere first.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
+	if _, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("lt-warmup", "ok")); err != nil {
+		t.Fatalf("warmup SyncPropose failed: %v", err)
+	}
+	waitForReplication(t, cluster, trackers, 1, "lt-warmup", "ok", defaultTimeout)
 
-	if err := leaderHost.RequestLeaderTransfer(ctx, 1, targetReplicaID); err != nil {
-		t.Fatalf("RequestLeaderTransfer failed: %v", err)
+	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
+
+	// Leadership must be held by the REQUESTED replica, not merely by
+	// someone.
+	targetInfo, err := cluster.hosts[targetIdx].GetShardInfo(1)
+	if err != nil {
+		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
+	}
+	if !targetInfo.IsLeader {
+		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
+	}
+	if targetInfo.ReplicaID != targetReplicaID {
+		t.Fatalf("transfer target node[%d] ReplicaID = %d, want %d",
+			targetIdx, targetInfo.ReplicaID, targetReplicaID)
 	}
 
-	// Verify the request was accepted (fire-and-forget). The transfer
-	// is asynchronous; we verify the API call succeeds without error.
-	// Also verify the original leader is still queryable.
+	// Every live node must agree that the requested replica leads the shard.
+	waitForCondition(t, failoverTimeout,
+		fmt.Sprintf("all nodes report replica %d as leader", targetReplicaID),
+		func() bool {
+			for _, i := range cluster.liveNodeIndexes() {
+				leaderID, known, leaderErr := cluster.hosts[i].GetLeaderID(1)
+				if leaderErr != nil || !known || leaderID != targetReplicaID {
+					return false
+				}
+			}
+			return true
+		},
+	)
+
+	// The original leader is still queryable and still reports the shard.
 	info, err := leaderHost.GetShardInfo(1)
 	if err != nil {
 		t.Fatalf("GetShardInfo after transfer request failed: %v", err)
@@ -398,7 +463,13 @@ func TestHostAPI_MultipleShards_ThreeNode(t *testing.T) {
 	}
 }
 
-// TestHostAPI_ConcurrentProposals_ThreeNode sends proposals from 5 goroutines.
+// TestHostAPI_ConcurrentProposals_ThreeNode sends proposals from 5 goroutines
+// and verifies that nearly all of them succeed and that every value that was
+// accepted is present on every node.
+//
+// The previous version's only floor was "at least one proposal succeeded" and
+// its only replication check was Len() >= successCount, so a run in which 99
+// of 100 proposals failed passed: one success, and every node's Len() is >= 1.
 func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -409,9 +480,17 @@ func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 
 	numGoroutines := 5
 	proposalsPerGoroutine := 20
+	totalProposals := numGoroutines * proposalsPerGoroutine
+	// A stable 3-node cluster with a live leader must accept essentially
+	// every proposal; the 10% allowance covers a leadership change under a
+	// loaded CI host, not a broken propose path.
+	minSuccess := int64(totalProposals * 9 / 10)
 
 	var wg sync.WaitGroup
 	var successCount atomic.Int64
+	var writtenMu sync.Mutex
+	written := make(map[string]string, totalProposals)
+	var proposeErrs []error
 
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)
@@ -424,18 +503,31 @@ func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 				_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(key, val))
 				cancel()
 				if err != nil {
+					// Collected, not asserted here: this runs on a
+					// non-test goroutine, where t.Fatal would only stop
+					// this goroutine and let the test carry on.
+					writtenMu.Lock()
+					proposeErrs = append(proposeErrs, fmt.Errorf("propose %q: %w", key, err))
+					writtenMu.Unlock()
 					continue
 				}
 				successCount.Add(1)
+				writtenMu.Lock()
+				written[key] = val
+				writtenMu.Unlock()
 			}
 		}(g)
 	}
 
 	wg.Wait()
-	t.Logf("concurrent proposals: %d/%d succeeded", successCount.Load(), numGoroutines*proposalsPerGoroutine)
+	t.Logf("concurrent proposals: %d/%d succeeded", successCount.Load(), totalProposals)
 
-	if successCount.Load() == 0 {
-		t.Fatal("no proposals succeeded")
+	for _, err := range proposeErrs {
+		t.Logf("proposal error: %v", err)
+	}
+	if got := successCount.Load(); got < minSuccess {
+		t.Fatalf("only %d/%d proposals succeeded, want at least %d",
+			got, totalProposals, minSuccess)
 	}
 
 	// Verify replication to all followers.
@@ -444,21 +536,9 @@ func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 		return int64(leaderSM.Len()) >= successCount.Load()
 	})
 
-	for i := range cluster.hosts {
-		if i == leaderIdx {
-			continue
-		}
-		followerSM := trackers[i].Get(1, uint64(i+1))
-		if followerSM == nil {
-			continue
-		}
-		waitForCondition(t, defaultTimeout*2,
-			fmt.Sprintf("follower[%d] replication", i),
-			func() bool {
-				return int64(followerSM.Len()) >= successCount.Load()
-			},
-		)
-	}
+	// Every accepted key must carry its own value on every node — a count of
+	// applied entries says nothing about WHICH entries arrived.
+	verifyAllData(t, cluster, trackers, 1, written)
 }
 
 // TestHostAPI_ProposeToFollower_Forwarded verifies that proposing to a
@@ -505,13 +585,10 @@ func TestHostAPI_LargeValue_Replication(t *testing.T) {
 		t.Fatalf("SyncPropose large value failed: %v", err)
 	}
 
-	// Verify replication.
-	for i := range cluster.hosts {
-		replicaID := uint64(i + 1)
-		nodeSM := trackers[i].Get(1, replicaID)
-		if nodeSM == nil {
-			continue
-		}
+	// Verify replication. A node whose state machine has not registered is
+	// waited for, never skipped: skipping it drops it from the assertion.
+	for _, i := range cluster.liveNodeIndexes() {
+		nodeSM := waitForStateMachine(t, cluster, trackers, 1, i, defaultTimeout)
 		waitForCondition(t, defaultTimeout,
 			fmt.Sprintf("node[%d] replicates large value", i),
 			func() bool {
@@ -686,8 +763,10 @@ func TestHostAPI_Session_Lifecycle_FiveNode(t *testing.T) {
 	rs.Release()
 }
 
-// TestHostAPI_Snapshot_FiveNode requests a snapshot on the leader after
-// writing data in a 5-node cluster.
+// TestHostAPI_Snapshot_FiveNode requests a snapshot on the leader of a 5-node
+// cluster and verifies the snapshot actually happened: a non-zero index, an
+// artifact on disk, and a higher index on a second request after more writes.
+// See TestHostAPI_Snapshot_LeaderRequest for what the previous version missed.
 func TestHostAPI_Snapshot_FiveNode(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -715,14 +794,34 @@ func TestHostAPI_Snapshot_FiveNode(t *testing.T) {
 		return leaderSM.Len() >= 5
 	})
 
-	rs, err := leaderHost.RequestSnapshot(ctx, 1, quicraft.SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot failed: %v", err)
+	// SnapshotEntries stays 0 for this shard (see
+	// TestHostAPI_Snapshot_LeaderRequest), so no automatic snapshot competes
+	// with the explicit requests below.
+	snapshotDir := cluster.nodeHostDirs[leaderIdx]
+	firstIndex := requestSnapshotIndex(t, leaderHost, 1)
+	assertSnapshotArtifact(t, snapshotDir, firstIndex, defaultTimeout)
+	t.Logf("first snapshot taken at index %d", firstIndex)
+
+	for i := 5; i < 10; i++ {
+		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+			fmt.Sprintf("snap5-key-%d", i),
+			fmt.Sprintf("snap5-val-%d", i),
+		))
+		if err != nil {
+			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
+		}
 	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
+	waitForCondition(t, defaultTimeout, "10 entries applied", func() bool {
+		return leaderSM.Len() >= 10
+	})
+
+	secondIndex := requestSnapshotIndex(t, leaderHost, 1)
+	if secondIndex <= firstIndex {
+		t.Fatalf("second snapshot index = %d, want > %d (the snapshot did not advance)",
+			secondIndex, firstIndex)
 	}
-	rs.Release()
+	assertSnapshotArtifact(t, snapshotDir, secondIndex, defaultTimeout)
+	t.Logf("second snapshot taken at index %d", secondIndex)
 }
 
 // TestHostAPI_ReadIndex_FiveNode verifies ReadIndex on the leader of a
@@ -749,12 +848,14 @@ func TestHostAPI_ReadIndex_FiveNode(t *testing.T) {
 }
 
 // TestHostAPI_LeaderTransfer_FiveNode requests leadership transfer to a
-// specific follower in a 5-node cluster and verifies the request completes.
+// specific follower in a 5-node cluster and verifies that leadership actually
+// moved to THAT follower. See TestHostAPI_LeaderTransfer_ThreeNode for why the
+// previous ShardID check proved nothing.
 func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
 
-	cluster.startShard(1)
+	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 
@@ -762,14 +863,42 @@ func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 	targetIdx := cluster.waitForFollower(1, leaderElectionTimeout)
 	targetReplicaID := uint64(targetIdx + 1)
 
+	// A transfer target must have an up-to-date log before the leader will
+	// hand over, so replicate one entry everywhere first.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
+	if _, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("lt5-warmup", "ok")); err != nil {
+		t.Fatalf("warmup SyncPropose failed: %v", err)
+	}
+	waitForReplication(t, cluster, trackers, 1, "lt5-warmup", "ok", defaultTimeout)
 
-	if err := leaderHost.RequestLeaderTransfer(ctx, 1, targetReplicaID); err != nil {
-		t.Fatalf("RequestLeaderTransfer failed: %v", err)
+	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
+
+	targetInfo, err := cluster.hosts[targetIdx].GetShardInfo(1)
+	if err != nil {
+		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
+	}
+	if !targetInfo.IsLeader {
+		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
+	}
+	if targetInfo.ReplicaID != targetReplicaID {
+		t.Fatalf("transfer target node[%d] ReplicaID = %d, want %d",
+			targetIdx, targetInfo.ReplicaID, targetReplicaID)
 	}
 
-	// Verify the request was accepted. Leadership transfer is asynchronous.
+	waitForCondition(t, failoverTimeout,
+		fmt.Sprintf("all nodes report replica %d as leader", targetReplicaID),
+		func() bool {
+			for _, i := range cluster.liveNodeIndexes() {
+				leaderID, known, leaderErr := cluster.hosts[i].GetLeaderID(1)
+				if leaderErr != nil || !known || leaderID != targetReplicaID {
+					return false
+				}
+			}
+			return true
+		},
+	)
+
 	info, err := leaderHost.GetShardInfo(1)
 	if err != nil {
 		t.Fatalf("GetShardInfo after transfer request failed: %v", err)
@@ -926,7 +1055,9 @@ func TestHostAPI_MultipleShards_FiveNode(t *testing.T) {
 }
 
 // TestHostAPI_ConcurrentProposals_FiveNode sends proposals from 5 goroutines
-// (20 each) to the leader of a 5-node cluster and verifies replication.
+// (20 each) to the leader of a 5-node cluster and verifies that nearly all of
+// them succeed and that every accepted value is present on every node. See
+// TestHostAPI_ConcurrentProposals_ThreeNode for what the previous floor missed.
 func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -937,9 +1068,14 @@ func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 
 	numGoroutines := 5
 	proposalsPerGoroutine := 20
+	totalProposals := numGoroutines * proposalsPerGoroutine
+	minSuccess := int64(totalProposals * 9 / 10)
 
 	var wg sync.WaitGroup
 	var successCount atomic.Int64
+	var writtenMu sync.Mutex
+	written := make(map[string]string, totalProposals)
+	var proposeErrs []error
 
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)
@@ -952,18 +1088,31 @@ func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 				_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(key, val))
 				cancel()
 				if err != nil {
+					// Collected, not asserted here: this runs on a
+					// non-test goroutine, where t.Fatal would only stop
+					// this goroutine and let the test carry on.
+					writtenMu.Lock()
+					proposeErrs = append(proposeErrs, fmt.Errorf("propose %q: %w", key, err))
+					writtenMu.Unlock()
 					continue
 				}
 				successCount.Add(1)
+				writtenMu.Lock()
+				written[key] = val
+				writtenMu.Unlock()
 			}
 		}(g)
 	}
 
 	wg.Wait()
-	t.Logf("concurrent proposals (5-node): %d/%d succeeded", successCount.Load(), numGoroutines*proposalsPerGoroutine)
+	t.Logf("concurrent proposals (5-node): %d/%d succeeded", successCount.Load(), totalProposals)
 
-	if successCount.Load() == 0 {
-		t.Fatal("no proposals succeeded")
+	for _, err := range proposeErrs {
+		t.Logf("proposal error: %v", err)
+	}
+	if got := successCount.Load(); got < minSuccess {
+		t.Fatalf("only %d/%d proposals succeeded, want at least %d",
+			got, totalProposals, minSuccess)
 	}
 
 	// Verify replication to all nodes.
@@ -972,21 +1121,7 @@ func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 		return int64(leaderSM.Len()) >= successCount.Load()
 	})
 
-	for i := range cluster.hosts {
-		if i == leaderIdx {
-			continue
-		}
-		followerSM := trackers[i].Get(1, uint64(i+1))
-		if followerSM == nil {
-			continue
-		}
-		waitForCondition(t, defaultTimeout*2,
-			fmt.Sprintf("follower[%d] replication (5-node)", i),
-			func() bool {
-				return int64(followerSM.Len()) >= successCount.Load()
-			},
-		)
-	}
+	verifyAllData(t, cluster, trackers, 1, written)
 }
 
 // TestHostAPI_ProposeToFollower_FiveNode verifies that proposing to a follower
@@ -1033,13 +1168,10 @@ func TestHostAPI_LargeValue_FiveNode(t *testing.T) {
 		t.Fatalf("SyncPropose large value failed: %v", err)
 	}
 
-	// Verify replication to all 5 nodes.
-	for i := range cluster.hosts {
-		replicaID := uint64(i + 1)
-		nodeSM := trackers[i].Get(1, replicaID)
-		if nodeSM == nil {
-			continue
-		}
+	// Verify replication to all 5 nodes. A node whose state machine has not
+	// registered is waited for, never skipped.
+	for _, i := range cluster.liveNodeIndexes() {
+		nodeSM := waitForStateMachine(t, cluster, trackers, 1, i, defaultTimeout)
 		waitForCondition(t, defaultTimeout,
 			fmt.Sprintf("node[%d] replicates large value (5-node)", i),
 			func() bool {

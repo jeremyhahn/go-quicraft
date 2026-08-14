@@ -263,8 +263,8 @@ func FuzzMessageBatchRoundTrip(f *testing.F) {
 		msgType, from, to uint64, entryCmd []byte) {
 
 		// The decoder accepts exactly the current wire version (no
-		// negotiation, no legacy decode path), so only WireVersion
-		// round-trips.
+		// negotiation, no legacy decode path, and pinned at 1 pre-release),
+		// so only WireVersion round-trips.
 		binVer = WireVersion
 		// Clamp message type to valid range.
 		if msgType > RateLimit {
@@ -364,9 +364,14 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		uint64(math.MaxUint64), "/a", uint64(1),
 		[]byte{0xFF}, uint64(ConcurrentStateMachine), true, uint64(math.MaxUint64), true, uint64(math.MaxUint64))
 
+	// The []byte parameter fed Snapshot.Checksum, which was removed from the
+	// wire format (never computed, never verified — see the Snapshot type doc). It is kept in the signature, unnamed, so the seed
+	// corpus already in testdata/fuzz/FuzzSnapshotRoundTrip keeps parsing: the
+	// corpus file format is positional and dropping an argument would make every
+	// stored case unreadable, losing the inputs rather than the field.
 	f.Fuzz(func(t *testing.T, shardID, replicaID, index, term,
 		ccID uint64, filepath string, fileSize uint64,
-		checksum []byte, smType uint64, imported bool,
+		_ []byte, smType uint64, imported bool,
 		onDiskIndex uint64, witness bool, epoch uint64) {
 
 		// Clamp state machine type to valid range.
@@ -376,10 +381,6 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		// Clamp filepath length.
 		if len(filepath) > MaxFilepathLen {
 			filepath = filepath[:MaxFilepathLen]
-		}
-		// Clamp checksum length.
-		if len(checksum) > int(MaxChecksumLen) {
-			checksum = checksum[:MaxChecksumLen]
 		}
 
 		s := Snapshot{
@@ -396,7 +397,6 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 			},
 			Filepath:    filepath,
 			FileSize:    fileSize,
-			Checksum:    checksum,
 			Type:        smType,
 			Imported:    imported,
 			OnDiskIndex: onDiskIndex,
@@ -442,9 +442,6 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		}
 		if s.FileSize != s2.FileSize {
 			t.Fatalf("FileSize mismatch: %d != %d", s.FileSize, s2.FileSize)
-		}
-		if !bytes.Equal(s.Checksum, s2.Checksum) {
-			t.Fatalf("Checksum mismatch")
 		}
 		if s.Type != s2.Type {
 			t.Fatalf("Type mismatch: %d != %d", s.Type, s2.Type)

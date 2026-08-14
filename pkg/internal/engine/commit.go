@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -513,8 +514,7 @@ func (w *commitWorker) processBatch() {
 			if pbErr != nil || len(piggyback.CommittedEntries) == 0 {
 				// No piggyback available — original skip-apply fast path.
 				if pbErr != nil {
-					slog.Warn("piggyback GetPiggybackUpdate failed",
-						"shard", u.ShardID, "replica", u.ReplicaID, "error", pbErr)
+					notePiggybackFailure(u.ShardID, u.ReplicaID, pbErr)
 				}
 				node.commitPending.Store(false)
 				w.workSignal.Notify(node.shardID)
@@ -597,6 +597,52 @@ func (w *commitWorker) abandonBatchTail(start int) {
 			w.workSignal.Notify(node.shardID)
 		}
 	}
+}
+
+// piggybackFailures counts GetPiggybackUpdate errors process-wide. A failure
+// here is not terminal for the shard — the commit worker falls back to the
+// skip-apply path and the entries are re-offered on a later cycle — but it
+// PERMANENTLY degrades the multi-node fast path for as long as the underlying
+// condition persists, turning every two-phase proposal back into a full extra
+// pipeline cycle. A repeated Warn is not something an operator can alert on, so
+// the condition is counted as well and the log record is rate-limited.
+//
+// It is a package counter rather than a RaftMetrics method because RaftMetrics
+// is implemented outside this package; adding a method to that interface is a
+// change to its implementor, not to the engine.
+var piggybackFailures atomic.Uint64
+
+// piggybackReportInterval bounds how often the degradation is logged. The
+// condition is persistent (a broken LogReader read path does not heal between
+// commits) while the call site runs on every commit cycle.
+const piggybackReportInterval = time.Minute
+
+// lastPiggybackReport is the unix-nano time the degradation warning was last
+// emitted, process-wide.
+var lastPiggybackReport atomic.Int64
+
+// PiggybackFailures returns the process-wide count of GetPiggybackUpdate
+// failures. Exposed so the host layer can surface the fast path's health.
+func PiggybackFailures() uint64 {
+	return piggybackFailures.Load()
+}
+
+// notePiggybackFailure records a GetPiggybackUpdate failure and emits a
+// rate-limited warning carrying the running total. The compare-and-swap makes
+// concurrent commit workers yield exactly one record per interval.
+func notePiggybackFailure(shardID, replicaID uint64, err error) {
+	total := piggybackFailures.Add(1)
+	now := time.Now().UnixNano()
+	prev := lastPiggybackReport.Load()
+	if prev != 0 && now-prev < int64(piggybackReportInterval) {
+		return
+	}
+	if !lastPiggybackReport.CompareAndSwap(prev, now) {
+		return
+	}
+	slog.Warn("piggyback GetPiggybackUpdate failed; commit fast path degraded",
+		"shard", shardID, "replica", replicaID,
+		"total_failures", total, "error", err)
 }
 
 // failBatchProposals completes every pending proposal carried by a batch that

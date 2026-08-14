@@ -99,8 +99,6 @@ type remote struct {
 // newRemote creates a new remote tracker for a follower. The peer starts
 // in the probe state with the given next index and an inflights tracker
 // of the given capacity.
-//
-//nolint:unparam // maxInflight is constant in production but varies in tests
 func newRemote(next uint64, maxInflight int) *remote {
 	return &remote{
 		next:      next,

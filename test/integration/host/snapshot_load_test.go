@@ -18,14 +18,12 @@ package host_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
@@ -188,6 +186,15 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 		t.Logf("node[%d] verified: %d entries consistent", i, nodeSM.Len())
 	}
 
+	// The state machines holding every key is equally consistent with a log
+	// that never compacted, so the automatic snapshots this test is named for
+	// are only proven by an artifact on disk. With SnapshotEntries=50 and 300+
+	// applied entries every replica takes several.
+	for _, i := range cluster.liveNodeIndexes() {
+		indexes := waitForSnapshotArtifact(t, cluster.nodeHostDirs[i], membershipTimeout)
+		t.Logf("node[%d] automatic snapshot artifacts at indexes %v", i, indexes)
+	}
+
 	// Verify via SyncRead on the leader for linearizable correctness.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	leaderHost = cluster.hosts[leaderIdx]
@@ -208,11 +215,10 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 }
 
 // TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred confirms that with
-// SnapshotEntries=50, writing 200+ entries actually triggers multiple
-// snapshots. The test verifies this by checking that the LastApplied index
-// on each node advances well beyond what a non-compacting log would show,
-// and by requesting an explicit snapshot that succeeds (proving the snapshot
-// machinery is functional).
+// SnapshotEntries=50, writing 200+ entries actually triggers snapshots. The
+// test verifies this by requiring a snapshot artifact on disk for every node,
+// and by requesting an explicit snapshot and requiring it to resolve at an
+// index that covers the entries written.
 //
 // The test exercises:
 // - Snapshot triggering threshold enforcement
@@ -244,35 +250,34 @@ func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 	// Verify all data is replicated.
 	verifyAllData(t, cluster, trackers, shardID, expected)
 
+	// Automatic snapshots must have happened on their own, before anything is
+	// requested explicitly. Every node runs its own auto-snapshot trigger
+	// (engine/apply.go), so every node must have an artifact.
+	for _, i := range cluster.liveNodeIndexes() {
+		indexes := waitForSnapshotArtifact(t, cluster.nodeHostDirs[i], membershipTimeout)
+		t.Logf("node[%d] automatic snapshot artifacts at indexes %v", i, indexes)
+	}
+
+	// Advance the applied index past the newest automatic snapshot before
+	// asking for one explicitly: a save whose index does not advance is a
+	// no-op that reports index 0 (engine/snapshot_pool.go).
+	proposeAndWait(t, cluster, trackers, shardID, "snap-marker", "ok")
+	expected["snap-marker"] = "ok"
+
 	// Request an explicit snapshot to prove the snapshot machinery works.
 	// This also confirms that the SM can serialize its state correctly
-	// after being modified by many entries and compactions.
-	// Retry with backoff if an automatic snapshot is still in progress.
-	const maxSnapRetries = 10
-	const snapRetryInterval = 500 * time.Millisecond
-	var snapshotSucceeded bool
-	for attempt := range maxSnapRetries {
-		snapCtx, snapCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		rs, err := leaderHost.RequestSnapshot(snapCtx, shardID, quicraft.SnapshotOption{})
-		snapCancel()
-		if err == nil {
-			rs.Release()
-			t.Logf("explicit snapshot request succeeded on leader (attempt %d)", attempt+1)
-			snapshotSucceeded = true
-			break
-		}
-		if errors.Is(err, quicraft.ErrSnapshotInProgress) {
-			t.Logf("snapshot in progress, retrying (attempt %d/%d)", attempt+1, maxSnapRetries)
-			retryTimer := time.NewTimer(snapRetryInterval)
-			<-retryTimer.C
-			retryTimer.Stop()
-			continue
-		}
-		t.Fatalf("RequestSnapshot after %d entries failed: %v", totalEntries, err)
+	// after being modified by many entries and compactions. requestSnapshotIndex
+	// waits for the snapshot to COMPLETE — the request only being accepted
+	// proves nothing, because the save runs asynchronously.
+	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	leaderHost = cluster.hosts[leaderIdx]
+	snapIndex := requestSnapshotIndex(t, leaderHost, shardID)
+	if snapIndex < uint64(totalEntries) {
+		t.Fatalf("explicit snapshot index = %d, want >= %d: the snapshot does not "+
+			"even cover the %d entries this test wrote", snapIndex, totalEntries, totalEntries)
 	}
-	if !snapshotSucceeded {
-		t.Fatalf("RequestSnapshot failed after %d retries: snapshot still in progress", maxSnapRetries)
-	}
+	assertSnapshotArtifact(t, cluster.nodeHostDirs[leaderIdx], snapIndex, defaultTimeout)
+	t.Logf("explicit snapshot on leader node[%d] completed at index %d", leaderIdx, snapIndex)
 
 	// Verify LastApplied is reasonable on all nodes. After 200 user entries
 	// plus config entries and session entries, LastApplied should be
@@ -377,7 +382,22 @@ func TestHostAPI_SnapshotUnderLoad_NewNodeCatchUp(t *testing.T) {
 
 	// Verify the new node receives all data via snapshot transfer.
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
-	t.Logf("node[%d] caught up on all %d entries via snapshot", result.idx, totalEntries)
+
+	// "It has the keys" is exactly what log replay would produce too. The
+	// joiner starts empty, so the only way its state machine can be restored
+	// from a snapshot is an InstallSnapshot streamed from the leader — that
+	// restore, not the key set, is what this test claims to exercise.
+	joinerSM := result.tracker.Get(shardID, newReplicaID)
+	if joinerSM == nil {
+		t.Fatalf("node[%d] (replica %d) has no state machine after catch-up", result.idx, newReplicaID)
+	}
+	if joinerSM.Recoveries() == 0 {
+		t.Fatalf("node[%d] (replica %d) never restored from a snapshot: it caught up "+
+			"by log replay, so the snapshot streaming path was not exercised",
+			result.idx, newReplicaID)
+	}
+	t.Logf("node[%d] caught up on all %d entries via snapshot (%d snapshot restores)",
+		result.idx, totalEntries, joinerSM.Recoveries())
 
 	// Write a few more entries and verify the new node receives them.
 	postData := proposeNEntries(t, cluster, trackers, shardID, 10, "post-catchup")

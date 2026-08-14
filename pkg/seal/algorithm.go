@@ -26,8 +26,21 @@ import (
 )
 
 // SymmetricAlgorithm identifies a supported authenticated encryption algorithm.
-// Values are single-byte identifiers suitable for embedding in ciphertext headers
-// to enable algorithm-agile decryption without out-of-band negotiation.
+// Values are single-byte identifiers, and one is embedded in every barrier
+// ciphertext header.
+//
+// That byte does NOT select the cipher, and must not be made to. It is
+// UNAUTHENTICATED — it sits outside the AEAD tag and outside the AAD — so a
+// decryptor that honoured it would be honouring an attacker-chosen algorithm
+// identifier, i.e. a downgrade oracle: flip the byte, and a reader picks a
+// different primitive for a key derived for another one. Barrier.Decrypt
+// therefore selects the AEAD from the AUTHENTICATED epoch (the epoch's DEK
+// determines the primitive) and uses the header byte only to cross-check the
+// nonce width, rejecting any value whose nonce size disagrees with the active
+// cipher — see Barrier.decryptLocked. The identifier's real jobs are forensic
+// (identifying data on disk) and derivational (an HKDFV2 domain separator);
+// runtime negotiation is not one of them, and a deployment is expected to use
+// ONE algorithm for the life of its data (see SealedRootKey.Algorithm).
 type SymmetricAlgorithm byte
 
 const (

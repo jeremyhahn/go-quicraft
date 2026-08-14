@@ -151,6 +151,14 @@ func identityMembership() logdb.Membership {
 			2: "spki:2222222222222222222222222222222222222222222222222222222222222222",
 			3: "spki:3333333333333333333333333333333333333333333333333333333333333333",
 		},
+		// Replica 9 is the tombstone in Removed above; this is the identity the
+		// configuration held for it when the removal committed. The two are
+		// deliberately consistent — RemovedIdentities' key set is a strict
+		// subset of Removed's, so a fixture where they disagree would not be a
+		// state the apply path can produce.
+		RemovedIdentities: map[uint64]string{
+			9: "spki:9999999999999999999999999999999999999999999999999999999999999999",
+		},
 	}
 }
 
@@ -233,6 +241,101 @@ func TestConformanceSnapshotMembershipIdentitiesSurviveReopen(t *testing.T) {
 			t.Fatalf("membership round-trip lost a neighbouring field: %+v", membership)
 		}
 	})
+}
+
+// TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen pins the
+// tombstone half of the removal deny-list across a restart.
+//
+// Removal authorization is evaluated against the AUTHENTICATED connection
+// identity, because the claimed msg.From is a value a removed replica can
+// simply change — it still holds its private key, so it authenticates normally
+// and evades a tombstone keyed on the ID it chooses to name. RemovedIdentities
+// is what makes the deny-list answerable about the identity instead.
+//
+// Dropping it across this round-trip is not an information loss, it REVOKES A
+// REVOCATION. The replica comes back holding the tombstone replica IDs (Removed
+// survives) but not the identities they were recorded against, so a
+// decommissioned node still carrying its certificate is readmitted — silently,
+// with no error raised anywhere, and precisely on the restart an operator
+// performs after removing it. Certificate revocation is the only control left
+// at that point, and it is opt-in and soft-fail by default.
+//
+// Asserting only "no error" would pass against exactly that. The assertion is
+// the map's CONTENT after the reopen.
+func TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen(t *testing.T) {
+	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
+		want := identityMembership()
+
+		if err := r.DB().SaveState([]logdb.Update{{
+			ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 4, Vote: 1, Commit: 10},
+		}}); err != nil {
+			t.Fatalf("SaveState: %v", err)
+		}
+		if err := r.DB().SaveSnapshot(1, 1, logdb.Snapshot{
+			Index: 10, Term: 4, Filepath: "snap-10.dat", Membership: want,
+		}); err != nil {
+			t.Fatalf("SaveSnapshot: %v", err)
+		}
+
+		db := r.Reopen(t)
+
+		snap, err := db.GetSnapshot(1, 1)
+		if err != nil {
+			t.Fatalf("GetSnapshot after reopen: %v", err)
+		}
+		assertRemovedIdentities(t, "GetSnapshot",
+			snap.Membership.RemovedIdentities, want.RemovedIdentities)
+
+		// recoverLogReader reads the membership back through ReadState as well,
+		// so both exits must carry the field or the gap reappears on the path
+		// an actual restart takes.
+		_, membership, err := db.ReadState(1, 1)
+		if err != nil {
+			t.Fatalf("ReadState after reopen: %v", err)
+		}
+		assertRemovedIdentities(t, "ReadState",
+			membership.RemovedIdentities, want.RemovedIdentities)
+
+		// The tombstone ID and its identity must survive TOGETHER. Keeping
+		// Removed while losing RemovedIdentities is the specific inconsistent
+		// state this test exists to refuse.
+		if !membership.Removed[9] {
+			t.Fatalf("Removed[9] was lost while RemovedIdentities survived: %+v", membership)
+		}
+		// The active identity map must not have absorbed the tombstone: an
+		// identity in Identities is an ALLOW, and moving a removal into it
+		// would readmit exactly the replica the tombstone ejects.
+		if _, ok := membership.Identities[9]; ok {
+			t.Fatalf("the removed replica's identity reappeared in Identities, "+
+				"which is the active binding: %+v", membership.Identities)
+		}
+	})
+}
+
+// assertRemovedIdentities fails unless got holds exactly want.
+func assertRemovedIdentities(t *testing.T, where string, got, want map[uint64]string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: RemovedIdentities = %v (%d entries), want %v (%d entries).\n"+
+			"This map is the deny-list the receive gate evaluates against the "+
+			"AUTHENTICATED connection identity. Losing it readmits a removed "+
+			"replica that still holds its certificate, on the restart that "+
+			"follows the removal.\n"+
+			"If this fails for waldb only, the field did not reach the record "+
+			"encoding: waldb's snapshot record carries its OWN membership "+
+			"section (membershipSectionVersion, currently v5), independent of "+
+			"proto.Membership. It must be counted in membershipSize, marshaled "+
+			"in walShard.writeSnapshot AFTER the v4 session-policy tail (so v3 "+
+			"and v4 sections keep their existing offsets), and read back in "+
+			"walShard.replaySnapshot under a sectionVersion >= v5 guard, ahead "+
+			"of that function's trailing-bytes check.",
+			where, got, len(got), want, len(want))
+	}
+	for id, identity := range want {
+		if got[id] != identity {
+			t.Fatalf("%s: RemovedIdentities[%d] = %q, want %q", where, id, got[id], identity)
+		}
+	}
 }
 
 // TestConformanceSnapshotMembershipDoesNotAliasCallerIdentities pins that a

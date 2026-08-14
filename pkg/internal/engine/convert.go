@@ -100,6 +100,16 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 			result.Identities[k] = v
 		}
 	}
+	// RemovedIdentities is the identity half of the removal deny-list. Dropping
+	// it here would revoke a revocation: the snapshot this save produces is what
+	// a restart reads back, and a replica that comes up without its tombstone
+	// identities can be evaded by a removed node claiming another replica ID.
+	if len(m.RemovedIdentities) > 0 {
+		result.RemovedIdentities = make(map[uint64]string, len(m.RemovedIdentities))
+		for k, v := range m.RemovedIdentities {
+			result.RemovedIdentities[k] = v
+		}
+	}
 	return result
 }
 

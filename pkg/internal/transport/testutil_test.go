@@ -113,3 +113,17 @@ func (d *dropRecorder) drops() []dropSample {
 	defer d.mu.Unlock()
 	return append([]dropSample(nil), d.messageDrops...)
 }
+
+// firstDropWithReason returns the first recorded message drop carrying reason,
+// and whether one was recorded at all. Polling for a specific reason this way
+// avoids copying the whole drop log on every poll.
+func (d *dropRecorder) firstDropWithReason(reason string) (dropSample, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, s := range d.messageDrops {
+		if s.reason == reason {
+			return s, true
+		}
+	}
+	return dropSample{}, false
+}

@@ -34,26 +34,12 @@ func TestE2E_ThreeNodeCluster_LeaderElection(t *testing.T) {
 		t.Fatalf("expected leader index in [0,2], got %d", leaderIdx)
 	}
 
-	// Wait for exactly one leader. During election transitions, multiple
-	// nodes may momentarily report IsLeader before convergence.
-	waitForCondition(t, leaderElectionTimeout, "exactly 1 leader", func() bool {
-		count := 0
-		for i := range cluster.hosts {
-			if cluster.stopped[i].Load() {
-				continue
-			}
-			info, err := cluster.hosts[i].GetShardInfo(1)
-			if err != nil {
-				return false
-			}
-			if info.IsLeader {
-				count++
-			}
-		}
-		return count == 1
-	})
+	// Wait for exactly one leader, checking election safety on every poll.
+	// Two nodes leading the SAME term is not a transition to wait out, it is
+	// the violation, so it fails immediately rather than being polled past.
+	singleIdx := waitForSingleLeader(t, cluster, 1, leaderElectionTimeout)
 
-	t.Logf("leader elected at node index %d", leaderIdx)
+	t.Logf("leader elected at node index %d (single-leader check settled on node[%d])", leaderIdx, singleIdx)
 }
 
 // TestE2E_ThreeNodeCluster_AllNodesAgreeOnLeader verifies that all nodes
@@ -105,26 +91,11 @@ func TestE2E_FiveNodeCluster_LeaderElection(t *testing.T) {
 		t.Fatalf("expected leader index in [0,4], got %d", leaderIdx)
 	}
 
-	// Wait for exactly one leader. During election transitions, multiple
-	// nodes may momentarily report IsLeader before convergence.
-	waitForCondition(t, leaderElectionTimeout, "exactly 1 leader in 5-node cluster", func() bool {
-		count := 0
-		for i := range cluster.hosts {
-			if cluster.stopped[i].Load() {
-				continue
-			}
-			info, err := cluster.hosts[i].GetShardInfo(1)
-			if err != nil {
-				return false
-			}
-			if info.IsLeader {
-				count++
-			}
-		}
-		return count == 1
-	})
+	// Wait for exactly one leader, checking election safety on every poll.
+	singleIdx := waitForSingleLeader(t, cluster, 1, leaderElectionTimeout)
 
-	t.Logf("5-node cluster elected leader at node index %d", leaderIdx)
+	t.Logf("5-node cluster elected leader at node index %d (single-leader check settled on node[%d])",
+		leaderIdx, singleIdx)
 }
 
 // TestE2E_MultipleShards_IndependentLeaders verifies that multiple shards
@@ -232,30 +203,10 @@ func TestE2E_FiveNodeCluster_MultipleShards(t *testing.T) {
 		}
 	}
 
-	// Wait for exactly one leader per shard. During election transitions,
-	// multiple nodes may momentarily report IsLeader before the old leader
-	// steps down. Poll until convergence.
+	// Wait for exactly one leader per shard, checking election safety on every
+	// poll of every shard.
 	for _, sid := range shardIDs {
-		sid := sid
-		waitForCondition(t, leaderElectionTimeout,
-			fmt.Sprintf("shard %d exactly 1 leader", sid),
-			func() bool {
-				leaderCount := 0
-				for i := range cluster.hosts {
-					if cluster.stopped[i].Load() {
-						continue
-					}
-					info, err := cluster.hosts[i].GetShardInfo(sid)
-					if err != nil {
-						return false
-					}
-					if info.IsLeader {
-						leaderCount++
-					}
-				}
-				return leaderCount == 1
-			},
-		)
+		waitForSingleLeader(t, cluster, sid, leaderElectionTimeout)
 	}
 
 	// Verify each shard can accept proposals independently.

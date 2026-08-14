@@ -69,10 +69,10 @@ func TestNewLogger_DefaultsToInfoOnUnknownLevel(t *testing.T) {
 
 	// The handler should be enabled for info but the exact level
 	// is verified indirectly: debug should be disabled.
-	if logger.Handler().Enabled(nil, slog.LevelDebug) {
+	if logger.Handler().Enabled(t.Context(), slog.LevelDebug) {
 		t.Error("expected debug to be disabled at default info level")
 	}
-	if !logger.Handler().Enabled(nil, slog.LevelInfo) {
+	if !logger.Handler().Enabled(t.Context(), slog.LevelInfo) {
 		t.Error("expected info to be enabled at default info level")
 	}
 }
@@ -97,16 +97,16 @@ func TestNewLogger_LevelFiltering(t *testing.T) {
 			logger := NewLogger(cfg)
 			h := logger.Handler()
 
-			if got := h.Enabled(nil, slog.LevelDebug); got != tt.enabledDebug {
+			if got := h.Enabled(t.Context(), slog.LevelDebug); got != tt.enabledDebug {
 				t.Errorf("debug enabled = %v, want %v", got, tt.enabledDebug)
 			}
-			if got := h.Enabled(nil, slog.LevelInfo); got != tt.enabledInfo {
+			if got := h.Enabled(t.Context(), slog.LevelInfo); got != tt.enabledInfo {
 				t.Errorf("info enabled = %v, want %v", got, tt.enabledInfo)
 			}
-			if got := h.Enabled(nil, slog.LevelWarn); got != tt.enabledWarn {
+			if got := h.Enabled(t.Context(), slog.LevelWarn); got != tt.enabledWarn {
 				t.Errorf("warn enabled = %v, want %v", got, tt.enabledWarn)
 			}
-			if got := h.Enabled(nil, slog.LevelError); got != tt.enabledError {
+			if got := h.Enabled(t.Context(), slog.LevelError); got != tt.enabledError {
 				t.Errorf("error enabled = %v, want %v", got, tt.enabledError)
 			}
 		})
@@ -127,10 +127,10 @@ func TestSetDefaultLogger(t *testing.T) {
 	if _, ok := handler.(*slog.JSONHandler); !ok {
 		t.Errorf("expected default logger to use *slog.JSONHandler, got %T", handler)
 	}
-	if handler.Enabled(nil, slog.LevelInfo) {
+	if handler.Enabled(t.Context(), slog.LevelInfo) {
 		t.Error("expected info to be disabled at warn level")
 	}
-	if !handler.Enabled(nil, slog.LevelWarn) {
+	if !handler.Enabled(t.Context(), slog.LevelWarn) {
 		t.Error("expected warn to be enabled at warn level")
 	}
 }

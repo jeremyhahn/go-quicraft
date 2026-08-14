@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
@@ -43,9 +44,51 @@ const shareFormatVersion = 0x01
 // value: [version:1][x:1].
 const rawShareOverhead = 2
 
+// MaxSecretBytes bounds the per-share payload this package will produce or
+// consume, and therefore the secret length.
+//
+// Shamir here is a KEY-custody primitive: the secret it splits is a 32-byte
+// root key, and every larger payload costs O(shares x len) field operations
+// with roughly 1.75x the input held in memory at once while combining. Without
+// a bound, a caller (or an attacker submitting shares to a recovery ceremony)
+// could hand Combine 255 shares of a megabyte each — ~340 MB of input, ~0.75x
+// of it copied, and seconds of CPU — from unauthenticated material, since
+// shares cannot be authenticated before they are combined. 64 KiB is four
+// orders of magnitude above any legitimate key and caps the work at a few
+// megabytes and milliseconds. Split large payloads by enveloping them under a
+// key that IS this size, never by sharing the payload itself.
+const MaxSecretBytes = 64 << 10
+
+// maxShares is the number of distinct shares the scheme can express: the
+// x-coordinate is a non-zero byte, so 255 is a property of GF(2^8), not a
+// policy. Combine applies it up front so an oversized share list is rejected
+// before any of it is decoded.
+const maxShares = 255
+
 // randReader is the source of cryptographic randomness for polynomial
-// coefficients. Injectable for testing error paths.
+// coefficients. It is package-private and swapped ONLY through
+// testOnlyRandReader, which panics outside a test binary: it sits on the
+// root-key path, where a mutable global source of randomness is exactly the
+// thing that must not be reachable from production code.
 var randReader io.Reader = rand.Reader
+
+// testOnlyRandReader replaces the package randomness source and returns a
+// function restoring the previous one. It PANICS outside a test binary.
+//
+// The rest of this codebase carries its randomness in a per-instance field
+// (see seal.Barrier.randReader and seal.SoftwareStrategy.randReader) precisely
+// so that no such global exists. This package's API is a set of free functions
+// with no instance to hang it on, so the global stays — behind a gate that
+// makes it provably unreachable from production, and that no future caller can
+// quietly step around.
+func testOnlyRandReader(r io.Reader) func() {
+	if !testing.Testing() {
+		panic("shamir.testOnlyRandReader: test-only randomness override called outside a test binary")
+	}
+	prev := randReader
+	randReader = r
+	return func() { randReader = prev }
+}
 
 // Split divides a secret into N shares where any M shares can reconstruct it.
 //
@@ -108,6 +151,11 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	}
 	if len(secret) == 0 {
 		return nil, &SplitError{Reason: "secret cannot be empty"}
+	}
+	if len(secret) > MaxSecretBytes {
+		return nil, &SplitError{Reason: fmt.Sprintf(
+			"secret is %d bytes, exceeding the %d-byte limit; share a key that envelopes the payload, not the payload",
+			len(secret), MaxSecretBytes)}
 	}
 
 	// Random coefficients: one degree-(threshold-1) polynomial per secret
@@ -197,6 +245,13 @@ func combine(shares []*Share) ([]byte, error) {
 	// json.Unmarshal of `[null]` into a []*Share produces exactly this. One
 	// malformed submission must not panic the process running an unseal
 	// ceremony.
+	// The x-coordinate is a non-zero byte, so no set larger than maxShares can
+	// contain distinct shares. Rejecting up front bounds the decode work an
+	// unauthenticated submission can force; the duplicate-x check below would
+	// otherwise only notice after decoding its way there.
+	if len(shares) > maxShares {
+		return nil, &CombineError{Reason: fmt.Sprintf("too many shares: %d exceeds the maximum of %d", len(shares), maxShares)}
+	}
 	for i, share := range shares {
 		if share == nil {
 			return nil, &CombineError{Reason: fmt.Sprintf("share %d is nil", i)}
@@ -276,6 +331,15 @@ func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (b
 		return 0, nil, &CombineError{Reason: fmt.Sprintf(
 			"share %d has unsupported format version %d (legacy or foreign share)", i, raw[0])}
 	}
+	// Bound the payload BEFORE the caller decodes the rest of the set: shares
+	// arriving at a recovery ceremony are unauthenticated by construction (they
+	// cannot be checked until they are combined), so an oversized submission
+	// must be rejected on the first share rather than after 255 of them have
+	// been decoded and copied. See MaxSecretBytes.
+	if payload := len(raw) - rawShareOverhead; payload > MaxSecretBytes {
+		return 0, nil, &CombineError{Reason: fmt.Sprintf(
+			"share %d payload is %d bytes, exceeding the %d-byte limit", i, payload, MaxSecretBytes)}
+	}
 	x := raw[1]
 	if x == 0 {
 		return 0, nil, &CombineError{Reason: fmt.Sprintf("share %d has zero x-coordinate", i)}
@@ -328,6 +392,11 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	}
 	if len(values) < threshold {
 		return nil, &CombineError{Reason: fmt.Sprintf("need at least %d shares, got %d", threshold, len(values))}
+	}
+	// Same bound as combine: no distinct share set can exceed the 255 non-zero
+	// x-coordinates GF(2^8) provides.
+	if len(values) > maxShares {
+		return nil, &CombineError{Reason: fmt.Sprintf("too many shares: %d exceeds the maximum of %d", len(values), maxShares)}
 	}
 	xs := make([]byte, len(values))
 	ys := make([][]byte, len(values))

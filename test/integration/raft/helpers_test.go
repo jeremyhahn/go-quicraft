@@ -26,10 +26,17 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -69,13 +76,109 @@ func encodeKVGet(key string) []byte {
 	return []byte(key)
 }
 
+// ---------------------------------------------------------------------------
+// Apply-Order Violations
+// ---------------------------------------------------------------------------
+
+// applyOrderViolations collects apply-order invariant breaches observed by any
+// kvStateMachine in the package. The state machines are driven by engine
+// goroutines that have no *testing.T, so a breach is parked here and surfaced
+// by the t.Cleanup that assertApplyOrder installs. Integration tests in this
+// package never run in parallel, so one package-level sink is unambiguous.
+var applyOrderViolations struct {
+	mu      sync.Mutex
+	list    []string
+	armedBy *testing.T
+}
+
+// recordApplyViolation parks an apply-order breach for the running test.
+func recordApplyViolation(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	applyOrderViolations.mu.Lock()
+	applyOrderViolations.list = append(applyOrderViolations.list, msg)
+	applyOrderViolations.mu.Unlock()
+}
+
+// assertApplyOrder arms the violation sink for t and installs a t.Cleanup that
+// fails the test if any state machine observed a duplicate, backward or
+// replayed apply while the test was running. It is idempotent: arming the
+// same test twice must not discard breaches already recorded for it.
+func assertApplyOrder(t *testing.T) {
+	t.Helper()
+
+	applyOrderViolations.mu.Lock()
+	if applyOrderViolations.armedBy == t {
+		applyOrderViolations.mu.Unlock()
+		return
+	}
+	applyOrderViolations.armedBy = t
+	applyOrderViolations.list = nil
+	applyOrderViolations.mu.Unlock()
+
+	t.Cleanup(func() {
+		applyOrderViolations.mu.Lock()
+		found := applyOrderViolations.list
+		applyOrderViolations.list = nil
+		applyOrderViolations.armedBy = nil
+		applyOrderViolations.mu.Unlock()
+		if len(found) == 0 {
+			return
+		}
+		shown := found
+		if len(shown) > 20 {
+			shown = shown[:20]
+		}
+		t.Errorf("state machine apply-order violations (%d total):\n  %s",
+			len(found), strings.Join(shown, "\n  "))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// KV State Machine
+// ---------------------------------------------------------------------------
+
 // kvStateMachine is a simple in-memory key-value store that implements
 // StateMachine for integration testing. It supports put and get
 // operations and full snapshot save/recover.
 type kvStateMachine struct {
-	mu      sync.RWMutex
-	data    map[string]string
-	applied atomic.Uint64
+	mu   sync.RWMutex
+	data map[string]string
+	// prevIndex is the raft index of the previously applied entry. Every
+	// entry handed to Update must carry a STRICTLY greater index: an index
+	// that repeats or moves backward means the entry was applied twice or
+	// replayed, which no amount of state comparison can detect afterwards on
+	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
+	// point.
+	//
+	// Note: consecutive indices are NOT required. The user state machine only
+	// ever sees user commands; the engine legitimately consumes indices for
+	// the initial-membership entry, each leader's no-op entry, config changes
+	// and session register/unregister entries, so gaps are expected and are
+	// counted rather than failed. See applyGaps.
+	prevIndex uint64
+	// applyGaps counts skipped index ranges, for diagnostics only.
+	applyGaps atomic.Uint64
+	applied   atomic.Uint64
+}
+
+// checkIndexLocked enforces strict forward progress of the applied index and
+// records a violation if the entry repeats or rolls back. kv.mu must be held.
+func (kv *kvStateMachine) checkIndexLocked(index uint64) {
+	switch {
+	case index <= kv.prevIndex:
+		recordApplyViolation(
+			"kvStateMachine: applied index did not advance: entry index %d applied after %d (duplicate, reordered or replayed apply)",
+			index, kv.prevIndex)
+	case index > kv.prevIndex+1:
+		kv.applyGaps.Add(1)
+	}
+	kv.prevIndex = index
+	kv.applied.Store(index)
+}
+
+// ApplyGaps returns the number of skipped index ranges observed so far.
+func (kv *kvStateMachine) ApplyGaps() uint64 {
+	return kv.applyGaps.Load()
 }
 
 func newKVStateMachine() *kvStateMachine {
@@ -89,6 +192,11 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for i, entry := range entries {
+		// The index invariant holds for every entry the state machine is
+		// handed, including malformed ones, so it is checked before any
+		// command-shape early exit.
+		kv.checkIndexLocked(entry.Index)
+
 		if len(entry.Cmd) < 3 {
 			results[i] = sm.Result{Value: 0}
 			continue
@@ -108,7 +216,6 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 		default:
 			results[i] = sm.Result{Value: 0}
 		}
-		kv.applied.Store(entry.Index)
 	}
 	return nil
 }
@@ -137,7 +244,15 @@ func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 
-	// Format: [count:uint32][key_len:uint16][key][val_len:uint32][val]...
+	// The applied index is written ahead of the payload so a recovering
+	// replica can tell whether the snapshot moves it forward or rolls it back.
+	indexBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(indexBuf, kv.prevIndex)
+	if _, err := w.Write(indexBuf); err != nil {
+		return err
+	}
+
+	// Format: [applied:uint64][count:uint32][key_len:uint16][key][val_len:uint32][val]...
 	countBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(countBuf, uint32(len(kv.data)))
 	if _, err := w.Write(countBuf); err != nil {
@@ -173,6 +288,23 @@ func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <
 func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	// This is the only point at which the applied-index expectation may be
+	// reset, and the reset must still move the replica FORWARD: installing a
+	// snapshot older than what this replica already applied would silently
+	// roll the state machine back.
+	indexBuf := make([]byte, 8)
+	if _, err := io.ReadFull(r, indexBuf); err != nil {
+		return err
+	}
+	snapshotIndex := binary.BigEndian.Uint64(indexBuf)
+	if snapshotIndex < kv.prevIndex {
+		recordApplyViolation(
+			"kvStateMachine: snapshot rolled the state machine backward: recovered at index %d, already applied through %d",
+			snapshotIndex, kv.prevIndex)
+	}
+	kv.prevIndex = snapshotIndex
+	kv.applied.Store(snapshotIndex)
 
 	countBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, countBuf); err != nil {
@@ -265,12 +397,25 @@ var _ sm.StateMachine = (*kvStateMachine)(nil)
 // applied entry. Used for stress tests where we only care about
 // counting applied entries, not their content.
 type counterStateMachine struct {
+	mu      sync.Mutex
 	count   atomic.Int64
 	applied atomic.Uint64
+	// prevIndex carries the same strict-advance invariant as
+	// kvStateMachine.prevIndex: a counter that is incremented twice for one
+	// entry is otherwise indistinguishable from one that saw two entries.
+	prevIndex uint64
 }
 
 func (c *counterStateMachine) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for i, entry := range entries {
+		if entry.Index <= c.prevIndex {
+			recordApplyViolation(
+				"counterStateMachine: applied index did not advance: entry index %d applied after %d (duplicate, reordered or replayed apply)",
+				entry.Index, c.prevIndex)
+		}
+		c.prevIndex = entry.Index
 		c.count.Add(1)
 		results[i] = sm.Result{Value: uint64(c.count.Load())}
 		c.applied.Store(entry.Index)
@@ -392,6 +537,7 @@ func testMTLSConfig(t *testing.T) *config.MTLSConfig {
 // Each call gets unique temp directories via t.TempDir().
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
+	assertApplyOrder(t)
 	return config.HostConfig{
 		WALDir:                t.TempDir(),
 		NodeHostDir:           t.TempDir(),
@@ -557,3 +703,275 @@ const defaultTimeout = 10 * time.Second
 // With RTT=50ms and ElectionRTT=10, election timeout is ~500ms. We
 // give 5x headroom for CI environments.
 const leaderElectionTimeout = 5 * time.Second
+
+// ---------------------------------------------------------------------------
+// Linearizable read assertions
+// ---------------------------------------------------------------------------
+
+// syncReadExact performs a LINEARIZABLE read of key through h (ReadIndex plus
+// a state machine lookup at the confirmed read index) and asserts the value is
+// exactly want.
+//
+// Transport-level failures are retried until the timeout: right after an
+// election the new leader may briefly reject ReadIndex while it commits its
+// no-op entry. A read that SUCCEEDS with the wrong value is never retried and
+// fails immediately — an entry that was committed before the read cannot
+// legally change or disappear, so retrying would only hide the violation
+// behind a timeout message.
+func syncReadExact(t *testing.T, h *quicraft.Host, shardID uint64, key, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		result, err := h.SyncRead(ctx, shardID, key)
+		cancel()
+		if err == nil {
+			got, ok := result.(string)
+			if !ok {
+				t.Fatalf("SyncRead(shard %d, %q) returned %T, want string", shardID, key, result)
+			}
+			if got != want {
+				t.Fatalf("linearizable read of %q on shard %d = %q, want %q: a committed entry did not survive into the current leader's term (Leader Completeness violated)",
+					key, shardID, got, want)
+			}
+			return
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for a linearizable read of %q on shard %d to succeed: %v",
+				timeout, key, shardID, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// assertSMHasExact fails the test unless the state machine holds key with
+// exactly want. Unlike a Lookup through the Host this reads the replica's own
+// applied state directly, so it cannot be satisfied by a read that was served
+// somewhere else.
+func assertSMHasExact(t *testing.T, machine *kvStateMachine, label, key, want string) {
+	t.Helper()
+	if machine == nil {
+		t.Fatalf("%s: state machine not found", label)
+	}
+	got, ok := machine.Get(key)
+	if !ok {
+		t.Fatalf("%s state machine is missing key %q (want %q): a committed entry was lost", label, key, want)
+	}
+	if got != want {
+		t.Fatalf("%s state machine has %q = %q, want %q", label, key, got, want)
+	}
+}
+
+// proposeCommitted proposes a put through h and waits for it to be COMMITTED
+// AND APPLIED: RequestState.Result resolves from the state machine apply
+// callback, whereas a bare Propose followed by Release proves only that the
+// proposal entered the pipeline. Every write a test later makes an assertion
+// about goes through here.
+//
+// Transient rejections (a leader elected moments ago, a momentarily busy
+// pipeline) are retried until timeout; the timeout itself is a hard failure.
+// Retrying is safe because a put is idempotent under last-write-wins.
+func proposeCommitted(t *testing.T, h *quicraft.Host, shardID uint64, key, value string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	cmd := encodeKVPut(key, value)
+	var lastErr error
+	for {
+		attemptTimeout := time.Until(deadline)
+		if attemptTimeout > 5*time.Second {
+			attemptTimeout = 5 * time.Second
+		}
+		if attemptTimeout <= 0 {
+			t.Fatalf("timed out after %v committing %q=%q on shard %d: %v",
+				timeout, key, value, shardID, lastErr)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		rs, err := h.Propose(ctx, shardID, cmd)
+		if err == nil {
+			_, lastErr = rs.Result()
+			rs.Release()
+			if lastErr == nil {
+				cancel()
+				return
+			}
+		} else {
+			lastErr = err
+		}
+		cancel()
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v committing %q=%q on shard %d: %v",
+				timeout, key, value, shardID, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot artifact assertions
+// ---------------------------------------------------------------------------
+
+// snapshotArtifact is one durable snapshot found on disk.
+type snapshotArtifact struct {
+	index uint64
+	path  string
+	size  int64
+}
+
+func (a snapshotArtifact) String() string {
+	return fmt.Sprintf("index=%d size=%d path=%s", a.index, a.size, a.path)
+}
+
+// findSnapshotArtifacts walks dir and returns every snapshot.dat written for
+// shardID/replicaID, with the index decoded from the enclosing
+// snapshot-<020d index> directory (see snapshotSaveDir in
+// pkg/internal/engine/snapshot_pool.go). A recursive walk is used rather than
+// a hardcoded path so the assertion survives layout changes above the
+// shard-<n>/replica-<n>/snapshot-<index> suffix.
+//
+// The artifact is the only durable proof that a snapshot was actually taken:
+// a state machine that merely holds the expected keys is equally explained by
+// plain log replay.
+func findSnapshotArtifacts(t *testing.T, dir string, shardID, replicaID uint64) []snapshotArtifact {
+	t.Helper()
+
+	shardSeg := fmt.Sprintf("shard-%d", shardID)
+	replicaSeg := fmt.Sprintf("replica-%d", replicaID)
+
+	var found []snapshotArtifact
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Snapshot GC can remove a directory mid-walk; anything else is
+			// a real failure.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || d.Name() != "snapshot.dat" {
+			return nil
+		}
+		snapDir := filepath.Dir(path)
+		base := filepath.Base(snapDir)
+		if !strings.HasPrefix(base, "snapshot-") {
+			return nil
+		}
+		replicaDir := filepath.Dir(snapDir)
+		if filepath.Base(replicaDir) != replicaSeg {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(replicaDir)) != shardSeg {
+			return nil
+		}
+		index, parseErr := strconv.ParseUint(strings.TrimPrefix(base, "snapshot-"), 10, 64)
+		if parseErr != nil {
+			return fmt.Errorf("undecodable snapshot directory name %q: %w", base, parseErr)
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			if errors.Is(statErr, fs.ErrNotExist) {
+				return nil
+			}
+			return statErr
+		}
+		found = append(found, snapshotArtifact{index: index, path: path, size: info.Size()})
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walking %s for snapshot artifacts of shard %d replica %d: %v",
+			dir, shardID, replicaID, walkErr)
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].index < found[j].index })
+	return found
+}
+
+// waitForSnapshotArtifact fails the test unless a non-empty snapshot.dat for
+// shardID/replicaID at exactly index appears under dir within timeout.
+func waitForSnapshotArtifact(t *testing.T, dir string, shardID, replicaID, index uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		artifacts := findSnapshotArtifacts(t, dir, shardID, replicaID)
+		for _, a := range artifacts {
+			if a.index != index {
+				continue
+			}
+			if a.size == 0 {
+				t.Fatalf("snapshot artifact %s is zero bytes: an empty snapshot restores nothing", a.path)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no snapshot artifact at index %d for shard %d replica %d under %s after %v (found %v): the snapshot request reported success without writing a durable snapshot",
+				index, shardID, replicaID, dir, timeout, artifacts)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// awaitSnapshot issues a snapshot request on h, WAITS for its result (the
+// request is asynchronous, so a bare Release waits for nothing at all), and
+// asserts the reported snapshot index is non-zero and covers everything the
+// replica had applied when the request was made. It then asserts the matching
+// durable artifact exists under nodeHostDir and returns the snapshot index.
+func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, replicaID uint64) uint64 {
+	t.Helper()
+
+	info, err := h.GetShardInfo(shardID)
+	if err != nil {
+		t.Fatalf("GetShardInfo(shard %d) before snapshot: %v", shardID, err)
+	}
+	appliedBefore := info.LastApplied
+	if appliedBefore == 0 {
+		t.Fatalf("shard %d has applied nothing before the snapshot request; the snapshot would be vacuous", shardID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout*3)
+	defer cancel()
+
+	// The snapshot pool releases a shard's snapshotting slot only AFTER the
+	// completion callback has run (see snapshot_pool.go), so a request issued
+	// immediately after a previous snapshot resolved can still be rejected.
+	// That is a scheduling artifact, not a snapshot failure, so it is retried;
+	// every other error is fatal.
+	var rs *quicraft.RequestState
+	submitDeadline := time.Now().Add(defaultTimeout)
+	for {
+		rs, err = h.RequestSnapshot(ctx, shardID, quicraft.SnapshotOption{})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, quicraft.ErrSnapshotInProgress) {
+			t.Fatalf("RequestSnapshot(shard %d) failed: %v", shardID, err)
+		}
+		if time.Now().After(submitDeadline) {
+			t.Fatalf("RequestSnapshot(shard %d) still reported a snapshot in progress after %v",
+				shardID, defaultTimeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if rs == nil {
+		t.Fatalf("RequestSnapshot(shard %d) returned nil", shardID)
+	}
+	defer rs.Release()
+
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			t.Fatalf("snapshot on shard %d failed: %v", shardID, result.Err)
+		}
+		if result.Value == 0 {
+			t.Fatalf("snapshot on shard %d completed at index 0: no snapshot was taken", shardID)
+		}
+		if result.Value < appliedBefore {
+			t.Fatalf("snapshot on shard %d completed at index %d, below the %d entries already applied: the snapshot does not cover committed state",
+				shardID, result.Value, appliedBefore)
+		}
+		waitForSnapshotArtifact(t, nodeHostDir, shardID, replicaID, result.Value, defaultTimeout)
+		return result.Value
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for the snapshot on shard %d to complete: %v", shardID, ctx.Err())
+		return 0
+	}
+}

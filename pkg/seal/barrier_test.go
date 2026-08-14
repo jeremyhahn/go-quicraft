@@ -1242,13 +1242,17 @@ func TestBarrier_ConcurrentEncryptAndRotate(t *testing.T) {
 // --- SetSealedRootKey ---
 
 func TestBarrier_SetSealedRootKey(t *testing.T) {
-	// Simulate loading persisted sealed key data.
-	b := MustNewBarrier(DefaultBarrierConfig(1))
+	// Simulate loading persisted sealed key data. Both barriers carry a
+	// StatePersister: a restart-unseal cannot prove how much of the loaded
+	// epoch's NIST invocation budget is already spent, so it rotates to a fresh
+	// epoch — which requires a persister — rather than encrypt under an
+	// unprovable budget. See Barrier.resolveInvocationBudget.
+	b := MustNewBarrier(testBarrierConfig(1))
 	s := testStrategy(t)
 	defer s.Close()
 
 	// Create a second barrier that was initialized.
-	b2 := MustNewBarrier(DefaultBarrierConfig(1))
+	b2 := MustNewBarrier(testBarrierConfig(1))
 	if err := b2.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("Initialize failed: %v", err)
 	}
@@ -3450,7 +3454,7 @@ func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	mock := &mockInvocationCounter{enabled: true, resetErr: resetErr}
 	cfg := testBarrierConfig(1)
 	cfg.InvocationCounter = mock
-	cfg.NonceTracking = false
+	cfg.NonceTracking = BoolPtr(false)
 	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
@@ -3639,8 +3643,8 @@ func TestBarrier_ProviderOverridesTrackingFlag(t *testing.T) {
 	mockNT := &mockNonceTracker{enabled: true}
 
 	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationLimit = -1  // would normally mean disabled
-	cfg.NonceTracking = false // would normally mean no tracker
+	cfg.InvocationLimit = -1           // would normally mean disabled
+	cfg.NonceTracking = BoolPtr(false) // would normally mean no tracker
 	cfg.InvocationCounter = mockIC
 	cfg.NonceTrackerProvider = mockNT
 	b := MustNewBarrier(cfg)
@@ -3672,8 +3676,8 @@ func TestBarrier_Config(t *testing.T) {
 	if got.InvocationLimit != cfg.InvocationLimit {
 		t.Fatalf("Config().InvocationLimit = %d, want %d", got.InvocationLimit, cfg.InvocationLimit)
 	}
-	if got.NonceTracking != cfg.NonceTracking {
-		t.Fatalf("Config().NonceTracking = %v, want %v", got.NonceTracking, cfg.NonceTracking)
+	if got.GetNonceTracking() != cfg.GetNonceTracking() {
+		t.Fatalf("Config().NonceTracking = %v, want %v", got.GetNonceTracking(), cfg.GetNonceTracking())
 	}
 }
 
@@ -3841,7 +3845,7 @@ func TestBarrier_EncryptWithInvocationCounterError(t *testing.T) {
 	mockIC := &mockInvocationCounter{enabled: true, incrementErr: ErrInvocationLimitExceeded}
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
-	cfg.NonceTracking = false
+	cfg.NonceTracking = BoolPtr(false)
 	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
@@ -3865,7 +3869,7 @@ func TestBarrier_EncryptWithInvocationCounterError_NilCheckSucceeds(t *testing.T
 	mockIC := &mockInvocationCounter{enabled: true, incrementErr: nil}
 	cfg := DefaultBarrierConfig(1)
 	cfg.InvocationCounter = mockIC
-	cfg.NonceTracking = false
+	cfg.NonceTracking = BoolPtr(false)
 	b := MustNewBarrier(cfg)
 	s := testStrategy(t)
 
@@ -4123,21 +4127,23 @@ func TestBarrier_DecryptDuringConcurrentSeal(t *testing.T) {
 
 // --- Invocation budget across restarts (NIST SP 800-38D) ---
 
-// TestBarrier_UnsealSeedsInvocationCounterAfterRestart verifies that an
-// unseal on a fresh process (default in-memory counter, count unknown)
-// pessimistically seeds the AEAD invocation counter to the rotation
-// threshold, so ShouldRotateKey fires immediately and the epoch is
-// rotated to a DEK with a known-zero count. Without this, a frequently
-// restarted node could encrypt unbounded volumes under one epoch DEK
-// with the in-memory counter resetting to zero on every boot.
-func TestBarrier_UnsealSeedsInvocationCounterAfterRestart(t *testing.T) {
+// TestBarrier_RestartRotatesRatherThanReGrantingBudget verifies the NIST
+// SP 800-38D budget is not re-granted on restart.
+//
+// The old behaviour seeded the counter to the ROTATION THRESHOLD (95%) and let
+// the process encrypt through the remaining 5% — 214,748,364 invocations — on
+// every restart, against the SAME epoch DEK, forever. This asserts the
+// replacement: a restart-unseal that cannot prove the loaded epoch's spent
+// budget moves to a FRESH epoch whose count genuinely starts at zero.
+func TestBarrier_RestartRotatesRatherThanReGrantingBudget(t *testing.T) {
 	b, s := testInitializedBarrier(t)
-
-	// Encrypt something so the WAL-equivalent state is non-empty.
 	if _, err := b.Encrypt(nil, []byte("data")); err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 	sealed := b.SealedRootKeyData()
+	if sealed.Epoch != 1 {
+		t.Fatalf("pre-restart epoch = %d, want 1", sealed.Epoch)
+	}
 
 	// Simulate a process restart: a brand-new barrier restored from the
 	// persisted sealed root key, with a fresh in-memory counter.
@@ -4149,28 +4155,107 @@ func TestBarrier_UnsealSeedsInvocationCounterAfterRestart(t *testing.T) {
 		t.Fatalf("Unseal: %v", err)
 	}
 
+	// The loaded epoch must not still be the write epoch: its spent budget is
+	// unknowable, so continuing on it is exactly the defect.
+	if got := b2.CurrentEpoch(); got != 2 {
+		t.Fatalf("epoch after restart-unseal = %d, want 2 (a fresh epoch with a known-zero count)", got)
+	}
+
 	ic := b2.InvocationCounter()
 	if ic == nil || !ic.IsEnabled() {
 		t.Fatal("invocation counter must be enabled by default")
 	}
-	if ic.Count() == 0 {
-		t.Fatal("counter must be pessimistically seeded after restart-unseal")
-	}
-	if !b2.ShouldRotateKey() {
-		t.Fatal("ShouldRotateKey must fire immediately after restart-unseal")
-	}
-
-	// Encryption still works in the threshold→limit headroom window.
-	if _, err := b2.Encrypt(nil, []byte("more data")); err != nil {
-		t.Fatalf("Encrypt within headroom: %v", err)
-	}
-
-	// Rotation resets the budget for the fresh epoch.
-	if _, err := b2.Rotate(); err != nil {
-		t.Fatalf("Rotate: %v", err)
+	// Assert the ACTUAL counter, not a proxy: the fresh epoch starts at zero,
+	// where the old code left 4080218932 of a 4294967296 budget "already spent"
+	// on a key that had in truth performed one encryption.
+	if got := ic.Count(); got != 0 {
+		t.Fatalf("invocation count on the fresh epoch = %d, want 0", got)
 	}
 	if b2.ShouldRotateKey() {
-		t.Fatal("budget must be reset after rotation")
+		t.Fatal("a freshly rotated epoch must not already be at its rotation threshold")
+	}
+
+	// The new epoch is usable, and the old one is still readable.
+	ct2, err := b2.Encrypt(nil, []byte("more data"))
+	if err != nil {
+		t.Fatalf("Encrypt on the fresh epoch: %v", err)
+	}
+	if epoch := binary.BigEndian.Uint64(ct2[:8]); epoch != 2 {
+		t.Fatalf("ciphertext header epoch = %d, want 2", epoch)
+	}
+}
+
+// TestBarrier_RestartWithoutPersisterRefusesToEncrypt is the other half: a
+// barrier that CANNOT rotate (no StatePersister — what DefaultBarrierConfig
+// produces) must refuse to encrypt under the loaded epoch rather than help
+// itself to another slice of that DEK's budget. Decryption stays available, so
+// the node can still read and serve its data.
+func TestBarrier_RestartWithoutPersisterRefusesToEncrypt(t *testing.T) {
+	b := MustNewBarrier(DefaultBarrierConfig(1))
+	s := testStrategy(t)
+	defer func() { _ = s.Close() }()
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	ct, err := b.Encrypt(nil, []byte("written before the restart"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	sealed := b.SealedRootKeyData()
+
+	b2 := MustNewBarrier(DefaultBarrierConfig(1))
+	if err := b2.SetSealedRootKey(sealed); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	if err := b2.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+
+	// The counter is seeded to the FULL limit, not to the 95% threshold: the
+	// remaining 5% is precisely the headroom the old code re-granted on every
+	// restart.
+	ic := b2.InvocationCounter()
+	if got, limit := ic.Count(), ic.Limit(); got != limit {
+		t.Fatalf("seeded count = %d, want the full limit %d (no re-granted headroom)", got, limit)
+	}
+	if _, err := b2.Encrypt(nil, []byte("must not be written")); !errors.Is(err, ErrInvocationLimitExceeded) {
+		t.Fatalf("Encrypt after unprovable-budget restart = %v, want ErrInvocationLimitExceeded", err)
+	}
+
+	// Reads are unaffected: failing closed must not cost the node its data.
+	got, err := b2.Decrypt(nil, ct)
+	if err != nil {
+		t.Fatalf("Decrypt after unprovable-budget restart: %v", err)
+	}
+	if !bytes.Equal(got, []byte("written before the restart")) {
+		t.Fatal("decrypted plaintext does not match")
+	}
+}
+
+// TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount pins the boundary: an
+// in-process seal/unseal cycle keeps the SAME counter object, which is still an
+// accurate count for the same epoch, so it must NOT be re-seeded and must NOT
+// force a rotation. A "count == 0 means unseeded" test cannot express this —
+// zero is both "never encrypted" and "fresh process" — which is why the barrier
+// tracks authority explicitly.
+func TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	for i := 0; i < 3; i++ {
+		if _, err := b.Encrypt(nil, []byte("data")); err != nil {
+			t.Fatalf("Encrypt: %v", err)
+		}
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if got := b.CurrentEpoch(); got != 1 {
+		t.Fatalf("epoch after in-process seal/unseal = %d, want 1 (no rotation)", got)
+	}
+	if got := b.InvocationCounter().Count(); got != 3 {
+		t.Fatalf("invocation count after in-process seal/unseal = %d, want the true 3", got)
 	}
 }
 

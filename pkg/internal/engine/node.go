@@ -17,6 +17,7 @@ package engine
 import (
 	"context"
 	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -275,6 +276,16 @@ type Node struct {
 	// listener is the event listener for error and lifecycle callbacks.
 	// May be nil if no listener is configured.
 	listener *config.EventListener
+
+	// listeners carries the listener notifications above off the goroutine that
+	// produced them. handleError is reachable from the step worker while it
+	// holds nodesMu.RLock, and from a per-shard apply goroutine that a
+	// synchronous UnloadNode joins on — so a listener reacting to OnShardFailed
+	// by stopping the shard deadlocks against its own producer. Set by
+	// Engine.LoadNode; nil on a node built outside an engine, which dispatches
+	// inline (correctly: with no worker goroutine there is no lock to be
+	// reentrant against).
+	listeners *listenerDispatcher
 
 	// snapshotter provides snapshot save/recover capability for the SM.
 	// May be nil for nodes that don't support snapshots (e.g. witnesses).
@@ -580,6 +591,25 @@ func (n *Node) IsFailed() bool {
 	return n.failed.Load()
 }
 
+// Fail trips the circuit breaker for this shard and reports err through the
+// node's error handler, exactly as failApply and failCommit do for a terminal
+// apply or commit error. The shard stays offline until it is reloaded or
+// recovered from a snapshot; there is no automatic reset, deliberately.
+//
+// It exists so that a fault detected OUTSIDE the engine's own workers — the
+// Host's routing mirror of the committed membership fold, which decodes the same
+// entries a second time — can reach the same terminal state instead of logging
+// and carrying on. Runtime failing open where recovery fails closed, over the
+// identical bytes, is a divergence generator: the replica keeps serving with a
+// routing table that disagrees with the membership raft holds, and persists that
+// disagreement with the next snapshot.
+//
+// Idempotent, and safe from any goroutine.
+func (n *Node) Fail(err error) {
+	n.failed.Store(true)
+	n.handleError(err)
+}
+
 // CommittedIndex returns the last known committed log index.
 // Updated atomically by the step worker; safe to read from any goroutine.
 func (n *Node) CommittedIndex() uint64 {
@@ -623,13 +653,36 @@ func (n *Node) SetCommittedIndex(idx uint64) {
 // handleError reports an error for this shard. It invokes the event
 // listener if configured. This does not stop the shard; the circuit
 // breaker in the apply worker handles permanent failure escalation.
+//
+// The listener is NOT run on the calling goroutine once the node is loaded into
+// an engine. handleError is reachable from the step worker (a GetUpdate error,
+// under nodesMu.RLock) and from a per-shard apply goroutine that a synchronous
+// Engine.UnloadNode joins on, and "react to a failed shard by stopping it" is
+// the natural handler to write — which deadlocked both paths against their own
+// producer. See listenerDispatcher for the ordering guarantee and the
+// queue-full policy.
 func (n *Node) handleError(err error) {
-	if n.listener != nil && n.listener.OnShardFailed != nil {
-		n.listener.OnShardFailed(config.ShardFailedInfo{
-			ShardID:   n.shardID,
-			ReplicaID: n.replicaID,
-			Err:       err,
-		})
+	if n.listener == nil || n.listener.OnShardFailed == nil {
+		return
+	}
+	cb := n.listener.OnShardFailed
+	info := config.ShardFailedInfo{
+		ShardID:   n.shardID,
+		ReplicaID: n.replicaID,
+		Err:       err,
+	}
+	// Dropped rather than retried: this is the terminal-failure notification,
+	// and the only way the queue is full is a listener that is not consuming,
+	// so holding engine liveness for it would be the deadlock this dispatcher
+	// exists to remove. The event still reaches the operator through the log
+	// below, and the shard's failed state remains observable via GetShardInfo.
+	if !n.listeners.dispatch(func() { cb(info) }) {
+		slog.Error("shard failure notification dropped: listener queue full",
+			"shard", n.shardID,
+			"replica", n.replicaID,
+			"error", err,
+			"dropped_total", n.listeners.droppedCount(),
+		)
 	}
 }
 
@@ -769,6 +822,23 @@ func (n *Node) IsRemoved(replicaID uint64) bool {
 		return false
 	}
 	return n.peer.IsRemoved(replicaID)
+}
+
+// IsRemovedIdentity reports whether the AUTHENTICATED node identity of a
+// connection is one this shard has committed a removal for. It is the half of
+// the removal deny-list that a removed replica cannot evade by claiming a
+// different msg.From; see raft.Peer.IsRemovedIdentity for the full rationale and
+// for the address-only-shard residual.
+//
+// When the peer is nil (e.g. during initialization) nothing is known to be
+// removed, so it returns false — matching IsRemoved, and for the same reason:
+// the message is allowed through to a raft layer that will apply its own term
+// and log rules.
+func (n *Node) IsRemovedIdentity(identity string) bool {
+	if n.peer == nil {
+		return false
+	}
+	return n.peer.IsRemovedIdentity(identity)
 }
 
 // DiagPipeline is a point-in-time snapshot of a node's pipeline state.

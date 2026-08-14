@@ -323,9 +323,9 @@ The commit worker uses a flat `[]logdb.Entry` buffer that is sub-sliced across a
 
 Sources: `pkg/internal/engine/commit.go`, `pkg/internal/engine/convert.go`
 
-### Lock-Free MPSC Proposal Queue (O19)
+### Double-Buffered MPSC Proposal Queue (O19)
 
-Proposals now bypass the Go buffered channel (`inboxC`) and use a dedicated `EntryQueue[T]` double-buffered MPSC queue. The queue has bounded capacity (`maxLen=256`) with backpressure -- `Add()` returns false at capacity, signaling the caller to return `ErrSystemBusy`. The double-buffer swap means producers hold the lock only for a slice append (typically <50ns), and the consumer acquires the lock once per drain cycle. This eliminates channel serialization under 8+ concurrent writers.
+Proposals now bypass the Go buffered channel (`inboxC`) and use a dedicated `EntryQueue[T]` double-buffered MPSC queue. It is guarded by a `sync.Mutex`, not lock-free; the win is amortization, not lock elimination. The queue has bounded capacity (`maxLen=256`) with backpressure -- `Add()` returns false at capacity, signaling the caller to return `ErrSystemBusy`. The double-buffer swap means producers hold the lock only for a slice append (typically <50ns), and the consumer acquires the lock once per drain cycle. This eliminates channel serialization under 8+ concurrent writers.
 
 Sources: `pkg/internal/queue/entryqueue.go`, `pkg/internal/engine/node.go`, `pkg/internal/engine/step.go`
 

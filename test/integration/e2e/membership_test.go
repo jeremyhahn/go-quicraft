@@ -17,7 +17,6 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -115,12 +114,8 @@ func TestE2E_RemoveNode_FourToThree(t *testing.T) {
 	t.Logf("removing follower node[%d] replicaID=%d", followerIdx, removedReplicaID)
 
 	// Request node removal through the leader.
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
 
-	if err := cluster.hosts[leaderIdx].SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 
 	// Stop the removed node.
 	cluster.stopNode(followerIdx)
@@ -275,12 +270,7 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 		t.Fatalf("no leader found for removal")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := cluster.hosts[leaderIdx].SyncRequestDeleteNode(ctx, shardID, addedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", addedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, addedReplicaID, membershipTimeout)
 
 	cluster.stopNode(result.idx)
 	t.Logf("phase 3: removed and stopped node[%d] (replica %d)", result.idx, addedReplicaID)
@@ -342,12 +332,7 @@ func TestE2E_RemoveNode_ThenPropose(t *testing.T) {
 	removedReplicaID := uint64(followerIdx + 1)
 	t.Logf("removing follower node[%d] replicaID=%d", followerIdx, removedReplicaID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := cluster.hosts[leaderIdx].SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 
 	cluster.stopNode(followerIdx)
 	t.Logf("stopped removed node[%d]", followerIdx)

@@ -422,10 +422,12 @@ func (s *segment) Sync() error {
 // prefix truncation — and the destruction of every later segment — on every
 // subsequent restart.
 //
-// A corruption is NOT accepted as a torn tail on the strength of being the
-// first failure: scanning continues over the remaining blocks and collects the
-// DURABILITY GENERATION of every chunk that still decodes above the damage.
-// What those generations say decides the outcome:
+// Damage is NOT accepted as a torn tail on the strength of being the first
+// failure, and this holds for BOTH shapes it can take — a chunk whose CRC does
+// not verify, and a zero-filled hole with data above it. Scanning continues over
+// the remaining blocks and collects the DURABILITY GENERATION of every chunk
+// that still decodes above the damage. What those generations say decides the
+// outcome:
 //
 //   - They span more than one generation, or one of them is lower than a
 //     generation already seen in the clean prefix. Either way a Sync completed
@@ -447,10 +449,20 @@ func (s *segment) Sync() error {
 // corruption of acknowledged data and refuse to start on, forever, after a
 // routine power loss. See record.go for why the generation proves what it does.
 //
-// The zero-hole rule below is deliberately left as it was. A zero region with
-// data after it still truncates without consulting the generations; that is the
-// older and more permissive of the two paths, and tightening it is a separate
-// change with its own blast radius. See docs/storage/wal.md.
+// The zero-hole rule below is held to exactly the same standard. It used to
+// truncate on sight, without consulting the generations, which made a zeroed
+// sector under acknowledged data — a reallocated block, a partially restored
+// file, a filesystem hole — silently destroy committed entries and roll the
+// commit index backwards, while the IDENTICAL damage expressed as a flipped CRC
+// byte at the same offset correctly refused to open. The two classifiers now
+// share one verdict.
+//
+// A crash cannot produce a hole under acknowledged data in the first place:
+// writes are strictly ascending in file offset, so a block lying below a later
+// generation was covered by that generation's fdatasync and its pages cannot
+// revert to zeros. A hole whose survivors span a completed fdatasync is
+// therefore medium damage or tampering, never an interrupted write, and the only
+// safe answer is the one the CRC path already gives.
 //
 //nolint:gocyclo // WAL recovery walks blocks, chunk types and padding while distinguishing a legal torn tail from corruption; that distinction is the whole function, and splitting it separates the hole detection from the stride arithmetic it depends on
 func (s *segment) ReadAll() ([][]byte, int64, error) {
@@ -476,17 +488,21 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 	// the FINAL open block may have a longer zero tail). If any later
 	// block contains data, that zero region was a write hole — a crash
 	// lost block N while block N+1 reached the medium (fdatasync does not
-	// order inter-block writes). Records after the hole must NOT be
-	// resurrected: a WAL is valid only as a prefix, and replaying
-	// post-hole entries would create a Raft log gap violating Log
-	// Matching.
+	// order inter-block writes), or the medium lost a sector that had
+	// already been acknowledged. Records after the hole must NOT be
+	// resurrected either way: a WAL is valid only as a prefix, and
+	// replaying post-hole entries would create a Raft log gap violating
+	// Log Matching. Which of the two it is decides only whether the
+	// segment may be TRUNCATED at the hole, and the durability generations
+	// above it are what answer that.
 	holeOffset := int64(-1)
 
-	// corruptOffset remembers the file offset of the first chunk that failed to
-	// decode. Unlike holeOffset it does not end the scan: the blocks after it
-	// are still swept, gathering the durability generations that say whether the
-	// damage sits below acknowledged data. Everything from corruptOffset on is
-	// untrusted either way — no record past it is ever appended to records.
+	// corruptOffset remembers the file offset where the clean prefix ends: the
+	// first chunk that failed to decode, or the zero hole that turned out to
+	// have data above it. Recording it does not end the scan — the blocks after
+	// it are still swept, gathering the durability generations that say whether
+	// the damage sits below acknowledged data. Everything from corruptOffset on
+	// is untrusted either way — no record past it is ever appended to records.
 	corruptOffset := int64(-1)
 
 	// prefixMaxSeq is the highest durability generation seen in the clean
@@ -572,20 +588,36 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 				break
 			}
 
-			// Data after a zero hole: stop recovery at the hole. Everything
-			// from the hole onward (including this data) is untrusted; only
-			// the clean prefix before the hole is returned, and recovery
-			// must not replay any higher-numbered segment either.
+			// Data after a zero hole. The clean prefix ends AT THE HOLE and
+			// nothing above it is ever replayed — a WAL is valid only as a
+			// prefix, and resurrecting post-hole entries would create a Raft log
+			// gap violating Log Matching. Whether the segment may be TRUNCATED
+			// there is a different question, and it is answered exactly as it is
+			// for a failed CRC: by the durability generations of whatever still
+			// decodes above the damage. Record the hole as the corruption point
+			// and let the post-corruption sweep gather that evidence instead of
+			// truncating on sight.
 			if holeOffset >= 0 {
 				s.stoppedAtCorruption = true
+				corruptOffset = holeOffset
 				slog.Warn("waldb: stopping WAL recovery at zero-filled hole",
 					"segment_id", s.id,
 					"dir", s.dir,
 					"hole_offset", holeOffset,
 					"data_offset", offset+int64(pos),
+					"prefix_generation", prefixMaxSeq,
 					"recovered_records", len(records),
 				)
-				return records, holeOffset, nil
+
+				// Sweep the REST OF THIS BLOCK, starting at the data that
+				// follows the hole, before striding on. Same blind spot the CRC
+				// path closes: when the hole sits in the last block that holds
+				// data there are no later blocks to probe, and the evidence that
+				// decides the verdict would never be gathered at all.
+				if s.gatherEvidence(block, offset, pos, prefixMaxSeq, &ev, len(records)) {
+					return records, corruptOffset, nil
+				}
+				break
 			}
 
 			data, recType, durSeq, consumed, err := decodeRecord(block[pos:])

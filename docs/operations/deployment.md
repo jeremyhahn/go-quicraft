@@ -418,7 +418,11 @@ cfg.EventListener = &config.EventListener{
     OnNodeReady:           func(info config.EventShardInfo) { /* ... */ },
     OnNodeUnloaded:        func(info config.EventShardInfo) { /* ... */ },
     OnNodeDeleted:         func(info config.EventShardInfo) { /* ... */ },
-    OnMembershipChanged:   func(info config.MembershipChangedInfo) { /* ... */ },
+    OnMembershipChanged:   func(info config.EventShardInfo) { /* ... */ },
+    OnConnectionEstablished: func(info config.ConnectionInfo) { /* ... */ },
+    OnConnectionFailed:    func(info config.ConnectionInfo) { /* ... */ },
+    OnLogCompacted:        func(info config.EventShardInfo) { /* ... */ },
+    OnLogDBCompacted:      func(info config.EventShardInfo) { /* ... */ },
 
     // Failures
     OnShardFailed:        func(info config.ShardFailedInfo) { /* ... */ },
@@ -426,10 +430,32 @@ cfg.EventListener = &config.EventListener{
     OnLogDBDiskFull:      func(info config.DiskInfo) { /* ... */ },
 
     // Proposal and read drops
-    OnProposalDropped:    func(info config.ProposalDroppedInfo) { /* ... */ },
-    OnReadIndexDropped:   func(info config.ReadIndexDroppedInfo) { /* ... */ },
+    OnProposalDropped:    func(info config.EventShardInfo) { /* ... */ },
+    OnReadIndexDropped:   func(info config.EventShardInfo) { /* ... */ },
 }
 ```
+
+`config.EventListener` is a **struct of optional func fields**, not an
+interface: set only the callbacks you need and leave the rest nil. Only
+non-nil callbacks are invoked.
+
+Most shard-scoped callbacks share one payload type, `config.EventShardInfo`
+(`ShardID`, `ReplicaID`, `LeaderID`, `Term`). There is no per-event info
+type for membership changes, proposal drops or read-index drops. The
+specialized payloads are:
+
+| Type | Fields |
+|------|--------|
+| `config.LeaderInfo` | `ShardID`, `ReplicaID`, `Term`, `LeaderID` |
+| `config.SnapshotInfo` | `ShardID`, `ReplicaID`, `Index`, `From` |
+| `config.ShardFailedInfo` | `ShardID`, `ReplicaID`, `Err` |
+| `config.DiskInfo` | `WALDir`, `UsedBytes`, `MaxBytes`, `Shards` |
+| `config.ConnectionInfo` | `Address`, `Err` |
+
+Callbacks are invoked **synchronously on engine worker goroutines and must
+not block.** In particular they run outside the per-node `raftMu`, and code
+that re-enters the Host from a callback risks stalling the commit worker for
+every shard that worker owns.
 
 ## Disk Management
 
@@ -510,9 +536,23 @@ Source: `pkg/internal/engine/snapshot_pool.go`, `pkg/host.go`
 **Manual snapshots:**
 
 ```go
-rs, err := host.RequestSnapshot(ctx, shardID)
+// SnapshotOption is a plain struct passed BY VALUE and is required.
+// The zero value uses shard-level defaults.
+rs, err := host.RequestSnapshot(ctx, shardID, quicraft.SnapshotOption{})
 result, err := rs.Result()
+
+// Synchronous form returns the snapshot index directly.
+index, err := host.SyncRequestSnapshot(ctx, shardID, quicraft.SnapshotOption{})
 ```
+
+`SnapshotOption` has no `With...` constructors -- set its fields directly:
+
+| Field | Purpose |
+|-------|---------|
+| `ExportPath` | Write an exported snapshot to this path instead of the shard's snapshot dir |
+| `CompactionOverhead` | Per-request override of the shard's compaction overhead |
+| `OverrideCompactionOverhead` | Must be true for `CompactionOverhead` to take effect |
+| `Exported` | Set automatically when `ExportPath` is non-empty; not normally set by callers |
 
 `RequestSnapshot` atomically claims the per-shard snapshotting slot. Only one snapshot per shard can be in progress; concurrent requests return `ErrSnapshotInProgress`.
 
@@ -621,8 +661,11 @@ if err != nil {
     log.Fatal(err)
 }
 
-// First boot: generate root key, derive epoch-1 DEK, seal root key
-barrier.Initialize(strategy)
+// First boot: generate root key, derive epoch-1 DEK, seal root key.
+// Initialize takes (ctx, strategy, creds) and returns error.
+if err := barrier.Initialize(ctx, strategy, seal.Credentials{}); err != nil {
+    log.Fatal(err)
+}
 
 // Pass to host
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
@@ -635,7 +678,10 @@ barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(deploymentID))
 if err := barrier.SetSealedRootKey(loadedSealedKey); err != nil {
     log.Fatalf("invalid sealed key: %v", err)
 }
-barrier.Unseal(strategy)
+// Unseal has the same shape as Initialize: (ctx, strategy, creds) error.
+if err := barrier.Unseal(ctx, strategy, seal.Credentials{}); err != nil {
+    log.Fatal(err)
+}
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 ```
 
@@ -688,8 +734,9 @@ Source: `pkg/host.go`
 
 1. Sets `draining` flag atomically via `CompareAndSwap` (idempotent -- second call returns immediately)
 2. New `Propose()` and `ReadIndex()` calls return `ErrDraining`
-3. Polls pending proposals, reads, and snapshots every 50ms
-4. Returns when all in-flight work completes or `ShutdownTimeout` expires
+3. Takes a fast path and returns immediately when no operations are pending
+4. Otherwise blocks on a channel that `completePendingOp` closes when the pending-operation counter reaches zero -- event-driven, not polled -- against a single `ShutdownTimeout` timer
+5. Returns when all in-flight work completes, or an error if `ShutdownTimeout` (default 30s) expires first
 
 ```go
 // Programmatic
@@ -710,65 +757,122 @@ Host.Close()
   1. Set closed flag (atomic CAS, idempotent via sync.Once)
 
   2. Drain in-flight work
-     - Drain() polls pending proposals, reads, snapshots every 50ms
+     - Drain() blocks until the pending-operation counter reaches zero
      - Bounded by ShutdownTimeout (default 30s)
-     - If drain times out, logs a warning and proceeds
+     - If drain times out, logs a warning AND joins the error into Close's
+       return value -- an abandoned drain must not report a clean shutdown
 
   3. Stop key rotation goroutine
      - close(keyRotStopC) signals, then <-keyRotDone waits
      - Prevents rotation during shutdown
 
-  4. Stop QUIC transport
-     - No new inbound messages arrive while workers drain
-     - Closes all active QUIC connections
+  4. Stop pending-proposal sweeper
+     - close(sweepStopC), then <-sweepDone
 
-  5. Stop engine (tiered worker shutdown)
+  5. Stop engine (tiered worker shutdown) -- BEFORE the transport
      - Per-tier WaitGroups ensure sequential close-and-wait:
        a. Step workers exit first (no more Raft ticks or proposal processing)
        b. Commit workers drain commitC, persist remaining entries, then exit
        c. Apply workers drain applyC, apply remaining entries to SM, then exit
        d. Snapshot workers cancel in-progress snapshots and exit
 
-  6. Stop all shard nodes
+  6. Drain in-flight snapshot sends
+     - transportSender.Wait() joins sends the (now-stopped) step workers
+       launched before exiting; the transport is still up, so they complete
+
+  7. Stop QUIC transport -- LAST
+     - Closes all active QUIC connections
+     - No send goroutine can touch a torn-down transport
+
+  8. Stop all shard nodes
      - Set stopped flag, reject pending proposals/reads/snapshots with ErrClosed
      - Clear all pending maps
 
-  7. Close LogDB
+  9. Close LogDB
      - Flush buffered writes, fsync all WAL segments, close file handles
 
-  8. Seal barrier (if configured)
+ 10. Seal barrier (if configured)
      - barrier.Seal() zeros root key and all DEKs from memory
      - Already-sealed is not an error during shutdown
 ```
 
 **Why this order matters:**
 
-- **Transport before engine:** Stops new inbound messages so engine workers see a quiescent pipeline.
-- **Engine before nodes:** Engine workers produce completions that nodes consume. Stopping engine first ensures all committed entries are applied before node state is cleaned up.
-- **Step before commit before apply:** Preserves the pipeline's natural flow direction. Each tier drains work from the previous tier.
-- **LogDB before barrier:** LogDB reads and writes may need the barrier for decryption. Close LogDB before sealing the barrier.
+- **Engine before transport:** the engine's step workers are the *only*
+  producers of snapshot sends, and each send does `snapshotWg.Add(1)`.
+  `engine.Stop()` closes `stepStopC` and joins the step workers, after which
+  no new `Add` can occur. Stopping the engine first is what eliminates the
+  illegal "`WaitGroup.Add` concurrent with `Wait`" race, where a producer
+  could call `Add(1)` while `Close` was already blocked in `Wait()`.
+- **Transport last:** after all snapshot sends have drained, so no send
+  goroutine touches a torn-down transport.
+- **Step before commit before apply:** preserves the pipeline's natural flow
+  direction. Each tier drains work from the previous tier.
+- **LogDB before barrier:** LogDB reads and writes may need the barrier for
+  decryption. Close LogDB before sealing the barrier.
+
+`Close()` returns an `error`. It reports a drain that timed out, and any
+error from the teardown steps; it no longer swallows them.
+
+### Startup Order
+
+Startup is the mirror image, and for the same reason -- **the transport
+starts last**:
+
+```
+NewHost()
+  1. Construct LogDB, barrier, registry, message handler
+  2. Wire msgHandler.host, msgHandler.engine, the engine callback,
+     and the per-shard import locker
+  3. eng.Start()                     -- engine worker pipeline
+  4. tr.Start()                      -- QUIC listener, LAST
+```
+
+The transport must start after **all** wiring is complete. The moment it
+starts, its receive goroutines can call `HandleMessage`/`HandleSnapshot`,
+which read `msgHandler.host` (registry, config, LogDB) and
+`msgHandler.engine`. Starting the transport before those fields are set is a
+data race between the receive goroutine reading them and `NewHost` writing
+them. If `tr.Start()` fails, `NewHost` unwinds by stopping the engine and
+then the transport.
 
 ### Membership Operations
 
 All membership changes are proposed through Raft consensus:
 
+Every membership call takes a **trailing `configChangeIndex uint64`**. Pass 0
+to apply unconditionally, or the `ConfigChangeID` from a prior
+`SyncGetShardMembership` to make the change conditional on the configuration
+not having moved underneath you (see below).
+
 ```go
 // Add a voting replica
-rs, _ := host.RequestAddNode(ctx, shardID, replicaID, "10.0.0.4:63001")
+rs, _ := host.RequestAddNode(ctx, shardID, replicaID, "10.0.0.4:63001", 0)
 result, _ := rs.Result()
 
 // Remove a replica
-rs, _ := host.RequestRemoveNode(ctx, shardID, replicaID)
+rs, _ := host.RequestRemoveNode(ctx, shardID, replicaID, 0)
 
 // Add a non-voting observer
-rs, _ := host.RequestAddObserver(ctx, shardID, replicaID, "10.0.0.5:63001")
+rs, _ := host.RequestAddObserver(ctx, shardID, replicaID, "10.0.0.5:63001", 0)
 
 // Add a voting witness (no state machine)
-rs, _ := host.RequestAddWitness(ctx, shardID, replicaID, "10.0.0.6:63001")
+rs, _ := host.RequestAddWitness(ctx, shardID, replicaID, "10.0.0.6:63001", 0)
 
 // Transfer leadership
 host.RequestLeaderTransfer(ctx, shardID, targetReplicaID)
 ```
+
+Each also has an identity-carrying variant that commits the replica's stable
+cryptographic node identity alongside its address --
+`RequestAddNodeWithIdentity`, `RequestAddObserverWithIdentity`,
+`RequestAddWitnessWithIdentity` -- taking `(ctx, shardID, replicaID, addr,
+identity string, configChangeIndex uint64)`.
+
+Note the asymmetric naming: the async remove is `RequestRemoveNode`, while
+the synchronous form is `SyncRequestDeleteNode`. There is no
+`RequestDeleteNode` and no `RequestAddNonVoting` (`AddNonVoting` is a
+`proto` config-change constant; the Host method is `RequestAddObserver`).
 
 > **Stable addresses for non-voting members.** Observers and witnesses do not
 > run election timers, so — unlike a full voting replica, which re-advertises
@@ -796,14 +900,45 @@ Two methods provide membership views with different consistency guarantees:
 ```go
 // Linearizable (for safe membership mutations)
 membership, err := host.SyncGetShardMembership(ctx, shardID)
-// membership.ConfigChangeID should be passed to RequestAddNode/RequestRemoveNode
+
+// Pass membership.ConfigChangeID as the trailing configChangeIndex argument
 // to detect stale membership and serialize concurrent config changes.
+rs, err := host.RequestAddNode(ctx, shardID, replicaID, addr, membership.ConfigChangeID)
 
 // Local (for monitoring, dashboards)
 membership, err := host.GetShardMembership(shardID)
 ```
 
-Both methods return a `*Membership` containing `Nodes`, `Observers`, `Witnesses`, `Removed`, and `ConfigChangeID`. All maps are deep-copied to prevent aliasing with internal state.
+Both methods return a `*Membership`. All maps are deep-copied to prevent
+aliasing with internal state. Its fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `ConfigChangeID` | `uint64` | Log index of the config change that produced this membership |
+| `Nodes` | `map[uint64]string` | Full voting members |
+| `Observers` | `map[uint64]string` | Non-voting observers |
+| `Witnesses` | `map[uint64]string` | Witnesses (vote, no state machine) |
+| `Removed` | `map[uint64]struct{}` | Replicas removed from the cluster |
+| `MaxWitnesses` | `uint64` | Replicated witness cap (0 = none) |
+| `RequireFullReplicaMajority` | `bool` | Replicated full-replica-majority policy |
+| `SessionExpiryEntries` | `uint64` | Replicated session expiry threshold |
+| `MaxTotalSessions` | `uint64` | Replicated cap on registered sessions |
+| `MaxSessionsPerClient` | `uint64` | Replicated cap on cached responses per session |
+| `Identities` | `map[uint64]string` | Committed node identity per replica (sparse) |
+| `RemovedIdentities` | `map[uint64]string` | Identity each removed replica held at removal |
+
+The witness and session policy fields are exposed so an operator can read
+what a shard actually **committed**, rather than what any one node happens to
+be configured with. The two differ exactly when someone edited a node's
+`Config` after bootstrap — in which case the shard's value governs, and the
+node logs the disagreement at startup.
+
+A shard bootstrapped before the session policy was replicated reports all
+three session fields as zero: it committed no policy, and every replica is
+still running on its own configuration. There is currently no config change
+that alters the session policy after bootstrap; the witness policy is changed
+via `Host.RequestUpdateWitnessPolicy` / `SyncRequestUpdateWitnessPolicy`,
+which take `(ctx, shardID, policy config.WitnessConfig, configChangeIndex uint64)`.
 
 ### Node Removal
 
@@ -811,7 +946,7 @@ Source: `pkg/host.go`, `pkg/logdb/waldb/db.go`
 
 When a replica is removed from a shard, the following cleanup sequence runs:
 
-1. `RequestRemoveNode(ctx, shardID, replicaID)` proposes a `RemoveNode` config change through Raft
+1. `RequestRemoveNode(ctx, shardID, replicaID, configChangeIndex)` proposes a `RemoveNode` config change through Raft
 2. Once committed and applied, the membership no longer includes the removed replica
 3. On the removed node, call `LogDB.RemoveNodeData(shardID, replicaID)` to clean up persistent state:
    - Writes a durable `payloadTypeRemoveNode` record to the WAL (survives crash-recovery)

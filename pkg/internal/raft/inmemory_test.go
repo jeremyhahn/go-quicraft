@@ -621,7 +621,7 @@ func TestInMemory_AppliedLogTo_NoCompactionBelowThreshold(t *testing.T) {
 	im := newInMemory(0)
 	// Merge 1024 entries so the backing array is allocated once.
 	im.merge(makeEntries(1, 1025, 1))
-	initialPtr := &im.entries[0]
+	initial := im.entries
 
 	// Apply 100 entries one-at-a-time. wastedPrefix should accumulate
 	// but no compaction should occur because 100 < 512 (entrySliceSize)
@@ -636,12 +636,12 @@ func TestInMemory_AppliedLogTo_NoCompactionBelowThreshold(t *testing.T) {
 	if im.shrunk != true {
 		t.Fatal("expected shrunk to be true (deferred)")
 	}
-	// The entries slice header should still point into the original
-	// backing array (no reallocation occurred).
-	currentPtr := &im.entries[0]
-	if currentPtr == initialPtr {
-		// Pointers could match if the compiler reuses the same base,
-		// but entry values must be correct regardless.
+	// No reallocation occurred: the slice was resliced forward inside the
+	// ORIGINAL backing array, so its first element is the original array's
+	// 100th. A compaction would have copied the live entries into a fresh
+	// allocation and this identity would not hold.
+	if &im.entries[0] != &initial[100] {
+		t.Fatal("entries were reallocated; appliedLogTo compacted below the threshold")
 	}
 	if len(im.entries) != 924 {
 		t.Fatalf("expected 924 entries remaining, got %d", len(im.entries))

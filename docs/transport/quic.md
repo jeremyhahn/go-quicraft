@@ -469,14 +469,18 @@ Every message and snapshot chunk is wrapped in an 8-byte binary frame header:
 | Field   | Offset | Size   | Value                             |
 |---------|--------|--------|-----------------------------------|
 | Magic   | 0      | 2      | `0x51 0x43` ("QC" for QuicRaft)   |
-| Version | 2      | 1      | `0x01` (non-zero required)        |
+| Version | 2      | 1      | `0x01` exactly (`transport.WireVersion`) |
 | Flags   | 3      | 1      | Bitfield (see below)              |
 | Length  | 4      | 4      | uint32 big-endian, max 16 MB      |
 
 Maximum frame payload: `MaxFrameSize = 16 * 1024 * 1024` (16 MB).
 
-**Version validation:** Frames with version byte 0x00 are rejected (prevents
-accidental misinterpretation of uninitialized buffers as valid frames).
+**Version validation:** the byte is gated on **exact equality** with
+`transport.WireVersion` -- any other value, 0x00 and 0xFF alike, returns
+`ErrUnsupportedVersion`. Rejecting 0x00 keeps an uninitialized buffer from
+being read as a valid frame; rejecting everything above keeps a peer built from
+another commit from being misparsed rather than refused. There is no accepted
+range, because there is no version other than 1 to accept.
 
 **Decompression limit:** Payloads are decompressed only if the decompressed
 size is within `MaxDecompressedSize`, which is PINNED to `MaxFrameSize` (16 MB)
@@ -510,16 +514,29 @@ frames on the same stream.
 Source: `pkg/proto/messagebatch.go`
 
 ```
-+----------+---------------+-----------+--------+-----------+-----+
-| BinVer:8 | DeploymentID:8| AddrLen:4 | Addr:N | ReqCnt:4  | ... |
-+----------+---------------+-----------+--------+-----------+-----+
-                                                     |
-                                          ReqCnt x Message
++----------+---------------+---------------+-----------+--------+-----------+-----+
+| BinVer:8 | DeploymentID:8| SourceEpoch:8 | AddrLen:4 | Addr:N | ReqCnt:4  | ... |
++----------+---------------+---------------+-----------+--------+-----------+-----+
+                                                                     |
+                                                          ReqCnt x Message
 ```
 
-- `BinVer` validated against `proto.WireVersion` (currently 1)
+Fixed portion: 24 bytes (BinVer + DeploymentID + SourceEpoch).
+
+- `BinVer` validated against `proto.WireVersion` (**1**, pinned there for the
+  whole pre-release period) for **exact** equality -- `BinVer != WireVersion`
+  returns `ErrUnsupportedVersion`. There is no version negotiation and no
+  legacy decode path, so batches from both older and newer binaries are
+  rejected. Note that a matching `BinVer` is not a guarantee that two binaries
+  agree on the bytes: pre-release layout changes happen in place at version 1.
+  See [Compatibility](../operations/compatibility.md).
 - `DeploymentID` validated against transport config (cross-cluster rejection)
-- `ReqCnt` validated against `maxMessagesPerBatch` (10000)
+- `SourceEpoch` is the sender's per-process boot epoch. It changes only when
+  the sending node restarts, which lets the receiver distinguish a genuine
+  peer restart from a benign re-dial and evict the stale cached outbound
+  connection promptly instead of waiting for `MaxIdleTimeout`
+- `ReqCnt` validated against `proto.MaxMessagesPerBatch` (10000), then
+  cross-checked against the bytes remaining in the frame
 - Cumulative size tracked against `MaxBatchSize` (64 MB)
 
 ### Message Wire Format

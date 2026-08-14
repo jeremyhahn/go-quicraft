@@ -288,7 +288,7 @@ func TestGetMapBufferTooSmall(t *testing.T) {
 
 func TestGetMapTooManyEntries(t *testing.T) {
 	buf := make([]byte, 4)
-	putUint32(buf, maxMembershipEntries+1)
+	putUint32(buf, MaxMembershipEntries+1)
 	_, _, err := getMap(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {
 		t.Fatalf("getMap: got %v, want ErrTooManyMembershipEntries", err)
@@ -380,7 +380,7 @@ func TestGetBoolMapBufferTooSmall(t *testing.T) {
 
 func TestGetBoolMapTooManyEntries(t *testing.T) {
 	buf := make([]byte, 4)
-	putUint32(buf, maxMembershipEntries+1)
+	putUint32(buf, MaxMembershipEntries+1)
 	_, _, err := getBoolMap(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {
 		t.Fatalf("getBoolMap: got %v, want ErrTooManyMembershipEntries", err)

@@ -576,8 +576,6 @@ func (l *raftLog) tryAppend(prevLogIndex, prevLogTerm uint64, ents []proto.Entry
 
 // append directly appends entries to the log via the in-memory layer.
 // Returns the last index after appending.
-//
-//nolint:unparam // Return value used in tests for convenience
 func (l *raftLog) append(entries []proto.Entry) uint64 {
 	if len(entries) == 0 {
 		return l.lastIndex()
