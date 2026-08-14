@@ -1,3 +1,14 @@
+# Version control
+#
+# Six Dockerfiles here COPY the whole build context (the quicraft, etcd and
+# dragonboat benchmark images and the three devcontainer images), so without
+# this .git is baked into every one of them -- 9.7M of history in a 20M tree,
+# and the complete commit history of a private repository inside images that
+# may be published. Nothing in any build reads git metadata: there is no
+# version stamping, and the only `git` in a Dockerfile is apt installing the
+# client into the devcontainer.
+.git/
+
 # Build artifacts
 build/coverage/
 build/quicraft
