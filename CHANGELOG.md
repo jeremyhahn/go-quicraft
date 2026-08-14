@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The deferred `SessionExpiryEntries` decision was resolved, not carried forward.** This section previously recorded that the default had to stay 0 because the threshold was node-local configuration the apply path treated as replicated, and proposed replicating it as the alternative. That alternative shipped: see the session-policy entry under `0.3.0-alpha` BREAKING. `TestSessionExpiry_DisagreeingThresholdsDiverge`, which demonstrated the divergence, was replaced by `TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas`, which asserts that two replicas with different LOCAL configuration now apply identically — and, in a second subtest, that they both follow the shard's policy when it enables expiry rather than merely agreeing to do nothing.
 
+## [0.3.1-alpha] - 2026-08-14
+
+### Fixed
+
+- WAL `SaveState` permission-based failure tests (read-only shard
+  directories) now skip when running as root. CI job containers run as
+  root, which bypasses permission bits, so the writes the tests expect to
+  fail were succeeding — failing the Test job and the release gate.
+
+### Changed
+
+- CI: SARIF uploads and `trivy-action` are GitHub-only (Gitea has no
+  code-scanning API, and the action's setup cannot authenticate to
+  github.com with a Gitea token); Gitea runs gate with the trivy CLI
+  installed from the release tarball.
+- Makefile: `release-alpha` / `deps-latest` targets and `GOWORK=off`
+  (workspace-proof builds), per dependency-resolution.md.
+
 ## [0.3.0-alpha] - 2026-08-12
 
 ### Security

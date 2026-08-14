@@ -1000,7 +1000,7 @@ help:
 	@echo "  docker-test                    Run unit tests in devcontainer"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
-SUBMODULE_TAGS := 
+SUBMODULE_TAGS :=
 # Builds never resolve through a workspace: modules come from Gitea tags
 # (dependency-resolution.md §2). Immunizes against stray go.work files.
 export GOWORK=off
