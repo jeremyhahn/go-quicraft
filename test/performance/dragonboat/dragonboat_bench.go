@@ -25,11 +25,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
-	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 	"github.com/jeremyhahn/dragonboat/v4"
 	dbconfig "github.com/jeremyhahn/dragonboat/v4/config"
 	dbsm "github.com/jeremyhahn/dragonboat/v4/statemachine"
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
+	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 )
 
 // LeaderElectionTimeoutError is returned when no leader is elected within

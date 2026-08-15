@@ -29,6 +29,15 @@ require (
 // `replace lni => jeremyhahn` makes go load one module version under two
 // different paths, which is an error.
 //
+// The fork is published in two places on purpose, and both serve the same
+// commit, so the one go.sum entry verifies either way. Public consumers
+// resolve github.com/jeremyhahn/dragonboat/v4 from GitHub through
+// proxy.golang.org. Development machines and the CI runner set
+// GOPRIVATE=github.com/jeremyhahn/* and rewrite that prefix to the internal
+// Gitea, so they resolve it from the mirror there instead — which is why CI
+// failed with "repository not found" until the fork was mirrored, despite the
+// GitHub repository being public.
+//
 // The perf module is unpublished, so that one still resolves from the sibling
 // directory.
 replace github.com/jeremyhahn/go-quicraft/test/performance => ../
