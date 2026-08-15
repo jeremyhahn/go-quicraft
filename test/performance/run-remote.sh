@@ -4,11 +4,12 @@
 #
 # The bench server has Docker but no Go/Rust toolchain, so the perfcompare
 # orchestrator is cross-compiled locally and shipped alongside the source. The
-# dragonboat fork is pre-staged into .build-cache/dragonboat so the remote
-# Docker build needs no extra source.
+# dragonboat fork used to be pre-staged into .build-cache/dragonboat because it
+# was consumable only as a directory; it is a published module now and the
+# remote Docker build fetches it like any other dependency.
 #
 # Usage:
-#   ./run-remote.sh stage     # rsync repo + dragonboat fork to the server
+#   ./run-remote.sh stage     # rsync repo to the server
 #   ./run-remote.sh run       # start the full 30s suite in the background
 #   ./run-remote.sh status    # tail the remote run log
 #   ./run-remote.sh fetch     # copy JSON results back into ./results
@@ -24,9 +25,6 @@ HOST="${PERF_HOST:?PERF_HOST is required (ssh destination of the bench server, e
 # login's home directory (both ssh and rsync do this); override with an absolute
 # path if the staging tree belongs elsewhere.
 REMOTE_DIR="${REMOTE_DIR:-bench/go-quicraft}"
-# Local checkout of the dragonboat fork used as the comparison engine. Required
-# for staging; clone https://github.com/lni/dragonboat and point this at it.
-DRAGONBOAT_SRC="${DRAGONBOAT_SRC:?DRAGONBOAT_SRC is required (path to a local dragonboat checkout)}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BENCHTIME="${BENCHTIME:-30s}"
 PERF_TIMEOUT="${PERF_TIMEOUT:-7200s}"
@@ -43,17 +41,13 @@ stage() {
     exit 1
   fi
 
-  echo ">> staging dragonboat fork into .build-cache"
-  mkdir -p "$REPO_ROOT/.build-cache"
-  rsync -a --delete --exclude '.git' "$DRAGONBOAT_SRC/" "$REPO_ROOT/.build-cache/dragonboat/"
-
   echo ">> cross-building perfcompare (linux/amd64)"
   ( cd "$REPO_ROOT/test/performance" && GOWORK=off GOOS=linux GOARCH=amd64 \
       go build -o /tmp/perfcompare.linux ./cmd/perfcompare/ )
 
   echo ">> rsyncing repo -> $HOST:$REMOTE_DIR"
   ssh "$HOST" "mkdir -p '$REMOTE_DIR'"
-  # Include .git (orchestrator's findRepoRoot needs it) and .build-cache; skip
+  # Include .git (the orchestrator's findRepoRoot needs it); skip
   # heavy/irrelevant trees. The remote results dir and run log are excluded so
   # --delete never destroys data from previous runs when re-staging.
   rsync -a --delete \

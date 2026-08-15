@@ -3,18 +3,35 @@ module github.com/jeremyhahn/go-quicraft/test/performance/dragonboat
 go 1.26.6
 
 require (
+	github.com/jeremyhahn/dragonboat/v4 v4.0.1
 	github.com/jeremyhahn/go-quicraft/test/performance v0.0.0
-	github.com/lni/dragonboat/v4 v4.0.0
 )
 
-// Resolve the unpublished perf module from the sibling directory and the
-// dragonboat fork (module path github.com/lni/dragonboat/v4, tagged v4.0.0)
-// from the workspace checkout so the benchmark builds standalone. In Docker the
-// dragonboat Dockerfile rewrites the lni replace to the staged build-cache copy.
-replace (
-	github.com/jeremyhahn/go-quicraft/test/performance => ../
-	github.com/lni/dragonboat/v4 => ../../../../dragonboat
-)
+// The benchmark measures a FORK of dragonboat, github.com/jeremyhahn/
+// dragonboat/v4, and now says so in the import paths rather than disguising it
+// as upstream. The fork exists because the benchmark needs a dragonboat that
+// compiles against PebbleDB v1.1.5, which upstream v4.0.0 does not.
+//
+// This used to require github.com/lni/dragonboat/v4 and redirect it with
+//
+//	github.com/lni/dragonboat/v4 => ../../../../dragonboat
+//
+// a replace that escaped the repository altogether: it resolved only on a
+// machine that happened to have the fork checked out four levels up, and
+// failed on every clean checkout. Nothing caught it, because the CI job meant
+// to build the nested modules never expanded its matrix and silently rebuilt
+// the root module instead — the release gate was the first to build this for
+// real, and it stopped there.
+//
+// Pinning the fork by version rather than replacing upstream with it is not
+// just tidier, it is the only form that works: once the fork declares its own
+// module path, its internal imports resolve under that path too, and a
+// `replace lni => jeremyhahn` makes go load one module version under two
+// different paths, which is an error.
+//
+// The perf module is unpublished, so that one still resolves from the sibling
+// directory.
+replace github.com/jeremyhahn/go-quicraft/test/performance => ../
 
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect

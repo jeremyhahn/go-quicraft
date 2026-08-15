@@ -44,9 +44,8 @@ var knownSystems = []string{"quicraft", "etcd", "dragonboat", "openraft"}
 // environment (--net=host).
 type dockerGoConfig struct {
 	image      string
-	dockerfile string                      // relative to the perf dir (orchestrator cwd)
-	privileged bool                        // QuicRaft needs --privileged for UDP buffer tuning
-	stage      func(repoRoot string) error // optional pre-build staging step
+	dockerfile string // relative to the perf dir (orchestrator cwd)
+	privileged bool   // QuicRaft needs --privileged for UDP buffer tuning
 }
 
 // dockerGoSystems maps each Go benchmark system to its Docker configuration.
@@ -54,7 +53,7 @@ type dockerGoConfig struct {
 var dockerGoSystems = map[string]dockerGoConfig{
 	"quicraft":   {image: "quicraft-bench-quicraft", dockerfile: "quicraft/Dockerfile", privileged: true},
 	"etcd":       {image: "quicraft-bench-etcd", dockerfile: "etcd/Dockerfile"},
-	"dragonboat": {image: "quicraft-bench-dragonboat", dockerfile: "dragonboat/Dockerfile", stage: stageDragonboat},
+	"dragonboat": {image: "quicraft-bench-dragonboat", dockerfile: "dragonboat/Dockerfile"},
 }
 
 func main() {
@@ -226,12 +225,6 @@ func runGoDocker(system, benchtime, timeout string, noBuild bool) (*perfresult.B
 		return nil, fmt.Errorf("cannot find repo root: %w", err)
 	}
 
-	if cfg.stage != nil {
-		if err := cfg.stage(repoRoot); err != nil {
-			return nil, err
-		}
-	}
-
 	if !noBuild {
 		fmt.Printf("  building Docker image %s...\n", cfg.image)
 		buildCmd := exec.Command("docker", "build", "-t", cfg.image, "-f", cfg.dockerfile, repoRoot)
@@ -281,44 +274,6 @@ func benchTmpMount() []string {
 		return nil
 	}
 	return []string{"-v", host + ":/bench-tmp", "-e", "TMPDIR=/bench-tmp"}
-}
-
-// dragonboatSrc returns the path to the dragonboat fork source, honoring the
-// DRAGONBOAT_SRC env var and falling back to the standard workspace checkout.
-func dragonboatSrc() string {
-	if v := os.Getenv("DRAGONBOAT_SRC"); v != "" {
-		return v
-	}
-	return "/home/jhahn/sources/dragonboat"
-}
-
-// stageDragonboat copies the dragonboat fork into the repo's .build-cache so the
-// Docker build context contains it (the module path github.com/lni/dragonboat/v4
-// tagged v4.0.0 is not published upstream). If the cache already exists — for
-// example rsynced onto a remote bench host — it is reused as-is.
-func stageDragonboat(repoRoot string) error {
-	dst := filepath.Join(repoRoot, ".build-cache", "dragonboat")
-	if _, err := os.Stat(filepath.Join(dst, "go.mod")); err == nil {
-		fmt.Printf("  using staged dragonboat source at %s\n", dst)
-		return nil
-	}
-
-	src := dragonboatSrc()
-	if _, err := os.Stat(filepath.Join(src, "go.mod")); err != nil {
-		return fmt.Errorf("dragonboat source not found at %s; set DRAGONBOAT_SRC or pre-stage %s: %w", src, dst, err)
-	}
-
-	fmt.Printf("  staging dragonboat source %s -> %s\n", src, dst)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	cp := exec.Command("rsync", "-a", "--exclude", ".git", src+"/", dst+"/")
-	cp.Stdout = os.Stdout
-	cp.Stderr = os.Stderr
-	if err := cp.Run(); err != nil {
-		return fmt.Errorf("staging dragonboat via rsync failed: %w", err)
-	}
-	return nil
 }
 
 // openraftImage is the Docker image name for the OpenRaft benchmark.

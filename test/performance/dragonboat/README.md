@@ -42,10 +42,14 @@ make perf-compare-dragonboat
 Or manually:
 
 ```bash
-cp -r /path/to/dragonboat .build-cache/dragonboat
 docker build -t quicraft-bench-dragonboat -f test/performance/dragonboat/Dockerfile .
 docker run --rm quicraft-bench-dragonboat
 ```
+
+The comparison engine is the fork `github.com/jeremyhahn/dragonboat/v4`, which
+is upstream v4.0.0 plus a PebbleDB v1.1.5 compatibility fix. It is pinned in
+`go.mod` like any other dependency, so nothing has to be checked out or staged
+beforehand.
 
 ## Architecture Notes
 

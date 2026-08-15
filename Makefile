@@ -502,10 +502,10 @@ ci-errfs:
 # ============================================================================
 
 PERF_CMD := $(PERF_DIR)/cmd/perfcompare
-# Path to a local dragonboat checkout, used as the comparison engine. Defaults
-# to a sibling of this repository; override for a checkout elsewhere:
-#   make perf-run DRAGONBOAT_SRC=/path/to/dragonboat
-DRAGONBOAT_SRC ?= $(CURDIR)/../dragonboat
+# The dragonboat comparison engine is the published fork
+# github.com/jeremyhahn/dragonboat/v4, pinned in
+# test/performance/dragonboat/go.mod. It needs no local checkout and no
+# DRAGONBOAT_SRC override.
 SYSTEMS ?= all
 BENCHTIME ?= 30s
 PERF_TIMEOUT ?= 3600s

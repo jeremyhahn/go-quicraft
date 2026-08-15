@@ -19,7 +19,7 @@ import (
 	"io"
 	"sync"
 
-	dsm "github.com/lni/dragonboat/v4/statemachine"
+	dsm "github.com/jeremyhahn/dragonboat/v4/statemachine"
 )
 
 // Wire format for KV operations:
