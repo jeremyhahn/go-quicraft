@@ -4072,6 +4072,21 @@ func nopHostRelease() {}
 // Propose submits an asynchronous proposal through Raft. Returns a
 // RequestState that the caller must poll via Result and release via Release.
 func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*RequestState, error) {
+	// A context that is ALREADY done must not submit work. Without this the
+	// caller's outcome is decided by a select over two ready cases — the
+	// result channel and ctx.Done() — which Go resolves uniformly at random,
+	// so SyncPropose returned success or ErrCanceled by coin flip whenever the
+	// proposal committed before the cancellation was observed. That is how
+	// TestSyncPropose_CancelReturnsCanceled failed on a loaded CI runner while
+	// passing 40 consecutive local runs.
+	//
+	// Failing here also means an abandoned request never reaches the log at
+	// all. Cancellation racing an in-flight proposal is still inherently
+	// undecidable — ErrCanceled never proved the entry did not commit — but
+	// that is a different case from one the caller cancelled before asking.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4143,6 +4158,11 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 // on that error. A NO-OP session (Host.GetNoOPSession) is the supported form
 // there and is not affected.
 func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []byte) (*RequestState, error) {
+	// See Propose: an already-done context must not submit work, or the
+	// outcome is a coin flip between the result and the cancellation.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4408,6 +4428,11 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 // Witnesses cannot serve reads (they don't store log data).
 // Observers and followers forward the ReadIndex to the leader.
 func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, error) {
+	// See Propose: an already-done context must not submit work, or the
+	// outcome is a coin flip between the result and the cancellation.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}

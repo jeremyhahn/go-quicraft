@@ -707,3 +707,64 @@ func TestConfigRejectsReplicaIDThatWouldTruncateTheProposalKey(t *testing.T) {
 			"accepted: its keys silently collide with another replica's")
 	}
 }
+
+// TestProposeRejectsAlreadyCanceledContext verifies that the submission entry
+// points refuse a context that is already done, deterministically, and that
+// nothing reaches the raft log when they do.
+//
+// The previous behaviour was a coin flip. SyncPropose selects over the result
+// channel and ctx.Done(); when a single-node shard commits before the
+// cancellation is observed BOTH cases are ready, and Go chooses among ready
+// cases uniformly at random. TestSyncPropose_CancelReturnsCanceled therefore
+// failed on a loaded CI runner and passed 40 consecutive runs locally, which is
+// exactly the signature of a test whose subject is nondeterministic rather than
+// a test that is flaky.
+//
+// Asserting on the log range is the half that has teeth: returning ErrCanceled
+// while still appending the entry would satisfy the error check alone.
+func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	before, err := h.GetLogRange(1)
+	if err != nil {
+		t.Fatalf("GetLogRange failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Repeated because the defect was probabilistic: one attempt against the
+	// old code passed roughly half the time.
+	const attempts = 50
+	for i := range attempts {
+		if _, err := h.Propose(ctx, 1, []byte("canceled")); !errors.Is(err, ErrCanceled) {
+			t.Fatalf("attempt %d: Propose with a canceled context returned %v, want ErrCanceled", i, err)
+		}
+		if _, err := h.SyncPropose(ctx, 1, []byte("canceled")); !errors.Is(err, ErrCanceled) {
+			t.Fatalf("attempt %d: SyncPropose with a canceled context returned %v, want ErrCanceled", i, err)
+		}
+		if _, err := h.ReadIndex(ctx, 1); !errors.Is(err, ErrCanceled) {
+			t.Fatalf("attempt %d: ReadIndex with a canceled context returned %v, want ErrCanceled", i, err)
+		}
+	}
+
+	after, err := h.GetLogRange(1)
+	if err != nil {
+		t.Fatalf("GetLogRange failed: %v", err)
+	}
+	if after.LastIndex != before.LastIndex {
+		t.Fatalf("a canceled proposal still reached the log: last index moved %d -> %d",
+			before.LastIndex, after.LastIndex)
+	}
+}
