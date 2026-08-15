@@ -158,9 +158,13 @@ jobs:
       # the coordinator's shutdown RPC, which surfaces as a bare
       # "context deadline exceeded" AFTER the full -fuzztime has elapsed and
       # reads exactly like a crash. It is not one; it is the gate failing on
-      # its own scheduling. Capping concurrency keeps the box subscribed rather
-      # than oversubscribed, and the integration gate no longer overlaps these
-      # at all (see its `needs`).
+      # its own scheduling.
+      #
+      # max-parallel is declared for hosts that honour it. Gitea's act_runner
+      # does NOT: on release 424 all six jobs started within the same second
+      # with this set to 3. The enforceable half of the fix is -parallel on the
+      # fuzz command itself, below, which Go applies rather than the runner.
+      # The integration gate no longer overlaps these at all (see its `needs`).
       max-parallel: 3
       matrix:
         package:
@@ -194,9 +198,14 @@ jobs:
             echo "FAIL: no fuzz targets found in ${{ matrix.package }}"
             exit 1
           fi
+          # -parallel bounds the fuzzing WORKERS per job. Left at its default
+          # it is GOMAXPROCS, so each job alone would claim the whole runner
+          # and six of them would treble-book it. Two apiece keeps every job
+          # making progress without the coordinator losing its workers to the
+          # scheduler at shutdown.
           for target in ${TARGETS}; do
             echo "==> ${target}"
-            go test -tags=quicraft_fuzz -count=1 -run='^$' \
+            go test -tags=quicraft_fuzz -count=1 -run='^$' -parallel=2 \
               -fuzz="^${target}\$" -fuzztime=10s '${{ matrix.package }}'
           done
 
