@@ -274,7 +274,13 @@ type ErrorFS struct {
 // can be armed later with Reset.
 func New(delegate waldb.FS, injectAt int64, err error) *ErrorFS {
 	efs := &ErrorFS{delegate: delegate}
-	efs.spec.Store(&injectSpec{at: injectAt, err: err, times: 1})
+	// mode is stated rather than left to the zero value. modeError IS the zero
+	// value, so omitting it compiles to the same thing — but then the default
+	// behaviour of every ErrorFS depends on the ORDER of the iota block above,
+	// and a reader has to go and check it. Naming it here is the difference
+	// between "the default is to return the error untouched" being a fact in
+	// the code and being a fact about a constant's position.
+	efs.spec.Store(&injectSpec{at: injectAt, err: err, times: 1, mode: modeError})
 	return efs
 }
 
