@@ -9,11 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.1-alpha] - 2026-08-15
 
-Repairs to the release and CI gates. No non-test source changed anywhere in the
-module — the compiled library is identical to 0.4.0-alpha, the only edits under
-`pkg/` being to a `_test.go` file behind a build tag — so the two
-formats-and-safety notices in that entry still apply in full, and consumers can
-move from 0.4.0-alpha to this with no code change of their own.
+Repairs to the release and CI gates, plus one behaviour fix those gates
+uncovered. The formats-and-safety notices in the 0.4.0-alpha entry still apply
+in full, and there is no format change here, so consumers move from
+0.4.0-alpha to this without changing their own code.
 
 0.4.0-alpha never published. Its release run failed three gates, and the
 `Publish` job correctly refused to run — the tag exists and resolves, but the
@@ -53,13 +52,33 @@ checksummed would fail its build with a security error.
   because the suite runs with the weak-parameter bypass enabled. At 1 MiB the
   same ten-second budget goes from ~500 executions to ~185,000.
 
+### Fixed (behaviour)
+
+- **`Propose`, `ProposeWithSession` and `ReadIndex` now reject a context that
+  is already done, instead of submitting the request anyway.** They validated
+  closed, draining, witness, disk-full and payload size and then submitted, so
+  a request the caller had already abandoned still entered the raft log.
+
+  The visible symptom was worse than the omission. `SyncPropose` waits in a
+  `select` over the result channel and `ctx.Done()`; when a shard commits
+  before the cancellation is observed both cases are ready, and Go chooses
+  among ready cases uniformly at random — so with an already-canceled context
+  the call returned success or `ErrCanceled` by coin flip. It surfaced as a
+  unit test that failed on a loaded CI runner and passed forty consecutive
+  runs locally.
+
+  This narrows what `ErrCanceled` means rather than changing it. Cancellation
+  racing an in-flight proposal remains undecidable, and `ErrCanceled` still
+  never proves the entry did not commit; a context that was already done
+  before the call is not a race, and now neither submits nor reports success.
+
 ### Changed
 
-- A replication wait that times out in the host integration suite now prints
-  each live node's view of the leader, its term, applied index, local log span,
-  queue depth and health. A single timeout line could not distinguish a
-  leaderless cluster from a wedged replica from a slow runner, and the one such
-  failure observed on a release runner did not reproduce in ~30 local runs
+- A replication wait that times out in the host and e2e integration suites now
+  prints each live node's view of the leader, its term, applied index, local
+  log span, queue depth and health. A single timeout line could not distinguish
+  a leaderless cluster from a wedged replica from a slow runner, and the one
+  such failure observed on a release runner did not reproduce in ~30 local runs
   under contention, so it could not be interpreted at all.
 
 ## [0.4.0-alpha] - 2026-08-15
