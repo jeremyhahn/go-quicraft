@@ -881,6 +881,13 @@ func (w *commitWorker) requestReload(shardID uint64) {
 // (violating lastApplied <= committed). The state-only SaveState does not truncate
 // entries, so the cost is one fsync without touching the durable log.
 //
+// What it does NOT persist is entries — the logdb.Update below has no Entries
+// field, by design. That is why GetPiggybackUpdate withholds ordered messages
+// whenever the peer has unsaved entries: an ordered message reaching this
+// function is one whose durability requirement this state-only fsync can
+// actually satisfy. Do not "optimize" that withholding away without giving this
+// path an entry write, or the shard resumes acknowledging RAM-only log indices.
+//
 // It returns false only when the worker is shutting down (stopC fired mid-
 // delivery); in that case the caller must stop processing the batch (the shared
 // batch buffers are no longer safe to iterate). It returns true for normal
@@ -889,6 +896,12 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	// Split messages: free-order may go immediately (they do not depend on
 	// commit-index durability); ordered responses go AFTER the commit index
 	// is durable. Reuse pre-allocated buffers.
+	//
+	// The ordered half is empty by construction whenever the peer still holds
+	// unsaved entries — GetPiggybackUpdate leaves those messages in r.msgs
+	// because this function fsyncs hard state only. The split is still needed
+	// for the case it does receive: ordered messages backed purely by the
+	// term/vote/commit written below.
 	w.freeOrderBuf = w.freeOrderBuf[:0]
 	w.orderedMsgSplitBuf = w.orderedMsgSplitBuf[:0]
 	if len(piggyback.Messages) > 0 {
@@ -905,13 +918,14 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	}
 
 	// Persist the advanced commit index (hard state) BEFORE applying or
-	// sending ordered responses. The piggyback's entries were already
-	// fsynced, but the commit-index advance was not part of this batch's
+	// sending ordered responses. The entries this piggyback APPLIES are
+	// already fsynced — GetPiggybackUpdate clamps them to the peer's durable
+	// marker — but the commit-index advance was not part of any earlier
 	// SaveState. Skipping it (the old behavior) meant a crash could leave an
 	// on-disk state machine whose durable lastApplied exceeded the recovered
 	// HardState.Commit — violating lastApplied <= committed and risking
-	// re-apply. piggyback.State is the peer's current hard state (set by
-	// GetPiggybackUpdate via hardState()), so persisting it is correct.
+	// re-apply. piggyback.State is that same clamped hard state, so persisting
+	// it never advertises a commit past the durable log.
 	if w.logdb != nil {
 		stateUpdate := []logdb.Update{{
 			ShardID:   piggyback.ShardID,
@@ -938,14 +952,33 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		}
 		if saveErr != nil {
 			// Terminal for this cycle, but SELF-HEALING — NOT a shard failure.
-			// The piggyback's entries were already fsynced by this batch's
-			// SaveState; only the commit-index advance failed to persist. Commit
-			// has not run yet (it is below), so the processed marker has not
-			// moved and the entries are re-offered on a later cycle. Do NOT fail
-			// the shard (no handleError/OnShardFailed for a transient disk
-			// hiccup): release the un-applied entries, clear commitPending, and
-			// wake the step worker to retry. The error is typed *SaveStateError
-			// because this WAS a SaveState failure, not a Commit failure.
+			// The piggyback's entries were already fsynced by the batch that
+			// produced them; only this cycle's hard-state advance failed to
+			// persist. Commit has not run yet (it is below), so the processed
+			// marker has not moved and the entries are re-offered on a later
+			// cycle. Do NOT fail the shard (no handleError/OnShardFailed for a
+			// transient disk hiccup): release the un-applied entries, clear
+			// commitPending, and wake the step worker to retry. The error is
+			// typed *SaveStateError because this WAS a SaveState failure, not a
+			// Commit failure.
+			//
+			// Self-healing is a property of the RAFT STATE too, but only
+			// because of the two steps below; it was NOT free.
+			//
+			//  1. prevState is untouched — NotePiggybackPersisted runs only
+			//     after a successful save. hasStateChanged() therefore still
+			//     reports this term/vote/commit as unpersisted, so the next
+			//     update is not ReadOnly and carries the hard state back
+			//     through SaveState. Advancing prevState here (the old
+			//     behavior, done inside GetPiggybackUpdate) made a vote granted
+			//     in this window invisible, and a later ReadOnly update could
+			//     then transmit its RequestVoteResp with no WAL write at all.
+			//  2. The ordered messages this cycle drained are handed back to
+			//     the peer instead of being dropped. They were withheld
+			//     precisely because they depend on this failed write; the next
+			//     cycle that persists releases them. Dropping a ReplicateResp
+			//     only costs a retransmit, but dropping a VoteResp stalls an
+			//     election for a full timeout.
 			slog.Warn("piggyback commit-index persist failed after retries",
 				"shard", piggyback.ShardID, "replica", piggyback.ReplicaID,
 				"error", &SaveStateError{
@@ -953,6 +986,11 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 					ReplicaID: piggyback.ReplicaID,
 					Err:       saveErr,
 				})
+			if len(w.orderedMsgSplitBuf) > 0 {
+				node.raftMu.Lock()
+				node.peer.RequeueMessages(w.orderedMsgSplitBuf)
+				node.raftMu.Unlock()
+			}
 			piggyback.ReleaseCommittedEntries()
 			node.commitPending.Store(false)
 			if w.workSignal != nil {
@@ -962,8 +1000,14 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		}
 	}
 
-	// Commit piggyback to advance processed markers (in-memory).
+	// Record the hard state as durable and advance the processed markers
+	// (in-memory). NotePiggybackPersisted is what GetPiggybackUpdate stopped
+	// doing: prevState may only claim a state that has actually reached stable
+	// storage, and reaching this line is the proof. It takes the Update's
+	// State — the commit-clamped one that was written — not the peer's current
+	// hard state, which the step worker may already have moved on.
 	node.raftMu.Lock()
+	node.peer.NotePiggybackPersisted(piggyback.State)
 	pbCommitErr := node.peer.Commit(piggyback)
 	node.raftMu.Unlock()
 

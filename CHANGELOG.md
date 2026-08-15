@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-alpha] - 2026-08-15
+
 **This release breaks both the wire format and the on-disk format, and the
 version numbers do NOT record it.** Every wire and persisted format is now
 pinned at **version 1** and stays there until the first production release —
@@ -196,12 +198,35 @@ compile cleanly and fail at run time.
   under one key.
 
   `SealedRootKey.StateMAC` is an HMAC-SHA256 over a canonical,
-  length-prefixed encoding of `(Strategy, Version, Epoch, Salt, KnownEpochs,
-  HKDFVersion, Algorithm, DeploymentID)`, keyed from the root key. It is
+  length-prefixed encoding of `(Strategy, Version, DeploymentID, Epoch, Salt,
+  KnownEpochs, HKDFVersion, Algorithm, Ciphertext, Metadata, Nonce,
+  HardwarePayload)`, keyed from the root key. The ciphertext is covered even
+  though it authenticates itself, so that genuine metadata from one blob
+  cannot be paired with a genuine ciphertext from another. It is
   stamped by `Initialize`, `Rotate` and `PurgeEpochsBefore`, and verified by
   `Unseal`. A blob written by a pre-MAC build carries none, and `Unseal`
   fails closed with `ErrSealedStateUnauthenticated` — accepting an absent MAC
   is a downgrade an attacker triggers by deleting the field.
+
+  **An embedder that re-wraps the root key itself must stamp the result**, and
+  gets two entry points to do it. A `SealingStrategy` produces only the
+  ciphertext and its own strategy fields, so a password change, a rekey or a
+  Shamir re-split assembles the new blob outside the barrier — and an
+  unstamped blob is refused by its own next `Unseal`, indistinguishable from
+  a stripped one:
+
+  - `(*Barrier).StampSealedStateMAC(*SealedRootKey) error` — requires the
+    barrier unsealed, because the root key is the MAC key.
+  - `StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64,
+    *SealedRootKey) error` — for a caller holding the plaintext root key with
+    no unsealed barrier. This is the import case, which cannot satisfy the
+    method's precondition: a replica seals a leader-exported root key and
+    persists the blob *before* any barrier exists to unseal, and that
+    persisted blob is what the subsequent `Unseal` reads.
+
+  Both stamp LAST, after every covered field has its final value. Stamping
+  before the ciphertext is final produces a blob that fails its own
+  authentication.
 
   **One-start migration:** set `BarrierConfig.AllowUnauthenticatedSealedState
   = true`, start once (`Unseal` proceeds and logs a warning, then restamps

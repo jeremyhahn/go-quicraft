@@ -107,6 +107,69 @@ func TestConfig_SetDefaults(t *testing.T) {
 	})
 }
 
+// TestConfig_SetDefaults_SnapshotEntries pins the tri-state that this field
+// used to get wrong.
+//
+// The old behaviour was that zero meant "never snapshot", which made "never"
+// the DEFAULT — the one configuration a practical Raft deployment cannot run
+// in (Ongaro, "Consensus: Bridging Theory and Practice", ch. 5 treats
+// compaction as a requirement, not a feature). In this implementation it also
+// silently disabled three things that advance only inside saveSnapshot: the
+// snapshot-directory GC, the epoch purge floor, and the at-rest barrier — the
+// last of which is how a set of barrier end-to-end tests came to assert
+// nothing at all.
+//
+// Three states, three distinct meanings, and the test asserts each separately
+// because collapsing any two of them is exactly the defect.
+func TestConfig_SetDefaults_SnapshotEntries(t *testing.T) {
+	t.Run("unset takes the default rather than meaning disabled", func(t *testing.T) {
+		c := Config{}
+		c.SetDefaults()
+		if c.SnapshotEntries != DefaultSnapshotEntries {
+			t.Fatalf("SnapshotEntries = %d after SetDefaults, want DefaultSnapshotEntries (%d): "+
+				"an unset field must select the default, not silently disable log compaction",
+				c.SnapshotEntries, DefaultSnapshotEntries)
+		}
+	})
+
+	t.Run("an explicit value is preserved", func(t *testing.T) {
+		c := Config{SnapshotEntries: 25000}
+		c.SetDefaults()
+		if c.SnapshotEntries != 25000 {
+			t.Fatalf("SnapshotEntries = %d, want the caller's 25000", c.SnapshotEntries)
+		}
+	})
+
+	t.Run("SnapshotsDisabled is preserved and survives SetDefaults", func(t *testing.T) {
+		c := Config{SnapshotEntries: SnapshotsDisabled}
+		c.SetDefaults()
+		if c.SnapshotEntries != SnapshotsDisabled {
+			t.Fatalf("SnapshotEntries = %d, want SnapshotsDisabled (%d): the opt-out must "+
+				"survive defaulting or it is not an opt-out", c.SnapshotEntries, SnapshotsDisabled)
+		}
+	})
+
+	t.Run("the default satisfies every rule a default config is judged by", func(t *testing.T) {
+		// These two couplings are why the value is what it is, and a future
+		// change to any of the three constants must keep them true.
+		if DefaultSnapshotEntries <= DefaultCompactionOverhead {
+			t.Errorf("DefaultSnapshotEntries (%d) must exceed DefaultCompactionOverhead (%d), "+
+				"or Validate rejects a wholly default config",
+				DefaultSnapshotEntries, DefaultCompactionOverhead)
+		}
+		if DefaultSessionExpiryEntries > DefaultSnapshotEntries {
+			t.Errorf("DefaultSessionExpiryEntries (%d) must not exceed DefaultSnapshotEntries (%d), "+
+				"or validateSessions warns on every start of a default config",
+				DefaultSessionExpiryEntries, DefaultSnapshotEntries)
+		}
+		c := Config{ShardID: 1, ReplicaID: 1}
+		c.SetDefaults()
+		if err := c.Validate(); err != nil {
+			t.Fatalf("a wholly default Config must validate, got %v", err)
+		}
+	})
+}
+
 func TestConfig_Validate_Valid(t *testing.T) {
 	t.Run("valid config after SetDefaults", func(t *testing.T) {
 		c := validConfig()
@@ -255,11 +318,27 @@ func TestConfig_Validate_ObserverWitness(t *testing.T) {
 }
 
 func TestConfig_Validate_SnapshotEntries(t *testing.T) {
-	t.Run("zero is valid (disabled)", func(t *testing.T) {
+	// Validate accepts a zero because SetDefaults runs first at both entry
+	// points and replaces it; the name says "unset", not "disabled", because
+	// zero no longer means disabled — see TestSetDefaults_SnapshotEntries.
+	t.Run("zero (unset) passes validation, since SetDefaults resolves it", func(t *testing.T) {
 		c := validConfig()
 		c.SnapshotEntries = 0
 		if err := c.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+
+	t.Run("SnapshotsDisabled passes validation", func(t *testing.T) {
+		// The sentinel must survive both coupled rules: it is > 0, so the
+		// CompactionOverhead comparison applies to it and must not fire, and
+		// it must not trip validateSessions' "SessionExpiryEntries exceeds
+		// SnapshotEntries" warning either. A sentinel that fails its own
+		// config's validation is not an opt-out, it is a trap.
+		c := validConfig()
+		c.SnapshotEntries = SnapshotsDisabled
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() with SnapshotsDisabled = %v, want nil", err)
 		}
 	})
 

@@ -3928,7 +3928,12 @@ func TestPeer_GetPiggybackUpdate_DrainsMessages(t *testing.T) {
 	}
 }
 
-func TestPeer_GetPiggybackUpdate_UpdatesPrevState(t *testing.T) {
+// TestPeer_GetPiggybackUpdate_DefersPrevState pins the ownership of the
+// prevState advance: extraction does not perform it, the persist
+// acknowledgement does. The old name (UpdatesPrevState) described the
+// behaviour that made a failed piggyback SaveState claim an un-fsynced
+// term/vote as durable.
+func TestPeer_GetPiggybackUpdate_DefersPrevState(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
@@ -3943,14 +3948,23 @@ func TestPeer_GetPiggybackUpdate_UpdatesPrevState(t *testing.T) {
 		t.Fatal("expected hasStateChanged=true before GetPiggybackUpdate")
 	}
 
-	_, err := p.GetPiggybackUpdate(0)
+	update, err := p.GetPiggybackUpdate(0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// prevState should now match the current hard state.
+	// Extracting the update must NOT advance prevState. The hard state it
+	// carries has not been fsynced yet, and treating it as recorded here
+	// would drop it from the next cycle if the persist fails -- the whole
+	// reason the advance moved to NotePiggybackPersisted.
+	if !p.hasStateChanged() {
+		t.Fatal("expected hasStateChanged=true until the update is persisted")
+	}
+
+	// Acknowledging the persist is what records it.
+	p.NotePiggybackPersisted(update.State)
 	if p.hasStateChanged() {
-		t.Fatal("expected hasStateChanged=false after GetPiggybackUpdate")
+		t.Fatal("expected hasStateChanged=false after NotePiggybackPersisted")
 	}
 }
 

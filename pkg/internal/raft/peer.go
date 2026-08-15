@@ -1436,10 +1436,18 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 // during commitPending via processCommitPendingInbox.
 //
 // Unlike GetUpdate, this method:
-//   - Does NOT touch entriesToSave (already persisted in cycle 1)
+//   - Does NOT write entriesToSave into the Update, and the engine path it
+//     feeds persists no entries. That is only safe for the entries this
+//     method APPLIES — they are clamped to the durable marker below. It says
+//     nothing about entries appended by processCommitPendingInbox during the
+//     commitPending window, which are still RAM-only; see the ordered-message
+//     withholding below, which is what keeps that distinction honest.
 //   - Does NOT touch readStates (drained by processCommitPendingInbox)
 //   - Does NOT touch hasPendingSnapshot
-//   - DOES drain messages and update prevState
+//   - DOES drain messages the durability rules permit it to release
+//   - Does NOT advance prevState. The engine does that via
+//     NotePiggybackPersisted once the hard state is actually on disk, so a
+//     failed persist leaves hasStateChanged() true and the state is re-emitted.
 //   - Returns empty Update (CommittedEntries=nil) if nothing to apply
 //
 // The caller must hold raftMu.
@@ -1454,7 +1462,8 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	// crash HardState.Commit would exceed the recovered log — the invariant
 	// this fix protects. Extract and advertise only up to the durable marker;
 	// the remainder re-emits on a later cycle once it is persisted, because
-	// prevState is set to the clamped hard state below rather than the raw one.
+	// NotePiggybackPersisted records the CLAMPED hard state as prevState rather
+	// than the raw one.
 	saved := p.r.log.savedIndex()
 	committedEntries, pooled, err := p.r.log.entriesToApplyUpTo(saved)
 	if err != nil {
@@ -1479,14 +1488,66 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	}
 	// Drain pending messages produced by processCommitPendingInbox
 	// (e.g., broadcastAppend Replicate after tryCommit).
+	//
+	// Durability split. The engine path this Update feeds (executePiggyback)
+	// fsyncs HARD STATE ONLY — its logdb.Update carries no Entries — so any
+	// entry appended during the commitPending window is still RAM-only when
+	// these messages go out. processCommitPendingInbox steps Replicate here
+	// (only InstallSnapshot is filtered), and handleAppend answers it with an
+	// ORDERED ReplicateResp naming an index this replica has not made durable.
+	// Releasing that is the Figure 2 violation "updated on stable storage
+	// before responding to RPCs" exists to prevent: the leader counts the
+	// match toward its commit quorum, and a crash here loses entries already
+	// acknowledged to a client.
+	//
+	// So while entriesToSave() is non-empty, hand the sender only the
+	// free-order messages and leave the ordered ones in r.msgs. They are
+	// withheld, never dropped: len(r.msgs) > 0 keeps HasUpdate true, and the
+	// next GetUpdate cycle — which DOES carry EntriesToSave through SaveState —
+	// releases them after the fsync. This reuses the existing free-order split
+	// (proto.IsFreeOrderMessage) rather than inventing a second rule; the
+	// step worker applies exactly the same predicate for the same reason while
+	// commitPending is set.
 	if len(p.r.msgs) > 0 {
-		update.Messages = p.r.drainMessages()
+		msgs := p.r.drainMessages()
+		if len(p.r.log.entriesToSave()) > 0 {
+			msgs = p.r.withholdOrderedMessages(msgs)
+		}
+		if len(msgs) > 0 {
+			update.Messages = msgs
+		}
 	}
-	// Update prevState so step worker's HasUpdate/hasStateChanged
-	// doesn't re-extract the same commit index change.
-	p.prevState = hs
 	p.syncLeaderID()
 	return update, nil
+}
+
+// NotePiggybackPersisted advances prevState to the hard state the engine has
+// just written to stable storage on the piggyback path.
+//
+// It exists because GetPiggybackUpdate deliberately does NOT advance prevState:
+// the persist happens after the Update leaves this package and can fail. An
+// earlier version advanced it optimistically, so a failed piggyback SaveState
+// left prevState claiming a term/vote/commit that never reached disk. A vote
+// granted in that window became invisible to hasStateChanged(), letting a later
+// update be ReadOnly and transmit its RequestVoteResp with no WAL write at all.
+//
+// hs must be the State carried by the Update that was persisted (the clamped
+// one), not the peer's current hard state, which may already have moved on.
+//
+// The caller must hold raftMu.
+func (p *Peer) NotePiggybackPersisted(hs proto.State) {
+	p.prevState = hs
+}
+
+// RequeueMessages returns messages to the outbound buffer after the engine
+// failed to establish the durability they were waiting on. They are placed
+// AHEAD of anything produced since the drain, preserving emission order, and
+// go out on the next cycle that persists. Dropping them instead is not
+// equivalent: a lost VoteResp stalls an election until the next timeout.
+//
+// The caller must hold raftMu.
+func (p *Peer) RequeueMessages(msgs []proto.Message) {
+	p.r.requeueMessages(msgs)
 }
 
 // Commit acknowledges that the engine has persisted the Update. This

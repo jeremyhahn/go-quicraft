@@ -3836,6 +3836,55 @@ func (r *raft) drainMessages() []proto.Message {
 	return msgs
 }
 
+// withholdOrderedMessages partitions an ALREADY-DRAINED batch: it compacts the
+// free-order messages to the front of msgs (returning that prefix) and pushes
+// the ordered ones back into r.msgs so a later, durability-bearing cycle emits
+// them.
+//
+// It is the drain-first counterpart of drainFreeOrderMessages and exists
+// because the two run on different goroutines. drainFreeOrderMessages returns
+// r.freeMsgBuf, a single buffer owned by the step worker; the commit worker
+// calls this one on the piggyback path while the step worker is concurrently
+// inside processCommitPendingInbox, so reusing freeMsgBuf there would let one
+// worker overwrite the batch the other is still sending. Operating on the
+// caller's already-swapped drainMessages() slice keeps each worker on its own
+// storage while applying the identical proto.IsFreeOrderMessage rule.
+//
+// The in-place compaction is safe because the write index never runs ahead of
+// the read index, and r.msgs is the OTHER half of the drainMessages double
+// buffer, so appending to it cannot alias msgs.
+func (r *raft) withholdOrderedMessages(msgs []proto.Message) []proto.Message {
+	n := 0
+	for i := range msgs {
+		if proto.IsFreeOrderMessage(msgs[i].Type) {
+			msgs[n] = msgs[i]
+			n++
+		} else {
+			r.msgs = append(r.msgs, msgs[i])
+		}
+	}
+	return msgs[:n]
+}
+
+// requeueMessages puts previously drained messages back at the FRONT of the
+// outbound buffer. Used when the engine drained messages, failed to persist
+// the state they were waiting on, and must hand them back rather than drop
+// them. Front placement preserves emission order: everything currently in
+// r.msgs was produced after these were drained.
+func (r *raft) requeueMessages(msgs []proto.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	if len(r.msgs) == 0 {
+		r.msgs = append(r.msgs, msgs...)
+		return
+	}
+	combined := make([]proto.Message, 0, len(msgs)+len(r.msgs))
+	combined = append(combined, msgs...)
+	combined = append(combined, r.msgs...)
+	r.msgs = combined
+}
+
 // drainFreeOrderMessages extracts only free-order messages (Replicate,
 // Ping, Heartbeat, Quiesce) from the outbound buffer, leaving ordered
 // messages (VoteResp, HeartbeatResp, ReplicateResp, etc.) in place.

@@ -214,6 +214,66 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsFalsePreservesSnapshotEntries(t
 	}
 }
 
+// TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled pins the one place the
+// two projects' zero values disagree.
+//
+// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is off; I
+// will call RequestSnapshot myself". Quicraft used to read it the same way and
+// no longer does: a zero there means "I did not choose", and SetDefaults
+// substitutes DefaultSnapshotEntries. Passing the zero through would therefore
+// silently ENABLE snapshotting on a config that explicitly asked for it off.
+//
+// The witness case is the sharp one, because dragonboat's own Validate REQUIRES
+// SnapshotEntries == 0 for a witness — so every witness converted by this shim
+// would have started snapshotting, on a replica that holds no entry payloads to
+// snapshot.
+func TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled(t *testing.T) {
+	t.Run("plain replica", func(t *testing.T) {
+		c := Config{ShardID: 1, ReplicaID: 1, SnapshotEntries: 0}
+
+		qc := c.ToQuicraft()
+		if qc.SnapshotEntries != qcConfig.SnapshotsDisabled {
+			t.Fatalf("SnapshotEntries: got %d, want SnapshotsDisabled (%d): a dragonboat "+
+				"config that asked for snapshotting OFF must not be silently switched on",
+				qc.SnapshotEntries, qcConfig.SnapshotsDisabled)
+		}
+		// The sentinel has to survive the very next thing quicraft does to it,
+		// or the mapping is decorative.
+		qc.SetDefaults()
+		if qc.SnapshotEntries != qcConfig.SnapshotsDisabled {
+			t.Fatalf("SnapshotEntries: got %d after SetDefaults, want SnapshotsDisabled (%d)",
+				qc.SnapshotEntries, qcConfig.SnapshotsDisabled)
+		}
+		if err := qc.Validate(); err != nil {
+			t.Fatalf("Validate() after converting a snapshots-off config = %v, want nil", err)
+		}
+	})
+
+	t.Run("witness, where dragonboat requires zero", func(t *testing.T) {
+		c := Config{
+			ShardID:         1,
+			ReplicaID:       1,
+			HeartbeatRTT:    1,
+			ElectionRTT:     10,
+			IsWitness:       true,
+			SnapshotEntries: 0,
+		}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("a witness with SnapshotEntries 0 is the only shape dragonboat "+
+				"accepts; Validate() = %v, want nil", err)
+		}
+
+		qc := c.ToQuicraft()
+		qc.SetDefaults()
+		if qc.SnapshotEntries != qcConfig.SnapshotsDisabled {
+			t.Fatalf("witness SnapshotEntries: got %d, want SnapshotsDisabled (%d): a witness "+
+				"stores no entry payloads, so enabling snapshots on one is meaningless work "+
+				"against a config dragonboat would not even accept in the other direction",
+				qc.SnapshotEntries, qcConfig.SnapshotsDisabled)
+		}
+	})
+}
+
 func TestConfig_ToQuicraft_UnsetCompactionOverheadSmallSnapshotEntries(t *testing.T) {
 	// A valid dragonboat config with SnapshotEntries <= quicraft's
 	// DefaultCompactionOverhead and CompactionOverhead unset must convert

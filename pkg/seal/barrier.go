@@ -2142,6 +2142,76 @@ func (b *Barrier) restampStateMACFromEnclaveLocked(s *SealedRootKey) error {
 	return b.restampStateMACLocked(rootBuf.Bytes(), s)
 }
 
+// StampSealedStateMAC re-authenticates a sealed blob's metadata under this
+// barrier's root key, and is how an embedder that re-wraps the root key ITSELF
+// produces a blob that will survive its own next Unseal.
+//
+// The barrier stamps the MAC for every operation it performs (Initialize,
+// Rotate, PurgeEpochsBefore). It cannot do so for a re-wrap it does not
+// perform: a SealingStrategy produces only the root-key ciphertext and its own
+// strategy fields, so an embedder that changes a barrier password, rekeys, or
+// re-splits a Shamir quorum assembles the new blob outside the barrier and
+// hands it back through SetSealedRootKey. Without this method that blob
+// carries no StateMAC, and the next Unseal refuses it with
+// ErrSealedStateUnauthenticated -- correctly, since an absent MAC is
+// indistinguishable from a stripped one.
+//
+// Call it AFTER every covered field (Epoch, KnownEpochs, Salt, HKDFVersion,
+// Algorithm, Strategy) has its final value, and before persisting the blob:
+// the MAC covers exactly those fields, so stamping first and editing after
+// produces a blob that fails its own authentication.
+//
+// The barrier must be unsealed, because the root key is the MAC key. A
+// StrategyNone deployment keeps no root key and expects no MAC; calling this
+// on one returns ErrNoRootKeyAvailable rather than inventing an authenticator
+// there is nothing to authenticate with.
+func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error {
+	if sealed == nil {
+		return ErrNilSealedData
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.state != barrierUnsealed {
+		return ErrBarrierSealed
+	}
+	return b.restampStateMACFromEnclaveLocked(sealed)
+}
+
+// StampSealedStateMACWithRootKey is StampSealedStateMAC for a caller that
+// holds the plaintext root key but has no unsealed barrier to stamp with.
+//
+// That is not a loophole around the method's unsealed requirement -- it is the
+// import case, which cannot satisfy it. A replica importing a root key
+// exported by a leader seals it under its own strategy and persists the blob
+// BEFORE any barrier exists to unseal: the persisted blob is what the
+// subsequent Unseal reads. Stamping has to happen at assembly time, from the
+// key in hand.
+//
+// The deploymentID must be the one the barrier that will later unseal this
+// blob is configured with, because it is covered by the MAC -- a blob stamped
+// for one deployment does not authenticate under another, which is the
+// property that stops a sealed blob from being replayed into a different
+// cluster.
+//
+// The same ordering rule applies: stamp only once every covered field has its
+// final value. See StampSealedStateMAC for the full list.
+func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error {
+	if sealed == nil {
+		return ErrNilSealedData
+	}
+	if len(rootKey) == 0 {
+		return ErrNoRootKeyAvailable
+	}
+	mac, err := sealedStateMAC(rootKey, deploymentID, sealed)
+	if err != nil {
+		return err
+	}
+	sealed.StateMAC = mac
+	return nil
+}
+
 // SetSealedRootKey sets the sealed root key data for subsequent Unseal calls.
 // This is used when loading persisted sealed key data during node startup.
 //

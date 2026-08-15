@@ -243,6 +243,22 @@ func (c Config) ToQuicraft() qcConfig.Config {
 		if compactionOverhead >= snapshotEntries {
 			compactionOverhead = snapshotEntries - 1
 		}
+	} else {
+		// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is
+		// off; the user will call RequestSnapshot". Quicraft used to read a
+		// zero the same way, but no longer does: a zero there now means "I did
+		// not choose" and SetDefaults substitutes DefaultSnapshotEntries.
+		// Passing the zero through would therefore silently ENABLE snapshotting
+		// on a config that explicitly asked for it off — and would do it to
+		// every witness, since dragonboat REQUIRES SnapshotEntries == 0 for
+		// witnesses (see Validate).
+		//
+		// SnapshotsDisabled is the sentinel that preserves the caller's
+		// meaning. CompactionOverhead is left as the caller set it: with no
+		// automatic snapshot there is no automatic compaction for it to bound,
+		// and quicraft's SnapshotEntries > CompactionOverhead check does not
+		// apply to the sentinel.
+		snapshotEntries = qcConfig.SnapshotsDisabled
 	}
 
 	return qcConfig.Config{
