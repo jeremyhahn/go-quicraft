@@ -152,6 +152,16 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Go's fuzzing engine starts one worker per CPU, so six of these jobs at
+      # once put ~24 workers on a 20-core runner. That does not corrupt a
+      # result — a fuzz worker has no timing assertions — but it does starve
+      # the coordinator's shutdown RPC, which surfaces as a bare
+      # "context deadline exceeded" AFTER the full -fuzztime has elapsed and
+      # reads exactly like a crash. It is not one; it is the gate failing on
+      # its own scheduling. Capping concurrency keeps the box subscribed rather
+      # than oversubscribed, and the integration gate no longer overlaps these
+      # at all (see its `needs`).
+      max-parallel: 3
       matrix:
         package:
           - ./pkg/proto
