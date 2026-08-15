@@ -57,8 +57,16 @@ func (e *Entry) Size() int {
 
 // MarshalTo writes the entry into buf and returns the number of bytes
 // written. buf must be at least Size() bytes. Returns ErrBufferTooSmall
-// if buf is too short.
+// if buf is too short, or ErrEntrySizeLimitExceeded if Cmd exceeds
+// MaxEntrySize — the same bound UnmarshalFrom applies, mirrored here so the
+// encoder cannot emit an entry this package refuses to read back. Entry.Type is
+// deliberately NOT validated on write: the compression flag lives in the same
+// field and callers legitimately construct types the mask, not the enum,
+// defines.
 func (e *Entry) MarshalTo(buf []byte) (int, error) {
+	if uint64(len(e.Cmd)) > uint64(MaxEntrySize) {
+		return 0, ErrEntrySizeLimitExceeded
+	}
 	required := e.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall

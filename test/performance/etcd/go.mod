@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance/etcd
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/jeremyhahn/go-quicraft/test/performance v0.0.0

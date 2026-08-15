@@ -17,7 +17,9 @@ package waldb
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -391,55 +393,117 @@ func firstDecodableAt(t *testing.T, path string, from int64) (int64, int) {
 	return 0, 0
 }
 
-// TestOpen_OlderFormatVersionIsRefusedByName pins the version gate.
+// TestWALFormatVersionIsPinnedAtOne pins the VALUE, separately from the gate
+// that enforces it.
 //
-// A directory written under format version 1 carries 7-byte chunk headers. Under
-// this build's parser every one of them fails CRC from the first byte, the clean
-// prefix comes back empty, and — with nothing decodable above the damage — the
-// torn-tail repair would truncate the whole log to zero. The version has to be
-// checked before any segment byte is read, and the error has to say which
-// version was found rather than reporting the directory as damaged.
-func TestOpen_OlderFormatVersionIsRefusedByName(t *testing.T) {
+// Every wire and persisted format in this repository is held at 1 for the whole
+// pre-release period; a layout change is made in place and the dev directories
+// that hold the old bytes are wiped. A bump here is therefore never the right
+// response to a framing change before 1.0, and this is what says so at the one
+// place a bump would be typed.
+func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
+	if walFormatVersion != 1 {
+		t.Fatalf("walFormatVersion = %d, want 1: every format is pinned at 1 until "+
+			"the first production release, and a pre-release framing change is made "+
+			"IN PLACE rather than by bumping this constant (see "+
+			"docs/operations/compatibility.md)", walFormatVersion)
+	}
+}
+
+// TestOpen_ForeignFormatVersionIsRefusedByName pins the version gate.
+//
+// The on-disk format is PINNED at walFormatVersion for the whole pre-release
+// period, and the gate is EXACT equality in both directions: a marker recording
+// a LOWER number came from a build whose chunk headers were four bytes shorter,
+// and one recording a HIGHER number from a build this one cannot anticipate at
+// all. Either way every chunk fails CRC from the first byte, the clean prefix
+// comes back empty, and — with nothing decodable above the damage — the
+// torn-tail repair would truncate the whole log to zero. So the version is
+// checked before any segment byte is read, and the error says which version was
+// found rather than reporting the directory as damaged.
+//
+// The sweep is what makes this an equality assertion rather than a floor or a
+// ceiling. A gate written as a range would pass a one-sided test while silently
+// admitting the other side.
+func TestOpen_ForeignFormatVersionIsRefusedByName(t *testing.T) {
+	for _, recorded := range []uint32{0, 2, 3, 5, 255, 1 << 16, math.MaxUint32} {
+		t.Run("version_"+itoa(int(recorded)), func(t *testing.T) {
+			if recorded == walFormatVersion {
+				t.Fatalf("fixture: %d is the supported version, not a foreign one", recorded)
+			}
+			dir := t.TempDir()
+			seedWAL(t, dir, 1024)
+			sizesBefore := segmentSizes(t, dir)
+
+			// Rewrite the marker byte for byte as a build recording that version
+			// would have written it: right magic, right geometry, wrong version.
+			buf := make([]byte, walFormatSize)
+			copy(buf[0:8], walFormatMagic)
+			binary.LittleEndian.PutUint32(buf[8:12], recorded)
+			binary.LittleEndian.PutUint32(buf[12:16], 1024)
+			if err := os.WriteFile(filepath.Join(dir, walFormatFilename), buf, 0o600); err != nil {
+				t.Fatalf("write marker: %v", err)
+			}
+
+			db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
+			if err == nil {
+				db.Close()
+				t.Fatal("Open accepted a directory written in another on-disk format; " +
+					"its chunk framing is not this build's, so every record fails CRC " +
+					"and the log is truncated away as a torn tail")
+			}
+			if !errors.Is(err, ErrWALFormatUnsupportedVersion) {
+				t.Fatalf("Open error = %v, want ErrWALFormatUnsupportedVersion", err)
+			}
+			if errors.Is(err, ErrWALFormatMalformed) {
+				t.Fatal("a foreign format version was reported as a MALFORMED marker; " +
+					"the file is perfectly intelligible and the remedy is to wipe and " +
+					"re-sync, not a corruption investigation")
+			}
+			var version *WALFormatVersionError
+			if !errors.As(err, &version) {
+				t.Fatalf("Open error = %v, want a *WALFormatVersionError naming both versions", err)
+			}
+			if version.Recorded != recorded || version.Supported != walFormatVersion {
+				t.Fatalf("version error = recorded %d supported %d, want %d and %d",
+					version.Recorded, version.Supported, recorded, walFormatVersion)
+			}
+
+			if got := segmentSizes(t, dir); !sameSizes(got, sizesBefore) {
+				t.Fatalf("a refused open mutated the segments on disk: %v -> %v",
+					sizesBefore, got)
+			}
+		})
+	}
+}
+
+// TestOpen_SupportedFormatVersionIsAccepted is the positive control for the
+// sweep above: the same fixture, the same hand-written marker, the supported
+// version — and the directory opens with its data intact. Without it the sweep
+// would pass just as well against a gate that refused every marker.
+func TestOpen_SupportedFormatVersionIsAccepted(t *testing.T) {
 	dir := t.TempDir()
 	seedWAL(t, dir, 1024)
-	sizesBefore := segmentSizes(t, dir)
 
-	// Rewrite the marker as a version-1 one, byte for byte as that build wrote it.
 	buf := make([]byte, walFormatSize)
 	copy(buf[0:8], walFormatMagic)
-	binary.LittleEndian.PutUint32(buf[8:12], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], walFormatVersion)
 	binary.LittleEndian.PutUint32(buf[12:16], 1024)
-	if err := os.WriteFile(dir+string(os.PathSeparator)+walFormatFilename, buf, 0o600); err != nil {
-		t.Fatalf("write v1 marker: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, walFormatFilename), buf, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
 	}
 
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if err == nil {
-		db.Close()
-		t.Fatal("Open accepted a directory written in an older on-disk format; its " +
-			"chunk headers are four bytes shorter, so every record fails CRC and " +
-			"the log is truncated away as a torn tail")
+	if err != nil {
+		t.Fatalf("Open with the supported format version: %v", err)
 	}
-	if !errors.Is(err, ErrWALFormatUnsupportedVersion) {
-		t.Fatalf("Open error = %v, want ErrWALFormatUnsupportedVersion", err)
+	defer db.Close()
+	st, _, err := db.ReadState(1, 1)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
 	}
-	if errors.Is(err, ErrWALFormatMalformed) {
-		t.Fatal("an older format version was reported as a MALFORMED marker; the " +
-			"file is perfectly intelligible and the remedy is an upgrade procedure, " +
-			"not a corruption investigation")
-	}
-	var version *WALFormatVersionError
-	if !errors.As(err, &version) {
-		t.Fatalf("Open error = %v, want a *WALFormatVersionError naming both versions", err)
-	}
-	if version.Recorded != 1 || version.Supported != walFormatVersion {
-		t.Fatalf("version error = recorded %d supported %d, want 1 and %d",
-			version.Recorded, version.Supported, walFormatVersion)
-	}
-
-	if got := segmentSizes(t, dir); !sameSizes(got, sizesBefore) {
-		t.Fatalf("a refused open mutated the segments on disk: %v -> %v",
-			sizesBefore, got)
+	if st.Term != 4 || st.Vote != 2 {
+		t.Fatalf("state = %+v, want Term 4 Vote 2", st)
 	}
 }
 

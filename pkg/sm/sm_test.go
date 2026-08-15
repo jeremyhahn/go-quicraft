@@ -239,7 +239,6 @@ var _ StateMachine = (*testStateMachine)(nil)
 
 type testConcurrentStateMachine struct {
 	testStateMachine
-	snapshotState map[string][]byte
 }
 
 func newTestConcurrentStateMachine() *testConcurrentStateMachine {

@@ -17,8 +17,12 @@ package enclave
 import (
 	"bytes"
 	"errors"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // TestProtectedBuffer_Lifecycle verifies the full lifecycle: create, read, destroy.
@@ -242,18 +246,48 @@ func TestSealProtectedBuffer_DestroyedBuffer(t *testing.T) {
 	}
 }
 
-// TestInitMemguard verifies that InitMemguard does not panic. The function
-// sets up signal handlers for secure cleanup.
-func TestInitMemguard(t *testing.T) {
-	// Should not panic. Calling it multiple times is safe.
-	InitMemguard()
-}
+// TestNoSignalHandlerInstalled is the regression for the removed InitMemguard.
+// That function called memguard.CatchSignal, which calls signal.Reset() with no
+// arguments — detaching EVERY handler in the process, including the embedding
+// application's — and turns SIGTERM into an immediate core.Exit(1) with no
+// engine quiesce, no barrier seal and no WAL flush. It had no callers, and this
+// package must not acquire one: a storage library silently seizing the host
+// process's signal disposition at import time is not a decision it gets to make.
+//
+// The test pins the absence behaviourally rather than by grep: it installs its
+// own SIGUSR1 handler, exercises this package's whole key lifecycle, and
+// requires the handler to still fire afterwards. Anything that reintroduces a
+// CatchSignal call anywhere on these paths resets that handler and the delivery
+// is lost.
+func TestNoSignalHandlerInstalled(t *testing.T) {
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, syscall.SIGUSR1)
+	defer signal.Stop(sigC)
 
-// TestInitMemguard_Idempotent verifies that calling InitMemguard multiple
-// times does not panic.
-func TestInitMemguard_Idempotent(t *testing.T) {
-	InitMemguard()
-	InitMemguard()
+	key := []byte("signal-disposition-must-survive!!")
+	pk := NewProtectedKey(key)
+	buf, err := pk.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	buf.Destroy()
+	pk.Clear()
+
+	pb := NewProtectedBuffer(32)
+	pb.Destroy()
+
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGUSR1); err != nil {
+		t.Fatalf("raising SIGUSR1: %v", err)
+	}
+	select {
+	case got := <-sigC:
+		if got != syscall.SIGUSR1 {
+			t.Fatalf("received %v, want SIGUSR1", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGUSR1 was never delivered: something in pkg/enclave reset the process signal handlers " +
+			"(memguard.CatchSignal calls signal.Reset() with no arguments)")
+	}
 }
 
 // TestErrEnclaveNil_Message verifies the sentinel error message.

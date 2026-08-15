@@ -894,19 +894,24 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		return proto.ErrTooManyMessages
 	}
 
-	// Entry.Cmd slices AND Snapshot.Checksum alias the receive buffer via
-	// zero-copy unmarshal. Copy them into a single bulk allocation before
-	// returning the buffer to the pool: the buffer is recycled below while the
-	// step worker still reads these fields asynchronously, so any alias left
-	// behind would be read after the buffer was handed to another frame.
-	// This reduces N allocations to 1 per frame, cutting GC pressure on the
-	// receive hot path.
+	// Entry.Cmd slices alias the receive buffer via zero-copy unmarshal. Copy
+	// them into a single bulk allocation before returning the buffer to the
+	// pool: the buffer is recycled below while the step worker still reads these
+	// fields asynchronously, so any alias left behind would be read after the
+	// buffer was handed to another frame. This reduces N allocations to 1 per
+	// frame, cutting GC pressure on the receive hot path.
+	//
+	// Cmd is now the ONLY such alias on a decoded Message. Snapshot.Checksum was
+	// the other one, and it was detached here at the cost of an allocation and
+	// two copies per frame for a field nothing ever computed or verified; it was
+	// removed from the wire format in an earlier pre-release layout.
+	// Snapshot.Filepath and every membership map are copied by their own
+	// decoders (getString, getMap), so they own their storage already.
 	totalCmdBytes := 0
 	for i := range batch.Requests {
 		for j := range batch.Requests[i].Entries {
 			totalCmdBytes += len(batch.Requests[i].Entries[j].Cmd)
 		}
-		totalCmdBytes += len(batch.Requests[i].Snapshot.Checksum)
 	}
 	if totalCmdBytes > 0 {
 		bulk := make([]byte, totalCmdBytes)
@@ -919,11 +924,6 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 					batch.Requests[i].Entries[j].Cmd = bulk[off : off+len(cmd) : off+len(cmd)]
 					off += len(cmd)
 				}
-			}
-			if sum := batch.Requests[i].Snapshot.Checksum; len(sum) > 0 {
-				copy(bulk[off:], sum)
-				batch.Requests[i].Snapshot.Checksum = bulk[off : off+len(sum) : off+len(sum)]
-				off += len(sum)
 			}
 		}
 	}

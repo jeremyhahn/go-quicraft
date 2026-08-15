@@ -17,7 +17,6 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 )
@@ -57,13 +56,8 @@ func TestE2E_ReplaceFollower_ThreeNode(t *testing.T) {
 	t.Logf("leader after follower stop: node[%d]", leaderIdx)
 
 	// Remove the stopped follower from the Raft membership.
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
 
-	leaderHost := cluster.hosts[leaderIdx]
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replicaID=%d from membership", removedReplicaID)
 
 	// Add a replacement node with a new replicaID (4).
@@ -114,8 +108,10 @@ func TestE2E_ReplaceFollower_ThreeNode(t *testing.T) {
 		}
 	}
 
-	// Assert: the removed replica appears in Membership.Removed.
-	membership, err := leaderHost.GetShardMembership(shardID)
+	// Assert: the removed replica appears in Membership.Removed. Resolve the
+	// leader now rather than reusing one captured before the membership change,
+	// which a re-election in between would have deposed.
+	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].GetShardMembership(shardID)
 	if err != nil {
 		t.Fatalf("GetShardMembership failed: %v", err)
 	}
@@ -162,14 +158,8 @@ func TestE2E_ReplaceFollower_FiveNode(t *testing.T) {
 	cluster.stopNode(followerIdx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replicaID=%d from membership", removedReplicaID)
 
 	// Add replacement node with replicaID=6.
@@ -218,8 +208,9 @@ func TestE2E_ReplaceFollower_FiveNode(t *testing.T) {
 		}
 	}
 
-	// Assert: membership is correct.
-	membership, err := leaderHost.GetShardMembership(shardID)
+	// Assert: membership is correct. Resolve the leader now rather than reusing
+	// one captured before the membership change.
+	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].GetShardMembership(shardID)
 	if err != nil {
 		t.Fatalf("GetShardMembership failed: %v", err)
 	}
@@ -270,14 +261,8 @@ func TestE2E_ReplaceNode_DataIntegrity(t *testing.T) {
 	cluster.stopNode(followerIdx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 
 	const replacementReplicaID uint64 = 4
 	result := addNodeToCluster(t, cluster, shardID, replacementReplicaID, testShardConfig)
@@ -347,14 +332,8 @@ func TestE2E_ReplaceNode_ContinuedWrites(t *testing.T) {
 	cluster.stopNode(followerIdx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 
 	const replacementReplicaID uint64 = 4
 	result := addNodeToCluster(t, cluster, shardID, replacementReplicaID, testShardConfig)

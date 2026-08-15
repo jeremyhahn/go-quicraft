@@ -53,7 +53,7 @@ Commit workers forward to apply unconditionally (no stopC escape) after persist:
 
 **Source**: `step.go`
 
-Drains proposals from lock-free MPSC `EntryQueue` and ReadIndex requests from dedicated `readIndexQ`. For each input, calls `Peer.Handle()` to process the Raft state change. Also drives Raft logical clocks via `Tick()` at intervals derived from `RTTMillisecond`. Produces `Update` (entries to persist, messages to send, committed entries) forwarded to commit worker.
+Drains proposals from the MPSC `EntryQueue` and ReadIndex requests from the dedicated `readIndexQ`. For each input, calls `Peer.Handle()` to process the Raft state change. Also drives Raft logical clocks via `Tick()` at intervals derived from `RTTMillisecond`. Produces `Update` (entries to persist, messages to send, committed entries) forwarded to commit worker.
 
 **Main loop**: Woken by WorkSignal (message arrival, apply completion) or ticker. Drains inbox into reusable buffer, calls `peer.Handle()` for each message, checks `peer.HasUpdate()`, retrieves `Update`, and sends to commit worker via `commitC` (blocking with `stopC` escape).
 
@@ -65,11 +65,17 @@ Drains proposals from lock-free MPSC `EntryQueue` and ReadIndex requests from de
 
 **Message pipelining**: Separates `InstallSnapshot` messages (routed to `sender.SendSnapshot()` for chunked streaming) from regular protocol messages (batched through `sender.Send()`). Sends before entries are persisted, overlapping network and disk I/O safely.
 
-**Ownership guard**: Checks `node.commitPending.Load()` before calling `Tick()` or `Handle()`. When true, skips the node entirely to prevent concurrent Peer access with commit/apply workers.
+**Ownership guard**: Checks `node.commitPending.Load()` before calling `Handle()` or `processReady()`. When true, the node is skipped for `Handle`/ready processing to prevent concurrent Peer access with the commit and apply workers.
+
+`Tick()` is the exception: it runs **unconditionally**, regardless of `commitPending` state. This is required for leader liveness — the leader must always advance its heartbeat timer and send heartbeats, even while WAL fsync and state machine apply are in progress. Without it, a commit+apply cycle (200-500us under load) starves heartbeat delivery, followers time out and campaign, and the leader then fails `checkQuorum` and steps down.
+
+What prevents `Tick()` racing `Commit()` is the per-node `raftMu` mutex, which serializes the two. Contention is minimal: `Tick()` is ~100ns (counter increment, conditional heartbeat broadcast) and `Commit()` ~200ns (marker updates, inmem truncation), and both run at most once per RTT interval. `raftMu` is **not reentrant** — event callbacks such as `OnLeaderUpdated` are invoked outside it, because a callback running under `raftMu` would block the commit worker for every shard that worker owns.
+
+When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. Only **free-order** messages are drained and sent inline (`Heartbeat` for liveness, and `RequestPreVote` on an election timeout). Ordered messages such as `VoteResp` are filtered out defensively, so none is ever sent before the WAL persist completes.
 
 **Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
 
-**Lock-free proposal queue**: Proposal entry queue is MPSC without locks (zero-copy shard boundary). Reduces step worker contention vs shared proposals map.
+**Batched proposal queue**: The proposal entry queue (`internal/queue.EntryQueue`) is MPSC with a *brief* `sync.Mutex`, not lock-free. Multiple producers take the lock only for a slice append (typically <50ns); the single consumer takes it once per drain cycle to `Swap` the write buffer with a caller-provided read buffer, regardless of item count. That amortization — one acquisition per drain rather than per item — is what reduces step worker contention versus a shared proposals map. `maxLen` provides bounded backpressure: `Add`/`AddOne` return false at capacity (the caller returns `ErrSystemBusy`) and add nothing.
 
 
 ## Commit Worker
@@ -160,7 +166,34 @@ Asynchronous snapshot operations. Bounded pool (NumWorkers/2, minimum 2) with pe
 
 **Per-shard dedup**: `LoadOrStore` ensures only one snapshot per shard in-flight. Returns `SnapshotDuplicateError` if shard already has snapshot in-flight, `SnapshotPoolBusyError` if request channel full.
 
-**Save flow**: Creates directory, opens data file, calls state machine `SaveSnapshot()`, fsyncs, enforces `MaxSnapshotSize` (post-compression), encrypts if barrier unsealed, writes 60-byte binary metadata (Index|Term|ShardID|ReplicaID|CreatedAt|Epoch), persists to LogDB including full cluster membership, garbage collects old snapshots (keep 3), updates `lastSnapshotIndex`, compacts log, purges old barrier epochs.
+**Save flow**: Creates directory, opens data file, calls state machine `SaveSnapshot()`, fsyncs, enforces `MaxSnapshotSize` (post-compression), encrypts if barrier unsealed, writes the `snapshot.meta` record, persists to LogDB including full cluster membership, garbage collects old snapshots (keep 3), updates `lastSnapshotIndex`, compacts log, purges old barrier epochs.
+
+### snapshot.meta
+
+A snapshot directory MUST describe itself: it outlives its LogDB record (up to `maxSnapshotsRetained` directories are retained while only the newest is recorded), and the DEK purge floor is computed by scanning these directories and reading the `Epoch` field back as fact.
+
+The record is **self-describing**: a 16-byte header followed by a body of little-endian uint64 fields. Total size at the current version is **72 bytes**.
+
+```
+ off  size  field
+   0     8  magic "QRSNAPMD"
+   8     2  version (uint16, format version of the BODY)
+  10     2  reserved (uint16, 0)
+  12     4  body length (uint32, bytes of body that follow)
+  16     8  Index
+  24     8  Term
+  32     8  ShardID
+  40     8  ReplicaID
+  48     8  CreatedAt (unix seconds)
+  56     8  Epoch
+  64     8  Compression
+```
+
+**Evolution rule**: body fields are append-only — an existing field never moves and never changes meaning. A new field is appended and the version is incremented. Because the body length is recorded, a reader can always tell a field that is ABSENT (written by an older version) from one that is CORRUPT (a truncated or foreign record). Changing the meaning of an existing field is not permitted under this rule; that requires a new magic.
+
+**Compatibility**: three pre-magic ("v0") layouts are still accepted verbatim, positionally, at their original offsets — **40** bytes (`Index|Term|ShardID|ReplicaID|CreatedAt`), **48** bytes (`...|Epoch`) and **56** bytes (`...|Epoch|Compression`). The 40-byte layout was written by the snapshot receive and import paths and carries no `Epoch` even though the artifact beside it may be encrypted, so such a directory can hold ciphertext at an epoch nothing on disk names. It is therefore reported as UNEVALUABLE, never as epoch 0 — a zero `Epoch` with `EpochRecorded` false means UNKNOWN, not plaintext, and the two are opposite in consequence for DEK purging. Nothing rewrites an existing record: a v0 record stays v0 until its snapshot directory rolls off.
+
+The declared body length is bounded at 64 KiB before use. It is a `uint32` read from a file and is used to slice the body, so on a 32-bit GOARCH an unbounded declared length could become a negative int and panic inside the purge-floor scan, whose entire input is bytes on disk.
 
 **Recover flow**: Gets latest snapshot metadata from LogDB, locates directory, decrypts if epoch non-zero, opens data file, calls state machine `RecoverFromSnapshot()`, updates `lastApplied` and `lastSnapshotIndex`. Sets `recovering` atomic flag gating all SM operations during recovery (safety property S1).
 
@@ -180,9 +213,11 @@ Asynchronous snapshot operations. Bounded pool (NumWorkers/2, minimum 2) with pe
 - commitPending=true: Commit worker holds Peer via Peer.Commit(), then apply worker (SM.Apply only, Peer untouched)
 - commitPending=false: Ownership returned to step worker
 
-Step worker checks `commitPending.Load()` before touching Peer. When true, skips node in both `tick()` and `processReady()`. No re-enqueue to avoid spin loops; naturally re-checked on next tick or WorkSignal notification.
+Step worker checks `commitPending.Load()` before touching Peer in `processReady()` and skips the node when set. No re-enqueue, to avoid spin loops; naturally re-checked on the next tick or WorkSignal notification. `tick()` is deliberately **not** gated this way — see the Step Worker ownership guard above.
 
-**Happens-before proof (commitIndex safety)**: `commitPending` flag blocks step worker from touching Peer until apply worker finishes, so entries MUST be persisted AND applied before step worker produces new Update referencing them. Also prevents duplicate CommittedEntries: when `commitPending` cleared, `lastApplied` has advanced past committed entries, so next `GetUpdate(lastApplied)` does not reproduce them. `tick()` guard essential: without it, `Peer.Tick()` would race with `Peer.Commit()` from commit worker.
+**Happens-before proof (commitIndex safety)**: the `commitPending` flag blocks the step worker from producing a new Update until the apply worker finishes, so entries MUST be persisted AND applied before the step worker produces a new Update referencing them. It also prevents duplicate CommittedEntries: when `commitPending` is cleared, `lastApplied` has advanced past the committed entries, so the next `GetUpdate(lastApplied)` does not reproduce them.
+
+The `Tick()`/`Commit()` race is prevented by the per-node `raftMu` mutex, not by the `commitPending` flag. Both `Peer.Tick()` and `Peer.Commit()` are called with `raftMu` held; `raftMu` also covers the step worker's `Peer.Step` and config-resolution paths and inbox message handling.
 
 **Cross-worker atomics**: commitPending and lastApplied padded to 128B to prevent false sharing. Other fields (failed, snapshotting, lastSnapshotIndex) have specific reader/writer relationships enforced by pipeline topology.
 

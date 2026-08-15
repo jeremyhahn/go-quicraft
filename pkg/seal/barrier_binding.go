@@ -14,7 +14,11 @@
 
 package seal
 
-import "log/slog"
+import (
+	"bytes"
+	"io"
+	"log/slog"
+)
 
 // ContextBinding reports how a barrier treats the OPTIONAL caller-supplied
 // context that the *Context methods fold into the AEAD AAD (a snapshot frame's
@@ -113,21 +117,99 @@ func (c ContextBinding) Resolved() bool {
 // plaintext reports that the strategy in force is StrategyNone, whose encryptor
 // is an identity pass-through rather than a real cipher.
 //
+// A delegated encryptor that implements AADSymmetricEncrypter is not taken at
+// its word: the Go method set is a CLAIM, and the implementations live in other
+// repositories (go-xkms), where the interface's own "do not implement this if
+// you drop the aad" warning is the only thing standing between a typo and a
+// deployment that believes it has splice protection it does not have.
+// verifyAADBinding turns the claim into a measurement — see there for what is
+// proved and what it costs.
+//
 // It never returns ContextBindingUnresolved: it is called from Initialize and
 // Unseal with the encryptor in hand, at which point the capability is known by
 // construction. Whether the barrier has REACHED that point is state, not
 // encryptor shape, and is decided by Barrier.ContextBinding.
-func contextBindingFor(enc SymmetricEncrypter, plaintext bool) ContextBinding {
+func contextBindingFor(enc SymmetricEncrypter, plaintext bool, rand io.Reader) ContextBinding {
 	if enc == nil {
 		return ContextBindingBarrier
 	}
 	if plaintext {
 		return ContextBindingPlaintext
 	}
-	if _, ok := enc.(AADSymmetricEncrypter); ok {
-		return ContextBindingDelegated
+	aadEnc, ok := enc.(AADSymmetricEncrypter)
+	if !ok {
+		return ContextBindingUnsupported
 	}
-	return ContextBindingUnsupported
+	if err := verifyAADBinding(aadEnc, rand); err != nil {
+		slog.Error("quicraft/seal: delegated encryptor declares seal.AADSymmetricEncrypter but does not "+
+			"authenticate the AAD; treating it as incapable of positional binding",
+			"error", err,
+			"consequence", "caller context is refused with ErrHardwareMode instead of being silently dropped; "+
+				"RequireContextAAD will refuse this barrier",
+		)
+		return ContextBindingUnsupported
+	}
+	return ContextBindingDelegated
+}
+
+// aadProbeSize is the byte length of the plaintext and of each AAD value used
+// by verifyAADBinding. 32 bytes is a full AES/ChaCha key's worth of entropy —
+// far more than the probe needs, and small enough that the round trip is
+// negligible even against a network KMS.
+const aadProbeSize = 32
+
+// verifyAADBinding measures, once per barrier setup, whether a delegated
+// encryptor ACTUALLY authenticates the AAD it accepts.
+//
+// The test is the definition of the property: seal a probe under aadA, require
+// that it opens under aadA and returns the same bytes, and require that it
+// FAILS under a different aadB. An encryptor that accepts the aad argument and
+// drops it passes the first two and fails the third — which is precisely the
+// case AADSymmetricEncrypter's doc comment asks implementers not to create and
+// has, until now, had no way to detect. A structural type assertion cannot
+// distinguish the two, because both have identical method sets.
+//
+// Both AAD values are random, so an encryptor cannot special-case a known probe
+// without also breaking real traffic, and aadB is an independent draw rather
+// than a mutation of aadA so a length- or prefix-sensitive implementation
+// cannot accidentally pass.
+//
+// Cost: one encrypt and two decrypts against the delegated encryptor, at
+// Initialize/Unseal only — never on the data path. That is worth paying at
+// setup: the alternative is discovering the missing binding from the ciphertext
+// after it is at rest, at which point nothing can retroactively bind it.
+func verifyAADBinding(enc AADSymmetricEncrypter, rand io.Reader) error {
+	probe := make([]byte, aadProbeSize)
+	aadA := make([]byte, aadProbeSize)
+	aadB := make([]byte, aadProbeSize)
+	defer wipeBytes(probe)
+	if _, err := io.ReadFull(rand, probe); err != nil {
+		return &AADBindingProbeError{Stage: "probe-entropy", Err: err}
+	}
+	if _, err := io.ReadFull(rand, aadA); err != nil {
+		return &AADBindingProbeError{Stage: "probe-entropy", Err: err}
+	}
+	if _, err := io.ReadFull(rand, aadB); err != nil {
+		return &AADBindingProbeError{Stage: "probe-entropy", Err: err}
+	}
+
+	ct, err := enc.EncryptWithAAD(probe, aadA)
+	if err != nil {
+		return &AADBindingProbeError{Stage: "encrypt", Err: err}
+	}
+
+	got, err := enc.DecryptWithAAD(ct, aadA)
+	if err != nil {
+		return &AADBindingProbeError{Stage: "decrypt-matching-aad", Err: err}
+	}
+	if !bytes.Equal(got, probe) {
+		return &AADBindingProbeError{Stage: "decrypt-matching-aad", Err: ErrAADProbeRoundTrip}
+	}
+
+	if _, err := enc.DecryptWithAAD(ct, aadB); err == nil {
+		return &AADBindingProbeError{Stage: "decrypt-wrong-aad", Err: ErrAADProbeNotBound}
+	}
+	return nil
 }
 
 // ContextBinding reports how this barrier treats a caller-supplied context.
@@ -153,13 +235,18 @@ func contextBindingFor(enc SymmetricEncrypter, plaintext bool) ContextBinding {
 //
 // SupportsContextAAD is the predicate most callers want, and IsPlaintextMode
 // separates "nothing to bind" from "binding unavailable".
+// The value is RESOLVED ONCE, by the Initialize or Unseal that installed the
+// encryptor, and read back from b.binding here. Re-deriving it per call would
+// re-run verifyAADBinding — a real encrypt/decrypt round trip against a
+// possibly remote encryptor — on every query, on a predicate callers are
+// invited to ask freely.
 func (b *Barrier) ContextBinding() ContextBinding {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {
 		return ContextBindingUnresolved
 	}
-	return contextBindingFor(b.hwEncryptor, b.plaintextMode)
+	return b.binding
 }
 
 // SupportsContextAAD reports whether this barrier can ACTUALLY bind a
@@ -247,11 +334,29 @@ func (b *Barrier) delegatedEncrypt(plaintext, contextAAD []byte) ([]byte, error)
 	if len(contextAAD) == 0 {
 		return b.hwEncryptor.Encrypt(plaintext)
 	}
-	aadEnc, ok := b.hwEncryptor.(AADSymmetricEncrypter)
+	aadEnc, ok := b.aadEncryptorLocked()
 	if !ok {
 		return nil, ErrHardwareMode
 	}
 	return aadEnc.EncryptWithAAD(plaintext, aadForEpoch(b.epoch, contextAAD))
+}
+
+// aadEncryptorLocked returns the delegated encryptor as an AADSymmetricEncrypter
+// only if the barrier's RESOLVED binding says it genuinely authenticates AAD.
+// The caller must hold at least b.mu.RLock().
+//
+// It gates on b.binding rather than repeating the type assertion, and that is
+// the whole point: the assertion is what the behavioural probe exists to
+// distrust. Re-deriving the capability here would hand the caller's context to
+// an encryptor the probe already caught dropping it — reporting
+// SupportsContextAAD false to whoever asks while still writing unbound frames
+// for whoever does not, which is worse than either answer alone.
+func (b *Barrier) aadEncryptorLocked() (AADSymmetricEncrypter, bool) {
+	if b.binding != ContextBindingDelegated {
+		return nil, false
+	}
+	aadEnc, ok := b.hwEncryptor.(AADSymmetricEncrypter)
+	return aadEnc, ok
 }
 
 // delegatedDecrypt opens a ciphertext sealed by delegatedEncrypt under the same
@@ -269,7 +374,7 @@ func (b *Barrier) delegatedDecrypt(ciphertext, contextAAD []byte, epoch uint64) 
 	if len(contextAAD) == 0 {
 		return b.hwEncryptor.Decrypt(ciphertext)
 	}
-	aadEnc, ok := b.hwEncryptor.(AADSymmetricEncrypter)
+	aadEnc, ok := b.aadEncryptorLocked()
 	if !ok {
 		return nil, ErrHardwareMode
 	}

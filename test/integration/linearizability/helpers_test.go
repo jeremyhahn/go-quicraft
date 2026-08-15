@@ -30,6 +30,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,27 +58,110 @@ const failoverTimeout = 20 * time.Second
 // KV Command Encoding
 // ---------------------------------------------------------------------------
 
-// Wire format: [op:1][keyLen:2 BigEndian][key][value]
+// Wire format: [op:1][keyLen:2 BigEndian][key][payload]
 const (
-	opPut byte = 1
-	opGet byte = 2
+	opPut    byte = 1
+	opGet    byte = 2
+	opAppend byte = 3
 )
+
+// appendSep separates the tokens accumulated by an opAppend command. The
+// append op exists so the session workload is NOT idempotent: re-applying an
+// append produces a value the model forbids, which is what makes a duplicate
+// apply observable. A last-write-wins put can never expose one.
+const appendSep = ","
+
+// encodeKVCmd encodes a command for the kvStateMachine.
+func encodeKVCmd(op byte, key, payload string) []byte {
+	keyBytes := []byte(key)
+	payloadBytes := []byte(payload)
+	buf := make([]byte, 1+2+len(keyBytes)+len(payloadBytes))
+	buf[0] = op
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(keyBytes)))
+	copy(buf[3:3+len(keyBytes)], keyBytes)
+	copy(buf[3+len(keyBytes):], payloadBytes)
+	return buf
+}
 
 // encodeKVPut encodes a put command for the kvStateMachine.
 func encodeKVPut(key, value string) []byte {
-	keyBytes := []byte(key)
-	valBytes := []byte(value)
-	buf := make([]byte, 1+2+len(keyBytes)+len(valBytes))
-	buf[0] = opPut
-	binary.BigEndian.PutUint16(buf[1:3], uint16(len(keyBytes)))
-	copy(buf[3:3+len(keyBytes)], keyBytes)
-	copy(buf[3+len(keyBytes):], valBytes)
-	return buf
+	return encodeKVCmd(opPut, key, value)
+}
+
+// encodeKVAppend encodes an append command for the kvStateMachine. The token
+// is appended to the key's current value, separated by appendSep.
+func encodeKVAppend(key, token string) []byte {
+	return encodeKVCmd(opAppend, key, token)
 }
 
 // encodeKVGet encodes a get query key for kvStateMachine.Lookup.
 func encodeKVGet(key string) []byte {
 	return []byte(key)
+}
+
+// appendResult is the value the kvStateMachine returns for an opAppend. It
+// carries the FULL post-append value so a caller can compare the result it
+// was handed against the value the model predicts, and so a session retry can
+// be checked byte-for-byte against the cached response.
+func appendResult(value string) sm.Result {
+	return sm.Result{Value: uint64(len(value)), Data: []byte(value)}
+}
+
+// ---------------------------------------------------------------------------
+// Apply-Order Violations
+// ---------------------------------------------------------------------------
+
+// applyOrderViolations collects apply-order invariant breaches observed by any
+// kvStateMachine in the package. The state machines are driven by engine
+// goroutines that have no *testing.T, so a breach is parked here and surfaced
+// by the t.Cleanup that assertApplyOrder installs. Integration tests in this
+// package never run in parallel, so one package-level sink is unambiguous.
+var applyOrderViolations struct {
+	mu      sync.Mutex
+	list    []string
+	armedBy *testing.T
+}
+
+// recordApplyViolation parks an apply-order breach for the running test.
+func recordApplyViolation(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	applyOrderViolations.mu.Lock()
+	applyOrderViolations.list = append(applyOrderViolations.list, msg)
+	applyOrderViolations.mu.Unlock()
+}
+
+// assertApplyOrder arms the violation sink for t and installs a t.Cleanup that
+// fails the test if any state machine observed a duplicate, backward or
+// replayed apply while the test was running. It is idempotent: arming the
+// same test twice must not discard breaches already recorded for it.
+func assertApplyOrder(t *testing.T) {
+	t.Helper()
+
+	applyOrderViolations.mu.Lock()
+	if applyOrderViolations.armedBy == t {
+		applyOrderViolations.mu.Unlock()
+		return
+	}
+	applyOrderViolations.armedBy = t
+	applyOrderViolations.list = nil
+	applyOrderViolations.mu.Unlock()
+
+	t.Cleanup(func() {
+		applyOrderViolations.mu.Lock()
+		found := applyOrderViolations.list
+		applyOrderViolations.list = nil
+		applyOrderViolations.armedBy = nil
+		applyOrderViolations.mu.Unlock()
+		if len(found) == 0 {
+			return
+		}
+		shown := found
+		if len(shown) > 20 {
+			shown = shown[:20]
+		}
+		t.Errorf("state machine apply-order violations (%d total):\n  %s",
+			len(found), strings.Join(shown, "\n  "))
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +171,24 @@ func encodeKVGet(key string) []byte {
 // kvStateMachine is a simple in-memory key-value store that implements
 // sm.StateMachine for linearizability testing.
 type kvStateMachine struct {
-	mu      sync.RWMutex
-	data    map[string]string
-	applied atomic.Uint64
+	mu   sync.RWMutex
+	data map[string]string
+	// prevIndex is the raft index of the previously applied entry. Every
+	// entry handed to Update must carry a STRICTLY greater index: an index
+	// that repeats or moves backward means the entry was applied twice or
+	// replayed, which no amount of state comparison can detect afterwards
+	// on a last-write-wins store. RecoverFromSnapshot is the only legal
+	// reset point.
+	//
+	// Note: consecutive indices are NOT required. The user state machine
+	// only ever sees user commands; the engine legitimately consumes
+	// indices for the initial-membership entry, each leader's no-op entry,
+	// config changes and session register/unregister entries, so gaps are
+	// expected and are recorded rather than failed. See applyGaps.
+	prevIndex uint64
+	// applyGaps counts skipped index ranges, for diagnostics only.
+	applyGaps atomic.Uint64
+	applied   atomic.Uint64
 }
 
 func newKVStateMachine() *kvStateMachine {
@@ -98,11 +197,31 @@ func newKVStateMachine() *kvStateMachine {
 	}
 }
 
+// checkIndexLocked enforces strict forward progress of the applied index and
+// records a violation if the entry repeats or rolls back. kv.mu must be held.
+func (kv *kvStateMachine) checkIndexLocked(index uint64) {
+	switch {
+	case index <= kv.prevIndex:
+		recordApplyViolation(
+			"kvStateMachine: applied index did not advance: entry index %d applied after %d (duplicate, reordered or replayed apply)",
+			index, kv.prevIndex)
+	case index > kv.prevIndex+1:
+		kv.applyGaps.Add(1)
+	}
+	kv.prevIndex = index
+	kv.applied.Store(index)
+}
+
 // Update applies committed entries to the KV store.
 func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for i, entry := range entries {
+		// The index invariant holds for every entry the state machine is
+		// handed, including malformed ones, so it is checked before any
+		// command-shape early exit.
+		kv.checkIndexLocked(entry.Index)
+
 		if len(entry.Cmd) < 3 {
 			results[i] = sm.Result{Value: 0}
 			continue
@@ -119,12 +238,26 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 			value := string(entry.Cmd[3+keyLen:])
 			kv.data[key] = value
 			results[i] = sm.Result{Value: uint64(len(value))}
+		case opAppend:
+			token := string(entry.Cmd[3+keyLen:])
+			value := kv.data[key]
+			if value == "" {
+				value = token
+			} else {
+				value = value + appendSep + token
+			}
+			kv.data[key] = value
+			results[i] = appendResult(value)
 		default:
 			results[i] = sm.Result{Value: 0}
 		}
-		kv.applied.Store(entry.Index)
 	}
 	return nil
+}
+
+// ApplyGaps returns the number of skipped index ranges observed so far.
+func (kv *kvStateMachine) ApplyGaps() uint64 {
+	return kv.applyGaps.Load()
 }
 
 // Lookup reads a value by key from the KV store.
@@ -146,10 +279,18 @@ func (kv *kvStateMachine) Lookup(_ context.Context, query interface{}) (interfac
 	return val, nil
 }
 
-// SaveSnapshot serializes the entire KV store to the writer.
+// SaveSnapshot serializes the entire KV store to the writer. The applied
+// index is written ahead of the payload so a recovering replica can tell
+// whether the snapshot moves it forward or rolls it backward.
 func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <-chan struct{}) error {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
+
+	indexBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(indexBuf, kv.prevIndex)
+	if _, err := w.Write(indexBuf); err != nil {
+		return err
+	}
 
 	countBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(countBuf, uint32(len(kv.data)))
@@ -182,10 +323,27 @@ func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <
 	return nil
 }
 
-// RecoverFromSnapshot restores the KV store from a snapshot reader.
+// RecoverFromSnapshot restores the KV store from a snapshot reader. This is
+// the only point at which the applied-index expectation may be reset, and the
+// reset must still move the replica FORWARD: installing a snapshot older than
+// what this replica already applied would silently roll the state machine
+// back, so it is recorded as a violation.
 func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	indexBuf := make([]byte, 8)
+	if _, err := io.ReadFull(r, indexBuf); err != nil {
+		return err
+	}
+	snapshotIndex := binary.BigEndian.Uint64(indexBuf)
+	if snapshotIndex < kv.prevIndex {
+		recordApplyViolation(
+			"kvStateMachine: snapshot rolled the state machine backward: recovered at index %d, already applied through %d",
+			snapshotIndex, kv.prevIndex)
+	}
+	kv.prevIndex = snapshotIndex
+	kv.applied.Store(snapshotIndex)
 
 	countBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, countBuf); err != nil {
@@ -385,6 +543,7 @@ func testMTLSConfig(t *testing.T) *config.MTLSConfig {
 // testHostConfig creates a valid HostConfig for linearizability testing.
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
+	assertApplyOrder(t)
 	return config.HostConfig{
 		WALDir:                t.TempDir(),
 		NodeHostDir:           t.TempDir(),
@@ -660,12 +819,24 @@ func (c *testCluster) addNode(shardID uint64) int {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
 	}
 
-	// Find the leader and request membership addition.
-	leaderIdx := c.findLeader(shardID)
-	if leaderIdx < 0 {
-		h.Close()
-		c.t.Fatal("addNode: no leader found for membership addition")
-	}
+	// Wait for a leader rather than sampling once. addNode is called mid-test
+	// under sustained client load, where a transient election leaves findLeader
+	// returning -1 for a few ticks; an instantaneous sample turns that ordinary
+	// window into a test failure. This still fails — loudly — if no leader
+	// appears within leaderElectionTimeout, so the assertion is not weakened,
+	// only made insensitive to when it is sampled.
+	//
+	// h is closed on the failure path via defer rather than inline:
+	// waitForClusterLeader calls t.Fatalf, which runs Goexit and would otherwise
+	// leak the host we just constructed.
+	leaderFound := false
+	defer func() {
+		if !leaderFound {
+			h.Close()
+		}
+	}()
+	leaderIdx := c.waitForClusterLeader(shardID, leaderElectionTimeout)
+	leaderFound = true
 
 	c.hostsMu.RLock()
 	leaderHost := c.hosts[leaderIdx]
@@ -729,6 +900,151 @@ func (c *testCluster) removeNode(idx int, shardID uint64) {
 	}
 
 	c.stopNode(idx)
+}
+
+// ---------------------------------------------------------------------------
+// Leader/Term Safety Guard
+// ---------------------------------------------------------------------------
+
+// leaderObservation is one poll sample of one host's view of a shard.
+type leaderObservation struct {
+	index     int
+	replicaID uint64
+	term      uint64
+	isLeader  bool
+}
+
+// observeLeaders samples (node, IsLeader, Term) from EVERY host currently in
+// the cluster and returns the leaders it found.
+//
+// It deliberately does not consult c.stopped: restartNode and addNode replace
+// or extend c.hosts, and a check that skips indices from a stale view of which
+// nodes are up is exactly how a second leader escapes notice. A host that is
+// genuinely down returns an error from GetShardInfo and contributes nothing.
+func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
+	c.hostsMu.RLock()
+	hosts := make([]*quicraft.Host, len(c.hosts))
+	copy(hosts, c.hosts)
+	c.hostsMu.RUnlock()
+
+	var leaders []leaderObservation
+	for i, h := range hosts {
+		if h == nil {
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			continue
+		}
+		if !info.IsLeader {
+			continue
+		}
+		leaders = append(leaders, leaderObservation{
+			index:     i,
+			replicaID: info.ReplicaID,
+			term:      info.Term,
+			isLeader:  true,
+		})
+	}
+	return leaders
+}
+
+// leaderTermGuard continuously asserts the Raft election-safety invariant:
+// at most one leader may exist in a given term. It fails the test the INSTANT
+// two distinct replicas report leadership of the same term — there is no
+// convergence window, because two leaders in one term is never a transient
+// state that resolves itself, it is a log-safety violation that has already
+// happened.
+//
+// GetShardInfo returns (LeaderID, Term, IsLeader) as a seqlock-consistent
+// triple, so a replica can never report leading a term it did not lead; a
+// same-term pair from two replicas is therefore real and not a torn read.
+type leaderTermGuard struct {
+	t       *testing.T
+	cluster *testCluster
+	shardID uint64
+	stopC   chan struct{}
+	doneC   chan struct{}
+	polls   atomic.Int64
+	maxTerm atomic.Uint64
+}
+
+// startLeaderTermGuard launches the guard and registers its shutdown so that
+// a test cannot finish without the invariant having been checked.
+func startLeaderTermGuard(t *testing.T, cluster *testCluster, shardID uint64) *leaderTermGuard {
+	t.Helper()
+	g := &leaderTermGuard{
+		t:       t,
+		cluster: cluster,
+		shardID: shardID,
+		stopC:   make(chan struct{}),
+		doneC:   make(chan struct{}),
+	}
+	go g.run()
+	t.Cleanup(g.stop)
+	return g
+}
+
+// run polls the cluster until stopped.
+func (g *leaderTermGuard) run() {
+	defer close(g.doneC)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		g.check()
+		select {
+		case <-g.stopC:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// check performs one sweep and reports any same-term multi-leader sighting.
+func (g *leaderTermGuard) check() {
+	leaders := g.cluster.observeLeaders(g.shardID)
+	g.polls.Add(1)
+
+	byTerm := make(map[uint64][]leaderObservation, len(leaders))
+	for _, obs := range leaders {
+		if obs.term > g.maxTerm.Load() {
+			g.maxTerm.Store(obs.term)
+		}
+		byTerm[obs.term] = append(byTerm[obs.term], obs)
+	}
+	for term, obs := range byTerm {
+		if len(obs) < 2 {
+			continue
+		}
+		var sb strings.Builder
+		for _, o := range obs {
+			fmt.Fprintf(&sb, " node[%d](replica=%d)", o.index, o.replicaID)
+		}
+		// Errorf, not Fatalf: this runs on the guard goroutine.
+		g.t.Errorf("election safety violated on shard %d: %d leaders in term %d:%s",
+			g.shardID, len(obs), term, sb.String())
+	}
+}
+
+// stop halts the guard, runs one final sweep, and fails the test if the guard
+// never actually observed the cluster — a guard that never polled would
+// otherwise "pass" without checking anything.
+func (g *leaderTermGuard) stop() {
+	select {
+	case <-g.stopC:
+		return
+	default:
+	}
+	close(g.stopC)
+	<-g.doneC
+	g.check()
+	if polls := g.polls.Load(); polls < 2 {
+		g.t.Errorf("leader/term guard for shard %d only completed %d polls; the election-safety invariant was not exercised",
+			g.shardID, polls)
+	}
+	if g.maxTerm.Load() == 0 {
+		g.t.Errorf("leader/term guard for shard %d never observed a leader in any term", g.shardID)
+	}
 }
 
 // ---------------------------------------------------------------------------

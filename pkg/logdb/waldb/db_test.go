@@ -2460,19 +2460,20 @@ func TestMembershipSizeHelper(t *testing.T) {
 		// All nil maps.
 	}
 	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1) +
-	// 5 map count headers * 4 bytes each + the 24-byte session policy
-	// = 18 + 20 + 24 = 62. The fifth map is Identities and the session policy
-	// closes the section; both are appended by the v4 layout.
-	if got := membershipSize(m); got != 62 {
-		t.Fatalf("membershipSize(empty)=%d, want 62", got)
+	// 6 map count headers * 4 bytes each + the 24-byte session policy
+	// = 18 + 24 + 24 = 66. The fifth map is Identities and the sixth is
+	// RemovedIdentities; the session policy sits between them.
+	if got := membershipSize(m); got != 66 {
+		t.Fatalf("membershipSize(empty)=%d, want 66", got)
 	}
-	// membershipSize is what this binary WRITES (v4); minMembershipSize is the
-	// floor for what it will READ, which is still the v3 size so that sections
-	// written before Identities existed are not rejected as truncated before
-	// the version byte is even examined. They are expected to differ by exactly
-	// the v4 tail: one map count header plus the session policy.
-	if got, want := membershipSize(m), minMembershipSize+4+membershipSessionPolicySize; got != want {
-		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize+4+policy=%d", got, want)
+	// membershipSize is what this binary WRITES; minMembershipSize is the floor
+	// for what it will READ. With one layout and every field written
+	// unconditionally the two are the SAME number, and they must stay equal:
+	// a read floor below the written size would let a section too short to hold
+	// the layout reach the field reads, and one above it would reject a section
+	// this very binary wrote.
+	if got, want := membershipSize(m), minMembershipSize; got != want {
+		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize=%d", got, want)
 	}
 }
 
@@ -3739,13 +3740,18 @@ func TestRotateSegmentSyncsBeforeClose(t *testing.T) {
 		allIndexes = append(allIndexes, uint64(i))
 	}
 
-	// Verify all entries are readable (none lost during rotation).
+	// Verify all entries are readable (none lost or reordered during rotation).
 	got, err := db.GetEntries(1, 1, 1, 51, 0)
 	if err != nil {
 		t.Fatalf("GetEntries: %v", err)
 	}
-	if len(got) != 50 {
-		t.Errorf("expected 50 entries, got %d", len(got))
+	if len(got) != len(allIndexes) {
+		t.Fatalf("expected %d entries, got %d", len(allIndexes), len(got))
+	}
+	for i, want := range allIndexes {
+		if got[i].Index != want {
+			t.Fatalf("entry %d: index %d, want %d", i, got[i].Index, want)
+		}
 	}
 
 	// Verify multiple segments were created.

@@ -88,6 +88,21 @@ type membershipSnapshot struct {
 	// identities maps replica IDs to their committed cryptographic node
 	// identity. Sparse: see proto.Membership.Identities.
 	identities map[uint64]string
+	// removedIdentities is the replicated tombstone map: removed replica ID to
+	// the identity the configuration held for it. See
+	// proto.Membership.RemovedIdentities, including why nothing is ever evicted
+	// from it.
+	removedIdentities map[uint64]string
+	// removedIdentitySet is removedIdentities INVERTED — the same fact keyed by
+	// the identity string.
+	//
+	// The receive path asks the question the other way round ("is the identity
+	// on this connection one this shard removed?") and asks it once per inbound
+	// message, so the index is built once per membership change rather than
+	// scanned per message. Same trade as sharedAddresses, and safe for the same
+	// reason: everything on a published snapshot is immutable after
+	// construction.
+	removedIdentitySet map[string]struct{}
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
 	// sharedAddresses holds every address more than one ACTIVE member claims,
@@ -161,6 +176,26 @@ func (s *membershipSnapshot) isRemoved(replicaID uint64) bool {
 	return s.removed[replicaID]
 }
 
+// isRemovedIdentity reports whether identity is one this shard has committed a
+// removal for, whatever replica ID the holder now claims.
+//
+// The empty identity is never removed. A connection with no authenticated
+// identity (an address-only shard, or a peer whose certificate yields none) must
+// fall through to the checks that CAN judge it rather than be matched against a
+// tombstone it cannot be distinguished from — an empty-matches-empty rule would
+// deny every such peer on any shard that had ever removed an identity-less
+// member, which is a shard-wide outage, not a security improvement.
+//
+// Safe for concurrent reads because the snapshot maps are never modified after
+// construction.
+func (s *membershipSnapshot) isRemovedIdentity(identity string) bool {
+	if identity == "" {
+		return false
+	}
+	_, removed := s.removedIdentitySet[identity]
+	return removed
+}
+
 // toProto converts the snapshot to a proto.Membership value. The maps
 // are deep-copied to prevent external mutation of the immutable snapshot.
 func (s *membershipSnapshot) toProto() proto.Membership {
@@ -176,6 +211,7 @@ func (s *membershipSnapshot) toProto() proto.Membership {
 		Witnesses:                  copyStringMap(s.witnesses),
 		Removed:                    copyBoolMap(s.removed),
 		Identities:                 copyStringMap(s.identities),
+		RemovedIdentities:          copyStringMap(s.removedIdentities),
 	}
 }
 
@@ -209,6 +245,17 @@ type membership struct {
 	// the property the whole gate rests on, and the reason cc.NodeIdentity is
 	// the only input the handlers read.
 	identities map[uint64]string
+	// removedIdentities maps every REMOVED replica ID to the identity the
+	// configuration held for it when the removal was applied. It is what makes
+	// the removal deny-list answerable against the AUTHENTICATED peer identity
+	// instead of the claimed msg.From — see proto.Membership.RemovedIdentities
+	// for the threat it closes, why nothing is ever evicted, and the address-only
+	// residual.
+	//
+	// Written in exactly one place, handleRemoveNode, from a value that was
+	// itself only ever written by a committed config change. No inbound message
+	// field reaches it, which is the property the gate rests on.
+	removedIdentities map[uint64]string
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
 
@@ -243,6 +290,7 @@ func newMembership(m proto.Membership) *membership {
 		witnesses:                  copyStringMap(m.Witnesses),
 		removed:                    copyBoolMap(m.Removed),
 		identities:                 copyStringMap(m.Identities),
+		removedIdentities:          copyStringMap(m.RemovedIdentities),
 		configChangeID:             m.ConfigChangeID,
 		maxWitnesses:               m.MaxWitnesses,
 		requireFullReplicaMajority: m.RequireFullReplicaMajority,
@@ -261,12 +309,38 @@ func (m *membership) snapshot() *membershipSnapshot {
 		witnesses:                  copyStringMap(m.witnesses),
 		removed:                    copyBoolMap(m.removed),
 		identities:                 copyStringMap(m.identities),
+		removedIdentities:          copyStringMap(m.removedIdentities),
+		removedIdentitySet:         invertIdentities(m.removedIdentities),
 		configChangeID:             m.configChangeID,
 		maxWitnesses:               m.maxWitnesses,
 		requireFullReplicaMajority: m.requireFullReplicaMajority,
 		sessionPolicy:              m.sessionPolicy,
 		sharedAddresses:            m.sharedAddresses(),
 	}
+}
+
+// invertIdentities builds the identity-keyed lookup set for a replica-ID-keyed
+// identity map, or nil when there is nothing to look up — which is every shard
+// that has never removed an identity-bearing member, so the common case costs
+// one nil check on the read path.
+//
+// Empty identities are skipped. They cannot be present in a map only
+// handleRemoveNode writes (it records nothing for a member with no committed
+// identity), but the set is an AUTHORIZATION index and an empty key in it would
+// deny every connection whose identity could not be determined. Refusing to
+// build one is cheaper than relying on the writer forever.
+func invertIdentities(m map[uint64]string) map[string]struct{} {
+	var set map[string]struct{}
+	for _, identity := range m {
+		if identity == "" {
+			continue
+		}
+		if set == nil {
+			set = make(map[string]struct{}, len(m))
+		}
+		set[identity] = struct{}{}
+	}
+	return set
 }
 
 // SessionPolicy returns the shard's replicated session policy from the
@@ -455,12 +529,27 @@ func (m *membership) identityHolder(identity string) (uint64, bool) {
 }
 
 // validateMemberIdentity refuses a config change whose identity is already
-// bound to a DIFFERENT active replica of this shard. It is validate-only, like
-// every other shape rule: refusing an already-committed entry on the apply path
-// would make replicas diverge.
+// bound to a DIFFERENT active replica of this shard, or which this shard has
+// committed a REMOVAL for under any replica ID. It is validate-only, like every
+// other shape rule: refusing an already-committed entry on the apply path would
+// make replicas diverge.
+//
+// The tombstone check is what keeps the deny-list from producing a silently
+// unreachable member. Because the tombstone is on the identity and nothing
+// evicts it, an add that reuses a removed replica's keypair would commit
+// successfully and then have every one of its messages dropped by
+// Peer.IsRemovedIdentity on every peer — a voter counted in every quorum that
+// can never be heard from. See ErrRemovedMemberIdentity.
 func validateMemberIdentity(m *membership, cc proto.ConfigChange) error {
 	if holder, dup := m.identityHolder(cc.NodeIdentity); dup && holder != cc.ReplicaID {
 		return ErrDuplicateMemberIdentity
+	}
+	if cc.NodeIdentity != "" {
+		for _, removed := range m.removedIdentities {
+			if removed == cc.NodeIdentity {
+				return ErrRemovedMemberIdentity
+			}
+		}
 	}
 	return nil
 }
@@ -650,11 +739,35 @@ func handleRemoveNode(m *membership, cc proto.ConfigChange) error {
 	delete(m.addresses, cc.ReplicaID)
 	delete(m.observers, cc.ReplicaID)
 	delete(m.witnesses, cc.ReplicaID)
-	// The identity goes with the member. Leaving it behind would let a
-	// removed replica's identity linger as an authorization fact for a
-	// replica ID the tombstone already denies, and it would make a later
-	// re-add of that ID (which the tombstone refuses anyway) inherit a
-	// binding nobody re-established.
+	// The identity MOVES to the tombstone; it is not dropped and it does not
+	// stay where it was.
+	//
+	// Not left in identities, because that map is the ACTIVE binding: it is what
+	// identityHolder scans to refuse a duplicate, so leaving a departed
+	// replica's identity there would refuse the legitimate operation of
+	// recycling a decommissioned machine into a NEW replica ID — the same
+	// operation addressHolder deliberately permits by not counting removed
+	// replicas.
+	//
+	// Not deleted either, which is the half of the removal that used to be
+	// missing. Deleting it left NOTHING in replicated state to evaluate the
+	// removal deny-list against, so the gate could only ever consult the CLAIMED
+	// msg.From — and a removed replica still holds its private key, so it
+	// authenticates perfectly well and evades its own tombstone by naming any
+	// other replica ID. Retaining it here is what lets the receive path ask the
+	// question of the AUTHENTICATED identity instead.
+	//
+	// The record is UNCONDITIONAL and deterministic, like every other apply-path
+	// effect: it is a pure function of (this membership, this committed entry),
+	// so every replica computes the identical map and no replica can refuse an
+	// entry its peers accepted. It is deliberately NOT gated on anything that
+	// could be true on one replica and false on another.
+	if identity := m.identities[cc.ReplicaID]; identity != "" {
+		if m.removedIdentities == nil {
+			m.removedIdentities = make(map[uint64]string)
+		}
+		m.removedIdentities[cc.ReplicaID] = identity
+	}
 	delete(m.identities, cc.ReplicaID)
 	if m.removed == nil {
 		m.removed = make(map[uint64]bool)

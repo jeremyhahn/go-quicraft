@@ -176,11 +176,22 @@ func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, erro
 		"segments_deleted", orphans,
 	)
 
-	if err := shard.truncateCorruptSegment(target.SegmentID, cleanEnd); err != nil {
-		return RepairResult{}, &RecoveryError{SegmentID: target.SegmentID, Err: err}
-	}
+	// High to low, for the same reason recovery repairs in that order: the
+	// segments above the truncation point go first and their unlinks are made
+	// durable (discardSegmentsAbove fsyncs the directory and reports a failure
+	// to do so), and only then is the named segment cut. A crash between the two
+	// leaves the corrupt segment still corrupt, so a re-run of the repair finds
+	// the same clean end and does the same thing. Cutting first would leave a
+	// segment that ends at a clean record boundary with CRC-valid segments still
+	// sitting above it, and the next recovery would replay straight through both
+	// — readmitting exactly the records the operator authorized destroying, with
+	// a hole where the cut was. That is the double-vote case syncDirFS exists
+	// for, arrived at from the one code path an operator drives by hand.
 	if err := shard.discardSegmentsAbove(orphans); err != nil {
 		return RepairResult{}, err
+	}
+	if err := shard.truncateCorruptSegment(target.SegmentID, cleanEnd); err != nil {
+		return RepairResult{}, &RecoveryError{SegmentID: target.SegmentID, Err: err}
 	}
 
 	slog.Warn("waldb: WAL repair complete; this node has lost its most recent "+

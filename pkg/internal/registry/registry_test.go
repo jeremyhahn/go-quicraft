@@ -188,7 +188,7 @@ func TestConcurrentRegisterResolveRemove(t *testing.T) {
 		go func(id uint64) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				r.Resolve(id, uint64(i%10)) //nolint:errcheck
+				r.Resolve(id, uint64(i%10))
 			}
 		}(uint64(g))
 	}
@@ -333,7 +333,7 @@ func BenchmarkRegistryResolve(b *testing.B) {
 	}
 	// Resolve an entry known to exist.
 	for b.Loop() {
-		r.Resolve(5, 5) //nolint:errcheck
+		r.Resolve(5, 5)
 	}
 }
 
@@ -353,7 +353,7 @@ func BenchmarkRegistryResolve_Concurrent(b *testing.B) {
 	}
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			r.Resolve(5, 5) //nolint:errcheck
+			r.Resolve(5, 5)
 		}
 	})
 }

@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 )
 
 // Share represents a single piece of a secret split using Shamir's Secret Sharing.
@@ -53,9 +54,31 @@ type Share struct {
 }
 
 // MarshalJSON implements json.Marshaler for Share.
+//
+// It is NOT redacted, and must not be: this is the SERIALIZATION path, and a
+// custody layer that persists or distributes shares as JSON needs the real
+// value back. Redaction belongs to the paths that exist to be read by humans —
+// String, and LogValue below, which is what a structured logger resolves first.
 func (s *Share) MarshalJSON() ([]byte, error) {
 	type Alias Share
 	return json.Marshal(&struct{ *Alias }{Alias: (*Alias)(s)})
+}
+
+// LogValue implements slog.LogValuer so that a Share reaching a structured
+// logger is redacted whatever the handler is.
+//
+// String alone was not enough. slog resolves a LogValuer FIRST, but with none
+// present slog.JSONHandler encodes an arbitrary value through its
+// json.Marshaler — so logging a *Share through a JSON handler wrote the full
+// share material and never called String at all. Shares are root-key custody
+// material and a single leaked share is a permanent, unrevocable disclosure, so
+// the redaction has to hold on every handler rather than on the one that
+// happens to use fmt.
+func (s *Share) LogValue() slog.Value {
+	if s == nil {
+		return slog.StringValue("Share(nil)")
+	}
+	return slog.StringValue(s.String())
 }
 
 // UnmarshalJSON implements json.Unmarshaler for Share.

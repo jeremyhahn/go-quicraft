@@ -15,7 +15,6 @@
 package proto
 
 import (
-	"bytes"
 	"errors"
 	"testing"
 )
@@ -35,7 +34,6 @@ func TestSnapshotMarshalUnmarshalRoundTrip(t *testing.T) {
 		},
 		Filepath:    "/snapshots/shard-1/snap-100.dat",
 		FileSize:    1024 * 1024,
-		Checksum:    []byte{0xDE, 0xAD, 0xBE, 0xEF},
 		Type:        RegularStateMachine,
 		Imported:    true,
 		OnDiskIndex: 99,
@@ -76,7 +74,6 @@ func TestSnapshotMarshalUnmarshalAllBoolsTrue(t *testing.T) {
 		},
 		Filepath:    "snap.dat",
 		FileSize:    100,
-		Checksum:    nil,
 		Type:        OnDiskStateMachine,
 		Imported:    true,
 		OnDiskIndex: 49,
@@ -139,7 +136,6 @@ func TestSnapshotReset(t *testing.T) {
 		Term:        5,
 		Filepath:    "/path",
 		FileSize:    1024,
-		Checksum:    []byte{1, 2, 3},
 		Type:        1,
 		Imported:    true,
 		OnDiskIndex: 99,
@@ -151,7 +147,7 @@ func TestSnapshotReset(t *testing.T) {
 		t.Fatal("Reset snapshot should be empty")
 	}
 	if s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
-		s.FileSize != 0 || s.Checksum != nil || s.Type != 0 ||
+		s.FileSize != 0 || s.Type != 0 ||
 		s.Imported || s.OnDiskIndex != 0 || s.Witness || s.Epoch != 0 {
 		t.Fatal("Reset did not clear all fields")
 	}
@@ -200,7 +196,6 @@ func TestSnapshotWithLargeMembership(t *testing.T) {
 		},
 		Filepath: "/var/lib/quicraft/shard-1/snapshot-1000",
 		FileSize: 10 * 1024 * 1024,
-		Checksum: make([]byte, 32),
 	}
 	buf := make([]byte, s.Size())
 	s.MarshalTo(buf)
@@ -281,7 +276,6 @@ func TestSnapshotUnmarshalNormalFieldsSucceed(t *testing.T) {
 		},
 		Filepath: "/var/lib/quicraft/snapshot.dat",
 		FileSize: 1024,
-		Checksum: []byte{0x01, 0x02, 0x03, 0x04},
 		Epoch:    3,
 	}
 	buf := make([]byte, s.Size())
@@ -320,9 +314,6 @@ func assertSnapshotEqual(t *testing.T, want, got *Snapshot) {
 	}
 	if got.FileSize != want.FileSize {
 		t.Fatalf("FileSize: got %d, want %d", got.FileSize, want.FileSize)
-	}
-	if !bytes.Equal(got.Checksum, want.Checksum) {
-		t.Fatalf("Checksum: got %v, want %v", got.Checksum, want.Checksum)
 	}
 	if got.Type != want.Type {
 		t.Fatalf("Type: got %d, want %d", got.Type, want.Type)

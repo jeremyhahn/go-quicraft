@@ -699,7 +699,7 @@ it still holds authority via a heartbeat quorum round.
 ### Batch Coalescing (OPT-8)
 
 Multiple concurrent ReadIndex requests are coalesced into a single heartbeat
-round. The step worker maintains a dedicated lock-free MPSC `readIndexQ`
+round. The step worker maintains a dedicated MPSC `readIndexQ`
 queue separate from the proposal inbox. Each tick, the step worker drains
 ALL pending ReadIndex keys at once and submits a single `Peer.Handle(ReadIndex)`
 call with the first key as `batchKey`. All pending keys complete when the
@@ -711,7 +711,7 @@ overhead from O(N) per caller to O(1) for N concurrent callers.
 ```
 Client ---ReadIndex(key)---> Host.ReadIndex()
                               |
-                        append to readIndexQ (lock-free)
+                        append to readIndexQ (brief mutex, batched drain)
                               |
 Step Worker (per tick)
   |
@@ -1237,10 +1237,24 @@ transfers through strict ordering:
    completes.
 3. **Back to Step Worker**: Next tick cycle.
 
-No mutexes protect the raft state machine itself. Synchronization is managed
-at the engine layer through atomic flags and channels. The only field safe
-for concurrent reads is `leaderID`, an `atomic.Uint64` synced after each
-operation via `syncLeaderID()`.
+The raft state machine has no internal locking of its own. Synchronization is
+managed at the engine layer, by the per-node `raftMu` mutex together with
+atomic flags and channels.
+
+`raftMu` is what serializes `Peer.Tick()` against `Peer.Commit()` — `Tick()`
+runs unconditionally, regardless of the `commitPending` flag, because the
+leader must keep advancing its heartbeat timer while WAL fsync and apply are
+in progress. It also covers the step worker's `Peer.Step` and
+config-resolution paths and inbox message handling; several `Peer` methods
+document "the caller must hold raftMu". Contention is minimal, since both
+`Tick()` and `Commit()` run at most once per RTT interval and cost ~100-200ns.
+
+`raftMu` is **not reentrant**. Event callbacks are invoked outside it: a
+callback running under `raftMu` blocks the commit worker's lock acquisition
+for every shard that worker owns.
+
+The only field safe for concurrent reads without the mutex is `leaderID`, an
+`atomic.Uint64` synced after each operation via `syncLeaderID()`.
 
 ### Core Methods
 
@@ -1378,17 +1392,25 @@ minus 2), providing a safety margin. Requires:
 
 ### Flow
 
+**There is no `Host.LeaseRead` method.** Lease read is not a separate API --
+it is an internal optimization inside the existing ReadIndex path, entirely
+transparent to callers. You enable it with `Config.LeaseRead = true` and keep
+calling `Host.ReadIndex` / `Host.SyncRead` exactly as before.
+
 ```
-Host.LeaseRead(ctx, shardID, query)
+Host.ReadIndex(ctx, shardID)   (or Host.SyncRead)
   |
-  +-- check raft lease is valid
+  +-- raft checks whether the leader's lease is still valid
   |     |
-  |     +-- leader && lease_ticks < lease_timeout? --> skip ReadIndex
-  |     +-- else: fall back to ReadIndex
+  |     +-- leader && lease_ticks < lease_timeout? --> skip the heartbeat round
+  |     +-- else: standard ReadIndex (heartbeat quorum confirmation)
   |
-  +-- if lease valid: SM.Lookup immediately (no wait)
-  +-- if lease invalid: ReadIndex + wait + SM.Lookup (standard path)
+  +-- lease valid:   read index resolves immediately (no round trip)
+  +-- lease invalid: ReadIndex + wait, then SM.Lookup (standard path)
 ```
+
+The leader tracks per-remote heartbeat ack timestamps in
+`remoteLastAck map[uint64]int` for this.
 
 ### Failure Mode
 

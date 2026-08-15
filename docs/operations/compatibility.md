@@ -31,14 +31,63 @@ exact version and upgrade deliberately.
 If a v2+ line is ever cut, the module path takes the `/v2` suffix as Go
 requires; the release workflow refuses a `v2+` tag without it.
 
+## Format versions are PINNED AT 1 until the first production release
+
+**Every wire and persisted format in this repository is pinned at version 1 for
+the whole pre-release period, and every decoder gates on exact equality with
+1.** That covers `proto.WireVersion`, the `proto.Membership` section version
+byte, `transport.WireVersion` (the frame header) and `waldb`'s snapshot-record
+membership section version.
+
+The policy, stated as a rule:
+
+- A layout change is made **IN PLACE, at version 1**. The number does not move.
+- The consuming repositories are updated **in lockstep**, in the same change, to
+  read and write the new layout at the same version.
+- Development clusters are **wiped and re-synced**, never migrated. There is no
+  dual-read path, no migration window and no legacy decode case, because there
+  is no deployed data and no deployed peer whose bytes anyone has promised to
+  keep reading.
+- The version numbers increment **for the first time at the first production
+  release**. From that point a bump means what it normally means: a decoder
+  taught the old layout, a migration story, and a supported window that widens
+  rather than moves.
+- The transport version remains a **supremum** over the persisted ones — see
+  [The transport version is a SUPREMUM](#the-transport-version-is-a-supremum).
+  That relation is asserted at compile time and holds trivially while both are
+  1; it is retained because it is what stops the two drifting apart at the 1.0
+  bump.
+
+**State the consequence plainly: two binaries built from different pre-release
+commits may be mutually unreadable while BOTH stamp version 1, and that is
+intended.** Mixing them — over the wire, or over a data directory one of them
+wrote — is unsupported, and the failure it produces is a decode or recovery
+error rather than a version mismatch that names itself. Rebuild every node, and
+every consuming repo, from the same commit.
+
+Why the version byte is kept even though the value never moves: it is the
+mechanism that makes the 1.0 bump possible at all. A format with no in-band
+discriminator cannot be superseded — that is precisely the state `Membership`
+was in before it grew a leading byte, and a section without one begins at
+`ConfigChangeID`, whose low byte is indistinguishable from a version. Keeping
+the byte and refusing anything that is not 1 also turns a commit skew into a
+clean refusal instead of fields read at the wrong offsets.
+
+Every version number in the repository is now 1, the `WALFORMAT` marker
+included; see
+[section 4](#4-walformat-marker-version--1--persisted-exact-match-checked-first).
+
 ## Version discriminators that actually exist
 
 There is no single "format version" for the system. Six independent
 discriminators exist, each scoped to what it protects. The scoping is
 deliberate: a transport-only bump must never make a node unable to replay its
-own log.
+own log. The four that are version NUMBERS — sections 1 to 4 — are all pinned at
+1 by the policy above. The remaining two are not numbers of that kind: the WAL
+payload-type ladder is a per-record type tag, and `snapshot.meta` is
+self-describing.
 
-### 1. `proto.WireVersion` = 3 — transport-scoped, exact match
+### 1. `proto.WireVersion` = 1 — transport-scoped, exact match
 
 Stamped into `MessageBatch.BinVer` and `SnapshotChunk.BinVer`. Both ends of a
 QUIC connection are live processes, so a mismatch costs one rejected connection
@@ -46,72 +95,160 @@ and nothing durable. It is gated on **exact equality**: a peer speaking another
 dialect is refused outright rather than misparsed, and the operator upgrades
 both ends. There is no supported window and no negotiation.
 
-**Operational consequence:** a rolling upgrade across a `WireVersion` bump does
-not work. Nodes on the old version and nodes on the new version cannot talk at
-all.
+**It does not move for a pre-release layout change.** The transport layout HAS
+changed during development and will change again; under the pinning policy the
+number stays at 1 and every peer is rebuilt. So a `BinVer` match is not a
+guarantee that two binaries agree on the bytes — it is a guarantee only that
+neither is from a different major format generation. Build every node from the
+same commit.
+
+**Operational consequence:** a rolling upgrade across a pre-release layout
+change does not work, and it does not announce itself as a version mismatch
+either. Nodes from different commits either fail to decode each other's batches
+or, in the worst case for a change that preserves lengths, disagree about what
+a field means. Stop the cluster, replace every binary, wipe, re-sync.
+
+From 1.0 onward the number carries its normal meaning and a bump names a real
+dialect boundary.
 
 ### 2. `transport.WireVersion` = 0x01 — transport-scoped frame header
 
 The third byte of every QUIC frame, after the two magic bytes `Q` `C`. Same
 scope and same reasoning as above; it is versioned separately because the frame
-header can change without the payload encoding changing, and vice versa.
+header can change without the payload encoding changing, and vice versa. It has
+been 1 throughout and stays there.
 
-### 3. Membership section version byte = 4 — persisted, range-checked
+### 3. `Membership` section version byte = 1 — persisted, exact match
 
 The leading byte of every `Membership` section. Membership is persisted: it goes
 into the WAL, into snapshot records, into exported snapshot artifacts, and into
 the `EntryInitialMembership` entry at log index 1. Those bytes outlive the
-process — and the binary — that wrote them, so the decoder accepts a **range**,
-`[minSupportedMembershipVersion, membershipFormatVersion]`, with one decode path
-per version.
+process — and the binary — that wrote them, which is why the format carries an
+explicit discriminator at all: a `Membership` is always EMBEDDED in a larger
+buffer, so neither a length check nor a trailing-byte check can tell one layout
+from another.
 
-Supported window today: **3-4**. A binary on `0.3.0-alpha` writes v4 and
-reads both, which is what lets a node replay a log whose index-1 entry an older
-binary wrote. The two layouts before v3 are unreadable by construction:
+The decoder accepts **exactly 1** and refuses every other byte value with
+`*proto.UnsupportedMembershipVersionError` (which matches
+`proto.ErrUnsupportedVersion` under `errors.Is`), before a single field is
+interpreted. There is no range and no per-version decode path: pre-release, no
+bytes in another layout are meant to exist anywhere, because dev clusters are
+wiped rather than migrated.
 
-| Layout | Fixed region | Maps | Version byte |
-|---|---|---|---|
-| v1 | `ConfigChangeID` (base 8 bytes) | 4 | none |
-| v2 | `ConfigChangeID`, `MaxWitnesses`, policy flags (base 24) | 4 | none |
-| v3 | v2 fields with a leading version byte (base 25) | 4 | yes |
-| v4 | v3 fields plus the session policy (base 25 → 49) | 5 — `Identities` appended after `Removed` | yes |
+The v1 layout, field by field:
 
-An empty v2 section is byte-identical to an empty v1 one, and both are
-indistinguishable from arbitrary `ConfigChangeID` bytes — they cannot be told
-apart in band. Closing that defect is why v3 exists, and why v4 could be added
-as a decode branch rather than a format break.
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | Version byte (`1`) |
+| 1 | 8 | `ConfigChangeID` |
+| 9 | 8 | `MaxWitnesses` |
+| 17 | 8 | `RequireFullReplicaMajority` (bool as uint64) |
+| 25 | 8 | `SessionExpiryEntries` |
+| 33 | 8 | `MaxTotalSessions` |
+| 41 | 8 | `MaxSessionsPerClient` |
+| 49 | var | `Addresses` map |
+| — | var | `Observers` map |
+| — | var | `Witnesses` map |
+| — | var | `Removed` bool map |
+| — | var | `Identities` map |
+| — | var | `RemovedIdentities` map |
 
-v4 exists to carry two things v3 could not. `Identities` is the map of replica
-ID to stable node identity that the receive-side sender gate authorizes
-`msg.From` against. The **session policy** — `SessionExpiryEntries`,
-`MaxTotalSessions` and `MaxSessionsPerClient` — sits in the fixed region, after
-the v3 fields it leaves byte-identical, and is what the deterministic apply path
-reads instead of each node's own `Config`. Both landed in one revision on
-purpose: shipping them as v4 and v5 would cost downstream a second on-disk break
-for a layout nothing outside the development tree had written.
+The fixed region is **49 bytes** and an empty section is **73**: the fixed
+region plus six 4-byte map count prefixes. Every map is written unconditionally,
+so an empty map is four zero bytes rather than an absent field, and an unset
+session policy is 24 zero bytes rather than an absent one.
 
-A v3 section decodes with no identities and no session policy, and both are
-supported states — see
-[Node identities](#node-identities-and-requirememberidentity) and
-[Session policy across a restart](#session-policy-across-a-restart). An unset
-session policy is distinguishable from a committed one that disables expiry:
-`MaxTotalSessions` can never legitimately be zero in a committed policy
-(`config.Validate` rejects it), so it is the "policy recorded" discriminator and
-a threshold of zero keeps its own meaning.
+An unset session policy is still distinguishable from a committed one that
+disables expiry: `MaxTotalSessions` can never legitimately be zero in a
+committed policy (`config.Validate` rejects it), so it is the "policy recorded"
+discriminator (`SessionPolicy.IsSet`) and a threshold of zero keeps its own
+meaning — expiry explicitly DISABLED cluster-wide.
 
-`proto.ConfigChange` changed in the same release and is discriminated
-differently: it has no version byte because it is exactly one `Entry.Cmd`, so
-the buffer has a readable END. A payload that stops after the witness-policy
-fields was written before identities existed and decodes with an empty
-`NodeIdentity`; a payload that stops anywhere else is a truncation and errors.
+`Identities` is the map of replica ID to stable node identity that the
+receive-side sender gate authorizes `msg.From` against. `RemovedIdentities` is
+the node identity every replica the shard has REMOVED held at the moment of its
+removal: the removal deny-list has to be answerable against the AUTHENTICATED
+peer identity rather than the CLAIMED `msg.From`, because a removed replica
+still holds its private key and so still authenticates. Its entries are never
+evicted — no eviction policy exists that is not also a re-admission policy. Both
+maps are SPARSE: a shard whose members carry no committed identity records
+nothing in either, and its deny-list remains a check on the claimed `msg.From`.
+See [Node identities](#node-identities-and-requirememberidentity).
 
-`waldb` pins its own `membershipSectionVersion` independently, for the
-membership section inside its snapshot records. It moved to **4** in the same
-change and for the same reason, and it accepts the range **3-4** on replay
-rather than an exact match — see
-[Identities across a restart](#identities-across-a-restart).
+`proto.ConfigChange` carries no version byte, and needs none — but for the
+opposite reason it used to. It has exactly ONE layout and every field in it is
+mandatory, so there is nothing to discriminate: a payload that does not span the
+whole layout is a truncation and errors with `ErrBufferTooSmall`, at every cut
+point without exception.
 
-### 4. `WALFORMAT` marker version = 2 — persisted, exact match, checked first
+It used to be LENGTH-discriminated, and that was a defect rather than a
+convenience. A payload stopping after the witness-policy fields decoded
+successfully with an EMPTY `NodeIdentity` — which is precisely the state that
+falls back to the weaker address-based authorization — so a truncated config
+change was indistinguishable from an identity-less one and silently downgraded
+an authorization check. An identity-less change is now spelled with an explicit
+zero-length prefix, which is a value a writer chose rather than a length a
+reader inferred.
+
+`waldb` pins its own `membershipSectionVersion` — also **1**, also exact-match
+on replay — for the membership section inside its snapshot records. Its layout
+is NOT byte-identical to `proto.Membership`: it packs the policy flags into one
+byte where proto spends eight, and carries the session policy as a **tail**
+after `Identities` rather than in its fixed region, because its decoder parses
+straight-line from a fixed offset and a grown fixed region would move every map.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | Version byte (`1`) |
+| 1 | 8 | `ConfigChangeID` |
+| 9 | 8 | `MaxWitnesses` |
+| 17 | 1 | Policy flags (`RequireFullReplicaMajority`) |
+| 18 | var | `Addresses` map |
+| — | var | `Observers` map |
+| — | var | `Witnesses` map |
+| — | var | `Removed` map |
+| — | var | `Identities` map |
+| — | 24 | Session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient` |
+| — | var | `RemovedIdentities` map |
+
+Its fixed region is **18 bytes** and an empty section is **66** — which is also
+the read floor replay enforces before it looks at the version byte. The two
+numbers are equal by construction: one layout, every field unconditional, so the
+smallest thing that may be READ is exactly the size of what is WRITTEN.
+
+#### The transport version is a SUPREMUM
+
+Independent scoping does not mean the two namespaces are unrelated. `Membership`
+is embedded in `Snapshot`, which is embedded in `Message`, which is embedded in
+`MessageBatch` — and it is embedded directly in `SnapshotChunk`. Both of those
+gate on exact equality, so a `Membership` layout change alters the transport
+bytes without altering the discriminator that is supposed to describe them.
+
+> **The rule, from the first production release onward:** bump
+> `proto.WireVersion` whenever ANY type reachable from `MessageBatch` or
+> `SnapshotChunk` changes layout, **including the embedded persisted ones**. The
+> transport number is the supremum of every layout version on the wire, never a
+> number that tracks only the transport-only fields.
+
+The `Membership` half is mechanical rather than remembered: a compile-time
+constant assertion enforces `proto.WireVersion >= membershipFormatVersion`, so
+bumping the persisted Membership layout without bumping the wire version fails
+the build. It holds trivially at `1 >= 1` and is kept for exactly that future
+bump. The rest is judgement.
+
+The converse does **not** hold. `WireVersion` may move without the persisted
+version moving, because a transport-only change (a new `SnapshotChunk` field,
+say) leaves every persisted byte alone. That asymmetry is why the assertion is
+`>=` and not `==`.
+
+The two constants stay SEPARATE even while they hold the same value, and neither
+may be derived from the other. If the persisted version were `uint8(WireVersion)`
+the first post-1.0 transport-only bump would silently change the version byte
+every replica expects at log index 1, and a released cluster could not replay its
+own log. A source-level test parses `membership.go` and fails the build on that
+"simplification".
+
+### 4. `WALFORMAT` marker version = 1 — persisted, exact match, checked first
 
 A 16-byte file in the WAL root: magic `QRWALFMT`, a uint32 format version and
 the uint32 block size. It records the two things a segment file does not carry
@@ -120,12 +257,19 @@ records are written in — and it is read before a single segment byte is.
 
 | Version | Chunk header | Status |
 |---|---|---|
-| 1 | 7 bytes: CRC32, length, type | **Refused** — `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`, naming both versions) |
-| 2 | 11 bytes: CRC32, length, type, durability sequence | Current |
+| 1 | 11 bytes: CRC32, length, type, durability sequence | Current |
+| anything else | — | **Refused** — `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`, naming both versions) |
 
-It is gated on **exact equality**, and unlike the payload-type ladder it cannot
-be a per-record decision: the framing is what tells you where records begin, so
-there is no record to inspect until it has been settled.
+Like every other number here it is pinned at 1 for the pre-release period: the
+chunk framing HAS changed during development — an earlier 7-byte header carried
+no durability sequence — and under the pinning policy that change was made in
+place, with the dev directories that held the old framing wiped rather than
+migrated.
+
+It is gated on **exact equality** in both directions, and unlike the
+payload-type ladder it cannot be a per-record decision: the framing is what
+tells you where records begin, so there is no record to inspect until it has
+been settled.
 
 Two failure modes, both fatal, both before any replay:
 
@@ -136,7 +280,7 @@ Two failure modes, both fatal, both before any replay:
 - **No marker over a populated directory.** `ErrWALFormatMissing`. Every
   directory this build creates is marked before its first segment exists, so
   segments with no marker above them come from a build that predates it — which
-  is also a build that predates the durability sequence. Under version 2's
+  is also a build that predates the durability sequence. Under this build's
   parser every one of those chunks fails CRC from the first byte, the clean
   prefix comes back empty, and the torn-tail repair would truncate the whole log
   to zero and delete every segment above it. **Silent misparse presented as a
@@ -424,17 +568,19 @@ recovers from a snapshot comes back still bound by identity:
 |---|---|
 | `logdb.Membership` | Yes |
 | `memdb` | Yes, deep-copied |
-| `waldb` snapshot-record membership section | Yes, at section version 4 |
+| `waldb` snapshot-record membership section | Yes, at section version 1 |
 | `host.go` `protoMembershipToLogDB` / `logdbMembershipToProto` | Yes, both directions |
 | `engine` `protoMembershipToLogDB` (a replica's own snapshot save) | Yes |
 
-The `waldb` section is versioned in its own right and accepts the **range 3-4**
-on replay rather than an exact match, so a record written before identities
-existed still replays; it decodes with an EMPTY identity map, which is the same
-compatibility state a v3 `proto.Membership` produces. The length guard replay
-applies before reading that version byte stays at the v3 minimum for the same
-reason — raising it to the v4 size would reject every existing section as
-truncated before the version check that knows how to read it ever ran.
+The `waldb` section is versioned in its own right, at 1, and gates on **exact
+equality** on replay. There is no tail this replayer may skip and no earlier
+layout whose absent fields would decode as empty, which changes what a dropped
+field looks like: it would come back as an EMPTY identity map with no error
+anywhere. For these two maps that is a security regression rather than a
+data-loss one — losing `RemovedIdentities` readmits a decommissioned node
+holding a still-valid certificate, on exactly the restart an operator performs
+after removing it — so the full-fidelity round trip is asserted directly rather
+than inferred from a version check.
 
 ### Session policy across a restart
 
@@ -448,16 +594,15 @@ relearn it from — and a replica that relearns nothing falls back to its own
 |---|---|
 | `logdb.Membership` | Yes |
 | `memdb` | Yes |
-| `waldb` snapshot-record membership section | Yes, as a v4 tail after `Identities` |
+| `waldb` snapshot-record membership section | Yes, as a tail after `Identities` |
 | `host.go` `protoMembershipToLogDB` / `logdbMembershipToProto` | Yes, both directions |
 | `engine` `protoMembershipToLogDB` (a replica's own snapshot save) | Yes |
 | `messagehandler` (a received `InstallSnapshot`) | Yes |
 
 The `waldb` placement differs from `proto.Membership`'s deliberately: that
-decoder parses straight-line rather than through a per-version entry point, so
-growing its fixed region would give v3 and v4 different map offsets. Appending
-the policy after `Identities` keeps v3 replay reading its maps where it always
-did. Both placements are pinned by the shared LogDB conformance suite, which runs
+decoder parses straight-line from a fixed offset, so growing its fixed region
+would move every map in the section, while appending to the tail does not. Both
+placements are pinned by the shared LogDB conformance suite, which runs
 `memdb` and `waldb` through one assertion table and reopens the database — a
 save/read pair inside one process never reaches `waldb`'s record encoding at all.
 
@@ -520,10 +665,13 @@ far), the procedure per node is:
 5. Wait for `ShardInfo.Health` to leave `recovering` and `LastApplied` to catch
    up before moving to the next node.
 
-This is a rolling **replacement**, not a rolling upgrade: at no point do a new
-node and an old node exchange traffic, because `proto.WireVersion` refuses it.
-Plan for the cluster to run with reduced redundancy for the duration, and do not
-start step 2 on the next node until step 5 completes on the previous one.
+This is a rolling **replacement**, not a rolling upgrade: at no point should a
+new node and an old node exchange traffic. Across a genuine `proto.WireVersion`
+boundary the gate refuses it outright; across a PRE-RELEASE layout change it may
+not, because both binaries stamp version 1 — which is why the procedure wipes
+each node's data directory rather than relying on a version check to catch the
+skew. Plan for the cluster to run with reduced redundancy for the duration, and
+do not start step 2 on the next node until step 5 completes on the previous one.
 
 For a whole-cluster cold upgrade, stop everything, wipe everything, and restore
 from an application-level backup taken before the upgrade. `waldb.Reencrypt`
@@ -540,7 +688,7 @@ mistaken for corruption:
 | Symptom at start-up | Meaning |
 |---|---|
 | `ErrWALFormatMissing` | WAL segments written before the format marker existed. Expected on every `0.2.0-alpha` directory. Delete the WAL directory. |
-| `*WALFormatVersionError` naming versions 1 and 2 | A marker from `0.2.0-alpha`. Same remedy; the message names both versions so it is distinguishable from damage. |
+| `*WALFormatVersionError` | A marker from another build's on-disk format. Same remedy; the message names both the version found and the version this build reads, so it is distinguishable from damage. |
 | `ErrLegacySnapshotFormat` / `...V2` / `...V3` | A WAL snapshot record from an older payload-type generation. |
 | `ErrDecryptionFailed` on every read | The at-rest AAD binding changed. The key is fine; the ciphertext is not readable. Wipe, do not hunt for a key problem. |
 
@@ -556,6 +704,49 @@ section (`waldb.FS.Rename`, `walContextBarrier.ContextBindingResolved`,
 `SecurityMetrics.IncUnauthorizedMessageDropped`'s `reason` parameter) affect
 only embedders that IMPLEMENT those interfaces. Verify with a build before
 concluding you are unaffected.
+
+### `0.3.0-alpha` → `0.3.1-alpha`
+
+`0.3.1-alpha` was a CI and test-infrastructure release. It changed no wire
+format, no persisted format and no public API. A `0.3.0-alpha` data directory is
+read by `0.3.1-alpha` unchanged, and the two versions interoperate on the wire.
+
+Upgrade in place, node by node, with no wipe. It is the only boundary in this
+project's history where that is true.
+
+### `0.3.1-alpha` → next release
+
+**This one is a format break in both directions, and there is no rolling
+upgrade.** Follow the rolling-replacement procedure above.
+
+**Every format version was reset to 1 and pinned there** under the policy in
+[Format versions are PINNED AT 1](#format-versions-are-pinned-at-1-until-the-first-production-release).
+The version numbers therefore do NOT record the break — the layouts changed
+underneath them, and both the old and the new binary stamp 1.
+
+| What changed | Consequence |
+|---|---|
+| `proto.WireVersion` pinned to 1; the transport layout changed | Old and new nodes exchange **no** usable Raft traffic, and the mismatch does not announce itself as a version error. Both ends must be replaced together. |
+| `Membership` layout: six maps including `RemovedIdentities`, session policy in the fixed region | An existing log, snapshot or WAL from an earlier commit does **not** replay. Wipe and re-sync. |
+| `waldb` membership section: same collapse to version 1, exact-match gate | Same. The read floor rose to the current 66-byte minimum, so a shorter section is a torn record. |
+| `Snapshot.Checksum` removed | Transport-layout change. Never computed, never verified — see the `proto.Snapshot` type doc. |
+| Write-side limits added | `Membership.MarshalTo` now refuses what its own decoder would reject (`ErrTooManyMembershipEntries`, `ErrAddressTooLong`) instead of producing a durable-but-unreadable bootstrap entry. |
+
+Two changes are **source-compatible but break at run time**, which is the
+dangerous shape — nothing fails to compile:
+
+| Symptom | Meaning | Remedy |
+|---|---|---|
+| `ErrSealedStateUnauthenticated` on first unseal | The sealed root key blob predates `state_mac` and carries none. Refusing an absent MAC is deliberate: accepting it is a downgrade an attacker triggers by deleting the field. | One-start migration — set `BarrierConfig.AllowUnauthenticatedSealedState = true`, start once, re-persist `SealedRootKeyData()` (Unseal restamps the MAC), then clear the flag. |
+| `ErrSealedStateUnauthenticated` after a password change, rekey, key import or Shamir re-split | The embedder re-wrapped the root key itself. A `SealingStrategy` returns only the ciphertext and its own strategy fields, so the assembled blob carries no MAC — and an absent MAC is refused exactly like a stripped one. Not a migration problem: the blob was written by a current build. | Stamp before persisting. With the barrier unsealed, `(*Barrier).StampSealedStateMAC(sealed)`; when the root key is in hand but no barrier is unsealed yet (the import case), `StampSealedStateMACWithRootKey(rootKey, deploymentID, sealed)`. Stamp LAST — the MAC covers the ciphertext too. |
+| `ErrSessionsUnsupportedOnDisk` from a call that used to succeed | Client sessions on an `sm.DiskStateMachine` shard. They silently diverged the cluster before, because the session table lives only in the snapshot stream and an on-disk SM never takes the recover path on restart. | Use NO-OP sessions (`Host.GetNoOPSession`) and make the operations idempotent. |
+| `ErrKDFNotFIPSApproved` on unseal | An Argon2id-wrapped blob under FIPS mode; unsealing re-derives the same wrapping key. | Unseal once with FIPS **off**, re-seal with `NewSoftwareStrategyFIPS` (PBKDF2-SHA256), which unseals identically in either mode. |
+| Nonce tracking silently absent | `BarrierConfig.NonceTracking` is now `*bool`. As a plain `bool` its zero value meant "off"; as a pointer, nil means "use the default", which is **enabled**. | Nothing, unless you relied on the old zero-value behaviour. Disable deliberately with `BoolPtr(false)`; read the effective value with `GetNonceTracking()`. |
+
+Also source-breaking for embedders: `StopShard` and `Host.Close` now return
+errors they previously swallowed (`Close` reports a drain that timed out);
+`batch.EncodeBatch` returns `([]byte, error)`; and
+`proto.MaxChecksumLen` / `proto.ErrChecksumTooLong` are removed.
 
 ### Before upgrading
 

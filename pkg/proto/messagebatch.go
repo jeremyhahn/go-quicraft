@@ -67,9 +67,18 @@ func (mb *MessageBatch) Size() int {
 }
 
 // MarshalTo writes the message batch into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrTooManyMessages if Requests exceeds MaxMessagesPerBatch, or
+// ErrAddressTooLong if SourceAddress exceeds MaxAddressLength — the read side's
+// bounds applied on write. MaxMessagesPerBatch's doc already made bounding the
+// producer a MUST; this is that MUST enforced rather than documented.
 func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
+	if len(mb.Requests) > MaxMessagesPerBatch {
+		return 0, ErrTooManyMessages
+	}
+	if len(mb.SourceAddress) > MaxAddressLength {
+		return 0, ErrAddressTooLong
+	}
 	required := mb.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall

@@ -21,72 +21,109 @@
 // with a 4-byte count prefix and entries sorted by key ascending for
 // deterministic output.
 //
-// # Compatibility contract
+// # Compatibility contract: every format is PINNED at version 1 pre-release
 //
-// The package carries two INDEPENDENT version namespaces. Neither may be
-// derived from the other, and a bump to one must never change how the other
-// is read:
+// go-quicraft has not made a production release. Until it does, EVERY wire and
+// persisted format in this repository is pinned at version 1 — WireVersion,
+// membershipFormatVersion, internal/transport.WireVersion and
+// logdb/waldb.membershipSectionVersion alike — and every decoder gates on
+// EXACT equality with 1.
+//
+// A layout change during this period is made IN PLACE, at version 1, and the
+// consuming repositories (go-qrdb, go-xkms, go-quicbaas, go-trusted-ca) are
+// updated to match in the same change. Development clusters are WIPED and
+// re-synced rather than migrated. There is no dual-read path, no migration
+// window, and no legacy decode case, because there is no deployed data and no
+// deployed peer whose bytes anyone has promised to keep reading.
+//
+// The consequence is blunt and intended: two binaries built from different
+// pre-release commits may be mutually unreadable while BOTH stamp version 1.
+// Mixing them — over the wire, or over a data directory one of them wrote —
+// is unsupported, and the failure it produces is a decode error, not a
+// version mismatch that names itself. Rebuild every node and every consuming
+// repo from the same commit.
+//
+// The version numbers increment for the first time at the first production
+// release. From that point a bump means what it normally means: a decoder
+// that must be taught the old layout, a migration story, and a supported
+// window that widens rather than moves.
+//
+// # Why the version byte stays
+//
+// Pinning the VALUE is not the same as removing the mechanism. Every format
+// still writes its version and still refuses anything that is not 1, for two
+// reasons. It is what makes the 1.0 bump possible at all: a format with no
+// discriminator cannot be superseded in band, which is exactly the state
+// Membership was in before it grew a leading byte, and a section with no
+// version byte is byte-indistinguishable from one whose first field happens to
+// start with the same value. And it is what turns a commit skew into a clean
+// refusal instead of a misparse — the wrong bytes are rejected at the gate
+// rather than interpreted at the wrong offsets.
+//
+// # Two namespaces, one value
+//
+// The package carries two version namespaces which happen to hold the same
+// value today and must NOT be derived from each other:
 //
 //   - TRANSPORT-scoped: WireVersion. Stamped into MessageBatch.BinVer and
 //     SnapshotChunk.BinVer, and mirrored by the frame header byte in
 //     internal/transport. Both ends of a QUIC connection are live processes,
 //     so a mismatch costs one rejected connection and nothing durable.
-//     Gated on EXACT equality: a peer speaking another dialect is refused
-//     outright rather than misparsed, and the operator upgrades both ends.
-//     Supported window: WireVersion only.
 //
 //   - PERSISTED-scoped: membershipFormatVersion (see membership.go). Stamped
 //     as the leading byte of every Membership section, which is written to
 //     the WAL, into snapshot records and exported snapshot artifacts, and
 //     into the EntryInitialMembership entry at log index 1. Those bytes
-//     outlive the process — and the binary — that wrote them, so the decoder
-//     accepts a RANGE, [minSupportedMembershipVersion,
-//     membershipFormatVersion], with one decode path per version. Supported
-//     window: 3-3 (degenerate: v3 is the only released layout).
+//     outlive the process — and the binary — that wrote them.
 //
-// The distinction is not stylistic. Membership is the bootstrap
-// configuration at log index 1, so if the persisted version were derived
-// from WireVersion, bumping WireVersion for any transport-only reason would
-// simultaneously make every existing node unable to replay its own log —
-// with no dual-read path and no migration, a permanently unstartable
-// cluster. Persisted formats widen their read window; transport formats do
-// not have to.
+// The distinction is not stylistic, and it is why the two survive as separate
+// constants through the pinned period. Membership is the bootstrap
+// configuration at log index 1, so if the persisted version were derived from
+// WireVersion, the first post-1.0 transport-only bump would simultaneously
+// change the version byte every replica expects at log index 1 and leave a
+// released cluster unable to replay its own log.
 //
-// Two other version discriminators exist outside this package and follow the
-// same rule: internal/transport.WireVersion (transport-scoped, range-checked
-// on read) and logdb/waldb.membershipSectionVersion (persisted-scoped, pinned
-// independently for waldb's own snapshot-record layout).
+// # The transport version is a SUPREMUM
+//
+// Independent does not mean unrelated. Membership is embedded in Snapshot,
+// which is embedded in Message, which is embedded in MessageBatch, and it is
+// embedded directly in SnapshotChunk. Both of those gate on
+// BinVer == WireVersion by EXACT equality, so a Membership layout change
+// alters the transport bytes without altering the discriminator that is
+// supposed to describe them — two dialects stamping one version number.
+//
+// THE RULE, from the first production release onward: bump WireVersion
+// whenever ANY type reachable from MessageBatch or SnapshotChunk changes
+// layout, INCLUDING the embedded persisted ones. The transport number is the
+// supremum of every layout version on the wire, never a number that only
+// tracks the transport-only fields. The blank-identifier constant assertion in
+// membership.go enforces the Membership half of that at compile time — it
+// holds trivially at 1 >= 1 and is retained precisely because it is what stops
+// the two drifting apart at the bump that matters.
+//
+// The converse does NOT hold: WireVersion may move without membershipFormatVersion
+// moving, because a transport-only change leaves every persisted byte alone. That
+// asymmetry is why the assertion is >= and not ==.
 package proto
 
 import "fmt"
 
-// WireVersion is the current TRANSPORT wire format version. It is written
-// as the first 8 bytes of MessageBatch and into SnapshotChunk.BinVer.
-// Receivers validate it for exact equality before unmarshaling; a mismatch
-// is reported as ErrUnsupportedVersion.
+// WireVersion is the TRANSPORT wire format version. It is written as the first
+// 8 bytes of MessageBatch and into SnapshotChunk.BinVer. Receivers validate it
+// for exact equality before unmarshaling; a mismatch is reported as
+// ErrUnsupportedVersion.
+//
+// It is PINNED at 1 for the whole pre-release period and does not move for a
+// layout change — the layout changes in place and every consumer is rebuilt.
+// See the compatibility contract in the package comment for the policy, what
+// it costs (peers from different pre-release commits may be mutually
+// unreadable while both stamp 1), and when the pinning ends.
 //
 // Scope: transport only. Nothing stamped with WireVersion is read back off
-// disk, so it may be bumped freely for a transport-layer change. It is NOT
-// the version of any persisted structure — in particular, the persisted
-// Membership section carries its own membershipFormatVersion, which this
-// constant must never be substituted for or derived into. See the
-// compatibility contract in the package comment for why.
-//
-// Version history (entries below predate the split, when a single number
-// identified both namespaces):
-//
-//	v1: original layout (Membership base 8 bytes, ConfigChange fixed 36 bytes).
-//	v2: replicated witness policy — Membership gained MaxWitnesses and
-//	    RequireFullReplicaMajority (base 8 -> 24 bytes) and ConfigChange
-//	    gained the same fields (fixed 36 -> 52 bytes). The v1 layouts carry
-//	    no per-type version byte and cannot be decoded by v2.
-//	v3: Membership gained a leading version byte (base 24 -> 25 bytes), so a
-//	    legacy section is rejected in band instead of being misparsed. The
-//	    embedding types (Snapshot, SnapshotChunk) grow by the same byte.
-//	    Bumped because v2 and v3 encode Membership differently while both
-//	    would otherwise stamp BinVer 2, which is the exact ambiguity the
-//	    version byte removes.
-const WireVersion uint64 = 3
+// disk. It is NOT the version of any persisted structure — in particular, the
+// persisted Membership section carries its own membershipFormatVersion, which
+// this constant must never be substituted for or derived into.
+const WireVersion uint64 = 1
 
 // MaxEntrySize is the maximum byte length of an Entry.Cmd payload.
 // Enforced during UnmarshalFrom to prevent memory exhaustion from
@@ -115,10 +152,6 @@ const MaxNodeIdentityLength = 256
 // snapshot and snapshot file metadata. Enforced during UnmarshalFrom
 // to prevent unbounded allocation from crafted payloads.
 const MaxFilepathLen = 4096
-
-// MaxChecksumLen is the maximum byte length of a checksum field in
-// snapshot metadata. Sized for SHA-512 (64 bytes).
-const MaxChecksumLen uint32 = 64
 
 // MaxMetadataLen is the maximum byte length of application-defined
 // metadata in snapshot file records. Enforced during UnmarshalFrom.
@@ -149,9 +182,17 @@ const MaxMessagesPerBatch = 10000
 // this value.
 const MaxEntriesPerMessage = 10000
 
-// maxMembershipEntries is the maximum number of entries allowed in a
-// single Membership map. Validated before allocation in UnmarshalFrom.
-const maxMembershipEntries = 10000
+// MaxMembershipEntries is the maximum number of entries allowed in a single
+// Membership map. Validated before allocation in UnmarshalFrom, and mirrored on
+// the write side in MarshalTo.
+//
+// Exported for the same reason as MaxMessagesPerBatch and MaxEntriesPerMessage:
+// it is a property of the format, not of the decoder, and callers that build a
+// membership have to bound themselves by it. Host.StartShard in particular takes
+// the members map straight from the operator into Membership.Addresses and
+// commits it at log index 1, so a caller that exceeds this writes a bootstrap
+// entry no binary can read back.
+const MaxMembershipEntries = 10000
 
 // Entry type constants identify the kind of log entry. The lower 4 bits
 // of Entry.Type hold the entry type; upper bits hold compression flags.

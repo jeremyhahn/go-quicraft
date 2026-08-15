@@ -18,6 +18,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"testing"
 
@@ -414,37 +417,130 @@ func TestValidateFrameHeaderVersionZeroRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L5: Frame version validation rejects version 0
+// L5: Frame version validation is EXACT
 // ---------------------------------------------------------------------------
 
-// TestValidateFrameHeaderVersionRangeTable exercises the full version range
-// to verify that only valid versions (1 through WireVersion) are accepted.
-func TestValidateFrameHeaderVersionRangeTable(t *testing.T) {
-	tests := []struct {
-		name    string
-		version byte
-		wantErr error
-	}{
-		{"version_0_rejected", 0x00, ErrUnsupportedVersion},
-		{"version_1_accepted", 0x01, nil},
-		{"version_above_wire_rejected", WireVersion + 1, ErrUnsupportedVersion},
-		{"version_255_rejected", 0xFF, ErrUnsupportedVersion},
+// TestValidateFrameHeaderVersionIsExact sweeps every one of the 256 values the
+// version byte can hold and asserts that exactly one of them — WireVersion — is
+// accepted.
+//
+// The exhaustive form is the point. The gate used to read
+// `buf[2] < 1 || buf[2] > WireVersion`, which is the same test as equality
+// while WireVersion is 1 and becomes a compatibility WINDOW the moment the
+// constant moves. A table of hand-picked values passes against both shapes; a
+// sweep that asserts a single accepted value cannot.
+func TestValidateFrameHeaderVersionIsExact(t *testing.T) {
+	accepted := 0
+	for v := 0; v < 256; v++ {
+		header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, byte(v), 0x00, 0, 0, 0, 10}
+		err := ValidateFrameHeader(header[:])
+		if byte(v) == WireVersion {
+			if err != nil {
+				t.Fatalf("version 0x%02x is WireVersion and must be accepted, got %v", v, err)
+			}
+			accepted++
+			continue
+		}
+		if !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("version 0x%02x: got %v, want ErrUnsupportedVersion; the gate "+
+				"must be exact equality with WireVersion, not a range that widens "+
+				"the moment the constant moves", v, err)
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("%d version bytes were accepted, want exactly 1 (WireVersion)", accepted)
+	}
+}
+
+// TestValidateFrameHeaderVersionErrorIsUnchanged pins the sentinel the version
+// gate returns, separately from the values it applies to. Tightening the gate
+// must not change what a peer on the wrong dialect sees: connection handling
+// keys off ErrUnsupportedVersion, and swapping it for a generic parse error
+// would turn a named refusal into an opaque one.
+func TestValidateFrameHeaderVersionErrorIsUnchanged(t *testing.T) {
+	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion + 1, 0x00, 0, 0, 0, 10}
+	err := ValidateFrameHeader(header[:])
+	if err != ErrUnsupportedVersion {
+		t.Fatalf("ValidateFrameHeader returned %v (%T), want the ErrUnsupportedVersion "+
+			"sentinel itself", err, err)
+	}
+	// The magic is checked BEFORE the version, so a header that is wrong in
+	// both ways still reports the magic. That ordering is what makes a probe
+	// from an unrelated protocol distinguishable from a version skew.
+	bad := [FrameHeaderSize]byte{0x00, 0x00, WireVersion + 1, 0x00, 0, 0, 0, 10}
+	if err := ValidateFrameHeader(bad[:]); !errors.Is(err, ErrInvalidMagic) {
+		t.Fatalf("ValidateFrameHeader on a bad magic AND a bad version = %v, want ErrInvalidMagic", err)
+	}
+}
+
+// TestValidateFrameHeaderVersionGateIsNotARange reads the gate's SOURCE and
+// fails if the version byte is compared with a relational operator.
+//
+// A behavioural test cannot separate the two shapes while WireVersion is 1:
+// `buf[2] < 1 || buf[2] > WireVersion` and `buf[2] != WireVersion` accept
+// exactly the same single value today, so every input-driven assertion passes
+// against both. The difference is entirely in what happens at the FIRST bump —
+// the range form silently becomes a compatibility window admitting every
+// version below the new one, which is the drift the pinning policy exists to
+// prevent, and it does so with no test failing to announce it.
+//
+// So the invariant is pinned where it actually lives, in the form of the
+// expression. This mirrors TestMembershipVersionNotDerivedFromWireVersion in
+// pkg/proto, which guards a rule with the same shape for the same reason.
+func TestValidateFrameHeaderVersionGateIsNotARange(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "frame.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse frame.go: %v", err)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, tc.version, 0x00, 0, 0, 0, 10}
-			err := ValidateFrameHeader(header[:])
-			if tc.wantErr == nil {
-				if err != nil {
-					t.Fatalf("version 0x%02x: expected no error, got %v", tc.version, err)
-				}
-			} else {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("version 0x%02x: expected %v, got %v", tc.version, tc.wantErr, err)
-				}
+	var gate *ast.FuncDecl
+	for _, decl := range f.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "ValidateFrameHeader" && fn.Recv == nil {
+			gate = fn
+			break
+		}
+	}
+	if gate == nil {
+		t.Fatal("ValidateFrameHeader not found in frame.go; update this guard")
+	}
+
+	mentionsWireVersion := func(n ast.Node) bool {
+		found := false
+		ast.Inspect(n, func(v ast.Node) bool {
+			if id, ok := v.(*ast.Ident); ok && id.Name == "WireVersion" {
+				found = true
 			}
+			return true
 		})
+		return found
+	}
+
+	exact := 0
+	ast.Inspect(gate.Body, func(n ast.Node) bool {
+		bin, ok := n.(*ast.BinaryExpr)
+		if !ok {
+			return true
+		}
+		if !mentionsWireVersion(bin.X) && !mentionsWireVersion(bin.Y) {
+			return true
+		}
+		switch bin.Op {
+		case token.NEQ:
+			exact++
+		case token.EQL:
+			exact++
+		case token.LSS, token.LEQ, token.GTR, token.GEQ:
+			t.Errorf("ValidateFrameHeader compares the frame version to WireVersion "+
+				"with %q at %s; the gate must be exact equality, because a relational "+
+				"form widens into a compatibility window the moment WireVersion moves",
+				bin.Op, fset.Position(bin.Pos()))
+		}
+		return true
+	})
+	if exact != 1 {
+		t.Fatalf("ValidateFrameHeader makes %d exact comparison(s) against WireVersion, "+
+			"want exactly 1; the version byte must be gated, and gated once", exact)
 	}
 }
 

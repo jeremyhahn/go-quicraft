@@ -17,8 +17,6 @@
 package e2e_test
 
 import (
-	"context"
-	"fmt"
 	"testing"
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
@@ -57,14 +55,8 @@ func TestE2E_Barrier_ReplaceNode(t *testing.T) {
 	cluster.stopNode(followerIdx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster.testCluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replica %d from membership", removedReplicaID)
 
 	// Create a replacement node with an independent barrier.
@@ -117,8 +109,11 @@ func TestE2E_Barrier_SnapshotCatchUp(t *testing.T) {
 	result := addNodeToCluster(t, cluster.testCluster, shardID, 4, snapshotCfg, quicraft.WithBarrier(b))
 	t.Logf("new node[%d] added at %s as replicaID=4 (snapshot catch-up)", result.idx, result.addr)
 
-	// Wait for the new node to receive all 50 entries via snapshot.
+	// Wait for the new node to receive all 50 entries via snapshot, and prove
+	// it was a snapshot: the key set alone is equally consistent with log
+	// replay, which would not exercise the encrypted transfer path at all.
 	waitForNodeData(t, result.tracker, shardID, 4, expected, membershipTimeout)
+	assertCaughtUpViaSnapshot(t, result.tracker, shardID, 4, membershipTimeout)
 	t.Logf("new node caught up on all 50 entries via encrypted snapshot transfer")
 
 	// Propose 10 more entries and verify all 60 on all 4 nodes.
@@ -200,14 +195,8 @@ func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 	cluster.stopNode(followerIdx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, removedReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", removedReplicaID, err)
-	}
+	syncDeleteNode(t, cluster.testCluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replica %d from membership", removedReplicaID)
 
 	// Add replacement node with a fresh, independently initialized barrier.
@@ -229,34 +218,11 @@ func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 		finalExpected[k] = v
 	}
 
-	// Verify all 40 entries across 3 live barrier nodes.
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		var tracker *smTracker
-		if i < len(trackers) {
-			tracker = trackers[i]
-		}
-		if tracker == nil {
-			// Use the replacement tracker for the dynamically added node.
-			if i == result.idx {
-				tracker = result.tracker
-				replicaID = 4
-			} else {
-				continue
-			}
-		}
-		for key, val := range finalExpected {
-			waitForCondition(t, membershipTimeout,
-				fmt.Sprintf("node[%d] has key=%q after key rotation replacement", i, key),
-				func() bool {
-					got, ok := tracker.Get(shardID, replicaID).Get(key)
-					return ok && got == val
-				},
-			)
-		}
-	}
+	// Verify all 40 entries across every live barrier node, including the
+	// replacement. verifyAllData counts the nodes it checked and fails on a
+	// shortfall; the hand-rolled loop this replaces skipped any node whose
+	// tracker index was past the end of the captured slice, which is precisely
+	// the replacement node the test exists to verify.
+	verifyAllData(t, cluster.testCluster, trackers, shardID, finalExpected)
 	t.Logf("all 40 entries verified on 3 live nodes (cross-epoch data intact, replacement fully caught up)")
 }

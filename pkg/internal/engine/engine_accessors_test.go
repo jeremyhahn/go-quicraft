@@ -194,12 +194,20 @@ func grepTreeForBytes(t *testing.T, root string, want []byte) string {
 	t.Helper()
 	var hit string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || hit != "" {
-			return nil //nolint:nilerr // an unreadable entry cannot hold the secret in readable form
+		// Every error here is fatal to the assertion, never a reason to move
+		// on: this helper backs a claim that a secret is NOWHERE under root,
+		// and a file the test could not read is a file it could not clear.
+		// Swallowing the error would turn an I/O or permissions problem into a
+		// silent pass of an at-rest-secrecy test.
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || hit != "" {
+			return nil
 		}
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return nil
+			return readErr
 		}
 		if bytes.Contains(data, want) {
 			hit = path

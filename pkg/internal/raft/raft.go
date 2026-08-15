@@ -412,6 +412,29 @@ type raft struct {
 	// stale" — assuming stale is the shape that suppresses elections outright.
 	resolveStaleConfig func() bool
 
+	// validateConfigChange is the shard's FULL committed-membership validator
+	// (membership.validate), installed by NewPeer. It is the propose-time gate
+	// for a config change that arrives as a wire-forwarded Propose, which
+	// bypasses the Host API's ValidateConfigChange and Peer.ProposeConfigChange
+	// entirely — the two places the identical rules already ran.
+	//
+	// It must run HERE, at the leader's last gate before the entry enters the
+	// log, and nowhere later: the apply path deliberately never re-validates
+	// (membership.apply CONVERGES so a committed change replays identically on
+	// every replica), so an entry that gets past this point is applied by the
+	// whole shard whatever it says. A duplicate identity is the sharpest case —
+	// two replica IDs bound to one keypair are both satisfiable by one physical
+	// node, so it holds two votes and two match indices in a quorum that
+	// believes they are independent, and quorum intersection is gone.
+	//
+	// Nil on a bare raft (the state-machine unit tests, the adversarial
+	// harness), which has no membership at all; validateConfigChangePolicy is
+	// the fallback there and enforces the subset of rules raft can answer from
+	// its own remote/witness tracking. It is deliberately NOT run alongside the
+	// full validator: membership.validate is a strict superset of it, and
+	// running both would be the same rule stated in two places, free to drift.
+	validateConfigChange func(cc proto.ConfigChange) error
+
 	// Function pointers set on role transition for zero-branch dispatch.
 	stepFunc func(r *raft, msg proto.Message) error
 	tickFunc func(r *raft)
@@ -1737,11 +1760,24 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 	// Check if we can grant the vote.
 	var canVote bool
 	if isPreVote {
-		// For PreVote: grant if the candidate's log is up-to-date and
-		// we haven't received a heartbeat from a valid leader recently.
-		// The "leader lease" check uses ticks, not wall-clock time.
+		// For PreVote: grant if the candidate is prospecting for a term
+		// STRICTLY ABOVE ours, its log is up-to-date, and we have not heard
+		// from a valid leader recently. The "leader lease" check uses ticks,
+		// not wall-clock time.
+		//
+		// The msg.Term > r.term test is not optional (etcd/raft folds the same
+		// clause into canVote; dragonboat's handleNodeRequestPreVote grants
+		// only on m.Term > r.term). step() already drops msg.Term < r.term, so
+		// without it the hole is exactly msg.Term == r.term: a replica at term
+		// T that has ALREADY voted in T would still grant a pre-vote to a
+		// different candidate prospecting for that same, already-decided term.
+		// The real-vote path would then deny every one of those grants, so the
+		// pre-candidate burns a term increment and a broadcast on every voter
+		// for a round that cannot succeed — precisely the disruption PreVote
+		// exists to prevent. Safety is not at stake (one vote per term is
+		// enforced on the real-vote path); wasted elections are.
 		leaderActive := r.leaderID != noLeader && r.electionTick < r.electionTimeout
-		canVote = logOK && !leaderActive
+		canVote = logOK && !leaderActive && msg.Term > r.term
 	} else {
 		// For a real vote: grant if the log is up-to-date AND either this
 		// is a repeat of the vote already cast this term, or no vote has
@@ -2040,14 +2076,14 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 			if r.pendingConfigChange || foundCC {
 				return ErrPendingConfigChange
 			}
-			// Leader-side witness-policy check before append. The Host
-			// API pre-validates on the node the client contacted, but a
-			// follower-forwarded Propose reaches this leader with no
-			// validation at all, and a differently-configured contact
-			// node may have validated against a laxer policy. This is
-			// the last gate before the change enters the log; the
-			// committed-replay path never re-checks (determinism).
-			if err := r.validateConfigChangePolicy(msg.Entries[i].Cmd); err != nil {
+			// Leader-side membership validation before append. The Host API
+			// pre-validates on the node the client contacted, but a
+			// follower-forwarded Propose reaches this leader with no validation
+			// at all, and a differently-configured contact node may have
+			// validated against a laxer policy. This is the last gate before the
+			// change enters the log; the committed-replay path never re-checks
+			// (determinism), so anything admitted here is applied shard-wide.
+			if err := r.validateProposedConfigChange(msg.Entries[i].Cmd); err != nil {
 				return err
 			}
 			foundCC = true
@@ -2091,28 +2127,48 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 	return nil
 }
 
-// validateConfigChangePolicy enforces this node's WitnessConfig policy
-// against a proposed config change using the leader's live peer tracking
-// (remotes/witnesses; the leader itself is always a full voting replica).
-// It mirrors the membership-level validateAddWitness/validateRemoveNode
-// policy checks but runs at the raft layer, where forwarded proposals
-// arrive without any prior validation. Only the policy rules are checked
-// here — structural rules (duplicates, unknown members, last-voter) stay
-// with the Host-side validation and the tolerant apply path. An
-// unmarshalable payload passes through with a warning, matching the
-// apply path's tolerance (processConfigChanges warns and skips it), so
-// the propose and apply layers never disagree about which entries are
-// acceptable.
-func (r *raft) validateConfigChangePolicy(cmd []byte) error {
+// validateProposedConfigChange is the leader's propose-time gate for one
+// EntryConfigChange payload. It decodes the payload and hands it to the full
+// committed-membership validator when a Peer installed one, falling back to the
+// raft-local policy subset on a bare raft.
+//
+// An undecodable payload is REJECTED, not warned past. It used to fall through
+// with `return nil` on the reasoning that the apply path is equally tolerant, so
+// propose and apply would never disagree about which entries are acceptable.
+// That symmetry was the bug: the apply path's tolerance exists because a
+// COMMITTED entry must produce the same outcome on every replica, which says
+// nothing about whether an entry should be allowed to commit in the first place.
+// A payload nothing can decode is a payload no gate has judged — the cap, the
+// witness policy, the duplicate-identity and duplicate-address rules all read
+// fields that failed to parse — so admitting it put an unvalidated membership
+// change into the durable log of every replica. Rejecting costs a legitimate
+// client nothing: it never produces bytes that do not decode.
+func (r *raft) validateProposedConfigChange(cmd []byte) error {
 	var cc proto.ConfigChange
 	if _, err := cc.UnmarshalFrom(cmd); err != nil {
-		slog.Warn("config change payload unmarshal failed at propose time",
+		slog.Warn("rejected config change with an undecodable payload at propose time",
 			"shard", r.shardID,
 			"replica", r.replicaID,
 			"error", err,
 		)
-		return nil
+		return ErrConfigChangeUnmarshal
 	}
+	if r.validateConfigChange != nil {
+		return r.validateConfigChange(cc)
+	}
+	return r.validateConfigChangePolicy(cc)
+}
+
+// validateConfigChangePolicy enforces this node's WitnessConfig policy
+// against a proposed config change using the leader's live peer tracking
+// (remotes/witnesses; the leader itself is always a full voting replica).
+// It mirrors the membership-level validateAddWitness/validateRemoveNode
+// policy checks but runs at the raft layer, for a bare raft that has no
+// membership to consult. Only the policy rules are checked here — the
+// structural rules (duplicate identity, duplicate address, removed-node
+// tombstones, empty address, last-voter) live in membership.validate, which
+// validateProposedConfigChange prefers whenever a Peer installed it.
+func (r *raft) validateConfigChangePolicy(cc proto.ConfigChange) error {
 	// The voting-member cap must be enforced HERE for every net-new voting
 	// member. This is the last gate before the entry enters the log on a
 	// follower-forwarded Propose, which bypasses the Host API's
@@ -2795,14 +2851,71 @@ func (r *raft) sendHeartbeatTo(to uint64, ctx uint64) {
 }
 
 // handleHeartbeat processes a heartbeat message on a follower.
+//
+// A Heartbeat is the ONLY leader-to-follower push that carries no log-matching
+// proof — no prevLogIndex, no prevLogTerm, no entries — yet it installs a leader
+// and advances the commit index. handleAppend earns those rights by proving its
+// sender holds a log that matches this replica's; a Heartbeat can prove nothing,
+// so both rights are gated here instead.
+//
+//  1. SENDER. A replica that already recognises a leader for this term refuses a
+//     Heartbeat from anyone else. Election Safety guarantees one leader per term,
+//     so a second claimant at the same term is a stale duplicate or a forgery. A
+//     replica with no leader yet (r.leaderID == noLeader) accepts, which is what
+//     keeps first contact after an election working; step() has already installed
+//     msg.From as leader for a HIGHER term before reaching here, so this gate is
+//     about the current term only.
+//
+//  2. COMMIT. The advance goes through raftLog.tryCommit with the CURRENT TERM,
+//     the same rule the leader applies to its own match-index quorum (Raft
+//     §5.4.2), rather than through a bare commitTo clamped to lastIndex. The
+//     difference is what a follower can PROVE locally: an entry at r.term was
+//     appended by this term's leader through handleAppend, which log-matched the
+//     whole prefix beneath it, so committing to it is sound. An entry from an
+//     OLDER term is exactly the tail a new leader may still truncate, and the
+//     bare clamp committed it on nothing but the sender's say-so.
+//
+// The two together close the forged-commit escalation: a Heartbeat naming a
+// higher term is stepped down to by step(), but its commit claim then meets a
+// log whose tail is at the OLD term and advances nothing; a Heartbeat at the
+// CURRENT term never gets that far because the sender gate refuses it. The
+// transport-layer leader-originated binding (see the message handler's
+// leaderOriginatedMessages) is the third leg: it stops an arbitrary certificate
+// holder from naming an established member's replica ID in the first place.
+//
+// LIVENESS: refusing the advance costs one heartbeat interval at most. A
+// follower whose tail is behind the current term is by definition one the leader
+// is still replicating to, and handleAppend advances its commit index as the
+// entries land. A caught-up follower holds this term's entries (becomeLeader
+// appends a no-op at r.term on every election), so the ordinary steady-state
+// heartbeat advance is unaffected.
 func (r *raft) handleHeartbeat(msg proto.Message) error {
+	if r.leaderID != noLeader && msg.From != r.leaderID {
+		slog.Warn("dropped heartbeat from a replica that is not this shard's leader",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"leader", r.leaderID,
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrHeartbeatNotFromLeader
+	}
+
 	r.electionTick = 0
 	r.leaderID = msg.From
 
 	if msg.Commit > r.log.committed {
 		commitTo := min(msg.Commit, r.log.lastIndex())
-		if commitTo > r.log.committed {
-			r.log.commitTo(commitTo)
+		if !r.log.tryCommit(commitTo, r.term) && commitTo > r.log.committed {
+			slog.Debug("heartbeat commit advance refused: log tail is not from the current term",
+				"shard", r.shardID,
+				"replica", r.replicaID,
+				"from", msg.From,
+				"msg_commit", msg.Commit,
+				"commit_to", commitTo,
+				"committed", r.log.committed,
+				"last_index", r.log.lastIndex(),
+				"term", r.term)
 		}
 	}
 
@@ -3721,6 +3834,55 @@ func (r *raft) drainMessages() []proto.Message {
 	r.msgs = r.msgsBuf[:0]
 	r.msgsBuf = msgs[:0]
 	return msgs
+}
+
+// withholdOrderedMessages partitions an ALREADY-DRAINED batch: it compacts the
+// free-order messages to the front of msgs (returning that prefix) and pushes
+// the ordered ones back into r.msgs so a later, durability-bearing cycle emits
+// them.
+//
+// It is the drain-first counterpart of drainFreeOrderMessages and exists
+// because the two run on different goroutines. drainFreeOrderMessages returns
+// r.freeMsgBuf, a single buffer owned by the step worker; the commit worker
+// calls this one on the piggyback path while the step worker is concurrently
+// inside processCommitPendingInbox, so reusing freeMsgBuf there would let one
+// worker overwrite the batch the other is still sending. Operating on the
+// caller's already-swapped drainMessages() slice keeps each worker on its own
+// storage while applying the identical proto.IsFreeOrderMessage rule.
+//
+// The in-place compaction is safe because the write index never runs ahead of
+// the read index, and r.msgs is the OTHER half of the drainMessages double
+// buffer, so appending to it cannot alias msgs.
+func (r *raft) withholdOrderedMessages(msgs []proto.Message) []proto.Message {
+	n := 0
+	for i := range msgs {
+		if proto.IsFreeOrderMessage(msgs[i].Type) {
+			msgs[n] = msgs[i]
+			n++
+		} else {
+			r.msgs = append(r.msgs, msgs[i])
+		}
+	}
+	return msgs[:n]
+}
+
+// requeueMessages puts previously drained messages back at the FRONT of the
+// outbound buffer. Used when the engine drained messages, failed to persist
+// the state they were waiting on, and must hand them back rather than drop
+// them. Front placement preserves emission order: everything currently in
+// r.msgs was produced after these were drained.
+func (r *raft) requeueMessages(msgs []proto.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	if len(r.msgs) == 0 {
+		r.msgs = append(r.msgs, msgs...)
+		return
+	}
+	combined := make([]proto.Message, 0, len(msgs)+len(r.msgs))
+	combined = append(combined, msgs...)
+	combined = append(combined, r.msgs...)
+	r.msgs = combined
 }
 
 // drainFreeOrderMessages extracts only free-order messages (Replicate,

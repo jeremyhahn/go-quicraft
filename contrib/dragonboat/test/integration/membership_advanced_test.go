@@ -18,9 +18,14 @@ package integration_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
+	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 	dbConfig "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/config"
 )
 
@@ -262,14 +267,41 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	t.Logf("SyncRequestAddNonVoting succeeded: NonVotings=%d", len(updated.NonVotings))
 }
 
-// TestIntegration_DB_ConcurrentConfigChangeRejected verifies that only one
-// config change can be in flight at a time. A second config change submitted
-// before the first commits is rejected (ErrRejected or a similar error
-// indicating a pending config change). The first config change should
-// eventually succeed.
+// TestIntegration_DB_ConcurrentConfigChangeRejected verifies that only ONE
+// config change may be in flight at a time (PhD thesis 4.1): a second config
+// change submitted while the first is still unapplied is REJECTED, the first
+// still completes, and a config change issued sequentially afterwards
+// succeeds.
+//
+// The overlap is made deterministic rather than raced for. The Raft layer's
+// latch is `log.confChangeIndex > log.processed`, and processed only advances
+// as the state machine drains committed entries, so the window normally lasts
+// the couple of milliseconds a config change takes to commit and apply. The
+// shard therefore runs gated state machines: a proposal whose key carries
+// gateKeyPrefix parks every replica's apply loop until the test releases it,
+// which pins processed below the config-change entry for as long as the test
+// needs.
+//
+// Three assertions, none of which can be satisfied by everything failing:
+//
+//	NEGATIVE  the overlapping second change must come back Rejected.
+//	FIRST     the first change must Complete once the gate opens, and
+//	          replica 10 must be in the membership while replica 11 is not.
+//	POSITIVE  a control config change issued AFTER the first one applied must
+//	          succeed and must land replica 11 in the membership. Without it a
+//	          shard that rejected every config change would pass.
 func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
+
+	// release opens the apply gate. It is closed exactly once, either by the
+	// test body at the point the overlap is no longer needed or by the defer
+	// on any earlier failure — a parked apply loop would otherwise wedge
+	// cluster.close().
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	openGate := func() { releaseOnce.Do(func() { close(release) }) }
+	defer openGate()
 
 	// OrderedConfigChange must be true so the Raft layer enforces
 	// one-at-a-time config changes.
@@ -283,17 +315,24 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 			OrderedConfigChange: true,
 		}
 	}
-	trackers := cluster.startShardWithConfig(1, orderedCfg)
+	trackers, gated := cluster.startGatedShard(1, release, orderedCfg)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("leader elected at node[%d]", leaderIdx)
 
-	// Warmup entry required after election (PhD 6.4).
+	// Warmup entry required after election (PhD 6.4). "warmup" carries no gate
+	// prefix, so it applies normally.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
 	leaderHost := cluster.hosts[leaderIdx]
+	leaderReplicaID := uint64(leaderIdx + 1)
 
-	// Get the current ConfigChangeID.
+	// Get the current ConfigChangeID. Both overlapping changes use it: apply
+	// is about to be parked, so the shard's configChangeIndex cannot advance
+	// and the Host-level staleness check passes for both. That is deliberate —
+	// it forces the rejection to come from the pending-config-change rule and
+	// not from staleness, which TestIntegration_DB_OrderedMembershipChange
+	// already covers.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
@@ -302,7 +341,34 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	}
 	configChangeID := membership.ConfigChangeID
 
-	// Submit the first config change asynchronously via RequestAddReplica.
+	// Park the leader's apply loop on a gate entry. Propose is asynchronous;
+	// the entry commits and then blocks inside the state machine's Update.
+	gateSession := dbClient.NewNoOPSession(1, nil)
+	gateRS, gateErr := leaderHost.Propose(gateSession, encodeKVPut("gate-hold", "1"), defaultTimeout)
+	if gateErr != nil {
+		t.Fatalf("Propose(gate entry) failed: %v", gateErr)
+	}
+	defer gateRS.Release()
+
+	var leaderGate *dbGatedKVStateMachine
+	waitForCondition(t, defaultTimeout,
+		fmt.Sprintf("leader node[%d] registers a gated state machine", leaderIdx),
+		func() bool {
+			leaderGate = gated[leaderIdx].Get(1, leaderReplicaID)
+			return leaderGate != nil
+		},
+	)
+	select {
+	case <-leaderGate.entered:
+		t.Logf("leader node[%d] apply loop parked on the gate entry", leaderIdx)
+	case <-time.After(defaultTimeout):
+		t.Fatalf("leader node[%d] apply loop never reached the gate entry within %v",
+			leaderIdx, defaultTimeout)
+	}
+
+	// FIRST config change. It appends to the leader's log immediately, which
+	// raises log.confChangeIndex; because processed is pinned below it by the
+	// gate, the pending-config-change latch now stays armed indefinitely.
 	rs1, err := leaderHost.RequestAddReplica(1, 10, "127.0.0.1:59990", configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("first RequestAddReplica failed: %v", err)
@@ -310,63 +376,62 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	defer rs1.Release()
 	t.Logf("first config change submitted (add replica 10) with ConfigChangeID=%d", configChangeID)
 
-	// Immediately submit a second config change with the SAME ConfigChangeID.
-	// Since the first has not committed yet, this should be rejected.
-	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.0.0.1:59991", configChangeID, defaultTimeout)
+	// Let the step worker drain the first change in its own Propose batch.
+	// Two config changes coalesced into ONE batch are both rejected (the
+	// foundCC pass in handleLeaderPropose), which is a different code path
+	// from the one under test. The step worker turns a batch around in well
+	// under a millisecond; this window is three orders of magnitude of
+	// margin, and the gate means there is no opposing race to lose — the
+	// latch cannot clear while apply is parked, however long the wait.
+	settle := time.NewTimer(500 * time.Millisecond)
+	<-settle.C
+	settle.Stop()
 
+	// SECOND config change, overlapping the first. This must be rejected.
+	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.0.0.1:59991", configChangeID, defaultTimeout)
 	if secondErr != nil {
-		// The synchronous path rejected the second request outright.
-		t.Logf("second config change correctly rejected at submission: %v", secondErr)
+		// The submission path may reject synchronously; it must still be a
+		// rejection and not some unrelated failure.
+		if !errors.Is(secondErr, dragonboat.ErrRejected) {
+			t.Fatalf("overlapping second config change failed at submission with %v, want ErrRejected", secondErr)
+		}
+		t.Logf("second config change rejected at submission: %v", secondErr)
 	} else {
 		defer rs2.Release()
-		// The second request was accepted into the pipeline; wait for its
-		// result -- it should fail (rejected/timeout).
 		select {
 		case result := <-rs2.ResultC():
-			if result.Completed() {
-				// If ConfigChangeID was 0 (initial bootstrap), both may succeed
-				// because 0 means "don't check". This is acceptable behavior.
-				if configChangeID == 0 {
-					t.Logf("both config changes accepted (ConfigChangeID=0 skips staleness check)")
-				} else {
-					t.Fatal("second config change should not complete with a non-zero stale ConfigChangeID")
-				}
-			} else {
-				t.Logf("second config change correctly rejected via ResultC: timeout=%v rejected=%v",
-					result.Timeout(), result.Rejected())
+			if !result.Rejected() {
+				t.Fatalf("overlapping second config change was not rejected: "+
+					"completed=%v timeout=%v rejected=%v dropped=%v aborted=%v terminated=%v",
+					result.Completed(), result.Timeout(), result.Rejected(),
+					result.Dropped(), result.Aborted(), result.Terminated())
 			}
+			t.Logf("second config change correctly Rejected while the first was still unapplied")
 		case <-time.After(defaultTimeout):
-			t.Logf("second config change timed out (expected: pending config blocks it)")
+			t.Fatalf("overlapping second config change produced no result within %v; "+
+				"a pending config change must be rejected promptly, not left to time out",
+				defaultTimeout)
 		}
 	}
 
-	// Wait for the first config change to resolve.
-	//
-	// Completing is the common outcome, but it is NOT guaranteed. The step
-	// worker batches proposals, so when both requests land in a single
-	// Propose the leader rejects the WHOLE batch — PhD 4.1 permits only one
-	// config change in flight, and rejecting the batch rather than the
-	// second entry alone is what keeps pendingConfigChange from sticking
-	// true forever. Both callers then get a retryable rejection and nothing
-	// enters the log, which is the safe outcome; demanding that the first
-	// always wins asserts a scheduling race.
+	// Open the gate so the parked entry — and behind it the first config
+	// change — can apply.
+	openGate()
+
 	select {
 	case result := <-rs1.ResultC():
-		if !result.Completed() && !result.Rejected() {
-			t.Fatalf("first config change neither completed nor was rejected: "+
+		if !result.Completed() {
+			t.Fatalf("first config change did not complete: "+
 				"timeout=%v rejected=%v dropped=%v aborted=%v terminated=%v",
-				result.Timeout(), result.Rejected(), result.Dropped(), result.Aborted(), result.Terminated())
+				result.Timeout(), result.Rejected(), result.Dropped(),
+				result.Aborted(), result.Terminated())
 		}
-		if result.Rejected() {
-			t.Logf("first config change rejected: both changes batched into one Propose")
-			return
-		}
-		t.Logf("first config change completed successfully")
+		t.Logf("first config change completed")
 	case <-time.After(defaultTimeout):
-		t.Fatal("first config change timed out waiting for ResultC")
+		t.Fatalf("first config change produced no result within %v after the gate opened", defaultTimeout)
 	}
 
-	// Verify the membership includes replica 10 from the first change.
+	// The first change landed and the rejected one did not.
 	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer verifyCancel()
 	updatedMembership, mErr := leaderHost.SyncGetShardMembership(verifyCtx, 1)
@@ -374,7 +439,35 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 		t.Fatalf("SyncGetShardMembership after config changes failed: %v", mErr)
 	}
 	if _, exists := updatedMembership.Nodes[10]; !exists {
-		t.Fatalf("replica 10 not found in membership after first config change")
+		t.Fatalf("replica 10 not found in membership after the first config change: %v",
+			updatedMembership.Nodes)
 	}
-	t.Logf("concurrent config change rejection verified: first succeeded, second was rejected")
+	if _, exists := updatedMembership.Nodes[11]; exists {
+		t.Fatalf("replica 11 IS in the membership; the rejected config change must not have "+
+			"entered the log: %v", updatedMembership.Nodes)
+	}
+
+	// POSITIVE CONTROL. The very change that was rejected while overlapping
+	// must now succeed when issued sequentially. A shard that rejects every
+	// config change, or one whose latch stuck armed after the rejection,
+	// fails here.
+	seqCtx, seqCancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer seqCancel()
+	if addErr := leaderHost.SyncRequestAddReplica(seqCtx, 1, 11, "127.0.0.1:59991",
+		updatedMembership.ConfigChangeID); addErr != nil {
+		t.Fatalf("sequential config change after the first applied must succeed, got: %v", addErr)
+	}
+
+	finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer finalCancel()
+	finalMembership, fErr := leaderHost.SyncGetShardMembership(finalCtx, 1)
+	if fErr != nil {
+		t.Fatalf("SyncGetShardMembership after the sequential config change failed: %v", fErr)
+	}
+	if _, exists := finalMembership.Nodes[11]; !exists {
+		t.Fatalf("replica 11 not found in membership after the sequential config change: %v",
+			finalMembership.Nodes)
+	}
+	t.Logf("concurrent config change rejection verified: overlapping change rejected, "+
+		"first completed, sequential control succeeded (%d voters)", len(finalMembership.Nodes))
 }

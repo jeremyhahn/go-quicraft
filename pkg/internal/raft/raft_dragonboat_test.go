@@ -623,7 +623,7 @@ func TestDragonboat_RecoverPendingConfigChange(t *testing.T) {
 	// New config change should be rejected.
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: []byte("cc2")}},
+		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(12)}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
 		t.Fatalf("expected ErrPendingConfigChange, got %v", err)
@@ -666,7 +666,7 @@ func TestDragonboat_RecoverDoublePendingConfigChange(t *testing.T) {
 	// The scan only looks at entries above committed.
 	err := r.step(proto.Message{
 		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: []byte("cc3")}},
+		Entries: []proto.Entry{{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(13)}},
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
 		t.Fatalf("expected ErrPendingConfigChange for second uncommitted CC, got %v", err)

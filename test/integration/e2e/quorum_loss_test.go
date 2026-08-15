@@ -25,11 +25,60 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestE2E_QuorumLoss_RejectsWrites verifies that a 5-node cluster
-// rejects proposals when quorum is lost. In a 5-node cluster, quorum
-// requires 3 nodes. Stopping 3 nodes leaves only 2 alive, which is
-// insufficient for consensus. Proposals must fail with a timeout or
-// error rather than blocking indefinitely.
+// assertKeyAbsentEverywhere fails if key is present on the state machine of any
+// live node, after a settling window long enough for a commit to have
+// propagated had one occurred.
+//
+// This is the assertion that actually says "the write did not happen". An error
+// from Propose says only that the CALLER gave up waiting; an entry can still be
+// in the leader's log, and if it were ever committed and applied without a
+// majority that is the safety violation, whatever the caller was told.
+func assertKeyAbsentEverywhere(
+	t *testing.T,
+	cluster *testCluster,
+	trackers []*smTracker,
+	shardID uint64,
+	key string,
+	settle time.Duration,
+) {
+	t.Helper()
+
+	settleTimer := time.NewTimer(settle)
+	<-settleTimer.C
+	settleTimer.Stop()
+
+	checked := 0
+	for i := range cluster.hosts {
+		if cluster.stopped[i].Load() {
+			continue
+		}
+		nodeSM := resolveStateMachine(cluster, trackers, shardID, i)
+		if nodeSM == nil {
+			t.Fatalf("node[%d] is live but has no state machine; the absence of %q there proves nothing", i, key)
+		}
+		if got, ok := nodeSM.Get(key); ok {
+			t.Fatalf("node[%d] applied %q=%q without a majority: the write was committed while quorum was lost",
+				i, key, got)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("assertKeyAbsentEverywhere(%q) checked no nodes", key)
+	}
+	t.Logf("%q is absent from all %d live state machines", key, checked)
+}
+
+// TestE2E_QuorumLoss_RejectsWrites verifies that a 5-node cluster cannot commit
+// a proposal once quorum is lost. In a 5-node cluster quorum requires 3 nodes;
+// three followers are stopped, leaving the LEADER plus one follower.
+//
+// The leader is deliberately left RUNNING. The previous version stopped the
+// leader before proposing anything, so every remaining node answered Propose
+// with ErrNotLeader — an outcome produced by the absence of a leader, not by
+// the quorum rule. That test passed identically on a build with no quorum
+// requirement at all. Keeping the old leader up puts the quorum rule itself on
+// the only path to a commit, and the decisive assertion is that the value never
+// reaches ANY state machine rather than that the caller received an error.
 func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -41,36 +90,67 @@ func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Write data before quorum loss for later recovery verification.
+	// Positive control: the SAME leader commits without difficulty while it
+	// still has a majority. Without this, a build that cannot commit anything
+	// would pass the quorum-loss assertion for the wrong reason.
 	proposeAndWait(t, cluster, trackers, 1, "pre-quorum-loss", "intact")
 	waitForReplication(t, cluster, trackers, 1, "pre-quorum-loss", "intact", defaultTimeout)
 
 	t.Logf("initial leader: node[%d], pre-quorum-loss data replicated", leaderIdx)
 
-	// Stop 3 nodes to lose quorum (need 3 of 5 for quorum, leaving only 2).
-	// Always stop the leader last to maximize the chance that followers
-	// detect the stop quickly.
+	// Stop 3 followers, leaving the leader and one follower: 2 of 5, a
+	// minority. The leader stays up so it is the quorum rule, not the absence
+	// of a leader, that has to stop the write.
 	stoppedCount := 0
 	for i := range cluster.hosts {
-		if i == leaderIdx {
+		if i == leaderIdx || stoppedCount >= 3 {
 			continue
 		}
-		if stoppedCount < 2 {
-			t.Logf("stopping follower node[%d]", i)
-			cluster.stopNode(i)
-			stoppedCount++
-		}
+		t.Logf("stopping follower node[%d]", i)
+		cluster.stopNode(i)
+		stoppedCount++
 	}
-	// Stop the leader to ensure quorum is fully lost.
-	t.Logf("stopping leader node[%d]", leaderIdx)
-	cluster.stopNode(leaderIdx)
-
+	if stoppedCount != 3 {
+		t.Fatalf("expected to stop 3 followers, stopped %d", stoppedCount)
+	}
 	if cluster.liveNodes() != 2 {
 		t.Fatalf("expected 2 live nodes after quorum loss, got %d", cluster.liveNodes())
 	}
+	if cluster.stopped[leaderIdx].Load() {
+		t.Fatalf("node[%d] was the leader and must still be running for this test", leaderIdx)
+	}
 
-	// Verify no leader can be elected in the 2-node remainder.
-	// Wait several election cycles to confirm.
+	// Propose through the still-running old leader. It may accept the proposal
+	// into its log — that is legal — but it must never report a commit.
+	const lostKey = "should-fail"
+	const lostVal = "never-committed"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, encodeKVPut(lostKey, lostVal))
+	if err == nil {
+		_, resErr := rs.Result()
+		rs.Release()
+		if resErr == nil {
+			cancel()
+			t.Fatalf("node[%d] reported %q as committed with only %d of 5 nodes alive: "+
+				"a majority was not required", leaderIdx, lostKey, cluster.liveNodes())
+		}
+		t.Logf("node[%d]: proposal accepted but never committed: %v", leaderIdx, resErr)
+	} else {
+		t.Logf("node[%d]: Propose rejected outright: %v", leaderIdx, err)
+	}
+	cancel()
+
+	// The decisive assertion.
+	assertKeyAbsentEverywhere(t, cluster, trackers, 1, lostKey, 2*time.Second)
+
+	// The leader must also step down once CheckQuorum notices the lost peers,
+	// and no leader may be elected from the 2-node remainder thereafter.
+	waitForCondition(t, failoverTimeout,
+		"leader steps down after losing quorum",
+		func() bool { return cluster.findLeader(1) < 0 },
+	)
+	t.Logf("old leader node[%d] stepped down after losing quorum", leaderIdx)
+
 	noLeaderDuration := 3 * time.Second
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -92,8 +172,7 @@ noLeaderLoop:
 
 	t.Logf("confirmed: no leader elected with only %d nodes alive", cluster.liveNodes())
 
-	// Attempt proposals on the surviving nodes. Each should fail because
-	// there is no leader and quorum cannot be achieved.
+	// With no leader, every surviving node must also refuse a fresh proposal.
 	for i := range cluster.hosts {
 		if cluster.stopped[i].Load() {
 			continue
@@ -102,18 +181,19 @@ noLeaderLoop:
 		// Use a short timeout so we don't block the test for long.
 		// The proposal should fail quickly with ErrTimeout, ErrClosed,
 		// or context.DeadlineExceeded.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		cmd := encodeKVPut("should-fail", "never-committed")
-		_, err := cluster.hosts[i].Propose(ctx, 1, cmd)
-		cancel()
+		propCtx, propCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cmd := encodeKVPut("should-fail-leaderless", "never-committed")
+		_, propErr := cluster.hosts[i].Propose(propCtx, 1, cmd)
+		propCancel()
 
-		if err == nil {
+		if propErr == nil {
 			t.Fatalf("node[%d]: Propose succeeded despite quorum loss; "+
 				"writes should be rejected", i)
 		}
 
-		t.Logf("node[%d]: Propose correctly failed: %v", i, err)
+		t.Logf("node[%d]: Propose correctly failed: %v", i, propErr)
 	}
+	assertKeyAbsentEverywhere(t, cluster, trackers, 1, "should-fail-leaderless", time.Second)
 
 	t.Logf("quorum loss correctly prevents all writes with %d of 5 nodes alive",
 		cluster.liveNodes())
@@ -211,16 +291,26 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	)
 	t.Logf("leader stepped down after quorum loss")
 
-	// Verify writes are rejected during quorum loss.
+	// Verify writes are rejected during quorum loss. An error from Propose is
+	// necessary but not sufficient — it only says the caller gave up — so the
+	// value's absence from every live state machine is asserted as well.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	cmd := encodeKVPut("during-loss", "should-fail")
-	_, err := cluster.hosts[activeLeaderIdx].Propose(ctx, 1, cmd)
-	cancel()
-
+	rs, err := cluster.hosts[activeLeaderIdx].Propose(ctx, 1, cmd)
 	if err == nil {
-		t.Fatal("Propose succeeded during quorum loss; expected failure")
+		_, resErr := rs.Result()
+		rs.Release()
+		if resErr == nil {
+			cancel()
+			t.Fatalf("Propose reported %q as committed during quorum loss (%d of 5 alive)",
+				"during-loss", cluster.liveNodes())
+		}
+		t.Logf("proposal accepted but never committed during quorum loss: %v", resErr)
+	} else {
+		t.Logf("proposal correctly rejected during quorum loss: %v", err)
 	}
-	t.Logf("proposal correctly rejected during quorum loss: %v", err)
+	cancel()
+	assertKeyAbsentEverywhere(t, cluster, trackers, 1, "during-loss", time.Second)
 
 	// Restore quorum: remove stopped nodes from membership and add
 	// replacement nodes. We need to restore at least 1 node to get
@@ -299,44 +389,11 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "post-recovery", "restored")
 	expected["post-recovery"] = "restored"
 
-	// Verify pre-quorum-loss data is intact on all live nodes.
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-
-		replicaID := uint64(i + 1)
-		var tracker *smTracker
-		if i < len(trackers) && trackers[i] != nil {
-			tracker = trackers[i]
-		} else if i < len(cluster.trackers) {
-			tracker = cluster.trackers[i]
-		}
-		if tracker == nil {
-			continue
-		}
-
-		nodeSM := tracker.Get(1, replicaID)
-		if nodeSM == nil {
-			waitForCondition(t, membershipTimeout,
-				fmt.Sprintf("node[%d] SM registered", i),
-				func() bool {
-					nodeSM = tracker.Get(1, replicaID)
-					return nodeSM != nil
-				},
-			)
-		}
-
-		for key, val := range expected {
-			waitForCondition(t, membershipTimeout,
-				fmt.Sprintf("node[%d] has key=%q after recovery", i, key),
-				func() bool {
-					got, ok := nodeSM.Get(key)
-					return ok && got == val
-				},
-			)
-		}
-	}
+	// Verify pre-quorum-loss data is intact on all live nodes. verifyAllData
+	// counts the nodes it checked and fails on a shortfall; the hand-rolled
+	// loop this replaces skipped any node whose tracker was nil, which is
+	// exactly the recovered node whose recovery is the point of the test.
+	verifyAllData(t, cluster, trackers, 1, expected)
 
 	t.Logf("quorum recovery complete: all %d live nodes have %d entries",
 		cluster.liveNodes(), len(expected))

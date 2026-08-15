@@ -100,10 +100,10 @@ func saveEncryptedTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLo
 	}
 }
 
-// recoverTestSnapshot runs one recovery and returns its result error plus the
-// state the snapshotter ended up holding.
+// recoverTestSnapshot runs one recovery and returns the state the snapshotter
+// ended up holding plus the recovery's result error.
 func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
-	barrier SnapshotBarrier, shardID, replicaID uint64, compression config.CompressionType) (error, uint64) {
+	barrier SnapshotBarrier, shardID, replicaID uint64, compression config.CompressionType) (uint64, error) {
 	t.Helper()
 	stopC := make(chan struct{})
 	defer close(stopC)
@@ -127,11 +127,11 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 	}
 	select {
 	case res := <-p.CompletedC():
-		return res.err, ss.state.Load()
+		return ss.state.Load(), res.err
 	case <-time.After(2 * time.Second):
 		t.Fatal("recover timeout")
 	}
-	return nil, 0
+	return 0, nil
 }
 
 // TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier is the
@@ -169,7 +169,7 @@ func TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier(t *testing.T) {
 				t.Fatal("saved snapshot recorded Epoch 0; the fail-closed path is not exercised")
 			}
 
-			err, state := recoverTestSnapshot(t, baseDir, ldb, tc.barrier(b), 5, 1, config.NoCompression)
+			state, err := recoverTestSnapshot(t, baseDir, ldb, tc.barrier(b), 5, 1, config.NoCompression)
 			if !errors.Is(err, ErrSnapshotEncryptedBarrierUnavailable) {
 				t.Fatalf("recover error = %v, want ErrSnapshotEncryptedBarrierUnavailable; "+
 					"an undecryptable snapshot must not be recovered from ciphertext", err)
@@ -207,7 +207,7 @@ func TestSnapshotPool_RecoverSnapshot_UsesArtifactCompression(t *testing.T) {
 					snap.Compression, tc.saved)
 			}
 
-			err, state := recoverTestSnapshot(t, baseDir, ldb, nil, 7, 1, tc.recoverer)
+			state, err := recoverTestSnapshot(t, baseDir, ldb, nil, 7, 1, tc.recoverer)
 			if err != nil {
 				t.Fatalf("recover failed: %v", err)
 			}

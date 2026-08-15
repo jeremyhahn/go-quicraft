@@ -3838,19 +3838,64 @@ func TestStop_WithPreClosedConnectionsAndStreams(t *testing.T) {
 // Send queue backpressure path (quic.go:530-538)
 // ---------------------------------------------------------------------------
 
+// fillSendQueue offers messages into sq's data channel until the channel
+// refuses one, and returns how many were accepted. The refusal is the point:
+// it is the queue-full condition Send's backpressure branch depends on, so
+// without observing it a "the queue is full now" test would be asserting
+// against an arbitrary queue depth.
+func fillSendQueue(t *testing.T, sq *sendQueue, shardID, to uint64) int {
+	t.Helper()
+	const offers = 4 * defaultSendQueueLen
+	for i := 0; i < offers; i++ {
+		select {
+		case sq.ch <- proto.Message{Type: proto.Replicate, ShardID: shardID, From: 1, To: to, Term: 1}:
+		default:
+			return i
+		}
+	}
+	t.Fatalf("send queue accepted all %d offers without filling (len=%d cap=%d)",
+		offers, len(sq.ch), cap(sq.ch))
+	return 0
+}
+
+// requireQueueFullDrop calls Send until the transport counts a queue-full drop,
+// then asserts the drop carries the expected shard and target. Retrying is what
+// makes this deterministic: the per-target worker drains in batches of up to
+// 256, so a single Send issued just after the queue filled can still be
+// accepted. Send must never block on a full queue, so a hang here is a failure
+// in its own right.
+func requireQueueFullDrop(t *testing.T, tr *QUICTransport, rec *dropRecorder, shardID, to uint64) {
+	t.Helper()
+	const sends = 8 * defaultSendQueueLen
+	for i := 0; i < sends; i++ {
+		tr.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: shardID, From: 1, To: to, Term: uint64(i + 1)},
+		})
+		if got, ok := rec.firstDropWithReason(dropReasonQueueFull); ok {
+			if got.shardID != shardID || got.to != to {
+				t.Fatalf("queue-full drop = %+v, want shard %d to %d", got, shardID, to)
+			}
+			return
+		}
+	}
+	t.Fatalf("Send never took the queue-full backpressure path in %d sends", sends)
+}
+
 // TestSend_QueueBackpressure verifies that when the send queue is full,
-// messages are dropped without blocking, triggering the backpressure
-// debug log path.
+// messages are dropped without blocking and counted under the queue-full
+// reason rather than vanishing.
 
 func TestSend_QueueBackpressure(t *testing.T) {
 	handler1 := newTestHandler()
 	reg1 := registry.NewRegistry()
 	mtls := testMTLSConfig(t)
+	rec := &dropRecorder{}
 
 	t1, err := NewQUICTransport(Config{
 		ListenAddress: ":0",
 		DeploymentID:  42,
 		MTLSConfig:    mtls,
+		Metrics:       rec,
 	}, handler1, reg1)
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
@@ -3869,19 +3914,8 @@ func TestSend_QueueBackpressure(t *testing.T) {
 		t.Fatal("expected non-nil send queue")
 	}
 
-	// Fill the data channel completely.
-	for i := 0; i < defaultSendQueueLen; i++ {
-		select {
-		case sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}:
-		default:
-			break
-		}
-	}
-
-	// Now Send should hit the backpressure path (default case in select).
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
+	fillSendQueue(t, sq, 1, 2)
+	requireQueueFullDrop(t, t1, rec, 1, 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -5070,17 +5104,20 @@ func TestGetOrCreateSendQueue_DoubleCheckHitViaBarrier(t *testing.T) {
 }
 
 // TestSend_BackpressureLoggingOverflow exercises the send queue backpressure
-// path by flooding the data channel past capacity.
+// path by flooding the data channel past capacity, and asserts the overflow is
+// counted rather than silently swallowed.
 
 func TestSend_BackpressureLoggingOverflow(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
 	mtls := testMTLSConfig(t)
+	rec := &dropRecorder{}
 
 	tr, err := NewQUICTransport(Config{
 		ListenAddress: ":0",
 		DeploymentID:  42,
 		MTLSConfig:    mtls,
+		Metrics:       rec,
 	}, handler, reg)
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
@@ -5098,19 +5135,10 @@ func TestSend_BackpressureLoggingOverflow(t *testing.T) {
 		t.Fatal("expected non-nil queue")
 	}
 
-	// Fill the data channel to capacity.
-	for i := 0; i < cap(sq.ch); i++ {
-		select {
-		case sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2}:
-		default:
-			break
-		}
+	if accepted := fillSendQueue(t, sq, 1, 2); accepted == 0 {
+		t.Fatal("send queue refused the very first offer; it was never empty")
 	}
-
-	// Now Send should hit the backpressure default case.
-	tr.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 99},
-	})
+	requireQueueFullDrop(t, tr, rec, 1, 2)
 }
 
 // ---------------------------------------------------------------------------

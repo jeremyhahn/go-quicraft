@@ -70,7 +70,7 @@ because Go strings are immutable.
 ```
 
 Keys are sorted ascending via `sort.Slice`. Count is validated against
-`maxMembershipEntries` (10,000) and each value length against
+`MaxMembershipEntries` (10,000) and each value length against
 `MaxAddressLength` (256) before allocation during unmarshal.
 
 **`map[uint64]bool`** (Membership removed set):
@@ -136,11 +136,18 @@ The `Type` field is a uint64 that encodes two pieces of information:
 
 Entry type constants:
 
-| Value | Constant            | Description                       |
-|-------|---------------------|-----------------------------------|
-| 0     | `EntryNormal`       | Normal state machine command      |
-| 1     | `EntryConfigChange`  | Membership change (ConfigChange)  |
-| 2     | `EntryEncodedEntry`  | Session-managed encoded entry     |
+| Value | Constant                 | Description                                        |
+|-------|--------------------------|----------------------------------------------------|
+| 0     | `EntryNormal`            | Normal state machine command                       |
+| 1     | `EntryConfigChange`      | Membership change (ConfigChange)                   |
+| 2     | `EntryEncodedEntry`      | Session-managed encoded entry                      |
+| 3     | `EntryMetadata`          | Witness metadata entry (Index+Term only, no `Cmd`) |
+| 4     | `EntryInitialMembership` | Bootstrap membership (`Cmd` = marshaled `Membership`) |
+
+`UnmarshalFrom` rejects any masked type outside this set with
+`ErrInvalidEntryType`. A reader that omits `EntryInitialMembership` cannot
+replay any shard's log: every shard writes that entry at log index 1 on
+first start, so the very first entry a replica reads back is refused.
 
 Compression constants:
 
@@ -310,11 +317,11 @@ MessageBatch is the transport-level framing for a batch of Raft messages
 sent in a single network write. One batch per QUIC stream write.
 
 ```
- 0                   8                  16  20
- +-------------------+-------------------+----+
- |   BinVer (8)      | DeploymentID (8)  |ALen|
- +-------------------+-------------------+----+
-20                                       20+ALen    24+ALen
+ 0                   8                  16                  24  28
+ +-------------------+-------------------+-------------------+----+
+ |   BinVer (8)      | DeploymentID (8)  | SourceEpoch (8)   |ALen|
+ +-------------------+-------------------+-------------------+----+
+28                                       28+ALen    32+ALen
  +---------------------------------------+----------+
  |   SourceAddress (ALen bytes)          | ReqCnt(4)|
  +---------------------------------------+----------+
@@ -328,27 +335,42 @@ sent in a single network write. One batch per QUIC stream write.
 |----------|------|---------------|--------|----------------------------------|
 | 0        | 8    | BinVer        | uint64 | Wire format version              |
 | 8        | 8    | DeploymentID  | uint64 | Deployment identity token        |
-| 16       | 4    | AddrLen       | uint32 | Length of SourceAddress           |
-| 20       | N    | SourceAddress | string | Sender network address           |
-| 20+N     | 4    | ReqCount      | uint32 | Number of Message records        |
-| 24+N     | var  | Requests      | []Message | Count-prefixed messages       |
+| 16       | 8    | SourceEpoch   | uint64 | Sender's per-process boot epoch  |
+| 24       | 4    | AddrLen       | uint32 | Length of SourceAddress          |
+| 28       | N    | SourceAddress | string | Sender network address           |
+| 28+N     | 4    | ReqCount      | uint32 | Number of Message records        |
+| 32+N     | var  | Requests      | []Message | Count-prefixed messages       |
 
-Fixed portion: `2 * 8 = 16 bytes` (BinVer + DeploymentID).
+Fixed portion: `messageBatchFixedSize = 3 * 8 = 24 bytes`
+(BinVer + DeploymentID + SourceEpoch).
 SourceAddress uses the standard `[Len:4][Data:N]` string encoding.
+
+### SourceEpoch
+
+`SourceEpoch` is the sender's per-process boot epoch. It changes only when
+the sending node restarts, which lets a receiver tell a genuine peer restart
+apart from a benign re-dial and evict the now-stale cached outbound
+connection promptly instead of waiting for `MaxIdleTimeout`. See
+[Transport](../transport/quic.md) for how the receive path uses it.
 
 ### Validation Rules
 
 The receiver validates fields in order during `UnmarshalFrom`:
 
-1. **Wire version**: `BinVer > WireVersion` returns `ErrUnsupportedVersion`.
-   BinVer is the FIRST field so the receiver rejects incompatible versions
-   before parsing any further data.
+1. **Wire version**: `BinVer != WireVersion` returns `ErrUnsupportedVersion`.
+   The gate is EXACT equality, not `<=`: there is no version negotiation and
+   no legacy decode path, so batches from both older AND newer binaries are
+   rejected rather than misparsed. BinVer is the FIRST field so the receiver
+   rejects incompatible versions before parsing any further data.
 
 2. **Source address length**: `AddrLen > MaxAddressLength` (256) returns
    `ErrAddressTooLong`.
 
-3. **Request count**: `ReqCount > maxMessagesPerBatch` (10,000) returns
-   `ErrTooManyMessages`.
+3. **Request count**: `ReqCount > MaxMessagesPerBatch` (10,000) returns
+   `ErrTooManyMessages`. The count is then checked for consistency with the
+   bytes remaining in the frame -- `ReqCount * minMessageWireSize` must not
+   exceed them -- so a short frame claiming thousands of requests cannot
+   drive the slice allocation before failing.
 
 4. **Cumulative size**: after unmarshaling each message, the running byte
    offset is checked against `MaxBatchSize` (64 MB). Exceeding returns
@@ -403,8 +425,8 @@ prefix, an inline Membership, and variable-length trailing fields.
  +-------------------+----------------------------------------------+
                      |
  +--- Filepath (len+data) ---+--- FileSize (8) ---+
- +--- Checksum (len+data) ---+
- +--- Type (8) ---+--- Imported (8) ---+--- OnDiskIndex (8) ---+--- Witness (8) ---+
+ +--- Type (8) ---+--- Imported (8) ---+--- OnDiskIndex (8) ---+
+ +--- Witness (8) ---+--- Epoch (8) ---+
 ```
 
 ### Field Layout
@@ -418,38 +440,163 @@ prefix, an inline Membership, and variable-length trailing fields.
 | Variable   | Membership  | var     | struct | Cluster membership (see below)   |
 | Variable   | Filepath    | 4+N     | string | Snapshot data file path          |
 | Fixed      | FileSize    | 8       | uint64 | Snapshot file size in bytes      |
-| Variable   | Checksum    | 4+N     | []byte | Integrity checksum               |
 | Fixed      | Type        | 8       | uint64 | State machine type code          |
 | Fixed      | Imported    | 8       | bool   | External import flag             |
 | Fixed      | OnDiskIndex | 8       | uint64 | On-disk SM tracked index         |
 | Fixed      | Witness     | 8       | bool   | Witness replica flag             |
+| Fixed      | Epoch       | 8       | uint64 | Barrier encryption epoch (0 = plaintext) |
 
-Minimum size: 32 bytes (the 4 leading fixed fields). The trailing 4 fixed
-fields (Type, Imported, OnDiskIndex, Witness) contribute 32 bytes.
+Minimum size: 32 bytes (the 4 leading fixed fields). The trailing 5 fixed
+fields (Type, Imported, OnDiskIndex, Witness, Epoch) contribute 40 bytes.
+`Type` is validated against `maxStateMachineType` on both write and read;
+an out-of-range value returns an `*InvalidSnapshotTypeError`.
 `IsEmpty()` returns true when both `Index` and `Term` are zero.
+
+### The removed Checksum field
+
+Snapshot carried a `Checksum []byte` between `FileSize` and `Type` through
+an earlier pre-release layout, and it was **removed**. It was decoded, bounded
+and copied out of the pooled receive buffer on every message, and it was
+never computed and never verified anywhere in the repository -- so it was
+empty on every real snapshot, and the receive path paid an allocation and
+two copies per message to keep an empty slice alive.
+
+It was removed rather than implemented because a field named `Checksum` that
+rides the wire and is never checked reads as an integrity control to anyone
+auditing the format, and an integrity control that does not exist is worse
+than an absent one. Populating it properly is not a codec change: the value
+has to be computed over the final artifact bytes (post-compression,
+post-encryption), stamped where the artifact is produced, and verified in
+three separate consumers (recovery, streamed receive, `ImportSnapshot`).
+
+What snapshot integrity rests on meanwhile, stated plainly: TLS in transit,
+and barrier AEAD at rest. A shard configured with a plaintext barrier
+(`seal.None`) has **no** at-rest integrity check on its snapshot artifacts.
+That was equally true while the field existed.
 
 ## Membership Wire Format
 
 Source: `pkg/proto/membership.go`
 
 Membership encodes the cluster configuration: voting members, observers,
-witnesses, and removed replicas. All four maps use deterministic sorted-key
+witnesses, removed replicas, committed node identities, and the replicated
+witness and session policies. All six maps use deterministic sorted-key
 encoding.
 
+Membership is the one type in this package that is **persisted** as well as
+transmitted -- it is written to the WAL, into snapshot records and exported
+snapshot artifacts, and into the `EntryInitialMembership` entry at log index
+1. It therefore carries its own layout version byte, independent of
+`WireVersion`. See [Version Compatibility](#version-compatibility) below.
+
+The layout, at version **1**:
+
 ```
- 0                   8
- +-------------------+
- | ConfigChangeID(8) |
- +-------------------+
- |  Addresses map    |  -- map[uint64]string, sorted by key
- +-------------------+
- |  Observers map    |  -- map[uint64]string, sorted by key
- +-------------------+
- |  Witnesses map    |  -- map[uint64]string, sorted by key
- +-------------------+
- |  Removed boolMap  |  -- map[uint64]bool, sorted by key
- +-------------------+
+ 0     1                   9                  17                  25
+ +-----+-------------------+-------------------+-------------------+
+ |Ver:1| ConfigChangeID(8) |  MaxWitnesses(8)  |      RFRM(8)      |
+ +-----+-------------------+-------------------+-------------------+
+25                       33                  41                  49
+ +-------------------------+-------------------+-------------------+
+ | SessionExpiryEntries(8) | MaxTotalSessions  | MaxSessionsPerCli |
+ +-------------------------+-------------------+-------------------+
+49
+ +-----------------------+
+ |  Addresses map        |  -- map[uint64]string, sorted by key
+ +-----------------------+
+ |  Observers map        |  -- map[uint64]string, sorted by key
+ +-----------------------+
+ |  Witnesses map        |  -- map[uint64]string, sorted by key
+ +-----------------------+
+ |  Removed boolMap      |  -- map[uint64]bool, sorted by key
+ +-----------------------+
+ |  Identities map       |  -- map[uint64]string, sorted by key
+ +-----------------------+
+ | RemovedIdentities map |  -- map[uint64]string, sorted by key
+ +-----------------------+
 ```
+
+### Fixed Region
+
+| Offset | Size | Field                        | Type   | Description                          |
+|--------|------|------------------------------|--------|--------------------------------------|
+| 0      | 1    | Version                      | uint8  | Layout version byte (1)              |
+| 1      | 8    | ConfigChangeID               | uint64 | Log index that produced this config  |
+| 9      | 8    | MaxWitnesses                 | uint64 | Replicated witness cap (0 = none)    |
+| 17     | 8    | RequireFullReplicaMajority   | bool   | Replicated full-replica-majority policy |
+| 25     | 8    | SessionExpiryEntries         | uint64 | Replicated session inactivity threshold |
+| 33     | 8    | MaxTotalSessions             | uint64 | Replicated cap on registered sessions |
+| 41     | 8    | MaxSessionsPerClient         | uint64 | Replicated cap on cached responses per session |
+
+Fixed region: `membershipFixedSize = 49 bytes`. An empty membership --
+all six maps present but zero-length -- is **73 bytes** (49 + 6 x 4). Every
+map is written unconditionally, so an empty map is four zero bytes rather
+than an absent field, and an unset session policy is 24 zero bytes rather
+than an absent one.
+
+The version byte is the sole layout discriminator. Membership is always
+embedded in a larger buffer, so neither a length check nor a trailing-byte
+check can tell one layout from another; the explicit byte is the only
+in-band signal.
+
+### The identity maps
+
+`Identities` maps replica IDs to the stable cryptographic node identity the
+shard has committed for them -- the value derived from a peer's leaf
+certificate. It is the authorization key that the address is not: an address
+is matched against certificate SANs, so a wildcard or shared-SAN certificate
+covers every member's address, while an identity is derived from the peer's
+public key.
+
+`RemovedIdentities` maps the replica IDs in `Removed` to the identity the
+configuration held for them at the moment of removal. It is the tombstone's
+authorization key, and it is what lets the removal deny-list be evaluated
+against the authenticated connection identity rather than the claimed
+`msg.From`. Entries are never evicted: evicting a tombstone re-opens the
+hole for exactly that replica.
+
+Both maps are **sparse**. A shard bootstrapped before identities existed, or
+by an operator who supplied none, has no entry for its members. A missing
+entry is a compatibility state, never a permission.
+
+### Version Compatibility
+
+`Membership`'s decoder accepts **exactly version 1** and refuses every other
+byte value with an `*UnsupportedMembershipVersionError` (which matches
+`ErrUnsupportedVersion` under `errors.Is`), before a single field is
+interpreted. There is no range, no per-version decode path and no legacy
+layout.
+
+That is the pre-release pinning policy: every wire and persisted format in
+this repository stays at version 1 until the first production release, a
+layout change is made IN PLACE and the consuming repos are rebuilt to match,
+and development clusters are wiped and re-synced rather than migrated. See
+[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)
+for the full policy and its consequences -- chiefly that two binaries from
+different pre-release commits may be mutually unreadable while both stamp 1.
+
+The version byte itself is **kept**, and only its value is pinned. It is the
+mechanism that makes the 1.0 bump possible: a format with no in-band
+discriminator cannot be superseded, and a section without one would begin at
+`ConfigChangeID`, whose low byte is indistinguishable from a version. It also
+turns a commit skew into a clean refusal rather than fields read at the wrong
+offsets.
+
+`UnmarshalFrom` is **all or nothing**: decoding runs into a local value and
+the receiver is assigned only on success, so a failure at any point leaves
+the target exactly as it was rather than half-overwritten. On success every
+field is overwritten, so a reused receiver cannot retain a stale `Identities`
+or `RemovedIdentities` map -- one would authorize a replica the decoded
+configuration never named, the other deny a sender it never tombstoned.
+
+**`membershipFormatVersion` is deliberately not derived from `WireVersion`,**
+even though both are 1. The two namespaces have different scopes:
+`WireVersion` is transport-scoped and never read back off disk, while the
+Membership version byte is written into the bootstrap entry at log index 1
+and outlives the binary that wrote it. If the persisted version were
+`uint8(WireVersion)`, the first post-1.0 transport-only bump would change the
+version byte every replica expects at log index 1 and a released cluster
+could not replay its own log. A source-level test enforces the separation.
 
 ### String Map Encoding (`map[uint64]string`)
 
@@ -459,8 +606,18 @@ encoding.
     [Key:8][ValueLen:4][Value:N]
 ```
 
-- Count validated against `maxMembershipEntries` (10,000)
-- Each value length validated against `MaxAddressLength` (256)
+- Count validated against `MaxMembershipEntries` (10,000)
+- Each value length validated against `MaxAddressLength` (256). This applies
+  to `Identities` and `RemovedIdentities` too: `getMap` is shared by all four
+  string maps, and `MaxNodeIdentityLength` has the same value, so nothing is
+  admitted or refused differently.
+- Empty map: 4 bytes (the count prefix alone)
+
+Both limits are mirrored on the **write** side by `MarshalTo`. A codec that
+can emit what it cannot parse is a durability bug here, not a style
+complaint: `Host.StartShard` copies the caller's members map straight into
+`Addresses` and the result is committed at log index 1, so an unchecked
+oversized value would produce a bootstrap entry no binary can read back.
 
 ### Bool Map Encoding (`map[uint64]bool`)
 
@@ -470,8 +627,9 @@ encoding.
     [Key:8][Value:8]
 ```
 
-- Count validated against `maxMembershipEntries` (10,000)
+- Count validated against `MaxMembershipEntries` (10,000)
 - Fixed 16 bytes per entry
+- Empty map: 4 bytes
 
 ### Deterministic Encoding
 
@@ -488,8 +646,8 @@ func sortedKeys(m map[uint64]string) []uint64 {
 }
 ```
 
-This is critical for snapshot checksums and WAL CRC integrity -- the same
-logical membership must always produce the same bytes.
+This is critical for WAL CRC integrity and for barrier AEAD authentication
+-- the same logical membership must always produce the same bytes.
 
 ## ConfigChange Wire Format
 
@@ -507,24 +665,80 @@ entry. It describes a membership change operation.
  +-------+-----------------------+-------------------+
  |AdrLen |  Address (N bytes)    |  Initialize (8)   |
  +-------+-----------------------+-------------------+
+ +--- MaxWitnesses (8) ---+--- RequireFullReplicaMajority (8) ---+
+ +--- IdLen (4) ---+--- NodeIdentity (M bytes) ---+
 ```
 
-| Offset | Size | Field          | Type   | Description                     |
-|--------|------|----------------|--------|---------------------------------|
-| 0      | 8    | ConfigChangeID | uint64 | Log index of this change        |
-| 8      | 8    | Type           | uint64 | AddNode/RemoveNode/AddNonVoting/AddWitness |
-| 16     | 8    | ReplicaID      | uint64 | Target replica                  |
-| 24     | 4+N  | Address        | string | Network address (empty for remove) |
-| 28+N   | 8    | Initialize     | bool   | Needs initial state flag        |
+| Offset | Size | Field                      | Type   | Description                     |
+|--------|------|----------------------------|--------|---------------------------------|
+| 0      | 8    | ConfigChangeID             | uint64 | Log index of this change        |
+| 8      | 8    | Type                       | uint64 | See the type table below        |
+| 16     | 8    | ReplicaID                  | uint64 | Target replica (0 for `UpdateWitnessPolicy`) |
+| 24     | 4+N  | Address                    | string | Network address (empty for remove) |
+| 28+N   | 8    | Initialize                 | bool   | Needs initial state flag        |
+| 36+N   | 8    | MaxWitnesses               | uint64 | New witness cap for `UpdateWitnessPolicy` |
+| 44+N   | 8    | RequireFullReplicaMajority | bool   | New policy for `UpdateWitnessPolicy` |
+| 52+N   | 4+M  | NodeIdentity               | string | Committed node identity (always present; `M` may be 0) |
+
+Fixed portion: `configChangeFixedSize = 6*8 + 4 = 52 bytes` -- the six
+uint64-width fields plus the 4-byte address length prefix. The trailing
+`NodeIdentity` adds its own 4-byte length prefix plus its bytes. The prefix is
+**unconditional**: an empty identity is four zero bytes, never a shorter buffer.
+
+`NodeIdentity` is the stable cryptographic node identity to commit for the
+replica being added. It travels through consensus alongside `Address` so the
+receive-side gate reads a value no inbound message can write. It is supplied
+by the operator through the Host API, never captured from a connection.
+It is empty for `RemoveNode` and `UpdateWitnessPolicy`, and empty for an add
+whose caller supplied none.
+
+### One layout, every field mandatory
+
+`ConfigChange` carries no version byte and needs none: there is exactly one
+layout to decode, so there is nothing for a discriminator to discriminate.
+`UnmarshalFrom` refuses any payload that does not span the whole layout with
+`ErrBufferTooSmall` -- at every cut point, including the two that used to mean
+something else.
+
+This replaces a LENGTH-discriminated scheme, and the replacement closes a
+defect rather than merely retiring dead code. A payload ending after
+`RequireFullReplicaMajority` used to decode successfully with an empty
+`NodeIdentity`, and an empty identity is exactly the compatibility state that
+falls back to the weaker address-based authorization -- so a **truncated**
+`ConfigChange` was byte-indistinguishable from a legitimate identity-less one,
+and truncation silently downgraded an authorization check. A payload ending
+after `Initialize` used to be reported as a pre-witness-policy layout with
+`ErrUnsupportedVersion`; under the pinning policy there is no other layout to
+name, so it too is simply short.
+
+An identity-less config change is still entirely legal and still commits --
+`RemoveNode`, `UpdateWitnessPolicy` and an add made without
+`RequestAddNodeWithIdentity` all produce one. It is written with an explicit
+zero length prefix, so what the decoder sees is a value the writer chose rather
+than a length the reader inferred.
 
 Config change type constants:
 
-| Value | Constant       | Description                    |
-|-------|----------------|--------------------------------|
-| 0     | `AddNode`      | Add voting member              |
-| 1     | `RemoveNode`   | Remove replica                 |
-| 2     | `AddNonVoting` | Add non-voting observer        |
-| 3     | `AddWitness`   | Add witness replica            |
+| Value | Constant              | Description                                    |
+|-------|-----------------------|------------------------------------------------|
+| 0     | `AddNode`             | Add voting member                              |
+| 1     | `RemoveNode`          | Remove replica                                 |
+| 2     | `AddNonVoting`        | Add non-voting observer                        |
+| 3     | `AddWitness`          | Add witness replica                            |
+| 4     | `UpdateWitnessPolicy` | Replace the shard's replicated witness policy  |
+
+`UpdateWitnessPolicy` carries no target replica; the `MaxWitnesses` and
+`RequireFullReplicaMajority` fields hold the new values. A `Type` above
+`UpdateWitnessPolicy` is rejected with `ErrInvalidConfigChangeType` on both
+write and read.
+
+`MarshalTo` mirrors the read side's per-field bounds --
+`ErrInvalidConfigChangeType`, `ErrAddressTooLong` (`MaxAddressLength`, 256)
+and `ErrNodeIdentityTooLong` (`MaxNodeIdentityLength`, 256). These are not
+cosmetic: a `ConfigChange` is marshaled into an `Entry.Cmd` and committed, so
+a payload this package can emit but not parse is a committed entry every
+replica faults on -- a self-inflicted cluster-wide outage from an
+over-length operator-supplied address.
 
 ## ReadyToRead Wire Format
 
@@ -641,11 +855,32 @@ Membership and optional FileInfo.
  +--- FileInfo (var, if HasFileInfo) ---+
  +--- Membership (var) ---+
  +--- OnDiskIndex (8) ---+--- DeploymentID (8) ---+--- BinVer (8) ---+
+ +--- Epoch (8) ---+
  +--- Data (len+data) ---+
 ```
 
 Minimum header: 72 bytes (9 fixed uint64 fields before the first
 variable-length Filepath).
+
+`Epoch` sits between `BinVer` and `Data`. It is the barrier encryption epoch
+the snapshot was saved under (0 = plaintext), and the receiver needs it to
+decrypt barrier-encrypted snapshot data. Omitting it from a decoder reads
+the length prefix of `Data` out of the epoch field, so the chunk payload is
+mis-sized rather than merely mis-labeled.
+
+`BinVer` is gated on **exact** equality with `WireVersion`, mirroring
+`MessageBatch`. This is a deliberate choice and not the persisted-format
+oversight the Membership version byte closes: `SnapshotChunk` is
+transport-only. The receiver keeps only `chunk.Data` (written to
+`snapshot.dat`) and re-derives the metadata into a `logdb.Snapshot` record in
+waldb's own layout, so no marshaled `SnapshotChunk`, and no `BinVer` byte,
+is ever written to disk. `BinVer` is required: an unstamped chunk (`BinVer`
+0) is indistinguishable from a v1 sender's.
+
+`ChunkSize` is redundant with the length prefix on `Data`. When a sender
+populates it (non-zero), the receiver requires it to agree with the actual
+payload length and returns `ErrChunkSizeMismatch` otherwise. A zero value
+means "unspecified" and consumers fall back to `len(Data)`.
 
 ## Bootstrap Wire Format
 
@@ -674,18 +909,29 @@ State machine type constants:
 
 ## Size Limits and Constants
 
-| Constant               | Value      | Enforced In              | Description                      |
-|------------------------|------------|--------------------------|----------------------------------|
-| `WireVersion`          | 1          | `MessageBatch.UnmarshalFrom` | Current wire format version |
-| `MaxEntrySize`         | 8 MB       | `Entry.UnmarshalFrom`    | Max Entry.Cmd payload           |
-| `MaxBatchSize`         | 64 MB      | `MessageBatch.UnmarshalFrom` | Max cumulative batch size  |
-| `MaxAddressLength`     | 256 bytes  | `getString`, `getMap`    | Max node address string         |
-| `maxMessagesPerBatch`  | 10,000     | `MessageBatch.UnmarshalFrom`, `Message.UnmarshalFrom` | Max messages per batch / entries per message |
-| `maxMembershipEntries` | 10,000     | `getMap`, `getBoolMap`   | Max entries per membership map  |
+| Constant                  | Value      | Enforced In              | Description                      |
+|---------------------------|------------|--------------------------|----------------------------------|
+| `WireVersion`             | 1          | `MessageBatch.UnmarshalFrom`, `SnapshotChunk.UnmarshalFrom` | Current transport wire format version (exact match) |
+| `MaxEntrySize`            | 8 MB       | `Entry.UnmarshalFrom`    | Max `Entry.Cmd` payload          |
+| `MaxBatchSize`            | 64 MB      | `MessageBatch.UnmarshalFrom` | Max cumulative batch size    |
+| `MaxAddressLength`        | 256 bytes  | `getString`, `getMap`    | Max node address string          |
+| `MaxNodeIdentityLength`   | 256 bytes  | `ConfigChange`           | Max committed node identity string |
+| `MaxFilepathLen`          | 4096 bytes | `Snapshot`, `SnapshotChunk`, `SnapshotFile` | Max filepath string |
+| `MaxMetadataLen`          | 64 KB      | `SnapshotFile.UnmarshalFrom` | Max application metadata     |
+| `MaxSnapshotChunkDataLen` | 8 MB       | `SnapshotChunk.UnmarshalFrom` | Max chunk payload (= `MaxEntrySize`) |
+| `MaxMessagesPerBatch`     | 10,000     | `MessageBatch.UnmarshalFrom` | Max messages per batch       |
+| `MaxEntriesPerMessage`    | 10,000     | `Message.UnmarshalFrom`  | Max log entries per message      |
+| `MaxMembershipEntries`    | 10,000     | `getMap`, `getBoolMap`   | Max entries per membership map   |
 
 All limits are validated **before** allocation during `UnmarshalFrom`.
 This prevents a crafted payload from exhausting memory by claiming a
 large count and triggering a proportional `make()`.
+
+`MaxMessagesPerBatch`, `MaxEntriesPerMessage` and `MaxMembershipEntries` are
+**exported** because they are properties of the wire protocol, not of the
+decoder. A producer that exceeds one emits a payload every peer rejects, and
+a rejection is indistinguishable from a broken connection at the sender.
+Producers MUST bound themselves by these values.
 
 ## MarshalTo / UnmarshalFrom Pattern
 
@@ -735,8 +981,8 @@ Every `UnmarshalFrom` validates input before use:
    fixed header before reading any field.
 
 2. **Count/length limits** -- variable-length counts are checked against
-   hard limits before allocation (`MaxEntrySize`, `maxMessagesPerBatch`,
-   `maxMembershipEntries`, `MaxAddressLength`).
+   hard limits before allocation (`MaxEntrySize`, `MaxMessagesPerBatch`,
+   `MaxEntriesPerMessage`, `MaxMembershipEntries`, `MaxAddressLength`).
 
 3. **Enum validation** -- `Entry.Type` and `Message.Type` are checked
    against the known range after decoding.
@@ -752,17 +998,32 @@ Every `UnmarshalFrom` validates input before use:
 
 All errors are package-level sentinel values (not `fmt.Errorf`):
 
-| Error                          | Condition                                   |
-|--------------------------------|---------------------------------------------|
-| `ErrBufferTooSmall`            | Input buffer shorter than required           |
-| `ErrInvalidEntryType`          | Unknown Entry.Type (after masking)           |
-| `ErrInvalidMessageType`        | Unknown Message.Type                         |
-| `ErrAddressTooLong`            | Address string exceeds MaxAddressLength      |
-| `ErrEntrySizeLimitExceeded`    | Entry.Cmd length exceeds MaxEntrySize        |
-| `ErrBatchSizeLimitExceeded`    | Cumulative batch size exceeds MaxBatchSize   |
-| `ErrTooManyMessages`           | Message/entry count exceeds limit            |
-| `ErrTooManyMembershipEntries`  | Membership map count exceeds limit           |
-| `ErrUnsupportedVersion`        | BinVer exceeds current WireVersion           |
+| Error                          | Condition                                        |
+|--------------------------------|--------------------------------------------------|
+| `ErrBufferTooSmall`            | Input buffer shorter than required                |
+| `ErrInvalidEntryType`          | Unknown `Entry.Type` (after masking)              |
+| `ErrInvalidMessageType`        | Unknown `Message.Type`                            |
+| `ErrInvalidConfigChangeType`   | `ConfigChange.Type` above `UpdateWitnessPolicy`   |
+| `ErrAddressTooLong`            | Address string exceeds `MaxAddressLength`         |
+| `ErrNodeIdentityTooLong`       | Node identity exceeds `MaxNodeIdentityLength`     |
+| `ErrFilepathTooLong`           | Filepath exceeds `MaxFilepathLen`                 |
+| `ErrMetadataTooLong`           | Metadata exceeds `MaxMetadataLen`                 |
+| `ErrChunkDataTooLong`          | Chunk data exceeds `MaxSnapshotChunkDataLen`      |
+| `ErrChunkSizeMismatch`         | `SnapshotChunk.ChunkSize` disagrees with `len(Data)` |
+| `ErrEntrySizeLimitExceeded`    | `Entry.Cmd` length exceeds `MaxEntrySize`         |
+| `ErrBatchSizeLimitExceeded`    | Cumulative batch size exceeds `MaxBatchSize`      |
+| `ErrTooManyMessages`           | Message/entry count exceeds limit                 |
+| `ErrTooManyMembershipEntries`  | Membership map count exceeds limit                |
+| `ErrDuplicateMapKey`           | A membership map repeats a key                    |
+| `ErrUnsupportedVersion`        | `BinVer != WireVersion`, or a `Membership` section version byte that is not 1 |
+
+Two errors are typed rather than sentinel, and both match a sentinel under
+`errors.Is`:
+
+| Error                                 | Matches                    | Condition                                          |
+|---------------------------------------|----------------------------|----------------------------------------------------|
+| `*UnsupportedMembershipVersionError`  | `ErrUnsupportedVersion`    | Membership version byte is not `1`; names the version found and the one supported |
+| `*InvalidSnapshotTypeError`           | `ErrInvalidSnapshotType`   | `Snapshot.Type` above `maxStateMachineType`        |
 
 ## Zero-Copy Semantics
 
@@ -806,7 +1067,7 @@ The zero-copy design interacts with `sync.Pool` buffer management:
 ### getBytes vs getString
 
 `getBytes` returns a zero-copy alias: `buf[4:total]`. This is used for
-binary data like `Snapshot.Checksum` and `SnapshotFile.Metadata`.
+binary data like `SnapshotFile.Metadata` and `SnapshotChunk.Data`.
 
 `getString` returns a copied string: `string(buf[4:total])`. This is
 required because Go strings are immutable and must not alias mutable
@@ -906,37 +1167,82 @@ Source: `pkg/proto/messagebatch.go`, `pkg/proto/constants.go`
 
 ## Wire Format Versioning
 
-Every top-level on-disk and on-wire structure includes a version field as
-the first 8 bytes. This enables rolling upgrades and forward compatibility.
+**Every version in this package is pinned at 1 for the whole pre-release
+period, and every gate on it is an exact match.** A layout change is made IN
+PLACE at version 1, the consuming repos are rebuilt to match, and dev
+clusters are wiped and re-synced rather than migrated. The numbers increment
+for the first time at the first production release. The consequence is
+intended and worth stating plainly: two binaries from different pre-release
+commits may be mutually unreadable while both stamp 1. See
+[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release).
 
-`MessageBatch.BinVer` is the FIRST field in the batch wire format.
-The receiver validates `BinVer <= WireVersion` before parsing any further
-data. `SnapshotChunk.BinVer` serves the same purpose for snapshot streams.
+Within that, the package still carries **two independent version
+namespaces**. Neither may be derived from the other, and a bump to one must
+never change how the other is read.
+
+**Transport-scoped: `WireVersion` = 1.** Stamped into `MessageBatch.BinVer`
+and `SnapshotChunk.BinVer`, and mirrored by the frame header byte in
+`internal/transport`. Both ends of a QUIC connection are live processes, so a
+mismatch costs one rejected connection and nothing durable. Gated on **exact
+equality** -- a peer speaking another dialect is refused outright rather than
+misparsed.
+
+**Persisted-scoped: the `Membership` version byte = 1.** Written to the WAL,
+into snapshot records and exported snapshot artifacts, and into the
+`EntryInitialMembership` entry at log index 1. Those bytes outlive the
+process -- and the binary -- that wrote them, which is why the format carries
+an explicit discriminator at all. Also gated on exact equality.
+
+The distinction is not stylistic, and it is why the two survive as separate
+constants while holding the same value. If the persisted version were derived
+from `WireVersion`, the first post-1.0 transport-only bump would
+simultaneously make every existing node unable to replay its own log -- with
+no dual-read path and no migration, a permanently unstartable cluster.
+
+### The transport version is a SUPREMUM
+
+Independent does not mean unrelated. `Membership` is embedded in `Snapshot`,
+which is embedded in `Message`, which is embedded in `MessageBatch`, and it
+is embedded directly in `SnapshotChunk`. Both of those gate on exact
+equality, so a `Membership` layout change alters the transport bytes without
+altering the discriminator that is supposed to describe them.
+
+**The rule: bump `WireVersion` whenever any type reachable from
+`MessageBatch` or `SnapshotChunk` changes layout, including the embedded
+persisted ones.** The transport number is the supremum of every layout
+version on the wire, never a number that only tracks the transport-only
+fields. A compile-time constant assertion in `membership.go` enforces
+`WireVersion >= membershipFormatVersion`, so the `Membership` half of that is
+mechanical rather than remembered. It holds trivially at `1 >= 1` and is kept
+for exactly that future bump.
+
+The converse does not hold: `WireVersion` may move without the persisted
+version moving, because a transport-only change leaves every persisted byte
+alone. That asymmetry is why the assertion is `>=` and not `==`.
 
 ### Upgrade Strategy
 
-The system supports a two-phase rolling upgrade using separate read and
-write version thresholds. By default `WriteVersion == WireVersion`, but
-during rolling upgrades an operator can hold writes at the previous
-version:
+Because the transport gate is exact equality, there is **no rolling upgrade
+across a `WireVersion` bump** and no mixed-version steady state. A cluster
+spanning two wire versions does not degrade -- it stops exchanging Raft
+messages entirely. The upgrade procedure is a rolling *replacement*, not a
+rolling *restart*.
 
-1. Upgrade all nodes to version N binary (reads version <= N, writes
-   version N-1 via config).
-2. Verify all nodes are healthy on version N.
-3. Set `WriteVersion = N` and restart each node (rolling restart).
-4. Version N-1 data is re-written as version N during compaction.
+Pre-release the same is true across a LAYOUT change even though the number
+does not move -- and it does not announce itself as a version mismatch, so
+the procedure wipes each node's data directory rather than relying on the
+gate to catch the skew.
 
-This prevents a partially-upgraded cluster from producing version N data
-that version N-1 nodes cannot read.
+See [Compatibility](../operations/compatibility.md) for the authoritative
+per-release procedure and the version history.
 
 ### No Reserved Padding
 
 The fixed-layout encoding does not include reserved padding bytes for
-future fields. When a new field is needed, `WireVersion` is incremented
-and `UnmarshalFrom` checks the version to decide whether to read the
-additional field. Padding would waste space on every entry in the hot
-path -- at 100K entries/sec, even 8 bytes of padding equals 800 KB/sec
-of wasted I/O and storage.
+future fields. When a new field is needed, the relevant version constant is
+incremented. Padding would waste space on every entry in the hot path -- at
+100K entries/sec, even 8 bytes of padding equals 800 KB/sec of wasted I/O
+and storage.
 
 ## Cross-References
 

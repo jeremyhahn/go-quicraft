@@ -33,10 +33,14 @@ import (
 // testCluster manages a group of Hosts for multi-node integration tests.
 // Each Host runs on a separate listen address with real QUIC transport.
 type testCluster struct {
-	hosts    []*quicraft.Host
-	addrs    []string
-	trackers []*smTracker
-	t        *testing.T
+	hosts []*quicraft.Host
+	addrs []string
+	// nodeHostDirs[i] is hosts[i]'s NodeHostDir. Snapshot artifacts are
+	// written beneath it, so tests that must prove a snapshot actually
+	// reached disk need the per-host root.
+	nodeHostDirs []string
+	trackers     []*smTracker
+	t            *testing.T
 }
 
 // newTestCluster creates a 3-node cluster with real QUIC transport.
@@ -61,8 +65,10 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 
 	mtls := testMTLSConfig(t)
 	hosts := make([]*quicraft.Host, numNodes)
+	nodeHostDirs := make([]string, numNodes)
 	for i := range numNodes {
 		cfg := testHostConfig(t, addrs[i], mtls)
+		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg)
 		if err != nil {
 			// Clean up any previously created hosts.
@@ -75,9 +81,10 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	}
 
 	return &testCluster{
-		hosts: hosts,
-		addrs: addrs,
-		t:     t,
+		hosts:        hosts,
+		addrs:        addrs,
+		nodeHostDirs: nodeHostDirs,
+		t:            t,
 	}
 }
 
@@ -430,6 +437,13 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 // a new leader is elected from the remaining nodes. This exercises the
 // Raft election timeout, candidate promotion, and vote exchange over
 // QUIC transport.
+//
+// It also verifies LEADER COMPLETENESS: every entry committed under the old
+// leader is present in the new leader's log and state machine, in the new
+// term. Electing a leader and then only writing something new is satisfied by
+// a leader that silently lost all pre-failover committed state, so the
+// pre-failover entries are re-read through the new leader — linearizably, and
+// directly out of the new leader's own state machine.
 func TestMultiNode_LeaderFailover(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -438,18 +452,30 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	oldLeaderReplicaID := uint64(leaderIdx + 1)
 
-	// Write initial data via the first leader.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("before-failover", "original")
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
+	oldLeaderInfo, err := cluster.hosts[leaderIdx].GetShardInfo(1)
 	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
+		t.Fatalf("GetShardInfo on the original leader failed: %v", err)
 	}
-	rs.Release()
+	oldTerm := oldLeaderInfo.Term
+	if oldTerm == 0 {
+		t.Fatal("original leader reports term 0")
+	}
 
-	// Wait for the proposal to be applied on ALL followers. In a 3-node
+	// Write initial data via the first leader, awaiting apply on each so the
+	// entries are known-committed before the leader is killed. Values embed
+	// the old leader's identity and term so a value that survives is
+	// provably the one written pre-failover.
+	preFailover := make(map[string]string, 6)
+	preFailover["before-failover"] = "original"
+	for i := 0; i < 5; i++ {
+		preFailover[fmt.Sprintf("before-failover-%d", i)] =
+			fmt.Sprintf("committed-by-replica-%d-term-%d-seq-%d", oldLeaderReplicaID, oldTerm, i)
+	}
+	for key, value := range preFailover {
+		proposeCommitted(t, cluster.hosts[leaderIdx], 1, key, value, defaultTimeout)
+	}
+
+	// Wait for the proposals to be applied on ALL followers. In a 3-node
 	// cluster, both remaining followers must have established QUIC
 	// connections (via replication from the leader) before we stop the
 	// leader, otherwise re-election between the two survivors can stall.
@@ -459,12 +485,16 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 		}
 		replicaID := uint64(i + 1)
 		sm := trackers[i].Get(1, replicaID)
-		if sm != nil {
+		if sm == nil {
+			t.Fatalf("follower[%d] state machine not found", i)
+		}
+		for key, value := range preFailover {
+			k, v := key, value
 			waitForCondition(t, defaultTimeout,
-				fmt.Sprintf("follower[%d] apply before failover", i),
+				fmt.Sprintf("follower[%d] apply %q before failover", i, k),
 				func() bool {
-					_, ok := sm.Get("before-failover")
-					return ok
+					got, ok := sm.Get(k)
+					return ok && got == v
 				},
 			)
 		}
@@ -497,22 +527,39 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 		t.Errorf("new leader %d should differ from old leader %d",
 			newLeaderReplicaID, oldLeaderReplicaID)
 	}
+	newLeaderHost := cluster.hosts[newLeaderIdx]
 
-	// Propose via the new leader.
-	cmd2 := encodeKVPut("after-failover", "survived")
-	rs2, err := cluster.hosts[newLeaderIdx].Propose(ctx, 1, cmd2)
+	newLeaderInfo, err := newLeaderHost.GetShardInfo(1)
 	if err != nil {
-		t.Fatalf("Propose to new leader failed: %v", err)
+		t.Fatalf("GetShardInfo on the new leader failed: %v", err)
 	}
-	rs2.Release()
+	if newLeaderInfo.Term <= oldTerm {
+		t.Errorf("new leader term = %d, want > old leader term %d: the failover did not start a new term",
+			newLeaderInfo.Term, oldTerm)
+	}
 
-	// Verify the new entry is applied on the new leader.
+	// Propose via the new leader and wait for apply. Once this resolves the
+	// new leader has applied through an index strictly above every
+	// pre-failover entry, so its state machine can be inspected directly
+	// without racing catch-up.
+	proposeCommitted(t, newLeaderHost, 1, "after-failover", "survived", defaultTimeout*2)
+
 	newLeaderSM := trackers[newLeaderIdx].Get(1, newLeaderReplicaID)
-	if newLeaderSM != nil {
-		waitForCondition(t, defaultTimeout, "new leader SM apply after failover", func() bool {
-			val, ok := newLeaderSM.Get("after-failover")
-			return ok && val == "survived"
-		})
+	if newLeaderSM == nil {
+		t.Fatalf("new leader[%d] state machine not found", newLeaderIdx)
+	}
+	assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx),
+		"after-failover", "survived")
+
+	// LEADER COMPLETENESS: every entry committed in the old term must be in
+	// the new leader's own applied state...
+	for key, value := range preFailover {
+		assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx), key, value)
+	}
+
+	// ...and must still be readable linearizably through the new leader.
+	for key, value := range preFailover {
+		syncReadExact(t, newLeaderHost, 1, key, value, defaultTimeout)
 	}
 }
 
@@ -614,6 +661,17 @@ func TestMultiNode_Session_OnLeader(t *testing.T) {
 
 // TestMultiNode_RequestSnapshot_OnLeader verifies that snapshot requests
 // work on the leader in a multi-node cluster.
+//
+// RequestSnapshot is ASYNCHRONOUS: the returned RequestState resolves only
+// when the snapshot has been saved, so a test that releases it without
+// reading the result waits for nothing and would pass even if no snapshot
+// were ever taken. This test reads the result, requires a non-zero snapshot
+// index covering the applied state, requires the durable snapshot.dat
+// artifact on disk, and requires a second snapshot to ADVANCE past the first.
+//
+// Note that automatic snapshots never fire here: Config.SnapshotEntries has
+// no default (SetDefaults leaves it 0) and testShardConfig does not set it,
+// so every snapshot in this package is the one explicitly requested below.
 func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -621,28 +679,33 @@ func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 	cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
+	leaderReplicaID := uint64(leaderIdx + 1)
+	leaderDir := cluster.nodeHostDirs[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Write some data first.
+	// Write some data first, awaiting apply so the snapshot has committed
+	// state to capture.
 	for i := 0; i < 5; i++ {
-		cmd := encodeKVPut(fmt.Sprintf("snap-key-%d", i), fmt.Sprintf("snap-val-%d", i))
-		rs, err := leaderHost.Propose(ctx, 1, cmd)
-		if err != nil {
-			t.Fatalf("Propose[%d] failed: %v", i, err)
-		}
-		rs.Release()
+		proposeCommitted(t, leaderHost, 1,
+			fmt.Sprintf("snap-key-%d", i), fmt.Sprintf("snap-val-%d", i), defaultTimeout)
 	}
 
-	rs, err := leaderHost.RequestSnapshot(ctx, 1, quicraft.SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot failed: %v", err)
+	firstIndex := awaitSnapshot(t, leaderHost, leaderDir, 1, leaderReplicaID)
+
+	// More writes, then a second snapshot. A snapshot index that never moves
+	// is indistinguishable from no snapshot being taken at all.
+	for i := 5; i < 10; i++ {
+		proposeCommitted(t, leaderHost, 1,
+			fmt.Sprintf("snap-key-%d", i), fmt.Sprintf("snap-val-%d", i), defaultTimeout)
 	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
+
+	secondIndex := awaitSnapshot(t, leaderHost, leaderDir, 1, leaderReplicaID)
+	if secondIndex <= firstIndex {
+		t.Fatalf("second snapshot index %d did not advance past the first (%d) after 5 more committed entries",
+			secondIndex, firstIndex)
 	}
-	rs.Release()
+
+	t.Logf("shard 1 replica %d: snapshot index advanced %d -> %d, both artifacts present on disk under %s",
+		leaderReplicaID, firstIndex, secondIndex, leaderDir)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1046,11 @@ func TestFiveNode_ProposeToFollower(t *testing.T) {
 // TestFiveNode_LeaderFailover verifies that when the leader is stopped in
 // a 5-node cluster, a new leader is elected from the remaining 4 nodes
 // and proposals succeed.
+//
+// As in the 3-node case, it also verifies LEADER COMPLETENESS by re-reading
+// the entries committed before the failover through the new leader; a new
+// leader that accepts writes but lost pre-failover committed state must fail
+// here.
 func TestFiveNode_LeaderFailover(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -991,34 +1059,48 @@ func TestFiveNode_LeaderFailover(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	oldLeaderReplicaID := uint64(leaderIdx + 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Warmup: write initial data via the leader to ensure all QUIC
-	// connections are fully established before stopping the leader.
-	cmd := encodeKVPut("before-failover-5n", "original")
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
+	oldLeaderInfo, err := cluster.hosts[leaderIdx].GetShardInfo(1)
 	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
+		t.Fatalf("GetShardInfo on the original leader failed: %v", err)
 	}
-	rs.Release()
+	oldTerm := oldLeaderInfo.Term
+	if oldTerm == 0 {
+		t.Fatal("original leader reports term 0")
+	}
 
-	// Wait for the warmup proposal to be applied on at least one follower.
+	// Write initial data via the leader, awaiting apply on each. This also
+	// ensures all QUIC connections are fully established before stopping the
+	// leader.
+	preFailover := make(map[string]string, 6)
+	preFailover["before-failover-5n"] = "original"
+	for i := 0; i < 5; i++ {
+		preFailover[fmt.Sprintf("before-failover-5n-%d", i)] =
+			fmt.Sprintf("committed-by-replica-%d-term-%d-seq-%d", oldLeaderReplicaID, oldTerm, i)
+	}
+	for key, value := range preFailover {
+		proposeCommitted(t, cluster.hosts[leaderIdx], 1, key, value, defaultTimeout)
+	}
+
+	// Wait for the pre-failover entries to be applied on EVERY follower, so
+	// the surviving four all carry the committed state into the election.
 	for i := range cluster.hosts {
 		if i == leaderIdx {
 			continue
 		}
 		replicaID := uint64(i + 1)
 		followerSM := trackers[i].Get(1, replicaID)
-		if followerSM != nil {
+		if followerSM == nil {
+			t.Fatalf("follower[%d] state machine not found", i)
+		}
+		for key, value := range preFailover {
+			k, v := key, value
 			waitForCondition(t, defaultTimeout,
-				fmt.Sprintf("follower[%d] apply before failover", i),
+				fmt.Sprintf("follower[%d] apply %q before failover", i, k),
 				func() bool {
-					_, ok := followerSM.Get("before-failover-5n")
-					return ok
+					got, ok := followerSM.Get(k)
+					return ok && got == v
 				},
 			)
-			break
 		}
 	}
 
@@ -1049,22 +1131,36 @@ func TestFiveNode_LeaderFailover(t *testing.T) {
 		t.Errorf("new leader %d should differ from old leader %d",
 			newLeaderReplicaID, oldLeaderReplicaID)
 	}
+	newLeaderHost := cluster.hosts[newLeaderIdx]
 
-	// Propose via the new leader.
-	cmd2 := encodeKVPut("after-failover-5n", "survived")
-	rs2, err := cluster.hosts[newLeaderIdx].Propose(ctx, 1, cmd2)
+	newLeaderInfo, err := newLeaderHost.GetShardInfo(1)
 	if err != nil {
-		t.Fatalf("Propose to new leader failed: %v", err)
+		t.Fatalf("GetShardInfo on the new leader failed: %v", err)
 	}
-	rs2.Release()
+	if newLeaderInfo.Term <= oldTerm {
+		t.Errorf("new leader term = %d, want > old leader term %d: the failover did not start a new term",
+			newLeaderInfo.Term, oldTerm)
+	}
 
-	// Verify the new entry is applied on the new leader.
+	// Propose via the new leader and wait for apply, which pins the new
+	// leader's applied index above every pre-failover entry.
+	proposeCommitted(t, newLeaderHost, 1, "after-failover-5n", "survived", defaultTimeout*2)
+
 	newLeaderSM := trackers[newLeaderIdx].Get(1, newLeaderReplicaID)
-	if newLeaderSM != nil {
-		waitForCondition(t, defaultTimeout, "new leader SM apply after failover", func() bool {
-			val, ok := newLeaderSM.Get("after-failover-5n")
-			return ok && val == "survived"
-		})
+	if newLeaderSM == nil {
+		t.Fatalf("new leader[%d] state machine not found", newLeaderIdx)
+	}
+	assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx),
+		"after-failover-5n", "survived")
+
+	// LEADER COMPLETENESS: everything committed in the old term must live on
+	// in the new leader's applied state and be readable linearizably through
+	// it.
+	for key, value := range preFailover {
+		assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx), key, value)
+	}
+	for key, value := range preFailover {
+		syncReadExact(t, newLeaderHost, 1, key, value, defaultTimeout)
 	}
 }
 
@@ -1248,7 +1344,9 @@ func TestFiveNode_Session_OnLeader(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestFiveNode_RequestSnapshot_OnLeader verifies that snapshot requests
-// work on the leader in a 5-node cluster.
+// work on the leader in a 5-node cluster. Like the 3-node case it awaits the
+// asynchronous snapshot result, requires a non-zero advancing snapshot index,
+// and requires the durable snapshot.dat artifact on disk.
 func TestFiveNode_RequestSnapshot_OnLeader(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -1256,31 +1354,30 @@ func TestFiveNode_RequestSnapshot_OnLeader(t *testing.T) {
 	cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
+	leaderReplicaID := uint64(leaderIdx + 1)
+	leaderDir := cluster.nodeHostDirs[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Write some data first.
+	// Write some data first, awaiting apply on each.
 	for i := 0; i < 5; i++ {
-		cmd := encodeKVPut(
-			fmt.Sprintf("five-snap-key-%d", i),
-			fmt.Sprintf("five-snap-val-%d", i),
-		)
-		rs, err := leaderHost.Propose(ctx, 1, cmd)
-		if err != nil {
-			t.Fatalf("Propose[%d] failed: %v", i, err)
-		}
-		rs.Release()
+		proposeCommitted(t, leaderHost, 1,
+			fmt.Sprintf("five-snap-key-%d", i), fmt.Sprintf("five-snap-val-%d", i), defaultTimeout)
 	}
 
-	rs, err := leaderHost.RequestSnapshot(ctx, 1, quicraft.SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot failed: %v", err)
+	firstIndex := awaitSnapshot(t, leaderHost, leaderDir, 1, leaderReplicaID)
+
+	for i := 5; i < 10; i++ {
+		proposeCommitted(t, leaderHost, 1,
+			fmt.Sprintf("five-snap-key-%d", i), fmt.Sprintf("five-snap-val-%d", i), defaultTimeout)
 	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
+
+	secondIndex := awaitSnapshot(t, leaderHost, leaderDir, 1, leaderReplicaID)
+	if secondIndex <= firstIndex {
+		t.Fatalf("second snapshot index %d did not advance past the first (%d) after 5 more committed entries",
+			secondIndex, firstIndex)
 	}
-	rs.Release()
+
+	t.Logf("shard 1 replica %d: snapshot index advanced %d -> %d, both artifacts present on disk under %s",
+		leaderReplicaID, firstIndex, secondIndex, leaderDir)
 }
 
 // ---------------------------------------------------------------------------

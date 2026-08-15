@@ -38,7 +38,11 @@ const (
 	// MagicByte1 is the second byte of the frame magic ("C").
 	MagicByte1 byte = 0x43
 
-	// WireVersion is the current wire format version.
+	// WireVersion is the frame header's wire format version. Like every other
+	// format in this repository it is PINNED at 1 for the whole pre-release
+	// period: a layout change is made in place and every peer is rebuilt, so
+	// the number does not move for it. Receivers gate on EXACT equality; see
+	// ValidateFrameHeader and docs/operations/compatibility.md.
 	WireVersion byte = 0x01
 
 	// MaxFrameSize is the maximum allowed frame payload size (16MB).
@@ -222,7 +226,16 @@ func ValidateFrameHeader(buf []byte) error {
 	if buf[0] != MagicByte0 || buf[1] != MagicByte1 {
 		return ErrInvalidMagic
 	}
-	if buf[2] < 1 || buf[2] > WireVersion {
+	// EXACT equality, not a range. Both ends of a QUIC connection are live
+	// processes and every format in this repository is pinned at version 1
+	// until the first production release, so there is no window of accepted
+	// versions to express — see docs/operations/compatibility.md. Written as
+	// `buf[2] >= 1 && buf[2] <= WireVersion` the gate degenerates to the same
+	// test today and silently WIDENS into a compatibility window the moment
+	// the constant moves, which is the drift the pinning policy exists to
+	// prevent. A peer speaking any other dialect is refused outright rather
+	// than misparsed.
+	if buf[2] != WireVersion {
 		return ErrUnsupportedVersion
 	}
 	length := binary.BigEndian.Uint32(buf[4:8])

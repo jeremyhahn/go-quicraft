@@ -1003,13 +1003,22 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
+	// Close AFTER the fsync above, and FAIL the save when it errors. This is a
+	// write handle: on Linux, Close is where a deferred writeback error
+	// (EIO/ENOSPC recorded after the last successful write) is reported, so
+	// swallowing it would let a truncated or unwritten artifact continue on to
+	// encryption, the LogDB snapshot record and log compaction — the record
+	// would name a snapshot that cannot be read back, and the entries it covers
+	// would already be gone. The sync-then-close-then-check idiom is the same
+	// one SyncDir, encryptSnapshotFile and writeSnapshotMetadata use. Nothing
+	// references the directory yet, so the deferred discard guard reclaims it.
 	if closeErr := f.Close(); closeErr != nil {
-		slog.Debug("snapshot: file close failed after successful write",
-			"shard_id", req.shardID,
-			"replica_id", req.replicaID,
-			"path", dataPath,
-			"error", closeErr,
-		)
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       closeErr,
+		}
 	}
 
 	// Encrypt the snapshot data file in-place when a barrier is configured.
@@ -1219,6 +1228,14 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"snapshot_index", snapshotIndex,
 					"error", err,
 				)
+				// Unreachable today — setSnapshot's only error is
+				// ErrSnapshotOutOfDate, handled above — but the fall-through was
+				// unguarded, so the day setSnapshot grows a second error the
+				// compaction block below would trim the log against a snapshot
+				// the LogReader never installed. The artifact is durable and
+				// recorded; only the discretionary follow-up work is skipped, and
+				// the next snapshot retries it.
+				return snapshotIndex, nil
 			}
 		}
 	}
@@ -1254,12 +1271,21 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			if lr := node.LogReader(); lr != nil {
 				if lrErr := lr.Compact(compactIndex); lrErr != nil &&
 					!errors.Is(lrErr, logdb.ErrCompacted) {
-					slog.Warn("log reader compaction failed",
+					slog.Warn("log reader compaction failed, skipping LogDB removal",
 						"shard_id", req.shardID,
 						"replica_id", req.replicaID,
 						"compact_index", compactIndex,
 						"error", lrErr,
 					)
+					// The marker did NOT advance. Removing the entries anyway
+					// produces exactly the stale-markerIndex state the ordering
+					// five lines above exists to prevent: raft keeps probing for
+					// entries the LogDB has discarded. Compaction is discretionary
+					// — the snapshot is durable, recorded and published — so skip
+					// the whole removal and let the next snapshot retry against a
+					// marker it can advance. ErrCompacted is not an error here: it
+					// means the marker is already at or past compactIndex.
+					return snapshotIndex, nil
 				}
 			}
 			if removeErr := p.logdb.RemoveEntriesTo(req.shardID, req.replicaID, compactIndex); removeErr != nil {
@@ -2887,9 +2913,21 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	if err != nil {
 		return err
 	}
+	// closed tracks whether the sync-then-close sequence below already ran, so
+	// the cleanup defer does not double-close a handle whose Close error was
+	// already reported. A Close error on a WRITE handle is the last chance to
+	// observe a deferred writeback failure, and this record is exactly what
+	// readSnapshotEpoch consults: an unreadable one classifies the directory
+	// UNEVALUABLE and suppresses DEK purging for the whole barrier until it
+	// rolls off. Dropping the error here (the old Debug-only defer) is what let
+	// that happen silently, so it is returned like every other write error.
+	closed := false
 	defer func() {
+		if closed {
+			return
+		}
 		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot: metadata file close failed",
+			slog.Debug("snapshot: metadata file close failed after write error",
 				"path", metaPath,
 				"shard_id", shardID,
 				"replica_id", replicaID,
@@ -2909,7 +2947,11 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	if _, err := f.Write(buf); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	closed = true
+	return f.Close()
 }
 
 // snapshotDirEntry holds a snapshot directory path and its parsed index.
@@ -3084,9 +3126,18 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 			Err:        err,
 		}
 	}
+	// dstClosed marks the sync-then-close sequence below as already run so the
+	// cleanup defer does not double-close. dst is a WRITE handle, so its Close
+	// is where a deferred writeback error surfaces; the old Debug-only defer
+	// dropped it while io.Copy, Sync and SyncDir errors all failed the export,
+	// which meant a truncated backup could be reported as a successful one.
+	dstClosed := false
 	defer func() {
+		if dstClosed {
+			return
+		}
 		if closeErr := dst.Close(); closeErr != nil {
-			slog.Debug("snapshot export: destination file close failed",
+			slog.Debug("snapshot export: destination file close failed after write error",
 				"path", dstPath,
 				"error", closeErr,
 			)
@@ -3101,6 +3152,14 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 	}
 
 	if err := dst.Sync(); err != nil {
+		return &SnapshotExportError{
+			ExportPath: exportPath,
+			Err:        err,
+		}
+	}
+
+	dstClosed = true
+	if err := dst.Close(); err != nil {
 		return &SnapshotExportError{
 			ExportPath: exportPath,
 			Err:        err,
@@ -3128,6 +3187,32 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 	}
 
 	return nil
+}
+
+// GCSnapshotDirs reclaims a shard's superseded snapshot directories, keeping
+// only the most recent maxSnapshotsRetained. It is the entry point for the two
+// paths that PUBLISH a snapshot directory without going through saveSnapshot —
+// the inbound-snapshot receive path (hostMessageHandler.HandleSnapshot, which
+// creates Node.SnapshotSaveDir(index) per received snapshot) and
+// Host.ImportSnapshot — neither of which previously reclaimed anything.
+//
+// It must be called AFTER the new snapshot is durably recorded, so retention is
+// computed against the set that includes it; calling it before would count the
+// new directory as absent and could evict a directory that is about to become
+// the only recent one.
+//
+// This is not cosmetic. A shard configured with SnapshotEntries == 0 — a
+// supported setting with no default, so the out-of-the-box state — never runs
+// saveSnapshot at all, so without this a follower that repeatedly falls behind
+// the leader's compaction floor accumulates one full state-machine image per
+// catch-up, forever. Worse, snapshotFloorScan.addNode folds EVERY retained
+// directory of EVERY loaded node into the minimum and globalSafePurgeFloor
+// takes the minimum across all of them, so one such shard's stale directories
+// pin the HOST-WIDE DEK purge floor: co-hosted shards that do save can never
+// purge a DEK and old epoch key material is never zeroed, defeating
+// purgeOldEpochs entirely.
+func GCSnapshotDirs(baseDir string, shardID, replicaID uint64) error {
+	return gcSnapshotDirs(baseDir, shardID, replicaID)
 }
 
 // gcSnapshotDirs removes old snapshot directories, keeping only the

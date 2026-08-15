@@ -949,8 +949,6 @@ func TestStepWorker_CommitPendingInbox_SendsMessages(t *testing.T) {
 	// Set commitPending to simulate busy pipeline.
 	node.commitPending.Store(true)
 
-	initialSentCount := sender.sentCount()
-
 	// Deliver a heartbeat to the inbox. The leader will produce
 	// response messages (sendAppend for probe peers, etc.).
 	node.Deliver(proto.Message{
@@ -961,16 +959,11 @@ func TestStepWorker_CommitPendingInbox_SendsMessages(t *testing.T) {
 	ws.Notify(1)
 	sw.processReady()
 
-	// Messages produced during commitPending inbox processing should
-	// be sent via the transport. The HeartbeatResp causes sendAppend
-	// to the responding peer, producing Replicate messages.
-	if sender.sentCount() <= initialSentCount {
-		// It's OK if no messages were sent (e.g., the follower is in
-		// probe state with no entries to send). The important thing is
-		// that the code path ran without panicking and the inbox was drained.
-	}
-
-	// Inbox should be drained.
+	// The message count is deliberately NOT asserted: a follower in probe
+	// state with nothing to send legitimately produces none, so either
+	// outcome is correct. What must hold is that processReady drained the
+	// inbox instead of leaving the delivered HeartbeatResp wedged behind
+	// commitPending.
 	remaining := node.DrainInbox(nil)
 	if len(remaining) != 0 {
 		t.Fatalf("inbox should be empty, got %d", len(remaining))
@@ -2002,16 +1995,6 @@ func (s *sequenceSender) getEvents() []sendEvent {
 	result := make([]sendEvent, len(s.events))
 	copy(result, s.events)
 	return result
-}
-
-func (s *sequenceSender) allSentMessages() []proto.Message {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var all []proto.Message
-	for _, ev := range s.events {
-		all = append(all, ev.msgs...)
-	}
-	return all
 }
 
 var _ MessageSender = (*sequenceSender)(nil)

@@ -16,11 +16,40 @@ package proto
 
 // Snapshot represents snapshot metadata for a Raft shard. It contains
 // fixed fields for identification and state, an inline Membership, and
-// variable-length fields for Filepath and Checksum. The wire format is:
+// one variable-length field, Filepath. The wire format is:
 //
 //	[ShardID:8][ReplicaID:8][Index:8][Term:8][Membership:var]
-//	[Filepath:len+data][FileSize:8][Checksum:len+data]
+//	[Filepath:len+data][FileSize:8]
 //	[Type:8][Imported:8][OnDiskIndex:8][Witness:8][Epoch:8]
+//
+// # The removed Checksum field
+//
+// This type carried a `Checksum []byte` through an earlier pre-release layout.
+// It was decoded,
+// bounded, bulk-copied out of the pooled receive buffer and propagated through
+// the whole transfer pipeline — and it was NEVER computed and NEVER verified,
+// anywhere in the repository. Nothing wrote it, so it was empty on every real
+// snapshot, and the receive path paid one allocation and two copies per message
+// to keep an empty slice alive.
+//
+// It was removed rather than implemented, at the format freeze, for one reason
+// that outweighs the cost of a future format break if a real one is wanted: a
+// field named Checksum that rides the wire and is never checked reads as an
+// integrity control to anyone auditing this format, and an integrity control
+// that does not exist is worse than an absent one. Populating it properly is
+// also not a codec change — the value has to be computed over the FINAL artifact
+// bytes (post-compression, post-encryption), stamped where the artifact is
+// produced, and verified in three separate consumers (recovery, streamed
+// receive, ImportSnapshot). Wiring one of those and not the others reproduces
+// exactly the state being removed, so it belongs in its own change with its own
+// tests, not as a side effect of a layout revision.
+//
+// What snapshot integrity rests on meanwhile, stated plainly: TLS in transit,
+// and barrier AEAD at rest. A shard configured with a PLAINTEXT barrier
+// (seal.None) therefore has NO at-rest integrity check on its snapshot
+// artifacts — silent bit rot or a truncated artifact is recovered into the state
+// machine. That was equally true while the field existed; removing it makes the
+// gap visible instead of apparently covered.
 type Snapshot struct {
 	// ShardID identifies the Raft shard this snapshot belongs to.
 	ShardID uint64
@@ -36,12 +65,6 @@ type Snapshot struct {
 	Filepath string
 	// FileSize is the size of the snapshot data file in bytes.
 	FileSize uint64
-	// Checksum is the integrity checksum of the snapshot data. After
-	// UnmarshalFrom, Checksum aliases the source buffer (zero-copy), like
-	// Entry.Cmd. The caller must copy if the data needs to outlive the
-	// buffer — on the receive path the buffer is pooled and is returned
-	// before the handler runs.
-	Checksum []byte
 	// Type identifies the state machine type.
 	Type uint64
 	// Imported indicates whether this snapshot was imported externally.
@@ -63,18 +86,26 @@ func (s *Snapshot) Size() int {
 	// Membership (variable)
 	// Filepath: 4-byte len + data
 	// FileSize: 8
-	// Checksum: 4-byte len + data
 	// Type, Imported, OnDiskIndex, Witness, Epoch: 5 * 8
 	return 4*8 + s.Membership.Size() +
 		(4 + len(s.Filepath)) + 8 +
-		(4 + len(s.Checksum)) +
 		5*8
 }
 
 // MarshalTo writes the snapshot metadata into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen,
+// InvalidSnapshotTypeError for a Type UnmarshalFrom would reject, or whatever
+// the embedded Membership's own write-side limits report — the read side's
+// checks applied on write, so this type cannot emit metadata it refuses to
+// read back.
 func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
+	if len(s.Filepath) > MaxFilepathLen {
+		return 0, ErrFilepathTooLong
+	}
+	if s.Type > maxStateMachineType {
+		return 0, &InvalidSnapshotTypeError{Type: s.Type}
+	}
 	required := s.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall
@@ -92,7 +123,6 @@ func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
 	offset += putString(buf[offset:], s.Filepath)
 	putUint64(buf[offset:], s.FileSize)
 	offset += 8
-	offset += putBytes(buf[offset:], s.Checksum)
 	putUint64(buf[offset:], s.Type)
 	offset += 8
 	putBool(buf[offset:], s.Imported)
@@ -135,13 +165,6 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	s.FileSize = getUint64(buf[offset:])
 	offset += 8
-	var cksum []byte
-	cksum, n, err = getBytes(buf[offset:], MaxChecksumLen, ErrChecksumTooLong)
-	if err != nil {
-		return 0, err
-	}
-	s.Checksum = cksum
-	offset += n
 	// 5 trailing fixed fields: Type, Imported, OnDiskIndex, Witness, Epoch
 	if len(buf) < offset+5*8 {
 		return 0, ErrBufferTooSmall
@@ -177,7 +200,6 @@ func (s *Snapshot) Reset() {
 	s.Membership.Reset()
 	s.Filepath = ""
 	s.FileSize = 0
-	s.Checksum = nil
 	s.Type = 0
 	s.Imported = false
 	s.OnDiskIndex = 0

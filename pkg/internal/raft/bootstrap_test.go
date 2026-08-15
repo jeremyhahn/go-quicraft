@@ -462,8 +462,10 @@ func TestInitialMembershipOutsideBootstrapIndexIsRefused(t *testing.T) {
 	// The same entry, but replicated at a later index.
 	stray := founding
 	stray.Index = 500
-	if applied := p.applyMembershipEntry(stray); applied {
-		t.Fatal("an initial-membership entry above the bootstrap index was applied")
+	if applied, err := p.applyMembershipEntry(stray); applied || err != nil {
+		t.Fatalf("an initial-membership entry above the bootstrap index was applied "+
+			"(applied=%v err=%v): the refusal is structural, not a decode failure, "+
+			"so it must be a silent no-op rather than a shard fault", applied, err)
 	}
 	for _, id := range []uint64{4, 5} {
 		if !p.membership.isMember(id) {
@@ -475,7 +477,8 @@ func TestInitialMembershipOutsideBootstrapIndexIsRefused(t *testing.T) {
 	}
 
 	// At the bootstrap index it is of course still applied.
-	if applied := p.applyMembershipEntry(founding); !applied {
-		t.Fatal("the founding entry at the bootstrap index was refused")
+	if applied, err := p.applyMembershipEntry(founding); !applied || err != nil {
+		t.Fatalf("the founding entry at the bootstrap index was refused "+
+			"(applied=%v err=%v)", applied, err)
 	}
 }

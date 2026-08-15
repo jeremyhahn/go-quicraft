@@ -51,7 +51,13 @@ type BarrierConfig struct {
 	// clusters sharing the same root key produce independent DEKs.
 	DeploymentID uint64
 
-	// NonceTracking enables per-nonce reuse detection. Default: true.
+	// NonceTracking enables per-nonce reuse detection. It is a *bool so that
+	// the ZERO VALUE means "unset, use the default" rather than "off": a plain
+	// bool made every hand-built BarrierConfig — the normal case for an
+	// embedder that pins Algorithm and DeploymentID explicitly — silently
+	// construct a barrier with NO nonce tracker at all. Nil defaults to TRUE;
+	// use GetNonceTracking to read the effective value and BoolPtr(false) to
+	// disable deliberately.
 	//
 	// MEMORY: the in-memory tracker retains EVERY unique nonce for the life of
 	// the epoch, so its memory grows LINEARLY with the number of encrypt
@@ -65,13 +71,20 @@ type BarrierConfig struct {
 	// random-nonce + invocation-cap argument) for extreme-throughput, long-epoch
 	// deployments where per-epoch memory must stay flat.
 	//
-	// The default tracker ENFORCES this rather than only documenting it: past
-	// DefaultMaxTrackedNonces it logs at error level and disables reuse
-	// detection for the epoch instead of growing until the process is killed.
-	// NewBarrier additionally warns when this is on with neither a
+	// CEILING — tracking is NOT unconditional for the life of the epoch. The
+	// default tracker enforces the memory bound above rather than only
+	// documenting it: past DefaultMaxTrackedNonces (4Mi nonces, ~160 MB) it logs
+	// at error level and DISABLES reuse detection for the remainder of the
+	// epoch instead of growing until the process is killed. Detection therefore
+	// covers the first DefaultMaxTrackedNonces encryptions of each epoch and no
+	// more; raise or remove the ceiling with
+	// InMemoryNonceTracker.SetMaxTrackedNonces (via NonceTrackerProvider) when
+	// the epoch is guaranteed to rotate well before memory becomes a concern.
+	// NewBarrier additionally warns when tracking is on with neither a
 	// StatePersister nor an InvocationCounter — the combination that provably
-	// cannot rotate, and therefore can never release the tracked set.
-	NonceTracking bool
+	// cannot rotate, and therefore can never release the tracked set, so the
+	// ceiling is reached and detection stops for good.
+	NonceTracking *bool
 
 	// InvocationLimit is the max encrypt operations per key epoch.
 	// Default: 2^32 (NIST SP 800-38D for random 96-bit nonces).
@@ -84,15 +97,22 @@ type BarrierConfig struct {
 	RotationThreshold float64
 
 	// StatePersister durably persists the sealed root-key state. It is
-	// REQUIRED for Rotate and for any PurgeEpochsBefore that actually purges:
-	// both change state that must survive a restart (the active epoch, the
-	// KnownEpochs set), and data written under an epoch the persisted blob
-	// does not name is undecryptable after a restart. When nil, those
-	// operations fail closed with ErrNoStatePersister and the current epoch
-	// stays active — writes continue until the hard invocation limit, at
-	// which point Encrypt itself fails closed. Initialize does NOT call the
-	// persister: the embedder persists SealedRootKeyData() directly at
-	// bootstrap.
+	// REQUIRED for Rotate, for UNSEAL AFTER A RESTART (which rotates, because
+	// the loaded epoch's spent NIST SP 800-38D invocation budget is unknowable
+	// — see Barrier.resolveInvocationBudget; without a persister the barrier
+	// unseals read-only and every Encrypt fails closed), and for any
+	// PurgeEpochsBefore that actually purges. All three change state that must
+	// survive a restart (the active epoch, the KnownEpochs set), and data
+	// written under an epoch the persisted blob does not name is undecryptable
+	// after that restart. When nil, they fail closed with ErrNoStatePersister
+	// and the current epoch stays active for READS; writes under it are refused
+	// from the first post-restart unseal onward, because a budget nobody can
+	// prove is not a budget.
+	//
+	// Initialize does NOT call the persister: the embedder persists
+	// SealedRootKeyData() directly at bootstrap. Unseal DOES, when it rotates.
+	// The persister is invoked with the barrier's write lock held on every one
+	// of these paths and must not re-enter the barrier.
 	StatePersister StatePersister
 
 	// InvocationCounter allows injection of a custom counter.
@@ -102,17 +122,17 @@ type BarrierConfig struct {
 	// invocation counts across process restarts (Seed it from durable
 	// state before Unseal). When nil, the barrier cannot know how many
 	// AEAD invocations the current epoch has already performed after a
-	// restart, so Unseal pessimistically seeds the default counter to
-	// the rotation threshold — forcing a prompt key rotation — to keep
-	// the NIST SP 800-38D 2^32 budget sound across process lifetimes.
+	// restart, so Unseal moves to a FRESH epoch whose count is provably zero
+	// (and refuses to encrypt under the loaded one if it cannot) to keep the
+	// NIST SP 800-38D 2^32 budget sound across process lifetimes. See
+	// Barrier.resolveInvocationBudget.
 	//
-	// CONSEQUENCE — a deployment that leaves this nil MUST both run a
-	// rotation loop AND configure StatePersister. The post-unseal seeding
-	// makes ShouldRotateKey() true almost immediately after every restart,
-	// so an embedder that never rotates burns the remaining headroom
-	// between the rotation threshold and InvocationLimit (default 5%) and
-	// then fails every Encrypt with the invocation-limit error. Inject a
-	// counter that persists its own count to avoid the forced rotation.
+	// CONSEQUENCE — a deployment that leaves this nil MUST configure
+	// StatePersister, because every restart costs it an epoch: the barrier
+	// rotates during Unseal rather than keep writing against an unprovable
+	// budget. Inject a counter that persists its own count to avoid the forced
+	// rotation; it then owns the correctness of that count, and seeding it too
+	// low is exactly as unsound as not counting at all.
 	InvocationCounter InvocationCounter
 
 	// NonceTrackerProvider allows injection of a custom nonce tracker.
@@ -152,6 +172,72 @@ type BarrierConfig struct {
 	// bind context is constructed normally and callers suppress their context
 	// (see Barrier.SupportsContextAAD and Barrier.ContextBinding).
 	RequireContextAAD bool
+
+	// RequireFIPS declares that this deployment REQUIRES the FIPS 140-3 module.
+	// When true, Validate (and therefore NewBarrier) fails closed with
+	// ErrFIPSUnavailable unless FIPSEnabled() reports the module active.
+	//
+	// It exists because FIPS enforcement is otherwise entirely ENVIRONMENT
+	// derived: without this flag "FIPS was not requested" and "FIPS was
+	// requested but this binary was not built with the module" are
+	// indistinguishable, and the second fails OPEN — the barrier quietly wraps
+	// its root key with Argon2id and encrypts with whatever
+	// SelectOptimalAlgorithm picked, which may be ChaCha20-Poly1305. Setting
+	// this turns that silent downgrade into a refusal at construction.
+	RequireFIPS bool
+
+	// MinEpoch is a floor on the epoch a persisted SealedRootKey may name.
+	// SetSealedRootKey rejects a blob whose Epoch is below it with
+	// ErrSealedEpochRollback.
+	//
+	// The sealed blob's metadata is authenticated (SealedRootKey.StateMAC) but
+	// authentication cannot detect REPLAY: an attacker with write access to the
+	// persisted state can restore an OLDER, genuinely-MACed copy of the same
+	// blob, which resurrects a retired epoch's DEK together with a fresh
+	// invocation counter and an empty nonce tracker — two independent
+	// random-nonce sequences under one key, exactly what the invocation cap
+	// exists to prevent. Only state the attacker cannot roll back in the same
+	// step can detect that, and the barrier holds none: the embedder does.
+	//
+	// Set it to the highest epoch any live WAL segment or retained snapshot
+	// still references (the engine computes exactly this as its global
+	// safe-purge floor / minimum live epoch). Zero disables the check, which is
+	// the historical behavior.
+	MinEpoch uint64
+
+	// AllowUnauthenticatedSealedState permits loading a SealedRootKey that
+	// carries no StateMAC — a blob written before the barrier authenticated its
+	// own metadata.
+	//
+	// The metadata (Epoch, KnownEpochs, Salt, HKDFVersion, Algorithm, Strategy)
+	// is plaintext next to the root-key ciphertext and is NOT covered by that
+	// ciphertext's AAD, so without the MAC every one of those fields is
+	// attacker-controlled under the write-access threat model this package
+	// already defends elsewhere. Accepting an ABSENT MAC is therefore a
+	// downgrade an attacker can trigger by simply deleting the field, which is
+	// why it fails closed by default and this escape hatch is explicit,
+	// per-deployment, and named for what it gives up.
+	//
+	// ON-DISK CONSEQUENCE: leaving this false requires every persisted blob to
+	// have been written by a build that stamps StateMAC. Migrate a pre-MAC
+	// deployment by starting once with this set to true and re-persisting
+	// SealedRootKeyData() (Unseal restamps the MAC), then clearing it.
+	AllowUnauthenticatedSealedState bool
+}
+
+// BoolPtr returns a pointer to the given bool value, for setting *bool config
+// fields where nil means "use the default". It mirrors config.BoolPtr and is
+// duplicated here so that pkg/seal — the foundational encryptor, which imports
+// nothing from the rest of the engine — stays dependency-free.
+func BoolPtr(v bool) *bool { return &v }
+
+// GetNonceTracking returns the effective NonceTracking value. A nil pointer
+// means the field was never set and yields the safe default, TRUE.
+func (c *BarrierConfig) GetNonceTracking() bool {
+	if c.NonceTracking == nil {
+		return true
+	}
+	return *c.NonceTracking
 }
 
 // DefaultBarrierConfig returns a BarrierConfig with sensible defaults:
@@ -165,14 +251,15 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 	return BarrierConfig{
 		Algorithm:     SelectOptimalAlgorithm(false),
 		DeploymentID:  deploymentID,
-		NonceTracking: true,
+		NonceTracking: BoolPtr(true),
 	}
 }
 
 // Validate reports whether the configuration can be used to construct a
-// Barrier, returning ErrUnsupportedAlgorithm for an unknown algorithm and
+// Barrier, returning ErrUnsupportedAlgorithm for an unknown algorithm,
 // ErrAlgorithmNotFIPSApproved when FIPS mode is active and the configured
-// cipher is not FIPS-approved.
+// cipher is not FIPS-approved, and ErrFIPSUnavailable when RequireFIPS is set
+// but the FIPS 140-3 module is not active.
 //
 // NewBarrier applies exactly these rules and returns this error, so calling
 // Validate first is an optimization, not a safety requirement. It is useful
@@ -183,6 +270,12 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 func (c *BarrierConfig) Validate() error {
 	if !c.Algorithm.Valid() {
 		return ErrUnsupportedAlgorithm
+	}
+	// A deployment that DEMANDS FIPS must not start on a binary that cannot
+	// provide it. Checked before the cipher rule below so the operator is told
+	// the module is missing rather than that some algorithm is unapproved.
+	if c.RequireFIPS && !FIPSEnabled() {
+		return ErrFIPSUnavailable
 	}
 	// FIPS 140 mode constrains the data-path cipher: the ChaCha20 family
 	// is not FIPS-approved and must be rejected at configuration time

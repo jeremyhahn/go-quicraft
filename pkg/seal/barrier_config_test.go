@@ -36,7 +36,7 @@ func TestDefaultBarrierConfig(t *testing.T) {
 	}
 
 	// Verify nonce tracking is enabled
-	if !cfg.NonceTracking {
+	if !cfg.GetNonceTracking() {
 		t.Fatal("NonceTracking should be enabled by default")
 	}
 
@@ -88,7 +88,7 @@ func TestBarrierConfig_Validate(t *testing.T) {
 			cfg := BarrierConfig{
 				Algorithm:     tt.algorithm,
 				DeploymentID:  1,
-				NonceTracking: true,
+				NonceTracking: BoolPtr(true),
 			}
 			err := cfg.Validate()
 			if err != nil {
@@ -104,7 +104,7 @@ func TestBarrierConfig_Validate_InvalidAlgorithm(t *testing.T) {
 	cfg := BarrierConfig{
 		Algorithm:     SymmetricAlgorithm(0xFF), // Invalid algorithm identifier
 		DeploymentID:  1,
-		NonceTracking: true,
+		NonceTracking: BoolPtr(true),
 	}
 
 	err := cfg.Validate()

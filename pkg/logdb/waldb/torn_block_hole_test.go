@@ -15,6 +15,7 @@
 package waldb
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +35,13 @@ import (
 //
 // The guard was previously uncovered -- removing it left the entire waldb suite
 // green.
+//
+// The segment is closed WITHOUT a Sync, so every record in it carries generation
+// 0: nothing here was ever acknowledged, and truncating at the tear destroys
+// nothing. The evidence flags are asserted below so that stays true by
+// construction rather than by accident -- the acknowledged-data counterpart is
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable, where the same
+// damage must instead refuse to open.
 func TestTornBlockTailIsAHoleNotAnEndOfRecords(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 1024
@@ -112,5 +120,25 @@ func TestTornBlockTailIsAHoleNotAnEndOfRecords(t *testing.T) {
 	if len(records) >= total {
 		t.Fatalf("ReadAll returned %d of %d records across a tear: records after "+
 			"the hole were replayed", len(records), total)
+	}
+	// The tear is inside a single unsynced generation, so recovery is licensed
+	// to truncate at it. Both evidence flags must stay clear, or a routine power
+	// loss becomes an unbootable node.
+	if torn.ackedDataAfterCorruption {
+		t.Fatal("ackedDataAfterCorruption is set for a tear inside one unsynced " +
+			"generation: recovery would refuse to open a WAL it must repair")
+	}
+	if torn.sequenceRegression {
+		t.Fatal("sequenceRegression is set for a single-generation segment")
+	}
+
+	// The surviving prefix must be the ORIGINAL prefix, byte for byte. A count
+	// is not enough: a recovery that dropped records BELOW the tear and made up
+	// the difference above it would satisfy the bound above.
+	for i := range records {
+		if !bytes.Equal(records[i], payload) {
+			t.Fatalf("recovered record %d is not the record written at that "+
+				"ordinal; the surviving prefix is not the original prefix", i)
+		}
 	}
 }

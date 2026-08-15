@@ -27,6 +27,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -441,25 +442,42 @@ func TestOpenFailsOnLegacySnapshotFormatV2(t *testing.T) {
 	}
 }
 
-// TestOpenFailsOnUnsupportedMembershipVersion verifies the in-section
-// version gate behind the payload-type gate: a current-payload-type record
-// whose membership section carries an unknown version byte fails recovery
-// rather than having its fields interpreted at the wrong offsets.
+// TestOpenFailsOnUnsupportedMembershipVersion verifies the in-section version
+// gate behind the payload-type gate, on EXACT equality: a
+// current-payload-type record whose membership section carries any version
+// byte other than membershipSectionVersion fails recovery rather than having
+// its fields interpreted at this layout's offsets.
+//
+// Every format in the repository is pinned at version 1 pre-release, so there
+// is no earlier layout to fall back to and no window to widen. A section
+// stamped with anything else was written by a binary built from a different
+// pre-release commit — the record is length-correct and CRC-clean, so the
+// version byte is the only thing that can catch it.
 func TestOpenFailsOnUnsupportedMembershipVersion(t *testing.T) {
-	dir := t.TempDir()
+	// The numbers earlier pre-release commits stamped, the two ends of the byte
+	// range and both neighbours of the supported value.
+	for _, bad := range []byte{0, 2, 3, 4, 5, 6, 0xFF} {
+		if bad == membershipSectionVersion {
+			t.Fatalf("fixture %d is the supported version; the table must list "+
+				"only values the gate has to refuse", bad)
+		}
+		t.Run(strconv.Itoa(int(bad)), func(t *testing.T) {
+			dir := t.TempDir()
 
-	payload := make([]byte, 1+snapshotRecordBaseSize+minMembershipSize)
-	payload[0] = payloadTypeSnapshot
-	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
-	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
-	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
-	binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
-	payload[1+snapshotRecordBaseSize] = membershipSectionVersion + 1
-	writeRawShardRecord(t, dir, 1, payload)
+			payload := make([]byte, 1+snapshotRecordBaseSize+minMembershipSize)
+			payload[0] = payloadTypeSnapshot
+			binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
+			binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
+			binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
+			binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
+			payload[1+snapshotRecordBaseSize] = bad
+			writeRawShardRecord(t, dir, 1, payload)
 
-	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if !errors.Is(err, ErrUnsupportedMembershipVersion) {
-		t.Fatalf("Open = %v, want ErrUnsupportedMembershipVersion", err)
+			_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+			if !errors.Is(err, ErrUnsupportedMembershipVersion) {
+				t.Fatalf("Open = %v, want ErrUnsupportedMembershipVersion", err)
+			}
+		})
 	}
 }
 
@@ -776,30 +794,43 @@ func TestReplaySnapshotAcceptsFullMembershipSection(t *testing.T) {
 	}
 }
 
-// TestReplayAcceptsV3MembershipSection verifies that a membership section
-// written before Identities existed still replays.
+// TestReplaySnapshotRoundTripsEveryMembershipField is the equivalence
+// statement for the single-version collapse of this section: every field the
+// layout carries — all six maps, the witness policy and the replicated session
+// policy — must survive SaveSnapshot and replay intact.
 //
-// The version gate accepts a RANGE precisely so a version bump does not make
-// every existing WAL unreplayable. Requiring an exact match — which is what
-// this code did before v4 — turns "this node was written by yesterday's
-// binary" into "this node cannot start", with the whole log intact on disk and
-// no way to reach it. A v3 section ends at Removed, so the replayer must stop
-// there rather than reading whatever follows as an identity map.
-func TestReplayAcceptsV3MembershipSection(t *testing.T) {
-	// Produce a real v4 record, then demote it to v3 exactly as a pre-v4
-	// binary would have written it: older version byte, and none of the v4
-	// tail — neither the Identities count nor the session policy behind it.
-	src := t.TempDir()
-	db, err := Open(src, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+// The version gate is EXACT, so there is no longer a tail this replayer may
+// skip and no earlier layout whose absent fields would decode as empty. That
+// makes a dropped field silent rather than loud: it would come back as an empty
+// map with no error anywhere, and for the two identity maps that is a security
+// regression, not a data-loss one. Identities is the receive gate's only
+// authorization input where it is present; RemovedIdentities is the deny-list
+// evaluated against the authenticated connection, so losing it readmits a
+// decommissioned node holding a still-valid certificate on exactly the restart
+// an operator performs after removing it.
+func TestReplaySnapshotRoundTripsEveryMembershipField(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	want := logdb.Membership{
+		ConfigChangeID:             17,
+		MaxWitnesses:               3,
+		RequireFullReplicaMajority: true,
+		SessionExpiryEntries:       100000,
+		MaxTotalSessions:           16384,
+		MaxSessionsPerClient:       128,
+		Addresses:                  map[uint64]string{1: "node-a:5000", 2: "node-b:5000"},
+		Observers:                  map[uint64]string{10: "obs-10:5000"},
+		Witnesses:                  map[uint64]string{20: "wit-20:5000"},
+		Removed:                    map[uint64]bool{30: true, 31: true},
+		Identities:                 map[uint64]string{1: "spki:aa", 2: "spki:bb"},
+		RemovedIdentities:          map[uint64]string{30: "spki:cc", 31: "spki:dd"},
+	}
 	snap := logdb.Snapshot{
-		Index: 7, Term: 2, Filepath: "snap-7.dat",
-		Membership: logdb.Membership{
-			ConfigChangeID: 5,
-			Addresses:      map[uint64]string{1: "node-a:5000"},
-		},
+		Index: 7, Term: 2, Filepath: "snap-7.dat", FileSize: 4096,
+		Membership: want,
 	}
 	if err := db.SaveSnapshot(1, 1, snap); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
@@ -808,25 +839,9 @@ func TestReplayAcceptsV3MembershipSection(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	rec := findRawShardRecord(t, src, 1, payloadTypeSnapshot)
-	memberOff := 1 + snapshotRecordBaseSize + len(snap.Filepath)
-	if rec[memberOff] != membershipSectionV4 {
-		t.Fatalf("fixture is not v4 (version byte = %d); this test demotes a v4 record", rec[memberOff])
-	}
-	// The v4 tail is the Identities count (4 bytes for the empty map this
-	// fixture has) plus the session policy.
-	tail := 4 + membershipSessionPolicySize
-	v3 := make([]byte, len(rec)-tail)
-	copy(v3, rec[:len(rec)-tail])
-	v3[memberOff] = membershipSectionV3
-
-	dir := t.TempDir()
-	writeRawShardRecord(t, dir, 1, v3)
-
 	reopened, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if err != nil {
-		t.Fatalf("Open after v3 demotion: a section written before Identities "+
-			"existed must still replay, got: %v", err)
+		t.Fatalf("Reopen: %v", err)
 	}
 	defer reopened.Close()
 
@@ -834,33 +849,42 @@ func TestReplayAcceptsV3MembershipSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
-	if got.Index != 7 || got.Membership.ConfigChangeID != 5 {
-		t.Fatalf("replayed snapshot = {Index:%d ConfigChangeID:%d}, want {7 5}",
-			got.Index, got.Membership.ConfigChangeID)
+	if got.Index != 7 || got.Term != 2 || got.Filepath != "snap-7.dat" || got.FileSize != 4096 {
+		t.Fatalf("snapshot header changed in round trip: %+v", got)
 	}
-	if addr := got.Membership.Addresses[1]; addr != "node-a:5000" {
-		t.Fatalf("replayed address = %q, want node-a:5000", addr)
+	m := got.Membership
+	if m.ConfigChangeID != want.ConfigChangeID || m.MaxWitnesses != want.MaxWitnesses ||
+		m.RequireFullReplicaMajority != want.RequireFullReplicaMajority {
+		t.Fatalf("fixed fields changed in round trip: %+v", m)
 	}
-	// A v3 section carries no identities, and the replayer must surface that as
-	// an empty map rather than nil: the quorum gate reads this map, and a nil
-	// one is only safe by accident.
-	if got.Membership.Identities == nil {
-		t.Fatal("Identities is nil after replaying a v3 section, want an empty map")
+	if m.SessionExpiryEntries != want.SessionExpiryEntries ||
+		m.MaxTotalSessions != want.MaxTotalSessions ||
+		m.MaxSessionsPerClient != want.MaxSessionsPerClient {
+		t.Fatalf("session policy changed in round trip: {expiry:%d total:%d perClient:%d}",
+			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient)
 	}
-	if len(got.Membership.Identities) != 0 {
-		t.Fatalf("Identities = %v after replaying a v3 section, want empty",
-			got.Membership.Identities)
+	for name, pair := range map[string][2]map[uint64]string{
+		"Addresses":         {want.Addresses, m.Addresses},
+		"Observers":         {want.Observers, m.Observers},
+		"Witnesses":         {want.Witnesses, m.Witnesses},
+		"Identities":        {want.Identities, m.Identities},
+		"RemovedIdentities": {want.RemovedIdentities, m.RemovedIdentities},
+	} {
+		if len(pair[1]) != len(pair[0]) {
+			t.Fatalf("%s: got %d entries, want %d", name, len(pair[1]), len(pair[0]))
+		}
+		for k, v := range pair[0] {
+			if pair[1][k] != v {
+				t.Fatalf("%s[%d]: got %q, want %q", name, k, pair[1][k], v)
+			}
+		}
 	}
-	// A v3 section carries no session policy either. It must come back UNSET
-	// (MaxTotalSessions == 0), because that is what tells the apply path to
-	// fall back to local configuration for a shard bootstrapped before the
-	// policy was replicated. A replayer that read the trailing bytes anyway
-	// would manufacture a policy out of whatever followed the section.
-	if got.Membership.MaxTotalSessions != 0 ||
-		got.Membership.SessionExpiryEntries != 0 ||
-		got.Membership.MaxSessionsPerClient != 0 {
-		t.Fatalf("v3 replay produced a session policy {expiry:%d total:%d perClient:%d}, want all zero",
-			got.Membership.SessionExpiryEntries, got.Membership.MaxTotalSessions,
-			got.Membership.MaxSessionsPerClient)
+	if len(m.Removed) != len(want.Removed) {
+		t.Fatalf("Removed: got %d entries, want %d", len(m.Removed), len(want.Removed))
+	}
+	for k := range want.Removed {
+		if !m.Removed[k] {
+			t.Fatalf("Removed[%d] lost in round trip", k)
+		}
 	}
 }

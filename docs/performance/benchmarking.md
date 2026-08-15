@@ -350,7 +350,7 @@ which is worse than having no baseline at all:
 # quicraft benchmark run
 # generated:     2026-08-04T19:29:54Z
 # mode:          baseline
-# run-host:      omega  (PERF_HOST=jhahn@198.51.100.90)
+# run-host:      omega  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
 # cpu-count:     20
 # governor:      powersave
@@ -400,10 +400,11 @@ What makes a good one, in rough order of impact:
 - **Consistent.** Use the same host for every baseline and comparison in a
   series; switching hosts invalidates the comparison entirely (see above).
 
-As a worked example, this project has used a node named `omega`
-(`PERF_HOST=jhahn@198.51.100.90`) -- an Intel Core i9-9900X @ 3.50 GHz, 20
-threads, 62 GB, idle at ~0.00 load. It is an example of a `PERF_HOST`, not a
-requirement: the harness has no knowledge of it, and every stored baseline it
+As a worked example, this project has used a dedicated node referred to in the
+stored baselines as `omega` -- an Intel Core i9-9900X @ 3.50 GHz, 20 threads,
+62 GB, idle at ~0.00 load. You point the harness at your own machine with
+`PERF_HOST=user@host`; there is no default and no built-in host. It is an
+example of a `PERF_HOST`, not a requirement: the harness has no knowledge of it, and every stored baseline it
 produced is labelled with its hostname precisely so nobody mistakes those
 numbers for universal ones. Its governor is `powersave` and nobody has root to
 change it, which is why the intervals in the examples above sit at ±9--28%

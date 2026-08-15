@@ -59,7 +59,6 @@ func randKey(t *testing.T, size int) []byte {
 func TestSymmetricAlgorithm_KeySize(t *testing.T) {
 	t.Run("known algorithms return correct key size", func(t *testing.T) {
 		for _, tc := range knownAlgorithms {
-			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				got := tc.alg.KeySize()
 				if got != tc.keySize {
@@ -81,7 +80,6 @@ func TestSymmetricAlgorithm_KeySize(t *testing.T) {
 func TestSymmetricAlgorithm_NonceSize(t *testing.T) {
 	t.Run("known algorithms return correct nonce size", func(t *testing.T) {
 		for _, tc := range knownAlgorithms {
-			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				got := tc.alg.NonceSize()
 				if got != tc.nonceSize {
@@ -103,7 +101,6 @@ func TestSymmetricAlgorithm_NonceSize(t *testing.T) {
 func TestSymmetricAlgorithm_String(t *testing.T) {
 	t.Run("known algorithms return readable names", func(t *testing.T) {
 		for _, tc := range knownAlgorithms {
-			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				got := tc.alg.String()
 				if got != tc.name {
@@ -136,7 +133,6 @@ func TestSymmetricAlgorithm_String(t *testing.T) {
 func TestSymmetricAlgorithm_Valid(t *testing.T) {
 	t.Run("known algorithms return true", func(t *testing.T) {
 		for _, tc := range knownAlgorithms {
-			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				if !tc.alg.Valid() {
 					t.Fatalf("Valid() = false for known algorithm %s", tc.name)
@@ -164,7 +160,6 @@ func TestSymmetricAlgorithm_Valid(t *testing.T) {
 func TestNewAEADForAlgorithm(t *testing.T) {
 	t.Run("each algorithm constructs AEAD with correct nonce and overhead", func(t *testing.T) {
 		for _, tc := range knownAlgorithms {
-			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				key := randKey(t, tc.keySize)
 
@@ -206,7 +201,6 @@ func TestNewAEADForAlgorithm_InvalidKeySize(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(fmt.Sprintf("%s_keySize_%d", tc.alg, tc.keySize), func(t *testing.T) {
 			key := make([]byte, tc.keySize)
 
@@ -312,7 +306,6 @@ func TestNewAESGCM_AllKeySizes(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.label, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
 
@@ -360,7 +353,6 @@ func TestAlgorithmRoundtrip(t *testing.T) {
 	additionalData := []byte("authenticated header data")
 
 	for _, tc := range knownAlgorithms {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
 
@@ -396,7 +388,6 @@ func TestAlgorithmRoundtrip_TamperedCiphertextFails(t *testing.T) {
 	plaintext := []byte("sensitive payload")
 
 	for _, tc := range knownAlgorithms {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
 			nonce := randKey(t, tc.nonceSize)
@@ -429,7 +420,6 @@ func TestAlgorithmRoundtrip_WrongAdditionalDataFails(t *testing.T) {
 	wrongAD := []byte("tampered AD")
 
 	for _, tc := range knownAlgorithms {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
 			nonce := randKey(t, tc.nonceSize)

@@ -821,15 +821,16 @@ func debugEnabled() bool {
 // copySnapshotRefs replaces every reference-typed field reachable from a
 // snapshot's metadata with an owned copy, so the transport's asynchronous
 // marshal never races a caller mutating the original.
+// Every map on the membership is covered, including the two authorization maps:
+// Identities was missed when it was added, and a snapshot whose identity map is
+// mutated between the enqueue and the marshal would ship a configuration that
+// authorizes a different set of replicas than the one the caller submitted.
 func copySnapshotRefs(s *proto.Snapshot) {
-	if len(s.Checksum) > 0 {
-		checksum := make([]byte, len(s.Checksum))
-		copy(checksum, s.Checksum)
-		s.Checksum = checksum
-	}
 	s.Membership.Addresses = copyAddrMap(s.Membership.Addresses)
 	s.Membership.Observers = copyAddrMap(s.Membership.Observers)
 	s.Membership.Witnesses = copyAddrMap(s.Membership.Witnesses)
+	s.Membership.Identities = copyAddrMap(s.Membership.Identities)
+	s.Membership.RemovedIdentities = copyAddrMap(s.Membership.RemovedIdentities)
 	if s.Membership.Removed != nil {
 		removed := make(map[uint64]bool, len(s.Membership.Removed))
 		for k, v := range s.Membership.Removed {

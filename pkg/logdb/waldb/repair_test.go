@@ -249,3 +249,111 @@ func TestRepair_RefusesTheWrongBlockSize(t *testing.T) {
 		t.Fatalf("a refused repair truncated the segment: %d -> %d", sizeBefore, size)
 	}
 }
+
+// TestRepair_DirSyncFailureIsReported is the regression test for the dropped
+// error in discardSegmentsAbove.
+//
+// The directory fsync that makes the orphan unlinks durable used to be
+// slog.Warn'd and swallowed, and the function returned nil regardless. Inside
+// recover() that was masked by a second, fatal directory fsync a few lines
+// later; Repair has no such backstop. It therefore returned a RepairResult
+// naming the segments it had deleted while the deletions might never reach the
+// medium — and a crash then resurrects segments holding CRC-valid records ABOVE
+// the offset the operator authorized truncating at, whose stale HardState
+// replays and lets the node vote twice in one term. That is precisely what the
+// directory fsync exists to prevent, reached through the one code path an
+// operator drives by hand.
+func TestRepair_DirSyncFailureIsReported(t *testing.T) {
+	const blockSize = 1024
+	dir, corrupt := corruptWALForRepair(t, blockSize)
+
+	shardDir := walShardDirByIndex(dir, corrupt.ShardIndex)
+	orphanID := corrupt.SegmentID + 7
+	writeSegmentRecords(t, shardDir, orphanID, blockSize, 4, 100)
+	segPath := walSegmentPath(dir, corrupt.ShardIndex, corrupt.SegmentID)
+	sizeBefore := statSize(t, segPath)
+
+	syncErr := errors.New("simulated EIO on directory fsync")
+	ffs := &dirSyncFailFS{FS: defaultFS(), failDir: shardDir, syncErr: syncErr}
+
+	res, err := Repair(dir, RepairTarget{
+		ShardIndex: corrupt.ShardIndex,
+		SegmentID:  corrupt.SegmentID,
+		TruncateAt: corrupt.CleanEnd,
+	}, WithFS(ffs), WithBlockSize(blockSize), WithMaxFileSize(64*1024))
+	if err == nil {
+		t.Fatalf("Repair returned %+v and no error, but the fsync proving the "+
+			"deletion of segment %d durable FAILED: a crash now resurrects a segment "+
+			"holding CRC-valid records above the authorized truncation point, and "+
+			"its stale HardState replays as a second vote in the same term",
+			res, orphanID)
+	}
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("Repair error = %v, want the directory fsync failure in the chain", err)
+	}
+	var dirErr *DirSyncError
+	if !errors.As(err, &dirErr) {
+		t.Fatalf("Repair error = %v, want a *DirSyncError", err)
+	}
+
+	// And the segment must NOT have been cut: the repair runs high to low, so a
+	// failure to make the deletions durable stops it before the truncation.
+	// Cutting first and then failing would leave a segment ending at a clean
+	// record boundary with the orphan still readable above it — the exact
+	// resurrection this fails closed to avoid.
+	if got := statSize(t, segPath); got != sizeBefore {
+		t.Fatalf("segment %d was truncated (%d -> %d) even though the discard "+
+			"could not be proven durable", corrupt.SegmentID, sizeBefore, got)
+	}
+}
+
+// TestRepair_DeletesOrphansBeforeCuttingTheSegment pins the repair ORDER.
+//
+// Truncating the named segment first leaves it ending cleanly at a record
+// boundary — nothing left for recovery to detect — while the segments above it
+// still hold CRC-valid records. A crash there produces a recovery that replays
+// the truncated segment in full and then every segment above it, readmitting
+// exactly the records the operator authorized destroying, with a hole where the
+// cut was. Deleting high to low means every intermediate crash state is a valid
+// prefix: the named segment is still corrupt, so a re-run finds the same clean
+// end and does the same thing.
+//
+// The order is observed through the ONE point where the two steps can be told
+// apart: a truncation that cannot even open the segment file. The discard must
+// already have happened.
+func TestRepair_DeletesOrphansBeforeCuttingTheSegment(t *testing.T) {
+	const blockSize = 1024
+	dir, corrupt := corruptWALForRepair(t, blockSize)
+
+	shardDir := walShardDirByIndex(dir, corrupt.ShardIndex)
+	orphanID := corrupt.SegmentID + 7
+	writeSegmentRecords(t, shardDir, orphanID, blockSize, 4, 100)
+	segPath := walSegmentPath(dir, corrupt.ShardIndex, corrupt.SegmentID)
+	sizeBefore := statSize(t, segPath)
+
+	openErr := errors.New("simulated EIO reopening the segment for truncation")
+	ffs := &faultFS{FS: defaultFS()}
+	ffs.arm(func(f *faultFS) {
+		f.failNames = map[string]bool{segmentFilename(corrupt.SegmentID): true}
+		f.failOpenFile = openErr
+	})
+
+	if _, err := Repair(dir, RepairTarget{
+		ShardIndex: corrupt.ShardIndex,
+		SegmentID:  corrupt.SegmentID,
+		TruncateAt: corrupt.CleanEnd,
+	}, WithFS(ffs), WithBlockSize(blockSize), WithMaxFileSize(64*1024)); !errors.Is(err, openErr) {
+		t.Fatalf("Repair error = %v, want the injected truncation failure", err)
+	}
+
+	if got := statSize(t, segPath); got != sizeBefore {
+		t.Fatalf("the failed truncation still changed segment %d (%d -> %d)",
+			corrupt.SegmentID, sizeBefore, got)
+	}
+	if _, err := os.Stat(walSegmentPath(dir, corrupt.ShardIndex, orphanID)); !os.IsNotExist(err) {
+		t.Fatalf("Stat(orphan %d) = %v, want not-exist: the segments above the "+
+			"truncation point must be gone BEFORE the named segment is cut, so no "+
+			"crash state leaves a clean-ending segment with CRC-valid records "+
+			"stranded above it", orphanID, err)
+	}
+}

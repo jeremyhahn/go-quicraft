@@ -1510,6 +1510,17 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 // table (ns.nodes + registry) from the committed membership entries in a batch,
 // so the transport can resolve new/removed replica addresses. It handles both
 // the bootstrap EntryInitialMembership and incremental config changes.
+//
+// A DECODE FAILURE FAULTS THE SHARD. This is the host-side MIRROR of the
+// authoritative fold in raft (Peer.Commit -> processConfigChanges), which runs
+// on the same committed entries earlier in the same pipeline and already treats
+// an undecodable payload as terminal — so by construction nothing undecodable
+// reaches here at all. That is exactly why continuing on one is wrong: it means
+// the invariant the two paths share has been broken, and the consequence is a
+// routing table that silently disagrees with the membership raft is computing
+// quorum over, on a replica that keeps acking the leader. Recovery has always
+// treated these bytes as fatal (ReconstructMembership -> StartShard aborts);
+// this closes the last place the runtime failed open over the same input.
 func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint64, entries []proto.Entry) {
 	if el := c.h.cfg.EventListener; el != nil && el.OnMembershipChanged != nil {
 		el.OnMembershipChanged(config.EventShardInfo{
@@ -1525,7 +1536,9 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 		// StartShard. Registration is idempotent, so a founding member that
 		// already registered via effectiveNodes is unaffected.
 		if entry.Type&proto.EntryTypeMask == proto.EntryInitialMembership {
-			c.registerBootstrapAddresses(ns, shardID, entry)
+			if !c.registerBootstrapAddresses(ns, shardID, entry) {
+				return
+			}
 			continue
 		}
 		if entry.Type&proto.EntryTypeMask != proto.EntryConfigChange {
@@ -1533,12 +1546,8 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 		}
 		var cc proto.ConfigChange
 		if _, err := cc.UnmarshalFrom(entry.Cmd); err != nil {
-			c.h.logger.Error("failed to unmarshal config change",
-				"shard", shardID,
-				"index", entry.Index,
-				"error", err,
-			)
-			continue
+			c.failShardOnCorruptConfig(shardID, entry.Index, "config change", err)
+			return
 		}
 		switch cc.Type {
 		case proto.AddNode, proto.AddNonVoting, proto.AddWitness:
@@ -1572,19 +1581,41 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 	}
 }
 
+// failShardOnCorruptConfig trips the shard's circuit breaker for a committed
+// config-carrying entry whose payload does not decode, and reports it through
+// the engine's terminal-error path so an operator sees it as a shard failure
+// rather than one ERROR line in a log.
+//
+// It is the host-side counterpart of raft.ErrCorruptConfigEntry, and it exists
+// so the two mirrors of the membership fold agree on failing CLOSED. A nil node
+// (the shard was unloaded between the apply and this call) is a no-op: there is
+// nothing left to fault, and the entry will be re-offered to a fresh fold if the
+// shard is loaded again.
+func (c *hostEngineCallback) failShardOnCorruptConfig(shardID, index uint64, kind string, err error) {
+	c.h.logger.Error("committed "+kind+" entry does not decode: failing the shard "+
+		"rather than routing on a configuration this replica cannot read",
+		"shard", shardID,
+		"index", index,
+		"error", err,
+	)
+	if node := c.h.engine.GetNode(shardID); node != nil {
+		node.Fail(&CorruptConfigEntryError{ShardID: shardID, Index: index, Kind: kind, Err: err})
+	}
+}
+
 // registerBootstrapAddresses registers every member address carried by a
 // committed EntryInitialMembership into the host's routing table (ns.nodes) and
 // the transport registry, so a replica that learned its configuration from the
 // log can resolve the founding members. Registration is idempotent.
-func (c *hostEngineCallback) registerBootstrapAddresses(ns *nodeState, shardID uint64, entry proto.Entry) {
+//
+// It reports whether the entry decoded. A false return has already faulted the
+// shard: see applyMembershipRouting for why an undecodable committed membership
+// is terminal here and not a skip.
+func (c *hostEngineCallback) registerBootstrapAddresses(ns *nodeState, shardID uint64, entry proto.Entry) bool {
 	var ms proto.Membership
 	if _, err := ms.UnmarshalFrom(entry.Cmd); err != nil {
-		c.h.logger.Error("failed to unmarshal bootstrap membership",
-			"shard", shardID,
-			"index", entry.Index,
-			"error", err,
-		)
-		return
+		c.failShardOnCorruptConfig(shardID, entry.Index, "bootstrap membership", err)
+		return false
 	}
 	groups := []map[uint64]string{ms.Addresses, ms.Observers, ms.Witnesses}
 	ns.nodesMu.Lock()
@@ -1599,6 +1630,7 @@ func (c *hostEngineCallback) registerBootstrapAddresses(ns *nodeState, shardID u
 			c.h.registry.Register(shardID, id, addr)
 		}
 	}
+	return true
 }
 
 // OnReadyToRead processes confirmed read index requests from the step
@@ -2790,6 +2822,26 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// two ways ("NODE-B:5001" and "node-b:5001") is refused here rather than
 	// bootstrapping the shard into a configuration the receive path then has to
 	// fail closed on.
+	//
+	// The FORMAT limits are checked here too, and they are not defensive
+	// pedantry: members is copied verbatim into proto.Membership.Addresses,
+	// raft.BuildInitialMembershipEntry marshals it, and the result is COMMITTED
+	// as the EntryInitialMembership at log index 1. An over-length address or an
+	// over-sized map produced bytes this package's own decoder refuses, so the
+	// shard bootstrapped successfully and then failed to start FOREVER: the next
+	// StartShard reconstructs membership from that entry, Membership.UnmarshalFrom
+	// returns ErrAddressTooLong, and reconstructShardMembership propagates it.
+	// proto.Membership.MarshalTo now refuses to write such a membership at all,
+	// which turns the permanent brick into an error; checking here as well is what
+	// turns that error into one naming the replica and the reason, at the call the
+	// operator actually made, before anything is persisted.
+	if len(members) > proto.MaxMembershipEntries {
+		return &InvalidMemberError{
+			ShardID: cfg.ShardID,
+			Reason: fmt.Sprintf("members map has %d entries; the membership format "+
+				"accepts at most %d", len(members), proto.MaxMembershipEntries),
+		}
+	}
 	seenAddresses := make(map[string]uint64, len(members))
 	for replicaID, addr := range members {
 		if replicaID == 0 {
@@ -2808,6 +2860,15 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				Reason:    "address must be non-empty",
 			}
 		}
+		if len(addr) > proto.MaxAddressLength {
+			return &InvalidMemberError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: replicaID,
+				Address:   addr,
+				Reason: fmt.Sprintf("address is %d bytes; the membership format "+
+					"accepts at most %d", len(addr), proto.MaxAddressLength),
+			}
+		}
 		canonical := netaddr.Canonical(addr)
 		if other, dup := seenAddresses[canonical]; dup {
 			return &InvalidMemberError{
@@ -2819,6 +2880,35 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			}
 		}
 		seenAddresses[canonical] = replicaID
+	}
+
+	// The same format bounds on cfg.MemberIdentities, which travels the same
+	// route: Host.StartShard seeds it into proto.Membership.Identities and it is
+	// marshaled into the same committed index-1 entry.
+	//
+	// The bound is MaxAddressLength and not MaxNodeIdentityLength, because the
+	// encoder is what decides: every string map in a Membership goes through the
+	// shared putMap/getMap pair, which bounds values at MaxAddressLength
+	// regardless of which map they came from. The two constants are equal today,
+	// so the distinction costs nothing; it is written this way so that raising
+	// MaxNodeIdentityLength alone cannot silently start producing unreadable
+	// bootstrap entries.
+	if len(cfg.MemberIdentities) > proto.MaxMembershipEntries {
+		return &InvalidMemberError{
+			ShardID: cfg.ShardID,
+			Reason: fmt.Sprintf("MemberIdentities has %d entries; the membership format "+
+				"accepts at most %d", len(cfg.MemberIdentities), proto.MaxMembershipEntries),
+		}
+	}
+	for replicaID, identity := range cfg.MemberIdentities {
+		if len(identity) > proto.MaxAddressLength {
+			return &InvalidMemberError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: replicaID,
+				Reason: fmt.Sprintf("node identity is %d bytes; the membership format "+
+					"accepts at most %d", len(identity), proto.MaxAddressLength),
+			}
+		}
 	}
 
 	// Enforce per-node certificate SANs before the shard exists.
@@ -3395,7 +3485,25 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// commit index, and the engine markers below MUST agree with it —
 		// seeding lastApplied above raft's processed makes the first Commit
 		// trip commitUpdate's assertion and take the commit worker down.
-		recoveredIndex = peer.SetProcessedIndex(recoveredIndex)
+		//
+		// The error is the fold's FATAL case: a committed config entry in the
+		// window this start is skipping does not decode. Abort rather than start.
+		// Those bytes are replicated state every peer can read and this binary
+		// cannot, so a replica that comes up anyway is computing quorum over a
+		// configuration it knows is wrong, and will persist it with its next
+		// snapshot. Failing StartShard is also the STRONGEST fail-closed answer
+		// available at this point and the one that matches the two paths that see
+		// the same input: the commit pipeline faults the shard
+		// (processConfigChanges -> failCommit) and membership reconstruction
+		// aborts this same call (reconstructShardMembership). Nothing has been
+		// published yet — the nodeState is not in h.nodes and the engine node does
+		// not exist — so returning here leaves no half-started shard behind, which
+		// is why it is an abort and not a Node.Fail.
+		var setErr error
+		recoveredIndex, setErr = peer.SetProcessedIndex(recoveredIndex)
+		if setErr != nil {
+			return &HostInitError{Field: "config_replay", Err: setErr}
+		}
 
 		// Resolve the term for the CLAMPED index. The snapshot branches above
 		// already paired recoveredTerm with recoveredIndex; the on-disk branch
@@ -3512,6 +3620,29 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// the pipeline. Mirrors the runtime recover path in snapshot_pool.go,
 	// which sets node.lastApplied/lastSnapshotIndex after RecoverFromSnapshot.
 	engNode.SeedLastApplied(recoveredIndex, recoveredTerm)
+	// Seed the STATE MACHINE's own applied marker to the same index. It is a
+	// second, independent counter (rsm.StateMachine.lastApplied) and neither
+	// RecoverFromSnapshot nor the on-disk Open path above sets it to the value
+	// raft actually resumes from, so without this it stays 0 on every restart
+	// while raft and the engine node resume at recoveredIndex.
+	//
+	// The counter is not bookkeeping: it is the LOWER BOUND of the session
+	// expiry checkpoint walk in rsm.Apply. A restarted replica starting that
+	// walk from 0 replays every checkpoint in (0, recoveredIndex] that its
+	// peers already ran, and ExpireSessions is capped at
+	// defaultMaxExpirePerCheckpoint deletions per call — so the replay is NOT
+	// idempotent and deletes sessions the rest of the shard still holds. From
+	// then on this replica answers ResultSessionExpired for entries its peers
+	// route into the user state machine: permanent divergence, with every raft
+	// invariant intact and nothing logged. It is also the index the next
+	// snapshot save is stamped with, which is why the runtime InstallSnapshot
+	// path (engine snapshotPool.recoverSnapshot) sets it for the same reason.
+	//
+	// recoveredIndex is the CLAMPED value peer.SetProcessedIndex returned, so
+	// the state machine's marker, the engine node's and raft's processed marker
+	// all name the same entry and the contiguity guard in rsm.Apply holds from
+	// the first batch.
+	stateMachine.SetLastApplied(recoveredIndex)
 	h.engine.LoadNode(engNode)
 	// The node is now live in the engine; StopShard/Close own its rsm.Close from
 	// here, so the StartShard rollback close must not also run.
@@ -3542,7 +3673,13 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// claimant's UnloadNode ran before LoadNode and could not have removed it.
 	if h.closed.Load() || h.draining.Load() || ns.stopped.Load() {
 		if ns.stopped.CompareAndSwap(false, true) {
-			h.teardownShard(ns, cfg.ShardID, ErrClosed)
+			// ErrClosed is the caller's answer here — the shard never became
+			// usable — so the state machine's Close error is logged rather
+			// than returned in its place.
+			if cerr := h.teardownShard(ns, cfg.ShardID, ErrClosed); cerr != nil {
+				h.logger.Warn("state machine close failed while aborting shard start",
+					"shard_id", cfg.ShardID, "error", cerr)
+			}
 		} else {
 			h.engine.UnloadNode(cfg.ShardID)
 		}
@@ -3616,7 +3753,13 @@ func (h *Host) StopShard(shardID uint64) error {
 	if !ns.stopped.CompareAndSwap(false, true) {
 		return ErrShardNotFound // another StopShard/Close already owns teardown
 	}
-	h.teardownShard(ns, shardID, ErrAborted)
+	// The state machine's Close error is the shard's LAST durability signal:
+	// for an on-disk SM it is the backing store's final flush-and-close, and a
+	// failed flush that is only logged reports a clean stop for a shard that
+	// lost writes. Teardown itself is unconditional and complete either way —
+	// the shard is unloaded, its pending requests failed and its nodeState
+	// removed — so the error is carried out rather than aborting the rest.
+	closeErr := h.teardownShard(ns, shardID, ErrAborted)
 
 	// Fire OnNodeUnloaded event listener.
 	if el := h.cfg.EventListener; el != nil && el.OnNodeUnloaded != nil {
@@ -3627,7 +3770,7 @@ func (h *Host) StopShard(shardID uint64) error {
 	}
 
 	h.logger.Info("shard stopped", "shard_id", shardID)
-	return nil
+	return closeErr
 }
 
 // teardownShard releases every resource a loaded shard holds. The caller
@@ -3639,7 +3782,14 @@ func (h *Host) StopShard(shardID uint64) error {
 //
 // pendingErr is the error delivered to the shard's still-pending proposals,
 // reads, and snapshots.
-func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
+//
+// It returns the USER STATE MACHINE's Close error and nothing else. Every other
+// step here is unconditional cleanup whose failure has a local remedy; the
+// state machine's Close is the embedding application's last chance to learn
+// that its store did not flush, so it is returned rather than logged away. The
+// teardown always completes: an error return does not mean the shard is still
+// loaded.
+func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) error {
 	ns.health.Store(uint32(ShardUnloaded))
 
 	// Signal cancellation to any in-progress DiskStateMachine.Open()
@@ -3685,8 +3835,10 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
 	// Pebble file locks). Without this a stopped shard leaves its
 	// DiskStateMachine open and a subsequent StartShard on the same data
 	// directory fails with "lock held by current process".
+	var smCloseErr error
 	if ns.rsm != nil {
 		if err := ns.rsm.Close(); err != nil {
+			smCloseErr = err
 			h.logger.Warn("state machine close failed during shard teardown",
 				"shard_id", shardID, "error", err)
 		}
@@ -3701,6 +3853,7 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) {
 	if h.metrics != nil {
 		h.metrics.UnregisterShard(shardID)
 	}
+	return smCloseErr
 }
 
 // SyncPropose proposes cmd through Raft consensus and blocks until the
@@ -3984,6 +4137,11 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 //
 // On error, the session state is unchanged and the proposal may be retried
 // with the same session.
+//
+// It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
+// sm.DiskStateMachine and the session is session-managed, for the reason given
+// on that error. A NO-OP session (Host.GetNoOPSession) is the supported form
+// there and is not affected.
 func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []byte) (*RequestState, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -4005,6 +4163,16 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 	// Witnesses vote but don't store log data; they cannot propose.
 	if ns.cfg.IsWitness {
 		return nil, ErrInvalidOperation
+	}
+
+	// A session-managed proposal on an on-disk state machine is refused HERE,
+	// before the entry exists, because the alternative is refusing it at apply
+	// time on one replica only. A no-op session carries no session state and is
+	// left to ValidForProposal below, which has always rejected it.
+	if !session.IsNoOPSession() {
+		if err := rejectSessionsOnDisk(ns); err != nil {
+			return nil, err
+		}
 	}
 
 	if !session.ValidForProposal(shardID) {
@@ -4049,7 +4217,8 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 // returning, advancing the session for the next proposal.
 //
 // On error, the session state is unchanged and the proposal may be retried
-// with the same session.
+// with the same session. It returns ErrSessionsUnsupportedOnDisk on a shard
+// backed by an sm.DiskStateMachine (see ProposeWithSession).
 func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd []byte) (sm.Result, error) {
 	rs, err := h.ProposeWithSession(ctx, session, cmd)
 	if err != nil {
@@ -4490,10 +4659,51 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 	}
 }
 
+// ErrSessionsUnsupportedOnDisk is returned by every client-session entry point
+// on a shard whose state machine is an sm.DiskStateMachine. Use NO-OP sessions
+// (Host.GetNoOPSession) there and make the operations idempotent, which is the
+// same constraint dragonboat places on IOnDiskStateMachine.
+//
+// The client session table is REPLICATED STATE that lives only inside the
+// snapshot stream: rsm.StateMachine serializes it ahead of the user state
+// machine's bytes and reads it back in RecoverFromSnapshot. An on-disk state
+// machine never takes that path on restart — its Open() returns a durable
+// applied index, and StartShard therefore SKIPS RecoverFromSnapshot entirely
+// because recovering would roll the user's database back to the snapshot index
+// — so the replica comes up with the correct data and an EMPTY session table.
+// Everything that follows is silent divergence: a session-managed proposal is
+// routed into the user state machine by the peers that still hold the session
+// and answered with ResultSessionExpired by the restarted replica, which never
+// applies the write at all. The client sees success because the leader
+// completed the proposal from its own apply.
+//
+// The rejection is deliberately a LOCAL, API-boundary decision. It reads only
+// the state machine's own type — fixed for the life of the shard by the
+// sm.CreateFunc the caller passed to StartShard — and never replicated state,
+// so it cannot be evaluated differently on two replicas, and it takes effect
+// before the entry is anywhere near the log.
+var ErrSessionsUnsupportedOnDisk = errors.New(
+	"quicraft: client sessions are not supported on on-disk state machines")
+
+// rejectSessionsOnDisk returns ErrSessionsUnsupportedOnDisk when the shard is
+// backed by an on-disk state machine, which cannot carry a session table
+// across a restart. See ErrSessionsUnsupportedOnDisk.
+func rejectSessionsOnDisk(ns *nodeState) error {
+	if ns.smType != rsm.SMTypeOnDisk.TypeCode() {
+		return nil
+	}
+	return ErrSessionsUnsupportedOnDisk
+}
+
 // GetNewSession creates a new client session for at-most-once proposal
 // semantics. The session registration is proposed through Raft consensus
 // so all replicas register the session. Blocks until the registration
 // is committed and applied, or ctx is cancelled.
+//
+// It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
+// sm.DiskStateMachine: an on-disk state machine cannot carry the session table
+// across a restart, so a registered session would silently stop existing on any
+// replica that restarts. Use Host.GetNoOPSession on those shards.
 func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -4501,6 +4711,9 @@ func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, err
 
 	ns, err := h.getNode(shardID)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectSessionsOnDisk(ns); err != nil {
 		return nil, err
 	}
 
@@ -4569,6 +4782,9 @@ func waitResultCtx(ctx context.Context, rs *RequestState) (RequestResult, error)
 //
 // The session must have a non-zero client ID and must belong to the
 // specified shard. On success the session is prepared for normal proposals.
+//
+// It returns ErrSessionsUnsupportedOnDisk on a shard backed by an
+// sm.DiskStateMachine, for the reason given on that error.
 func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -4590,6 +4806,9 @@ func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session,
 	shardID := session.ShardID()
 	ns, err := h.getNode(shardID)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectSessionsOnDisk(ns); err != nil {
 		return nil, err
 	}
 
@@ -4624,6 +4843,10 @@ func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session,
 // CloseSession closes a client session by proposing unregistration through
 // Raft consensus. Returns a RequestState that resolves when the
 // unregistration is committed and applied.
+//
+// It returns ErrSessionsUnsupportedOnDisk on a shard backed by an
+// sm.DiskStateMachine, for the reason given on that error. Nothing can have
+// registered a session there, so there is nothing to close.
 func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Session) (*RequestState, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -4631,6 +4854,9 @@ func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Sessio
 
 	ns, err := h.getNode(shardID)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectSessionsOnDisk(ns); err != nil {
 		return nil, err
 	}
 
@@ -4680,6 +4906,10 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 // GetNoOPSession returns a no-op session for proposals that do not require
 // at-most-once semantics. The no-op session has a fixed clientID of 0.
 // Use for idempotent operations only.
+//
+// It is the ONLY session form a shard backed by an sm.DiskStateMachine
+// supports; every session-managed entry point returns
+// ErrSessionsUnsupportedOnDisk there.
 func (h *Host) GetNoOPSession(shardID uint64) *Session {
 	return NewNoOPSession(shardID)
 }
@@ -5123,7 +5353,7 @@ const snapshotArtifactFixedHeaderSize = 8 + 4 + 8 + 8 + 8 + 2 + 4
 // imported artifact header before it is allocated, so a crafted/corrupt
 // membLen cannot trigger a multi-GB allocation (OOM/DoS) ahead of the
 // io.ReadFull that would otherwise fail. A real membership — four maps of at
-// most maxMembershipEntries entries, each entry an id plus a bounded address —
+// most proto.MaxMembershipEntries entries, each entry an id plus a bounded address —
 // is far below this 16 MiB ceiling; the inner proto decoder enforces the exact
 // per-map/per-field bounds.
 const maxSnapshotArtifactMembLen = 16 * 1024 * 1024
@@ -5453,6 +5683,13 @@ func (d *deferredHeaderWriter) flushHeader() error {
 // same way: a snapshot written without it recovers as "no policy", the replica
 // falls back to local configuration, and its apply path expires sessions at
 // indexes its peers do not. See proto.SessionPolicy.
+//
+// RemovedIdentities rides along for a sharper reason than the rest. Dropping it
+// would not lose information so much as revoke a revocation: the replica comes
+// back holding the tombstone replica IDs but not the identities they were
+// recorded against, so a removed node still carrying its certificate regains
+// the ability to evade its tombstone by claiming another replica ID — on
+// exactly the restart an operator performs after removing it.
 func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 	result := logdb.Membership{
 		ConfigChangeID:             m.ConfigChangeID,
@@ -5490,6 +5727,12 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 		result.Identities = make(map[uint64]string, len(m.Identities))
 		for k, v := range m.Identities {
 			result.Identities[k] = v
+		}
+	}
+	if len(m.RemovedIdentities) > 0 {
+		result.RemovedIdentities = make(map[uint64]string, len(m.RemovedIdentities))
+		for k, v := range m.RemovedIdentities {
+			result.RemovedIdentities[k] = v
 		}
 	}
 	return result
@@ -5673,7 +5916,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return mapContextError(err)
 	}
 
-	snapDir, err := h.importSnapshotDir(shardID, replicaID, header.Index, opts)
+	snapBaseDir, snapDir, err := h.importSnapshotDir(shardID, replicaID, header.Index, opts)
 	if err != nil {
 		return err
 	}
@@ -5889,6 +6132,8 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// directory the LogDB already points at.
 	published = false
 
+	h.gcShardSnapshots(snapBaseDir, shardID, replicaID)
+
 	// Advance the log compaction floor to the imported snapshot index, removing
 	// every entry at or below it.
 	//
@@ -5998,6 +6243,28 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	return replicaID, nil
 }
 
+// gcShardSnapshots reclaims a shard's superseded snapshot directories, keeping
+// only the most recent the engine retains.
+//
+// It must be called only AFTER the new snapshot is durably recorded, so
+// retention is computed against the set INCLUDING it; running it earlier counts
+// the new directory as absent and can evict the one about to become the shard's
+// most recent.
+//
+// The failure is logged, never returned. ImportSnapshot and the snapshot receive
+// path both call it at a point where the snapshot is already recorded and the
+// operation has SUCCEEDED, so returning the error would report completed,
+// durable work as failed — and for the import there is no way to retry, because
+// the snapshot index and directory now exist. Failing to reclaim disk loses no
+// correctness and the next snapshot runs the GC again.
+func (h *Host) gcShardSnapshots(baseDir string, shardID, replicaID uint64) {
+	if err := engine.GCSnapshotDirs(baseDir, shardID, replicaID); err != nil {
+		h.logger.Warn("snapshot recorded, but reclaiming the superseded snapshot "+
+			"directories failed; they will be reclaimed by a later snapshot",
+			"shard_id", shardID, "replica_id", replicaID, "error", err)
+	}
+}
+
 // importStageDirPattern names the directory an import stages its artifact in
 // before publishing it under the canonical, index-derived name.
 //
@@ -6069,7 +6336,11 @@ func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) err
 // made a disaster-recovery restore sort as the OLDEST snapshot on a node that
 // already had some: first in line for GC, and never chosen by the recovery
 // fallback, which would prefer a stale but higher-numbered directory.
-func (h *Host) importSnapshotDir(shardID, replicaID, index uint64, opts []ImportOption) (string, error) {
+// It returns the shard's snapshot BASE directory alongside the destination.
+// The base is what engine.GCSnapshotDirs takes, and deriving it back out of the
+// destination path would re-hard-code the very layout this function exists to
+// keep in one place.
+func (h *Host) importSnapshotDir(shardID, replicaID, index uint64, opts []ImportOption) (baseDir, snapDir string, err error) {
 	var iopts importOptions
 	for _, opt := range opts {
 		opt(&iopts)
@@ -6079,11 +6350,10 @@ func (h *Host) importSnapshotDir(shardID, replicaID, index uint64, opts []Import
 	// prove neither.
 	importDataDir, err := h.resolveImportDataDir(shardID, replicaID, iopts)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return engine.SnapshotSaveDir(
-		shardSnapshotBaseDir(h.cfg.NodeHostDir, importDataDir, shardID),
-		shardID, replicaID, index), nil
+	base := shardSnapshotBaseDir(h.cfg.NodeHostDir, importDataDir, shardID)
+	return base, engine.SnapshotSaveDir(base, shardID, replicaID, index), nil
 }
 
 // writeImportedSnapshotData writes the artifact's post-header bytes to the
@@ -6094,14 +6364,20 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 	if createErr != nil {
 		return createErr
 	}
-	closeFile := func(when string) {
-		if closeErr := f.Close(); closeErr != nil {
+	// closeFile returns the Close error as well as logging it. On the error
+	// paths the caller already has a better error and discards the whole
+	// directory, so the return is ignored there; on the SUCCESS path it must be
+	// checked — see the write_complete call below.
+	closeFile := func(when string) error {
+		closeErr := f.Close()
+		if closeErr != nil {
 			slog.Debug("snapshot import file close failed",
 				"shard", shardID,
 				"path", dataPath,
 				"when", when,
 				"error", closeErr)
 		}
+		return closeErr
 	}
 
 	// Bound the copy by the maximum snapshot size. An unbounded io.Copy lets
@@ -6119,14 +6395,27 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 		copyErr = &SnapshotTooLargeError{ShardID: shardID, MaxSize: maxSize}
 	}
 	if copyErr != nil {
-		closeFile("copy_error")
+		_ = closeFile("copy_error")
 		return copyErr
 	}
 	if syncErr := f.Sync(); syncErr != nil {
-		closeFile("sync_error")
+		_ = closeFile("sync_error")
 		return syncErr
 	}
-	closeFile("write_complete")
+	// The Close is part of the durability chain, not cleanup. Sync flushes what
+	// this process wrote; Close is where a file system reports a write failure
+	// it deferred (a full or quota-exceeded volume, a network file system's
+	// late error), and on some platforms it is the only place that error is
+	// ever delivered. Dropping it meant the import went on to SaveSnapshot —
+	// recording this artifact as the shard's durable snapshot — and then to
+	// RemoveEntriesTo, which DELETES the log entries the snapshot subsumes,
+	// over a snapshot file that may be short. The entries are gone and the
+	// snapshot cannot replace them. Returning it lands the caller on the
+	// staging-directory discard, so the operator can simply retry the import.
+	// Same idiom as HandleSnapshot's receive path.
+	if closeErr := closeFile("write_complete"); closeErr != nil {
+		return closeErr
+	}
 	return nil
 }
 
@@ -6271,6 +6560,14 @@ func (h *Host) DiagRemotes(shardID uint64) (string, error) {
 // Close shuts down the host, stopping all shards and releasing resources.
 // Close is idempotent. Close calls Drain() first to allow in-flight work
 // to complete gracefully before tearing down subsystems.
+//
+// Shutdown always runs to completion; the returned error is the JOIN
+// (errors.Join, so errors.Is reaches each cause) of everything that failed
+// along the way: an incomplete Drain, each shard state machine's Close, the
+// LogDB Close and the barrier Seal. This is the last durability signal the
+// embedding application receives — for an on-disk state machine, the Close
+// error is its backing store's final flush — so a nil return means every one
+// of those succeeded, not merely that shutdown was attempted.
 func (h *Host) Close() error {
 	if !h.closed.CompareAndSwap(false, true) {
 		return nil
@@ -6283,10 +6580,14 @@ func (h *Host) Close() error {
 
 	var closeErr error
 	h.stopOnce.Do(func() {
-		// Drain in-flight work first. If drain times out, log a
-		// warning but proceed with shutdown anyway.
+		// Drain in-flight work first. If drain times out, proceed with
+		// shutdown anyway — but REPORT it. A drain that timed out abandoned
+		// in-flight work, and returning nil from Close after that tells the
+		// embedding application its shutdown was clean when proposals it
+		// accepted were dropped.
 		if drainErr := h.Drain(); drainErr != nil {
 			h.logger.Warn("drain incomplete", "error", drainErr)
+			closeErr = errors.Join(closeErr, drainErr)
 		}
 
 		// Stop the key rotation goroutine and wait for it to exit
@@ -6387,11 +6688,20 @@ func (h *Host) Close() error {
 		// on-disk file locks (e.g., Pebble). Without this, a stopped
 		// shard would leave its DiskStateMachine open, causing "lock
 		// held by current process" errors on Host restart.
+		//
+		// Each failure is JOINED into closeErr rather than only logged. For an
+		// on-disk state machine this call is the backing store's final
+		// flush-and-close, so it is the last durability signal the embedding
+		// application ever receives; a Close that returns nil over a failed
+		// flush reports a clean shutdown for a host that lost writes. Every
+		// shard is still closed — one failure must not strand another shard's
+		// file lock — so the loop collects instead of returning early.
 		for _, ns := range stoppedNodes {
 			if ns.rsm != nil {
 				if err := ns.rsm.Close(); err != nil {
 					h.logger.Warn("state machine close failed during host close",
 						"shard_id", ns.shardID, "error", err)
+					closeErr = errors.Join(closeErr, err)
 				}
 				// Do NOT nil ns.rsm here. An in-flight reader (SyncRead/
 				// StaleRead) may still hold this nodeState and read the rsm
@@ -6406,7 +6716,7 @@ func (h *Host) Close() error {
 		// Close LogDB.
 		if h.logdb != nil {
 			if err := h.logdb.Close(); err != nil {
-				closeErr = err
+				closeErr = errors.Join(closeErr, err)
 			}
 		}
 
@@ -6415,9 +6725,7 @@ func (h *Host) Close() error {
 			if err := h.barrier.Seal(); err != nil {
 				// Already sealed is not an error during shutdown.
 				if err != ErrBarrierSealed {
-					if closeErr == nil {
-						closeErr = err
-					}
+					closeErr = errors.Join(closeErr, err)
 				}
 			}
 		}
@@ -8105,12 +8413,18 @@ const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 // 2/2 both at the pre-config-in-log baseline and at HEAD with this reconstruction
 // disabled).
 //
-// It returns ok=true only when the bootstrap entry is present. A log without one
-// (a shard bootstrapped the legacy out-of-band way, whose initial voters live
-// only in the caller's members map) returns ok=false so the caller falls back to
-// the bootstrap seed plus the same commit-time repair. A compacted-away index 1
-// is likewise ok=false — that case always has a snapshot, whose membership the
-// caller uses instead.
+// It returns ok=true only when the bootstrap entry is present. ok=false means
+// the entry is simply NOT AVAILABLE — compacted away, or below the reader's
+// range — and that case always has a snapshot whose membership the caller uses
+// instead; the caller falls back to the bootstrap seed plus commit-time repair.
+//
+// An index that IS readable and holds something OTHER than the bootstrap entry
+// is a different thing entirely and fails closed with *BootstrapEntryMissingError.
+// It used to return ok=false on the rationale of a legacy, out-of-band-bootstrapped
+// shard; config-in-log is now the only bootstrap path this code base creates, so
+// on a shard it made that condition means the log is damaged, and the fall-back
+// would re-seed membership from the caller's members map — dropping witnesses,
+// observers, Removed tombstones, identities and the replicated policies.
 //
 // The returned entry's Cmd is decoded before returning, so the reader's reusable
 // buffer is not retained.
@@ -8140,10 +8454,38 @@ func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (p
 		}
 		return proto.Membership{}, false, err
 	}
-	if len(entries) == 0 ||
-		entries[0].Index != raft.BootstrapMembershipIndex ||
-		entries[0].Type&proto.EntryTypeMask != proto.EntryInitialMembership {
+	if len(entries) == 0 || entries[0].Index != raft.BootstrapMembershipIndex {
+		// The entry could not be read at all, which is the same
+		// "not available" answer the ErrCompacted/ErrUnavailable branch above
+		// gives: benign, fall back to the seed plus commit-time repair.
 		return proto.Membership{}, false, nil
+	}
+	if entries[0].Type&proto.EntryTypeMask != proto.EntryInitialMembership {
+		// The log HAS an index 1 and it is not the founding configuration.
+		//
+		// This used to be the legacy path: a shard bootstrapped out of band,
+		// whose initial voters lived only in the caller's members map. That
+		// path no longer exists — config-in-log is the only bootstrap this code
+		// base performs, and every shard it creates lays an
+		// EntryInitialMembership down at BootstrapMembershipIndex before any
+		// other entry can be appended. On a shard this code made, an ordinary
+		// entry sitting at index 1 therefore means the log is DAMAGED.
+		//
+		// Returning "not found" here sends StartShard to the nothingRecovered
+		// seed, which rebuilds membership from the CALLER'S members map and so
+		// drops the witnesses, observers, Removed tombstones, committed
+		// identities and the replicated witness and session policies the shard
+		// agreed on — a replica that computes quorum over a different set than
+		// its peers, silently. Damaged durable state has no safe reconstruction,
+		// so fail closed and let the operator restore or re-provision.
+		//
+		// A log whose first index is ABOVE BootstrapMembershipIndex never
+		// reaches here: it is compacted, and the snapshot that compacted it
+		// carries the membership (the early return above).
+		return proto.Membership{}, false, &BootstrapEntryMissingError{
+			Index:     entries[0].Index,
+			EntryType: entries[0].Type & proto.EntryTypeMask,
+		}
 	}
 	ms, err := raft.ReconstructMembership([]proto.Entry{entries[0]})
 	if err != nil {
@@ -8394,6 +8736,12 @@ func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 			result.Identities[k] = v
 		}
 	}
+	if len(m.RemovedIdentities) > 0 {
+		result.RemovedIdentities = make(map[uint64]string, len(m.RemovedIdentities))
+		for k, v := range m.RemovedIdentities {
+			result.RemovedIdentities[k] = v
+		}
+	}
 	return result
 }
 
@@ -8412,6 +8760,33 @@ func (e *HostInitError) Error() string {
 // Unwrap returns the underlying error.
 func (e *HostInitError) Unwrap() error {
 	return e.Err
+}
+
+// BootstrapEntryMissingError reports that a shard's durable log holds an entry
+// at the bootstrap membership index that is NOT the founding configuration.
+//
+// Config-in-log is the only bootstrap this code base performs, so every shard
+// it creates commits an EntryInitialMembership at that index before any other
+// entry can be appended. Anything else there means the log was damaged, and the
+// only alternative to failing — rebuilding membership from the caller's members
+// map — silently drops the witnesses, observers, Removed tombstones, committed
+// identities and replicated policies the shard agreed on.
+//
+// The remedy is operational: restore this replica's data directory from a
+// backup, or wipe it and re-add the replica with join=true so it receives the
+// configuration by replication.
+type BootstrapEntryMissingError struct {
+	// Index is the log index inspected (raft.BootstrapMembershipIndex).
+	Index uint64
+	// EntryType is the masked proto entry type actually found there.
+	EntryType uint64
+}
+
+// Error returns a human-readable description of the damaged bootstrap entry.
+func (e *BootstrapEntryMissingError) Error() string {
+	return fmt.Sprintf("quicraft: log index %d holds entry type %d, not the "+
+		"bootstrap membership entry; the shard's durable log is damaged",
+		e.Index, e.EntryType)
 }
 
 // releaseRemovedMemberConn drops the outbound QUIC connection to a replica that

@@ -96,8 +96,12 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 }
 
 // NewSoftwareStrategyWithParams creates a SoftwareStrategy with custom Argon2id
-// parameters for backward compatibility. This always uses KDFArgon2id regardless
-// of FIPS mode, allowing explicit Argon2id tuning for constrained environments.
+// parameters, allowing explicit Argon2id tuning for constrained environments.
+//
+// It selects KDFArgon2id explicitly, so under FIPS mode it FAILS with
+// ErrKDFNotFIPSApproved rather than quietly wrapping a "FIPS" deployment's root
+// key with a non-approved KDF. Use NewSoftwareStrategyFIPS (PBKDF2-SHA256) or
+// NewSoftwareStrategy (which auto-selects by mode) there.
 func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error) {
 	params := KDFParams{
 		Time:    time,
@@ -153,6 +157,12 @@ func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams
 	}
 	if _, ok := kdfDispatchers[version]; !ok {
 		return nil, ErrKDFUnsupportedVersion
+	}
+	// Refuse a non-approved KDF at CONSTRUCTION under FIPS, not at the first
+	// derivation: the strategy is built once and used for every seal and unseal,
+	// so the earliest possible refusal is the one an operator can act on.
+	if err := checkKDFFIPS(version); err != nil {
+		return nil, err
 	}
 	p := make([]byte, len(passphrase))
 	copy(p, passphrase)
@@ -239,15 +249,19 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
-	// Open passphrase enclave for KDF derivation.
+	// Open passphrase enclave for KDF derivation. The Destroy is DEFERRED: a
+	// panic inside the KDF (or anything a caller injects on that path) would
+	// otherwise strand an mlock'd buffer holding the PLAINTEXT passphrase for
+	// the life of the process, and leaked locked buffers consume RLIMIT_MEMLOCK,
+	// which memguard answers by aborting the process.
 	ppBuf, err := passphrase.Open()
 	if err != nil {
 		return nil, &Error{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
 	}
+	defer ppBuf.Destroy()
 
 	// Derive wrapping key from passphrase using the configured KDF.
 	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, s.kdfVersion, s.kdfParams)
-	ppBuf.Destroy()
 	if err != nil {
 		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
@@ -363,15 +377,17 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	salt := sealed.Ciphertext[:kdfSaltLen]
 	rest := sealed.Ciphertext[kdfSaltLen:]
 
-	// Open passphrase enclave for KDF derivation.
+	// Open passphrase enclave for KDF derivation; Destroy is deferred for the
+	// same reason as in sealRootKeyBound — a stranded LockedBuffer holds the
+	// plaintext passphrase mlock'd for the process lifetime.
 	ppBuf, err := passphrase.Open()
 	if err != nil {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
 	}
+	defer ppBuf.Destroy()
 
 	// Derive the wrapping key from passphrase + KDF salt.
 	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, version, params)
-	ppBuf.Destroy()
 	if err != nil {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
@@ -463,7 +479,13 @@ func closedIfEnclaveGone(err error) error {
 }
 
 // Close releases strategy-held resources by clearing the passphrase enclave
-// reference, allowing memguard's finalizer to securely wipe the key material.
+// reference, after which the passphrase can no longer be opened. It does not
+// WIPE the enclave: memguard exposes no API to zero an Enclave's ciphertext and
+// registers no finalizer that would (v0.23.0 has none outside its own tests),
+// so the encrypted passphrase stays on the heap until the GC reclaims it —
+// unreadable without memguard's per-process session coffer key. See
+// enclave.ProtectedKey.Clear.
+//
 // This method is idempotent and safe to call concurrently with Seal/Unseal:
 // an operation that already loaded the reference completes against it, and any
 // operation that starts afterwards fails with ErrStrategyClosed. For deferred

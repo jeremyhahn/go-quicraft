@@ -356,9 +356,12 @@ func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 	}
 	defer h.Close()
 
-	// The log holds 1..50 and commits 50; the state machine claims 100.
+	// The log holds 1..50 and commits 50; the state machine claims 100. Index 1
+	// carries the shard's founding configuration, as config-in-log commits it
+	// before any other entry; a restart fixture without it models a damaged log.
 	entries := make([]logdb.Entry, 0, 50)
-	for i := uint64(1); i <= 50; i++ {
+	entries = append(entries, bootstrapLogEntry(t, 4, map[uint64]string{1: "127.0.0.1:5000"}))
+	for i := uint64(2); i <= 50; i++ {
 		entries = append(entries, logdb.Entry{Index: i, Term: 4})
 	}
 	if saveErr := db.SaveState([]logdb.Update{{
@@ -747,7 +750,6 @@ func TestStartShard_RacingStopShardLeavesNoZombie(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			defer close(started)
-			//nolint:errcheck // the race outcome is the subject; either result is legal
 			_ = h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
 		}()
 		go func() {
@@ -773,7 +775,6 @@ func TestStartShard_RacingStopShardLeavesNoZombie(t *testing.T) {
 				}
 				runtime.Gosched()
 			}
-			//nolint:errcheck // StopShard may legally find nothing to stop
 			_ = h.StopShard(1)
 		}()
 		wg.Wait()

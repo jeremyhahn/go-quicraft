@@ -346,7 +346,7 @@ func TestSessionLRU_ResponseEvictionBoundary(t *testing.T) {
 
 		// Record series 1, 2, 3.
 		for sid := uint64(1); sid <= 3; sid++ {
-			if err := m.RecordResult(10, sid, 0, uint64(sid*100), sm.Result{Value: sid}); err != nil {
+			if err := m.RecordResult(10, sid, 0, sid*100, sm.Result{Value: sid}); err != nil {
 				t.Fatalf("RecordResult(%d) = %v", sid, err)
 			}
 		}

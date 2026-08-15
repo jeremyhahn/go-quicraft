@@ -1337,13 +1337,13 @@ type failAfterNBarrier struct {
 }
 
 func (b *failAfterNBarrier) Encrypt(dst, plaintext []byte) ([]byte, error) {
-	b.testBarrier.mu.Lock()
-	defer b.testBarrier.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.calls++
 	if b.calls > b.failAfter {
 		return nil, errors.New("injected encrypt failure")
 	}
-	return b.testBarrier.encryptForEpoch(plaintext, b.testBarrier.epoch), nil
+	return b.encryptForEpoch(plaintext, b.epoch), nil
 }
 
 func (b *failAfterNBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error) {
@@ -1351,7 +1351,7 @@ func (b *failAfterNBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uin
 	if err != nil {
 		return nil, 0, err
 	}
-	return ct, b.testBarrier.epoch, nil
+	return ct, b.epoch, nil
 }
 
 func (b *failAfterNBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
@@ -1703,19 +1703,19 @@ type rotateAfterNBarrier struct {
 }
 
 func (b *rotateAfterNBarrier) EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error) {
-	b.testBarrier.mu.Lock()
-	if b.testBarrier.sealed {
-		b.testBarrier.mu.Unlock()
+	b.mu.Lock()
+	if b.sealed {
+		b.mu.Unlock()
 		return nil, 0, errors.New("barrier sealed")
 	}
-	epoch := b.testBarrier.epoch
-	ct := b.testBarrier.encryptForEpoch(plaintext, epoch)
+	epoch := b.epoch
+	ct := b.encryptForEpoch(plaintext, epoch)
 	b.calls++
 	if b.calls == b.rotateAfter {
 		// Rotate: every subsequent frame is sealed at the next epoch.
-		b.testBarrier.epoch++
+		b.epoch++
 	}
-	b.testBarrier.mu.Unlock()
+	b.mu.Unlock()
 	return ct, epoch, nil
 }
 

@@ -44,7 +44,6 @@ package errfs_test
 import (
 	"bytes"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +52,25 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/test/errfs"
 )
+
+// errInjectedIO is the failure every injection in this suite reports.
+//
+// It is deliberately NOT io.ErrUnexpectedEOF, which this suite injected until
+// three of its tests started failing on it. A short read is a legitimate,
+// non-error outcome for several WAL read paths: readWALFormat reads the
+// geometry marker with io.ReadFull and treats an EOF-family error as "these
+// bytes are not a marker", i.e. absent, because a zero-length marker is the
+// residue of a stamp that never delivered its content and must be re-stamped
+// rather than refused. Injecting an error that unwraps to io.ErrUnexpectedEOF
+// therefore hands production a value it is entitled to read as DATA, and the
+// injection is silently absorbed — the three tests saw ErrWALFormatMissing
+// instead of the fault they armed.
+//
+// A real filesystem reports EIO or ENOSPC here, and no waldb path treats those
+// as content. errInjectedIO models that: an error value with no meaning to any
+// production classifier, so an assertion that it reached the caller is an
+// assertion about error propagation and nothing else.
+var errInjectedIO = errors.New("errfs_test: injected I/O failure")
 
 // walBlockSize is the WAL block size used throughout these tests.
 const walBlockSize = 1024
@@ -63,6 +81,24 @@ const walBlockSize = 1024
 // whether sync is enabled. With blockSize=1024 and recordHeaderSize=7, a Cmd
 // of 1088 bytes spans at least two blocks.
 const largeCmdSize = walBlockSize + 64
+
+// compactionEntryPayload is the Cmd size the compaction fault tests give each
+// entry they write into a smallFileSize (2 KiB) segment.
+//
+// A WAL record must fit a segment WHOLE, and the largest payload waldb accepts
+// is (segmentBlocks-1) * (blockSize-recordHeaderSize) — one block is reserved
+// for the one a record may have to pad past to start. With a 2 KiB segment and
+// 1 KiB blocks that ceiling is 1013 bytes, and the record spends a further 77
+// on the payload-type byte and the per-entry header. A Cmd of walBlockSize
+// therefore no longer fits in ANY 2 KiB segment and SaveEntries rejects it
+// permanently with ErrRecordTooLarge, which is what these two tests were
+// failing on in setup: the ceiling moved when the record header grew and the
+// batch splitter started pre-checking it, and the fixture did not follow.
+//
+// 768 bytes sits under the ceiling with margin and still costs 856 framed
+// bytes, so two entries fill a segment and the eight these tests write span
+// four of them — enough for compaction to have segments to delete.
+const compactionEntryPayload = 768
 
 // maxSweepOps is the maximum number of injection targets to try in a sweep
 // before declaring failure. It is intentionally generous to handle machines
@@ -191,7 +227,7 @@ func copyDir(src, dst string) error {
 }
 
 // sweepUntilWriteError tries injectAt values 1, 2, … until writeFn returns a
-// non-nil error that wraps io.ErrUnexpectedEOF. For each attempt it copies
+// non-nil error that wraps errInjectedIO. For each attempt it copies
 // srcDir to a fresh temp directory so the DB state is identical across all
 // iterations. Returns the first injectAt that caused a write error.
 //
@@ -207,9 +243,9 @@ func sweepUntilWriteError(
 		if err := copyDir(srcDir, iterDir); err != nil {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		err := writeFn(iterDir, efs)
-		if err != nil && errors.Is(err, io.ErrUnexpectedEOF) {
+		if err != nil && errors.Is(err, errInjectedIO) {
 			return target
 		}
 	}
@@ -256,7 +292,7 @@ func TestErrorFS_WAL_WriteMidEntry(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -266,7 +302,7 @@ func TestErrorFS_WAL_WriteMidEntry(t *testing.T) {
 	if writeErr == nil {
 		t.Fatal("SaveEntries: expected error, got nil")
 	}
-	if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(writeErr, errInjectedIO) {
 		t.Fatalf("SaveEntries error chain does not contain injected error: %v", writeErr)
 	}
 	if !efs.Injected() {
@@ -340,7 +376,7 @@ func TestErrorFS_WAL_SyncFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs)
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -350,7 +386,7 @@ func TestErrorFS_WAL_SyncFailure(t *testing.T) {
 	if syncErr == nil {
 		t.Fatal("SaveEntries: expected error, got nil")
 	}
-	if !errors.Is(syncErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(syncErr, errInjectedIO) {
 		t.Fatalf("SaveEntries error does not wrap injected error: %v", syncErr)
 	}
 
@@ -385,7 +421,7 @@ func TestErrorFS_WAL_ReadDuringReplay(t *testing.T) {
 	mustClose(t, setup)
 
 	// Probe the total number of ops for a clean Open.
-	passthrough := errfs.New(waldb.DefaultFS(), 0, io.ErrUnexpectedEOF)
+	passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
 	probeDB, err := waldb.Open(dir,
 		waldb.WithFS(passthrough),
 		waldb.WithNoSync(true),
@@ -411,7 +447,7 @@ func TestErrorFS_WAL_ReadDuringReplay(t *testing.T) {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -419,7 +455,7 @@ func TestErrorFS_WAL_ReadDuringReplay(t *testing.T) {
 			waldb.WithMaxFileSize(64*1024),
 		)
 		if openErr != nil {
-			if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+			if !errors.Is(openErr, errInjectedIO) {
 				t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
 			}
 			foundReadError = true
@@ -481,7 +517,7 @@ func TestErrorFS_LogDB_SaveStateWriteFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -496,7 +532,7 @@ func TestErrorFS_LogDB_SaveStateWriteFailure(t *testing.T) {
 	if writeErr == nil {
 		t.Fatal("SaveState: expected error, got nil")
 	}
-	if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(writeErr, errInjectedIO) {
 		t.Fatalf("SaveState error chain does not contain injected error: %v", writeErr)
 	}
 	if !efs.Injected() {
@@ -540,7 +576,7 @@ func TestErrorFS_LogDB_GetRangeReadFailure(t *testing.T) {
 	mustClose(t, setup)
 
 	// Probe total ops for a clean Open.
-	passthrough := errfs.New(waldb.DefaultFS(), 0, io.ErrUnexpectedEOF)
+	passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
 	probeDB, err := waldb.Open(dir,
 		waldb.WithFS(passthrough),
 		waldb.WithNoSync(true),
@@ -561,7 +597,7 @@ func TestErrorFS_LogDB_GetRangeReadFailure(t *testing.T) {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -569,7 +605,7 @@ func TestErrorFS_LogDB_GetRangeReadFailure(t *testing.T) {
 			waldb.WithMaxFileSize(64*1024),
 		)
 		if openErr != nil {
-			if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+			if !errors.Is(openErr, errInjectedIO) {
 				t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
 			}
 			failCount++
@@ -613,7 +649,7 @@ func TestErrorFS_LogDB_SuccessfulReOpenAfterFailure(t *testing.T) {
 	// to simulate repeated crash scenarios across the op range.
 	probeCount := int64(0)
 	{
-		passthrough := errfs.New(waldb.DefaultFS(), 0, io.ErrUnexpectedEOF)
+		passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
 		probeDB, err := waldb.Open(dir,
 			waldb.WithFS(passthrough),
 			waldb.WithNoSync(true),
@@ -633,7 +669,7 @@ func TestErrorFS_LogDB_SuccessfulReOpenAfterFailure(t *testing.T) {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -693,7 +729,7 @@ func TestErrorFS_WAL_OpenFileFailure(t *testing.T) {
 	baseDir := t.TempDir()
 
 	// Probe total ops for Open + SaveEntries on fresh dir.
-	passthrough := errfs.New(waldb.DefaultFS(), 0, io.ErrUnexpectedEOF)
+	passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
 	probeDB, openErr := waldb.Open(baseDir,
 		waldb.WithFS(passthrough),
 		waldb.WithNoSync(true),
@@ -714,7 +750,7 @@ func TestErrorFS_WAL_OpenFileFailure(t *testing.T) {
 	foundError := false
 	for target := int64(1); target <= opsAfterWrite; target++ {
 		injectDir := t.TempDir()
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 
 		db, openErr := waldb.Open(injectDir,
 			waldb.WithFS(efs),
@@ -723,7 +759,7 @@ func TestErrorFS_WAL_OpenFileFailure(t *testing.T) {
 			waldb.WithMaxFileSize(64*1024),
 		)
 		if openErr != nil {
-			if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+			if !errors.Is(openErr, errInjectedIO) {
 				t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
 			}
 			foundError = true
@@ -734,7 +770,7 @@ func TestErrorFS_WAL_OpenFileFailure(t *testing.T) {
 		lenientClose(t, db)
 
 		if writeErr != nil {
-			if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+			if !errors.Is(writeErr, errInjectedIO) {
 				t.Fatalf("target=%d: SaveEntries error does not wrap injected: %v", target, writeErr)
 			}
 			foundError = true
@@ -771,7 +807,7 @@ func TestErrorFS_InjectedError_TypeAssertion(t *testing.T) {
 	for target := int64(1); target <= maxSweepOps; target++ {
 		iterDir := t.TempDir()
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -785,7 +821,7 @@ func TestErrorFS_InjectedError_TypeAssertion(t *testing.T) {
 		writeErr := db.SaveEntries(shardID, replicaID, []logdb.Entry{testEntryLarge(1, 1)})
 		lenientClose(t, db)
 
-		if writeErr != nil && errors.Is(writeErr, io.ErrUnexpectedEOF) {
+		if writeErr != nil && errors.Is(writeErr, errInjectedIO) {
 			found = &result{target: target, err: writeErr, efs: efs}
 			break
 		}
@@ -807,8 +843,8 @@ func TestErrorFS_InjectedError_TypeAssertion(t *testing.T) {
 	if injected.OpCount != found.target {
 		t.Errorf("InjectedError.OpCount=%d, want %d", injected.OpCount, found.target)
 	}
-	if !errors.Is(injected.Err, io.ErrUnexpectedEOF) {
-		t.Errorf("InjectedError.Err: %v, want io.ErrUnexpectedEOF", injected.Err)
+	if !errors.Is(injected.Err, errInjectedIO) {
+		t.Errorf("InjectedError.Err: %v, want errInjectedIO", injected.Err)
 	}
 	if !found.efs.Injected() {
 		t.Error("ErrorFS.Injected() should be true after firing")
@@ -832,7 +868,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 
 	for target := int64(1); target <= maxSweepOps; target++ {
 		dir := t.TempDir()
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(dir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -845,7 +881,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 		writeErr := db.SaveEntries(shardID, replicaID, []logdb.Entry{testEntryLarge(1, 1)})
 		lenientClose(t, db)
 
-		if writeErr != nil && errors.Is(writeErr, io.ErrUnexpectedEOF) {
+		if writeErr != nil && errors.Is(writeErr, errInjectedIO) {
 			firstFiredEFS = efs
 			break
 		}
@@ -864,7 +900,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 	}
 
 	// Phase 2: Reset to passthrough and verify state clears.
-	firstFiredEFS.Reset(0, io.ErrUnexpectedEOF)
+	firstFiredEFS.Reset(0, errInjectedIO)
 
 	if firstFiredEFS.Injected() {
 		t.Fatal("after Reset(0): Injected() should be false")
@@ -880,7 +916,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 	for target := int64(1); target <= maxSweepOps; target++ {
 		dir2 := t.TempDir()
 		// Re-arm the same efs instance (firstFiredEFS) at increasing targets.
-		firstFiredEFS.Reset(target, io.ErrUnexpectedEOF)
+		firstFiredEFS.Reset(target, errInjectedIO)
 
 		db2, openErr2 := waldb.Open(dir2,
 			waldb.WithFS(firstFiredEFS),
@@ -890,7 +926,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 		)
 		if openErr2 != nil {
 			// Injection fired during Open (non-critical-path check OK too).
-			if errors.Is(openErr2, io.ErrUnexpectedEOF) {
+			if errors.Is(openErr2, errInjectedIO) {
 				secondFired = true
 				break
 			}
@@ -900,7 +936,7 @@ func TestErrorFS_Reset_ClearsState(t *testing.T) {
 		secondErr := db2.SaveEntries(shardID, replicaID, []logdb.Entry{testEntryLarge(1, 1)})
 		lenientClose(t, db2)
 
-		if secondErr != nil && errors.Is(secondErr, io.ErrUnexpectedEOF) {
+		if secondErr != nil && errors.Is(secondErr, errInjectedIO) {
 			secondFired = true
 			break
 		}
@@ -954,7 +990,7 @@ func TestErrorFS_WAL_MultipleShards_PartialBatch(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -967,7 +1003,7 @@ func TestErrorFS_WAL_MultipleShards_PartialBatch(t *testing.T) {
 	if batchErr == nil {
 		t.Fatal("SaveState multi-shard: expected error, got nil")
 	}
-	if !errors.Is(batchErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(batchErr, errInjectedIO) {
 		t.Fatalf("SaveState error does not wrap injected: %v", batchErr)
 	}
 	if !efs.Injected() {
@@ -1101,7 +1137,7 @@ func TestErrorFS_WAL_DoubleFault_WriteAndRollback(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -1111,7 +1147,7 @@ func TestErrorFS_WAL_DoubleFault_WriteAndRollback(t *testing.T) {
 	if writeErr == nil {
 		t.Fatal("SaveEntries: expected error, got nil")
 	}
-	if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(writeErr, errInjectedIO) {
 		t.Fatalf("error chain missing injected error: %v", writeErr)
 	}
 
@@ -1161,7 +1197,7 @@ func TestErrorFS_WAL_TypedErrorWrappers_Recovery(t *testing.T) {
 	mustClose(t, setup)
 
 	// Probe total ops for a clean Open so we sweep the exact range.
-	passthrough := errfs.New(waldb.DefaultFS(), 0, io.ErrUnexpectedEOF)
+	passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
 	probeDB, err := waldb.Open(dir,
 		waldb.WithFS(passthrough),
 		waldb.WithNoSync(true),
@@ -1183,7 +1219,7 @@ func TestErrorFS_WAL_TypedErrorWrappers_Recovery(t *testing.T) {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF)
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
 			waldb.WithNoSync(true),
@@ -1195,7 +1231,7 @@ func TestErrorFS_WAL_TypedErrorWrappers_Recovery(t *testing.T) {
 			continue
 		}
 
-		if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+		if !errors.Is(openErr, errInjectedIO) {
 			t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
 		}
 
@@ -1257,7 +1293,7 @@ func TestErrorFS_WAL_TypedErrorWrappers_Write(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -1269,7 +1305,7 @@ func TestErrorFS_WAL_TypedErrorWrappers_Write(t *testing.T) {
 	if writeErr == nil {
 		t.Fatal("SaveEntries: expected error, got nil")
 	}
-	if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(writeErr, errInjectedIO) {
 		t.Fatalf("error chain missing injected error: %v", writeErr)
 	}
 
@@ -1340,7 +1376,7 @@ func TestErrorFS_WAL_CmdPayloadIntegrity(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	db, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at fired injectAt: %v", openErr)
@@ -1374,7 +1410,8 @@ func TestErrorFS_WAL_Compaction_RemoveFailure(t *testing.T) {
 	baseDir := t.TempDir()
 
 	// Write enough large entries to force at least two segment rotations.
-	// With maxFileSize=2KB and entries ~1KB each, two entries fill one segment.
+	// With maxFileSize=2KB and compactionEntryPayload-sized entries, two
+	// entries fill one segment.
 	setup, err := waldb.Open(baseDir,
 		waldb.WithBlockSize(walBlockSize),
 		waldb.WithMaxFileSize(smallFileSize),
@@ -1385,7 +1422,7 @@ func TestErrorFS_WAL_Compaction_RemoveFailure(t *testing.T) {
 	}
 	// Write 8 entries so we definitely span multiple segments.
 	for i := uint64(1); i <= 8; i++ {
-		entry := testEntryWithPayload(i, 1, walBlockSize)
+		entry := testEntryWithPayload(i, 1, compactionEntryPayload)
 		if err := setup.SaveEntries(shardID, replicaID, []logdb.Entry{entry}); err != nil {
 			t.Fatalf("setup SaveEntries(%d): %v", i, err)
 		}
@@ -1403,7 +1440,12 @@ func TestErrorFS_WAL_Compaction_RemoveFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), 1, io.ErrUnexpectedEOF).OnlyOps("Remove")
+	// Open with the injection DISARMED and arm it afterwards. Armed from op 1
+	// the fault lands on whichever Remove the open path happens to make first,
+	// which is not the call under test and leaves the assertion below
+	// unreached; Reset after Open puts the next Remove — GarbageCollect's —
+	// first in line.
+	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).OnlyOps(errfs.OpRemove)
 
 	db, openErr := waldb.Open(injectDir,
 		waldb.WithFS(efs),
@@ -1415,25 +1457,28 @@ func TestErrorFS_WAL_Compaction_RemoveFailure(t *testing.T) {
 		t.Fatalf("Open with Remove-only injection: %v", openErr)
 	}
 
+	efs.Reset(1, errInjectedIO)
+
 	compErr := db.Compact(shardID, replicaID)
 
-	if compErr != nil {
-		if !errors.Is(compErr, io.ErrUnexpectedEOF) {
-			t.Fatalf("Compact error does not wrap injected error: %v", compErr)
-		}
-		var deleteErr *waldb.CompactionDeleteError
-		if !errors.As(compErr, &deleteErr) {
-			t.Fatalf("Compact error missing CompactionDeleteError wrapper: %v", compErr)
-		}
-		if deleteErr.Path == "" {
-			t.Error("CompactionDeleteError.Path must not be empty")
-		}
-		t.Logf("CompactionDeleteError confirmed: path=%s", deleteErr.Path)
-	} else {
-		// GC may have found no segments eligible for deletion if all
-		// entries remain live; log and continue.
-		t.Logf("Compact returned nil — no obsolete segments found for deletion (injection not reached)")
+	// The compaction floor was advanced to 4 before this DB was opened, so the
+	// segments holding entries 1-3 are dead and GarbageCollect must unlink
+	// them. A nil error here means no Remove was attempted at all, which is a
+	// failure of the test's premise, not a tolerable outcome.
+	if compErr == nil {
+		t.Fatalf("Compact returned nil with a Remove fault armed: GC unlinked no segment, so the delete-error path was never exercised (fires=%d)", efs.Fires())
 	}
+	if !errors.Is(compErr, errInjectedIO) {
+		t.Fatalf("Compact error does not wrap injected error: %v", compErr)
+	}
+	var deleteErr *waldb.CompactionDeleteError
+	if !errors.As(compErr, &deleteErr) {
+		t.Fatalf("Compact error missing CompactionDeleteError wrapper: %v", compErr)
+	}
+	if deleteErr.Path == "" {
+		t.Error("CompactionDeleteError.Path must not be empty")
+	}
+	t.Logf("CompactionDeleteError confirmed: path=%s", deleteErr.Path)
 
 	// The DB must remain operational regardless of the compaction outcome.
 	writeErr := db.SaveEntries(shardID, replicaID, []logdb.Entry{testEntry(9, 1)})
@@ -1493,7 +1538,7 @@ func TestErrorFS_WAL_Compaction_ReadDirFailure(t *testing.T) {
 		t.Fatalf("setup Open: %v", err)
 	}
 	for i := uint64(1); i <= 8; i++ {
-		entry := testEntryWithPayload(i, 1, walBlockSize)
+		entry := testEntryWithPayload(i, 1, compactionEntryPayload)
 		if err := setup.SaveEntries(shardID, replicaID, []logdb.Entry{entry}); err != nil {
 			t.Fatalf("setup SaveEntries(%d): %v", i, err)
 		}
@@ -1508,9 +1553,11 @@ func TestErrorFS_WAL_Compaction_ReadDirFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	// Inject a ReadDir failure. Use OnlyOps("ReadDir") so it fires
-	// specifically when GarbageCollect calls ReadDir on the shard directory.
-	efs := errfs.New(waldb.DefaultFS(), 1, io.ErrUnexpectedEOF).OnlyOps("ReadDir")
+	// Open with the injection DISARMED and arm it afterwards. Open reads every
+	// shard directory, so a fault armed from op 1 fires there and the test
+	// returns before Compact — which is how this test used to "pass" without
+	// ever reaching the garbage collector it names.
+	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).OnlyOps(errfs.OpReadDir)
 
 	db, openErr := waldb.Open(injectDir,
 		waldb.WithFS(efs),
@@ -1519,24 +1566,22 @@ func TestErrorFS_WAL_Compaction_ReadDirFailure(t *testing.T) {
 		waldb.WithNoSync(true),
 	)
 	if openErr != nil {
-		// ReadDir may fire during Open (shard recovery). If so, the
-		// error must still wrap the injected error.
-		if !errors.Is(openErr, io.ErrUnexpectedEOF) {
-			t.Fatalf("Open error does not wrap injected: %v", openErr)
-		}
-		t.Logf("ReadDir injection fired during Open: %v", openErr)
-		return
+		t.Fatalf("Open with the ReadDir fault disarmed: %v", openErr)
 	}
+
+	efs.Reset(1, errInjectedIO)
 
 	compErr := db.Compact(shardID, replicaID)
 	lenientClose(t, db)
 
+	// GarbageCollect lists the shard directory before it deletes anything, so
+	// the armed fault must reach it. A nil error means it did not, and the
+	// wrapper assertions below would never run.
 	if compErr == nil {
-		t.Logf("Compact returned nil — ReadDir injection did not reach GC path; test passes trivially")
-		return
+		t.Fatalf("Compact returned nil with a ReadDir fault armed: GC never listed a shard directory (fires=%d)", efs.Fires())
 	}
 
-	if !errors.Is(compErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(compErr, errInjectedIO) {
 		t.Fatalf("Compact error does not wrap injected: %v", compErr)
 	}
 
@@ -1581,7 +1626,7 @@ func TestErrorFS_WAL_SyncSpecific_OnlyOps(t *testing.T) {
 		}
 
 		// Only fire on Sync operations.
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF).OnlyOps("Sync")
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO).OnlyOps("Sync")
 
 		// Use sync enabled (no WithNoSync) so Sync is called after writes.
 		db, openErr := waldb.Open(iterDir,
@@ -1592,7 +1637,7 @@ func TestErrorFS_WAL_SyncSpecific_OnlyOps(t *testing.T) {
 		if openErr != nil {
 			// If the injection fires during Open on a Sync call, that
 			// also satisfies the test. Record and break.
-			if errors.Is(openErr, io.ErrUnexpectedEOF) {
+			if errors.Is(openErr, errInjectedIO) {
 				var ie *errfs.InjectedError
 				if errors.As(openErr, &ie) && ie.Operation == "Sync" {
 					syncFiredAt = target
@@ -1607,7 +1652,7 @@ func TestErrorFS_WAL_SyncSpecific_OnlyOps(t *testing.T) {
 		writeErr := db.SaveEntries(shardID, replicaID, []logdb.Entry{testEntry(4, 1)})
 		lenientClose(t, db)
 
-		if writeErr != nil && errors.Is(writeErr, io.ErrUnexpectedEOF) {
+		if writeErr != nil && errors.Is(writeErr, errInjectedIO) {
 			var ie *errfs.InjectedError
 			if errors.As(writeErr, &ie) && ie.Operation == "Sync" {
 				syncFiredAt = target
@@ -1627,7 +1672,7 @@ func TestErrorFS_WAL_SyncSpecific_OnlyOps(t *testing.T) {
 	if syncInjErr.Operation != "Sync" {
 		t.Fatalf("InjectedError.Operation=%q, want Sync", syncInjErr.Operation)
 	}
-	if !errors.Is(syncWriteErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(syncWriteErr, errInjectedIO) {
 		t.Fatalf("error chain missing injected error: %v", syncWriteErr)
 	}
 }
@@ -1646,7 +1691,7 @@ func TestErrorFS_WAL_MkdirAllFailure(t *testing.T) {
 	// Fresh (empty) directory so all shards are lazy.
 	// OnlyOps("MkdirAll") fires specifically on directory creation.
 	// Use threshold 1 so the very first MkdirAll fires.
-	efs := errfs.New(waldb.DefaultFS(), 1, io.ErrUnexpectedEOF).OnlyOps("MkdirAll")
+	efs := errfs.New(waldb.DefaultFS(), 1, errInjectedIO).OnlyOps("MkdirAll")
 
 	injectDir := t.TempDir()
 
@@ -1660,7 +1705,7 @@ func TestErrorFS_WAL_MkdirAllFailure(t *testing.T) {
 	)
 	if openErr != nil {
 		// If MkdirAll fires during Open (some pre-existing path), verify chain.
-		if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+		if !errors.Is(openErr, errInjectedIO) {
 			t.Fatalf("Open error does not wrap injected: %v", openErr)
 		}
 		var ie *errfs.InjectedError
@@ -1684,7 +1729,7 @@ func TestErrorFS_WAL_MkdirAllFailure(t *testing.T) {
 		return
 	}
 
-	if !errors.Is(writeErr, io.ErrUnexpectedEOF) {
+	if !errors.Is(writeErr, errInjectedIO) {
 		t.Fatalf("SaveEntries error does not wrap injected: %v", writeErr)
 	}
 
@@ -1735,7 +1780,9 @@ func TestErrorFS_WAL_StatFailureDuringReplay(t *testing.T) {
 			t.Fatalf("copyDir(target=%d): %v", target, err)
 		}
 
-		efs := errfs.New(waldb.DefaultFS(), target, io.ErrUnexpectedEOF).OnlyOps("Stat")
+		// OpStat is the stat of a PATH, which is the call this test is about;
+		// the fstat of an open handle is OpFileStat and is not armed here.
+		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO).OnlyOps(errfs.OpStat)
 
 		db, openErr := waldb.Open(iterDir,
 			waldb.WithFS(efs),
@@ -1744,12 +1791,12 @@ func TestErrorFS_WAL_StatFailureDuringReplay(t *testing.T) {
 			waldb.WithNoSync(true),
 		)
 		if openErr != nil {
-			if !errors.Is(openErr, io.ErrUnexpectedEOF) {
+			if !errors.Is(openErr, errInjectedIO) {
 				t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
 			}
 			// Stat failure during Open is the scenario we're looking for.
 			var ie *errfs.InjectedError
-			if errors.As(openErr, &ie) && ie.Operation == "Stat" {
+			if errors.As(openErr, &ie) && ie.Operation == errfs.OpStat {
 				foundError = true
 				t.Logf("Stat injection during recovery fired at target=%d op=%d", target, ie.OpCount)
 			}
@@ -1765,9 +1812,16 @@ func TestErrorFS_WAL_StatFailureDuringReplay(t *testing.T) {
 		}
 	}
 
+	// Open stats the WAL root and each shard directory to decide whether it
+	// exists, and mistaking an unreadable directory for an absent one is how a
+	// populated WAL gets stamped with the wrong format. The failure must
+	// therefore reach the caller from at least one target in the sweep; a
+	// sweep that finds none means those stats are being swallowed, which is
+	// the defect this test exists to catch and not an acceptable outcome to
+	// log and pass over.
 	if !foundError {
-		t.Logf("Stat injection did not cause Open to fail across sweep; " +
-			"Stat errors during the DB open path may be handled gracefully (treated as absent directory)")
+		t.Fatalf("no Stat injection target in %d attempts made Open fail: path-stat errors "+
+			"during the open path are being read as an absent directory", maxSweepOps)
 	}
 }
 
@@ -1816,7 +1870,7 @@ func TestErrorFS_WAL_IdempotentRecovery(t *testing.T) {
 		t.Fatalf("copyDir inject: %v", err)
 	}
 
-	efs := errfs.New(waldb.DefaultFS(), firedAt, io.ErrUnexpectedEOF)
+	efs := errfs.New(waldb.DefaultFS(), firedAt, errInjectedIO)
 	faultDB, openErr := openDBWithEFS(t, injectDir, efs, waldb.WithNoSync(true))
 	if openErr != nil {
 		t.Fatalf("Open at firedAt: %v", openErr)

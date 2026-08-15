@@ -336,7 +336,22 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 
 	// Verify the new node has all data (received via snapshot).
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, initialData, membershipTimeout)
-	t.Logf("node[%d] caught up on all 150 entries via snapshot", result.idx)
+
+	// The key set alone would be identical under plain log replay. The joiner
+	// starts empty, so a restore from a snapshot can only have come from an
+	// InstallSnapshot streamed by the leader — which is the claim in this
+	// test's name and doc comment.
+	joinerSM := result.tracker.Get(shardID, newReplicaID)
+	if joinerSM == nil {
+		t.Fatalf("node[%d] (replica %d) has no state machine after catch-up", result.idx, newReplicaID)
+	}
+	if joinerSM.Recoveries() == 0 {
+		t.Fatalf("node[%d] (replica %d) never restored from a snapshot: it caught up "+
+			"by log replay, so this test did not exercise snapshot catch-up",
+			result.idx, newReplicaID)
+	}
+	t.Logf("node[%d] caught up on all 150 entries via snapshot (%d snapshot restores)",
+		result.idx, joinerSM.Recoveries())
 
 	// Write additional entries to verify the expanded cluster works.
 	postAddData := proposeNEntries(t, cluster, trackers, shardID, 10, "post-snap-add")

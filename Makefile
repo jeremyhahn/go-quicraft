@@ -290,6 +290,20 @@ integration-test-linearizability:
 _integration-test-linearizability:
 	$(GOTEST) -tags=integration -timeout=600s $(INT_TEST_DIR)/linearizability/...
 
+# CI-parity target: byte-identical to the `integration` job in
+# .github/workflows/ci.yml and the `integration` gate in release.yml. It runs
+# on the HOST, not in the devcontainer, because that is what a CI runner does —
+# `integration-test` above is the devcontainer path and is the one to use when
+# you want the container's tuned UDP buffers and pinned toolchain.
+#
+# The differences from _integration-test are deliberate and must not be
+# "harmonised" away: no -v (CI logs are already large), and -timeout=1800s
+# rather than 900s because a shared CI runner is slower than a dev box and -p 1
+# makes every package share the one deadline.
+.PHONY: ci-integration
+ci-integration:
+	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+
 # ============================================================================
 # Benchmarks
 # ============================================================================
@@ -438,23 +452,60 @@ fuzz-raft:
 .PHONY: fuzz-all
 fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft
 
+# CI-parity target: byte-identical to the `fuzz-seeds` job in
+# .github/workflows/ci.yml.
+#
+# -run=Fuzz WITHOUT -fuzz is not fuzzing. It executes each target once per
+# f.Add seed and once per file in its testdata/fuzz/<Target>/ corpus, then
+# exits — a deterministic regression suite over every input a previous fuzzing
+# run found interesting. That is what belongs in a PR gate; the unbounded
+# search lives in .github/workflows/fuzz.yml on a nightly schedule, and in the
+# fuzz-<pkg> targets above for local use.
+#
+# ./... rather than the six fuzzing packages: a new fuzz target in a package
+# not on that list would otherwise never run.
+.PHONY: ci-fuzz-seeds
+ci-fuzz-seeds:
+	$(GO) test -race -count=1 $(FUZZ_TAGS) -run=Fuzz ./...
+
 # ============================================================================
 # ErrorFS I/O Error Injection (Phase 3)
 # ============================================================================
 
 ERRFS_TAGS    := -tags=quicraft_errfs
+ERRFS_PKGS    := ./test/errfs/...
 GOERRFS       := $(GO) test $(ERRFS_TAGS) -race -count=1 -v
 
+# Verbose developer variant. -v is what you want when an injected-error test
+# fails, because the failure is a sequence of I/O outcomes and the test names
+# are the only way to tell which injection point produced it.
+#
+# This target previously had no caller: no other target depended on it and no
+# workflow ran it, so the 21 tests behind quicraft_errfs were only ever run by
+# hand. ci-errfs below is now the wired-in path (ci-full -> ci-errfs), and this
+# stays as the target you reach for once something is red.
 .PHONY: errfs-waldb
 errfs-waldb:
-	$(GOERRFS) ./test/errfs/...
+	$(GOERRFS) $(ERRFS_PKGS)
+
+# CI-parity target: byte-identical to the `errfs` job in
+# .github/workflows/ci.yml and the `errfs` gate in release.yml. Same suite as
+# errfs-waldb without -v. -race is kept in both: these tests drive the WAL
+# through injected I/O failures from concurrent goroutines, which is exactly
+# where a torn recovery path shows up as a race rather than a wrong answer.
+.PHONY: ci-errfs
+ci-errfs:
+	$(GO) test -race -count=1 $(ERRFS_TAGS) $(ERRFS_PKGS)
 
 # ============================================================================
 # Performance Comparison Benchmarks
 # ============================================================================
 
 PERF_CMD := $(PERF_DIR)/cmd/perfcompare
-DRAGONBOAT_SRC ?= /home/jhahn/sources/dragonboat
+# Path to a local dragonboat checkout, used as the comparison engine. Defaults
+# to a sibling of this repository; override for a checkout elsewhere:
+#   make perf-run DRAGONBOAT_SRC=/path/to/dragonboat
+DRAGONBOAT_SRC ?= $(CURDIR)/../dragonboat
 SYSTEMS ?= all
 BENCHTIME ?= 30s
 PERF_TIMEOUT ?= 3600s
@@ -711,6 +762,66 @@ ci: fmt vet lint security build test
 	@echo "CI pipeline passed"
 
 # ============================================================================
+# Full CI pipeline, including every build-tagged suite.
+#
+# `ci` above stops at `test`, which is `go test ./...` with NO build tags. The
+# Go toolchain does not warn when a build constraint excludes a file — it just
+# compiles a smaller program — so that quietly skipped 147 integration tests,
+# 21 errfs fault-injection tests and 35 fuzz targets, and it computed the 91%
+# coverage threshold over what was left.
+#
+# ci-full is the target that matches what .github/workflows/ci.yml now runs.
+# `ci` is kept as the fast inner loop; ci-full is what to run before opening a
+# PR and what to reproduce a red CI run with. The tagged suites come LAST
+# because they are the slow ones (~10 min, dominated by ci-integration) and
+# there is no reason to pay for them when gofmt is going to fail anyway.
+# ============================================================================
+
+.PHONY: ci-full
+ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-integration
+	@echo "Full CI pipeline passed (untagged + integration + errfs + fuzz seeds + all modules)"
+
+# ============================================================================
+# Multi-module build
+#
+# This repository is not one Go module: contrib/dragonboat and the benchmark
+# harnesses under test/performance/ are separate modules that require or
+# `replace` the root. Building only the root let a root-module change break a
+# sibling silently — contrib/dragonboat sat broken because its `go` directive
+# was below what the parent it replaces requires, and nothing built it.
+#
+# The list is DISCOVERED from the tree rather than written down here, so a new
+# go.mod is enrolled the moment it appears. Mirrors the `modules` job in
+# .github/workflows/ci.yml, which discovers the same way.
+#
+# GOWORK=off (exported at the bottom of this file) is load-bearing: inside a
+# workspace these modules resolve the root through the workspace instead of
+# through their own require/replace directives, and the `go` directive mismatch
+# this target exists to catch does not reproduce.
+# ============================================================================
+
+#
+# Every module is attempted even after one fails, mirroring `fail-fast: false`
+# on the CI matrix: one broken sibling must not hide a second one. Stopping at
+# the first failure is how contrib/dragonboat's breakage masked the identical
+# breakage in three test/performance modules.
+.PHONY: ci-modules
+ci-modules:
+	@rc=0; \
+	for dir in $$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort); do \
+		echo "==> $$dir"; \
+		if ! ( cd "$$dir" && $(GO) build ./... && $(GOVET) ./... ); then \
+			echo "    FAIL: $$dir"; rc=1; \
+		fi; \
+	done; \
+	if [ $$rc -ne 0 ]; then \
+		echo "ci-modules: one or more modules failed to build or vet"; \
+	else \
+		echo "All modules build and vet clean"; \
+	fi; \
+	exit $$rc
+
+# ============================================================================
 # Linting and static analysis
 # ============================================================================
 
@@ -926,6 +1037,11 @@ help:
 	@echo "  fuzz-session           Fuzz session encoding"
 	@echo "  fuzz-raft              Fuzz adversarial raft message sequences and log recovery"
 	@echo "    Flags: FUZZ_TIME=60s"
+	@echo "  ci-fuzz-seeds          Seed + committed-corpus pass only (deterministic, no mutation)"
+	@echo ""
+	@echo "ErrorFS I/O Error Injection:"
+	@echo "  errfs-waldb            Verbose run of the injected-I/O-failure suite"
+	@echo "  ci-errfs               Same suite, CI parity (no -v)"
 	@echo ""
 	@echo "Benchmarks (smoke test only - single run, noise-prone):"
 	@echo "  bench-<pkg>            Run benchmarks for a specific package"
@@ -967,7 +1083,13 @@ help:
 	@echo "              server, writemode"
 	@echo ""
 	@echo "CI Pipeline:"
-	@echo "  ci                     Run full CI pipeline (fmt→vet→lint→security→build→test)"
+	@echo "  ci                     Untagged pipeline (fmt→vet→lint→security→build→test)"
+	@echo "  ci-full                ci + every build-tagged suite and every module."
+	@echo "                         This is what .github/workflows/ci.yml runs."
+	@echo "  ci-integration         Integration suite on the host (-tags=integration, -p 1)"
+	@echo "  ci-errfs               ErrorFS fault injection (-tags=quicraft_errfs)"
+	@echo "  ci-fuzz-seeds          Every fuzz target vs its seeds + committed corpus"
+	@echo "  ci-modules             Build and vet every go.mod in the tree"
 	@echo ""
 	@echo "FIPS:"
 	@echo "  build-fips             Build with GOFIPS140=v1.0.0 (PBKDF2-SHA256 KDF)"
@@ -1001,16 +1123,20 @@ help:
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
 SUBMODULE_TAGS :=
-# Builds never resolve through a workspace: modules come from Gitea tags
-# (dependency-resolution.md §2). Immunizes against stray go.work files.
+# Builds never resolve through a workspace: modules come from published tags.
+# Immunizes against stray go.work files.
 export GOWORK=off
 
-# ---- dependency-resolution.md targets (2026-08-13 cutover) ----
-# SUBMODULE_TAGS lists nested modules tagged in lockstep with the root
-# (release-versioning.md P2). deps-latest runs before compiling in a
-# consumer repo; release-alpha publishes this repo's next -alpha tag to dev.
-# deps-latest picks the highest tag INCLUDING -alpha prereleases — bare
-# 'go get @latest' ignores prereleases and would downgrade to legacy v0.0.0.
+# RELEASE_REMOTE is the git remote release-alpha pushes tags to. Defaults to
+# 'origin'; override for a mirror or a private staging remote:
+#   make release-alpha RELEASE_REMOTE=staging
+RELEASE_REMOTE ?= origin
+
+# SUBMODULE_TAGS lists nested modules tagged in lockstep with the root.
+# deps-latest runs before compiling in a consumer repo; release-alpha publishes
+# this repo's next -alpha tag. deps-latest picks the highest tag INCLUDING
+# -alpha prereleases — bare 'go get @latest' ignores prereleases and would
+# downgrade to legacy v0.0.0.
 
 .PHONY: release-alpha deps-latest
 
@@ -1020,7 +1146,7 @@ release-alpha:
 	echo $${NEXT#v} > VERSION && git add VERSION && git commit -q -m "chore(release): $$NEXT" || true; \
 	git tag $$NEXT; \
 	for s in $(SUBMODULE_TAGS); do git tag "$$s/$$NEXT"; done; \
-	git push dev HEAD --tags && echo "Tagged $$NEXT"
+	git push $(RELEASE_REMOTE) HEAD --tags && echo "Tagged $$NEXT"
 
 deps-latest:
 	@GOWORK=off sh -c ' \

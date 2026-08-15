@@ -671,10 +671,13 @@ var quorumBearingClassification = map[uint64]struct {
 }{
 	// --- exempt: peer-to-peer traffic that buys the sender nothing tallied ---
 	proto.Replicate: {false, "raft.handleAppend: appends and commits, never tallied. " +
-		"Exempt so a replica whose configuration lags can still hear the leader that " +
-		"would bring it up to date"},
+		"Exempt from THIS gate so a replica whose configuration lags can still hear " +
+		"the leader that would bring it up to date — and bound instead by the " +
+		"leader-originated binding, which refuses a From the configuration NAMES " +
+		"but the connection cannot prove (see leaderOriginatedMessages)"},
 	proto.Heartbeat: {false, "raft.handleHeartbeat: advances commit, never tallied. " +
-		"Exempt for the same lag reason as Replicate"},
+		"Exempt from this gate for the same lag reason as Replicate, and bound by " +
+		"the leader-originated binding for the same forgery reason"},
 	proto.RequestVote: {false, "raft.handleVoteRequest: answered, never tallied. Exempt so " +
 		"a member that recovered at a new address can still campaign during quorum loss"},
 	proto.RequestPreVote: {false, "raft.handleVoteRequest: answered, never tallied, and " +

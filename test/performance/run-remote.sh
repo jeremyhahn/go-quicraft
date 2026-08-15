@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# run-remote.sh — provision the fairness-normalized benchmark suite onto the
-# dedicated bench server (ci-node-1) and run it in Docker.
+# run-remote.sh — provision the fairness-normalized benchmark suite onto a
+# dedicated bench server and run it in Docker.
 #
 # The bench server has Docker but no Go/Rust toolchain, so the perfcompare
 # orchestrator is cross-compiled locally and shipped alongside the source. The
@@ -17,10 +17,16 @@ set -euo pipefail
 # ssh destination of the machine that runs the suite. Same variable name as the
 # bench-compare harness (scripts/bench-compare.sh) so one export covers both.
 # Unlike bench-compare this suite has no local mode: it rsyncs a working tree and
-# drives Docker on the target, so a host is always required.
-HOST="${PERF_HOST:-ci-node-1}"
-REMOTE_DIR="${REMOTE_DIR:-/home/jhahn/bench/go-quicraft}"
-DRAGONBOAT_SRC="${DRAGONBOAT_SRC:-/home/jhahn/sources/dragonboat}"
+# drives Docker on the target, so a host is always required. There is no default
+# — export PERF_HOST=user@host for your own bench machine.
+HOST="${PERF_HOST:?PERF_HOST is required (ssh destination of the bench server, e.g. user@host)}"
+# Staging directory on the bench host. Relative paths resolve against the remote
+# login's home directory (both ssh and rsync do this); override with an absolute
+# path if the staging tree belongs elsewhere.
+REMOTE_DIR="${REMOTE_DIR:-bench/go-quicraft}"
+# Local checkout of the dragonboat fork used as the comparison engine. Required
+# for staging; clone https://github.com/lni/dragonboat and point this at it.
+DRAGONBOAT_SRC="${DRAGONBOAT_SRC:?DRAGONBOAT_SRC is required (path to a local dragonboat checkout)}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BENCHTIME="${BENCHTIME:-30s}"
 PERF_TIMEOUT="${PERF_TIMEOUT:-7200s}"

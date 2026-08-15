@@ -6,7 +6,7 @@ At-rest encryption in QuicRaft is built on a **per-node Barrier** that manages A
 - `pkg/crypto/` — AES-GCM and ChaCha20-Poly1305 AEAD with automatic hardware detection
 - `pkg/seal/` — Barrier/seal/unseal pattern for at-rest key protection
 - `pkg/crypto/shamir/` — Shamir's Secret Sharing for key management
-- `pkg/enclave/` — Secure enclave integration
+- `pkg/enclave/` — memguard-backed in-process memory protection for key material
 
 **Source:** `pkg/seal/barrier.go`, `pkg/seal/barrier_config.go`, `pkg/seal/strategy.go`, `pkg/seal/errors.go`
 
@@ -345,7 +345,8 @@ Because the epoch always occupies the fixed 8-byte prefix and the context is app
 
 - **Opt-in only.** A nil/empty context yields byte-identical, epoch-only AAD, so `EncryptWithContext(_, _, nil)` and `Encrypt` are interoperable and all existing ciphertext and callers are unaffected. Positional binding exists **only** when the caller passes a context that uniquely identifies the frame.
 - **The context is not stored** in the ciphertext (the wire format is unchanged). The caller must reproduce the exact same context bytes at decrypt time; a mismatched or omitted context fails authentication with the generic `ErrDecryptionFailed`.
-- **Intended contexts.** Snapshot chunks pass `SnapshotIndex || ChunkSeq`; WAL records pass `SegmentID || RecordSeq`. When threaded, this binds each frame to its position and artifact, so same-epoch reorder, splice, and truncation fail authentication.
+- **Actual contexts.** Both consumers are threaded today, and both use a magic-tagged, fixed-width, **big-endian** layout with no delimiters, so no two distinct positions can produce the same bytes. Snapshot frames pass a 39-byte context, WAL records a 30-byte one; see [Snapshot AAD](#aad-additional-authenticated-data) and [WAL positional binding](#positional-binding-for-wal-records) for the exact byte layouts. This binds each frame to its position and artifact, so same-epoch reorder, splice, and truncation fail authentication.
+- **The magic is a scheme tag, not a version byte.** It is part of the authenticated context rather than a byte on disk, so the scheme identifies itself: a frame sealed under a future layout can never authenticate against this one, and there is no unauthenticated version marker for an attacker to rewrite. There is no epoch-only fallback — a reader that fails to authenticate a frame must **never** retry without the context, because that retry would be the vulnerability.
 - **Delegated (hardware) mode.** The plain `SymmetricEncrypter` seam takes no AAD. A delegated encryptor that can authenticate AAD end to end declares it by also implementing `AADSymmetricEncrypter`; the barrier then routes the context through `EncryptWithAAD`/`DecryptWithAAD` using the SAME `aadForEpoch(epoch, contextAAD)` bytes the software path builds, so hardware deployments keep their positional binding. An encryptor that does NOT implement it returns `ErrHardwareMode` for a non-empty context (fail-closed) rather than silently dropping the binding; a nil/empty context is delegated unchanged in both cases.
 - **Capability reporting.** `Barrier.SupportsContextAAD()` is what callers gate on (true for software and for a capable delegated encryptor). `Barrier.ContextBinding()` and `Barrier.IsPlaintextMode()` separate "nothing to bind because nothing is encrypted" (`StrategyNone`) from "binding unavailable because the encryptor cannot carry AAD" — `IsHardwareMode()` is true for both and cannot tell them apart.
 - **Startup enforcement.** `BarrierConfig.RequireContextAAD` makes the requirement a deployment property: `Initialize`/`Unseal` fail with `ErrContextAADUnsupported` when the barrier cannot bind context, including `StrategyNone` (requiring authenticated positional binding while selecting no encryption is a misconfiguration). Default `false` preserves existing behavior.
@@ -441,14 +442,22 @@ With 16 commit workers at 100K entries/sec, total RLock overhead is ~1-1.5ms/sec
 
 When a barrier is active, WAL records are encrypted before writing to disk. The WAL subsystem has its own `WALBarrier` interface that mirrors the barrier methods needed, avoiding direct dependency:
 
+The on-disk chunk header is `recordHeaderSize = 11` bytes:
+
 ```
-Plaintext record:  [CRC32:4 | Length:4 | Type:1 | Data:N]
-Encrypted record:  [CRC32:4 | Length:4 | Type:1 | Epoch:8 | Nonce:12 | Ciphertext:N | Tag:16]
+Plaintext chunk:  [CRC32:4 | Length:2 | Type:1 | DurSeq:4 | Data:N]
+Encrypted chunk:  [CRC32:4 | Length:2 | Type:1 | DurSeq:4 | Epoch:8 | AlgID:1 | Nonce:12 | Ciphertext:N | Tag:16]
 ```
 
-- `CRC32` covers `epoch + nonce + ciphertext + tag`
+- `CRC32` covers `[Type][DurSeq][Data]` — that is, everything after the length field, which for an encrypted chunk means the epoch, algorithm ID, nonce, ciphertext and tag
+- `Length` is **2 bytes** and holds the payload length excluding the header, so `maxRecordDataLen` is 65535; a logical record longer than that is split across First/Middle/Last chunks
 - `Type` is unencrypted (entry batch, state, snapshot)
-- `Epoch` is unencrypted (routing — tells decryptor which DEK)
+- `DurSeq` is the chunk's durability sequence. It sits **inside** the checksummed region deliberately: recovery uses it to decide whether truncating is safe, so a flipped bit in it must invalidate the chunk rather than silently move the chunk into another generation. It is placed after the type byte so the covered region stays one contiguous slice and the CRC is computed in a single pass
+- `Epoch` is unencrypted (routing — tells the decryptor which DEK)
+
+CRC32-C protects against **accidental** corruption only — bit flips, partial writes, torn pages. It is not a cryptographic integrity check: an adversary with disk access can trivially recompute a valid CRC32 after modifying record contents. Tamper protection comes from the barrier's AES-256-GCM AEAD; the CRC remains as a fast first-pass detector so garbage is not fed into the decryption path. That split is deliberate — CRC32-C runs at ~30 GB/s hardware-accelerated where HMAC-SHA256 runs at ~1-3 GB/s.
+
+See [WAL Persistence](../storage/wal.md) for the full segment and block layout.
 
 ### WAL Write Integration
 
@@ -495,9 +504,22 @@ The WAL does **not** construct its own nonces. `writeRecord` calls `barrier.Encr
 
 Crash-recovery nonce safety therefore does not rely on a per-segment counter: because every nonce is random, a recovered segment that resumes appending cannot reproduce a pre-crash nonce by construction. Collision safety is instead bounded by the barrier's per-DEK NIST SP 800-38D invocation cap (2^32) and, when enabled, the nonce-reuse tracker — see [Nonce Generation](#nonce-generation). A `Rotate()` further guarantees uniqueness across epochs: the new DEK has never been used with any nonce.
 
-### Positional binding for WAL records (optional)
+### Positional binding for WAL records
 
-Random nonces and epoch-only AAD do not, on their own, bind a WAL record to its position, so an at-rest attacker could in principle reorder or splice same-epoch records. To bind position, the WAL write/read path can pass a per-record context — `SegmentID || RecordSeq` — to the barrier's context-AAD API (`EncryptWithEpochContext` / `DecryptForEpochContext`; see [Optional Context-AAD](#optional-context-aad-positional-binding)). This is opt-in: it protects records only once the WAL threads that context on both encrypt and decrypt.
+Random nonces and epoch-only AAD do not, on their own, bind a WAL record to its position: two records sealed under the same DEK and epoch authenticate identically no matter where they sit, so an at-rest attacker with write access could reorder, splice or truncate same-epoch records without the authentication tag noticing.
+
+Every encrypted WAL record therefore additionally binds its **position** — which WAL shard, which segment, and which record ordinal within that segment — into the AAD, so a record only authenticates at the exact place it was written. The context is fixed-width and **big-endian** with no delimiters, **30 bytes** total:
+
+```
+context = "QRWAL1"(6) || WALShardIdx:8 || SegmentID:8 || RecordSeq:8      = 30 bytes
+AAD     = [Epoch:8 little-endian] || context                             = 38 bytes
+```
+
+`WALShardIdx` is required, not decorative: each WAL shard is its own directory with an independent `%06d.log` ID space, and all of them share one barrier, so `(SegmentID, RecordSeq)` alone is not unique across shards.
+
+`RecordSeq` is the ordinal of the **logical** record within its segment, 0-based — the number of logical records already committed to that segment, which is exactly the index at which `segment.ReadAll` returns the record during recovery. Chunking a record across blocks does not affect it: `ReadAll` assembles First/Middle/Last chunks into one entry before appending.
+
+The context bytes are built in one place (`walRecordContext`), used by both the encrypt and the decrypt side, so the two cannot drift. This is **not** opt-in: there is no on-disk version marker and no epoch-only fallback, and WALs written before this scheme are not readable.
 
 ## Snapshot Encryption
 
@@ -513,19 +535,30 @@ Each chunk's nonce is a **fresh random nonce** from the barrier (12 bytes for AE
 
 ### AAD (Additional Authenticated Data)
 
-By default each chunk binds **only its epoch** (`epochAAD`). Epoch-only AAD does not bind a chunk to its position, so an at-rest attacker could in principle reorder chunks, substitute chunks from another snapshot at the same epoch, or truncate the stream without failing per-chunk authentication.
+Epoch-only AAD does not bind a chunk to its position, so an at-rest attacker could reorder chunks, substitute chunks from another snapshot at the same epoch, or truncate the stream without failing per-chunk authentication.
 
-To bind position, the snapshot path can pass a per-chunk context — `SnapshotIndex || ChunkSeq` — to the barrier's context-AAD API (`EncryptWithEpochPinnedContext` / `DecryptForEpochContext`; see [Optional Context-AAD](#optional-context-aad-positional-binding)):
+Every snapshot frame therefore binds a **positional context** built by `engine.NewSnapshotAAD`. It is the magic followed by four **big-endian** uint64 fields — every field fixed width, so no delimiter is needed and no two distinct identities can produce the same bytes. `SnapshotFrameAADLen` is **39 bytes**:
 
 ```
-context = [SnapshotIndex:8 | ChunkSeq:4]   →   AAD = [Epoch:8] || context
+ off  size  field
+   0     7  magic "QRSNAP1"
+   7     8  ShardID
+  15     8  ReplicaID
+  23     8  SnapshotIndex
+  31     8  ChunkSeq (0-based ordinal within snapshot.dat)
+
+context = 39 bytes
+AAD     = [Epoch:8 little-endian] || context   = 47 bytes
 ```
 
-When threaded on both encrypt and decrypt, this makes:
+This makes:
 - **Chunk reordering** — a wrong `ChunkSeq` fails authentication.
 - **Cross-snapshot substitution** — a wrong `SnapshotIndex` fails authentication.
+- **Cross-replica substitution** — a wrong `ShardID` or `ReplicaID` fails authentication.
 
-This binding is opt-in and exists only where the caller supplies the context. Stream **truncation** is additionally guarded at the application layer by verifying `TotalChunkCount` agreement across all chunks.
+Stream **truncation** is additionally guarded at the application layer by verifying `TotalChunkCount` agreement across all chunks.
+
+`NewSnapshotAAD` first asks the barrier whether it can actually authenticate a caller-supplied context (`SupportsContextAAD`). A barrier that cannot must not be handed one: the write fails closed rather than silently dropping the binding. `ContextBinding()` and `IsPlaintextMode()` separate the two reasons a barrier may be unable to bind — no-encryption mode, where there is no AEAD and nothing a position could be bound to, versus a delegated encryptor that is protecting the data but cannot authenticate where it belongs. Only the second is a security limitation.
 
 ### Snapshot Encryption: Atomic Write Pattern
 
@@ -881,17 +914,32 @@ the seam interfaces, never the custody machinery.
   `ShamirConfig` / `ShamirInitResult` / `QuorumProgress` value types that a host application
   injects an implementation for.
 
-**`Combine` integrity check is opt-out via a zero digest.** Shares produced by
-`Split` carry a SHA-256 digest of the original secret, and `Combine` verifies the
-reconstructed secret against it, returning an `IntegrityError` on mismatch. As a
-deliberate special case, when the first share's `Digest` is the zero value
-(`[32]byte{}`) the SHA-256 check is **skipped**. This supports the accumulator
-path, where the seal adapter's `ShareAccumulator` constructs shares without
-`Split` and therefore has no access to the original digest. When a zero digest
-disables verification, the **caller MUST validate the reconstructed secret
-out-of-band** — e.g. by authenticating it against an independent commitment or
-by using it in an authenticated decrypt that fails on a wrong key. (The
-accumulator/custody machinery that drives this path lives in go-qrdb, not here.)
+**`Combine` performs NO integrity check.** This is the single most important
+property for an integrator to get right, and it is easy to assume otherwise.
+
+Shares carry **no digest of the secret**. There is no `Digest` field on
+`Share`, `Combine` does no hashing of any kind, and it is a one-line
+delegation to `CombineUnverified` — both names exist only to let callers
+express intent. With fewer-than-threshold genuine shares, or a corrupted or
+mismatched share, reconstruction yields **indistinguishable garbage, not an
+error**.
+
+Embedding a digest would be an offline brute-force oracle that defeats
+Shamir's information-theoretic secrecy for low-entropy secrets, which is why
+an earlier design that stored `sha256(secret)` in each share was removed.
+`Threshold` and `Total` on a `Share` are likewise **unauthenticated
+caller-supplied metadata**.
+
+`IntegrityError` still exists in the package but is marked deprecated and is
+**never returned**; it is retained only for API/SDK compatibility. Do not
+write code that waits for it.
+
+**The caller MUST authenticate the reconstructed secret out-of-band** — for
+example by using it as the key in an authenticated decrypt that fails on a
+wrong key, or by checking it against an independent commitment. An integrator
+who skips this silently accepts a garbage reconstructed root key. (The
+accumulator/custody machinery that drives this path lives in go-qrdb, not
+here.)
 
 The **Shamir sealing strategy** (splitting the root key), **share custody**, the
 **M-of-N quorum/unseal orchestration**, and the **Security-Officer CSR challenge-response
@@ -904,7 +952,21 @@ engine never persists Shamir shares. See the coordination repo's
 
 **Source:** `pkg/enclave/`
 
-Secure enclave integration for hardware-backed key protection on supported platforms (e.g., Apple Secure Enclave, Intel SGX).
+Despite the name, `pkg/enclave` is **not** hardware enclave integration. There
+is no Apple Secure Enclave support and no Intel SGX support anywhere in this
+repository. The package is a thin wrapper over
+[memguard](https://github.com/awnumar/memguard) providing memory-protected
+containers for key material in the process's own address space:
+
+- `ProtectedKey` wraps a `memguard.Enclave`, keeping a key encrypted at rest
+  in process memory and decrypting it only into a guarded buffer for use.
+- `ProtectedBuffer` provides `mlock`'d, guard-page-protected buffers for
+  temporary access.
+- `WipeBytes` zeroes a plain byte slice.
+
+For hardware-backed key protection (TPM 2.0, PKCS#11, cloud KMS), the barrier
+delegates to an external encryptor — that is go-xkms's domain, not this
+package's. See [Delegated (hardware) mode](#optional-context-aad-positional-binding).
 
 ## Host Integration
 
@@ -1013,7 +1075,8 @@ Counter resets on successful unseal. Primary defense is Argon2id's computational
 
 **Source:** `pkg/seal/barrier.go`
 
-The barrier uses [memguard](https://github.com/awnuber/memguard) for hardware-assisted memory protection of all key material.
+The barrier uses [memguard](https://github.com/awnumar/memguard), via
+`pkg/enclave`, for in-process memory protection of all key material.
 
 ### memguard Protections
 
@@ -1023,8 +1086,31 @@ The barrier uses [memguard](https://github.com/awnuber/memguard) for hardware-as
 | **Encrypted at-rest memory** | `memguard.Enclave` encrypts root key in process memory; decrypted only into guarded buffers for use |
 | **Guard pages** | Canary pages before/after each `LockedBuffer` detect buffer overflows/underflows |
 | **Memory locking** | `mlock` prevents swapping key material to disk |
-| **Signal handler cleanup** | memguard installs handlers to destroy buffers on SIGTERM/SIGKILL |
 | **ptrace protection** | Process-level `PR_SET_DUMPABLE(0)` prevents debugger attachment on Linux |
+
+### No signal handler is installed
+
+This library installs **no signal handler**. An earlier `InitMemguard` called
+`memguard.CatchSignal(SIGTERM, SIGINT)`; it had no callers and was removed,
+because wiring it up would have been actively harmful in an embedded
+consensus engine:
+
+- `memguard.CatchSignal` calls `signal.Reset()` with **no arguments**, which
+  detaches *every* signal handler in the process — including the embedding
+  application's own, and including handlers this library knows nothing about.
+- Its handler then calls `core.Exit(1)`. SIGTERM would stop being a graceful
+  shutdown and become an immediate exit: no engine quiesce, no `Host.Close`,
+  no barrier seal, no WAL flush.
+- It would not have bought much. memguard already wipes `LockedBuffer`s on
+  `Destroy`, and the enclave ciphertext it cannot wipe is useless without the
+  session coffer key, which dies with the process either way.
+
+Note also that **SIGKILL is uncatchable** — no handler, memguard's or anyone
+else's, has ever been able to run on it. Any claim that signal-handler
+cleanup covers SIGKILL was false even while the handler existed.
+
+An embedder that wants signal-triggered wiping must install it in its own
+`main`, alongside — not instead of — its graceful shutdown path.
 | **Canary values** | Integrity canaries detect in-memory corruption of guarded buffers |
 
 ### Key Material Allocation

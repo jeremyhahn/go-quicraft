@@ -14,50 +14,35 @@
 
 package proto
 
-// Persisted Membership layout revisions. Every revision UnmarshalFrom can
-// decode has a named constant here and a matching case in its version
-// switch; the constant is the value of the section's leading byte.
+// membershipV1 is the one persisted Membership layout this build reads or
+// writes, and — under the pre-release pinning policy in the package comment —
+// the only one that will exist until the first production release.
 //
-// Layout history:
+// The v1 layout is:
 //
-//	v1: [ConfigChangeID:8][4 maps]                           (base 8)
-//	v2: [ConfigChangeID:8][MaxWitnesses:8][Policy:8][4 maps]  (base 24)
-//	v3: [Version:1] prefixed to the v2 fixed fields           (base 25)
-//	v4: v3 with the session policy appended to the fixed region (base 49)
-//	    and a FIFTH map, Identities, appended after Removed
+//	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
+//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+//	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
 //
-// v1 and v2 have no constant because they carry no version byte at all and
-// cannot be discriminated in band: an empty v2 section is byte-identical to
-// an empty v1 one, and both are indistinguishable from arbitrary
-// ConfigChangeID bytes. They are unreadable by construction, which is the
-// defect v3 exists to close.
-const (
-	// membershipV3 prefixes a version byte to the v2 fixed fields, making
-	// the layout self-describing.
-	membershipV3 uint8 = 3
-
-	// membershipV4 adds two things v3 could not carry: the session policy
-	// (SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient) in the
-	// fixed region, and the Identities map — the stable cryptographic node
-	// identity committed membership assigns each replica — after Removed.
-	//
-	// The two arrived in the same unreleased layout revision deliberately.
-	// Shipping the identity map as v4 and the session policy as v5 would cost
-	// downstream a second on-disk format break for a version nothing has
-	// written outside this development tree.
-	membershipV4 uint8 = 4
-)
+// The number is 1 because the project is pre-release, not because the layout
+// is the first one ever written: earlier development commits wrote other
+// layouts under other numbers, and those bytes are gone with the dev clusters
+// that held them. Under the pinning policy a layout change is made IN PLACE at
+// version 1 and the consuming repos are updated to match, so this constant
+// does not move again until 1.0.
+const membershipV1 uint8 = 1
 
 // membershipFormatVersion is the PERSISTED Membership layout revision this
-// build writes, stamped as the section's first byte. Membership is always
-// embedded in a larger buffer, so neither a length check nor a
-// trailing-byte check can discriminate layouts; the explicit byte is the
-// only in-band discriminator.
+// build writes AND the only one it reads, stamped as the section's first byte.
+// Membership is always embedded in a larger buffer, so neither a length check
+// nor a trailing-byte check can discriminate layouts; the explicit byte is the
+// only in-band discriminator, and it is retained through the pinned period
+// precisely so the 1.0 bump has a mechanism to use.
 //
 // This constant is DELIBERATELY NOT derived from WireVersion, and must
-// never become so again. The two version namespaces have different scopes
-// and must evolve independently (see the compatibility contract in the
-// package comment):
+// never become so. The two version namespaces have different scopes and must
+// be free to move independently at the first production release (see the
+// compatibility contract in the package comment):
 //
 //   - WireVersion is TRANSPORT-scoped. It stamps MessageBatch.BinVer and
 //     SnapshotChunk.BinVer, both of which are decoded by a live peer and
@@ -67,50 +52,60 @@ const (
 //     artifacts, and into the EntryInitialMembership entry at log index 1,
 //     where they outlive the process — and the binary — that wrote them.
 //
-// While the two shared a value, bumping WireVersion for an unrelated
-// transport change (a new SnapshotChunk field, say) also changed the
-// version byte every replica expects at log index 1, so no node could
-// replay its own log: a cluster-wide brick with no migration path. Bump
-// this constant only when the Membership BYTES change, and in the same
-// change add a decode case for the outgoing layout.
-const membershipFormatVersion uint8 = membershipV4
+// While the two shared a derivation, bumping WireVersion for an unrelated
+// transport change (a new SnapshotChunk field, say) also changed the version
+// byte every replica expects at log index 1, so no node could replay its own
+// log: a cluster-wide brick with no migration path. That is why they are two
+// constants even while they hold the same value.
+const membershipFormatVersion uint8 = membershipV1
 
-// minSupportedMembershipVersion is the oldest persisted Membership layout
-// UnmarshalFrom will decode. Together with membershipFormatVersion it
-// defines the supported window [min, current]; a reader accepts a RANGE
-// because it must keep decoding the versions already on disk, not only the
-// one it writes.
+// The wire-version-covers-membership assertion: at COMPILE TIME, the TRANSPORT
+// version must be at least the PERSISTED Membership version.
 //
-// The floor is 3 because v1 and v2 have no in-band discriminator. It exists
-// as an explicit constant so that dropping support for an old layout is a
-// deliberate one-line decision taken after its migration window, rather
-// than an implicit consequence of a decoder that only ever matched the
-// version it happened to write.
-const minSupportedMembershipVersion uint8 = membershipV3
+// Membership rides the wire inside Snapshot -> Message -> MessageBatch and
+// directly inside SnapshotChunk, and both of those gate on
+// BinVer == WireVersion by exact equality. A Membership layout bump that left
+// WireVersion alone would therefore change the transport bytes while leaving
+// the transport discriminator unchanged — two dialects behind one version
+// number, which is exactly the ambiguity the version byte exists to remove.
+//
+// The assertion holds trivially while both are pinned at 1, and that is the
+// point of keeping it: the pinning ends at the first production release, and
+// this is what stops the two numbers drifting apart at the bump that matters.
+//
+// The relation is >= and not ==: a transport-only change (a new SnapshotChunk
+// field) must be free to move WireVersion without touching a single persisted
+// byte, so the transport number is a SUPREMUM over every layout on the wire.
+// See the compatibility contract in the package comment.
+//
+// The expression is a typed-constant subtraction: if WireVersion ever falls
+// below membershipFormatVersion the difference is negative, a negative value is
+// not representable in uint64, and the package does not compile. Bumping
+// Membership without bumping the wire version is a build error instead of a
+// review miss. The blank name is deliberate — nothing should ever READ this;
+// its only job is to be type-checked.
+const _ uint64 = WireVersion - uint64(membershipFormatVersion)
 
-// Membership fixed-region sizes. Each readable layout owns its own constant
-// because v4 GREW the fixed region: a single shared size would silently read
-// the v4 session policy out of a v3 section's first map count.
+// Membership fixed-region offsets and sizes. There is exactly one layout, so
+// there is exactly one set of these. The session policy's offset and its size
+// are named separately from the total rather than folded into one number,
+// because a future version that GREW the fixed region would have to state its
+// own offsets — and the way that goes wrong is a single shared size constant
+// silently reading one layout's first map count as another's last fixed field.
 const (
-	// membershipFixedSizeV3 is the wire size of the v3 fixed region:
-	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) +
+	// sessionPolicyOffset is where the replicated session policy starts:
+	// immediately after Version(1) + ConfigChangeID(8) + MaxWitnesses(8) +
 	// RequireFullReplicaMajority(8).
-	membershipFixedSizeV3 = 1 + 8 + 8 + 8 // 25 bytes
+	sessionPolicyOffset = 1 + 8 + 8 + 8 // 25 bytes
 
-	// membershipSessionPolicySize is what the replicated session policy adds
-	// to the fixed region: SessionExpiryEntries(8) + MaxTotalSessions(8) +
+	// membershipSessionPolicySize is what the replicated session policy
+	// occupies: SessionExpiryEntries(8) + MaxTotalSessions(8) +
 	// MaxSessionsPerClient(8).
 	membershipSessionPolicySize = 3 * 8 // 24 bytes
 
-	// membershipFixedSizeV4 is the wire size of the v4 fixed region: the v3
-	// fields followed by the session policy, at the offsets sessionPolicyOffset
-	// names.
-	membershipFixedSizeV4 = membershipFixedSizeV3 + membershipSessionPolicySize // 49 bytes
-
-	// sessionPolicyOffset is where the v4 session policy starts — immediately
-	// after the v3 fields, which v4 leaves byte-identical so the shared decode
-	// path can read them from either layout.
-	sessionPolicyOffset = membershipFixedSizeV3
+	// membershipFixedSize is the wire size of the whole fixed region, and thus
+	// the offset the six-map region begins at.
+	membershipFixedSize = sessionPolicyOffset + membershipSessionPolicySize // 49 bytes
 )
 
 // SessionPolicy is the shard's replicated session configuration: the three
@@ -140,7 +135,7 @@ type SessionPolicy struct {
 }
 
 // IsSet reports whether this value is a policy the shard actually committed,
-// as opposed to the zero value a v3 section decodes to.
+// as opposed to the zero value a section written without one decodes to.
 //
 // MaxTotalSessions is the discriminator because it can never legitimately be
 // zero in a committed policy: config.Validate rejects a zero MaxTotalSessions
@@ -159,8 +154,8 @@ func (p SessionPolicy) IsSet() bool {
 // The wire format encodes a version byte and the fixed fields
 // (ConfigChangeID, MaxWitnesses, RequireFullReplicaMajority,
 // SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient) followed by
-// four maps (Addresses, Observers, Witnesses, Removed) and the Identities
-// map, each with sorted keys for deterministic output.
+// six maps (Addresses, Observers, Witnesses, Removed, Identities,
+// RemovedIdentities), each with sorted keys for deterministic output.
 type Membership struct {
 	// ConfigChangeID is the log index of the configuration change
 	// that produced this membership.
@@ -175,8 +170,8 @@ type Membership struct {
 	RequireFullReplicaMajority bool
 	// SessionExpiryEntries is the shard's replicated session inactivity
 	// threshold, in applied log entries. Zero means expiry is disabled — see
-	// SessionPolicy.IsSet for how that is told apart from a v3 section that
-	// carries no policy at all.
+	// SessionPolicy.IsSet for how that is told apart from a membership that
+	// carries no committed policy at all.
 	SessionExpiryEntries uint64
 	// MaxTotalSessions is the shard's replicated cap on registered sessions.
 	// Non-zero in every committed policy, which is what makes it the
@@ -220,11 +215,63 @@ type Membership struct {
 	// TransportConfig.RequireMemberIdentity). A missing entry is therefore a
 	// compatibility state, never a permission.
 	Identities map[uint64]string
+	// RemovedIdentities maps the replica IDs in Removed to the node identity
+	// the configuration held for them AT THE MOMENT OF REMOVAL. It is the
+	// TOMBSTONE's authorization key, and it is the reason the removal deny-list
+	// can be evaluated against something a sender cannot choose.
+	//
+	// The deny-list used to be answerable only against the CLAIMED msg.From,
+	// which a removed replica evades by naming a different replica ID: it still
+	// holds its private key, so it still authenticates, and nothing in
+	// replicated state connected the connection it opened to the removal that
+	// was committed for it. Retaining the identity here closes that, because the
+	// receive path can ask "is the AUTHENTICATED identity on this connection one
+	// this shard has removed?" — a question whose answer does not depend on any
+	// field the sender fills in.
+	//
+	// # Retention: entries are NEVER evicted
+	//
+	// Evicting a tombstone re-opens the hole for exactly that replica, so no
+	// eviction policy exists that is not also a re-admission policy; and a
+	// time-based or count-based one would re-admit a removed replica at a moment
+	// no operator chose and no two replicas would agree on (eviction would have
+	// to be deterministic replicated state or the shards diverge). The map is
+	// append-only for the life of the shard, exactly like Removed itself.
+	//
+	// That is safe because it adds NO new growth axis. Its key set is a SUBSET
+	// of Removed's — an entry appears only when a removal is committed for a
+	// member that had a committed identity — so it can never hold more entries
+	// than Removed, which has carried the same unbounded-in-principle,
+	// MaxMembershipEntries-in-practice shape since v1. A shard that would
+	// overflow this map has already overflowed Removed and become unreadable.
+	// Each entry costs 8 + 4 + len(identity) bytes on the wire (~81 for the
+	// "spki:" + SHA-256-hex form this build produces), so the 10000-entry cap is
+	// under a megabyte — well inside MaxBatchSize and MaxEntrySize.
+	//
+	// What the cap buys is a LOUD failure rather than a silent one: MarshalTo
+	// refuses to write a map beyond it, so an operator who has genuinely removed
+	// ten thousand replicas from one shard gets ErrTooManyMembershipEntries on
+	// the config change instead of a membership that is durable and unreadable.
+	// Forgetting a tombstone to stay under a cap is the one outcome that must
+	// not happen quietly.
+	//
+	// # Residual: address-only shards
+	//
+	// It is SPARSE, for the same reason Identities is: a shard whose members
+	// carry no committed identity records nothing here when they are removed,
+	// and the deny-list for that shard remains what it always was — a check on
+	// the claimed msg.From, evadable by naming another ID. Nothing inside
+	// replicated state can fix that, because there is no authenticated fact
+	// about the connection for the configuration to be asked about. The remedy
+	// is to commit identities (Config.MemberIdentities at bootstrap,
+	// Host.RequestAddNodeWithIdentity thereafter) and, once migrated,
+	// TransportConfig.RequireMemberIdentity.
+	RemovedIdentities map[uint64]string
 }
 
 // SessionPolicy returns the shard's replicated session policy. The result
-// reports IsSet false for a configuration decoded from a v3 section, which
-// carried no policy.
+// reports IsSet false for a configuration that never had one committed — the
+// fixed region is always present, so an absent policy is 24 zero bytes.
 func (m *Membership) SessionPolicy() SessionPolicy {
 	return SessionPolicy{
 		ExpiryEntries:        m.SessionExpiryEntries,
@@ -246,17 +293,61 @@ func (m *Membership) SetSessionPolicy(p SessionPolicy) {
 // [RequireFullReplicaMajority:8][SessionExpiryEntries:8][MaxTotalSessions:8]
 // [MaxSessionsPerClient:8]
 // [Addresses map][Observers map][Witnesses map][Removed boolMap]
-// [Identities map]
+// [Identities map][RemovedIdentities map]
 func (m *Membership) Size() int {
-	return membershipFixedSizeV4 + mapSize(m.Addresses) + mapSize(m.Observers) +
-		mapSize(m.Witnesses) + boolMapSize(m.Removed) + mapSize(m.Identities)
+	return membershipFixedSize + mapSize(m.Addresses) + mapSize(m.Observers) +
+		mapSize(m.Witnesses) + boolMapSize(m.Removed) + mapSize(m.Identities) +
+		mapSize(m.RemovedIdentities)
+}
+
+// checkWritable refuses a membership this package's own UnmarshalFrom would
+// not accept back.
+//
+// Every limit in this package used to be enforced on READ only, so MarshalTo
+// happily produced bytes UnmarshalFrom refuses — and for Membership that is
+// reachable through a legal API call with a DURABLE consequence, not merely an
+// asymmetry in a codec. Host.StartShard copies the caller's members map
+// straight into Addresses, raft.BuildInitialMembershipEntry marshals it
+// unchecked, and the result is committed as the EntryInitialMembership at log
+// index 1. The next start decodes that entry, getMap refuses the oversized
+// value, and the error propagates: StartShard aborts permanently, on data the
+// shard itself wrote. "Durable but unreadable" is the failure
+// waldb.checkMembershipSize already exists to prevent on its own layout; this
+// is the same rule on this one.
+//
+// The bounds MIRROR the read side exactly, including which sentinel each
+// reports, because the point is that the two agree. In particular every string
+// map — Identities and RemovedIdentities included — is bounded at
+// MaxAddressLength and reports ErrAddressTooLong, because getMap is shared by
+// all five and that is the sentinel getMap returns. MaxNodeIdentityLength has
+// the same value, so nothing is admitted or refused differently; reporting
+// ErrNodeIdentityTooLong here would just mean marshal and unmarshal disagreed
+// about the NAME of a refusal they agree on.
+func (m *Membership) checkWritable() error {
+	for _, sm := range []map[uint64]string{
+		m.Addresses, m.Observers, m.Witnesses, m.Identities, m.RemovedIdentities,
+	} {
+		if err := checkWritableMap(sm); err != nil {
+			return err
+		}
+	}
+	return checkWritableBoolMap(m.Removed)
 }
 
 // MarshalTo writes the membership into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short. The encoder only ever writes membershipFormatVersion —
-// old layouts are readable, never writable.
+// buf must be at least Size() bytes. There is exactly one layout, and the
+// encoder stamps membershipFormatVersion at buf[0] so the decoder can refuse
+// anything that is not it.
+//
+// Returns ErrBufferTooSmall if buf is too short, ErrTooManyMembershipEntries if
+// any map holds more than MaxMembershipEntries entries, or ErrAddressTooLong if
+// any map value exceeds MaxAddressLength. The latter two are the read side's
+// limits applied on write; see checkWritable for why a codec that can emit what
+// it cannot parse is a durability bug here and not a style complaint.
 func (m *Membership) MarshalTo(buf []byte) (int, error) {
+	if err := m.checkWritable(); err != nil {
+		return 0, err
+	}
 	required := m.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall
@@ -268,147 +359,103 @@ func (m *Membership) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
 	putUint64(buf[sessionPolicyOffset+16:], m.MaxSessionsPerClient)
-	offset := membershipFixedSizeV4
+	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
 	offset += putMap(buf[offset:], m.Observers)
 	offset += putMap(buf[offset:], m.Witnesses)
 	offset += putBoolMap(buf[offset:], m.Removed)
 	offset += putMap(buf[offset:], m.Identities)
+	offset += putMap(buf[offset:], m.RemovedIdentities)
 	return offset, nil
 }
 
 // UnmarshalFrom reads the membership from buf and returns bytes consumed.
-// The leading version byte selects the decode path: every layout in
-// [minSupportedMembershipVersion, membershipFormatVersion] is decoded,
-// which is what lets a node keep replaying bytes an older binary wrote.
-// Map counts and address lengths are validated before allocation.
+// The leading version byte must be membershipFormatVersion EXACTLY: there is
+// one layout, and a byte naming any other is refused before a single field is
+// interpreted. Map counts and address lengths are validated before allocation.
+//
+// Exact equality is the same gate MessageBatch and SnapshotChunk apply to
+// BinVer, and it is what the pre-release pinning policy makes correct here too:
+// no persisted bytes from another layout are meant to exist, because dev
+// clusters are wiped rather than migrated (see the package comment). A range
+// gate would silently decode a section this build cannot interpret — the
+// version byte is the ONLY in-band discriminator, since Membership is always
+// embedded in a larger buffer and neither a length check nor a trailing-byte
+// check can tell one layout from another.
 //
 // Returns an *UnsupportedMembershipVersionError (which matches
-// ErrUnsupportedVersion under errors.Is, and names both the version found
-// and the supported range) if the version byte falls outside that window,
-// ErrBufferTooSmall on truncated input, ErrTooManyMembershipEntries if any
-// map count exceeds the limit, or ErrAddressTooLong if any address string
-// exceeds MaxAddressLength.
+// ErrUnsupportedVersion under errors.Is, and names both the version found and
+// the one supported) if the version byte is anything else, ErrBufferTooSmall on
+// truncated input, ErrTooManyMembershipEntries if any map count exceeds the
+// limit, or ErrAddressTooLong if any address string exceeds MaxAddressLength.
+//
+// It is ALL OR NOTHING. Decoding runs into a local value and the receiver is
+// assigned only on success, so a failure at any point leaves m exactly as it
+// was rather than half-overwritten. That matters for the two authorization
+// maps in particular: a partial decode that kept a STALE Identities map would
+// authorize a replica the decoded configuration never named, and one that kept
+// a stale RemovedIdentities would deny a sender it never tombstoned. Every call
+// site abandons the value on error today, so neither is reachable; the
+// invariant is a property of the decoder rather than of its callers.
 func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < 1 {
 		return 0, ErrBufferTooSmall
 	}
-	// The version byte is the sole layout discriminator, and is checked
-	// ahead of the length so a legacy buffer reports the format mismatch
-	// rather than an opaque short-buffer error. A v1 or v2 buffer starts
-	// with the ConfigChangeID low byte instead, so anything outside the
-	// supported window is rejected before a single field is interpreted.
-	// Version 0 — the low byte of every small ConfigChangeID, including the
-	// empty v1/v2 membership that no heuristic could tell apart from a v2
-	// record with RequireFullReplicaMajority=false — is below the floor and
-	// is never a valid version.
+	// The version byte is checked ahead of the length so a buffer in any other
+	// layout reports the format mismatch rather than an opaque short-buffer
+	// error. A section written without a version byte starts with the
+	// ConfigChangeID low byte instead, so version 0 — the low byte of every
+	// small ConfigChangeID — is never a valid version and is rejected here.
 	version := buf[0]
-	if version < minSupportedMembershipVersion || version > membershipFormatVersion {
+	if version != membershipFormatVersion {
 		return 0, &UnsupportedMembershipVersionError{Found: version}
 	}
-	// One case per readable layout. The window is [3, 4]: a v3 record written
-	// by an older binary — every EntryInitialMembership at log index 1 in an
-	// existing cluster, and every snapshot and WAL membership section it ever
-	// wrote — still decodes, which is what lets a node replay its own log after
-	// the upgrade. It simply decodes with no Identities.
-	switch version {
-	case membershipV3:
-		return m.unmarshalV3(buf)
-	case membershipV4:
-		return m.unmarshalV4(buf)
-	default:
-		// Reached only if membershipFormatVersion (or the floor) moved
-		// without a matching case. Refuse rather than decode an unknown
-		// layout with the v3 reader.
-		return 0, &UnsupportedMembershipVersionError{Found: version}
-	}
-}
-
-// unmarshalV3 decodes the v3 layout — [Version:1][ConfigChangeID:8]
-// [MaxWitnesses:8][RequireFullReplicaMajority:8] followed by the Addresses,
-// Observers, Witnesses and Removed maps — and returns bytes consumed. The
-// caller has already validated buf[0]; buf may be longer than the section.
-//
-// Identities and the session policy are cleared, not left alone: Membership
-// values are reused (see Reset), so a stale identity map surviving a v3 decode
-// would silently authorize a replica the decoded configuration never named,
-// and a stale session policy would be read as one this shard committed.
-func (m *Membership) unmarshalV3(buf []byte) (int, error) {
-	offset, err := m.unmarshalCommon(buf, membershipFixedSizeV3)
-	if err != nil {
-		return 0, err
-	}
-	m.SetSessionPolicy(SessionPolicy{})
-	m.Identities = nil
-	return offset, nil
-}
-
-// unmarshalV4 decodes the v4 layout — the v3 layout with the session policy
-// appended to the fixed region and the Identities map appended after Removed —
-// and returns bytes consumed. The caller has already validated buf[0]; buf may
-// be longer than the section.
-func (m *Membership) unmarshalV4(buf []byte) (int, error) {
-	// The session policy sits INSIDE the fixed region, so it is read before
-	// the shared decode reaches the maps at their v4 offset. Its own bound
-	// check runs first: unmarshalCommon validates the length it was told to
-	// expect, which is no help to the three reads below it.
-	if len(buf) < membershipFixedSizeV4 {
+	if len(buf) < membershipFixedSize+4 { // fixed region + first map count
 		return 0, ErrBufferTooSmall
 	}
-	m.SessionExpiryEntries = getUint64(buf[sessionPolicyOffset:])
-	m.MaxTotalSessions = getUint64(buf[sessionPolicyOffset+8:])
-	m.MaxSessionsPerClient = getUint64(buf[sessionPolicyOffset+16:])
-	offset, err := m.unmarshalCommon(buf, membershipFixedSizeV4)
-	if err != nil {
-		return 0, err
-	}
-	identities, n, err := getMap(buf[offset:])
-	if err != nil {
-		return 0, err
-	}
-	m.Identities = identities
-	return offset + n, nil
-}
-
-// unmarshalCommon decodes the region v3 and v4 share — the v3 fixed fields
-// plus the Addresses, Observers, Witnesses and Removed maps — and returns the
-// offset just past it. Keeping it in one place is what guarantees the two
-// layouts cannot drift apart in the region they are supposed to agree on.
-//
-// fixedSize is the caller's layout's fixed-region size, which is where its map
-// region begins: the v3 and v4 fixed fields are byte-identical, but v4's are
-// followed by the session policy, so the two layouts share the FIELDS and not
-// the offset the maps start at.
-func (m *Membership) unmarshalCommon(buf []byte, fixedSize int) (int, error) {
-	if len(buf) < fixedSize+4 { // fixed region + first map count
-		return 0, ErrBufferTooSmall
-	}
-	m.ConfigChangeID = getUint64(buf[1:])
-	m.MaxWitnesses = getUint64(buf[9:])
-	m.RequireFullReplicaMajority = getBool(buf[17:])
-	offset := fixedSize
+	// Decoding into a local is what makes the method all-or-nothing; see the
+	// doc comment.
+	var decoded Membership
+	decoded.ConfigChangeID = getUint64(buf[1:])
+	decoded.MaxWitnesses = getUint64(buf[9:])
+	decoded.RequireFullReplicaMajority = getBool(buf[17:])
+	decoded.SessionExpiryEntries = getUint64(buf[sessionPolicyOffset:])
+	decoded.MaxTotalSessions = getUint64(buf[sessionPolicyOffset+8:])
+	decoded.MaxSessionsPerClient = getUint64(buf[sessionPolicyOffset+16:])
+	offset := membershipFixedSize
 	var n int
 	var err error
-	m.Addresses, n, err = getMap(buf[offset:])
+	decoded.Addresses, n, err = getMap(buf[offset:])
 	if err != nil {
 		return 0, err
 	}
 	offset += n
-	m.Observers, n, err = getMap(buf[offset:])
+	decoded.Observers, n, err = getMap(buf[offset:])
 	if err != nil {
 		return 0, err
 	}
 	offset += n
-	m.Witnesses, n, err = getMap(buf[offset:])
+	decoded.Witnesses, n, err = getMap(buf[offset:])
 	if err != nil {
 		return 0, err
 	}
 	offset += n
-	m.Removed, n, err = getBoolMap(buf[offset:])
+	decoded.Removed, n, err = getBoolMap(buf[offset:])
 	if err != nil {
 		return 0, err
 	}
 	offset += n
+	decoded.Identities, n, err = getMap(buf[offset:])
+	if err != nil {
+		return 0, err
+	}
+	offset += n
+	decoded.RemovedIdentities, n, err = getMap(buf[offset:])
+	if err != nil {
+		return 0, err
+	}
+	offset += n
+	*m = decoded
 	return offset, nil
 }
 
@@ -425,4 +472,5 @@ func (m *Membership) Reset() {
 	m.Witnesses = nil
 	m.Removed = nil
 	m.Identities = nil
+	m.RemovedIdentities = nil
 }

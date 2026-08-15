@@ -57,7 +57,7 @@ var (
 	ErrTooManyMessages = errors.New("proto: message count exceeds limit")
 
 	// ErrTooManyMembershipEntries is returned when a membership map
-	// count exceeds maxMembershipEntries during unmarshal.
+	// count exceeds MaxMembershipEntries during unmarshal.
 	ErrTooManyMembershipEntries = errors.New("proto: membership entry count exceeds limit")
 
 	// ErrDuplicateMapKey is returned when a membership map on the wire
@@ -71,15 +71,15 @@ var (
 	ErrInvalidConfigChangeType = errors.New("proto: invalid config change type")
 
 	// ErrUnsupportedVersion is returned when a version stamp in the buffer
-	// does not name a layout this build can decode, or when a payload
-	// matches a legacy fixed layout (ConfigChange). It covers both version
-	// namespaces described in the package comment:
+	// does not name the layout this build decodes. Every format is pinned at
+	// version 1 pre-release and every gate is an EXACT match (see the
+	// compatibility contract in the package comment), so this sentinel covers
+	// both version namespaces identically:
 	//
-	//   - transport-scoped, exact match: MessageBatch.BinVer and
-	//     SnapshotChunk.BinVer must equal WireVersion.
-	//   - persisted-scoped, range match: the Membership section's leading
-	//     version byte must fall in [minSupportedMembershipVersion,
-	//     membershipFormatVersion]. That case returns the richer
+	//   - transport-scoped: MessageBatch.BinVer and SnapshotChunk.BinVer must
+	//     equal WireVersion.
+	//   - persisted-scoped: the Membership section's leading version byte must
+	//     equal membershipFormatVersion. That case returns the richer
 	//     *UnsupportedMembershipVersionError, which matches this sentinel
 	//     under errors.Is.
 	ErrUnsupportedVersion = errors.New("proto: unsupported wire version")
@@ -87,10 +87,6 @@ var (
 	// ErrFilepathTooLong is returned when a filepath string exceeds
 	// MaxFilepathLen during unmarshal.
 	ErrFilepathTooLong = errors.New("proto: filepath exceeds MaxFilepathLen")
-
-	// ErrChecksumTooLong is returned when a checksum field exceeds
-	// MaxChecksumLen during unmarshal.
-	ErrChecksumTooLong = errors.New("proto: checksum exceeds MaxChecksumLen")
 
 	// ErrMetadataTooLong is returned when a metadata field exceeds
 	// MaxMetadataLen during unmarshal.
@@ -113,23 +109,23 @@ var (
 )
 
 // UnsupportedMembershipVersionError is returned when a persisted Membership
-// section's leading version byte falls outside the window this build can
-// decode. It names the version found and the supported range so an operator
-// reading a log line can tell a downgrade (found < min: the data was written
-// by a newer binary than the one reading it, or support was dropped) from an
-// upgrade (found > current: this binary is older than the writer) without
-// consulting the source.
+// section's leading version byte is not the one version this build decodes. It
+// names the version found alongside the supported one so an operator reading a
+// log line can tell the two causes apart without consulting the source: a byte
+// that is a plausible version number means the data was written by a binary
+// speaking a different format generation, and a byte that is not means the
+// section is corrupt or the offset is wrong.
 type UnsupportedMembershipVersionError struct {
 	// Found is the version byte read from the buffer.
 	Found uint8
 }
 
 // Error returns a human-readable description naming the version found and
-// the supported range.
+// the one this build supports.
 func (e *UnsupportedMembershipVersionError) Error() string {
 	return fmt.Sprintf(
-		"proto: unsupported membership format version %d (supported: %d-%d)",
-		e.Found, minSupportedMembershipVersion, membershipFormatVersion)
+		"proto: unsupported membership format version %d (supported: %d)",
+		e.Found, membershipFormatVersion)
 }
 
 // Is reports whether target matches the sentinel ErrUnsupportedVersion error,

@@ -191,6 +191,29 @@ type SealedRootKey struct {
 	// BarrierConfig.Algorithm explicitly rather than rely on auto-selection.
 	Algorithm SymmetricAlgorithm `json:"algorithm,omitempty"`
 
+	// StateMAC authenticates this blob's METADATA under the root key it
+	// describes. It is HMAC-SHA256 over a canonical, length-prefixed encoding
+	// of (Strategy, Version, Epoch, Salt, KnownEpochs, HKDFVersion, Algorithm,
+	// DeploymentID), keyed by a key HKDF'd from the root key; see
+	// Barrier.stateMAC.
+	//
+	// It exists because the wrapping AEAD covers only Ciphertext — its AAD is
+	// the constant strategy name — so every other field is plaintext beside it
+	// and bound to nothing. The epoch is the field that matters: rewriting it
+	// downward resurrects an already-spent DEK with a freshly zeroed invocation
+	// counter and an empty nonce tracker, giving two independent random-nonce
+	// sequences under one key.
+	//
+	// Stamped by Initialize, Rotate and PurgeEpochsBefore (every operation that
+	// changes the covered fields), verified by Unseal once the root key is
+	// recovered. NOT covered: FailedAttempts and LastFailedUnixNano, which are
+	// written by persistBackoffState on a FAILED unseal, where no root key is
+	// available to re-MAC with.
+	//
+	// A MAC cannot detect REPLAY of an older, genuinely authenticated blob; see
+	// BarrierConfig.MinEpoch for that half.
+	StateMAC []byte `json:"state_mac,omitempty"`
+
 	// Nonce is the AES-GCM nonce used during sealing, when stored separately
 	// from the ciphertext (hardware strategies may store nonce externally).
 	Nonce []byte `json:"nonce,omitempty"`

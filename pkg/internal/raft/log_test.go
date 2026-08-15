@@ -274,11 +274,15 @@ func TestRaftLog_Term_InvalidIndex(t *testing.T) {
 	entries := makeEntries(1, 4, 1)
 	l := newTestRaftLog(entries)
 
-	_, err := l.term(10)
-	// For in-memory only entries beyond lastIndex, term() returns 0
-	// since inmem returns false and logdb returns ErrUnavailable.
-	if err == nil {
-		// The term for an unavailable index should return an error.
+	// For an index beyond lastIndex the in-memory log reports a miss and the
+	// LogDB reports ErrUnavailable, so term() must surface that error rather
+	// than hand back a zero term a caller could mistake for a real one.
+	term, err := l.term(10)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("term(10) error = %v, want %v", err, ErrUnavailable)
+	}
+	if term != 0 {
+		t.Fatalf("term(10) = %d alongside its error, want 0", term)
 	}
 }
 

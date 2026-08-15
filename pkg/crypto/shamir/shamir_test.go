@@ -959,14 +959,12 @@ func BenchmarkCombine(b *testing.B) {
 // With an all-zeros randReader every sharing polynomial degenerates to its
 // constant term, so each share's y-payload must equal the secret exactly.
 func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
-	orig := randReader
-	defer func() { randReader = orig }()
-
 	secret := []byte{0x00, 0x01, 0x7F, 0xFF}
 	threshold, total := 3, 5
 
 	// All-zero coefficients: p(x) = secret byte for every x.
-	randReader = zeroReader{}
+	restore := testOnlyRandReader(zeroReader{})
+	defer restore()
 	shares, err := Split(secret, threshold, total)
 	if err != nil {
 		t.Fatalf("Split with zero coefficients: %v", err)
@@ -992,7 +990,7 @@ func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
 	// Known non-zero coefficients: shares must match direct polynomial
 	// evaluation with exactly the supplied bytes.
 	coeffBytes := []byte{0x11, 0x00, 0x22, 0x00, 0x33, 0x00, 0x44, 0x00}
-	randReader = bytes.NewReader(coeffBytes)
+	testOnlyRandReader(bytes.NewReader(coeffBytes))
 	shares, err = Split(secret, threshold, total)
 	if err != nil {
 		t.Fatalf("Split with fixed coefficients: %v", err)

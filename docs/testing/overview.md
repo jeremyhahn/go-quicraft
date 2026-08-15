@@ -326,7 +326,19 @@ make coverage
 
 Coverage profiles are written to `build/coverage/<package>.out` and can be viewed with `go tool cover -html=build/coverage/<package>.out`.
 
-All packages maintain 91%+ coverage enforced in CI.
+Aggregate coverage is **91.5%**. Not every package clears that mark, and the
+ones that do not are the durability and transport layers:
+
+| Package | Coverage |
+|---------|----------|
+| `pkg/logdb` | 85.2% |
+| `pkg/logdb/waldb` | 88.3% |
+| `pkg/internal/transport` | 89.2% |
+| `pkg/internal/engine` | 90.4% |
+| **Aggregate** | **91.5%** |
+
+Each package is enforced in CI against its own configured threshold, not
+against a single repo-wide 91% floor.
 
 ## Benchmark Infrastructure
 

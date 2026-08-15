@@ -1271,3 +1271,100 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 		t.Fatalf("GetEntries: got %d entries, want 10", len(got))
 	}
 }
+
+// TestAtRestProtection_PlaintextBarrierIsUnprotected is the regression test for
+// the seventh plaintext-downgrade axis: AtRestProtection asked whether a barrier
+// OBJECT EXISTED, not whether it ENCRYPTS.
+//
+// A seal.Barrier running StrategyNone installs an identity pass-through
+// encryptor. db.barrier is non-nil, so the DB declared AtRestBarrierEncrypted
+// and the host's requireEncryptedLogDB gate — whose stated purpose is to REFUSE
+// rather than silently downgrade — accepted a store that writes every user
+// command to disk in cleartext. The barrier already knew: IsPlaintextMode
+// reports true, and waldb asserts that very interface at Open to pick a warning
+// string. AtRestProtection simply never asked.
+//
+// The assertion is on the RAW BYTES ON DISK, not on a round trip. A round trip
+// succeeds under both a real barrier and a pass-through, which is exactly why
+// the declaration cannot be trusted to a type assertion in the first place.
+func TestAtRestProtection_PlaintextBarrierIsUnprotected(t *testing.T) {
+	barrier := newNoneBarrier(t)
+	if !barrier.IsPlaintextMode() {
+		t.Fatal("fixture: a none-strategy barrier must report IsPlaintextMode")
+	}
+
+	dir := t.TempDir()
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const marker = "PLAINTEXT-USER-COMMAND-e4f1a2"
+	if err := db.SaveEntries(1, 1, []logdb.Entry{{
+		Index: 1, Term: 1, Cmd: []byte(marker),
+	}}); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+	seg0 := segmentPath(db, 1, 0)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Ground truth first: the command really is on the medium in cleartext.
+	raw, err := os.ReadFile(seg0)
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	at := bytes.Index(raw, []byte(marker))
+	if at < 0 {
+		t.Fatalf("fixture: the plaintext command is not in %s, so this test is not "+
+			"observing what it claims to", seg0)
+	}
+
+	if got := db.AtRestProtection(); got != logdb.AtRestUnprotected {
+		t.Fatalf("AtRestProtection() = %v, want %v: the user command is sitting in "+
+			"%s at offset %d in cleartext, and a host that requires at-rest "+
+			"encryption is being told this store provides it",
+			got, logdb.AtRestUnprotected, seg0, at)
+	}
+}
+
+// TestAtRestProtection_RealBarrierIsEncrypted is the other side of the same
+// predicate: narrowing AtRestProtection must not start reporting a genuinely
+// encrypting barrier as unprotected, which would refuse every correctly
+// configured node.
+func TestAtRestProtection_RealBarrierIsEncrypted(t *testing.T) {
+	barrier := newTestBarrier(t)
+	if barrier.IsPlaintextMode() {
+		t.Fatal("fixture: a software-strategy barrier must not report plaintext mode")
+	}
+
+	dir := t.TempDir()
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const marker = "SEALED-USER-COMMAND-9b7c3d"
+	if err := db.SaveEntries(1, 1, []logdb.Entry{{
+		Index: 1, Term: 1, Cmd: []byte(marker),
+	}}); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+	seg0 := segmentPath(db, 1, 0)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := os.ReadFile(seg0)
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	if bytes.Contains(raw, []byte(marker)) {
+		t.Fatalf("the user command appears in cleartext in %s under a software "+
+			"barrier", seg0)
+	}
+	if got := db.AtRestProtection(); got != logdb.AtRestBarrierEncrypted {
+		t.Fatalf("AtRestProtection() = %v, want %v", got, logdb.AtRestBarrierEncrypted)
+	}
+}

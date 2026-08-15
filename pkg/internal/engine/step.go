@@ -79,15 +79,24 @@ type stepWorker struct {
 	prevLeaderTerms map[uint64]uint64
 	stopC           chan struct{}
 
+	// listeners carries user-visible notifications off this goroutine. The step
+	// worker fires them while holding nodesMu.RLock, and a listener that calls
+	// back into Host.StopShard re-enters nodesMu.Lock() on this same goroutine —
+	// a permanent deadlock, because sync.RWMutex is not reentrant. Handing the
+	// notification to the dispatcher instead means the user's code runs on a
+	// goroutine that holds no engine lock. See listenerDispatcher.
+	listeners *listenerDispatcher
+
 	// enqueuingNode records the node currently being handed off to the commit
 	// pipeline (mid enqueueForCommit or commitMemoryMode): its commitPending is
 	// set but its item has not yet reached commitC/applyC, so nothing else owns
 	// it. Set before commitPending.Store(true) and cleared after the channel
 	// send. On a step-worker panic this is the ONE node the recovery must
-	// unwedge — the rest are covered by drainCommitC (items in the channel) or
-	// owned by the commit/apply worker (items already handed off). Written and
-	// read only on the step-worker goroutine (recovery runs on it during the
-	// panic unwind), so no synchronization is required.
+	// unwedge — an item already IN commitC is owned by the commit worker, which
+	// consumes and commits it normally after the restart, and an item already
+	// handed off is owned by the commit/apply worker. Written and read only on
+	// the step-worker goroutine (recovery runs on it during the panic unwind),
+	// so no synchronization is required.
 	enqueuingNode *Node
 	inboxBuf      []proto.Message // reusable buffer for draining node inboxes
 	proposeBuf    []proto.Entry   // reusable buffer for batching inbox proposals
@@ -765,6 +774,13 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 // sites run outside raftMu, so reading the two mirrors separately could report a
 // combination that never co-existed — telling a listener a replica led in a term
 // it never led.
+//
+// The callback itself is DELIVERED BY THE LISTENER DISPATCHER, not on this
+// goroutine: tick() and processReady() hold nodesMu.RLock across this call, and
+// a listener that reacts to a leadership change by stopping the shard would
+// re-enter nodesMu.Lock() on this very goroutine. The (leader, term) pair is
+// captured here, so what the listener eventually sees is the state at detection
+// time, not a later re-read.
 func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 	if w.callback == nil || node.peer == nil {
 		return
@@ -787,14 +803,46 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 		w.prevLeaderTerms[shardID] = term
 		return
 	}
+	// Hand the notification to the listener dispatcher and commit the
+	// bookkeeping ONLY if it was accepted. OnLeaderUpdated maintains the Host's
+	// isLeader mirror, so a dropped one would leave GetShardInfo permanently
+	// wrong; recording prevLeaders only on acceptance makes a refused dispatch
+	// (queue full) re-publish on the next tick instead of losing the event.
+	// This is why the queue-full policy for leadership is retry, not drop.
+	cb := w.callback
+	if !w.listeners.dispatch(func() {
+		cb.OnLeaderUpdated(shardID, currentLeader, term)
+	}) {
+		slog.Warn("leader update notification deferred: listener queue full",
+			"shard_id", shardID,
+			"leader_id", currentLeader,
+			"term", term,
+		)
+		return
+	}
 	w.prevLeaders[shardID] = currentLeader
 	w.prevLeaderTerms[shardID] = term
-	w.callback.OnLeaderUpdated(shardID, currentLeader, term)
 }
 
 // processCallbacks detects leader changes, delivers ReadyToRead notifications,
 // and detects campaign launches. All notifications are delivered through the
 // callback interface.
+//
+// Leader changes and campaign launches go through the listener dispatcher (they
+// reach user code); OnReadyToRead is invoked INLINE because it is engine-to-Host
+// plumbing that completes registered ReadIndex requests, and queueing it behind
+// user code would delay every linearizable read by the depth of that queue.
+//
+// A panic in the inline OnReadyToRead still loses the Update that GetUpdate
+// already extracted, with the node neither failed nor notified. That is largely
+// self-healing — update.State carries the full current HardState rather than a
+// diff, so the next cycle re-derives it — except for the readStates, which
+// GetUpdate drained out of the peer and which are gone: those ReadIndex callers
+// wait for the host's sweeper. It is left as-is deliberately: the remaining
+// panic surface here is engine-owned plumbing rather than user code (the user
+// callbacks that used to run here now run on the dispatcher, under its own
+// recover), so a panic in it is an engine bug that the step worker's
+// restart-on-panic must surface, not an expected condition to be absorbed.
 func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.Update) {
 	// Detect leader change and notify callback.
 	if w.callback != nil {
@@ -813,11 +861,7 @@ func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.U
 		for i := range update.Messages {
 			if update.Messages[i].Type == proto.RequestVote ||
 				update.Messages[i].Type == proto.RequestPreVote {
-				w.callback.OnCampaignLaunched(
-					shardID, node.ReplicaID(), update.Messages[i].Term)
-				if w.metrics != nil {
-					w.metrics.IncElection(shardID)
-				}
+				w.fireCampaign(shardID, node, update.Messages[i].Term)
 				break
 			}
 		}
@@ -836,13 +880,32 @@ func scanPreVoteCampaign(msgs []proto.Message) (term uint64, launched bool) {
 	return 0, false
 }
 
-// fireCampaign delivers the campaign-launch observability callbacks. Must be
-// called OUTSIDE raftMu — OnCampaignLaunched runs arbitrary user listener code.
+// fireCampaign delivers the campaign-launch observability callbacks. The
+// listener notification goes through the dispatcher — OnCampaignLaunched runs
+// arbitrary user listener code and this is called from tick(), which holds
+// nodesMu.RLock — while the metric is incremented inline (IncElection is engine
+// code with no reentrancy hazard, and keeping it here keeps the counter exact
+// even when the notification queue is full).
+//
+// Queue-full policy for campaigns is DROP: dispatch counts and reports it, and
+// the event is pure observability of a cold path, so re-publishing it later
+// would report an election at the wrong time rather than at the right one.
 func (w *stepWorker) fireCampaign(shardID uint64, node *Node, term uint64) {
 	if w.callback == nil {
 		return
 	}
-	w.callback.OnCampaignLaunched(shardID, node.ReplicaID(), term)
+	cb := w.callback
+	replicaID := node.ReplicaID()
+	if !w.listeners.dispatch(func() {
+		cb.OnCampaignLaunched(shardID, replicaID, term)
+	}) {
+		slog.Error("campaign notification dropped: listener queue full",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"term", term,
+			"dropped_total", w.listeners.droppedCount(),
+		)
+	}
 	if w.metrics != nil {
 		w.metrics.IncElection(shardID)
 	}
@@ -1041,25 +1104,35 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	w.heartbeatRespBuf = heartbeatResps
 	w.otherMsgBuf = otherMsgs
 
+	// Register batch aliases BEFORE taking raftMu, and therefore before
+	// submitting the ReadIndex to raft. The happens-before this ordering exists
+	// for is unchanged (and strengthened): in single-node clusters
+	// Handle(ReadIndex) resolves immediately and DrainReadStatesOnly below
+	// returns the result, so aliases registered after Handle could be orphaned
+	// by an OnReadyToRead that fired first. Running it OUTSIDE the lock is what
+	// this hoist buys — OnReadIndexBatched is a host callback and the rule this
+	// method already states for publishLeaderChange applies verbatim: a callback
+	// under node.raftMu stalls the commit worker's Lock for every shard that
+	// worker owns, for however long the callback takes.
+	var batchKey uint64
+	haveReadKeys := len(w.readKeyBuf) > 0
+	if haveReadKeys {
+		batchKey = w.readKeyBuf[0]
+		if len(w.readKeyBuf) > 1 && w.callback != nil {
+			w.callback.OnReadIndexBatched(shardID, batchKey, w.readKeyBuf[1:])
+		}
+	}
+
 	// Phase 1: Process ReadIndex requests and HeartbeatResp under lock,
 	// then immediately extract and deliver ReadIndex completions.
 	// This minimizes read latency by not waiting for proposal processing.
 	node.raftMu.Lock()
 
 	// Process batched ReadIndex keys first. Same coalescing logic as
-	// the normal processReady path: aliases are registered via
-	// OnReadIndexBatched BEFORE submitting the batch key to raft.
-	if len(w.readKeyBuf) > 0 {
-		batchKey := w.readKeyBuf[0]
-		// Register batch aliases BEFORE submitting the ReadIndex
-		// to raft. Same rationale as the normal processReady path:
-		// in single-node clusters, Handle(ReadIndex) resolves
-		// immediately and DrainReadStatesOnly below returns the result.
-		// If aliases were registered after Handle, OnReadyToRead
-		// could fire before aliases exist, orphaning alias callers.
-		if len(w.readKeyBuf) > 1 && w.callback != nil {
-			w.callback.OnReadIndexBatched(shardID, batchKey, w.readKeyBuf[1:])
-		}
+	// the normal processReady path. readIndexErr is captured here and the
+	// completion callback fires after the unlock below.
+	var readIndexErr error
+	if haveReadKeys {
 		if err := node.peer.Handle(proto.Message{
 			Type:   proto.ReadIndex,
 			From:   node.ReplicaID(),
@@ -1072,12 +1145,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 				"num_requests", len(w.readKeyBuf),
 				"error", err,
 			)
-			// Complete all pending reads with the error. Same rationale
-			// as the normal path: aliases are already registered but no
-			// ReadyToRead will fire.
-			if w.callback != nil {
-				w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, err)
-			}
+			readIndexErr = err
 		}
 	}
 
@@ -1120,6 +1188,15 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 
 	node.raftMu.Unlock()
 
+	// Complete all pending reads with the submit error, OUTSIDE raftMu. Same
+	// rationale as the normal path: aliases are already registered but no
+	// ReadyToRead will fire, so without this the callers block to their context
+	// deadline. Fired before the readStates delivery below to preserve the
+	// order the locked version had.
+	if readIndexErr != nil && w.callback != nil {
+		w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, readIndexErr)
+	}
+
 	// Publish OUTSIDE raftMu. OnLeaderUpdated runs arbitrary user listener code
 	// (and the Host's failPendingRequests); running it under the lock stalls the
 	// commit worker's node.raftMu.Lock() for every shard that worker owns, for
@@ -1156,6 +1233,12 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// will be included in the next update after commitPending clears.
 	// This reduces latency by eliminating the blocking window where
 	// proposals sit in the MPSC queue waiting for commit to complete.
+	// proposeErr is captured under the lock; OnProposalFailed fires after the
+	// unlock below. This path is hot rather than exotic — peer.Handle(Propose)
+	// on a leaderless follower returns NotLeaderError, which is exactly what
+	// drives it — and the host's completion of every stranded proposal is
+	// unbounded work to hold node.raftMu across.
+	var proposeErr error
 	if len(w.commitProposeBuf) > 0 {
 		if w.metrics != nil {
 			w.metrics.ObserveProposalBatchSize(shardID, len(w.commitProposeBuf))
@@ -1171,11 +1254,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 				"num_entries", len(w.commitProposeBuf),
 				"error", err,
 			)
-			// Notify the host so it can complete pending proposals
-			// with the error instead of leaving callers blocked.
-			if w.callback != nil {
-				w.callback.OnProposalFailed(shardID, w.commitProposeBuf, err)
-			}
+			proposeErr = err
 		}
 		// Update rate limiter cache after proposals are appended.
 		node.peer.RateLimited()
@@ -1221,6 +1300,13 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	additionalReadStates := node.peer.DrainReadStatesOnly()
 
 	node.raftMu.Unlock()
+
+	// Notify the host so it can complete pending proposals with the error
+	// instead of leaving callers blocked. Fired first among the post-unlock
+	// callbacks, preserving the order the locked version had.
+	if proposeErr != nil && w.callback != nil {
+		w.callback.OnProposalFailed(shardID, w.commitProposeBuf, proposeErr)
+	}
 
 	// Send free-order messages outside the lock. A pre-vote campaign among them
 	// is reported so it stays visible to OnCampaignLaunched/IncElection.
@@ -1287,8 +1373,10 @@ func (w *stepWorker) sendMessages(msgs []proto.Message) {
 // clearStepCommitPending unwedges the ONE node that was mid hand-off to the
 // commit pipeline (enqueueForCommit or commitMemoryMode) when a step-worker
 // panic hit: its commitPending is set but its item never reached commitC/applyC,
-// so nothing else will ever clear it. Called by the engine's restart loop after
-// drainCommitC has already handled every item still in the channel.
+// so nothing else will ever clear it. Called by the engine's restart loop; it is
+// the ONLY thing that recovery does to the pipeline, because items already in
+// commitC are owned by the commit worker and are committed normally after the
+// restart.
 //
 // It is deliberately NOT a blanket clear over every owned node. A node whose
 // item is in the commit worker's in-flight batch legitimately holds

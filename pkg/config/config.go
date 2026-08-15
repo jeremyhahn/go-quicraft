@@ -75,6 +75,43 @@ const (
 	// that a client which dies without CloseSession leaks a session entry
 	// permanently — see SessionExpiryEntries.
 	SessionExpiryDisabled uint64 = math.MaxUint64
+
+	// DefaultSnapshotEntries is the number of applied entries between automatic
+	// snapshots when Config.SnapshotEntries is left unset.
+	//
+	// There IS a default, and there has to be, because the alternative default
+	// is "never compact the log" — and an unbounded log is not a configuration
+	// a practical Raft implementation can run in (Ongaro, "Consensus: Bridging
+	// Theory and Practice", ch. 5, treats compaction as a requirement rather
+	// than a feature). Disk grows without bound and restart replay grows with
+	// it, linearly, forever.
+	//
+	// In THIS implementation the cost is sharper than disk, because three
+	// things advance only inside saveSnapshot: the snapshot-directory GC, the
+	// epoch purge floor, and the at-rest barrier itself. A shard that never
+	// snapshots therefore never reclaims a snapshot directory, never zeroes an
+	// old epoch's DEK, and never asks its barrier to encrypt anything.
+	//
+	// The value is the only one that satisfies every constraint already in this
+	// file: it must exceed DefaultCompactionOverhead (5000), or Validate
+	// rejects the pair; and it must be at least DefaultSessionExpiryEntries
+	// (100000), or a wholly default configuration trips validateSessions'
+	// "sessions may never expire between snapshots" warning on every start. It
+	// also matches etcd's DefaultSnapshotCount, so it is a figure with
+	// production mileage rather than an invention.
+	DefaultSnapshotEntries uint64 = 100000
+
+	// SnapshotsDisabled turns automatic snapshotting off. Assign it to
+	// Config.SnapshotEntries; leaving that field zero now selects
+	// DefaultSnapshotEntries instead, for the same reason zero no longer
+	// disables session expiry — an unset field cannot mean both "I did not
+	// choose" and "never do this".
+	//
+	// Choosing it means taking responsibility for calling Host.RequestSnapshot,
+	// and accepting the three consequences named above until you do. It needs
+	// no special case: the apply path's trigger is a >= comparison against a
+	// threshold no applied index can reach.
+	SnapshotsDisabled uint64 = math.MaxUint64
 )
 
 // MaxReplicationPayloadBytes bounds MaxApplyEntrySize, which raft uses as the
@@ -242,9 +279,16 @@ type Config struct {
 	HeartbeatRTT uint64
 
 	// SnapshotEntries is the number of applied entries between automatic
-	// snapshots. Set to 0 to disable automatic snapshots (manual-only via
-	// Host.RequestSnapshot). When non-zero, must be greater than
-	// CompactionOverhead.
+	// snapshots. Must be greater than CompactionOverhead.
+	//
+	// Assign SnapshotsDisabled for manual-only snapshotting via
+	// Host.RequestSnapshot. Zero does NOT disable it — SetDefaults reads an
+	// unset field as "I did not choose" and substitutes
+	// DefaultSnapshotEntries, because never compacting the log is not a
+	// default any practical Raft deployment can live with, and it additionally
+	// stops this implementation from reclaiming snapshot directories, purging
+	// old epoch keys, or ever invoking the at-rest barrier. See
+	// DefaultSnapshotEntries and SnapshotsDisabled.
 	SnapshotEntries uint64
 
 	// CompactionOverhead is the number of entries to retain after log
@@ -289,7 +333,13 @@ type Config struct {
 	MaxEntrySize uint64
 
 	// MaxApplyEntrySize is the maximum total bytes of entries in a single
-	// SM.Update() call. Default: 64 MB.
+	// SM.Update() call. It also bounds the leader's replication payload, so it
+	// can never exceed MaxReplicationPayloadBytes.
+	//
+	// Default: MaxReplicationPayloadBytes (16711672 bytes, ~15.94 MB). NOT
+	// 64 MB — validateSizeLimits refuses anything above the replication bound,
+	// so 64 MB is not merely a stale figure, it is a value this field cannot
+	// legally hold.
 	MaxApplyEntrySize uint64
 
 	// MaxSnapshotSize is the maximum snapshot file size in bytes.
@@ -358,7 +408,10 @@ type Config struct {
 	// and applies the shard's value. There is currently no config change that
 	// alters the committed policy, so it is fixed for the life of the shard.
 	//
-	// Set to 0 to disable automatic expiry. Disabling is an explicit,
+	// Assign SessionExpiryDisabled to disable automatic expiry. Zero does NOT
+	// disable it — SetDefaults reads an unset field as "I did not choose" and
+	// substitutes DefaultSessionExpiryEntries, because one value cannot mean
+	// both that and "never expire anything". Disabling is an explicit,
 	// replicated choice, not an absent one. When disabled, sessions are only
 	// removed via explicit unregister or when the MaxTotalSessions limit
 	// forces rejection of new registrations, so a client that registers a
@@ -428,6 +481,15 @@ func (c *Config) SetDefaults() {
 	}
 	if c.CompactionOverhead == 0 {
 		c.CompactionOverhead = DefaultCompactionOverhead
+	}
+	// An unset snapshot interval takes the default rather than meaning
+	// "disabled". Never snapshotting is not a viable steady state: the log
+	// grows without bound, restart replay grows with it, and in this
+	// implementation the snapshot-directory GC, the epoch purge floor and the
+	// at-rest barrier all advance ONLY inside saveSnapshot. Operators who
+	// genuinely want manual-only snapshotting say so with SnapshotsDisabled.
+	if c.SnapshotEntries == 0 {
+		c.SnapshotEntries = DefaultSnapshotEntries
 	}
 	if c.MaxProposalPayloadSize == 0 {
 		c.MaxProposalPayloadSize = uint64(proto.MaxEntrySize)

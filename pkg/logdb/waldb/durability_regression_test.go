@@ -341,8 +341,13 @@ func TestRemoveNodeData_TombstonePinnedAgainstGC(t *testing.T) {
 }
 
 // writeMultiBlockSegment populates segment 0 of the WAL shard serving shardID
-// with enough records to span several blocks, so a mid-file block can be
-// zeroed to simulate a write hole.
+// with enough records to span several blocks, EACH IN ITS OWN DURABILITY
+// GENERATION: every SaveEntries is a separate fsynced batch, so every record
+// carries a generation that a completed fdatasync separates from its
+// neighbours' and recovery can prove each one was acknowledged.
+//
+// That makes it the fixture for damage recovery must REFUSE. Use
+// writeSingleGenerationSegment for a genuine interrupted write.
 func writeMultiBlockSegment(t *testing.T, db *DB, shardID uint64) {
 	t.Helper()
 	for i := uint64(0); i < 15; i++ {
@@ -354,6 +359,40 @@ func writeMultiBlockSegment(t *testing.T, db *DB, shardID uint64) {
 		if err := db.SaveEntries(shardID, 1, []logdb.Entry{e}); err != nil {
 			t.Fatalf("SaveEntries %d: %v", i, err)
 		}
+	}
+}
+
+// writeSingleGenerationSegment populates segment 0 of the WAL shard serving
+// shardID with several blocks' worth of records that ALL belong to ONE
+// durability generation: a single SaveState carrying one Update per replica is
+// written record by record and fsynced exactly once at the end.
+//
+// That is the shape of a batch still in flight when the machine loses power,
+// and it is the only shape a mid-file zero hole may legally be repaired at. One
+// fdatasync covers as many WriteAt calls as the batch had blocks and writeback
+// may persist any subset of those pages, so losing an interior block leaves
+// decodable records above the hole — but none of them has a completed sync
+// behind it, so nothing there was ever acknowledged and truncating to the clean
+// prefix destroys nothing.
+//
+// Replica 1's entry is written first, so it lands in block 0 and survives a
+// tear at block 1.
+func writeSingleGenerationSegment(t *testing.T, db *DB, shardID uint64) {
+	t.Helper()
+	updates := make([]logdb.Update, 0, 15)
+	for i := uint64(0); i < 15; i++ {
+		updates = append(updates, logdb.Update{
+			ShardID:   shardID,
+			ReplicaID: i + 1,
+			Entries: []logdb.Entry{{
+				Index: 1,
+				Term:  1,
+				Cmd:   bytes.Repeat([]byte{byte(i + 1)}, 200),
+			}},
+		})
+	}
+	if err := db.SaveState(updates); err != nil {
+		t.Fatalf("SaveState (single generation): %v", err)
 	}
 }
 
@@ -392,7 +431,7 @@ func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	writeMultiBlockSegment(t, db, shardID)
+	writeSingleGenerationSegment(t, db, shardID)
 	rotateShard(t, db, shardID)
 	if err := db.SaveNodeState(shardID, 1, logdb.State{Term: 7, Vote: 2, Commit: 1}); err != nil {
 		t.Fatalf("SaveNodeState seg1: %v", err)
@@ -464,7 +503,7 @@ func TestRecovery_NonFinalCorruptionIsFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	writeMultiBlockSegment(t, db, shardID)
+	writeSingleGenerationSegment(t, db, shardID)
 	rotateShard(t, db, shardID)
 	if err := db.SaveNodeState(shardID, 1, logdb.State{Term: 7, Vote: 2, Commit: 1}); err != nil {
 		t.Fatalf("SaveNodeState: %v", err)
@@ -621,7 +660,7 @@ func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	writeMultiBlockSegment(t, db, shardID)
+	writeSingleGenerationSegment(t, db, shardID)
 	seg0Path := segmentPath(db, shardID, 0)
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -705,9 +744,19 @@ func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 }
 
 // TestRecovery_CorruptSegmentTruncateFailureIsFatal verifies the repair is
-// fail-stop: if the corrupt segment cannot be truncated, Open must fail rather
-// than proceed to discard the higher segments (which would then be deleted
-// again on every subsequent restart).
+// fail-stop: if the corrupt segment cannot be truncated, Open must FAIL rather
+// than report a successful recovery over a segment that still carries its
+// damaged tail (which the next restart would re-detect, repeating the repair
+// and the discard forever).
+//
+// The fixture used to rotate a SECOND segment on top of the corrupt one and
+// then assert that the discard of that segment "must not run before a failed
+// repair". Both halves were inert. A corruption in a non-final segment is
+// rejected by the prefix rule (ErrNonFinalSegmentCorruption) before the repair
+// path is reached at all, so the injected truncation failure was never
+// exercised and the surviving segment 1 was untouched for a reason that had
+// nothing to do with ordering. The corrupt segment is now the FINAL one, which
+// is the only shape that reaches the code the test names.
 func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -717,24 +766,20 @@ func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	writeMultiBlockSegment(t, db, shardID)
-	rotateShard(t, db, shardID)
-	if err := db.SaveNodeState(shardID, 1, logdb.State{Term: 7, Vote: 2, Commit: 1}); err != nil {
-		t.Fatalf("SaveNodeState: %v", err)
-	}
+	writeSingleGenerationSegment(t, db, shardID)
 	seg0Path := segmentPath(db, shardID, 0)
-	seg1Path := segmentPath(db, shardID, 1)
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	corruptSegmentBlock(t, seg0Path, blockSize)
-	seg1SizeBefore := statSize(t, seg1Path)
+	sizeBefore := statSize(t, seg0Path)
 
+	truncErr := errors.New("simulated EIO on reopen for truncation")
 	ffs := &faultFS{FS: defaultFS()}
 	ffs.arm(func(f *faultFS) {
 		f.failNames = map[string]bool{segmentFilename(0): true}
-		f.failOpenFile = errors.New("simulated EIO on reopen for truncation")
+		f.failOpenFile = truncErr
 	})
 	_, err = Open(dir, WithFS(ffs), WithBlockSize(blockSize), WithMaxFileSize(64*1024))
 	if err == nil {
@@ -747,9 +792,18 @@ func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	if recErr.SegmentID != 0 {
 		t.Fatalf("RecoveryError.SegmentID = %d, want 0", recErr.SegmentID)
 	}
-	// The higher segment must be untouched: the discard never ran.
-	if got := statSize(t, seg1Path); got != seg1SizeBefore {
-		t.Fatalf("segment 1 size = %d, want %d (discard must not run before a failed repair)", got, seg1SizeBefore)
+	// The failure that aborted the open must be the truncation, not something
+	// that happened to fail earlier and looked the same.
+	if !errors.Is(err, truncErr) {
+		t.Fatalf("Open error = %v, want the injected truncation failure in the "+
+			"chain (otherwise the test never reached the repair path)", err)
+	}
+	// The corrupt segment must be byte-length identical: the truncation is the
+	// step that failed, and a partially applied one would leave a cut this
+	// recovery never proved durable.
+	if got := statSize(t, seg0Path); got != sizeBefore {
+		t.Fatalf("segment 0 size = %d, want %d (the failed truncation must not have applied)",
+			got, sizeBefore)
 	}
 }
 
@@ -983,5 +1037,135 @@ func TestRemoveNodeData_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 	if epoch != 1 {
 		t.Fatalf("MinLiveEpoch after unproven deletion = %d, want 1 "+
 			"(the floor must not rise on a deletion a crash can undo)", epoch)
+	}
+}
+
+// TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint pins the
+// rotation rollback's ORDER.
+//
+// rollbackShard used to truncate the CHECKPOINT segment first and only then
+// delete the intermediate segments and empty the active one. A crash in that
+// window leaves segment K ending cleanly at a record boundary — no corruption
+// for recovery to detect — while segments K+1..N still hold their fsynced,
+// CRC-valid batch records. The next recovery therefore replays K in full and
+// then every segment above it, resurrecting exactly the records the caller was
+// told had FAILED, with a hole where the truncated ones were. That is the
+// prefix-validity rule inverted by an ordering accident.
+//
+// High to low, every intermediate crash state is instead a valid prefix: the
+// checkpoint segment still carries its batch tail, which is an ordinary
+// interrupted write and is what a crash one instruction earlier would have left
+// anyway.
+//
+// The order is observed at the one point the two steps can be told apart: a
+// truncation of the checkpoint segment that cannot even open the file. The
+// higher segments must already be gone.
+func TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	ffs := &faultFS{FS: defaultFS()}
+	db, err := Open(dir, WithFS(ffs), WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const shardID = uint64(1)
+	if err := db.SaveEntries(shardID, 1, makeEntries(1, 3, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	shard := db.getShard(shardID)
+	shard.mu.Lock()
+
+	// Checkpoint the pre-batch durable boundary of segment 0.
+	if err := shard.activeSegment.flushBlock(); err != nil {
+		shard.mu.Unlock()
+		t.Fatalf("flushBlock: %v", err)
+	}
+	cp := shardCheckpoint{
+		fileOffset:  shard.activeSegment.fileOffset,
+		blockOffset: shard.activeSegment.blockOffset,
+		seg:         shard.activeSegment,
+		segID:       shard.activeSegmentID,
+		valid:       true,
+	}
+
+	// Batch data past the checkpoint, in the checkpoint segment and then in two
+	// more segments, exactly as a batch that hit ErrSegmentFull twice would
+	// leave behind.
+	batch := bytes.Repeat([]byte{0xa5}, 300)
+	writeBatchBytes := func(label string) {
+		if _, err := shard.activeSegment.Write(batch); err != nil {
+			shard.mu.Unlock()
+			t.Fatalf("Write (%s): %v", label, err)
+		}
+		if err := shard.activeSegment.Sync(); err != nil {
+			shard.mu.Unlock()
+			t.Fatalf("Sync (%s): %v", label, err)
+		}
+	}
+	writeBatchBytes("checkpoint segment")
+	if err := shard.rotateSegment(); err != nil {
+		shard.mu.Unlock()
+		t.Fatalf("rotateSegment 1: %v", err)
+	}
+	intermediateID := shard.activeSegmentID
+	writeBatchBytes("intermediate segment")
+	if err := shard.rotateSegment(); err != nil {
+		shard.mu.Unlock()
+		t.Fatalf("rotateSegment 2: %v", err)
+	}
+	activeID := shard.activeSegmentID
+	writeBatchBytes("active segment")
+
+	seg0Path := filepath.Join(shard.dir, segmentFilename(cp.segID))
+	seg0Size := statSize(t, seg0Path)
+	if seg0Size <= cp.fileOffset+int64(cp.blockOffset) {
+		shard.mu.Unlock()
+		t.Fatalf("fixture: segment %d is %d bytes, not past the checkpoint end %d",
+			cp.segID, seg0Size, cp.fileOffset+int64(cp.blockOffset))
+	}
+
+	// Fail only the reopen of the CHECKPOINT segment, which is the truncation.
+	truncErr := errors.New("simulated EIO reopening the checkpoint segment")
+	ffs.arm(func(f *faultFS) {
+		f.failNames = map[string]bool{segmentFilename(cp.segID): true}
+		f.failOpenFile = truncErr
+	})
+
+	rbErr := rollbackShard(shard, &cp)
+	shard.mu.Unlock()
+
+	if rbErr == nil {
+		t.Fatal("rollbackShard: expected an error when the checkpoint truncation fails")
+	}
+	if !errors.Is(rbErr, truncErr) {
+		t.Fatalf("rollbackShard error = %v, want the injected truncation failure", rbErr)
+	}
+	if !errors.Is(rbErr, ErrDBPoisoned) {
+		t.Fatalf("rollbackShard error = %v, want ErrDBPoisoned in the chain", rbErr)
+	}
+
+	// The intermediate segment must already be gone.
+	if _, err := defaultFS().Stat(filepath.Join(shard.dir, segmentFilename(intermediateID))); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(intermediate segment %d) = %v, want fs.ErrNotExist: the "+
+			"segments above the checkpoint must be discarded BEFORE the checkpoint "+
+			"segment is cut, or a crash between the two replays the checkpoint "+
+			"segment in full and then this one, resurrecting the failed batch",
+			intermediateID, err)
+	}
+
+	// The active segment must already replay to nothing.
+	activeRecs := reopenReadOnly(t, shard.dir, activeID, 1024)
+	if len(activeRecs) != 0 {
+		t.Fatalf("active segment %d still replays %d records; it must be emptied "+
+			"before the checkpoint segment is cut", activeID, len(activeRecs))
+	}
+
+	// And the checkpoint segment is untouched: its truncation is the step that
+	// failed, so the on-disk state is still the longer — but valid — prefix.
+	if got := statSize(t, seg0Path); got != seg0Size {
+		t.Fatalf("checkpoint segment %d size = %d, want %d (the failed truncation "+
+			"must not have applied)", cp.segID, got, seg0Size)
 	}
 }

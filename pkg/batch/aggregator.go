@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 const (
@@ -41,17 +43,32 @@ const (
 	// rather than blocking.
 	DefaultQueueSize = 10000
 
-	// DefaultProposeTimeout bounds one batch's SyncPropose when the caller
-	// supplied no deadline of its own. It is generous — a propose that has to
-	// wait out an election legitimately takes seconds — but finite: the flush
-	// goroutine is single, so an unbounded propose stops every shard's flush
-	// and wedges Close (see proposeContext).
+	// DefaultProposeTimeout is the ceiling on one batch's SyncPropose. It is
+	// generous — a propose that has to wait out an election legitimately takes
+	// seconds — but finite: the flush goroutine is single, so an unbounded
+	// propose stops every shard's flush and wedges Close (see proposeContext).
 	DefaultProposeTimeout = 30 * time.Second
+
+	// DefaultMaxBatchBytes is the maximum encoded size of one flushed batch.
+	//
+	// It is proto.MaxEntrySize because the encoded batch is proposed as a
+	// SINGLE Raft entry command: proto.Entry rejects a Cmd above that at
+	// marshal AND unmarshal time, so it is an absolute wire-format ceiling no
+	// configuration can raise (Config.MaxEntrySize and
+	// Config.MaxProposalPayloadSize can only lower it, and
+	// MaxReplicationPayloadBytes — the looser bound on a whole replication
+	// batch — is above it). Without a byte cap only the proposal COUNT
+	// triggers a flush, so DefaultMaxBatchSize commands of a few KiB each
+	// build a batch the host rejects whole as EntryTooLarge; the aggregator
+	// has no split-and-retry, and the next batch forms identically, so writes
+	// that individually succeed fail forever.
+	DefaultMaxBatchBytes uint64 = uint64(proto.MaxEntrySize)
 )
 
 // Flush reason labels for the flushReasonTotal metric.
 const (
 	flushReasonSize  = "size"
+	flushReasonBytes = "bytes"
 	flushReasonTime  = "time"
 	flushReasonClose = "close"
 )
@@ -79,15 +96,28 @@ type Config struct {
 	// accumulated before a flush is triggered.
 	MaxBatchSize int
 
+	// MaxBatchBytes is the maximum ENCODED size of the accumulated batch. A
+	// proposal that would push the batch past it triggers a flush first, so
+	// the batch handed to the proposer never exceeds it and an oversized
+	// proposal ends up alone in its own batch instead of poisoning the
+	// unrelated commands batched with it. See DefaultMaxBatchBytes.
+	//
+	// The cap is applied to the WHOLE accumulated batch rather than per shard.
+	// A per-shard subset is never larger than the whole, so the bound holds
+	// for every shard's proposal; a multi-shard workload simply flushes
+	// slightly sooner than the per-shard arithmetic would require.
+	MaxBatchBytes uint64
+
 	// FlushInterval is the maximum duration between batch flushes.
 	FlushInterval time.Duration
 
 	// QueueSize is the capacity of the proposal channel.
 	QueueSize int
 
-	// ProposeTimeout bounds a single batch's SyncPropose when the submitting
-	// callers supplied no deadline of their own. A caller's own deadline is
-	// always honored as-is and never shortened by this value.
+	// ProposeTimeout is the CEILING on a single batch's SyncPropose. A batch
+	// is proposed under min(latest live caller deadline, ProposeTimeout): the
+	// aggregator never proposes for longer than this, and never cuts a caller
+	// short of its own deadline. See proposeContext.
 	ProposeTimeout time.Duration
 }
 
@@ -95,6 +125,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		MaxBatchSize:   DefaultMaxBatchSize,
+		MaxBatchBytes:  DefaultMaxBatchBytes,
 		FlushInterval:  DefaultFlushInterval,
 		QueueSize:      DefaultQueueSize,
 		ProposeTimeout: DefaultProposeTimeout,
@@ -110,6 +141,9 @@ func WithConfig(cfg Config) Option {
 	return func(a *Aggregator) {
 		if cfg.MaxBatchSize > 0 {
 			a.cfg.MaxBatchSize = cfg.MaxBatchSize
+		}
+		if cfg.MaxBatchBytes > 0 {
+			a.cfg.MaxBatchBytes = cfg.MaxBatchBytes
 		}
 		if cfg.FlushInterval > 0 {
 			a.cfg.FlushInterval = cfg.FlushInterval
@@ -180,9 +214,11 @@ type Aggregator struct {
 	logger   *slog.Logger
 	registry prometheus.Registerer
 
-	// Batching state - protected by mu.
+	// Batching state - protected by mu. batchBytes is the encoded size of
+	// currentBatch, maintained incrementally so the byte cap costs no scan.
 	mu           sync.Mutex
 	currentBatch []*proposal
+	batchBytes   uint64
 
 	// Queue for incoming proposals.
 	queue chan *proposal
@@ -192,6 +228,13 @@ type Aggregator struct {
 	closeChan chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+	// lifetimeCtx is the parent of every propose context. Proposing under a
+	// CALLER's context makes one submitter's deadline (or cancellation) govern
+	// the whole batch it happens to share, so the aggregator owns the parent
+	// and derives a bounded child per flush. lifetimeCancel runs after the
+	// flush loop has exited, releasing anything still derived from it.
+	lifetimeCtx    context.Context
+	lifetimeCancel context.CancelFunc
 	// flushDone is closed when flushLoop returns. A Submit blocked on the
 	// close path uses it as a terminator: once the loop has exited, any
 	// proposal not already flushed will never be flushed, so Submit must not
@@ -222,6 +265,7 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 		closeChan: make(chan struct{}),
 		flushDone: make(chan struct{}),
 	}
+	a.lifetimeCtx, a.lifetimeCancel = context.WithCancel(context.Background())
 
 	for _, opt := range opts {
 		opt(a)
@@ -241,6 +285,16 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 // Submit enqueues a proposal for batching and blocks until the batch
 // containing this proposal is flushed or the context is canceled.
 //
+// OWNERSHIP: Submit COPIES data. The aggregator holds a proposal until its
+// batch flushes — up to FlushInterval later, plus the propose itself — and
+// Submit can return before that (its own context expiring is the common case),
+// so the caller regains control of data while the aggregator has not yet read
+// it. Keeping the caller's slice would let a pooled or reused buffer be
+// refilled in the window between the two, and the flush would then encode and
+// replicate the buffer's LATER contents: a wrong command committed identically
+// on every replica, with no divergence to detect it. Callers that can
+// guarantee the buffer is never touched again may use SubmitNoCopy.
+//
 // Returns:
 //   - ClosedError if the aggregator has been closed
 //   - QueueFullError if the queue is at capacity
@@ -252,6 +306,35 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 // than a definite rejection. Retrying an indeterminate submission can apply
 // the batch twice; see the Aggregator doc comment.
 func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) error {
+	// append to a nil slice rather than make+copy: it yields nil for an empty
+	// command (which encodes identically) and one allocation otherwise.
+	return a.submit(ctx, shardID, append([]byte(nil), data...))
+}
+
+// SubmitNoCopy is Submit without the defensive copy of data.
+//
+// OWNERSHIP: the caller PERMANENTLY transfers data to the aggregator. The
+// aggregator reads the slice at an unspecified later time — after Submit's
+// caller has returned, on the flush goroutine — and the caller must never
+// write to, reslice into, reuse, or return data to a pool, whatever
+// SubmitNoCopy returned and however it returned. That includes the error
+// paths: a QueueFullError means the proposal was never enqueued, but a
+// context error means it WAS, and the batch it is in may still be encoded and
+// replicated. Treat data as owned by the aggregator forever.
+//
+// Use it only for a buffer that is allocated per call and then dropped. When
+// in doubt use Submit; a wrong command committed on every replica is not
+// detectable after the fact.
+//
+// It returns the same errors as Submit.
+func (a *Aggregator) SubmitNoCopy(ctx context.Context, shardID uint64, data []byte) error {
+	return a.submit(ctx, shardID, data)
+}
+
+// submit enqueues a proposal whose data the aggregator already owns and waits
+// for its batch's result. It backs both Submit and SubmitNoCopy, which differ
+// only in how that ownership was obtained.
+func (a *Aggregator) submit(ctx context.Context, shardID uint64, data []byte) error {
 	if a.closed.Load() {
 		return &ClosedError{}
 	}
@@ -270,11 +353,28 @@ func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) er
 		return &QueueFullError{QueueSize: a.cfg.QueueSize}
 	}
 
+	return a.awaitResult(ctx, p)
+}
+
+// awaitResult blocks until p's batch reports a result, the caller's context
+// ends, or the aggregator closes, and returns what the caller should see.
+func (a *Aggregator) awaitResult(ctx context.Context, p *proposal) error {
 	select {
 	case err := <-p.resultCh:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		// The result may have arrived in the same instant the context expired.
+		// select picks uniformly among ready cases, so honoring ctx.Done()
+		// blind reports a timeout for a batch that is already committed HALF
+		// the time — and the caller's only recourse is to retry a batch of up
+		// to MaxBatchSize commands with no at-most-once path. Drain the result
+		// first: a delivered result is always the better answer.
+		select {
+		case err := <-p.resultCh:
+			return err
+		default:
+			return ctx.Err()
+		}
 	case <-a.closeChan:
 		// Close raced with this submission. If the proposal was enqueued
 		// before flushLoop's close branch drained the queue, that branch
@@ -292,7 +392,14 @@ func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) er
 		case err := <-p.resultCh:
 			return err
 		case <-ctx.Done():
-			return ctx.Err()
+			// Same drain-first rule as above: a result already delivered beats
+			// the context error it tied with.
+			select {
+			case err := <-p.resultCh:
+				return err
+			default:
+				return ctx.Err()
+			}
 		case <-a.flushDone:
 			select {
 			case err := <-p.resultCh:
@@ -321,6 +428,11 @@ func (a *Aggregator) Close() error {
 		close(a.closeChan)
 	})
 	a.wg.Wait()
+	// AFTER wg.Wait, not before: the close path's final flush proposes under a
+	// child of lifetimeCtx, and cancelling first would fail the very batch
+	// Close exists to drain. By here the flush loop has returned and nothing
+	// is in flight, so this only releases the parent.
+	a.lifetimeCancel()
 	return nil
 }
 
@@ -341,7 +453,7 @@ func (a *Aggregator) flushLoop() {
 			a.metrics.queueDepth.Set(float64(len(a.queue)))
 			a.addToBatch(p)
 
-			if len(a.currentBatch) >= a.cfg.MaxBatchSize {
+			if a.BatchLen() >= a.cfg.MaxBatchSize {
 				a.flush(flushReasonSize)
 				timer.Reset(a.cfg.FlushInterval)
 			}
@@ -373,16 +485,46 @@ func (a *Aggregator) flushLoop() {
 	}
 }
 
-// addToBatch appends a proposal to the current batch under the lock.
+// addToBatch appends a proposal to the current batch under the lock, first
+// flushing the accumulated batch when p would push it past MaxBatchBytes.
+//
+// Flushing BEFORE the append (rather than after) is what keeps an oversized
+// proposal from taking unrelated commands down with it: a proposal that
+// exceeds the cap on its own is proposed alone, so the host's EntryTooLarge
+// rejection reaches its own caller as a definite error while everything
+// batched with it commits normally.
+//
+// Only flushLoop mutates currentBatch, so releasing the lock between the
+// decision and the append cannot lose an interleaved proposal.
 func (a *Aggregator) addToBatch(p *proposal) {
+	size := proposalBytes(p)
+
+	a.mu.Lock()
+	overflow := len(a.currentBatch) > 0 && a.batchBytes+size > a.cfg.MaxBatchBytes
+	a.mu.Unlock()
+
+	if overflow {
+		a.flush(flushReasonBytes)
+	}
+
 	a.mu.Lock()
 	a.currentBatch = append(a.currentBatch, p)
+	a.batchBytes += size
 	a.mu.Unlock()
+}
+
+// proposalBytes is a proposal's contribution to the encoded batch: its
+// command plus the length prefix EncodeBatch writes in front of it.
+func proposalBytes(p *proposal) uint64 {
+	return uint64(len(p.data)) + lengthPrefixSize
 }
 
 // drainQueue reads all remaining proposals from the queue channel and
 // adds them to the current batch. Called during shutdown to ensure no
-// proposals are lost.
+// proposals are lost. It goes through addToBatch, so a drain large enough to
+// exceed MaxBatchBytes still flushes in bounded pieces rather than building
+// one unproposable batch at the very moment the caller wants everything
+// durable.
 func (a *Aggregator) drainQueue() {
 	for {
 		select {
@@ -401,6 +543,7 @@ func (a *Aggregator) flush(reason string) {
 	a.mu.Lock()
 	batch := a.currentBatch
 	a.currentBatch = make([]*proposal, 0, a.cfg.MaxBatchSize)
+	a.batchBytes = 0
 	a.mu.Unlock()
 
 	if len(batch) == 0 {
@@ -440,28 +583,57 @@ func (a *Aggregator) flush(reason string) {
 // then distributes the result to all waiting callers.
 func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	shardLabel := strconv.FormatUint(shardID, 10)
-	batchLen := len(proposals)
-
-	a.metrics.batchSize.Observe(float64(batchLen))
 	a.metrics.batchesTotal.WithLabelValues(shardLabel, "attempted").Inc()
 
-	// Encode all proposal data as a length-prefixed batch.
+	// Drop the proposals whose callers have already given up BEFORE the batch
+	// is encoded. Selecting only the context to propose UNDER is not enough:
+	// a caller told context.Canceled — a DEFINITE rejection, not an
+	// indeterminate outcome — still had its command carried into the encoded
+	// payload by whichever proposal in the batch was still live, and every
+	// replica applied it. Encode only the survivors.
+	live := a.rejectAbandoned(shardID, proposals)
+	batchLen := len(live)
+	if batchLen == 0 {
+		// Nobody is left to receive a result, and proposing anyway would
+		// replicate a batch whose outcome no one observes while occupying the
+		// flush goroutine for the whole propose.
+		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
+		return
+	}
+
+	a.metrics.batchSize.Observe(float64(batchLen))
+
+	// Encode the surviving proposal data as a length-prefixed batch.
 	cmds := make([][]byte, batchLen)
-	for i, p := range proposals {
+	for i, p := range live {
 		cmds[i] = p.data
 	}
-	encoded := EncodeBatch(cmds)
+	encoded, encErr := EncodeBatch(cmds)
+	if encErr != nil {
+		// A command the batch format cannot represent. This is a definite
+		// rejection: nothing was proposed, and a retry of the same command
+		// fails identically.
+		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
+		a.logger.Error("batch encode failed",
+			slog.Uint64("shard_id", shardID),
+			slog.Int("batch_size", batchLen),
+			slog.String("error", encErr.Error()),
+		)
+		flushErr := &FlushError{ShardID: shardID, Err: encErr, Indeterminate: false}
+		for _, p := range live {
+			p.resultCh <- flushErr
+		}
+		return
+	}
 
-	// Every waiting caller has already given up: there is nobody left to
-	// receive a result, and proposing anyway would replicate a batch whose
-	// outcome no one observes while occupying the flush goroutine for the
-	// whole propose. Report the cancellation to the (already departed)
-	// waiters and move on.
-	ctx, cancel, ok := a.proposeContext(proposals)
+	// A caller may still have gone away between the filter and here; that
+	// leaves nobody to receive a result, so the batch is dropped rather than
+	// proposed blind.
+	ctx, cancel, ok := a.proposeContext(live)
 	if !ok {
 		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
 		flushErr := &FlushError{ShardID: shardID, Err: context.Canceled, Indeterminate: false}
-		for _, p := range proposals {
+		for _, p := range live {
 			p.resultCh <- flushErr
 		}
 		return
@@ -491,7 +663,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 			slog.String("error", err.Error()),
 		)
 		flushErr := &FlushError{ShardID: shardID, Err: err, Indeterminate: indeterminate}
-		for _, p := range proposals {
+		for _, p := range live {
 			p.resultCh <- flushErr
 		}
 		return
@@ -499,9 +671,25 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 
 	a.metrics.batchesTotal.WithLabelValues(shardLabel, "success").Inc()
 
-	for _, p := range proposals {
+	for _, p := range live {
 		p.resultCh <- nil
 	}
+}
+
+// rejectAbandoned returns the proposals whose callers are still waiting, and
+// reports a DEFINITE failure carrying its own context error to each one that
+// is not. Filtering in place is safe: the destination index never runs ahead
+// of the source, and the per-shard slice is not shared.
+func (a *Aggregator) rejectAbandoned(shardID uint64, proposals []*proposal) []*proposal {
+	live := proposals[:0]
+	for _, p := range proposals {
+		if ctxErr := p.ctx.Err(); ctxErr != nil {
+			p.resultCh <- &FlushError{ShardID: shardID, Err: ctxErr, Indeterminate: false}
+			continue
+		}
+		live = append(live, p)
+	}
+	return live
 }
 
 // proposeContext returns the context a batch's SyncPropose runs under, a
@@ -520,21 +708,54 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 // precisely when the propose cannot complete. There is also no caller left to
 // receive the result, so the batch is dropped rather than proposed blind.
 //
-// The chosen context is bounded when it carries no deadline of its own. A
-// caller's own deadline is never shortened — it is already a bound, and
-// overriding it would silently change the contract Submit was called under.
+// The returned context is NEVER a caller's context, and is never derived from
+// one. A batch is shared by callers who know nothing of each other, so
+// adopting one of them made an arbitrary submitter — whichever landed in the
+// batch first — govern all the rest: a 200ms caller aborted a 30s caller's
+// propose after 200ms of its budget (and an at-least-once retry then
+// duplicated the WHOLE batch), while a caller supplying an hour-long deadline
+// bypassed ProposeTimeout entirely and parked the single flush goroutine for
+// the hour, which is precisely the wedge described above.
+//
+// The parent is instead the aggregator's own lifetime context, and the
+// deadline is min(latest live caller deadline, now+ProposeTimeout):
+//
+//   - the ProposeTimeout ceiling always applies, so no caller can leave the
+//     flush goroutine parked past it;
+//   - taking the LATEST rather than the earliest caller deadline means no
+//     caller is cut short of the budget it asked for — a caller that has
+//     already timed out is simply no longer waiting, and the batch it shares
+//     is still owed to everyone else.
 func (a *Aggregator) proposeContext(proposals []*proposal) (context.Context, context.CancelFunc, bool) {
+	deadline := time.Now().Add(a.cfg.ProposeTimeout)
+	var latest time.Time
+	live, allBounded := false, true
+
 	for _, p := range proposals {
 		if p.ctx.Err() != nil {
 			continue
 		}
-		if _, hasDeadline := p.ctx.Deadline(); hasDeadline {
-			return p.ctx, func() {}, true
+		live = true
+		d, hasDeadline := p.ctx.Deadline()
+		if !hasDeadline {
+			// A deadline-less caller waits indefinitely; only ProposeTimeout
+			// bounds this batch.
+			allBounded = false
+			continue
 		}
-		ctx, cancel := context.WithTimeout(p.ctx, a.cfg.ProposeTimeout)
-		return ctx, cancel, true
+		if d.After(latest) {
+			latest = d
+		}
 	}
-	return nil, nil, false
+
+	if !live {
+		return nil, nil, false
+	}
+	if allBounded && latest.Before(deadline) {
+		deadline = latest
+	}
+	ctx, cancel := context.WithDeadline(a.lifetimeCtx, deadline)
+	return ctx, cancel, true
 }
 
 // initMetrics creates and registers Prometheus metrics. Uses sync.Once

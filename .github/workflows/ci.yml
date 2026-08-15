@@ -13,6 +13,13 @@ permissions:
 env:
   GO_VERSION: "1.26.6"
   COVERAGE_THRESHOLD: 91
+  # Builds never resolve through a workspace: modules come from tags
+  # (dependency-resolution.md §2). CI checks out this repo alone so no go.work
+  # exists here today, but the module matrix below walks into nested modules
+  # that a developer's workspace does cover, and a stray go.work landing in the
+  # tree would silently change what every job compiles. Same rationale as
+  # `export GOWORK=off` in the Makefile and the GOWORK=off in release.yml.
+  GOWORK: "off"
 
 jobs:
   lint:
@@ -172,6 +179,18 @@ jobs:
         run: |
           GOFIPS140=v1.0.0 CGO_ENABLED=0 go build ./...
 
+  # The untagged suite. Every job below this one exists because `go test ./...`
+  # with NO build tags silently excludes whole test suites: the Go toolchain
+  # does not warn that a constrained file was skipped, it simply compiles a
+  # smaller program. In this repository that hid, by construction,
+  #   * 147 test functions behind `//go:build integration` in test/integration/
+  #     — every multi-node, election, partition, snapshot-catch-up and
+  #     linearizability test there is,
+  #   * 21 fault-injection tests behind `quicraft_errfs`,
+  #   * 35 fuzz targets behind `quicraft_fuzz`,
+  # and the COVERAGE_THRESHOLD below was being computed over the remainder.
+  # `go vet` passes under each tag, so the excluded code could rot semantically
+  # with nothing in CI noticing.
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -196,3 +215,198 @@ jobs:
             echo "FAIL: coverage ${COVERAGE}% is below minimum ${{ env.COVERAGE_THRESHOLD }}%"
             exit 1
           fi
+
+  # ==========================================================================
+  # Tagged suites
+  #
+  # These three gate a PR rather than running nightly. The trade is CI latency
+  # against the class of bug each one catches, and for a consensus engine that
+  # four other repositories depend on the latency loses:
+  #
+  #   integration  ~9 min. It is the ONLY thing in CI that starts more than one
+  #                node, holds an election, partitions a cluster or streams a
+  #                snapshot. A merge that breaks leader election is not a defect
+  #                to find the next morning, it is a defect that must never
+  #                reach main. 9 min also fits inside the 30 min the `test` job
+  #                was already budgeted, so the pipeline's critical path is
+  #                unchanged (it runs in parallel with `test`).
+  #   errfs        seconds. Fault injection on the WAL write path. No excuse.
+  #   fuzz-seeds   seconds. Runs every fuzz target against its f.Add seeds and
+  #                the committed corpus under pkg/*/testdata/fuzz/. This is a
+  #                deterministic regression test, NOT fuzzing.
+  #
+  # Mutation fuzzing (`-fuzz`, unbounded and nondeterministic) is deliberately
+  # NOT here: a newly discovered crash would fail an unrelated PR at random.
+  # It runs on a schedule in fuzz.yml, and both it and all three jobs below are
+  # required before a tag can publish (see release.yml).
+  #
+  # Keep each command byte-identical to the matching `ci-*` target in the
+  # Makefile; `make ci-full` is how a developer reproduces this locally.
+  # ==========================================================================
+
+  integration:
+    name: Integration [build tag integration]
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    # 45, not 30: the suite is ~9 min on a quiet machine but every package runs
+    # under -race with -p 1, so a loaded runner stretches it considerably. The
+    # -timeout=1800s below is the real budget; this is only the outer backstop.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      # -p 1 is load-bearing, not caution. Each of the four packages spins up
+      # multi-node QUIC clusters under -race; running them concurrently starves
+      # runner CPU enough that the snapshot catch-up tests (30s waits) flake.
+      # Every package is stable standalone. Do not drop it to shorten the job.
+      - name: Run integration suite
+        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
+  errfs:
+    name: ErrorFS injection [build tag quicraft_errfs]
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # -race is kept: these tests drive the WAL through injected I/O failures
+      # from concurrent goroutines, which is precisely where a torn recovery
+      # path shows up as a race rather than as a wrong answer.
+      - name: Run errfs suite
+        run: go test -race -count=1 -tags=quicraft_errfs ./test/errfs/...
+
+  fuzz-seeds:
+    name: Fuzz seeds [build tag quicraft_fuzz]
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # -run=Fuzz without -fuzz executes each target once per seed and once per
+      # file in its testdata/fuzz/<Target>/ corpus, then exits. That proves the
+      # 35 targets still COMPILE under the tag and still pass every input a
+      # previous fuzzing run found interesting — which is the part of fuzzing
+      # that belongs in a PR gate.
+      - name: Run fuzz targets against seeds and committed corpus
+        run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz ./...
+
+  # ==========================================================================
+  # Multi-module build matrix
+  #
+  # This repository is not one Go module. The root module plus contrib/ and the
+  # benchmark harnesses under test/performance/ are separately versioned, and
+  # every one of them `replace`s or requires the root. Building only the root
+  # meant a root-module change could break a sibling silently: contrib/dragonboat
+  # sat broken because its `go 1.26.5` directive was below what the parent it
+  # replaces requires, and nothing in CI compiled it.
+  #
+  # The module list is DISCOVERED, not declared, so adding a go.mod anywhere in
+  # the tree enrolls it automatically. A static list would drift back into
+  # exactly the state this job exists to prevent.
+  # ==========================================================================
+
+  discover-modules:
+    name: Discover modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enumerate go.mod directories
+        id: find
+        run: |
+          set -euo pipefail
+          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' \
+            | sed 's|^\./||' | sort | jq -R . | jq -sc .)"
+          echo "Modules: ${MODULES}"
+          echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
+
+  modules:
+    name: Module ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    needs: discover-modules
+    timeout-minutes: 20
+    strategy:
+      # One broken sibling must not hide a second one.
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.discover-modules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # GOWORK=off (workflow env) matters most here: with a workspace active
+      # these modules resolve the root through the workspace and the `go`
+      # directive mismatch that broke contrib/dragonboat would not reproduce.
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+  # ==========================================================================
+  # contrib/dragonboat test suites
+  #
+  # The `modules` matrix above only BUILDS and VETS every nested module. That
+  # left contrib/dragonboat's ~560 tests — including a full integration suite
+  # that starts multi-node QUIC clusters through the dragonboat compatibility
+  # API — running nowhere at all: the adapter could regress in any way that
+  # still compiles and CI stayed green.
+  #
+  # This job is deliberately separate from the matrix rather than a `go test`
+  # step added to it. The other nested modules (test/performance/*) are
+  # benchmark harnesses with no test functions worth gating a PR on, and the
+  # integration suite needs the UDP tuning and the -p 1 the matrix does not.
+  #
+  # Keep each command byte-identical to the matching `ci-*` target in
+  # contrib/dragonboat/Makefile.
+  # ==========================================================================
+
+  contrib-dragonboat:
+    name: contrib/dragonboat [unit + integration]
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Run contrib/dragonboat unit tests
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -timeout=900s ./...
+
+      # -p 1 is load-bearing, not caution: every package here spins up
+      # multi-node QUIC clusters under -race, and running them concurrently
+      # starves runner CPU enough to flake the tests with 30s waits.
+      - name: Run contrib/dragonboat integration suite
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...

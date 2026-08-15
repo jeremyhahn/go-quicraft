@@ -91,14 +91,37 @@ var ErrSnapshotReencryptRequired = errors.New(
 // caller verifies the result and performs the atomic directory swap, so a
 // partial run never changes the Raft-visible content of the source.
 //
+// Closing the DESTINATION is part of the migration and its failure is reported
+// (ReencryptError, Op "close-dest"). DB.Close flushes, truncates and closes
+// every shard's active segment, so a swallowed error here would return "the
+// migration succeeded" for a rekey whose newly written WAL was never completed
+// on disk — and the caller's next act is to swap that directory into place.
+//
 // The source is NOT opened read-only: Open runs full crash recovery on
 // srcDir, which may repair a corrupt segment tail, discard orphaned segments
 // above it, create a new active segment and fsync the directory. That is the
 // same recovery any normal Open would perform, and it never removes records
 // that a normal Open would have replayed — but srcDir is modified on disk, so
 // the caller must not treat it as byte-for-byte immutable across a run.
-func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc) (int, error) {
-	srcOpts := []Option{}
+//
+// opts are the same options Open takes and are applied to BOTH sides, which is
+// what makes a non-default geometry migratable at all: opening the source with
+// the default block size when it was written with another is refused outright
+// by Open's WALFORMAT check (a WAL written with WithBlockSize could not be
+// re-encrypted AT ALL), and opening the destination with the default would
+// produce a migrated directory the caller's own configuration then rejects on
+// the next Open. One option set for both sides makes the destination a
+// geometry-faithful copy by construction, and a block size that disagrees with
+// what srcDir records still fails closed, naming both values — Reencrypt is
+// not the one path in this package where a wrong geometry is silently
+// accepted. Pass the SAME options the node normally opens its WAL with.
+//
+// The srcBarrier and dstBarrier parameters are applied after opts and are
+// authoritative: a WithBarrier in opts cannot override the side-specific
+// barrier the caller named explicitly.
+func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc, opts ...Option) (count int, err error) {
+	srcOpts := make([]Option, 0, len(opts)+1)
+	srcOpts = append(srcOpts, opts...)
 	if srcBarrier != nil {
 		srcOpts = append(srcOpts, WithBarrier(srcBarrier))
 	}
@@ -106,9 +129,13 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	if err != nil {
 		return 0, &ReencryptError{Op: "open-source", Err: err}
 	}
+	// The SOURCE is a read path: it was opened only so its records could be
+	// listed and decrypted, and nothing this call did needs to survive in it.
+	// Its close error is genuinely uninteresting and stays discarded.
 	defer func() { _ = src.Close() }()
 
-	dstOpts := []Option{}
+	dstOpts := make([]Option, 0, len(opts)+1)
+	dstOpts = append(dstOpts, opts...)
 	if dstBarrier != nil {
 		dstOpts = append(dstOpts, WithBarrier(dstBarrier))
 	}
@@ -116,7 +143,17 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	if err != nil {
 		return 0, &ReencryptError{Op: "open-dest", Err: err}
 	}
-	defer func() { _ = dst.Close() }()
+	// The DESTINATION close is NOT: DB.Close flushes, truncates and closes every
+	// shard's active segment and reports the first failure, so discarding it
+	// returns (count, nil) — "the migration succeeded" — for a rekey whose newly
+	// written WAL could not be completed on disk. The operator then swaps that
+	// directory into place. Report it instead, without masking an error the
+	// migration itself already produced.
+	defer func() {
+		if cerr := dst.Close(); cerr != nil && err == nil {
+			err = &ReencryptError{Op: "close-dest", Err: cerr}
+		}
+	}()
 
 	nodes, err := src.ListNodeInfo()
 	if err != nil {
@@ -124,7 +161,6 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	}
 
 	barrierInvolved := srcBarrier != nil || dstBarrier != nil
-	var count int
 	for _, ni := range nodes {
 		if err := reencryptNode(src, dst, ni, barrierInvolved, snapFn); err != nil {
 			return count, err

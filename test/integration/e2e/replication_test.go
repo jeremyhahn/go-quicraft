@@ -101,7 +101,7 @@ func TestE2E_Replication_ConcurrentProposals(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	const (
 		numWorkers       = 5
@@ -111,6 +111,12 @@ func TestE2E_Replication_ConcurrentProposals(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numWorkers*entriesPerWorker)
 
+	// Every entry must still commit -- the verification below requires all of
+	// them on every node. What changed is that a leadership change during the
+	// run is retried against the NEW leader instead of being reported as a
+	// failed proposal: the workers used to pin the leader index sampled before
+	// they started and fatal on ErrNotLeader, so an ordinary re-election failed
+	// the test with a message that reads like a lost write.
 	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
@@ -118,20 +124,8 @@ func TestE2E_Replication_ConcurrentProposals(t *testing.T) {
 			for i := range entriesPerWorker {
 				key := fmt.Sprintf("w%d-k%d", workerID, i)
 				value := fmt.Sprintf("w%d-v%d", workerID, i)
-
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-				cmd := encodeKVPut(key, value)
-				rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-				if err != nil {
-					cancel()
-					errCh <- fmt.Errorf("worker %d entry %d propose: %w", workerID, i, err)
-					return
-				}
-				_, err = rs.Result()
-				rs.Release()
-				cancel()
-				if err != nil {
-					errCh <- fmt.Errorf("worker %d entry %d result: %w", workerID, i, err)
+				if err := proposeUntilCommitted(cluster, 1, key, value, membershipTimeout); err != nil {
+					errCh <- fmt.Errorf("worker %d entry %d: %w", workerID, i, err)
 					return
 				}
 			}
@@ -394,6 +388,9 @@ func TestE2E_FiveNode_Replication_ConcurrentProposals(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numWorkers*entriesPerWorker)
 
+	// See TestE2E_Replication_ConcurrentProposals: every entry must still
+	// commit, but a leadership change is retried against the new leader rather
+	// than failing the test.
 	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
@@ -401,20 +398,8 @@ func TestE2E_FiveNode_Replication_ConcurrentProposals(t *testing.T) {
 			for i := range entriesPerWorker {
 				key := fmt.Sprintf("f5w%d-k%d", workerID, i)
 				value := fmt.Sprintf("f5w%d-v%d", workerID, i)
-
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-				cmd := encodeKVPut(key, value)
-				rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-				if err != nil {
-					cancel()
-					errCh <- fmt.Errorf("worker %d entry %d propose: %w", workerID, i, err)
-					return
-				}
-				_, err = rs.Result()
-				rs.Release()
-				cancel()
-				if err != nil {
-					errCh <- fmt.Errorf("worker %d entry %d result: %w", workerID, i, err)
+				if err := proposeUntilCommitted(cluster, 1, key, value, membershipTimeout); err != nil {
+					errCh <- fmt.Errorf("worker %d entry %d: %w", workerID, i, err)
 					return
 				}
 			}

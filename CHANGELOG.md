@@ -7,42 +7,444 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-alpha] - 2026-08-15
+
+**This release breaks both the wire format and the on-disk format, and the
+version numbers do NOT record it.** Every wire and persisted format is now
+pinned at **version 1** and stays there until the first production release —
+`proto.WireVersion`, the `proto.Membership` section byte, the transport frame
+header, the `waldb` snapshot-record membership section and the `WALFORMAT`
+marker alike. The LAYOUTS changed underneath those numbers.
+
+- Pre-release peers and on-disk data written by any earlier commit are
+  **incompatible**. There is no rolling upgrade, no migration and no dual-read
+  path.
+- **Dev clusters must be wiped and re-synced.** Stop every node, replace every
+  binary, delete every data directory, start fresh.
+- Consuming repositories (go-qrdb, go-xkms, go-quicbaas, go-trusted-ca) are
+  updated **in lockstep** with the new layout, at the same version.
+- **Two binaries from different pre-release commits may be mutually unreadable
+  while both stamp version 1, and that is intended.** The failure is a decode
+  or recovery error, not a version mismatch that names itself — so do not rely
+  on the version gate to catch a commit skew. Build everything from one commit.
+
+What actually changed in the layouts: `proto.Membership` now carries **six
+maps**, including `RemovedIdentities`; `proto.Snapshot.Checksum` was
+**removed**; and write-side limits were added so the encoders refuse what their
+own decoders would reject.
+
+The version numbers increment for the first time at the first production
+release. From then on a bump means what it normally means.
+
+Read the two runtime-only breakages below before upgrading: sealed-state
+`state_mac` and session-managed proposals on on-disk state machines both
+compile cleanly and fail at run time.
+
 ### BREAKING
 
-- **`NewPrometheusMetricsCollector` no longer labels most metrics with `shard_id` by default.** The collector targets a library whose documented design point is 10,000+ shards on one host, and per-shard labelling cost far more than the count of shard-labelled metric names suggested: a histogram child is one series per bucket plus `_sum` and `_count`, so each active shard cost a measured **113 active Prometheus series**. At 10k shards that is ~1.13M series from a single host, enough to destabilise a shared Prometheus — a failure that lands on every other tenant of it, with no way for an operator to opt out.
+- **Every format version is PINNED AT 1 for the whole pre-release period, and
+  every gate on it is EXACT equality.** `proto.WireVersion` is 1,
+  `proto.Membership`'s section version byte is 1, `waldb`'s snapshot-record
+  membership section version is 1, `waldb`'s `WALFORMAT` marker version is 1
+  (**was 2**), and `transport.WireVersion` remains 0x01. The multi-version
+  machinery is gone: no supported range, no per-version decode path, no legacy
+  layout constants.
 
-  The new `config.MetricsConfig.PerShardMetrics` selects the mode, and it defaults to **off**: proposal/commit/apply/ReadIndex latency, proposal batch size, snapshot counts and snapshot byte histograms now aggregate to one host-level series each, taking a shard to a measured **6 series**. Pass `NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: true})` to restore the previous behaviour. The mode is fixed when the collector is built, because a Prometheus vector's label set is decided at construction; it is deliberately not a `HostConfig` field, which could not take effect.
+  The `WALFORMAT` change is the one an operator can trip over without touching
+  a wire: a data directory written by any earlier build records version 2 and
+  is now refused with `*WALFormatVersionError` naming 2 and 1. That is the
+  intended outcome — the chunk framing is unchanged (11 bytes,
+  `[CRC32:4][Len:2][Type:1][DurSeq:4]`), but the pinning policy renumbers the
+  marker, and reading a directory whose marker this build does not recognise is
+  exactly the misparse-presented-as-a-repair the marker exists to prevent.
+  **Wipe the WAL directory and re-sync.**
 
-  **Alerting is unaffected.** Every signal an operator pages on keeps its `shard_id` in both modes: `elections_total` (leader change), `proposals_dropped_total`, `messages_dropped_total`, `snapshots_rejected_total`, and both `quicraft_security_*` counters. What aggregates is volume-and-latency telemetry, whose per-shard breakdown is a debugging aid rather than an alerting input.
+  `transport.ValidateFrameHeader` gates the frame version byte on
+  `!= WireVersion` rather than on the range `>= 1 && <= WireVersion`. The two
+  accept the same single value today; the range form would have widened into a
+  compatibility window at the first bump, with no test failing to announce it.
+  The rejection is unchanged: `ErrUnsupportedVersion`.
 
-  Aggregated series keep the **same metric name** and drop only the `shard_id` label, so a rule written as `sum without(shard_id) (...)` is correct in both modes; dashboards that group *by* `shard_id` collapse to a single host-wide series rather than reporting wrong numbers. The change is made visible in three places: the `# HELP` text of an aggregated series says so, the new `quicraft_metrics_per_shard_enabled` gauge exports the mode (1/0) so a dashboard can branch on it without reading the config, and `docs/operations/deployment.md` gained a "Metrics cardinality" section with the measured budget.
+  The policy, stated as a rule. A layout change during pre-release is made **IN
+  PLACE, at version 1**; the consuming repos are updated in the same change to
+  read and write the new layout at the same version; and dev clusters are wiped
+  and re-synced rather than migrated. There is no deployed data and no deployed
+  peer whose bytes anyone has promised to keep reading, so carrying a decode
+  path for every development layout bought nothing and cost a version number
+  per change. The numbers increment for the first time at the first production
+  release, and from then on a bump means a decoder taught the old layout, a
+  migration story, and a supported window that widens rather than moves.
 
-- **`seal.NewBarrier` returns `(*Barrier, error)` instead of panicking on an invalid configuration.** An exported constructor in a public package that panics takes down the EMBEDDER's process, and `pkg/seal` is embedded in go-qrdb, go-xkms and go-quicbaas. The previous doc comment told runtime callers to call `BarrierConfig.Validate` first — a convention, not a guarantee, and the invalid configs it guards against (an unknown algorithm, a non-FIPS-approved cipher under FIPS mode) are exactly what a config read from a file, an API request, or per-tenant settings produces. An operator's typo must be an error the embedder can reject, not a crash.
+  **The version byte itself is KEPT.** Only its value is pinned. It is the
+  mechanism that makes the 1.0 bump possible — a format with no in-band
+  discriminator cannot be superseded, which is exactly the state `Membership`
+  was in before it grew a leading byte — and it turns a commit skew into a
+  clean refusal (`ErrUnsupportedVersion` /
+  `*UnsupportedMembershipVersionError` / `ErrUnsupportedMembershipVersion`)
+  rather than fields read at the wrong offsets.
 
-  `seal.MustNewBarrier` is the panicking form, following the `regexp.MustCompile` precedent, for configs built from compile-time constants where an invalid value is a programmer error. `NewEpochBarrier` remains an alias of `NewBarrier` and so changes signature with it; `MustNewEpochBarrier` completes the alias set. `crypto.NewBarrier` re-exports the new signature and `crypto.MustNewBarrier` is added.
+  **The transport version remains a SUPREMUM over the persisted ones.**
+  `Membership` rides the wire inside `Snapshot` → `Message` → `MessageBatch`
+  and directly inside `SnapshotChunk`, both of which gate on `BinVer` by exact
+  equality, so a Membership layout change alters the transport bytes without
+  altering the discriminator meant to describe them. The compile-time assertion
+  `WireVersion >= membershipFormatVersion` is retained: it holds trivially at
+  `1 >= 1` and is what stops the two drifting apart at the 1.0 bump. The two
+  constants stay separate and neither is derived from the other — if the
+  persisted version were `uint8(WireVersion)`, the first post-1.0
+  transport-only bump would change the version byte every replica expects at
+  log index 1 and a released cluster could not replay its own log.
 
-  `BarrierConfig.Validate` stays exported and is unchanged, but is now an admission-time convenience rather than a safety requirement: `NewBarrier` applies the same rules and returns the same error identity, so a caller that forgets it no longer risks a panic.
+- **The `proto.Membership` LAYOUT changed: six maps, including
+  `RemovedIdentities`.** The layout, at version 1, is
+  `[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]`
+  `[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]` then
+  `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities`,
+  `RemovedIdentities`. Fixed region 49 bytes; an empty section is 73. Every map
+  is written unconditionally, so an empty map is four zero bytes rather than an
+  absent field, and an unset session policy is 24 zero bytes rather than an
+  absent one.
 
-  **Downstream call sites needing coordination** (not edited here): `go-qrdb/pkg/seal/barrier.go:244` (`epochBarrier := quicraftseal.NewBarrier(epochConfig)` — inside `NewStorageBarrier`, which already returns an error, so the new error threads straight through) and `go-qrdb/pkg/seal/strategy.go:122` (`var NewEpochBarrier = quicraftseal.NewBarrier` — a re-export whose signature changes with it, making this a breaking change in go-qrdb's own API surface). go-xkms and go-quicbaas do **not** call this constructor: their `seal.NewBarrier` is their own package's four-argument function, and neither imports `go-quicraft/pkg/seal` at all — only `pkg/crypto/shamir`.
+  `RemovedIdentities` maps each replica ID in `Removed` to the node identity
+  the configuration held for it **at the moment of removal**. It exists
+  because the removal deny-list has to be answerable against the
+  AUTHENTICATED peer identity and not the CLAIMED `msg.From`. Deleting the
+  identity along with the member left nothing in replicated state to ask that
+  question of, so a removed replica evaded its own tombstone simply by naming
+  a different replica ID — it still holds its private key, so it still
+  authenticates. Entries are **never evicted**: no eviction policy exists
+  that is not also a re-admission policy. The map adds no new growth axis —
+  its key set is a subset of `Removed`'s — and `MarshalTo` refuses to write
+  past `MaxMembershipEntries` so an operator gets
+  `ErrTooManyMembershipEntries` on the config change rather than a membership
+  that is durable and unreadable.
+
+  `Membership.UnmarshalFrom` is **all or nothing**: it decodes into a local and
+  assigns the receiver only on success, so a failed decode cannot leave a stale
+  `Identities` map (which would authorize a replica the decoded configuration
+  never named) or a stale `RemovedIdentities` map (which would deny a sender it
+  never tombstoned).
+
+  The `waldb` snapshot-record membership section carries the same fields in its
+  own layout — policy flags in one byte where proto spends eight, and the
+  session policy as a tail after `Identities` rather than in the fixed region.
+  Its fixed region is 18 bytes and an empty section is 66, which is also the
+  read floor replay enforces before it looks at the version byte; the two are
+  equal by construction now that every field is unconditional.
+
+- **`proto.ConfigChange` collapsed to ONE fixed layout, and a truncated config
+  change is now REFUSED instead of silently downgraded.** The type is
+  length-discriminated no longer: every field, including the trailing
+  `NodeIdentity`, is mandatory, and `UnmarshalFrom` returns `ErrBufferTooSmall`
+  for any payload that does not span the whole layout.
+
+  This is a security fix, not only a cleanup. A payload ending where the
+  identity's length prefix begins used to decode with `err == nil` and an EMPTY
+  `NodeIdentity` — a 65-byte strict prefix of a valid 108-byte encoding parsed
+  cleanly — and an empty identity is precisely the compatibility state that
+  falls back to the weaker address-based authorization at the receive gate
+  (`membership.recordIdentity` records nothing for it). A **truncated**
+  `ConfigChange` was therefore byte-indistinguishable from a legitimate
+  identity-less one, and truncation silently downgraded the check the identity
+  exists to raise. Length is not a safe discriminator for a field whose absence
+  weakens an authorization decision.
+
+  The other affordance went with it: a payload ending after `Initialize` used to
+  be reported as a pre-witness-policy layout with `ErrUnsupportedVersion`. Under
+  the pinning policy there is no other layout to name, so it is simply short.
+
+  **Nothing an in-tree writer emits changes.** `MarshalTo` always wrote the
+  trailing 4-byte length prefix, so an identity-less change — `RemoveNode`,
+  `UpdateWitnessPolicy`, or an add made without `RequestAddNodeWithIdentity` —
+  is spelled with an explicit zero-length prefix and still round-trips. What is
+  refused is a payload no encoder in this repository produces.
+
+- **Write-side limits were added to `Membership.MarshalTo`.** It now returns
+  `ErrTooManyMembershipEntries` or `ErrAddressTooLong` for anything its own
+  decoder would reject. That asymmetry was reachable through a legal API call
+  with a durable consequence: `Host.StartShard` copies the caller's members map
+  straight into `Addresses` and the result is committed as the
+  `EntryInitialMembership` at log index 1, so the next start decoded its own
+  bootstrap entry, refused it, and aborted permanently.
+
+- **`proto.Snapshot.Checksum` was REMOVED.** The layout is now
+  `…[FileSize:8][Type:8][Imported:8][OnDiskIndex:8][Witness:8][Epoch:8]`.
+  The field rode the wire through an earlier pre-release layout and was **never
+  computed and never verified anywhere in the repository** — empty on every real snapshot,
+  costing the receive path one allocation and two copies per message to keep
+  an empty slice alive. It was removed rather than implemented because a
+  field named `Checksum` that is never checked reads as an integrity control
+  to anyone auditing the format, and an integrity control that does not exist
+  is worse than an absent one. Doing it properly is not a codec change: the
+  value must be computed over the FINAL artifact bytes (post-compression,
+  post-encryption) and verified in three separate consumers (recovery,
+  streamed receive, `ImportSnapshot`), so it belongs in its own change.
+
+  Stated plainly, snapshot integrity now rests on TLS in transit and barrier
+  AEAD at rest. A shard configured with a plaintext barrier (`seal.None`) has
+  **no** at-rest integrity check on its snapshot artifacts. That was equally
+  true while the field existed; removing it makes the gap visible instead of
+  apparently covered.
+
+  `proto.MaxChecksumLen` and `proto.ErrChecksumTooLong` are removed with it.
+
+- **Sealed-state blobs now carry a `state_mac` and are REFUSED without one.**
+  *(Source-compatible; breaks at RUNTIME on first unseal.)* The wrapping AEAD
+  covers only `Ciphertext` — its AAD is the constant strategy name — so every
+  other field of a `SealedRootKey` sat in plaintext beside it, bound to
+  nothing. The epoch is the field that matters: rewriting it downward
+  resurrects an already-spent DEK with a freshly zeroed invocation counter
+  and an empty nonce tracker, giving two independent random-nonce sequences
+  under one key.
+
+  `SealedRootKey.StateMAC` is an HMAC-SHA256 over a canonical,
+  length-prefixed encoding of `(Strategy, Version, DeploymentID, Epoch, Salt,
+  KnownEpochs, HKDFVersion, Algorithm, Ciphertext, Metadata, Nonce,
+  HardwarePayload)`, keyed from the root key. The ciphertext is covered even
+  though it authenticates itself, so that genuine metadata from one blob
+  cannot be paired with a genuine ciphertext from another. It is
+  stamped by `Initialize`, `Rotate` and `PurgeEpochsBefore`, and verified by
+  `Unseal`. A blob written by a pre-MAC build carries none, and `Unseal`
+  fails closed with `ErrSealedStateUnauthenticated` — accepting an absent MAC
+  is a downgrade an attacker triggers by deleting the field.
+
+  **An embedder that re-wraps the root key itself must stamp the result**, and
+  gets two entry points to do it. A `SealingStrategy` produces only the
+  ciphertext and its own strategy fields, so a password change, a rekey or a
+  Shamir re-split assembles the new blob outside the barrier — and an
+  unstamped blob is refused by its own next `Unseal`, indistinguishable from
+  a stripped one:
+
+  - `(*Barrier).StampSealedStateMAC(*SealedRootKey) error` — requires the
+    barrier unsealed, because the root key is the MAC key.
+  - `StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64,
+    *SealedRootKey) error` — for a caller holding the plaintext root key with
+    no unsealed barrier. This is the import case, which cannot satisfy the
+    method's precondition: a replica seals a leader-exported root key and
+    persists the blob *before* any barrier exists to unseal, and that
+    persisted blob is what the subsequent `Unseal` reads.
+
+  Both stamp LAST, after every covered field has its final value. Stamping
+  before the ciphertext is final produces a blob that fails its own
+  authentication.
+
+  **One-start migration:** set `BarrierConfig.AllowUnauthenticatedSealedState
+  = true`, start once (`Unseal` proceeds and logs a warning, then restamps
+  the MAC), re-persist `SealedRootKeyData()`, and clear the flag.
+
+  Two limits, stated: `FailedAttempts`/`LastFailedUnixNano` are NOT covered
+  (they are written on a failed unseal, where no root key exists to re-MAC
+  with), and a MAC cannot detect **replay** of an older genuinely
+  authenticated blob — `BarrierConfig.MinEpoch` is the other half of that
+  defence.
+
+- **Session-managed proposals now return `ErrSessionsUnsupportedOnDisk` on
+  on-disk state machines.** *(Source-compatible; breaks at RUNTIME.)* This is
+  the change most likely to surprise: nothing fails to compile, and code that
+  worked before now returns an error on first call. It affects
+  `GetNewSession`, `RegisterSession`, `ProposeWithSession`,
+  `SyncProposeWithSession` and `CloseSession` on any shard whose state
+  machine is an `sm.DiskStateMachine`. **NO-OP sessions still work** — use
+  `Host.GetNoOPSession` and make the operations idempotent, which is the same
+  constraint dragonboat places on `IOnDiskStateMachine`.
+
+  It was permitted before and silently diverged the cluster. The client
+  session table is replicated state that lives only inside the snapshot
+  stream, so it is restored by `RecoverFromSnapshot` — and an on-disk state
+  machine whose `Open()` returns a durable applied index never takes that
+  path on restart, because recovering would roll the user's database back to
+  the snapshot index. The replica came up with the correct data and an EMPTY
+  session table: a session-managed proposal was then applied by the peers
+  that still held the session and answered `ResultSessionExpired` by the
+  restarted replica, which never applied the write at all, while the client
+  saw success from the leader's own apply.
+
+  The rejection is deliberately a local, API-boundary decision. It reads only
+  the state machine's own type — fixed for the life of the shard by the
+  `sm.CreateFunc` passed to `StartShard` — and never replicated state, so it
+  cannot be evaluated differently on two replicas.
+
+- **Under FIPS mode, an Argon2id-wrapped blob cannot be unsealed.**
+  `DeriveKey` returns `ErrKDFNotFIPSApproved` for `KDFArgon2id` while FIPS is
+  active, and unsealing re-derives the same wrapping key. Migrate by
+  unsealing once with FIPS **off** and re-sealing with
+  `NewSoftwareStrategyFIPS` (PBKDF2-SHA256), which stamps
+  `KDFPbkdf2SHA256` into `SealedRootKey.Metadata` and unseals identically in
+  either mode.
+
+- **`seal.BarrierConfig.NonceTracking` is now `*bool`.** As a plain `bool`
+  the zero value meant "off", so every hand-built `BarrierConfig` silently
+  constructed a barrier with NO nonce tracker at all. As a pointer the zero
+  value means "unset, use the default", and **nil defaults to true**. Read
+  the effective value with `GetNonceTracking()`; disable deliberately with
+  `BoolPtr(false)`.
+
+- **`StopShard` and `Host.Close` return errors they previously swallowed.**
+  `Close` in particular now reports a drain that timed out: returning nil
+  after abandoning in-flight work told the embedding application its shutdown
+  was clean when proposals it had accepted were dropped.
+
+- **`batch.EncodeBatch` returns `([]byte, error)`** (was `[]byte`).
+
+- **`raft.Peer.SetProcessedIndex` returns `(uint64, error)`.** Internal
+  (`pkg/internal/raft`); listed for completeness, not part of the public API.
 
 ### Added
 
-- `config.MetricsConfig` and `quicraft.NewPrometheusMetricsCollectorWithConfig`, controlling metric label cardinality (see BREAKING above).
-- `quicraft_metrics_per_shard_enabled` gauge, reporting whether per-shard metric labels are enabled.
+- `proto.MaxMembershipEntries` is now **exported** (10000), joining
+  `MaxMessagesPerBatch` and `MaxEntriesPerMessage`. These are properties of
+  the wire format, not of the decoder: `Host.StartShard` takes the operator's
+  members map straight into `Membership.Addresses` and commits it at log
+  index 1, so a caller that exceeds the cap would write a bootstrap entry no
+  binary can read back. Producers MUST bound themselves by these values.
+- Write-side limit enforcement across `pkg/proto`. `MarshalTo` now mirrors
+  the read side's bounds on `Membership`, `ConfigChange`, `Entry`,
+  `MessageBatch` and `Snapshot`, so the package can no longer emit a payload
+  it refuses to parse back. For the persisted types that asymmetry was a
+  durability bug, not a style complaint.
+- `SECURITY.md` (vulnerability reporting policy) and `CONTRIBUTING.md`.
 
-- **`quicraft.Temporary(err) bool` and `quicraft.NotLeader(err) (replicaID uint64, ok bool)` classify the package's ~60 sentinels.** The package mixed transient conditions (`ErrTimeout`, `ErrSystemBusy`, `ErrShardNotReady`, `ErrNotLeader`) and permanent ones (`ErrShardNotFound`, `ErrInvalidOperation`, `ErrRejected`, `ErrClosed`) with nothing distinguishing them, so a caller could not ask "should I retry?" without string-matching or enumerating sentinels — and four downstream products would each have re-derived the classification and disagreed.
+### Changed
 
-  Every sentinel is classified deliberately, not by pattern. `Temporary` is true only for conditions that clear on their own without operator or caller intervention: `ErrBusy`/`ErrSystemBusy`, `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrRotateInProgress`, `ErrSnapshotInProgress`. **Everything else is permanent, including errors this package never produced** — retrying a permanent failure forever converts one bad request into sustained load and hides the real fault. Several plausible-looking candidates are excluded on purpose and the reason is recorded next to each in `pkg/errors.go`: `ErrStaleConfigChange` (the identical request fails forever; the caller must re-read membership and build a new one), `ErrDraining` (a one-way transition into shutdown), `ErrCanceled` (the caller's own decision, whereas a server-side deadline surfaces as `ErrTimeout`), `ErrSessionLimitExceeded`, `ErrBarrierSealed`, `ErrShardBarrierUnresolved`, `ErrDiskFull`, `ErrLogDBWrite` and `ErrShardFailed`.
-
-  `NotLeader` surfaces `NotLeaderError.LeaderID` so callers redirect without type-asserting; `ok` is true for any not-leader error and `replicaID` is 0 when the leader is unknown. Both use `errors.Is`/`errors.As`, so wrapped errors and the typed errors' `Is` methods (`*BusyError`, `*NotLeaderError`) classify correctly. A table test asserts every exported sentinel, and a companion test parses `errors.go` and fails when it declares an exported `Err*` var the table does not classify — so a sentinel added later cannot become silently permanent without someone deciding that it should be.
-
-### Fixed
-
-- `docs/api/reference.md` and the metrics tables in `docs/operations/deployment.md` were stale: they named `readindex_latency_seconds` (the metric is `read_index_latency_seconds`), showed `messages_sent_total`/`messages_received_total` as carrying `shard_id`/`to`/`msg_type` when those labels belong to the opt-in `*_detailed_total` variants, and omitted `piggyback_commits_total`, `messages_dropped_total`, `snapshots_rejected_total` and both security counters entirely.
+- `Membership.UnmarshalFrom` is now **all or nothing**: decoding runs into a
+  local value and the receiver is assigned only on success. Previously a v3
+  decode that failed early kept a STALE `Identities` map — which would
+  authorize a replica the decoded configuration never named — and a v4 decode
+  that failed in the maps left a NEW session policy on an OLD configuration.
+  Every call site abandoned the value on error, so neither was reachable; the
+  invariant is now a property of the decoder rather than of its callers.
+- `enclave.InitMemguard` was **deleted**. It had no callers, and calling it
+  would have been actively harmful: `memguard.CatchSignal` invokes
+  `signal.Reset()` with no arguments, detaching EVERY signal handler in the
+  process including the embedder's own, and its handler calls `core.Exit(1)`
+  — turning SIGTERM from a graceful shutdown into an immediate exit with no
+  engine quiesce, no `Host.Close`, no barrier seal and no WAL flush. No
+  signal handler is installed by this library. An embedder that wants
+  signal-triggered wiping must install it in its own `main`, alongside — not
+  instead of — its graceful shutdown path.
 
 ### Documentation
 
-- **The deferred `SessionExpiryEntries` decision was resolved, not carried forward.** This section previously recorded that the default had to stay 0 because the threshold was node-local configuration the apply path treated as replicated, and proposed replicating it as the alternative. That alternative shipped: see the session-policy entry under `0.3.0-alpha` BREAKING. `TestSessionExpiry_DisagreeingThresholdsDiverge`, which demonstrated the divergence, was replaced by `TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas`, which asserts that two replicas with different LOCAL configuration now apply identically — and, in a second subtest, that they both follow the shard's policy when it enables expiry rather than merely agreeing to do nothing.
+This release corrects documentation that had drifted far enough from the code
+to produce broken integrations. The corrections are listed because several
+were actively misleading, not merely stale.
+
+- **Nine binary-layout specs were regenerated from the encoders.**
+  `MessageBatch` omitted `SourceEpoch`, so every documented offset past byte
+  16 was wrong (the fixed portion is 24, not 16) — in `wire-format.md`,
+  `transport/quic.md` and `architecture/overview.md`. `Membership` was stale
+  by multiple revisions. The WAL snapshot record was documented at 60 bytes
+  without `Compression` (it is 62, with `[Epoch:8][Compression:2]
+  [FilePathLen:4]`). `snapshot.meta` was documented as 60 bytes / 6 fields;
+  it is 72, and 60 is not even a legacy size (40/48/56 are). `ConfigChange`
+  ended at `Initialize`, a payload the decoder EXPLICITLY REJECTS as legacy.
+  `SnapshotChunk` omitted `Epoch`, so a reader built to that table reads the
+  chunk length prefix out of the epoch field. `WireVersion` was documented as
+  1 with a `<=` gate.
+- **The entry type tables omitted `EntryMetadata` (3) and
+  `EntryInitialMembership` (4)**, and the config-change table omitted
+  `UpdateWitnessPolicy` (4). The first is the sharpest: a reader built to
+  that table rejects the bootstrap entry at log index 1 and cannot replay any
+  shard's log.
+- **Context-AAD composition was wrong for both consumers.** Snapshot frames
+  bind a 39-byte big-endian context (`"QRSNAP1"(7) || shardID:8 ||
+  replicaID:8 || index:8 || seq:8`); WAL records bind a 30-byte one
+  (`"QRWAL1"(6) || shardIdx:8 || segID:8 || recordSeq:8`). Anyone writing a
+  re-encryption tool against the old spec failed authentication on every
+  frame. The docs also described both as opt-in; both are threaded.
+- **The WAL chunk header was documented in the pre-v2 format.** It is
+  `recordHeaderSize = 11` — `[CRC32:4][Length:2][Type:1][DurSeq:4]` — with
+  the CRC covering `[Type][DurSeq][Data]` and `maxRecordDataLen = 65535`.
+  (`storage/wal.md` had this right; `security/encryption.md` did not.)
+- **`sm.Hasher` and `sm.NALookup` were documented with THREE-value
+  signatures** in `architecture/overview.md`. They are two-value:
+  `GetHash() (uint64, error)` and `BytesLookup(key []byte) ([]byte, error)`.
+  The three-value shape is an internal `pkg/internal/rsm` wrapper. Because
+  detection is by type assertion, an implementer of the documented signature
+  did not satisfy the interface, got NO compile error, and had their
+  hash-verification or zero-alloc path silently never invoked.
+- **`storage/wal.md` omitted 12 fields from the `logdb` type listings**,
+  including the four it elsewhere calls load-bearing — `Entry.Key`,
+  `ClientID`, `SeriesID`, `RespondedTo`. An alternative `logdb.LogDB` backend
+  written from that list silently disables session deduplication and
+  downgrades sender authorization. Also missing: six `Membership` fields
+  (seven with `RemovedIdentities`), `Snapshot.Compression`, and
+  `Bootstrap.DataDir`/`DataDirRecorded`.
+- **`security/encryption.md` claimed Shamir `Combine` performs a SHA-256
+  integrity check. It performs none.** There is no `Digest` field, `Combine`
+  is a one-line delegation to `CombineUnverified`, and `IntegrityError` is
+  marked never-returned and retained only for API compatibility. A digest
+  would be an offline brute-force oracle against low-entropy secrets. The
+  caller MUST authenticate the reconstructed secret out of band; an
+  integrator trusting the old text silently accepted a garbage root key.
+- **`pkg/enclave` was described as Apple Secure Enclave / Intel SGX
+  integration.** It is a memguard wrapper; neither is supported anywhere in
+  this repository.
+- **A `WriteVersion` rolling-upgrade procedure was documented for an API that
+  does not exist** — `grep -rn WriteVersion` returns zero code hits — and the
+  real gate is exact equality, which makes the mixed-version state that
+  procedure creates impossible by construction. An operator following it took
+  an outage. Deleted, with a pointer to `operations/compatibility.md`.
+- **Shutdown and startup ordering were documented backwards** in
+  `operations/deployment.md` and `operations/lifecycle.md`. The engine stops
+  FIRST (its step workers are the only producers of snapshot sends, so
+  stopping them is what eliminates the illegal `WaitGroup.Add`-concurrent-
+  with-`Wait` race) and the transport stops LAST, after those sends drain.
+  Startup mirrors it: the transport starts last, after all wiring, or the
+  receive goroutines race `NewHost` writing the fields they read.
+- **Removed API that does not exist**: `Host.LeaseRead` (only
+  `config.Config.LeaseRead` exists; lease read is internal and transparent to
+  ReadIndex/SyncRead), `config.MembershipChangedInfo`,
+  `config.ProposalDroppedInfo`, `config.ReadIndexDroppedInfo` (all three
+  callbacks take `config.EventShardInfo`), `HostConfig.EnableMetrics`, and
+  `RequestDeleteNode`/`RequestAddNonVoting` (the methods are
+  `RequestRemoveNode` and `RequestAddObserver`; only the *sync* remove is
+  named `SyncRequestDeleteNode`).
+- **Corrected call signatures in examples**: four `deployment.md` membership
+  examples omitted the required trailing `configChangeIndex`;
+  `barrier.Initialize`/`Unseal` omitted `(ctx, …, creds)`; `RequestSnapshot`
+  omitted the required `SnapshotOption`. `Host.Drain` was documented as
+  polling every 50ms — it is event-driven on a channel close.
+- **"Lock-free" was false in six places.** The `EntryQueue` behind
+  `proposalQ`/`inboxQ`/`readIndexQ` is mutex-guarded; the win is amortizing
+  one acquisition over a batched drain, not eliminating locks.
+  `performance/architecture.md` contradicted itself two lines apart. The
+  genuinely lock-free claims (`Host.nodes` sync.Map, the rate limiter's CAS
+  loop, the atomic leader/membership snapshots) are unchanged.
+- **The step worker does NOT skip a shard while `commitPending` is set.**
+  `Tick` runs unconditionally, because a leader must keep advancing its
+  heartbeat timer while WAL fsync and apply are in progress. The
+  `Tick`/`Commit` race is prevented by the per-node `raftMu` mutex, which no
+  document previously mentioned.
+- **README**: added the missing `go get` line; corrected the Go badge
+  (1.26.5 → 1.26.6) and version badge (0.1.0-alpha → 0.3.1-alpha); removed
+  the stale "64 buckets" ReadyMap description (it is one `sync.Mutex` over
+  one map plus a two-map rotation); and replaced "all above 91% coverage"
+  with the measured per-package figures — `logdb` 85.2%, `waldb` 88.3%,
+  `transport` 89.2%, `engine` 90.4%, aggregate 91.5%. Only the aggregate
+  cleared the old claim, and the packages that miss it are the durability
+  layer.
+- **Public-repo hygiene**: private lab identifiers removed from
+  `docs/performance/benchmarking.md`, `test/performance/run-remote.sh` and
+  the `Makefile`. `PERF_HOST` and `DRAGONBOAT_SRC` are now required
+  environment settings with no baked-in defaults, `REMOTE_DIR` defaults to a
+  path relative to the remote login's home directory, and the release remote
+  is `RELEASE_REMOTE` (default `origin`).
+- `operations/compatibility.md` gained a `0.3.1-alpha` entry and the
+  supremum rule for the transport version.
+
+### Known Issues
+
+- `pkg/config/config.go:292` — the godoc for `MaxApplyEntrySize` says
+  "Default: 64 MB". The default is `MaxReplicationPayloadBytes` = 16711672
+  (~15.94 MiB), and `Validate` REJECTS anything larger, so 64 MB is not even
+  a legal value. Both `deployment.md` and `api/reference.md` state it
+  correctly; the code comment is the only place carrying the stale figure.
+- `pkg/config/config.go:361` — the godoc for `SessionExpiryEntries` says "Set
+  to 0 to disable automatic expiry". `SetDefaults` rewrites 0 to
+  `DefaultSessionExpiryEntries` (100000). The disable sentinel is
+  `SessionExpiryDisabled` (`math.MaxUint64`), and that constant's own godoc
+  says so — the two comments in the same file contradict each other.
 
 ## [0.3.1-alpha] - 2026-08-14
 
@@ -153,6 +555,22 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 - `TransportConfig.MaxDecompressedSize` is pinned to `MaxFrameSize` and rejected if set to anything else. Configuring it lower bought no bomb protection — a peer that wants the node to buffer 16 MB can simply send an uncompressed 16 MB frame — while creating an asymmetric wire contract in which a receiver silently stopped accepting replication that every sender considered valid. `SetDefaults` still maps 0 to the pinned value, so deployments that never set it are unaffected
 
+- **`NewPrometheusMetricsCollector` no longer labels most metrics with `shard_id` by default.** The collector targets a library whose documented design point is 10,000+ shards on one host, and per-shard labelling cost far more than the count of shard-labelled metric names suggested: a histogram child is one series per bucket plus `_sum` and `_count`, so each active shard cost a measured **113 active Prometheus series**. At 10k shards that is ~1.13M series from a single host, enough to destabilise a shared Prometheus — a failure that lands on every other tenant of it, with no way for an operator to opt out.
+
+  The new `config.MetricsConfig.PerShardMetrics` selects the mode, and it defaults to **off**: proposal/commit/apply/ReadIndex latency, proposal batch size, snapshot counts and snapshot byte histograms now aggregate to one host-level series each, taking a shard to a measured **6 series**. Pass `NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{PerShardMetrics: true})` to restore the previous behaviour. The mode is fixed when the collector is built, because a Prometheus vector's label set is decided at construction; it is deliberately not a `HostConfig` field, which could not take effect.
+
+  **Alerting is unaffected.** Every signal an operator pages on keeps its `shard_id` in both modes: `elections_total` (leader change), `proposals_dropped_total`, `messages_dropped_total`, `snapshots_rejected_total`, and both `quicraft_security_*` counters. What aggregates is volume-and-latency telemetry, whose per-shard breakdown is a debugging aid rather than an alerting input.
+
+  Aggregated series keep the **same metric name** and drop only the `shard_id` label, so a rule written as `sum without(shard_id) (...)` is correct in both modes; dashboards that group *by* `shard_id` collapse to a single host-wide series rather than reporting wrong numbers. The change is made visible in three places: the `# HELP` text of an aggregated series says so, the new `quicraft_metrics_per_shard_enabled` gauge exports the mode (1/0) so a dashboard can branch on it without reading the config, and `docs/operations/deployment.md` gained a "Metrics cardinality" section with the measured budget.
+
+- **`seal.NewBarrier` returns `(*Barrier, error)` instead of panicking on an invalid configuration.** An exported constructor in a public package that panics takes down the EMBEDDER's process, and `pkg/seal` is embedded in go-qrdb, go-xkms and go-quicbaas. The previous doc comment told runtime callers to call `BarrierConfig.Validate` first — a convention, not a guarantee, and the invalid configs it guards against (an unknown algorithm, a non-FIPS-approved cipher under FIPS mode) are exactly what a config read from a file, an API request, or per-tenant settings produces. An operator's typo must be an error the embedder can reject, not a crash.
+
+  `seal.MustNewBarrier` is the panicking form, following the `regexp.MustCompile` precedent, for configs built from compile-time constants where an invalid value is a programmer error. `NewEpochBarrier` remains an alias of `NewBarrier` and so changes signature with it; `MustNewEpochBarrier` completes the alias set. `crypto.NewBarrier` re-exports the new signature and `crypto.MustNewBarrier` is added.
+
+  `BarrierConfig.Validate` stays exported and is unchanged, but is now an admission-time convenience rather than a safety requirement: `NewBarrier` applies the same rules and returns the same error identity, so a caller that forgets it no longer risks a panic.
+
+  **Downstream call sites needing coordination** (not edited here): `go-qrdb/pkg/seal/barrier.go:244` (`epochBarrier := quicraftseal.NewBarrier(epochConfig)` — inside `NewStorageBarrier`, which already returns an error, so the new error threads straight through) and `go-qrdb/pkg/seal/strategy.go:122` (`var NewEpochBarrier = quicraftseal.NewBarrier` — a re-export whose signature changes with it, making this a breaking change in go-qrdb's own API surface). go-xkms and go-quicbaas do **not** call this constructor: their `seal.NewBarrier` is their own package's four-argument function, and neither imports `go-quicraft/pkg/seal` at all — only `pkg/crypto/shamir`.
+
 ### Fixed
 
 - **A restarted replica could permanently fail to resume replication.** With the leader alive, healthy and committing, a replica that restarted underneath a saturated pipeline was never sent another entry and stayed thousands of entries behind indefinitely — the shard kept running on the remaining members, one replica short, until that replica was restarted again. The leader had 256 append messages outstanding to the peer's previous incarnation, so no acknowledgement for them could ever arrive. The in-flight window only drains from ABOVE (records at or below an acknowledged index are freed), while every acknowledgement the returning replica can still send reports a position BELOW the window, so it freed nothing. A full window is what makes a peer "paused", and the paused peer was skipped on every send path: the leader could not send it the one entry that would let it advance, so it could never acknowledge anything that would free a slot. A heartbeat response now releases one slot, letting exactly one message through — acknowledged normally if the window was merely busy, rejected if the peer restarted, and the rejection drives the existing backtracking that repairs the peer's position. This restores etcd/raft's `MsgHeartbeatResp` behaviour: the primitive it needs (`inflights.freeFirstOne`) existed here and had been deleted as unused, which is what left the stall unrecoverable. The condition deliberately does not try to detect the restart from leader state alone — a peer that is merely busy is indistinguishable from a wedged one by match/next/window shape, so any such test fires on healthy pipelined replication and resets it continuously
@@ -171,11 +589,28 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 - Apply-gap detection was disabled at `lastApplied == 0`, so a dropped first batch silently diverged the state machine
 - A data race on the snapshot recovery markers could abandon a recovering replica's snapshot install, leaving it admitted to the configuration and starving
 
+- `docs/api/reference.md` and the metrics tables in `docs/operations/deployment.md` were stale: they named `readindex_latency_seconds` (the metric is `read_index_latency_seconds`), showed `messages_sent_total`/`messages_received_total` as carrying `shard_id`/`to`/`msg_type` when those labels belong to the opt-in `*_detailed_total` variants, and omitted `piggyback_commits_total`, `messages_dropped_total`, `snapshots_rejected_total` and both security counters entirely.
+
 ### Changed
 
 - **A pending request made with a deadline-less context now expires.** A proposal, read, snapshot or config change registered under `context.Background()` recorded the zero time, which the sweeper skips by design, so the entry was never reclaimed: its `RequestState` never returned to the pool and `pendingOps` never fell back to zero, which made every later `Drain()` burn the full `ShutdownTimeout`. Such an entry is now clamped at registration, so `RequestState.Result()` returns `ErrTimeout` after 5 minutes for a proposal, read or config change instead of blocking indefinitely — a backstop for a request that can never complete (leader crash, partition, a lost apply), not a request SLA. Snapshots carry their own 1-hour backstop, matching the snapshot transfer ceiling, because serializing a multi-gigabyte state machine legitimately outruns the commit-path bound. A caller-supplied context deadline always wins
 - `ShardInfo.Health` reports `recovering` and `snapshotting` instead of `healthy` while those gates are up; `Host.DiagShardGates` exposes them directly. A replica invisible to consensus previously reported healthy
 - `BarrierConfig.Validate` is exported so a runtime-built config can be rejected instead of panicking
+
+### Added
+
+- `config.MetricsConfig` and `quicraft.NewPrometheusMetricsCollectorWithConfig`, controlling metric label cardinality (see BREAKING above).
+- `quicraft_metrics_per_shard_enabled` gauge, reporting whether per-shard metric labels are enabled.
+
+- **`quicraft.Temporary(err) bool` and `quicraft.NotLeader(err) (replicaID uint64, ok bool)` classify the package's ~60 sentinels.** The package mixed transient conditions (`ErrTimeout`, `ErrSystemBusy`, `ErrShardNotReady`, `ErrNotLeader`) and permanent ones (`ErrShardNotFound`, `ErrInvalidOperation`, `ErrRejected`, `ErrClosed`) with nothing distinguishing them, so a caller could not ask "should I retry?" without string-matching or enumerating sentinels — and four downstream products would each have re-derived the classification and disagreed.
+
+  Every sentinel is classified deliberately, not by pattern. `Temporary` is true only for conditions that clear on their own without operator or caller intervention: `ErrBusy`/`ErrSystemBusy`, `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrRotateInProgress`, `ErrSnapshotInProgress`. **Everything else is permanent, including errors this package never produced** — retrying a permanent failure forever converts one bad request into sustained load and hides the real fault. Several plausible-looking candidates are excluded on purpose and the reason is recorded next to each in `pkg/errors.go`: `ErrStaleConfigChange` (the identical request fails forever; the caller must re-read membership and build a new one), `ErrDraining` (a one-way transition into shutdown), `ErrCanceled` (the caller's own decision, whereas a server-side deadline surfaces as `ErrTimeout`), `ErrSessionLimitExceeded`, `ErrBarrierSealed`, `ErrShardBarrierUnresolved`, `ErrDiskFull`, `ErrLogDBWrite` and `ErrShardFailed`.
+
+  `NotLeader` surfaces `NotLeaderError.LeaderID` so callers redirect without type-asserting; `ok` is true for any not-leader error and `replicaID` is 0 when the leader is unknown. Both use `errors.Is`/`errors.As`, so wrapped errors and the typed errors' `Is` methods (`*BusyError`, `*NotLeaderError`) classify correctly. A table test asserts every exported sentinel, and a companion test parses `errors.go` and fails when it declares an exported `Err*` var the table does not classify — so a sentinel added later cannot become silently permanent without someone deciding that it should be.
+
+### Documentation
+
+- **The deferred `SessionExpiryEntries` decision was resolved, not carried forward.** This section previously recorded that the default had to stay 0 because the threshold was node-local configuration the apply path treated as replicated, and proposed replicating it as the alternative. That alternative shipped: see the session-policy entry under `0.3.0-alpha` BREAKING. `TestSessionExpiry_DisagreeingThresholdsDiverge`, which demonstrated the divergence, was replaced by `TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas`, which asserts that two replicas with different LOCAL configuration now apply identically — and, in a second subtest, that they both follow the shard's policy when it enables expiry rather than merely agreeing to do nothing.
 
 ### Security
 
@@ -189,7 +624,6 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 - `WithShardBarriers` without `WithBarrier` or `WithLogDB` is refused: the default WAL takes one barrier, so per-shard encryption alone produced encrypted snapshots over a plaintext log while an operator's spot-check showed encryption working
 - **A failed sweep of a snapshot decrypt scratch file is now reported.** Both decrypt paths (recovery and snapshot send) write a full plaintext copy of the state machine to a sibling scratch file and remove it when done; the sweeper reclaims what a crash orphaned. A failed removal — a read-only mount, a permissions or ownership change — was logged at DEBUG and returned to no caller, so the plaintext copy stayed next to its ciphertext for the life of the snapshot directory with nothing to signal it. Failures (and a directory the sweep cannot even list) now log at WARN and increment a process-wide counter, `engine.StaleDecryptSweepFailures()`; any increase warrants an alert
 - **One snapshot directory with an indeterminate epoch no longer hides the others.** The DEK purge-floor scan returned on the first directory it could not evaluate, so its log named one directory while the next scan named the next. The scan now visits every directory and reports them all in a single record, with the reason for each (`legacy_record_without_epoch` vs `unreadable`). The VERDICT is unchanged and deliberately so: an epoch that cannot be established may be any epoch, so such a directory suppresses purging for the barrier that could have sealed it — in per-shard-barrier mode that is one tenant's barrier, and other tenants keep purging normally
-
 
 ## [0.2.0-alpha] - 2026-08-06
 

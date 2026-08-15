@@ -466,3 +466,183 @@ func TestReadAll_ZeroPaddingAfterCorruptionIsStillATornTail(t *testing.T) {
 			"flagging it would make an ordinary interrupted write unrecoverable")
 	}
 }
+
+// zeroBlockAt zeroes one whole block of a segment file at an explicit offset,
+// simulating a lost or reallocated sector. Unlike flipByteAt it leaves no
+// decode-level damage at all: the region simply reads as zeros, which is what
+// used to route it into the permissive classifier.
+func zeroBlockAt(t *testing.T, path string, off int64, blockSize int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	if _, err := f.WriteAt(make([]byte, blockSize), off); err != nil {
+		t.Fatalf("zero block at %d: %v", off, err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync corruption: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop is the end-to-end
+// reproduction of the WAL's most damaging failure mode, and the DB-level half of
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable.
+//
+// Sixty single-entry SaveState calls, each its own fsynced batch and therefore
+// its own durability generation, then one zeroed block in the middle of the
+// segment. Before the fix the WAL reopened SUCCESSFULLY, returning nine of the
+// sixty entries with HardState.Commit rolled back from 60 to 9 — fifty-one
+// acknowledged, committed Raft log entries destroyed and the commit index moved
+// BACKWARDS, with Open returning nil. Flipping four bytes at the same offset
+// instead of zeroing them correctly refused to open, which is what made the
+// asymmetry visible: identical damage, opposite verdicts.
+//
+// The whole file must also survive untouched, because the operator is being told
+// to restore from snapshot/peers and the evidence has to still be there.
+func TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop(t *testing.T) {
+	const (
+		blockSize = 1024
+		entries   = 60
+		holeAt    = 3 * blockSize
+	)
+	dir := t.TempDir()
+	const shardID = uint64(1)
+
+	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(1024*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// One SaveState per entry: each is independently fsynced, so each record
+	// carries a generation a completed fdatasync separates from its neighbours'.
+	for i := uint64(1); i <= entries; i++ {
+		upd := logdb.Update{
+			ShardID:   shardID,
+			ReplicaID: 1,
+			State:     logdb.State{Term: 7, Vote: 3, Commit: i},
+			Entries:   []logdb.Entry{{Index: i, Term: 7, Cmd: bytes.Repeat([]byte{byte(i)}, 64)}},
+		}
+		if err := db.SaveState([]logdb.Update{upd}); err != nil {
+			t.Fatalf("SaveState %d: %v", i, err)
+		}
+	}
+	seg0Path := segmentPath(db, shardID, 0)
+
+	// Baseline, taken BEFORE the DB is closed. Reopening to check it would
+	// create segment 1, and segment 0 would then be non-final — which the prefix
+	// rule rejects on its own, hiding the defect behind a different fail-stop.
+	// The damage has to land in the HIGHEST-numbered segment, which is the only
+	// place recovery is ever willing to truncate.
+	first, length, err := db.EntryRange(shardID, 1)
+	if err != nil {
+		t.Fatalf("EntryRange (baseline): %v", err)
+	}
+	st, _, err := db.ReadState(shardID, 1)
+	if err != nil {
+		t.Fatalf("ReadState (baseline): %v", err)
+	}
+	if first != 1 || length != entries || st.Commit != entries {
+		t.Fatalf("baseline: first=%d length=%d commit=%d, want 1/%d/%d",
+			first, length, st.Commit, entries, entries)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(segmentPath(db, shardID, 1)); !os.IsNotExist(err) {
+		t.Fatalf("fixture: segment 1 exists (%v); segment 0 must be the final "+
+			"segment or the non-final rule masks what this test measures", err)
+	}
+
+	sizeBefore := statSize(t, seg0Path)
+	if sizeBefore <= holeAt+blockSize {
+		t.Fatalf("fixture: segment is %d bytes, need data above offset %d",
+			sizeBefore, holeAt+blockSize)
+	}
+	zeroBlockAt(t, seg0Path, holeAt, blockSize)
+	bytesBefore, err := os.ReadFile(seg0Path)
+	if err != nil {
+		t.Fatalf("read segment before recovery: %v", err)
+	}
+
+	db2, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(1024*1024))
+	if err == nil {
+		gotFirst, gotLen, rangeErr := db2.EntryRange(shardID, 1)
+		gotState, _, stateErr := db2.ReadState(shardID, 1)
+		db2.Close()
+		t.Fatalf("Open SUCCEEDED over a zero-filled hole sitting under acknowledged "+
+			"data: EntryRange=(%d,%d,%v) state=%+v (%v). %d of %d committed entries "+
+			"were destroyed and the commit index rolled back from %d — the identical "+
+			"damage expressed as a CRC failure at the same offset correctly refuses "+
+			"to open",
+			gotFirst, gotLen, rangeErr, gotState, stateErr,
+			entries-gotLen, entries, entries)
+	}
+	if !errors.Is(err, ErrMidSegmentCorruption) {
+		t.Fatalf("Open error = %v, want ErrMidSegmentCorruption", err)
+	}
+
+	// A fail-stop must not have repaired anything: the operator restores from
+	// snapshot/peers with the WAL intact for forensics.
+	bytesAfter, err := os.ReadFile(seg0Path)
+	if err != nil {
+		t.Fatalf("read segment after recovery: %v", err)
+	}
+	if !bytes.Equal(bytesAfter, bytesBefore) {
+		t.Fatalf("the fail-stop mutated the segment on disk (size %d -> %d)",
+			len(bytesBefore), len(bytesAfter))
+	}
+}
+
+// TestRecovery_ZeroHoleInsideOneGenerationStillBoots guards the other direction:
+// making the hole path consult the durability generations must not refuse a WAL
+// that an ordinary power loss produces.
+//
+// One SaveState carrying many per-replica updates is written record by record
+// and fsynced once. Tearing an interior block of that single in-flight batch
+// leaves decodable records above the hole, all of them in the generation that
+// never completed a sync — so nothing above the damage was acknowledged,
+// recovery truncates to the clean prefix, and the node boots on it.
+func TestRecovery_ZeroHoleInsideOneGenerationStillBoots(t *testing.T) {
+	const blockSize = 1024
+	dir := t.TempDir()
+	const shardID = uint64(1)
+
+	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	writeSingleGenerationSegment(t, db, shardID)
+	seg0Path := segmentPath(db, shardID, 0)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sizeBefore := statSize(t, seg0Path)
+	zeroBlockAt(t, seg0Path, blockSize, blockSize)
+
+	db2, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open after an interrupted multi-block write: %v — consulting the "+
+			"durability generations on the hole path must not refuse a WAL that an "+
+			"ordinary power loss produces", err)
+	}
+	defer db2.Close()
+
+	// Replica 1's record is the first one written, so it is below the hole and
+	// must have survived.
+	first, length, err := db2.EntryRange(shardID, 1)
+	if err != nil {
+		t.Fatalf("EntryRange after recovery: %v", err)
+	}
+	if first != 1 || length != 1 {
+		t.Fatalf("EntryRange = (%d, %d), want (1, 1)", first, length)
+	}
+	// And the segment was actually repaired on disk, so the next restart is a
+	// plain recovery rather than a re-detection of the same damage.
+	if got := statSize(t, seg0Path); got >= sizeBefore {
+		t.Fatalf("corrupt segment was not truncated: size %d -> %d", sizeBefore, got)
+	}
+}

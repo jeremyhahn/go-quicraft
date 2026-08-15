@@ -26,10 +26,15 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,6 +92,63 @@ func encodeKVGet(key string) []byte {
 }
 
 // ---------------------------------------------------------------------------
+// Apply-Order Violations
+// ---------------------------------------------------------------------------
+
+// applyOrderViolations collects apply-order invariant breaches observed by any
+// kvStateMachine in the package. The state machines are driven by engine
+// goroutines that have no *testing.T, so a breach is parked here and surfaced
+// by the t.Cleanup that assertApplyOrder installs. Integration tests in this
+// package never run in parallel, so one package-level sink is unambiguous.
+var applyOrderViolations struct {
+	mu      sync.Mutex
+	list    []string
+	armedBy *testing.T
+}
+
+// recordApplyViolation parks an apply-order breach for the running test.
+func recordApplyViolation(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	applyOrderViolations.mu.Lock()
+	applyOrderViolations.list = append(applyOrderViolations.list, msg)
+	applyOrderViolations.mu.Unlock()
+}
+
+// assertApplyOrder arms the violation sink for t and installs a t.Cleanup that
+// fails the test if any state machine observed a duplicate, backward or
+// replayed apply while the test was running. It is idempotent: arming the
+// same test twice must not discard breaches already recorded for it.
+func assertApplyOrder(t *testing.T) {
+	t.Helper()
+
+	applyOrderViolations.mu.Lock()
+	if applyOrderViolations.armedBy == t {
+		applyOrderViolations.mu.Unlock()
+		return
+	}
+	applyOrderViolations.armedBy = t
+	applyOrderViolations.list = nil
+	applyOrderViolations.mu.Unlock()
+
+	t.Cleanup(func() {
+		applyOrderViolations.mu.Lock()
+		found := applyOrderViolations.list
+		applyOrderViolations.list = nil
+		applyOrderViolations.armedBy = nil
+		applyOrderViolations.mu.Unlock()
+		if len(found) == 0 {
+			return
+		}
+		shown := found
+		if len(shown) > 20 {
+			shown = shown[:20]
+		}
+		t.Errorf("state machine apply-order violations (%d total):\n  %s",
+			len(found), strings.Join(shown, "\n  "))
+	})
+}
+
+// ---------------------------------------------------------------------------
 // KV State Machine
 // ---------------------------------------------------------------------------
 
@@ -94,9 +156,57 @@ func encodeKVGet(key string) []byte {
 // sm.StateMachine for E2E testing. It supports put and get operations
 // and full snapshot save/recover.
 type kvStateMachine struct {
-	mu      sync.RWMutex
-	data    map[string]string
-	applied atomic.Uint64
+	mu   sync.RWMutex
+	data map[string]string
+	// prevIndex is the raft index of the previously applied entry. Every
+	// entry handed to Update must carry a STRICTLY greater index: an index
+	// that repeats or moves backward means the entry was applied twice or
+	// replayed, which no amount of state comparison can detect afterwards on
+	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
+	// point.
+	//
+	// Note: consecutive indices are NOT required. The user state machine only
+	// ever sees user commands; the engine legitimately consumes indices for
+	// the initial-membership entry, each leader's no-op entry, config changes
+	// and session register/unregister entries, so gaps are expected and are
+	// counted rather than failed. See applyGaps.
+	prevIndex uint64
+	// applyGaps counts skipped index ranges, for diagnostics only.
+	applyGaps atomic.Uint64
+	applied   atomic.Uint64
+	// recovers counts RecoverFromSnapshot calls. It is how a test can tell
+	// "this replica caught up by receiving a SNAPSHOT" from "this replica
+	// caught up by replaying the LOG" -- two paths that leave identical data
+	// behind, so every assertion phrased over the resulting key set is
+	// satisfied by either one. Several tests logged the snapshot claim while
+	// checking nothing that could distinguish them.
+	recovers atomic.Uint64
+}
+
+// RecoverCount returns how many times this state machine has been restored
+// from a snapshot.
+func (kv *kvStateMachine) RecoverCount() uint64 {
+	return kv.recovers.Load()
+}
+
+// checkIndexLocked enforces strict forward progress of the applied index and
+// records a violation if the entry repeats or rolls back. kv.mu must be held.
+func (kv *kvStateMachine) checkIndexLocked(index uint64) {
+	switch {
+	case index <= kv.prevIndex:
+		recordApplyViolation(
+			"kvStateMachine: applied index did not advance: entry index %d applied after %d (duplicate, reordered or replayed apply)",
+			index, kv.prevIndex)
+	case index > kv.prevIndex+1:
+		kv.applyGaps.Add(1)
+	}
+	kv.prevIndex = index
+	kv.applied.Store(index)
+}
+
+// ApplyGaps returns the number of skipped index ranges observed so far.
+func (kv *kvStateMachine) ApplyGaps() uint64 {
+	return kv.applyGaps.Load()
 }
 
 func newKVStateMachine() *kvStateMachine {
@@ -110,6 +220,11 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for i, entry := range entries {
+		// The index invariant holds for every entry the state machine is
+		// handed, including malformed ones, so it is checked before any
+		// command-shape early exit.
+		kv.checkIndexLocked(entry.Index)
+
 		if len(entry.Cmd) < 3 {
 			results[i] = sm.Result{Value: 0}
 			continue
@@ -129,7 +244,6 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 		default:
 			results[i] = sm.Result{Value: 0}
 		}
-		kv.applied.Store(entry.Index)
 	}
 	return nil
 }
@@ -157,6 +271,14 @@ func (kv *kvStateMachine) Lookup(_ context.Context, query interface{}) (interfac
 func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <-chan struct{}) error {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
+
+	// The applied index is written ahead of the payload so a recovering
+	// replica can tell whether the snapshot moves it forward or rolls it back.
+	indexBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(indexBuf, kv.prevIndex)
+	if _, err := w.Write(indexBuf); err != nil {
+		return err
+	}
 
 	countBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(countBuf, uint32(len(kv.data)))
@@ -193,6 +315,25 @@ func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <
 func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	kv.recovers.Add(1)
+
+	// This is the only point at which the applied-index expectation may be
+	// reset, and the reset must still move the replica FORWARD: installing a
+	// snapshot older than what this replica already applied would silently
+	// roll the state machine back.
+	indexBuf := make([]byte, 8)
+	if _, err := io.ReadFull(r, indexBuf); err != nil {
+		return err
+	}
+	snapshotIndex := binary.BigEndian.Uint64(indexBuf)
+	if snapshotIndex < kv.prevIndex {
+		recordApplyViolation(
+			"kvStateMachine: snapshot rolled the state machine backward: recovered at index %d, already applied through %d",
+			snapshotIndex, kv.prevIndex)
+	}
+	kv.prevIndex = snapshotIndex
+	kv.applied.Store(snapshotIndex)
 
 	countBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, countBuf); err != nil {
@@ -300,6 +441,30 @@ func (t *smTracker) Get(shardID, replicaID uint64) *kvStateMachine {
 	return t.machines[smKey{shardID, replicaID}]
 }
 
+// forShard returns the one state machine this tracker holds for shardID,
+// regardless of replica ID, or nil when there is not exactly one.
+//
+// A tracker belongs to exactly one host and a host runs exactly one replica of
+// a given shard, so the lookup is unambiguous. It exists because the caller's
+// "replicaID is nodeIndex+1" convention stops holding the moment a test
+// replaces a node with a fresh replica ID — and a lookup that misses then
+// returns nil, which the old helpers read as "nothing to verify here".
+func (t *smTracker) forShard(shardID uint64) *kvStateMachine {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var found *kvStateMachine
+	for k, machine := range t.machines {
+		if k.shardID != shardID {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = machine
+	}
+	return found
+}
+
 // kvCreateFunc returns a sm.CreateFunc that produces kvStateMachine instances.
 // The returned smTracker provides access to the underlying state machines
 // for test assertions.
@@ -403,6 +568,7 @@ func testMTLSConfig(t *testing.T) *config.MTLSConfig {
 // cluster must share the same CA certificate.
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
+	assertApplyOrder(t)
 	return config.HostConfig{
 		WALDir:                t.TempDir(),
 		NodeHostDir:           t.TempDir(),
@@ -452,10 +618,23 @@ type testCluster struct {
 	hostsMu  sync.RWMutex
 	hosts    []*quicraft.Host
 	addrs    []string
+	configs  []config.HostConfig
 	trackers []*smTracker
 	stopped  []atomic.Bool // tracks which nodes have been stopped
 	mtls     *config.MTLSConfig
 	t        *testing.T
+}
+
+// nodeHostDir returns the NodeHostDir the host at idx was constructed with. It
+// is the root under which that node's snapshot artifacts land, so a test can
+// inspect what was actually written to disk rather than trusting a round trip.
+func (c *testCluster) nodeHostDir(idx int) string {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	if idx < 0 || idx >= len(c.configs) {
+		c.t.Fatalf("nodeHostDir: no recorded config for node[%d] (have %d)", idx, len(c.configs))
+	}
+	return c.configs[idx].NodeHostDir
 }
 
 // newTestCluster creates an N-node cluster with real QUIC transport.
@@ -470,13 +649,15 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	mtls := testMTLSConfig(t)
 	addrs := make([]string, numNodes)
 	hosts := make([]*quicraft.Host, numNodes)
+	configs := make([]config.HostConfig, numNodes)
 
 	for i := range numNodes {
 		var h *quicraft.Host
 		var addr string
+		var cfg config.HostConfig
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			cfg := testHostConfig(t, addr, mtls)
+			cfg = testHostConfig(t, addr, mtls)
 			var err error
 			h, err = quicraft.NewHost(cfg)
 			if err == nil {
@@ -493,11 +674,13 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		}
 		addrs[i] = addr
 		hosts[i] = h
+		configs[i] = cfg
 	}
 
 	return &testCluster{
 		hosts:   hosts,
 		addrs:   addrs,
+		configs: configs,
 		stopped: make([]atomic.Bool, numNodes),
 		mtls:    mtls,
 		t:       t,
@@ -646,6 +829,112 @@ func (c *testCluster) liveNodes() int {
 }
 
 // ---------------------------------------------------------------------------
+// Leader/Term Safety
+// ---------------------------------------------------------------------------
+
+// leaderObservation is one poll sample of one host's view of a shard.
+type leaderObservation struct {
+	index     int
+	replicaID uint64
+	term      uint64
+}
+
+// observeLeaders samples (node, IsLeader, Term) from EVERY host currently in
+// the cluster and returns the leaders it found.
+//
+// It deliberately does NOT consult c.stopped. A node this harness believes is
+// down but which is still running — or one that was restarted and re-added —
+// is exactly where a second leader hides, and skipping it is how a same-term
+// split brain becomes invisible. A host that is genuinely closed returns an
+// error from GetShardInfo and contributes nothing.
+func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
+	c.hostsMu.RLock()
+	hosts := make([]*quicraft.Host, len(c.hosts))
+	copy(hosts, c.hosts)
+	c.hostsMu.RUnlock()
+
+	var leaders []leaderObservation
+	for i, h := range hosts {
+		if h == nil {
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil || !info.IsLeader {
+			continue
+		}
+		leaders = append(leaders, leaderObservation{
+			index:     i,
+			replicaID: info.ReplicaID,
+			term:      info.Term,
+		})
+	}
+	return leaders
+}
+
+// splitBrain returns a description of a same-term multi-leader sighting, or the
+// empty string when the observations are consistent with election safety.
+//
+// Two leaders in DIFFERENT terms is a legal, ordinary handover: the old leader
+// simply has not learned it was superseded. Two leaders in the SAME term is the
+// Raft election-safety violation, and it is never transient — it has already
+// happened by the time it is observed, so it must never be waited out.
+func splitBrain(leaders []leaderObservation) string {
+	byTerm := make(map[uint64][]leaderObservation, len(leaders))
+	for _, obs := range leaders {
+		byTerm[obs.term] = append(byTerm[obs.term], obs)
+	}
+	for term, obs := range byTerm {
+		if len(obs) < 2 {
+			continue
+		}
+		var sb strings.Builder
+		for _, o := range obs {
+			fmt.Fprintf(&sb, " node[%d](replica=%d)", o.index, o.replicaID)
+		}
+		return fmt.Sprintf("%d leaders in term %d:%s", len(obs), term, sb.String())
+	}
+	return ""
+}
+
+// waitForSingleLeader polls until exactly one host reports leadership of the
+// shard, checking the election-safety invariant on EVERY iteration.
+//
+// This replaces the older "poll until the leader count is 1" shape, which
+// treated two simultaneous leaders as an intermediate state to wait out. That
+// IS the violation: waiting for it to resolve turns the one condition the test
+// exists to detect into a reason to keep polling. It also never read Term, so a
+// same-term split brain was indistinguishable from a legal handover, and it
+// skipped stopped nodes, so a partitioned node holding a second claim was
+// invisible.
+func waitForSingleLeader(t *testing.T, cluster *testCluster, shardID uint64, timeout time.Duration) int {
+	t.Helper()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	var last []leaderObservation
+	for {
+		last = cluster.observeLeaders(shardID)
+		if violation := splitBrain(last); violation != "" {
+			t.Fatalf("election safety violated on shard %d: %s", shardID, violation)
+			return -1
+		}
+		if len(last) == 1 {
+			return last[0].index
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out after %v waiting for exactly one leader on shard %d; observed %d leader(s): %v",
+				timeout, shardID, len(last), last)
+			return -1
+		case <-ticker.C:
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Wait Helpers
 // ---------------------------------------------------------------------------
 
@@ -713,29 +1002,103 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// waitForReplication waits for a key to appear in all live nodes' state
-// machines with the expected value.
+// resolveStateMachine returns the state machine for node i on the given shard.
+//
+// The cluster's own tracker slice is consulted FIRST because it is the live
+// one: addNodeToCluster appends to it and recovery paths overwrite entries in
+// it, while a trackers slice a test captured from startShard is a snapshot
+// from before those changes and points at state machines that no longer run.
+// The caller's slice is the fallback, which covers a shard whose trackers were
+// never stored on the cluster.
+func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
+	replicaID := uint64(i + 1)
+
+	cluster.hostsMu.RLock()
+	live := make([]*smTracker, len(cluster.trackers))
+	copy(live, cluster.trackers)
+	cluster.hostsMu.RUnlock()
+
+	if i < len(live) && live[i] != nil {
+		if machine := live[i].Get(shardID, replicaID); machine != nil {
+			return machine
+		}
+	}
+	if i < len(trackers) && trackers[i] != nil {
+		if machine := trackers[i].Get(shardID, replicaID); machine != nil {
+			return machine
+		}
+	}
+	// replicaID == i+1 stops holding once a test replaces a node with a fresh
+	// replica ID, so fall back to the tracker's single machine for the shard.
+	// Without this the lookup returns nil for a node that is running perfectly
+	// well, and every caller reads that as "no state machine to check".
+	if i < len(live) && live[i] != nil {
+		if machine := live[i].forShard(shardID); machine != nil {
+			return machine
+		}
+	}
+	if i < len(trackers) && trackers[i] != nil {
+		if machine := trackers[i].forShard(shardID); machine != nil {
+			return machine
+		}
+	}
+	return nil
+}
+
+// waitForReplication waits for a key to appear with the expected value in the
+// state machine of EVERY live node, and fails if it did not actually check
+// every one of them.
+//
+// The count is the point. The previous version skipped any node whose index
+// was past the end of the caller's trackers slice and any node whose state
+// machine had not registered yet, silently and without a word in the log. A
+// test that adds a replacement node and then "verifies data intact on all live
+// nodes" verified nothing at all for that node, because the trackers slice was
+// captured before the node existed.
 func waitForReplication(t *testing.T, cluster *testCluster, trackers []*smTracker, shardID uint64, key, expectedVal string, timeout time.Duration) {
 	t.Helper()
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
+
+	cluster.hostsMu.RLock()
+	numNodes := len(cluster.hosts)
+	cluster.hostsMu.RUnlock()
+
+	live := make([]int, 0, numNodes)
+	for i := range numNodes {
+		if !cluster.stopped[i].Load() {
+			live = append(live, i)
 		}
-		if i >= len(trackers) {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		sm := trackers[i].Get(shardID, replicaID)
-		if sm == nil {
-			continue
+	}
+	if len(live) == 0 {
+		t.Fatalf("waitForReplication(key=%q): no live nodes to verify", key)
+	}
+
+	verified := 0
+	for _, i := range live {
+		machine := resolveStateMachine(cluster, trackers, shardID, i)
+		if machine == nil {
+			// The shard may not have registered its state machine yet; that
+			// is a condition to wait for, not one to skip.
+			waitForCondition(t, timeout,
+				fmt.Sprintf("node[%d] registers a state machine for shard %d", i, shardID),
+				func() bool {
+					machine = resolveStateMachine(cluster, trackers, shardID, i)
+					return machine != nil
+				},
+			)
 		}
 		waitForCondition(t, timeout,
 			fmt.Sprintf("node[%d] replicates key=%q", i, key),
 			func() bool {
-				val, ok := sm.Get(key)
+				val, ok := machine.Get(key)
 				return ok && val == expectedVal
 			},
 		)
+		verified++
+	}
+
+	if verified < len(live) {
+		t.Fatalf("waitForReplication(key=%q): verified %d nodes but %d are live",
+			key, verified, len(live))
 	}
 }
 
@@ -903,26 +1266,25 @@ func addNodeToCluster(
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}
 
-	// Request membership addition from the leader.
-	leaderIdx := cluster.findLeader(shardID)
-	if leaderIdx < 0 {
-		h.Close()
-		t.Fatal("no leader found for membership addition")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := cluster.hosts[leaderIdx].SyncRequestAddNode(ctx, shardID, newReplicaID, addr, 0); err != nil {
-		h.Close()
-		t.Fatalf("SyncRequestAddNode(replica=%d) failed: %v", newReplicaID, err)
-	}
+	// Request membership addition from whichever node is currently the leader,
+	// retrying a re-election rather than failing on it.
+	//
+	// h is closed on the failure path via defer: syncAddNode calls t.Fatalf,
+	// which runs Goexit and would otherwise leak the host just constructed.
+	added := false
+	defer func() {
+		if !added {
+			h.Close()
+		}
+	}()
+	syncAddNode(t, cluster, shardID, newReplicaID, addr, membershipTimeout)
+	added = true
 
 	// Start the shard in join mode on the new host.
 	createFn, tracker := kvCreateFunc()
 	scfg := cfgFn(shardID, newReplicaID)
 	if err := h.StartShard(nil, true, createFn, scfg); err != nil {
-		h.Close()
+		added = false
 		t.Fatalf("StartShard(join=true) for replica=%d failed: %v", newReplicaID, err)
 	}
 
@@ -931,6 +1293,7 @@ func addNodeToCluster(
 	idx := len(cluster.hosts)
 	cluster.hosts = append(cluster.hosts, h)
 	cluster.addrs = append(cluster.addrs, addr)
+	cluster.configs = append(cluster.configs, hostCfg)
 	cluster.trackers = append(cluster.trackers, tracker)
 	cluster.stopped = append(cluster.stopped, atomic.Bool{})
 	cluster.hostsMu.Unlock()
@@ -941,6 +1304,136 @@ func addNodeToCluster(
 		tracker: tracker,
 		idx:     idx,
 	}
+}
+
+// syncAddNode adds a voting replica through whichever node is CURRENTLY the
+// leader, retrying transient leadership errors until it succeeds or timeout.
+//
+// The membership calls used to be issued against a leader index sampled once,
+// then treated ErrNotLeader as fatal. A re-election between the sample and the
+// call is ordinary Raft behaviour, so the test failed with "not leader, leader
+// unknown" for a membership change that was never actually refused. The
+// assertion is unchanged in strength: the change must still succeed, and it
+// still fails hard on a non-transient error or on running out of time.
+func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr string, timeout time.Duration) {
+	t.Helper()
+	syncMembershipChange(t, cluster, shardID, timeout,
+		fmt.Sprintf("SyncRequestAddNode(replica=%d)", replicaID),
+		func(ctx context.Context, h *quicraft.Host) error {
+			return h.SyncRequestAddNode(ctx, shardID, replicaID, addr, 0)
+		})
+}
+
+// syncDeleteNode removes a replica through whichever node is CURRENTLY the
+// leader, retrying transient leadership errors. See syncAddNode.
+func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, timeout time.Duration) {
+	t.Helper()
+	syncMembershipChange(t, cluster, shardID, timeout,
+		fmt.Sprintf("SyncRequestDeleteNode(replica=%d)", replicaID),
+		func(ctx context.Context, h *quicraft.Host) error {
+			return h.SyncRequestDeleteNode(ctx, shardID, replicaID, 0)
+		})
+}
+
+// syncMembershipChange runs fn against the current leader until it succeeds,
+// retrying only transient leadership errors.
+func syncMembershipChange(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	timeout time.Duration,
+	desc string,
+	fn func(context.Context, *quicraft.Host) error,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		leaderHost := cluster.leaderHost(shardID)
+		if leaderHost == nil {
+			lastErr = quicraft.ErrNotLeader
+			timer := time.NewTimer(50 * time.Millisecond)
+			<-timer.C
+			timer.Stop()
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
+		err := fn(ctx, leaderHost)
+		cancel()
+		if err == nil {
+			return
+		}
+		if !isTransientLeadershipError(err) {
+			t.Fatalf("%s failed: %v", desc, err)
+			return
+		}
+		lastErr = err
+		timer := time.NewTimer(50 * time.Millisecond)
+		<-timer.C
+		timer.Stop()
+	}
+	t.Fatalf("%s never succeeded within %v: %v", desc, timeout, lastErr)
+}
+
+// proposeUntilCommitted proposes one key/value through whichever node is
+// CURRENTLY the leader, retrying transient leadership errors until the entry
+// commits or the deadline passes. It returns nil on success and an error the
+// caller should treat as fatal otherwise.
+//
+// It exists for the concurrent-writer goroutines, which pinned the leader index
+// captured at the start of the test and treated every error — including
+// ErrNotLeader from a perfectly ordinary re-election — as a hard failure. That
+// is not a weaker assertion than "no errors": every entry must still commit,
+// and the caller still verifies all of them replicated afterwards. It only
+// stops a legal leadership change from being reported as a lost write.
+//
+// Safe to call from a non-test goroutine: it never touches t.
+func proposeUntilCommitted(cluster *testCluster, shardID uint64, key, value string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	cmd := encodeKVPut(key, value)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		leaderHost := cluster.leaderHost(shardID)
+		if leaderHost == nil {
+			lastErr = quicraft.ErrNotLeader
+			timer := time.NewTimer(20 * time.Millisecond)
+			<-timer.C
+			timer.Stop()
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		rs, err := leaderHost.Propose(ctx, shardID, cmd)
+		if err != nil {
+			cancel()
+			if !isTransientLeadershipError(err) {
+				return fmt.Errorf("propose %q: %w", key, err)
+			}
+			lastErr = err
+			timer := time.NewTimer(20 * time.Millisecond)
+			<-timer.C
+			timer.Stop()
+			continue
+		}
+
+		_, resErr := rs.Result()
+		rs.Release()
+		cancel()
+		if resErr == nil {
+			return nil
+		}
+		if !isTransientLeadershipError(resErr) {
+			return fmt.Errorf("commit %q: %w", key, resErr)
+		}
+		lastErr = resErr
+		timer := time.NewTimer(20 * time.Millisecond)
+		<-timer.C
+		timer.Stop()
+	}
+	return fmt.Errorf("%q never committed within %v: %w", key, timeout, lastErr)
 }
 
 // proposeNEntries proposes N entries through the leader and returns the
@@ -965,8 +1458,21 @@ func proposeNEntries(
 	return expected
 }
 
-// verifyAllData verifies all KV pairs from expected are present on all
-// live nodes' state machines.
+// verifyAllData verifies that every KV pair in expected is present on the state
+// machine of EVERY live node, and fails if it did not actually check every one
+// of them.
+//
+// The count is the point, and it is the same point as in waitForReplication.
+// The previous version skipped three separate classes of node in silence: any
+// index past the end of the caller's trackers slice (which is every node a test
+// added after capturing it), any nil tracker entry, and any node whose state
+// machine lookup returned nil. That last one is the damaging case: the tracker
+// records a machine the instant the engine invokes the state-machine factory,
+// so a nil result means the factory was never invoked for that replica — a
+// startup or recovery failure. Skipping it removes the one broken node from
+// every data assertion while the caller logs "verified on N nodes". This helper
+// is the sole final assertion of the rolling-restart tests, where the node that
+// failed to come back is exactly the node being skipped.
 func verifyAllData(
 	t *testing.T,
 	cluster *testCluster,
@@ -976,14 +1482,33 @@ func verifyAllData(
 ) {
 	t.Helper()
 
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() || i >= len(trackers) {
-			continue
+	cluster.hostsMu.RLock()
+	numNodes := len(cluster.hosts)
+	cluster.hostsMu.RUnlock()
+
+	live := make([]int, 0, numNodes)
+	for i := range numNodes {
+		if !cluster.stopped[i].Load() {
+			live = append(live, i)
 		}
-		replicaID := uint64(i + 1)
-		nodeSM := trackers[i].Get(shardID, replicaID)
+	}
+	if len(live) == 0 {
+		t.Fatalf("verifyAllData(shard=%d): no live nodes to verify", shardID)
+	}
+
+	verified := 0
+	for _, i := range live {
+		nodeSM := resolveStateMachine(cluster, trackers, shardID, i)
 		if nodeSM == nil {
-			continue
+			// A missing state machine is a condition to WAIT for and then
+			// FAIL on, never one to skip.
+			waitForCondition(t, membershipTimeout,
+				fmt.Sprintf("node[%d] registers a state machine for shard %d", i, shardID),
+				func() bool {
+					nodeSM = resolveStateMachine(cluster, trackers, shardID, i)
+					return nodeSM != nil
+				},
+			)
 		}
 		for key, val := range expected {
 			waitForCondition(t, membershipTimeout,
@@ -994,7 +1519,53 @@ func verifyAllData(
 				},
 			)
 		}
+		verified++
 	}
+
+	if verified < len(live) {
+		t.Fatalf("verifyAllData(shard=%d): verified %d nodes but %d are live",
+			shardID, verified, len(live))
+	}
+}
+
+// assertCaughtUpViaSnapshot fails unless the replica actually restored itself
+// from a SNAPSHOT rather than replaying the log.
+//
+// Holding the right keys proves nothing about which path produced them: log
+// replay and snapshot install leave byte-identical state, so "the joiner has
+// the keys" is satisfied by either. Several tests logged "caught up via
+// snapshot transfer (not log replay)" while asserting only the key set. The
+// state machine counts its own RecoverFromSnapshot calls, which is the one
+// signal that separates the two.
+func assertCaughtUpViaSnapshot(t *testing.T, tracker *smTracker, shardID, replicaID uint64, timeout time.Duration) {
+	t.Helper()
+
+	nodeSM := tracker.Get(shardID, replicaID)
+	if nodeSM == nil {
+		waitForCondition(t, timeout,
+			fmt.Sprintf("replica=%d registers a state machine", replicaID),
+			func() bool {
+				nodeSM = tracker.Get(shardID, replicaID)
+				return nodeSM != nil
+			},
+		)
+	}
+	waitForCondition(t, timeout,
+		fmt.Sprintf("replica=%d recovers from a snapshot rather than replaying the log", replicaID),
+		func() bool { return nodeSM.RecoverCount() > 0 },
+	)
+	t.Logf("replica=%d restored from a snapshot %d time(s)", replicaID, nodeSM.RecoverCount())
+}
+
+// assertSnapshotTaken fails unless the node at idx has written at least one
+// snapshot artifact under its NodeHostDir. It is the companion to
+// assertCaughtUpViaSnapshot on the SENDING side: a snapshot has to exist before
+// one can be transferred.
+func assertSnapshotTaken(t *testing.T, cluster *testCluster, idx int) {
+	t.Helper()
+	dir := cluster.nodeHostDir(idx)
+	paths := waitForSnapshotArtifact(t, fmt.Sprintf("node[%d]", idx), dir, membershipTimeout)
+	t.Logf("node[%d] wrote %d snapshot artifact(s) under %s", idx, len(paths), dir)
 }
 
 // waitForMembershipSize polls GetShardMembership until the number of
@@ -1058,8 +1629,62 @@ func waitForNodeData(
 // testing at-rest encryption E2E.
 type barrierTestCluster struct {
 	*testCluster
-	barriers []*seal.Barrier
+	barriers []*countingBarrier
 }
+
+// ---------------------------------------------------------------------------
+// Counting Barrier
+// ---------------------------------------------------------------------------
+
+// countingBarrier wraps a seal.Barrier and counts the frames the SNAPSHOT
+// pipeline seals through it, so a test can assert that at-rest encryption was
+// actually INVOKED rather than merely configured.
+//
+// It exists because the only thing the barrier tests used to assert was
+// IsSealed() == false, an in-memory flag that no production code path touches.
+// A total plaintext downgrade — the engine resolving no barrier for the shard
+// and writing the snapshot in the clear — leaves that flag exactly as it was.
+//
+// EncryptWithEpochPinnedContext and EncryptWithEpochContext are the only two
+// entry points the snapshot encrypt loop uses: engine.epochPinner.sealFrame
+// takes the pinned one when the barrier offers it (seal.Barrier does) and the
+// context one otherwise. Neither is reachable from the WAL, which seals records
+// through EncryptWithEpoch/EncryptWithContext, so the count is specific to
+// snapshot frames and cannot be satisfied by ordinary log traffic.
+//
+// The overriding methods shadow the promoted ones, including for the dynamic
+// type assertions the engine performs (atomicEpochPinner, walContextBarrier).
+type countingBarrier struct {
+	*seal.Barrier
+	frameSeals atomic.Int64
+}
+
+// EncryptWithEpochPinnedContext seals one snapshot frame and counts it.
+func (b *countingBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.Barrier.EncryptWithEpochPinnedContext(dst, plaintext, contextAAD)
+	if err == nil {
+		b.frameSeals.Add(1)
+	}
+	return ct, epoch, err
+}
+
+// EncryptWithEpochContext seals one snapshot frame on the non-atomic pinning
+// path and counts it.
+func (b *countingBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.Barrier.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err == nil {
+		b.frameSeals.Add(1)
+	}
+	return ct, epoch, err
+}
+
+// snapshotFrameSeals reports how many snapshot frames this barrier has sealed.
+func (b *countingBarrier) snapshotFrameSeals() int64 {
+	return b.frameSeals.Load()
+}
+
+// Compile-time assertion that the wrapper is still a usable host barrier.
+var _ quicraft.Barrier = (*countingBarrier)(nil)
 
 // testBarrierConfig returns a seal.BarrierConfig carrying a no-op
 // StatePersister. seal.Barrier.Rotate and PurgeEpochsBefore fail closed with
@@ -1081,12 +1706,13 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 	mtls := testMTLSConfig(t)
 	addrs := make([]string, numNodes)
 	hosts := make([]*quicraft.Host, numNodes)
-	barriers := make([]*seal.Barrier, numNodes)
+	configs := make([]config.HostConfig, numNodes)
+	barriers := make([]*countingBarrier, numNodes)
 
 	for i := range numNodes {
 		// Create and initialize a barrier for this node.
 		_ = seal.AllowWeakKDFParams()
-		b := seal.MustNewBarrier(testBarrierConfig(1))
+		b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
 		s, err := seal.NewSoftwareStrategyWithParams(
 			[]byte(fmt.Sprintf("test-passphrase-%d", i)), 1, 64*1024, 1)
 		if err != nil {
@@ -1106,9 +1732,10 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 
 		var h *quicraft.Host
 		var addr string
+		var cfg config.HostConfig
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			cfg := testHostConfig(t, addr, mtls)
+			cfg = testHostConfig(t, addr, mtls)
 			h, err = quicraft.NewHost(cfg, quicraft.WithBarrier(b))
 			if err == nil {
 				break
@@ -1123,11 +1750,13 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		}
 		addrs[i] = addr
 		hosts[i] = h
+		configs[i] = cfg
 	}
 
 	tc := &testCluster{
 		hosts:   hosts,
 		addrs:   addrs,
+		configs: configs,
 		stopped: make([]atomic.Bool, numNodes),
 		mtls:    mtls,
 		t:       t,
@@ -1140,10 +1769,10 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 
 // newBarrierForNode creates a fresh initialized+unsealed barrier suitable
 // for a replacement node in barrier cluster tests.
-func newBarrierForNode(t *testing.T) *seal.Barrier {
+func newBarrierForNode(t *testing.T) *countingBarrier {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
-	b := seal.MustNewBarrier(testBarrierConfig(1))
+	b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
 	s, err := seal.NewSoftwareStrategyWithParams(
 		[]byte("replacement-passphrase"), 1, 64*1024, 1)
 	if err != nil {
@@ -1153,4 +1782,128 @@ func newBarrierForNode(t *testing.T) *seal.Barrier {
 		t.Fatalf("barrier.Initialize for replacement: %v", err)
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// At-Rest Snapshot Artifact Assertions
+// ---------------------------------------------------------------------------
+
+// snapshotDataFileName is the payload file the engine writes inside each
+// snapshot directory (<snapshotDir>/shard-N/replica-N/snapshot-<index>/).
+// It is duplicated here rather than exported from the engine because a test
+// that reads the constant from the code under test cannot notice the code
+// writing somewhere else entirely.
+const snapshotDataFileName = "snapshot.dat"
+
+// snapshotArtifacts returns every snapshot payload file beneath dir. The whole
+// tree is walked rather than the documented path being reconstructed so the
+// search still finds the artifacts if the layout changes.
+func snapshotArtifacts(t *testing.T, dir string) []string {
+	t.Helper()
+	var found []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !d.IsDir() && d.Name() == snapshotDataFileName {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s for snapshot artifacts: %v", dir, err)
+	}
+	return found
+}
+
+// waitForSnapshotArtifact blocks until at least one snapshot payload file
+// exists beneath dir, and fails if none appears. Snapshots are written
+// asynchronously by the snapshot pool, so the artifact lags the request.
+func waitForSnapshotArtifact(t *testing.T, label, dir string, timeout time.Duration) []string {
+	t.Helper()
+	var paths []string
+	waitForCondition(t, timeout,
+		fmt.Sprintf("%s writes a snapshot artifact under %s", label, dir),
+		func() bool {
+			paths = snapshotArtifacts(t, dir)
+			return len(paths) > 0
+		},
+	)
+	return paths
+}
+
+// assertSnapshotsSealed fails unless dir holds at least one snapshot artifact
+// AND no artifact contains any of the plaintext needles.
+//
+// This is deliberately a check of the BYTES ON DISK rather than a round trip.
+// A round trip through the engine reads back whatever it wrote, so it passes
+// identically whether the artifact was sealed or written in the clear — which
+// is exactly the plaintext downgrade at-rest encryption exists to prevent. The
+// non-empty artifact count is part of the assertion: a search that finds no
+// files to search is vacuous, not a pass.
+func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
+	t.Helper()
+	if len(needles) == 0 {
+		t.Fatalf("%s: assertSnapshotsSealed called with no plaintext needles", label)
+	}
+	paths := waitForSnapshotArtifact(t, label, dir, membershipTimeout)
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("%s: reading snapshot artifact %s: %v", label, p, err)
+		}
+		if len(data) == 0 {
+			t.Fatalf("%s: snapshot artifact %s is empty", label, p)
+		}
+		for _, needle := range needles {
+			if bytes.Contains(data, []byte(needle)) {
+				t.Fatalf("%s: snapshot artifact %s (%d bytes) contains the plaintext "+
+					"bytes %q; the at-rest barrier did not encrypt it",
+					label, p, len(data), needle)
+			}
+		}
+	}
+	t.Logf("%s: %d snapshot artifact(s) under %s, none containing plaintext", label, len(paths), dir)
+}
+
+// requestSnapshotSync asks host for an explicit snapshot of shardID and WAITS
+// for the result, returning the snapshot index.
+//
+// Reading the result is the point: RequestSnapshot is asynchronous, so a caller
+// that Release()s the state without reading it has asserted nothing about
+// whether a snapshot was taken, only that one was asked for. An automatic
+// snapshot may already be running, which is the one legitimate transient
+// failure, so that case retries; everything else fails immediately.
+func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint64 {
+	t.Helper()
+
+	const maxSnapRetries = 20
+	const snapRetryInterval = 500 * time.Millisecond
+
+	for attempt := range maxSnapRetries {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		rs, err := host.RequestSnapshot(ctx, shardID, quicraft.SnapshotOption{})
+		cancel()
+		if err == nil {
+			result, resultErr := rs.Result()
+			rs.Release()
+			if resultErr != nil {
+				t.Fatalf("RequestSnapshot(shard=%d) result failed: %v", shardID, resultErr)
+			}
+			if result.Value == 0 {
+				t.Fatalf("RequestSnapshot(shard=%d) completed at index 0; no snapshot was taken", shardID)
+			}
+			return result.Value
+		}
+		if errors.Is(err, quicraft.ErrSnapshotInProgress) {
+			timer := time.NewTimer(snapRetryInterval)
+			<-timer.C
+			timer.Stop()
+			continue
+		}
+		t.Fatalf("RequestSnapshot(shard=%d) failed on attempt %d: %v", shardID, attempt+1, err)
+	}
+	t.Fatalf("RequestSnapshot(shard=%d) never completed: a snapshot was in progress for %v",
+		shardID, time.Duration(maxSnapRetries)*snapRetryInterval)
+	return 0
 }

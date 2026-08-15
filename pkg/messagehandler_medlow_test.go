@@ -204,7 +204,6 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, receivers)
 	for i := 0; i < receivers; i++ {
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

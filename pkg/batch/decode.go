@@ -27,11 +27,21 @@ const lengthPrefixSize = 4
 // Format: [cmd1_len:4 BE][cmd1_data][cmd2_len:4 BE][cmd2_data]...
 //
 // Each command is prefixed with its length as a 4-byte big-endian uint32.
-// An empty slice produces a zero-length output. The caller is responsible
-// for ensuring individual commands do not exceed math.MaxUint32 bytes.
-func EncodeBatch(cmds [][]byte) []byte {
+// An empty slice produces a zero-length output.
+//
+// A command longer than math.MaxInt32 is rejected with an EncodeError rather
+// than encoded. Both decode paths refuse a length prefix above MaxInt32 (it
+// wraps negative on a 32-bit int and panics the slice expression), so encoding
+// one would produce a payload that this package can never read back — and the
+// aggregator's payload is a committed Raft entry, so the whole batch would be
+// permanently undecodable on every replica. The write side must reject exactly
+// what the read side rejects.
+func EncodeBatch(cmds [][]byte) ([]byte, error) {
 	totalSize := 0
 	for _, cmd := range cmds {
+		if len(cmd) > math.MaxInt32 {
+			return nil, &EncodeError{Reason: "command length exceeds MaxInt32"}
+		}
 		totalSize += lengthPrefixSize + len(cmd)
 	}
 
@@ -44,7 +54,7 @@ func EncodeBatch(cmds [][]byte) []byte {
 		off += len(cmd)
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeBatch splits a batch payload into individual commands.

@@ -31,10 +31,21 @@ const (
 // the explicit value "off" is honored as disabled rather than being
 // misread as enabled.
 //
-// When enabled, FIPS mode constrains BOTH the KDF (PBKDF2-SHA256 instead
-// of Argon2id, see kdf.go) and the data-path cipher: SelectOptimalAlgorithm
-// returns AES-256-GCM unconditionally, and BarrierConfig.validate rejects
-// the ChaCha20/XChaCha20 algorithms, which are not FIPS-approved.
+// When enabled, FIPS mode constrains BOTH the KDF and the data-path cipher:
+//
+//   - KDF: DefaultKDFVersion selects PBKDF2-SHA256, and DeriveKey (plus the
+//     software-strategy constructors) REFUSE Argon2id with
+//     ErrKDFNotFIPSApproved — including the explicitly-Argon2id constructor
+//     NewSoftwareStrategyWithParams. See kdf.go.
+//   - Cipher: SelectOptimalAlgorithm returns AES-256-GCM unconditionally, and
+//     BarrierConfig.Validate rejects the ChaCha20/XChaCha20 algorithms, which
+//     are not FIPS-approved.
+//
+// Detection is ENVIRONMENTAL, so a false return means either "FIPS was not
+// requested" or "FIPS was requested but this binary has no module" — and the
+// second would otherwise fail open onto Argon2id and ChaCha20-Poly1305. A
+// deployment that requires FIPS must say so with BarrierConfig.RequireFIPS,
+// which turns that ambiguity into a refusal at NewBarrier.
 func FIPSEnabled() bool {
 	if fips140.Enabled() {
 		return true

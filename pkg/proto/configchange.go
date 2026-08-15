@@ -15,16 +15,22 @@
 package proto
 
 // ConfigChange represents a membership change request. It is serialized
-// as the Cmd payload of an EntryConfigChange entry. The wire format is:
+// as the Cmd payload of an EntryConfigChange entry. There is exactly ONE
+// layout, and every field in it is mandatory:
 //
 //	[ConfigChangeID:8][Type:8][ReplicaID:8][Address:len+data][Initialize:8]
 //	[MaxWitnesses:8][RequireFullReplicaMajority:8][NodeIdentity:len+data]
 //
-// NodeIdentity is a TRAILING field and its absence is meaningful: a payload
-// that ends after RequireFullReplicaMajority was written by a binary that had
-// no identity concept, and decodes with an empty NodeIdentity. See
-// UnmarshalFrom for why the tail can be discriminated here but not in
-// Membership.
+// The type carries no version byte and needs none. Under the pre-release
+// pinning policy (see the package comment) there is one layout to decode, so
+// there is nothing for a discriminator to discriminate: a payload that does not
+// span the whole layout is refused rather than read as an earlier one. An
+// absent NodeIdentity is spelled as a four-byte zero LENGTH PREFIX, not as a
+// short buffer — the field is always present, and only its content may be
+// empty.
+//
+// That distinction is the reason the layout is fixed rather than
+// length-discriminated. See UnmarshalFrom.
 type ConfigChange struct {
 	// ConfigChangeID is the log index that identifies this config change.
 	ConfigChangeID uint64
@@ -48,8 +54,12 @@ type ConfigChange struct {
 	// NodeIdentity is the stable cryptographic node identity to commit for
 	// the replica being added — the value quicraft.NodeIdentity derives from
 	// that node's leaf certificate. Empty for RemoveNode and
-	// UpdateWitnessPolicy, and empty for an add whose caller supplied none
-	// (the pre-identity behaviour).
+	// UpdateWitnessPolicy, and empty for an add whose caller supplied none.
+	//
+	// An empty value is a real, encoded state (a zero length prefix), never an
+	// absent field. It selects the weaker address-based authorization on the
+	// receive side, so it must be something a WRITER chose and not something a
+	// truncated buffer produced; see UnmarshalFrom.
 	//
 	// It travels through consensus alongside Address so the receive-side gate
 	// reads a value no inbound message can write. It is supplied by the
@@ -67,7 +77,9 @@ type ConfigChange struct {
 const configChangeFixedSize = 6*8 + 4 // 52 bytes
 
 // configChangeIdentitySize is the wire size the trailing NodeIdentity field
-// adds: its own 4-byte length prefix plus the bytes.
+// adds: its own 4-byte length prefix plus the bytes. The prefix is
+// unconditional, so an empty identity still costs four bytes — that is what
+// makes an empty identity distinguishable from a payload that stops early.
 func (cc *ConfigChange) configChangeIdentitySize() int {
 	return 4 + len(cc.NodeIdentity)
 }
@@ -78,9 +90,31 @@ func (cc *ConfigChange) Size() int {
 }
 
 // MarshalTo writes the config change into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short.
+// buf must be at least Size() bytes.
+//
+// Returns ErrBufferTooSmall if buf is too short, ErrInvalidConfigChangeType for
+// a type UnmarshalFrom would reject, ErrAddressTooLong if Address exceeds
+// MaxAddressLength, or ErrNodeIdentityTooLong if NodeIdentity exceeds
+// MaxNodeIdentityLength.
+//
+// Those three are the READ side's checks applied on write, and they are not
+// cosmetic here: a ConfigChange is marshaled into an Entry.Cmd and COMMITTED, so
+// a payload this package can emit but not parse is a committed entry every
+// replica faults on (peer.applyMembershipEntry returns ErrCorruptConfigEntry and
+// the shard is failed) — a self-inflicted cluster-wide outage from an
+// over-length operator-supplied address. Unlike Membership these limits are
+// per-FIELD, so each keeps its own sentinel: getString is called with the right
+// bound and the right error at both ends.
 func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
+	if cc.Type > maxConfigChangeType {
+		return 0, ErrInvalidConfigChangeType
+	}
+	if len(cc.Address) > MaxAddressLength {
+		return 0, ErrAddressTooLong
+	}
+	if len(cc.NodeIdentity) > MaxNodeIdentityLength {
+		return 0, ErrNodeIdentityTooLong
+	}
 	required := cc.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall
@@ -101,9 +135,29 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 }
 
 // UnmarshalFrom reads the config change from buf and returns bytes consumed.
-// Returns ErrBufferTooSmall on truncated input, ErrAddressTooLong if the
-// address exceeds MaxAddressLength, or ErrUnsupportedVersion if the buffer
-// matches the legacy (pre-WireVersion 2) layout.
+// Returns ErrBufferTooSmall if buf does not span the whole layout,
+// ErrInvalidConfigChangeType for an unknown type, ErrAddressTooLong if the
+// address exceeds MaxAddressLength, or ErrNodeIdentityTooLong if the identity
+// exceeds MaxNodeIdentityLength.
+//
+// # Why a short buffer is an error and not a shorter layout
+//
+// The decoder used to discriminate on LENGTH: a payload ending after
+// Initialize was reported as a pre-witness-policy layout, and one ending after
+// RequireFullReplicaMajority decoded successfully with an EMPTY NodeIdentity.
+// The second of those was a security defect, not just dead compatibility code.
+//
+// A truncated ConfigChange was byte-indistinguishable from one that genuinely
+// carried no identity, and an empty identity is precisely the state that falls
+// back to the weaker address-based authorization on the receive side. A 61-byte
+// prefix of a valid 78-byte encoding decoded with err == nil and silently
+// downgraded the gate the identity exists to raise. Length is not a safe
+// discriminator for a field whose absence weakens a check.
+//
+// Under the pinning policy there is nothing left to discriminate anyway — one
+// layout, all of it required — so the length test is now a bound: anything that
+// does not span the layout is refused, and an identity-less change is spelled
+// with an explicit zero length prefix by MarshalTo.
 func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < 24+4 { // 3 uint64 fields + address length prefix
 		return 0, ErrBufferTooSmall
@@ -121,37 +175,21 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	cc.Address = addr
 	offset += n
-	if len(buf) < offset+8 {
+	// Initialize, MaxWitnesses and RequireFullReplicaMajority are checked as
+	// one 24-byte region: they are all mandatory, so there is no boundary
+	// between them at which a payload may legally stop.
+	if len(buf) < offset+24 {
 		return 0, ErrBufferTooSmall
 	}
 	cc.Initialize = getBool(buf[offset:])
 	offset += 8
-	if len(buf) < offset+16 {
-		// Legacy-layout detection: the v1 ConfigChange (no witness-policy
-		// fields) ended exactly here, so a buffer that terminates at this
-		// offset is a payload written by a pre-WireVersion 2 binary, not a
-		// truncation of a v2 payload. Report it as an unsupported format
-		// rather than an opaque short-buffer error.
-		if len(buf) == offset {
-			return 0, ErrUnsupportedVersion
-		}
-		return 0, ErrBufferTooSmall
-	}
 	cc.MaxWitnesses = getUint64(buf[offset:])
 	offset += 8
 	cc.RequireFullReplicaMajority = getBool(buf[offset:])
 	offset += 8
-	// NodeIdentity is a trailing field, and a payload that ENDS here was
-	// written before identities existed. Unlike Membership — which is embedded
-	// in a larger buffer and therefore has no readable end, which is why it
-	// carries an explicit version byte — a ConfigChange is exactly one
-	// Entry.Cmd, so "the buffer ended" is an unambiguous in-band discriminator
-	// and needs no version byte of its own. It decodes with no identity, which
-	// is the compatibility state the receive-side gate handles explicitly.
-	if len(buf) == offset {
-		cc.NodeIdentity = ""
-		return offset, nil
-	}
+	// The trailing identity is read like any other field: getString requires
+	// its four-byte length prefix, so a payload that ends here — the shape that
+	// used to decode as "no identity" — returns ErrBufferTooSmall.
 	identity, n, err := getString(buf[offset:], MaxNodeIdentityLength, ErrNodeIdentityTooLong)
 	if err != nil {
 		return 0, err

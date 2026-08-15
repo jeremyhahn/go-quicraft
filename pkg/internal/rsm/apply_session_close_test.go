@@ -346,7 +346,7 @@ func TestApply_SessionExpiryCannotDropSessionMidBatch(t *testing.T) {
 		{Index: 500, Type: proto.EntryNormal, Cmd: makeCmd("z", "z")},
 	}
 	results := make([]sm.Result, len(entries))
-	if err := rsm.Apply(entries, results); err != nil {
+	if err := applyContiguous(t, rsm, entries, results); err != nil {
 		t.Fatalf("Apply = %v, want nil", err)
 	}
 	if rsm.Sessions().IsRegistered(20) {

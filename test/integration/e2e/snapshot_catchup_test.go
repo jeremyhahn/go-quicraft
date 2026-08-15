@@ -58,6 +58,12 @@ func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 
 	// Verify all 50 entries are present on the new node via snapshot catch-up.
 	waitForNodeData(t, result.tracker, 1, 4, expected, membershipTimeout)
+
+	// ...and that it really was a SNAPSHOT. Having the keys is equally
+	// consistent with plain log replay, so the claim in the name of this test
+	// needs the state machine's own recovery count to be checked.
+	assertCaughtUpViaSnapshot(t, result.tracker, 1, 4, membershipTimeout)
+	assertSnapshotTaken(t, cluster, cluster.waitForClusterLeader(1, leaderElectionTimeout))
 	t.Logf("new node (replicaID=4) caught up with all 50 entries via snapshot")
 
 	// Propose 10 more entries and verify the new node receives them
@@ -108,7 +114,8 @@ func TestE2E_SnapshotCatchUp_DataIntegrity(t *testing.T) {
 
 	// Wait for the new node to receive and apply the snapshot.
 	waitForNodeData(t, result.tracker, 1, 4, expected, membershipTimeout)
-	t.Logf("new node caught up, comparing state machine snapshots for data integrity")
+	assertCaughtUpViaSnapshot(t, result.tracker, 1, 4, membershipTimeout)
+	t.Logf("new node caught up via snapshot, comparing state machines for data integrity")
 
 	// Re-find the leader since it may have changed during membership change.
 	leaderIdx = cluster.waitForClusterLeader(1, leaderElectionTimeout)
@@ -190,6 +197,8 @@ func TestE2E_SnapshotCatchUp_FiveNode(t *testing.T) {
 
 	// Verify all 60 entries are present on the 6th node.
 	waitForNodeData(t, result.tracker, 1, 6, expected, membershipTimeout)
+	assertCaughtUpViaSnapshot(t, result.tracker, 1, 6, membershipTimeout)
+	assertSnapshotTaken(t, cluster, cluster.waitForClusterLeader(1, leaderElectionTimeout))
 	t.Logf("6th node caught up with all 60 entries via snapshot")
 
 	// Propose 10 more entries and verify normal replication to all 6 nodes.

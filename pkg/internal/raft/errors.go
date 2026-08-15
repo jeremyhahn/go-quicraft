@@ -199,6 +199,28 @@ var (
 	// still need distinct keypairs. See membership.identityHolder.
 	ErrDuplicateMemberIdentity = errors.New("raft: node identity already held by another member of this shard")
 
+	// ErrRemovedMemberIdentity is returned when a config change would bind a
+	// node identity this shard has already committed a REMOVAL for, under any
+	// replica ID.
+	//
+	// The removal tombstone is on the IDENTITY, not on the replica ID it
+	// happened to be bound to, and nothing evicts it (see
+	// proto.Membership.RemovedIdentities). So a keypair whose replica was
+	// removed is banned from this shard permanently: the receive-side deny-list
+	// refuses its traffic whatever ID it presents. Letting such an add COMMIT
+	// would produce a member every replica silently black-holes — a shard with a
+	// voter that can never be reached, counted in every quorum. Refusing it at
+	// propose time is the same fail-fast the duplicate checks make, and it is
+	// validate-only for the same reason: refusing an already-committed entry on
+	// the apply path would diverge replicas.
+	//
+	// The remedy is a NEW keypair. Recycling a decommissioned machine's ADDRESS
+	// into a fresh replica ID stays legal (removed replicas do not count in
+	// addressHolder); recycling its PRIVATE KEY does not, and that asymmetry is
+	// deliberate — reusing a removed replica's key is precisely the capability
+	// the tombstone exists to revoke.
+	ErrRemovedMemberIdentity = errors.New("raft: node identity belongs to a replica this shard has removed")
+
 	// ErrReadIndexRespNotFromLeader is returned when a ReadIndexResp arrives
 	// from a replica that is not this shard's current leader. The message is
 	// the wire form of a completed heartbeat-quorum round and its correlation
@@ -218,6 +240,36 @@ var (
 	// keeps hasConfigChangeToApply true) or land a payload-less metadata entry
 	// in the durable log. The batch is rejected before any state mutation.
 	ErrReservedEntryType = errors.New("raft: proposed entry carries a reserved entry type")
+
+	// ErrHeartbeatNotFromLeader is returned when a Heartbeat names a sender
+	// that is not the leader this replica already recognises for the current
+	// term. A Heartbeat carries NO log-matching proof yet installs a leader and
+	// advances the commit index, so it is the one leader-to-follower push whose
+	// authority rests entirely on the sender's identity. A replica that has
+	// already accepted a leader for this term has no reason to accept a second
+	// one at the same term — Election Safety says there is only one — so the
+	// second is either a stale duplicate or a forgery, and either way it must
+	// not move the commit index.
+	ErrHeartbeatNotFromLeader = errors.New("raft: heartbeat from a replica that is not this shard's leader")
+
+	// ErrConfigChangeUnmarshal is returned when a proposed EntryConfigChange
+	// carries a payload that does not decode. It is a REJECTION, never a
+	// pass-through: an undecodable payload cannot be validated, so admitting it
+	// would put an entry into the log that no propose-time gate has judged,
+	// while the apply path deliberately never re-validates (a committed change
+	// must replay identically on every replica). This is a propose-time refusal
+	// only; the commit path handles an undecodable committed entry separately.
+	ErrConfigChangeUnmarshal = errors.New("raft: proposed config change payload does not decode")
+
+	// ErrCorruptConfigEntry is returned when a COMMITTED config-carrying entry
+	// fails to decode on the apply path. Recovery already treats these bytes as
+	// fatal (ReconstructMembership), and the runtime must reach the same
+	// decision: a committed entry is authoritative replicated state, so one this
+	// replica cannot read leaves it computing quorum over a configuration that
+	// differs from every peer's, silently and durably (the divergent membership
+	// is persisted with the next snapshot). Faulting the shard is the only
+	// outcome that does not manufacture a split configuration.
+	ErrCorruptConfigEntry = errors.New("raft: committed config entry does not decode")
 )
 
 // DecompressError wraps an underlying Snappy decode failure with context

@@ -270,34 +270,39 @@ func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 // TestCopySnapshotRefs_DetachesEveryReference pins the ownership contract of
 // the asynchronous send path: SendSnapshot hands snapshot metadata to a
 // background marshal, so every reference-typed field must be copied. If any
-// field still aliased the caller's memory, a caller mutating its membership map
-// or checksum after the call would race the marshal and could put a DIFFERENT
-// membership on the wire than the one raft committed.
+// field still aliased the caller's memory, a caller mutating its membership maps
+// after the call would race the marshal and could put a DIFFERENT membership on
+// the wire than the one raft committed.
+//
+// The two AUTHORIZATION maps are covered explicitly. Identities was missed when
+// copySnapshotRefs was written and RemovedIdentities arrived later; a snapshot
+// whose identity map is mutated between the enqueue and the marshal ships a
+// configuration that authorizes a different set of replicas than the caller
+// submitted, which is a strictly worse outcome than a stale address.
 func TestCopySnapshotRefs_DetachesEveryReference(t *testing.T) {
 	orig := proto.Snapshot{
-		Index:    7,
-		Term:     2,
-		Checksum: []byte{1, 2, 3, 4},
+		Index: 7,
+		Term:  2,
 		Membership: proto.Membership{
-			Addresses: map[uint64]string{1: "a:1"},
-			Observers: map[uint64]string{2: "b:2"},
-			Witnesses: map[uint64]string{3: "c:3"},
-			Removed:   map[uint64]bool{4: true},
+			Addresses:         map[uint64]string{1: "a:1"},
+			Observers:         map[uint64]string{2: "b:2"},
+			Witnesses:         map[uint64]string{3: "c:3"},
+			Removed:           map[uint64]bool{4: true},
+			Identities:        map[uint64]string{1: "spki:aa"},
+			RemovedIdentities: map[uint64]string{4: "spki:dd"},
 		},
 	}
 	copied := orig
 	copySnapshotRefs(&copied)
 
 	// Mutate every source reference; the copy must be unaffected.
-	orig.Checksum[0] = 0xFF
 	orig.Membership.Addresses[1] = "mutated"
 	orig.Membership.Observers[2] = "mutated"
 	orig.Membership.Witnesses[3] = "mutated"
 	orig.Membership.Removed[4] = false
+	orig.Membership.Identities[1] = "spki:mutated"
+	orig.Membership.RemovedIdentities[4] = "spki:mutated"
 
-	if copied.Checksum[0] != 1 {
-		t.Error("Checksum still aliases the caller's slice")
-	}
 	if copied.Membership.Addresses[1] != "a:1" {
 		t.Error("Membership.Addresses still aliases the caller's map")
 	}
@@ -310,6 +315,15 @@ func TestCopySnapshotRefs_DetachesEveryReference(t *testing.T) {
 	if !copied.Membership.Removed[4] {
 		t.Error("Membership.Removed still aliases the caller's map")
 	}
+	if copied.Membership.Identities[1] != "spki:aa" {
+		t.Error("Membership.Identities still aliases the caller's map: a mutation " +
+			"after the enqueue would put a different authorization set on the wire")
+	}
+	if copied.Membership.RemovedIdentities[4] != "spki:dd" {
+		t.Error("Membership.RemovedIdentities still aliases the caller's map: a " +
+			"mutation after the enqueue would put a different removal deny-list " +
+			"on the wire")
+	}
 }
 
 // TestCopySnapshotRefs_PreservesNilDistinction pins the wire-format detail that
@@ -319,9 +333,6 @@ func TestCopySnapshotRefs_PreservesNilDistinction(t *testing.T) {
 	s := proto.Snapshot{Index: 1}
 	copySnapshotRefs(&s)
 
-	if s.Checksum != nil {
-		t.Error("nil Checksum was materialised into a non-nil slice")
-	}
 	if s.Membership.Addresses != nil {
 		t.Error("nil Addresses map was materialised into a non-nil map")
 	}

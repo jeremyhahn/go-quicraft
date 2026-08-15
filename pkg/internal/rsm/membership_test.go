@@ -418,7 +418,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 			{Index: 200, Cmd: makeCmd("ex", "val")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -448,7 +448,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 			{Index: 50, ClientID: 10, SeriesID: 1, Cmd: makeCmd("act", "ive")},
 		}
 		r1 := make([]sm.Result, 1)
-		if err := rsm.Apply(entries1, r1); err != nil {
+		if err := applyContiguous(t, rsm, entries1, r1); err != nil {
 			t.Fatalf("Apply(1) = %v", err)
 		}
 
@@ -457,7 +457,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 			{Index: 120, Cmd: makeCmd("xx", "yy")},
 		}
 		r2 := make([]sm.Result, 1)
-		if err := rsm.Apply(entries2, r2); err != nil {
+		if err := applyContiguous(t, rsm, entries2, r2); err != nil {
 			t.Fatalf("Apply(2) = %v", err)
 		}
 
@@ -495,7 +495,7 @@ func TestMembership_SessionPreservedAcrossSnapshotWithExpiry(t *testing.T) {
 			{Index: 800, ClientID: 10, SeriesID: 1, Cmd: makeCmd("pr", "sv")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm1, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -628,7 +628,7 @@ func TestMembership_DedupAfterSnapshotRecovery(t *testing.T) {
 			{Index: 10, ClientID: 10, SeriesID: 2, Cmd: makeCmd("dd2", "DIFFERENT")},
 		}
 		dupResults := make([]sm.Result, 1)
-		if err := rsm2.Apply(dupEntries, dupResults); err != nil {
+		if err := applyContiguous(t, rsm2, dupEntries, dupResults); err != nil {
 			t.Fatalf("Apply(dup) = %v", err)
 		}
 		if dupResults[0].Value != originalSeries2Result {
@@ -898,7 +898,7 @@ func TestMembership_ExpiredSessionEntryRejected(t *testing.T) {
 			{Index: 200, Cmd: makeCmd("trigger", "expiry")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply = %v", err)
 		}
 
@@ -1011,7 +1011,7 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 				{Index: 100 + evictedSeries, ClientID: 10, SeriesID: evictedSeries, Cmd: makeCmd("fail", "fail")},
 			}
 			results := make([]sm.Result, 1)
-			if err := rsm.Apply(entries, results); err != nil {
+			if err := applyContiguous(t, rsm, entries, results); err != nil {
 				t.Fatalf("Apply(replay %d) = %v", evictedSeries, err)
 			}
 			if results[0].Value != sm.ResultSessionExpired {
@@ -1024,7 +1024,7 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 			{Index: 200, ClientID: 10, SeriesID: 5, Cmd: makeCmd("fail", "fail")},
 		}
 		dupResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dupEntries, dupResults); err != nil {
+		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
 			t.Fatalf("Apply(dup series 5) = %v", err)
 		}
 		if dupResults[0].Value == sm.ResultSessionExpired {
@@ -1167,7 +1167,7 @@ func TestMembership_HighRespondedToEvictsMultiple(t *testing.T) {
 			{Index: 10, ClientID: 10, SeriesID: 10, RespondedTo: 3, Cmd: makeCmd("h10", "v")},
 		}
 		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
+		if err := applyContiguous(t, rsm, entries, results); err != nil {
 			t.Fatalf("Apply(10) = %v", err)
 		}
 
@@ -1177,7 +1177,7 @@ func TestMembership_HighRespondedToEvictsMultiple(t *testing.T) {
 				{Index: 100 + evicted, ClientID: 10, SeriesID: evicted, Cmd: makeCmd("x", "y")},
 			}
 			replayResults := make([]sm.Result, 1)
-			if err := rsm.Apply(replayEntries, replayResults); err != nil {
+			if err := applyContiguous(t, rsm, replayEntries, replayResults); err != nil {
 				t.Fatalf("Apply(replay %d) = %v", evicted, err)
 			}
 			if replayResults[0].Value != sm.ResultSessionExpired {

@@ -381,6 +381,37 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 		return nil
 	}
 
+	// The batch must not start ABOVE lastApplied+1. lastApplied is not
+	// bookkeeping here: it is the lower bound of the expiry checkpoint walk
+	// below, so a batch that leaves a hole beneath it makes this replica
+	// evaluate expiry over a different index range than the replicas that
+	// applied the same committed log contiguously — a divergence that leaves
+	// every raft invariant intact and would otherwise be silent.
+	//
+	// A hole has two causes and both are fatal to this state machine:
+	// committed entries were dropped before reaching it, or lastApplied was
+	// never seeded from the index the shard RESUMED at (Host.StartShard seeds
+	// it beside engine Node.SeedLastApplied, and the runtime InstallSnapshot
+	// path seeds it via SetLastApplied). Failing loudly is the point — the
+	// alternative is a replica that quietly answers ResultSessionExpired for
+	// entries its peers apply normally.
+	//
+	// This is the same assertion the engine's apply worker makes one layer
+	// down against its own counter (internal/engine, ErrApplyGap), stated as
+	// an upper bound rather than an equality because the two layers see
+	// different streams: the worker filters entries at or below its marker
+	// before checking, whereas an already-applied entry that reaches here is
+	// the documented on-disk replay case and stays a no-op.
+	if prev := s.lastApplied.Load(); entries[0].Index > prev+1 {
+		slog.Error("rsm: committed entry gap before apply",
+			"shardID", s.shardID,
+			"replicaID", s.replicaID,
+			"last_applied", prev,
+			"batch_first_index", entries[0].Index,
+		)
+		return ErrApplyGap
+	}
+
 	// Adopt the shard's replicated policy before a single entry is classified,
 	// so the limits this batch is evaluated against are the shard's and not
 	// this node's. See sessionPolicyFn for why it is read here rather than
@@ -402,7 +433,15 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// Expiry enabled: walk the fixed checkpoints (multiples of the inactivity
 	// threshold) that fall in (prevIndex, lastIndex]. prevIndex is the last index applied
 	// before this call, so the checkpoint set continues seamlessly across Apply
-	// calls and across restart (lastApplied is restored from the snapshot). For
+	// calls and across restart — but ONLY because lastApplied is explicitly
+	// SEEDED to the resumed index by the two paths that resume a state machine
+	// (Host.StartShard and the engine's InstallSnapshot recovery, both via
+	// SetLastApplied). RecoverFromSnapshot does NOT restore it: the session
+	// table is in the snapshot stream, this counter is not. A replica that
+	// resumed with it left at 0 would re-walk every checkpoint its peers
+	// already walked, and ExpireSessions is capped per call, so the re-walk
+	// deletes sessions the shard still holds. The contiguity guard at the top
+	// of Apply is what makes that unseeded state fail instead of diverge. For
 	// each checkpoint we first flush every not-yet-applied entry at or below
 	// the checkpoint index, then run expiry — so expiry always observes a
 	// consistent, fully-applied session state as of that exact index.
@@ -1004,13 +1043,23 @@ func (s *StateMachine) LastApplied() uint64 {
 	return s.lastApplied.Load()
 }
 
-// SetLastApplied records idx as the index of the last applied entry. It is
-// called by the engine's snapshot pool after RecoverFromSnapshot installs
-// snapshot state at idx: the recovered state reflects exactly idx, and this
-// counter is the index source for the NEXT snapshot save, so the two must
-// agree or a snapshot taken before the next Apply would pair a stale index
-// with post-recovery state. The engine quiesces applies for the duration of
-// recovery, so no concurrent Apply can race this store.
+// SetLastApplied records idx as the index of the last applied entry. Every
+// path that RESUMES a state machine at a non-zero index must call it, because
+// nothing else sets this counter: the on-disk Open path seeds it from the SM's
+// own durable position and RecoverFromSnapshot sets it not at all (the session
+// table travels in the snapshot stream; this counter does not).
+//
+// The two callers are the engine's snapshot pool, after RecoverFromSnapshot
+// installs snapshot state at idx, and Host.StartShard, beside the engine node's
+// SeedLastApplied on the restart path. Both matter for the same two reasons:
+// the counter is the index source for the NEXT snapshot save, so a snapshot
+// taken before the next Apply would otherwise pair a stale index with
+// post-recovery state; and it is the lower bound of Apply's session expiry
+// checkpoint walk, so a stale value silently re-expires sessions the rest of
+// the shard still holds (see Apply).
+//
+// Applies are quiesced for the duration of recovery and the node is not yet in
+// the pipeline during StartShard, so no concurrent Apply can race this store.
 func (s *StateMachine) SetLastApplied(idx uint64) {
 	s.lastApplied.Store(idx)
 }

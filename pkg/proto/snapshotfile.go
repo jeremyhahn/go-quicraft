@@ -39,8 +39,18 @@ func (sf *SnapshotFile) Size() int {
 }
 
 // MarshalTo writes the snapshot file into buf and returns bytes written.
-// buf must be at least Size() bytes.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen, or
+// ErrMetadataTooLong if Metadata exceeds MaxMetadataLen — the read side's
+// bounds applied on write, so the encoder cannot emit a record this package
+// refuses to read back.
 func (sf *SnapshotFile) MarshalTo(buf []byte) (int, error) {
+	if len(sf.Filepath) > MaxFilepathLen {
+		return 0, ErrFilepathTooLong
+	}
+	if uint64(len(sf.Metadata)) > uint64(MaxMetadataLen) {
+		return 0, ErrMetadataTooLong
+	}
 	required := sf.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall

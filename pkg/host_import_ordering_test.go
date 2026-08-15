@@ -98,10 +98,23 @@ func TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots(t *testing.
 	// order LAST. Parse the names exactly as engine.listSnapshotDirs does — the
 	// imported directory's own name included, whatever it turned out to be —
 	// so this asserts the ordering GC and the recovery fallback actually see.
+	//
+	// ImportSnapshot now runs snapshot GC once the artifact is recorded, and
+	// the GC retains the last three directories — so the four here become
+	// three, with the OLDEST reclaimed. That the restore is not the one
+	// reclaimed is the property this test is about, and it is asserted
+	// directly below as well as through the ordering.
 	indices := snapshotDirIndices(t, filepath.Dir(wantDir))
-	if len(indices) != len(existing)+1 {
-		t.Fatalf("snapshot tree has %d directories %v, want %d",
-			len(indices), indices, len(existing)+1)
+	const retained = 3 // engine's maxSnapshotsRetained
+	if want := min(len(existing)+1, retained); len(indices) != want {
+		t.Fatalf("snapshot tree has %d directories %v, want %d (the import records "+
+			"a fourth and the GC retains the newest %d)",
+			len(indices), indices, want, retained)
+	}
+	if _, statErr := os.Stat(wantDir); statErr != nil {
+		t.Fatalf("the imported snapshot directory %q is gone after the import's own "+
+			"GC ran (%v): a disaster-recovery restore must never be the directory "+
+			"retention reclaims", wantDir, statErr)
 	}
 	importedOrder := snapshotDirIndex(t, imported.Filepath)
 	var maxIdx, minIdx uint64 = 0, ^uint64(0)
