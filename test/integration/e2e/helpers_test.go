@@ -677,7 +677,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		configs[i] = cfg
 	}
 
-	return &testCluster{
+	c := &testCluster{
 		hosts:   hosts,
 		addrs:   addrs,
 		configs: configs,
@@ -685,6 +685,79 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		mtls:    mtls,
 		t:       t,
 	}
+	setDiagCluster(t, c)
+	return c
+}
+
+// diagCluster holds the cluster most recently built by newTestCluster, so a
+// wait that expires can print the raft state behind it.
+//
+// A package-level handle rather than a parameter threaded through the twenty
+// call sites of waitForNodeData: this is the same trade the apply-order sink in
+// this package already makes, and for the same reason — integration tests here
+// never run in parallel, so "the current cluster" is unambiguous. The Cleanup
+// clears it so a later test can never print a torn-down cluster's state.
+var diagCluster struct {
+	mu sync.Mutex
+	c  *testCluster
+}
+
+func setDiagCluster(t *testing.T, c *testCluster) {
+	diagCluster.mu.Lock()
+	diagCluster.c = c
+	diagCluster.mu.Unlock()
+	t.Cleanup(func() {
+		diagCluster.mu.Lock()
+		if diagCluster.c == c {
+			diagCluster.c = nil
+		}
+		diagCluster.mu.Unlock()
+	})
+}
+
+// shardStateDump renders each live node's raft state for one shard: who it
+// believes the leader is, its term, how far it has applied, what its local log
+// spans and how much is queued. A node still catching up, a node that disagrees
+// about the leader, and a node whose log stops short all look different here.
+//
+// It never fails the test — it runs while one is already failing, so an error
+// on one node is reported inline and the rest still print.
+func shardStateDump(shardID uint64) string {
+	diagCluster.mu.Lock()
+	c := diagCluster.c
+	diagCluster.mu.Unlock()
+	if c == nil {
+		return "shard state: no cluster registered"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "shard %d state at failure:\n", shardID)
+
+	c.hostsMu.RLock()
+	hosts := make([]*quicraft.Host, len(c.hosts))
+	copy(hosts, c.hosts)
+	c.hostsMu.RUnlock()
+
+	for i, h := range hosts {
+		if h == nil || c.stopped[i].Load() {
+			fmt.Fprintf(&b, "  node[%d]: stopped\n", i)
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			fmt.Fprintf(&b, "  node[%d]: GetShardInfo: %v\n", i, err)
+			continue
+		}
+		logSpan := "unavailable"
+		if lr, err := h.GetLogRange(shardID); err == nil {
+			logSpan = fmt.Sprintf("[%d,%d]", lr.FirstIndex, lr.LastIndex)
+		}
+		fmt.Fprintf(&b,
+			"  node[%d] replica=%d leader=%d term=%d isLeader=%v applied=%d log=%s pending=%d confChange=%d health=%v\n",
+			i, info.ReplicaID, info.LeaderID, info.Term, info.IsLeader,
+			info.LastApplied, logSpan, info.Pending, info.ConfigChangeIndex, info.Health)
+	}
+	return b.String()
 }
 
 // startShard starts a shard on all nodes in the cluster. Returns the
@@ -983,6 +1056,31 @@ func waitForApplied(t *testing.T, h *quicraft.Host, shardID, targetIndex uint64,
 
 // waitForCondition polls until the predicate returns true or the timeout
 // expires.
+func waitForConditionDiag(
+	t *testing.T,
+	timeout time.Duration,
+	desc string,
+	predicate func() bool,
+	diag func() string,
+) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		if predicate() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out after %v waiting for condition: %s\n%s", timeout, desc, diag())
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicate func() bool) {
 	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -1611,12 +1709,13 @@ func waitForNodeData(
 		)
 	}
 	for key, val := range expected {
-		waitForCondition(t, timeout,
+		waitForConditionDiag(t, timeout,
 			fmt.Sprintf("replica=%d has key=%q", replicaID, key),
 			func() bool {
 				got, ok := nodeSM.Get(key)
 				return ok && got == val
 			},
+			func() string { return shardStateDump(shardID) },
 		)
 	}
 }
