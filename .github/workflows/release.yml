@@ -105,7 +105,15 @@ jobs:
   integration:
     name: Gate - integration suite
     runs-on: ubuntu-latest
-    needs: validate
+    # Runs LAST and alone, for the same reason ci.yml chains its heavy jobs:
+    # this suite stands up multi-node QUIC clusters under -race, and its waits
+    # are measured in seconds. Fanned out beside six fuzz gates, the errfs
+    # suite and the module build on one 20-core self-hosted runner, it lost a
+    # 30-second replication wait — which is exactly how the v0.4.0-alpha
+    # release gate failed. The fuzz, errfs and module gates are cheap and
+    # stay parallel with each other; nothing here needs their OUTPUT, so the
+    # dependency is purely to keep them off the runner at the same time.
+    needs: [validate, errfs, fuzz, modules]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
