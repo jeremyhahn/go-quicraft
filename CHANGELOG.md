@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1-alpha] - 2026-08-15
+
+Repairs to the release and CI gates. No library code changed: the go-quicraft
+module itself is byte-for-byte 0.4.0-alpha, and the two formats-and-safety
+notices in that entry still apply in full.
+
+0.4.0-alpha never published. Its release run failed three gates, and the
+`Publish` job correctly refused to run — the tag exists and resolves, but the
+gates behind it did not pass. This version is the same tree with those three
+causes fixed. It is a NEW version rather than a moved tag because go-qrdb had
+already recorded 0.4.0-alpha in its `go.sum`, and repointing a tag it has
+checksummed would fail its build with a security error.
+
+### Fixed
+
+- **The multi-module CI gate had never built a nested module.** It fanned out
+  over `matrix: ${{ fromJSON(needs.discover-modules.outputs.modules) }}`, which
+  the runner does not expand: it scheduled one job literally named
+  `Module ${{ matrix.module }}` whose `working-directory` interpolated to the
+  empty string, so it rebuilt the repository root and reported success. Five
+  modules were enrolled and none were compiled. Both workflows now use a shell
+  loop, collect failures instead of stopping at the first, and fail if
+  discovery returns fewer modules than exist — the defect was a gate quietly
+  verifying nothing, not a red build.
+
+- **`test/performance/dragonboat` could not build on a clean checkout.** It
+  resolved its comparison engine through
+  `replace github.com/lni/dragonboat/v4 => ../../../../dragonboat`, a path
+  outside the repository, so it compiled only where the fork happened to be
+  checked out four levels up. The fork is published as
+  `github.com/jeremyhahn/dragonboat/v4 v4.0.1` and is now required by version
+  and imported under its own name. Everything that existed to work around an
+  unpublishable dependency — the staged `.build-cache` copy, the Dockerfile's
+  rewrite of the `replace`, `perfcompare`'s staging hook and `DRAGONBOAT_SRC` —
+  is gone with it.
+
+- **The seal fuzz targets spent their entire budget on a key derivation they do
+  not test.** Each built a barrier per input with Argon2id at 64 MiB, holding
+  the package to ~50 exec/s and then to 0 exec/s as the GC fell behind; the
+  release gate's bounded mutation pass failed with `context deadline exceeded`,
+  which reads like a crash and was not one. The work factor bought nothing
+  because the suite runs with the weak-parameter bypass enabled. At 1 MiB the
+  same ten-second budget goes from ~500 executions to ~185,000.
+
+### Changed
+
+- A replication wait that times out in the host integration suite now prints
+  each live node's view of the leader, its term, applied index, local log span,
+  queue depth and health. A single timeout line could not distinguish a
+  leaderless cluster from a wedged replica from a slow runner, and the one such
+  failure observed on a release runner did not reproduce in ~30 local runs
+  under contention, so it could not be interpreted at all.
+
 ## [0.4.0-alpha] - 2026-08-15
 
 **This release breaks both the wire format and the on-disk format, and the
