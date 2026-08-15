@@ -793,6 +793,28 @@ func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.
 // expires.
 func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicate func() bool) {
 	t.Helper()
+	waitForConditionDiag(t, timeout, desc, predicate, nil)
+}
+
+// waitForConditionDiag is waitForCondition with a diagnostic callback that is
+// invoked ONCE, on timeout, and appended to the failure message.
+//
+// A replication wait that expires says only that some node did not reach some
+// state within N seconds, which is the same message whether the cluster is
+// leaderless, wedged behind a stuck replication window, or merely slow on a
+// loaded machine. When that happened on a release runner the log gave no way
+// to tell those apart, and the failure did not reproduce in thirty local runs
+// under deliberate CPU contention — so the one observation that existed had to
+// be thrown away. The diagnostic runs only on the failing path, so it costs
+// nothing when the suite is green.
+func waitForConditionDiag(
+	t *testing.T,
+	timeout time.Duration,
+	desc string,
+	predicate func() bool,
+	diag func() string,
+) {
+	t.Helper()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
@@ -803,11 +825,55 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 		}
 		select {
 		case <-deadline.C:
+			if diag != nil {
+				t.Fatalf("timed out after %v waiting for condition: %s\n%s",
+					timeout, desc, diag())
+			}
 			t.Fatalf("timed out after %v waiting for condition: %s", timeout, desc)
 			return
 		case <-ticker.C:
 		}
 	}
+}
+
+// shardStateDump renders the raft state of every live node for one shard: who
+// each node believes the leader is, the term it is in, how far it has applied,
+// what its local log actually spans, and how much is still queued. A node that
+// is behind, a node that disagrees about the leader, and a node whose log stops
+// short all look different here, which is the whole point.
+//
+// It never fails the test: it runs while a test is already failing, so an error
+// reading one node is reported inline and the remaining nodes still print.
+func shardStateDump(cluster *testCluster, shardID uint64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "shard %d state at failure:\n", shardID)
+
+	for _, i := range cluster.liveNodeIndexes() {
+		cluster.hostsMu.RLock()
+		h := cluster.hosts[i]
+		cluster.hostsMu.RUnlock()
+		if h == nil {
+			fmt.Fprintf(&b, "  node[%d]: <nil host>\n", i)
+			continue
+		}
+
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			fmt.Fprintf(&b, "  node[%d]: GetShardInfo: %v\n", i, err)
+			continue
+		}
+
+		logSpan := "unavailable"
+		if lr, err := h.GetLogRange(shardID); err == nil {
+			logSpan = fmt.Sprintf("[%d,%d]", lr.FirstIndex, lr.LastIndex)
+		}
+
+		fmt.Fprintf(&b,
+			"  node[%d] replica=%d leader=%d term=%d isLeader=%v applied=%d log=%s pending=%d confChange=%d health=%v\n",
+			i, info.ReplicaID, info.LeaderID, info.Term, info.IsLeader,
+			info.LastApplied, logSpan, info.Pending, info.ConfigChangeIndex, info.Health)
+	}
+	return b.String()
 }
 
 // waitForConditionNoFatal polls the predicate until timeout, returning true
@@ -917,12 +983,13 @@ func waitForReplication(t *testing.T, cluster *testCluster, trackers []*smTracke
 	verified := 0
 	for _, i := range live {
 		nodeSM := waitForStateMachine(t, cluster, trackers, shardID, i, timeout)
-		waitForCondition(t, timeout,
+		waitForConditionDiag(t, timeout,
 			fmt.Sprintf("node[%d] replicates key=%q", i, key),
 			func() bool {
 				val, ok := nodeSM.Get(key)
 				return ok && val == expectedVal
 			},
+			func() string { return shardStateDump(cluster, shardID) },
 		)
 		verified++
 	}
@@ -1125,12 +1192,13 @@ func verifyAllData(
 	for _, i := range live {
 		nodeSM := waitForStateMachine(t, cluster, trackers, shardID, i, membershipTimeout)
 		for key, val := range expected {
-			waitForCondition(t, membershipTimeout,
+			waitForConditionDiag(t, membershipTimeout,
 				fmt.Sprintf("node[%d] has key=%q", i, key),
 				func() bool {
 					got, ok := nodeSM.Get(key)
 					return ok && got == val
 				},
+				func() string { return shardStateDump(cluster, shardID) },
 			)
 		}
 		verified++
