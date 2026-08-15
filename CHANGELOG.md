@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.1-alpha] - 2026-08-15
 
-Repairs to the release and CI gates. No library code changed: the go-quicraft
-module itself is byte-for-byte 0.4.0-alpha, and the two formats-and-safety
-notices in that entry still apply in full.
+Repairs to the release and CI gates. No non-test source changed anywhere in the
+module — the compiled library is identical to 0.4.0-alpha, the only edits under
+`pkg/` being to a `_test.go` file behind a build tag — so the two
+formats-and-safety notices in that entry still apply in full, and consumers can
+move from 0.4.0-alpha to this with no code change of their own.
 
 0.4.0-alpha never published. Its release run failed three gates, and the
 `Publish` job correctly refused to run — the tag exists and resolves, but the
