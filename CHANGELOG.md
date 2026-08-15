@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2-alpha] - 2026-08-15
+
+Release-workflow fixes only. Nothing outside `.github/workflows/` differs from
+0.4.1-alpha, so the library, its formats and its behaviour are unchanged and
+0.4.1-alpha remains a perfectly good version to depend on — it resolves and
+builds. What it did not do is get through its own release gate.
+
+### Fixed
+
+- **The release gates all ran at once, and the runner could not carry them.**
+  Every gate hung off `needs: validate`, so the integration suite — multi-node
+  QUIC clusters under `-race`, with waits measured in seconds — was fanned out
+  beside six fuzz gates, the errfs suite and the module build on one 20-core
+  self-hosted runner.
+
+  This produced three failures wearing three different disguises across two
+  release attempts: a 30s rolling-restart wait, a 30s snapshot-catch-up wait,
+  and `context deadline exceeded` from a fuzz gate that had run at 79,000
+  exec/s and completed its full budget before dying in shutdown. None was a
+  defect in the code under test. The last is the one worth naming: it is
+  indistinguishable from a crash at a glance, on the gate whose entire purpose
+  is to report crashes.
+
+  The integration gate now runs alone, after the cheap gates, and the fuzz
+  matrix is capped at three concurrent jobs — Go's fuzzing engine starts one
+  worker per CPU, so six jobs schedule ~24 workers on 20 cores by themselves.
+  `ci.yml` got the same treatment in the same release for the same reason.
+
 ## [0.4.1-alpha] - 2026-08-15
 
 Repairs to the release and CI gates, plus one behaviour fix those gates
