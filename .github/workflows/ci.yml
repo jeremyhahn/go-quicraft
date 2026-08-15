@@ -247,7 +247,22 @@ jobs:
   integration:
     name: Integration [build tag integration]
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    # `needs: test` is for ISOLATION, not ordering: it keeps the two heaviest
+    # jobs off the runner at the same time. Each of these jobs already
+    # serialises internally with -p 1 because concurrent multi-node QUIC
+    # packages under -race starve each other — but nothing was stopping the
+    # JOBS from overlapping, and on a 20-core self-hosted runner they did. In
+    # run 418, Integration (547s) overlapped the full unit suite (188s) AND
+    # contrib/dragonboat's own multi-node integration suite (130s), and a 30s
+    # snapshot-catch-up wait expired inside that window. The run before it lost
+    # a 30s rolling-restart wait the same way. Neither reproduces on a quiet
+    # machine — the rolling-restart case survived thirty local runs, twenty of
+    # them under deliberate twenty-way CPU contention.
+    #
+    # This serialises the three heavy jobs and costs a few minutes of wall
+    # clock. The short jobs (errfs, fuzz seeds) stay parallel; they finish in
+    # seconds and contend with nothing.
+    needs: [lint, build, test]
     # 45, not 30: the suite is ~9 min on a quiet machine but every package runs
     # under -race with -p 1, so a loaded runner stretches it considerably. The
     # -timeout=1800s below is the real budget; this is only the outer backstop.
@@ -397,7 +412,11 @@ jobs:
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration]
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    # Last of the three heavy jobs; see the note on `integration`. This one
+    # stands up multi-node QUIC clusters through the dragonboat compatibility
+    # API, so running it beside the main integration suite is the same mistake
+    # twice.
+    needs: [lint, build, integration]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
