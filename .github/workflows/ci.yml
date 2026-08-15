@@ -308,7 +308,7 @@ jobs:
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz ./...
 
   # ==========================================================================
-  # Multi-module build matrix
+  # Multi-module build
   #
   # This repository is not one Go module. The root module plus contrib/ and the
   # benchmark harnesses under test/performance/ are separately versioned, and
@@ -320,35 +320,23 @@ jobs:
   # The module list is DISCOVERED, not declared, so adding a go.mod anywhere in
   # the tree enrolls it automatically. A static list would drift back into
   # exactly the state this job exists to prevent.
+  #
+  # This was a `discover-modules` job feeding
+  # `matrix: ${{ fromJSON(needs.discover-modules.outputs.modules) }}`, and it
+  # never ran. The runner does not expand a matrix sourced from another job's
+  # output, so it scheduled ONE job literally named `Module ${{ matrix.module }}`
+  # whose `working-directory` interpolated to the empty string — the repository
+  # root. Every run since was green because it built the root module a second
+  # time and not one of the five nested modules; the first honest run of the
+  # equivalent loop in release.yml failed on the first tag. A shell loop
+  # expands identically on every runner, and MODULE_FLOOR makes a repeat of
+  # that silent collapse fail the job instead of passing it.
   # ==========================================================================
 
-  discover-modules:
-    name: Discover modules
-    runs-on: ubuntu-latest
-    outputs:
-      modules: ${{ steps.find.outputs.modules }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Enumerate go.mod directories
-        id: find
-        run: |
-          set -euo pipefail
-          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' \
-            | sed 's|^\./||' | sort | jq -R . | jq -sc .)"
-          echo "Modules: ${MODULES}"
-          echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
-
   modules:
-    name: Module ${{ matrix.module }}
+    name: Nested module build + vet
     runs-on: ubuntu-latest
-    needs: discover-modules
     timeout-minutes: 20
-    strategy:
-      # One broken sibling must not hide a second one.
-      fail-fast: false
-      matrix:
-        module: ${{ fromJSON(needs.discover-modules.outputs.modules) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -359,13 +347,34 @@ jobs:
       # GOWORK=off (workflow env) matters most here: with a workspace active
       # these modules resolve the root through the workspace and the `go`
       # directive mismatch that broke contrib/dragonboat would not reproduce.
-      - name: Build
-        working-directory: ${{ matrix.module }}
-        run: go build ./...
-
-      - name: Vet
-        working-directory: ${{ matrix.module }}
-        run: go vet ./...
+      - name: Build and vet every module in the tree
+        run: |
+          set -uo pipefail
+          MODULE_FLOOR=6
+          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort)"
+          COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
+          echo "Discovered ${COUNT} module(s):"
+          printf '%s\n' "${MODULES}"
+          if [ "${COUNT}" -lt "${MODULE_FLOOR}" ]; then
+            echo "FAIL: discovered ${COUNT} modules but expected at least ${MODULE_FLOOR}."
+            echo "If a module was removed on purpose, lower MODULE_FLOOR in the same commit."
+            echo "Otherwise discovery has broken and this gate is verifying nothing."
+            exit 1
+          fi
+          # Collected rather than fail-fast: one broken sibling must not hide
+          # a second one. This is what `fail-fast: false` did for the matrix.
+          FAILED=""
+          for dir in ${MODULES}; do
+            echo "::group::${dir}"
+            if ! (cd "${dir}" && go build ./... && go vet ./...); then
+              FAILED="${FAILED} ${dir}"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "${FAILED}" ]; then
+            echo "FAIL: module(s) did not build or vet cleanly:${FAILED}"
+            exit 1
+          fi
 
   # ==========================================================================
   # contrib/dragonboat test suites
