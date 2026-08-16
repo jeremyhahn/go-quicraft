@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -777,7 +778,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// left at a clean boundary for the caller to continue on (see
 	// handleStream): tearing the stream down would punish every peer sharing
 	// the aggregate budget for one peer's burst.
-	if !t.reserveMsgRecvBudget(int64(length)) {
+	if !t.reserveMsgRecvBudget(decodeCharge(int64(length))) {
 		n := t.recvBudgetDrops.Add(1)
 		if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 			slog.Warn("message frame dropped: receive memory budget exhausted",
@@ -788,7 +789,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		}
 		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
 	}
-	defer t.releaseMsgRecvBudget(int64(length))
+	defer t.releaseMsgRecvBudget(decodeCharge(int64(length)))
 
 	// The per-connection sub-budget bounds what one peer can hold of the
 	// aggregate, so a single connection cannot starve all the others.
@@ -846,7 +847,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		// deferred release keeps the accounting exactly balanced on every exit
 		// path (success and error) for the remainder of this frame's processing.
 		if delta := int64(declaredLen) - int64(length); delta > 0 {
-			if !t.reserveMsgRecvBudget(delta) {
+			if !t.reserveMsgRecvBudget(decodeCharge(delta)) {
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
 				if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
@@ -859,7 +860,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 				}
 				return ErrMessageRecvMemoryBudgetExceeded
 			}
-			defer t.releaseMsgRecvBudget(delta)
+			defer t.releaseMsgRecvBudget(decodeCharge(delta))
 			if !t.reserveConnMsgRecvBudget(inboundConn, delta) {
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
@@ -1349,6 +1350,37 @@ func (t *QUICTransport) dropFrame(r io.Reader, length uint32, transient error) e
 		return &FrameDrainError{Declared: length, Drained: drained, Err: err}
 	}
 	return transient
+}
+
+// decodeCharge converts a frame's on-the-wire length into the heap it can
+// actually occupy while being decoded.
+//
+// The budget used to reserve the wire length alone, which is the one number the
+// decode is guaranteed NOT to be bounded by. Decoding a membership-dense frame
+// was measured at up to 9.77x its wire size — maps whose size hint was clamped
+// far below their real entry count reallocated the whole table at every
+// doubling, and the superseded tables stayed live until GC. Sizing those maps
+// exactly brought the worst case to 5.05x, and proto.MaxDecodeMemoryFactor
+// states the ceiling the codec now holds itself to.
+//
+// Charging the wire length therefore let a 256 MB MaxMessageReceiveMemory admit
+// frames that could occupy roughly 2 GB of heap at once, which is the aggregate
+// bound the budget exists to enforce, defeated by construction. Charging the
+// factor makes the configured limit mean what it says. The visible effect is
+// that fewer frames are admitted concurrently for the same configured budget;
+// that is the correct reading of the setting, not a regression.
+//
+// Saturating rather than wrapping: length is already bounded by MaxFrameSize
+// well below the overflow point, but a reservation that wrapped negative would
+// hand out unlimited budget, so the arithmetic is not left to trust.
+func decodeCharge(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	if n > math.MaxInt64/proto.MaxDecodeMemoryFactor {
+		return math.MaxInt64
+	}
+	return n * proto.MaxDecodeMemoryFactor
 }
 
 // reserveMsgRecvBudget atomically reserves n bytes against the aggregate

@@ -14,7 +14,36 @@
 
 package sm
 
-import "strconv"
+import (
+	"fmt"
+	"strconv"
+)
+
+// UnsupportedLookupResultError is returned by CachedDiskStateMachine.BytesLookup
+// when the wrapped state machine's Lookup answers with a type the byte-oriented
+// path cannot represent.
+//
+// It exists because the alternative was returning (nil, nil), which reports the
+// answer as "supported, and the value is empty" — indistinguishable from a
+// genuine empty value and from a missing key. A caller reading through the
+// no-allocation path then silently saw nothing where the ordinary Lookup would
+// have returned a real result. Naming the type that came back is the difference
+// between a one-line fix in the state machine and an unexplained empty read.
+type UnsupportedLookupResultError struct {
+	// Got is the concrete type the inner Lookup returned.
+	Got string
+}
+
+// Error returns a human-readable description of the unusable result type.
+func (e *UnsupportedLookupResultError) Error() string {
+	return "sm: BytesLookup cannot represent a Lookup result of type " + e.Got +
+		"; implement NALookup on the state machine or return []byte"
+}
+
+// unsupportedLookupResult builds the error for v.
+func unsupportedLookupResult(v interface{}) error {
+	return &UnsupportedLookupResultError{Got: fmt.Sprintf("%T", v)}
+}
 
 // InvalidCacheConfigError is returned when CacheConfig validation fails.
 type InvalidCacheConfigError struct {

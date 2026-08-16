@@ -231,7 +231,15 @@ func (c *CachedDiskStateMachine) BytesLookup(key []byte) ([]byte, error) {
 	if b, ok := result.([]byte); ok {
 		return b, nil
 	}
-	return nil, nil
+	// The inner state machine answered with something this byte-oriented path
+	// cannot represent. Returning (nil, nil) reported that as "supported, and
+	// the value is empty", which is indistinguishable from a genuine empty
+	// value and from a missing key — so a caller reading through the
+	// no-allocation path silently saw nothing where the ordinary Lookup would
+	// have handed back a real result. Report the type instead: it is a
+	// programming error in the state machine, and naming what came back is the
+	// difference between a one-line fix and an unexplained empty read.
+	return nil, unsupportedLookupResult(result)
 }
 
 // GetHash delegates to the inner SM if it implements Hasher.

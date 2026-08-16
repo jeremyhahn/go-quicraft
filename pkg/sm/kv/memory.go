@@ -275,7 +275,20 @@ func (m *MemoryStore) SaveSnapshot(_ context.Context, w io.Writer, stopper <-cha
 	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
 		return err
 	}
-	for k, v := range clone {
+	// Serialise in key order. Ranging the map directly emits pairs in Go's
+	// randomised iteration order, so two replicas holding IDENTICAL state
+	// produce different snapshot bytes — and so does one replica snapshotting
+	// the same state twice. That defeats every byte-level comparison a
+	// consensus engine wants to make of a snapshot: divergence detection,
+	// deduplication, and any digest an operator compares across replicas. The
+	// decoder is order-independent, so this changes only what is written.
+	keys := make([]string, 0, len(clone))
+	for k := range clone {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := clone[k]
 		select {
 		case <-stopper:
 			return context.Canceled

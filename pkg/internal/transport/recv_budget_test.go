@@ -151,7 +151,13 @@ func TestMsgRecvBudget_CompressedDeltaCharged(t *testing.T) {
 // budget is processed normally, and both the compressed-length reservation and
 // the decompression delta are released afterward, restoring the baseline.
 func TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess(t *testing.T) {
-	const budget = 64 * 1024
+	// Scaled by the decode factor deliberately. The budget charges what a frame
+	// can occupy while being DECODED, not its wire length, so "a frame that
+	// fits" is a frame whose decode fits. Writing the multiplier out rather
+	// than hard-coding a larger number keeps this fixture correct if the factor
+	// ever changes, instead of silently becoming an out-of-budget test that
+	// asserts the in-budget path.
+	const budget = 64 * 1024 * proto.MaxDecodeMemoryFactor
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
 	cfg := Config{
