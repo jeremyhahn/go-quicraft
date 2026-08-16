@@ -12,10 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package enclave provides memory-protected containers for sensitive
-// cryptographic key material using memguard. ProtectedKey encrypts keys
-// at rest in memory via memguard.Enclave, while ProtectedBuffer provides
-// mlock'd guard-page-protected buffers for temporary access.
+// Package enclave provides userspace memory-protected containers for sensitive
+// cryptographic key material, built on memguard. ProtectedKey keeps a key
+// encrypted at rest in ordinary process memory via memguard.Enclave;
+// ProtectedBuffer provides an mlock'd, guard-paged buffer for the window in
+// which the plaintext key must actually be used.
+//
+// # The name is not a hardware enclave
+//
+// "Enclave" here is memguard's term for an encrypted in-memory container. It is
+// NOT a TEE, not SGX/SEV/TrustZone, and not a TPM or HSM boundary: everything
+// this package protects lives in the address space of this process, protected
+// by this process, and any code running with the ability to read this process's
+// memory — a debugger, a live core read, another goroutine with a stray slice —
+// defeats it. Hardware key custody in this stack belongs to go-xkms, where the
+// key never leaves the device. Nothing here should be read as offering that
+// property.
+//
+// # What is actually guaranteed
+//
+//   - ProtectedBuffer: memory is mlock'd (excluded from swap), fenced by guard
+//     pages, and canary-checked, and Destroy WIPES it before unmapping. That
+//     wipe is real and is the strongest guarantee in this package.
+//   - ProtectedKey: the key material is AEAD-encrypted under a per-process
+//     session key that memguard itself keeps in a locked buffer. A memory
+//     disclosure that captures only the enclave's ciphertext yields nothing
+//     without that session key, which is never written out and dies with the
+//     process.
+//   - Plaintext exposure is bounded to Open/Destroy windows, during which the
+//     key lives only in a ProtectedBuffer.
+//
+// # What is NOT guaranteed
+//
+//   - Clear does NOT wipe. It drops the enclave reference so the key can no
+//     longer be opened; the enclave's ciphertext is an ordinary heap slice that
+//     memguard exposes no API to zero, and it registers no finalizer, so those
+//     bytes persist until the garbage collector reclaims them. See
+//     ProtectedKey.Clear.
+//   - Nothing here survives SIGKILL, a hypervisor snapshot, or a cold-boot
+//     attack on the machine.
+//   - Derived copies made by consumers are outside this boundary. A cipher.AEAD
+//     built from an opened key holds the key in its own expanded key schedule,
+//     and neither the standard library nor x/crypto offers a way to wipe it.
 package enclave
 
 import (
@@ -121,6 +159,15 @@ func (p *ProtectedBuffer) Destroy() {
 
 // ProtectedKey wraps memguard.Enclave for encrypting key material at rest in memory.
 // The key is only decrypted when needed and immediately re-encrypted.
+//
+// LIFECYCLE, STATED HONESTLY: a ProtectedKey can be made unusable (Clear) but
+// cannot be erased. Clear revokes the ABILITY to open the key; the enclave's
+// ciphertext remains on the heap until the GC reclaims it, because memguard
+// offers no way to zero it. Callers that need erasure of the plaintext have it
+// already — the plaintext exists only inside the ProtectedBuffer that Open
+// returns, and ProtectedBuffer.Destroy genuinely wipes. Callers that need
+// erasure of the ciphertext cannot get it from this type; treat the key as
+// GC-bounded, not wiped. See the package doc.
 //
 // ProtectedKey is safe for concurrent use: the enclave reference is held in
 // an atomic.Pointer, so Open and Clear may race without a torn read. An

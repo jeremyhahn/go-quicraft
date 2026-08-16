@@ -20,15 +20,36 @@ package seal
 // file/KV record and its fsync.
 //
 // Contract:
+//
 //   - Returning nil MUST mean the blob is durable — it will be read back
 //     verbatim after a crash. The barrier activates the new epoch only after
 //     a nil return, so a premature nil re-introduces the data-loss window this
 //     hook exists to close.
+//
 //   - The argument is a private copy; the persister may retain or mutate it.
+//
 //   - The persister is invoked with the barrier's write lock HELD. It MUST NOT
 //     call back into the same Barrier (Encrypt, Rotate, SealedRootKeyData, …)
 //     or it will deadlock.
+//
 //   - Returning an error aborts the operation with the previous epoch intact.
+//
+//   - EXCLUSIVITY: the embedder MUST guarantee that only ONE live barrier writes
+//     a given sealed blob. This is a cryptographic requirement, not an
+//     operational preference. Every DEK input (root key, salt, deployment ID,
+//     epoch) is a function of the blob, and Unseal's forced rotation moves to
+//     epoch+1, so two barriers loaded from the same blob derive the SAME DEK,
+//     each with a zeroed invocation counter and an empty nonce tracker. Both
+//     then believe they own the full NIST SP 800-38D budget for that key and
+//     neither can see the other's nonces — the exact duplicate-key condition the
+//     invocation cap exists to bound.
+//
+//     The barrier cannot detect this, and none of its other defences apply:
+//     MinEpoch is a floor against replay of an OLDER blob, while here both
+//     loaders read the current one, and StateMAC authenticates both copies
+//     because both are genuine. Enforce it outside — an exclusive
+//     data-directory lock, or a persister backed by a compare-and-swap that
+//     rejects a write whose expected prior epoch no longer matches.
 type StatePersister func(*SealedRootKey) error
 
 // BarrierConfig configures the algorithm-agile epoch barrier.
@@ -71,13 +92,18 @@ type BarrierConfig struct {
 	// random-nonce + invocation-cap argument) for extreme-throughput, long-epoch
 	// deployments where per-epoch memory must stay flat.
 	//
-	// CEILING — tracking is NOT unconditional for the life of the epoch. The
-	// default tracker enforces the memory bound above rather than only
+	// CEILING — tracking covers a PREFIX of the epoch, never the whole of it.
+	// The default tracker enforces the memory bound above rather than only
 	// documenting it: past DefaultMaxTrackedNonces (4Mi nonces, ~160 MB) it logs
-	// at error level and DISABLES reuse detection for the remainder of the
-	// epoch instead of growing until the process is killed. Detection therefore
-	// covers the first DefaultMaxTrackedNonces encryptions of each epoch and no
-	// more; raise or remove the ceiling with
+	// at error level and SATURATES — it admits no further nonces, so memory
+	// stays flat, and keeps rejecting repeats of the ones it already holds,
+	// which costs nothing. Exact detection therefore covers the first
+	// DefaultMaxTrackedNonces encryptions of each epoch and no more: with the
+	// default 2^32 invocation limit that is 0.0977% of the epoch's permitted
+	// invocations, and the remaining 99.9% rests on the random-96-bit-nonce plus
+	// invocation-cap argument alone. Read the coverage state from
+	// InMemoryNonceTracker.Saturated and Count, not from IsEnabled, which
+	// reports only the operator's switch. Raise or remove the ceiling with
 	// InMemoryNonceTracker.SetMaxTrackedNonces (via NonceTrackerProvider) when
 	// the epoch is guaranteed to rotate well before memory becomes a concern.
 	// NewBarrier additionally warns when tracking is on with neither a
@@ -203,6 +229,12 @@ type BarrierConfig struct {
 	// still references (the engine computes exactly this as its global
 	// safe-purge floor / minimum live epoch). Zero disables the check, which is
 	// the historical behavior.
+	//
+	// SCOPE — this is a floor against REPLAY, and replay only. It does nothing
+	// about the other route to a duplicated DEK: two live barriers loading the
+	// SAME current blob, which needs no rollback and therefore clears any floor
+	// this field can express. Only the embedder's exclusive ownership of the
+	// blob rules that out; see the StatePersister contract.
 	MinEpoch uint64
 
 	// AllowUnauthenticatedSealedState permits loading a SealedRootKey that

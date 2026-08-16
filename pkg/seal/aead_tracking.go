@@ -49,6 +49,17 @@ const (
 	// far above any legitimate pre-rotation working set (~4M nonces, on the
 	// order of 160 MB) and exists so the failure is a loud, bounded
 	// degradation instead of an OOM.
+	//
+	// COVERAGE, STATED PLAINLY: 4Mi is 0.0977% of DefaultInvocationLimit. An
+	// epoch that rides its NIST budget to the end therefore has fewer than one
+	// invocation in a thousand covered by exact reuse detection, and the
+	// remainder rests on the random-96-bit-nonce + invocation-cap argument
+	// alone. That is not a defect of the ceiling — retaining 2^32 nonces is not
+	// implementable — but it is the reason detection must never be described as
+	// covering "the epoch": it covers a PREFIX of the epoch. Past the ceiling
+	// the tracker becomes SATURATED rather than blind: it admits no new nonces
+	// (so memory stays flat) and keeps rejecting repeats of the ones it already
+	// holds, which costs nothing. See InMemoryNonceTracker.Saturated.
 	DefaultMaxTrackedNonces int64 = 4 << 20
 )
 
@@ -245,10 +256,18 @@ func (ic *InMemoryInvocationCounter) Close() error {
 //
 // Thread-safe: reads use sync.Map's lock-free fast path; writes use
 // sync.Map's internal sharding. The enabled flag is protected by atomic operations.
-// Memory is bounded by maxTracked: past that ceiling the tracker logs an error
-// and disables itself rather than growing without limit, since Clear is reached
-// only through a successful key rotation. Clear re-arms a tracker that
-// auto-disabled, because the new epoch starts with no history to retain.
+//
+// COVERAGE IS A PREFIX, NOT AN EPOCH. Memory is bounded by maxTracked, and
+// entries are released only by Clear, which is reached only through a successful
+// key rotation. Past the ceiling the tracker becomes SATURATED: it stops
+// ADMITTING new nonces — which is the only thing that would grow memory — and
+// keeps CHECKING every presented nonce against the set it already holds, which
+// is free. Exact detection therefore covers the first maxTracked encryptions of
+// an epoch and no more; the remainder rests on the random-nonce plus
+// invocation-cap argument (NIST SP 800-38D). Saturated reports this state
+// distinctly from IsEnabled, so a monitor can tell "operator turned it off" from
+// "ceiling reached, coverage now partial". Clear ends saturation, because the new
+// epoch starts with no history to retain.
 type InMemoryNonceTracker struct {
 	enabled atomic.Bool
 	nonces  atomic.Pointer[sync.Map]
@@ -258,10 +277,13 @@ type InMemoryNonceTracker struct {
 	// the ceiling.
 	maxTracked atomic.Int64
 
-	// overflowed records that the ceiling was reached and tracking was
-	// auto-disabled, so the error is logged once per epoch and Clear knows to
-	// re-arm.
-	overflowed atomic.Bool
+	// saturated records that the ceiling was reached, so the error is logged
+	// once per epoch, no further nonces are admitted, and Clear knows to lift
+	// it. It is deliberately NOT the enabled flag: an operator's SetEnabled
+	// decision and a memory ceiling are different facts and conflating them
+	// made a saturated tracker report "disabled, zero nonces tracked" — the
+	// same reading as a tracker that was never turned on.
+	saturated atomic.Bool
 }
 
 // NewNonceTracker creates an InMemoryNonceTracker bounded at
@@ -298,12 +320,19 @@ func nonceKey(nonce []byte) string {
 	return string(nonce)
 }
 
-// CheckAndRecordNonce checks whether nonce has been seen before and, if unique,
-// records it so future calls with the same bytes will be rejected.
+// CheckAndRecordNonce checks whether nonce has been seen before and, if unique
+// and there is room below the ceiling, records it so future calls with the same
+// bytes will be rejected.
 //
-// Returns ErrNonceReuse if the nonce was previously recorded.
-// Returns nil and records the nonce when it is unique.
-// Returns nil without recording when tracking is disabled.
+// Returns ErrNonceReuse if the nonce is present in the tracked set.
+// Returns nil and records the nonce when it is unique and the tracker has room.
+// Returns nil WITHOUT recording when the tracker is saturated (the ceiling has
+// been reached) or when tracking is disabled.
+//
+// The reuse check runs against the tracked set unconditionally, saturated or
+// not: looking a nonce up costs no memory, so there is no reason to stop
+// checking the prefix the tracker does hold. What saturation stops is ADMISSION,
+// which is the only operation that grows memory.
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
@@ -314,6 +343,15 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 	key := nonceKey(nonce)
 	nonces := nt.nonces.Load()
 
+	// Saturated: check only. A new nonce is accepted unverified — it is outside
+	// the covered prefix — but a repeat of a retained one is still caught.
+	if nt.saturated.Load() {
+		if _, exists := nonces.Load(key); exists {
+			return ErrNonceReuse
+		}
+		return nil
+	}
+
 	// The reuse check runs FIRST so a repeat of an already-recorded nonce is
 	// still caught at the ceiling: it costs no additional memory.
 	if _, loaded := nonces.LoadOrStore(key, struct{}{}); loaded {
@@ -322,54 +360,76 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 
 	// This nonce is new. Admitting it past the ceiling is what would grow the
 	// tracker without limit, so the entry that crosses the ceiling is rolled
-	// back and tracking is disabled instead.
+	// back and the tracker saturates instead.
 	n := nt.count.Add(1)
 	if max := nt.maxTracked.Load(); max > 0 && n > max {
 		nonces.Delete(key)
 		nt.count.Add(-1)
-		nt.disableOnOverflow(max)
+		nt.saturateAtCeiling(max)
 	}
 	return nil
 }
 
-// disableOnOverflow turns tracking off once the ceiling is reached and reports
-// it once, at error level: continuing to grow would exhaust memory, and
-// silently dropping nonces would leave a tracker that reports "no reuse"
-// without checking. Rotating the epoch (Clear) re-arms it.
-func (nt *InMemoryNonceTracker) disableOnOverflow(max int64) {
-	if !nt.overflowed.CompareAndSwap(false, true) {
+// saturateAtCeiling stops admission once the ceiling is reached and reports it
+// once, at error level. Continuing to admit would exhaust memory; the retained
+// set stays checkable, so detection degrades to the covered prefix rather than
+// vanishing. Rotating the epoch (Clear) lifts it.
+func (nt *InMemoryNonceTracker) saturateAtCeiling(max int64) {
+	if !nt.saturated.CompareAndSwap(false, true) {
 		return
 	}
-	nt.enabled.Store(false)
-	slog.Error("quicraft/seal: nonce tracker ceiling reached; nonce-reuse detection DISABLED for this epoch",
+	slog.Error("quicraft/seal: nonce tracker ceiling reached; reuse detection now covers only the nonces already tracked",
 		"tracked", nt.count.Load(),
 		"max_tracked", max,
 		"remedy", "rotate the epoch (requires a StatePersister), raise SetMaxTrackedNonces, or disable NonceTracking",
 	)
 }
 
-// Contains reports whether nonce has been previously recorded without modifying
-// the tracker state. Returns false when tracking is disabled.
+// Saturated reports whether the tracker has reached its ceiling. A saturated
+// tracker admits no new nonces — so exact detection covers only the invocations
+// recorded before the ceiling — but still rejects repeats of what it holds.
+//
+// It is the honest coverage signal and is deliberately separate from IsEnabled:
+// an operator who turned tracking off and a tracker that ran out of room are
+// different conditions with different remedies.
+//
+// Thread-safe.
+func (nt *InMemoryNonceTracker) Saturated() bool {
+	return nt.saturated.Load()
+}
+
+// Contains reports whether nonce is present in the tracked set, without
+// modifying tracker state.
+//
+// It reports the tracker's ACTUAL contents rather than gating on the enabled
+// flag: a tracker that recorded nonces and was later disabled still holds them
+// (SetEnabled preserves history, and re-enabling resumes checking against it),
+// so answering "false" there would misreport the state an operator is asking
+// about.
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Contains(nonce []byte) bool {
-	if !nt.enabled.Load() {
+	// A zero-value tracker (one not built by NewNonceTracker) has no map. It
+	// holds nothing, so the answer is false — and reaching through the nil
+	// pointer to say so would panic.
+	nonces := nt.nonces.Load()
+	if nonces == nil {
 		return false
 	}
-
-	key := nonceKey(nonce)
-	_, exists := nt.nonces.Load().Load(key)
+	_, exists := nonces.Load(nonceKey(nonce))
 	return exists
 }
 
 // Count returns the number of unique nonces currently tracked.
-// Returns 0 when tracking is disabled.
+//
+// It reports the ACTUAL tracked count in every state, including saturated and
+// disabled. Zeroing it whenever the enabled flag was false made the two states
+// that matter most — "never turned on" and "ceiling reached, coverage now
+// partial" — read identically as "0 nonces tracked", which is precisely the
+// reading an operator must not be given.
 //
 // Thread-safe (O(1) via atomic counter).
 func (nt *InMemoryNonceTracker) Count() int {
-	if !nt.enabled.Load() {
-		return 0
-	}
 	return int(nt.count.Load())
 }
 
@@ -388,12 +448,10 @@ func (nt *InMemoryNonceTracker) Count() int {
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Clear() error {
-	// A tracker that auto-disabled on overflow is re-armed here: the epoch has
-	// changed, so there is no history left to retain and detection can resume
-	// from empty. A tracker disabled explicitly via SetEnabled stays disabled.
-	if nt.overflowed.CompareAndSwap(true, false) {
-		nt.enabled.Store(true)
-	}
+	// A saturated tracker regains full coverage here: the epoch has changed, so
+	// there is no history left to retain and admission can resume from empty. A
+	// tracker disabled explicitly via SetEnabled stays disabled.
+	nt.saturated.Store(false)
 	if !nt.enabled.Load() {
 		return nil
 	}

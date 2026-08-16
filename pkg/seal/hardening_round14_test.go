@@ -318,8 +318,13 @@ func TestNonceTracking_ZeroValueDefaultsOn(t *testing.T) {
 
 // TestNonceTracking_CeilingIsDocumentedAndAdjustable pins the second half of
 // DEFECT 3: detection is NOT unconditional for the life of the epoch. Past the
-// ceiling the tracker disables itself, and the only lever is
-// SetMaxTrackedNonces — which was documented nowhere.
+// ceiling the tracker saturates — it admits nothing further — and the only
+// lever is SetMaxTrackedNonces, which was documented nowhere.
+//
+// Updated for the saturation semantics: the tracker no longer clears its
+// enabled flag at the ceiling, because that conflated an operator's switch with
+// a memory bound and made a saturated tracker report "off, zero tracked". What
+// it stops is ADMISSION; the nonces it already holds stay checked.
 func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 	nt := NewNonceTracker(true)
 	if got := nt.MaxTrackedNonces(); got != DefaultMaxTrackedNonces {
@@ -331,20 +336,32 @@ func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 			t.Fatalf("CheckAndRecordNonce(%d): %v", i, err)
 		}
 	}
-	if nt.IsEnabled() {
-		t.Fatal("the tracker must disable itself once its ceiling is crossed")
+	if !nt.Saturated() {
+		t.Fatal("the tracker must saturate once its ceiling is crossed")
 	}
-	// The documented consequence: a genuine repeat is no longer detected.
-	if err := nt.CheckAndRecordNonce([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}); err != nil {
-		t.Fatalf("post-ceiling CheckAndRecordNonce = %v, want nil (detection is off)", err)
+	if got := nt.Count(); got != 2 {
+		t.Fatalf("tracked count = %d past the ceiling, want it pinned at 2", got)
 	}
-	// Raising the ceiling and clearing (what a rotation does) re-arms it.
+	// The documented consequence: a nonce OUTSIDE the covered prefix is no
+	// longer recorded, so its later repeat cannot be detected.
+	uncovered := []byte{9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if err := nt.CheckAndRecordNonce(uncovered); err != nil {
+		t.Fatalf("post-ceiling CheckAndRecordNonce = %v, want nil (outside the covered prefix)", err)
+	}
+	if err := nt.CheckAndRecordNonce(uncovered); err != nil {
+		t.Fatalf("repeat of an uncovered nonce = %v, want nil (it was never admitted)", err)
+	}
+	// Raising the ceiling and clearing (what a rotation does) restores full
+	// coverage.
 	nt.SetMaxTrackedNonces(DefaultMaxTrackedNonces)
 	if err := nt.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
+	if nt.Saturated() {
+		t.Fatal("Clear must lift saturation on a tracker that hit its ceiling")
+	}
 	if !nt.IsEnabled() {
-		t.Fatal("Clear must re-arm a tracker that auto-disabled on overflow")
+		t.Fatal("Clear must leave an enabled tracker enabled")
 	}
 }
 

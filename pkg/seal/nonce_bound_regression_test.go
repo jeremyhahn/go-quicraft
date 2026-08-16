@@ -17,6 +17,7 @@ package seal
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -96,8 +97,13 @@ func TestNonceTrackerBoundedPastCeiling(t *testing.T) {
 	if err := nt.CheckAndRecordNonce(nonceN(4)); err != nil {
 		t.Fatalf("nonce past the ceiling must be admitted, not rejected: %v", err)
 	}
-	if nt.IsEnabled() {
-		t.Fatal("tracker must disable itself at the ceiling instead of growing without limit")
+	if !nt.Saturated() {
+		t.Fatal("tracker must saturate at the ceiling instead of growing without limit")
+	}
+	// The bound that matters is on MEMORY: the nonce that crossed the ceiling
+	// is rolled back, so the tracked set never exceeds maxTracked.
+	if got := nt.Count(); got != 4 {
+		t.Fatalf("tracked count past the ceiling = %d, want it pinned at the ceiling (4)", got)
 	}
 	if got := nt.MaxTrackedNonces(); got != 4 {
 		t.Fatalf("MaxTrackedNonces = %d, want 4", got)
@@ -107,9 +113,115 @@ func TestNonceTrackerBoundedPastCeiling(t *testing.T) {
 	}
 }
 
-// TestNonceTrackerClearReArmsAfterOverflow pins that rotation restores
-// detection: the new epoch has no history to retain, so an auto-disabled
-// tracker must come back rather than stay off for the process lifetime.
+// TestNonceTrackerSaturatedStillDetectsRetainedReuse pins the half of the
+// degradation that is free: past the ceiling the tracker stops ADMITTING
+// nonces, because admission is what consumes memory, but a lookup costs
+// nothing. A repeat of a nonce it already holds must therefore still be
+// rejected. Abandoning the check as well turned a bounded loss of coverage into
+// a total one — a tracker that answers "no reuse" about a nonce sitting in its
+// own map.
+func TestNonceTrackerSaturatedStillDetectsRetainedReuse(t *testing.T) {
+	captureLogs(t)
+
+	nt := NewNonceTracker(true)
+	nt.SetMaxTrackedNonces(2)
+	for i := uint64(0); i < 2; i++ {
+		if err := nt.CheckAndRecordNonce(nonceN(i)); err != nil {
+			t.Fatalf("nonce %d rejected below the ceiling: %v", i, err)
+		}
+	}
+	if err := nt.CheckAndRecordNonce(nonceN(2)); err != nil {
+		t.Fatalf("nonce past the ceiling must be admitted: %v", err)
+	}
+	if !nt.Saturated() {
+		t.Fatal("tracker must be saturated after crossing the ceiling")
+	}
+
+	// Catastrophic reuse of a RETAINED nonce must still fail closed.
+	if err := nt.CheckAndRecordNonce(nonceN(0)); !errors.Is(err, ErrNonceReuse) {
+		t.Fatalf("reuse of a retained nonce while saturated returned %v, want ErrNonceReuse: "+
+			"the covered prefix stopped being checked", err)
+	}
+	// Rejecting it must not have grown the set.
+	if got := nt.Count(); got != 2 {
+		t.Fatalf("tracked count = %d after a saturated reuse check, want 2", got)
+	}
+	// A nonce outside the covered prefix is accepted unverified and, crucially,
+	// still not admitted.
+	if err := nt.CheckAndRecordNonce(nonceN(9)); err != nil {
+		t.Fatalf("unseen nonce while saturated returned %v, want nil", err)
+	}
+	if got := nt.Count(); got != 2 {
+		t.Fatalf("tracked count = %d after admitting past the ceiling, want the ceiling (2)", got)
+	}
+}
+
+// TestNonceTrackerCountAndContainsReportTrueState pins the metric honesty fix.
+// Count and Contains used to be gated on the enabled flag, so a saturated
+// tracker — one holding maxTracked nonces with detection degraded to a prefix —
+// reported "0 tracked" and "false" for nonces sitting in its own map. That is
+// the same reading as a tracker that was never enabled, which is the one
+// conclusion an operator must not draw from it.
+func TestNonceTrackerCountAndContainsReportTrueState(t *testing.T) {
+	captureLogs(t)
+
+	nt := NewNonceTracker(true)
+	nt.SetMaxTrackedNonces(2)
+	for i := uint64(0); i < 3; i++ { // third crosses the ceiling
+		if err := nt.CheckAndRecordNonce(nonceN(i)); err != nil {
+			t.Fatalf("nonce %d: %v", i, err)
+		}
+	}
+	if got := nt.Count(); got != 2 {
+		t.Fatalf("Count() while saturated = %d, want the 2 nonces actually held", got)
+	}
+	if !nt.Contains(nonceN(0)) {
+		t.Fatal("Contains() while saturated denied a nonce the tracker holds")
+	}
+
+	// The same honesty after an explicit disable, which preserves history by
+	// contract (SetEnabled documents that re-enabling resumes checking against
+	// everything recorded).
+	nt2 := NewNonceTracker(true)
+	if err := nt2.CheckAndRecordNonce(nonceN(5)); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	nt2.SetEnabled(false)
+	if got := nt2.Count(); got != 1 {
+		t.Fatalf("Count() after SetEnabled(false) = %d, want the 1 nonce still retained", got)
+	}
+	if !nt2.Contains(nonceN(5)) {
+		t.Fatal("Contains() after SetEnabled(false) denied a nonce that is still retained")
+	}
+}
+
+// TestNonceTrackerSaturationIsNotDisablement pins that the two states stay
+// distinguishable in both directions: saturation must not flip the operator's
+// enabled flag, and an explicit disable must not read as saturation.
+func TestNonceTrackerSaturationIsNotDisablement(t *testing.T) {
+	captureLogs(t)
+
+	nt := NewNonceTracker(true)
+	nt.SetMaxTrackedNonces(1)
+	_ = nt.CheckAndRecordNonce(nonceN(0))
+	_ = nt.CheckAndRecordNonce(nonceN(1))
+	if !nt.Saturated() {
+		t.Fatal("tracker should be saturated")
+	}
+	if !nt.IsEnabled() {
+		t.Fatal("saturation must not clear the operator's enabled flag: the two are " +
+			"different facts with different remedies")
+	}
+
+	off := NewNonceTracker(false)
+	if off.Saturated() {
+		t.Fatal("a tracker that was never enabled must not report saturation")
+	}
+}
+
+// TestNonceTrackerClearReArmsAfterOverflow pins that rotation restores full
+// coverage: the new epoch has no history to retain, so a saturated tracker must
+// start admitting again rather than stay capped for the process lifetime.
 func TestNonceTrackerClearReArmsAfterOverflow(t *testing.T) {
 	captureLogs(t)
 
@@ -121,15 +233,18 @@ func TestNonceTrackerClearReArmsAfterOverflow(t *testing.T) {
 	if err := nt.CheckAndRecordNonce(nonceN(1)); err != nil {
 		t.Fatalf("overflow nonce rejected: %v", err)
 	}
-	if nt.IsEnabled() {
-		t.Fatal("tracker should be disabled after overflow")
+	if !nt.Saturated() {
+		t.Fatal("tracker should be saturated after crossing the ceiling")
 	}
 
 	if err := nt.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
+	if nt.Saturated() {
+		t.Fatal("Clear must lift saturation so the new epoch is covered from empty")
+	}
 	if !nt.IsEnabled() {
-		t.Fatal("Clear must re-arm a tracker that auto-disabled on overflow")
+		t.Fatal("Clear must leave an enabled tracker enabled")
 	}
 	if got := nt.Count(); got != 0 {
 		t.Fatalf("count after Clear = %d, want 0", got)

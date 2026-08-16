@@ -79,46 +79,68 @@ var (
 		"quicraft/seal: algorithm is not FIPS-approved; FIPS 140 mode requires AES-GCM")
 )
 
+// AEAD per-invocation plaintext ceilings. Exceeding one of these does not
+// return an error from the underlying implementation — it PANICS inside
+// crypto/cipher or x/crypto — so the barrier has to reject the message before
+// it reaches Seal. See SymmetricAlgorithm.MaxPlaintextSize.
+const (
+	// maxPlaintextGCM is GCM's ceiling: the 32-bit block counter limits one
+	// invocation to (2^32 - 2) 16-byte blocks, ~64 GiB. crypto/cipher panics
+	// with "crypto/cipher: message too large for GCM" beyond it.
+	maxPlaintextGCM uint64 = ((1 << 32) - 2) * 16
+
+	// maxPlaintextChaCha is the ChaCha20-Poly1305 ceiling used by x/crypto for
+	// BOTH the 12-byte-nonce and the extended-nonce (X) construction, ~256 GiB.
+	// x/crypto panics with "chacha20poly1305: plaintext too large" beyond it.
+	maxPlaintextChaCha uint64 = (1 << 38) - 64
+)
+
 // algorithmParams holds the static parameters for a SymmetricAlgorithm.
 type algorithmParams struct {
-	keySize   int
-	nonceSize int
-	name      string
-	newAEAD   func(key []byte) (cipher.AEAD, error)
+	keySize      int
+	nonceSize    int
+	maxPlaintext uint64
+	name         string
+	newAEAD      func(key []byte) (cipher.AEAD, error)
 }
 
 // algorithmRegistry maps algorithm identifiers to their parameters and
 // constructor functions for O(1) dispatch in newAEADForAlgorithm.
 var algorithmRegistry = map[SymmetricAlgorithm]algorithmParams{
 	AlgAES128GCM: {
-		keySize:   16,
-		nonceSize: 12,
-		name:      "AES-128-GCM",
-		newAEAD:   newAESGCM,
+		keySize:      16,
+		nonceSize:    12,
+		maxPlaintext: maxPlaintextGCM,
+		name:         "AES-128-GCM",
+		newAEAD:      newAESGCM,
 	},
 	AlgAES192GCM: {
-		keySize:   24,
-		nonceSize: 12,
-		name:      "AES-192-GCM",
-		newAEAD:   newAESGCM,
+		keySize:      24,
+		nonceSize:    12,
+		maxPlaintext: maxPlaintextGCM,
+		name:         "AES-192-GCM",
+		newAEAD:      newAESGCM,
 	},
 	AlgAES256GCM: {
-		keySize:   32,
-		nonceSize: 12,
-		name:      "AES-256-GCM",
-		newAEAD:   newAESGCM,
+		keySize:      32,
+		nonceSize:    12,
+		maxPlaintext: maxPlaintextGCM,
+		name:         "AES-256-GCM",
+		newAEAD:      newAESGCM,
 	},
 	AlgChaCha20Poly1305: {
-		keySize:   chacha20poly1305.KeySize,
-		nonceSize: chacha20poly1305.NonceSize,
-		name:      "ChaCha20-Poly1305",
-		newAEAD:   chacha20poly1305.New,
+		keySize:      chacha20poly1305.KeySize,
+		nonceSize:    chacha20poly1305.NonceSize,
+		maxPlaintext: maxPlaintextChaCha,
+		name:         "ChaCha20-Poly1305",
+		newAEAD:      chacha20poly1305.New,
 	},
 	AlgXChaCha20Poly1305: {
-		keySize:   chacha20poly1305.KeySize,
-		nonceSize: chacha20poly1305.NonceSizeX,
-		name:      "XChaCha20-Poly1305",
-		newAEAD:   chacha20poly1305.NewX,
+		keySize:      chacha20poly1305.KeySize,
+		nonceSize:    chacha20poly1305.NonceSizeX,
+		maxPlaintext: maxPlaintextChaCha,
+		name:         "XChaCha20-Poly1305",
+		newAEAD:      chacha20poly1305.NewX,
 	},
 }
 
@@ -136,6 +158,25 @@ func (a SymmetricAlgorithm) KeySize() int {
 func (a SymmetricAlgorithm) NonceSize() int {
 	if p, ok := algorithmRegistry[a]; ok {
 		return p.nonceSize
+	}
+	return 0
+}
+
+// MaxPlaintextSize returns the largest plaintext, in bytes, that this algorithm
+// may seal in a SINGLE invocation. Returns 0 for unrecognised identifiers.
+//
+// This is a hard limit of the construction, not a policy: GCM's block counter
+// is 32 bits, and x/crypto's ChaCha20-Poly1305 reuses a 32-bit counter for both
+// nonce widths. Both implementations answer an over-long message with a PANIC
+// rather than an error — "crypto/cipher: message too large for GCM",
+// "chacha20poly1305: plaintext too large" — so a caller that hands one an
+// oversized frame crashes the embedding process instead of receiving a
+// rejection. Barrier.Encrypt checks this bound before it allocates or seals so
+// the outcome is a typed ErrPlaintextTooLarge; the decrypt path applies the
+// same bound to the ciphertext payload, where x/crypto's Open panics too.
+func (a SymmetricAlgorithm) MaxPlaintextSize() uint64 {
+	if p, ok := algorithmRegistry[a]; ok {
+		return p.maxPlaintext
 	}
 	return 0
 }

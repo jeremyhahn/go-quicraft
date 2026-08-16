@@ -245,6 +245,14 @@ type Barrier struct {
 	// via BarrierConfig.AEADProvider.
 	aeadProvider AEADProvider
 
+	// maxPlaintext is the configured algorithm's single-invocation plaintext
+	// ceiling, resolved once at construction because the algorithm is fixed for
+	// the barrier's lifetime (SetSealedRootKey refuses a blob that disagrees
+	// with it). It exists as a field rather than a call per Encrypt so the bound
+	// is one named value at the single place that enforces it; see
+	// SymmetricAlgorithm.MaxPlaintextSize for why a bound is required at all.
+	maxPlaintext uint64
+
 	// AEAD safety trackers (interface types for IoC).
 	invocations  InvocationCounter    // per-epoch AEAD invocation counter
 	nonceTracker NonceTrackerProvider // per-epoch nonce reuse detection
@@ -354,6 +362,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		invocations:    ic,
 		nonceTracker:   nt,
 		aeadProvider:   ap,
+		maxPlaintext:   config.Algorithm.MaxPlaintextSize(),
 		timeNow:        time.Now,
 		randReader:     rand.Reader,
 	}, nil
@@ -818,6 +827,26 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 //     while Decrypt keeps working — a node with no persister can still read and
 //     serve its data, it just cannot add to a key whose remaining budget it
 //     cannot prove.
+//
+// WHAT THE FRESH EPOCH ASSUMES — SINGLE-WRITER OWNERSHIP OF THE BLOB. The
+// rotation above yields a DEK whose count starts at a provable zero for THIS
+// process. It says nothing about any other process. Every input to
+// deriveDEK — root key, salt, deployment ID, epoch — comes from the loaded
+// blob, and the epoch it rotates to is a pure function of the loaded one
+// (epoch+1), so TWO barriers that load the same blob derive the SAME new DEK,
+// each with a zeroed invocation counter and an empty nonce tracker. That is the
+// duplicate-key-with-reset-counter condition the whole invocation cap exists to
+// prevent: n writers each spend up to the full 2^32 budget against one key,
+// and neither tracker can see the other's nonces.
+//
+// Nothing in this package can detect it. BarrierConfig.MinEpoch does not help
+// here — it is a floor against REPLAY of an older blob, and this hazard needs no
+// rollback at all: both loaders read the current, genuinely authenticated state.
+// SealedRootKey.StateMAC does not help either; both copies are authentic. The
+// missing fact — "am I the only writer of this blob?" — lives entirely outside
+// the barrier, so the EMBEDDER must guarantee it (an exclusive data-directory
+// lock, or a persister backed by a compare-and-swap). See the StatePersister
+// contract in barrier_config.go.
 func (b *Barrier) resolveInvocationBudget() {
 	if b.invocations == nil || !b.invocations.IsEnabled() {
 		// Counting is off by configuration (InvocationLimit == -1). The
@@ -844,11 +873,19 @@ func (b *Barrier) resolveInvocationBudget() {
 	if b.config.StatePersister != nil {
 		newEpoch, err := b.rotateLocked()
 		if err == nil {
+			// "known-zero for this process" is the accurate claim, and the
+			// qualifier is not pedantry: the rotated-to epoch is a pure function
+			// of the loaded blob, so a second process loading the same blob
+			// derives this very DEK and also starts from zero. Naming the
+			// assumption in the log is what makes an operator who is running two
+			// writers over one data directory able to recognise it here.
 			slog.Warn("AEAD invocation count for the loaded epoch is unrecoverable; "+
-				"rotated to a fresh epoch with a known-zero count",
+				"rotated to a fresh epoch whose count is zero FOR THIS PROCESS (sound only "+
+				"if this process is the sole writer of the sealed blob)",
 				"from_epoch", newEpoch-1,
 				"epoch", newEpoch,
 				"limit", limit,
+				"requires", "exclusive ownership of the persisted sealed root key",
 			)
 			// This forced rotation is what grows KnownEpochs by one PER
 			// RESTART, and SetSealedRootKey refuses to load a blob naming more
@@ -978,6 +1015,12 @@ func (b *Barrier) Seal() error {
 // dst MUST NOT overlap plaintext except exactly (crypto/cipher's in-place
 // requirement): the AEAD seals directly into dst, and an inexact overlap
 // PANICS inside crypto/cipher. Pass nil when in doubt.
+//
+// A plaintext longer than the algorithm's per-invocation ceiling
+// (SymmetricAlgorithm.MaxPlaintextSize) is refused with ErrPlaintextTooLarge
+// rather than passed to a cipher that would panic on it. The bound applies to
+// the barrier's own AEAD path only; in delegated (hardware) mode the encryptor
+// owns its own limits, as it owns its own key and nonce management.
 //
 // The method uses a two-phase fast path:
 //  1. Atomic check of b.unsealed (no contention).
@@ -1261,6 +1304,17 @@ func aadForEpoch(epoch uint64, contextAAD []byte) []byte {
 //
 // Wire format: [epoch:8][algID:1][nonce:N][ciphertext+tag]
 func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher.AEAD, contextAAD []byte) ([]byte, error) {
+	// Bound the frame BEFORE allocating or sealing. Both GCM and
+	// ChaCha20-Poly1305 answer an over-long plaintext with a panic rather than
+	// an error (see SymmetricAlgorithm.MaxPlaintextSize), so without this check
+	// an oversized frame takes down the embedding process from inside
+	// crypto/cipher — a library killing its host over an input it could have
+	// rejected. Checking first also avoids allocating the output buffer for a
+	// message that can never be sealed.
+	if uint64(len(plaintext)) > b.maxPlaintext {
+		return nil, ErrPlaintextTooLarge
+	}
+
 	nonceSize := aead.NonceSize()
 	overhead := aead.Overhead()
 	totalSize := epochSize + algIDSize + nonceSize + len(plaintext) + overhead
@@ -1515,6 +1569,17 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 	nonceStart := epochSize + algIDSize
 	nonce := ciphertext[nonceStart : nonceStart+nonceSize]
 	encrypted := ciphertext[nonceStart+nonceSize:]
+
+	// Bound the payload for the same reason encryptLocked bounds the plaintext,
+	// and with more urgency: this input comes off disk or the wire. x/crypto's
+	// ChaCha20-Poly1305 Open PANICS on an over-long ciphertext (GCM's Open
+	// returns an error), so an oversized frame would crash the process rather
+	// than fail authentication. Rejected with the generic ErrDecryptionFailed
+	// like every other decrypt failure, so the length reveals nothing the caller
+	// could use as an oracle.
+	if uint64(len(encrypted)) > b.maxPlaintext+uint64(aead.Overhead()) {
+		return nil, ErrDecryptionFailed
+	}
 
 	// Construct AAD binding the ciphertext to its epoch and, when supplied, the
 	// caller's positional/artifact context.
@@ -1858,13 +1923,47 @@ func (b *Barrier) RegisterInFlightEpoch(epoch uint64) {
 	b.inFlightMu.Unlock()
 }
 
-// DeregisterInFlightEpoch decrements the in-flight reference count for an epoch.
-// If the count reaches zero, the entry is removed from the map.
+// DeregisterInFlightEpoch releases one reference taken by
+// RegisterInFlightEpoch (or by one of the EncryptWithEpochPinned* methods).
+// When the last reference is released the entry is removed and the epoch
+// becomes purgeable again.
+//
+// A call for an epoch that holds no reference changes nothing and is reported
+// at ERROR level. It is a caller bug — releases must match Registers one for
+// one — and the consequence of getting it wrong is severe and remote from its
+// cause: one release too many drops a pin some other writer is relying on, the
+// next PurgeEpochsBefore retires that epoch's DEK, and the snapshot or WAL
+// segment holding the frame sealed under it becomes permanently undecryptable
+// with nothing in the failure pointing back at the extra release.
+//
+// The guard is honest about its reach. It enforces the invariant that IS
+// decidable here — the count never goes below zero, and an epoch nobody holds is
+// never "released" — and it makes the caller bug loud at the moment it happens.
+// It CANNOT repair a duplicate release that arrives while the count is still
+// positive: from the barrier's side that call is indistinguishable from the
+// legitimate one, and no reference count can tell them apart. Preventing that
+// requires a single-use release handle rather than a bare epoch number, which is
+// a public API change and is deliberately not made here. The previous
+// unconditional decrement additionally erased its own underflow (`<= 0` deleted
+// the entry), so the caller bug left no trace at all.
 func (b *Barrier) DeregisterInFlightEpoch(epoch uint64) {
 	b.inFlightMu.Lock()
-	b.inFlightEpochs[epoch]--
-	if b.inFlightEpochs[epoch] <= 0 {
+	n, held := b.inFlightEpochs[epoch]
+	if !held || n <= 0 {
+		b.inFlightMu.Unlock()
+		slog.Error("quicraft/seal: unbalanced DeregisterInFlightEpoch; epoch holds no in-flight reference",
+			"epoch", epoch,
+			"deployment_id", b.config.DeploymentID,
+			"impact", "ignored; a release without a matching Register would otherwise unpin an "+
+				"epoch another writer still holds and expose its DEK to PurgeEpochsBefore",
+		)
+		return
+	}
+	n--
+	if n == 0 {
 		delete(b.inFlightEpochs, epoch)
+	} else {
+		b.inFlightEpochs[epoch] = n
 	}
 	b.inFlightMu.Unlock()
 }
@@ -2322,11 +2421,28 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return ErrTooManyKnownEpochs
 	}
 
-	// Validate that KnownEpochs contains the current epoch and nothing above
-	// it. Epochs only advance and Epoch is the highest one reached, so a larger
-	// entry is corruption or padding — never a legitimate historical DEK.
+	// Validate that KnownEpochs contains the current epoch, nothing above it,
+	// and no epoch 0. Epochs only advance and Epoch is the highest one reached,
+	// so a larger entry is corruption or padding — never a legitimate historical
+	// DEK.
+	//
+	// Epoch 0 is rejected for the same reason sealed.Epoch == 0 is: epochs start
+	// at 1 (Initialize) and Rotate only ever increments, so no data was ever
+	// sealed under epoch 0 and no DEK for it can be legitimate. Accepting it was
+	// not inert. Unseal derives and installs a full epoch-0 DEK, AEAD and
+	// mlock'd enclave for it; Unseal's forced rotation then re-persists it
+	// through sortedEpochsWith, so a single accepted zero becomes a DURABLE
+	// member of the derivation set that every subsequent start pays for and no
+	// purge floor can retire (PurgeEpochsBefore drops epochs strictly BELOW
+	// minEpoch, and nothing is below 0). It also leaves b.ciphers[0] populated,
+	// which is the one epoch value a corrupt or zero-filled ciphertext header
+	// decodes to, turning a header that should fail closed on an unknown epoch
+	// into one that reaches the AEAD.
 	epochFound := false
 	for _, ep := range sealed.KnownEpochs {
+		if ep == 0 {
+			return ErrInvalidSealedEpoch
+		}
 		if ep > sealed.Epoch {
 			return ErrKnownEpochAboveCurrent
 		}

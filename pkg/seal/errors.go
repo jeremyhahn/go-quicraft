@@ -85,6 +85,17 @@ var (
 	// to contain the required epoch, nonce, and authentication tag.
 	ErrCiphertextTooShort = errors.New("quicraft/seal: ciphertext too short")
 
+	// ErrPlaintextTooLarge is returned by the Encrypt family when a single
+	// frame exceeds the configured algorithm's per-invocation ceiling
+	// (SymmetricAlgorithm.MaxPlaintextSize): ~64 GiB for AES-GCM, ~256 GiB for
+	// the ChaCha20-Poly1305 family.
+	//
+	// It exists because the underlying implementations do not return an error
+	// there — crypto/cipher and x/crypto both PANIC — so without this check an
+	// over-long frame would crash the embedding process from inside the cipher.
+	// A library must not kill its host over an input it can reject.
+	ErrPlaintextTooLarge = errors.New("quicraft/seal: plaintext exceeds the algorithm's maximum message size")
+
 	// ErrUnsealBackoff is returned when an Unseal attempt is rejected
 	// due to brute-force protection backoff.
 	ErrUnsealBackoff = errors.New("quicraft/seal: unseal rejected, backoff active")
@@ -94,7 +105,9 @@ var (
 	ErrPurgeCurrentEpoch = errors.New("quicraft/seal: cannot purge current epoch")
 
 	// ErrInvalidSealedEpoch is returned when SetSealedRootKey receives a
-	// sealed key with Epoch == 0. A valid sealed key must have epoch >= 1.
+	// sealed key with Epoch == 0, or with 0 among its KnownEpochs. Epochs start
+	// at 1 (Initialize) and only ever increment, so nothing was sealed under
+	// epoch 0 and a DEK for it can never be legitimate.
 	ErrInvalidSealedEpoch = errors.New("quicraft/seal: sealed root key has invalid epoch (must be > 0)")
 
 	// ErrInvalidSealedSalt is returned when SetSealedRootKey receives a
