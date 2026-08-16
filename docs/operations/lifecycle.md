@@ -384,6 +384,87 @@ The snapshot pool's `recoverSnapshot` then:
 
 ---
 
+## Runbook: Recovering a Shard That Has Lost Quorum
+
+**When this applies.** A shard has lost more than a minority of its voters to
+*unrecoverable* failure — the machines and their disks are gone, not merely
+unreachable. A 5-voter shard that has lost 3 is the canonical case.
+
+**Why nothing else works.** Removing a dead replica is a configuration change, a
+configuration change is a log entry, and committing a log entry needs the quorum
+that no longer exists. Restoring a snapshot does not help either: the snapshot
+carries the same configuration. Without the procedure below the data is intact
+on disk and permanently unreachable.
+
+### Before you start — this loses data by design
+
+Rewriting a shard's membership discards Raft's safety argument. The excluded
+replicas may hold committed entries the snapshot you are about to import does
+not, and once they are out of the configuration nothing will ever reconcile
+that: **acknowledged writes can be silently lost.** This is a deliberate
+Leader Completeness violation, correct only when the alternative is losing the
+shard entirely.
+
+Two preconditions are not enforceable by the library and are yours to establish:
+
+1. **The excluded replicas are permanently gone.** A partitioned replica that
+   comes back to a configuration it was written out of will be told it is not a
+   member, while still holding entries the new configuration never saw.
+2. **Every survivor gets the SAME membership map.** Different maps on different
+   survivors create two configurations that each believe they are
+   authoritative. That is split-brain by construction.
+
+### Procedure
+
+1. **Stop every surviving replica.** `ImportSnapshot` requires the shard to be
+   stopped on the host performing the import.
+
+2. **Identify the most up-to-date survivor.** Compare `ShardInfo.LastApplied`
+   across survivors, or the highest snapshot index each has recorded. Data held
+   only by a less advanced replica is lost, so choose deliberately.
+
+3. **Export a snapshot from that replica.**
+
+   ```go
+   f, err := os.Create("/tmp/shard-7.artifact")
+   err = host.ExportSnapshot(ctx, 7, f)
+   ```
+
+4. **Import it on every survivor**, naming only the survivors:
+
+   ```go
+   survivors := map[uint64]string{
+       3: "10.0.0.3:9000",
+       4: "10.0.0.4:9000",
+   }
+   err := host.ImportSnapshot(ctx, 7, artifactReader,
+       quicraft.WithImportMembership(survivors))
+   ```
+
+   The map is the complete new **voting** membership. Observers and witnesses
+   from the artifact are dropped — a recovery configuration names exactly the
+   replicas you verified. Shard policy (session limits, witness policy) is
+   preserved; it is not membership.
+
+   The importing replica must appear in its own map. Every refusal is by name
+   and matches `ErrImportMembershipInvalid`; none is silently resolved, because
+   a configuration accepted by accident is not detectable afterwards.
+
+5. **Restart the survivors** with a `Config` whose membership matches the map
+   you imported. The shard elects among the survivors and resumes.
+
+6. **Re-add replacements normally** with `RequestAddReplica` once the shard has
+   a leader. From this point ordinary membership change applies again.
+
+### Verifying the outcome
+
+`ShardInfo.Replicas` reports each follower's `Match`, replication `State` and
+`Active` flag, so you can confirm the recovered configuration is replicating
+rather than merely elected. `Host.StateMachineHash` compares state machines
+across replicas if you need to establish that the survivors agree.
+
+---
+
 ## Graceful Shutdown
 
 ### Host.Close()
