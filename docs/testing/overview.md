@@ -429,6 +429,41 @@ Tests verify:
 - Sync failures propagate as typed errors
 - Re-open succeeds after injected failure
 
+## Running Heavyweight Suites Off-Box
+
+Every test target runs under `-race`, and the integration suites stand up
+multi-node QUIC clusters. On a workstation that is also running editors,
+browsers and agents, that contention is enough to expire the 30-second
+catch-up waits in the snapshot tests — and those failures read as raft defects
+rather than as the scheduling artefacts they are. Diagnosing them has
+repeatedly cost days.
+
+Run them on **omega** (`198.51.100.90`), the department's spare-capacity host
+and the machine the `omega-docker` Gitea runner already executes CI on:
+
+```
+make remote-ci-full            # the whole gate, off-box
+make remote-test               # any target: remote-<target> runs <target> there
+make remote-integration-test
+make remote-tools              # one-time: install the scanners omega lacks
+```
+
+`remote-<target>` is a pattern rule, so no target needs enrolling by hand. It
+rsyncs the **working tree** — including uncommitted edits, which is the point
+during development — with `--delete`, so a file removed locally cannot linger
+remotely and turn a broken build green. `.git` is excluded deliberately:
+nothing on the remote can perform a git operation against this repository's
+history.
+
+Override `OMEGA_DIR` to keep concurrent work from colliding:
+
+```
+make remote-test OMEGA_DIR='~/ci/qr-myfeature'
+```
+
+Targeted single-package runs are fine locally while developing. Final
+verification goes through the Makefile targets, on omega.
+
 ## Makefile Target Reference
 
 ### Unit Test Targets
@@ -482,6 +517,12 @@ Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Ou
 | Target       | Description                         |
 |--------------|-------------------------------------|
 | `errfs-waldb` | WAL/LogDB I/O error injection tests |
+
+### Network Partition Targets
+
+| Target | Description |
+|--------|-------------|
+| `ci-netfault` | Partitions between LIVE replicas (`quicraft_netfault`); the only tests that can construct a deposed-but-running leader |
 
 ### Fuzz Testing Targets
 

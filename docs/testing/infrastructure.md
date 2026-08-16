@@ -71,6 +71,41 @@ ErrorFS framework (`test/errfs/`) injects I/O failures at WAL/LogDB layer to ver
 
 11 test cases verify no panic, correct typed error, successful re-open. Run via `make errfs-waldb`.
 
+### Network Partition Injection
+
+`test/netfault/` drops messages between **live** replicas, behind the
+`quicraft_netfault` build tag. Run via `make ci-netfault`.
+
+Why it exists: every "partition" test in the suite previously called
+`stopNode`, which is a process kill. A killed node holds no leadership belief,
+answers nothing, and returns with cold in-memory state — so the most dangerous
+configuration in Raft, a **live leader deposed by a quorum it can no longer
+reach**, could not be constructed anywhere. The cost was measured: with the
+suite as it stood, weakening the election quorum from a strict majority to
+`n/2` passed 18 of 19 linearizability tests.
+
+| Primitive | Effect |
+|-----------|--------|
+| `Isolate(replica)` | Cuts one replica off both directions without stopping it — it keeps its term, role and ticker |
+| `Partition(groupA, groupB)` | Blocks both directions across a cut; each side stays internally connected |
+| `BlockLink(from, to)` | Blocks a single directed edge, for asymmetric partitions |
+| `Heal()` | Removes every fault; tests register it with `t.Cleanup` because the state is process-global |
+
+Drops are applied on the **sending** side, which expresses any directed cut
+since the edge A→B is controlled entirely at A, and are silent — the sender's
+connections stay up and no error is surfaced, as on a real network.
+
+**Production cost is zero, and this is verified rather than asserted.** In a
+normal build `netFaultEnabled` is a false compile-time constant, so
+`go build -gcflags=-S` shows no `CALL` to the drop hook in the send path (only
+the dead 3-byte stub, which the linker discards), and `test/netfault` does not
+appear in `go list -deps` for the transport package.
+
+Every test asserts `netfault.BlockedCount()` is non-zero before proceeding, so
+building without the tag fails the suite loudly instead of silently exercising a
+healthy cluster — which is precisely the defect the package was written to
+correct.
+
 ### Linearizability Verification
 
 porcupine-based framework (`test/integration/linearizability/`) verifies distributed consistency under faults:
