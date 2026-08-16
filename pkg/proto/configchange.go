@@ -162,18 +162,39 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < 24+4 { // 3 uint64 fields + address length prefix
 		return 0, ErrBufferTooSmall
 	}
-	cc.ConfigChangeID = getUint64(buf[0:])
-	cc.Type = getUint64(buf[8:])
-	if cc.Type > maxConfigChangeType {
+	// Decoded into a LOCAL and assigned only on success, so the method is
+	// all-or-nothing.
+	//
+	// Writing fields into the receiver as they were parsed meant a failure
+	// part-way through left the receiver holding the NEW ConfigChangeID, Type,
+	// ReplicaID and Address bolted onto the OLD NodeIdentity — a mixture that
+	// describes no configuration any writer produced. NodeIdentity is what
+	// selects identity-based authorization over the weaker address-based
+	// path, so a stale one beside a new target is precisely the shape
+	// Membership.UnmarshalFrom was hardened against (see its comment: "a
+	// partial decode that kept a STALE Identities map would authorize a
+	// replica the decoded configuration never named"). ConfigChange carries
+	// the same class of field and did not get the same treatment.
+	//
+	// Every current caller declares a fresh value and abandons it on error, so
+	// nothing is reachable today — which is exactly the argument the
+	// Membership decoder rejected, because the invariant belongs in the
+	// decoder rather than in the discipline of its callers. This type is also
+	// the one a pooling refactor would reach for first: it is decoded once per
+	// config entry during replay.
+	var decoded ConfigChange
+	decoded.ConfigChangeID = getUint64(buf[0:])
+	decoded.Type = getUint64(buf[8:])
+	if decoded.Type > maxConfigChangeType {
 		return 0, ErrInvalidConfigChangeType
 	}
-	cc.ReplicaID = getUint64(buf[16:])
+	decoded.ReplicaID = getUint64(buf[16:])
 	offset := 24
 	addr, n, err := getString(buf[offset:], MaxAddressLength, ErrAddressTooLong)
 	if err != nil {
 		return 0, err
 	}
-	cc.Address = addr
+	decoded.Address = addr
 	offset += n
 	// Initialize, MaxWitnesses and RequireFullReplicaMajority are checked as
 	// one 24-byte region: they are all mandatory, so there is no boundary
@@ -181,11 +202,11 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < offset+24 {
 		return 0, ErrBufferTooSmall
 	}
-	cc.Initialize = getBool(buf[offset:])
+	decoded.Initialize = getBool(buf[offset:])
 	offset += 8
-	cc.MaxWitnesses = getUint64(buf[offset:])
+	decoded.MaxWitnesses = getUint64(buf[offset:])
 	offset += 8
-	cc.RequireFullReplicaMajority = getBool(buf[offset:])
+	decoded.RequireFullReplicaMajority = getBool(buf[offset:])
 	offset += 8
 	// The trailing identity is read like any other field: getString requires
 	// its four-byte length prefix, so a payload that ends here — the shape that
@@ -194,8 +215,10 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cc.NodeIdentity = identity
+	decoded.NodeIdentity = identity
 	offset += n
+
+	*cc = decoded
 	return offset, nil
 }
 

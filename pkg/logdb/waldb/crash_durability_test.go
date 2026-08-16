@@ -37,9 +37,6 @@ const (
 	crashDurMaxFileSize = 8 * 1024
 
 	crashDurReplicaID = 7
-	// crashDurEntriesPerBatch keeps each shard's per-batch payload above one
-	// block so a block seal (segment.WriteAt) is guaranteed.
-	crashDurEntriesPerBatch = 2
 	// crashDurRoot is the virtual mount point the WAL directory is created
 	// inside. crashFS is purely in-memory; no real path is touched.
 	crashDurRoot = "/mnt/crashfs"
@@ -48,6 +45,15 @@ const (
 // crashDurShardIDs hash to four distinct WAL shards, so one SaveState batch
 // spans four segment files and a crash can land between two shards' writes.
 var crashDurShardIDs = []uint64{1, 2, 3, 4}
+
+// crashDurEntriesPerBatch keeps each shard's per-batch payload above one block
+// so a block seal (segment.WriteAt) is guaranteed.
+//
+// It is a var, not a const, so crashPhaseMidBatchRotation can widen a single
+// batch far enough to rotate INSIDE itself. At the default of 2 every rotation
+// falls between batches, which is precisely why the suite could not see the
+// one flush a mid-batch rotation depends on.
+var crashDurEntriesPerBatch = 2
 
 // crashDurEntry regenerates the entry a writer stores at the given position.
 // Content is a pure function of (shardID, index, term), so a recovered entry
@@ -327,6 +333,7 @@ func TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss(t *testing.T) {
 		{name: "MidBatch", crash: crashPhaseMidBatch},
 		{name: "MidRotation", crash: crashPhaseMidRotation},
 		{name: "AfterCompaction", crash: crashPhaseAfterCompaction},
+		{name: "MidBatchRotation", crash: crashPhaseMidBatchRotation},
 		{name: "EncryptedAfterAck", encrypted: true, crash: crashPhaseAfterAck},
 	}
 
@@ -392,6 +399,35 @@ func crashPhaseMidBatch(t *testing.T, h *crashDurHarness) {
 	if err == nil {
 		t.Fatal("the batch interrupted mid-write returned success; the crash never landed inside it")
 	}
+}
+
+// crashPhaseMidBatchRotation acks ONE batch large enough to rotate INSIDE
+// itself, then cuts power.
+//
+// This is the state no other phase in this suite produces, and it is the only
+// one in which rotateSegment's fsync is load-bearing. SaveState sets batchMode,
+// which suppresses writeRecord's inline sync (db.go), and syncSegment flushes
+// only s.activeSegment — so when a batch rotates part-way through, the fsync in
+// rotateSegment is the ONLY flush the OUTGOING segment ever receives.
+// segment.Close does flushBlock + Truncate + Close and does not fsync.
+//
+// With the default 2 entries per batch every rotation falls BETWEEN batches, so
+// deleting that fsync left both the waldb suite and the errfs suite fully
+// green while a crash lost entries the WAL had already acknowledged — and Raft
+// had already told peers were committed.
+func crashPhaseMidBatchRotation(t *testing.T, h *crashDurHarness) {
+	t.Helper()
+	h.w.mustSave(t, 2)
+
+	prev := crashDurEntriesPerBatch
+	// Each entry is comfortably over a block; 12 of them span more than one
+	// crashDurMaxFileSize segment, forcing at least one rotation inside the
+	// single batch below.
+	crashDurEntriesPerBatch = 12
+	defer func() { crashDurEntriesPerBatch = prev }()
+
+	h.w.mustSave(t, 1)
+	h.cfs.Crash()
 }
 
 // crashPhaseMidRotation cuts power while a full segment is being rolled over

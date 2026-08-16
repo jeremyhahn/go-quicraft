@@ -3964,9 +3964,21 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pending.stageEpoch(landing)
 	// Capture the segment the record landed in (post-rotation if writeRecord
 	// rotated) so the commit point can pin it against garbage collection.
+	// The snapshot is DEEP-COPIED before it is staged. ss is the caller's
+	// value and its Membership carries six maps; staging it verbatim meant the
+	// in-memory record waldb later serves from GetSnapshot aliased the
+	// caller's maps in both directions, so a later mutation by the owning
+	// layer silently rewrote a record already reported as persisted.
+	//
+	// memdb has done this since it was written (memdb.copyMembership, with a
+	// comment explaining why), and the two are implementations of the SAME
+	// LogDB interface: code correct against the test backend was wrong against
+	// the production one. Identities and RemovedIdentities make it more than a
+	// hygiene issue — they are the authorization state a replica recovering
+	// from a snapshot has no other source for.
 	pending.snapshots = append(pending.snapshots, pendingSnapshotUpdate{
 		key:         key,
-		snapshot:    ss,
+		snapshot:    copySnapshot(ss),
 		landedSegID: landing.segID,
 	})
 	return nil
@@ -4053,7 +4065,11 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	if !recordDataDir {
 		bs.DataDir = ""
 	}
-	s.bootstraps[key] = bs
+	// Deep-copied for the same reason writeSnapshot is: bs is the caller's
+	// value, its Addresses map is retained here and served from GetBootstrap,
+	// and memdb copies. Storing the reference let the owning layer mutate a
+	// record waldb had already reported as persisted.
+	s.bootstraps[key] = copyBootstrap(bs)
 	s.setBootstrapSegment(key, landing.segID)
 	s.advanceCommittedHWM(landing.segID)
 	s.applyEpochLocked(landing)
@@ -4184,7 +4200,10 @@ func (db *DB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Membershi
 	if !ok {
 		return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
 	}
-	return state, ss.Membership, nil
+	// The membership is copied on the way out: ReadState hands back waldb's
+	// own map otherwise, and a caller that mutates what it was given would
+	// rewrite the record every later reader sees.
+	return state, copyMembership(ss.Membership), nil
 }
 
 // EntryRange returns the first index and the contiguous span of available
@@ -4442,7 +4461,13 @@ func (db *DB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
 	if !ok {
 		return logdb.Snapshot{}, logdb.ErrNoSnapshot
 	}
-	return ss, nil
+	// Deep-copied on the way OUT as well as in. Returning the stored value
+	// hands the caller waldb's own maps: a caller that mutates the membership
+	// it received — reasonably, since it was handed a value — rewrites the
+	// record waldb still serves to everyone else, with no write and no error.
+	// memdb copies on both sides; these are two implementations of one
+	// interface and must not differ on who owns the memory.
+	return copySnapshot(ss), nil
 }
 
 // RemoveNodeData durably removes all data for the given node. A remove-node
@@ -4681,7 +4706,7 @@ func (db *DB) GetBootstrap(shardID, replicaID uint64) (logdb.Bootstrap, bool, er
 	if !ok {
 		return logdb.Bootstrap{}, false, nil
 	}
-	return bs, true, nil
+	return copyBootstrap(bs), true, nil
 }
 
 // Close closes the DB and releases all resources. Close is idempotent: a

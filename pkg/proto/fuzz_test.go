@@ -647,6 +647,14 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 				Observers:                  map[uint64]string{obsKey: obsVal},
 				Witnesses:                  map[uint64]string{witKey: witVal},
 				Removed:                    map[uint64]bool{removedKey: true},
+				// The authorization maps and the replicated session policy.
+				// No shape carried them, so the comparisons below could not
+				// observe a converter or codec that dropped either.
+				Identities:           map[uint64]string{addrKey: "spki:" + addrVal},
+				RemovedIdentities:    map[uint64]string{removedKey: "spki:removed"},
+				SessionExpiryEntries: ccID,
+				MaxTotalSessions:     maxWitnesses + 1,
+				MaxSessionsPerClient: maxWitnesses + 2,
 			},
 			{
 				ConfigChangeID:             ccID,
@@ -736,6 +744,36 @@ func checkMembershipRoundTrip(t *testing.T, m *Membership) {
 			if m2.Removed[k] != v {
 				t.Fatalf("Removed[%d] mismatch: %v != %v", k, v, m2.Removed[k])
 			}
+		}
+
+		// The AUTHORIZATION maps and the replicated session policy were
+		// neither populated by any shape nor compared here — 5 of 12 fields.
+		// A regression dropping Identities or RemovedIdentities "revokes a
+		// revocation" (an ejected keypair is readmitted); one dropping the
+		// session policy makes a recovering replica expire sessions at log
+		// indexes its peers do not. Both are silent.
+		for _, p := range []struct {
+			name      string
+			want, got map[uint64]string
+		}{
+			{"Identities", m.Identities, m2.Identities},
+			{"RemovedIdentities", m.RemovedIdentities, m2.RemovedIdentities},
+		} {
+			if len(p.want) != len(p.got) {
+				t.Fatalf("%s length mismatch: %d != %d", p.name, len(p.want), len(p.got))
+			}
+			for k, v := range p.want {
+				if p.got[k] != v {
+					t.Fatalf("%s[%d] mismatch: %q != %q", p.name, k, v, p.got[k])
+				}
+			}
+		}
+		if m.SessionExpiryEntries != m2.SessionExpiryEntries ||
+			m.MaxTotalSessions != m2.MaxTotalSessions ||
+			m.MaxSessionsPerClient != m2.MaxSessionsPerClient {
+			t.Fatalf("session policy mismatch: %d/%d/%d != %d/%d/%d",
+				m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient,
+				m2.SessionExpiryEntries, m2.MaxTotalSessions, m2.MaxSessionsPerClient)
 		}
 	}
 }

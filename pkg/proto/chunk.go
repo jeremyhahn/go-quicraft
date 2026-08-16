@@ -97,10 +97,40 @@ func (sc *SnapshotChunk) Size() int {
 
 // MarshalTo writes the snapshot chunk into buf and returns bytes written.
 func (sc *SnapshotChunk) MarshalTo(buf []byte) (int, error) {
+	// The read side's bounds, applied on WRITE. Every other type in this
+	// package does this (Entry, Message, MessageBatch, Snapshot, SnapshotFile,
+	// Membership, ConfigChange) precisely so it cannot emit metadata it
+	// refuses to read back; SnapshotChunk was the one that did not, and could
+	// produce four distinct frames its own UnmarshalFrom rejects.
+	//
+	// A producer whose values drift out of bounds otherwise emits chunks every
+	// peer rejects, and at the sender a rejection is indistinguishable from a
+	// broken connection — which is the failure the other seven types were
+	// changed to prevent. Today's two producers stay inside these limits, so
+	// this is defence in depth rather than a live bug.
 	required := sc.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall
 	}
+	// Checked AFTER the buffer-size check so error precedence is unchanged for
+	// callers that already depend on it.
+	if len(sc.Filepath) > MaxFilepathLen {
+		return 0, ErrFilepathTooLong
+	}
+	if uint64(len(sc.Data)) > uint64(MaxSnapshotChunkDataLen) {
+		return 0, ErrChunkDataTooLong
+	}
+	if sc.ChunkSize != 0 && sc.ChunkSize != uint64(len(sc.Data)) {
+		return 0, ErrChunkSizeMismatch
+	}
+	// NOTE: BinVer is deliberately NOT validated here. An unstamped chunk
+	// (BinVer 0) is indistinguishable from a v1 sender's on the read side, and
+	// refusing it at marshal would be the stricter choice — but
+	// TestSnapshotChunkValidatesBinVer marshals exactly such a chunk in order
+	// to exercise the READER's version gate, and both production producers
+	// (host.go emptySnapshotChunk and forEachSnapshotChunk) already stamp
+	// WireVersion. Adding the write-side gate is a behaviour change for
+	// callers rather than a bounds fix, so it is left to a deliberate decision.
 	putUint64(buf[0:], sc.ShardID)
 	putUint64(buf[8:], sc.ReplicaID)
 	putUint64(buf[16:], sc.From)
