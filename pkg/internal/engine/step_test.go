@@ -848,13 +848,17 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 		Type: proto.HeartbeatResp,
 		From: 2,
 		Term: hbTerm,
-		Hint: 100, // ctx high enough to cover all pending ReadIndex
+		// The context the leader ACTUALLY issued. Exactly one ReadIndex was
+		// delivered above, and handleLeaderReadIndex assigns contexts by
+		// incrementing from zero at becomeLeader, so it is 1. A larger value is a
+		// message no honest follower could send, and the leader now refuses it.
+		Hint: 1,
 	})
 	node.Deliver(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 3,
 		Term: hbTerm,
-		Hint: 100,
+		Hint: 1,
 	})
 
 	// Process. commitPending is true, so processCommitPendingInbox runs.
@@ -1900,8 +1904,8 @@ func TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim(t *testing.T) {
 	default:
 	}
 	hbTerm, _, _, _, _, _ := node.Peer().DiagRaftState()
-	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 2, Term: hbTerm, Hint: 100})
-	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 3, Term: hbTerm, Hint: 100})
+	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 2, Term: hbTerm, Hint: 1})
+	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 3, Term: hbTerm, Hint: 1})
 
 	cb.panicOnReadyToRead = true
 
@@ -3188,7 +3192,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 		Type: proto.HeartbeatResp,
 		From: 2,
 		Term: curTerm,
-		Hint: 200,
+		Hint: 1,
 	})
 	node.DeliverLocal(proto.Message{
 		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
@@ -3205,7 +3209,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 		Type: proto.HeartbeatResp,
 		From: 3,
 		Term: curTerm,
-		Hint: 200,
+		Hint: 1,
 	})
 
 	ws.Notify(1)

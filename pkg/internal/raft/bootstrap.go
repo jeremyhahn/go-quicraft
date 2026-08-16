@@ -14,7 +14,12 @@
 
 package raft
 
-import "github.com/jeremyhahn/go-quicraft/pkg/proto"
+import (
+	"errors"
+	"log/slog"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
 
 // Config-in-log bootstrap.
 //
@@ -113,6 +118,26 @@ func initialMembershipFromEntry(e proto.Entry) (proto.Membership, error) {
 // are skipped. A run that begins above a compaction floor yields only the
 // changes it contains, which is why the caller prefers a snapshot's membership
 // when one exists.
+//
+// A committed config-carrying entry whose payload does NOT DECODE is fatal, for
+// BOTH entry types: the return is ErrCorruptConfigEntry joined with the decoder's
+// own error, so errors.Is finds the sentinel and the cause alike. This is the
+// same decision the runtime commit path makes (peer.applyMembershipEntry), and
+// the two must agree: the bytes are committed replicated state that every other
+// replica can read, so skipping one here reconstructs a membership that differs
+// from the rest of the shard — a replica computing quorum over its own voting
+// set, silently, and durably once the next snapshot persists it. There is no
+// "recover as much as possible" answer for a configuration; a partial fold is
+// not a degraded membership, it is a DIFFERENT one, and a replica that adopted
+// it could commit on a quorum the real configuration never granted. Only the
+// EntryInitialMembership half used to fail closed; the EntryConfigChange half
+// skipped the entry and returned success, which is the divergence above.
+//
+// A ZERO-LENGTH EntryConfigChange payload is deliberately not in that class. It
+// is the silent no-op it has always been on the runtime path too: every replica
+// reads the same nothing and skips identically, so it cannot diverge them, and
+// no legitimate producer emits one (the propose-time gate refuses any payload
+// that does not decode).
 func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 	m := newMembership(proto.Membership{})
 	for i := range entries {
@@ -131,7 +156,13 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 			}
 			ms, err := initialMembershipFromEntry(entries[i])
 			if err != nil {
-				return proto.Membership{}, err
+				slog.Error("committed initial-membership entry does not decode during recovery",
+					"entry_index", entries[i].Index,
+					"entry_term", entries[i].Term,
+					"entry_type", entries[i].Type,
+					"error", err,
+				)
+				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry, err)
 			}
 			m = newMembership(ms)
 		case proto.EntryConfigChange:
@@ -140,7 +171,13 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 			}
 			var cc proto.ConfigChange
 			if _, err := cc.UnmarshalFrom(entries[i].Cmd); err != nil {
-				continue
+				slog.Error("committed config change entry does not decode during recovery",
+					"entry_index", entries[i].Index,
+					"entry_term", entries[i].Term,
+					"entry_type", entries[i].Type,
+					"error", err,
+				)
+				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry, err)
 			}
 			_ = m.apply(cc, entries[i].Index)
 		}

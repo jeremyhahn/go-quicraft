@@ -3117,6 +3117,33 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	// response confirming leadership at ctx X also confirms leadership at
 	// all earlier ctx values. Regular heartbeats use ctx=0 and ReadIndex
 	// entries have ctx >= 1, so <= 0 never matches any ReadIndex entry.
+	//
+	// That reasoning holds only for a context this leader ISSUED. r.readIndexCtx
+	// is the highest one ever assigned in this tenure — becomeLeader zeroes it,
+	// handleLeaderReadIndex is the only writer and only ever increments, and
+	// every broadcast stamps its then-current value — so the set of contexts a
+	// heartbeat of this leader's can possibly have carried is exactly
+	// {0} u [1, readIndexCtx]. A response echoing anything ABOVE that bound
+	// corresponds to no heartbeat this leader ever sent, and under the <= rule
+	// it would ack EVERY pending read from one message, including reads whose
+	// confirming heartbeat has not been broadcast yet (handleLeaderReadIndex
+	// defers the broadcast to flushReadIndex). With the leader's own pre-set
+	// self-ack that is already a quorum of two, so a single stale or forged
+	// response would resolve a linearizable read at a committed index no
+	// heartbeat round ever validated — the exact guarantee ReadIndex exists to
+	// provide. Refuse the message rather than clamping it: an unissued context
+	// is not a weaker proof of liveness, it is not this leader's protocol at
+	// all, and the peer's setActive/replication handling above has already run.
+	if msg.Hint > r.readIndexCtx {
+		slog.Warn("dropped heartbeat response echoing an unissued read index context",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"resp_ctx", msg.Hint,
+			"issued_ctx", r.readIndexCtx,
+			"term", r.term)
+		return ErrReadIndexContextNotIssued
+	}
 	if len(r.pendingReadIndex) > 0 {
 		ctx := msg.Hint
 		bitPos, known := r.replicaToBit[msg.From]
@@ -3153,7 +3180,54 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 // is fully replaced (non-matching case). When entries are retained,
 // they may contain config changes newer than the snapshot's membership,
 // so rebuilding would lose those changes.
+//
+// SENDER. An InstallSnapshot from a replica that is not the leader this node
+// already recognises for the current term is refused, before it can touch any
+// state. This is the same gate handleHeartbeat applies, applied to the strictly
+// more powerful message: a Heartbeat carries no log-matching proof and may move
+// the commit index, while an InstallSnapshot carries no proof either and may
+// REPLACE the entire log and rebuild the voting set from a membership the sender
+// chose. Election Safety says there is one leader per term, so a second claimant
+// at the current term is a stale duplicate or a forgery.
+//
+// The two unconditional writes below are why the gate has to come first rather
+// than only guarding the accepting branches. They run even on the REJECT path
+// (a snapshot at or below the committed index), so before this gate any
+// authenticated shard member could hold a healthy follower's election timer at
+// zero indefinitely — and install itself as that follower's leaderID, which
+// makes handleVoteRequest's leader-lease test deny PreVotes and dropHighTermVote
+// discard higher-term RequestVotes — simply by retransmitting one long-obsolete
+// snapshot. Suppressing an election is not a lesser power than winning one.
+//
+// The term dimension is already covered upstream and deliberately not repeated:
+// step() drops a lower-term InstallSnapshot (answering with a corrective
+// ReplicateResp) and, for a higher term, calls becomeFollower(msg.Term, msg.From)
+// — InstallSnapshot is one of the leader-originated types it trusts to name a
+// leader — so msg.From IS r.leaderID by the time the handler runs. stepCandidate
+// reaches the same state through stepDownToFollower. A replica with no leader
+// for this term yet (leaderID == noLeader) accepts, which is what keeps first
+// contact after an election working.
+//
+// LIVENESS: refusing costs at most one snapshot retry interval, and only in the
+// case where this replica has already accepted a DIFFERENT leader — which by
+// Election Safety means the sender was deposed. That leader is replicating to
+// this replica and sends its own snapshot if one is needed. The locally injected
+// installs (messagehandler's post-receive and its persisted re-delivery) carry
+// the sending leader's replica ID in From, so they pass exactly when the wire
+// message that triggered them would have.
 func (r *raft) handleSnapshot(msg proto.Message) error {
+	if r.leaderID != noLeader && msg.From != r.leaderID {
+		slog.Warn("dropped install snapshot from a replica that is not this shard's leader",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"leader", r.leaderID,
+			"msg_term", msg.Term,
+			"term", r.term,
+			"snapshot_index", msg.Snapshot.Index)
+		return ErrSnapshotNotFromLeader
+	}
+
 	r.electionTick = 0
 	r.leaderID = msg.From
 
@@ -3837,6 +3911,35 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 	// (e.g., stale message from a previous transfer round).
 	if r.state == leader {
 		return nil
+	}
+	// Refuse to campaign at all when this replica's own last log term is
+	// unreadable, BEFORE becomeCandidate runs.
+	//
+	// campaign() checks the same thing and returns without sending anything —
+	// a vote request advertising LogTerm 0 is rejected by every peer holding a
+	// non-empty log, so the round cannot be won. But by then becomeCandidate
+	// has already incremented the term, cleared leaderID and reset the timers,
+	// leaving this replica parked at T+1 having sent zero RequestVotes. The
+	// term is not inert: send() stamps r.term on every reply, so it reaches the
+	// live leader through ordinary Replicate/Heartbeat rejections and deposes
+	// it — a healthy leader lost to a transient local storage fault, for an
+	// election that never happened.
+	//
+	// startElection has carried this bar since the identical defect was fixed
+	// there. TimeoutNow is the OTHER campaign entry point, which is why the bar
+	// is repeated here rather than left to the shared campaign() call below —
+	// the same reason every gate above it is repeated.
+	//
+	// Refusing costs only liveness, and only for this round: the leader retries
+	// the transfer on its transfer timeout, and the ordinary election timeout
+	// campaigns normally once the log becomes readable again.
+	if _, ok := r.log.lastTerm(); !ok {
+		slog.Warn("ignoring TimeoutNow: local last log term unreadable",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term,
+			"last_index", r.log.lastIndex())
+		return ErrUnreadableLogCannotCampaign
 	}
 	// Exit quiesce before starting the election. Without this, a
 	// quiesced follower that wins the election would use the quiesce

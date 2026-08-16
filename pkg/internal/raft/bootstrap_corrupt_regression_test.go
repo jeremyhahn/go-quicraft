@@ -71,6 +71,7 @@ func corruptBootstrapEntries(t *testing.T) map[string]proto.Entry {
 // cannot distinguish from "this log has no bootstrap entry", and it then
 // re-seeds the shard from its local members map.
 func TestReconstructMembership_CorruptBootstrapEntryFailsClosed(t *testing.T) {
+	quietLogs(t)
 	for name, e := range corruptBootstrapEntries(t) {
 		t.Run(name, func(t *testing.T) {
 			ms, err := ReconstructMembership([]proto.Entry{e})
@@ -223,5 +224,95 @@ func TestPeer_CorruptBootstrapEntryDoesNotWipeMembership(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReconstructMembership_CorruptConfigChangeFailsClosed closes the OTHER
+// half of the same contract. Only the EntryInitialMembership branch above ever
+// failed closed; an undecodable committed EntryConfigChange was `continue`d and
+// reconstruction returned SUCCESS over a membership missing that change.
+//
+// That is a divergence, not a degradation. The entry is committed replicated
+// state, so every peer that can read it folds it and this replica does not: two
+// replicas reconstruct DIFFERENT memberships from the same log, compute quorum
+// over different voting sets, and the loser persists its version with the next
+// snapshot. Four doc comments (peer.applyMembershipEntry, ErrCorruptConfigEntry,
+// Host.reconstructShardMembership's caller and pkg/errors.go) already asserted
+// this path was fatal and justified the runtime's own fail-closed behaviour by
+// pointing at it. The code is what changed to match; a consensus engine has no
+// "recover as much of the configuration as possible" answer.
+func TestReconstructMembership_CorruptConfigChangeFailsClosed(t *testing.T) {
+	quietLogs(t)
+
+	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+	})
+	if err != nil {
+		t.Fatalf("BuildInitialMembershipEntry: %v", err)
+	}
+	valid := marshalConfigChange(t, proto.ConfigChange{
+		Type: proto.AddNode, ReplicaID: 4, Address: "addr4",
+	})
+	if len(valid) < 4 {
+		t.Fatalf("fixture: encoded config change is only %d bytes", len(valid))
+	}
+
+	corrupt := map[string][]byte{
+		"foreign payload": []byte("this is not a marshaled config change"),
+		"torn tail":       valid[:len(valid)-3],
+	}
+	for name, cmd := range corrupt {
+		t.Run(name, func(t *testing.T) {
+			ms, err := ReconstructMembership([]proto.Entry{
+				bootstrap,
+				{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: cmd},
+			})
+			if !errors.Is(err, ErrCorruptConfigEntry) {
+				t.Fatalf("ReconstructMembership over an undecodable COMMITTED config "+
+					"change returned (%+v, %v), want ErrCorruptConfigEntry. Skipping "+
+					"the entry reconstructs a membership every peer that can read "+
+					"those bytes disagrees with — a silent, durable split of the "+
+					"voting set quorum() is computed over", ms, err)
+			}
+			if len(ms.Addresses) != 0 {
+				t.Fatalf("a failed reconstruction returned a non-empty membership "+
+					"%+v alongside its error: the caller cannot be left with a "+
+					"partially folded configuration to adopt", ms)
+			}
+		})
+	}
+}
+
+// TestReconstructMembership_ValidConfigChangeStillFolds is the liveness control
+// for the test above, and the reason the guard keys on the DECODE rather than on
+// the entry type. A committed AddNode above the bootstrap entry must still be
+// folded, or config-in-log recovery loses every membership change a shard ever
+// made.
+func TestReconstructMembership_ValidConfigChangeStillFolds(t *testing.T) {
+	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+	})
+	if err != nil {
+		t.Fatalf("BuildInitialMembershipEntry: %v", err)
+	}
+
+	ms, err := ReconstructMembership([]proto.Entry{
+		bootstrap,
+		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: marshalConfigChange(t,
+			proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "addr4"})},
+		// A ZERO-LENGTH payload stays the silent no-op it is on the runtime path:
+		// every replica reads the same nothing and skips identically, so it
+		// cannot diverge them and must not be treated as corruption.
+		{Index: 3, Term: 1, Type: proto.EntryConfigChange},
+		// And a non-config entry in the run is still skipped.
+		{Index: 4, Term: 1, Type: proto.EntryNormal, Cmd: []byte("payload")},
+	})
+	if err != nil {
+		t.Fatalf("ReconstructMembership over a VALID committed config change: %v", err)
+	}
+	if len(ms.Addresses) != 4 || ms.Addresses[4] != "addr4" {
+		t.Fatalf("reconstructed voters = %v, want the 3 founders plus replica 4: "+
+			"the fail-closed guard must not have stopped legitimate folding",
+			ms.Addresses)
 	}
 }

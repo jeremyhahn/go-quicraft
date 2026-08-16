@@ -1804,6 +1804,13 @@ func TestRaft_HeartbeatResp_ReadIndexSkipsSendAppendWhenCaughtUp(t *testing.T) {
 	rm.match = r.log.lastIndex()
 	rm.next = r.log.lastIndex() + 1
 
+	// Stand the leader's ReadIndex counter up to the context the response
+	// echoes below. handleHeartbeatResp refuses a context this leader never
+	// issued (ErrReadIndexContextNotIssued), so a response echoing 42 on a
+	// leader whose counter is still 0 is a message no honest follower could
+	// have produced, and the fixture would be testing an unreachable state.
+	r.readIndexCtx = 42
+
 	// Send a HeartbeatResp with Hint > 0 (ReadIndex context).
 	err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
@@ -1880,6 +1887,10 @@ func TestRaft_HeartbeatResp_ReadIndexRetryStateSendsAppend(t *testing.T) {
 	rm := r.remotes[2]
 	rm.becomeProbe()
 	rm.probeSent = false
+
+	// The leader must have ISSUED the context the response echoes; see the
+	// sibling test above.
+	r.readIndexCtx = 99
 
 	// Send a HeartbeatResp with Hint > 0 (ReadIndex context) but remote
 	// is in Probe state (not caught up).
@@ -10525,6 +10536,11 @@ func TestRaft_Witness_HeartbeatRespReplicateStateSkipsCorrectly(t *testing.T) {
 
 	// Advance witness to Replicate state.
 	r.witnesses[20].becomeReplicate()
+
+	// The leader must have ISSUED the context the response echoes, or
+	// handleHeartbeatResp refuses it as a context no heartbeat of this
+	// leader's ever carried.
+	r.readIndexCtx = 42
 
 	// Send ReadIndex heartbeat response from witness (Hint > 0).
 	if err := r.step(proto.Message{

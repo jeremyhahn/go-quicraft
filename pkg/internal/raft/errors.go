@@ -179,6 +179,24 @@ var (
 	// timeout — and it only arises when the local log cannot be read.
 	ErrStaleConfigCannotCampaign = errors.New("raft: configuration tail unresolved, cannot campaign on a stale voting set")
 
+	// ErrUnreadableLogCannotCampaign is returned when a TimeoutNow reaches a
+	// replica whose OWN last log term cannot be read. campaign() refuses to
+	// build a vote request in that state — advertising LogTerm 0 is rejected by
+	// every peer holding a non-empty log — so a campaign started here would send
+	// nothing at all. becomeCandidate runs FIRST though, and it increments the
+	// term, so the round costs a term with no vote request behind it. That term
+	// is not inert: send() stamps r.term on every reply this replica makes, so
+	// it reaches the live leader through ordinary Replicate/Heartbeat rejections
+	// and forces a step-down — one replica with a transient storage fault
+	// deposing a healthy leader while emitting no election traffic of its own.
+	// startElection has refused this since the same defect was fixed there;
+	// TimeoutNow is the OTHER campaign entry point and needs the same bar.
+	//
+	// The condition is transient: the transfer target is retried by the leader's
+	// transfer timeout, and an ordinary election timeout campaigns normally once
+	// the read succeeds.
+	ErrUnreadableLogCannotCampaign = errors.New("raft: local last log term unreadable, cannot campaign")
+
 	// ErrDuplicateMemberAddress is returned when a config change would add a
 	// replica at an address another ACTIVE member of the shard already holds.
 	// The inbound authorization chain is replica ID -> committed address ->
@@ -251,6 +269,42 @@ var (
 	// second is either a stale duplicate or a forgery, and either way it must
 	// not move the commit index.
 	ErrHeartbeatNotFromLeader = errors.New("raft: heartbeat from a replica that is not this shard's leader")
+
+	// ErrSnapshotNotFromLeader is returned when an InstallSnapshot names a
+	// sender that is not the leader this replica already recognises for the
+	// current term.
+	//
+	// InstallSnapshot is the weakest-proof push in the protocol: it carries no
+	// prevLogIndex/prevLogTerm, no entries and no log-matching test of any kind,
+	// yet its non-matching branch REPLACES this replica's entire log and rebuilds
+	// the voting set from the snapshot's membership. A Heartbeat, which can at
+	// least only move the commit index, is already gated on sender identity for
+	// exactly this reason (ErrHeartbeatNotFromLeader); the strictly more powerful
+	// message was not.
+	//
+	// Election Safety guarantees one leader per term, so a second claimant at the
+	// current term is a stale duplicate or a forgery. step() has already installed
+	// msg.From as leader for a HIGHER term before the handler runs, and a LOWER
+	// term never reaches it, so this gate concerns the current term only. A
+	// replica with no leader yet (leaderID == noLeader) accepts, which keeps
+	// first contact after an election and the candidate step-down path working.
+	ErrSnapshotNotFromLeader = errors.New("raft: install snapshot from a replica that is not this shard's leader")
+
+	// ErrReadIndexContextNotIssued is returned when a HeartbeatResp echoes a
+	// ReadIndex correlation context greater than any this leader has issued.
+	//
+	// ReadIndex confirms leadership by counting heartbeat responses that echo the
+	// context stamped on the confirming heartbeat round: a response carrying ctx X
+	// proves the peer still regarded this replica as leader AFTER the read's index
+	// was recorded, because the heartbeat bearing X was sent after it. The
+	// confirmation rule is "ack every pending read whose ctx is at or below the
+	// echoed one", so an echoed context ABOVE the counter — a value no heartbeat
+	// ever carried — confirms every pending read at once from a single response,
+	// including reads the leader has not yet broadcast a confirming heartbeat for.
+	// Combined with the leader's own self-ack that is a quorum in a three-voter
+	// shard, and the read is answered at a committed index no round ever
+	// validated: a stale or deposed leader can then serve a linearizable read.
+	ErrReadIndexContextNotIssued = errors.New("raft: heartbeat response echoes a read index context this leader never issued")
 
 	// ErrConfigChangeUnmarshal is returned when a proposed EntryConfigChange
 	// carries a payload that does not decode. It is a REJECTION, never a
