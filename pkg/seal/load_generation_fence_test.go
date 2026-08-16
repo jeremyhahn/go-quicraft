@@ -480,3 +480,97 @@ func TestFenceClaimFailureAbortsUnseal(t *testing.T) {
 		t.Fatalf("Encrypt after an aborted unseal returned %v, want ErrBarrierSealed", err)
 	}
 }
+
+// TestPreFenceBlobStillLoads pins the migration path for a sealed blob written
+// before the load-generation fence existed.
+//
+// Such a blob carries a PRESENT metadata tag computed over the v1 field set, so
+// it fails the v2 comparison while being entirely authentic. The
+// AllowUnauthenticatedSealedState hatch does not rescue it — that hatch is for a
+// blob with NO tag at all — so without an explicit v1 path a deployment that
+// upgraded into the fence could never load its own sealed state again. That is
+// data loss, delivered by a security fix.
+func TestPreFenceBlobStillLoads(t *testing.T) {
+	store := bootstrapFenced(t, 909)
+
+	// Rewrite the stored blob as a pre-fence build would have left it: no
+	// LoadGeneration, and a tag over the v1 covered set.
+	blob := store.read(t)
+	blob.LoadGeneration = 0
+	legacy := legacyStateMAC(t, 909, blob)
+	blob.StateMAC = legacy
+	store.save(t, blob)
+
+	b := MustNewBarrier(func() BarrierConfig {
+		cfg := DefaultBarrierConfig(909)
+		cfg.StatePersister = store.persister(t)
+		return cfg
+	}())
+	if err := b.SetSealedRootKey(store.read(t)); err != nil {
+		t.Fatalf("SetSealedRootKey on a pre-fence blob: %v", err)
+	}
+	if err := b.Unseal(context.Background(), testStrategy(t), Credentials{}); err != nil {
+		t.Fatalf("a pre-fence blob failed to unseal: %v; the deployment cannot "+
+			"reach its own data after upgrading", err)
+	}
+	if _, err := b.Encrypt(nil, []byte("after migration")); err != nil {
+		t.Fatalf("Encrypt after migrating a pre-fence blob: %v", err)
+	}
+	// The claim must have advanced off zero, so the blob is now fenced.
+	if got := b.LoadGeneration(); got == 0 {
+		t.Error("a migrated blob was left unfenced: LoadGeneration is still 0")
+	}
+}
+
+// TestTamperedPreFenceBlobIsStillRefused is the other half: accepting a valid v1
+// tag must not become a way to bypass authentication. An attacker with write
+// access to the blob and no root key cannot produce a v1 tag any more than a v2
+// one, so a blob whose metadata has been edited must still be refused.
+func TestTamperedPreFenceBlobIsStillRefused(t *testing.T) {
+	store := bootstrapFenced(t, 910)
+
+	blob := store.read(t)
+	blob.LoadGeneration = 0
+	blob.StateMAC = legacyStateMAC(t, 910, blob)
+	// Now tamper, AFTER the tag was computed. The salt is chosen deliberately:
+	// it is covered by the tag and feeds DEK derivation, but unlike the epoch it
+	// passes the structural checks that run before authentication — so this
+	// reaches the MAC comparison, which is the path under test.
+	if len(blob.Salt) == 0 {
+		t.Fatal("fixture: the blob has no salt to tamper with")
+	}
+	blob.Salt = append([]byte(nil), blob.Salt...)
+	blob.Salt[0] ^= 0xFF
+	store.save(t, blob)
+
+	cfg := DefaultBarrierConfig(910)
+	cfg.StatePersister = store.persister(t)
+	b := MustNewBarrier(cfg)
+	if err := b.SetSealedRootKey(store.read(t)); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	err := b.Unseal(context.Background(), testStrategy(t), Credentials{})
+	if err == nil {
+		t.Fatal("a tampered pre-fence blob unsealed; the v1 acceptance path is " +
+			"an authentication bypass")
+	}
+	if !errors.Is(err, ErrSealedStateUnauthenticated) {
+		t.Fatalf("Unseal of a tampered pre-fence blob = %v, want "+
+			"ErrSealedStateUnauthenticated", err)
+	}
+}
+
+// legacyStateMAC computes the v1 metadata tag the way a pre-fence build would
+// have, by recovering the root key through the same strategy the barrier uses.
+func legacyStateMAC(t *testing.T, deploymentID uint64, s *SealedRootKey) []byte {
+	t.Helper()
+	rootKey, err := testStrategy(t).UnsealRootKey(context.Background(), s, Credentials{})
+	if err != nil {
+		t.Fatalf("UnsealRootKey for the legacy tag: %v", err)
+	}
+	mac, err := sealedStateMACAt(1, rootKey, deploymentID, s)
+	if err != nil {
+		t.Fatalf("sealedStateMACAt(1): %v", err)
+	}
+	return mac
+}

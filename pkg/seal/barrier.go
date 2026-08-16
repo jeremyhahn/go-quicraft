@@ -2346,6 +2346,23 @@ const sealedStateMACVersion byte = 2
 // which are higher-layer custody bookkeeping this package neither reads nor
 // acts on (go-qrdb owns them and may legitimately rewrite them).
 func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]byte, error) {
+	return sealedStateMACAt(sealedStateMACVersion, rootKey, deploymentID, s)
+}
+
+// sealedStateMACAt computes the tag under a SPECIFIC covered-field version.
+//
+// Only the current version is ever WRITTEN. Older versions are computed solely
+// to recognise a blob this build has not yet migrated: see
+// verifySealedStateMAC, which accepts a valid v1 tag once and immediately
+// restamps at the current version.
+//
+// Verifying an old version is not a downgrade. Forging a v1 tag requires the
+// same HKDF-derived MAC key as forging a v2 one, and that key comes from the
+// root key the sealing strategy just recovered — an attacker with write access
+// to the blob but no root key cannot produce either. What v1 gives up is
+// coverage of LoadGeneration, which a pre-fence blob does not carry at all, so
+// there is nothing for the older encoding to leave unprotected.
+func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]byte, error) {
 	macKey := make([]byte, sha256.Size)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, rootKey, nil, []byte(sealedStateMACInfo)), macKey); err != nil {
 		return nil, &Error{Strategy: "state-mac", Err: err}
@@ -2363,12 +2380,16 @@ func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]by
 		mac.Write(p)
 	}
 
-	mac.Write([]byte{sealedStateMACVersion})
+	mac.Write([]byte{version})
 	putBytes([]byte(s.Strategy))
 	putUint(uint64(s.Version))
 	putUint(deploymentID)
 	putUint(s.Epoch)
-	putUint(s.LoadGeneration)
+	// v1 did not cover LoadGeneration; the field did not exist. Reproducing the
+	// v1 encoding exactly is what makes a pre-fence blob recognisable.
+	if version >= 2 {
+		putUint(s.LoadGeneration)
+	}
 	putBytes(s.Salt)
 	putUint(uint64(len(s.KnownEpochs)))
 	for _, ep := range s.KnownEpochs {
@@ -2422,6 +2443,31 @@ func (b *Barrier) verifySealedStateMAC(rootKey []byte) error {
 		return err
 	}
 	if !hmac.Equal(want, b.sealed.StateMAC) {
+		// Before refusing, check whether this is simply a blob written by a
+		// build that predates the load-generation fence. Such a blob carries a
+		// PRESENT tag computed over the v1 field set, so it fails the
+		// comparison above while being entirely authentic — and the
+		// AllowUnauthenticatedSealedState hatch does not apply to it, because
+		// that hatch is for a blob with NO tag at all. Without this path a
+		// pre-fence deployment could never load its own sealed state again.
+		//
+		// Accepting it is not a downgrade: forging a v1 tag needs the same
+		// HKDF-derived MAC key as forging a v2 one, so an attacker with blob
+		// write access and no root key cannot produce either. The tag is
+		// restamped at the current version by the normal persist path, so a
+		// blob is recognised this way exactly once.
+		if b.sealed.LoadGeneration == 0 {
+			legacy, legacyErr := sealedStateMACAt(1, rootKey, b.config.DeploymentID, b.sealed)
+			if legacyErr == nil && hmac.Equal(legacy, b.sealed.StateMAC) {
+				slog.Warn("quicraft/seal: sealed root key authenticated under the pre-fence "+
+					"metadata encoding; it will be restamped at the current version on the "+
+					"next persist",
+					"epoch", b.sealed.Epoch,
+					"deployment_id", b.config.DeploymentID,
+				)
+				return nil
+			}
+		}
 		slog.Error("quicraft/seal: unseal refused; sealed root key metadata failed authentication",
 			"epoch", b.sealed.Epoch,
 			"deployment_id", b.config.DeploymentID,
