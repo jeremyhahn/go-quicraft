@@ -578,6 +578,29 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	return nil
 }
 
+// unsealPreconditionLocked reports why this barrier may not attempt an unseal
+// at all, or nil when it may. The caller must hold b.mu.
+//
+// Extracted from Unseal to keep it under the cyclomatic limit, which the
+// load-generation claim and its pre-fence migration path pushed it over.
+//
+// The superseded case is the interesting one: a barrier that has lost the claim
+// must not re-claim by sealing and unsealing again. Allowing it would launder
+// the supersession into a fresh claim and put two instances into a loop of
+// stealing the blob back from each other, which is precisely the outcome
+// leaving the choice to an operator is meant to avoid.
+func (b *Barrier) unsealPreconditionLocked() error {
+	switch {
+	case b.state == barrierUninitialized:
+		return ErrBarrierNotInit
+	case b.state == barrierUnsealed:
+		return ErrBarrierUnsealed
+	case b.superseded.Load():
+		return ErrBarrierSuperseded
+	}
+	return nil
+}
+
 // Unseal decrypts the root key using the provided strategy and derives the
 // DEK for the current epoch. The barrier must be in the sealed state.
 //
@@ -616,18 +639,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.state == barrierUninitialized {
-		return ErrBarrierNotInit
-	}
-	if b.state == barrierUnsealed {
-		return ErrBarrierUnsealed
-	}
-	// A superseded barrier must not re-claim the blob. Sealing and unsealing
-	// again would otherwise launder the supersession into a fresh claim and put
-	// two instances into a loop of stealing the state back from each other,
-	// which is the opposite of leaving the choice to an operator.
-	if b.superseded.Load() {
-		return ErrBarrierSuperseded
+	if err := b.unsealPreconditionLocked(); err != nil {
+		return err
 	}
 
 	// Brute-force backoff check.

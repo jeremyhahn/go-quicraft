@@ -102,6 +102,13 @@ type Engine struct {
 	// against configuration methods (SetSender, SetCallback) being
 	// called after workers are running, which would be a data race.
 	started atomic.Bool
+
+	// stopOnce makes Stop idempotent, matching Node.Stop. Every stop channel
+	// below is closed unconditionally, so a second Stop panicked on "close of
+	// closed channel" — and Stop is reachable twice through Host.Close, which
+	// documents itself as idempotent, and through a test or supervisor that
+	// stops the engine directly before closing the host.
+	stopOnce sync.Once
 }
 
 // NewEngine creates an Engine with the configured number of workers.
@@ -579,7 +586,16 @@ func (e *Engine) NotifyWork(shardID uint64) {
 //
 // This sequential close-and-wait pattern guarantees that no in-flight
 // items are lost between tiers.
+//
+// Stop is idempotent, like Node.Stop: a second call is a no-op, and a
+// concurrent one blocks until the first has finished the whole ordered
+// shutdown. Callers may therefore stop the engine defensively.
 func (e *Engine) Stop() {
+	e.stopOnce.Do(e.stop)
+}
+
+// stop performs the ordered shutdown exactly once; see Stop.
+func (e *Engine) stop() {
 	// 1. Stop all loaded nodes. This closes each node's stopC channel,
 	// which unblocks any in-flight snapshot save/recover operations
 	// that select on node.stopC. Without this, snapshot operations

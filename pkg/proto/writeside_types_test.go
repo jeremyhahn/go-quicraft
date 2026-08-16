@@ -237,8 +237,8 @@ func TestMessageMarshalRefusesPositionlessSnapshot(t *testing.T) {
 		{"epoch only", Snapshot{Epoch: 7}},
 		{"witness flag only", Snapshot{Witness: true}},
 		{"on-disk index only", Snapshot{OnDiskIndex: 99}},
-		{"imported flag only", Snapshot{Imported: true}},
 		{"state machine type only", Snapshot{Type: OnDiskStateMachine}},
+		{"compression only", Snapshot{Compression: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := Message{Type: InstallSnapshot, From: 1, To: 2, Snapshot: tc.snap}

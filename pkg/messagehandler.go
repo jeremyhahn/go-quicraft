@@ -1165,6 +1165,15 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 					FileSize:   uint64(fi.Size()),
 					Membership: logdbMembershipToProto(existing.Membership),
 					Epoch:      existing.Epoch,
+					// Carry the artifact's full description, not just its
+					// position. The re-delivered install reaches the LogReader,
+					// and the SEND path reads the LogReader's copy when this
+					// replica ships the snapshot on: a Compression this message
+					// drops becomes a follower recording NoCompression for a
+					// snappy artifact, which its recovery then feeds to the
+					// state machine as garbage.
+					OnDiskIndex: existing.OnDiskIndex,
+					Compression: uint64(existing.Compression),
 				},
 			}
 			if !deliverSnapshotControl(h.engine, shardID, installMsg) {
@@ -1243,7 +1252,29 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 
 	fsys := h.host.snapshotFsys()
 
-	if err := fsys.MkdirAll(snapshotDir, 0o750); err != nil {
+	// STAGE, then publish with one rename. The receive must never write into
+	// the canonical snapshot-<index> directory directly.
+	//
+	// Same-index re-sends are routine and supported — msg.Hint carries a
+	// transfer sequence precisely to disambiguate them, and the dedup branch
+	// above re-delivers from LogDB rather than refusing — so this code is
+	// reached with a snapshot-<index> directory already on disk whenever LogDB
+	// and the tree disagree about it: a previous receive that wrote the files
+	// and then failed before SaveSnapshot, a crash whose cleanup never ran, or
+	// a local save that created the directory but has not recorded it yet.
+	// Opening snapshot.dat there with O_TRUNC destroyed that artifact before a
+	// single received byte had been authenticated, and the failure path then
+	// called RemoveAll on a directory this receive had not created — deleting a
+	// complete snapshot on the strength of a transfer that failed.
+	//
+	// Staging removes both. The directory below is created by THIS receive, so
+	// it is the only thing the failure path may remove, and the canonical name
+	// appears only when a fully written, fsynced artifact is renamed onto it.
+	// This is the discipline Host.ImportSnapshot already uses; see
+	// engine.RecvStageDirPrefix for why the receive gets its own staged name
+	// rather than the import one.
+	stageParent := filepath.Dir(snapshotDir)
+	if err := fsys.MkdirAll(stageParent, 0o750); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -1251,18 +1282,31 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			Err:       err,
 		}
 	}
+	stageDir, err := fsys.MkdirTemp(stageParent, engine.RecvStageDirPattern)
+	if err != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "stage",
+			Err:       err,
+		}
+	}
 
-	// Clean up partial snapshot directory on error. The committed flag
-	// is set at the end of the successful path so that only failed
-	// attempts leave orphaned directories.
+	// ownedDir is the directory this receive may discard on failure. It is the
+	// staging directory until the publishing rename, and the canonical
+	// directory afterwards — at which point ownership HAS been proved, because
+	// the rename moved a directory this receive created onto it. It is never a
+	// directory this receive merely found. committed is set once the artifact
+	// is durably recorded, after which nothing here may remove anything.
+	ownedDir := stageDir
 	var committed bool
 	defer func() {
 		if !committed {
-			if err := fsys.RemoveAll(snapshotDir); err != nil {
+			if err := fsys.RemoveAll(ownedDir); err != nil {
 				slog.Debug("snapshot directory cleanup failed",
 					"shard", shardID,
 					"replica", replicaID,
-					"dir", snapshotDir,
+					"dir", ownedDir,
 					"error", err)
 			}
 		}
@@ -1300,8 +1344,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// through unchanged (recvEpoch stays 0). A barrier sealed between the
 	// resolution above and here fails inside EncryptWithEpoch, so the failure
 	// still arrives with no plaintext artifact in existence.
-	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
-	f, err := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	stageDataPath := filepath.Join(stageDir, "snapshot.dat")
+	f, err := fsys.OpenFile(stageDataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -1402,7 +1446,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// FileSize on a record with a non-empty Filepath makes this replica
 	// stream an EMPTY snapshot once it becomes leader, silently erasing the
 	// receiving follower's state.
-	onDiskInfo, statErr := fsys.Stat(dataPath)
+	onDiskInfo, statErr := fsys.Stat(stageDataPath)
 	if statErr != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -1417,7 +1461,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// and the classified compression, so the directory describes itself even
 	// without its LogDB record — and so the DEK purge floor, which is computed
 	// by scanning these directories, sees the epoch this artifact needs.
-	if err := writeReceivedSnapshotMetadata(fsys, snapshotDir, snapshotIndex, snapshotTerm,
+	if err := writeReceivedSnapshotMetadata(fsys, stageDir, snapshotIndex, snapshotTerm,
 		shardID, replicaID, recvEpoch, recvCompression); err != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -1426,6 +1470,62 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			Err:       err,
 		}
 	}
+
+	// Publish. The rename is what makes the canonical name appear, and it
+	// appears already complete: data written, fsynced and closed, metadata
+	// beside it.
+	//
+	// A destination that already exists here is provably NOT the snapshot LogDB
+	// records. The dedup branch above returned for every existing.Index >=
+	// snapshotIndex, so the recorded snapshot — if there is one — is at a LOWER
+	// index and therefore under a DIFFERENT directory name. The guard is kept
+	// anyway and fails closed, because it also covers the paths that reach here
+	// without having consulted LogDB at all: a nil LogDB, or a read that
+	// returned ErrNoSnapshot while the tree still holds the artifact. Deleting
+	// the shard's live snapshot would leave LogDB pointing at nothing, which
+	// makes the shard unstartable and makes every leader re-send hit the dedup
+	// branch — a permanent wedge.
+	if recorded := h.host.recordedSnapshotPath(shardID, replicaID); recorded != "" &&
+		recorded == filepath.Clean(snapshotDir) {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "publish",
+			Err:       ErrSnapshotDestinationRecorded,
+		}
+	}
+	// os.Rename onto a non-empty directory fails, so an orphaned destination is
+	// cleared first. It is an orphan by the argument above: no LogDB record
+	// names it.
+	if _, statErr := fsys.Stat(snapshotDir); statErr == nil {
+		slog.Warn("snapshot receive is replacing an unrecorded snapshot directory "+
+			"left by an earlier failed transfer",
+			"shard", shardID,
+			"replica", replicaID,
+			"dir", snapshotDir,
+		)
+		if rmErr := fsys.RemoveAll(snapshotDir); rmErr != nil {
+			return &SnapshotReceiveError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Op:        "publish",
+				Err:       rmErr,
+			}
+		}
+	}
+	if renameErr := fsys.Rename(stageDir, snapshotDir); renameErr != nil {
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "publish",
+			Err:       renameErr,
+		}
+	}
+	// Ownership has transferred: the canonical directory IS the directory this
+	// receive created, so the failure path may now discard it — and must, since
+	// the staging name no longer exists.
+	ownedDir = snapshotDir
+	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
 
 	// Make the directory entries durable BEFORE recording the snapshot in
 	// LogDB: the data and metadata files are fsynced, but the entries
@@ -1617,6 +1717,12 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			// so if this node became leader doSendSnapshot would skip decryption
 			// and stream ciphertext that followers cannot recover.
 			Epoch: recvEpoch,
+			// The compression CLASSIFIED from the received bytes, and the
+			// sender's on-disk cursor, both as persisted to LogDB just above —
+			// so the LogReader's copy and the durable record describe the same
+			// artifact.
+			Compression: uint64(recvCompression),
+			OnDiskIndex: first.OnDiskIndex,
 		},
 	}
 	if !deliverSnapshotControl(h.engine, shardID, installMsg) {

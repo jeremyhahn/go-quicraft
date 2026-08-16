@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -33,6 +34,12 @@ import (
 // change therefore leaves a COMPLETE PLAINTEXT COPY of the state machine on
 // disk with nothing anywhere to say so. The counter is the observable a monitor
 // can alert on; the WARN is what an operator reading logs sees.
+// The failure is injected through sweepRemove rather than by chmod-ing the
+// directory. A chmod does not stop root, and the CI container runs the suite
+// as root, so the permission-based version of this test SKIPPED there — which
+// is precisely the environment the regression would ship from. The injected
+// error is the same EACCES a read-only mount produces, and the assertion is
+// unchanged: the sweeper must count and log what it could not reclaim.
 func TestSweepStaleDecryptTmp_FailureIsReported(t *testing.T) {
 	dir := t.TempDir()
 	orphan := filepath.Join(dir, ".send-decrypt-abc.tmp")
@@ -40,26 +47,22 @@ func TestSweepStaleDecryptTmp_FailureIsReported(t *testing.T) {
 		t.Fatalf("write orphan: %v", err)
 	}
 
-	// Deny write on the directory so the unlink fails, modelling a read-only
-	// mount or a permissions change.
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatalf("chmod: %v", err)
+	var attempted []string
+	restore := sweepRemove
+	sweepRemove = func(path string) error {
+		attempted = append(attempted, path)
+		return &os.PathError{Op: "remove", Path: path, Err: syscall.EACCES}
 	}
-	t.Cleanup(func() {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Logf("restore dir mode: %v", err)
-		}
-	})
+	t.Cleanup(func() { sweepRemove = restore })
 
 	before := StaleDecryptSweepFailures()
 	SweepStaleDecryptTmp(dir)
 
-	if _, err := os.Stat(orphan); err != nil {
-		t.Skipf("the orphan was removed despite a non-writable directory "+
-			"(%v): this process bypasses directory permissions, so the failure "+
-			"path cannot be exercised here", err)
+	if len(attempted) != 1 || attempted[0] != orphan {
+		t.Fatalf("sweeper attempted to remove %v, want exactly [%s]: it never "+
+			"reached the removal, so the failure branch was not exercised",
+			attempted, orphan)
 	}
-
 	after := StaleDecryptSweepFailures()
 	if after <= before {
 		t.Fatalf("StaleDecryptSweepFailures = %d, was %d: a plaintext copy of the "+
@@ -71,31 +74,33 @@ func TestSweepStaleDecryptTmp_FailureIsReported(t *testing.T) {
 // the sweep can silently not happen: the directory itself cannot be listed, so
 // whether a plaintext copy is sitting in it is unknown. That is the same
 // operational state as a failed removal and must be reported the same way.
+// The unlistable path is a REGULAR FILE where a directory was expected, not a
+// chmod 000 directory. ENOTDIR is refused for root as well, so this exercises
+// the branch in every environment; the chmod version skipped under the CI
+// container's root user, leaving the reporting path unverified exactly where
+// it ships from. Operationally the two are the same class of fault — the sweep
+// cannot look, so whether a plaintext copy is sitting there is unknown — and
+// the sweeper must report both the same way.
 func TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported(t *testing.T) {
 	parent := t.TempDir()
-	dir := filepath.Join(parent, "snapshot-dir")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	notADir := filepath.Join(parent, "snapshot-dir")
+	if err := os.WriteFile(notADir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".decrypt-abc.tmp"), []byte("plaintext"), 0o600); err != nil {
-		t.Fatalf("write orphan: %v", err)
+
+	// Guard the premise: a listing that SUCCEEDS would make the assertion
+	// below vacuous, and the failure must not be a missing path (which the
+	// sweeper deliberately ignores).
+	if _, err := os.ReadDir(notADir); err == nil {
+		t.Fatal("os.ReadDir on a regular file succeeded; the failure branch " +
+			"cannot be exercised and this test would assert nothing")
+	} else if os.IsNotExist(err) {
+		t.Fatalf("os.ReadDir reported not-exist (%v); the sweeper ignores that "+
+			"case by design, so the counter would not move", err)
 	}
-	if err := os.Chmod(dir, 0o000); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Logf("restore dir mode: %v", err)
-		}
-	})
 
 	before := StaleDecryptSweepFailures()
-	if entries, err := os.ReadDir(dir); err == nil {
-		t.Skipf("the unreadable directory listed %d entries: this process bypasses "+
-			"directory permissions, so the failure path cannot be exercised here",
-			len(entries))
-	}
-	SweepStaleDecryptTmp(dir)
+	SweepStaleDecryptTmp(notADir)
 
 	if after := StaleDecryptSweepFailures(); after <= before {
 		t.Fatalf("StaleDecryptSweepFailures = %d, was %d: the sweep could not "+

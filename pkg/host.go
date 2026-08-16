@@ -1439,9 +1439,33 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		}
 	}
 
+	// results is engine-supplied and must be index-parallel with entries; the
+	// apply worker slices it to len(entries) before calling. A SHORT slice is
+	// therefore an engine invariant violation, but indexing past it below
+	// would panic inside the apply worker's callback and, since that panic is
+	// recovered as a worker panic, cost the whole worker partition — every
+	// shard it serves — rather than the one shard with the bad batch.
+	//
+	// Clamp instead, and say so loudly. Proposals beyond the clamp are left in
+	// pendingProposals for the sweeper to fail on their deadline, which is the
+	// same outcome they would have had if the batch had never been offered;
+	// lastApplied still advances from entries below, because the entries WERE
+	// applied whatever the results slice says.
+	matched := entries
+	if len(results) < len(entries) {
+		slog.Error("OnApplied: results slice is shorter than entries; "+
+			"engine invariant violated, proposals beyond the results will "+
+			"time out instead of completing",
+			"shard_id", shardID,
+			"entries", len(entries),
+			"results", len(results),
+		)
+		matched = entries[:len(results)]
+	}
+
 	// Complete pending proposals. Uses sync.Map for lock-free lookups
 	// on this hot path — no mutex contention with concurrent Propose.
-	for i, entry := range entries {
+	for i, entry := range matched {
 		// Match by entry.Key (the proposal tracking key set by Host.Propose)
 		// rather than entry.Index (assigned by the raft state machine).
 		v, ok := ns.pendingProposals.LoadAndDelete(entry.Key)
@@ -1905,11 +1929,15 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 		return
 	}
 
-	// Complete pending snapshot RequestStates.
+	// Complete pending snapshot RequestStates. The engine's error is
+	// translated once, outside the loop, so every waiter on this shard is
+	// handed the SAME public identity for the one failure.
+	apiErr := translateSnapshotError(err)
+
 	ns.pendingSnapshotsMu.Lock()
 	for key, rs := range ns.pendingSnapshots {
 		if err != nil {
-			rs.complete(RequestResult{Err: err})
+			rs.complete(RequestResult{Err: apiErr})
 		} else {
 			rs.complete(RequestResult{Value: index})
 		}
@@ -2259,6 +2287,24 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 	if errors.Is(err, raft.ErrReadIndexNotReady) {
 		return ErrReadIndexNotReady
 	}
+	if errors.Is(err, raft.ErrDecompressionBomb) {
+		// A committed entry whose snappy header declares an expansion beyond
+		// MaxEntrySize. The apply worker fails the whole batch with it, so it
+		// reaches the caller of every proposal in that batch. Without the
+		// mapping the public ErrDecompressionBomb had no producer at all and
+		// the raft-internal one is unmatchable from outside the module.
+		return ErrDecompressionBomb
+	}
+	if errors.Is(err, engine.ErrShardFailed) {
+		// The apply circuit breaker latched — a state-machine panic
+		// (*engine.SMPanicError) or a repeated apply failure
+		// (*engine.CircuitBreakerError), both of which match this sentinel
+		// through their own Is methods. The shard is offline until it is
+		// reloaded or recovered, which is exactly what the public
+		// ErrShardFailed tells the caller; leaving the engine error to escape
+		// meant no caller could tell a latched shard from a transient refusal.
+		return ErrShardFailed
+	}
 	if errors.Is(err, raft.ErrPendingConfigChange) {
 		// A config change proposed while another is still uncommitted, or
 		// two batched into one Propose (PhD 4.1 permits only one in flight).
@@ -2269,6 +2315,85 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		// nothing entered the log, so re-proposing once the pending change
 		// commits succeeds.
 		return ErrRejected
+	}
+	return err
+}
+
+// translateSnapshotSubmitError converts the snapshot pool's REFUSAL to accept a
+// request into a public error.
+//
+// The pool refuses for two structurally different reasons and the caller's
+// correct response differs, but both used to collapse into
+// ErrSnapshotInProgress. A *SnapshotPoolBusyError means every snapshot worker
+// in the process is occupied — nothing is snapshotting THIS shard, so the
+// request simply found no worker and an operator told "already in progress"
+// goes looking for a concurrent snapshot that does not exist. A
+// *SnapshotDuplicateError is this shard's single-flight slot genuinely being
+// held, which is the only case ErrSnapshotInProgress describes.
+//
+// Both remain Temporary, so a retry loop is unaffected by the distinction; what
+// changes is that the two conditions are now tellable apart.
+func translateSnapshotSubmitError(err error) error {
+	var poolBusy *engine.SnapshotPoolBusyError
+	if errors.As(err, &poolBusy) {
+		return ErrBusy
+	}
+	return ErrSnapshotInProgress
+}
+
+// translateSnapshotError converts the error a snapshot pool worker reports
+// into an identity the public API defines.
+//
+// The pool lives in an internal package, so everything it produces —
+// engine.ErrStopped, *engine.SnapshotError, *engine.SnapshotTooLargeError —
+// is unmatchable by any errors.Is a caller outside this module can write.
+// Handed to the snapshot RequestState verbatim (which is what happened before
+// this function existed) they left SyncRequestSnapshot callers with string
+// comparison as their only option, and left the public sentinels for these
+// very conditions — ErrStopped, ErrSnapshotRecoveryFailed — with no producer
+// anywhere in the library.
+//
+// Anything unrecognised passes through unchanged. That is deliberate: the
+// barrier failures (ErrShardBarrierUnresolved, ErrSnapshotBarrierSealed,
+// ErrSnapshotEncryptedBarrierUnavailable) are declared in the engine precisely
+// so both layers fail with ONE identity, and re-mapping them would break the
+// property they exist for. Wrapping an error this function does not recognise
+// would likewise claim knowledge the host does not have.
+func translateSnapshotError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, engine.ErrStopped) {
+		return ErrStopped
+	}
+	if errors.Is(err, engine.ErrShardFailed) {
+		return ErrShardFailed
+	}
+	if errors.Is(err, engine.ErrSnapshotCorrupt) {
+		return ErrSnapshotCorrupt
+	}
+	if errors.Is(err, engine.ErrSnapshotSizeMismatch) {
+		return ErrSnapshotSizeMismatch
+	}
+	if errors.Is(err, engine.ErrSnapshotMembershipAhead) {
+		// The save was refused because the commit frontier had folded a config
+		// change the apply frontier had not reached — an internal state
+		// transition that clears on its own, which is exactly what ErrAborted
+		// means and why it classifies as Temporary. A retry takes the snapshot.
+		return ErrAborted
+	}
+	var tooLarge *engine.SnapshotTooLargeError
+	if errors.As(err, &tooLarge) {
+		return &SnapshotTooLargeError{ShardID: tooLarge.ShardID, MaxSize: tooLarge.Limit}
+	}
+	var snapErr *engine.SnapshotError
+	if errors.As(err, &snapErr) {
+		return &SnapshotFailedError{
+			ShardID:   snapErr.ShardID,
+			ReplicaID: snapErr.ReplicaID,
+			Recovery:  !snapErr.Save,
+			Err:       snapErr.Err,
+		}
 	}
 	return err
 }
@@ -2301,16 +2426,20 @@ type Host struct {
 	diskFull              *atomic.Bool // set by disk full callback in buildWALOptions
 	id                    string
 	stopOnce              sync.Once
-	proposalKeySeq        atomic.Uint64 // sequence half of the proposal key; see nextProposalKey
-	readKeySeq            atomic.Uint64 // monotonic key generator for read request tracking
-	snapshotKeySeq        atomic.Uint64 // monotonic key generator for snapshot request tracking
-	pendingOps            atomic.Int64  // tracks outstanding pending operations for drain
-	keyRotStopC           chan struct{} // closed to stop the key rotation goroutine
-	keyRotDone            chan struct{} // closed when the key rotation goroutine exits
-	sweepStopC            chan struct{} // closed to stop the pending proposal sweeper goroutine
-	sweepDone             chan struct{} // closed when the sweeper goroutine exits
-	drainC                chan struct{} // closed when pendingOps reaches 0 during drain
-	drainCMu              sync.Mutex    // protects drainC creation
+	// closeErr is the shutdown outcome the FIRST Close computed. Every other
+	// Close returns it too, which is only safe because stopOnce.Do publishes
+	// the write to every caller that blocked on it.
+	closeErr       error
+	proposalKeySeq atomic.Uint64 // sequence half of the proposal key; see nextProposalKey
+	readKeySeq     atomic.Uint64 // monotonic key generator for read request tracking
+	snapshotKeySeq atomic.Uint64 // monotonic key generator for snapshot request tracking
+	pendingOps     atomic.Int64  // tracks outstanding pending operations for drain
+	keyRotStopC    chan struct{} // closed to stop the key rotation goroutine
+	keyRotDone     chan struct{} // closed when the key rotation goroutine exits
+	sweepStopC     chan struct{} // closed to stop the pending proposal sweeper goroutine
+	sweepDone      chan struct{} // closed when the sweeper goroutine exits
+	drainC         chan struct{} // closed when pendingOps reaches 0 during drain
+	drainCMu       sync.Mutex    // protects drainC creation
 	// fsys routes snapshot persistence I/O. nil means the real filesystem;
 	// only tests set it (withSnapshotFS), so the injection never reaches the
 	// public API.
@@ -3310,6 +3439,19 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		release()
 	}
 
+	// Reclaim an InstallSnapshot receive staging directory orphaned by a crash.
+	// A receive removes its own on every error return, so only a kill leaves
+	// one, and nothing else ever will: the name cannot parse as
+	// "snapshot-<index>", which is exactly what keeps a half-written transfer
+	// out of snapshot GC and the DEK purge-floor scan.
+	//
+	// No lock is needed and none would help. A receive needs the shard's engine
+	// node to route to, and this runs before that node exists, so the shard
+	// provably has no receive in flight — which is why the receive staging name
+	// is distinct from the import one, whose sweeper reclaims under the import
+	// lock while the shard is running.
+	engine.SweepStaleRecvStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
+
 	// The state machine reads the shard's REPLICATED session policy, and falls
 	// back to this node's configuration only while none is known — a shard
 	// bootstrapped before the policy was replicated, or a join=true replica
@@ -3431,6 +3573,18 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			// state the removed Checksum field was in — an integrity control
 			// that looks present and is not.
 			if err := engine.VerifySnapshotArtifact(ss.Filepath, dataPath); err != nil {
+				return &HostInitError{Field: "snapshot_integrity", Err: err}
+			}
+
+			// And against the FileSize the record claims. The meta hash only
+			// exists for artifacts a stamping binary wrote, so for an inherited
+			// snapshot this is the ONLY at-rest check there is — and without it
+			// a snapshot.dat truncated after it was recorded recovers as a
+			// SHORTER state machine rather than as an error: the replica comes
+			// up at the snapshot's index holding a prefix of its state,
+			// diverged from every peer at the same log position with every
+			// Raft invariant intact.
+			if err := engine.VerifySnapshotFileSize(dataPath, ss.FileSize); err != nil {
 				return &HostInitError{Field: "snapshot_integrity", Err: err}
 			}
 
@@ -4478,7 +4632,16 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 				ReplicaID: ns.replicaID,
 			})
 		}
-		return nil, ErrSystemBusy
+		// ErrDropped, not ErrSystemBusy. ErrSystemBusy is documented as the
+		// GLOBAL in-memory log limit (MaxTotalInMemLogSize) and is returned by
+		// the rate-limiter check at the top of this function; reporting it
+		// here told the caller a limit had been reached that had not, and sent
+		// an operator to the wrong metric. This path is a per-shard proposal
+		// QUEUE overflow — the condition ErrDropped is documented for, the
+		// condition IncProposalDropped counts, and the condition
+		// OnProposalDropped announces. Both classify as Temporary, so retry
+		// loops are unaffected.
+		return nil, ErrDropped
 	}
 
 	// Wake the step worker so it processes the proposal queue.
@@ -4858,14 +5021,10 @@ func (h *Host) GetNewSessionWithOwner(
 		return nil, err
 	}
 
-	// Generate a unique client ID from cryptographic random bytes.
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return nil, &HostInitError{Field: "session_rand", Err: err}
+	clientID, err := newClientID(rand.Reader)
+	if err != nil {
+		return nil, err
 	}
-	clientID := uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 |
-		uint64(buf[3])<<24 | uint64(buf[4])<<32 | uint64(buf[5])<<40 |
-		uint64(buf[6])<<48 | uint64(buf[7])<<56
 
 	session := newSession(shardID, clientID, ownerID)
 	session.PrepareForRegister()
@@ -4896,6 +5055,48 @@ func (h *Host) GetNewSessionWithOwner(
 	session.PrepareForPropose()
 	return session, nil
 }
+
+// clientIDRerollLimit bounds the re-roll below. Eight draws of a value that is
+// wrong with probability 2^-64 cannot plausibly all fail; exhausting them means
+// the entropy source is returning a constant, which must be an error and not a
+// silent loop.
+const clientIDRerollLimit = 8
+
+// newClientID draws a session client ID from the system CSPRNG, rejecting zero.
+//
+// Zero is proto.NotSessionManagedClientID — the value that marks an entry as
+// carrying NO session. A session minted with it is structurally a no-op
+// session, and the failure is silent in both directions: the registration entry
+// fails Entry.IsNewSessionRequest, so the state machine skips it entirely and
+// returns an empty result, and the caller's own check is
+// `result.Value != clientID`, which 0 != 0 satisfies. GetNewSession therefore
+// returned SUCCESS and handed back a session whose every later proposal is
+// unsessioned — at-most-once delivery silently off for that client, which is
+// the one guarantee the API exists to provide. RegisterSession already rejects
+// a zero client ID; this closes the same hole on the minting side.
+// entropy is a parameter rather than a direct crypto/rand call so the rejection
+// can be tested: a value the code exists to refuse cannot be produced by the
+// real CSPRNG within the age of the universe, and a test that cannot produce it
+// asserts nothing.
+func newClientID(entropy io.Reader) (uint64, error) {
+	for i := 0; i < clientIDRerollLimit; i++ {
+		var buf [8]byte
+		if _, err := io.ReadFull(entropy, buf[:]); err != nil {
+			return 0, &HostInitError{Field: "session_rand", Err: err}
+		}
+		clientID := binary.LittleEndian.Uint64(buf[:])
+		if clientID != proto.NotSessionManagedClientID {
+			return clientID, nil
+		}
+	}
+	return 0, &HostInitError{Field: "session_rand", Err: ErrEntropyDegenerate}
+}
+
+// ErrEntropyDegenerate is returned when the system CSPRNG produced the same
+// rejected value on every attempt, which means it is not producing entropy at
+// all. Continuing would mint predictable identifiers, so the operation fails.
+var ErrEntropyDegenerate = errors.New(
+	"quicraft: the system random source returned a degenerate value repeatedly")
 
 // waitResultCtx waits for a RequestState to complete while honoring the
 // caller's context. It bridges the gap for request states that carry no
@@ -5464,7 +5665,7 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 			h.completePendingOp()
 		}
 		rs.Release()
-		return nil, ErrSnapshotInProgress
+		return nil, translateSnapshotSubmitError(submitErr)
 	}
 
 	return rs, nil
@@ -5791,7 +5992,14 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		barrier.RegisterInFlightEpoch(logdbSnap.Epoch)
 		defer barrier.DeregisterInFlightEpoch(logdbSnap.Epoch)
 
-		hw := &deferredHeaderWriter{w: w, header: headerBytes}
+		// The decrypt loop is the LONGER of the two export paths — it reads,
+		// authenticates and re-emits every frame of a multi-gigabyte artifact
+		// — yet it was the one path that never looked at ctx, so an encrypted
+		// export ignored a cancelled caller for its whole duration while a
+		// plaintext export of the same artifact stopped promptly. ctxWriter
+		// puts the check on the frame boundary, which is the only place the
+		// loop yields control anyway.
+		hw := &deferredHeaderWriter{w: &ctxWriter{ctx: ctx, w: w}, header: headerBytes}
 		if _, err = decryptSnapshotFrames(barrier, shardID, ns.replicaID, logdbSnap.Index, f, hw); err != nil {
 			return err
 		}
@@ -5809,6 +6017,27 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		return err
 	}
 	return nil
+}
+
+// ctxWriter fails a Write once its context is done, so a long producer that
+// has no context parameter of its own still stops promptly when the caller
+// gives up. It checks BEFORE writing: the point is not to emit the chunk the
+// cancellation arrived during.
+//
+// The error is mapped through mapContextError, so a cancelled export surfaces
+// as ErrCanceled / ErrTimeout exactly as the plaintext path's copyWithContext
+// does — one identity for one condition, whichever path produced it.
+type ctxWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+// Write emits p unless the context is already done.
+func (c *ctxWriter) Write(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, mapContextError(err)
+	}
+	return c.w.Write(p)
 }
 
 // deferredHeaderWriter withholds a header from the underlying writer until
@@ -6290,76 +6519,23 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 		return tempErr
 	}
 
-	dataPath := filepath.Join(stageDir, "snapshot.dat")
-	if writeErr := h.writeImportedSnapshotData(fsys, shardID, dataPath, r); writeErr != nil {
-		// Do not leave a partial (possibly multi-gigabyte) artifact behind
-		// for an import that will never be recorded in LogDB.
-		discardImportDir(fsys, shardID, stageDir)
-		return writeErr
-	}
-
-	// Re-encrypt the imported snapshot under THIS host's own barrier so it is
-	// encrypted at rest with the same key every other on-disk snapshot for the
-	// shard uses. The artifact's bytes are plaintext (ExportSnapshot decrypts
-	// before writing, so an import never carries ciphertext), so this is what
-	// closes the at-rest gap for a shard whose barrier is configured — the
-	// same role reencryptReceivedSnapshot plays for a network-received
-	// snapshot. A nil barrier is a no-op (snapshot stays plaintext, epoch 0);
-	// a barrier sealed after the precheck above fails closed here rather than
-	// leaving the plaintext artifact durably recorded, as does a per-shard
-	// barrier that stopped resolving since the precheck.
-	importBarrier, barrierErr := h.barrierForShard(shardID)
-	if barrierErr != nil {
-		discardImportDir(fsys, shardID, stageDir)
-		return barrierErr
-	}
-	epoch, unpin, encErr := reencryptImportPinned(fsys, dataPath, shardID, replicaID, header.Index, importBarrier)
-	// The pin must live until SaveSnapshot below records the epoch, so it is
-	// released on THIS function's return, not the helper's.
-	defer unpin()
-	if encErr != nil {
-		// Never recorded in LogDB, so the partial artifact must not be left
-		// behind for a later scan to trip over.
-		discardImportDir(fsys, shardID, stageDir)
-		return encErr
-	}
-
-	// Write the snapshot metadata file beside the artifact, recording the epoch
-	// the re-encryption above actually used.
-	//
-	// Without it the directory is anonymous to every scan: engine's purge-floor
-	// computation reads snapshot.meta for each snapshot directory and treats a
-	// MISSING file as "GC'd, imposes no floor", so the imported snapshot's DEK
-	// is legitimately dropped by the next PurgeEpochsBefore and the restored
-	// state becomes permanently undecryptable — StartShard then fails closed.
-	// For a disaster-recovery import that is total loss of the restore.
+	// Term is floored at 1 (the minimum valid term) so the Raft engine never
+	// treats the imported snapshot as uninitialized. It is computed here, once,
+	// because the staged snapshot.meta and the LogDB record below must describe
+	// this snapshot identically.
 	term := header.Term
 	if term == 0 {
 		term = 1
 	}
-	if metaErr := writeReceivedSnapshotMetadata(fsys, stageDir, header.Index, term,
-		shardID, replicaID, epoch, header.Compression); metaErr != nil {
-		discardImportDir(fsys, shardID, stageDir)
-		return metaErr
-	}
 
-	// Determine the data file size for recovery's InstallSnapshot path. This
-	// is measured AFTER reencryption so FileSize always means "size of the
-	// file at Filepath", matching the framed-ciphertext size when a barrier
-	// is configured rather than the plaintext size written above. It is read
-	// from the staging path, which is the same file the rename below publishes.
-	// A failed Stat must NOT fall through with FileSize 0: recovery records that
-	// size in the snapshot record, and a (non-empty Filepath, zero FileSize)
-	// pair makes this replica stream a metadata-only snapshot once it becomes
-	// leader — erasing the receiving follower's state. The import has not been
-	// published or recorded in LogDB yet, so the staging directory is discarded
-	// and the operator can retry.
-	fi, statErr := fsys.Stat(dataPath)
-	if statErr != nil {
-		discardImportDir(fsys, shardID, stageDir)
-		return statErr
+	fileSize, epoch, unpin, stageErr := h.stageImportedArtifact(
+		ctx, fsys, shardID, replicaID, header, term, stageDir, r)
+	// The epoch pin must live until the SaveSnapshot below records it, so it is
+	// released on THIS function's return rather than the helper's.
+	defer unpin()
+	if stageErr != nil {
+		return stageErr
 	}
-	fileSize := uint64(fi.Size())
 
 	// Make the staged directory's own entries durable before it is published:
 	// the rename below makes the whole directory reachable at once, and a
@@ -6697,7 +6873,7 @@ func (h *Host) importSnapshotDir(shardID, replicaID, index uint64, opts []Import
 // writeImportedSnapshotData writes the artifact's post-header bytes to the
 // snapshot data file and makes them durable. The file is always closed; on
 // error the caller discards the whole directory.
-func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPath string, r io.Reader) error {
+func (h *Host) writeImportedSnapshotData(ctx context.Context, fsys snapshotFS, shardID uint64, dataPath string, r io.Reader) error {
 	f, createErr := fsys.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if createErr != nil {
 		return createErr
@@ -6727,8 +6903,14 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 	// The shard is stopped by definition here, so its per-shard
 	// Config.MaxSnapshotSize is not available; the package default is the
 	// applicable ceiling.
+	// The copy is ctx-aware. This is the single longest-running step of an
+	// import — it writes the whole artifact, which for a restore is measured
+	// in gigabytes — and an io.Copy could not be interrupted at all, so an
+	// operator who aborted a wrong-artifact restore had to wait for it to
+	// finish writing before the staging directory was discarded. Every other
+	// bulk copy in the host (export, the plaintext branch) already checks.
 	maxSize := config.DefaultMaxSnapshotSize
-	written, copyErr := io.Copy(f, io.LimitReader(r, int64(maxSize)+1))
+	written, copyErr := copyWithContextN(ctx, f, io.LimitReader(r, int64(maxSize)+1))
 	if copyErr == nil && uint64(written) > maxSize {
 		copyErr = &SnapshotTooLargeError{ShardID: shardID, MaxSize: maxSize}
 	}
@@ -6755,6 +6937,96 @@ func (h *Host) writeImportedSnapshotData(fsys snapshotFS, shardID uint64, dataPa
 		return closeErr
 	}
 	return nil
+}
+
+// stageImportedArtifact writes the artifact's payload into the import's staging
+// directory and makes that directory a complete, self-describing snapshot: the
+// data file, re-encrypted under this host's own barrier, and the snapshot.meta
+// recording the epoch it actually used. It returns the on-disk size the LogDB
+// record must carry, that epoch, and the pin holding the epoch's DEK alive.
+//
+// It is separate from ImportSnapshot because it is a coherent phase with a
+// single postcondition — "the staging directory now holds a publishable
+// snapshot" — and because every one of its failures has the same remedy: the
+// import has not been published or recorded, so the staging directory is
+// discarded and the operator retries.
+//
+// unpin is never nil, so the caller can defer it unconditionally; it must be
+// held until the LogDB record naming the epoch is durable.
+func (h *Host) stageImportedArtifact(
+	ctx context.Context,
+	fsys snapshotFS,
+	shardID, replicaID uint64,
+	header snapshotArtifactHeader,
+	term uint64,
+	stageDir string,
+	r io.Reader,
+) (fileSize, epoch uint64, unpin func(), err error) {
+	unpin = func() {}
+	dataPath := filepath.Join(stageDir, "snapshot.dat")
+	if writeErr := h.writeImportedSnapshotData(ctx, fsys, shardID, dataPath, r); writeErr != nil {
+		// Do not leave a partial (possibly multi-gigabyte) artifact behind
+		// for an import that will never be recorded in LogDB.
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, writeErr
+	}
+
+	// Re-encrypt the imported snapshot under THIS host's own barrier so it is
+	// encrypted at rest with the same key every other on-disk snapshot for the
+	// shard uses. The artifact's bytes are plaintext (ExportSnapshot decrypts
+	// before writing, so an import never carries ciphertext), so this is what
+	// closes the at-rest gap for a shard whose barrier is configured — the
+	// same role reencryptReceivedSnapshot plays for a network-received
+	// snapshot. A nil barrier is a no-op (snapshot stays plaintext, epoch 0);
+	// a barrier sealed after the precheck above fails closed here rather than
+	// leaving the plaintext artifact durably recorded, as does a per-shard
+	// barrier that stopped resolving since the precheck.
+	importBarrier, barrierErr := h.barrierForShard(shardID)
+	if barrierErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, barrierErr
+	}
+	var encErr error
+	epoch, unpin, encErr = reencryptImportPinned(fsys, dataPath, shardID, replicaID, header.Index, importBarrier)
+	if encErr != nil {
+		// Never recorded in LogDB, so the partial artifact must not be left
+		// behind for a later scan to trip over.
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, encErr
+	}
+
+	// Write the snapshot metadata file beside the artifact, recording the epoch
+	// the re-encryption above actually used.
+	//
+	// Without it the directory is anonymous to every scan: engine's purge-floor
+	// computation reads snapshot.meta for each snapshot directory and treats a
+	// MISSING file as "GC'd, imposes no floor", so the imported snapshot's DEK
+	// is legitimately dropped by the next PurgeEpochsBefore and the restored
+	// state becomes permanently undecryptable — StartShard then fails closed.
+	// For a disaster-recovery import that is total loss of the restore.
+	if metaErr := writeReceivedSnapshotMetadata(fsys, stageDir, header.Index, term,
+		shardID, replicaID, epoch, header.Compression); metaErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, metaErr
+	}
+
+	// Determine the data file size for recovery's InstallSnapshot path. This
+	// is measured AFTER reencryption so FileSize always means "size of the
+	// file at Filepath", matching the framed-ciphertext size when a barrier
+	// is configured rather than the plaintext size written above. It is read
+	// from the staging path, which is the same file the rename below publishes.
+	// A failed Stat must NOT fall through with FileSize 0: recovery records that
+	// size in the snapshot record, and a (non-empty Filepath, zero FileSize)
+	// pair makes this replica stream a metadata-only snapshot once it becomes
+	// leader — erasing the receiving follower's state. The import has not been
+	// published or recorded in LogDB yet, so the staging directory is discarded
+	// and the operator can retry.
+	fi, statErr := fsys.Stat(dataPath)
+	if statErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, statErr
+	}
+	return uint64(fi.Size()), epoch, unpin, nil
 }
 
 // discardImportDir removes an import's STAGING directory when the import will
@@ -6906,16 +7178,26 @@ func (h *Host) DiagRemotes(shardID uint64) (string, error) {
 // embedding application receives — for an on-disk state machine, the Close
 // error is its backing store's final flush — so a nil return means every one
 // of those succeeded, not merely that shutdown was attempted.
+//
+// A concurrent or repeated Close BLOCKS until the shutdown that is already
+// running has finished, and returns that same error. Returning nil to the
+// second caller — which is what the closed-flag CAS alone did — reported a
+// clean shutdown before any of it had happened, and reported it to precisely
+// the caller most likely to act on it: the deferred Close in a supervisor that
+// races the explicit one in the shutdown path.
 func (h *Host) Close() error {
-	if !h.closed.CompareAndSwap(false, true) {
-		return nil
+	// Only the first caller fires the event; the CAS is what elects it. The
+	// closed flag also fails new work fast, so it is set before any of the
+	// (potentially slow) shutdown work below begins.
+	if h.closed.CompareAndSwap(false, true) {
+		if el := h.cfg.EventListener; el != nil && el.OnNodeHostShuttingDown != nil {
+			el.OnNodeHostShuttingDown()
+		}
 	}
 
-	// Fire OnNodeHostShuttingDown before any shutdown work begins.
-	if el := h.cfg.EventListener; el != nil && el.OnNodeHostShuttingDown != nil {
-		el.OnNodeHostShuttingDown()
-	}
-
+	// sync.Once.Do does not return until f has completed, for EVERY caller —
+	// that is what makes the join below correct for the losers of the CAS as
+	// well as the winner, and what publishes h.closeErr to them safely.
 	var closeErr error
 	h.stopOnce.Do(func() {
 		// Drain in-flight work first. If drain times out, proceed with
@@ -7069,9 +7351,10 @@ func (h *Host) Close() error {
 		}
 
 		h.logger.Info("host closed", "id", h.id)
+		h.closeErr = closeErr
 	})
 
-	return closeErr
+	return h.closeErr
 }
 
 // Drain transitions the host into drain mode as part of graceful shutdown.
@@ -8272,6 +8555,17 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
+	// Drain is a one-way transition into shutdown: it stops accepting NEW work
+	// and waits only for what is already in flight. Propose, ReadIndex and the
+	// session path all refuse here; a config change did not, so a membership
+	// change submitted during drain either raced the drain deadline (accepted,
+	// never waited for, host torn down mid-commit) or was completed with
+	// ErrClosed by the Close sweep — in both cases the caller cannot tell
+	// whether the voting set changed. Refuse it for the same reason a proposal
+	// is refused, and for a quorum change the reason is stronger.
+	if h.draining.Load() {
+		return nil, ErrDraining
+	}
 
 	ns, err := h.getNode(shardID)
 	if err != nil {
@@ -8988,6 +9282,13 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 			Filepath:   snapFilePath,
 			FileSize:   snapFileSize,
 			Epoch:      ss.Epoch,
+			// The durable record's full description of the artifact, not just
+			// its position. This LogReader snapshot is what the SEND path reads
+			// when this replica becomes leader and ships the snapshot on, so a
+			// field dropped here is a field the FOLLOWER records wrong: a
+			// snappy artifact announced as uncompressed is recovered as garbage.
+			OnDiskIndex: ss.OnDiskIndex,
+			Compression: uint64(ss.Compression),
 		}
 		if applyErr := lr.ApplySnapshot(protoSS); applyErr != nil {
 			return false, applyErr
@@ -9390,22 +9691,38 @@ const copyWithContextChunkSize = 1 << 20 // 1 MB
 // responsiveness. Returns mapContextError(ctx.Err()) on cancellation,
 // or any I/O error encountered during the copy.
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) error {
+	_, err := copyWithContextN(ctx, dst, src)
+	return err
+}
+
+// copyWithContextN is copyWithContext, additionally reporting how many bytes
+// reached dst. Callers that enforce a size limit need the count: an
+// io.LimitReader can only stop the copy, it cannot say whether the limit was
+// the reason, so the byte total is what distinguishes an artifact that ended
+// exactly at the limit from one that was truncated by it.
+//
+// The count is the bytes WRITTEN, and it is accurate on the error paths too,
+// so a caller can discard exactly what it wrote.
+func copyWithContextN(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
 	buf := make([]byte, copyWithContextChunkSize)
+	var written int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return mapContextError(err)
+			return written, mapContextError(err)
 		}
 		n, readErr := src.Read(buf)
 		if n > 0 {
-			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
-				return writeErr
+			w, writeErr := dst.Write(buf[:n])
+			written += int64(w)
+			if writeErr != nil {
+				return written, writeErr
 			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
-				return nil
+				return written, nil
 			}
-			return readErr
+			return written, readErr
 		}
 	}
 }

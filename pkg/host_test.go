@@ -6188,9 +6188,15 @@ func TestPropose_InboxFull(t *testing.T) {
 	}
 
 	// Continuously fill the proposal queue and call Propose until we observe
-	// ErrSystemBusy. The step worker drains the proposalQ concurrently, so
+	// ErrDropped. The step worker drains the proposalQ concurrently, so
 	// we may need several attempts. Proposals go through the MPSC proposalQ
 	// (not the inbox channel), so we must fill that queue.
+	//
+	// ErrDropped, not ErrSystemBusy: this is a per-shard proposal QUEUE
+	// overflow. ErrSystemBusy is the global MaxTotalInMemLogSize limiter, and
+	// reporting it here pointed an operator at a limit that had not been
+	// reached. The two must stay distinguishable, so the assertion also
+	// rejects the busy identity outright.
 	deadline := time.Now().Add(2 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -6202,11 +6208,16 @@ func TestPropose_InboxFull(t *testing.T) {
 			}
 		}
 		_, lastErr = h.Propose(context.Background(), 1, []byte("cmd"))
-		if errors.Is(lastErr, ErrSystemBusy) {
+		if errors.Is(lastErr, ErrDropped) {
+			if errors.Is(lastErr, ErrBusy) {
+				t.Fatalf("Propose error = %v, which matches BOTH ErrDropped and "+
+					"ErrBusy; a queue overflow must not be reported as a rate limit",
+					lastErr)
+			}
 			return // success
 		}
 	}
-	t.Errorf("Propose error = %v, want ErrSystemBusy (proposal queue never became full)", lastErr)
+	t.Errorf("Propose error = %v, want ErrDropped (proposal queue never became full)", lastErr)
 }
 
 func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
@@ -9690,6 +9701,12 @@ func TestHost_SeparateKeySequences(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
+	// Baselines. Deltas from these are what independence means, and they hold
+	// whatever the shard did on its way to a leader.
+	propBase := h.proposalKeySeq.Load()
+	readBase := h.readKeySeq.Load()
+	snapBase := h.snapshotKeySeq.Load()
+
 	// Generate keys from each counter.
 	propKey1 := h.proposalKeySeq.Add(1)
 	readKey1 := h.readKeySeq.Add(1)
@@ -9710,15 +9727,39 @@ func TestHost_SeparateKeySequences(t *testing.T) {
 		t.Errorf("snapshot keys not monotonic: %d <= %d", snapKey2, snapKey1)
 	}
 
-	// Keys from different counters should be independent. Since all
-	// counters start at 0, the first Add(1) from each returns 1, which
-	// demonstrates they are separate sequences. Verify the first keys
-	// have the same value (they are from different sequences so this
-	// is expected and correct).
-	if propKey1 != readKey1 || readKey1 != snapKey1 {
-		// They SHOULD be equal (all started at 0, first increment = 1).
-		// This verifies they are independent counters, not a shared one.
-		t.Logf("propKey1=%d, readKey1=%d, snapKey1=%d", propKey1, readKey1, snapKey1)
+	// Independence: each Add must advance ITS OWN counter by exactly one, so
+	// the first key from each is one past that counter's own baseline. Fold
+	// the three into one sequence and the second and third Adds return 2 and
+	// 3 instead, which is what this catches. The property was previously
+	// "asserted" with t.Logf, so the whole thing was a shared counter away
+	// from passing.
+	if got := propKey1 - propBase; got != 1 {
+		t.Errorf("first proposal key advanced its counter by %d, want 1 "+
+			"(propKey1=%d, base=%d): the counters are not independent",
+			got, propKey1, propBase)
+	}
+	if got := readKey1 - readBase; got != 1 {
+		t.Errorf("first read key advanced its counter by %d, want 1 "+
+			"(readKey1=%d, base=%d): reads share a counter with proposals",
+			got, readKey1, readBase)
+	}
+	if got := snapKey1 - snapBase; got != 1 {
+		t.Errorf("first snapshot key advanced its counter by %d, want 1 "+
+			"(snapKey1=%d, base=%d): snapshots share a counter with another path",
+			got, snapKey1, snapBase)
+	}
+
+	// And the second round must advance each by exactly one more, which pins
+	// that the Adds above did not simply all land on one counter that was
+	// already at the same value.
+	if got := propKey2 - propKey1; got != 1 {
+		t.Errorf("proposal counter advanced by %d between keys, want 1", got)
+	}
+	if got := readKey2 - readKey1; got != 1 {
+		t.Errorf("read counter advanced by %d between keys, want 1", got)
+	}
+	if got := snapKey2 - snapKey1; got != 1 {
+		t.Errorf("snapshot counter advanced by %d between keys, want 1", got)
 	}
 }
 
@@ -12966,8 +13007,16 @@ func TestDiagRemotes_InvalidShard(t *testing.T) {
 // translateProposalError
 // ---------------------------------------------------------------------------
 
-// TestTranslateProposalError_NotLeader verifies that the internal
-// NotLeaderError is translated to the public ErrNotLeader with leader info.
+// TestTranslateProposalError_NotLeader pins what the NotLeader branch is FOR:
+// replacing the raft layer's internal NotLeaderError — which carries no leader
+// identity a caller can use, and lives in a package no caller can import —
+// with the public *NotLeaderError carrying the leader this replica currently
+// believes in, so a client can redirect without a second round trip.
+//
+// It calls the branch directly. The previous version proposed against a host
+// with no elected leader and then, if an error came back at all, logged
+// whatever it was with t.Logf; it returned early when the proposal succeeded,
+// asserted nothing when it failed, and passed with the branch deleted.
 func TestTranslateProposalError_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
@@ -12982,20 +13031,45 @@ func TestTranslateProposalError_NotLeader(t *testing.T) {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	// Try proposing before leader is elected. This should return
-	// a NotLeader-type error.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+	ns := testLoadNode(h, 1)
 
-	_, err = h.SyncPropose(ctx, 1, []byte("no-leader"))
-	if err == nil {
-		// Leader was elected too fast. This is expected in single-node
-		// clusters with fast ticks.
-		return
+	// The leader this replica knows about, and the address it would redirect
+	// a client to. Both are what the translation must surface.
+	const leaderID uint64 = 7
+	const leaderAddr = "127.0.0.1:5007"
+	ns.leaderID.Store(leaderID)
+	ns.nodesMu.Lock()
+	ns.nodes[leaderID] = leaderAddr
+	ns.nodesMu.Unlock()
+
+	// The internal error carries a stale leader (0 = unknown) and no shard at
+	// all, so everything in the result has to come from the nodeState.
+	got := h.translateProposalError(ns, &raft.NotLeaderError{})
+
+	var public *NotLeaderError
+	if !errors.As(got, &public) {
+		t.Fatalf("translateProposalError(raft.NotLeaderError) = %v (%T), want "+
+			"*quicraft.NotLeaderError: the raft type is in an internal package, "+
+			"so a caller that receives it can neither match nor read it", got, got)
 	}
-	// The error should be one of the recognized types.
-	if !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) && !errors.Is(err, ErrNotLeader) && !errors.Is(err, ErrSystemBusy) {
-		t.Logf("SyncPropose returned error: %v (type: %T)", err, err)
+	if public.LeaderID != leaderID {
+		t.Errorf("LeaderID = %d, want %d: surfacing the leader is the whole "+
+			"reason the translation consults the nodeState", public.LeaderID, leaderID)
+	}
+	if public.LeaderAddress != leaderAddr {
+		t.Errorf("LeaderAddress = %q, want %q", public.LeaderAddress, leaderAddr)
+	}
+	if public.ShardID != 1 {
+		t.Errorf("ShardID = %d, want 1", public.ShardID)
+	}
+	if !errors.Is(got, ErrNotLeader) {
+		t.Error("the translated error must match ErrNotLeader")
+	}
+	if !Temporary(got) {
+		t.Error("a not-leader error must classify as temporary")
+	}
+	if id, ok := NotLeader(got); !ok || id != leaderID {
+		t.Errorf("NotLeader(translated) = (%d, %v), want (%d, true)", id, ok, leaderID)
 	}
 }
 
@@ -14586,15 +14660,21 @@ func TestSyncRead_SuccessImmediate(t *testing.T) {
 		t.Fatalf("SyncPropose failed: %v", err)
 	}
 
-	// Now do a linearizable read.
-	result, err := h.SyncRead(ctx, 1, nil)
+	// Now do a linearizable read. The query is non-nil and distinctive
+	// because mockStateMachine.Lookup echoes it: the echo is the only
+	// evidence available here that the state machine was actually consulted
+	// and its answer returned to the caller. Reading with a nil query and
+	// discarding the result — which is what this test used to do — passes
+	// against a SyncRead that returns (nil, nil) without touching the SM.
+	const query = "success-immediate"
+	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {
 		t.Fatalf("SyncRead failed: %v", err)
 	}
-	// The test SM's Lookup may return nil for a nil query -- the key
-	// point is that SyncRead completed without error (linearizable read
-	// succeeded through the pipeline).
-	_ = result
+	if result != query {
+		t.Fatalf("SyncRead result = %#v, want %q: the state machine's Lookup "+
+			"answer did not reach the caller", result, query)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -15908,14 +15988,19 @@ func TestSyncRead_SuccessEndToEnd(t *testing.T) {
 		t.Fatalf("warmup SyncPropose failed: %v", err)
 	}
 
-	// SyncRead exercises the full pipeline: ReadIndex -> wait -> Lookup.
-	result, err := h.SyncRead(ctx, 1, nil)
+	// SyncRead exercises the full pipeline: ReadIndex -> wait -> Lookup. The
+	// Lookup answer is asserted, not discarded: mockStateMachine echoes the
+	// query, so the echo proves the last stage of that pipeline ran and its
+	// output reached the caller.
+	const query = "success-end-to-end"
+	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {
 		t.Fatalf("SyncRead failed: %v", err)
 	}
-	// The result depends on the test SM; the key verification is that
-	// SyncRead completed without error through the full pipeline.
-	_ = result
+	if result != query {
+		t.Fatalf("SyncRead result = %#v, want %q: ReadIndex confirmed but the "+
+			"state machine's answer did not reach the caller", result, query)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -16258,11 +16343,15 @@ func TestSyncRead_WithMetrics(t *testing.T) {
 		t.Fatalf("warmup SyncPropose failed: %v", err)
 	}
 
-	result, err := h.SyncRead(ctx, 1, nil)
+	const query = "with-metrics"
+	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {
 		t.Fatalf("SyncRead with metrics failed: %v", err)
 	}
-	_ = result
+	if result != query {
+		t.Fatalf("SyncRead result = %#v, want %q: a metrics collector on the "+
+			"read path must not change what the caller receives", result, query)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -16777,16 +16866,36 @@ func TestTranslateProposalError_NotLeaderError(t *testing.T) {
 	v, _ := h.nodes.Load(uint64(1))
 	ns := v.(*nodeState)
 
-	// Test with a NotLeaderError that has known leader info.
+	// The nodeState is the authority on who the leader is. The internal error
+	// carries its own idea of it, and the translation must IGNORE that: the
+	// raft layer's copy is whatever the peer believed when it refused the
+	// proposal, while the nodeState mirrors the leadership the host has since
+	// observed. Handing the caller the stale one sends the retry to a replica
+	// that has already lost the term.
+	ns.leaderID.Store(9)
+	ns.nodesMu.Lock()
+	ns.nodes[9] = "192.168.1.109:5000"
+	ns.nodesMu.Unlock()
+
 	nle := &raft.NotLeaderError{
 		LeaderID:      5,
 		LeaderAddress: "192.168.1.100:5000",
 	}
 	result := h.translateProposalError(ns, nle)
 
-	// The result should be an ErrNotLeader (or similar error type).
-	if result == nil {
-		t.Fatal("expected non-nil error")
+	var public *NotLeaderError
+	if !errors.As(result, &public) {
+		t.Fatalf("translateProposalError = %v (%T), want *quicraft.NotLeaderError; "+
+			"the previous assertion was result != nil, which the untranslated "+
+			"pass-through satisfies too", result, result)
+	}
+	if public.LeaderID != 9 || public.LeaderAddress != "192.168.1.109:5000" {
+		t.Errorf("translated leader = %d at %q, want 9 at %q: the translation must "+
+			"report the leader the HOST knows, not the one the raft error carried",
+			public.LeaderID, public.LeaderAddress, "192.168.1.109:5000")
+	}
+	if !errors.Is(result, ErrNotLeader) {
+		t.Error("the translated error must match ErrNotLeader")
 	}
 }
 
@@ -16809,16 +16918,34 @@ func TestTranslateProposalError_NotLeaderError_NoLeader(t *testing.T) {
 	v, _ := h.nodes.Load(uint64(1))
 	ns := v.(*nodeState)
 
-	// Test with a NotLeaderError that has no leader info.
+	// No leader is known to this replica.
+	ns.leaderID.Store(0)
+
 	nle := &raft.NotLeaderError{
 		LeaderID:      0,
 		LeaderAddress: "",
 	}
 	result := h.translateProposalError(ns, nle)
 
-	// The result should indicate no leader is known.
-	if result == nil {
-		t.Fatal("expected non-nil error")
+	var public *NotLeaderError
+	if !errors.As(result, &public) {
+		t.Fatalf("translateProposalError = %v (%T), want *quicraft.NotLeaderError; "+
+			"the previous assertion was result != nil, which the untranslated "+
+			"pass-through satisfies too", result, result)
+	}
+	// An unknown leader must be reported as leader ZERO and still as a
+	// not-leader error. The documented contract is that a caller reads
+	// (0, true) as "retry, but discover the leader yourself" — inventing an
+	// address here, or degrading to a non-not-leader error, both break it.
+	if public.LeaderID != 0 || public.LeaderAddress != "" {
+		t.Errorf("translated leader = %d at %q, want 0 and empty",
+			public.LeaderID, public.LeaderAddress)
+	}
+	if id, ok := NotLeader(result); !ok || id != 0 {
+		t.Errorf("NotLeader(translated) = (%d, %v), want (0, true)", id, ok)
+	}
+	if !Temporary(result) {
+		t.Error("a not-leader error with no known leader is still retryable")
 	}
 }
 
@@ -18985,8 +19112,15 @@ func TestProposeEntry_DroppedProposalFiresEvent(t *testing.T) {
 		}
 	}
 
-	if !errors.Is(propErr, ErrSystemBusy) {
-		t.Errorf("expected ErrSystemBusy, got: %v", propErr)
+	// The error and the event must agree: OnProposalDropped announces a drop,
+	// so the error handed back must be the drop sentinel and not the global
+	// rate-limit one.
+	if !errors.Is(propErr, ErrDropped) {
+		t.Errorf("expected ErrDropped, got: %v", propErr)
+	}
+	if errors.Is(propErr, ErrBusy) {
+		t.Errorf("proposal drop reported as a rate limit (%v); ErrSystemBusy is "+
+			"the global MaxTotalInMemLogSize limiter, which was not reached", propErr)
 	}
 	if !dropped.Load() {
 		t.Error("expected OnProposalDropped to be called")
@@ -19953,12 +20087,18 @@ func TestSyncRead_SuccessPath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	result, err := h.SyncRead(ctx, 1, "test-query")
+	const query = "test-query"
+	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {
 		t.Fatalf("SyncRead failed: %v", err)
 	}
-	// The test state machine returns nil for Lookup.
-	_ = result
+	// mockStateMachine.Lookup echoes the query, so this asserts the SM was
+	// consulted and its answer returned. The comment this replaces claimed
+	// the test SM returns nil, which is not what mockStateMachine does — the
+	// result was simply never checked.
+	if result != query {
+		t.Fatalf("SyncRead result = %#v, want %q", result, query)
+	}
 }
 
 // ---------------------------------------------------------------------------

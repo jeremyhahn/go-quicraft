@@ -169,10 +169,6 @@ var (
 	// and global busy conditions.
 	ErrSystemBusy error = &BusyError{message: "quicraft: system busy, global rate limit exceeded"}
 
-	// ErrRotateInProgress is returned when a key rotation is requested
-	// while another rotation is already in progress.
-	ErrRotateInProgress = errors.New("quicraft: key rotation already in progress")
-
 	// ErrDecompressionBomb is returned when a decompressed payload
 	// exceeds the configured maximum size, preventing zip-bomb attacks.
 	ErrDecompressionBomb = errors.New("quicraft: decompressed size exceeds limit")
@@ -203,7 +199,9 @@ var (
 	ErrDecryptionFailed = seal.ErrDecryptionFailed
 
 	// ErrSnapshotRecoveryFailed is returned when recovering from a
-	// snapshot fails due to corruption or incompatibility.
+	// snapshot fails due to corruption or incompatibility. It is produced as
+	// *SnapshotFailedError with Recovery set, so the underlying engine cause
+	// stays reachable through Unwrap.
 	ErrSnapshotRecoveryFailed = errors.New("quicraft: snapshot recovery failed")
 
 	// ErrEntryTooLarge is the sentinel form of EntryTooLargeError, used
@@ -242,8 +240,10 @@ var (
 	// in progress for the shard.
 	ErrSnapshotInProgress = errors.New("quicraft: snapshot already in progress")
 
-	// ErrStopped is returned when an operation is interrupted because
-	// the stopper channel was closed.
+	// ErrStopped is returned when an operation is interrupted because the
+	// shard or the engine stopped underneath it — a snapshot save or recovery
+	// abandoned because the node's stop channel closed. It is distinct from
+	// ErrClosed, which means the request never started.
 	ErrStopped = errors.New("quicraft: operation stopped")
 
 	// ErrReadIndexNotReady is returned when a ReadIndex request cannot
@@ -268,6 +268,24 @@ var (
 	// ErrSnapshotCorrupt is returned when an encrypted snapshot frame has a
 	// corrupt/oversized length prefix during decryption (send/export path).
 	ErrSnapshotCorrupt = errors.New("quicraft: snapshot frame corrupt")
+
+	// ErrSnapshotDestinationRecorded is returned when a received snapshot's
+	// canonical directory is the directory LogDB currently records as this
+	// replica's live snapshot.
+	//
+	// A receive publishes by renaming its staging directory onto the canonical
+	// name, which means clearing whatever is already there. Doing that to the
+	// LIVE artifact leaves the LogDB record pointing at nothing: the shard
+	// cannot start, and every leader re-send is answered by the dedup branch
+	// from the record that now describes a deleted directory — a permanent
+	// wedge with no self-heal. The transfer is refused instead, and the leader
+	// re-sends after its ack timeout.
+	//
+	// It is unreachable through the normal path (the dedup branch answers every
+	// re-send at or below the recorded index) and exists for the paths that
+	// reach the publish without a usable LogDB answer.
+	ErrSnapshotDestinationRecorded = errors.New(
+		"quicraft: received snapshot's destination is the snapshot LogDB currently records")
 
 	// ErrShardNotStopped is returned when RemoveData is called for a
 	// shard that is still loaded on this host.
@@ -460,6 +478,51 @@ func (e *SnapshotReceiveError) Error() string {
 // Unwrap returns the underlying error.
 func (e *SnapshotReceiveError) Unwrap() error {
 	return e.Err
+}
+
+// SnapshotFailedError reports a snapshot operation the engine's snapshot pool
+// could not complete. It is the public face of the engine-internal snapshot
+// error: RequestSnapshot's RequestState used to carry that internal error
+// verbatim, so a caller of SyncRequestSnapshot had no errors.Is it could write
+// against the failure and fell back to string matching.
+//
+// Only the RECOVERY direction claims a sentinel. Installing an artifact into
+// the state machine is what ErrSnapshotRecoveryFailed describes, so a recovery
+// failure matches it; a SAVE failure has no sentinel and deliberately claims
+// none, because inventing one would say more about the failure than the host
+// knows. Both directions keep the underlying cause reachable through Unwrap,
+// which is what preserves the barrier sentinels (ErrShardBarrierUnresolved,
+// ErrSnapshotBarrierSealed) that the engine already fails with by public
+// identity.
+type SnapshotFailedError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	// Recovery is true when the failed operation was installing an artifact
+	// into the state machine, false when it was writing one out.
+	Recovery bool
+	// Err is the underlying engine failure.
+	Err error
+}
+
+// Error returns a human-readable description of the snapshot failure.
+func (e *SnapshotFailedError) Error() string {
+	op := "save"
+	if e.Recovery {
+		op = "recovery"
+	}
+	return fmt.Sprintf(
+		"quicraft: snapshot %s failed for shard %d replica %d: %v",
+		op, e.ShardID, e.ReplicaID, e.Err,
+	)
+}
+
+// Unwrap returns the underlying engine failure.
+func (e *SnapshotFailedError) Unwrap() error { return e.Err }
+
+// Is reports whether target matches ErrSnapshotRecoveryFailed. Only a recovery
+// failure matches; a save failure has no sentinel of its own.
+func (e *SnapshotFailedError) Is(target error) bool {
+	return e.Recovery && target == ErrSnapshotRecoveryFailed
 }
 
 // CorruptConfigEntryError reports a COMMITTED config-carrying entry whose
@@ -1000,8 +1063,8 @@ var temporaryErrors = [...]error{
 	// The leader has not yet committed an entry in its current term
 	// (Raft PhD 6.4). It will, within one heartbeat interval.
 	ErrReadIndexNotReady,
-	// Another rotation or snapshot holds the single-flight slot.
-	ErrRotateInProgress,
+	// Another snapshot holds the shard's single-flight slot, or every
+	// snapshot worker in the pool is occupied.
 	ErrSnapshotInProgress,
 }
 
@@ -1014,7 +1077,7 @@ var temporaryErrors = [...]error{
 // coming up (ErrShardNotStarted, ErrShardNotReady), a request that reached
 // the wrong replica (ErrNotLeader), a leader that has not yet committed in
 // its term (ErrReadIndexNotReady), and a single-flight slot that is already
-// taken (ErrRotateInProgress, ErrSnapshotInProgress).
+// taken (ErrSnapshotInProgress).
 //
 // EVERY other error is reported as permanent, including errors this package
 // did not produce. That default is deliberate: retrying a permanent failure

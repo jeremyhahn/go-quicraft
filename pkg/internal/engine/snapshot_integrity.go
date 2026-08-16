@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 
 	"github.com/cespare/xxhash/v2"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
 // hashSnapshotData returns the xxhash64 and byte length of the snapshot data
@@ -120,6 +122,71 @@ func VerifySnapshotArtifact(dir, dataPath string) error {
 		return nil
 	}
 	return verifySnapshotData(dataPath, meta)
+}
+
+// VerifySnapshotFileSize checks the snapshot data file at dataPath against the
+// FileSize the LogDB record claims for it.
+//
+// FileSize was written by every path that records a snapshot and read by NONE
+// of the paths that load one: the record travelled through convert.go into the
+// raft layer and out onto the wire, and nothing ever compared it to the file it
+// describes. A snapshot.dat truncated after it was recorded — a volume that
+// filled between the write and a later flush, a partial restore from a backup,
+// a torn copy — was therefore loaded as if complete. What comes out of that is
+// not an error but a SHORTER state machine: recovery reads the frames it finds
+// and stops, so the replica comes up at the snapshot's index holding a prefix
+// of its state, silently diverged from every peer at the same log position.
+//
+// This is a cheap check that the artifact is the one that was recorded, and it
+// is complementary to VerifySnapshotArtifact: the meta-based hash only exists
+// for artifacts written by a binary that stamps it, whereas FileSize is on
+// every record ever written and is the only at-rest check an inherited
+// artifact has.
+//
+// A recorded size of zero claims nothing and is not checked: a record written
+// before FileSize was populated carries zero, and refusing those would make an
+// upgrade unable to recover the snapshots it inherited.
+func VerifySnapshotFileSize(dataPath string, recorded uint64) error {
+	if recorded == 0 {
+		return nil
+	}
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		return err
+	}
+	if uint64(info.Size()) != recorded {
+		return &SnapshotSizeMismatchError{
+			Path:     dataPath,
+			Recorded: recorded,
+			OnDisk:   uint64(info.Size()),
+		}
+	}
+	return nil
+}
+
+// verifyRecoveryArtifact runs BOTH at-rest checks a recovery makes on the
+// artifact it is about to read: the snapshot.meta integrity fields, and the
+// FileSize the LogDB record claims.
+//
+// The two are complementary and neither subsumes the other. The meta hash only
+// exists for artifacts a stamping binary wrote, so an inherited one has no hash
+// to check at all; FileSize is on every record ever written. Conversely the
+// hash catches a flipped byte, which no size can.
+//
+// The size is checked only when the record NAMES a directory. The recovery's
+// discovery fallback picks the newest directory on disk, which may be a
+// different index, and rec.FileSize describes the file in the RECORDED
+// directory — not that one.
+func verifyRecoveryArtifact(snapshotDir, dataPath string, rec logdb.Snapshot) error {
+	if meta, metaErr := readSnapshotMetaFile(snapshotDir); metaErr == nil {
+		if err := verifySnapshotData(dataPath, meta); err != nil {
+			return err
+		}
+	}
+	if rec.Filepath == "" {
+		return nil
+	}
+	return VerifySnapshotFileSize(dataPath, rec.FileSize)
 }
 
 // HashSnapshotFile is hashSnapshotData exported for the receive and import

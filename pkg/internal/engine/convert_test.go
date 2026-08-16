@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -603,5 +604,105 @@ func TestEntryFieldCount(t *testing.T) {
 	if got := reflect.TypeOf(logdb.Entry{}).NumField(); got != mapped {
 		t.Fatalf("logdb.Entry has %d fields, proto.Entry has %d. The converters "+
 			"are field-by-field, so the two must stay in step.", got, mapped)
+	}
+}
+
+// TestSnapshotFieldCount is the same guard for the snapshot types, and it is
+// the one that was missing when proto.Snapshot turned out to have no
+// Compression field at all.
+//
+// The two types are converted field by field in six hand-written places — this
+// package's protoSnapshotToLogDB, host.go's recoverLogReader and its export
+// header, messagehandler.go's dedup re-delivery and its post-receive install,
+// and snapshot_pool.go's CreateSnapshot — and not one of them fails to compile
+// when a field is added on either side. A field that reaches only some of them
+// round-trips as ZERO, and for this type zero is a meaningful value in every
+// case: Compression zero means "uncompressed", so a snappy artifact is handed
+// to the state machine as garbage; Epoch zero means "plaintext", so ciphertext
+// is handed to it raw; FileSize zero makes this replica ship a metadata-only
+// snapshot that erases the receiving follower's state.
+//
+// The counts differ on purpose. Snapshot has three wire-only fields with no
+// logdb counterpart — Type, Witness and the identity pair ShardID/ReplicaID
+// (LogDB keys records by shard and replica instead of storing them) — so the
+// guard pins each side separately rather than requiring them to match.
+func TestSnapshotFieldCount(t *testing.T) {
+	const protoMapped = 12
+	if got := reflect.TypeOf(proto.Snapshot{}).NumField(); got != protoMapped {
+		t.Fatalf("proto.Snapshot has %d fields, but the converters map %d.\n"+
+			"Adding or removing one means updating protoSnapshotToLogDB, the "+
+			"proto.Snapshot literals in host.go (recoverLogReader), "+
+			"messagehandler.go (both install messages) and snapshot_pool.go "+
+			"(CreateSnapshot), plus Size/MarshalTo/UnmarshalFrom/"+
+			"hasContentBeyondPosition/Reset in proto — then bumping this count.",
+			got, protoMapped)
+	}
+
+	const logdbMapped = 8
+	if got := reflect.TypeOf(logdb.Snapshot{}).NumField(); got != logdbMapped {
+		t.Fatalf("logdb.Snapshot has %d fields, but the converters map %d.\n"+
+			"Adding one means deciding whether proto.Snapshot must carry it — "+
+			"Compression did, and did not, which made every snapshot record "+
+			"built by conversion claim NoCompression — then updating every "+
+			"converter and bumping this count.", got, logdbMapped)
+	}
+}
+
+// TestProtoSnapshotToLogDB_CarriesEveryConvertibleField pins the conversion
+// itself, field by field, with a DISTINCT non-zero value per field so a
+// mis-wired assignment (two fields reading the same source) is visible.
+//
+// The field-count guard above catches an addition; this catches a field that
+// exists on both sides and is simply not carried, which is the shape
+// Compression had.
+func TestProtoSnapshotToLogDB_CarriesEveryConvertibleField(t *testing.T) {
+	ps := proto.Snapshot{
+		ShardID:   9,
+		ReplicaID: 4,
+		Index:     101,
+		Term:      7,
+		Membership: proto.Membership{
+			ConfigChangeID: 55,
+			Addresses:      map[uint64]string{1: "n1:5000"},
+		},
+		Filepath:    "/snapshots/shard-9/snapshot-101",
+		FileSize:    4096,
+		OnDiskIndex: 88,
+		Epoch:       3,
+		Compression: uint64(config.Snappy),
+	}
+
+	ls := protoSnapshotToLogDB(&ps)
+
+	for _, c := range []struct {
+		field     string
+		got, want uint64
+	}{
+		{"Index", ls.Index, ps.Index},
+		{"Term", ls.Term, ps.Term},
+		{"FileSize", ls.FileSize, ps.FileSize},
+		{"OnDiskIndex", ls.OnDiskIndex, ps.OnDiskIndex},
+		{"Epoch", ls.Epoch, ps.Epoch},
+		{"Compression", uint64(ls.Compression), ps.Compression},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d: the conversion drops it, so every "+
+				"snapshot record built through this path describes the artifact "+
+				"wrongly", c.field, c.got, c.want)
+		}
+	}
+	if ls.Filepath != ps.Filepath {
+		t.Errorf("Filepath = %q, want %q", ls.Filepath, ps.Filepath)
+	}
+	if ls.Membership.ConfigChangeID != ps.Membership.ConfigChangeID {
+		t.Errorf("Membership.ConfigChangeID = %d, want %d",
+			ls.Membership.ConfigChangeID, ps.Membership.ConfigChangeID)
+	}
+
+	// config.Snappy must not be the zero value, or the Compression assertion
+	// above passes against a conversion that drops the field.
+	if config.Snappy == config.NoCompression {
+		t.Fatal("config.Snappy equals NoCompression; the Compression assertion " +
+			"cannot distinguish a carried field from a dropped one")
 	}
 }

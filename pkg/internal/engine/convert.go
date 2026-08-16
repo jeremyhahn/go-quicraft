@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -121,6 +122,14 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 }
 
 // protoSnapshotToLogDB converts a proto.Snapshot to a logdb.Snapshot.
+//
+// Compression is carried, and it could not be until proto.Snapshot grew the
+// field: every record this conversion produced therefore said NoCompression
+// whatever the artifact actually was. That is the one field here whose loss is
+// not merely descriptive — recovery builds its reader chain from it, so a
+// snappy artifact recorded as uncompressed is handed to the state machine as
+// garbage. The direct receive path and the import path set it correctly, which
+// is what kept the gap from showing.
 func protoSnapshotToLogDB(s *proto.Snapshot) logdb.Snapshot {
 	return logdb.Snapshot{
 		Index:       s.Index,
@@ -130,6 +139,7 @@ func protoSnapshotToLogDB(s *proto.Snapshot) logdb.Snapshot {
 		FileSize:    s.FileSize,
 		OnDiskIndex: s.OnDiskIndex,
 		Epoch:       s.Epoch,
+		Compression: config.CompressionType(s.Compression),
 	}
 }
 

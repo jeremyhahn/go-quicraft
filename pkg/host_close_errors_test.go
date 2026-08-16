@@ -191,7 +191,7 @@ func TestWriteImportedSnapshotData_ReportsCloseFailure(t *testing.T) {
 	h := &Host{}
 	dataPath := filepath.Join(t.TempDir(), "snapshot.dat")
 
-	err := h.writeImportedSnapshotData(closeFailingImportFS{}, 1, dataPath,
+	err := h.writeImportedSnapshotData(context.Background(), closeFailingImportFS{}, 1, dataPath,
 		strings.NewReader("an imported state machine image"))
 	if !errors.Is(err, errTestCloseFailed) {
 		t.Fatalf("writeImportedSnapshotData = %v, want the file's Close error. The "+

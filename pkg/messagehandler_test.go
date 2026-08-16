@@ -1166,17 +1166,36 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 	}
 	authorizeSnapshotPath(t, eng, h, 10, 1, 2)
 
-	// Pre-create the snapshot directory and put a read-only file where
-	// snapshot.dat would go so that os.Create fails after MkdirAll.
-	snapshotDir := handler.engine.GetNode(10).SnapshotSaveDir(777)
-	if err := os.MkdirAll(snapshotDir, 0o750); err != nil {
+	// A snapshot directory already exists at the index about to be received,
+	// holding a complete artifact, and LogDB does NOT record it — the shape a
+	// previous transfer leaves when it wrote the files and then failed, and the
+	// shape a same-index re-send routinely meets. It must survive a transfer
+	// that fails: the receive may only discard directories it created itself.
+	node := handler.engine.GetNode(10)
+	snapshotDir := node.SnapshotSaveDir(777)
+	cfs := newCrashFS(node.SnapshotDir(), cfg.NodeHostDir)
+	h.fsys = cfs
+
+	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
+	const preexisting = "a complete snapshot that predates this transfer"
+	if err := cfs.MkdirAll(snapshotDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	// Create a directory where the file would be, so os.Create fails.
-	dataPath := filepath.Join(snapshotDir, "snapshot.dat")
-	if err := os.MkdirAll(dataPath, 0o750); err != nil {
-		t.Fatalf("failed to create blocking dir: %v", err)
+	seed, err := cfs.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("seed snapshot.dat: %v", err)
 	}
+	if _, err := seed.Write([]byte(preexisting)); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed close: %v", err)
+	}
+
+	// Fail the receive's own write, after it has created its staging
+	// directory. The hook is installed AFTER the seeding above so the seed is
+	// not what trips it.
+	cfs.failOnce(opWrite, "snapshot.dat", errInjected)
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -1191,7 +1210,7 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		},
 	}
 
-	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
+	err = handler.HandleSnapshot(chunks, authorizeAllSenders)
 	if err == nil {
 		t.Fatal("expected error from HandleSnapshot, got nil")
 	}
@@ -1201,9 +1220,26 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		t.Fatalf("expected SnapshotReceiveError, got %T: %v", err, err)
 	}
 
-	// The snapshot directory should be cleaned up by the deferred cleanup.
-	if _, statErr := os.Stat(snapshotDir); !os.IsNotExist(statErr) {
-		t.Fatalf("snapshot directory should have been removed after error, but still exists")
+	// The pre-existing artifact must be untouched. Writing straight into the
+	// canonical directory truncated it before a byte was validated, and the
+	// failure cleanup then removed the whole directory — destroying a complete
+	// snapshot on the strength of a transfer that failed.
+	got, exists := cfs.liveBytes(dataPath)
+	if !exists {
+		t.Fatal("the pre-existing snapshot.dat is gone after a FAILED receive: " +
+			"the receive wrote into, and then deleted, a directory it did not create")
+	}
+	if string(got) != preexisting {
+		t.Fatalf("the pre-existing snapshot.dat = %q, want %q: the receive "+
+			"truncated an artifact it did not create before validating a byte",
+			got, preexisting)
+	}
+
+	// And the receive must not leak its own staging directory.
+	for _, name := range cfs.entries(filepath.Dir(snapshotDir)) {
+		if engine.IsSnapshotRecvStage(name) {
+			t.Fatalf("the failed receive left its staging directory %q behind", name)
+		}
 	}
 }
 
@@ -1703,13 +1739,13 @@ func TestHostMessageHandler_HandleSnapshot_MetadataWriteError(t *testing.T) {
 	handler := &hostMessageHandler{engine: eng, host: h}
 	authorizeSnapshotPath(t, eng, h, 7, 4, 1)
 
-	// Pre-create the snapshot directory and place a directory where
-	// snapshot.meta would be created, so os.Create fails.
-	snapshotDir := handler.engine.GetNode(7).SnapshotSaveDir(300)
-	metaBlocker := filepath.Join(snapshotDir, "snapshot.meta")
-	if err := os.MkdirAll(metaBlocker, 0o750); err != nil {
-		t.Fatalf("failed to create blocking dir: %v", err)
-	}
+	// Fail the metadata write. The receive stages in a directory of its own,
+	// so a blocker planted at the canonical path no longer intercepts it — the
+	// failure is injected at the filesystem instead.
+	node := handler.engine.GetNode(7)
+	cfs := newCrashFS(node.SnapshotDir(), cfg.NodeHostDir)
+	h.fsys = cfs
+	cfs.failOnce(opWrite, "snapshot.meta", errInjected)
 
 	chunks := []proto.SnapshotChunk{
 		{

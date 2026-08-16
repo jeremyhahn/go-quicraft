@@ -20,7 +20,34 @@ package proto
 //
 //	[ShardID:8][ReplicaID:8][Index:8][Term:8][Membership:var]
 //	[Filepath:len+data][FileSize:8]
-//	[Type:8][Imported:8][OnDiskIndex:8][Witness:8][Epoch:8]
+//	[Type:8][OnDiskIndex:8][Witness:8][Epoch:8][Compression:8]
+//
+// # The removed Imported field
+//
+// Imported rode this layout and was read by NOTHING outside marshal, unmarshal,
+// IsEmpty and Reset. It had exactly one writer, and that writer set it from the
+// save request's `exported` flag: it recorded "this save is an EXPORT", which is
+// close to the OPPOSITE of what the field's name and doc comment claimed. A
+// field that is written wrongly and read nowhere is worse than an absent one,
+// because the next reader to want the fact takes it and gets the wrong answer.
+//
+// If a wire-level statement that a snapshot was imported is wanted later — an
+// imported snapshot is one whose membership may have been rewritten by a
+// disaster-recovery override, which is genuinely worth knowing — it must arrive
+// with its consumer in the same change, and with a logdb.Snapshot counterpart so
+// it survives a restart.
+//
+// Type and Witness are in the same condition and are NOT removed here. Type has
+// no writer anywhere and is therefore zero on every snapshot ever produced,
+// while both MarshalTo and UnmarshalFrom validate it against
+// maxStateMachineType — a range check on a value no code path can set; removing
+// it orphans that constant and the InvalidSnapshotTypeError it raises, which
+// live in other files. Witness IS written (the leader sets it when it strips
+// the data file for a witness peer) and read by nothing; the fact it states is
+// already carried by the empty Filepath the same branch produces, and the layer
+// that could act on the disagreement it would reveal — a stripped snapshot
+// arriving at a replica that does not consider itself a witness — is the raft
+// role-mismatch check, not this type.
 //
 // # The removed Checksum field
 //
@@ -67,8 +94,6 @@ type Snapshot struct {
 	FileSize uint64
 	// Type identifies the state machine type.
 	Type uint64
-	// Imported indicates whether this snapshot was imported externally.
-	Imported bool
 	// OnDiskIndex is the index tracked for on-disk state machines.
 	OnDiskIndex uint64
 	// Witness indicates whether this is a witness replica snapshot.
@@ -78,6 +103,17 @@ type Snapshot struct {
 	// must be propagated through the snapshot transfer pipeline so the
 	// receiver can decrypt barrier-encrypted snapshot data.
 	Epoch uint64
+	// Compression is the algorithm the snapshot data file was written with,
+	// as a config.CompressionType value widened to uint64 (this package
+	// cannot import config — config imports it).
+	//
+	// It is a property of what the WRITER did, not of the reader's own
+	// configuration, so a recovery must take it from the artifact's record.
+	// Without the field on this type, every snapshot record built by
+	// converting a proto.Snapshot recorded NoCompression whatever the data
+	// actually was — and a compressed artifact read as uncompressed is fed to
+	// the state machine as garbage.
+	Compression uint64
 }
 
 // Size returns the total marshaled size of the snapshot in bytes.
@@ -86,7 +122,7 @@ func (s *Snapshot) Size() int {
 	// Membership (variable)
 	// Filepath: 4-byte len + data
 	// FileSize: 8
-	// Type, Imported, OnDiskIndex, Witness, Epoch: 5 * 8
+	// Type, OnDiskIndex, Witness, Epoch, Compression: 5 * 8
 	return 4*8 + s.Membership.Size() +
 		(4 + len(s.Filepath)) + 8 +
 		5*8
@@ -125,13 +161,13 @@ func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
 	offset += 8
 	putUint64(buf[offset:], s.Type)
 	offset += 8
-	putBool(buf[offset:], s.Imported)
-	offset += 8
 	putUint64(buf[offset:], s.OnDiskIndex)
 	offset += 8
 	putBool(buf[offset:], s.Witness)
 	offset += 8
 	putUint64(buf[offset:], s.Epoch)
+	offset += 8
+	putUint64(buf[offset:], s.Compression)
 	offset += 8
 	return offset, nil
 }
@@ -165,7 +201,7 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	s.FileSize = getUint64(buf[offset:])
 	offset += 8
-	// 5 trailing fixed fields: Type, Imported, OnDiskIndex, Witness, Epoch
+	// 5 trailing fixed fields: Type, OnDiskIndex, Witness, Epoch, Compression
 	if len(buf) < offset+5*8 {
 		return 0, ErrBufferTooSmall
 	}
@@ -174,13 +210,13 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 		return 0, &InvalidSnapshotTypeError{Type: s.Type}
 	}
 	offset += 8
-	s.Imported = getBool(buf[offset:])
-	offset += 8
 	s.OnDiskIndex = getUint64(buf[offset:])
 	offset += 8
 	s.Witness = getBool(buf[offset:])
 	offset += 8
 	s.Epoch = getUint64(buf[offset:])
+	offset += 8
+	s.Compression = getUint64(buf[offset:])
 	offset += 8
 	return offset, nil
 }
@@ -205,8 +241,8 @@ func (s *Snapshot) IsEmpty() bool {
 // Message cannot encode and would otherwise discard in silence.
 func (s *Snapshot) hasContentBeyondPosition() bool {
 	return s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
-		s.FileSize != 0 || s.Type != 0 || s.Imported ||
-		s.OnDiskIndex != 0 || s.Witness || s.Epoch != 0 ||
+		s.FileSize != 0 || s.Type != 0 || s.OnDiskIndex != 0 ||
+		s.Witness || s.Epoch != 0 || s.Compression != 0 ||
 		!s.Membership.isZero()
 }
 
@@ -220,8 +256,8 @@ func (s *Snapshot) Reset() {
 	s.Filepath = ""
 	s.FileSize = 0
 	s.Type = 0
-	s.Imported = false
 	s.OnDiskIndex = 0
 	s.Witness = false
 	s.Epoch = 0
+	s.Compression = 0
 }

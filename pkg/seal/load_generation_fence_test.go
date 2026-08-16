@@ -35,15 +35,6 @@ type fenceStore struct {
 	saves int
 }
 
-func newFenceStore(t *testing.T, initial *SealedRootKey) *fenceStore {
-	t.Helper()
-	s := &fenceStore{}
-	if initial != nil {
-		s.save(t, initial)
-	}
-	return s
-}
-
 func (s *fenceStore) save(t *testing.T, sealed *SealedRootKey) {
 	t.Helper()
 	encoded, err := json.Marshal(sealed)
@@ -75,12 +66,6 @@ func (s *fenceStore) read(t *testing.T) *SealedRootKey {
 		t.Fatalf("unmarshal sealed state: %v", err)
 	}
 	return &sealed
-}
-
-func (s *fenceStore) saveCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saves
 }
 
 // fenceBarrier builds a barrier wired to store and loads the current on-disk

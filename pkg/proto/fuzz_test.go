@@ -398,7 +398,6 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 			Filepath:    filepath,
 			FileSize:    fileSize,
 			Type:        smType,
-			Imported:    imported,
 			OnDiskIndex: onDiskIndex,
 			Witness:     witness,
 			Epoch:       epoch,
@@ -445,9 +444,6 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		}
 		if s.Type != s2.Type {
 			t.Fatalf("Type mismatch: %d != %d", s.Type, s2.Type)
-		}
-		if s.Imported != s2.Imported {
-			t.Fatalf("Imported mismatch: %v != %v", s.Imported, s2.Imported)
 		}
 		if s.OnDiskIndex != s2.OnDiskIndex {
 			t.Fatalf("OnDiskIndex mismatch: %d != %d", s.OnDiskIndex, s2.OnDiskIndex)

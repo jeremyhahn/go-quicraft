@@ -35,10 +35,10 @@ func TestSnapshotMarshalUnmarshalRoundTrip(t *testing.T) {
 		Filepath:    "/snapshots/shard-1/snap-100.dat",
 		FileSize:    1024 * 1024,
 		Type:        RegularStateMachine,
-		Imported:    true,
 		OnDiskIndex: 99,
 		Witness:     false,
 		Epoch:       7,
+		Compression: 1,
 	}
 	buf := make([]byte, s.Size())
 	n, err := s.MarshalTo(buf)
@@ -74,8 +74,6 @@ func TestSnapshotMarshalUnmarshalAllBoolsTrue(t *testing.T) {
 		},
 		Filepath:    "snap.dat",
 		FileSize:    100,
-		Type:        OnDiskStateMachine,
-		Imported:    true,
 		OnDiskIndex: 49,
 		Witness:     true,
 	}
@@ -137,18 +135,18 @@ func TestSnapshotReset(t *testing.T) {
 		Filepath:    "/path",
 		FileSize:    1024,
 		Type:        1,
-		Imported:    true,
 		OnDiskIndex: 99,
 		Witness:     true,
 		Epoch:       3,
+		Compression: 1,
 	}
 	s.Reset()
 	if !s.IsEmpty() {
 		t.Fatal("Reset snapshot should be empty")
 	}
 	if s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
-		s.FileSize != 0 || s.Type != 0 ||
-		s.Imported || s.OnDiskIndex != 0 || s.Witness || s.Epoch != 0 {
+		s.FileSize != 0 || s.Type != 0 || s.OnDiskIndex != 0 ||
+		s.Witness || s.Epoch != 0 || s.Compression != 0 {
 		t.Fatal("Reset did not clear all fields")
 	}
 }
@@ -318,14 +316,14 @@ func assertSnapshotEqual(t *testing.T, want, got *Snapshot) {
 	if got.Type != want.Type {
 		t.Fatalf("Type: got %d, want %d", got.Type, want.Type)
 	}
-	if got.Imported != want.Imported {
-		t.Fatalf("Imported: got %v, want %v", got.Imported, want.Imported)
-	}
 	if got.OnDiskIndex != want.OnDiskIndex {
 		t.Fatalf("OnDiskIndex: got %d, want %d", got.OnDiskIndex, want.OnDiskIndex)
 	}
 	if got.Witness != want.Witness {
 		t.Fatalf("Witness: got %v, want %v", got.Witness, want.Witness)
+	}
+	if got.Compression != want.Compression {
+		t.Fatalf("Compression: got %d, want %d", got.Compression, want.Compression)
 	}
 	if got.Epoch != want.Epoch {
 		t.Fatalf("Epoch: got %d, want %d", got.Epoch, want.Epoch)

@@ -20,6 +20,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -47,7 +49,6 @@ func sentinelTable() []sentinelClassification {
 		{"ErrShardNotReady", ErrShardNotReady, true},
 		{"ErrNotLeader", ErrNotLeader, true},
 		{"ErrReadIndexNotReady", ErrReadIndexNotReady, true},
-		{"ErrRotateInProgress", ErrRotateInProgress, true},
 		{"ErrSnapshotInProgress", ErrSnapshotInProgress, true},
 
 		// --- permanent ---
@@ -86,6 +87,8 @@ func sentinelTable() []sentinelClassification {
 		{"ErrInvalidSession", ErrInvalidSession, false},
 		{"ErrSnapshotSizeMismatch", ErrSnapshotSizeMismatch, false},
 		{"ErrSnapshotCorrupt", ErrSnapshotCorrupt, false},
+		{"ErrEntropyDegenerate", ErrEntropyDegenerate, false},
+		{"ErrSnapshotDestinationRecorded", ErrSnapshotDestinationRecorded, false},
 		{"ErrShardNotStopped", ErrShardNotStopped, false},
 		{"ErrStaleConfigChange", ErrStaleConfigChange, false},
 		{"ErrReplicaNotFound", ErrReplicaNotFound, false},
@@ -97,8 +100,17 @@ func sentinelTable() []sentinelClassification {
 		{"ErrRemoveLastFullReplica", ErrRemoveLastFullReplica, false},
 		{"ErrNonVotingRoleInMembers", ErrNonVotingRoleInMembers, false},
 		{"ErrImportLayoutUnknown", ErrImportLayoutUnknown, false},
+		{"ErrImportMembershipInvalid", ErrImportMembershipInvalid, false},
 		{"ErrImportDataDirMismatch", ErrImportDataDirMismatch, false},
 		{"ErrImportSnapshotDirExists", ErrImportSnapshotDirExists, false},
+
+		// Declared outside errors.go. These were invisible to the
+		// exhaustiveness check for as long as it parsed only errors.go, so
+		// nobody had ever decided whether they were retryable.
+		{"ErrSessionsUnsupportedOnDisk", ErrSessionsUnsupportedOnDisk, false},
+		{"ErrSnapshotEncryptedBarrierUnavailable", ErrSnapshotEncryptedBarrierUnavailable, false},
+		{"ErrSnapshotBarrierSealed", ErrSnapshotBarrierSealed, false},
+		{"ErrInvalidSnapshotOption", ErrInvalidSnapshotOption, false},
 	}
 }
 
@@ -113,50 +125,152 @@ func TestTemporary_Sentinels(t *testing.T) {
 	}
 }
 
-// TestTemporary_ClassifiesEverySentinel parses errors.go and fails when it
-// declares an exported Err* sentinel that the classification table does not
-// mention. Without this, a sentinel added later is silently permanent and
-// nobody ever decides whether that is right.
-func TestTemporary_ClassifiesEverySentinel(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "errors.go", nil, 0)
+// declaredSentinels parses every non-test source file of THIS package and
+// returns the exported Err* package-level variables it declares, mapped to the
+// file that declares them.
+//
+// It reads the whole package, not errors.go alone. Sentinels are declared next
+// to what produces them — ErrSessionsUnsupportedOnDisk and the two snapshot
+// barrier re-exports live in host.go, ErrInvalidSnapshotOption in
+// snapshot_option.go — and a check scoped to one file simply cannot see them.
+// Four exported sentinels were unclassified for exactly that reason: the test
+// reported complete coverage of a set it had defined to exclude them.
+func declaredSentinels(t *testing.T) map[string]string {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse errors.go: %v", err)
+		t.Fatalf("read package directory: %v", err)
 	}
 
-	classified := make(map[string]bool, len(sentinelTable()))
-	for _, tc := range sentinelTable() {
-		classified[tc.name] = true
-	}
-
-	var declared []string
-	for _, decl := range file.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
+	fset := token.NewFileSet()
+	declared := make(map[string]string)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		for _, spec := range gen.Specs {
-			value, ok := spec.(*ast.ValueSpec)
-			if !ok {
+		file, parseErr := parser.ParseFile(fset, name, nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", name, parseErr)
+		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
 				continue
 			}
-			for _, name := range value.Names {
-				if len(name.Name) > 3 && name.Name[:3] == "Err" && ast.IsExported(name.Name) {
-					declared = append(declared, name.Name)
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, ident := range value.Names {
+					if strings.HasPrefix(ident.Name, "Err") && len(ident.Name) > 3 &&
+						ast.IsExported(ident.Name) {
+						declared[ident.Name] = name
+					}
 				}
 			}
 		}
 	}
-
 	if len(declared) == 0 {
-		t.Fatal("parsed no exported Err* sentinels from errors.go; the AST walk is broken")
+		t.Fatal("parsed no exported Err* sentinels from the package; the AST walk is broken")
 	}
-	for _, name := range declared {
+	return declared
+}
+
+// TestTemporary_ClassifiesEverySentinel holds the classification table and the
+// package's actual declarations against each other in BOTH directions.
+//
+// The one-directional version could only catch an addition. A sentinel that
+// was REMOVED left its table row behind, still asserting a classification for
+// something no longer in the API, and a sentinel declared in any file other
+// than errors.go was never seen at all. Both directions are needed because the
+// table is a record of a human decision and the declarations are the API: they
+// are two independent sources, and the test is only worth anything while it
+// compares them rather than restating one of them.
+func TestTemporary_ClassifiesEverySentinel(t *testing.T) {
+	declared := declaredSentinels(t)
+
+	classified := make(map[string]bool, len(sentinelTable()))
+	for _, tc := range sentinelTable() {
+		if classified[tc.name] {
+			t.Errorf("sentinel %s appears twice in sentinelTable", tc.name)
+		}
+		classified[tc.name] = true
+	}
+
+	for name, file := range declared {
 		if !classified[name] {
-			t.Errorf("sentinel %s is declared in errors.go but is not classified in "+
-				"sentinelTable; decide whether it is temporary and add a row", name)
+			t.Errorf("sentinel %s is declared in %s but is not classified in "+
+				"sentinelTable; decide whether it is temporary and add a row", name, file)
 		}
 	}
+	for name := range classified {
+		if _, ok := declared[name]; !ok {
+			t.Errorf("sentinelTable classifies %s, which this package no longer "+
+				"declares; drop the row so the table describes the real API", name)
+		}
+	}
+}
+
+// TestTemporary_ImplementationMatchesTheDecision compares the temporaryErrors
+// LIST — the implementation — against the classification table — the recorded
+// decision. They are written independently and must agree.
+//
+// Without it the suite only ever asserted the list against itself: sentinelTable
+// says "temporary" exactly where temporaryErrors has an entry, and Temporary
+// answers from temporaryErrors, so TestTemporary_Sentinels passes for any list
+// the table was copied from. Appending a sentinel to temporaryErrors and
+// nothing else — silently making a permanent failure retried forever — was
+// invisible. Here it is not: the sentinel becomes temporary while the table
+// still says permanent.
+func TestTemporary_ImplementationMatchesTheDecision(t *testing.T) {
+	byIdentity := make(map[error]string, len(sentinelTable()))
+	wantTemporary := make(map[string]bool, len(sentinelTable()))
+	for _, tc := range sentinelTable() {
+		byIdentity[tc.err] = tc.name
+		wantTemporary[tc.name] = tc.temporary
+	}
+
+	seen := make(map[string]bool, len(temporaryErrors))
+	for _, listed := range temporaryErrors {
+		name, known := byIdentity[listed]
+		if !known {
+			t.Errorf("temporaryErrors holds %v, which sentinelTable does not "+
+				"classify; every retryable sentinel must be a decided one", listed)
+			continue
+		}
+		if seen[name] {
+			t.Errorf("temporaryErrors lists %s twice", name)
+		}
+		seen[name] = true
+		if !wantTemporary[name] {
+			t.Errorf("temporaryErrors makes %s retryable, but sentinelTable "+
+				"classifies it as permanent", name)
+		}
+	}
+
+	// The other direction, allowing for sentinels that are temporary through
+	// another entry's Is (ErrSystemBusy is a *BusyError and matches ErrBusy).
+	for name, temporary := range wantTemporary {
+		if temporary && !seen[name] && !Temporary(mustSentinel(t, name)) {
+			t.Errorf("sentinelTable classifies %s as retryable but nothing in "+
+				"temporaryErrors makes Temporary agree", name)
+		}
+	}
+}
+
+// mustSentinel returns the error the table records under name.
+func mustSentinel(t *testing.T, name string) error {
+	t.Helper()
+	for _, tc := range sentinelTable() {
+		if tc.name == name {
+			return tc.err
+		}
+	}
+	t.Fatalf("no sentinel named %s in sentinelTable", name)
+	return nil
 }
 
 // TestTemporary_Wrapped proves the classification survives wrapping, which is

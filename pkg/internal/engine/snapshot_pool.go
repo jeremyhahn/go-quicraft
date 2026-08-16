@@ -859,6 +859,50 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		membership = peer.GetMembership()
 	}
 
+	// The membership must be the one in effect AT snapshotIndex, and the two
+	// come from DIFFERENT frontiers, so that has to be checked rather than
+	// assumed.
+	//
+	// snapshotIndex is the APPLY frontier: it is what the state machine has
+	// consumed, which is what SaveSnapshot is about to serialize. Membership is
+	// folded at COMMIT time (Peer.Commit -> processConfigChanges, the
+	// commit-time semantics ProposeConfigChange documents), and commit runs
+	// ahead of apply — by construction here, because the saving gate this code
+	// holds STOPS applies while the step worker keeps committing.
+	//
+	// So a config change committed at C > snapshotIndex is already in the
+	// published membership while its entry has not been applied, and recording
+	// it produces a snapshot that claims a configuration which did not exist at
+	// its own index. A follower that installs it adopts membership as of C and
+	// then sets configFoldedThrough to the snapshot's index, so every entry in
+	// (index, C] is offered to the fold a SECOND time; and until it catches up
+	// it computes quorums from a voting set the log at that index does not
+	// justify.
+	//
+	// Membership.ConfigChangeID is the log index of the last config change
+	// folded into it, which makes the test exact: anything applied at or below
+	// snapshotIndex was necessarily committed — and therefore folded — first, so
+	// ConfigChangeID <= snapshotIndex means the captured membership is precisely
+	// the one in effect at snapshotIndex.
+	//
+	// The condition is TRANSIENT and clears on its own: it lasts only until the
+	// apply frontier passes C, which the very act of returning here permits (the
+	// deferred release re-opens the gate). The save is refused rather than
+	// recorded wrong, and the next trigger takes it.
+	if membership.ConfigChangeID > snapshotIndex {
+		return 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err: &SnapshotMembershipAheadError{
+				ShardID:        req.shardID,
+				ReplicaID:      req.replicaID,
+				SnapshotIndex:  snapshotIndex,
+				ConfigChangeID: membership.ConfigChangeID,
+			},
+		}
+	}
+
 	// Create snapshot directory using the standard naming convention:
 	// <snapshotDir>/shard-<N>/replica-<N>/snapshot-<index>
 	saveDir := snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)
@@ -1237,7 +1281,19 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			FileSize:   fileSize,
 			Membership: membership,
 			Epoch:      epoch,
-			Imported:   req.exported,
+			// The compression this save actually used. The LogReader's copy is
+			// what the SEND path reads when this replica ships the snapshot to
+			// a follower, and a snapshot whose record says NoCompression while
+			// its bytes are snappy is fed to the receiving state machine as
+			// garbage.
+			//
+			// OnDiskIndex is deliberately NOT set: it is the state machine's own
+			// internal applied counter, NOT a raft log index (see StartShard),
+			// and nothing in the local save path can observe it — the
+			// Snapshotter interface does not report it. Seeding it with
+			// snapshotIndex would put a raft log index in a field documented not
+			// to hold one, which is worse than leaving it unstated.
+			Compression: uint64(compression),
 		}); err != nil {
 			if errors.Is(err, logdb.ErrSnapshotOutOfDate) {
 				slog.Warn("LogReader snapshot out of date",
@@ -1553,14 +1609,12 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	//
 	// Fails CLOSED. Falling back to an older snapshot directory is NOT the
 	// remedy: that would roll the replica backwards silently.
-	if meta, metaErr := readSnapshotMetaFile(snapshotDir); metaErr == nil {
-		if verifyErr := verifySnapshotData(dataPath, meta); verifyErr != nil {
-			return &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      false,
-				Err:       verifyErr,
-			}
+	if verifyErr := verifyRecoveryArtifact(snapshotDir, dataPath, logdbSnap); verifyErr != nil {
+		return &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       verifyErr,
 		}
 	}
 
@@ -2671,6 +2725,86 @@ func IsSnapshotImportStage(name string) bool {
 	return strings.HasPrefix(name, ImportStageDirPrefix)
 }
 
+// Snapshot RECEIVE staging-directory naming, the InstallSnapshot counterpart of
+// the import names above and used for the same reason: a receive must not write
+// into the canonical "snapshot-<index>" directory, because same-index re-sends
+// are a supported, routine event (msg.Hint carries a transfer sequence
+// precisely to disambiguate them) and opening snapshot.dat with O_TRUNC there
+// destroys whatever was already at that index before a single received byte has
+// been validated. The receive stages into a directory it created, then
+// publishes with one rename.
+//
+// It gets its OWN prefix rather than reusing ImportStageDirPrefix because the
+// two have different liveness proofs. An import staging directory is protected
+// by the shard's import lock, which is what lets sweepImportStage reclaim
+// orphans while the shard is running; a receive holds no such lock and can be
+// in flight concurrently with a snapshot recovery, so a sweeper matching this
+// prefix must run only where no receive is possible — Host.StartShard, before
+// the shard's node exists to route an InstallSnapshot to.
+//
+// Unlike an import staging directory, this one holds CIPHERTEXT whenever the
+// shard has a barrier: the receive encrypts inline as it writes. An orphan is
+// therefore a disk leak rather than a plaintext exposure — still worth
+// reclaiming, since nothing else enumerates the name.
+const (
+	// RecvStageDirPrefix marks a directory an InstallSnapshot receive stages
+	// its artifact in. The name deliberately cannot parse as
+	// "snapshot-<index>", so listSnapshotDirs, snapshot GC and the DEK
+	// purge-floor scan all skip a half-written receive.
+	RecvStageDirPrefix = ".recv-"
+
+	// RecvStageDirPattern is the os.MkdirTemp pattern for a receive staging
+	// directory. Every receive must build its name from this.
+	RecvStageDirPattern = RecvStageDirPrefix + "*"
+)
+
+// IsSnapshotRecvStage reports whether a directory entry name is a receive
+// staging directory. It is the single matcher the sweeper uses, so a name that
+// can be CREATED is by construction a name that can be RECLAIMED.
+func IsSnapshotRecvStage(name string) bool {
+	return strings.HasPrefix(name, RecvStageDirPrefix)
+}
+
+// SweepStaleRecvStageDirs removes orphaned InstallSnapshot receive staging
+// directories from a shard/replica's snapshot tree.
+//
+// A receive removes its own staging directory on every error return; this
+// reclaims the ones a CRASH left behind, which nothing else ever will — the
+// name is invisible to listSnapshotDirs by construction, so snapshot garbage
+// collection, the recovery fallback and the DEK purge-floor scan all skip it.
+//
+// The caller must ensure no receive is in flight for the shard. Host.StartShard
+// is the only such place: a receive needs the shard's engine node to route to,
+// and StartShard runs before that node exists.
+//
+// Errors are logged and counted through the same reporting path a failed
+// scratch sweep uses; a failed cleanup must not abort startup.
+func SweepStaleRecvStageDirs(baseDir string, shardID, replicaID uint64) {
+	base := snapshotBaseDir(baseDir, shardID, replicaID)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			noteStaleDecryptSweepFailure(base, "read_dir", err)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !IsSnapshotRecvStage(entry.Name()) {
+			continue
+		}
+		stalePath := filepath.Join(base, entry.Name())
+		if rmErr := os.RemoveAll(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
+			noteStaleDecryptSweepFailure(stalePath, "remove_all", rmErr)
+			continue
+		}
+		slog.Warn("snapshot: reclaimed an orphaned InstallSnapshot receive staging directory",
+			"path", stalePath,
+			"shard_id", shardID,
+			"replica_id", replicaID,
+		)
+	}
+}
+
 // SweepStaleDecryptTmpTree removes orphaned snapshot scratch files from EVERY
 // retained snapshot directory of the given shard/replica, not just the one
 // currently being recovered.
@@ -2808,11 +2942,23 @@ func SweepStaleDecryptTmp(dir string) {
 			continue
 		}
 		stalePath := filepath.Join(dir, name)
-		if rmErr := os.Remove(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
+		if rmErr := sweepRemove(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
 			noteStaleDecryptSweepFailure(stalePath, "remove", rmErr)
 		}
 	}
 }
+
+// sweepRemove unlinks a swept scratch path. It is a variable solely so the
+// failure branch above can be exercised: the real causes — a read-only mount,
+// a permissions or ownership change, an immutable attribute — either need
+// privileges to construct or, worse, do NOT apply to a process running as
+// root, which is how the test suite runs in a CI container. A test that
+// chmods the directory and hopes unlink fails silently proves nothing there,
+// and the branch it guards is the one that makes a plaintext state machine
+// left at rest visible at all.
+//
+// Production code must never assign to it.
+var sweepRemove = os.Remove
 
 // staleDecryptSweepFailures counts the times the sweeper could not reclaim (or
 // could not even inspect) a snapshot decrypt scratch file or an import staging

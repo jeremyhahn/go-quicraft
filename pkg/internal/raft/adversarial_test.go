@@ -375,7 +375,6 @@ func (s *fuzzStream) snapshot(shardID uint64) proto.Snapshot {
 	ss.Membership.MaxWitnesses = s.u64()
 	flags := s.next()
 	ss.Membership.RequireFullReplicaMajority = flags&0x01 != 0
-	ss.Imported = flags&0x02 != 0
 	ss.Witness = flags&0x04 != 0
 	ss.Membership.Addresses = s.idMap()
 	ss.Membership.Observers = s.idMap()

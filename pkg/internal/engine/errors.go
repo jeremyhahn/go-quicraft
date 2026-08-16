@@ -104,6 +104,18 @@ var (
 	ErrSnapshotIndexNotAdvanced = errors.New(
 		"engine: snapshot index has not advanced since the last snapshot")
 
+	// ErrSnapshotSizeMismatch is returned when a snapshot data file's size on
+	// disk does not match the FileSize its LogDB record claims. It is the
+	// sentinel form of *SnapshotSizeMismatchError.
+	ErrSnapshotSizeMismatch = errors.New(
+		"engine: snapshot file size does not match the size recorded for it")
+
+	// ErrSnapshotMembershipAhead is returned when a snapshot save is asked to
+	// record a membership that folded a config change ABOVE the snapshot's own
+	// index. It is the sentinel form of *SnapshotMembershipAheadError.
+	ErrSnapshotMembershipAhead = errors.New(
+		"engine: snapshot membership is ahead of the snapshot index")
+
 	// ErrApplyGap is returned when a committed batch does not start at
 	// lastApplied+1. The missing range can never be re-offered (Raft's
 	// processed marker already advanced past it), so the shard is failed
@@ -353,6 +365,71 @@ func (e *SnapshotTooLargeError) Error() string {
 // Is reports whether target matches the sentinel ErrSnapshotTooLarge error.
 func (e *SnapshotTooLargeError) Is(target error) bool {
 	return target == ErrSnapshotTooLarge
+}
+
+// SnapshotMembershipAheadError reports a snapshot save whose captured
+// membership had already folded a config change committed ABOVE the snapshot's
+// index.
+//
+// The snapshot's index is the APPLY frontier and its membership is folded at
+// COMMIT time, and commit runs ahead of apply, so the two can disagree.
+// Recording the pair anyway produces a snapshot claiming a configuration that
+// did not exist at its own index: a follower installing it adopts the later
+// membership, sets its fold marker to the snapshot's index, and re-folds every
+// config change in between — while computing quorums, until it catches up, from
+// a voting set the log at that index does not justify.
+//
+// It is TRANSIENT by construction: it lasts only until the apply frontier
+// passes the config change, which returning this error permits by releasing the
+// save's apply gate. The next snapshot trigger takes it.
+type SnapshotMembershipAheadError struct {
+	ShardID       uint64
+	ReplicaID     uint64
+	SnapshotIndex uint64
+	// ConfigChangeID is the log index of the last config change the captured
+	// membership folded.
+	ConfigChangeID uint64
+}
+
+// Error returns a human-readable description of the frontier disagreement.
+func (e *SnapshotMembershipAheadError) Error() string {
+	return fmt.Sprintf(
+		"engine: snapshot for shard %d replica %d at index %d would record a membership "+
+			"whose last config change is at index %d, above the snapshot",
+		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.ConfigChangeID)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotMembershipAhead.
+func (e *SnapshotMembershipAheadError) Is(target error) bool {
+	return target == ErrSnapshotMembershipAhead
+}
+
+// Retryable reports that the save may be re-requested unchanged. It is always
+// true: nothing was written, and the apply frontier advances past the config
+// change as soon as this error releases the save's apply gate.
+func (e *SnapshotMembershipAheadError) Retryable() bool { return true }
+
+// SnapshotSizeMismatchError reports a snapshot data file whose size on disk
+// disagrees with the FileSize its LogDB record claims. It carries both sizes,
+// because the direction is diagnostic: a SHORTER file is a truncation (a full
+// volume, a torn copy, a partial restore) and a LONGER one means the record
+// describes a different artifact than the directory holds.
+type SnapshotSizeMismatchError struct {
+	Path     string
+	Recorded uint64
+	OnDisk   uint64
+}
+
+// Error returns a human-readable description of the size disagreement.
+func (e *SnapshotSizeMismatchError) Error() string {
+	return fmt.Sprintf(
+		"engine: snapshot %s is %d bytes on disk but its record claims %d",
+		e.Path, e.OnDisk, e.Recorded)
+}
+
+// Is reports whether target matches the sentinel ErrSnapshotSizeMismatch.
+func (e *SnapshotSizeMismatchError) Is(target error) bool {
+	return target == ErrSnapshotSizeMismatch
 }
 
 // SMPanicError is returned when a user state machine panics during Apply
