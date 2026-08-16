@@ -1404,3 +1404,118 @@ func TestHandleLeaderReadIndex_RefusesOnWitnessRoleMismatch(t *testing.T) {
 			len(r.readStates), len(r.pendingReadIndex))
 	}
 }
+
+// observerMismatchMembership lists replica 1 as a NON-VOTING observer among
+// four real voters. Four is deliberate: with an even voting set the two quorum
+// formulas actually differ. The configuration's quorum is quorumOf(4) = 3,
+// while a replica that wrongly counts itself computes quorumOf(4+1) = 3 and
+// supplies one of those itself — so it needs only 2 real grants where the
+// configuration requires 3. That gap is what lets two observers be elected in
+// the same term.
+func observerMismatchMembership() proto.Membership {
+	return proto.Membership{
+		ConfigChangeID: 4,
+		Addresses: map[uint64]string{
+			2: "addr2", 3: "addr3", 4: "addr4", 5: "addr5",
+		},
+		Observers: map[uint64]string{1: "addr1"},
+	}
+}
+
+// TestObserverRoleMismatch_CannotCampaign is the observer counterpart to
+// TestWitnessRoleMismatch_CannotCampaign.
+//
+// checkSelfRole compared only the WITNESS bit against the replicated
+// membership. A replica the configuration lists as a non-voting observer, but
+// which was started with IsObserver=false, latched no mismatch: startElection
+// gates on the local r.isObserver, so it campaigned. Voters granted it a vote
+// because handleVoteRequest's configuration test is isKnownMember, and
+// getRemote searches observers as well as voters. numVotingMembers then added
+// an unconditional +1 for self, so it sized quorum over V+1 while the real
+// voting set was V and counted its own vote toward it.
+//
+// The failure is not merely that a non-voter leads: two such replicas can each
+// collect a "majority" from disjoint halves of the real voting set and both be
+// elected in the SAME term, after which followers accept Replicate from both
+// and truncate each other's entries.
+func TestObserverRoleMismatch_CannotCampaign(t *testing.T) {
+	cfg := raftTestCfgPreVote(1, 1, false)
+	cfg.IsObserver = false // contradicts the replicated membership below
+
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = observerMismatchMembership()
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	if !r.roleMismatch {
+		t.Fatal("a replicated membership that lists this replica as a " +
+			"non-voting OBSERVER while it was started with IsObserver=false " +
+			"was not detected: startElection gates on the local flag, so " +
+			"nothing else stops it campaigning")
+	}
+
+	// The election timer must not produce a candidacy.
+	for i := 0; i < 10*int(cfg.ElectionRTT); i++ {
+		r.tickFunc(r)
+	}
+	if r.state == candidate || r.state == preCandidate || r.state == leader {
+		t.Fatalf("replica campaigned (state=%v) while the configuration "+
+			"lists it as a non-voting observer: it counts its own vote "+
+			"toward a quorum computed over a voting set it is not in", r.state)
+	}
+
+	// TimeoutNow is the other campaign entry point and bypasses startElection.
+	// The error is deliberately ignored: a refusal may surface as an error OR
+	// as a silent no-op depending on which gate fires first, and the assertion
+	// that matters is the resulting STATE either way.
+	_ = r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1})
+	if r.state == candidate || r.state == leader {
+		t.Fatalf("TimeoutNow made a role-mismatched observer a %v", r.state)
+	}
+}
+
+// TestObserverCandidate_IsDeniedAVote is the independent second half of the
+// fix, enforced by every VOTER rather than by the miscounting candidate.
+//
+// handleVoteRequest's configuration test is isKnownMember, which is true for
+// observers because getRemote searches r.observers. That is correct for
+// witnesses — they vote — and wrong for observers, which by definition do not.
+// This holds even when the candidate's own role latch is bypassed.
+func TestObserverCandidate_IsDeniedAVote(t *testing.T) {
+	// This replica (2) is a real voter; replica 1 is a non-voting observer.
+	cfg := raftTestCfgPreVote(1, 2, false)
+	lr := newTestLogReader(nil, proto.State{})
+	lr.membership = observerMismatchMembership()
+
+	r, err := newRaft(cfg, lr)
+	if err != nil {
+		t.Fatalf("newRaft: %v", err)
+	}
+	if _, ok := r.observers[1]; !ok {
+		t.Fatal("fixture is wrong: replica 1 must be a known observer on " +
+			"this voter, or the test proves nothing")
+	}
+
+	r.msgs = r.msgs[:0]
+	if err := r.step(proto.Message{
+		Type: proto.RequestVote, From: 1, To: 2, Term: r.term + 1,
+	}); err != nil {
+		t.Fatalf("step(RequestVote): %v", err)
+	}
+
+	if len(r.msgs) != 1 {
+		t.Fatalf("expected exactly one vote response, got %d", len(r.msgs))
+	}
+	if !r.msgs[0].Reject {
+		t.Fatal("a voter GRANTED a vote to a candidate the configuration " +
+			"lists as a non-voting observer: two such candidates can each " +
+			"collect a majority from disjoint halves of the real voting set " +
+			"and both be elected in the same term")
+	}
+	if r.vote == 1 {
+		t.Fatal("the voter recorded its durable vote for a non-voting " +
+			"observer, consuming this term's vote")
+	}
+}

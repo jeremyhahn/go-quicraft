@@ -159,11 +159,34 @@ func (r *remote) becomeProbe() {
 // becomeSnapshot transitions to the snapshot state, recording the index
 // of the snapshot being sent and the sequence identifying this transfer
 // attempt (see snapshotSeq). The inflights tracker is reset.
+// snapshotTransferTicks bounds how long a transfer may sit in remoteSnapshot
+// with no status report before the peer falls back to probe.
+//
+// remoteSnapshot is the only state whose isPaused() is unconditionally true,
+// and it was also the only one entered with no countdown armed:
+// snapshotWaitTicks == 0 is tickSnapshotWait's sentinel for "in flight, do not
+// count down". The countdown was armed only by handleSnapshotStatus. But
+// SnapshotStatus is a one-shot control message with no protocol-level
+// retransmission — deliverSnapshotControl gives it 5 attempts at 100ms and
+// then discards it — so losing it (the leader's own inbox saturated for half a
+// second, which is exactly the load that made the follower fall behind) left
+// the peer paused for the rest of the term. It received nothing further, its
+// match froze, and it silently stopped contributing to the commit quorum while
+// the leader still reported it healthy. Only a leadership change recovered it.
+//
+// The bound is generous because it is a backstop, not a schedule: a real
+// status report overwrites it (snapshotDone/snapshotFailed SET this field
+// rather than adding to it), so this only fires when the report never arrives.
+const snapshotTransferTicks = 60
+
 func (r *remote) becomeSnapshot(snapshotIndex, seq uint64) {
 	r.state = remoteSnapshot
 	r.snapshotIndex = snapshotIndex
 	r.snapshotSeq = seq
-	r.snapshotWaitTicks = 0
+	// Arm the backstop countdown rather than leaving the sentinel 0. Expiry
+	// runs through tickSnapshotWaits -> becomeProbe, which re-derives
+	// next = max(match+1, snapshotIndex+1) and resumes the normal retry path.
+	r.snapshotWaitTicks = snapshotTransferTicks
 	r.probeSent = false
 	r.inflights.reset()
 }

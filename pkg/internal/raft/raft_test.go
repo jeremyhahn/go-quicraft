@@ -3026,9 +3026,15 @@ func TestRaft_SnapshotStatus_StaleTransferIgnored(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if rm.state != remoteSnapshot || rm.snapshotWaitTicks != 0 {
-			t.Fatalf("stale status (reject=%v) must be ignored: state=%s waitTicks=%d",
-				reject, rm.state, rm.snapshotWaitTicks)
+		// becomeSnapshot arms a transfer BACKSTOP (snapshotTransferTicks) so a
+		// lost SnapshotStatus cannot pause the peer forever. A stale status
+		// must therefore leave the countdown exactly at that backstop —
+		// unchanged — rather than at the ack-wait or retry value a fresh
+		// status would install. Asserting "unchanged" is sharper than the old
+		// "still zero": it distinguishes "ignored" from "armed by a status".
+		if rm.state != remoteSnapshot || rm.snapshotWaitTicks != snapshotTransferTicks {
+			t.Fatalf("stale status (reject=%v) must be ignored: state=%s waitTicks=%d (want %d)",
+				reject, rm.state, rm.snapshotWaitTicks, snapshotTransferTicks)
 		}
 	}
 }
@@ -3063,8 +3069,11 @@ func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("stale status: %v", err)
 	}
-	if rm.snapshotWaitTicks != 0 {
-		t.Fatalf("stale same-index status must not arm the countdown, got %d", rm.snapshotWaitTicks)
+	// Unchanged from the transfer backstop becomeSnapshot armed: the stale
+	// status neither installed the ack-wait nor the retry countdown.
+	if rm.snapshotWaitTicks != snapshotTransferTicks {
+		t.Fatalf("stale same-index status must not arm the countdown, got %d (want the backstop %d)",
+			rm.snapshotWaitTicks, snapshotTransferTicks)
 	}
 	// Attempt #2's own status is honored.
 	if err := r.step(proto.Message{

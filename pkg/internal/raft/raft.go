@@ -74,7 +74,26 @@ func (s roleState) String() string {
 // obviously safe rather than exactly safe.
 const maxAdoptableTerm = math.MaxUint64 - 1024
 
-const maxVotingMembers = 64
+// MaxVotingMembers is the maximum number of voting members (remotes +
+// witnesses + self) a shard supports, bounded by the ReadIndex ackBits
+// bitfield: it is a uint64, so positions 0..63 are available.
+//
+// Exported because the cap has to be enforced at ADMISSION, and the bootstrap
+// path lives in package quicraft. It was previously enforced only by the
+// config-change validators (validateAddNode, validateAddWitness), which the
+// bootstrap path does not run: StartShard accepted a 65-member map, committed
+// it as the EntryInitialMembership at index 1, and then rebuildReplicaToBit
+// panicked in becomeLeader on every election forever. The membership is
+// durable, so the shard could never elect a leader again, across restarts.
+//
+// Do NOT add this check to applyMembershipEntry or the config-change handlers:
+// refusing an already-committed entry there makes replicas diverge, which is
+// what the NOTE in membership.go's handleAddNode warns about. Admission is the
+// only place it can be enforced safely.
+const MaxVotingMembers = 64
+
+// maxVotingMembers is the unexported spelling used throughout this package.
+const maxVotingMembers = MaxVotingMembers
 
 // maxInflightMsgs is the default maximum number of in-flight append
 // messages per remote peer.
@@ -531,12 +550,13 @@ func (r *raft) initRemotes(membership proto.Membership) {
 	}
 	r.setSelfMembership(membershipHasSelf(membership, r.replicaID))
 	_, listedWitness := membership.Witnesses[r.replicaID]
-	r.checkSelfRole(membershipHasSelf(membership, r.replicaID), listedWitness)
+	_, listedObserver := membership.Observers[r.replicaID]
+	r.checkSelfRole(membershipHasSelf(membership, r.replicaID), listedWitness, listedObserver)
 }
 
-// checkSelfRole cross-checks this replica's LOCALLY configured witness role
-// against the REPLICATED membership and latches roleMismatch when they
-// disagree. Called wherever the configuration is (re)established:
+// checkSelfRole cross-checks this replica's LOCALLY configured witness and
+// non-voting roles against the REPLICATED membership and latches roleMismatch
+// when either disagrees. Called wherever the configuration is (re)established:
 // construction, snapshot restore, and commit-time config change application.
 //
 // Nothing else validates the two against each other. config.IsWitness feeds
@@ -547,20 +567,30 @@ func (r *raft) initRemotes(membership proto.Membership) {
 // full replica, and the disagreement is invisible until it wins an election
 // and starts answering reads out of it.
 //
+// The OBSERVER half matters for a different and worse reason. startElection
+// gates campaigning on the LOCAL r.isObserver, while quorum() and countVotes()
+// size the voting set from the REPLICATED membership plus an unconditional +1
+// for self (numVotingMembers). A replica the configuration lists as an observer
+// but which is configured locally as a voter therefore computes
+// quorumOf(V+1) over a real voting set of V — for even V that is strictly
+// FEWER grants than the configuration requires — counts its own vote, and can
+// win. Two such replicas can be elected in the same term. Both halves must be
+// compared here or that state is reachable with nothing latched.
+//
 // dragonboat fails closed by panicking (internal/raft/raft.go addNode /
-// addWitness). Panicking a whole host over one shard's configuration is not
-// available here — a host carries thousands of shards — so the latch refuses
-// the two operations that can turn the bad state machine into an
-// authoritative answer: campaigning and serving reads. Voting is deliberately
-// NOT refused; witnesses vote, and a replica that stopped voting would remove
-// itself from a quorum the rest of the cluster still counts it in.
-func (r *raft) checkSelfRole(inConfig, listedWitness bool) {
+// addWitness / addNonVoting). Panicking a whole host over one shard's
+// configuration is not available here — a host carries thousands of shards —
+// so the latch refuses the two operations that can turn the bad state machine
+// into an authoritative answer: campaigning and serving reads. Voting is
+// deliberately NOT refused; witnesses vote, and a replica that stopped voting
+// would remove itself from a quorum the rest of the cluster still counts it in.
+func (r *raft) checkSelfRole(inConfig, listedWitness, listedObserver bool) {
 	// A replica the configuration does not mention makes no statement about
 	// its role. setSelfMembership already makes it unelectable.
 	if !inConfig {
 		return
 	}
-	mismatch := listedWitness != r.isWitness
+	mismatch := listedWitness != r.isWitness || listedObserver != r.isObserver
 	if mismatch == r.roleMismatch {
 		return
 	}
@@ -569,7 +599,8 @@ func (r *raft) checkSelfRole(inConfig, listedWitness bool) {
 		slog.Info("replica role now agrees with the replicated membership",
 			"shard", r.shardID,
 			"replica", r.replicaID,
-			"is_witness", r.isWitness)
+			"is_witness", r.isWitness,
+			"is_observer", r.isObserver)
 		return
 	}
 	slog.Error("replica role contradicts the replicated membership: refusing to campaign or serve reads until they agree",
@@ -577,6 +608,8 @@ func (r *raft) checkSelfRole(inConfig, listedWitness bool) {
 		"replica", r.replicaID,
 		"configured_witness", r.isWitness,
 		"membership_witness", listedWitness,
+		"configured_observer", r.isObserver,
+		"membership_observer", listedObserver,
 		"term", r.term)
 	// A leader that only now learns the configuration calls it a witness has
 	// been answering reads and counting quorums it had no right to. Step
@@ -1757,6 +1790,35 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		return nil
 	}
 
+	// A candidate the configuration lists as NON-VOTING must never be granted a
+	// vote. The membership test above is deliberately "known in any role"
+	// (isKnownMember consults remotes, observers AND witnesses), which is right
+	// for witnesses — they vote — and wrong for observers, which by definition
+	// do not. Without this, an observer whose LOCAL config says IsObserver=false
+	// campaigns, collects grants from real voters, counts its own vote, and can
+	// be elected; two of them can be elected in the same term because each sizes
+	// its quorum as quorumOf(V+1) over a real voting set of V.
+	//
+	// checkSelfRole latches that disagreement on the observer itself, and this
+	// is the independent second half: it holds even if the observer's own latch
+	// is bypassed, because it is enforced by every voter rather than by the
+	// candidate. Denying a vote can only ever cost liveness, never safety —
+	// the same argument the configuration test above rests on.
+	if !r.joining && r.membershipKnown() {
+		if _, nonVoting := r.observers[msg.From]; nonVoting {
+			slog.Warn("vote denied: candidate is a non-voting observer in the current configuration",
+				"shard", r.shardID,
+				"replica", r.replicaID,
+				"candidate", msg.From,
+				"term", r.term,
+				"msg_term", msg.Term,
+				"pre_vote", isPreVote,
+			)
+			r.send(proto.Message{Type: respType, To: msg.From, Reject: true})
+			return nil
+		}
+	}
+
 	// Check if we can grant the vote.
 	var canVote bool
 	if isPreVote {
@@ -2470,6 +2532,14 @@ func (r *raft) sendSnapshot(to uint64) {
 			"shard", r.shardID,
 			"to", to,
 		)
+		// Returning without touching the remote used to leave next wherever
+		// the caller had put it — including past the end of the leader's log,
+		// where term() fails on every retry and nothing is ever sent to this
+		// peer again. becomeProbe re-seats next at match+1, which is always a
+		// index the leader can read, so the ordinary probe/backtrack loop
+		// keeps running and the peer stays reachable. This is a safety net for
+		// any caller that leaves next unreadable, not just declineRemote.
+		rm.becomeProbe()
 		return
 	}
 
@@ -2645,7 +2715,25 @@ func (r *raft) declineRemote(rm *remote, rejectedIndex, hintIndex, hintTerm uint
 		// Leader does not have any entries at the conflicting term.
 		// Use the follower's hint (first index of the conflicting
 		// term) to skip the entire term on the follower's log.
-		rm.next = hintIndex
+		//
+		// The hint is peer-supplied and is only ever meaningful as a
+		// BACKTRACK, so it is clamped to the index that was rejected. Log
+		// matching guarantees an honest follower can never name a higher one:
+		// if its term at rejectedIndex is T and the leader's is lower, the
+		// leader holds no entries at T at all (holding (rejectedIndex+1, T)
+		// would require holding (rejectedIndex, T)), so lastIndexOfTerm(T)
+		// is 0 and hintIndex <= rejectedIndex.
+		//
+		// Unclamped, a buggy or malicious follower replies with
+		// Hint: 1<<62 and drives next past the end of the leader's log.
+		// sendAppend's term() lookup then fails forever, and it falls through
+		// to sendSnapshot — which, on a shard that has never compacted,
+		// returns without touching rm.state or rm.next. No message is ever
+		// sent to that peer again, so no rejection can arrive to backtrack it:
+		// the replica removes itself from replication permanently while the
+		// leader still reports it healthy. remote.declineFrom already applies
+		// the identical clamp; this branch was the one that did not.
+		rm.next = min(hintIndex, rejectedIndex)
 	}
 
 	// Ensure next never drops below 1.
@@ -3190,7 +3278,8 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 	// here before purgeDepartedVotes drops the now-invalid self vote.
 	r.setSelfMembership(membershipHasSelf(m, r.replicaID))
 	_, listedWitness := m.Witnesses[r.replicaID]
-	r.checkSelfRole(membershipHasSelf(m, r.replicaID), listedWitness)
+	_, listedObserver := m.Observers[r.replicaID]
+	r.checkSelfRole(membershipHasSelf(m, r.replicaID), listedWitness, listedObserver)
 	r.purgeDepartedVotes()
 }
 

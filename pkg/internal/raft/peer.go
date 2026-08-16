@@ -1024,12 +1024,13 @@ func (p *Peer) syncRaftRemotes() {
 	// for a term the real configuration is also electing a leader in.
 	p.r.setSelfMembership(p.membership.isMember(p.replicaID))
 
-	// Cross-check the locally configured witness role against the replicated
-	// configuration this call just applied. A committed AddWitness naming
-	// this replica, or an AddNode promoting it out of the witness set, is the
-	// point at which the two can start to disagree.
+	// Cross-check the locally configured witness AND non-voting roles against
+	// the replicated configuration this call just applied. A committed
+	// AddWitness or AddObserver naming this replica, or an AddNode promoting it
+	// out of either set, is the point at which the two can start to disagree.
 	p.r.checkSelfRole(p.membership.isMember(p.replicaID),
-		p.membership.isWitness(p.replicaID))
+		p.membership.isWitness(p.replicaID),
+		p.membership.isObserver(p.replicaID))
 
 	// Drop vote records for replicas that just left. The election quorum is
 	// computed over the voting set this call just reshaped; a stale grant
