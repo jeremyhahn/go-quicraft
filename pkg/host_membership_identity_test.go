@@ -56,6 +56,25 @@ func identityProtoMembership() proto.Membership {
 			2: "spki:2222222222222222222222222222222222222222222222222222222222222222",
 			3: "spki:3333333333333333333333333333333333333333333333333333333333333333",
 		},
+		// RemovedIdentities is the removal DENY-LIST — the map that keeps an
+		// ejected replica's keypair from being readmitted. It was absent from
+		// this fixture, so the read-back direction (logdbMembershipToProto)
+		// could drop it entirely with no test failing anywhere: a replica
+		// would restart having forgotten which keypairs it had ejected, and a
+		// decommissioned node still holding its certificate would be
+		// readmitted — on exactly the restart an operator performs after
+		// removing it. Per the field's own doc comment, dropping it "revokes
+		// a revocation".
+		RemovedIdentities: map[uint64]string{
+			9: "spki:9999999999999999999999999999999999999999999999999999999999999999",
+		},
+		// The replicated session policy travels the same path and was equally
+		// unguarded here: a snapshot that loses it comes back unset, the
+		// replica falls back to its own Config, and it expires sessions at log
+		// indexes its peers do not.
+		SessionExpiryEntries: 7000,
+		MaxTotalSessions:     8192,
+		MaxSessionsPerClient: 32,
 	}
 }
 
@@ -83,7 +102,27 @@ func TestMembershipConvertersRoundTripIdentities(t *testing.T) {
 		t.Fatalf("round-trip Identities = %v, want %v", got.Identities, want.Identities)
 	}
 
-	// The neighbouring fields must be unharmed.
+	// RemovedIdentities is asserted separately and loudly: it is the deny-list
+	// that stops an ejected replica's keypair being readmitted, and until this
+	// fixture carried it the read-back direction could drop the whole map with
+	// nothing failing. Losing it "revokes a revocation" — a replica restarts
+	// having forgotten which keypairs it ejected.
+	for id, identity := range want.RemovedIdentities {
+		if got.RemovedIdentities[id] != identity {
+			t.Fatalf("round-trip RemovedIdentities[%d] = %q, want %q: the "+
+				"removal deny-list did not survive, so a decommissioned "+
+				"replica still holding this certificate would be readmitted "+
+				"on the next restart", id, got.RemovedIdentities[id], identity)
+		}
+	}
+	if len(got.RemovedIdentities) != len(want.RemovedIdentities) {
+		t.Fatalf("round-trip RemovedIdentities = %v, want %v",
+			got.RemovedIdentities, want.RemovedIdentities)
+	}
+
+	// The neighbouring fields must be unharmed, including the replicated
+	// session policy — a snapshot that loses it makes the replica expire
+	// sessions at log indexes its peers do not.
 	if got.ConfigChangeID != want.ConfigChangeID ||
 		got.MaxWitnesses != want.MaxWitnesses ||
 		!got.RequireFullReplicaMajority ||
@@ -92,6 +131,14 @@ func TestMembershipConvertersRoundTripIdentities(t *testing.T) {
 		got.Witnesses[4] != want.Witnesses[4] ||
 		!got.Removed[9] {
 		t.Fatalf("round-trip lost a neighbouring field: %+v", got)
+	}
+	if got.SessionExpiryEntries != want.SessionExpiryEntries ||
+		got.MaxTotalSessions != want.MaxTotalSessions ||
+		got.MaxSessionsPerClient != want.MaxSessionsPerClient {
+		t.Fatalf("round-trip lost the replicated session policy: "+
+			"expiry=%d total=%d perClient=%d, want %d/%d/%d",
+			got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxSessionsPerClient,
+			want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient)
 	}
 }
 
