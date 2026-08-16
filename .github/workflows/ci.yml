@@ -265,9 +265,22 @@ jobs:
             # `make bench-compare` — the RELEASE performance comparison. They
             # were only built and vetted, never run, so a regression in the
             # comparison logic would silently pass or fail that gate.
+            # The ROOT module is built and vetted here but NOT tested: it has
+            # its own `test` job with -race, the UDP tuning the QUIC tests
+            # need, and the coverage gate. Running its suite again here ran it
+            # CONCURRENTLY with that job and reintroduced exactly the runner
+            # contention the `needs:` chain on `integration` exists to prevent
+            # — a timing-sensitive assertion in TestStartShard_FreshStart_NoSeed
+            # (it reads ns.lastApplied straight after StartShard, while the
+            # index-1 membership entry is still being applied) lost the race
+            # and failed a job that had found nothing wrong.
+            TEST_CMD="true"
+            if [ "${dir}" != "." ]; then
+              TEST_CMD="go test -count=1 ./..."
+            fi
             if ! (cd "${dir}" && go build ./... && go vet ./... \
                   && go vet -tags=benchmark ./... \
-                  && go test -count=1 ./...); then
+                  && eval "${TEST_CMD}"); then
               FAILED="${FAILED} ${dir}"
             fi
             echo "::endgroup::"
