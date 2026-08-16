@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -469,5 +470,109 @@ func BenchmarkProtoUpdatesToLogDBReuse_LargeBatch(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		dst, flatBuf = protoUpdatesToLogDBReuse(dst, flatBuf, src)
+	}
+}
+
+// TestProtoMembershipToLogDB_CarriesEveryField is the guard the older
+// TestProtoMembershipToLogDB could not provide.
+//
+// That test left MaxWitnesses, RequireFullReplicaMajority, Identities,
+// RemovedIdentities and all three session-policy fields at ZERO on both
+// sides, so deleting any of them from the converter changed nothing it
+// observed — every relevant package stayed green. The one round-trip test in
+// the repo that DOES assert them
+// (TestMembershipConvertersRoundTripIdentities) exercises the identically
+// named function in package quicraft, not this one. This is the converter
+// snapshotPool.save actually uses, so a dropped field here means a restarted
+// replica computes a different witness quorum than its peers, or expires
+// sessions at log indexes they do not.
+//
+// Every field is given a DISTINCT non-zero value so no two can be confused
+// and no omission can be masked by a zero default.
+func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
+	pm := proto.Membership{
+		ConfigChangeID:             11,
+		MaxWitnesses:               3,
+		RequireFullReplicaMajority: true,
+		SessionExpiryEntries:       5000,
+		MaxTotalSessions:           4096,
+		MaxSessionsPerClient:       64,
+		Addresses:                  map[uint64]string{1: "a1", 2: "a2"},
+		Observers:                  map[uint64]string{3: "o3"},
+		Witnesses:                  map[uint64]string{4: "w4"},
+		Removed:                    map[uint64]bool{5: true},
+		Identities:                 map[uint64]string{1: "spki:one", 2: "spki:two"},
+		RemovedIdentities:          map[uint64]string{5: "spki:five"},
+	}
+
+	lm := protoMembershipToLogDB(&pm)
+
+	checks := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"ConfigChangeID", lm.ConfigChangeID, uint64(11)},
+		{"MaxWitnesses", lm.MaxWitnesses, uint64(3)},
+		{"RequireFullReplicaMajority", lm.RequireFullReplicaMajority, true},
+		{"SessionExpiryEntries", lm.SessionExpiryEntries, uint64(5000)},
+		{"MaxTotalSessions", lm.MaxTotalSessions, uint64(4096)},
+		{"MaxSessionsPerClient", lm.MaxSessionsPerClient, uint64(64)},
+		{"Addresses[1]", lm.Addresses[1], "a1"},
+		{"Addresses[2]", lm.Addresses[2], "a2"},
+		{"Observers[3]", lm.Observers[3], "o3"},
+		{"Witnesses[4]", lm.Witnesses[4], "w4"},
+		{"Removed[5]", lm.Removed[5], true},
+		{"Identities[1]", lm.Identities[1], "spki:one"},
+		{"Identities[2]", lm.Identities[2], "spki:two"},
+		{"RemovedIdentities[5]", lm.RemovedIdentities[5], "spki:five"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v — a field dropped here is persisted "+
+				"zeroed into every snapshot", c.field, c.got, c.want)
+		}
+	}
+}
+
+// TestProtoMembershipToLogDB_MapsAreDeepCopied pins the aliasing contract.
+// The converter must not hand LogDB the caller's maps: the proto membership
+// it is given is raft's live copy, and a backend that stores the reference
+// would see it mutate underneath a persisted record.
+func TestProtoMembershipToLogDB_MapsAreDeepCopied(t *testing.T) {
+	pm := proto.Membership{
+		Addresses:         map[uint64]string{1: "a1"},
+		Identities:        map[uint64]string{1: "spki:one"},
+		RemovedIdentities: map[uint64]string{2: "spki:two"},
+		Removed:           map[uint64]bool{2: true},
+	}
+	lm := protoMembershipToLogDB(&pm)
+
+	pm.Addresses[1] = "MUTATED"
+	pm.Identities[1] = "MUTATED"
+	pm.RemovedIdentities[2] = "MUTATED"
+	pm.Removed[2] = false
+
+	if lm.Addresses[1] != "a1" || lm.Identities[1] != "spki:one" ||
+		lm.RemovedIdentities[2] != "spki:two" || !lm.Removed[2] {
+		t.Fatal("the converted membership aliases the caller's maps: a later " +
+			"mutation of raft's live membership would change a record already " +
+			"handed to LogDB")
+	}
+}
+
+// TestLogDBMembershipFieldCount fails when a field is added to
+// logdb.Membership, so the addition cannot be made without also deciding
+// whether every converter carries it. The converters are hand-written in four
+// places; this is what stops a fifth field from silently reaching only some
+// of them.
+func TestLogDBMembershipFieldCount(t *testing.T) {
+	const mapped = 12
+	if got := reflect.TypeOf(logdb.Membership{}).NumField(); got != mapped {
+		t.Fatalf("logdb.Membership has %d fields, but the converters map %d.\n"+
+			"Adding a field means updating every converter — engine/convert.go, "+
+			"host.go protoMembershipToLogDB, host.go logdbMembershipToProto, and "+
+			"the inline map in messagehandler.go — and their round-trip tests, "+
+			"then bumping this count.", got, mapped)
 	}
 }

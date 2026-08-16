@@ -494,6 +494,31 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// worker re-evaluates this node immediately rather than
 	// waiting for the next tick.
 	if !req.save {
+		if err != nil {
+			// A FAILED restore must fail the shard, not resume applies on it.
+			//
+			// StateMachine.RecoverFromSnapshot now stages the session table so
+			// a failure cannot leave sessions and user state at different
+			// indexes — but the USER state machine is still free to have
+			// mutated itself before returning an error. sm.StateMachine
+			// documents all-or-nothing only for Update, not for
+			// RecoverFromSnapshot, and the engine has no way to roll a user SM
+			// back. Resuming the apply pipeline against a possibly
+			// half-restored state machine applies committed entries onto an
+			// undefined base — divergence with every Raft invariant intact.
+			//
+			// Failing the shard is the same terminal state a permanent
+			// SaveState failure reaches. Recovery is an operator action:
+			// restart the shard, which builds a fresh state machine instance
+			// and replays from the last good snapshot.
+			slog.Error("snapshot recovery failed; failing the shard rather "+
+				"than resuming applies on a possibly half-restored state machine",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"error", err,
+			)
+			req.node.Fail(err)
+		}
 		req.node.SetRecovering(false)
 		if p.workSignal != nil {
 			p.workSignal.Notify(req.shardID)
@@ -1241,7 +1266,8 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	}
 
 	// Garbage collect old snapshot directories.
-	if gcErr := gcSnapshotDirs(node.SnapshotDir(), req.shardID, req.replicaID); gcErr != nil {
+	if gcErr := gcSnapshotDirs(node.SnapshotDir(), req.shardID, req.replicaID,
+		p.recordedSnapshotDir(req.shardID, req.replicaID)); gcErr != nil {
 		slog.Warn("snapshot GC failed",
 			"shard_id", req.shardID,
 			"replica_id", req.replicaID,
@@ -1513,6 +1539,30 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// plaintext and fail — permanently losing an otherwise-valid snapshot.
 	dataPath := filepath.Join(snapshotDir, snapshotDataFile)
 	recoverPath := dataPath
+
+	// CONSUMER 1 of 3: verify the artifact against the integrity fields in its
+	// snapshot.meta BEFORE anything reads it. The check is over the file as
+	// written — post-compression, post-encryption — so it runs here, on the
+	// canonical path, rather than after the decrypt-to-scratch step below.
+	//
+	// Without a barrier this is the ONLY at-rest integrity check a snapshot
+	// has: a flipped byte inside a serialized value leaves the length
+	// unchanged, no structural check trips, and the corrupt value is recovered
+	// into the state machine and served — a permanent single-replica
+	// divergence at the same log index with every Raft invariant intact.
+	//
+	// Fails CLOSED. Falling back to an older snapshot directory is NOT the
+	// remedy: that would roll the replica backwards silently.
+	if meta, metaErr := readSnapshotMetaFile(snapshotDir); metaErr == nil {
+		if verifyErr := verifySnapshotData(dataPath, meta); verifyErr != nil {
+			return &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      false,
+				Err:       verifyErr,
+			}
+		}
+	}
 
 	// Sweep stale decrypt scratch files left by a crash during a prior
 	// recovery OR a prior snapshot SEND. Both write plaintext to a sibling
@@ -2908,6 +2958,23 @@ func DecompressingSnapshotReader(r io.Reader, c config.CompressionType) (io.Read
 // that outlives its LogDB record still says how to read itself.
 func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64,
 	compression config.CompressionType) error {
+	// Stamp the integrity fields over the data file AS WRITTEN. This runs
+	// after the data file has been written, encrypted and fsynced, so the
+	// bytes hashed here are exactly the bytes every consumer will later read.
+	//
+	// A hash error is NOT fatal to the save: the artifact itself is already
+	// durable and correct, and refusing to record a snapshot because it could
+	// not be re-read would turn a transient read fault into a lost snapshot.
+	// The record is written without the fields, which makes the artifact
+	// recover without an integrity check rather than fail one.
+	var dataLen, dataHash uint64
+	if sum, size, hashErr := hashSnapshotData(filepath.Join(dir, snapshotDataFile)); hashErr == nil {
+		dataHash, dataLen = sum, size
+	} else {
+		slog.Warn("snapshot: could not hash the data file; recording metadata "+
+			"without an integrity check",
+			"dir", dir, "shard_id", shardID, "replica_id", replicaID, "error", hashErr)
+	}
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -2943,6 +3010,8 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 		ReplicaID:   replicaID,
 		Epoch:       epoch,
 		Compression: compression,
+		DataLen:     dataLen,
+		DataHash:    dataHash,
 	})
 	if _, err := f.Write(buf); err != nil {
 		return err
@@ -3211,13 +3280,18 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 // pin the HOST-WIDE DEK purge floor: co-hosted shards that do save can never
 // purge a DEK and old epoch key material is never zeroed, defeating
 // purgeOldEpochs entirely.
-func GCSnapshotDirs(baseDir string, shardID, replicaID uint64) error {
-	return gcSnapshotDirs(baseDir, shardID, replicaID)
+// recorded is the path LogDB records for this node, or "" when the caller does
+// not know it. It is never removed: GC selects by index order alone, so an
+// unusable higher-indexed directory (a partial receive left by a crash) can
+// push the recorded one into the removal window, and deleting it leaves the
+// LogDB record pointing at nothing.
+func GCSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) error {
+	return gcSnapshotDirs(baseDir, shardID, replicaID, recorded)
 }
 
 // gcSnapshotDirs removes old snapshot directories, keeping only the
 // most recent maxSnapshotsRetained. Returns nil if no cleanup is needed.
-func gcSnapshotDirs(baseDir string, shardID, replicaID uint64) error {
+func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) error {
 	dirs, err := listSnapshotDirs(baseDir, shardID, replicaID)
 	if err != nil {
 		return err
@@ -3226,11 +3300,45 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64) error {
 		return nil
 	}
 	// Remove oldest snapshots (dirs are sorted ascending by index).
+	//
+	// The directory LogDB RECORDS is skipped, whatever its rank. GC selects by
+	// index order alone, so higher-indexed directories that are unusable —
+	// e.g. partial receives left by a crash — push the recorded one into the
+	// removal window, and deleting it leaves the LogDB record pointing at
+	// nothing. discardSaveDir has had this guard since it was written; GC,
+	// which removes far more directories, did not.
 	toRemove := dirs[:len(dirs)-maxSnapshotsRetained]
 	for _, d := range toRemove {
+		if recorded != "" && filepath.Clean(d.path) == recorded {
+			slog.Error("snapshot: refusing to GC the directory LogDB records",
+				"shard_id", shardID,
+				"replica_id", replicaID,
+				"path", d.path,
+			)
+			continue
+		}
 		if err := os.RemoveAll(d.path); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Make the removals durable. Without this a metadata-lazy filesystem can
+	// resurrect a GC'd directory after a crash, and the resurrected one is a
+	// half-deleted tree no consumer validates. waldb fsyncs after segment
+	// deletion for exactly this reason.
+	return SyncDir(snapshotBaseDir(baseDir, shardID, replicaID))
+}
+
+// recordedSnapshotDir returns the cleaned path LogDB records for the node, or
+// "" when there is none or it cannot be read. A read failure yields "" rather
+// than an error: GC must not be blocked by an unreadable record, and the
+// consequence of not knowing is only that the guard above does not fire.
+func (p *snapshotPool) recordedSnapshotDir(shardID, replicaID uint64) string {
+	if p.logdb == nil {
+		return ""
+	}
+	rec, err := p.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil || rec.Filepath == "" {
+		return ""
+	}
+	return filepath.Clean(rec.Filepath)
 }

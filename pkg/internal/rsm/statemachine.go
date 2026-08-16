@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -87,6 +88,34 @@ func (t SMType) TypeCode() uint64 {
 // calls, so the same committed-entry sequence expires the same sessions at the
 // same log indices regardless of how a replica batches applies.
 const defaultMaxExpirePerCheckpoint = 64
+
+// maxExpirePerCheckpoint returns the per-checkpoint reclaim cap, scaled to the
+// shard's REPLICATED table capacity rather than fixed at 64.
+//
+// A fixed 64 makes the worst-case recovery time depend on MaxTotalSessions: at
+// the defaults (16384 sessions, 100000-entry expiry window) a full table needs
+// 16384/64 = 256 windows to drain, i.e. 25.6 MILLION applied entries during
+// which every new GetNewSession on the shard fails. A crashed client fleet —
+// a rolling deploy of a service that does not close its sessions — is enough
+// to reach that state, and the recovery constant is three orders of magnitude
+// larger than the failure that caused it.
+//
+// Scaling to MaxTotalSessions/8 bounds the drain at 8 windows for ANY
+// configured capacity while keeping the amortised scan small. The value is
+// derived from the REPLICATED policy, so every replica computes the same cap
+// from the same committed state and expiry stays deterministic; ExpireSessions
+// already sorts candidates before truncating to the cap, so which sessions are
+// selected is unchanged in kind.
+func (s *StateMachine) maxExpirePerCheckpoint() int {
+	n := s.sessionPolicy.MaxTotalSessions / 8
+	if n < defaultMaxExpirePerCheckpoint {
+		return defaultMaxExpirePerCheckpoint
+	}
+	if n > math.MaxInt32 {
+		n = math.MaxInt32
+	}
+	return int(n)
+}
 
 // StateMachine wraps a user-implemented state machine with session
 // deduplication, entry conversion, and snapshot coordination. The
@@ -462,7 +491,7 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 			}
 			segStart = i
 		}
-		s.sessions.ExpireSessions(boundary, interval, defaultMaxExpirePerCheckpoint)
+		s.sessions.ExpireSessions(boundary, interval, s.maxExpirePerCheckpoint())
 	}
 	// Flush the trailing segment above the last checkpoint (indices in
 	// (lastK*interval, lastIndex]); its checkpoint is reached in a future Apply.
@@ -1016,13 +1045,38 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// the first point at which a policy is known at all.
 	s.refreshSessionPolicy()
 
-	// Recover session state first.
-	if err := s.sessions.UnmarshalFrom(r); err != nil {
+	// The session table is decoded into a STAGED manager and swapped in only
+	// after the user state machine has also restored. Restoring a snapshot is
+	// all-or-nothing: the table and the user state describe the same log
+	// index, and installing one without the other breaks at-most-once
+	// delivery in both directions.
+	//
+	// Decoding straight into s.sessions replaced the live table before
+	// s.sm.RecoverFromSnapshot ran. If the user restore then failed — a
+	// truncated payload, a user SM that rejects it — the node kept user data
+	// from index N beside session metadata from a later index M. A client
+	// retry could then be answered from a cached result for an operation the
+	// user state machine never applied, or a cached response could vanish and
+	// let a duplicate command execute a second time. Neither surfaces an
+	// error anywhere.
+	//
+	// The reader is sequential, so staging costs nothing: UnmarshalFrom
+	// advances r to exactly the position the user restore must start from,
+	// whether or not the staged manager is ultimately adopted.
+	staged := session.NewManager(
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient)
+	if err := staged.UnmarshalFrom(r); err != nil {
 		return err
 	}
 
-	// Recover user SM state.
-	return s.sm.RecoverFromSnapshot(ctx, r, stopper)
+	// Recover user SM state. Only once this succeeds is the snapshot's session
+	// table adopted.
+	if err := s.sm.RecoverFromSnapshot(ctx, r, stopper); err != nil {
+		return err
+	}
+
+	s.sessions = staged
+	return nil
 }
 
 // Close releases resources held by both the session manager and the

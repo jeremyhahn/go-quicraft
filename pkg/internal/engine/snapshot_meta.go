@@ -121,9 +121,11 @@ const (
 	metaBodyCreatedAtOff   = 32
 	metaBodyEpochOff       = 40
 	metaBodyCompressionOff = 48
+	metaBodyDataLenOff     = 56
+	metaBodyDataHashOff    = 64
 
 	// snapshotMetaBodySize is the body size at snapshotMetaVersion.
-	snapshotMetaBodySize = 7 * 8
+	snapshotMetaBodySize = 9 * 8
 
 	// snapshotMetaSize is the total size of a record this binary writes.
 	snapshotMetaSize = snapshotMetaHeaderSize + snapshotMetaBodySize
@@ -177,6 +179,28 @@ type SnapshotMeta struct {
 	// CompressionRecorded reports whether the record carried the Compression
 	// field.
 	CompressionRecorded bool
+
+	// DataLen and DataHash are the length and xxhash64 of snapshot.dat AS
+	// WRITTEN — after compression and after encryption. They are the only
+	// at-rest integrity check a snapshot has when no barrier is configured:
+	// with a barrier, per-frame AEAD covers it, but a plaintext deployment had
+	// nothing at all, and a single flipped byte inside a serialized value
+	// leaves the file length unchanged so no structural check trips. The
+	// replica then recovers the corrupt value into the state machine and
+	// serves it, diverging from its peers at the same log index with every
+	// Raft invariant intact.
+	//
+	// Hashing the FINAL bytes (rather than the pre-encryption ones) is what
+	// makes one value verifiable by all three consumers — recovery, the
+	// streamed receive path and ImportSnapshot — without any of them needing a
+	// key.
+	DataLen  uint64
+	DataHash uint64
+
+	// DataHashRecorded reports whether the record carried DataLen/DataHash.
+	// Artifacts written before this field existed leave it false and are
+	// recovered without an integrity check rather than refused.
+	DataHashRecorded bool
 }
 
 // MarshalSnapshotMeta encodes m as a snapshot.meta record at the current
@@ -206,6 +230,8 @@ func MarshalSnapshotMeta(m SnapshotMeta) []byte {
 	binary.LittleEndian.PutUint64(body[metaBodyCreatedAtOff:], createdAt)
 	binary.LittleEndian.PutUint64(body[metaBodyEpochOff:], m.Epoch)
 	binary.LittleEndian.PutUint64(body[metaBodyCompressionOff:], uint64(m.Compression))
+	binary.LittleEndian.PutUint64(body[metaBodyDataLenOff:], m.DataLen)
+	binary.LittleEndian.PutUint64(body[metaBodyDataHashOff:], m.DataHash)
 	return buf
 }
 
@@ -278,6 +304,13 @@ func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	if bodyLen >= metaBodyCompressionOff+8 {
 		m.Compression = config.CompressionType(binary.LittleEndian.Uint64(body[metaBodyCompressionOff:]))
 		m.CompressionRecorded = true
+	}
+	// Both integrity fields are read together or not at all: a hash without
+	// its length, or a length without its hash, is not a check.
+	if bodyLen >= metaBodyDataHashOff+8 {
+		m.DataLen = binary.LittleEndian.Uint64(body[metaBodyDataLenOff:])
+		m.DataHash = binary.LittleEndian.Uint64(body[metaBodyDataHashOff:])
+		m.DataHashRecorded = true
 	}
 	return m, nil
 }

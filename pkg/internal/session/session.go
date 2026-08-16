@@ -27,7 +27,12 @@ import (
 // process the same log entries, so they expire the same sessions
 // at the same point in the log.
 type clientSession struct {
-	clientID        uint64
+	clientID uint64
+	// registeredIndex is the log index of the Register entry that created
+	// THIS incarnation of the clientID. An entry below it belongs to a
+	// previous incarnation whose at-most-once state is gone; see
+	// Manager.CheckDuplicate.
+	registeredIndex uint64
 	respondedTo     uint64               // highest completed series
 	responses       map[uint64]sm.Result // seriesID -> cached result
 	lastActiveIndex uint64               // log index of last activity
@@ -38,6 +43,7 @@ type clientSession struct {
 func newClientSession(clientID uint64, index uint64) *clientSession {
 	return &clientSession{
 		clientID:        clientID,
+		registeredIndex: index,
 		responses:       make(map[uint64]sm.Result),
 		lastActiveIndex: index,
 	}

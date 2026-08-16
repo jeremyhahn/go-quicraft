@@ -985,9 +985,9 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated seriesID in response", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 24) // 4 (count) + 8 (clientID) + 8 (respondedTo) + 4 (numResponses)
+		b := make([]byte, 32) // 4 (count) + 8 (clientID) + 8 (registeredIndex) + 8 (respondedTo) + 4 (numResponses)
 		b[0] = 1              // numSessions = 1
-		b[20] = 1             // numResponses = 1, but no actual response data
+		b[28] = 1             // numResponses = 1, but no actual response data
 		buf.Write(b)
 
 		m := NewManager(10, 10)
@@ -999,9 +999,9 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated result value", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 32) // count + clientID + respondedTo + numResponses + seriesID -- missing value
+		b := make([]byte, 40) // count + clientID + registeredIndex + respondedTo + numResponses + seriesID -- missing value
 		b[0] = 1              // numSessions = 1
-		b[20] = 1             // numResponses = 1
+		b[28] = 1             // numResponses = 1
 		buf.Write(b)
 
 		m := NewManager(10, 10)
@@ -1013,9 +1013,9 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated data length", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 40) // ... + seriesID + value -- missing dataLen
+		b := make([]byte, 48) // ... + seriesID + value -- missing dataLen
 		b[0] = 1              // numSessions
-		b[20] = 1             // numResponses
+		b[28] = 1             // numResponses
 		buf.Write(b)
 
 		m := NewManager(10, 10)
@@ -1027,10 +1027,10 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated data payload", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 44)
+		b := make([]byte, 52)
 		b[0] = 1  // numSessions
-		b[20] = 1 // numResponses
-		b[40] = 5 // dataLen = 5, but no data follows
+		b[28] = 1 // numResponses
+		b[48] = 5 // dataLen = 5, but no data follows
 		buf.Write(b)
 
 		m := NewManager(10, 10)
@@ -1357,6 +1357,10 @@ func TestUnmarshalFrom_BoundsCheckNumResponses(t *testing.T) {
 		binary.LittleEndian.PutUint64(b, 1)
 		buf.Write(b)
 
+		// registeredIndex = 0
+		b = make([]byte, 8)
+		buf.Write(b)
+
 		// respondedTo = 0
 		b = make([]byte, 8)
 		buf.Write(b)
@@ -1423,6 +1427,10 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 		// clientID = 1
 		b = make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, 1)
+		buf.Write(b)
+
+		// registeredIndex = 0
+		b = make([]byte, 8)
 		buf.Write(b)
 
 		// respondedTo = 0

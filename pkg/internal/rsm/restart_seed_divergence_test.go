@@ -63,12 +63,23 @@ const (
 )
 
 // seedFixturePolicy is the shard's replicated session policy for the fixture.
+//
 // MaxTotalSessions has to admit every client or the registrations themselves
-// would be what differs.
+// would be what differs — but it also SIZES the per-checkpoint expiry cap
+// (StateMachine.maxExpirePerCheckpoint returns MaxTotalSessions/8, floored at
+// defaultMaxExpirePerCheckpoint). This fixture depends on the capped scan
+// leaving a BACKLOG of idle-but-live sessions at the cut: that backlog is the
+// state the restart is supposed to re-walk. A capacity large enough to lift
+// the cap above the floor drains the backlog during the registrations and the
+// fixture stops testing anything, which is what the precondition assertion in
+// the test below catches.
+//
+// 510 is chosen to sit just under 8*defaultMaxExpirePerCheckpoint (512), so
+// the cap floors at 64 while still admitting all 500 clients with margin.
 func seedFixturePolicy() proto.SessionPolicy {
 	return proto.SessionPolicy{
 		ExpiryEntries:        seedFixtureExpiry,
-		MaxTotalSessions:     4 * seedFixtureClients,
+		MaxTotalSessions:     510,
 		MaxSessionsPerClient: 100,
 	}
 }

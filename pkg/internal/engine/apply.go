@@ -270,9 +270,26 @@ func (w *applyWorker) shutdownIfStopping() {
 	default:
 		return
 	}
+	closing := make([]uint64, 0, len(w.shardChans))
 	for shardID, ch := range w.shardChans {
 		close(ch)
 		delete(w.shardChans, shardID)
+		closing = append(closing, shardID)
+	}
+	// The wait below is UNBOUNDED and cannot safely be abandoned: a per-shard
+	// goroutine parked inside a user state machine's Apply never returns, and
+	// returning from Close while it still touches shard state would be a
+	// use-after-free for the caller. HostConfig.ShutdownTimeout bounds Drain,
+	// not this — so an operator who configured a shutdown timeout and sees the
+	// process hang has, without this line, no indication of where or why.
+	//
+	// Logged before blocking rather than after, since after may never come.
+	if len(closing) > 0 {
+		slog.Info("apply worker waiting for in-flight SM.Apply calls to return; "+
+			"Close blocks until every user state machine returns",
+			"worker", w.workerID,
+			"shards", closing,
+		)
 	}
 	w.wg.Wait()
 	// All per-shard goroutines have exited, so closing done keeps the

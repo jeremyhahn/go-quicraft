@@ -55,7 +55,7 @@ func TestGCSnapshotDirs_ReclaimsReceivePathDirectories(t *testing.T) {
 		}
 	}
 
-	if err := GCSnapshotDirs(base, shardID, replicaID); err != nil {
+	if err := GCSnapshotDirs(base, shardID, replicaID, ""); err != nil {
 		t.Fatalf("GCSnapshotDirs: %v", err)
 	}
 
@@ -77,7 +77,7 @@ func TestGCSnapshotDirs_ReclaimsReceivePathDirectories(t *testing.T) {
 	}
 
 	// Idempotent: a second call with nothing to reclaim must be a no-op.
-	if err := GCSnapshotDirs(base, shardID, replicaID); err != nil {
+	if err := GCSnapshotDirs(base, shardID, replicaID, ""); err != nil {
 		t.Fatalf("second GCSnapshotDirs: %v", err)
 	}
 	dirs, err = listSnapshotDirs(base, shardID, replicaID)
@@ -102,7 +102,7 @@ func TestGCSnapshotDirs_UnderRetentionKeepsEverything(t *testing.T) {
 			t.Fatalf("MkdirAll: %v", err)
 		}
 	}
-	if err := GCSnapshotDirs(base, shardID, replicaID); err != nil {
+	if err := GCSnapshotDirs(base, shardID, replicaID, ""); err != nil {
 		t.Fatalf("GCSnapshotDirs: %v", err)
 	}
 	dirs, err := listSnapshotDirs(base, shardID, replicaID)

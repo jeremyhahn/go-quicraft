@@ -4817,3 +4817,79 @@ func TestStateMachineApply_ExpiryBatchShapeInvariant(t *testing.T) {
 		t.Errorf("index-21 op result = %d, want ResultSessionExpired (%d)", aRes, sm.ResultSessionExpired)
 	}
 }
+
+// failingRecoverSM restores nothing and reports an error, standing in for a
+// truncated user snapshot payload or a user state machine that rejects one.
+type failingRecoverSM struct{ aliasingSM }
+
+func (failingRecoverSM) RecoverFromSnapshot(context.Context, io.Reader, <-chan struct{}) error {
+	return errors.New("user state machine refused the snapshot")
+}
+
+// newRecoverTestSM builds a StateMachine whose user SM refuses every restore.
+func newRecoverTestSM(t *testing.T, failing bool) *StateMachine {
+	t.Helper()
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		if failing {
+			return failingRecoverSM{}
+		}
+		return aliasingSM{}
+	})
+	s, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched pins
+// snapshot restore atomicity.
+//
+// The session table and the user state machine describe the SAME log index.
+// RecoverFromSnapshot used to decode the snapshot's session table directly
+// over the live one and only then call the user SM. A user restore that
+// failed after that point left the node running user data from index N beside
+// session metadata from a later index M — so a client retry could be answered
+// from a cached result for an operation the user SM never applied, or a
+// cached response could disappear and let a duplicate command execute twice.
+// At-most-once delivery is broken in both directions, silently.
+//
+// The table is now staged and adopted only on success.
+func TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched(t *testing.T) {
+	// A snapshot whose session table holds clientID 4242.
+	source := newRecoverTestSM(t, false)
+	const snapClientID uint64 = 4242
+	if err := source.sessions.Register(snapClientID, 1); err != nil {
+		t.Fatalf("Register on source: %v", err)
+	}
+	var snap bytes.Buffer
+	if err := source.sessions.MarshalTo(&snap); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	snap.WriteString("user-state-payload-the-target-will-refuse")
+
+	// The target holds a DIFFERENT live session and refuses the user restore.
+	target := newRecoverTestSM(t, true)
+	const liveClientID uint64 = 99
+	if err := target.sessions.Register(liveClientID, 1); err != nil {
+		t.Fatalf("Register on target: %v", err)
+	}
+
+	if err := target.RecoverFromSnapshot(context.Background(), &snap, nil); err == nil {
+		t.Fatal("RecoverFromSnapshot returned nil despite the user state " +
+			"machine refusing the snapshot")
+	}
+
+	if !target.sessions.IsRegistered(liveClientID) {
+		t.Fatal("a FAILED snapshot restore destroyed the live session table: " +
+			"the node would hold session metadata from the snapshot beside " +
+			"user state from before it, breaking at-most-once delivery")
+	}
+	if target.sessions.IsRegistered(snapClientID) {
+		t.Fatalf("a FAILED snapshot restore installed the snapshot's session "+
+			"%d: the user state machine never restored, so a retry on that "+
+			"session would be answered from a cache describing state that "+
+			"does not exist", snapClientID)
+	}
+}

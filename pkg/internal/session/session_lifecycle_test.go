@@ -364,6 +364,10 @@ func TestSession_VersionValidation_TooManyResponses(t *testing.T) {
 	binary.LittleEndian.PutUint64(u64[:], 1)
 	buf.Write(u64[:])
 
+	// registeredIndex = 0
+	binary.LittleEndian.PutUint64(u64[:], 0)
+	buf.Write(u64[:])
+
 	// respondedTo = 0
 	binary.LittleEndian.PutUint64(u64[:], 0)
 	buf.Write(u64[:])
@@ -588,6 +592,10 @@ func TestSession_UnmarshalResponseDataExceedsMax(t *testing.T) {
 
 	// clientID = 1
 	binary.LittleEndian.PutUint64(b8[:], 1)
+	buf.Write(b8[:])
+
+	// registeredIndex = 0
+	binary.LittleEndian.PutUint64(b8[:], 0)
 	buf.Write(b8[:])
 
 	// respondedTo = 0

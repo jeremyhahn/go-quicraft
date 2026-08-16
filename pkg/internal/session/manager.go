@@ -127,6 +127,21 @@ func (m *Manager) CheckDuplicate(clientID, seriesID, index uint64) (sm.Result, b
 	if !exists {
 		return sm.Result{}, false, ErrSessionNotFound
 	}
+	// An entry BELOW the index that created this incarnation belongs to a
+	// PREVIOUS incarnation of the same clientID: the session expired and the
+	// client re-registered under an ID it had persisted (Host.RegisterSession
+	// accepts a caller-supplied ID, which is the documented way a client
+	// survives its own restart). The new incarnation starts with respondedTo
+	// zero and an empty response cache, so without this the stale entry looks
+	// brand new — seriesID > 0 and no cached result — and is applied a second
+	// time. At-most-once is broken with no error raised anywhere.
+	//
+	// Answering it the way an expired session is answered is the behaviour
+	// Raft PhD Figure 6.1 step 3 prescribes. The comparison is index-based, so
+	// it is deterministic and replicated for free.
+	if index < sess.registeredIndex {
+		return sm.Result{}, false, ErrSessionNotFound
+	}
 	// If seriesID <= respondedTo, the client has already acknowledged
 	// this result and the cached response was evicted. Re-applying would
 	// violate at-most-once semantics.
@@ -276,7 +291,7 @@ func (m *Manager) MaxResponses() uint64 {
 // MarshalTo serializes all session state to the writer for snapshot
 // inclusion. The format is:
 // [numSessions:4][session1][session2]...
-// Each session: [clientID:8][respondedTo:8][numResponses:4]
+// Each session: [clientID:8][registeredIndex:8][respondedTo:8][numResponses:4]
 //
 //	[{seriesID:8, value:8, dataLen:4, data:N}...][lastActiveIndex:8]
 func (m *Manager) MarshalTo(w io.Writer) error {
@@ -311,6 +326,16 @@ func marshalSession(w io.Writer, sess *clientSession) error {
 	binary.LittleEndian.PutUint64(buf[:8], sess.clientID)
 	if _, err := w.Write(buf[:8]); err != nil {
 		return &MarshalError{Op: "write clientID", Err: err}
+	}
+
+	// registeredIndex. It must survive the snapshot or the incarnation floor
+	// in CheckDuplicate disappears on restore — which is exactly the path
+	// (restart, then a stale entry commits) the floor exists to close. The
+	// wire format is pinned at v1 pre-release, so the layout is changed in
+	// place and both sides are updated in lockstep.
+	binary.LittleEndian.PutUint64(buf[:8], sess.registeredIndex)
+	if _, err := w.Write(buf[:8]); err != nil {
+		return &MarshalError{Op: "write registeredIndex", Err: err}
 	}
 
 	// respondedTo
@@ -423,6 +448,12 @@ func unmarshalSession(r io.Reader, maxResponses uint64) (*clientSession, error) 
 	}
 	clientID := binary.LittleEndian.Uint64(buf[:8])
 
+	// registeredIndex — the incarnation floor. See marshalSession.
+	if _, err := io.ReadFull(r, buf[:8]); err != nil {
+		return nil, &UnmarshalError{Op: "read registeredIndex", Err: err}
+	}
+	registeredIndex := binary.LittleEndian.Uint64(buf[:8])
+
 	// respondedTo
 	if _, err := io.ReadFull(r, buf[:8]); err != nil {
 		return nil, &UnmarshalError{Op: "read respondedTo", Err: err}
@@ -492,6 +523,7 @@ func unmarshalSession(r io.Reader, maxResponses uint64) (*clientSession, error) 
 
 	return &clientSession{
 		clientID:        clientID,
+		registeredIndex: registeredIndex,
 		respondedTo:     respondedTo,
 		responses:       responses,
 		lastActiveIndex: lastActiveIndex,

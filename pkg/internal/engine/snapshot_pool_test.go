@@ -1062,7 +1062,7 @@ func TestSnapshotPool_GCSnapshotDirs_NothingToClean(t *testing.T) {
 		t.Fatalf("mkdir failed: %v", err)
 	}
 
-	err := gcSnapshotDirs(tmpDir, 1, 1)
+	err := gcSnapshotDirs(tmpDir, 1, 1, "")
 	if err != nil {
 		t.Fatalf("gcSnapshotDirs should succeed with nothing to clean: %v", err)
 	}
@@ -4337,7 +4337,7 @@ func TestSnapshotPool_GCSnapshotDirs_RemovesOrphanedDirs(t *testing.T) {
 	}
 
 	// Run garbage collection.
-	if err := gcSnapshotDirs(tmpDir, shardID, replicaID); err != nil {
+	if err := gcSnapshotDirs(tmpDir, shardID, replicaID, ""); err != nil {
 		t.Fatalf("gcSnapshotDirs failed: %v", err)
 	}
 

@@ -184,6 +184,56 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 				"be rejected on every replica", gotA, gotB)
 		}
 	})
+
+	t.Run("local threshold differs in magnitude from the replicated one", func(t *testing.T) {
+		// The decisive case, and the one the two subtests above cannot see.
+		//
+		// The first disables expiry on the shard (replicated 0), which takes
+		// Apply's expiry-disabled fast path so the segmented checkpoint walk
+		// is never entered at all. The second sets replica B's LOCAL threshold
+		// to 100 — the same value the shard committed — so substituting local
+		// for replicated inside that walk is a no-op.
+		//
+		// Injecting `if s.localPolicy.ExpiryEntries != 0 { interval =
+		// s.localPolicy.ExpiryEntries }` into the walk therefore survived the
+		// whole suite, and that substitution is the exact divergence this file
+		// exists to prevent: two replicas evaluating different intervals expire
+		// different sessions at different indexes, and one then answers
+		// ResultSessionExpired for entries the other applies normally.
+		//
+		// Here the shard commits 100 while replica B is configured with 1000.
+		// Under the replicated policy both expire client 42 at the index-200
+		// checkpoint and reject the write. Under B's local value no checkpoint
+		// falls before index 300, so B would hold the session and APPLY the
+		// write — a different observable, on both the session table and the
+		// user state.
+		replicated := proto.SessionPolicy{
+			ExpiryEntries:        100,
+			MaxTotalSessions:     100,
+			MaxSessionsPerClient: 100,
+		}
+		a, akv := newReplica(t, 0, replicated)
+		b, bkv := newReplica(t, 1000, replicated)
+
+		applyLog(t, a)
+		applyLog(t, b)
+
+		if a.Sessions().IsRegistered(clientID) || b.Sessions().IsRegistered(clientID) {
+			t.Fatalf("session held: A=%v B=%v; the shard committed expiry=100, "+
+				"so BOTH replicas must expire client %d — including the one "+
+				"whose local configuration says 1000",
+				a.Sessions().IsRegistered(clientID),
+				b.Sessions().IsRegistered(clientID), clientID)
+		}
+
+		gotA, gotB := applied(t, akv), applied(t, bkv)
+		if gotA != "" || gotB != "" {
+			t.Fatalf("applied value: A=%q B=%q, want both empty. A replica that "+
+				"reads the checkpoint interval from its LOCAL config finds no "+
+				"checkpoint before index 300, holds the session and applies a "+
+				"write its peers reject", gotA, gotB)
+		}
+	})
 }
 
 // TestSessionPolicy_LocalUsedOnlyWhileShardHasNone pins the fallback that keeps
