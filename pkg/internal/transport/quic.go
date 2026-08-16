@@ -290,12 +290,41 @@ type QUICTransport struct {
 	// returns (handleConnection). Keyed by *quic.Conn, value *srcAddrAuthEntry.
 	srcAddrAuth sync.Map
 
-	// connMsgBudget holds the per-inbound-connection message-receive
-	// reservation, keyed by *quic.Conn with value *atomic.Int64. The global
-	// msgRecvBudget alone lets one peer occupy the entire budget and force
-	// every other peer's frames into the exhaustion path; this sub-budget caps
-	// any single connection at maxConnMsgRecv. Entries are removed with the
-	// auth cache when the connection's handler returns.
+	// inboundConns tracks live INBOUND connections, keyed by *quic.Conn with
+	// an empty-struct value. Inbound connections were held only as locals
+	// inside handleConnection, so nothing could reach them after admission —
+	// and revocation runs only in VerifyConnection, i.e. only at handshake.
+	// A peer whose certificate was revoked, or whose replica the shard
+	// committed a removal for, therefore kept its session for the lifetime of
+	// the process: quic-go's keep-alive (10s) sits below MaxIdleTimeout (30s),
+	// so the connection never idle-closes, and CloseTarget only reaches the
+	// OUTBOUND half. Revocation stopped a compromised node reconnecting and
+	// nothing else.
+	//
+	// Entries are added once the handshake has completed and removed by
+	// forgetInboundConnState, which runs after every stream goroutine on the
+	// connection has finished.
+	inboundConns sync.Map
+
+	// connMsgBudget holds the per-PEER message-receive reservation, keyed by
+	// the peer's authenticated identity (msgBudgetKey) with value
+	// *peerMsgBudget. The global msgRecvBudget alone lets one peer occupy the
+	// entire budget and force every other peer's frames into the exhaustion
+	// path; this sub-budget caps any single peer at maxConnMsgRecv.
+	//
+	// It was keyed by *quic.Conn, which did not achieve that: MaxConnectionsPerIP
+	// is 16, so one peer opened four connections, saturated four separate
+	// sub-budgets of MaxMessageReceiveMemory/4 each, and drove the global
+	// budget to zero — after which every other peer's frames were silently
+	// dropped. Reproduced with 16 streams and 128 bytes of traffic: the frame
+	// header alone reserves its declared length before the body is read, so
+	// the attacker never has to send one.
+	//
+	// Keying on identity rather than the connection is what makes the cap mean
+	// what its name says. The identity is already derived on this path for
+	// authorization, so this costs one map lookup, not a new mechanism.
+	// Entries are refcounted by live connection and removed when the last one
+	// closes.
 	connMsgBudget sync.Map
 
 	// maxConnMsgRecv is the per-inbound-connection ceiling on in-flight
@@ -308,6 +337,25 @@ type QUICTransport struct {
 	// suppress every other transport's first diagnostic, and in-process
 	// multi-node deployments (and the test suite) run many transports at once.
 	lastProtocolViolationLog atomic.Int64
+
+	// Rate-limit stamps for the remaining peer-driven diagnostics on the
+	// inbound hot path. Every one of these lines is triggerable at the frame
+	// rate by one authenticated peer, and slog's default handler writes
+	// synchronously to stderr under a single mutex — so an unsampled line here
+	// puts a write syscall on the raft receive path AND serialises every other
+	// log call in the process behind it. The counters beside them are
+	// unconditional, so the sampled line can carry the true total.
+	lastRecvBudgetLog     atomic.Int64
+	lastZeroShardLog      atomic.Int64
+	lastSpoofedSourceLog  atomic.Int64
+	lastSnapshotRejectLog atomic.Int64
+	lastZeroRTTLog        atomic.Int64
+
+	recvBudgetDrops     atomic.Uint64
+	zeroShardDrops      atomic.Uint64
+	spoofedSourceClears atomic.Uint64
+	snapshotStreamDrops atomic.Uint64
+	zeroRTTRefusals     atomic.Uint64
 
 	// peerFrameRejections counts every frame a peer's decoder refused
 	// (QUICStreamErrFrameRejected). The warning below it is rate-limited, and

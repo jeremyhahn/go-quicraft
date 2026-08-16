@@ -21,7 +21,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -541,12 +540,16 @@ func TestMsgRecvBudget_PerConnectionCompressedDeltaRejected(t *testing.T) {
 	if got := tr.msgRecvBudget.Load(); got != aggregateBefore {
 		t.Fatalf("aggregate budget = %d after rejection, want %d (reserve/release imbalance)", got, aggregateBefore)
 	}
-	v, ok := tr.connMsgBudget.Load(conn)
+	// The sub-budget is keyed by the peer's authenticated IDENTITY, not by the
+	// connection: keying on the connection let one peer open
+	// MaxConnectionsPerIP connections and hold that many separate sub-budgets,
+	// which is exactly the cap this reservation exists to impose.
+	v, ok := tr.connMsgBudget.Load(msgBudgetKey(conn))
 	if !ok {
-		t.Fatal("per-connection budget entry disappeared")
+		t.Fatal("per-peer budget entry disappeared")
 	}
-	if got := v.(*atomic.Int64).Load(); got != preReserve {
-		t.Fatalf("per-connection reservation = %d after rejection, want %d (the rejected delta leaked)",
+	if got := v.(*peerMsgBudget).reserved.Load(); got != preReserve {
+		t.Fatalf("per-peer reservation = %d after rejection, want %d (the rejected delta leaked)",
 			got, preReserve)
 	}
 

@@ -130,6 +130,11 @@ const (
 	// covers this node's own host, so it cannot be told apart from any other
 	// member. See refuseInboundPromiscuousCert.
 	QUICErrPromiscuousCert quic.ApplicationErrorCode = 0x5
+
+	// QUICErrRevoked is sent when a live connection's peer certificate is
+	// found revoked (or unverifiable) by the periodic re-check, rather than at
+	// handshake. See revokeCheckConnections.
+	QUICErrRevoked quic.ApplicationErrorCode = 0x6
 )
 
 // Stream-level QUIC error codes, sent in STOP_SENDING / RESET_STREAM frames

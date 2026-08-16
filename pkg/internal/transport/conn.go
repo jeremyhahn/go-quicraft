@@ -921,7 +921,70 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 			return
 		case <-ticker.C:
 			t.cleanStaleConnections()
+			t.revokeCheckConnections()
 		}
+	}
+}
+
+// revokeCheckConnections re-runs the revocation verdict against every LIVE
+// connection's verified leaf and tears down any that is no longer admissible.
+//
+// VerifyConnection runs only at handshake, so without this a certificate
+// revoked after admission keeps its session for as long as the process lives:
+// quic-go's keep-alive (10s) sits under MaxIdleTimeout (30s), so the
+// connection never idle-closes, and cleanStaleConnections only reaps
+// connections whose context is ALREADY dead. Revocation stopped a compromised
+// node reconnecting and did nothing about the connection it already had —
+// which, for a process that stays up for months, is close to no revocation.
+//
+// Running it on the existing 30s cleanup tick bounds post-revocation survival
+// to one interval. Both directions are covered: inbound from t.inboundConns,
+// outbound from the connection pool.
+func (t *QUICTransport) revokeCheckConnections() {
+	if t.revocationChecker == nil {
+		return
+	}
+	drop := func(conn *quic.Conn) {
+		certs := conn.ConnectionState().TLS.PeerCertificates
+		if len(certs) == 0 {
+			return
+		}
+		leaf := certs[0]
+		revoked, err := t.revocationChecker.IsRevoked(leaf)
+		if !revoked && err == nil {
+			return
+		}
+		// A checker ERROR is treated the same as revoked, matching the
+		// fail-closed posture VerifyConnection already takes: an unavailable
+		// or stale revocation source must not leave an unverifiable peer
+		// connected.
+		slog.Warn("closing connection: peer certificate is no longer admissible",
+			"remote", conn.RemoteAddr().String(),
+			"serial", leaf.SerialNumber.Text(16),
+			"revoked", revoked,
+			"error", err,
+		)
+		_ = conn.CloseWithError(QUICErrRevoked, "peer certificate revoked")
+	}
+
+	t.inboundConns.Range(func(k, _ any) bool {
+		if conn, ok := k.(*quic.Conn); ok {
+			drop(conn)
+		}
+		return true
+	})
+
+	// Snapshot the outbound pool rather than calling drop under connMu:
+	// connMu is the transport's hottest lock and CloseWithError is not
+	// something to hold it across.
+	t.connMu.RLock()
+	outbound := make([]*quic.Conn, 0, len(t.conns))
+	for _, c := range t.conns {
+		outbound = append(outbound, c)
+	}
+	t.connMu.RUnlock()
+	for _, c := range outbound {
+		drop(c)
 	}
 }
 
@@ -1390,10 +1453,63 @@ func (t *QUICTransport) inboundAuthorizedForCached(conn *quic.Conn, target strin
 // connection with nothing left to remove it, pinning the whole *quic.Conn.
 func (t *QUICTransport) forgetInboundConnState(conn *quic.Conn) {
 	t.srcAddrAuth.Delete(conn)
-	t.connMsgBudget.Delete(conn)
+	t.inboundConns.Delete(conn)
+	t.releasePeerMsgBudgetRef(conn)
 }
 
-// reserveConnMsgRecvBudget reserves n bytes against the per-connection
+// peerMsgBudget is one peer's share of the message-receive budget, shared by
+// every connection that peer holds.
+type peerMsgBudget struct {
+	reserved atomic.Int64
+	// conns counts live connections using this entry. The entry is removed
+	// when it reaches zero, so the map stays bounded across connection churn
+	// without being torn down while another connection is still reserving
+	// against it.
+	conns atomic.Int64
+}
+
+// msgBudgetKey returns the accounting key for a connection's receive
+// reservations: the peer's authenticated identity, falling back to its source
+// IP when no verified leaf is present.
+//
+// Never the connection pointer and never the source port — both are things one
+// peer can multiply at will, and keying on either turns a per-peer cap into a
+// per-connection cap that MaxConnectionsPerIP then multiplies straight back
+// out.
+func msgBudgetKey(conn *quic.Conn) string {
+	if id := peerNodeIdentity(conn); id != "" {
+		return id
+	}
+	return "ip:" + extractIP(conn.RemoteAddr())
+}
+
+// acquirePeerMsgBudgetRef registers a live connection against its peer's
+// budget entry. Paired with releasePeerMsgBudgetRef via forgetInboundConnState.
+func (t *QUICTransport) acquirePeerMsgBudgetRef(conn *quic.Conn) {
+	if conn == nil || t.maxConnMsgRecv <= 0 {
+		return
+	}
+	v, _ := t.connMsgBudget.LoadOrStore(msgBudgetKey(conn), new(peerMsgBudget))
+	v.(*peerMsgBudget).conns.Add(1)
+}
+
+// releasePeerMsgBudgetRef drops one connection's reference and removes the
+// entry once no connection from that peer remains.
+func (t *QUICTransport) releasePeerMsgBudgetRef(conn *quic.Conn) {
+	if conn == nil || t.maxConnMsgRecv <= 0 {
+		return
+	}
+	key := msgBudgetKey(conn)
+	v, ok := t.connMsgBudget.Load(key)
+	if !ok {
+		return
+	}
+	if v.(*peerMsgBudget).conns.Add(-1) <= 0 {
+		t.connMsgBudget.Delete(key)
+	}
+}
+
+// reserveConnMsgRecvBudget reserves n bytes against the per-PEER
 // message-receive sub-budget in addition to the aggregate budget, so a single
 // peer cannot occupy the whole of MaxMessageReceiveMemory and force every
 // other peer's frames into the exhaustion path. A nil conn (test/unit paths)
@@ -1403,26 +1519,26 @@ func (t *QUICTransport) reserveConnMsgRecvBudget(conn *quic.Conn, n int64) bool 
 	if conn == nil || t.maxConnMsgRecv <= 0 {
 		return true
 	}
-	v, _ := t.connMsgBudget.LoadOrStore(conn, new(atomic.Int64))
-	reserved := v.(*atomic.Int64)
-	if reserved.Add(n) > t.maxConnMsgRecv {
-		reserved.Add(-n)
+	v, _ := t.connMsgBudget.LoadOrStore(msgBudgetKey(conn), new(peerMsgBudget))
+	pb := v.(*peerMsgBudget)
+	if pb.reserved.Add(n) > t.maxConnMsgRecv {
+		pb.reserved.Add(-n)
 		return false
 	}
 	return true
 }
 
 // releaseConnMsgRecvBudget returns n previously-reserved bytes to the
-// per-connection message-receive sub-budget.
+// per-peer message-receive sub-budget.
 func (t *QUICTransport) releaseConnMsgRecvBudget(conn *quic.Conn, n int64) {
 	if conn == nil || t.maxConnMsgRecv <= 0 {
 		return
 	}
-	v, ok := t.connMsgBudget.Load(conn)
+	v, ok := t.connMsgBudget.Load(msgBudgetKey(conn))
 	if !ok {
 		return
 	}
-	v.(*atomic.Int64).Add(-n)
+	v.(*peerMsgBudget).reserved.Add(-n)
 }
 
 // ConnectionCount returns the number of active connections in the pool.

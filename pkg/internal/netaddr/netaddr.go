@@ -36,6 +36,7 @@ package netaddr
 
 import (
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -105,6 +106,7 @@ func Canonical(address string) string {
 		return CanonicalHost(address)
 	}
 	host = CanonicalHost(host)
+	port = canonicalPort(port)
 	// An IPv6 literal must go back inside brackets or the result is not a
 	// re-parseable address (and "::1" + ":5001" would concatenate into a
 	// different literal entirely).
@@ -112,4 +114,29 @@ func Canonical(address string) string {
 		return "[" + host + "]:" + port
 	}
 	return host + ":" + port
+}
+
+// canonicalPort normalises a port NUMERICALLY rather than accepting whatever
+// spelling the caller used.
+//
+// "5001", "05001" and "+5001" all resolve to the same UDP endpoint —
+// net.ResolveUDPAddr accepts every one of them and returns :5001 — so leaving
+// them as distinct strings let one endpoint be named twice in a configuration.
+// Both the duplicate-address check in StartShard and the addressHolder /
+// sharedAddresses guards in membership key on Canonical, and the receive-side
+// certificate check drops the port entirely, so a single host behind
+// "node-b:5001" and "node-b:05001" satisfied all of them as two "distinct"
+// replicas — and then held two votes and two match indices in a quorum that
+// believed they were independent. That is precisely the outcome those guards
+// exist to prevent, defeated by one character.
+//
+// A non-numeric port (a service name) is lower-cased and trimmed but otherwise
+// left alone: resolving it is not a pure function of the string, and this
+// package must stay one.
+func canonicalPort(port string) string {
+	trimmed := strings.TrimSpace(port)
+	if n, err := strconv.ParseUint(strings.TrimPrefix(trimmed, "+"), 10, 16); err == nil {
+		return strconv.FormatUint(n, 10)
+	}
+	return strings.ToLower(trimmed)
 }
