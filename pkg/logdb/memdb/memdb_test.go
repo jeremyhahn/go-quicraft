@@ -1334,26 +1334,83 @@ func TestRemoveNodeDataThenRecreateSameNode(t *testing.T) {
 	}
 }
 
+// TestRemoveEntriesToReleasesMemory asserts what its name claims: that
+// compaction actually RELEASES the compacted prefix, rather than re-slicing
+// past it and leaving the whole original array — every dropped Cmd payload
+// included — reachable from the surviving slice.
+//
+// Asserting only that the remaining entries read back is not a test of that. It
+// passes identically for `nd.entries = nd.entries[cutIdx:]`, which releases
+// nothing at all and turns a compacted node into a permanent hold on the log it
+// was compacting away.
+//
+// The release is proven by aliasing rather than by measuring the heap: the old
+// backing array is overwritten after the compaction, and a slice that merely
+// re-sliced it would then serve the overwritten bytes. A GC-and-measure test
+// would be nondeterministic; this one cannot be.
 func TestRemoveEntriesToReleasesMemory(t *testing.T) {
 	db := New()
 	entries := make([]logdb.Entry, 1000)
 	for i := range entries {
 		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1, Cmd: make([]byte, 1024)}
 	}
-	db.SaveState([]logdb.Update{
+	if err := db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	nd := db.getNode(1, 1)
+	if nd == nil {
+		t.Fatal("node missing after SaveState")
+	}
+	// A full view of the pre-compaction backing array, retained across the
+	// compaction so it can be poisoned afterwards.
+	nd.mu.RLock()
+	old := nd.entries[:cap(nd.entries)]
+	nd.mu.RUnlock()
 
 	// Remove first 500.
-	db.RemoveEntriesTo(1, 1, 500)
+	if err := db.RemoveEntriesTo(1, 1, 500); err != nil {
+		t.Fatalf("RemoveEntriesTo: %v", err)
+	}
 
-	// Remaining entries should be accessible.
+	// The surviving slice must not carry the dropped prefix's capacity with it.
+	nd.mu.RLock()
+	live, capacity := len(nd.entries), cap(nd.entries)
+	nd.mu.RUnlock()
+	if live != 500 {
+		t.Fatalf("live entries = %d, want 500", live)
+	}
+	if capacity != live {
+		t.Errorf("compacted slice has cap %d for len %d: it is a re-slice of the "+
+			"original array, so the 500 compacted entries and every Cmd payload "+
+			"they hold are still reachable and can never be collected",
+			capacity, live)
+	}
+
+	// Poison the pre-compaction array. A compacted slice that shares it now
+	// serves zeroed entries; one that copied is untouched.
+	clear(old)
+
 	got, _, err := db.IterateEntries(nil, 0, 1, 1, 501, 1001, 0)
 	if err != nil {
-		t.Fatalf("IterateEntries after compaction: error %v", err)
+		t.Fatalf("IterateEntries after compaction: error %v (the surviving entries "+
+			"still alias the pre-compaction backing array, so nothing was released)", err)
 	}
 	if len(got) != 500 {
-		t.Errorf("remaining entries = %d, want 500", len(got))
+		t.Fatalf("remaining entries = %d, want 500", len(got))
+	}
+	for i, e := range got {
+		if want := uint64(501 + i); e.Index != want {
+			t.Fatalf("entry %d has index %d, want %d: the surviving entries alias "+
+				"the pre-compaction array, which is exactly the memory the "+
+				"compaction was supposed to release", i, e.Index, want)
+		}
+		if len(e.Cmd) != 1024 {
+			t.Fatalf("entry %d lost its payload (len %d): the surviving entries "+
+				"alias the pre-compaction array", e.Index, len(e.Cmd))
+		}
 	}
 }
 

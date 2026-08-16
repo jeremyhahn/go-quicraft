@@ -115,6 +115,29 @@ type segment struct {
 	// file, or tampering. Recovery fails closed on its own sentinel rather than
 	// guessing which. See ErrRecordSequenceRegression.
 	sequenceRegression bool
+	// generationBoundaryInDamage is set by ReadAll when it truncates a segment
+	// whose SURVIVING records all carry a generation strictly HIGHER than any
+	// generation in the clean prefix. A completed fdatasync therefore happened
+	// somewhere inside the bytes the damage destroyed, and any older-generation
+	// record that was swallowed there had been ACKNOWLEDGED. The truncation
+	// still goes ahead — see the reasoning at the end of ReadAll — so the node
+	// may come up holding a strictly shorter log than the one it promised its
+	// peers.
+	//
+	// It is deliberately NOT an error: turning it into one would refuse the
+	// ordinary interrupted write whose lost page starts exactly at a batch
+	// boundary, which is the common shape this scheme exists to repair. It is
+	// instead the one outcome of recovery that the operator has to be told
+	// about, so it is carried out of ReadAll rather than left in a log line.
+	// See walShard.noteGenerationBoundaryResidual and DB.RecoveryResiduals.
+	generationBoundaryInDamage bool
+	// prefixGeneration and survivingGeneration are the two generations that
+	// straddle the destroyed region, valid only when
+	// generationBoundaryInDamage is set. survivingGeneration is strictly
+	// greater than prefixGeneration, and every generation between them (if
+	// any) was written entirely inside the damage.
+	prefixGeneration    uint32
+	survivingGeneration uint32
 }
 
 // segmentFilename returns the canonical filename for a given segment ID.
@@ -736,7 +759,10 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 			// and for that the operator gets a named warning rather than silence.
 			// See docs/storage/wal.md, "Residuals".
 			if ev.minSeq > prefixMaxSeq {
-				slog.Warn("waldb: a durability generation boundary lies INSIDE the "+
+				s.generationBoundaryInDamage = true
+				s.prefixGeneration = prefixMaxSeq
+				s.survivingGeneration = ev.minSeq
+				slog.Error("waldb: a durability generation boundary lies INSIDE the "+
 					"damaged region; if any record of the older generation was lost "+
 					"there it had been acknowledged, and this node is now shorter than "+
 					"the log it promised — reconcile it against its peers",

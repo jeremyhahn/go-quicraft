@@ -476,3 +476,146 @@ func TestSaveSnapshot_RollsBackPartialRecord(t *testing.T) {
 		t.Fatalf("GetSnapshot = %+v, %v; want the pre-failure snapshot at index 1", ss, err)
 	}
 }
+
+// TestSaveBootstrap_RollsBackPartialRecord is the SaveBootstrap counterpart of
+// TestSaveSnapshot_RollsBackPartialRecord.
+//
+// SaveBootstrap was the ONE standalone writer with no checkpoint at all —
+// SaveSnapshot, RemoveEntriesTo and RemoveNodeData all take one. A record that
+// failed midway therefore left its already-flushed blocks in the segment while
+// the caller was told the write failed, and nothing ever removed them. The next
+// successful write appends directly on top, so what recovery finds is a torn
+// record with valid data above it in the middle of a live segment: the shape it
+// must fail closed on. One failed SaveBootstrap could cost the whole WAL shard
+// on the next restart.
+func TestSaveBootstrap_RollsBackPartialRecord(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(1024*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const shardID, replicaID = uint64(1), uint64(1)
+	if err := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+		Addresses: map[uint64]string{1: "node1:9000"},
+		Type:      3,
+	}); err != nil {
+		t.Fatalf("SaveBootstrap: %v", err)
+	}
+
+	shard := db.getShard(shardID)
+	shard.mu.Lock()
+	sizeBefore := shard.activeSegment.Size()
+	simulated := errors.New("simulated EIO on block flush")
+	shard.activeSegment.f = &failingWriteAtFile{
+		File: shard.activeSegment.f, writeErr: simulated, failAfter: 1,
+	}
+	shard.mu.Unlock()
+
+	// An address map large enough to span several blocks, so the first block
+	// seal succeeds and the next one fails.
+	addrs := make(map[uint64]string, 200)
+	for i := 0; i < 200; i++ {
+		addrs[uint64(i)] = "replica-address-0000000000000000000000000000"
+	}
+	err = db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{Addresses: addrs, Type: 3})
+	if !errors.Is(err, simulated) {
+		t.Fatalf("SaveBootstrap = %v, want the injected write error", err)
+	}
+
+	shard.mu.Lock()
+	sizeAfter := shard.activeSegment.Size()
+	shard.mu.Unlock()
+	if sizeAfter != sizeBefore {
+		t.Fatalf("segment size %d after the failed write, want %d: the partial "+
+			"bootstrap record was left behind instead of being rolled back, and the "+
+			"next successful write will bury it under valid data",
+			sizeAfter, sizeBefore)
+	}
+
+	bs, ok, err := db.GetBootstrap(shardID, replicaID)
+	if err != nil || !ok {
+		t.Fatalf("GetBootstrap = ok %v err %v; want the pre-failure record", ok, err)
+	}
+	if len(bs.Addresses) != 1 || bs.Addresses[1] != "node1:9000" {
+		t.Fatalf("GetBootstrap addresses = %v, want the pre-failure record", bs.Addresses)
+	}
+
+	// Restore a working file, write on top, and prove recovery reads the whole
+	// segment back cleanly — the rolled-back bytes must not be sitting under it.
+	shard.mu.Lock()
+	shard.activeSegment.f = shard.activeSegment.f.(*failingWriteAtFile).File
+	shard.mu.Unlock()
+
+	if err := db.SaveEntries(shardID, replicaID, makeEntries(1, 2, 1)); err != nil {
+		t.Fatalf("SaveEntries after the rolled-back bootstrap: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(1024*1024))
+	if err != nil {
+		t.Fatalf("reopen after a rolled-back bootstrap write: %v (the partial "+
+			"record was buried under valid data and recovery had to fail closed)", err)
+	}
+	defer db2.Close()
+	got, err := db2.GetEntries(shardID, replicaID, 1, 3, 0)
+	if err != nil {
+		t.Fatalf("GetEntries after reopen: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("recovered %d entries, want 2", len(got))
+	}
+}
+
+// TestSaveSnapshot_RejectsZeroIndex pins the fresh-node hole in the staleness
+// rule on the DIRECT snapshot path.
+//
+// TestSaveState_ZeroIndexSnapshotIsNotPersisted covers the batch path, which
+// has always required Index > 0. SaveSnapshot only compared against a STORED
+// snapshot, so on a node that had none an index-0 snapshot went straight
+// through: it wrote a WAL record, made GetSnapshot report a snapshot existing
+// at no index, and pinned the segment it landed in against garbage collection
+// until a real snapshot replaced it.
+func TestSaveSnapshot_RejectsZeroIndex(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const shardID, replicaID = uint64(1), uint64(1)
+	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
+
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: 0, Term: 5}); !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
+		t.Fatalf("SaveSnapshot(Index=0) on a fresh node = %v, want ErrSnapshotOutOfDate", err)
+	}
+	if _, err := db.GetSnapshot(shardID, replicaID); !errors.Is(err, logdb.ErrNoSnapshot) {
+		t.Fatalf("GetSnapshot after a rejected index-0 snapshot = %v, want "+
+			"ErrNoSnapshot: a phantom snapshot at index 0 was published, and a "+
+			"caller reads that as a recovery point this replica does not have", err)
+	}
+
+	// No record was written, so no segment is pinned by a snapshot that does
+	// not exist.
+	shard := db.getShard(shardID)
+	shard.dataMu.RLock()
+	pinned := shard.metaSegments[key].hasSnapshot
+	shard.dataMu.RUnlock()
+	if pinned {
+		t.Fatal("an index-0 snapshot pinned a segment against garbage collection: " +
+			"the pin outlives every entry in that segment and is only released by " +
+			"a real snapshot")
+	}
+
+	// A real snapshot still lands, and index 0 stays rejected afterwards.
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: 10, Term: 5}); err != nil {
+		t.Fatalf("SaveSnapshot(Index=10): %v", err)
+	}
+	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: 0}); !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
+		t.Fatalf("SaveSnapshot(Index=0) over a stored snapshot = %v, want ErrSnapshotOutOfDate", err)
+	}
+}

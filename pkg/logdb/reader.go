@@ -699,22 +699,28 @@ func (lr *LogReader) ApplySnapshot(ss proto.Snapshot) error {
 // setSnapshot stores snapshot metadata if it is newer than the current
 // snapshot. Caller must hold mu.Lock.
 func (lr *LogReader) setSnapshot(ss proto.Snapshot) error {
-	if lr.membership.ConfigChangeID != 0 || lr.state.Commit != 0 {
-		// We have existing state. Only accept newer snapshots.
-		if ss.Index <= lr.markerIndex && ss.Index > 0 {
-			return ErrSnapshotOutOfDate
-		}
-		// The marker check alone is insufficient for CreateSnapshot: compaction
-		// retains CompactionOverhead entries below the snapshot, so markerIndex
-		// normally TRAILS the recorded snapshot index. Without this guard an ss
-		// with markerIndex < ss.Index < lr.snapshot.Index would be accepted and
-		// regress lr.snapshot (and overwrite lr.membership). Reject anything not
-		// strictly newer than the recorded snapshot. The legitimate advance
-		// (ApplySnapshot/CreateSnapshot to a higher index) has ss.Index >
-		// lr.snapshot.Index and passes.
-		if lr.snapshot.Index > 0 && ss.Index <= lr.snapshot.Index {
-			return ErrSnapshotOutOfDate
-		}
+	// Each guard is conditioned on the state IT compares against, not on a
+	// proxy for "this reader has been used".
+	//
+	// Both used to sit behind `lr.membership.ConfigChangeID != 0 ||
+	// lr.state.Commit != 0`, which is a guess: ConfigChangeID 0 and Commit 0
+	// are perfectly legal values for a replica that has recovered from a
+	// snapshot and not yet committed anything of its own, and for that replica
+	// the guess switched BOTH guards off. A stale snapshot then overwrote the
+	// recorded one and, with it, lr.membership — the quorum set. The proxy also
+	// bought nothing: on a genuinely fresh reader markerIndex and
+	// snapshot.Index are both 0, which makes each guard inert on its own terms.
+	//
+	// The marker check alone is insufficient for CreateSnapshot: compaction
+	// retains CompactionOverhead entries below the snapshot, so markerIndex
+	// normally TRAILS the recorded snapshot index, and an ss with
+	// markerIndex < ss.Index < lr.snapshot.Index would pass it. The legitimate
+	// advance (ApplySnapshot/CreateSnapshot to a higher index) clears both.
+	if ss.Index > 0 && ss.Index <= lr.markerIndex {
+		return ErrSnapshotOutOfDate
+	}
+	if lr.snapshot.Index > 0 && ss.Index <= lr.snapshot.Index {
+		return ErrSnapshotOutOfDate
 	}
 	lr.membership = ss.Membership
 	lr.snapshot = ss

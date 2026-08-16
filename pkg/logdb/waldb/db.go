@@ -455,6 +455,15 @@ type walShard struct {
 	// monitor is configured.
 	diskMon *DiskMonitor
 
+	// residuals records every generation-boundary residual this shard's
+	// recovery raised (see logdb.RecoveryResidual). It is written ONLY by
+	// recover(), which runs before the shard is reachable from any DB, and is
+	// read-only for the rest of the shard's life: nothing clears it, because a
+	// node that came up shorter than the log it acknowledged stays that way
+	// until an operator reconciles it, and the operator may not look for hours.
+	// Read under dataMu.RLock like any other served state.
+	residuals []logdb.RecoveryResidual
+
 	// Per-node entry indexes for range queries and compaction tracking.
 	// The map itself is protected by dataMu; each index has its own lock.
 	indexes map[nodeKey]*index
@@ -1078,6 +1087,10 @@ func (s *walShard) recover() error {
 		s.advanceCommittedHWM(segID)
 	}
 
+	// Every segment has been replayed, so the per-replica ranges the residual
+	// report names are the ranges the node is actually coming up with.
+	s.finalizeResiduals()
+
 	return s.reconcileCompactionFloors()
 }
 
@@ -1399,6 +1412,16 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 	// damage or placed everything there in the segment's final unsynced batch,
 	// so the truncation recover() performs discards no acknowledged record.
 	if readSeg.stoppedAtCorruption {
+		// The truncation is licensed, but it is not always free: when the
+		// records above the damage all carry a generation HIGHER than anything
+		// in the clean prefix, an fsync completed inside the bytes that were
+		// destroyed, and whatever older-generation records it acknowledged are
+		// gone. Recovery proceeds by design; the fact must not evaporate with
+		// the log line that announces it.
+		if readSeg.generationBoundaryInDamage {
+			s.noteGenerationBoundaryResidual(segID, cleanEnd,
+				readSeg.prefixGeneration, readSeg.survivingGeneration)
+		}
 		slog.Warn("waldb: halting recovery after corruption; later segments skipped",
 			"segment_id", segID)
 		return cleanEnd, errRecoveryTruncated
@@ -4429,6 +4452,19 @@ func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) e
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
+	// A snapshot at index 0 is not a snapshot: index 0 is the empty log, so it
+	// covers nothing and can never be newer than what is stored. The staleness
+	// rule below rejects it whenever a snapshot IS stored, but on a fresh node
+	// there was nothing to compare against and it went straight through —
+	// writing a WAL record, publishing a snapshot GetSnapshot reports as
+	// existing at no index, and pinning the segment it landed in against
+	// garbage collection for as long as no real snapshot replaces it. Extend
+	// the same rule to the fresh node; the SaveState path has always required
+	// Index > 0.
+	if snapshot.Index == 0 {
+		return logdb.ErrSnapshotOutOfDate
+	}
+
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -4694,7 +4730,23 @@ func (db *DB) saveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	return shard.writeBootstrap(key, shardID, replicaID, bootstrap, recordDataDir)
+	// Standalone bootstrap write. This was the ONE standalone writer without a
+	// checkpoint — SaveSnapshot, RemoveEntriesTo and RemoveNodeData have all
+	// had one — so a failed write left its bytes in the segment and returned an
+	// error the caller reads as "nothing happened". Those bytes are a partial
+	// record, and the next successful write lands directly on top of them: what
+	// recovery then finds is a torn record with valid data above it, in the
+	// middle of a live segment. That is the shape recovery must fail closed on,
+	// so one failed SaveBootstrap could cost the whole shard's WAL on the next
+	// restart.
+	var cp shardCheckpoint
+	if err := captureShardCheckpoint(shard, &cp); err != nil {
+		return err
+	}
+	if err := shard.writeBootstrap(key, shardID, replicaID, bootstrap, recordDataDir); err != nil {
+		return db.rollbackStandalone(shard, &cp, err)
+	}
+	return nil
 }
 
 // GetBootstrap returns the bootstrap information for a node.

@@ -303,6 +303,14 @@ func TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto(t *testing.
 //
 // The flush must be a METADATA sync: a dirent create is metadata, and it is
 // what fdatasync is permitted to leave behind.
+//
+// The count is measured as a DELTA across the lazy creation, not as an absolute
+// total. Open publishes the format marker by rename and metadata-syncs the WAL
+// root to make that publication durable (see
+// TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto), so the root
+// already carries a nonzero SyncMetadata count before the first write ever
+// happens. Asserting `> 0` therefore asserted the format marker's flush and
+// nothing else: deleting the fsync this test is named for left it green.
 func TestEnsureActiveSegment_FsyncsShardDirParent(t *testing.T) {
 	dir := t.TempDir() + "/wal"
 	ffs := newSyncAccountingFS()
@@ -314,14 +322,34 @@ func TestEnsureActiveSegment_FsyncsShardDirParent(t *testing.T) {
 	}
 	defer db.Close()
 
-	// First write to shard 5 lazily creates <dir>/shard-5 and must fsync its
-	// parent, <dir> (the WAL root).
-	if err := db.SaveEntries(5, 1, makeEntries(1, 3, 1)); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
+	// Baseline AFTER Open: everything below is attributable to the lazy
+	// creation alone.
+	before := ffs.metaSyncCount(dir)
+
+	const shardID = uint64(5)
+	shardDir := filepath.Join(dir, shardDirName(int(shardID%DefaultShardCount)))
+	if _, err := os.Stat(shardDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("fixture: %s already exists after Open (stat err %v); the shard "+
+			"directory is not being created lazily and the path under test is "+
+			"never taken", shardDir, err)
 	}
 
-	if ffs.metaSyncCount(dir) == 0 {
-		t.Fatalf("WAL root %q was never metadata-synced; the shard directory entry is not durable", dir)
+	// First write to shard 5 lazily creates <dir>/shard-5 and must fsync its
+	// parent, <dir> (the WAL root).
+	if err := db.SaveEntries(shardID, 1, makeEntries(1, 3, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+	if _, err := os.Stat(shardDir); err != nil {
+		t.Fatalf("fixture: %s was not created by the first write: %v", shardDir, err)
+	}
+
+	if after := ffs.metaSyncCount(dir); after == before {
+		t.Fatalf("the lazy creation of %s did not metadata-sync its parent %q "+
+			"(SyncMetadata count stayed at %d): the shard directory's own dirent "+
+			"is not durable, so a crash on a filesystem without a global metadata "+
+			"journal loses the whole directory — and every Raft group hashing to "+
+			"it — although SaveEntries fsynced the segment and returned success",
+			shardDir, dir, before)
 	}
 	if got := ffs.syncCount(dir); got != 0 {
 		t.Fatalf("WAL root %q was flushed with Sync %d times instead of SyncMetadata", dir, got)

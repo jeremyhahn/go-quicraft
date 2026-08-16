@@ -61,6 +61,52 @@ type crashFS struct {
 	// durable; Crash resurrects them.
 	tombs map[string]*crashNode
 	hook  atomic.Pointer[crashHook]
+	// wb, when set, replaces the all-or-nothing loss of unsynced bytes with a
+	// per-page verdict; see crashWriteback.
+	wb atomic.Pointer[crashWriteback]
+	// The write log records the byte ranges handed to WriteAt, so a test can
+	// find out WHERE an in-flight batch landed and name the pages it wants the
+	// crash to swallow. It is off by default and costs nothing when off.
+	wlogMu sync.Mutex
+	wlogOn bool
+	wlog   []crashWrite
+}
+
+// crashDefaultPageSize is the writeback granularity used when a test enables
+// partial writeback without naming one. Real writeback is per page-cache page.
+const crashDefaultPageSize = 4096
+
+// crashWriteback models the fact that the page cache does NOT flush a file's
+// dirty pages as a unit.
+//
+// Without it crashFS loses every unsynced byte of every file, which can only
+// ever produce a clean truncation of the tail. That is one shape of power loss,
+// and it is the shape the durability-sequence scheme (see record.go) does not
+// need: a WAL that simply ends early has no damage under acknowledged data to
+// classify. The shape the scheme EXISTS for is the other one — a batch spanning
+// several blocks issues one WriteAt per block before a single fdatasync, and
+// writeback may persist an arbitrary SUBSET of those pages, leaving decodable
+// records sitting above a zero-filled hole. Recovery must read that as an
+// interrupted write and truncate, not as damage under acknowledged data and
+// refuse to open. Modelling it requires losing page N while keeping page N+1,
+// which the whole-file model cannot express at all.
+//
+// retained reports whether the page's CURRENT content reached the medium. A
+// page that did not reverts to the file's durable image, exactly as a real lost
+// writeback leaves the previously persisted content in place — which is why an
+// acknowledged byte sharing a page with an in-flight one is never destroyed by
+// this model, only the in-flight byte is. Pages that never existed in the
+// durable image read back as zeros: a hole.
+type crashWriteback struct {
+	pageSize int
+	retained func(path string, page int) bool
+}
+
+// crashWrite is one recorded WriteAt.
+type crashWrite struct {
+	path string
+	off  int64
+	n    int
 }
 
 // crashNode is one filesystem object. Directories carry no content; only
@@ -136,6 +182,42 @@ func (c *crashFS) fire(op crashOp, path string) {
 	}
 }
 
+// setWriteback installs (or with a nil predicate clears) the per-page
+// writeback verdict the next Crash applies. pageSize <= 0 selects
+// crashDefaultPageSize.
+func (c *crashFS) setWriteback(pageSize int, retained func(path string, page int) bool) {
+	if retained == nil {
+		c.wb.Store(nil)
+		return
+	}
+	if pageSize <= 0 {
+		pageSize = crashDefaultPageSize
+	}
+	c.wb.Store(&crashWriteback{pageSize: pageSize, retained: retained})
+}
+
+// recordWrites turns the WriteAt log on or off, discarding whatever it held.
+func (c *crashFS) recordWrites(on bool) {
+	c.wlogMu.Lock()
+	defer c.wlogMu.Unlock()
+	c.wlogOn = on
+	c.wlog = nil
+}
+
+// writesTo returns the recorded WriteAt ranges issued against path, in order.
+func (c *crashFS) writesTo(path string) []crashWrite {
+	target := filepath.Clean(path)
+	c.wlogMu.Lock()
+	defer c.wlogMu.Unlock()
+	var out []crashWrite
+	for _, w := range c.wlog {
+		if w.path == target {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // Crash discards every byte and every directory entry that was not made
 // durable, and invalidates all outstanding handles.
 func (c *crashFS) Crash() {
@@ -155,7 +237,15 @@ func (c *crashFS) Crash() {
 	for _, path := range doomed {
 		delete(c.nodes, path)
 	}
-	for _, n := range c.nodes {
+	// The post-crash image becomes BOTH the live and the durable image. A real
+	// medium has no second copy: what survived the power loss is what is on the
+	// disk, so a LATER crash with no intervening Sync restores exactly this and
+	// not some earlier state. Leaving durable behind would let a second crash
+	// resurrect content the first one had already overwritten or discarded,
+	// which is the model lying in the direction that hides bugs.
+	wb := c.wb.Load()
+	for path, n := range c.nodes {
+		n.durable = postCrashImage(path, n, wb)
 		n.live = append([]byte(nil), n.durable...)
 	}
 	for path, n := range c.tombs {
@@ -165,6 +255,48 @@ func (c *crashFS) Crash() {
 		}
 	}
 	c.tombs = make(map[string]*crashNode)
+}
+
+// postCrashImage computes what a file reads back as after power is cut.
+//
+// With no writeback model installed this is the whole-file rule crashFS has
+// always applied: every unsynced byte is gone and the file reverts to its
+// durable image. With one installed the verdict is taken page by page, so a
+// dirty page that reached the medium survives even when the page below it did
+// not — the interleaving a real page-cache flush is free to produce, and the
+// one the durability sequence exists to classify.
+//
+// A page that did not reach the medium keeps whatever the DURABLE image held
+// there, which is what a real lost writeback leaves behind. Where the durable
+// image does not reach, it reads as zeros, because nothing was ever written
+// there: that is the hole a surviving higher page then sits above.
+func postCrashImage(path string, n *crashNode, wb *crashWriteback) []byte {
+	if n.dir || wb == nil {
+		return append([]byte(nil), n.durable...)
+	}
+	ps := wb.pageSize
+	// The post-crash file reaches as far as the durable image did, plus any
+	// retained page beyond it.
+	size := len(n.durable)
+	for page := 0; page*ps < len(n.live); page++ {
+		if !wb.retained(path, page) {
+			continue
+		}
+		if end := min((page+1)*ps, len(n.live)); end > size {
+			size = end
+		}
+	}
+	img := make([]byte, size)
+	copy(img, n.durable)
+	for page := 0; page*ps < size; page++ {
+		if !wb.retained(path, page) {
+			continue
+		}
+		lo := page * ps
+		hi := min(min(lo+ps, size), len(n.live))
+		copy(img[lo:hi], n.live[lo:hi])
+	}
+	return img
 }
 
 // entryChainDurableLocked reports whether path and every ancestor inside the
@@ -431,7 +563,18 @@ func (f *crashFile) WriteAt(p []byte, off int64) (int, error) {
 		f.node.live = grown
 	}
 	copy(f.node.live[off:end], p)
+	f.fs.logWrite(f.path, off, len(p))
 	return len(p), nil
+}
+
+// logWrite appends one WriteAt range to the log when recording is on.
+func (c *crashFS) logWrite(path string, off int64, n int) {
+	c.wlogMu.Lock()
+	defer c.wlogMu.Unlock()
+	if !c.wlogOn {
+		return
+	}
+	c.wlog = append(c.wlog, crashWrite{path: path, off: off, n: n})
 }
 
 func (f *crashFile) Write(p []byte) (int, error) {

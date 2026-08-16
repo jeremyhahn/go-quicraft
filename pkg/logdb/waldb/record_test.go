@@ -15,6 +15,7 @@
 package waldb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"hash/crc32"
 	"testing"
@@ -289,4 +290,99 @@ func TestRecordHeaderSize(t *testing.T) {
 // Castagnoli table.
 func crc32Checksum(data []byte) uint32 {
 	return crc32.Checksum(data, crc32Table)
+}
+
+// TestDecodeRecord_CRCMismatch reaches ErrCorruptedRecord the way the medium
+// actually produces it: a bit flip in a well-formed record.
+//
+// The other ErrCorruptedRecord tests reach it through the FRAMING checks — a
+// buffer shorter than a header, and a length field pointing past the buffer —
+// which are reached before the checksum is ever computed. Neither exercises the
+// CRC comparison, so the whole reason the checksum exists had no unit-level
+// test at all: replacing the comparison with `computed != computed` would have
+// left this file green.
+//
+// Every byte of the checksummed region is flipped in turn, so the test also
+// pins WHAT the CRC covers. The header's own length and CRC fields sit outside
+// it (a flip there is caught by the framing checks or by the comparison itself),
+// but type, durability sequence and payload must every one of them be inside:
+// a durability sequence outside the covered region could be flipped to move a
+// record into another generation, which is exactly the evidence recovery uses
+// to decide whether truncating destroys acknowledged data.
+func TestDecodeRecord_CRCMismatch(t *testing.T) {
+	data := []byte("payload-under-checksum")
+	buf := make([]byte, recordHeaderSize+len(data))
+	n, err := encodeRecord(buf, RecordFull, 0x11223344, data)
+	if err != nil {
+		t.Fatalf("encodeRecord: %v", err)
+	}
+	if _, _, _, _, err := decodeRecord(buf[:n]); err != nil {
+		t.Fatalf("fixture: the intact record does not decode: %v", err)
+	}
+
+	// buf[6:] is [Type][DurSeq][Data] — the region the checksum covers.
+	for i := 6; i < n; i++ {
+		corrupt := make([]byte, n)
+		copy(corrupt, buf[:n])
+		corrupt[i] ^= 0x01
+
+		_, _, _, _, err := decodeRecord(corrupt)
+		if err == nil {
+			t.Fatalf("a single flipped bit at offset %d decoded as a valid record: "+
+				"that byte is not covered by the checksum, so the medium can change "+
+				"it without recovery ever noticing", i)
+		}
+		// Offset 6 is the type byte, whose validity is checked before the CRC.
+		if i == 6 {
+			if err != ErrInvalidRecordType && err != ErrCorruptedRecord {
+				t.Fatalf("flipping the type byte gave %v, want ErrInvalidRecordType "+
+					"or ErrCorruptedRecord", err)
+			}
+			continue
+		}
+		if err != ErrCorruptedRecord {
+			t.Fatalf("flipping the byte at offset %d gave %v, want ErrCorruptedRecord",
+				i, err)
+		}
+	}
+}
+
+// TestRecordDurabilitySequenceOnDisk pins the durability sequence's on-disk
+// position and encoding.
+//
+// It is the value recovery reads to decide whether truncating a damaged segment
+// destroys records this node already acknowledged, and nothing asserted its
+// concrete bytes: every other test either round-trips it through
+// encode/decode — which agrees with itself whatever the layout is — or discards
+// it at the call site. Moving the field, or writing it big-endian, would leave
+// this package green and make every existing WAL's evidence read as a different
+// generation.
+func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
+	const durSeq = uint32(0x0A0B0C0D)
+	data := []byte("x")
+	buf := make([]byte, recordHeaderSize+len(data))
+	if _, err := encodeRecord(buf, RecordFull, durSeq, data); err != nil {
+		t.Fatalf("encodeRecord: %v", err)
+	}
+
+	// [CRC32:4][Length:2][Type:1][DurSeq:4][Data:N], little-endian.
+	if got := buf[7:11]; !bytes.Equal(got, []byte{0x0D, 0x0C, 0x0B, 0x0A}) {
+		t.Fatalf("durability sequence on disk = %x at buf[7:11], want 0d0c0b0a "+
+			"(0x%08X little-endian at offset 7)", got, durSeq)
+	}
+	if got := binary.LittleEndian.Uint16(buf[4:6]); got != uint16(len(data)) {
+		t.Fatalf("length field = %d, want %d: the durability sequence is not "+
+			"counted as payload", got, len(data))
+	}
+
+	_, _, gotSeq, consumed, err := decodeRecord(buf)
+	if err != nil {
+		t.Fatalf("decodeRecord: %v", err)
+	}
+	if gotSeq != durSeq {
+		t.Fatalf("decoded durability sequence = 0x%08X, want 0x%08X", gotSeq, durSeq)
+	}
+	if consumed != recordHeaderSize+len(data) {
+		t.Fatalf("consumed = %d, want %d", consumed, recordHeaderSize+len(data))
+	}
 }

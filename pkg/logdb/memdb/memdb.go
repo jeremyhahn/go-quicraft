@@ -99,10 +99,20 @@ func (m *MemDB) AtRestProtection() logdb.AtRestProtection {
 	return logdb.AtRestNonDurable
 }
 
-// Close marks the database as closed. All subsequent operations return
-// ErrClosed. Close is idempotent.
+// Close marks the database as closed and releases every node's data. All
+// subsequent operations return ErrClosed. Close is idempotent.
+//
+// Releasing the map is the whole point of closing an in-memory store: this
+// backend holds the entire Raft log of every shard on the heap, so a Close that
+// only flipped a flag left all of it alive for as long as the caller kept the
+// handle — which, in a host that closes one store and opens another, is the
+// full log twice. No operation can observe the released map: every exported
+// method checks the closed flag before it reaches the nodes.
 func (m *MemDB) Close() error {
 	m.closed.Store(true)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nodes = make(map[nodeKey]*nodeData)
 	return nil
 }
 
@@ -114,12 +124,53 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	}
 	for i := range updates {
 		u := &updates[i]
-		nd := m.getOrCreateNode(u.ShardID, u.ReplicaID)
-		nd.mu.Lock()
-		m.applyUpdate(nd, u)
-		nd.mu.Unlock()
+		m.withNode(u.ShardID, u.ReplicaID, func(nd *nodeData) error {
+			m.applyUpdate(nd, u)
+			return nil
+		})
 	}
 	return nil
+}
+
+// withNode runs fn against a node's data under that node's own lock, having
+// first confirmed the node is still the one the map holds.
+//
+// The re-check is what makes a write and a concurrent RemoveNodeData
+// linearizable. getOrCreateNode resolves the *nodeData under the map lock and
+// releases it before the node lock is taken, so RemoveNodeData can unlink the
+// node in that window; writing into the unlinked value then stored the batch
+// somewhere no reader can ever reach while still returning nil, which is the
+// one thing a durability API must never do — the caller was told the write
+// happened. Neither ordering of the two calls explains that outcome.
+//
+// Re-checking makes the write win: the node is recreated and the result is
+// exactly what "remove, then save" produces. The alternative ordering, "save,
+// then remove", is also legal and is what happens when RemoveNodeData gets the
+// map lock second. Both are honest; only the lost write was not.
+//
+// The retry cannot spin indefinitely against anything but an unbroken stream of
+// RemoveNodeData calls for the same node, which is not a workload — each
+// iteration is bounded and makes the same progress the first attempt would.
+//
+// Lock order is nd.mu then m.mu, and it is the ONLY order in this package:
+// getNode and getOrCreateNode release m.mu before any caller touches nd.mu, and
+// RemoveNodeData/ListNodeInfo take m.mu alone.
+func (m *MemDB) withNode(shardID, replicaID uint64, fn func(nd *nodeData) error) error {
+	key := nodeKey{shardID: shardID, replicaID: replicaID}
+	for {
+		nd := m.getOrCreateNode(shardID, replicaID)
+		nd.mu.Lock()
+		m.mu.RLock()
+		live := m.nodes[key] == nd
+		m.mu.RUnlock()
+		if !live {
+			nd.mu.Unlock()
+			continue
+		}
+		err := fn(nd)
+		nd.mu.Unlock()
+		return err
+	}
 }
 
 // applyUpdate applies a single Update to a node. Caller must hold nd.mu.Lock.
@@ -209,7 +260,25 @@ func mergeEntries(existing, incoming []logdb.Entry) []logdb.Entry {
 
 	// Truncate existing entries at the insertion point and append new ones.
 	// Reuses existing slice capacity when possible (common case: sequential append).
-	return appendCopied(existing[:insertAt], incoming)
+	merged := appendCopied(existing[:insertAt], incoming)
+
+	// Reusing the capacity is what makes the append cheap, and it is also what
+	// keeps the DROPPED entries alive: an overwrite that replaces a long
+	// uncommitted suffix with a short one leaves the difference sitting in the
+	// backing array past len, each element still holding a pointer to its Cmd
+	// payload. Nothing reads those elements again, so the retention is
+	// invisible until it is measured — and under leader churn it is unbounded,
+	// because every overwrite adds its own orphaned tail and none is ever
+	// reclaimed. Clear the region so the payloads become collectable the moment
+	// they leave the log.
+	//
+	// When append reallocated, this clears the abandoned array instead, which
+	// costs a pass over memory that is about to be collected anyway and keeps
+	// the rule free of a special case that could silently stop applying.
+	if n := len(merged); n < len(existing) {
+		clear(existing[n:])
+	}
+	return merged
 }
 
 // appendCopied appends incoming entries to dst with each Cmd deep-copied so
@@ -433,26 +502,35 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 		return logdb.ErrClosed
 	}
 
-	nd := m.getOrCreateNode(shardID, replicaID)
-
-	nd.mu.Lock()
-	defer nd.mu.Unlock()
-
-	if nd.hasSnap && snapshot.Index <= nd.snapshot.Index {
+	// A snapshot at index 0 is not a snapshot: index 0 is the empty log, so it
+	// covers nothing and can never be newer than what is stored. Storing it
+	// makes GetSnapshot report a snapshot that exists at no index, and the
+	// caller's next SaveSnapshot at a real index is the only thing that clears
+	// it. The staleness rule below already rejects it whenever a snapshot IS
+	// stored — this extends the same rule to the fresh node it slipped through
+	// on, and matches the SaveState path, which has always required Index > 0.
+	if snapshot.Index == 0 {
 		return logdb.ErrSnapshotOutOfDate
 	}
 
-	// The snapshot's membership becomes the node's membership, exactly as it
-	// does on the SaveState path and in waldb (whose ReadState serves the
-	// latest snapshot's membership); leaving it untouched made ReadState
-	// report an empty membership after a snapshot install. The maps are
-	// deep-copied for the same reason Entry.Cmd is: the caller owns them.
-	membership := copyMembership(snapshot.Membership)
-	nd.snapshot = snapshot
-	nd.snapshot.Membership = membership
-	nd.hasSnap = true
-	nd.membership = membership
-	return nil
+	return m.withNode(shardID, replicaID, func(nd *nodeData) error {
+		if nd.hasSnap && snapshot.Index <= nd.snapshot.Index {
+			return logdb.ErrSnapshotOutOfDate
+		}
+
+		// The snapshot's membership becomes the node's membership, exactly as
+		// it does on the SaveState path and in waldb (whose ReadState serves
+		// the latest snapshot's membership); leaving it untouched made
+		// ReadState report an empty membership after a snapshot install. The
+		// maps are deep-copied for the same reason Entry.Cmd is: the caller
+		// owns them.
+		membership := copyMembership(snapshot.Membership)
+		nd.snapshot = snapshot
+		nd.snapshot.Membership = membership
+		nd.hasSnap = true
+		nd.membership = membership
+		return nil
+	})
 }
 
 // GetSnapshot returns the most recent snapshot metadata for the given node.
@@ -517,19 +595,23 @@ func (m *MemDB) SaveBootstrap(shardID uint64, replicaID uint64, bootstrap logdb.
 		return logdb.ErrClosed
 	}
 
-	nd := m.getOrCreateNode(shardID, replicaID)
-
-	nd.mu.Lock()
-	defer nd.mu.Unlock()
-
 	// A record stored by this version always carries an explicit DataDir, so
 	// mark it recorded regardless of what the caller passed: DataDirRecorded
 	// describes the RECORD, not the request, and a reader must be able to tell
 	// "the shard has no DataDir" from "nothing was ever written here".
 	bootstrap.DataDirRecorded = true
-	nd.bootstrap = bootstrap
-	nd.hasBoot = true
-	return nil
+	// Deep-copy the address map for exactly the reason Entry.Cmd and every
+	// Membership map are copied: the caller owns it and may reuse or mutate it
+	// after the call. This was the ONE write path that did not, so a caller
+	// that recycled its bootstrap map silently rewrote the stored initial
+	// membership — the set a recovering replica dials and authorizes against.
+	bootstrap.Addresses = copyAddrMap(bootstrap.Addresses)
+
+	return m.withNode(shardID, replicaID, func(nd *nodeData) error {
+		nd.bootstrap = bootstrap
+		nd.hasBoot = true
+		return nil
+	})
 }
 
 // GetBootstrap returns the bootstrap information for a node. The bool

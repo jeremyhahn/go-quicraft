@@ -3572,3 +3572,120 @@ func TestTermRingBufferAppendRepairAfterWraparound(t *testing.T) {
 		t.Errorf("lookup(3) = (%d, %v), want (5, true)", term, ok)
 	}
 }
+
+// TestCreateSnapshot_RejectsRegressionAboveTheMarker pins the guard that the
+// marker check cannot cover.
+//
+// Compaction deliberately retains CompactionOverhead entries BELOW the
+// snapshot, so markerIndex normally trails the recorded snapshot index. That
+// leaves a live band, markerIndex < ss.Index < snapshot.Index, in which a stale
+// snapshot passes the marker check. Accepting it does not merely record the
+// wrong index: setSnapshot also overwrites lr.membership from the snapshot, so
+// the reader's quorum set rolls back to an older configuration — a removed
+// replica reappears as a voter, and quorum is computed over a set the cluster
+// has moved past.
+//
+// Deleting the guard left the whole pkg/logdb suite green.
+func TestCreateSnapshot_RejectsRegressionAboveTheMarker(t *testing.T) {
+	lr := NewLogReader(1, 1, nil)
+
+	// Recover into a state with a marker well below the recorded snapshot,
+	// which is exactly what compaction with overhead produces.
+	newer := proto.Snapshot{
+		Index:      100,
+		Term:       5,
+		Membership: proto.Membership{ConfigChangeID: 9, Addresses: map[uint64]string{1: "a", 2: "b"}},
+	}
+	if err := lr.ApplySnapshot(newer); err != nil {
+		t.Fatalf("ApplySnapshot(100): %v", err)
+	}
+	// Move the marker back below the snapshot, modelling the retained overhead.
+	lr.mu.Lock()
+	lr.markerIndex = 90
+	lr.markerTerm = 5
+	lr.mu.Unlock()
+
+	stale := proto.Snapshot{
+		Index:      95, // above the marker, below the recorded snapshot
+		Term:       4,
+		Membership: proto.Membership{ConfigChangeID: 3, Addresses: map[uint64]string{1: "a"}},
+	}
+	if err := lr.CreateSnapshot(stale); !errors.Is(err, ErrSnapshotOutOfDate) {
+		t.Fatalf("CreateSnapshot(95) over a recorded snapshot at 100 = %v, want "+
+			"ErrSnapshotOutOfDate: it sits ABOVE the compaction marker (90), so the "+
+			"marker check passes it, and accepting it rolls the recorded snapshot "+
+			"back and overwrites the membership the reader computes quorum over", err)
+	}
+	if got := lr.Snapshot(); got.Index != 100 {
+		t.Fatalf("recorded snapshot regressed to index %d, want 100", got.Index)
+	}
+	_, membership := lr.NodeState()
+	if membership.ConfigChangeID != 9 || len(membership.Addresses) != 2 {
+		t.Fatalf("membership regressed to %+v: a stale snapshot overwrote the "+
+			"quorum set with an older configuration", membership)
+	}
+}
+
+// TestSetSnapshot_GuardsDoNotDependOnUnrelatedState pins the removal of the
+// zero-value proxy that used to gate both guards.
+//
+// They sat behind `membership.ConfigChangeID != 0 || state.Commit != 0`, a
+// guess at "this reader has been used". ConfigChangeID 0 and Commit 0 are legal
+// for a replica that recovered from a snapshot and has committed nothing of its
+// own since, and for exactly that replica the guess switched BOTH guards off —
+// so the one state in which a stale snapshot is most likely to arrive was the
+// one state in which nothing rejected it.
+func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
+	lr := NewLogReader(1, 1, nil)
+
+	// A snapshot whose membership carries no config change, on a reader that
+	// has committed nothing: both halves of the old proxy read zero.
+	recorded := proto.Snapshot{
+		Index:      50,
+		Term:       3,
+		Membership: proto.Membership{Addresses: map[uint64]string{1: "a", 2: "b"}},
+	}
+	if err := lr.ApplySnapshot(recorded); err != nil {
+		t.Fatalf("ApplySnapshot(50): %v", err)
+	}
+	_, membership := lr.NodeState()
+	if membership.ConfigChangeID != 0 {
+		t.Fatalf("fixture: ConfigChangeID = %d, want 0 so the old proxy reads zero",
+			membership.ConfigChangeID)
+	}
+	if st, _ := lr.NodeState(); st.Commit != 0 {
+		t.Fatalf("fixture: Commit = %d, want 0 so the old proxy reads zero", st.Commit)
+	}
+
+	for _, ss := range []proto.Snapshot{
+		{Index: 10, Term: 2, Membership: proto.Membership{Addresses: map[uint64]string{1: "a"}}},
+		{Index: 50, Term: 3, Membership: proto.Membership{Addresses: map[uint64]string{1: "a"}}},
+	} {
+		if err := lr.ApplySnapshot(ss); !errors.Is(err, ErrSnapshotOutOfDate) {
+			t.Fatalf("ApplySnapshot(%d) over a recorded snapshot at 50 = %v, want "+
+				"ErrSnapshotOutOfDate: the reader's ConfigChangeID and Commit are "+
+				"both zero, which is legal after a snapshot recovery, and used to "+
+				"disable every staleness check on this path", ss.Index, err)
+		}
+		if err := lr.CreateSnapshot(ss); !errors.Is(err, ErrSnapshotOutOfDate) {
+			t.Fatalf("CreateSnapshot(%d) over a recorded snapshot at 50 = %v, want "+
+				"ErrSnapshotOutOfDate", ss.Index, err)
+		}
+	}
+	if got := lr.Snapshot(); got.Index != 50 {
+		t.Fatalf("recorded snapshot is now at index %d, want 50", got.Index)
+	}
+	_, membership = lr.NodeState()
+	if len(membership.Addresses) != 2 {
+		t.Fatalf("membership was overwritten by a stale snapshot: %+v", membership)
+	}
+
+	// The legitimate advance still works.
+	if err := lr.ApplySnapshot(proto.Snapshot{Index: 60, Term: 4,
+		Membership: proto.Membership{Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"}}}); err != nil {
+		t.Fatalf("ApplySnapshot(60): %v", err)
+	}
+	if got := lr.Snapshot(); got.Index != 60 {
+		t.Fatalf("recorded snapshot = %d after a legitimate advance, want 60", got.Index)
+	}
+}
