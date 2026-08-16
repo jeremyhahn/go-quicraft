@@ -1849,6 +1849,318 @@ func TestProcessReady_WALMode_OrderedMsgsNotSentBeforeCommitC(t *testing.T) {
 	}
 }
 
+// TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim pins the window
+// that Peer.InvalidatePersistedState exists to close.
+//
+// OnReadyToRead is invoked inline on the step worker, before the update reaches
+// any persistence path, and GetUpdate has ALREADY advanced prevState by then. A
+// panic there destroys the update while the peer still believes its hard state
+// is durable — after which every subsequent update is classified ReadOnly and
+// skips SaveState, so a granted vote is answered but never written.
+//
+// The engine's restart loop calls discardExtractedUpdate on the unwind; this
+// asserts the worker has recorded which node needs that treatment, and that
+// applying it re-arms the peer.
+func TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 16)
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+
+	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case item := <-commitC:
+		if err := peer.Commit(item.update); err != nil {
+			t.Fatalf("initial commit failed: %v", err)
+		}
+		node.commitPending.Store(false)
+	default:
+	}
+
+	// Produce an update carrying ReadyToRead: a ReadIndex confirmed by
+	// heartbeat quorum.
+	node.DeliverReadIndex(42)
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case item := <-commitC:
+		if err := peer.Commit(item.update); err != nil {
+			t.Fatalf("commit failed: %v", err)
+		}
+		node.commitPending.Store(false)
+	default:
+	}
+	hbTerm, _, _, _, _, _ := node.Peer().DiagRaftState()
+	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 2, Term: hbTerm, Hint: 100})
+	node.Deliver(proto.Message{Type: proto.HeartbeatResp, From: 3, Term: hbTerm, Hint: 100})
+
+	cb.panicOnReadyToRead = true
+
+	panicked := func() (p bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				p = true
+			}
+		}()
+		ws.Notify(1)
+		sw.processReady()
+		return false
+	}()
+	if !panicked {
+		t.Fatal("OnReadyToRead did not fire, so this test never entered the " +
+			"window it is meant to cover")
+	}
+
+	// The update is gone. The worker must know whose durability claim went
+	// with it — enqueuingNode is NOT set here, because the panic unwound
+	// before the hand-off ever began.
+	if sw.extractedNode != node {
+		t.Fatalf("extractedNode = %v, want the panicking node; the recovery "+
+			"has no way to know the hard state was never persisted",
+			sw.extractedNode)
+	}
+
+	// What the engine's restart loop does.
+	sw.discardExtractedUpdate()
+
+	if !node.peer.HasUpdate(node.lastApplied.Load()) {
+		t.Error("the peer reports no work after losing an unpersisted update, " +
+			"so the step worker never re-extracts and the hard state is " +
+			"never written")
+	}
+	next, err := node.peer.GetUpdate(true, node.lastApplied.Load())
+	if err != nil {
+		t.Fatalf("GetUpdate after recovery: %v", err)
+	}
+	if next.ReadOnly {
+		t.Error("the update after the lost one is ReadOnly, so it bypasses " +
+			"SaveState and the hard state never reaches the WAL")
+	}
+}
+
+// persistBeforeRespondFixture is the message set both split sites are driven
+// with below. The classification is written out as LITERAL message types on
+// purpose.
+//
+// Every pre-existing test of this property partitioned its observations with
+// proto.IsFreeOrderMessage — the same predicate the production code branches
+// on — so the test's expectation moved in lockstep with the behaviour it was
+// meant to pin. Inverting the split in enqueueForCommit sent every
+// RequestVoteResp before its fsync and the entire package still passed. That
+// mutation is two-leaders-in-one-term: a follower that answers a vote request
+// before the grant is durable can crash, forget the vote, and grant it again
+// to a different candidate in the same term.
+//
+// Nothing in this file may ask proto.IsFreeOrderMessage what the answer is.
+var persistBeforeRespondFixture = struct {
+	messages []proto.Message
+	// freeOrder may go out before the state behind them is durable.
+	freeOrder []uint64
+	// ordered MUST NOT be transmitted until SaveState/Commit has returned.
+	ordered []uint64
+}{
+	messages: []proto.Message{
+		{Type: proto.Replicate, From: 1, To: 2},
+		{Type: proto.RequestVoteResp, From: 1, To: 3},
+		{Type: proto.Heartbeat, From: 1, To: 4},
+		{Type: proto.HeartbeatResp, From: 1, To: 5},
+		{Type: proto.ReplicateResp, From: 1, To: 6},
+		{Type: proto.Quiesce, From: 1, To: 7},
+	},
+	freeOrder: []uint64{proto.Replicate, proto.Heartbeat, proto.Quiesce},
+	ordered: []uint64{
+		proto.RequestVoteResp, proto.HeartbeatResp, proto.ReplicateResp,
+	},
+}
+
+// typeNames renders a message slice as its type names, for failure output.
+func typeNames(msgs []proto.Message) []string {
+	out := make([]string, len(msgs))
+	for i := range msgs {
+		out[i] = proto.MessageTypeName(msgs[i].Type)
+	}
+	return out
+}
+
+// containsType reports whether msgs holds a message of type t.
+func containsType(msgs []proto.Message, t uint64) bool {
+	for i := range msgs {
+		if msgs[i].Type == t {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist drives the real
+// WAL-mode split site with a synthetic update carrying both classes, and
+// asserts the outcome against the literal fixture above.
+//
+// This is the test that fails when the split predicate in enqueueForCommit is
+// inverted, and it is the only one in the package that does.
+func TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist(t *testing.T) {
+	sender := newTestSender()
+	ws := NewWorkSignal(1)
+	// Buffered by one: enqueueForCommit hands the item over and returns, so
+	// everything observed on the sender afterwards was transmitted BEFORE the
+	// commit worker could possibly have called SaveState.
+	commitC := make(chan *commitItem, 1)
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
+
+	peer, lr := newTestPeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+
+	update := proto.Update{ShardID: 1}
+	update.Messages = append(update.Messages, persistBeforeRespondFixture.messages...)
+
+	if sw.enqueueForCommit(1, node, update) {
+		t.Fatal("enqueueForCommit reported shutdown on a live stopC")
+	}
+
+	var item *commitItem
+	select {
+	case item = <-commitC:
+	default:
+		t.Fatal("enqueueForCommit did not queue a commitItem")
+	}
+
+	sent := sender.sentMessages()
+
+	// The safety property: nothing ordered may have left the node yet.
+	for _, want := range persistBeforeRespondFixture.ordered {
+		if containsType(sent, want) {
+			t.Errorf("%s was transmitted BEFORE the state behind it was persisted; "+
+				"a crash here re-grants the same term. sent=%v",
+				proto.MessageTypeName(want), typeNames(sent))
+		}
+		if !containsType(item.orderedMsgs, want) {
+			t.Errorf("%s missing from commitItem.orderedMsgs, so it is never sent at all; "+
+				"orderedMsgs=%v", proto.MessageTypeName(want), typeNames(item.orderedMsgs))
+		}
+	}
+
+	// The liveness property: free-order traffic must NOT be held behind fsync,
+	// or replication stalls for a disk round trip on every update.
+	for _, want := range persistBeforeRespondFixture.freeOrder {
+		if !containsType(sent, want) {
+			t.Errorf("%s was withheld until after persist; replication now waits on "+
+				"fsync. sent=%v", proto.MessageTypeName(want), typeNames(sent))
+		}
+		if containsType(item.orderedMsgs, want) {
+			t.Errorf("%s was deferred into orderedMsgs; it belongs on the fast path. "+
+				"orderedMsgs=%v", proto.MessageTypeName(want), typeNames(item.orderedMsgs))
+		}
+	}
+}
+
+// TestCommitMemoryMode_OrderedMessagesSentAfterCommit is the memory-mode twin.
+//
+// Memory mode has no fsync, so the split is observable as two distinct SEND
+// BATCHES either side of peer.Commit: batch 0 before, batch 1 after. The
+// existing coverage of this site checked batch membership with
+// proto.IsFreeOrderMessage, so inverting the split moved test and code
+// together; this compares each batch against the literal fixture instead.
+func TestCommitMemoryMode_OrderedMessagesSentAfterCommit(t *testing.T) {
+	sender := newSequenceSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 16)
+	applyC := make(chan *applyItem, 16)
+	stopC := make(chan struct{})
+
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+	sw.memoryMode = true
+	sw.applyC = applyC
+	sw.applyPool = &sync.Pool{New: func() interface{} { return &applyItem{} }}
+
+	peer, lr := newTestPeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	sw.loadNode(node)
+
+	tickPeerToLeader(peer)
+
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case <-applyC:
+		node.commitPending.Store(false)
+	default:
+	}
+	sender.mu.Lock()
+	sender.events = sender.events[:0]
+	sender.seq.Store(0)
+	sender.mu.Unlock()
+
+	// A real update from the peer, so Commit succeeds; the messages on it are
+	// then replaced with the fixture.
+	node.DeliverProposal([]proto.Entry{{Cmd: []byte("persist-order")}})
+	ws.Notify(1)
+	_ = ws.Swap(0)
+	if buf := node.DrainProposals(nil); len(buf) > 0 {
+		_ = peer.Handle(proto.Message{
+			Type: proto.Propose, Origin: proto.OriginLocal, Entries: buf,
+		})
+	}
+	peer.FlushReadIndex()
+	if !peer.HasUpdate(node.lastApplied.Load()) {
+		t.Fatal("peer should have an update after propose")
+	}
+	update, err := peer.GetUpdate(true, node.lastApplied.Load())
+	if err != nil {
+		t.Fatalf("GetUpdate failed: %v", err)
+	}
+	update.Messages = append(update.Messages[:0],
+		persistBeforeRespondFixture.messages...)
+
+	if sw.commitMemoryMode(node, update) {
+		t.Fatal("commitMemoryMode reported shutdown on a live stopC")
+	}
+
+	events := sender.getEvents()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 send batches (free-order before Commit, ordered "+
+			"after), got %d", len(events))
+	}
+
+	// Batch 0 goes out before peer.Commit: it must hold the free-order set and
+	// nothing else. An ordered message here has outrun the state it reports.
+	for _, want := range persistBeforeRespondFixture.ordered {
+		if containsType(events[0].msgs, want) {
+			t.Errorf("%s was sent BEFORE peer.Commit applied the state it "+
+				"acknowledges; pre-commit batch=%v",
+				proto.MessageTypeName(want), typeNames(events[0].msgs))
+		}
+		if !containsType(events[1].msgs, want) {
+			t.Errorf("%s never reached the post-commit batch=%v",
+				proto.MessageTypeName(want), typeNames(events[1].msgs))
+		}
+	}
+	for _, want := range persistBeforeRespondFixture.freeOrder {
+		if !containsType(events[0].msgs, want) {
+			t.Errorf("%s was held back until after Commit; pre-commit batch=%v",
+				proto.MessageTypeName(want), typeNames(events[0].msgs))
+		}
+		if containsType(events[1].msgs, want) {
+			t.Errorf("%s was deferred to the post-commit batch=%v",
+				proto.MessageTypeName(want), typeNames(events[1].msgs))
+		}
+	}
+}
+
 // TestProcessReady_WALMode_EmptyMessages verifies that when an update
 // has no messages, the orderedMsgs slice is properly reset and no
 // messages are sent.
