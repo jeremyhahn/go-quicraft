@@ -53,6 +53,11 @@ type testCallback struct {
 	readIndexFailedCalls []readIndexFailedCall
 	readIndexFailedCount atomic.Int64
 	snapshotRejected     atomic.Int64
+
+	// panicOnReadyToRead makes OnReadyToRead panic, standing in for a bug in
+	// the engine-to-Host plumbing that runs inline on the step worker. Set
+	// before the worker starts; never mutated concurrently.
+	panicOnReadyToRead bool
 }
 
 type readIndexBatchCall struct {
@@ -151,6 +156,9 @@ func (c *testCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, term uin
 
 func (c *testCallback) OnReadyToRead(shardID uint64, readyToRead []proto.ReadyToRead) {
 	c.readyCount.Add(1)
+	if c.panicOnReadyToRead {
+		panic("test: OnReadyToRead panicked")
+	}
 	cp := make([]proto.ReadyToRead, len(readyToRead))
 	copy(cp, readyToRead)
 	c.mu.Lock()

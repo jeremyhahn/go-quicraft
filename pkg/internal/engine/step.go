@@ -98,6 +98,15 @@ type stepWorker struct {
 	// the step-worker goroutine (recovery runs on it during the panic unwind),
 	// so no synchronization is required.
 	enqueuingNode *Node
+
+	// extractedNode records the node whose update has been pulled out of the
+	// Peer by GetUpdate but has not yet reached a path that persists it. It is
+	// a strictly wider window than enqueuingNode, which only opens once the
+	// hand-off itself begins: a panic in processCallbacks — the inline
+	// OnReadyToRead in particular — unwinds before enqueuingNode is ever set,
+	// and that is precisely the window in which GetUpdate has already advanced
+	// prevState. Same goroutine discipline as enqueuingNode.
+	extractedNode *Node
 	inboxBuf      []proto.Message // reusable buffer for draining node inboxes
 	proposeBuf    []proto.Entry   // reusable buffer for batching inbox proposals
 	// commitProposeBuf is a SEPARATE reusable buffer for the commit-pending
@@ -453,6 +462,12 @@ func (w *stepWorker) processReady() {
 		// holds exclusive access to the Peer here, so reading them is
 		// safe without additional locking.
 		node.publishLogMarkers()
+		// From here until the update reaches its persistence path, this node
+		// is owed a hard-state write that GetUpdate has already optimistically
+		// marked as done (it advanced prevState at extraction). If the
+		// goroutine unwinds in between, discardExtractedUpdate takes that
+		// claim back. See Peer.InvalidatePersistedState.
+		w.extractedNode = node
 		// Detect leader change, ReadyToRead, and campaign launch.
 		w.processCallbacks(shardID, node, update)
 		// Read-only updates (e.g., ReadIndex confirmations) carry no
@@ -462,6 +477,9 @@ func (w *stepWorker) processReady() {
 		// and commitPending blocking. This reduces ReadIndex latency
 		// from ~300us (3 goroutine hops) to ~5us (inline callback).
 		if update.ReadOnly {
+			// A ReadOnly update carries no hard state to persist, so there is
+			// nothing left owed once its messages are away.
+			w.extractedNode = nil
 			if len(update.Messages) > 0 {
 				w.sendMessages(update.Messages)
 			}
@@ -478,6 +496,9 @@ func (w *stepWorker) processReady() {
 			if w.commitMemoryMode(node, update) {
 				return
 			}
+			// Commit succeeded, so the state this update carried is as durable
+			// as memory mode ever makes it.
+			w.extractedNode = nil
 			continue
 		}
 		// WAL-mode pipeline: split messages by persistence ordering
@@ -485,6 +506,8 @@ func (w *stepWorker) processReady() {
 		if w.enqueueForCommit(shardID, node, update) {
 			return
 		}
+		// The commit worker owns the update and its SaveState from here.
+		w.extractedNode = nil
 	}
 }
 
@@ -1393,6 +1416,37 @@ func (w *stepWorker) clearStepCommitPending() {
 	}
 	w.enqueuingNode = nil
 	node.commitPending.Store(false)
+	if w.workSignal != nil {
+		w.workSignal.Notify(node.shardID)
+	}
+}
+
+// discardExtractedUpdate withdraws the durability claim GetUpdate made on
+// behalf of an update that the panic just destroyed.
+//
+// GetUpdate advances prevState when it hands an update out, not when the engine
+// persists it. If the update never reaches SaveState, prevState is left
+// asserting that a term and vote are on disk when they are not, and because the
+// ReadOnly classification is computed from exactly that diff, the NEXT update
+// is marked ReadOnly and skips the WAL as well. The hard state then never gets
+// written at all: the node answers RequestVote from memory, crashes, comes back
+// with no record of the grant, and can grant the same term to a second
+// candidate.
+//
+// The lost readStates are not recoverable here — they were drained out of the
+// Peer by the same GetUpdate — and those ReadIndex callers are completed by the
+// host's sweeper. Durability of the hard state is the part that cannot be left
+// to heal on its own.
+//
+// Runs on the step-worker goroutine during the panic unwind, which is the same
+// goroutine that holds exclusive Peer access, so no locking is required.
+func (w *stepWorker) discardExtractedUpdate() {
+	node := w.extractedNode
+	if node == nil {
+		return
+	}
+	w.extractedNode = nil
+	node.peer.InvalidatePersistedState()
 	if w.workSignal != nil {
 		w.workSignal.Notify(node.shardID)
 	}

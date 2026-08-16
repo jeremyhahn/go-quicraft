@@ -1037,6 +1037,73 @@ func TestPeer_HasUpdate_VoteChanged(t *testing.T) {
 
 // --- GetUpdate ---
 
+// TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL pins the recovery from
+// an update that was extracted but never persisted.
+//
+// GetUpdate advances prevState when it hands an update out, not when the engine
+// writes it. That is an optimistic claim, and when it is wrong — the step
+// worker panics between extraction and SaveState — prevState asserts a term and
+// vote are on disk that never got there. Because ReadOnly is computed from
+// exactly that diff, the NEXT update is then classified ReadOnly and skips the
+// WAL too, so the hard state is never written at all: the node answers
+// RequestVote from memory, restarts with no record of the grant, and can grant
+// the same term to a second candidate.
+//
+// GetPiggybackUpdate was already fixed for this by not advancing prevState (see
+// NotePiggybackPersisted); the main extraction path was not.
+func TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL(t *testing.T) {
+	p := newTestPeer(t, testConfig(), proto.State{}, threeNodeMembership())
+
+	// Grant a vote, so there is hard state whose durability matters.
+	if err := p.Handle(proto.Message{
+		Type: proto.RequestVote, From: 2, To: 1, Term: 5, LogIndex: 0, LogTerm: 0,
+	}); err != nil {
+		t.Fatalf("Handle(RequestVote): %v", err)
+	}
+
+	lost, err := p.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if lost.ReadOnly {
+		t.Fatal("the update carrying the vote grant was ReadOnly, so it would " +
+			"never have been persisted in the first place")
+	}
+	if lost.State.Term != 5 || lost.State.Vote != 2 {
+		t.Fatalf("expected the grant in the update, got term=%d vote=%d",
+			lost.State.Term, lost.State.Vote)
+	}
+
+	// The engine never persists `lost` — a panic destroyed it. This is the
+	// engine telling the peer so.
+	p.InvalidatePersistedState()
+
+	// The shard must be woken: on an idle follower that has just granted a
+	// vote, nothing else is going to move term, vote or commit.
+	if !p.hasStateChanged() {
+		t.Error("hasStateChanged() = false after a lost update, so HasUpdate " +
+			"never wakes the step worker and the grant is never written")
+	}
+
+	next, err := p.GetUpdate(true, 0)
+	if err != nil {
+		t.Fatalf("GetUpdate (second): %v", err)
+	}
+	if next.ReadOnly {
+		t.Fatal("the update after a lost one is ReadOnly, so SaveState is " +
+			"skipped and the vote grant never reaches the WAL")
+	}
+	if next.State.Term != 5 || next.State.Vote != 2 {
+		t.Fatalf("the re-persisted state lost the grant: term=%d vote=%d",
+			next.State.Term, next.State.Vote)
+	}
+
+	// The demand is satisfied by that update, not sticky forever.
+	if p.stateUnpersisted {
+		t.Error("stateUnpersisted survived the update that persisted the state")
+	}
+}
+
 func TestPeer_GetUpdate_CollectsEntriesToSave(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 	p.r.log.inmem.merge([]proto.Entry{

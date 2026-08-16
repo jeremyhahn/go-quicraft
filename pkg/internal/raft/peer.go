@@ -76,6 +76,28 @@ type Peer struct {
 	// persist new hard state.
 	prevState proto.State
 
+	// stateUnpersisted forces the next GetUpdate to report a state change even
+	// when the hard state equals prevState.
+	//
+	// GetUpdate advances prevState at EXTRACTION time, which is optimistic: it
+	// assumes the engine will go on to persist the update it just handed out.
+	// If that update is lost instead — a panic between extraction and
+	// SaveState — prevState claims a term/vote/commit that never reached disk,
+	// the next update is classified ReadOnly, and ReadOnly bypasses SaveState
+	// entirely. A vote granted in the lost update is then answered by a
+	// RequestVoteResp with no WAL write behind it, which is
+	// two-leaders-in-one-term after a crash.
+	//
+	// GetPiggybackUpdate already avoids this by not advancing prevState at all
+	// (see NotePiggybackPersisted); this flag is the equivalent for the main
+	// extraction path, where not advancing is not an option because the
+	// ReadOnly classification is computed from the same diff.
+	//
+	// Written by InvalidatePersistedState from the engine's panic-recovery
+	// path, cleared by the GetUpdate that acts on it. Guarded by the same
+	// exclusive step-worker access as the rest of Peer.
+	stateUnpersisted bool
+
 	// leaderID is accessed atomically for concurrent query safety.
 	// Written by syncLeaderID (called after step/tick), read by any
 	// goroutine via LeaderID() and IsLeader(). This is the only field
@@ -1358,7 +1380,11 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 	hs := p.r.hardState()
 
 	// Detect state change before updating prevState (needed for ReadOnly).
-	stateChanged := hs.Term != p.prevState.Term ||
+	// stateUnpersisted forces the change on: a previously extracted update was
+	// lost before SaveState, so prevState is claiming durability it does not
+	// have and this update must carry the hard state back through the WAL.
+	stateChanged := p.stateUnpersisted ||
+		hs.Term != p.prevState.Term ||
 		hs.Vote != p.prevState.Vote ||
 		hs.Commit != p.prevState.Commit
 
@@ -1423,11 +1449,29 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 		len(update.CommittedEntries) == 0 &&
 		update.Snapshot.Index == 0
 
-	// Update previous state for next diff and sync the atomic leaderID.
+	// Update previous state for next diff and sync the atomic leaderID. The
+	// re-persist demand is satisfied by THIS update: it is not ReadOnly, so it
+	// reaches SaveState.
 	p.prevState = hs
+	p.stateUnpersisted = false
 	p.syncLeaderID()
 
 	return update, nil
+}
+
+// InvalidatePersistedState marks the hard state as possibly-unpersisted, so the
+// next GetUpdate carries it back through SaveState instead of classifying the
+// update ReadOnly and skipping the WAL.
+//
+// The engine calls this when an extracted update is discarded without being
+// persisted — today, when a panic unwinds the step worker between GetUpdate and
+// the commit hand-off. Without it, prevState permanently claims a term and vote
+// that never reached disk.
+//
+// Safe to call repeatedly; it costs at most one extra hard-state write.
+// Must be called with the same exclusive Peer access GetUpdate requires.
+func (p *Peer) InvalidatePersistedState() {
+	p.stateUnpersisted = true
 }
 
 // GetPiggybackUpdate extracts committed entries, messages, and the
@@ -2074,8 +2118,15 @@ func (p *Peer) DiagRemotes() string {
 
 // hasStateChanged returns true if the hard state has changed since the
 // last GetUpdate call. Checks term, vote, and commit index.
+//
+// It also reports true while a re-persist is owed (see stateUnpersisted).
+// HasUpdate is what wakes the step worker; if this returned false there, the
+// shard would sit idle with unpersisted hard state until unrelated traffic
+// happened to move term, vote or commit — which on an idle follower that has
+// just granted a vote is exactly when it matters.
 func (p *Peer) hasStateChanged() bool {
-	return p.r.term != p.prevState.Term ||
+	return p.stateUnpersisted ||
+		p.r.term != p.prevState.Term ||
 		p.r.vote != p.prevState.Vote ||
 		p.r.log.committed != p.prevState.Commit
 }

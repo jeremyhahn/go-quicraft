@@ -841,6 +841,13 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 			// batch, which legitimately holds commitPending across SaveState,
 			// causing a double GetUpdate extraction and double apply.
 			sw.clearStepCommitPending()
+			// An update extracted from the Peer but destroyed by this panic
+			// took a durability claim with it: GetUpdate advanced prevState at
+			// extraction, so without this the hard state it carried is never
+			// written and the next update is classified ReadOnly and skips the
+			// WAL too. Wider window than clearStepCommitPending above — a panic
+			// in processCallbacks unwinds before the hand-off even starts.
+			sw.discardExtractedUpdate()
 		}
 	}()
 	sw.run()
