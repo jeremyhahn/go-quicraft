@@ -300,7 +300,16 @@ jobs:
       - name: Test
         run: |
           go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./...
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          if [ ! -s coverage.out ]; then
+            echo "FAIL: coverage.out is missing or empty; the test run produced no coverage data"
+            exit 1
+          fi
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | sed 's/%//')
+          case "${COVERAGE}" in
+            '' | *[!0-9.]* )
+              echo "FAIL: coverage could not be read from coverage.out (got '${COVERAGE}')"
+              exit 1 ;;
+          esac
           echo "Total coverage: ${COVERAGE}%"
           if [ $(echo "${COVERAGE} < 91" | bc -l) -eq 1 ]; then
             echo "FAIL: coverage ${COVERAGE}% is below minimum 91%"

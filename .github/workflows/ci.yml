@@ -77,10 +77,24 @@ jobs:
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
+      # The guards around the comparison mirror check-coverage in the Makefile,
+      # and for the same reason: with an empty or missing profile COVERAGE is
+      # the empty string, bc fails and prints nothing, the test degenerates to
+      # `[ -eq 1 ]`, and the shell error sends the if down the else branch — so
+      # the gate used to PASS exactly when it had no coverage data to judge.
       - name: Run tests with coverage
         run: |
           go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./...
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          if [ ! -s coverage.out ]; then
+            echo "FAIL: coverage.out is missing or empty; the test run produced no coverage data"
+            exit 1
+          fi
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | sed 's/%//')
+          case "${COVERAGE}" in
+            '' | *[!0-9.]* )
+              echo "FAIL: coverage could not be read from coverage.out (got '${COVERAGE}')"
+              exit 1 ;;
+          esac
           echo "Total coverage: ${COVERAGE}%"
           if [ $(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) -eq 1 ]; then
             echo "FAIL: coverage ${COVERAGE}% is below minimum ${{ env.COVERAGE_THRESHOLD }}%"
@@ -154,6 +168,36 @@ jobs:
       # Every package is stable standalone. Do not drop it to shorten the job.
       - name: Run integration suite
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
+  netfault:
+    name: Network partitions [build tag quicraft_netfault]
+    runs-on: ubuntu-latest
+    # Serialised behind the same three heavy jobs as `integration`, and for the
+    # same reason: these stand up 3-to-5-node QUIC clusters under -race and wait
+    # on election timeouts, so a contended runner turns a real timing assertion
+    # into a flake.
+    needs: [quality, build, test, integration]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      # These are the only tests in the repository that can construct a LIVE
+      # leader deposed by a quorum it cannot reach. Everything else calls
+      # stopNode, which is a process kill. Without this lane, weakening the
+      # election quorum from a strict majority to n/2 passed 18 of 19
+      # linearizability tests.
+      #
+      # The suite asserts its own faults are installed, so a missing build tag
+      # fails the job rather than silently testing a healthy cluster.
+      - name: Run network-partition suite
+        run: make ci-netfault
 
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs]

@@ -53,9 +53,17 @@ GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 TRIVY         := trivy
 
 # Coverage
+#
+# COVER_MIN is the floor every coverage target enforces; the run-coverage canned
+# recipe further down is the single place the flags live.
+#
+# Two variables used to sit here — COVER_FLAGS (`-coverprofile`) and
+# COVER_EXCLUDE (`-coverpkg=./...`, a name that says the opposite of its value)
+# — and NEITHER was referenced by any target, so both are gone. -coverpkg was
+# measured before dropping it rather than wired in on the strength of the
+# variable's name: see the note on run-coverage for why passing it would loosen
+# this gate rather than tighten it.
 COVER_MIN     := 91
-COVER_FLAGS   := -coverprofile
-COVER_EXCLUDE := -coverpkg=./...
 
 # Docker
 DOCKER_IMAGE  := go-quicraft-dev
@@ -303,6 +311,23 @@ _integration-test-linearizability:
 .PHONY: ci-integration
 ci-integration:
 	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+
+# Real network partitions between LIVE replicas.
+#
+# A separate lane rather than part of ci-integration because it needs a second
+# build tag: quicraft_netfault compiles the send-path drop hook into the
+# transport, which a normal build folds away as a false constant. The suite is
+# self-guarding — every test asserts netfault.BlockedCount() is non-zero — so
+# running it with the tag missing fails loudly instead of silently exercising a
+# healthy cluster, which is exactly the defect it was written to correct.
+#
+# -p 1 for the same reason ci-integration uses it: the injector state is
+# process-global and multi-node QUIC clusters under -race starve a shared
+# runner when run concurrently.
+.PHONY: ci-netfault
+ci-netfault:
+	$(GO) test -race -count=1 -tags='integration quicraft_netfault' -timeout=1800s -p 1 \
+		$(INT_TEST_DIR)/e2e/...
 
 # ============================================================================
 # Benchmarks
@@ -604,10 +629,39 @@ perf-all: perf-run-all perf-generate
 # Coverage
 # ============================================================================
 
-# check-coverage: extract percentage from coverage profile and fail if below threshold
+# check-coverage: extract the percentage from a coverage profile and fail if it
+# is below the threshold, if the profile does not exist, or if no percentage can
+# be read out of it.
 # Usage: $(call check-coverage,profile.out,package-name)
+#
+# The three guards before the comparison are not defensive padding. The previous
+# version went straight to
+#
+#	COVERAGE=$$(go tool cover -func=$(1) | grep total | ...)
+#	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]
+#
+# and on an empty or missing profile COVERAGE is the empty string, `bc` fails
+# with a syntax error and prints NOTHING, so the test reads `[ -eq 1 ]`, the
+# shell reports "unary operator expected", the if takes the else branch, and the
+# gate PASSES. A coverage gate that passes precisely when it has no coverage
+# data is the failure mode the gate exists to prevent, so every way of ending up
+# without a number is now an explicit failure.
+#
+# `awk '/^total:/'` rather than `grep total`: the old filter also matched any
+# function whose name contains "total", and with more than one match `awk
+# {print $$3}` emitted two values, which lands right back in the unparseable
+# case above.
 define check-coverage
-	@COVERAGE=$$($(GO) tool cover -func=$(1) | grep total | awk '{print $$3}' | sed 's/%//'); \
+	@if [ ! -s $(1) ]; then \
+		echo "FAIL: $(2) coverage profile $(1) is missing or empty; the test run produced no coverage data"; \
+		exit 1; \
+	fi; \
+	COVERAGE=$$($(GO) tool cover -func=$(1) | awk '/^total:/ {print $$3}' | sed 's/%//'); \
+	case "$${COVERAGE}" in \
+		'' | *[!0-9.]* ) \
+			echo "FAIL: $(2) coverage could not be read from $(1) (got '$${COVERAGE}')"; \
+			exit 1 ;; \
+	esac; \
 	echo "$(2) coverage: $${COVERAGE}%"; \
 	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]; then \
 		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)%"; \
@@ -615,125 +669,123 @@ define check-coverage
 	fi
 endef
 
+# run-coverage: measure one scope's coverage and enforce COVER_MIN on it.
+# Usage: $(call run-coverage,<label>,<package pattern>)
+#
+# Every coverage target below goes through here, so the flags a coverage run
+# needs are decided once instead of being copied twenty-three times, and a new
+# package target cannot be added with a different set by accident.
+#
+# On -coverpkg, which the dead COVER_EXCLUDE variable used to hold and which is
+# deliberately NOT passed here: it does not do what the variable's presence
+# suggests. `go test -coverprofile` already emits an entry for a package that
+# has no test file at all, at 0%, so a test-less package is ALREADY in the
+# denominator and already drags the total down — measured, not assumed: adding a
+# 270-statement package with no tests moved the module total from 91.3% to 89.7%
+# without -coverpkg. What -coverpkg adds is credit for statements covered by
+# some OTHER package's tests, which raises the same tree from 91.3% to 92.0%.
+# Against an unchanged COVER_MIN that is a 0.7-point loosening of the gate, so
+# adopting it is a threshold decision for the owner, not a wiring fix.
+define run-coverage
+	$(GOTEST) -coverprofile=$(COVER_DIR)/$(1).out $(2)
+	$(call check-coverage,$(COVER_DIR)/$(1).out,$(1))
+endef
+
 .PHONY: coverage
 coverage: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/total.out ./...
-	$(call check-coverage,$(COVER_DIR)/total.out,total)
+	$(call run-coverage,total,./...)
 
 .PHONY: coverage-proto
 coverage-proto: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/proto.out $(PKG_PROTO)
-	$(call check-coverage,$(COVER_DIR)/proto.out,proto)
+	$(call run-coverage,proto,$(PKG_PROTO))
 
 .PHONY: coverage-config
 coverage-config: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/config.out $(PKG_CONFIG)
-	$(call check-coverage,$(COVER_DIR)/config.out,config)
+	$(call run-coverage,config,$(PKG_CONFIG))
 
 .PHONY: coverage-queue
 coverage-queue: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/queue.out $(PKG_QUEUE)
-	$(call check-coverage,$(COVER_DIR)/queue.out,queue)
+	$(call run-coverage,queue,$(PKG_QUEUE))
 
 .PHONY: coverage-stopper
 coverage-stopper: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/stopper.out $(PKG_STOPPER)
-	$(call check-coverage,$(COVER_DIR)/stopper.out,stopper)
+	$(call run-coverage,stopper,$(PKG_STOPPER))
 
 .PHONY: coverage-invariant
 coverage-invariant: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/invariant.out $(PKG_INVARIANT)
-	$(call check-coverage,$(COVER_DIR)/invariant.out,invariant)
+	$(call run-coverage,invariant,$(PKG_INVARIANT))
 
 .PHONY: coverage-logdb
 coverage-logdb: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/logdb.out $(PKG_LOGDB)
-	$(call check-coverage,$(COVER_DIR)/logdb.out,logdb)
+	$(call run-coverage,logdb,$(PKG_LOGDB))
 
 .PHONY: coverage-raft
 coverage-raft: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/raft.out $(PKG_RAFT)
-	$(call check-coverage,$(COVER_DIR)/raft.out,raft)
+	$(call run-coverage,raft,$(PKG_RAFT))
 
 .PHONY: coverage-waldb
 coverage-waldb: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/waldb.out $(PKG_WALDB)
-	$(call check-coverage,$(COVER_DIR)/waldb.out,waldb)
+	$(call run-coverage,waldb,$(PKG_WALDB))
 
 .PHONY: coverage-seal
 coverage-seal: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/seal.out $(PKG_SEAL)
-	$(call check-coverage,$(COVER_DIR)/seal.out,seal)
+	$(call run-coverage,seal,$(PKG_SEAL))
 
 .PHONY: coverage-rsm
 coverage-rsm: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/rsm.out $(PKG_RSM)
-	$(call check-coverage,$(COVER_DIR)/rsm.out,rsm)
+	$(call run-coverage,rsm,$(PKG_RSM))
 
 .PHONY: coverage-session
 coverage-session: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/session.out $(PKG_SESSION)
-	$(call check-coverage,$(COVER_DIR)/session.out,session)
+	$(call run-coverage,session,$(PKG_SESSION))
 
 .PHONY: coverage-snapshot
 coverage-snapshot: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/snapshot.out $(PKG_SNAPSHOT)
-	$(call check-coverage,$(COVER_DIR)/snapshot.out,snapshot)
+	$(call run-coverage,snapshot,$(PKG_SNAPSHOT))
 
 .PHONY: coverage-engine
 coverage-engine: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/engine.out $(PKG_ENGINE)
-	$(call check-coverage,$(COVER_DIR)/engine.out,engine)
+	$(call run-coverage,engine,$(PKG_ENGINE))
 
 .PHONY: coverage-registry
 coverage-registry: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/registry.out $(PKG_REGISTRY)
-	$(call check-coverage,$(COVER_DIR)/registry.out,registry)
+	$(call run-coverage,registry,$(PKG_REGISTRY))
 
 .PHONY: coverage-transport
 coverage-transport: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/transport.out $(PKG_TRANSPORT)
-	$(call check-coverage,$(COVER_DIR)/transport.out,transport)
+	$(call run-coverage,transport,$(PKG_TRANSPORT))
 
 .PHONY: coverage-quicraft
 coverage-quicraft: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/quicraft.out $(PKG_QUICRAFT)
-	$(call check-coverage,$(COVER_DIR)/quicraft.out,quicraft)
+	$(call run-coverage,quicraft,$(PKG_QUICRAFT))
 
 .PHONY: coverage-errors
 coverage-errors: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/errors.out $(PKG_ERRORS)
-	$(call check-coverage,$(COVER_DIR)/errors.out,errors)
+	$(call run-coverage,errors,$(PKG_ERRORS))
 
 .PHONY: coverage-sm
 coverage-sm: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/sm.out $(PKG_SM)
-	$(call check-coverage,$(COVER_DIR)/sm.out,sm)
+	$(call run-coverage,sm,$(PKG_SM))
 
 .PHONY: coverage-server
 coverage-server: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/server.out $(PKG_SERVER)
-	$(call check-coverage,$(COVER_DIR)/server.out,server)
+	$(call run-coverage,server,$(PKG_SERVER))
 
 .PHONY: coverage-writemode
 coverage-writemode: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/writemode.out $(PKG_WRITEMODE)
-	$(call check-coverage,$(COVER_DIR)/writemode.out,writemode)
+	$(call run-coverage,writemode,$(PKG_WRITEMODE))
 
 .PHONY: coverage-batch
 coverage-batch: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/batch.out $(PKG_BATCH)
-	$(call check-coverage,$(COVER_DIR)/batch.out,batch)
+	$(call run-coverage,batch,$(PKG_BATCH))
 
 .PHONY: coverage-enclave
 coverage-enclave: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/enclave.out $(PKG_ENCLAVE)
-	$(call check-coverage,$(COVER_DIR)/enclave.out,enclave)
+	$(call run-coverage,enclave,$(PKG_ENCLAVE))
 
 .PHONY: coverage-crypto
 coverage-crypto: | $(COVER_DIR)
-	$(GOTEST) -coverprofile=$(COVER_DIR)/crypto.out $(PKG_CRYPTO)
-	$(call check-coverage,$(COVER_DIR)/crypto.out,crypto)
+	$(call run-coverage,crypto,$(PKG_CRYPTO))
 
 $(COVER_DIR):
 	mkdir -p $(COVER_DIR)
@@ -778,8 +830,8 @@ ci: fmt vet lint security build test
 # ============================================================================
 
 .PHONY: ci-full
-ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-integration
-	@echo "Full CI pipeline passed (untagged + integration + errfs + fuzz seeds + all modules)"
+ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-integration ci-netfault
+	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + all modules)"
 
 # ============================================================================
 # Heavyweight test offload to omega (198.51.100.90)
