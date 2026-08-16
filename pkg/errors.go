@@ -1005,6 +1005,44 @@ func Temporary(err error) bool {
 	return false
 }
 
+// MaybeAppliedError wraps an error whose request had ALREADY been submitted
+// to Raft when it failed. The entry may still commit and apply even though
+// this caller received an error.
+//
+// It exists because Temporary() answers "is it reasonable to retry?" and says
+// nothing about "did it happen?" — and for a consensus library those are
+// different questions with different consequences. A proposal that reached the
+// log and then failed its wait (leadership moved, the deadline expired, the
+// shard was closed) is in exactly this state: retrying an UNSESSIONED proposal
+// after one of those errors can apply the command twice.
+//
+// Wrapping preserves every existing errors.Is / Temporary / NotLeader result,
+// so a caller that does not know about this type behaves exactly as before.
+type MaybeAppliedError struct{ Err error }
+
+func (e *MaybeAppliedError) Error() string {
+	return e.Err.Error() + " (already submitted to raft; it may still commit)"
+}
+
+func (e *MaybeAppliedError) Unwrap() error { return e.Err }
+
+// MaybeApplied reports whether err's request had been delivered to Raft before
+// it failed, so the entry may still commit and apply.
+//
+// Check this BEFORE acting on Temporary. A blind retry of an unsessioned
+// proposal when this returns true can double-apply the command; use a client
+// session (Host.GetNewSession / SyncProposeWithSession) if the operation is
+// not idempotent, and the session layer will deduplicate the retry.
+//
+// A nil error returns false.
+func MaybeApplied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var m *MaybeAppliedError
+	return errors.As(err, &m)
+}
+
 // NotLeader reports whether err indicates this replica is not the leader,
 // and returns the known leader's replica ID when the error carries one.
 //
@@ -1019,6 +1057,14 @@ func Temporary(err error) bool {
 //
 // Every not-leader error is also Temporary, so a retry loop can gate on
 // Temporary and use NotLeader only to pick a target.
+//
+// CHECK MaybeApplied FIRST. A not-leader error is produced at two very
+// different points: as a pre-flight refusal (nothing was submitted — safe to
+// retry anywhere) and when leadership moves out from under a proposal that is
+// ALREADY in the log. The two are structurally identical to a caller, so the
+// second is wrapped in *MaybeAppliedError. Retrying that one without a client
+// session can apply the command twice, because an unsessioned proposal carries
+// ClientID 0 and nothing deduplicates it.
 func NotLeader(err error) (replicaID uint64, ok bool) {
 	if err == nil {
 		return 0, false

@@ -967,3 +967,51 @@ func TestInvalidMemberError_Is_DoesNotMatchOther(t *testing.T) {
 		t.Error("InvalidMemberError should not match ErrReplicaNotFound")
 	}
 }
+
+// TestMaybeApplied pins the distinction Temporary() cannot make: whether a
+// failed request had already reached the raft log.
+//
+// Temporary answers "is a retry reasonable?"; MaybeApplied answers "did it
+// happen?". Conflating them is what made the library's own documented retry
+// loop — gate on Temporary, use NotLeader to pick a target — able to
+// double-apply an unsessioned proposal that had already committed.
+func TestMaybeApplied(t *testing.T) {
+	preFlight := &NotLeaderError{ShardID: 1, LeaderID: 2}
+	postDelivery := &MaybeAppliedError{Err: &NotLeaderError{ShardID: 1, LeaderID: 2}}
+
+	if MaybeApplied(nil) {
+		t.Error("MaybeApplied(nil) = true, want false")
+	}
+	if MaybeApplied(preFlight) {
+		t.Error("a pre-flight NotLeaderError must not report MaybeApplied: " +
+			"nothing was submitted, so a retry is safe")
+	}
+	if !MaybeApplied(postDelivery) {
+		t.Fatal("a post-delivery NotLeaderError must report MaybeApplied: " +
+			"the entry is in the log and can still commit")
+	}
+
+	// Wrapping must not change any existing classification, or callers that
+	// predate MaybeApplied would silently change behaviour.
+	if !Temporary(postDelivery) {
+		t.Error("wrapping broke Temporary(): a wrapped not-leader error is " +
+			"still retryable, just not blindly")
+	}
+	id, ok := NotLeader(postDelivery)
+	if !ok || id != 2 {
+		t.Errorf("wrapping broke NotLeader(): got (%d, %v), want (2, true)", id, ok)
+	}
+	var nle *NotLeaderError
+	if !errors.As(postDelivery, &nle) || nle.ShardID != 1 {
+		t.Error("wrapping broke errors.As unwrapping to *NotLeaderError")
+	}
+	if !errors.Is(postDelivery, ErrNotLeader) {
+		t.Error("wrapping broke errors.Is(err, ErrNotLeader)")
+	}
+
+	// The message must say so; an operator reading a log line is the other
+	// consumer of this distinction.
+	if got := postDelivery.Error(); !strings.Contains(got, "may still commit") {
+		t.Errorf("MaybeAppliedError.Error() = %q, want it to state the ambiguity", got)
+	}
+}

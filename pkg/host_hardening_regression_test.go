@@ -768,3 +768,86 @@ func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 			before.LastIndex, after.LastIndex)
 	}
 }
+
+// TestCancelledConfigChange_SubmitsNothing is the membership counterpart to
+// TestSyncPropose_CancelReturnsCanceled.
+//
+// requestConfigChange checked closed, leader, config-change staleness and the
+// rate limiter — but never the context. A caller that cancelled before calling
+// received ErrCanceled while the membership change committed and applied, so
+// it could not tell whether the voting set had changed. Retrying after that
+// answer issues a duplicate or conflicting change against a configuration it
+// has mis-read.
+//
+// The pre-existing cancellation tests could not catch this: they accept ANY
+// non-nil error and never look at the log or the membership afterwards. This
+// one asserts both halves — the exact error, and that nothing moved — on a
+// single-node shard where a config change WOULD commit (quorum of one), so a
+// missing guard is observable rather than masked by an uncommittable shard.
+func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
+	h := newTestHost(t)
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	scfg := testShardConfig(1, 1)
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	before, err := h.GetShardMembership(1)
+	if err != nil {
+		t.Fatalf("GetShardMembership: %v", err)
+	}
+	_, _, _, lastIdxBefore, _, _, err := h.DiagRaftState(1)
+	if err != nil {
+		t.Fatalf("DiagRaftState: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	addErr := h.SyncRequestAddNode(ctx, 1, 2, "127.0.0.1:5001", 0)
+	if !errors.Is(addErr, ErrCanceled) {
+		t.Fatalf("SyncRequestAddNode with an already-cancelled context "+
+			"returned %v, want ErrCanceled", addErr)
+	}
+
+	// Give any entry that WAS submitted time to commit and apply, so the
+	// assertion below cannot pass merely by racing an in-flight append. On a
+	// single-node shard commit is immediate; this drains the pipeline rather
+	// than guessing at a duration.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		commitPending, qLen, inbox, pending, derr := h.DiagPipelineState(1)
+		if derr != nil {
+			t.Fatalf("DiagPipelineState: %v", derr)
+		}
+		if !commitPending && qLen == 0 && inbox == 0 && pending == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, _, _, lastIdxAfter, _, _, err := h.DiagRaftState(1)
+	if err != nil {
+		t.Fatalf("DiagRaftState after: %v", err)
+	}
+	if lastIdxAfter != lastIdxBefore {
+		t.Fatalf("a cancelled config change appended to the log: last index "+
+			"moved %d -> %d. ErrCanceled told the caller the membership was "+
+			"unchanged while the change was committing",
+			lastIdxBefore, lastIdxAfter)
+	}
+
+	after, err := h.GetShardMembership(1)
+	if err != nil {
+		t.Fatalf("GetShardMembership after: %v", err)
+	}
+	if len(after.Nodes) != len(before.Nodes) {
+		t.Fatalf("a cancelled config change altered the membership: %d -> %d nodes",
+			len(before.Nodes), len(after.Nodes))
+	}
+	if _, added := after.Nodes[2]; added {
+		t.Fatal("a cancelled SyncRequestAddNode added the replica anyway")
+	}
+}

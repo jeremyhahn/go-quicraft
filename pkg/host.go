@@ -269,7 +269,12 @@ func WithMetrics(c MetricsCollector) HostOption {
 			o.metrics = nil
 			return
 		}
-		o.metrics = c
+		// Wrap so a panic in the caller's collector cannot escape into engine
+		// code. The engine calls it from inside node.raftMu, whose unlocks are
+		// plain statements rather than defers, so an escaping panic leaves the
+		// lock held forever and deadlocks every shard on that worker plus
+		// Host.Close. See safeMetricsCollector.
+		o.metrics = newSafeMetricsCollector(c)
 	}
 }
 
@@ -1820,7 +1825,19 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 			"new_leader", leaderID,
 			"term", term,
 		)
-		notLeaderErr := &NotLeaderError{ShardID: shardID, LeaderID: leaderID}
+		// Wrapped in MaybeAppliedError because every request this fails was
+		// ALREADY delivered to raft: pendingProposals is rolled back when
+		// DeliverProposal fails, so anything still in it at a leadership change
+		// is in the log and can still commit under the new leader (Leader
+		// Completeness guarantees it if it reached a quorum). The bare
+		// *NotLeaderError is also produced as a pre-flight refusal where
+		// nothing was submitted; the two are otherwise indistinguishable to a
+		// caller, and NotLeader's own doc invites a retry loop. Wrapping keeps
+		// errors.Is / Temporary / NotLeader behaviour identical and gives a
+		// caller that checks MaybeApplied the one bit it needs to retry safely.
+		notLeaderErr := &MaybeAppliedError{
+			Err: &NotLeaderError{ShardID: shardID, LeaderID: leaderID},
+		}
 		c.h.failPendingClientRequests(ns, notLeaderErr)
 	}
 
@@ -1851,7 +1868,19 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 			"new_leader", leaderID,
 			"term", term,
 		)
-		notLeaderErr := &NotLeaderError{ShardID: shardID, LeaderID: leaderID}
+		// Wrapped in MaybeAppliedError because every request this fails was
+		// ALREADY delivered to raft: pendingProposals is rolled back when
+		// DeliverProposal fails, so anything still in it at a leadership change
+		// is in the log and can still commit under the new leader (Leader
+		// Completeness guarantees it if it reached a quorum). The bare
+		// *NotLeaderError is also produced as a pre-flight refusal where
+		// nothing was submitted; the two are otherwise indistinguishable to a
+		// caller, and NotLeader's own doc invites a retry loop. Wrapping keeps
+		// errors.Is / Temporary / NotLeader behaviour identical and gives a
+		// caller that checks MaybeApplied the one bit it needs to retry safely.
+		notLeaderErr := &MaybeAppliedError{
+			Err: &NotLeaderError{ShardID: shardID, LeaderID: leaderID},
+		}
 		c.h.failPendingClientRequests(ns, notLeaderErr)
 	}
 }
@@ -2842,6 +2871,27 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				"accepts at most %d", len(members), proto.MaxMembershipEntries),
 		}
 	}
+	// The voting-set cap is enforced here because this is the ONLY admission
+	// point the bootstrap path passes through. validateAddNode and
+	// validateAddWitness apply the same bound to config changes, but neither
+	// runs on bootstrap: a 65-member map was accepted, committed as the
+	// EntryInitialMembership at index 1, and then panicked rebuildReplicaToBit
+	// inside becomeLeader on every subsequent election. The step worker's
+	// recover() restarts and the next election panics again, so the shard never
+	// elects a leader — and because the membership is committed and durable, a
+	// restart does not clear it.
+	//
+	// Rejecting here means the bad configuration is never written. It cannot be
+	// rejected at apply time instead: refusing an already-committed entry would
+	// make replicas diverge.
+	if len(members) > raft.MaxVotingMembers {
+		return &InvalidMemberError{
+			ShardID: cfg.ShardID,
+			Reason: fmt.Sprintf("members map has %d voting members; a shard accepts "+
+				"at most %d (the ReadIndex acknowledgement bitfield is a uint64)",
+				len(members), raft.MaxVotingMembers),
+		}
+	}
 	seenAddresses := make(map[string]uint64, len(members))
 	for replicaID, addr := range members {
 		if replicaID == 0 {
@@ -3371,6 +3421,18 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		ss, ssErr := h.logdb.GetSnapshot(cfg.ShardID, cfg.ReplicaID)
 		if ssErr == nil && ss.Index > 0 && ss.Filepath != "" {
 			dataPath := filepath.Join(ss.Filepath, "snapshot.dat")
+
+			// CONSUMER 2 of 3: verify the artifact against the integrity
+			// fields in its snapshot.meta before the state machine sees it.
+			// Same check the runtime recovery path applies, on the same
+			// as-written bytes, and it must be here too: a shard recovered at
+			// STARTUP takes this path, not snapshotPool.recoverSnapshot.
+			// Wiring one consumer and not the others reproduces exactly the
+			// state the removed Checksum field was in — an integrity control
+			// that looks present and is not.
+			if err := engine.VerifySnapshotArtifact(ss.Filepath, dataPath); err != nil {
+				return &HostInitError{Field: "snapshot_integrity", Err: err}
+			}
 
 			// snapshot.dat is stored ENCRYPTED whenever the record carries a
 			// non-zero epoch, so it must be decrypted before the state machine
@@ -4033,6 +4095,11 @@ lookup:
 //
 // See SyncReadBuf for usage details and the pooling contract.
 func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (result []byte, release func(), err error) {
+	// Same already-cancelled guard as the other read paths. NALookupBuf takes
+	// no context, so this is the only place the cancellation can be honoured.
+	if err := ctx.Err(); err != nil {
+		return nil, nopHostRelease, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, nopHostRelease, ErrClosed
 	}
@@ -4554,6 +4621,14 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 // interface, where QueryLocalNode was the original name and StaleRead
 // was added later as a more descriptive alias.
 func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
+	// Reads honour an already-cancelled context before touching the state
+	// machine, so cancellation is a strict "do not execute this read"
+	// boundary rather than a suggestion. Without this a cancelled read still
+	// reached the SM and returned data — and on the byte-key path the SM's
+	// Lookup takes no context at all, so nothing downstream could refuse it.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4582,6 +4657,14 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 // compatibility. StaleRead is the preferred name as it clearly
 // communicates the staleness guarantee (or lack thereof).
 func (h *Host) StaleRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
+	// Reads honour an already-cancelled context before touching the state
+	// machine, so cancellation is a strict "do not execute this read"
+	// boundary rather than a suggestion. Without this a cancelled read still
+	// reached the SM and returned data — and on the byte-key path the SM's
+	// Lookup takes no context at all, so nothing downstream could refuse it.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4617,6 +4700,14 @@ func (h *Host) StaleRead(ctx context.Context, shardID uint64, query interface{})
 // partition (at most the data that was committed before the read). For
 // strict linearizability, use SyncRead.
 func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
+	// Reads honour an already-cancelled context before touching the state
+	// machine, so cancellation is a strict "do not execute this read"
+	// boundary rather than a suggestion. Without this a cancelled read still
+	// reached the SM and returned data — and on the byte-key path the SM's
+	// Lookup takes no context at all, so nothing downstream could refuse it.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4906,6 +4997,14 @@ func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Sessio
 // create a proto.Entry with the session fields, deliver via engine inbox,
 // and return a RequestState the caller can wait on.
 func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Session) (*RequestState, error) {
+	// Same already-cancelled guard as Propose (834088c). Without it a
+	// cancelled GetNewSession/RegisterSession/CloseSession still appends its
+	// session entry: a session the caller discarded gets registered, a retry
+	// fails as a duplicate, or a session the caller believes is live is
+	// unregistered — all while the caller was told ErrCanceled.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -5214,6 +5313,14 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 // CompactionOverhead replaces the shard-level value for this snapshot's
 // log compaction.
 func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (*RequestState, error) {
+	// Same already-cancelled guard as Propose (834088c). A cancelled call used
+	// to claim the shard's single-flight snapshot slot and enqueue disk work
+	// before the wait observed the cancellation, so it both started expensive
+	// I/O the caller had abandoned and made concurrent callers see
+	// ErrSnapshotInProgress for a snapshot nobody was waiting on.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -6283,7 +6390,8 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 // the snapshot index and directory now exist. Failing to reclaim disk loses no
 // correctness and the next snapshot runs the GC again.
 func (h *Host) gcShardSnapshots(baseDir string, shardID, replicaID uint64) {
-	if err := engine.GCSnapshotDirs(baseDir, shardID, replicaID); err != nil {
+	if err := engine.GCSnapshotDirs(baseDir, shardID, replicaID,
+		h.recordedSnapshotPath(shardID, replicaID)); err != nil {
 		h.logger.Warn("snapshot recorded, but reclaiming the superseded snapshot "+
 			"directories failed; they will be reclaimed by a later snapshot",
 			"shard_id", shardID, "replica_id", replicaID, "error", err)
@@ -7942,6 +8050,19 @@ func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
 //
 //nolint:gocyclo // one funnel for every membership change: role validation, witness-policy gating, cert exclusivity, claim/rollback and the pending-op bookkeeping; splitting it would move validation away from the rollback that pairs with it, which is exactly where this path has produced defects
 func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto.ConfigChange) (*RequestState, error) {
+	// A context that is ALREADY done must not submit a QUORUM CHANGE. This is
+	// the same guard Propose grew in 834088c, applied to the path where the
+	// consequence is worst: without it the caller receives ErrCanceled while
+	// the membership change commits and applies, so it cannot tell whether the
+	// voting set changed. A retry after that answer issues a duplicate or
+	// conflicting change against a configuration it has mis-read.
+	//
+	// Cancellation racing an in-flight config change remains undecidable — see
+	// MaybeAppliedError — but a context that was done BEFORE the call is not a
+	// race, and it now neither submits nor reports success.
+	if err := ctx.Err(); err != nil {
+		return nil, mapContextError(err)
+	}
 	configChangeIndex := cc.ConfigChangeID
 	if h.closed.Load() {
 		return nil, ErrClosed
@@ -9046,4 +9167,65 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) error {
 			return readErr
 		}
 	}
+}
+
+// recordedSnapshotPath returns the cleaned snapshot directory LogDB records for
+// the node, or "" when there is none or it cannot be read.
+//
+// It exists so snapshot GC can refuse to delete the directory the durable
+// record points at. A read failure yields "" rather than an error: GC must not
+// be blocked by an unreadable record, and the only consequence of not knowing
+// is that the guard does not fire.
+func (h *Host) recordedSnapshotPath(shardID, replicaID uint64) string {
+	if h.logdb == nil {
+		return ""
+	}
+	rec, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil || rec.Filepath == "" {
+		return ""
+	}
+	return filepath.Clean(rec.Filepath)
+}
+
+// StateMachineHash returns a hash of this replica's applied state machine
+// state, together with the applied index it was taken at.
+//
+// It exists to detect the one failure Raft cannot: a state machine that is not
+// a deterministic function of the log. Consensus keeps agreeing on the entry
+// sequence while replicas silently derive different state from it, and the
+// first symptom is usually a linearizable read returning different values
+// depending on which replica served it.
+//
+// ok is false when the user state machine does not implement sm.Hasher; that
+// is not an error, only an absence of the facility. Implementations must make
+// the hash ORDER-INDEPENDENT (both reference stores in pkg/sm/kv sort before
+// hashing) or it reports divergence that does not exist.
+//
+// Compare across replicas at the SAME applied index — the returned index is
+// what makes that possible. Two replicas at different indexes are expected to
+// differ, so a comparison that ignores it is meaningless.
+//
+// This is a diagnostic, not a hot path: it hashes the whole state machine.
+func (h *Host) StateMachineHash(shardID uint64) (hash uint64, appliedIndex uint64, ok bool, err error) {
+	if h.closed.Load() {
+		return 0, 0, false, ErrClosed
+	}
+	ns, nsErr := h.getNode(shardID)
+	if nsErr != nil {
+		return 0, 0, false, nsErr
+	}
+	if ns.rsm == nil {
+		return 0, 0, false, ErrShardNotFound
+	}
+	// The index is read FIRST so it can never be newer than the state the hash
+	// covers: a concurrent apply between the two reads then makes the pair
+	// conservative (an older index for newer state), which a comparison
+	// rejects as "not at the same index" rather than accepting as a false
+	// divergence.
+	appliedIndex = ns.rsm.LastApplied()
+	hash, ok, err = ns.rsm.GetHash()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return hash, appliedIndex, ok, nil
 }

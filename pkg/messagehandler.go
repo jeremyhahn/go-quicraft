@@ -1566,7 +1566,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// snapshot is recorded and the transfer succeeded. Failing to reclaim disk
 	// costs space, and the next successful receive or local save runs the GC
 	// again.
-	if gcErr := engine.GCSnapshotDirs(node.SnapshotDir(), shardID, replicaID); gcErr != nil {
+	if gcErr := engine.GCSnapshotDirs(node.SnapshotDir(), shardID, replicaID,
+		h.host.recordedSnapshotPath(shardID, replicaID)); gcErr != nil {
 		slog.Warn("snapshot recorded but reclaiming superseded snapshot directories failed",
 			"shard", shardID,
 			"replica", replicaID,
@@ -1901,6 +1902,24 @@ func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, sha
 		return err
 	}
 
+	// Stamp the integrity fields over the data file AS STORED. Both callers of
+	// this function — the streamed receive path and Host.ImportSnapshot — have
+	// already written and fsynced snapshot.dat by the time they get here, so
+	// the bytes hashed are the bytes every later consumer reads.
+	//
+	// A hash failure is not fatal: the artifact is already durable, and
+	// refusing to record it would turn a transient read fault into a lost
+	// snapshot. The record is then written without the fields, which recovers
+	// without a check rather than failing one.
+	var dataLen, dataHash uint64
+	if sum, size, hashErr := engine.HashSnapshotFile(filepath.Join(dir, "snapshot.dat")); hashErr == nil {
+		dataHash, dataLen = sum, size
+	} else {
+		slog.Warn("snapshot: could not hash the received data file; recording "+
+			"metadata without an integrity check",
+			"dir", dir, "shard_id", shardID, "replica_id", replicaID, "error", hashErr)
+	}
+
 	buf := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
 		Index:       index,
 		Term:        term,
@@ -1908,6 +1927,8 @@ func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, sha
 		ReplicaID:   replicaID,
 		Epoch:       epoch,
 		Compression: compression,
+		DataLen:     dataLen,
+		DataHash:    dataHash,
 	})
 	// Write, sync, THEN close — and report whichever failed first, with the
 	// close error reported when nothing before it failed. This is a write path:
