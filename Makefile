@@ -894,18 +894,28 @@ remote-%: remote-sync
 # One-time (or after a toolchain bump) provisioning of the scanners omega does
 # not ship with. Kept separate from remote-sync so the common path stays fast.
 #
-# golangci-lint is installed UNCONDITIONALLY at the pinned version, not
-# "if absent". omega already had a v1 binary on PATH, so a `command -v` guard
-# skipped the install and `make lint` then died on `unknown flag: --timeout`,
-# which v2 moved. A linter of the wrong major version is worse than none: it
-# reports a different set of findings from CI while looking like it passed.
+# Every tool is installed UNCONDITIONALLY, not "if absent". omega had a v1
+# golangci-lint AND a years-old gosec on PATH, so `command -v` guards skipped
+# both installs: `make lint` died on `unknown flag: --timeout` (v2 moved it) and
+# `make gosec` died printing its usage, because the old binary has no
+# -exclude-dir and a rule set predating G115/G306.
+#
+# An analyser of the wrong version is worse than none. It gates on a different
+# rule set from CI while looking like it passed — the precise failure mode this
+# repository's review keeps turning up. golangci-lint is pinned to the version
+# quality.yml installs; gosec and govulncheck follow quality.yml's @latest.
 .PHONY: remote-tools
 remote-tools:
 	@$(OMEGA_SSH) '$(OMEGA_PATH); \
-		command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest; \
-		command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@latest; \
+		go install golang.org/x/vuln/cmd/govulncheck@latest; \
+		go install github.com/securego/gosec/v2/cmd/gosec@latest; \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
+		command -v trivy >/dev/null || curl -sfL \
+			https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+			| sh -s -- -b $$HOME/go/bin >/dev/null; \
 		echo "omega tools ready ($(GOLANGCI_VERSION))"'
+	@$(OMEGA_SSH) '$(OMEGA_PATH); for t in go golangci-lint gosec govulncheck trivy; do \
+		printf "  %-14s %s\n" "$$t" "$$(command -v $$t || echo MISSING)"; done'
 
 # ============================================================================
 # Multi-module build
