@@ -1035,6 +1035,69 @@ func TestPeer_HasUpdate_VoteChanged(t *testing.T) {
 	}
 }
 
+// TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind pins the structured
+// answer to "which replica is lagging, and why".
+//
+// Before this existed the information was reachable only by parsing the
+// DiagRemotes debug string, which made it available to a human reading a log
+// line and to nothing else — not to ShardInfo, not to an operator dashboard,
+// not to a pre-upgrade check asking whether it is safe to take another replica
+// down.
+func TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
+	p.r.becomeCandidate()
+	p.r.becomeLeader()
+
+	// A follower cannot be its own leader, so only 2 and 3 are tracked.
+	// Advance replica 2 and leave replica 3 behind.
+	p.r.remotes[2].match = 40
+	p.r.remotes[2].next = 41
+	p.r.remotes[3].match = 5
+	p.r.remotes[3].next = 6
+
+	progress := p.RemoteProgress()
+	if len(progress) != 2 {
+		t.Fatalf("RemoteProgress() returned %d entries, want 2 (replicas 2 and 3): %+v",
+			len(progress), progress)
+	}
+
+	// Deterministic order matters: map iteration would reshuffle this on every
+	// call, which makes successive samples impossible to diff.
+	if progress[0].ReplicaID != 2 || progress[1].ReplicaID != 3 {
+		t.Fatalf("RemoteProgress() is not ordered by replica ID: got %d then %d",
+			progress[0].ReplicaID, progress[1].ReplicaID)
+	}
+
+	if progress[0].Match != 40 || progress[1].Match != 5 {
+		t.Errorf("match indexes not reported: got r2=%d r3=%d, want 40 and 5",
+			progress[0].Match, progress[1].Match)
+	}
+	if progress[1].Match >= progress[0].Match {
+		t.Errorf("the lagging replica is not distinguishable from the caught-up "+
+			"one: r2 match=%d, r3 match=%d", progress[0].Match, progress[1].Match)
+	}
+	for i := range progress {
+		if progress[i].State == "" || progress[i].State == "unknown" {
+			t.Errorf("replica %d has no replication state, so a follower stuck "+
+				"in probe cannot be told from one merely behind",
+				progress[i].ReplicaID)
+		}
+	}
+}
+
+// TestPeer_RemoteProgress_NilOnFollower pins that a non-leader reports nothing
+// rather than a stale or zero-valued view: only a leader tracks remote
+// progress, and an empty slice would read as "all followers at index 0".
+func TestPeer_RemoteProgress_NilOnFollower(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
+	if got := p.RemoteProgress(); got != nil {
+		t.Fatalf("RemoteProgress() on a follower = %+v, want nil", got)
+	}
+	if s := p.DiagRemotes(); s != "not leader" {
+		t.Errorf("DiagRemotes() on a follower = %q, want %q", s, "not leader")
+	}
+}
+
 // --- GetUpdate ---
 
 // TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL pins the recovery from

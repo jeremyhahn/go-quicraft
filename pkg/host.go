@@ -8375,7 +8375,42 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		Health:               h.shardHealth(ns, leaderID, lastApplied),
 		LastApplied:          lastApplied,
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
+		Replicas:             h.replicaProgress(ns.shardID),
 	}
+}
+
+// replicaProgress converts the engine's published follower progress into the
+// public form. It returns nil for a follower, for an unknown shard, and on the
+// first call for a shard, because publication is opt-in and the next tick has
+// not run yet.
+//
+// It reads the snapshot the step worker publishes rather than the Peer, so it
+// takes no raft lock: GetShardInfo is an operator call and must not be able to
+// queue behind a SaveState.
+func (h *Host) replicaProgress(shardID uint64) []ReplicaProgress {
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil {
+		return nil
+	}
+	progress := engNode.ReplicaProgress()
+	if len(progress) == 0 {
+		return nil
+	}
+	out := make([]ReplicaProgress, len(progress))
+	for i := range progress {
+		out[i] = ReplicaProgress{
+			ReplicaID:  progress[i].ReplicaID,
+			Match:      progress[i].Match,
+			Next:       progress[i].Next,
+			State:      progress[i].State,
+			Paused:     progress[i].Paused,
+			Active:     progress[i].Active,
+			Inflights:  progress[i].Inflights,
+			IsWitness:  progress[i].IsWitness,
+			IsObserver: progress[i].IsObserver,
+		}
+	}
+	return out
 }
 
 // shardLaggingThreshold is the number of committed-but-unapplied entries at

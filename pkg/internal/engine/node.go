@@ -16,8 +16,10 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -883,7 +885,10 @@ type diagSnapshot struct {
 	lastIdx   uint64
 	msgs      int
 	state     string
-	remotes   string
+	// progress is the leader's view of each follower, or nil when this
+	// replica is not the leader. Published structured rather than rendered;
+	// DiagRemotes formats it on demand.
+	progress []raft.RemoteProgress
 }
 
 // publishDiagLocked captures the Peer's diagnostic state into diagSnap.
@@ -898,7 +903,12 @@ func (n *Node) publishDiagLocked() {
 		return
 	}
 	term, committed, processed, lastIdx, msgs, state := n.peer.DiagRaftState()
-	remotes := n.peer.DiagRemotes()
+	// Publish STRUCTURED progress and format only when a caller asks for text.
+	// This used to publish the rendered DiagRemotes string, which meant an
+	// fmt.Sprintf per follower per tick for as long as diagnostics stayed
+	// enabled — paid whether or not anyone read it, and enabled permanently by
+	// the first reader.
+	progress := n.peer.RemoteProgress()
 	n.diagSnap.Store(&diagSnapshot{
 		term:      term,
 		committed: committed,
@@ -906,7 +916,7 @@ func (n *Node) publishDiagLocked() {
 		lastIdx:   lastIdx,
 		msgs:      msgs,
 		state:     state,
-		remotes:   remotes,
+		progress:  progress,
 	})
 }
 
@@ -933,10 +943,41 @@ func (n *Node) DiagRemotes() string {
 		return "nil"
 	}
 	n.diagEnabled.Store(true)
-	if snap := n.diagSnap.Load(); snap != nil {
-		return snap.remotes
+	snap := n.diagSnap.Load()
+	if snap == nil {
+		return "(diagnostics warming up)"
 	}
-	return "(diagnostics warming up)"
+	if snap.progress == nil {
+		return "not leader"
+	}
+	var sb strings.Builder
+	for i := range snap.progress {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		rp := &snap.progress[i]
+		fmt.Fprintf(&sb, "r%d[match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
+			rp.ReplicaID, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
+	}
+	return sb.String()
+}
+
+// ReplicaProgress returns the leader's view of every follower's replication
+// position, or nil when this replica is not the leader.
+//
+// Same publication path as DiagRemotes — it reads the snapshot the step worker
+// stores under raftMu — so it neither races the workers nor blocks them. Like
+// the other diagnostics it is opt-in: the first call enables publication, and
+// until the next tick publishes it returns nil.
+func (n *Node) ReplicaProgress() []raft.RemoteProgress {
+	if n.peer == nil {
+		return nil
+	}
+	n.diagEnabled.Store(true)
+	if snap := n.diagSnap.Load(); snap != nil {
+		return snap.progress
+	}
+	return nil
 }
 
 // Stop signals the node to stop. Called when unloading from the engine.

@@ -914,6 +914,17 @@ remote-tools:
 			https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
 			| sh -s -- -b $$HOME/go/bin >/dev/null; \
 		echo "omega tools ready ($(GOLANGCI_VERSION))"'
+	@# ci-modules builds test/performance/dragonboat, which requires
+	@# github.com/jeremyhahn/dragonboat. A global insteadOf rewrites that to the
+	@# Gitea host over ssh, so the module download fails with "Host key
+	@# verification failed" until the host key is known -- an error that reads
+	@# like a missing repository rather than a missing known_hosts entry.
+	@$(OMEGA_SSH) 'mkdir -p $$HOME/.ssh && chmod 700 $$HOME/.ssh; \
+		for hk in "-p 2222 198.51.100.91" "github.com"; do \
+			ssh-keyscan $$hk 2>/dev/null >> $$HOME/.ssh/known_hosts; \
+		done; \
+		sort -u $$HOME/.ssh/known_hosts -o $$HOME/.ssh/known_hosts; \
+		chmod 600 $$HOME/.ssh/known_hosts; echo "  known_hosts seeded"'
 	@$(OMEGA_SSH) '$(OMEGA_PATH); for t in go golangci-lint gosec govulncheck trivy; do \
 		printf "  %-14s %s\n" "$$t" "$$(command -v $$t || echo MISSING)"; done'
 

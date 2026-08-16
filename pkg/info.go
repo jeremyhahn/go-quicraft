@@ -153,6 +153,56 @@ type ShardInfo struct {
 	// membership configuration change entry. 0 if no config change has
 	// been applied yet.
 	ConfigChangeIndex uint64 `json:"config_change_index"`
+
+	// Replicas reports how far each follower has replicated, as this leader
+	// understands it. It is empty on a follower, which tracks no such state,
+	// and empty on the first call for a shard because publication is opt-in
+	// and the next tick has not run yet.
+	//
+	// This is what answers "which replica is behind, and why". Before it
+	// existed the same information was reachable only by parsing the
+	// DiagRemotes debug string, so it was available to a human reading a log
+	// line and to nothing else — not to an operator dashboard, not to an
+	// alerting rule, not to a pre-upgrade safety check.
+	Replicas []ReplicaProgress `json:"replicas,omitempty"`
+}
+
+// ReplicaProgress is one follower's replication position from the leader's
+// point of view. Every field is the leader's local belief, which is precisely
+// what makes it useful when diagnosing a stall: a follower stuck in probe with
+// a stale match index is a different problem from one that is merely behind,
+// and one pinned at the inflight limit is flow-controlled rather than slow.
+type ReplicaProgress struct {
+	// ReplicaID identifies the follower.
+	ReplicaID uint64 `json:"replica_id"`
+
+	// Match is the highest log index known to be replicated to it.
+	Match uint64 `json:"match"`
+
+	// Next is the next index the leader will send.
+	Next uint64 `json:"next"`
+
+	// State is the replication state: "probe", "replicate" or "snapshot".
+	State string `json:"state"`
+
+	// Paused is true when the leader is withholding traffic, because the
+	// inflight window is full or a probe is awaiting its response.
+	Paused bool `json:"paused"`
+
+	// Active is true if the follower has responded within the election
+	// timeout. An inactive follower still counts in the configuration but
+	// not toward a live quorum — the distinction that decides whether it is
+	// safe to take another replica down.
+	Active bool `json:"active"`
+
+	// Inflights is the number of unacknowledged messages in the window.
+	Inflights int `json:"inflights"`
+
+	// IsWitness reports a voting member that carries no payload.
+	IsWitness bool `json:"is_witness"`
+
+	// IsObserver reports a non-voting member.
+	IsObserver bool `json:"is_observer"`
 }
 
 // HealthStatus describes the overall health of a Host instance. The Status

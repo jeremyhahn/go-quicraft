@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync/atomic"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -2090,15 +2091,39 @@ func (p *Peer) DiagRaftState() (term, committed, processed, lastIdx uint64, msgs
 // DiagRemotes returns diagnostic remote state for debugging commit stalls.
 // Returns a string describing each remote's match/next/state/paused.
 func (p *Peer) DiagRemotes() string {
-	r := p.r
-	if r.state != leader {
+	progress := p.RemoteProgress()
+	if progress == nil {
 		return "not leader"
 	}
 	result := ""
-	for id, rm := range r.remotes {
+	for i := range progress {
 		if result != "" {
 			result += " "
 		}
+		rp := &progress[i]
+		result += fmt.Sprintf("r%d[match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
+			rp.ReplicaID, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
+	}
+	return result
+}
+
+// RemoteProgress reports how far each follower has replicated, as the leader
+// currently understands it. It returns nil when this replica is not the leader,
+// because only a leader tracks remote progress at all.
+//
+// This is the structured form of what DiagRemotes renders as text. Answering
+// "which follower is behind, and why" was previously possible only by parsing
+// that string, which meant the answer was unavailable to metrics, to the public
+// ShardInfo, and to anything that is not a human reading a log line.
+//
+// Caller must hold raftMu (or be the step worker): it reads Peer.r directly.
+func (p *Peer) RemoteProgress() []RemoteProgress {
+	r := p.r
+	if r.state != leader {
+		return nil
+	}
+	out := make([]RemoteProgress, 0, len(r.remotes))
+	for id, rm := range r.remotes {
 		state := "unknown"
 		switch rm.state {
 		case remoteProbe:
@@ -2108,12 +2133,54 @@ func (p *Peer) DiagRemotes() string {
 		case remoteSnapshot:
 			state = "snapshot"
 		}
-		paused := rm.isPaused()
-		active := rm.isActive()
-		result += fmt.Sprintf("r%d[match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
-			id, rm.match, rm.next, state, paused, active, rm.inflights.Count())
+		_, isWitness := r.witnesses[id]
+		_, isObserver := r.observers[id]
+		out = append(out, RemoteProgress{
+			ReplicaID:  id,
+			Match:      rm.match,
+			Next:       rm.next,
+			State:      state,
+			Paused:     rm.isPaused(),
+			Active:     rm.isActive(),
+			Inflights:  rm.inflights.Count(),
+			IsWitness:  isWitness,
+			IsObserver: isObserver,
+		})
 	}
-	return result
+	// Deterministic order: map iteration would otherwise reorder the output on
+	// every call, which makes both the diagnostic string and any consumer
+	// diffing successive samples useless.
+	sort.Slice(out, func(i, j int) bool { return out[i].ReplicaID < out[j].ReplicaID })
+	return out
+}
+
+// RemoteProgress is one follower's replication position as the leader
+// understands it. Every field is the leader's local belief, which is what makes
+// it useful for diagnosing a stall: a follower stuck in probe with a stale match
+// index looks different from one that is simply behind.
+type RemoteProgress struct {
+	// ReplicaID identifies the follower.
+	ReplicaID uint64
+	// Match is the highest log index known to be replicated to it.
+	Match uint64
+	// Next is the next index the leader will send.
+	Next uint64
+	// State is the replication state: probe, replicate or snapshot.
+	State string
+	// Paused is true when the leader is withholding traffic — a full
+	// inflight window, or a probe awaiting its response.
+	Paused bool
+	// Active is true if the follower has responded within the election
+	// timeout. An inactive follower still counts in the configuration but
+	// not toward a live quorum.
+	Active bool
+	// Inflights is the number of unacknowledged messages in the window.
+	// A follower pinned at the window limit is flow-controlled, not slow.
+	Inflights int
+	// IsWitness reports a voting member that carries no payload.
+	IsWitness bool
+	// IsObserver reports a non-voting member.
+	IsObserver bool
 }
 
 // hasStateChanged returns true if the hard state has changed since the
