@@ -481,40 +481,25 @@ func (w *commitWorker) processBatch() {
 			continue
 		}
 
-		node.raftMu.Lock()
-		err := node.peer.Commit(u)
-
-		if err != nil {
-			node.raftMu.Unlock()
+		var piggyback proto.Update
+		status, err := commitUpdateLocked(node, &u, &piggyback)
+		switch status {
+		case commitFailed:
 			failCommit(node, w.callback, u, err)
 			continue
-		}
-
-		if len(u.CommittedEntries) == 0 {
-			// A snapshot recovery owns the state machine: extracting
-			// committed entries here would advance raft's processed marker
-			// and hand the batch to an apply worker that must park it on the
-			// recovering gate, holding commitPending — and with it every
-			// ordered response, including vote grants — for the whole
-			// unbounded recovery. The step worker suppresses the same
-			// extraction (GetUpdate moreEntriesToApply=false); entries stay
-			// in the log and are re-offered once the gate clears.
-			if node.IsRecovering() {
-				node.raftMu.Unlock()
-				node.commitPending.Store(false)
-				w.workSignal.Notify(node.shardID)
-				continue
-			}
-			// Piggyback: check if entries became committable during the
-			// commitPending window (processCommitPendingInbox advanced the
-			// commit index after handling follower ReplicateResp).
-			piggyback, pbErr := node.peer.GetPiggybackUpdate(node.lastApplied.Load())
-			node.raftMu.Unlock()
-
-			if pbErr != nil || len(piggyback.CommittedEntries) == 0 {
+		case commitRecovering:
+			// A snapshot recovery owns the state machine, so nothing was
+			// extracted for the apply worker (see commitUpdateLocked). Clear
+			// commitPending and re-notify: the entries stay in the log and are
+			// re-offered once the gate clears.
+			node.commitPending.Store(false)
+			w.workSignal.Notify(node.shardID)
+			continue
+		case commitPiggyback:
+			if err != nil || len(piggyback.CommittedEntries) == 0 {
 				// No piggyback available — original skip-apply fast path.
-				if pbErr != nil {
-					notePiggybackFailure(u.ShardID, u.ReplicaID, pbErr)
+				if err != nil {
+					notePiggybackFailure(u.ShardID, u.ReplicaID, err)
 				}
 				node.commitPending.Store(false)
 				w.workSignal.Notify(node.shardID)
@@ -522,6 +507,10 @@ func (w *commitWorker) processBatch() {
 			}
 
 			// Piggyback path: persist updated state, send messages, apply.
+			// It takes raftMu itself, in short bursts, and must therefore run
+			// with the lock released — which is why commitUpdateLocked returns
+			// the piggyback instead of executing it.
+			//
 			// On shutdown mid-delivery it returns false; stop processing the
 			// batch entirely rather than iterating cleared/nil batch slots
 			// (which would nil-deref node.raftMu on the next item).
@@ -534,8 +523,10 @@ func (w *commitWorker) processBatch() {
 			continue
 		}
 
-		node.raftMu.Unlock()
-
+		// commitApply: the update carries committed entries. The forward below
+		// is a BLOCKING channel send to the apply worker and must never run
+		// under node.raftMu — the apply worker's own progress depends on the
+		// commit and step workers being able to take it.
 		ai := w.applyPool.Get().(*applyItem)
 		ai.update = u
 		ai.node = node
@@ -567,6 +558,85 @@ func (w *commitWorker) processBatch() {
 		}
 	}
 	w.clearBatch()
+}
+
+// commitStatus classifies what commitUpdateLocked did, telling processBatch
+// which of its four continuations to run once node.raftMu has been released.
+type commitStatus uint8
+
+const (
+	// commitApply means the update committed and carries entries the caller
+	// must forward to the apply worker.
+	commitApply commitStatus = iota
+	// commitFailed means Peer.Commit returned an error, carried in the
+	// accompanying error value. Nothing was extracted.
+	commitFailed
+	// commitRecovering means the update committed with no entries and a
+	// snapshot recovery owns the state machine, so no piggyback was attempted.
+	commitRecovering
+	// commitPiggyback means the update committed with no entries and a
+	// piggyback update was requested. The piggyback out-parameter holds it and
+	// the accompanying error is GetPiggybackUpdate's, which may be nil with an
+	// empty piggyback (the common no-op case).
+	commitPiggyback
+)
+
+// commitUpdateLocked commits one update to its owning node's Peer with
+// node.raftMu held, and — when the update committed nothing to apply — asks the
+// peer for a piggyback update while still under the same lock, writing it to
+// the piggyback out-parameter. raftMu serializes all of this with the step
+// worker's Tick(), which runs unconditionally even while commitPending is set.
+//
+// Everything else processBatch does with the outcome stays in the caller,
+// outside the lock, and that placement is load-bearing rather than tidiness:
+//
+//   - failCommit enters the host callback and fails every pending proposal for
+//     the shard, which is unbounded user work.
+//   - executePiggyback fsyncs, sends messages and forwards to the apply worker,
+//     and takes raftMu itself in short bursts — running it here would
+//     self-deadlock on a non-reentrant sync.Mutex.
+//   - the applyC forward is a BLOCKING channel send; holding raftMu across it
+//     would let a full apply queue stall the step worker's Tick and, with it,
+//     leader heartbeats for every shard this worker owns.
+//
+// The lock is therefore released exactly where processBatch's explicit unlocks
+// released it before — the only change is that a defer now guarantees it. A
+// panic inside Peer.Commit (a corrupt log, a torn-down peer) previously leaked
+// node.raftMu: the commit worker recovers and restarts, the restarted worker
+// blocks forever on Lock(), and every shard it owns stops committing, taking
+// Host.Close (which joins the same worker) with it.
+//
+// The update is taken by pointer purely to avoid copying a proto.Update on the
+// commit hot path; it is neither retained nor mutated here.
+func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (commitStatus, error) {
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+
+	if err := node.peer.Commit(*u); err != nil {
+		return commitFailed, err
+	}
+
+	if len(u.CommittedEntries) == 0 {
+		// A snapshot recovery owns the state machine: extracting
+		// committed entries here would advance raft's processed marker
+		// and hand the batch to an apply worker that must park it on the
+		// recovering gate, holding commitPending — and with it every
+		// ordered response, including vote grants — for the whole
+		// unbounded recovery. The step worker suppresses the same
+		// extraction (GetUpdate moreEntriesToApply=false); entries stay
+		// in the log and are re-offered once the gate clears.
+		if node.IsRecovering() {
+			return commitRecovering, nil
+		}
+		// Piggyback: check if entries became committable during the
+		// commitPending window (processCommitPendingInbox advanced the
+		// commit index after handling follower ReplicateResp).
+		pb, err := node.peer.GetPiggybackUpdate(node.lastApplied.Load())
+		*piggyback = pb
+		return commitPiggyback, err
+	}
+
+	return commitApply, nil
 }
 
 // abandonBatchTail releases the batch items from index start onwards, which
@@ -987,9 +1057,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 					Err:       saveErr,
 				})
 			if len(w.orderedMsgSplitBuf) > 0 {
-				node.raftMu.Lock()
-				node.peer.RequeueMessages(w.orderedMsgSplitBuf)
-				node.raftMu.Unlock()
+				requeueMessagesLocked(node, w.orderedMsgSplitBuf)
 			}
 			piggyback.ReleaseCommittedEntries()
 			node.commitPending.Store(false)
@@ -1006,10 +1074,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	// storage, and reaching this line is the proof. It takes the Update's
 	// State — the commit-clamped one that was written — not the peer's current
 	// hard state, which the step worker may already have moved on.
-	node.raftMu.Lock()
-	node.peer.NotePiggybackPersisted(piggyback.State)
-	pbCommitErr := node.peer.Commit(piggyback)
-	node.raftMu.Unlock()
+	pbCommitErr := commitPiggybackLocked(node, &piggyback)
 
 	if pbCommitErr != nil {
 		failCommit(node, w.callback, piggyback, pbCommitErr)
@@ -1052,4 +1117,40 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		}
 	}
 	return true
+}
+
+// requeueMessagesLocked hands ordered messages back to the peer with
+// node.raftMu held, so the requeue cannot race the step worker's Tick.
+//
+// It exists as a function so the unlock is deferred. RequeueMessages appends to
+// the peer's message buffer, and a panic there (an oversized buffer, a
+// torn-down peer) on the SaveState-failure path would strand node.raftMu at
+// precisely the worst moment: the shard is already retrying, and the restarted
+// commit worker would block on Lock() forever instead of draining the retry.
+func requeueMessagesLocked(node *Node, msgs []proto.Message) {
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	node.peer.RequeueMessages(msgs)
+}
+
+// commitPiggybackLocked records the piggyback's hard state as durable and
+// commits it to the peer with node.raftMu held, returning Peer.Commit's error.
+//
+// The two calls belong to one critical section: NotePiggybackPersisted may only
+// claim a state that reached stable storage, and Commit advances the processed
+// markers derived from it, so the step worker must not observe the pair
+// half-applied. Everything after it in executePiggyback — the ordered message
+// send, the OnCommitted callback, the metrics update and the BLOCKING applyC
+// forward — runs with the lock released, exactly as the explicit unlock left
+// it: the applyC send can block until the apply worker drains, and raftMu held
+// across it would stall the step worker's Tick and the leader heartbeats it
+// drives for every shard this worker owns.
+//
+// The piggyback is taken by pointer to avoid copying a proto.Update on the
+// commit hot path; it is neither retained nor mutated here.
+func commitPiggybackLocked(node *Node, piggyback *proto.Update) error {
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	node.peer.NotePiggybackPersisted(piggyback.State)
+	return node.peer.Commit(*piggyback)
 }

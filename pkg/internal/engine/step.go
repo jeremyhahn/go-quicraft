@@ -252,41 +252,7 @@ func (w *stepWorker) tick() {
 		if node.IsFailed() || node.peer == nil {
 			continue
 		}
-		node.raftMu.Lock()
-		node.peer.Tick()
-		// When commitPending is true, processReady skips this node.
-		// But Tick may have produced heartbeat messages that must be
-		// sent immediately to maintain leader liveness. Drain and
-		// send only free-order messages inline. Tick during
-		// commitPending produces Heartbeat (leader liveness) and, on an
-		// election timeout, RequestPreVote — both free-order. Filter
-		// defensively to ensure ordered messages (e.g., VoteResp) are never
-		// sent before WAL persist completes.
-		var campaignTerm uint64
-		var campaignLaunched bool
-		if node.commitPending.Load() {
-			if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
-				// Detect a pre-vote campaign under the lock (pure reads); the
-				// observability callback fires after the unlock below. Without
-				// this, a campaign launched from tick() while commitPending is
-				// set never reaches OnCampaignLaunched/IncElection because it
-				// bypasses processCallbacks entirely.
-				campaignTerm, campaignLaunched = scanPreVoteCampaign(msgs)
-				w.sendMessages(msgs)
-			}
-		}
-		// Publish the log markers and the diagnostic snapshot under
-		// raftMu — the only race-free point to read Peer.r from
-		// (excludes the commit worker; sequential with the step worker's
-		// own Handle). The markers are published on EVERY tick, not just
-		// when an update is produced, so a snapshot pool waiting for the
-		// raft log to install a snapshot keeps seeing fresh values even
-		// on a node whose processReady work is otherwise idle. Two atomic
-		// stores; the diagnostic snapshot below stays a no-op unless a
-		// diagnostic accessor has been called.
-		node.publishLogMarkers()
-		node.publishDiagLocked()
-		node.raftMu.Unlock()
+		campaignTerm, campaignLaunched := w.tickNodeLocked(node)
 		// A CheckQuorum step-down happens entirely inside Tick(): tickLeader
 		// calls becomeFollower(r.term, noLeader), which changes neither term,
 		// vote nor commit index and emits no message. hasStateChanged() is
@@ -302,6 +268,59 @@ func (w *stepWorker) tick() {
 		}
 		w.publishLeaderChange(shardID, node)
 	}
+}
+
+// tickNodeLocked advances one node's Raft clock and publishes its markers with
+// node.raftMu held for the whole call, returning whether Tick launched a
+// pre-vote campaign (and at which term) so the caller can report it.
+//
+// The lock covers exactly Tick, the commitPending free-order drain/send, and
+// the two publications — nothing else. It is a separate method so the unlock
+// can be deferred: a panic anywhere in this region (Peer.Tick stepping a
+// corrupt log, a metrics collector called from sendMessages) would otherwise
+// leak node.raftMu permanently, and the step worker's panic handler restarts
+// the worker straight back into a Lock() that can never be taken — wedging
+// every shard this worker owns plus Host.Close, which joins the same worker.
+//
+// The campaign report and the leadership publish deliberately stay in the
+// caller, OUTSIDE this method: both run arbitrary user listener code, and the
+// commit worker's Lock() for every shard this worker owns would queue behind
+// it for however long that code takes.
+func (w *stepWorker) tickNodeLocked(node *Node) (campaignTerm uint64, campaignLaunched bool) {
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	node.peer.Tick()
+	// When commitPending is true, processReady skips this node.
+	// But Tick may have produced heartbeat messages that must be
+	// sent immediately to maintain leader liveness. Drain and
+	// send only free-order messages inline. Tick during
+	// commitPending produces Heartbeat (leader liveness) and, on an
+	// election timeout, RequestPreVote — both free-order. Filter
+	// defensively to ensure ordered messages (e.g., VoteResp) are never
+	// sent before WAL persist completes.
+	if node.commitPending.Load() {
+		if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
+			// Detect a pre-vote campaign under the lock (pure reads); the
+			// observability callback fires after the return below. Without
+			// this, a campaign launched from tick() while commitPending is
+			// set never reaches OnCampaignLaunched/IncElection because it
+			// bypasses processCallbacks entirely.
+			campaignTerm, campaignLaunched = scanPreVoteCampaign(msgs)
+			w.sendMessages(msgs)
+		}
+	}
+	// Publish the log markers and the diagnostic snapshot under
+	// raftMu — the only race-free point to read Peer.r from
+	// (excludes the commit worker; sequential with the step worker's
+	// own Handle). The markers are published on EVERY tick, not just
+	// when an update is produced, so a snapshot pool waiting for the
+	// raft log to install a snapshot keeps seeing fresh values even
+	// on a node whose processReady work is otherwise idle. Two atomic
+	// stores; the diagnostic snapshot below stays a no-op unless a
+	// diagnostic accessor has been called.
+	node.publishLogMarkers()
+	node.publishDiagLocked()
+	return campaignTerm, campaignLaunched
 }
 
 // processReady processes all loaded nodes, checking for pending work.
@@ -1149,12 +1168,106 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// Phase 1: Process ReadIndex requests and HeartbeatResp under lock,
 	// then immediately extract and deliver ReadIndex completions.
 	// This minimizes read latency by not waiting for proposal processing.
+	phase1FreeOrder, readStates, readIndexErr := w.commitPendingPhase1Locked(
+		shardID, node, batchKey, haveReadKeys, heartbeatResps)
+
+	// Complete all pending reads with the submit error, OUTSIDE raftMu. Same
+	// rationale as the normal path: aliases are already registered but no
+	// ReadyToRead will fire, so without this the callers block to their context
+	// deadline. Fired before the readStates delivery below to preserve the
+	// order the locked version had.
+	if readIndexErr != nil && w.callback != nil {
+		w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, readIndexErr)
+	}
+
+	// Publish OUTSIDE raftMu. OnLeaderUpdated runs arbitrary user listener code
+	// (and the Host's failPendingRequests); running it under the lock stalls the
+	// commit worker's node.raftMu.Lock() for every shard that worker owns, for
+	// however long the user's listener takes. LeaderID/Term are atomics, so
+	// nothing here needs the lock. Placed before the early return below so both
+	// exits from this function publish.
+	w.publishLeaderChange(shardID, node)
+
+	// Send Phase 1 free-order messages outside the lock. A pre-vote campaign
+	// among them is reported so a campaign launched under commitPending stays
+	// visible to OnCampaignLaunched/IncElection.
+	if len(phase1FreeOrder) > 0 {
+		w.reportFreeOrderCampaign(shardID, node, phase1FreeOrder)
+		w.sendMessages(phase1FreeOrder)
+	}
+
+	// Deliver ReadIndex completion callbacks immediately, before
+	// processing proposals. This prioritizes read latency.
+	if w.callback != nil && len(readStates) > 0 {
+		w.callback.OnReadyToRead(shardID, readStates)
+	}
+
+	// Phase 2: Process proposals and remaining inbox messages.
+	// These can proceed at lower priority since reads are done.
+	if len(w.commitProposeBuf) == 0 && len(otherMsgs) == 0 {
+		return
+	}
+
+	freeOrderMsgs, additionalReadStates, proposeErr := w.commitPendingPhase2Locked(shardID, node, otherMsgs)
+
+	// Notify the host so it can complete pending proposals with the error
+	// instead of leaving callers blocked. Fired first among the post-unlock
+	// callbacks, preserving the order the locked version had.
+	if proposeErr != nil && w.callback != nil {
+		w.callback.OnProposalFailed(shardID, w.commitProposeBuf, proposeErr)
+	}
+
+	// Send free-order messages outside the lock. A pre-vote campaign among them
+	// is reported so it stays visible to OnCampaignLaunched/IncElection.
+	if len(freeOrderMsgs) > 0 {
+		w.reportFreeOrderCampaign(shardID, node, freeOrderMsgs)
+		w.sendMessages(freeOrderMsgs)
+	}
+
+	// Deliver any additional ReadIndex completions from phase 2.
+	if w.callback != nil && len(additionalReadStates) > 0 {
+		w.callback.OnReadyToRead(shardID, additionalReadStates)
+	}
+
+	// Publish again after Phase 2, still outside the lock. This is the phase
+	// that can actually make this node a leader: RequestVoteResp is not a
+	// HeartbeatResp, so it is sorted into otherMsgs and stepped HERE — after the
+	// Phase 1 publish has already run. A node that won its election on a vote
+	// response delivered while commitPending was set would otherwise be reported
+	// as a follower by GetShardInfo until some later cycle happened to publish.
+	w.publishLeaderChange(shardID, node)
+}
+
+// commitPendingPhase1Locked steps the batched ReadIndex and the HeartbeatResp
+// messages into the peer with node.raftMu held, and returns the free-order
+// messages and the ReadIndex completions the caller must deliver. A non-nil
+// error is the ReadIndex submit failure; it is returned rather than reported
+// here so OnReadIndexFailed fires outside the lock.
+//
+// Everything the caller does with these return values — the failure callback,
+// the leadership publish, the message send, OnReadyToRead — MUST stay outside
+// this method. Each of them enters host or user listener code of unbounded
+// duration, and the commit worker's node.raftMu.Lock() for every shard this
+// worker owns queues behind whatever runs under the lock.
+//
+// The method exists so the unlock can be deferred while still ending exactly
+// where the explicit unlock did. A panic inside peer.Handle would otherwise
+// leak node.raftMu: the step worker's recover restarts the worker, the restart
+// blocks on Lock() forever, and every shard on this worker plus Host.Close
+// (which joins the worker) hangs with no diagnostic beyond a stuck process.
+func (w *stepWorker) commitPendingPhase1Locked(
+	shardID uint64,
+	node *Node,
+	batchKey uint64,
+	haveReadKeys bool,
+	heartbeatResps []proto.Message,
+) (freeOrder []proto.Message, readStates []proto.ReadyToRead, readIndexErr error) {
 	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
 
 	// Process batched ReadIndex keys first. Same coalescing logic as
 	// the normal processReady path. readIndexErr is captured here and the
-	// completion callback fires after the unlock below.
-	var readIndexErr error
+	// completion callback fires after the return below.
 	if haveReadKeys {
 		if err := node.peer.Handle(proto.Message{
 			Type:   proto.ReadIndex,
@@ -1201,54 +1314,41 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// A CheckQuorum step-down driven by the HeartbeatResps stepped above
 	// produces no proto.Update at all, so without publishing it the Host would
 	// keep serving a stale IsLeader through GetShardInfo — the flag clients
-	// route writes by. The publish itself happens after the unlock below.
-	phase1FreeOrder := node.peer.DrainFreeOrderMessages()
+	// route writes by. The publish itself happens in the caller, after the
+	// deferred unlock.
+	freeOrder = node.peer.DrainFreeOrderMessages()
 
 	// Extract ReadIndex completions immediately after processing
 	// HeartbeatResp. This allows us to deliver read results before
 	// processing proposals, reducing read latency.
-	readStates := node.peer.DrainReadStatesOnly()
+	readStates = node.peer.DrainReadStatesOnly()
 
-	node.raftMu.Unlock()
+	return freeOrder, readStates, readIndexErr
+}
 
-	// Complete all pending reads with the submit error, OUTSIDE raftMu. Same
-	// rationale as the normal path: aliases are already registered but no
-	// ReadyToRead will fire, so without this the callers block to their context
-	// deadline. Fired before the readStates delivery below to preserve the
-	// order the locked version had.
-	if readIndexErr != nil && w.callback != nil {
-		w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, readIndexErr)
-	}
-
-	// Publish OUTSIDE raftMu. OnLeaderUpdated runs arbitrary user listener code
-	// (and the Host's failPendingRequests); running it under the lock stalls the
-	// commit worker's node.raftMu.Lock() for every shard that worker owns, for
-	// however long the user's listener takes. LeaderID/Term are atomics, so
-	// nothing here needs the lock. Placed before the early return below so both
-	// exits from this function publish.
-	w.publishLeaderChange(shardID, node)
-
-	// Send Phase 1 free-order messages outside the lock. A pre-vote campaign
-	// among them is reported so a campaign launched under commitPending stays
-	// visible to OnCampaignLaunched/IncElection.
-	if len(phase1FreeOrder) > 0 {
-		w.reportFreeOrderCampaign(shardID, node, phase1FreeOrder)
-		w.sendMessages(phase1FreeOrder)
-	}
-
-	// Deliver ReadIndex completion callbacks immediately, before
-	// processing proposals. This prioritizes read latency.
-	if w.callback != nil && len(readStates) > 0 {
-		w.callback.OnReadyToRead(shardID, readStates)
-	}
-
-	// Phase 2: Process proposals and remaining inbox messages.
-	// These can proceed at lower priority since reads are done.
-	if len(w.commitProposeBuf) == 0 && len(otherMsgs) == 0 {
-		return
-	}
-
+// commitPendingPhase2Locked appends the batched proposals and steps the
+// remaining inbox messages into the peer with node.raftMu held, returning the
+// free-order messages to send, any further ReadIndex completions, and the
+// proposal submit error.
+//
+// proposeErr is returned rather than acted on here for a concrete reason:
+// peer.Handle(Propose) on a leaderless follower returns NotLeaderError, which
+// makes this path hot rather than exotic, and the host's completion of every
+// stranded proposal is unbounded work to hold node.raftMu across. The same
+// applies to the message send and the leadership publish the caller performs
+// afterwards; none of them may move into this method.
+//
+// The locked region is a method so the unlock can be deferred without
+// extending the hold: a panic in peer.Handle, or in the metrics collector the
+// proposal path calls, would otherwise strand node.raftMu and deadlock the
+// restarted step worker against every shard it owns.
+func (w *stepWorker) commitPendingPhase2Locked(
+	shardID uint64,
+	node *Node,
+	otherMsgs []proto.Message,
+) (freeOrder []proto.Message, readStates []proto.ReadyToRead, proposeErr error) {
 	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
 
 	// Process batched proposals. Unlike the normal processReady path which
 	// skips proposal drain during commitPending, we handle proposals here
@@ -1256,12 +1356,6 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// will be included in the next update after commitPending clears.
 	// This reduces latency by eliminating the blocking window where
 	// proposals sit in the MPSC queue waiting for commit to complete.
-	// proposeErr is captured under the lock; OnProposalFailed fires after the
-	// unlock below. This path is hot rather than exotic — peer.Handle(Propose)
-	// on a leaderless follower returns NotLeaderError, which is exactly what
-	// drives it — and the host's completion of every stranded proposal is
-	// unbounded work to hold node.raftMu across.
-	var proposeErr error
 	if len(w.commitProposeBuf) > 0 {
 		if w.metrics != nil {
 			w.metrics.ObserveProposalBatchSize(shardID, len(w.commitProposeBuf))
@@ -1315,41 +1409,14 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// the peer's buffer and will be sent after WAL persistence completes
 	// in the next GetUpdate cycle. DrainFreeOrderMessages filters them
 	// out automatically.
-	freeOrderMsgs := node.peer.DrainFreeOrderMessages()
+	freeOrder = node.peer.DrainFreeOrderMessages()
 
 	// Check for any additional ReadIndex completions that may have been
 	// generated by processing other inbox messages (e.g., ReadIndexResp
 	// from forwarded ReadIndex requests).
-	additionalReadStates := node.peer.DrainReadStatesOnly()
+	readStates = node.peer.DrainReadStatesOnly()
 
-	node.raftMu.Unlock()
-
-	// Notify the host so it can complete pending proposals with the error
-	// instead of leaving callers blocked. Fired first among the post-unlock
-	// callbacks, preserving the order the locked version had.
-	if proposeErr != nil && w.callback != nil {
-		w.callback.OnProposalFailed(shardID, w.commitProposeBuf, proposeErr)
-	}
-
-	// Send free-order messages outside the lock. A pre-vote campaign among them
-	// is reported so it stays visible to OnCampaignLaunched/IncElection.
-	if len(freeOrderMsgs) > 0 {
-		w.reportFreeOrderCampaign(shardID, node, freeOrderMsgs)
-		w.sendMessages(freeOrderMsgs)
-	}
-
-	// Deliver any additional ReadIndex completions from phase 2.
-	if w.callback != nil && len(additionalReadStates) > 0 {
-		w.callback.OnReadyToRead(shardID, additionalReadStates)
-	}
-
-	// Publish again after Phase 2, still outside the lock. This is the phase
-	// that can actually make this node a leader: RequestVoteResp is not a
-	// HeartbeatResp, so it is sorted into otherMsgs and stepped HERE — after the
-	// Phase 1 publish has already run. A node that won its election on a vote
-	// response delivered while commitPending was set would otherwise be reported
-	// as a follower by GetShardInfo until some later cycle happened to publish.
-	w.publishLeaderChange(shardID, node)
+	return freeOrder, readStates, proposeErr
 }
 
 // sendMessages delivers outbound Raft messages via the transport layer.

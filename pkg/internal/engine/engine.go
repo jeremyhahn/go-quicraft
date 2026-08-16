@@ -464,12 +464,27 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// the commit worker skips it, and the apply goroutine has exited; raftMu
 	// then serialises against any Commit still unwinding.
 	if node != nil && node.peer != nil {
-		node.raftMu.Lock()
-		node.peer.ReleaseGlobalRateLimit()
-		node.raftMu.Unlock()
+		releaseGlobalRateLimitLocked(node)
 	}
 
 	e.allNodes.Delete(shardID)
+}
+
+// releaseGlobalRateLimitLocked returns the shard's share of the shared host-wide
+// in-memory rate limiter with node.raftMu held, so the accounting cannot race a
+// Peer.Commit still unwinding inside appliedTo -> subGlobalSize.
+//
+// It is a function rather than an inline lock/unlock pair purely so the unlock
+// is deferred. A panic inside ReleaseGlobalRateLimit (a torn-down peer, a
+// corrupt limiter) would otherwise leak node.raftMu forever, and the next
+// worker to take it — the step or commit worker after its recover-and-restart —
+// blocks with no diagnostic. The deferred scope covers exactly the one call the
+// explicit unlock covered: the allNodes.Delete that follows in the caller must
+// stay outside, and no lock is needed for it.
+func releaseGlobalRateLimitLocked(node *Node) {
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	node.peer.ReleaseGlobalRateLimit()
 }
 
 // DeliverMessage routes a WIRE-RECEIVED Raft message to the target shard's

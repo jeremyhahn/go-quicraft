@@ -25,14 +25,21 @@ import (
 // it can never reach engine code.
 //
 // This is not defensive programming for its own sake. The engine calls the
-// collector from INSIDE critical sections — notably between
-// node.raftMu.Lock() and node.raftMu.Unlock() in the step and commit workers,
-// where the unlock is a plain statement rather than a defer. A panic escaping
-// a collector method there leaves raftMu held forever: the worker's
-// recover-and-restart loop then blocks on it, and with it every shard that
-// worker owns, and Host.Close, which waits on the same workers. One embedder
-// bug becomes a permanent whole-partition deadlock with no diagnostic beyond a
-// stuck process.
+// collector from inside critical sections in the step and commit workers. When
+// this wrapper was written those sections released node.raftMu with a plain
+// statement rather than a defer, so a panic escaping a collector method left
+// raftMu held forever: the worker's recover-and-restart loop then blocked on
+// it, and with it every shard that worker owned, and Host.Close, which waits on
+// the same workers. One embedder bug became a permanent whole-partition
+// deadlock with no diagnostic beyond a stuck process.
+//
+// Every raftMu acquisition in the engine now uses defer, so that specific
+// escape no longer leaks the lock. This barrier is still the right thing: it
+// keeps an embedder panic from unwinding engine workers at all, which would
+// otherwise cost a worker restart — dropping the in-flight update, and with it
+// the readStates that GetUpdate already drained out of the peer — every time a
+// metrics backend hiccups. Containing the panic where it happens is strictly
+// better than recovering from it three frames up.
 //
 // MetricsCollector was the last embedder-implemented interface still called
 // inline and unguarded; the state machine and the snapshot sender already have
