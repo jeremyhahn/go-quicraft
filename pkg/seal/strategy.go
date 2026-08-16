@@ -149,6 +149,33 @@ type SealedRootKey struct {
 	// on unseal. Populated by Initialize and Rotate, persisted by the caller.
 	KnownEpochs []uint64 `json:"known_epochs,omitempty"`
 
+	// LoadGeneration counts how many times this blob has been claimed by a
+	// barrier. Initialize stamps 1; every subsequent Unseal that can persist
+	// increments it and writes it back BEFORE the barrier will encrypt.
+	//
+	// It is the load-generation fence, and it exists because nothing else in
+	// this package can tell a barrier that another process has taken its sealed
+	// state. Every input to the epoch DEK — root key, salt, deployment ID,
+	// epoch — is a function of this blob, and Unseal's forced rotation moves to
+	// epoch+1, so two barriers loaded from one blob derive the SAME DEK, each
+	// with a zeroed invocation counter and an empty nonce tracker: n writers
+	// spending the full NIST SP 800-38D budget against one key, neither able to
+	// see the other's nonces. The generation makes that state OBSERVABLE — a
+	// barrier handed a blob whose generation is above the one it claimed knows
+	// another loader has been here and fails closed (ErrBarrierSuperseded).
+	//
+	// WHAT IT DOES NOT DO: it is not a lock and not a lease. It is checked when
+	// state is loaded (SetSealedRootKey) and enforced when state is written
+	// (Rotate, PurgeEpochsBefore) or used (Encrypt); the barrier never re-reads
+	// the persisted blob on its own, so a barrier that is superseded while
+	// running keeps encrypting until something hands it the newer state. See
+	// Barrier.SetSealedRootKey for the full enforcement contract.
+	//
+	// Covered by StateMAC: a barrier refuses to encrypt on the strength of this
+	// number, so leaving it unauthenticated would hand anyone with write access
+	// to the blob a way to stop a node from writing by inflating it.
+	LoadGeneration uint64 `json:"load_generation,omitempty"`
+
 	// FailedAttempts is the number of consecutive failed Unseal attempts.
 	// Persisted alongside the sealed key so that brute-force backoff state
 	// survives process restarts. A value of 0 indicates no recent failures.

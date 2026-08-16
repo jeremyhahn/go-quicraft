@@ -89,6 +89,13 @@ const (
 	// orders of magnitude of headroom while capping the work an attacker can
 	// force to milliseconds.
 	MaxKnownEpochs = 4096
+
+	// firstLoadGeneration is the LoadGeneration Initialize stamps into a new
+	// sealed blob. It starts at 1 rather than 0 so that "this blob has never
+	// been claimed" (a blob written before the fence existed, which decodes to
+	// 0) stays distinguishable from "claimed once by the process that created
+	// it". See SealedRootKey.LoadGeneration.
+	firstLoadGeneration uint64 = 1
 )
 
 // HKDFVersion identifies the layout of the HKDF info string used to derive
@@ -270,6 +277,20 @@ type Barrier struct {
 	// encrypted" and "fresh process, counter not yet seeded", and reading the
 	// second as the first is what re-granted the NIST budget on every restart.
 	invocationsAuthoritative bool
+
+	// loadGeneration is the LoadGeneration this barrier CLAIMED — stamped by
+	// Initialize (1) or written by the claim step in Unseal (loaded + 1). It is
+	// the number a later observation is compared against, and it is guarded by
+	// b.mu like the rest of the sealed state.
+	loadGeneration uint64
+
+	// superseded records that a blob naming a generation above b.loadGeneration
+	// was observed, i.e. another loader has taken this sealed state. It is an
+	// atomic.Bool rather than plain state under b.mu so the Encrypt fast path
+	// can consult it with a single load and no additional lock, matching
+	// b.unsealed; every write path re-checks it under the lock it already
+	// holds. Once set it is never cleared — see ErrBarrierSuperseded.
+	superseded atomic.Bool
 
 	// Brute-force protection state.
 	failedAttempts int64
@@ -460,6 +481,11 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	sealed.Epoch = initialEpoch
 	sealed.Salt = salt
 	sealed.KnownEpochs = []uint64{initialEpoch}
+	// The process that creates the blob holds its first claim. Stamped here,
+	// before the MAC below covers it, so the very first persisted state already
+	// carries a generation and the next loader has something to increment.
+	sealed.LoadGeneration = firstLoadGeneration
+	b.loadGeneration = firstLoadGeneration
 	// Record the DEK-derivation layout so a future version can still derive
 	// this deployment's keys after the layout changes again.
 	sealed.HKDFVersion = b.hkdfVersion
@@ -579,6 +605,13 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 // grows by one per restart until PurgeEpochsBefore retires the old epochs, so a
 // deployment that never purges walks toward MaxKnownEpochs; the engine's
 // retention-driven purge is what keeps the set bounded.
+//
+// Unseal also CLAIMS the blob: it writes back SealedRootKey.LoadGeneration + 1
+// through the StatePersister before the barrier will encrypt, so a later loader
+// can tell that this one was here. The claim is what makes ErrBarrierSuperseded
+// possible; see claimLoadGenerationLocked for what it does and does not detect,
+// and for the modes (delegated, no-encryption, no persister) in which it is
+// inert.
 func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Credentials) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -588,6 +621,13 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	}
 	if b.state == barrierUnsealed {
 		return ErrBarrierUnsealed
+	}
+	// A superseded barrier must not re-claim the blob. Sealing and unsealing
+	// again would otherwise launder the supersession into a fresh claim and put
+	// two instances into a loop of stealing the state back from each other,
+	// which is the opposite of leaving the choice to an operator.
+	if b.superseded.Load() {
+		return ErrBarrierSuperseded
 	}
 
 	// Brute-force backoff check.
@@ -729,6 +769,17 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		return nil
 	}
 
+	// CLAIM THE BLOB before deriving or installing anything. Ordering is the
+	// whole point: the claim must be durable BEFORE this barrier can encrypt,
+	// or a process that dies between encrypting and persisting would leave a
+	// generation on disk that the next loader increments without ever learning
+	// that a DEK was already used under it. A claim that cannot be persisted
+	// aborts the unseal with the barrier still sealed.
+	if err := b.claimLoadGenerationLocked(rootKey); err != nil {
+		wipeBytes(rootKey)
+		return err
+	}
+
 	// Derive DEK and cipher for the current epoch.
 	dek, aead, err := b.deriveEpochCipher(rootKey, b.salt, b.epoch)
 	if err != nil {
@@ -793,6 +844,83 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	return nil
 }
 
+// claimLoadGenerationLocked takes ownership of the sealed blob by writing back
+// LoadGeneration + 1, and is what lets a later loader discover that this
+// barrier was here. The caller must hold b.mu and must pass the plaintext root
+// key, which is needed to re-stamp the metadata MAC over the new generation.
+//
+// WHAT THE FENCE DETECTS. Two barriers loaded from one blob derive the same
+// epoch DEK with two zeroed invocation counters (see resolveInvocationBudget),
+// and nothing about that is visible from inside either process. After this
+// claim it is visible in the one place both processes share: the blob. A
+// barrier handed a blob whose generation exceeds its own claim knows another
+// loader has taken the state and fails closed — the silently shared DEK becomes
+// a loud, attributable error.
+//
+// WHAT IT DOES NOT DETECT, stated plainly rather than implied away:
+//
+//   - It is not continuous. The generation is compared when state is LOADED
+//     (SetSealedRootKey) and enforced when state is WRITTEN (Rotate,
+//     PurgeEpochsBefore) or USED (the Encrypt family). The barrier never
+//     re-reads the persisted blob on its own — that would put a disk read on
+//     the encrypt hot path — so a barrier superseded while running keeps
+//     encrypting until the embedder hands it the newer state.
+//   - It is not a lock. Two loaders that read the SAME generation before either
+//     writes both claim the same number and neither can tell. Detection lands
+//     on whichever loader reads after the other has written, which is the
+//     common case (a second process starting later) but not a guarantee. Only
+//     an exclusive lock or a compare-and-swap persister makes it one.
+//   - It is inert where there is no epoch DEK to duplicate: no-encryption
+//     (StrategyNone) and delegated/hardware mode both return from Unseal before
+//     this point, because the delegated encryptor owns its own key and nonce
+//     management, exactly as it owns the invocation counter and nonce tracker.
+//   - It is inert without a StatePersister: a claim that cannot be written down
+//     is not a claim. That deployment already cannot rotate, and Unseal already
+//     refuses to encrypt under an unprovable budget, so the fence adds nothing
+//     it did not already have — but an embedder that injects its own
+//     InvocationCounter and no persister keeps encrypting with no fence at all,
+//     which is why this is reported at WARN rather than passed over in silence.
+func (b *Barrier) claimLoadGenerationLocked(rootKey []byte) error {
+	if b.sealed == nil {
+		return ErrNilSealedData
+	}
+	persist := b.config.StatePersister
+	if persist == nil {
+		slog.Warn("quicraft/seal: no StatePersister, so the load-generation fence is inert; "+
+			"a second process loading this same sealed blob cannot be detected",
+			"epoch", b.epoch,
+			"load_generation", b.sealed.LoadGeneration,
+			"deployment_id", b.config.DeploymentID,
+			"remedy", "configure BarrierConfig.StatePersister so each load can claim the blob",
+		)
+		b.loadGeneration = b.sealed.LoadGeneration
+		return nil
+	}
+
+	claim := b.sealed.LoadGeneration + 1
+
+	// Persist a private copy first, exactly as Rotate does: the live state must
+	// not advance to a claim that never reached storage, or this barrier would
+	// believe it holds a generation the next loader will hand out again.
+	candidate := cloneSealedRootKey(b.sealed)
+	candidate.LoadGeneration = claim
+	if macErr := b.restampStateMACLocked(rootKey, candidate); macErr != nil {
+		return macErr
+	}
+	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
+		slog.Error("quicraft/seal: unseal aborted; the load-generation claim was not persisted",
+			"epoch", b.epoch,
+			"claim", claim,
+			"error", perr,
+		)
+		return &StatePersistError{Op: "claim", Epoch: b.epoch, Err: perr}
+	}
+
+	b.sealed = candidate
+	b.loadGeneration = claim
+	return nil
+}
+
 // resolveInvocationBudget re-establishes a SOUND NIST SP 800-38D invocation
 // budget after an unseal whose epoch this process did not create. The caller
 // must hold b.mu.
@@ -839,13 +967,20 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 // prevent: n writers each spend up to the full 2^32 budget against one key,
 // and neither tracker can see the other's nonces.
 //
-// Nothing in this package can detect it. BarrierConfig.MinEpoch does not help
-// here — it is a floor against REPLAY of an older blob, and this hazard needs no
-// rollback at all: both loaders read the current, genuinely authenticated state.
-// SealedRootKey.StateMAC does not help either; both copies are authentic. The
-// missing fact — "am I the only writer of this blob?" — lives entirely outside
-// the barrier, so the EMBEDDER must guarantee it (an exclusive data-directory
-// lock, or a persister backed by a compare-and-swap). See the StatePersister
+// The LOAD-GENERATION FENCE is what makes that state detectable rather than
+// silent: each Unseal claims the blob by writing back LoadGeneration + 1, and a
+// barrier that is later handed a blob naming a higher generation fails closed
+// with ErrBarrierSuperseded. See claimLoadGenerationLocked for what the fence
+// detects and — importantly — what it does not: it is checked at load and
+// enforced at write/encrypt, never polled, so it turns a silently shared DEK
+// into a loud failure at the next load rather than at the instant of sharing.
+//
+// The fence does not make the barrier self-sufficient. Two loaders that read
+// the same generation before either writes both claim the same number.
+// BarrierConfig.MinEpoch does not close that either — it is a floor against
+// REPLAY of an older blob, and this hazard needs no rollback at all — and
+// StateMAC cannot, because both copies are authentic. Exclusive ownership of
+// the blob remains the embedder's to guarantee; see the StatePersister
 // contract in barrier_config.go.
 func (b *Barrier) resolveInvocationBudget() {
 	if b.invocations == nil || !b.invocations.IsEnabled() {
@@ -1304,6 +1439,19 @@ func aadForEpoch(epoch uint64, contextAAD []byte) []byte {
 //
 // Wire format: [epoch:8][algID:1][nonce:N][ciphertext+tag]
 func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher.AEAD, contextAAD []byte) ([]byte, error) {
+	// The load-generation fence. It sits here, at the single choke point every
+	// Encrypt variant funnels through, rather than being repeated at six public
+	// entry points — and it costs one atomic load, no lock and no disk read, so
+	// the hot path is unchanged in shape. A superseded barrier must not add to
+	// an epoch DEK another loader is also using; see ErrBarrierSuperseded.
+	//
+	// Delegated (hardware) mode never reaches this function, and is out of the
+	// fence's scope for the same reason it is out of the invocation counter's
+	// and the nonce tracker's: the delegated encryptor owns its own key.
+	if b.superseded.Load() {
+		return nil, ErrBarrierSuperseded
+	}
+
 	// Bound the frame BEFORE allocating or sealing. Both GCM and
 	// ChaCha20-Poly1305 answer an over-long plaintext with a panic rather than
 	// an error (see SymmetricAlgorithm.MaxPlaintextSize), so without this check
@@ -1669,6 +1817,14 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 		return 0, ErrBarrierSealed
 	}
 
+	// A superseded barrier must not WRITE the blob either. Rotating would
+	// persist this instance's state — including its stale load generation —
+	// over the state of the loader that superseded it, erasing that loader's
+	// claim and with it the evidence either instance could act on.
+	if b.superseded.Load() {
+		return 0, ErrBarrierSuperseded
+	}
+
 	if b.hwEncryptor != nil {
 		return 0, ErrHardwareMode
 	}
@@ -1798,6 +1954,14 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 
 	if b.state != barrierUnsealed {
 		return 0, ErrBarrierSealed
+	}
+
+	// Purging writes the reduced state through the persister, so a superseded
+	// barrier is refused here for the same reason as in rotateLocked — and with
+	// an extra edge: it would retire DEKs on behalf of a blob it no longer
+	// owns, for epochs the current owner may still be reading.
+	if b.superseded.Load() {
+		return 0, ErrBarrierSuperseded
 	}
 
 	if b.hwEncryptor != nil {
@@ -2061,6 +2225,27 @@ func (b *Barrier) CurrentEpoch() uint64 {
 	return b.epoch
 }
 
+// LoadGeneration returns the sealed blob's load generation as CLAIMED by this
+// barrier: 1 after Initialize, and (loaded + 1) after an Unseal that could
+// persist the claim. Returns 0 for a barrier that has never loaded or created a
+// blob, and for one whose deployment cannot claim (no StatePersister), where the
+// loaded value is adopted unchanged.
+//
+// It is exported for operators and embedders: comparing it with the generation
+// in the blob on disk is how you tell which live instance owns the sealed state.
+// See SealedRootKey.LoadGeneration.
+func (b *Barrier) LoadGeneration() uint64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.loadGeneration
+}
+
+// IsSuperseded reports whether this barrier has observed a sealed blob claimed
+// by another loader. A superseded barrier refuses to encrypt, rotate or purge —
+// permanently, and by design — while decryption continues to work; see
+// ErrBarrierSuperseded.
+func (b *Barrier) IsSuperseded() bool { return b.superseded.Load() }
+
 // SealedRootKeyData returns a copy of the sealed root key for persistence.
 // Returns nil if the barrier has not been initialized.
 func (b *Barrier) SealedRootKeyData() *SealedRootKey {
@@ -2080,6 +2265,7 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 		Strategy:           src.Strategy,
 		Version:            src.Version,
 		Epoch:              src.Epoch,
+		LoadGeneration:     src.LoadGeneration,
 		FailedAttempts:     src.FailedAttempts,
 		LastFailedUnixNano: src.LastFailedUnixNano,
 		KDFVersion:         src.KDFVersion,
@@ -2125,7 +2311,14 @@ const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
 // is computed over. It is the first byte fed to the HMAC, so extending the
 // covered field set later produces unrelated tags rather than an ambiguous
 // re-parse of the same bytes.
-const sealedStateMACVersion byte = 1
+//
+// v2 adds LoadGeneration to the covered set. Blobs stamped under v1 do not
+// authenticate under v2 — the format is pinned pre-release and changed in
+// place, so a pre-fence blob is migrated by loading it once with
+// BarrierConfig.AllowUnauthenticatedSealedState and re-persisting, not by a
+// compatibility path that would let an attacker choose the older, weaker
+// coverage.
+const sealedStateMACVersion byte = 2
 
 // sealedStateMAC computes the metadata authentication tag for a sealed root
 // key: HMAC-SHA256, keyed by HKDF-SHA256(rootKey, info=sealedStateMACInfo),
@@ -2137,12 +2330,15 @@ const sealedStateMACVersion byte = 1
 // of another (a Salt ending in what looks like a length header cannot shift the
 // KnownEpochs that follow).
 //
-// COVERED: Strategy, Version, DeploymentID, Epoch, Salt, KnownEpochs,
-// HKDFVersion, Algorithm, Ciphertext, Metadata, Nonce, HardwarePayload. The
-// ciphertext is included even though it authenticates itself, so that genuine
-// metadata from one blob cannot be paired with a genuine ciphertext from
-// another. Metadata carries the KDF version byte, which selects the unwrapping
-// KDF and is otherwise unauthenticated.
+// COVERED: Strategy, Version, DeploymentID, Epoch, LoadGeneration, Salt,
+// KnownEpochs, HKDFVersion, Algorithm, Ciphertext, Metadata, Nonce,
+// HardwarePayload. The ciphertext is included even though it authenticates
+// itself, so that genuine metadata from one blob cannot be paired with a
+// genuine ciphertext from another. Metadata carries the KDF version byte, which
+// selects the unwrapping KDF and is otherwise unauthenticated. LoadGeneration
+// is covered because the barrier now REFUSES TO ENCRYPT on the strength of it:
+// left unauthenticated, inflating one number in a plaintext field would be a
+// durable, passphrase-free way to stop a node from writing.
 //
 // NOT COVERED, deliberately: FailedAttempts and LastFailedUnixNano, which
 // persistBackoffState writes after a FAILED unseal — the point at which no root
@@ -2172,6 +2368,7 @@ func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]by
 	putUint(uint64(s.Version))
 	putUint(deploymentID)
 	putUint(s.Epoch)
+	putUint(s.LoadGeneration)
 	putBytes(s.Salt)
 	putUint(uint64(len(s.KnownEpochs)))
 	for _, ep := range s.KnownEpochs {
@@ -2344,6 +2541,16 @@ func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed 
 //   - Epoch must not go BACKWARDS: it must be at least BarrierConfig.MinEpoch
 //     and, on a barrier that already holds state, at least the epoch it already
 //     holds.
+//   - LoadGeneration must not EXCEED this barrier's own claim. This is the
+//     observation point of the load-generation fence: a higher generation means
+//     another loader has claimed the sealed state since this barrier did, so the
+//     barrier marks itself superseded — permanently refusing to encrypt, rotate
+//     or purge, while decryption continues — and returns *SupersededError
+//     (errors.Is ErrBarrierSuperseded). The loaded state is NOT adopted in that
+//     case; the marking happens before the return so a caller that ignores the
+//     error is still not left encrypting. A barrier that has never claimed a
+//     generation simply adopts the blob's. See SealedRootKey.LoadGeneration and
+//     Barrier.claimLoadGenerationLocked for the fence's limits.
 //
 // The epoch floor is not tidiness either, and it is not made redundant by
 // SealedRootKey.StateMAC. The MAC proves the metadata was written by something
@@ -2469,6 +2676,53 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return &AlgorithmMismatchError{Sealed: sealed.Algorithm, Configured: b.config.Algorithm}
 	}
 
+	// THE LOAD-GENERATION FENCE, checked last so that a malformed or foreign
+	// blob is rejected on its own merits first and cannot poison a healthy,
+	// running barrier with a fabricated generation.
+	//
+	// A generation above this barrier's own claim means another loader has taken
+	// this sealed state since this barrier claimed it. That is the one thing the
+	// barrier could never previously see, and it is not survivable: both
+	// instances derive the same epoch DEK from the same blob and each believes
+	// it owns the whole NIST SP 800-38D budget. The barrier fails closed
+	// PERMANENTLY — marking comes before returning the error, because a caller
+	// that ignores the error must still not be left encrypting.
+	//
+	// The loaded state is deliberately NOT adopted: this instance is done, and
+	// quietly picking up the winner's epoch would make it a second writer of the
+	// winner's DEK, which is the failure being prevented.
+	//
+	// A barrier that has never claimed a generation (b.loadGeneration == 0 — a
+	// fresh instance, or a blob from before the fence existed) has nothing to be
+	// superseded from and simply adopts what it is given.
+	if b.loadGeneration > 0 && sealed.LoadGeneration > b.loadGeneration {
+		b.superseded.Store(true)
+		slog.Error("quicraft/seal: sealed root key was claimed by another loader; this barrier is "+
+			"now refused encryption (decryption is unaffected)",
+			"observed_generation", sealed.LoadGeneration,
+			"claimed_generation", b.loadGeneration,
+			"epoch", b.epoch,
+			"deployment_id", b.config.DeploymentID,
+			"remedy", "stop one of the two processes holding this sealed state; which instance "+
+				"should own it is an operator decision and is never resolved automatically",
+		)
+		return &SupersededError{Observed: sealed.LoadGeneration, Claimed: b.loadGeneration}
+	}
+	// A generation BELOW this barrier's claim is a rollback of the blob, not a
+	// competing claim, and it is the case BarrierConfig.MinEpoch and StateMAC
+	// own. Report it and carry on: refusing here would let anyone who can
+	// restore an old backup stop a node from writing.
+	if b.loadGeneration > 0 && sealed.LoadGeneration < b.loadGeneration {
+		slog.Error("quicraft/seal: sealed root key load generation went BACKWARDS; the persisted "+
+			"state is older than the one this barrier claimed",
+			"observed_generation", sealed.LoadGeneration,
+			"claimed_generation", b.loadGeneration,
+			"epoch", sealed.Epoch,
+			"deployment_id", b.config.DeploymentID,
+			"remedy", "set BarrierConfig.MinEpoch from the highest live epoch to refuse replayed state",
+		)
+	}
+
 	// Copy before retaining: b.salt would otherwise alias the caller's slice,
 	// and persistBackoffState would write into the caller's live struct.
 	sealed = cloneSealedRootKey(sealed)
@@ -2480,6 +2734,11 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	// unknown number of invocations. Whatever the in-memory counter holds, it is
 	// no longer a count of this epoch's usage. See resolveInvocationBudget.
 	b.invocationsAuthoritative = false
+
+	// Adopt the blob's generation as the baseline the next Unseal increments.
+	// It is the on-disk state that is authoritative here, exactly as it is for
+	// KnownEpochs below.
+	b.loadGeneration = sealed.LoadGeneration
 
 	// A blob persisted before the version field existed carries 0 and must
 	// keep deriving with the v1 info layout.

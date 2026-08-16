@@ -96,6 +96,24 @@ var (
 	// A library must not kill its host over an input it can reject.
 	ErrPlaintextTooLarge = errors.New("quicraft/seal: plaintext exceeds the algorithm's maximum message size")
 
+	// ErrBarrierSuperseded is returned by every write path (the Encrypt family,
+	// Rotate, PurgeEpochsBefore, Unseal) once the barrier has observed a sealed
+	// blob whose LoadGeneration is above the one it claimed. Another loader has
+	// taken this sealed state, so continuing to encrypt would put two
+	// independent random-nonce sequences under one epoch DEK — the exact
+	// condition the NIST SP 800-38D invocation cap exists to bound.
+	//
+	// It is TERMINAL for the barrier instance and deliberately not recoverable
+	// in-process: which loader should own the blob is an operator decision, and
+	// a barrier that re-claimed it automatically would produce two instances
+	// taking turns stealing it back. Decryption is unaffected — a superseded
+	// node can still read and serve its data.
+	//
+	// Errors from SetSealedRootKey wrap *SupersededError, which carries the two
+	// generations; errors.Is against this sentinel matches either form.
+	ErrBarrierSuperseded = errors.New(
+		"quicraft/seal: sealed root key was claimed by another loader; this barrier may no longer encrypt")
+
 	// ErrUnsealBackoff is returned when an Unseal attempt is rejected
 	// due to brute-force protection backoff.
 	ErrUnsealBackoff = errors.New("quicraft/seal: unseal rejected, backoff active")
@@ -325,6 +343,32 @@ func (e *StatePersistError) Error() string {
 func (e *StatePersistError) Unwrap() error {
 	return e.Err
 }
+
+// SupersededError reports that a sealed blob was claimed by another loader,
+// naming both generations so an embedder can tell "another process took this
+// data directory" apart from an I/O failure, a rollback, or a corrupt blob —
+// and can log which claim it lost to.
+//
+// It unwraps to ErrBarrierSuperseded, so errors.Is(err, ErrBarrierSuperseded)
+// matches both this and the bare sentinel the hot paths return.
+type SupersededError struct {
+	// Observed is the LoadGeneration carried by the blob just presented.
+	Observed uint64
+	// Claimed is the generation this barrier claimed when it last loaded or
+	// initialized the blob.
+	Claimed uint64
+}
+
+// Error returns a human-readable description of the lost claim.
+func (e *SupersededError) Error() string {
+	return fmt.Sprintf(
+		"quicraft/seal: sealed root key load generation %d supersedes this barrier's claim of %d; "+
+			"another loader holds this sealed state and this barrier may no longer encrypt",
+		e.Observed, e.Claimed)
+}
+
+// Unwrap returns ErrBarrierSuperseded so errors.Is matches the sentinel.
+func (e *SupersededError) Unwrap() error { return ErrBarrierSuperseded }
 
 // AlgorithmMismatchError is returned by SetSealedRootKey when the sealed blob
 // records a data-path algorithm different from the one this barrier is

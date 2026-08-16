@@ -17,12 +17,24 @@ package seal
 import (
 	"context"
 	"crypto/rand"
+	"io"
+	"log/slog"
 	"testing"
 )
 
 // benchBarrier creates a barrier initialized with fast Argon2id params.
+//
+// Logging is silenced for the duration. This is not cosmetic: go test
+// republishes the test binary's stderr on its own stdout, so a barrier's setup
+// logs land BETWEEN a benchmark's name and its result line and corrupt the
+// machine-readable output that every A/B comparison of this hot path depends
+// on. Nothing on the measured path logs, so no measurement is affected.
 func benchBarrier(b *testing.B) *Barrier {
 	b.Helper()
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.Cleanup(func() { slog.SetDefault(prevLogger) })
+
 	barrier := MustNewBarrier(DefaultBarrierConfig(1))
 	s, err := NewSoftwareStrategyWithParams([]byte("bench-passphrase"), 1, 64*1024, 1)
 	if err != nil {

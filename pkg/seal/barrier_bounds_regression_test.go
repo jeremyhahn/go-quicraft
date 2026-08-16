@@ -280,28 +280,28 @@ func TestDecryptRejectsOversizedCiphertext(t *testing.T) {
 
 // --- duplicate-writer hazard (documented, not defended) ---
 
-// TestDoubleLoadedBlobDerivesTheSameEpochDEK pins the barrier's actual
-// behaviour when one sealed blob is loaded by two live barriers, so that the
-// residual risk is recorded in a test rather than in a comment nobody re-reads.
+// TestDoubleLoadedBlobStillSharesTheEpochDEK pins the HAZARD the load-generation
+// fence exists to make visible, and the exact boundary of the fence's reach.
 //
-// Both barriers rotate on unseal (the loaded epoch's spent invocation budget is
-// unknowable) to the SAME epoch+1, derive the SAME DEK from the same root key,
-// salt, deployment ID and epoch, and each start from a zeroed invocation
-// counter and an empty nonce tracker. Given the same nonce they produce
-// byte-identical ciphertext: catastrophic AES-GCM nonce reuse that neither
-// tracker can see, because neither holds the other's nonces.
+// Two barriers loaded from one blob still derive the SAME epoch DEK — the fence
+// does not and cannot prevent that. Both rotate on unseal (the loaded epoch's
+// spent invocation budget is unknowable) to the same epoch+1 from the same root
+// key, salt and deployment ID, each with a zeroed invocation counter and an
+// empty nonce tracker; given the same nonce they produce byte-identical
+// ciphertext. What the fence changes is that the second loader leaves a claim
+// behind, so the condition becomes DETECTABLE at the next load instead of
+// silent — see TestLoadGenerationFenceSupersedesEarlierLoader.
 //
-// Nothing in this package can detect it — MinEpoch is a floor against replay of
-// an OLDER blob and both loaders read the current one, and StateMAC
-// authenticates both copies because both are genuine. Single-writer ownership
-// of the blob is an EMBEDDER obligation; see the StatePersister contract. If a
-// future change makes the barrier itself defend this, this test is the one that
-// must be rewritten, deliberately.
-func TestDoubleLoadedBlobDerivesTheSameEpochDEK(t *testing.T) {
+// Keeping this test is deliberate. If someone later believes the fence prevents
+// DEK sharing rather than exposing it, this is the test that says otherwise.
+func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
+	captureLogs(t)
 	src := MustNewBarrier(testBarrierConfig(77))
 	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
+	// Both loaders read the SAME on-disk state, before either writes its claim
+	// — the one interleaving the fence cannot separate.
 	blob := src.SealedRootKeyData()
 
 	load := func() *Barrier {
@@ -321,12 +321,19 @@ func TestDoubleLoadedBlobDerivesTheSameEpochDEK(t *testing.T) {
 			"behaviour (both rotate to loaded+1) has changed and this test must be revisited",
 			first.CurrentEpoch(), second.CurrentEpoch())
 	}
-	if got := first.invocations.Count(); got != 0 {
-		t.Fatalf("invocation count after the forced rotation = %d, want 0", got)
+	if first.LoadGeneration() != second.LoadGeneration() {
+		t.Fatalf("two loaders that read the same generation claimed %d and %d; the fence "+
+			"cannot distinguish them and both must claim the same number",
+			first.LoadGeneration(), second.LoadGeneration())
+	}
+	if first.IsSuperseded() || second.IsSuperseded() {
+		t.Fatal("neither loader can detect the other from a simultaneous read; the fence " +
+			"must not claim a detection it did not make")
 	}
 
 	// Same key, same nonce: the AEAD output is identical, which is exactly the
-	// condition the invocation cap and nonce tracker exist to prevent.
+	// condition the invocation cap and nonce tracker exist to prevent — and
+	// exactly what the fence exposes rather than prevents.
 	first.randReader = fixedNonceReader{0x5A}
 	second.randReader = fixedNonceReader{0x5A}
 	a, err := first.Encrypt(nil, []byte("duplicate writer"))
@@ -339,7 +346,7 @@ func TestDoubleLoadedBlobDerivesTheSameEpochDEK(t *testing.T) {
 	}
 	if !bytes.Equal(a, c) {
 		t.Fatalf("two barriers loaded from one blob no longer share an epoch DEK; " +
-			"if that is now defended, replace this test with one that asserts the defence")
+			"if that is now prevented rather than merely detected, rewrite this test")
 	}
 }
 

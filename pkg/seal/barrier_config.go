@@ -34,22 +34,37 @@ package seal
 //
 //   - Returning an error aborts the operation with the previous epoch intact.
 //
-//   - EXCLUSIVITY: the embedder MUST guarantee that only ONE live barrier writes
-//     a given sealed blob. This is a cryptographic requirement, not an
-//     operational preference. Every DEK input (root key, salt, deployment ID,
-//     epoch) is a function of the blob, and Unseal's forced rotation moves to
-//     epoch+1, so two barriers loaded from the same blob derive the SAME DEK,
-//     each with a zeroed invocation counter and an empty nonce tracker. Both
-//     then believe they own the full NIST SP 800-38D budget for that key and
-//     neither can see the other's nonces — the exact duplicate-key condition the
-//     invocation cap exists to bound.
+//   - EXCLUSIVITY: only ONE live barrier may write a given sealed blob. This is
+//     a cryptographic requirement, not an operational preference. Every DEK
+//     input (root key, salt, deployment ID, epoch) is a function of the blob,
+//     and Unseal's forced rotation moves to epoch+1, so two barriers loaded from
+//     the same blob derive the SAME DEK, each with a zeroed invocation counter
+//     and an empty nonce tracker. Both then believe they own the full NIST
+//     SP 800-38D budget for that key and neither can see the other's nonces —
+//     the exact duplicate-key condition the invocation cap exists to bound.
 //
-//     The barrier cannot detect this, and none of its other defences apply:
-//     MinEpoch is a floor against replay of an OLDER blob, while here both
-//     loaders read the current one, and StateMAC authenticates both copies
-//     because both are genuine. Enforce it outside — an exclusive
+//     WHAT THE BARRIER NOW ENFORCES — the load-generation fence. This persister
+//     is the mechanism: every Unseal writes back SealedRootKey.LoadGeneration+1
+//     through it BEFORE the barrier will encrypt, so each load leaves a claim in
+//     the blob. A barrier later handed a blob whose generation is above its own
+//     claim knows another loader has taken the state and fails closed,
+//     permanently, with ErrBarrierSuperseded — Encrypt, Rotate and
+//     PurgeEpochsBefore all refuse, while Decrypt keeps working. The persister
+//     is therefore called once per Unseal even when nothing else changed.
+//
+//     WHAT IT DOES NOT DETECT. The fence is checked when state is LOADED
+//     (SetSealedRootKey) and enforced when state is WRITTEN or USED; the barrier
+//     never re-reads the blob on its own, because that would put a disk read on
+//     the encrypt hot path. So a barrier superseded while running keeps
+//     encrypting until the embedder hands it the newer state, and two loaders
+//     that both read the same generation before either writes both claim the
+//     same number and neither can tell. The fence converts the common case — a
+//     second process starting on a data directory that is already in use — from
+//     silent DEK sharing into a loud, attributable failure; it is not a lock.
+//
+//     For a hard guarantee, keep enforcing exclusivity outside: an exclusive
 //     data-directory lock, or a persister backed by a compare-and-swap that
-//     rejects a write whose expected prior epoch no longer matches.
+//     rejects a write whose expected prior generation no longer matches.
 type StatePersister func(*SealedRootKey) error
 
 // BarrierConfig configures the algorithm-agile epoch barrier.
@@ -230,11 +245,13 @@ type BarrierConfig struct {
 	// safe-purge floor / minimum live epoch). Zero disables the check, which is
 	// the historical behavior.
 	//
-	// SCOPE — this is a floor against REPLAY, and replay only. It does nothing
-	// about the other route to a duplicated DEK: two live barriers loading the
-	// SAME current blob, which needs no rollback and therefore clears any floor
-	// this field can express. Only the embedder's exclusive ownership of the
-	// blob rules that out; see the StatePersister contract.
+	// SCOPE — this is a floor against REPLAY, and replay only. The other route
+	// to a duplicated DEK — two live barriers loading the SAME current blob —
+	// needs no rollback and therefore clears any floor this field can express;
+	// that one is the load-generation fence's job (see the StatePersister
+	// contract and SealedRootKey.LoadGeneration). The two are complementary and
+	// neither substitutes for the other: the fence detects a competing claim,
+	// this floor refuses an older state.
 	MinEpoch uint64
 
 	// AllowUnauthenticatedSealedState permits loading a SealedRootKey that
