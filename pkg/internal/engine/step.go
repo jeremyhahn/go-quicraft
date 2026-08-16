@@ -1086,7 +1086,9 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 // progress, improving throughput from ~250 ops/s to ~1200+ ops/s. ReadIndex
 // prioritization reduces read latency by ~4.5x under concurrent write load.
 //
-//nolint:gocyclo // pipeline optimization: processes proposals, heartbeats, reads, and snapshots during commit
+// The gocyclo suppression that sat here is gone: extracting the two locked
+// phases into commitPendingPhase1Locked and commitPendingPhase2Locked took this
+// function back under the limit on its own merits.
 func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// Drain all queued operations from MPSC queues. The actual processing
 	// happens under raftMu to serialize with the commit worker.

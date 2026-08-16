@@ -24,6 +24,10 @@ GOBENCH       := $(GO) test -run=^$$ -bench=. -benchmem
 GOVET         := $(GO) vet
 GOFMT         := gofmt
 GOLINT        := golangci-lint
+# Must match the version quality.yml installs. A different MAJOR version is not
+# a cosmetic difference: v2 moved flags (`--timeout`) and changed which linters
+# are enabled by default, so a developer and CI would gate on different rules.
+GOLANGCI_VERSION := v2.12.2
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 
@@ -889,13 +893,19 @@ remote-%: remote-sync
 
 # One-time (or after a toolchain bump) provisioning of the scanners omega does
 # not ship with. Kept separate from remote-sync so the common path stays fast.
+#
+# golangci-lint is installed UNCONDITIONALLY at the pinned version, not
+# "if absent". omega already had a v1 binary on PATH, so a `command -v` guard
+# skipped the install and `make lint` then died on `unknown flag: --timeout`,
+# which v2 moved. A linter of the wrong major version is worse than none: it
+# reports a different set of findings from CI while looking like it passed.
 .PHONY: remote-tools
 remote-tools:
 	@$(OMEGA_SSH) '$(OMEGA_PATH); \
 		command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest; \
 		command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@latest; \
-		command -v golangci-lint >/dev/null || go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest; \
-		echo "omega tools ready"'
+		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
+		echo "omega tools ready ($(GOLANGCI_VERSION))"'
 
 # ============================================================================
 # Multi-module build

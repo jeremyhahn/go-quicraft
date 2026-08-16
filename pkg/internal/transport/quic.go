@@ -1540,6 +1540,36 @@ func (t *QUICTransport) sendFrame(target string, msgs []proto.Message, payloadSi
 	}
 }
 
+// writeSnapshotHeader writes the framed SnapshotHeader that opens a snapshot
+// stream, which is what tells the receiver this stream carries a snapshot
+// rather than a message batch (FlagSnapshot).
+//
+// Extracted from SendSnapshot so that function stays under the cyclomatic
+// limit: it sits right at the threshold, and the three error branches here
+// were enough to push it over when the network-fault guard was added.
+//
+// The write deadline is set here rather than by the caller because a header
+// write to a stalled receiver would otherwise block indefinitely, holding a
+// snapshotTracker slot and with it Stop().
+func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk) error {
+	if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
+		return err
+	}
+	hdr := SnapshotHeader{
+		ShardID:    first.ShardID,
+		ReplicaID:  first.ReplicaID,
+		Index:      first.Index,
+		Term:       first.Term,
+		ChunkCount: first.ChunkCount,
+		Epoch:      first.Epoch,
+	}
+	var hdrBuf [SnapshotHeaderSize]byte
+	if _, err := hdr.MarshalTo(hdrBuf[:]); err != nil {
+		return err
+	}
+	return WriteFrame(stream, hdrBuf[:], FlagSnapshot)
+}
+
 // SendSnapshot sends snapshot chunks over a dedicated QUIC stream.
 // Each snapshot transfer uses a fresh bidirectional stream to avoid
 // interference with the regular message stream pool. The snapshotTracker
@@ -1607,27 +1637,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		}
 	}()
 
-	// Write snapshot header first. Set a write deadline so the header
-	// write does not block indefinitely on a stalled receiver.
-	if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
-		return err
-	}
-	hdr := SnapshotHeader{
-		ShardID:    first.ShardID,
-		ReplicaID:  first.ReplicaID,
-		Index:      first.Index,
-		Term:       first.Term,
-		ChunkCount: first.ChunkCount,
-		Epoch:      first.Epoch,
-	}
-	var hdrBuf [SnapshotHeaderSize]byte
-	if _, err := hdr.MarshalTo(hdrBuf[:]); err != nil {
-		return err
-	}
-
-	// Write a frame containing the snapshot header to signal this is a
-	// snapshot stream (FlagSnapshot).
-	if err := WriteFrame(stream, hdrBuf[:], FlagSnapshot); err != nil {
+	if err := writeSnapshotHeader(stream, first); err != nil {
 		return err
 	}
 
