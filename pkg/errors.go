@@ -807,6 +807,39 @@ func (e *ImportLayoutUnknownError) Is(target error) bool {
 	return target == ErrImportLayoutUnknown
 }
 
+// ErrImportMembershipInvalid is the sentinel for *ImportMembershipInvalidError.
+var ErrImportMembershipInvalid = errors.New("quicraft: snapshot import membership override is not usable")
+
+// ImportMembershipInvalidError is returned by Host.ImportSnapshot when the
+// membership passed to WithImportMembership cannot be used.
+//
+// The override is the one import input that can silently destroy committed
+// data — it rewrites the shard's configuration, discarding whatever the
+// excluded replicas held. Every plausible operator mistake (an address left
+// off, the local replica omitted, a map copied stale from a runbook) therefore
+// gets refused by name instead of resolved, because a configuration accepted by
+// accident is not detectable afterwards: the shard simply comes up missing
+// writes it once acknowledged.
+type ImportMembershipInvalidError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	// Reason states which rule the supplied membership broke.
+	Reason string
+}
+
+// Error returns a human-readable description of the unusable membership.
+func (e *ImportMembershipInvalidError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d: WithImportMembership rejected: %s",
+		e.ShardID, e.ReplicaID, e.Reason,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrImportMembershipInvalid.
+func (e *ImportMembershipInvalidError) Is(target error) bool {
+	return target == ErrImportMembershipInvalid
+}
+
 // ErrImportDataDirMismatch is the sentinel for *ImportDataDirMismatchError.
 var ErrImportDataDirMismatch = errors.New("quicraft: snapshot import DataDir disagrees with the shard's recorded DataDir")
 

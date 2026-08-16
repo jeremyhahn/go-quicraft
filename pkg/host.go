@@ -5917,8 +5917,161 @@ type ImportOption func(*importOptions)
 // on-disk layout, used to CROSS-CHECK what ImportSnapshot discovers from the
 // shard's persisted bootstrap record.
 type importOptions struct {
-	dataDir    string
-	dataDirSet bool
+	dataDir       string
+	dataDirSet    bool
+	membership    map[uint64]string
+	membershipSet bool
+}
+
+// WithImportMembership REPLACES the membership carried by the artifact with the
+// one given, so a shard whose quorum is permanently lost can be reconstituted
+// from the replicas that survive.
+//
+// # When this is the only option left
+//
+// A 5-voter shard that loses 3 nodes to unrecoverable hardware failure cannot
+// make progress and cannot repair itself: every path that would remove the dead
+// replicas is a configuration change, and a configuration change is a log entry,
+// and committing a log entry needs the quorum that no longer exists. Restoring a
+// snapshot does not help either, because the snapshot carries the SAME 5-voter
+// configuration. Without this option the data is intact on disk and permanently
+// unreachable.
+//
+// The recovery is: stop every surviving replica, export a snapshot from the most
+// up-to-date one, and import it on each survivor with the same membership map
+// naming only the survivors. Each then restarts into a configuration whose
+// quorum it can actually form.
+//
+// # This is unsafe, and deliberately so
+//
+// Rewriting membership discards Raft's safety argument. The excluded replicas
+// may hold committed entries this snapshot does not, and once they are gone from
+// the configuration nothing will ever reconcile that: committed writes can be
+// silently lost, which is a Leader Completeness violation performed on purpose.
+// It is the correct trade only when the alternative is losing the shard
+// entirely, and only when the operator has established that the excluded
+// replicas are permanently gone rather than merely unreachable — a partitioned
+// replica that returns to a configuration it was written out of will be told it
+// is not a member, while still holding entries the new configuration never saw.
+//
+// Every surviving replica must be given the SAME map. Importing different
+// memberships on different survivors creates two configurations that each
+// believe they are authoritative, which is split-brain by construction.
+//
+// # What it replaces
+//
+// The map is the complete new VOTING membership: replicaID to raft address.
+// Observers and witnesses from the artifact are dropped, because a
+// disaster-recovery configuration should name exactly the replicas the operator
+// has verified. Shard POLICY carried by the artifact — session limits, witness
+// policy — is preserved; it is not membership.
+//
+// The importing replica must appear in the map. Importing a configuration that
+// excludes the very replica doing the import produces a replica that cannot
+// participate in the shard it just restored, which is never what was meant.
+func WithImportMembership(members map[uint64]string) ImportOption {
+	return func(o *importOptions) {
+		// Copy: the caller's map must not be able to change under the import,
+		// and this value ends up in a persisted snapshot record.
+		cp := make(map[uint64]string, len(members))
+		for id, addr := range members {
+			cp[id] = addr
+		}
+		o.membership = cp
+		o.membershipSet = true
+	}
+}
+
+// importMembershipFor materialises the caller's options and resolves the
+// membership the imported snapshot should record.
+//
+// Split out of ImportSnapshot only to keep that function under the cyclomatic
+// limit; it sits at the threshold and this was the branch that tipped it.
+func importMembershipFor(
+	shardID, replicaID uint64,
+	artifact proto.Membership,
+	opts []ImportOption,
+) (proto.Membership, error) {
+	var iopts importOptions
+	for _, opt := range opts {
+		opt(&iopts)
+	}
+	return resolveImportMembership(shardID, replicaID, artifact, iopts)
+}
+
+// resolveImportMembership returns the membership the imported snapshot should
+// record: the artifact's own unless the caller overrode it.
+//
+// The override is validated hard. It is the one input to an import that can
+// silently destroy committed data, and every failure mode is an operator typo
+// away — an address left off, the local replica omitted, a stale map copied
+// from a runbook — so each is refused by name rather than resolved.
+func resolveImportMembership(
+	shardID, replicaID uint64,
+	artifact proto.Membership,
+	iopts importOptions,
+) (proto.Membership, error) {
+	if !iopts.membershipSet {
+		return artifact, nil
+	}
+	if len(iopts.membership) == 0 {
+		return proto.Membership{}, &ImportMembershipInvalidError{
+			ShardID: shardID, ReplicaID: replicaID,
+			Reason: "the membership is empty; a shard must have at least one voting member",
+		}
+	}
+	if len(iopts.membership) > raft.MaxVotingMembers {
+		return proto.Membership{}, &ImportMembershipInvalidError{
+			ShardID: shardID, ReplicaID: replicaID,
+			Reason: fmt.Sprintf("%d voting members exceeds the %d-member limit",
+				len(iopts.membership), raft.MaxVotingMembers),
+		}
+	}
+	if _, ok := iopts.membership[replicaID]; !ok {
+		return proto.Membership{}, &ImportMembershipInvalidError{
+			ShardID: shardID, ReplicaID: replicaID,
+			Reason: "the importing replica is not in the membership; it would " +
+				"restore the data and then be unable to participate in the shard",
+		}
+	}
+	for id, addr := range iopts.membership {
+		if id == 0 {
+			return proto.Membership{}, &ImportMembershipInvalidError{
+				ShardID: shardID, ReplicaID: replicaID,
+				Reason: "replica ID 0 is not a valid member",
+			}
+		}
+		if addr == "" {
+			return proto.Membership{}, &ImportMembershipInvalidError{
+				ShardID: shardID, ReplicaID: replicaID,
+				Reason: fmt.Sprintf("replica %d has an empty address; the "+
+					"survivors cannot reach each other", id),
+			}
+		}
+	}
+
+	// Policy travels with the shard, membership does not. ConfigChangeID is
+	// carried over so the recovered configuration is not ordered BEFORE the one
+	// the artifact recorded.
+	out := proto.Membership{
+		ConfigChangeID:             artifact.ConfigChangeID,
+		MaxWitnesses:               artifact.MaxWitnesses,
+		RequireFullReplicaMajority: artifact.RequireFullReplicaMajority,
+		Addresses:                  make(map[uint64]string, len(iopts.membership)),
+	}
+	for id, addr := range iopts.membership {
+		out.Addresses[id] = addr
+	}
+	out.SetSessionPolicy(artifact.SessionPolicy())
+
+	slog.Warn("quicraft: importing a snapshot with REWRITTEN membership; "+
+		"committed entries held only by the excluded replicas are discarded",
+		"shard", shardID,
+		"replica", replicaID,
+		"artifact_members", len(artifact.Addresses),
+		"new_members", len(out.Addresses),
+	)
+	return out, nil
 }
 
 // WithImportDataDir asserts that the shard will be started with this
@@ -6060,6 +6213,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// The header carries the original logical snapshot identity; the bytes
 	// that follow are the plaintext snapshot data.
 	header, err := readSnapshotArtifactHeader(r)
+	if err != nil {
+		return err
+	}
+
+	// Resolve the membership the shard will restart into BEFORE anything is
+	// staged. A rejected override is an operator typo in a disaster-recovery
+	// runbook, and the operator should learn that without first having a
+	// partially written snapshot tree to reason about.
+	recoveredMembership, err := importMembershipFor(shardID, replicaID, header.Membership, opts)
 	if err != nil {
 		return err
 	}
@@ -6283,10 +6445,13 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// before use", so this must reflect this host's own at-rest state, not
 	// the artifact's. term was floored above and is shared with the on-disk
 	// metadata so both descriptions of this snapshot agree.
+	// recoveredMembership was resolved before staging: the artifact's own,
+	// unless the operator is reconstituting a shard whose quorum is
+	// permanently lost.
 	logdbSnap := logdb.Snapshot{
 		Index:       header.Index,
 		Term:        term,
-		Membership:  protoMembershipToLogDB(header.Membership),
+		Membership:  protoMembershipToLogDB(recoveredMembership),
 		Filepath:    snapDir,
 		FileSize:    fileSize,
 		OnDiskIndex: header.OnDiskIndex,
