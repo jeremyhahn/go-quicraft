@@ -29,8 +29,12 @@ type Entry struct {
 	// Index is the log position of this entry.
 	Index uint64
 	// Type identifies the entry type and compression flag.
-	// Lower 4 bits: EntryNormal, EntryConfigChange, EntryEncodedEntry, or EntryMetadata.
+	// Lower 4 bits: EntryNormal, EntryConfigChange, EntryEncodedEntry,
+	// EntryMetadata, or EntryInitialMembership.
 	// Bit 4: EntryCompressFlag (Snappy compression).
+	// Bits 5 and above are RESERVED and must be zero: both MarshalTo and
+	// UnmarshalFrom refuse a value that sets any of them (see
+	// entryTypeReservedMask).
 	Type uint64
 	// Key is the client request key for deduplication.
 	Key uint64
@@ -81,6 +85,41 @@ type Entry struct {
 // (64 bytes) plus a 4-byte uint32 cmd length prefix.
 const entryHeaderSize = 8*8 + 4 // 68 bytes
 
+// entryTypeReservedMask covers every bit of Entry.Type that carries no meaning
+// in this format: everything outside the type enum (EntryTypeMask) and the
+// compression flag (EntryCompressFlag).
+//
+// They are REJECTED rather than masked away, at both ends. Masking would let a
+// sender attach 59 bits of its own to an entry and have this build silently
+// agree to a type it read as something else, which is the same trust-the-wire
+// mistake as accepting an unknown enum value — and it would do it while the
+// entry, bits and all, is committed to the raft log and replayed forever.
+// Rejecting also keeps Type byte-stable across a round trip, which the fuzz
+// round-trip targets assert and the log replay path depends on.
+const entryTypeReservedMask = ^(EntryTypeMask | EntryCompressFlag)
+
+// isValidEntryType reports whether t is an Entry.Type value this package will
+// both write and read back: a known entry type in the low four bits, the
+// compression flag optionally set, and nothing else.
+//
+// It is shared by MarshalTo and UnmarshalFrom deliberately. The two used to
+// disagree — the decoder checked the enum and the encoder checked nothing — so
+// the package could emit an entry it refused to parse, and an entry is the one
+// thing here that is committed to the raft log before anyone tries to read it
+// back.
+func isValidEntryType(t uint64) bool {
+	if t&entryTypeReservedMask != 0 {
+		return false
+	}
+	switch t & EntryTypeMask {
+	case EntryNormal, EntryConfigChange, EntryEncodedEntry, EntryMetadata,
+		EntryInitialMembership:
+		return true
+	default:
+		return false
+	}
+}
+
 // Size returns the total marshaled size of the entry in bytes.
 func (e *Entry) Size() int {
 	return entryHeaderSize + len(e.Cmd)
@@ -88,15 +127,24 @@ func (e *Entry) Size() int {
 
 // MarshalTo writes the entry into buf and returns the number of bytes
 // written. buf must be at least Size() bytes. Returns ErrBufferTooSmall
-// if buf is too short, or ErrEntrySizeLimitExceeded if Cmd exceeds
-// MaxEntrySize — the same bound UnmarshalFrom applies, mirrored here so the
-// encoder cannot emit an entry this package refuses to read back. Entry.Type is
-// deliberately NOT validated on write: the compression flag lives in the same
-// field and callers legitimately construct types the mask, not the enum,
-// defines.
+// if buf is too short, ErrEntrySizeLimitExceeded if Cmd exceeds MaxEntrySize,
+// or ErrInvalidEntryType if Type is one UnmarshalFrom would refuse — the read
+// side's bounds applied on write, so the encoder cannot emit an entry this
+// package refuses to read back.
+//
+// Type is validated too, and the objection that kept it unchecked here for so
+// long — the compression flag shares the field, so callers legitimately build
+// values the enum alone does not describe — is exactly what isValidEntryType
+// accounts for: the flag is admitted, the enum is checked under the mask, and
+// only the 59 bits that mean nothing are refused. An entry is committed to the
+// raft log before any peer parses it, so an encoder that emits a type its own
+// decoder rejects writes an entry every replica faults on forever.
 func (e *Entry) MarshalTo(buf []byte) (int, error) {
 	if uint64(len(e.Cmd)) > uint64(MaxEntrySize) {
 		return 0, ErrEntrySizeLimitExceeded
+	}
+	if !isValidEntryType(e.Type) {
+		return 0, ErrInvalidEntryType
 	}
 	required := e.Size()
 	if len(buf) < required {
@@ -142,11 +190,10 @@ func (e *Entry) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < total {
 		return 0, ErrBufferTooSmall
 	}
-	// Validate Entry.Type against known enum values (stripped of compression flag).
-	entryType := e.Type & EntryTypeMask
-	if entryType != EntryNormal && entryType != EntryConfigChange &&
-		entryType != EntryEncodedEntry && entryType != EntryMetadata &&
-		entryType != EntryInitialMembership {
+	// Validate Entry.Type: a known enum value under the mask, the compression
+	// flag at most, and no reserved bits. See entryTypeReservedMask for why the
+	// reserved bits are refused rather than masked off.
+	if !isValidEntryType(e.Type) {
 		return 0, ErrInvalidEntryType
 	}
 	if cmdLen > 0 {

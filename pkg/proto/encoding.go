@@ -28,12 +28,24 @@ const mapEntryMinBytes = 8 + 4
 // [key:8][value:8].
 const boolMapEntryBytes = 8 + 8
 
-// maxMapSizeHint bounds the capacity hint passed to make(map...) when the
-// entry count comes off the wire. The count is bounded by
-// MaxMembershipEntries and cross-checked against the remaining buffer, but
-// a hint is honoured before a single entry is parsed, so it is clamped
-// independently: memberships are small, and a larger map grows on demand.
-const maxMapSizeHint = 64
+// mapAllocBytesPerEntry is the measured upper bound on heap bytes one decoded
+// map entry costs, and it is what turns the per-entry WIRE minimums above into
+// the memory bound MaxDecodeMemoryFactor states.
+//
+// A Go map allocates its slots in groups of 8 and grows when a group set is
+// 7/8 full, so a map holding N entries owns between N*8/7 and N*16/7 slots
+// depending on where N falls against the power-of-two group count. One
+// map[uint64]string slot costs 1 control byte + 8 key bytes + 16 string-header
+// bytes = 25, putting the slot arrays alone at up to 25*16/7 ~= 57 bytes per
+// entry against the 12-byte wire minimum of mapEntryMinBytes; the map's own
+// header and table bookkeeping take the MEASURED worst case to ~62 (Go 1.26,
+// amd64), and the constant is rounded up from that.
+//
+// It is documentation and a test anchor, not a runtime check: nothing can
+// enforce the Go runtime's map layout from here. TestMapAllocBytesPerEntryIs-
+// AnUpperBound measures it and TestDecodeMemoryAmplification measures the ratio
+// it feeds, so a toolchain change that moves either one says so.
+const mapAllocBytesPerEntry = 64
 
 // putUint64 writes a uint64 value to buf in little-endian byte order.
 // buf must be at least 8 bytes.
@@ -90,18 +102,29 @@ func putBytes(buf []byte, data []byte) int {
 // errOverLimit is returned when the length prefix exceeds maxLen, so each
 // call site reports its own sentinel (ErrMetadataTooLong, ErrChunkDataTooLong,
 // ...) and errors.Is matching works per field.
+//
+// maxLen is ALWAYS applied. It used to be skipped when it was zero, which read
+// as "unlimited" — precisely backwards for a decoder, because the one way a
+// caller reaches that branch is by forgetting to pass its field's limit, and the
+// reward for forgetting was an unbounded length prefix taken straight off the
+// wire. A limit of zero now means what it says: only an empty payload is
+// admissible. No in-package caller passes zero.
 func getBytes(buf []byte, maxLen uint32, errOverLimit error) ([]byte, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
 	}
 	dataLen := binary.LittleEndian.Uint32(buf)
-	if maxLen > 0 && dataLen > maxLen {
-		return nil, 0, errOverLimit
-	}
-	// int is 32-bit on 32-bit platforms, where 4+int(dataLen) wraps negative
-	// and turns the bounds check below into a slice panic.
+	// Checked FIRST, before any narrowing conversion and before the limit
+	// comparison, matching getString: int is 32-bit on 32-bit platforms, where
+	// 4+int(dataLen) wraps negative and turns the bounds check below into a
+	// slice panic. Ordering it after the maxLen check would leave that wrap
+	// reachable for any caller whose own limit exceeds MaxInt32 — no caller
+	// does today, which is exactly why the guard must not depend on it.
 	if dataLen > math.MaxInt32 {
 		return nil, 0, ErrBufferTooSmall
+	}
+	if dataLen > maxLen {
+		return nil, 0, errOverLimit
 	}
 	total := 4 + int(dataLen)
 	if len(buf) < total {
@@ -127,6 +150,9 @@ func putString(buf []byte, s string) int {
 // returned when the length prefix exceeds maxLen, so each call site
 // reports its own sentinel (ErrAddressTooLong, ErrFilepathTooLong, ...)
 // and errors.Is matching works per field.
+//
+// maxLen is ALWAYS applied; a limit of zero admits only the empty string. See
+// getBytes for why a zero limit must not mean "unlimited".
 func getString(buf []byte, maxLen int, errOverLimit error) (string, int, error) {
 	if len(buf) < 4 {
 		return "", 0, ErrBufferTooSmall
@@ -138,7 +164,7 @@ func getString(buf []byte, maxLen int, errOverLimit error) (string, int, error) 
 	if strLen > math.MaxInt32 {
 		return "", 0, ErrBufferTooSmall
 	}
-	if maxLen > 0 && int(strLen) > maxLen {
+	if int(strLen) > maxLen {
 		return "", 0, errOverLimit
 	}
 	total := 4 + int(strLen)
@@ -201,6 +227,22 @@ func putMap(buf []byte, m map[uint64]string) int {
 // Returns the map, total bytes consumed, and any error. The count is
 // cross-checked against the remaining buffer before allocating, so a short
 // buffer with a large count cannot drive an oversized allocation.
+//
+// # The map is sized from the wire count, and that ALLOCATES LESS
+//
+// The capacity hint used to be clamped to 64, on the theory that a count off
+// the wire must never size an allocation. The cross-check below makes that
+// reasoning obsolete — a count that reaches the make() is one the caller
+// genuinely supplied bytes for — and the clamp was not conservative, it was
+// expensive: a map that starts at 64 slots and grows to N reallocates its whole
+// table at every doubling, so the decode touches roughly twice the memory the
+// final map occupies and every superseded table stays live until the next GC.
+//
+// Measured on a membership-dense frame (five string maps of 897 zero-length
+// entries), the clamped hint allocated 528 KB for a 54 KB frame: 9.8x against a
+// receive budget that charges the 54 KB. Sizing the map once brings the same
+// frame to 5.05x and drops the rehashing as a side effect. See
+// MaxDecodeMemoryFactor for the bound this buys and the test that holds it.
 func getMap(buf []byte) (map[uint64]string, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
@@ -213,7 +255,9 @@ func getMap(buf []byte) (map[uint64]string, int, error) {
 	if uint64(count)*mapEntryMinBytes > uint64(len(buf)-offset) {
 		return nil, 0, ErrBufferTooSmall
 	}
-	m := make(map[uint64]string, min(count, maxMapSizeHint))
+	// Sized exactly once, from a count the cross-check above has already proved
+	// the buffer can hold; see the doc comment.
+	m := make(map[uint64]string, count)
 	for i := uint32(0); i < count; i++ {
 		if len(buf) < offset+8+4 {
 			return nil, 0, ErrBufferTooSmall
@@ -313,7 +357,8 @@ func getBoolMap(buf []byte) (map[uint64]bool, int, error) {
 	if uint64(count)*boolMapEntryBytes > uint64(len(buf)-offset) {
 		return nil, 0, ErrBufferTooSmall
 	}
-	m := make(map[uint64]bool, min(count, maxMapSizeHint))
+	// Sized exactly once; see getMap.
+	m := make(map[uint64]bool, count)
 	for i := uint32(0); i < count; i++ {
 		if len(buf) < offset+16 {
 			return nil, 0, ErrBufferTooSmall

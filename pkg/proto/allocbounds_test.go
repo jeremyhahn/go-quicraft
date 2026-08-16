@@ -168,11 +168,13 @@ func TestGetBoolMap_CountExceedsBuffer(t *testing.T) {
 	}
 }
 
-// TestGetMap_SizeHintClamped asserts a large-but-satisfiable count does not
-// pre-size the map beyond maxMapSizeHint. Each entry is the 12-byte minimum
-// ([key:8][valueLen:4=0]), so the count passes the length cross-check while
-// the map still grows on demand rather than up front.
-func TestGetMap_SizeHintClamped(t *testing.T) {
+// TestGetMap_LargeSatisfiableCount asserts a large count the buffer genuinely
+// satisfies decodes in full. Each entry is the 12-byte minimum
+// ([key:8][valueLen:4=0]), so the count passes the length cross-check and every
+// entry is really there — this is the case the cross-check must NOT reject, and
+// the case getMap now sizes its map from in one allocation (see
+// TestGetMapSizesExactly).
+func TestGetMap_LargeSatisfiableCount(t *testing.T) {
 	const count = 4096
 	buf := make([]byte, 4+count*mapEntryMinBytes)
 	putUint32(buf, count)

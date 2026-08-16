@@ -36,9 +36,21 @@ func (b *Bootstrap) Size() int {
 }
 
 // MarshalTo writes the bootstrap into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf
-// is too short.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrTooManyMembershipEntries if Addresses holds more than
+// MaxMembershipEntries entries, or ErrAddressTooLong if any address exceeds
+// MaxAddressLength.
+//
+// The latter two are getMap's own limits applied on write, and Bootstrap was the
+// last putMap caller without them: it took the operator's members map verbatim
+// and emitted a section its own UnmarshalFrom refuses, which for a record
+// persisted to LogDB during shard initialization means a bootstrap that succeeds
+// once and is unreadable on every subsequent start. Membership.checkWritable
+// documents the same failure on the same shared decoder.
 func (b *Bootstrap) MarshalTo(buf []byte) (int, error) {
+	if err := checkWritableMap(b.Addresses); err != nil {
+		return 0, err
+	}
 	required := b.Size()
 	if len(buf) < required {
 		return 0, ErrBufferTooSmall

@@ -106,6 +106,15 @@ var (
 	// ErrInvalidSnapshotType is the sentinel for InvalidSnapshotTypeError.
 	// Use errors.Is to match.
 	ErrInvalidSnapshotType = errors.New("proto: invalid snapshot state machine type")
+
+	// ErrSnapshotWithoutPosition is returned by Message.MarshalTo when the
+	// embedded Snapshot carries content but has zero Index and zero Term.
+	// The message layout signals snapshot presence with Snapshot.IsEmpty,
+	// which asks only about the log position, so such a snapshot would encode
+	// as absent and be discarded whole. It is refused instead: a raft snapshot
+	// always covers a real log index, so the value is a construction bug at the
+	// sender rather than anything a peer should be asked to interpret.
+	ErrSnapshotWithoutPosition = errors.New("proto: snapshot has content but no log position")
 )
 
 // UnsupportedMembershipVersionError is returned when a persisted Membership

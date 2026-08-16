@@ -98,7 +98,7 @@ func TestPutGetBytes(t *testing.T) {
 	if n != 4+len(data) {
 		t.Fatalf("putBytes: wrote %d bytes, want %d", n, 4+len(data))
 	}
-	got, consumed, err := getBytes(buf, 0, ErrEntrySizeLimitExceeded)
+	got, consumed, err := getBytes(buf, MaxEntrySize, ErrEntrySizeLimitExceeded)
 	if err != nil {
 		t.Fatalf("getBytes: unexpected error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestPutGetBytesEmpty(t *testing.T) {
 	if n != 4 {
 		t.Fatalf("putBytes(nil): wrote %d bytes, want 4", n)
 	}
-	got, consumed, err := getBytes(buf, 0, ErrEntrySizeLimitExceeded)
+	got, consumed, err := getBytes(buf, MaxEntrySize, ErrEntrySizeLimitExceeded)
 	if err != nil {
 		t.Fatalf("getBytes: unexpected error: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestPutGetBytesEmpty(t *testing.T) {
 
 func TestGetBytesBufferTooSmall(t *testing.T) {
 	// Buffer too short for length prefix
-	_, _, err := getBytes([]byte{0, 0}, 0, ErrEntrySizeLimitExceeded)
+	_, _, err := getBytes([]byte{0, 0}, MaxEntrySize, ErrEntrySizeLimitExceeded)
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getBytes: got %v, want ErrBufferTooSmall", err)
 	}
@@ -139,7 +139,7 @@ func TestGetBytesBufferTooSmall(t *testing.T) {
 func TestGetBytesDataTruncated(t *testing.T) {
 	buf := make([]byte, 8)
 	putUint32(buf, 100) // claims 100 bytes but only 4 bytes of data follow
-	_, _, err := getBytes(buf, 0, ErrEntrySizeLimitExceeded)
+	_, _, err := getBytes(buf, MaxEntrySize, ErrEntrySizeLimitExceeded)
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getBytes: got %v, want ErrBufferTooSmall", err)
 	}
@@ -179,7 +179,7 @@ func TestPutGetStringEmpty(t *testing.T) {
 	if n != 4 {
 		t.Fatalf("putString: wrote %d, want 4", n)
 	}
-	got, consumed, err := getString(buf, 0, ErrAddressTooLong)
+	got, consumed, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
 	if err != nil {
 		t.Fatalf("getString: unexpected error: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestPutGetStringEmpty(t *testing.T) {
 }
 
 func TestGetStringBufferTooSmall(t *testing.T) {
-	_, _, err := getString([]byte{0, 0}, 0, ErrAddressTooLong)
+	_, _, err := getString([]byte{0, 0}, MaxAddressLength, ErrAddressTooLong)
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getString: got %v, want ErrBufferTooSmall", err)
 	}
@@ -210,7 +210,7 @@ func TestGetStringTooLong(t *testing.T) {
 func TestGetStringDataTruncated(t *testing.T) {
 	buf := make([]byte, 8)
 	putUint32(buf, 100) // claims 100 bytes but only 4 bytes follow
-	_, _, err := getString(buf, 0, ErrAddressTooLong)
+	_, _, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getString: got %v, want ErrBufferTooSmall", err)
 	}

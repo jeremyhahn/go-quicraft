@@ -499,6 +499,21 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	return offset, nil
 }
 
+// isZero reports whether the membership carries nothing: no configuration
+// change id, no policy, and not one entry in any of the six maps. It is the
+// predicate a Reset (or a never-populated) value satisfies, and it is what lets
+// Snapshot tell "no membership" apart from "an empty one", without exporting a
+// notion of emptiness this type has no other use for.
+func (m *Membership) isZero() bool {
+	return m.ConfigChangeID == 0 && m.MaxWitnesses == 0 &&
+		!m.RequireFullReplicaMajority && m.SessionExpiryEntries == 0 &&
+		m.MaxTotalSessions == 0 && m.MaxSessionsPerClient == 0 &&
+		m.MaxSessionsPerOwner == 0 &&
+		len(m.Addresses) == 0 && len(m.Observers) == 0 && len(m.Witnesses) == 0 &&
+		len(m.Removed) == 0 && len(m.Identities) == 0 &&
+		len(m.RemovedIdentities) == 0
+}
+
 // Reset clears all fields for reuse.
 func (m *Membership) Reset() {
 	m.ConfigChangeID = 0

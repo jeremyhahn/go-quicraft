@@ -136,6 +136,34 @@ const MaxEntrySize uint32 = 8 * 1024 * 1024 // 8MB
 // comparison against int offsets without truncation on 64-bit platforms.
 const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 
+// MaxDecodeMemoryFactor is the maximum heap memory one decode may allocate,
+// expressed as a multiple of the frame's WIRE length. A receiver that admits an
+// N-byte frame must expect to hold up to N*MaxDecodeMemoryFactor bytes while it
+// processes the decoded value.
+//
+// It exists because a wire-byte budget is not a memory budget. The decoded form
+// of a frame is materially larger than the frame: a 100-byte heartbeat becomes a
+// 320-byte Message in a slice, and a membership map entry costs 12 bytes on the
+// wire and about 57 in a Go map (see mapAllocBytesPerEntry). The
+// transport reserves the FRAME LENGTH against its aggregate
+// message-receive budget (MaxMessageReceiveMemory) before reading the body, so
+// without a stated ratio that budget describes bytes read rather than bytes
+// held, and an operator sizing it has no way to know the difference. A frame
+// admitted under a 256 MB budget can occupy up to 2 GB of heap; the reservation
+// has to be multiplied by this factor for the budget to mean what its name says.
+//
+// The bound is MEASURED, not derived — TestDecodeMemoryAmplification builds the
+// densest frames this format admits and fails if any exceeds it — and the
+// measured worst case is 5.1x, on a batch of small messages each carrying a
+// snapshot whose membership maps hold a single entry (a one-entry Go map owns a
+// whole 8-slot group). The constant carries headroom above that because the
+// dominant term is the Go runtime's map layout, which this package does not
+// control and cannot assert at compile time. It is not headroom for adding
+// allocations: 8 was already exceeded once, by a decoder that clamped its map
+// size hint and paid for the growth (9.8x), which is the regression the test
+// catches.
+const MaxDecodeMemoryFactor = 8
+
 // MaxAddressLength is the maximum byte length of a node address string
 // in membership changes and config change proposals. Enforced during
 // UnmarshalFrom to prevent unbounded allocation from crafted payloads.

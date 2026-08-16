@@ -187,8 +187,27 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 
 // IsEmpty returns true if the snapshot has no meaningful content
 // (zero Index and zero Term).
+//
+// The log POSITION is the whole test, and that is a deliberate semantic the rest
+// of the engine depends on: a snapshot is identified by the (Index, Term) it
+// covers, and one that covers nothing is not a snapshot regardless of what else
+// happens to be filled in. Message.MarshalTo uses it as the presence flag for
+// the embedded snapshot, so it also decides whether those other fields cross the
+// wire at all — see hasContentBeyondPosition, which exists so that combination
+// is refused rather than silently dropped.
 func (s *Snapshot) IsEmpty() bool {
 	return s.Index == 0 && s.Term == 0
+}
+
+// hasContentBeyondPosition reports whether any field other than Index and Term
+// is populated. Together with IsEmpty it identifies the one contradictory shape
+// this type can hold: content with no log position, which the containing
+// Message cannot encode and would otherwise discard in silence.
+func (s *Snapshot) hasContentBeyondPosition() bool {
+	return s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
+		s.FileSize != 0 || s.Type != 0 || s.Imported ||
+		s.OnDiskIndex != 0 || s.Witness || s.Epoch != 0 ||
+		!s.Membership.isZero()
 }
 
 // Reset clears all fields for reuse.

@@ -16,6 +16,7 @@ package proto
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -491,30 +492,97 @@ func TestMessageBatchUnmarshalFromBatchSizeBoundary(t *testing.T) {
 	}
 }
 
-func TestMessageBatchUint32OffsetTruncationFixed(t *testing.T) {
-	// This test documents the H9 security fix. Previously, the batch size
-	// check used uint32(offset) > MaxBatchSize, which silently truncated
-	// offsets larger than math.MaxUint32 (4GB). An attacker could craft a
-	// batch that wraps the uint32 offset, bypassing the size limit.
-	//
-	// We cannot allocate a 4GB+ buffer in a unit test, so we verify the
-	// fix algebraically: confirm that the uint64 comparison used in the
-	// fixed code correctly catches values that uint32 would truncate.
-	//
-	// Example: offset = 0x1_0000_0001 (4GB + 1)
-	//   uint32(offset) = 1          -> passes old check (1 <= 64MB)
-	//   uint64(offset) = 0x100000001 -> fails new check (4GB > 64MB)
-	offset := int(1<<32 + 1) // 4GB + 1
+// TestExceedsMaxBatchSizeDoesNotTruncate drives the PRODUCTION comparison at an
+// offset UnmarshalFrom cannot be driven to.
+//
+// It replaces a test that asserted uint32(1<<32+1) == 1 and
+// uint64(1<<32+1) > MaxBatchSize. Both are facts about Go's arithmetic, true no
+// matter what this package does, so that test passed identically against the
+// vulnerable code and against the fix — it could not fail. The H9 defect is a
+// truncating cast inside the decoder's cumulative-size gate, and reaching it
+// through UnmarshalFrom needs a 4 GB frame no test can allocate; calling the
+// gate directly is what makes it testable at all.
+func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
+	if math.MaxInt < math.MaxInt64 {
+		t.Skip("int is 32-bit on this platform; an offset past 4 GB is unrepresentable")
+	}
+	// Written through a variable so the shift is not a constant expression,
+	// which would fail to compile on a 32-bit platform before the skip runs.
+	one := 1
+	fourGB := one << 32
 
-	// Old code (vulnerable): uint32(offset) wraps to 1
-	truncated := uint32(offset)
-	if truncated > uint32(MaxBatchSize) {
-		t.Fatal("uint32 truncation unexpectedly caught the overflow - test premise invalid")
+	for _, tc := range []struct {
+		name   string
+		offset int
+		want   bool
+	}{
+		{"empty", 0, false},
+		{"just under the limit", int(MaxBatchSize) - 1, false},
+		{"exactly the limit", int(MaxBatchSize), false},
+		{"one byte over", int(MaxBatchSize) + 1, true},
+		// The H9 case. uint32(4GB+1) is 1, which is under MaxBatchSize, so a
+		// decoder that narrows the offset waves this through and keeps parsing.
+		{"4GB+1 truncates to 1 under a uint32 cast", fourGB + 1, true},
+		{"4GB+64MB truncates to 64MB under a uint32 cast", fourGB + int(MaxBatchSize), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exceedsMaxBatchSize(tc.offset); got != tc.want {
+				t.Fatalf("exceedsMaxBatchSize(%d) = %v, want %v; an offset of %d "+
+					"narrows to %d as a uint32, which is how a batch decodes past "+
+					"MaxBatchSize without the gate noticing",
+					tc.offset, got, tc.want, tc.offset, uint32(tc.offset))
+			}
+		})
+	}
+}
+
+// TestMessageBatchUnmarshalEnforcesMaxBatchSize is the call-site half: the gate
+// above is only worth having if the decoder actually consults it. This drives a
+// real frame past MaxBatchSize, which costs a 64 MB buffer and is the smallest
+// input that reaches the check.
+//
+// It cannot catch the truncating cast (a 64 MB offset does not overflow a
+// uint32) and does not try to; it catches the gate being removed, weakened, or
+// moved out of the request loop.
+func TestMessageBatchUnmarshalEnforcesMaxBatchSize(t *testing.T) {
+	// One message carrying one maximum-size entry. Cmd bytes are left zero:
+	// the decoder aliases them, so the frame is the only large allocation.
+	const msgSize = messageFixedSize + 4 + entryHeaderSize + int(MaxEntrySize) + 8
+	// Enough messages to carry the cumulative offset past the limit.
+	count := int(MaxBatchSize)/msgSize + 1
+	headerSize := messageBatchFixedSize + 4 + 4
+
+	buf := make([]byte, headerSize+count*msgSize)
+	putUint64(buf[0:], WireVersion)
+	putUint32(buf[messageBatchFixedSize:], 0) // SourceAddress length
+	putUint32(buf[messageBatchFixedSize+4:], uint32(count))
+	for i := 0; i < count; i++ {
+		off := headerSize + i*msgSize
+		putUint64(buf[off:], Replicate)
+		putUint32(buf[off+messageFixedSize:], 1) // one entry
+		entry := off + messageFixedSize + 4
+		putUint64(buf[entry:], 1)   // Term
+		putUint64(buf[entry+8:], 1) // Index
+		putUint64(buf[entry+16:], EntryNormal)
+		putUint32(buf[entry+64:], MaxEntrySize)
+		// HasSnapshot is already zero.
 	}
 
-	// New code (fixed): uint64(offset) preserves full value
-	if uint64(offset) <= MaxBatchSize {
-		t.Fatal("uint64 comparison failed to detect offset exceeding MaxBatchSize")
+	var mb MessageBatch
+	if _, err := mb.UnmarshalFrom(buf); !errors.Is(err, ErrBatchSizeLimitExceeded) {
+		t.Fatalf("UnmarshalFrom(%d-byte batch, limit %d): got %v, want "+
+			"ErrBatchSizeLimitExceeded", len(buf), MaxBatchSize, err)
+	}
+
+	// Control: the same bytes one message short must decode cleanly, so the
+	// test above is failing on the limit and not on the frame's shape.
+	putUint32(buf[messageBatchFixedSize+4:], uint32(count-1))
+	var ok MessageBatch
+	if _, err := ok.UnmarshalFrom(buf[:headerSize+(count-1)*msgSize]); err != nil {
+		t.Fatalf("UnmarshalFrom(batch just under the limit): %v", err)
+	}
+	if len(ok.Requests) != count-1 {
+		t.Fatalf("Requests = %d, want %d", len(ok.Requests), count-1)
 	}
 }
 

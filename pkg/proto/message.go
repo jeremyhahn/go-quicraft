@@ -119,14 +119,36 @@ func (m *Message) Size() int {
 
 // MarshalTo writes the message into buf and returns bytes written.
 // buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
-// short, or ErrTooManyMessages if Entries exceeds MaxEntriesPerMessage — the
-// read side's bound applied on write, so a producer learns at the SENDER that
-// its message is unparseable instead of having every peer silently reject the
-// frame (a rejection the sender cannot tell from a broken connection; see
+// short, ErrTooManyMessages if Entries exceeds MaxEntriesPerMessage, or
+// ErrInvalidMessageType if Type is outside the range UnmarshalFrom accepts —
+// the read side's bounds applied on write, so a producer learns at the SENDER
+// that its message is unparseable instead of having every peer silently reject
+// the frame (a rejection the sender cannot tell from a broken connection; see
 // MaxEntriesPerMessage).
+//
+// It also returns ErrSnapshotWithoutPosition rather than silently dropping a
+// snapshot the layout cannot express; see Snapshot.hasContentBeyondPosition.
 func (m *Message) MarshalTo(buf []byte) (int, error) {
 	if len(m.Entries) > MaxEntriesPerMessage {
 		return 0, ErrTooManyMessages
+	}
+	// The same range gate UnmarshalFrom applies. Message.Type selects the
+	// handler on the receiving side, so a value outside the enum is not a
+	// cosmetic mismatch: the frame is refused wholesale and the sender sees a
+	// dead connection.
+	if m.Type > RateLimit {
+		return 0, ErrInvalidMessageType
+	}
+	// The snapshot presence flag is derived from Snapshot.IsEmpty, which asks
+	// only about Index and Term. A snapshot carrying a filepath, a membership
+	// and a size but no log position therefore encodes as ABSENT, and every
+	// field of it is discarded with no error — the receiver gets an
+	// InstallSnapshot with nothing in it. Refuse instead: no position is not a
+	// state any producer here can legitimately reach (a raft snapshot always
+	// covers at least index 1), so the value is a construction bug, and the one
+	// outcome that must not happen is losing it quietly.
+	if m.Snapshot.IsEmpty() && m.Snapshot.hasContentBeyondPosition() {
+		return 0, ErrSnapshotWithoutPosition
 	}
 	required := m.Size()
 	if len(buf) < required {
