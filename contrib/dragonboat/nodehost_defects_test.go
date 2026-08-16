@@ -558,7 +558,16 @@ func TestNodeHost_NotLeaderSurfacesAsShardNotReady(t *testing.T) {
 	session := nh.GetNoOPSession(7)
 	_, err := nh.Propose(session, []byte("cmd"), time.Second)
 	if err == nil {
-		t.Skip("proposal accepted; leaderless path not exercised")
+		// This used to be a t.Skip, which disarmed the whole test: the ONE
+		// outcome that makes the three assertions below unreachable was
+		// treated as a reason not to run them, so the H4 regression was
+		// covered only for as long as nothing else broke first. And the
+		// skipped outcome is not a benign "path not exercised" -- replica 2
+		// was started with join=true, so it is in no committed configuration
+		// and has no leader. A proposal it ACCEPTS is a raft safety defect on
+		// its own, well before anything about the error mapping matters.
+		t.Fatal("Propose succeeded on a joining, leaderless replica: a replica " +
+			"in no committed configuration must never accept a proposal")
 	}
 	if errors.Is(err, ErrNotLeader) {
 		t.Fatalf("Propose returned ErrNotLeader, an error dragonboat never returns: %v", err)

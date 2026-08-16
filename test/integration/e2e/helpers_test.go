@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -146,6 +147,147 @@ func assertApplyOrder(t *testing.T) {
 		t.Errorf("state machine apply-order violations (%d total):\n  %s",
 			len(found), strings.Join(shown, "\n  "))
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Engine Failure Detection
+// ---------------------------------------------------------------------------
+
+// engineFailures is the sink for engine-side faults observed while a test
+// runs: a failed shard reported through EventListener.OnShardFailed, and a
+// worker-goroutine panic that the engine's recover-and-restart loop absorbed.
+//
+// Neither reaches the test goroutine on its own. A failed shard is a callback
+// on an engine worker, and a worker panic is recovered, logged and restarted
+// by design so one bad shard cannot take the host down. That is right for a
+// library and wrong for a test: the shard the test was driving is dead or
+// wedged, so every wait the test is sitting in runs to its full timeout, then
+// the test itself runs to `panic: test timed out` -- around thirty minutes of
+// CI, with the actual panic scrolled far above the failure and no shard named
+// at the point of failure.
+//
+// So the fault is parked here by whichever goroutine sees it, and the polling
+// helpers below check the sink on every tick and fail on the TEST goroutine,
+// where t.Fatal is legal. This is the same trade the apply-order sink above
+// makes and for the same reason: the reporting goroutine has no *testing.T.
+//
+// The fix deliberately lives here and not in the engine. Restart-on-panic is
+// the engine's chosen production behaviour and is covered by its own unit
+// tests; a test harness that cannot see the restart is a harness defect.
+var engineFailures struct {
+	mu    sync.Mutex
+	first string
+	// armedBy is the test the sink currently belongs to, so arming twice for
+	// one test does not discard a fault already recorded for it.
+	armedBy *testing.T
+}
+
+// recordEngineFailure parks the FIRST engine fault of a test. Later faults are
+// dropped: a wedged shard cascades (the restarted worker panics again on the
+// same state, the shard fails, its peers report connection failures), and the
+// first one is the one that explains the rest.
+func recordEngineFailure(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	engineFailures.mu.Lock()
+	if engineFailures.first == "" {
+		engineFailures.first = msg
+	}
+	engineFailures.mu.Unlock()
+}
+
+// armEngineFailureDetector binds the engine-failure sink to t and routes the
+// engine's own slog output through a watcher for the duration of the test. It
+// is idempotent for a given t.
+//
+// Watching the log output is what catches a worker panic. The panic is
+// recovered inside the engine and never becomes an error any Host API returns;
+// the only evidence that escapes the process is the Error-level "… panic
+// recovered …" record carrying the panic value and its stack. An invariant
+// violation (invariant.Assert) is exactly this shape: it panics on an engine
+// worker, the worker restarts, and nothing else in the process changes.
+//
+// The interception is on log.SetOutput rather than slog.SetDefault, which is
+// NOT a stylistic choice. The engine logs through the package-level slog
+// functions, and the default slog handler formats through the standard log
+// package. Installing a wrapper via slog.SetDefault ALSO redirects the log
+// package into that same wrapper (slog.SetDefault does both), so a record
+// forwarded to the original default handler re-enters the wrapper from
+// underneath while log's mutex is held, and the first engine panic deadlocks
+// the whole binary on it — a self-inflicted version of the hang this detector
+// exists to prevent. Tapping the writer sits below all of that: log holds its
+// mutex across the Write, the tap only appends to its own buffer, and nothing
+// re-enters log.
+func armEngineFailureDetector(t *testing.T) {
+	t.Helper()
+
+	engineFailures.mu.Lock()
+	if engineFailures.armedBy == t {
+		engineFailures.mu.Unlock()
+		return
+	}
+	engineFailures.armedBy = t
+	engineFailures.first = ""
+	engineFailures.mu.Unlock()
+
+	prev := log.Writer()
+	log.SetOutput(&panicWatchWriter{inner: prev})
+	t.Cleanup(func() {
+		log.SetOutput(prev)
+		engineFailures.mu.Lock()
+		engineFailures.first = ""
+		engineFailures.armedBy = nil
+		engineFailures.mu.Unlock()
+	})
+}
+
+// panicWatchWriter passes every log line through untouched and, in addition,
+// parks the ones reporting a recovered panic. Every recover-and-continue site
+// in the engine and the host words it "… panic recovered …" — step, commit and
+// apply workers, the apply dispatcher, the snapshot worker, the event-listener
+// dispatch and the state machine — and no healthy integration run emits one.
+type panicWatchWriter struct {
+	inner io.Writer
+}
+
+func (w *panicWatchWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("panic recovered")) {
+		recordEngineFailure("engine absorbed a panic and restarted the worker\n    %s",
+			trimPanicLogLine(string(p)))
+	}
+	return w.inner.Write(p)
+}
+
+// trimPanicLogLine cuts the recovered panic's log line down to the part that
+// names the fault. The record carries the whole stack as one quoted attribute,
+// which is thousands of characters of one line and unreadable inside a test
+// failure; the full text is still in the log the writer forwarded, so what
+// belongs in the failure message is the message, the worker and the panic
+// value that precede it.
+func trimPanicLogLine(line string) string {
+	line = strings.TrimRight(line, "\n")
+	if i := strings.Index(line, " stack="); i >= 0 {
+		line = line[:i] + " (stack in the log line above)"
+	}
+	return line
+}
+
+// failFastOnEngineFailure fails the running test if the engine reported a
+// failed shard or absorbed a worker panic. Every polling helper in this file
+// calls it on each tick, so a fault that would otherwise be waited out for the
+// full timeout -- and then for the whole test binary's timeout -- surfaces
+// within one poll interval, quoting the original panic and naming the shard
+// whenever the engine named one (OnShardFailed does; a worker panic identifies
+// the worker, since a step worker owns a partition rather than one shard).
+func failFastOnEngineFailure(t *testing.T) {
+	t.Helper()
+	engineFailures.mu.Lock()
+	first := engineFailures.first
+	engineFailures.mu.Unlock()
+	if first == "" {
+		return
+	}
+	t.Fatalf("aborting: the engine failed under this test, so no further "+
+		"progress is possible and waiting can only burn the timeout\n  %s", first)
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +711,19 @@ func testMTLSConfig(t *testing.T) *config.MTLSConfig {
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
 	assertApplyOrder(t)
+	armEngineFailureDetector(t)
 	return config.HostConfig{
+		// OnShardFailed is the engine's only outward report that a shard is
+		// finished: after it fires, that replica makes no further progress
+		// without an operator StopShard/StartShard. A test waiting on the
+		// shard therefore cannot succeed, and every wait it is in should
+		// abort now rather than run out its timeout. See engineFailures.
+		EventListener: &config.EventListener{
+			OnShardFailed: func(info config.ShardFailedInfo) {
+				recordEngineFailure("shard %d replica %d failed: %v",
+					info.ShardID, info.ReplicaID, info.Err)
+			},
+		},
 		WALDir:                t.TempDir(),
 		NodeHostDir:           t.TempDir(),
 		RaftAddress:           listenAddr,
@@ -845,6 +999,7 @@ func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		failFastOnEngineFailure(c.t)
 		idx := c.findLeader(shardID)
 		if idx >= 0 {
 			return idx
@@ -989,6 +1144,7 @@ func waitForSingleLeader(t *testing.T, cluster *testCluster, shardID uint64, tim
 
 	var last []leaderObservation
 	for {
+		failFastOnEngineFailure(t)
 		last = cluster.observeLeaders(shardID)
 		if violation := splitBrain(last); violation != "" {
 			t.Fatalf("election safety violated on shard %d: %s", shardID, violation)
@@ -1019,6 +1175,7 @@ func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		failFastOnEngineFailure(t)
 		leaderID, known, err := h.GetLeaderID(shardID)
 		if err == nil && known && leaderID > 0 {
 			return
@@ -1041,6 +1198,7 @@ func waitForApplied(t *testing.T, h *quicraft.Host, shardID, targetIndex uint64,
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		failFastOnEngineFailure(t)
 		info, err := h.GetShardInfo(shardID)
 		if err == nil && info.LastApplied >= targetIndex {
 			return
@@ -1069,6 +1227,7 @@ func waitForConditionDiag(
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		failFastOnEngineFailure(t)
 		if predicate() {
 			return
 		}
@@ -1088,6 +1247,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
+		failFastOnEngineFailure(t)
 		if predicate() {
 			return
 		}
