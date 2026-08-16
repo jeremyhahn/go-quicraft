@@ -380,7 +380,7 @@ If `crypto/rand.Read` fails (entropy exhaustion), encryption returns an error ra
 Random 96-bit nonces make nonce collision — not a repeated counter — the safety concern, so the barrier bounds invocations per DEK:
 
 - **NIST SP 800-38D invocation cap.** `InvocationCounter` counts `Encrypt` calls per epoch and returns `ErrInvocationLimitExceeded` once the limit (`DefaultInvocationLimit` = 2^32 for random 96-bit nonces) would be exceeded, failing closed until the key is rotated. This is a hard collision-safety bound, not advisory; `Unseal` seeds it pessimistically after a restart (see the StatePersister section).
-- **Nonce-reuse tracker.** When enabled, every generated nonce is recorded and a repeat is rejected outright (see below).
+- **Nonce-reuse tracker.** When enabled, the first `DefaultMaxTrackedNonces` (4Mi) nonces of an epoch are recorded and a repeat of any of them is rejected outright. That is **0.0977% of the 2^32 invocation budget**, not the whole of it — the tracker is a bounded-memory backstop against a defective RNG, not a proof of uniqueness across an epoch. Past the ceiling it *saturates*: it stops admitting new nonces, so memory stays flat, and keeps rejecting repeats within the retained prefix. See below.
 
 Because a rotated epoch derives a fresh DEK that has never been used with any nonce, the `(DEK, nonce)` pair is unique across epochs even if a random nonce were ever to repeat within the 2^32 budget.
 
@@ -397,8 +397,26 @@ XChaCha20-Poly1305 nonces that share a common 12-byte prefix are tracked
 exactly and are never falsely rejected as reuse, while genuine reuse of an
 identical nonce is always detected. `Clear()` (called by `Rotate`) swaps in a
 fresh map via an atomic pointer swap, avoiding a TOCTOU race with concurrent
-`CheckAndRecordNonce` calls. Memory grows linearly with encrypt operations
-per epoch, so plan key rotation to bound it.
+`CheckAndRecordNonce` calls.
+
+**Coverage is a bounded prefix, not the epoch.** Memory does **not** grow
+without limit: the tracker admits at most `DefaultMaxTrackedNonces` (4Mi)
+nonces per epoch and then saturates. A saturated tracker still rejects a repeat
+of any nonce it retained, and `Saturated()` and `Count()` report that state
+honestly — it does not disable itself or report zero. Detection therefore
+covers the first 0.0977% of an epoch's 2^32 permitted invocations. Collision
+safety across the remainder rests on the invocation cap plus random 96-bit
+nonces, which is the NIST SP 800-38D argument; the tracker is a backstop
+against a defective RNG, not the primary guarantee.
+
+**Single-writer ownership of the sealed blob is an embedder obligation.** Every
+DEK input is a function of the blob and the forced unseal rotation is
+`epoch+1`, so two barrier instances loaded from the *same* blob derive the
+*same* DEK, each with a zeroed invocation counter and an empty tracker. Neither
+would observe the other's nonces, and the per-key invocation budget is counted
+twice. `MinEpoch` does not guard this (no rollback is involved) and `StateMAC`
+does not either (both copies are authentic). Exactly one process must own a
+sealed blob at a time.
 
 ### Methods
 
@@ -406,7 +424,7 @@ per epoch, so plan key rotation to bound it.
 ```go
 func (b *Barrier) Encrypt(dst, plaintext []byte) ([]byte, error)
 ```
-Output: `[Epoch:8 | Nonce:12 | EncryptedData | Tag:16]`
+Output: `[Epoch:8 | algID:1 | Nonce:12 | EncryptedData | Tag:16]`
 
 **EncryptWithEpoch:**
 ```go
@@ -570,7 +588,7 @@ The `encryptSnapshotFile` function encrypts a plaintext snapshot data file in-pl
 1. Read entire plaintext file into memory
 2. Create temporary file (.encrypt-*.tmp) in same directory
 3. For each 64KB chunk of plaintext:
-   a. barrier.Encrypt(nil, chunk) → [Epoch:8 | Nonce:12 | Ciphertext | Tag:16]
+   a. barrier.Encrypt(nil, chunk) → [Epoch:8 | algID:1 | Nonce:12 | Ciphertext | Tag:16]
    b. Write frame: [ChunkLen:4 (little-endian) | EncryptedChunk]
 4. fsync the temporary file
 5. Atomic rename: temp file → original path
@@ -1230,7 +1248,7 @@ Client Proposal
   → Step worker processes proposal → raft appends to log
   → LogDB.SaveState(updates) via waldb
   → waldb.segment.Write(data)
-  → barrier.Encrypt(plaintext) → [Epoch:8 | Nonce:12 | Ciphertext | Tag:16]
+  → barrier.Encrypt(plaintext) → [Epoch:8 | algID:1 | Nonce:12 | Ciphertext | Tag:16]
   → Written to segment with [CRC32 | Length | Type | encrypted payload]
   → segment.Sync() → fsync to disk
 ```
