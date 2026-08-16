@@ -35,9 +35,22 @@ const (
 	// Uses Host.Propose() + RequestState.CommittedC().
 	WALDurable
 
-	// Batched collects writes and proposes as a single Raft entry.
-	// Same durability as Sync but amortized cost (~0.1-0.3ms per op).
-	// Uses batch.Aggregator.Submit().
+	// Batched collects writes and proposes them as a single Raft entry.
+	// Amortized cost (~0.1-0.3ms per op), and the same QUORUM durability as
+	// Sync once the batch commits.
+	//
+	// DELIVERY IS AT-LEAST-ONCE, NOT at-most-once. The aggregator proposes a
+	// raw encoded batch with NO client session (batch.Proposer has no session
+	// parameter), so nothing deduplicates a retry. A flush that fails with
+	// batch.FlushError.Indeterminate may nonetheless have committed, and
+	// retrying re-applies every command in that batch — up to MaxBatchSize
+	// commands from mutually unaware callers.
+	//
+	// A batched proposal also cannot report a per-item apply failure: the
+	// aggregate result is fanned out to every co-batched caller, so a command
+	// the state machine REJECTED is reported to its submitter as successful.
+	//
+	// Use Sync with a client session for any operation that is not idempotent.
 	Batched
 )
 

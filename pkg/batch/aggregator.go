@@ -373,7 +373,17 @@ func (a *Aggregator) awaitResult(ctx context.Context, p *proposal) error {
 		case err := <-p.resultCh:
 			return err
 		default:
-			return ctx.Err()
+			// INDETERMINATE, and it must say so. The proposal is already in
+			// currentBatch: rejectAbandoned drops it only if the flush has not
+			// yet passed that filter, so from here the outcome is genuinely
+			// unknown — the batch may still be encoded and replicated.
+			//
+			// A bare context.DeadlineExceeded reads, to every Go idiom, as
+			// "this did not happen", and a caller that retries on it
+			// duplicates a command that did. The rarer proposer-side timeout
+			// in flushShard is already marked indeterminate; the COMMON
+			// caller-side one carried less information than the rare one.
+			return &FlushError{ShardID: p.shardID, Err: ctx.Err(), Indeterminate: true}
 		}
 	case <-a.closeChan:
 		// Close raced with this submission. If the proposal was enqueued

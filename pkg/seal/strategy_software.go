@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
@@ -151,9 +152,38 @@ func NewDeferredSoftwareStrategy() *SoftwareStrategy {
 }
 
 // newSoftwareStrategy is the shared constructor for all SoftwareStrategy variants.
+// minRecommendedPassphraseLen is the length below which a passphrase is
+// reported as weak. 12 bytes is the NIST SP 800-63B minimum for a memorized
+// secret with no composition rules.
+//
+// It is a RECOMMENDATION, not a floor: see newSoftwareStrategy for why this
+// warns rather than refuses.
+const minRecommendedPassphraseLen = 12
+
 func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams) (*SoftwareStrategy, error) {
 	if len(passphrase) == 0 {
 		return nil, ErrInvalidPassphrase
+	}
+	// The KDF work-factor floors (kdf.go) are enforced precisely because "the
+	// sealed root key protects all data at rest and is a high-value OFFLINE
+	// attack target". That argument has two halves and only one was enforced:
+	// a work factor multiplies the per-guess cost, it cannot make a small
+	// guess space large. At Argon2id t=4/m=128MiB a single-character, PIN, or
+	// top-1000 password space still falls in minutes on one machine, and the
+	// recovered root key yields every epoch DEK.
+	//
+	// This WARNS rather than refuses. Rejecting a short passphrase would fire
+	// at Unseal as well as Seal, so it would lock existing deployments out of
+	// their own data — a policy decision for the operator, not one this
+	// constructor should make silently. Making the weakness loud is the part
+	// that is unambiguously right.
+	if len(passphrase) < minRecommendedPassphraseLen && !allowWeakKDFParams.Load() {
+		slog.Warn("quicraft/seal: passphrase is shorter than the recommended minimum; "+
+			"the KDF work factor cannot compensate for a small guess space, and "+
+			"the sealed root key is an offline attack target",
+			"length", len(passphrase),
+			"recommended_minimum", minRecommendedPassphraseLen,
+		)
 	}
 	if _, ok := kdfDispatchers[version]; !ok {
 		return nil, ErrKDFUnsupportedVersion

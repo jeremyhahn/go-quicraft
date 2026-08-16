@@ -850,6 +850,27 @@ func (b *Barrier) resolveInvocationBudget() {
 				"epoch", newEpoch,
 				"limit", limit,
 			)
+			// This forced rotation is what grows KnownEpochs by one PER
+			// RESTART, and SetSealedRootKey refuses to load a blob naming more
+			// than MaxKnownEpochs. Nothing in this package reconciles the two:
+			// the bound exists as a DoS guard against a forged blob, and it
+			// also caps the barrier's own legitimate growth.
+			//
+			// An embedder that has not wired up PurgeEpochsBefore — or one in
+			// a crash loop, which reaches 4096 in minutes rather than years —
+			// therefore walks into a node that cannot start at all, with data
+			// that needs bespoke tooling to recover (unwrap the root key, trim
+			// KnownEpochs, re-stamp the MAC). Warn while there is still room
+			// to act rather than at the point of failure.
+			if len(b.knownEpochs) > MaxKnownEpochs/2 {
+				slog.Error("quicraft/seal: the known-epoch set is approaching the "+
+					"load-time bound; a blob naming more than MaxKnownEpochs epochs "+
+					"CANNOT BE LOADED, and every restart adds one",
+					"known_epochs", len(b.knownEpochs),
+					"limit", MaxKnownEpochs,
+					"remedy", "call PurgeEpochsBefore with the minimum live epoch on a retention schedule",
+				)
+			}
 			return
 		}
 		slog.Error("AEAD invocation count for the loaded epoch is unrecoverable and the rotation "+

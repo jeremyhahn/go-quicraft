@@ -25,6 +25,23 @@ import (
 //
 // All methods accept context.Context for cancellation propagation, deadline
 // enforcement, and distributed tracing.
+//
+// # Determinism (mandatory)
+//
+// Update MUST be a pure function of (current state, entries). Every replica
+// applies the identical entry sequence and MUST reach byte-identical state.
+// In particular Update MUST NOT read wall-clock time, math/rand, environment
+// variables, host identity, GOMAXPROCS or any other per-node value, and MUST
+// NOT let Go's randomized map-iteration order affect the state it produces or
+// the Results it returns.
+//
+// A violation is NOT detected by Raft. Consensus continues to agree on the
+// log while replicas silently diverge in the state they derive from it, and
+// the first symptom is usually a linearizable read returning different values
+// depending on which replica served it. Implement Hasher and compare replicas
+// (Host.StateMachineHash) if you need to detect it.
+//
+// The same requirement applies to ConcurrentStateMachine and DiskStateMachine.
 type StateMachine interface {
 	// Update applies committed entries to the state machine. The results
 	// slice is pre-allocated by QuicRaft with len(results) == len(entries).

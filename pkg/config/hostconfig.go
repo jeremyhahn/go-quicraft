@@ -275,6 +275,17 @@ type HostConfig struct {
 
 	// ShutdownTimeout is the maximum time to wait for graceful shutdown.
 	// Default: 30s.
+	//
+	// It bounds Drain ONLY. Host.Close additionally waits, with NO timeout,
+	// for every in-flight SM.Apply to return: the apply worker's shutdown
+	// joins its per-shard goroutines, and one parked inside a user state
+	// machine's Apply never returns. A state machine that blocks in Apply
+	// therefore blocks Close indefinitely, whatever this value is.
+	//
+	// The wait cannot safely be abandoned — dropping it would let Close return
+	// while an apply goroutine still touches state the caller is about to free
+	// — so this is a documented limit rather than a bug to configure around.
+	// The shards still applying at shutdown are logged before the wait begins.
 	ShutdownTimeout time.Duration
 
 	// MaxWALDiskSize is the maximum WAL directory size in bytes. 0 means
