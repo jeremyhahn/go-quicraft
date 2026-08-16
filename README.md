@@ -174,16 +174,26 @@ case <-ctx.Done():
 }
 ```
 
-**Batched** -- amortized cost. Groups many writes into a single Raft entry, giving the same durability as Sync but at a fraction of the per-operation cost (~0.1-0.3ms per op). Good for high-throughput ingest where individual write latency is less important than aggregate throughput.
+**Batched** -- amortized cost. Groups many writes into a single Raft entry, giving the same quorum durability as Sync at a fraction of the per-operation cost (~0.1-0.3ms per op). Good for high-throughput ingest where individual write latency matters less than aggregate throughput.
+
+> **Delivery is at-least-once, not at-most-once.** The aggregator proposes a raw encoded batch with no client session, so nothing deduplicates a retry. A flush that fails with `FlushError.Indeterminate` may nonetheless have committed, and retrying re-applies every command in that batch. A batched proposal also cannot report a per-item apply failure: the aggregate result is shared by every co-batched caller. Use `SyncProposeWithSession` for operations that are not idempotent.
 
 ```go
 import "github.com/jeremyhahn/go-quicraft/pkg/batch"
 
-agg, err := batch.NewAggregator(host, batch.WithConfig(batch.Config{
-    MaxBatchSize:  256,               // Flush after 256 ops
-    FlushInterval: 5 * time.Millisecond, // Or after 5ms, whichever comes first
-    QueueSize:     4096,              // Backpressure at 4096 pending ops
-}))
+// *Host.SyncPropose returns (sm.Result, error); Proposer wants error alone,
+// so the Host is wrapped. The discarded Result is the limitation above: a
+// batched proposal cannot attribute a result to an individual command.
+agg, err := batch.NewAggregator(
+    batch.HostProposer{Host: host},
+    batch.WithConfig(batch.Config{
+        MaxBatchSize:   256,                  // Flush after 256 ops
+        MaxBatchBytes:  4 << 20,              // ...or 4 MiB, whichever first
+        FlushInterval:  5 * time.Millisecond, // ...or after 5ms
+        ProposeTimeout: 10 * time.Second,     // Bounds a stalled flush
+        QueueSize:      4096,                 // Backpressure at 4096 pending
+    }),
+)
 if err != nil {
     log.Fatal(err)
 }
@@ -191,7 +201,13 @@ defer agg.Close()
 
 // Submit blocks until the batch containing this op is committed.
 // Many concurrent Submit calls are grouped into one Raft proposal.
-err = agg.Submit(ctx, shardID, cmd)
+if err := agg.Submit(ctx, shardID, cmd); err != nil {
+    var fe *batch.FlushError
+    if errors.As(err, &fe) && fe.Indeterminate {
+        // The command MAY have committed. Do not blindly retry a
+        // non-idempotent operation here.
+    }
+}
 ```
 
 ### Read consistency levels

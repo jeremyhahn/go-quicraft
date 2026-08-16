@@ -1333,9 +1333,11 @@ The log is a two-tier structure: `raftLog` (`log.go:49`) composes
    Heartbeat messages.
 
 4. **Apply**: `entriesToApply()` returns entries in
-   `[processed+1, committed+1)`, limited to 64 MB
-   (`maxEntriesToApplySize`). Up to 64 MB of entries are returned per
-   apply tick to keep batches reasonably sized.
+   `[processed+1, committed+1)`, limited to `Config.MaxApplyEntrySize`.
+   That defaults to `MaxReplicationPayloadBytes` (16711672 bytes,
+   ~15.94 MB) and `validateSizeLimits` refuses anything above the
+   replication bound — so the batch cap is ~15.94 MB, NOT 64 MB, and
+   64 MB is a value the field cannot legally hold.
 
 5. **Truncate**: After apply, `appliedLogTo()` truncates the inmem
    buffer from the front, advances the processed index, and decreases
