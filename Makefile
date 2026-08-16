@@ -1024,13 +1024,27 @@ vuln:
 # does not fetch them. .build-cache is a local build artifact. Excluding them
 # is what makes this gate mean "the shipped library is clean" rather than
 # failing permanently on benchmark tooling and training everyone to ignore it.
+#
+# A missing binary FAILS rather than skipping. This target used to print
+# "trivy not installed, skipping fs scan" and return success, so `make security`
+# announced "All security scans passed" with one of its four scanners absent —
+# and that is exactly what happened on the omega test host, silently, until the
+# tool inventory was printed. `vuln` and `nancy` were both hardened against this
+# same shape earlier ("a security gate that cannot fail is not a gate"); trivy
+# was left behind.
+#
+# The nancy reasoning does NOT transfer here. nancy may skip because govulncheck
+# and trivy cover the same ground; nothing else in the suite scans for leaked
+# secrets, so a skipped trivy is a real hole rather than a redundant one.
 trivy:
-	@if command -v $(TRIVY) >/dev/null 2>&1; then \
-		$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
-			--skip-dirs .build-cache --skip-dirs test/performance .; \
-	else \
-		echo "trivy not installed, skipping fs scan (install: make install-trivy)"; \
+	@if ! command -v $(TRIVY) >/dev/null 2>&1; then \
+		echo "FAIL: trivy is not installed, so the dependency-CVE and secret scan"; \
+		echo "      did not run. This gate does not pass by default."; \
+		echo "      Install it with: make install-trivy"; \
+		exit 1; \
 	fi
+	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
+		--skip-dirs .build-cache --skip-dirs test/performance .
 
 # Scans the images this repo builds locally: the devcontainer dev image and the
 # integration image. Neither is built in CI, so this is the only gate they get
