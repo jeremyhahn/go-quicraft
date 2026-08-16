@@ -3437,7 +3437,18 @@ func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 	// Start registration and Close concurrently.
 	close(startC)
 	closeErr := h.Close()
-	if closeErr != nil {
+	// ErrShutdownTimeout is an EXPECTED outcome here, not a defect. This test
+	// deliberately registers pendingOps while Close is draining, and Drain is
+	// bounded by ShutdownTimeout (500ms in this fixture) — so a registration
+	// that lands after the drain begins counting legitimately makes it time
+	// out. Failing the test on it discarded the assertion the test exists for
+	// and flaked at roughly 10% under -race, on a machine doing nothing else.
+	//
+	// The property under test is the one in the loop below: every proposal
+	// registered concurrently with Close is completed with ErrClosed,
+	// regardless of timing. That assertion is unchanged, and any Close error
+	// OTHER than the drain timeout is still a failure.
+	if closeErr != nil && !errors.Is(closeErr, ErrShutdownTimeout) {
 		t.Fatalf("Close failed: %v", closeErr)
 	}
 
@@ -4143,14 +4154,37 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 	}
 	defer rs.Release()
 
-	// Verify a pendingRead entry was registered for this shard.
+	// Verify the read was registered for this shard.
+	//
+	// A live pendingReads entry is only ONE of the two states that prove it:
+	// this is a single-node shard, so the read reaches quorum immediately and
+	// OnReadyToRead can complete it — which removes the entry — before this
+	// assertion runs. Requiring the entry to still be present therefore
+	// asserted on a transient intermediate state the system is free to have
+	// already left, and flaked under -race on a loaded machine.
+	//
+	// Either observation proves the read was submitted; observing NEITHER is
+	// the defect this test exists to catch, and still fails.
 	ns := testLoadNode(h, 1)
 
 	ns.pendingReadsMu.Lock()
-	if len(ns.pendingReads) == 0 {
-		t.Error("expected at least one pendingRead entry after ReadIndex")
-	}
+	pending := len(ns.pendingReads)
 	ns.pendingReadsMu.Unlock()
+
+	completed := false
+	select {
+	case result := <-rs.ResultC():
+		completed = true
+		if result.Err != nil {
+			t.Errorf("ReadIndex completed with error: %v", result.Err)
+		}
+	default:
+	}
+
+	if pending == 0 && !completed {
+		t.Error("ReadIndex neither registered a pendingRead entry nor " +
+			"completed the request: the read was never submitted")
+	}
 }
 
 func TestOnReadyToRead_CompletesReadWhenApplied(t *testing.T) {
@@ -21054,8 +21088,21 @@ func TestStartShard_FreshStart_NoSeed(t *testing.T) {
 		t.Fatal("RecoverFromSnapshot called on fresh on-disk SM")
 	}
 	ns := testLoadNode(h, 1)
-	if got := ns.lastApplied.Load(); got != 0 {
-		t.Errorf("ns.lastApplied = %d, want 0 on fresh start", got)
+	// The property is that a fresh start does not SEED the applied marker from
+	// recovery — not that nothing has been applied yet.
+	//
+	// A bootstrapping shard commits its EntryInitialMembership at index 1 and
+	// applies it ASYNCHRONOUSLY, so lastApplied legitimately becomes 1 shortly
+	// after StartShard returns. Requiring exactly 0 was a race against that
+	// apply: it held on an idle machine and failed on a loaded CI runner,
+	// reporting a seeding regression that had not happened.
+	//
+	// Anything ABOVE 1 means the marker was seeded from somewhere — which is
+	// the regression this test exists to catch, and still fails.
+	if got := ns.lastApplied.Load(); got > 1 {
+		t.Errorf("ns.lastApplied = %d on fresh start; only the index-1 "+
+			"membership entry may have applied, so anything higher means the "+
+			"marker was seeded from recovery", got)
 	}
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {

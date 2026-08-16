@@ -264,6 +264,12 @@ func (w *applyWorker) run() {
 // shutdown. It is a no-op unless stopC is closed, so a panic-restart of the
 // dispatcher keeps the per-shard channels — and the committed items buffered
 // in them — intact. It is idempotent: shardChans is emptied as it goes.
+// applyShutdownWarnAfter is how long the shutdown wait may run before it is
+// reported. Long enough that an ordinary Close never pays for the diagnostic,
+// short enough that an operator watching a hung shutdown sees the cause
+// quickly.
+const applyShutdownWarnAfter = 2 * time.Second
+
 func (w *applyWorker) shutdownIfStopping() {
 	select {
 	case <-w.stopC:
@@ -281,17 +287,32 @@ func (w *applyWorker) shutdownIfStopping() {
 	// returning from Close while it still touches shard state would be a
 	// use-after-free for the caller. HostConfig.ShutdownTimeout bounds Drain,
 	// not this — so an operator who configured a shutdown timeout and sees the
-	// process hang has, without this line, no indication of where or why.
+	// process hang has, without a diagnostic, no indication of where or why.
 	//
-	// Logged before blocking rather than after, since after may never come.
-	if len(closing) > 0 {
-		slog.Info("apply worker waiting for in-flight SM.Apply calls to return; "+
-			"Close blocks until every user state machine returns",
+	// The diagnostic fires only once the wait has ALREADY proven slow. Logging
+	// unconditionally before the wait put a synchronous stderr write on the
+	// shutdown path of every Close, including the overwhelming majority that
+	// return promptly — and slog's default handler serialises on one mutex, so
+	// with several workers that is measurable against a short
+	// ShutdownTimeout. The information is only useful when the wait is long,
+	// which is exactly when this branch is reached.
+	waited := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(applyShutdownWarnAfter):
+		slog.Warn("apply worker still waiting for in-flight SM.Apply calls; "+
+			"Close blocks until every user state machine returns, and "+
+			"ShutdownTimeout does not bound this wait",
 			"worker", w.workerID,
 			"shards", closing,
+			"waited", applyShutdownWarnAfter,
 		)
+		<-waited
 	}
-	w.wg.Wait()
 	// All per-shard goroutines have exited, so closing done keeps the
 	// synchronous-unload contract truthful; without the ack a concurrent
 	// UnloadNode would block forever on its done channel.

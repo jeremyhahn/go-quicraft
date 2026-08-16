@@ -1032,6 +1032,31 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
+	// Let the stream pool reach steady state BEFORE snapshotting it.
+	//
+	// dialConnection pre-opens the heartbeat stream in a goroutine
+	// (`go t.preOpenHeartbeatStream(...)`) and nothing here joins it, so the
+	// count reaches its final value asynchronously. Snapshotting first and
+	// asserting equality afterwards made the assertion a race against that
+	// goroutine: if it registered its stream in between, StreamCount went from
+	// 1 to 2 and the test failed with "expected 1 streams after alive check,
+	// got 2" — attributing to evictStaleOutboundOnRecv a stream it never
+	// created. It survives an unloaded machine and fails on a busy CI runner.
+	//
+	// Waiting for both streams (pre-opened heartbeat + the data stream above)
+	// also makes the assertion STRONGER: the eviction path is now checked
+	// against a fully-populated pool rather than whatever subset happened to
+	// exist at snapshot time.
+	const wantStreams = 2
+	deadline := time.Now().Add(5 * time.Second)
+	for t1.StreamCount() < wantStreams && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := t1.StreamCount(); got != wantStreams {
+		t.Fatalf("stream pool did not settle: StreamCount = %d, want %d "+
+			"(pre-opened heartbeat stream plus the data stream)", got, wantStreams)
+	}
+
 	connsBefore := t1.ConnectionCount()
 	streamsBefore := t1.StreamCount()
 
