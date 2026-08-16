@@ -808,6 +808,15 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 
 	for i := range msgs {
 		msg := msgs[i] // copy the message value (shallow)
+		// Injected network fault (integration builds only). Placed before the
+		// deep copies below so a dropped message costs nothing, and modelled as
+		// a silent drop: the connection stays up and no error is reported,
+		// exactly as a partitioned network behaves. In a normal build
+		// netFaultEnabled is a false constant and this whole branch is
+		// compiled away.
+		if netFaultEnabled && netFaultDrop(msg.ShardID, msg.From, msg.To) {
+			continue
+		}
 		// Deep-copy entries to break the alias with the step worker's
 		// reusable proposeBuf. The EntryQueue.Swap double-buffering
 		// reuses backing arrays across drain cycles, so without this
@@ -1560,6 +1569,14 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	snapStart := time.Now()
 
 	first := &chunks[0]
+	// A partition that let snapshots through would not be a partition: a
+	// follower cut off from its leader must fall behind, which is the whole
+	// point of the catch-up tests. Reported as a stream error rather than a
+	// silent success so the sender retries, which is what an interrupted
+	// transfer looks like. Compiled away in a normal build.
+	if netFaultEnabled && netFaultDrop(first.ShardID, first.From, first.ReplicaID) {
+		return ErrStreamClosed
+	}
 	target, err := t.reg.Resolve(first.ShardID, first.ReplicaID)
 	if err != nil {
 		return err
