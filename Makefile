@@ -782,6 +782,70 @@ ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-integration
 	@echo "Full CI pipeline passed (untagged + integration + errfs + fuzz seeds + all modules)"
 
 # ============================================================================
+# Heavyweight test offload to omega (198.51.100.90)
+#
+# Every test target here runs under `-race` (see GOTEST), and ci-integration
+# stands up multi-node QUIC clusters. On a developer workstation that is also
+# running editors, browsers and other agents, that is enough contention to make
+# the 30-second catch-up waits in the snapshot tests flake — the failures are
+# environmental, they look like raft defects, and chasing them has cost real
+# days (see the CI runner-contention and load-generator incidents).
+#
+# omega is the department's designated spare-capacity host for exactly this
+# (software/CLAUDE.md: "Use it for agent fleets, performance and load testing
+# ... rather than loading a busy machine"). It is also where the omega-docker
+# Gitea runner lives, so CI already executes there; this target just gives the
+# same machine to the local inner loop.
+#
+#   make remote-ci-full        # the full gate, off-box
+#   make remote-test           # any target: remote-<target> runs <target> there
+#   make remote-integration-test
+#
+# The pattern rule means no target needs enrolling by hand. `remote-sync` is an
+# explicit rule, so it wins over the pattern and does not recurse.
+#
+# --delete keeps the remote tree an exact mirror, so a file deleted locally
+# cannot linger there and turn a broken build green. .git is excluded
+# deliberately: this ships the WORKING TREE, including uncommitted edits, which
+# is the whole point during development, and it means nothing on the remote can
+# perform a git operation against this repository's history.
+# ============================================================================
+
+OMEGA_USER    ?= jhahn
+OMEGA_HOST    ?= 198.51.100.90
+OMEGA_DIR     ?= ~/ci/go-quicraft
+# omega keeps its toolchain in ~/sdk and its go-installed tools in ~/go/bin;
+# a non-interactive ssh does not source the profile that would add them.
+OMEGA_PATH    := export PATH=$$HOME/sdk/go1.26.5/bin:$$HOME/go/bin:$$PATH
+OMEGA_SSH     := ssh -o BatchMode=yes -o ConnectTimeout=10 $(OMEGA_USER)@$(OMEGA_HOST)
+RSYNC_EXCLUDE := --exclude .git --exclude .build-cache --exclude $(COVER_DIR) \
+                 --exclude $(BUILD_DIR) --exclude '*.test' --exclude '*.prof' \
+                 --exclude '*.out' --exclude test/performance/openraft/target
+
+.PHONY: remote-sync
+remote-sync:
+	@$(OMEGA_SSH) 'mkdir -p $(OMEGA_DIR)'
+	@rsync -az --delete $(RSYNC_EXCLUDE) ./ $(OMEGA_USER)@$(OMEGA_HOST):$(OMEGA_DIR)/
+	@echo "synced working tree to $(OMEGA_USER)@$(OMEGA_HOST):$(OMEGA_DIR)"
+
+# remote-<target>: sync, then run <target> on omega. Output is streamed back,
+# so a failure reads exactly as it would locally.
+.PHONY: remote-%
+remote-%: remote-sync
+	@echo "==> running 'make $*' on $(OMEGA_HOST)"
+	@$(OMEGA_SSH) '$(OMEGA_PATH); cd $(OMEGA_DIR) && make $*'
+
+# One-time (or after a toolchain bump) provisioning of the scanners omega does
+# not ship with. Kept separate from remote-sync so the common path stays fast.
+.PHONY: remote-tools
+remote-tools:
+	@$(OMEGA_SSH) '$(OMEGA_PATH); \
+		command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest; \
+		command -v gosec >/dev/null || go install github.com/securego/gosec/v2/cmd/gosec@latest; \
+		command -v golangci-lint >/dev/null || go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest; \
+		echo "omega tools ready"'
+
+# ============================================================================
 # Multi-module build
 #
 # This repository is not one Go module: contrib/dragonboat and the benchmark
