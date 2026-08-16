@@ -16,6 +16,7 @@ package writemode
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -224,6 +225,101 @@ func TestFromString_RoundTrip(t *testing.T) {
 				t.Errorf("round-trip failed: %v -> %q -> %v", m, m.String(), parsed)
 			}
 		})
+	}
+}
+
+// TestFromString_RejectsAnAliasForAnUndescribedMode is the gate on Validate's
+// production caller. parseModes and modeSpecs are separate tables — the first
+// is many-to-one — and FromString is the only thing that checks them against
+// each other. An alias pointing at a Mode modeSpecs does not describe must be
+// REFUSED, not returned: a Mode that parses cleanly and then answers
+// "unknown(N)" from String and false from every durability predicate is a
+// configuration this package accepted while promising nothing.
+//
+// The drift is injected here rather than left to a future edit, because the
+// whole point is that the mistake compiles.
+func TestFromString_RejectsAnAliasForAnUndescribedMode(t *testing.T) {
+	const undescribed Mode = 200
+	if _, ok := modeSpecs[undescribed]; ok {
+		t.Fatalf("Mode(%d) is described by modeSpecs; pick a value that is not",
+			undescribed)
+	}
+
+	parseModes["drifted"] = undescribed
+	t.Cleanup(func() { delete(parseModes, "drifted") })
+
+	got, err := FromString("drifted")
+	if err == nil {
+		t.Fatalf("FromString(%q) = %v with no error; an alias for a Mode that "+
+			"modeSpecs does not describe must be refused", "drifted", got)
+	}
+	var target *InvalidModeError
+	if !errors.As(err, &target) {
+		t.Fatalf("FromString error = %T, want *InvalidModeError", err)
+	}
+	if got != Sync {
+		t.Errorf("FromString returned Mode(%d) alongside its error, want the zero "+
+			"value Sync", got)
+	}
+}
+
+// TestMode_UnknownValueGuaranteesNothing pins the answer an out-of-range Mode
+// gives, which the Mode doc comment relies on and which nothing tested.
+//
+// Mode is an open uint8, so this is the state a value decoded from
+// configuration or a wire field lands in when it does not name a real mode. All
+// three predicates report false — in particular RequiresQuorum, so an embedder
+// that branches on it treats an unnameable mode as one that needs no quorum.
+// That is why Validate exists and why the doc comment tells callers to run it
+// at the boundary; if the answers here are ever changed, this test and that
+// comment must move together.
+func TestMode_UnknownValueGuaranteesNothing(t *testing.T) {
+	for _, m := range []Mode{Mode(3), Mode(100), Mode(255)} {
+		if err := m.Validate(); err == nil {
+			t.Fatalf("Mode(%d).Validate() = nil, want an error", m)
+		}
+		if m.IsSynchronous() {
+			t.Errorf("Mode(%d).IsSynchronous() = true, want false", m)
+		}
+		if m.IsAsync() {
+			t.Errorf("Mode(%d).IsAsync() = true, want false", m)
+		}
+		if m.RequiresQuorum() {
+			t.Errorf("Mode(%d).RequiresQuorum() = true, want false", m)
+		}
+		if want := fmt.Sprintf("unknown(%d)", m); m.String() != want {
+			t.Errorf("Mode(%d).String() = %q, want %q", m, m.String(), want)
+		}
+	}
+}
+
+// TestModeSpecs_CoverEveryDeclaredMode pins that the three exported constants
+// are exactly the Modes modeSpecs describes. A constant added without a spec
+// would validate as invalid and answer false to every durability question while
+// still being part of the package's public API.
+func TestModeSpecs_CoverEveryDeclaredMode(t *testing.T) {
+	declared := []Mode{Sync, WALDurable, Batched}
+	for _, m := range declared {
+		if _, ok := modeSpecs[m]; !ok {
+			t.Errorf("Mode %d is declared but modeSpecs does not describe it", m)
+		}
+	}
+	if len(modeSpecs) != len(declared) {
+		t.Errorf("modeSpecs describes %d modes, but %d are declared: a spec "+
+			"without a constant is unreachable through FromString",
+			len(modeSpecs), len(declared))
+	}
+}
+
+// TestParseModes_OnlyNameDescribedModes is the static half of the drift guard:
+// every alias must already resolve to a described Mode, so the runtime check in
+// FromString never has to fire in a correct build.
+func TestParseModes_OnlyNameDescribedModes(t *testing.T) {
+	for alias, m := range parseModes {
+		if err := m.Validate(); err != nil {
+			t.Errorf("parseModes[%q] = Mode(%d), which modeSpecs does not describe: %v",
+				alias, m, err)
+		}
 	}
 }
 

@@ -239,12 +239,25 @@ func TestSubmit_TimedOutCallerBufferIsNotReplicated(t *testing.T) {
 // SubmitNoCopy is the documented zero-copy path, so it must NOT copy. Without
 // this the "copy in Submit" fix could be satisfied by copying everywhere,
 // silently removing the escape hatch the doc promises.
+//
+// The check is an IDENTITY check on the backing array of the slice the
+// aggregator stored, not a comparison of bytes. Its previous shape said in a
+// comment that "comparing the bytes cannot tell a copy from the original, so
+// compare identity" and then compared the bytes anyway — through the proposer,
+// which never sees the caller's slice at all because EncodeBatch copies every
+// command into a fresh payload. Making SubmitNoCopy copy left it passing.
+//
+// The proposal is inspected while it is still in the unflushed batch, which is
+// the only point at which the aggregator's own reference to the caller's array
+// is observable.
 func TestSubmitNoCopy_DoesNotCopy(t *testing.T) {
 	p := newRecordingProposer()
 	agg, err := NewAggregator(p,
 		WithConfig(Config{
+			// Neither the size threshold nor the timer may flush: the proposal
+			// must sit in the batch long enough to be inspected.
 			MaxBatchSize:  1000,
-			FlushInterval: 500 * time.Millisecond,
+			FlushInterval: time.Hour,
 			QueueSize:     10,
 		}),
 		WithLogger(slog.Default()),
@@ -259,26 +272,84 @@ func TestSubmitNoCopy_DoesNotCopy(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- agg.SubmitNoCopy(context.Background(), 1, buf) }()
 
-	p.awaitCall(t, 5*time.Second, "SubmitNoCopy never reached a flush")
+	waitForBatchLen(t, agg, 1)
+	if got := batchedDataOf(t, agg, 0); &got[0] != &buf[0] {
+		t.Fatalf("SubmitNoCopy stored a slice backed by a different array than the "+
+			"caller's (%p vs %p): the documented zero-copy path copied, so the "+
+			"escape hatch Submit's ownership contract points callers at is gone",
+			&got[0], &buf[0])
+	}
+
+	// Close drains the batch so the submitting goroutine is released.
+	if closeErr := agg.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
 	select {
 	case submitErr := <-done:
 		if submitErr != nil {
 			t.Fatalf("SubmitNoCopy: %v", submitErr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("SubmitNoCopy did not return after its batch was proposed")
+		t.Fatal("SubmitNoCopy did not return after its batch was flushed")
 	}
 
 	cmds := p.commands()
-	if len(cmds) != 1 {
-		t.Fatalf("proposer saw %d commands, want 1", len(cmds))
+	if len(cmds) != 1 || string(cmds[0]) != string(buf) {
+		t.Fatalf("replicated commands = %q, want exactly [%q]", cmds, string(buf))
 	}
-	// The aggregator must have used the caller's own backing array. Comparing
-	// the bytes cannot tell a copy from the original, so compare identity: the
-	// transferred slice is the one the proposer decoded out of.
-	if got := string(cmds[0]); got != string(buf) {
-		t.Fatalf("replicated command = %q, want %q", got, string(buf))
+}
+
+// TestSubmit_StoresAnIndependentArray is the counterpart identity check.
+// TestSubmit_CopiesCallerBuffer proves the copy by observing its EFFECT — the
+// recycled contents never reach the proposer — which is the property that
+// matters; this states the mechanism directly, so a build that satisfied the
+// effect some other way (by encoding eagerly, say) still has to declare
+// whether Submit and SubmitNoCopy differ at all.
+func TestSubmit_StoresAnIndependentArray(t *testing.T) {
+	p := newRecordingProposer()
+	agg, err := NewAggregator(p,
+		WithConfig(Config{
+			MaxBatchSize:  1000,
+			FlushInterval: time.Hour,
+			QueueSize:     10,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
 	}
+	defer func() { _ = agg.Close() }()
+
+	buf := []byte("CALLER-OWNED-BUF")
+	go func() { _ = agg.Submit(context.Background(), 1, buf) }()
+
+	waitForBatchLen(t, agg, 1)
+	stored := batchedDataOf(t, agg, 0)
+	if &stored[0] == &buf[0] {
+		t.Fatal("Submit stored the caller's own array; the caller regains control " +
+			"of it as soon as Submit returns, so the flush would encode whatever " +
+			"the buffer holds by then")
+	}
+	if string(stored) != string(buf) {
+		t.Fatalf("Submit stored %q, want a copy of %q", stored, buf)
+	}
+}
+
+// batchedDataOf returns the data slice the aggregator is holding for the
+// proposal at position i of the current unflushed batch.
+func batchedDataOf(t *testing.T, a *Aggregator, i int) []byte {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if i >= len(a.currentBatch) {
+		t.Fatalf("batch holds %d proposals, want more than %d", len(a.currentBatch), i)
+	}
+	data := a.currentBatch[i].data
+	if len(data) == 0 {
+		t.Fatal("the batched proposal carries no data, so its backing array cannot be compared")
+	}
+	return data
 }
 
 // TestFlush_CancelledProposalIsNotReplicated is the regression test for the

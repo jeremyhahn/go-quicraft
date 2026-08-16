@@ -23,27 +23,52 @@ import (
 	"time"
 )
 
-// perShardProposer blocks proposals for one designated shard until it is
-// released, and answers every other shard immediately.
-type perShardProposer struct {
-	slowShard uint64
-	release   chan struct{}
+// rendezvousProposer answers a SyncPropose only once EVERY expected shard has
+// entered one. A sequential flush can never satisfy that — the first shard
+// would have to return before the second is ever called — so a batch whose
+// proposes all complete is PROOF the shards were flushed concurrently, and a
+// batch that times out is proof they were not.
+//
+// The rendezvous replaces a "slow shard plus a wall-clock wait" shape, which
+// was a coin flip against the code it pinned. Two things were left to chance
+// there: whether the two shards landed in the same batch at all, and — because
+// flush ranges over a map, whose iteration order Go randomizes — whether the
+// SLOW shard happened to be picked first. With the concurrency removed the old
+// test still passed 5 runs in 20 (measured), because half the time the fast
+// shard was simply flushed first and never had to wait for anything.
+type rendezvousProposer struct {
+	want int
 
-	mu   sync.Mutex
-	seen map[uint64]int
+	mu      sync.Mutex
+	entered map[uint64]bool
+
+	allIn chan struct{}
+	once  sync.Once
 }
 
-func (p *perShardProposer) SyncPropose(_ context.Context, shardID uint64, _ []byte) error {
-	if shardID == p.slowShard {
-		<-p.release
+func newRendezvousProposer(want int) *rendezvousProposer {
+	return &rendezvousProposer{
+		want:    want,
+		entered: make(map[uint64]bool),
+		allIn:   make(chan struct{}),
 	}
+}
+
+func (p *rendezvousProposer) SyncPropose(ctx context.Context, shardID uint64, _ []byte) error {
 	p.mu.Lock()
-	if p.seen == nil {
-		p.seen = make(map[uint64]int)
-	}
-	p.seen[shardID]++
+	p.entered[shardID] = true
+	n := len(p.entered)
 	p.mu.Unlock()
-	return nil
+
+	if n >= p.want {
+		p.once.Do(func() { close(p.allIn) })
+	}
+	select {
+	case <-p.allIn:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // TestFlush_SlowShardDoesNotBlockOtherShards is the M7(a) regression test.
@@ -51,32 +76,60 @@ func (p *perShardProposer) SyncPropose(_ context.Context, shardID uint64, _ []by
 // goroutine, so one slow or leaderless shard blocked every other shard's
 // flush for the full proposal timeout, backing the queue up to QueueSize and
 // producing QueueFullError for entirely unrelated shards.
+//
+// The batch is filled one proposal at a time so both shards provably share a
+// single flush, and the proposer only returns once both are inside it. Reverting
+// flush to a sequential loop fails this test on every run and in either map
+// order: whichever shard is flushed first waits out ProposeTimeout for a peer
+// that cannot be called until it returns.
 func TestFlush_SlowShardDoesNotBlockOtherShards(t *testing.T) {
-	p := &perShardProposer{slowShard: 1, release: make(chan struct{})}
+	p := newRendezvousProposer(2)
 	agg, err := NewAggregator(p,
-		WithConfig(Config{MaxBatchSize: 100, FlushInterval: 5 * time.Millisecond, QueueSize: 100}),
+		WithConfig(Config{
+			// The second proposal fills the batch and triggers the flush; an
+			// hour-long interval keeps the timer from splitting the two shards
+			// into separate batches, which would leave nothing to prove.
+			MaxBatchSize:  2,
+			FlushInterval: time.Hour,
+			QueueSize:     10,
+			// Bounds the failing case: under a sequential flush the first
+			// shard's propose waits for a shard that will never be reached, and
+			// only this ceiling releases it.
+			ProposeTimeout: 2 * time.Second,
+		}),
 		WithLogger(slog.Default()),
 		WithRegistry(newTestRegistry(t)),
 	)
 	if err != nil {
 		t.Fatalf("NewAggregator: %v", err)
 	}
-	defer func() {
-		close(p.release)
-		_ = agg.Close()
-	}()
+	defer func() { _ = agg.Close() }()
 
-	fast := make(chan error, 1)
-	go func() { fast <- agg.Submit(context.Background(), 2, []byte("fast")) }()
-	go func() { _ = agg.Submit(context.Background(), 1, []byte("slow")) }()
+	first := make(chan error, 1)
+	go func() { first <- agg.Submit(context.Background(), 1, []byte("shard-1")) }()
 
-	select {
-	case submitErr := <-fast:
-		if submitErr != nil {
-			t.Fatalf("fast shard Submit: %v", submitErr)
+	// Shard 1's proposal must be in the batch before shard 2's is submitted, or
+	// the two could be flushed separately and never test anything.
+	waitForBatchLen(t, agg, 1)
+
+	second := make(chan error, 1)
+	go func() { second <- agg.Submit(context.Background(), 2, []byte("shard-2")) }()
+
+	for _, c := range []struct {
+		name string
+		ch   chan error
+	}{{"shard 1", first}, {"shard 2", second}} {
+		select {
+		case submitErr := <-c.ch:
+			if submitErr != nil {
+				t.Fatalf("%s: Submit = %v; the proposer answers only once BOTH "+
+					"shards are inside SyncPropose, so this batch's shards were "+
+					"flushed one after the other on the single flush goroutine",
+					c.name, submitErr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s never got a result", c.name)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the fast shard's flush was blocked behind the slow shard")
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"log/slog"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -235,21 +236,35 @@ func TestNewAggregator_WithRegistry(t *testing.T) {
 	}
 }
 
+// TestNewAggregator_WithNilRegistryUsesDefault pins WithRegistry's nil guard:
+// passing nil must LEAVE the existing registerer in place, because a nil
+// prometheus.Registerer is not a usable default — initMetrics would panic on
+// it, and the constructor has already installed prometheus.DefaultRegisterer.
+//
+// The option is exercised directly rather than through NewAggregator. The
+// previous shape passed WithRegistry(nil) followed by WithRegistry(a real one)
+// and then asserted only that the field was non-nil — which the SECOND call
+// guarantees regardless of what the first did. Deleting the nil guard left the
+// test passing, so the guard it exists to protect was unverified. Constructing
+// through NewAggregator with nil alone is not an option here either: the
+// aggregator would then register its collectors on the global default
+// registry, which is shared with every other test in the binary.
 func TestNewAggregator_WithNilRegistryUsesDefault(t *testing.T) {
 	t.Parallel()
-	mp := &mockProposer{}
-	agg, err := NewAggregator(mp,
-		WithRegistry(nil),
-		WithRegistry(newTestRegistry(t)),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
 
-	// The second WithRegistry call should have set a non-nil registry.
-	if agg.registry == nil {
-		t.Error("registry should not be nil")
+	existing := newTestRegistry(t)
+	a := &Aggregator{registry: existing}
+	WithRegistry(nil)(a)
+
+	if a.registry != prometheus.Registerer(existing) {
+		t.Errorf("WithRegistry(nil) replaced the registerer with %v; nil must be "+
+			"ignored so the constructor's default survives", a.registry)
+	}
+
+	replacement := newTestRegistry(t)
+	WithRegistry(replacement)(a)
+	if a.registry != prometheus.Registerer(replacement) {
+		t.Error("WithRegistry(non-nil) did not install the supplied registerer")
 	}
 }
 
@@ -438,54 +453,100 @@ func (b *blockingMockProposer) SyncPropose(_ context.Context, _ uint64, _ []byte
 	return nil
 }
 
+// enteredBlockingProposer blocks every SyncPropose until unblock is closed and
+// announces the first entry, so a test can wait for the flush goroutine to be
+// provably parked instead of guessing at a duration.
+type enteredBlockingProposer struct {
+	unblock chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *enteredBlockingProposer) SyncPropose(_ context.Context, _ uint64, _ []byte) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.unblock
+	return nil
+}
+
+// TestSubmit_QueueFull pins backpressure: once the queue is at capacity, Submit
+// must report QueueFullError IMMEDIATELY rather than blocking a caller behind a
+// flush that is going nowhere.
+//
+// The previous shape of this test could not fail. It looped up to 100 times
+// hoping to observe the condition and, when it never did, called t.Log — so a
+// build in which Submit blocked forever instead of rejecting, or returned some
+// unrelated error, passed exactly as cleanly as a correct one. There was no
+// t.Error or t.Fatal reachable from any aggregator behaviour in the whole body.
+//
+// The condition is now constructed deterministically: MaxBatchSize 1 sends the
+// first proposal straight into a flush that blocks in the proposer, which parks
+// the single flush goroutine so nothing drains the queue; the next QueueSize
+// submissions fill it exactly; and the one after that must be rejected.
 func TestSubmit_QueueFull(t *testing.T) {
 	t.Parallel()
 
-	// Create a proposer that blocks forever so the queue fills up.
-	blockingProposer := &blockingMockProposer{
+	const queueSize = 2
+
+	blocking := &enteredBlockingProposer{
 		unblock: make(chan struct{}),
+		entered: make(chan struct{}),
 	}
 
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(blockingProposer,
+	agg, err := NewAggregator(blocking,
 		WithConfig(Config{
-			MaxBatchSize:  1000,
-			FlushInterval: 10 * time.Second, // Long interval to prevent timer flushes.
-			QueueSize:     2,
+			// One proposal per flush, so the very first submission parks the
+			// flush goroutine inside the proposer.
+			MaxBatchSize: 1,
+			// Long enough that the timer plays no part.
+			FlushInterval:  time.Hour,
+			QueueSize:      queueSize,
+			ProposeTimeout: time.Hour,
 		}),
-		WithRegistry(reg),
+		WithRegistry(newTestRegistry(t)),
 	)
 	if err != nil {
 		t.Fatalf("NewAggregator failed: %v", err)
 	}
 	defer func() {
-		close(blockingProposer.unblock)
-		agg.Close()
+		close(blocking.unblock)
+		_ = agg.Close()
 	}()
 
-	// Fill the queue. The flush loop will dequeue items but proposer blocks,
-	// so eventually the queue fills.
-	var queueFullSeen bool
-	for i := range 100 {
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		submitErr := agg.Submit(ctx, 1, []byte{byte(i)})
-		cancel()
-		if submitErr != nil {
-			var qfe *QueueFullError
-			if errors.As(submitErr, &qfe) {
-				queueFullSeen = true
-				break
-			}
-			// Context timeout is also acceptable - the queue may have
-			// drained but proposer is blocking.
-			if errors.Is(submitErr, context.DeadlineExceeded) {
-				continue
-			}
-		}
+	// The first proposal reaches the proposer and parks the flush goroutine.
+	go func() { _ = agg.Submit(context.Background(), 1, []byte("parks-the-loop")) }()
+	select {
+	case <-blocking.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first proposal never reached the proposer")
 	}
 
-	if !queueFullSeen {
-		t.Log("queue full condition was not triggered (proposer may be draining fast enough)")
+	// Fill the queue exactly. Nothing drains it while the flush goroutine is
+	// parked, so each of these stays enqueued and its caller blocks.
+	for i := range queueSize {
+		go func() { _ = agg.Submit(context.Background(), 1, []byte{byte(i)}) }()
+	}
+	waitForCondition(t, 10*time.Second, "the queue never reached capacity", func() bool {
+		return len(agg.queue) == queueSize
+	})
+
+	// One more must be rejected outright, not blocked and not silently accepted.
+	done := make(chan error, 1)
+	go func() { done <- agg.Submit(context.Background(), 1, []byte("overflow")) }()
+	select {
+	case submitErr := <-done:
+		var qfe *QueueFullError
+		if !errors.As(submitErr, &qfe) {
+			t.Fatalf("Submit into a full queue = %T (%v), want *QueueFullError",
+				submitErr, submitErr)
+		}
+		if qfe.QueueSize != queueSize {
+			t.Errorf("QueueFullError.QueueSize = %d, want %d", qfe.QueueSize, queueSize)
+		}
+		if !errors.Is(submitErr, ErrQueueFull) {
+			t.Error("error should match the ErrQueueFull sentinel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Submit blocked on a full queue instead of reporting QueueFullError")
 	}
 }
 
@@ -538,6 +599,15 @@ func TestSubmit_SizeBasedFlush(t *testing.T) {
 	}
 }
 
+// TestSubmit_TimeBasedFlush pins that a batch below MaxBatchSize is flushed by
+// the interval timer, and that the flush is ATTRIBUTED to the timer.
+//
+// The previous assertion — proposer calls are non-empty — could not fail:
+// Submit returns nil only once a flush has delivered that proposal's result,
+// and a flush that delivered a result has by definition called the proposer.
+// The interesting half, that the TIMER is what triggered it, went unchecked, so
+// the flushReasonTime label had no coverage at all and a flush misreported as
+// "size" or "close" would have gone unnoticed by every test in the package.
 func TestSubmit_TimeBasedFlush(t *testing.T) {
 	t.Parallel()
 
@@ -545,7 +615,9 @@ func TestSubmit_TimeBasedFlush(t *testing.T) {
 	reg := newTestRegistry(t)
 	agg, err := NewAggregator(mp,
 		WithConfig(Config{
-			MaxBatchSize:  1000, // Large batch size so it does not trigger.
+			// Neither the size threshold nor Close may fire: the batch holds
+			// one proposal, and the assertions run before Close.
+			MaxBatchSize:  1000,
 			FlushInterval: 5 * time.Millisecond,
 			QueueSize:     100,
 		}),
@@ -562,11 +634,39 @@ func TestSubmit_TimeBasedFlush(t *testing.T) {
 		t.Fatalf("Submit failed: %v", submitErr)
 	}
 
-	// The item should have been flushed by the timer. Verify proposer was called.
-	calls := mp.getCalls()
-	if len(calls) == 0 {
-		t.Fatal("time-based flush did not trigger proposer call")
+	if got := flushReasonCount(t, reg, flushReasonTime); got < 1 {
+		t.Errorf("flush_reason_total{reason=%q} = %v, want at least 1: the batch "+
+			"was flushed, but not by the interval timer", flushReasonTime, got)
 	}
+	for _, other := range []string{flushReasonSize, flushReasonBytes, flushReasonClose} {
+		if got := flushReasonCount(t, reg, other); got != 0 {
+			t.Errorf("flush_reason_total{reason=%q} = %v, want 0: only the timer "+
+				"can flush a one-proposal batch under this configuration", other, got)
+		}
+	}
+}
+
+// flushReasonCount reads the quicraft_batch_flush_reason_total counter for one
+// reason label out of reg, returning 0 when the label has not been observed.
+func flushReasonCount(t *testing.T, reg *prometheus.Registry, reason string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "quicraft_batch_flush_reason_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "reason" && lp.GetValue() == reason {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func TestSubmit_ProposerError(t *testing.T) {
@@ -677,13 +777,37 @@ func TestSubmit_MultipleShards(t *testing.T) {
 		t.Fatal("proposer was never called for multi-shard submissions")
 	}
 
-	// Verify we got calls for different shards.
-	seenShards := make(map[uint64]bool)
+	// Every submitted shard must have been proposed, and its own command must
+	// be in its own batch. The previous assertion here was `len(seenShards) ==
+	// 0`, which the `len(calls) == 0` check above already rules out — every
+	// call carries a shard ID, so a non-empty call list can never produce an
+	// empty shard set. It could not fail, and in particular it could not catch
+	// a flush that merged or dropped a shard's proposals.
+	seen := make(map[uint64][]byte)
 	for _, call := range calls {
-		seenShards[call.shardID] = true
+		decoded, decErr := DecodeBatch(call.data)
+		if decErr != nil {
+			t.Fatalf("DecodeBatch for shard %d: %v", call.shardID, decErr)
+		}
+		for _, cmd := range decoded {
+			seen[call.shardID] = append(seen[call.shardID], cmd...)
+		}
 	}
-	if len(seenShards) == 0 {
-		t.Error("no shards seen in proposer calls")
+	for _, shardID := range shards {
+		got, ok := seen[shardID]
+		if !ok {
+			t.Errorf("shard %d was submitted but never proposed", shardID)
+			continue
+		}
+		if want := []byte{byte(shardID)}; !bytes.Equal(got, want) {
+			t.Errorf("shard %d was proposed %q, want %q: a shard's batch must "+
+				"carry that shard's commands and no others", shardID, got, want)
+		}
+	}
+	for shardID := range seen {
+		if !slices.Contains(shards, shardID) {
+			t.Errorf("the proposer saw shard %d, which was never submitted", shardID)
+		}
 	}
 }
 
@@ -916,18 +1040,28 @@ func TestConcurrentSubmit(t *testing.T) {
 	}
 }
 
+// TestConcurrentSubmitAndClose races Submit against Close and pins the property
+// that makes the race safe: a Submit that reports SUCCESS must have had its
+// command proposed, and a Submit that reports failure must not have.
+//
+// It previously ended at "the test passes if there are no panics or data
+// races" — every Submit's return value was discarded, so nothing but the race
+// detector could fail it. A build that reported success for a command it never
+// proposed (or ClosedError for one it did) passed silently, and that is exactly
+// the class of bug this shutdown race produces: the caller of a batched write
+// has no other signal, and the aggregator has no at-most-once path to repair a
+// wrong answer with.
 func TestConcurrentSubmitAndClose(t *testing.T) {
 	t.Parallel()
 
-	mp := &mockProposer{}
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(mp,
+	cp := &countingProposer{}
+	agg, err := NewAggregator(cp,
 		WithConfig(Config{
 			MaxBatchSize:  5,
 			FlushInterval: 2 * time.Millisecond,
 			QueueSize:     100,
 		}),
-		WithRegistry(reg),
+		WithRegistry(newTestRegistry(t)),
 	)
 	if err != nil {
 		t.Fatalf("NewAggregator failed: %v", err)
@@ -936,22 +1070,47 @@ func TestConcurrentSubmitAndClose(t *testing.T) {
 	const goroutines = 10
 	ctx := context.Background()
 
+	results := make([]error, goroutines)
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for range goroutines {
+	for g := range goroutines {
 		go func() {
 			defer wg.Done()
-			// Errors are expected since Close races with Submit.
-			agg.Submit(ctx, 1, []byte("race"))
+			// Errors are expected: Close races with Submit.
+			results[g] = agg.Submit(ctx, 1, []byte("race"))
 		}()
 	}
 
 	// Yield to give goroutines a chance to submit before closing.
 	runtime.Gosched()
-	agg.Close()
+	if closeErr := agg.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
 
 	wg.Wait()
-	// The test passes if there are no panics or data races.
+
+	// Close has returned, so the flush loop has exited and nothing further can
+	// be proposed: the proposer's count is final and comparable.
+	succeeded := 0
+	for g, submitErr := range results {
+		switch {
+		case submitErr == nil:
+			succeeded++
+		case errors.Is(submitErr, ErrClosed), errors.Is(submitErr, ErrFlush):
+			// The two legitimate refusals: the aggregator was already closed,
+			// or the batch failed.
+		default:
+			t.Errorf("goroutine %d: Submit = %T (%v); a submission racing Close "+
+				"must report nil, ErrClosed or ErrFlush and nothing else",
+				g, submitErr, submitErr)
+		}
+	}
+
+	if got := cp.count(); got != succeeded {
+		t.Errorf("%d Submit calls reported success but the proposer saw %d commands: "+
+			"a batched write was acknowledged without being proposed, or a proposed "+
+			"one was reported as failed", succeeded, got)
+	}
 }
 
 func TestSubmit_DataIntegrity(t *testing.T) {

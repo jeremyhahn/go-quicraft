@@ -253,47 +253,135 @@ func TestDecodeError_As(t *testing.T) {
 	}
 }
 
+// TestErrorTypes_AreDistinct pins that each concrete error type is
+// distinguishable from every OTHER one, which is what a caller switching on
+// errors.As depends on.
+//
+// Its previous shape asserted only errors.As(X, &targetOfXsOwnType) for each
+// type in turn — five tautologies that no implementation of Is or Unwrap could
+// falsify. Nothing in it tested distinctness, which is the name of the test and
+// the only interesting property: a type that started matching a sibling (an
+// over-broad Is, or an Unwrap chain that reached one) would have passed.
+//
+// The full cross-product is checked here, both for errors.As (type identity)
+// and errors.Is against each type's own sentinel. ErrEncode/EncodeError is
+// included; it was absent from every distinctness check in this file.
 func TestErrorTypes_AreDistinct(t *testing.T) {
 	t.Parallel()
 
-	closed := &ClosedError{}
-	queueFull := &QueueFullError{QueueSize: 10}
-	nilProposer := &NilProposerError{}
-	flush := &FlushError{ShardID: 1, Err: errors.New("e")}
-	decode := &DecodeError{Reason: "r"}
+	// asOf reports whether err matches the concrete type this entry names.
+	// Each closure allocates its own target so a match cannot leak between
+	// table rows.
+	cases := []struct {
+		name     string
+		err      error
+		sentinel error
+		matches  func(error) bool
+	}{
+		{"ClosedError", &ClosedError{}, ErrClosed,
+			func(e error) bool { var t *ClosedError; return errors.As(e, &t) }},
+		{"QueueFullError", &QueueFullError{QueueSize: 10}, ErrQueueFull,
+			func(e error) bool { var t *QueueFullError; return errors.As(e, &t) }},
+		{"NilProposerError", &NilProposerError{}, ErrNilProposer,
+			func(e error) bool { var t *NilProposerError; return errors.As(e, &t) }},
+		{"FlushError", &FlushError{ShardID: 1, Err: errors.New("e")}, ErrFlush,
+			func(e error) bool { var t *FlushError; return errors.As(e, &t) }},
+		{"DecodeError", &DecodeError{Reason: "r"}, ErrDecode,
+			func(e error) bool { var t *DecodeError; return errors.As(e, &t) }},
+		{"EncodeError", &EncodeError{Reason: "r"}, ErrEncode,
+			func(e error) bool { var t *EncodeError; return errors.As(e, &t) }},
+	}
 
-	var ce *ClosedError
-	var qfe *QueueFullError
-	var npe *NilProposerError
-	var fe *FlushError
-	var de *DecodeError
-
-	if !errors.As(closed, &ce) {
-		t.Error("ClosedError should match *ClosedError")
-	}
-	if !errors.As(queueFull, &qfe) {
-		t.Error("QueueFullError should match *QueueFullError")
-	}
-	if !errors.As(nilProposer, &npe) {
-		t.Error("NilProposerError should match *NilProposerError")
-	}
-	if !errors.As(flush, &fe) {
-		t.Error("FlushError should match *FlushError")
-	}
-	if !errors.As(decode, &de) {
-		t.Error("DecodeError should match *DecodeError")
+	for i, subject := range cases {
+		for j, probe := range cases {
+			gotAs := probe.matches(subject.err)
+			if wantAs := i == j; gotAs != wantAs {
+				t.Errorf("errors.As(%s, *%s) = %v, want %v",
+					subject.name, probe.name, gotAs, wantAs)
+			}
+			gotIs := errors.Is(subject.err, probe.sentinel)
+			if wantIs := i == j; gotIs != wantIs {
+				t.Errorf("errors.Is(%s, %v) = %v, want %v",
+					subject.name, probe.sentinel, gotIs, wantIs)
+			}
+		}
 	}
 }
 
 func TestSentinelErrors_AreDistinct(t *testing.T) {
 	t.Parallel()
 
-	sentinels := []error{ErrClosed, ErrQueueFull, ErrNilProposer, ErrFlush, ErrDecode}
+	// ErrEncode is included: it was the one sentinel this check never covered,
+	// so nothing prevented it from being defined as an alias of another.
+	sentinels := []error{ErrClosed, ErrQueueFull, ErrNilProposer, ErrFlush, ErrDecode, ErrEncode}
 	for i, a := range sentinels {
 		for j, b := range sentinels {
 			if i != j && errors.Is(a, b) {
 				t.Errorf("sentinel %q should not match %q", a, b)
 			}
 		}
+	}
+}
+
+// TestFlushError_ErrorIndeterminate covers FlushError.Error's indeterminate
+// branch, which no test reached. The wording is the caller's only signal that a
+// retry may apply the whole batch a second time — the aggregator has no
+// at-most-once path — so it must not read like the definite-failure message.
+func TestFlushError_ErrorIndeterminate(t *testing.T) {
+	t.Parallel()
+	inner := errors.New("context deadline exceeded")
+	err := &FlushError{ShardID: 5, Err: inner, Indeterminate: true}
+
+	want := "quicraft/batch: flush outcome indeterminate for shard 5: context deadline exceeded"
+	if got := err.Error(); got != want {
+		t.Errorf("FlushError.Error() = %q, want %q", got, want)
+	}
+
+	definite := &FlushError{ShardID: 5, Err: inner}
+	if definite.Error() == err.Error() {
+		t.Error("an indeterminate flush must not report the same message as a definite failure")
+	}
+}
+
+func TestEncodeError_Error(t *testing.T) {
+	t.Parallel()
+	err := &EncodeError{Reason: "command length exceeds MaxInt32"}
+	want := "quicraft/batch: encode failed: command length exceeds MaxInt32"
+	if got := err.Error(); got != want {
+		t.Errorf("EncodeError.Error() = %q, want %q", got, want)
+	}
+}
+
+func TestEncodeError_ErrorEmptyReason(t *testing.T) {
+	t.Parallel()
+	err := &EncodeError{Reason: ""}
+	want := "quicraft/batch: encode failed: "
+	if got := err.Error(); got != want {
+		t.Errorf("EncodeError.Error() = %q, want %q", got, want)
+	}
+}
+
+func TestEncodeError_Is(t *testing.T) {
+	t.Parallel()
+	err := &EncodeError{Reason: "bad command"}
+
+	if !errors.Is(err, ErrEncode) {
+		t.Error("EncodeError should match ErrEncode sentinel via errors.Is")
+	}
+	if errors.Is(err, ErrDecode) {
+		t.Error("EncodeError should not match ErrDecode")
+	}
+}
+
+func TestEncodeError_As(t *testing.T) {
+	t.Parallel()
+	var target *EncodeError
+	err := &EncodeError{Reason: "command length exceeds MaxInt32"}
+
+	if !errors.As(err, &target) {
+		t.Fatal("errors.As should match *EncodeError")
+	}
+	if target.Reason != "command length exceeds MaxInt32" {
+		t.Errorf("Reason = %q, want %q", target.Reason, "command length exceeds MaxInt32")
 	}
 }

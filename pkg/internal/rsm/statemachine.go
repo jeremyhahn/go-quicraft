@@ -1134,8 +1134,27 @@ func (s *StateMachine) SMType() SMType {
 	return s.smType
 }
 
-// Sessions returns the session manager for external access (e.g.,
-// by the leader for TTL expiration scans).
+// Sessions returns this state machine's session manager for INSPECTION.
+//
+// CONCURRENCY. session.Manager is not safe for concurrent use, and this hands
+// out the live one — the same object Apply, RecoverFromSnapshot and
+// SaveSnapshotGated mutate. Every method on it, including the read-only-looking
+// Count and IsRegistered, must therefore be called only when no Apply and no
+// snapshot save can be in flight for this shard: from a test that drives the
+// state machine directly, or from a shard the engine has quiesced. There is no
+// lock here to make that safe, and adding one would not help — the manager's
+// invariants span calls, so a caller reading Count and then acting on it needs
+// the whole window, not one method's worth.
+//
+// It has no production caller. The comment it used to carry claimed one — "by
+// the leader for TTL expiration scans" — and no such scan exists anywhere:
+// session expiry is driven from Apply at fixed log-index checkpoints precisely
+// BECAUSE a leader-local wall-clock scan would not be deterministic across
+// replicas (see Apply). The accessor is kept for the shard-level tests in this
+// package and for the host's session-policy tests, which assert the limits the
+// apply path actually resolved; nothing else may use it, and a future caller
+// that wants one of these numbers on a live shard needs a snapshot of the value
+// taken on the apply goroutine, not this pointer.
 func (s *StateMachine) Sessions() *session.Manager {
 	return s.sessions
 }
