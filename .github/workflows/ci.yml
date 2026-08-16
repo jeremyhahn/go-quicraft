@@ -22,145 +22,16 @@ env:
   GOWORK: "off"
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  # lint / security / trivy live in quality.yml so the RELEASE pipeline runs
+  # the identical gates. They were defined here, and release.yml never called
+  # them: a tag push ran no gosec, govulncheck, Trivy, gofmt, vet or lint at
+  # all. See quality.yml.
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yml
+    with:
+      go-version: "1.26.6"
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Check formatting
-        run: |
-          UNFORMATTED=$(gofmt -l .)
-          if [ -n "${UNFORMATTED}" ]; then
-            echo "Files not formatted:"
-            echo "${UNFORMATTED}"
-            exit 1
-          fi
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-
-      - name: golangci-lint
-        run: golangci-lint run --timeout=5m ./...
-
-  security:
-    name: Security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
-
-      # Writes SARIF (uploaded below) and still exits non-zero on findings to
-      # gate the build. Tests, examples and contrib adapters are excluded.
-      #
-      # Every -exclude rule below was checked against the code; record the
-      # reason here so the next person does not have to re-derive it. Keep this
-      # list identical to GOSEC_EXCLUDE in the Makefile.
-      #   G103 unsafe: the proto codec is a fixed-layout zero-copy encoding.
-      #   G104 unhandled error: fires on hash.Write, which never returns one.
-      #   G115 integer overflow on conversion: the conversions it flags sit
-      #        behind an explicit bounds check on the same value (frame and
-      #        entry sizes are validated against MaxFrameSize /
-      #        MaxReplicationPayloadBytes before the narrowing conversion).
-      #        NOT a blanket "we accept overflow" — a NEW conversion without a
-      #        preceding bound is a real finding this exclusion will hide, so
-      #        review narrowing conversions by hand.
-      #   G301/G306 file and directory permissions: 0755/0644 on data
-      #        directories and data files is the intended posture; secret
-      #        material is written 0600 explicitly.
-      #   G304 file inclusion via variable: every snapshot/WAL path is
-      #        constructed internally from (shard, replica, index), never from
-      #        a request.
-      #   G404 weak random: false positive. The only math/rand use is election
-      #        jitter in pkg/internal/raft/raft.go, and newRaft seeds it from
-      #        crypto/rand. Jitter must be fast and unpredictable-enough to
-      #        desynchronize campaigns; it is not a security primitive.
-      - name: Run gosec
-        run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
-
-      - name: Upload gosec SARIF
-        # Gitea has no code-scanning API; the upload 404s and fails the job.
-        if: always() && github.server_url == 'https://github.com'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gosec.sarif
-          category: gosec
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        run: govulncheck ./...
-
-  trivy:
-    name: Trivy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # A fresh source-scoped scan is uploaded to GitHub code scanning on every
-      # run, so the dashboard never reflects a stale analysis. Benchmark
-      # harnesses (test/performance/*), examples, and contrib adapters are
-      # excluded — none ship in a release; their deps are tracked via Dependabot.
-      # NOTE: do NOT image-scan the .devcontainer dev image into code scanning;
-      # that surfaces base-OS/toolchain CVEs that are not go-quicraft source vulns.
-      - name: Trivy scan (SARIF for code scanning)
-        # trivy-action's setup checks out aquasecurity/trivy from github.com
-        # with the runner token, which a Gitea token cannot authenticate.
-        if: github.server_url == 'https://github.com'
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-results.sarif
-          exit-code: 0
-          skip-dirs: test,examples,contrib
-          trivyignores: .trivyignore
-
-      - name: Upload Trivy SARIF
-        if: always() && github.server_url == 'https://github.com'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-fs
-
-      - name: Trivy gate (fail on CRITICAL/HIGH)
-        if: github.server_url == 'https://github.com'
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,secret
-          severity: CRITICAL,HIGH
-          exit-code: 1
-          format: table
-          skip-dirs: test,examples,contrib
-          trivyignores: .trivyignore
-
-      # Same gate on Gitea, via the trivy CLI installed from the release
-      # tarball (anonymous download — no github.com auth involved).
-      - name: Install Trivy (Gitea)
-        if: github.server_url != 'https://github.com'
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-      - name: Trivy gate (Gitea)
-        if: github.server_url != 'https://github.com'
-        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
 
   build:
     name: Build
@@ -194,7 +65,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    needs: [quality, build]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -262,7 +133,7 @@ jobs:
     # This serialises the three heavy jobs and costs a few minutes of wall
     # clock. The short jobs (errfs, fuzz seeds) stay parallel; they finish in
     # seconds and contend with nothing.
-    needs: [lint, build, test]
+    needs: [quality, build, test]
     # 45, not 30: the suite is ~9 min on a quiet machine but every package runs
     # under -race with -p 1, so a loaded runner stretches it considerably. The
     # -timeout=1800s below is the real budget; this is only the outer backstop.
@@ -287,7 +158,7 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs]
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    needs: [quality, build]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -305,7 +176,7 @@ jobs:
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz]
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    needs: [quality, build]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -381,7 +252,22 @@ jobs:
           FAILED=""
           for dir in ${MODULES}; do
             echo "::group::${dir}"
-            if ! (cd "${dir}" && go build ./... && go vet ./...); then
+            # `go vet -tags=benchmark` as well as the untagged pass. Three
+            # benchmark_test.go files under test/performance/ sit behind
+            # //go:build benchmark, and NOTHING passed that tag anywhere —
+            # not the Makefile, not this workflow — so they were never
+            # compiled OR vetted and could rot to a build error with CI green.
+            # That is the exact failure this job's own comment exists to
+            # prevent, one build tag over.
+            #
+            # `go test ./...` runs the 114 test functions in
+            # test/performance/perfresult and benchutil, which gate
+            # `make bench-compare` — the RELEASE performance comparison. They
+            # were only built and vetted, never run, so a regression in the
+            # comparison logic would silently pass or fail that gate.
+            if ! (cd "${dir}" && go build ./... && go vet ./... \
+                  && go vet -tags=benchmark ./... \
+                  && go test -count=1 ./...); then
               FAILED="${FAILED} ${dir}"
             fi
             echo "::endgroup::"
@@ -416,7 +302,7 @@ jobs:
     # stands up multi-node QUIC clusters through the dragonboat compatibility
     # API, so running it beside the main integration suite is the same mistake
     # twice.
-    needs: [lint, build, integration]
+    needs: [quality, build, integration]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

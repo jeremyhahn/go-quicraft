@@ -102,6 +102,19 @@ jobs:
   # the same commands as the corresponding ci.yml jobs; keep them in step.
   # ==========================================================================
 
+  # The lint / security / trivy gates, on the EXACT commit being released.
+  #
+  # These ran only in ci.yml, which triggers on branches; release.yml triggers
+  # on tags, so a tag published with no gosec, govulncheck, Trivy, gofmt, vet
+  # or golangci-lint having run on that commit. Advisories are time-sensitive:
+  # one published after the last branch build shipped unseen.
+  quality:
+    name: Gate - lint, security, trivy
+    needs: validate
+    uses: ./.github/workflows/quality.yml
+    with:
+      go-version: "1.26.6"
+
   integration:
     name: Gate - integration suite
     runs-on: ubuntu-latest
@@ -258,7 +271,7 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, integration, errfs, fuzz, modules]
+    needs: [validate, quality, integration, errfs, fuzz, modules]
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -281,8 +294,18 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Byte-identical to the ci.yml `test` job, deliberately. This step used
+      # to drop BOTH -race and the coverage threshold, so the race-enabled unit
+      # suite never ran on a tag at all.
       - name: Test
-        run: go test -count=1 -timeout=900s ./...
+        run: |
+          go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./...
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: ${COVERAGE}%"
+          if [ $(echo "${COVERAGE} < 91" | bc -l) -eq 1 ]; then
+            echo "FAIL: coverage ${COVERAGE}% is below minimum 91%"
+            exit 1
+          fi
 
       # Consumers read the release page, not the repository, so the notes have
       # to carry the section verbatim — including the on-disk break warnings,
