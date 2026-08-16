@@ -58,6 +58,16 @@ var (
 	// retained struct header. It converts a memory budget into a chunk-count
 	// ceiling at admission time.
 	minSnapshotChunkResidentBytes = int64((&proto.SnapshotChunk{}).Size()) + snapshotChunkStructBytes
+
+	// maxSnapshotChunkResidentBytes is the most memory one admitted chunk can
+	// occupy: the smallest valid frame, plus the largest Data payload a chunk
+	// may carry, plus the longest filepath it may name. It is the FLOOR on the
+	// derived per-peer memory ceiling (see snapshotReceiver.maxPerPeerMemory),
+	// so an operator who configures a small MaxSnapshotReceiveMemory cannot end
+	// up with a per-peer ceiling too tight for a single legal chunk — which
+	// would refuse every transfer rather than only unfair ones.
+	maxSnapshotChunkResidentBytes = minSnapshotChunkResidentBytes +
+		int64(maxSnapshotChunkDataLen) + int64(maxSnapshotFilepathLen)
 )
 
 // maxRateLimitChunkSleep caps the per-chunk rate-limit sleep. A pathologically
@@ -139,20 +149,32 @@ type snapshotReceiver struct {
 	// host-wide, across every peer.
 	sem chan struct{}
 
-	// peerMu protects peerSlots.
+	// peerMu protects peerUse.
 	peerMu sync.Mutex
 
-	// peerSlots counts in-flight receives per peer IDENTITY — see
-	// snapshotFairnessKey, which derives the key from the peer's authenticated
-	// certificate rather than from anything the peer picks per connection.
-	// Without it the host-global sem is holdable in full by one peer, after
-	// which every legitimate snapshot to a recovering follower is dropped and
-	// the shard cannot restore quorum.
-	peerSlots map[string]int
+	// peerUse tracks the snapshot-receive resources in use per peer IDENTITY —
+	// see snapshotFairnessKey, which derives the key from the peer's
+	// authenticated certificate rather than from anything the peer picks per
+	// connection. Without it the host-global sem and memory budget are both
+	// holdable in full by one peer, after which every legitimate snapshot to a
+	// recovering follower is dropped and the shard cannot restore quorum.
+	peerUse map[string]*peerSnapshotUse
 
 	// maxPerPeer is the ceiling on concurrent receives from a single peer
 	// identity: ceil(maxConcurrent/2), so no peer can occupy the whole budget.
 	maxPerPeer int
+
+	// maxPerPeerMemory is the ceiling on in-flight receive memory a single peer
+	// identity may hold, derived at construction from maxMemory in the same
+	// proportion maxPerPeer bears to the concurrency limit.
+	//
+	// The concurrency limit alone does not bound memory. A peer entitled to two
+	// of four slots was still free to charge the WHOLE of maxMemory against
+	// either of them — the only per-receive ceiling was maxMemory itself — so
+	// one peer could drive the host-global budget to zero and every other
+	// peer's chunks into the exhaustion path, which is exactly the starvation
+	// the per-peer slot limit exists to prevent, one level down.
+	maxPerPeerMemory int64
 
 	// maxTransferDuration, minTransferDuration, progressGracePeriod and
 	// minBytesPerSec are the whole-transfer liveness bounds, seeded from the
@@ -219,8 +241,9 @@ func newSnapshotReceiver(
 	}
 	sr := &snapshotReceiver{
 		sem:                 make(chan struct{}, maxConcurrent),
-		peerSlots:           make(map[string]int),
+		peerUse:             make(map[string]*peerSnapshotUse),
 		maxPerPeer:          maxPerPeer,
+		maxPerPeerMemory:    perPeerSnapshotMemory(maxMemory, maxConcurrent, maxPerPeer),
 		maxTransferDuration: maxSnapshotTransferDuration,
 		minTransferDuration: minSnapshotTransferDuration,
 		progressGracePeriod: snapshotProgressGracePeriod,
@@ -234,6 +257,47 @@ func newSnapshotReceiver(
 	return sr
 }
 
+// peerSnapshotUse is one peer identity's share of the snapshot-receive
+// resources: the concurrent transfers it holds and the memory those transfers
+// have reserved.
+//
+// Both live in ONE entry, guarded by peerMu, because their lifetimes are the
+// same: memory is only ever charged by a transfer that holds a slot, and every
+// charge is refunded before the slot it was taken under is released (the
+// refund runs inside receiveChunks, which returns before receiveSnapshot's
+// deferred releasePeerSlot). Pruning the entry at zero slots therefore cannot
+// discard a live reservation, and the map stays bounded across peer churn.
+type peerSnapshotUse struct {
+	slots    int
+	reserved int64
+}
+
+// perPeerSnapshotMemory derives the per-peer receive-memory ceiling from the
+// host-global budget, in the same proportion the per-peer slot limit bears to
+// the host-global concurrency limit: a peer entitled to half the slots gets
+// half the memory.
+//
+// It is floored at maxSnapshotChunkResidentBytes so a single legal chunk always
+// fits — a ceiling below that would refuse every transfer, not just unfair ones
+// — and clamped to the global budget so the sub-limit is never the looser of
+// the two.
+func perPeerSnapshotMemory(maxMemory int64, maxConcurrent, maxPerPeer int) int64 {
+	if maxMemory <= 0 {
+		return maxMemory
+	}
+	limit := maxMemory
+	if maxConcurrent > 0 && maxPerPeer < maxConcurrent {
+		limit = maxMemory / int64(maxConcurrent) * int64(maxPerPeer)
+	}
+	if limit < maxSnapshotChunkResidentBytes {
+		limit = maxSnapshotChunkResidentBytes
+	}
+	if limit > maxMemory {
+		limit = maxMemory
+	}
+	return limit
+}
+
 // acquirePeerSlot reserves one of a peer identity's concurrent-receive slots.
 // peerKey comes from snapshotFairnessKey and must be an identity the peer
 // cannot vary; keying this on anything a client chooses per connection (an
@@ -245,30 +309,121 @@ func (sr *snapshotReceiver) acquirePeerSlot(peerKey string) bool {
 	}
 	sr.peerMu.Lock()
 	defer sr.peerMu.Unlock()
-	if sr.peerSlots[peerKey] >= sr.maxPerPeer {
+	use := sr.peerUse[peerKey]
+	if use == nil {
+		use = &peerSnapshotUse{}
+		sr.peerUse[peerKey] = use
+	}
+	if use.slots >= sr.maxPerPeer {
+		if use.slots == 0 && use.reserved == 0 {
+			delete(sr.peerUse, peerKey)
+		}
 		return false
 	}
-	sr.peerSlots[peerKey]++
+	use.slots++
 	return true
 }
 
 // releasePeerSlot returns a peer identity's concurrent-receive slot, pruning
-// the map entry at zero so it does not grow across peer churn.
+// the map entry once the peer holds neither a slot nor a reservation so it does
+// not grow across peer churn.
 func (sr *snapshotReceiver) releasePeerSlot(peerKey string) {
 	if peerKey == "" {
 		return
 	}
 	sr.peerMu.Lock()
 	defer sr.peerMu.Unlock()
-	n, ok := sr.peerSlots[peerKey]
+	use, ok := sr.peerUse[peerKey]
 	if !ok {
 		return
 	}
-	if n <= 1 {
-		delete(sr.peerSlots, peerKey)
+	if use.slots > 0 {
+		use.slots--
+	}
+	if use.slots == 0 && use.reserved == 0 {
+		delete(sr.peerUse, peerKey)
+	}
+}
+
+// reservePeerMemory charges n bytes to a peer identity's memory sub-budget,
+// reporting whether the charge fit under maxPerPeerMemory. An empty key
+// (unit-test paths with no connection) is not accounted, matching
+// acquirePeerSlot.
+func (sr *snapshotReceiver) reservePeerMemory(peerKey string, n int64) bool {
+	if peerKey == "" || sr.maxPerPeerMemory <= 0 {
+		return true
+	}
+	sr.peerMu.Lock()
+	defer sr.peerMu.Unlock()
+	use := sr.peerUse[peerKey]
+	if use == nil {
+		use = &peerSnapshotUse{}
+		sr.peerUse[peerKey] = use
+	}
+	if use.reserved+n > sr.maxPerPeerMemory {
+		if use.slots == 0 && use.reserved == 0 {
+			delete(sr.peerUse, peerKey)
+		}
+		return false
+	}
+	use.reserved += n
+	return true
+}
+
+// releasePeerMemory returns n previously-charged bytes to a peer identity's
+// memory sub-budget.
+func (sr *snapshotReceiver) releasePeerMemory(peerKey string, n int64) {
+	if peerKey == "" || sr.maxPerPeerMemory <= 0 {
 		return
 	}
-	sr.peerSlots[peerKey] = n - 1
+	sr.peerMu.Lock()
+	defer sr.peerMu.Unlock()
+	use, ok := sr.peerUse[peerKey]
+	if !ok {
+		return
+	}
+	use.reserved -= n
+	if use.reserved < 0 {
+		use.reserved = 0
+	}
+	if use.slots == 0 && use.reserved == 0 {
+		delete(sr.peerUse, peerKey)
+	}
+}
+
+// chunkMemoryRejection names the ceiling that refused one chunk's reservation,
+// so the caller can report which of the two budgets ran out rather than
+// attributing every exhaustion to the host-global one.
+type chunkMemoryRejection struct {
+	detail string
+	budget int64
+}
+
+// reserveChunkMemory charges n bytes for one inbound chunk against BOTH the
+// host-global budget and the sending peer's sub-budget, returning nil when the
+// charge fit under both. On refusal nothing remains charged: the global
+// reservation is rolled back before the per-peer refusal is reported, so a
+// rejected chunk never leaks budget.
+//
+// Both ceilings are needed and neither subsumes the other. The global budget
+// bounds host memory; the per-peer budget bounds one peer's share of it. Paired
+// with releaseChunkMemory.
+func (sr *snapshotReceiver) reserveChunkMemory(peerKey string, n int64) *chunkMemoryRejection {
+	if remaining := sr.memoryBudget.Add(-n); remaining < 0 {
+		sr.memoryBudget.Add(n)
+		return &chunkMemoryRejection{detail: "receive memory budget exhausted", budget: sr.maxMemory}
+	}
+	if !sr.reservePeerMemory(peerKey, n) {
+		sr.memoryBudget.Add(n)
+		return &chunkMemoryRejection{detail: "per-peer receive memory budget exhausted", budget: sr.maxPerPeerMemory}
+	}
+	return nil
+}
+
+// releaseChunkMemory returns n previously-reserved bytes to both budgets.
+func (sr *snapshotReceiver) releaseChunkMemory(peerKey string, n int64) {
+	sr.memoryBudget.Add(n)
+	sr.releasePeerMemory(peerKey, n)
 }
 
 // transferBudget returns how long ONE inbound transfer of the declared chunk
@@ -414,7 +569,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 		defer tracker.DeregisterInFlightEpoch(hdr.Epoch)
 	}
 
-	sr.receiveChunks(stream, hdr, peer, stopC)
+	sr.receiveChunks(stream, hdr, peerKey, peer, stopC)
 }
 
 // rateLimitChunkSleep computes the per-chunk rate-limit sleep for a chunk of
@@ -434,7 +589,7 @@ func rateLimitChunkSleep(length uint32, bytesPerSec int64) time.Duration {
 // budget, applies rate limiting, and dispatches chunks to the handler.
 //
 //nolint:gocyclo // chunk streaming interleaves budget reservation with four distinct release paths, liveness accounting and validation; the budget charge and its release must stay in one function, since a missed release is a permanent leak that eventually rejects every inbound snapshot host-wide
-func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, peer PeerAuth, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
+func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeader, peerKey string, peer PeerAuth, stopC <-chan struct{}) { //nolint:gocognit // metrics instrumentation
 	recvStart := time.Now()
 	// Cap initial allocation to prevent a malicious header from causing an
 	// oversized pre-allocation. The slice grows dynamically beyond this cap.
@@ -457,7 +612,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	// atomic budget counter.
 	defer func() {
 		if charged > 0 {
-			sr.memoryBudget.Add(charged)
+			sr.releaseChunkMemory(peerKey, charged)
 		}
 	}()
 
@@ -555,15 +710,13 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		// until the transfer completes; charging the frame length alone lets a
 		// flood of minimum-size chunks hold multiples of the accounted memory.
 		chunkCharge := int64(length) + snapshotChunkStructBytes
-		remaining := sr.memoryBudget.Add(-chunkCharge)
-		if remaining < 0 {
-			// Over budget, restore and reject. This chunk was never
-			// added to charged so it must be restored inline.
-			sr.memoryBudget.Add(chunkCharge)
-			sr.rejectSnapshot(hdr, snapshotRejectMemory, "receive memory budget exhausted", totalBytes+int64(length),
+		if rejection := sr.reserveChunkMemory(peerKey, chunkCharge); rejection != nil {
+			// Over budget. reserveChunkMemory leaves nothing charged on
+			// refusal, so there is no inline restore to do here.
+			sr.rejectSnapshot(hdr, snapshotRejectMemory, rejection.detail, totalBytes+int64(length),
 				&SnapshotMemoryBudgetExceededError{
 					Accumulated: charged + chunkCharge,
-					Budget:      sr.maxMemory,
+					Budget:      rejection.budget,
 				})
 			return
 		}
@@ -572,7 +725,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		if _, err := io.ReadFull(stream, buf); err != nil {
 			// Read failed. This chunk was deducted from budget but
 			// not yet added to charged, so restore it inline.
-			sr.memoryBudget.Add(chunkCharge)
+			sr.releaseChunkMemory(peerKey, chunkCharge)
 			sr.rejectSnapshot(hdr, snapshotRejectIO, "chunk body read failed", totalBytes, err)
 			return
 		}
@@ -581,7 +734,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		if _, err := chunk.UnmarshalFrom(buf); err != nil {
 			// Unmarshal failed. Same as above: restore inline since
 			// this chunk is not yet tracked in charged.
-			sr.memoryBudget.Add(chunkCharge)
+			sr.releaseChunkMemory(peerKey, chunkCharge)
 			sr.rejectSnapshot(hdr, snapshotRejectMalformed, "chunk unmarshal failed", totalBytes, err)
 			return
 		}
@@ -590,7 +743,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		// header used for epoch pinning) to prevent oversized allocations
 		// and cross-cluster data corruption.
 		if err := sr.validateChunk(&chunk, hdr); err != nil {
-			sr.memoryBudget.Add(chunkCharge)
+			sr.releaseChunkMemory(peerKey, chunkCharge)
 			sr.rejectSnapshot(hdr, snapshotRejectMalformed, "chunk validation failed", totalBytes, err)
 			return
 		}

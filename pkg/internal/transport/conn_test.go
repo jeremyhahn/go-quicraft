@@ -3982,3 +3982,259 @@ func TestCloseTargetSendQueueRetirementSurvivesWorkerPrune(t *testing.T) {
 		t.Fatal("retired worker's idle prune deleted the live replacement queue")
 	}
 }
+
+// inboundConnCount returns how many inbound connections the transport is
+// tracking, which is the population every inbound reclaim policy operates on.
+func inboundConnCount(tr *QUICTransport) int {
+	n := 0
+	tr.inboundConns.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// awaitInboundConn waits for an inbound connection to be tracked and returns it
+// together with its liveness record.
+func awaitInboundConn(t *testing.T, tr *QUICTransport) (*quic.Conn, *inboundConnState) {
+	t.Helper()
+	var found *quic.Conn
+	var state *inboundConnState
+	pollUntil(t, 10*time.Second, 20*time.Millisecond,
+		"no inbound connection was tracked", func() bool {
+			tr.inboundConns.Range(func(k, v any) bool {
+				conn, ok := k.(*quic.Conn)
+				if !ok {
+					return true
+				}
+				st, ok := v.(*inboundConnState)
+				if !ok {
+					return true
+				}
+				found, state = conn, st
+				return false
+			})
+			return found != nil
+		})
+	return found, state
+}
+
+// TestIdleInboundConnectionIsReclaimed is the regression test for an inbound
+// connection that nothing could ever close.
+//
+// Tracking inbound connections was only half the control. This node's own
+// quic.Config sets KeepAlivePeriod (10s) below MaxIdleTimeout (30s) for BOTH
+// roles, so the listener PINGs every accepted connection forever and QUIC's
+// idle timeout can never fire on it; cleanStaleConnections reaps only
+// connections that are ALREADY dead. A peer that completes a handshake and then
+// says nothing held one of MaxIncomingConnections and one of
+// MaxConnectionsPerIP for the process lifetime, for the cost of answering a
+// PING.
+//
+// The test drives the sweep with an explicit clock rather than waiting out the
+// real 5-minute bound, and asserts BOTH directions: a connection inside the
+// bound survives, one past it does not.
+func TestIdleInboundConnectionIsReclaimed(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+	inbound, _ := awaitInboundConn(t, t2)
+
+	// CONTROL: a sweep at the current time must not touch a connection that
+	// has just carried a frame. Without this the assertion below would pass
+	// against a sweep that closes everything it sees.
+	t2.reapIdleInboundConns(time.Now())
+	select {
+	case <-inbound.Context().Done():
+		t.Fatal("a connection that carried a frame moments ago was reclaimed " +
+			"as idle: the sweep ignores the activity stamp and would tear down " +
+			"every healthy peering on each 30s tick")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// SUBJECT: past the idle bound the connection must actually be closed.
+	t2.reapIdleInboundConns(time.Now().Add(inboundIdleRetention + time.Second))
+	select {
+	case <-inbound.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("an inbound connection idle for more than %s was not closed: "+
+			"nothing else can ever reclaim it, so it holds a global and a "+
+			"per-IP connection slot for the process lifetime", inboundIdleRetention)
+	}
+
+	// The close must also drop the tracking entry, or the reclaimed connection
+	// leaks in the map it was reclaimed from.
+	pollUntil(t, 10*time.Second, 20*time.Millisecond,
+		"the reclaimed inbound connection was never untracked",
+		func() bool { return inboundConnCount(t2) == 0 })
+}
+
+// TestInboundActivityStampKeepsBusyConnectionAlive pins the stamp that makes
+// the idle sweep safe.
+//
+// The stamp is taken on every FRAME, not once at admission and not on stream
+// acceptance, and that distinction is the whole difference between a reclaim
+// policy and an outage: a sender caches and reuses one stream across bursts, so
+// a connection carrying continuous replication traffic accepts no new stream
+// for as long as the burst lasts, and an admission-only stamp ages out under it.
+//
+// The connection's record is backdated past the idle bound before the traffic
+// is sent, so only a stamp taken on the ARRIVING FRAME can save it. Without the
+// backdating the admission stamp alone keeps the connection alive and the test
+// passes against no per-frame stamp at all.
+func TestInboundActivityStampKeepsBusyConnectionAlive(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+	inbound, state := awaitInboundConn(t, t2)
+
+	// Age the connection well past the idle bound, as a long-lived peering
+	// reaches on its own between the sweeps.
+	stale := time.Now().Add(-2 * inboundIdleRetention)
+	state.lastActive.Store(stale.UnixNano())
+
+	// CONTROL: the backdated connection really is reapable, so the assertion
+	// below is about the stamp rather than about a sweep that never fires.
+	if state.lastActive.Load() > time.Now().Add(-inboundIdleRetention).UnixNano() {
+		t.Fatal("the connection was not aged past the idle bound; the " +
+			"assertion below would pass without any per-frame stamp")
+	}
+
+	// Traffic over the SAME cached stream must refresh it.
+	t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+
+	t2.reapIdleInboundConns(time.Now())
+	select {
+	case <-inbound.Context().Done():
+		t.Fatal("a connection that has just delivered a batch was reclaimed: " +
+			"the activity stamp is not taken on arriving frames, so any peering " +
+			"whose sender reuses one cached stream is torn down on a timer")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestCloseTargetClosesInboundFromRemovedPeer is the regression test for the
+// half of a removed member's connectivity that the member controls.
+//
+// CloseTarget reached only t.conns, the connection this node DIALED. A removed
+// member that dialed US kept a fully live inbound connection — keep-alived from
+// both ends, holding a global and a per-IP slot, free to open streams — and
+// when this node had never dialed the peer at all, CloseTarget reclaimed
+// literally nothing and returned false.
+//
+// The receiving transport advertises a host its peers' certificate does NOT
+// cover, so the co-location exemption (which every loopback deployment lands
+// in) does not apply and the certificate match is actually exercised.
+func TestCloseTargetClosesInboundFromRemovedPeer(t *testing.T) {
+	receiver, sender, cleanup := inboundCertMatchPair(t)
+	defer cleanup()
+
+	sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
+	inbound, _ := awaitInboundConn(t, receiver)
+
+	// CONTROL: an address the peer's certificate does not cover must not close
+	// anything, or the "match" is really a sweep over every inbound connection.
+	if n := receiver.closeInboundFromPeer("not-in-any-san.example:9999"); n != 0 {
+		t.Fatalf("closeInboundFromPeer closed %d connections for an address no "+
+			"peer certificate covers: the teardown is not certificate-matched "+
+			"and would close third-party peers", n)
+	}
+	select {
+	case <-inbound.Context().Done():
+		t.Fatal("the inbound connection was closed for an unrelated address")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// SUBJECT: the removed peer's own address closes its inbound connection.
+	// "localhost" is in the test leaf's SANs; the receiver advertises
+	// node-under-test.example, so the co-location exemption does not fire.
+	if !receiver.CloseTarget("localhost:9999") {
+		t.Fatal("CloseTarget reported nothing reclaimed for a removed peer " +
+			"holding a live inbound connection: the inbound half is invisible " +
+			"to membership removal")
+	}
+	select {
+	case <-inbound.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the removed peer's inbound connection is still live after " +
+			"CloseTarget: a removed member keeps talking to this node forever")
+	}
+}
+
+// TestCloseTargetSparesCoLocatedInbound pins the exemption that keeps the
+// inbound teardown from destroying single-machine deployments.
+//
+// A certificate is matched on HOST alone, so on one machine every replica's
+// leaf covers every other replica's address. Without the exemption, removing
+// one loopback replica would close the healthy inbound connections of all its
+// neighbours — the same reason every other certificate control here exempts
+// co-located hosts.
+func TestCloseTargetSparesCoLocatedInbound(t *testing.T) {
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
+	defer cleanup()
+
+	t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
+	handler2.waitBatch(t, 10*time.Second)
+	inbound, _ := awaitInboundConn(t, t2)
+
+	if n := t2.closeInboundFromPeer("127.0.0.1:9999"); n != 0 {
+		t.Fatalf("closeInboundFromPeer closed %d co-located connections: on a "+
+			"single machine every replica's certificate covers every other "+
+			"replica's address, so this closes healthy neighbours", n)
+	}
+	select {
+	case <-inbound.Context().Done():
+		t.Fatal("a co-located peer's inbound connection was torn down")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// inboundCertMatchPair builds a receiver whose ADVERTISED host is absent from
+// the shared test certificate, so certificate-matched inbound teardown can be
+// exercised: the co-located exemption would otherwise make it a no-op on
+// loopback, which is every test in this package.
+//
+// Returns (receiver, sender, cleanup).
+func inboundCertMatchPair(t *testing.T) (*QUICTransport, *QUICTransport, func()) {
+	t.Helper()
+	mtls := testMTLSConfig(t)
+
+	receiver, err := NewQUICTransport(Config{
+		ListenAddress:    "127.0.0.1:0",
+		AdvertiseAddress: "node-under-test.example:4001",
+		DeploymentID:     42,
+		MTLSConfig:       mtls,
+	}, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport(receiver): %v", err)
+	}
+	if err := receiver.Start(); err != nil {
+		t.Fatalf("receiver.Start: %v", err)
+	}
+
+	senderReg := registry.NewRegistry()
+	sender, err := NewQUICTransport(Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+	}, newTestHandler(), senderReg)
+	if err != nil {
+		receiver.Stop()
+		t.Fatalf("NewQUICTransport(sender): %v", err)
+	}
+	if err := sender.Start(); err != nil {
+		receiver.Stop()
+		t.Fatalf("sender.Start: %v", err)
+	}
+	senderReg.Register(1, 1, receiver.Addr().String())
+
+	return receiver, sender, func() {
+		sender.Stop()
+		receiver.Stop()
+	}
+}

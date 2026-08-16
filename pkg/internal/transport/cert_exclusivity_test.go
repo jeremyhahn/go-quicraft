@@ -736,3 +736,107 @@ func renewLeafOnSameKey(t *testing.T, mtls *MTLSConfig) *x509.Certificate {
 	}
 	return renewed
 }
+
+// TestUnnameableCertSelfHost_Table pins which advertised hosts leave the
+// promiscuous-certificate refusal with no question to ask.
+//
+// The distinction matters in both directions. Classifying a real host as
+// unnameable would silently disable a live security control; classifying a
+// loopback host as unnameable would confuse "this deployment is exempt" (a
+// documented property of co-located replicas) with "this control cannot run",
+// which is what the operator warning is about.
+func TestUnnameableCertSelfHost_Table(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"", true},
+		{"0.0.0.0", true},
+		{"::", true},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"node-a.raft.example.com", false},
+		{"10.20.30.40", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := unnameableCertSelfHost(tt.host); got != tt.want {
+				t.Fatalf("unnameableCertSelfHost(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPeerCertificateExclusivity_InertOnWildcardBind MEASURES the premise
+// behind the operator warning: on a wildcard bind with no AdvertiseAddress, the
+// promiscuous-certificate refusal admits the very certificate it exists to
+// refuse.
+//
+// This is not an assertion that the behaviour is desirable — failing closed
+// here would take down every wildcard-bound deployment on upgrade, which is an
+// operator's decision. It pins the fact so the warning
+// (reportPromiscuousCertCoverage) cannot be deleted as redundant, and so that a
+// later change to fail closed shows up here as a deliberate edit rather than as
+// a silent behaviour change.
+func TestPeerCertificateExclusivity_InertOnWildcardBind(t *testing.T) {
+	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
+	const peerAddr = "10.20.30.40:41000"
+
+	// CONTROL: with a real advertised host the same certificate IS refused.
+	if err := peerCertificateExclusivity(wildcard, "node-a.raft.example.com:5001", peerAddr); err == nil {
+		t.Fatal("the control case admitted a wildcard certificate; the " +
+			"measurement below would say nothing about the wildcard BIND")
+	}
+
+	for _, selfAddr := range []string{"0.0.0.0:5001", "[::]:5001", ":5001"} {
+		t.Run(selfAddr, func(t *testing.T) {
+			if err := peerCertificateExclusivity(wildcard, selfAddr, peerAddr); err != nil {
+				t.Fatalf("peerCertificateExclusivity(self=%q) = %v; if this now "+
+					"refuses, the control has been changed to fail closed and "+
+					"reportPromiscuousCertCoverage's WARN-only posture must be "+
+					"revisited with it", selfAddr, err)
+			}
+		})
+	}
+}
+
+// TestReportPromiscuousCertCoverage_FiresOnlyWhenInert pins the trigger for the
+// operator warning: it must fire exactly when the refusal cannot ask its
+// question, and stay silent otherwise — a warning on every healthy node is a
+// warning nobody reads.
+func TestReportPromiscuousCertCoverage_FiresOnlyWhenInert(t *testing.T) {
+	tests := []struct {
+		name             string
+		listenAddress    string
+		advertiseAddress string
+		wantInert        bool
+	}{
+		{"wildcard bind, no advertise address", "0.0.0.0:0", "", true},
+		{"wildcard bind rescued by advertise address", "0.0.0.0:0", "node-a.raft.example.com:5001", false},
+		{"loopback bind", "127.0.0.1:0", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, err := NewQUICTransport(Config{
+				ListenAddress:    tt.listenAddress,
+				AdvertiseAddress: tt.advertiseAddress,
+				DeploymentID:     42,
+				MTLSConfig:       testMTLSConfig(t),
+			}, newTestHandler(), registry.NewRegistry())
+			if err != nil {
+				t.Fatalf("NewQUICTransport: %v", err)
+			}
+			if err := tr.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer tr.Stop()
+
+			selfHost := canonicalCertHost(certAuthHost(tr.localAddr()))
+			if got := unnameableCertSelfHost(selfHost); got != tt.wantInert {
+				t.Fatalf("resolved advertised host %q is unnameable=%v, want %v "+
+					"(listen=%q advertise=%q)", selfHost, got, tt.wantInert,
+					tt.listenAddress, tt.advertiseAddress)
+			}
+		})
+	}
+}

@@ -135,7 +135,38 @@ const (
 	// found revoked (or unverifiable) by the periodic re-check, rather than at
 	// handshake. See revokeCheckConnections.
 	QUICErrRevoked quic.ApplicationErrorCode = 0x6
+
+	// QUICErrInboundIdle is sent when an inbound connection is reclaimed for
+	// having carried no frame for inboundIdleRetention. See
+	// reapIdleInboundConns.
+	QUICErrInboundIdle quic.ApplicationErrorCode = 0x7
+
+	// QUICErrPeerRemoved is sent to the INBOUND half of a peer whose removal
+	// from membership this node has committed. See closeInboundFromPeer.
+	QUICErrPeerRemoved quic.ApplicationErrorCode = 0x8
 )
+
+// closeReasonRedacted is the CONNECTION_CLOSE reason phrase used for every
+// close whose cause is an AUTHORIZATION verdict on the peer itself:
+// revocation, certificate policy, membership removal.
+//
+// The reason phrase is transmitted verbatim to the peer — quic-go's
+// PackApplicationClose copies ErrorMessage straight onto the wire, and only
+// TLS-alert (crypto) CONNECTION_CLOSE frames have their reason stripped, so a
+// handshake-stage verdict never travels but every one of these post-handshake
+// verdicts did. A prose phrase is the readable form of the verdict; a peer
+// probing for which of its certificates the cluster still accepts got the
+// answer written out for it. Every one of these closes logs its precise reason
+// LOCALLY, which is where an operator diagnosing the cluster reads it.
+//
+// It is deliberately empty rather than a generic sentence: any phrase is
+// something that can drift back into a description of the verdict, and it adds
+// nothing the numeric application error code does not already carry. The code
+// IS still distinct per verdict (QUICErrRevoked / QUICErrPromiscuousCert /
+// QUICErrPeerRemoved) — that is the protocol contract, and collapsing it would
+// cost the peer the ability to tell a policy close from a resource limit — so
+// this narrows the disclosure to its coarsest form rather than removing it.
+const closeReasonRedacted = ""
 
 // Stream-level QUIC error codes, sent in STOP_SENDING / RESET_STREAM frames
 // via Stream.CancelRead / Stream.CancelWrite. These are distinct from the

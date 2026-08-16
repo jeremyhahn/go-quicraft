@@ -17,6 +17,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -234,4 +235,103 @@ func waitForCount(h *identityCapturingHandler, want int, d time.Duration) (int, 
 		time.Sleep(10 * time.Millisecond)
 	}
 	return h.countIdentities(), false
+}
+
+// peerVisibleCloseError returns the CONNECTION_CLOSE the REMOTE end sent for a
+// connection, which is the only place the reason phrase a peer actually
+// receives can be read. quic-go cancels the connection context with the close
+// error as its cause.
+func peerVisibleCloseError(t *testing.T, conn *quic.Conn, timeout time.Duration) *quic.ApplicationError {
+	t.Helper()
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(timeout):
+		t.Fatal("the connection was never closed, so no close error is observable")
+	}
+	var appErr *quic.ApplicationError
+	if !errors.As(context.Cause(conn.Context()), &appErr) {
+		t.Fatalf("close cause = %v, want a *quic.ApplicationError",
+			context.Cause(conn.Context()))
+	}
+	if !appErr.Remote {
+		t.Fatalf("close error is LOCAL (%+v): this must be read from the side "+
+			"that RECEIVED the close, or the reason phrase under test is the "+
+			"one this process wrote to itself", appErr)
+	}
+	return appErr
+}
+
+// TestAuthorizationCloseReasonIsNotDisclosedToPeer pins that an authorization
+// verdict is not written out to the peer in the CONNECTION_CLOSE reason phrase.
+//
+// The phrase travels verbatim — quic-go's PackApplicationClose copies
+// ErrorMessage straight onto the wire, and only TLS-alert (crypto) closes have
+// their reason stripped — so "peer certificate revoked" was the readable answer
+// to a question the peer should have to work for. The precise verdict is still
+// logged locally at each close site; only the wire copy is removed.
+//
+// The numeric application error code is deliberately still distinct per verdict
+// and is asserted, so this test also pins that the redaction did not go so far
+// as to make a policy close indistinguishable from a resource limit.
+func TestAuthorizationCloseReasonIsNotDisclosedToPeer(t *testing.T) {
+	t.Run("revoked", func(t *testing.T) {
+		t1, t2, cleanup := transportPairWithRevocation(t)
+		defer cleanup()
+
+		// t1 dials t2 and is the side that will publish the revocation, so the
+		// peer-visible close is read from t2's INBOUND connection.
+		outbound, err := t1.getConnection(t2.Addr().String())
+		if err != nil {
+			t.Fatalf("getConnection: %v", err)
+		}
+		inbound, _ := awaitInboundConn(t, t2)
+
+		certs := outbound.ConnectionState().TLS.PeerCertificates
+		if len(certs) == 0 {
+			t.Fatal("test setup: no peer certificate on an mTLS connection")
+		}
+		t1.revocationChecker.AddRevokedSerial(certs[0].SerialNumber.Text(16))
+		t1.revokeCheckConnections()
+
+		appErr := peerVisibleCloseError(t, inbound, 5*time.Second)
+		if appErr.ErrorMessage != "" {
+			t.Fatalf("the peer received the reason phrase %q for a revocation "+
+				"close: the reason phrase is transmitted verbatim and tells an "+
+				"attacker which of its certificates the cluster still accepts",
+				appErr.ErrorMessage)
+		}
+		if appErr.ErrorCode != QUICErrRevoked {
+			t.Fatalf("close code = %d, want QUICErrRevoked (%d)",
+				appErr.ErrorCode, QUICErrRevoked)
+		}
+	})
+
+	t.Run("removed-from-membership", func(t *testing.T) {
+		receiver, sender, cleanup := inboundCertMatchPair(t)
+		defer cleanup()
+
+		sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
+		awaitInboundConn(t, receiver)
+
+		// The peer-visible side is the SENDER's outbound connection.
+		outbound, err := sender.getConnection(receiver.Addr().String())
+		if err != nil {
+			t.Fatalf("getConnection: %v", err)
+		}
+
+		if n := receiver.closeInboundFromPeer("localhost:9999"); n == 0 {
+			t.Fatal("no inbound connection was closed, so no close error is " +
+				"observable and the assertion below would be vacuous")
+		}
+
+		appErr := peerVisibleCloseError(t, outbound, 5*time.Second)
+		if appErr.ErrorMessage != "" {
+			t.Fatalf("the peer received the reason phrase %q for a membership "+
+				"removal close, disclosing the verdict verbatim", appErr.ErrorMessage)
+		}
+		if appErr.ErrorCode != QUICErrPeerRemoved {
+			t.Fatalf("close code = %d, want QUICErrPeerRemoved (%d)",
+				appErr.ErrorCode, QUICErrPeerRemoved)
+		}
+	})
 }

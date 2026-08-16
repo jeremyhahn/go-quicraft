@@ -64,6 +64,28 @@ const (
 	// outage never loses the epoch a re-dial needs to be stamped with, while
 	// a replica removed from membership is forgotten promptly.
 	peerIncarnationRetention = 10 * connectionCleanupInterval
+
+	// inboundIdleRetention is how long an INBOUND connection may carry no
+	// frame at all before it is reclaimed.
+	//
+	// Nothing else ever reclaims one. This node's own quic.Config sets
+	// KeepAlivePeriod (10s) below MaxIdleTimeout (30s) for BOTH roles, so the
+	// listener PINGs every accepted connection indefinitely and QUIC's idle
+	// timeout can never fire on it; cleanStaleConnections reaps only
+	// connections whose context is ALREADY dead, and CloseTarget reaches the
+	// outbound half. A peer that completes a handshake and then says nothing
+	// therefore holds one of MaxIncomingConnections (256) and one of
+	// MaxConnectionsPerIP (16) for the process lifetime, for the cost of
+	// answering a PING every 10 seconds.
+	//
+	// It is set to the same order as peerIncarnationRetention and an order of
+	// magnitude above MaxIdleTimeout: any live Raft peering is far busier than
+	// this (a leader heartbeats every tick, and a follower answers), so only a
+	// connection with no shard in common with this node — or a peer holding one
+	// open for its own reasons — can reach the bound. Reclaiming is cheap to
+	// get wrong in only one direction: the peer's next write fails, its
+	// write-failure path evicts the connection and re-dials.
+	inboundIdleRetention = 10 * connectionCleanupInterval
 )
 
 // getConnection returns an existing QUIC connection to the target address or
@@ -551,19 +573,23 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) b
 	return ok
 }
 
-// CloseTarget tears down the outbound connection to address and every piece of
-// address-keyed state that hangs off it: the pooled connection and its epoch
-// stamp (conns/connEpoch), every pooled stream opened on it, the per-target
-// send queue, and the peer's incarnation record. It reports whether a
-// connection was actually cached and therefore closed.
+// CloseTarget tears down BOTH directions of this node's connectivity to
+// address: every inbound connection whose certificate authorizes that address
+// (see closeInboundFromPeer), the outbound connection and its epoch stamp
+// (conns/connEpoch), every pooled stream opened on it, the per-target send
+// queue, and the peer's incarnation record. It reports whether anything was
+// actually reclaimed.
 //
-// It exists because nothing else ever closes an outbound to a peer that is
+// It exists because nothing else ever closes a connection to a peer that is
 // simply GONE. KeepAlivePeriod is below MaxIdleTimeout, so quic-go PINGs the
 // connection indefinitely and it never idle-closes; cleanStaleConnections only
 // reaps connections whose context is ALREADY dead, and a removed-but-still-
 // running member answers keep-alives forever. Without an explicit teardown the
 // connection, its streams, its epoch records and its keep-alive traffic persist
-// for the process lifetime.
+// for the process lifetime. That is true in BOTH directions, and the inbound
+// one is not a subset of the outbound: a removed member that dialed this node
+// while this node never dialed it has no outbound entry at all, so an
+// outbound-only teardown reclaimed exactly nothing.
 //
 // This is EVENT-DRIVEN teardown for a COMMITTED membership removal, and it is
 // deliberately not a sweep: a "not in the registry, so close it" scan would
@@ -595,7 +621,9 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) b
 // diagnostic only and are logged, exactly as on every other teardown path.
 //
 // CloseTarget is idempotent and safe on an unknown address: it mutates nothing
-// and returns false.
+// and returns false. The snapshot veto covers the inbound half too — a transfer
+// in flight is as likely to be arriving on an inbound connection as leaving on
+// an outbound one.
 func (t *QUICTransport) CloseTarget(address string) bool {
 	if address == "" {
 		return false
@@ -609,11 +637,17 @@ func (t *QUICTransport) CloseTarget(address string) bool {
 		return false
 	}
 
+	// The INBOUND half first, because it is the half that exists even when this
+	// node never dialed the peer: a removed member that dialed US keeps an
+	// otherwise immortal connection, and the early return below would skip it.
+	// See closeInboundFromPeer.
+	inbound := t.closeInboundFromPeer(address)
+
 	// Nothing cached: leave every other structure untouched so a call for an
 	// address this transport never dialed cannot disturb state that a live
 	// shard may still be using.
 	if !t.removeAndCloseConnection(address, "peer removed from membership") {
-		return false
+		return inbound > 0
 	}
 
 	// Locks are taken in the established order and never nested: connMu is
@@ -922,6 +956,7 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 		case <-ticker.C:
 			t.cleanStaleConnections()
 			t.revokeCheckConnections()
+			t.reapIdleInboundConns(time.Now())
 		}
 	}
 }
@@ -958,13 +993,16 @@ func (t *QUICTransport) revokeCheckConnections() {
 		// fail-closed posture VerifyConnection already takes: an unavailable
 		// or stale revocation source must not leave an unverifiable peer
 		// connected.
+		// The precise verdict is logged HERE and is deliberately not put in the
+		// CONNECTION_CLOSE reason phrase, which travels to the peer verbatim.
+		// See closeReasonRedacted.
 		slog.Warn("closing connection: peer certificate is no longer admissible",
 			"remote", conn.RemoteAddr().String(),
 			"serial", leaf.SerialNumber.Text(16),
 			"revoked", revoked,
 			"error", err,
 		)
-		_ = conn.CloseWithError(QUICErrRevoked, "peer certificate revoked")
+		_ = conn.CloseWithError(QUICErrRevoked, closeReasonRedacted)
 	}
 
 	t.inboundConns.Range(func(k, _ any) bool {
@@ -986,6 +1024,127 @@ func (t *QUICTransport) revokeCheckConnections() {
 	for _, c := range outbound {
 		drop(c)
 	}
+}
+
+// inboundConnState is the per-INBOUND-connection liveness record held in
+// QUICTransport.inboundConns.
+//
+// It exists so the reclaim half of inbound tracking has something to decide on.
+// Tracking alone only made the connections reachable; without a record of when
+// each last did anything, the only inbound connection this node could ever
+// close was one whose certificate had been revoked.
+type inboundConnState struct {
+	// lastActive is the Unix-nanosecond stamp of the last frame HEADER read
+	// from this connection. Stamped by handleStream on every frame rather than
+	// on stream acceptance: senders cache and reuse a stream across bursts, so
+	// a connection carrying continuous replication traffic may accept no new
+	// stream for hours, and reaping it would be a self-inflicted outage.
+	//
+	// Atomic because every stream goroutine on the connection writes it
+	// concurrently with the cleanup tick's read. A monotonically-increasing
+	// stamp does not need the writes ordered against each other: the reaper
+	// only asks whether ANY of them was recent.
+	lastActive atomic.Int64
+}
+
+// touch stamps the connection as having just carried a frame.
+func (s *inboundConnState) touch(now time.Time) {
+	if s != nil {
+		s.lastActive.Store(now.UnixNano())
+	}
+}
+
+// reapIdleInboundConns closes every inbound connection that has carried no
+// frame for inboundIdleRetention.
+//
+// This is the IDLE half of the inbound reclaim policy; closeInboundFromPeer is
+// the UNAUTHORIZED half and revokeCheckConnections the REVOKED half. All three
+// run without a goroutine of their own — the first and third on the existing
+// 30s cleanup tick, the second event-driven from CloseTarget — so post-
+// admission inbound state is bounded by one tick interval rather than by the
+// process lifetime.
+//
+// The close is all that is needed to reclaim the rest: it cancels the
+// connection context, AcceptStream fails, handleConnection returns, and its
+// deferred forgetInboundConnState drops the tracking entry, the SourceAddress
+// authorization cache and the peer's message-budget reference. The entry is
+// NOT deleted here, so a connection that somehow survives its close is
+// re-examined on the next tick instead of being forgotten while still live.
+func (t *QUICTransport) reapIdleInboundConns(now time.Time) {
+	cutoff := now.Add(-inboundIdleRetention).UnixNano()
+	t.inboundConns.Range(func(k, v any) bool {
+		conn, ok := k.(*quic.Conn)
+		if !ok {
+			return true
+		}
+		state, ok := v.(*inboundConnState)
+		if !ok {
+			return true
+		}
+		if state.lastActive.Load() > cutoff {
+			return true
+		}
+		slog.Info("reclaiming idle inbound connection",
+			"remote", conn.RemoteAddr().String(),
+			"idle_for", now.Sub(time.Unix(0, state.lastActive.Load())).String(),
+			"limit", inboundIdleRetention.String(),
+		)
+		_ = conn.CloseWithError(QUICErrInboundIdle, closeReasonRedacted)
+		return true
+	})
+}
+
+// closeInboundFromPeer closes every INBOUND connection whose verified leaf
+// authorizes address, and reports how many it closed.
+//
+// It is the inbound counterpart of CloseTarget's outbound teardown, and it is
+// the reason CloseTarget is not just an outbound operation. A committed removal
+// says the peer may no longer talk to this node AT ALL; closing only the
+// connection this node dialed leaves the one the peer dialed fully alive,
+// keep-alived from both ends, holding a global and a per-IP connection slot and
+// free to keep opening streams for the process lifetime. Removing a member has
+// to reach the half the member controls.
+//
+// Matching is by CERTIFICATE, not by remote address: the connection's remote
+// address carries the peer's ephemeral SOURCE PORT, which never equals the
+// Raft address a membership change names. The leaf covering that address is the
+// same fact every other in-band authorization on this transport reduces to, and
+// it is sound for exactly the same reason — per-node exclusive SANs, which
+// refuseInboundPromiscuousCert enforces on admission.
+//
+// Co-located addresses are exempt, using the same predicate every other
+// certificate control here uses. A certificate is matched on HOST alone, so on
+// a single machine every replica's leaf covers every other replica's address;
+// without the exemption, removing one loopback replica would close the healthy
+// inbound connections of all its neighbours. See isCoLocatedCertHost.
+func (t *QUICTransport) closeInboundFromPeer(address string) int {
+	host := canonicalCertHost(certAuthHost(address))
+	if host == "" {
+		return 0
+	}
+	if isCoLocatedCertHost(canonicalCertHost(certAuthHost(t.localAddr())), host) {
+		return 0
+	}
+	closed := 0
+	t.inboundConns.Range(func(k, _ any) bool {
+		conn, ok := k.(*quic.Conn)
+		if !ok {
+			return true
+		}
+		if !t.inboundAuthorizedFor(conn, address) {
+			return true
+		}
+		// The membership verdict is logged HERE; the reason phrase travels to
+		// the peer verbatim, so it carries none of it. See closeReasonRedacted.
+		slog.Info("closing inbound connection from removed peer",
+			"target", address,
+			"remote", conn.RemoteAddr().String(),
+		)
+		_ = conn.CloseWithError(QUICErrPeerRemoved, closeReasonRedacted)
+		closed++
+		return true
+	})
+	return closed
 }
 
 // cleanStaleConnections removes connections whose context is done and
@@ -1358,12 +1517,15 @@ func verifyCertificateExclusivity(leaf *x509.Certificate, selfAddr string, peers
 // act on. peerHost comes from the QUIC remote address, which is the one thing
 // about the peer that is not in-band: a sender cannot choose the source address
 // its packets arrive from and still complete a handshake.
+// A WILDCARD or otherwise unnameable advertised address is the one input that
+// silently disables all of the above, and is reported rather than tolerated —
+// see unnameableCertSelfHost and reportPromiscuousCertCoverage.
 func (t *QUICTransport) refuseInboundPromiscuousCert(conn *quic.Conn) error {
 	if conn == nil || t.tlsPair == nil {
 		return nil
 	}
 	selfHost := canonicalCertHost(certAuthHost(t.localAddr()))
-	if selfHost == "" {
+	if unnameableCertSelfHost(selfHost) {
 		return nil
 	}
 	certs := conn.ConnectionState().TLS.PeerCertificates
@@ -1386,7 +1548,7 @@ func (t *QUICTransport) refuseInboundPromiscuousCert(conn *quic.Conn) error {
 // that is not in-band.
 func peerCertificateExclusivity(peerLeaf *x509.Certificate, selfAddr, peerAddr string) error {
 	selfHost := canonicalCertHost(certAuthHost(selfAddr))
-	if selfHost == "" || peerLeaf == nil {
+	if unnameableCertSelfHost(selfHost) || peerLeaf == nil {
 		return nil
 	}
 	if isCoLocatedCertHost(selfHost, canonicalCertHost(certAuthHost(peerAddr))) {
@@ -1402,6 +1564,61 @@ func peerCertificateExclusivity(peerLeaf *x509.Certificate, selfAddr, peerAddr s
 		return nil
 	}
 	return &PromiscuousPeerCertificateError{PeerAddress: peerAddr, SelfHost: selfHost}
+}
+
+// unnameableCertSelfHost reports whether a host is one no certificate can
+// meaningfully be checked against, which makes every "does the peer's leaf also
+// cover ME" question answer NO regardless of what the leaf contains.
+//
+// Two forms qualify. An EMPTY host is an address with no host part at all
+// (":4001"). An UNSPECIFIED host is the wildcard bind — "0.0.0.0" or "::" —
+// which is what localAddr falls back to when no AdvertiseAddress is configured
+// and the listener bound every interface: it names the socket, never the node,
+// and no CA issues a SAN for it.
+//
+// Loopback is deliberately NOT here. A loopback self-host is a real, checkable
+// host; it simply lands in the co-location exemption (isCoLocatedCertHost),
+// which is a decision about the DEPLOYMENT rather than an inability to ask the
+// question.
+func unnameableCertSelfHost(selfHost string) bool {
+	if selfHost == "" {
+		return true
+	}
+	ip := net.ParseIP(selfHost)
+	return ip != nil && ip.IsUnspecified()
+}
+
+// reportPromiscuousCertCoverage warns when this node's advertised address
+// cannot be matched against a certificate, which turns the connection-level
+// promiscuous-certificate refusal into a permanent no-op.
+//
+// That refusal (refuseInboundPromiscuousCert) is the only exclusivity check an
+// attacker cannot decline to run, and its whole question is "does the inbound
+// peer's leaf also cover MY host". With a wildcard bind and no AdvertiseAddress
+// there is no such host: 0.0.0.0 appears in no certificate, so a leaf carrying
+// *.raft.example.com — which authorizes its holder to assert every member's
+// address on this transport — is admitted exactly as a correctly scoped one is.
+// The control does not fail; it silently stops existing, which is the worst
+// state for a security control to be in.
+//
+// It WARNS rather than refusing to start. Failing closed here would take down
+// every existing wildcard-bound deployment on upgrade, which is an operator's
+// decision to make, not this function's. Called once from Start, after the
+// listener has resolved the local address, because the condition is a static
+// property of the configuration and a per-connection log would be a flood.
+func (t *QUICTransport) reportPromiscuousCertCoverage() {
+	selfHost := canonicalCertHost(certAuthHost(t.localAddr()))
+	if !unnameableCertSelfHost(selfHost) {
+		return
+	}
+	slog.Warn("promiscuous-certificate refusal is INERT: this node has no "+
+		"advertised host a certificate can be matched against, so an inbound "+
+		"peer whose certificate also covers this node cannot be detected; set "+
+		"AdvertiseAddress to this node's reachable hostname or IP",
+		"listen_address", t.cfg.ListenAddress,
+		"advertise_address", t.cfg.AdvertiseAddress,
+		"resolved_host", selfHost,
+	)
 }
 
 // inboundAuthorizedForCached is the per-connection-cached form of

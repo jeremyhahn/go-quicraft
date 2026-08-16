@@ -290,8 +290,8 @@ type QUICTransport struct {
 	// returns (handleConnection). Keyed by *quic.Conn, value *srcAddrAuthEntry.
 	srcAddrAuth sync.Map
 
-	// inboundConns tracks live INBOUND connections, keyed by *quic.Conn with
-	// an empty-struct value. Inbound connections were held only as locals
+	// inboundConns tracks live INBOUND connections. Inbound connections were
+	// held only as locals
 	// inside handleConnection, so nothing could reach them after admission —
 	// and revocation runs only in VerifyConnection, i.e. only at handshake.
 	// A peer whose certificate was revoked, or whose replica the shard
@@ -301,9 +301,18 @@ type QUICTransport struct {
 	// OUTBOUND half. Revocation stopped a compromised node reconnecting and
 	// nothing else.
 	//
-	// Entries are added once the handshake has completed and removed by
-	// forgetInboundConnState, which runs after every stream goroutine on the
-	// connection has finished.
+	// Tracking is only half of it: the RECLAIM POLICIES are what act on this
+	// map, and there are three, none of which owns a goroutine.
+	// revokeCheckConnections and reapIdleInboundConns run on the existing 30s
+	// cleanup tick — revocation re-checks, and an idle bound that is the only
+	// thing able to reclaim a connection whose peer completes a handshake and
+	// then says nothing. closeInboundFromPeer is event-driven from CloseTarget,
+	// so a committed membership removal reaches the half the removed member
+	// controls.
+	//
+	// Entries are added once the handshake has completed, keyed by *quic.Conn
+	// with an *inboundConnState value, and removed by forgetInboundConnState,
+	// which runs after every stream goroutine on the connection has finished.
 	inboundConns sync.Map
 
 	// connMsgBudget holds the per-PEER message-receive reservation, keyed by
@@ -639,6 +648,10 @@ func (t *QUICTransport) Start() error {
 	// Pre-serialize the heartbeat MessageBatch header now that the local
 	// address is resolved. This enables the zero-alloc heartbeat fast path.
 	t.initHeartbeatPrefix()
+
+	// Now that the advertised address is resolved, say so if it leaves the
+	// promiscuous-certificate refusal unable to ask its question.
+	t.reportPromiscuousCertCoverage()
 
 	// Start the revocation checker's CRL reload goroutine. This must
 	// happen after the listener is created but before accepting

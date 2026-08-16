@@ -226,12 +226,15 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 	// sessions too — Accept yields every inbound connection regardless of
 	// whether its TLS session was resumed.
 	if err := t.refuseInboundPromiscuousCert(conn); err != nil {
+		// The precise verdict is logged HERE and kept out of the
+		// CONNECTION_CLOSE reason phrase, which travels to the peer verbatim.
+		// See closeReasonRedacted.
 		slog.Warn("refusing inbound connection: peer certificate is not exclusive",
 			"remote", conn.RemoteAddr().String(),
 			"error", err,
 		)
 		ipTracker.release(ip)
-		if closeErr := conn.CloseWithError(QUICErrPromiscuousCert, "peer certificate covers this node's address"); closeErr != nil {
+		if closeErr := conn.CloseWithError(QUICErrPromiscuousCert, closeReasonRedacted); closeErr != nil {
 			slog.Debug("transport: connection close failed after promiscuous-certificate refusal",
 				"ip", ip,
 				"error", closeErr,
@@ -291,9 +294,17 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 	// back out.
 	t.acquirePeerMsgBudgetRef(conn)
 
-	// Track the connection so revocation can reach it AFTER admission. See
-	// QUICTransport.inboundConns.
-	t.inboundConns.Store(conn, struct{}{})
+	// Track the connection so the reclaim policies can reach it AFTER
+	// admission: revocation re-checks (revokeCheckConnections), the idle sweep
+	// (reapIdleInboundConns) and committed membership removal
+	// (closeInboundFromPeer). See QUICTransport.inboundConns.
+	//
+	// Stamped as active on admission so a connection that has only just
+	// completed its handshake is never reaped before it has had a chance to
+	// send anything.
+	activity := &inboundConnState{}
+	activity.touch(time.Now())
+	t.inboundConns.Store(conn, activity)
 
 	// streamWG tracks the per-connection stream goroutines. The transport-wide
 	// t.wg does not bound them to this connection's lifetime.
@@ -365,7 +376,7 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 		go func() {
 			defer t.wg.Done()
 			defer streamWG.Done()
-			t.handleStream(conn, stream, streamSem, snapSem)
+			t.handleStream(conn, stream, activity, streamSem, snapSem)
 		}()
 	}
 }
@@ -384,7 +395,10 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 // stream, immediately after it has acquired a snapSem slot, so the slow
 // snapshot transfer is accounted against the dedicated snapshot budget rather
 // than the data-stream budget.
-func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream, streamSem, snapSem chan struct{}) {
+//
+// activity is the connection's shared liveness record and may be nil on unit
+// test paths that drive a stream without a tracked connection.
+func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream, activity *inboundConnState, streamSem, snapSem chan struct{}) {
 	// streamSemHeld tracks ownership of the data-stream slot so it is released
 	// exactly once. It is set false once the slot is released (on snapshot
 	// handoff) to prevent a double release in the deferred cleanup.
@@ -460,6 +474,14 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			t.recordProtocolViolation("inbound frame header rejected", inboundConn, err)
 			return
 		}
+
+		// The connection carried a frame, so it is not idle. Stamped on the
+		// frame rather than on stream acceptance because a sender reuses one
+		// cached stream across bursts: a busy connection can accept no new
+		// stream for hours, and reaping it would be a self-inflicted outage.
+		// errStreamIdle above deliberately does NOT reach here — a stream
+		// waiting at a clean frame boundary produced no traffic.
+		activity.touch(time.Now())
 
 		// A frame has begun arriving: complete its body (and any back-to-back
 		// frame on a hot stream) under the active deadline so a half-delivered

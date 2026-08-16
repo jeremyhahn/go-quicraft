@@ -628,8 +628,8 @@ func TestSnapshotReceiver_ReleaseUnknownPeerIsNoop(t *testing.T) {
 
 	sr.releasePeerSlot("never-seen:1")
 	sr.peerMu.Lock()
-	_, present := sr.peerSlots["never-seen:1"]
-	entries := len(sr.peerSlots)
+	_, present := sr.peerUse["never-seen:1"]
+	entries := len(sr.peerUse)
 	sr.peerMu.Unlock()
 	if present {
 		t.Fatal("releasing an unknown peer created a slot entry")
@@ -645,7 +645,7 @@ func TestSnapshotReceiver_ReleaseUnknownPeerIsNoop(t *testing.T) {
 	}
 	sr.releasePeerSlot("")
 	sr.peerMu.Lock()
-	entries = len(sr.peerSlots)
+	entries = len(sr.peerUse)
 	sr.peerMu.Unlock()
 	if entries != 0 {
 		t.Fatalf("peerSlots has %d entries after an unaccounted peer, want 0", entries)

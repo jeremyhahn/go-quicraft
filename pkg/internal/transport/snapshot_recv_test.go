@@ -202,7 +202,7 @@ func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
 			t.Fatalf("global snapshot semaphore holds %d slots after a shutdown refusal, want 0", n)
 		}
 		sr.peerMu.Lock()
-		slots := len(sr.peerSlots)
+		slots := len(sr.peerUse)
 		sr.peerMu.Unlock()
 		if slots != 0 {
 			t.Fatalf("peer slots retained after a shutdown refusal: %d, want 0", slots)
@@ -249,7 +249,7 @@ func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
 		}
 
 		hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 3}
-		sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+		sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 		// A partial snapshot committed as the latest snapshot would be loaded
 		// on recovery as if whole.
@@ -1191,7 +1191,7 @@ func TestReceiveChunks_ValidateChunkFailure(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	// Handler should NOT have received any snapshot.
 	snaps := handler.getSnapshots()
@@ -1311,7 +1311,7 @@ func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 			before := sr.AvailableMemory()
 
 			hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
-			sr.receiveChunks(&testChunkReader{data: tc.frames(t)}, hdr, PeerAuth{}, make(chan struct{}))
+			sr.receiveChunks(&testChunkReader{data: tc.frames(t)}, hdr, "", PeerAuth{}, make(chan struct{}))
 
 			if got := handler.snapshotCount.Load(); got != 0 {
 				t.Fatalf("HandleSnapshot called %d times; the transfer must not be committed", got)
@@ -1364,7 +1364,7 @@ func TestReceiveChunks_MemoryBudgetRestoredOnSuccess(t *testing.T) {
 	}
 
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 4}
-	sr.receiveChunks(&testChunkReader{data: buildChunkFrames(t, chunks)}, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(&testChunkReader{data: buildChunkFrames(t, chunks)}, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if got := handler.snapshotCount.Load(); got != 1 {
 		t.Fatalf("HandleSnapshot called %d times, want 1", got)
@@ -1422,7 +1422,7 @@ func TestReceiveChunks_LargeChunkCountInitCapCapped(t *testing.T) {
 		var m0, m1 runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&m0)
-		sr.receiveChunks(&testChunkReader{data: data}, hdr, PeerAuth{}, make(chan struct{}))
+		sr.receiveChunks(&testChunkReader{data: data}, hdr, "", PeerAuth{}, make(chan struct{}))
 		runtime.ReadMemStats(&m1)
 		delta := int64(m1.TotalAlloc - m0.TotalAlloc)
 		if minDelta < 0 || delta < minDelta {
@@ -1500,7 +1500,7 @@ func TestReceiveChunks_WithEventListener(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	select {
 	case info := <-received:
@@ -1555,7 +1555,7 @@ func TestReceiveChunks_WithMetrics(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	snaps := handler.getSnapshots()
 	if len(snaps) == 0 {
@@ -1649,7 +1649,7 @@ func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 		Term:       3,
 		ChunkCount: 1,
 	}
-	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	// The transfer WAS complete, so the handler must have been offered it.
 	if got := handler.calls.Load(); got != 1 {
@@ -1731,7 +1731,7 @@ func TestReceiveChunks_TruncatedTransferNotCommitted(t *testing.T) {
 		ChunkCount: 4,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 0 {
 		t.Fatalf("expected 0 snapshots committed for truncated transfer, got %d", len(snaps))
@@ -1791,7 +1791,7 @@ func TestReceiveChunks_CompleteTransferCommitted(t *testing.T) {
 		ChunkCount: 3,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 1 || len(snaps[0]) != 3 {
 		t.Fatalf("expected 1 committed snapshot of 3 chunks, got %d deliveries", len(snaps))
@@ -1808,7 +1808,7 @@ func TestReceiveChunks_ZeroChunkCountCommitsNothing(t *testing.T) {
 	reader := &testChunkReader{data: nil}
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 0}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	if handler.snapshotCount.Load() != 0 {
 		t.Fatalf("expected no HandleSnapshot for ChunkCount=0, got %d", handler.snapshotCount.Load())
@@ -1873,7 +1873,7 @@ func TestReceiveChunks_MemoryBudgetExceededPerReceive(t *testing.T) {
 		ChunkCount: 10,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	// The receive should have been aborted before all chunks were processed.
 	// Since maxMemory is 400 and each chunk is ~50 bytes, the receive should
@@ -1954,7 +1954,7 @@ func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 		t.Fatalf("global snapshot semaphore holds %d slots after a rejected admission, want 0", n)
 	}
 	sr.peerMu.Lock()
-	slots := len(sr.peerSlots)
+	slots := len(sr.peerUse)
 	sr.peerMu.Unlock()
 	if slots != 0 {
 		t.Fatalf("peer slots retained after a rejected admission: %d, want 0", slots)
@@ -1998,7 +1998,7 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	snapshots := handler.getSnapshots()
 	if len(snapshots) != 1 {
@@ -2079,7 +2079,7 @@ func TestReceiveChunks_StopSignalDuringIteration(t *testing.T) {
 	// Close stopC immediately so the loop exits on the first iteration.
 	stopC := make(chan struct{})
 	close(stopC)
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	// No snapshots should have been delivered.
 	snapshots := handler.getSnapshots()
@@ -2125,7 +2125,7 @@ func TestReceiveChunks_ChunkValidationFailsDeploymentID(t *testing.T) {
 		ChunkCount: 1,
 	}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	// No snapshots should be delivered.
 	snapshots := handler.getSnapshots()
@@ -2216,7 +2216,7 @@ func TestReceiveChunks_TotalBytesExceedsMaxMemory(t *testing.T) {
 		Index:      10,
 		ChunkCount: 5,
 	}
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	// Memory budget should be fully restored after receiveChunks returns.
 	available := sr.AvailableMemory()
@@ -2439,7 +2439,7 @@ func TestReceiveChunks_ChunkHeaderMismatchRejected(t *testing.T) {
 
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1, Epoch: 7}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 0 {
 		t.Fatalf("mismatching chunk must not be committed, got %d snapshots", len(snaps))
@@ -2499,7 +2499,7 @@ func TestReceiveChunks_BudgetExhaustedFiresRejectedListener(t *testing.T) {
 
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
 	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, PeerAuth{}, stopC)
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 
 	if snaps := handler.getSnapshots(); len(snaps) != 0 {
 		t.Fatalf("over-budget snapshot must not be committed, got %d snapshots", len(snaps))
@@ -2568,7 +2568,7 @@ func TestSnapshotPerPeerSlotFairness(t *testing.T) {
 	sr.releasePeerSlot("10.0.0.1:9")
 	sr.releasePeerSlot("10.0.0.2:9")
 	sr.peerMu.Lock()
-	remaining := len(sr.peerSlots)
+	remaining := len(sr.peerUse)
 	sr.peerMu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("peerSlots retained %d entries after full release", remaining)
@@ -2653,7 +2653,7 @@ func TestReceiveChunksRejectsZeroLengthFrameFlood(t *testing.T) {
 	reader := &testChunkReader{data: zeroLengthFrames(t, maxConsecutiveZeroLengthFrames+4)}
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 1 << 20}
 
-	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if rejected.Load() != 1 {
 		t.Fatalf("OnSnapshotRejected fired %d times, want 1", rejected.Load())
@@ -2693,7 +2693,7 @@ func TestReceiveChunksRejectsStalledProgress(t *testing.T) {
 	reader := &testChunkReader{data: buildChunkFrames(t, chunks)}
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 3}
 
-	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if rejected.Load() != 1 {
 		t.Fatalf("OnSnapshotRejected fired %d times, want 1", rejected.Load())
@@ -2722,7 +2722,7 @@ func TestReceiveChunksRejectsExceededTransferDuration(t *testing.T) {
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 1}
 
 	time.Sleep(time.Millisecond)
-	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if rejected.Load() != 1 {
 		t.Fatalf("OnSnapshotRejected fired %d times, want 1", rejected.Load())
@@ -2744,7 +2744,7 @@ func TestReceiveChunksZeroChunkCountReportsRejection(t *testing.T) {
 		OnSnapshotRejected: func(config.SnapshotInfo) { rejected.Add(1) },
 	}
 
-	sr.receiveChunks(&testChunkReader{}, &SnapshotHeader{ShardID: 1, ReplicaID: 2}, PeerAuth{},
+	sr.receiveChunks(&testChunkReader{}, &SnapshotHeader{ShardID: 1, ReplicaID: 2}, "", PeerAuth{},
 		make(chan struct{}))
 
 	if rejected.Load() != 1 {
@@ -2781,7 +2781,7 @@ func TestReceiveChunks_BudgetExhaustedCountsRejection(t *testing.T) {
 	reader := &testChunkReader{data: data}
 
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
-	sr.receiveChunks(reader, hdr, PeerAuth{}, make(chan struct{}))
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	got := rec.rejects()
 	if len(got) != 1 {
@@ -2811,5 +2811,246 @@ func TestReceiveSnapshot_ConcurrencyLimitCountsRejection(t *testing.T) {
 	}
 	if got[0].shardID != 9 || got[0].reason != string(snapshotRejectConcurrency) {
 		t.Fatalf("rejection = %+v, want shard 9 reason %q", got[0], snapshotRejectConcurrency)
+	}
+}
+
+// TestPerPeerSnapshotMemoryDerivation pins the ceiling perPeerSnapshotMemory
+// derives, including both guards.
+//
+// The derivation is the whole of the per-peer memory control: get it wrong in
+// the loose direction and the cap is the global budget again (inert), get it
+// wrong in the tight direction and a legal chunk no longer fits (every transfer
+// refused). Neither failure is visible from a transfer-level test that happens
+// to use small chunks.
+func TestPerPeerSnapshotMemoryDerivation(t *testing.T) {
+	const gb = int64(1) << 30
+	cases := []struct {
+		name                      string
+		maxMemory                 int64
+		maxConcurrent, maxPerPeer int
+		want                      int64
+	}{
+		{
+			name:      "production defaults give a peer its slot share",
+			maxMemory: gb, maxConcurrent: 4, maxPerPeer: 2, want: gb / 2,
+		},
+		{
+			name:      "a peer entitled to every slot is capped at the whole budget",
+			maxMemory: gb, maxConcurrent: 1, maxPerPeer: 1, want: gb,
+		},
+		{
+			name:      "a budget too small to split floors at one full-size chunk",
+			maxMemory: 4 * maxSnapshotChunkResidentBytes, maxConcurrent: 16, maxPerPeer: 2,
+			want: maxSnapshotChunkResidentBytes,
+		},
+		{
+			name:      "the floor never exceeds the global budget",
+			maxMemory: 1024, maxConcurrent: 4, maxPerPeer: 2, want: 1024,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := perPeerSnapshotMemory(tc.maxMemory, tc.maxConcurrent, tc.maxPerPeer)
+			if got != tc.want {
+				t.Fatalf("perPeerSnapshotMemory(%d, %d, %d) = %d, want %d",
+					tc.maxMemory, tc.maxConcurrent, tc.maxPerPeer, got, tc.want)
+			}
+			if got > tc.maxMemory {
+				t.Fatalf("per-peer ceiling %d exceeds the global budget %d: the "+
+					"sub-limit must never be the looser of the two", got, tc.maxMemory)
+			}
+		})
+	}
+}
+
+// TestSnapshotReceiveMemoryIsCappedPerPeer is the regression test for a peer
+// pinning the WHOLE snapshot receive budget.
+//
+// The host-global budget (1 GB by default) had no per-peer sub-limit at all:
+// the only per-receive ceiling was the global budget itself
+// ("charged > sr.maxMemory"), so one transfer from one peer could drive the
+// budget to zero and push every other peer's chunks into the exhaustion path.
+// The per-peer CONCURRENCY limit did not help — it bounds slots, not the bytes
+// a slot may hold.
+//
+// The A/B is the point: the two runs feed byte-identical frames into
+// identically configured receivers, and differ ONLY in whether the transfer is
+// attributed to a peer identity. Without a per-peer cap both succeed.
+func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
+	chunks := []proto.SnapshotChunk{
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 50, ChunkID: 0, ChunkCount: 4, ChunkSize: 8, Data: []byte("chunk-00")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 50, ChunkID: 1, ChunkCount: 4, ChunkSize: 8, Data: []byte("chunk-01")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 50, ChunkID: 2, ChunkCount: 4, ChunkSize: 8, Data: []byte("chunk-02")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 50, ChunkID: 3, ChunkCount: 4, ChunkSize: 8, Data: []byte("chunk-03")},
+	}
+	frames := buildChunkFrames(t, chunks)
+	// Two chunks' worth of residency: the third chunk must not fit under the
+	// per-peer ceiling while the global budget still has almost all of 1 GB.
+	perChunk := int64(chunks[0].Size()) + snapshotChunkStructBytes
+	ceiling := 2 * perChunk
+
+	newReceiver := func() (*snapshotReceiver, *testHandler, *dropRecorder) {
+		h := newTestHandler()
+		sr := newSnapshotReceiver(4, 1<<30, 0, 0, h)
+		rec := &dropRecorder{}
+		sr.metrics = rec
+		// Set the ceiling directly: the derived value is proportional to a 1 GB
+		// budget, and lowering the budget instead would make the GLOBAL cap the
+		// thing under test. Same reason the transfer-liveness bounds are fields.
+		sr.maxPerPeerMemory = ceiling
+		return sr, h, rec
+	}
+
+	hdr := func() *SnapshotHeader {
+		return &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 0, ChunkCount: uint64(len(chunks))}
+	}
+
+	// CONTROL: an unaccounted transfer (no peer identity, i.e. the unit-test
+	// path) is admitted, so the negative case below is a per-peer verdict and
+	// not a malformed fixture.
+	srCtl, hCtl, recCtl := newReceiver()
+	srCtl.receiveChunks(&testChunkReader{data: frames}, hdr(), "", PeerAuth{}, make(chan struct{}))
+	if n := hCtl.snapshotCount.Load(); n != 1 {
+		t.Fatalf("control transfer delivered %d snapshots, want 1 (rejects: %+v). "+
+			"The fixture itself is refused, so the per-peer assertion below "+
+			"would pass for the wrong reason", n, recCtl.rejects())
+	}
+
+	// SUBJECT: the same bytes attributed to a peer identity must stop at that
+	// peer's ceiling.
+	sr, h, rec := newReceiver()
+	before := sr.AvailableMemory()
+	sr.receiveChunks(&testChunkReader{data: frames}, hdr(), "peer-a", PeerAuth{}, make(chan struct{}))
+	if n := h.snapshotCount.Load(); n != 0 {
+		t.Fatalf("a transfer charging %d bytes was committed under a per-peer "+
+			"ceiling of %d: one peer can still pin the whole receive budget",
+			int64(len(chunks))*perChunk, ceiling)
+	}
+	rejects := rec.rejects()
+	if len(rejects) != 1 || rejects[0].reason != string(snapshotRejectMemory) {
+		t.Fatalf("rejections = %+v, want exactly one %q", rejects, snapshotRejectMemory)
+	}
+	if after := sr.AvailableMemory(); after != before {
+		t.Fatalf("global memory budget = %d after a per-peer rejection, want %d "+
+			"(leaked %d bytes): a refused reservation must leave nothing charged",
+			after, before, before-after)
+	}
+	sr.peerMu.Lock()
+	residual := len(sr.peerUse)
+	sr.peerMu.Unlock()
+	if residual != 0 {
+		t.Fatalf("peerUse retained %d entries after the transfer ended: the "+
+			"per-peer accounting leaks across peer churn", residual)
+	}
+}
+
+// TestSnapshotPerPeerMemoryIsPerIdentityAndReleased verifies the two properties
+// that make the cap a FAIRNESS control rather than a global one: a second peer
+// is unaffected by the first peer's exhaustion, and a peer's charge is returned
+// when its transfer ends.
+func TestSnapshotPerPeerMemoryIsPerIdentityAndReleased(t *testing.T) {
+	sr := newSnapshotReceiver(4, 1<<30, 0, 0, newTestHandler())
+	sr.maxPerPeerMemory = 100
+
+	if !sr.reservePeerMemory("peer-a", 100) {
+		t.Fatal("a peer could not reserve its full ceiling")
+	}
+	if sr.reservePeerMemory("peer-a", 1) {
+		t.Fatal("a peer reserved past its ceiling")
+	}
+	if !sr.reservePeerMemory("peer-b", 100) {
+		t.Fatal("peer-b was refused because peer-a was full: the ceiling is " +
+			"being applied globally rather than per identity, which is the " +
+			"starvation it exists to prevent")
+	}
+
+	sr.releasePeerMemory("peer-a", 100)
+	if !sr.reservePeerMemory("peer-a", 100) {
+		t.Fatal("peer-a could not reserve after releasing: a charge is not " +
+			"returned when a transfer ends, so a peer is permanently poisoned " +
+			"by its own completed snapshots")
+	}
+	sr.releasePeerMemory("peer-a", 100)
+	sr.releasePeerMemory("peer-b", 100)
+
+	sr.peerMu.Lock()
+	residual := len(sr.peerUse)
+	sr.peerMu.Unlock()
+	if residual != 0 {
+		t.Fatalf("peerUse retained %d entries once every reservation was "+
+			"released, want 0", residual)
+	}
+}
+
+// TestSnapshotPerPeerMemoryCapAppliesEndToEnd exercises the cap over a real
+// QUIC transfer, which is the only thing that pins the peerKey WIRING —
+// snapshotFairnessKey through receiveSnapshot into receiveChunks. A unit test
+// that calls receiveChunks with a key of its own choosing cannot tell a wired
+// key from a hardcoded empty one.
+func TestSnapshotPerPeerMemoryCapAppliesEndToEnd(t *testing.T) {
+	chunks := []proto.SnapshotChunk{
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, ChunkSize: 10, Data: []byte("chunk-0000")},
+		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 100, Term: 5, ChunkID: 1, ChunkCount: 2, ChunkSize: 10, Data: []byte("chunk-0001")},
+	}
+
+	mtls := testMTLSConfig(t)
+	rec := &dropRecorder{}
+	handler2 := newTestHandler()
+	t2, err := NewQUICTransport(Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+		Metrics:       rec,
+	}, handler2, registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport(receiver): %v", err)
+	}
+	// One chunk's residency: the transfer below sends two, so the second must
+	// be refused by the receiving peer's sub-budget while the 1 GB global
+	// budget is untouched. Set BEFORE Start: once the accept loop is running
+	// the receiver's fields are read by goroutines this test does not
+	// synchronise with, and a post-Start write is a data race.
+	t2.snapshotRecv.maxPerPeerMemory = int64(chunks[0].Size()) + snapshotChunkStructBytes
+	if err := t2.Start(); err != nil {
+		t.Fatalf("receiver Start: %v", err)
+	}
+	defer t2.Stop()
+
+	reg1 := registry.NewRegistry()
+	t1, err := NewQUICTransport(Config{
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
+	}, newTestHandler(), reg1)
+	if err != nil {
+		t.Fatalf("NewQUICTransport(sender): %v", err)
+	}
+	if err := t1.Start(); err != nil {
+		t.Fatalf("sender Start: %v", err)
+	}
+	defer t1.Stop()
+	reg1.Register(1, 2, t2.Addr().String())
+
+	if err := t1.SendSnapshot(chunks); err != nil {
+		t.Fatalf("SendSnapshot: %v", err)
+	}
+
+	pollUntil(t, 10*time.Second, 20*time.Millisecond,
+		"a snapshot exceeding the sending peer's memory ceiling was not "+
+			"rejected: the fairness key never reaches the memory accounting",
+		func() bool {
+			for _, r := range rec.rejects() {
+				if r.reason == string(snapshotRejectMemory) {
+					return true
+				}
+			}
+			return false
+		})
+	if n := handler2.snapshotCount.Load(); n != 0 {
+		t.Fatalf("HandleSnapshot ran %d times for a refused transfer, want 0", n)
+	}
+	if avail := t2.snapshotRecv.AvailableMemory(); avail != t2.snapshotRecv.maxMemory {
+		t.Fatalf("global budget = %d after a per-peer rejection, want the full %d",
+			avail, t2.snapshotRecv.maxMemory)
 	}
 }
