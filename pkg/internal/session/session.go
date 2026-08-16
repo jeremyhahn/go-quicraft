@@ -28,6 +28,14 @@ import (
 // at the same point in the log.
 type clientSession struct {
 	clientID uint64
+	// ownerID is the principal this session was registered under, copied from
+	// the register entry (proto.Entry.OwnerID). It is retained for the whole
+	// life of the session because REMOVAL needs it: Unregister and
+	// ExpireSessions must return the slot to the right owner, and the only
+	// record of which owner that was is this field. noOwnerID means the
+	// embedder declared none, and such a session is outside the per-owner cap
+	// entirely.
+	ownerID uint64
 	// registeredIndex is the log index of the Register entry that created
 	// THIS incarnation of the clientID. An entry below it belongs to a
 	// previous incarnation whose at-most-once state is gone; see
@@ -38,11 +46,19 @@ type clientSession struct {
 	lastActiveIndex uint64               // log index of last activity
 }
 
-// newClientSession creates a new client session with the given ID and
-// initial log index.
-func newClientSession(clientID uint64, index uint64) *clientSession {
+// noOwnerID is the Entry.OwnerID value meaning "the embedder declared no
+// owner". It is not an owner: sessions carrying it are neither counted toward
+// nor limited by the per-owner cap. Every session registered before OwnerID
+// existed decodes to this value, which is what makes the cap additive rather
+// than a behaviour change for existing embedders.
+const noOwnerID uint64 = 0
+
+// newClientSession creates a new client session with the given client ID,
+// owner and initial log index.
+func newClientSession(clientID, ownerID, index uint64) *clientSession {
 	return &clientSession{
 		clientID:        clientID,
+		ownerID:         ownerID,
 		registeredIndex: index,
 		responses:       make(map[uint64]sm.Result),
 		lastActiveIndex: index,

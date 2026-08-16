@@ -22,11 +22,18 @@ import "github.com/jeremyhahn/go-quicraft/pkg/config"
 
 // Entry represents a single Raft log entry.
 //
-// The session fields (Key, ClientID, SeriesID, RespondedTo) MUST be
+// The session fields (Key, ClientID, SeriesID, RespondedTo, OwnerID) MUST be
 // persisted: at-most-once delivery depends on them surviving crash
 // recovery. ClientID=0 means "not session-managed", so dropping these
 // fields on the WAL round-trip would silently disable session dedup for
 // every entry replayed after a restart.
+//
+// OwnerID is in that set for a related but distinct reason: it is the input to
+// a deterministic apply-path decision (the per-owner session cap, see
+// proto.SessionPolicy.MaxSessionsPerOwner). OwnerID=0 means "no owner", which
+// is also what a dropped field decodes to — so losing it on the round-trip does
+// not fail, it just silently lifts the cap on every entry replayed after a
+// restart, and the replica then admits registrations its peers refuse.
 type Entry struct {
 	// Index is the log position of this entry.
 	Index uint64
@@ -42,6 +49,9 @@ type Entry struct {
 	SeriesID uint64
 	// RespondedTo is the highest responded-to series for this client.
 	RespondedTo uint64
+	// OwnerID is the principal the embedder declared for the session this
+	// entry registers; 0 means none. See proto.Entry.OwnerID.
+	OwnerID uint64
 	// Cmd is the serialized command payload.
 	Cmd []byte
 }
@@ -67,8 +77,9 @@ type Membership struct {
 	// RequireFullReplicaMajority is the shard's replicated
 	// full-replica-majority witness policy.
 	RequireFullReplicaMajority bool
-	// SessionExpiryEntries, MaxTotalSessions and MaxSessionsPerClient are the
-	// shard's replicated SESSION POLICY (see proto.SessionPolicy). They must
+	// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient and
+	// MaxSessionsPerOwner are the shard's replicated SESSION POLICY (see
+	// proto.SessionPolicy). They must
 	// survive this round-trip for the same reason Identities must: they enter
 	// membership through the log — the EntryInitialMembership at index 1 — so
 	// a replica that rebuilds its configuration from a SNAPSHOT whose log has
@@ -84,9 +95,13 @@ type Membership struct {
 	// non-zero in every committed policy and is therefore the field that says
 	// whether a policy was recorded at all: see proto.SessionPolicy.IsSet.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the replicated cap on responses cached per
-	// session.
+	// MaxSessionsPerClient is the replicated RESPONSE-CACHE DEPTH: the number
+	// of cached results one session retains, not a session count. See
+	// proto.SessionPolicy.MaxSessionsPerClient for why the name says otherwise.
 	MaxSessionsPerClient uint64
+	// MaxSessionsPerOwner is the replicated cap on concurrent sessions per
+	// declared owner; 0 disables it. See proto.SessionPolicy.MaxSessionsPerOwner.
+	MaxSessionsPerOwner uint64
 	// Addresses maps replica IDs to their network addresses for
 	// full voting members.
 	Addresses map[uint64]string

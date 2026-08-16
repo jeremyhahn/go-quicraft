@@ -324,7 +324,7 @@ func TestMembership_MixedBatchOperations(t *testing.T) {
 		defer rsm.Close()
 
 		// Pre-register session 100 for unregister in the batch.
-		if err := rsm.Sessions().Register(100, 0); err != nil {
+		if err := rsm.Sessions().Register(100, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -409,7 +409,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 		defer rsm.Close()
 
 		// Register a session at index 0 via manager.
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -439,7 +439,7 @@ func TestMembership_SessionExpiryViaApply(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -483,10 +483,10 @@ func TestMembership_SessionPreservedAcrossSnapshotWithExpiry(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := rsm1.Sessions().Register(20, 0); err != nil {
+		if err := rsm1.Sessions().Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -593,7 +593,7 @@ func TestMembership_DedupAfterSnapshotRecovery(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register and apply.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -662,7 +662,7 @@ func TestMembership_RespondedToAdvancement(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -721,7 +721,7 @@ func TestMembership_SessionDeepCopy(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -751,7 +751,7 @@ func TestMembership_SessionDeepCopy(t *testing.T) {
 		}
 
 		// Mutate rsm1's sessions.
-		if err := rsm1.Sessions().Register(99, 0); err != nil {
+		if err := rsm1.Sessions().Register(99, 0, 0); err != nil {
 			t.Fatalf("Register(99) = %v", err)
 		}
 
@@ -778,7 +778,7 @@ func TestMembership_ApplyNonSessionEntriesLeavesSessionsUnchanged(t *testing.T) 
 		defer rsm.Close()
 
 		// Register one session.
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -889,7 +889,7 @@ func TestMembership_ExpiredSessionEntryRejected(t *testing.T) {
 		defer rsm.Close()
 
 		// Register session at index 0.
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -989,7 +989,7 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -1049,7 +1049,7 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -1103,7 +1103,7 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -1147,7 +1147,7 @@ func TestMembership_HighRespondedToEvictsMultiple(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -1203,7 +1203,7 @@ func TestMembership_RegisterUnregisterInSameBatch(t *testing.T) {
 		defer rsm.Close()
 
 		// Pre-register session 100 for unregister.
-		if err := rsm.Sessions().Register(100, 0); err != nil {
+		if err := rsm.Sessions().Register(100, 0, 0); err != nil {
 			t.Fatalf("Register(100) = %v", err)
 		}
 

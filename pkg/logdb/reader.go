@@ -630,6 +630,7 @@ func (lr *LogReader) PersistBootstrap(entries []proto.Entry, state proto.State) 
 				ClientID:    entries[i].ClientID,
 				SeriesID:    entries[i].SeriesID,
 				RespondedTo: entries[i].RespondedTo,
+				OwnerID:     entries[i].OwnerID,
 				Cmd:         entries[i].Cmd,
 			}
 		}
@@ -794,6 +795,7 @@ func logdbEntriesToProtoReuse(buf []proto.Entry, entries []Entry) []proto.Entry 
 			ClientID:    entries[i].ClientID,
 			SeriesID:    entries[i].SeriesID,
 			RespondedTo: entries[i].RespondedTo,
+			OwnerID:     entries[i].OwnerID,
 			Cmd:         entries[i].Cmd,
 		}
 	}

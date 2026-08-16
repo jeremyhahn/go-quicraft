@@ -43,7 +43,7 @@ func TestApply_SessionEntryAndCloseInSameBatch(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 0); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -95,7 +95,7 @@ func TestApply_CloseBeforeSessionEntryInSameBatch(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 0); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestApply_CloseOfDifferentClientInSameBatch(t *testing.T) {
 	defer rsm.Close()
 
 	for _, id := range []uint64{10, 20} {
-		if err := rsm.Sessions().Register(id, 0); err != nil {
+		if err := rsm.Sessions().Register(id, 0, 0); err != nil {
 			t.Fatalf("Register(%d) = %v", id, err)
 		}
 	}
@@ -188,7 +188,7 @@ func TestApply_OneSessionClosedOneOpenInSameBatch(t *testing.T) {
 	defer rsm.Close()
 
 	for _, id := range []uint64{10, 20} {
-		if err := rsm.Sessions().Register(id, 0); err != nil {
+		if err := rsm.Sessions().Register(id, 0, 0); err != nil {
 			t.Fatalf("Register(%d) = %v", id, err)
 		}
 	}
@@ -247,7 +247,7 @@ func TestApply_CloseThenReRegisterSameClientInSameBatch(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 0); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -296,7 +296,7 @@ func TestApply_InBatchDuplicateWithCloseInSameBatch(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 0); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -332,12 +332,12 @@ func TestApply_SessionExpiryCannotDropSessionMidBatch(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 450); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 450); err != nil {
 		t.Fatalf("Register(10) = %v", err)
 	}
 	// Client 20 is idle far behind the batch's last index and is expired by
 	// the end-of-batch scan; client 10 is active within the threshold.
-	if err := rsm.Sessions().Register(20, 1); err != nil {
+	if err := rsm.Sessions().Register(20, 0, 1); err != nil {
 		t.Fatalf("Register(20) = %v", err)
 	}
 

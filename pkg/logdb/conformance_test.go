@@ -142,6 +142,7 @@ func identityMembership() logdb.Membership {
 		SessionExpiryEntries:       12345,
 		MaxTotalSessions:           4321,
 		MaxSessionsPerClient:       77,
+		MaxSessionsPerOwner:        33,
 		Addresses:                  map[uint64]string{1: "10.0.0.1:5001", 2: "10.0.0.2:5001"},
 		Observers:                  map[uint64]string{3: "10.0.0.3:5001"},
 		Witnesses:                  map[uint64]string{4: "10.0.0.4:5001"},
@@ -444,19 +445,20 @@ func TestConformanceMembershipWithoutIdentitiesRoundTrips(t *testing.T) {
 	})
 }
 
-// assertSessionPolicy fails unless got carries exactly the three replicated
+// assertSessionPolicy fails unless got carries exactly the four replicated
 // session limits want does.
 func assertSessionPolicy(t *testing.T, where string, got, want logdb.Membership) {
 	t.Helper()
 	if got.SessionExpiryEntries == want.SessionExpiryEntries &&
 		got.MaxTotalSessions == want.MaxTotalSessions &&
-		got.MaxSessionsPerClient == want.MaxSessionsPerClient {
+		got.MaxSessionsPerClient == want.MaxSessionsPerClient &&
+		got.MaxSessionsPerOwner == want.MaxSessionsPerOwner {
 		return
 	}
-	t.Fatalf("%s: session policy = {expiry:%d total:%d perClient:%d}, want "+
-		"{expiry:%d total:%d perClient:%d}.\n"+
-		"These three drive the DETERMINISTIC apply path: the expiry threshold is "+
-		"the interval of the apply checkpoint walk, and the two limits decide "+
+	t.Fatalf("%s: session policy = {expiry:%d total:%d perClient:%d perOwner:%d}, want "+
+		"{expiry:%d total:%d perClient:%d perOwner:%d}.\n"+
+		"These four drive the DETERMINISTIC apply path: the expiry threshold is "+
+		"the interval of the apply checkpoint walk, and the three limits decide "+
 		"which session registrations and cached responses are admitted. A backend "+
 		"that drops them does not fail — the replica recovers, falls back to its "+
 		"own Config, and expires sessions at log indexes its peers do not, which "+
@@ -468,7 +470,9 @@ func assertSessionPolicy(t *testing.T, where string, got, want logdb.Membership)
 		"counted in membershipSize, and read back in walShard.replaySnapshot ahead "+
 		"of that function's trailing-bytes check.",
 		where, got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxSessionsPerClient,
-		want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient)
+		got.MaxSessionsPerOwner,
+		want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient,
+		want.MaxSessionsPerOwner)
 }
 
 // TestConformanceSnapshotMembershipSessionPolicySurvivesReopen pins the
@@ -528,7 +532,7 @@ func TestConformanceSnapshotMembershipSessionPolicySurvivesReopen(t *testing.T) 
 
 // TestConformanceMembershipWithoutSessionPolicyRoundTrips is the COMPATIBILITY
 // half: a record written before the policy was replicated must load with all
-// three fields ZERO rather than failing or inventing limits.
+// four fields ZERO rather than failing or inventing limits.
 //
 // Zero is not a policy of zero. MaxTotalSessions can never legitimately be zero
 // in a committed policy (config.Validate rejects it), which is what makes it

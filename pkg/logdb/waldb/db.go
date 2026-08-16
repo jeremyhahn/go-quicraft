@@ -1687,8 +1687,8 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 
 // Entry encoding layout (payloadTypeEntries, format V2):
 // [ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8]
-// [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][CmdLen:4][Cmd:N]
-const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 76 bytes
+// [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][OwnerID:8][CmdLen:4][Cmd:N]
+const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 84 bytes
 
 // maxCmdLen is the maximum allowed command length for a single WAL entry
 // during replay. This matches proto.MaxEntrySize (8 MB) and prevents
@@ -1740,7 +1740,8 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 		clientID := binary.LittleEndian.Uint64(data[pos+48:])
 		seriesID := binary.LittleEndian.Uint64(data[pos+56:])
 		respondedTo := binary.LittleEndian.Uint64(data[pos+64:])
-		cmdLen := binary.LittleEndian.Uint32(data[pos+72:])
+		ownerID := binary.LittleEndian.Uint64(data[pos+72:])
+		cmdLen := binary.LittleEndian.Uint32(data[pos+80:])
 
 		// Validate cmdLen against the maximum allowed entry size to
 		// prevent corrupted length prefixes from causing unbounded
@@ -1810,6 +1811,7 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 			ClientID:    clientID,
 			SeriesID:    seriesID,
 			RespondedTo: respondedTo,
+			OwnerID:     ownerID,
 			Cmd:         cmd,
 		}
 
@@ -1866,6 +1868,7 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumRemoved:4]{ [ReplicaID:8] }...
 // [NumIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 // [SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+// [MaxSessionsPerOwner:8]
 // [NumRemovedIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
@@ -1915,7 +1918,7 @@ const membershipFixedSize = 1 + 8 + 8 + 1 // 18 bytes
 // It equals membershipSize of an empty membership, and must: there is one
 // layout, every field is written unconditionally, and the read floor and the
 // written size are therefore the same number by construction.
-const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 66 bytes
+const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 74 bytes
 
 // membershipAddrMapSize returns the total serialized size for an address map:
 // [NumEntries:4] + for each entry: [ReplicaID:8][AddrLen:4][Addr:N].
@@ -1934,8 +1937,9 @@ func membershipRemovedMapSize(m map[uint64]bool) int {
 }
 
 // membershipSessionPolicySize is the size of the session-policy tail:
-// SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxSessionsPerClient(8).
-const membershipSessionPolicySize = 3 * 8 // 24 bytes
+// SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxSessionsPerClient(8) +
+// MaxSessionsPerOwner(8).
+const membershipSessionPolicySize = 4 * 8 // 32 bytes
 
 // membershipSize returns the total serialized size of a logdb.Membership. Every
 // field is unconditional: the size and the marshal site must agree exactly, or
@@ -2195,8 +2199,8 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	// The session policy. Its length is checked explicitly rather than leaned
 	// on minMembershipSize, which bounds the section as a whole and not the
 	// remainder at this offset: a record whose maps consumed more than their
-	// share would leave fewer than 24 bytes here, and the fixed-width reads
-	// below would slice past the record.
+	// share would leave fewer than membershipSessionPolicySize bytes here, and
+	// the fixed-width reads below would slice past the record.
 	if len(data)-pos < membershipSessionPolicySize {
 		slog.Error("waldb: snapshot record membership section is missing its session policy",
 			"segment_id", segID, "remaining", len(data)-pos,
@@ -2206,6 +2210,7 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	membership.SessionExpiryEntries = binary.LittleEndian.Uint64(data[pos:])
 	membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
 	membership.MaxSessionsPerClient = binary.LittleEndian.Uint64(data[pos+16:])
+	membership.MaxSessionsPerOwner = binary.LittleEndian.Uint64(data[pos+24:])
 	pos += membershipSessionPolicySize
 
 	// RemovedIdentities closes the section. It is the deny-list the receive
@@ -3749,7 +3754,8 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 		binary.LittleEndian.PutUint64(buf[pos+48:], e.ClientID)
 		binary.LittleEndian.PutUint64(buf[pos+56:], e.SeriesID)
 		binary.LittleEndian.PutUint64(buf[pos+64:], e.RespondedTo)
-		binary.LittleEndian.PutUint32(buf[pos+72:], uint32(len(e.Cmd)))
+		binary.LittleEndian.PutUint64(buf[pos+72:], e.OwnerID)
+		binary.LittleEndian.PutUint32(buf[pos+80:], uint32(len(e.Cmd)))
 		copy(buf[pos+entryRecordHeaderSize:], e.Cmd)
 
 		entrySize := entryRecordHeaderSize + len(e.Cmd)
@@ -3774,6 +3780,7 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 			ClientID:    e.ClientID,
 			SeriesID:    e.SeriesID,
 			RespondedTo: e.RespondedTo,
+			OwnerID:     e.OwnerID,
 			Cmd:         cmdCopy,
 		})
 
@@ -3948,12 +3955,13 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalRemovedMap(buf, pos, ss.Membership.Removed)
 	// Every remaining field is written unconditionally, so the section length
 	// always matches membershipSize: an empty map is four zero bytes, not an
-	// absent field, and an unset session policy is 24 zero bytes rather than an
-	// absent one.
+	// absent field, and an unset session policy is membershipSessionPolicySize
+	// zero bytes rather than an absent one.
 	pos = marshalAddrMap(buf, pos, ss.Membership.Identities)
 	binary.LittleEndian.PutUint64(buf[pos:], ss.Membership.SessionExpiryEntries)
 	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
 	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxSessionsPerClient)
+	binary.LittleEndian.PutUint64(buf[pos+24:], ss.Membership.MaxSessionsPerOwner)
 	pos += membershipSessionPolicySize
 	pos = marshalAddrMap(buf, pos, ss.Membership.RemovedIdentities)
 

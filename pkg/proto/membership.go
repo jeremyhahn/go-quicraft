@@ -22,6 +22,7 @@ package proto
 //
 //	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
 //	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+//	[MaxSessionsPerOwner:8]
 //	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
 //
 // The number is 1 because the project is pre-release, not because the layout
@@ -100,15 +101,15 @@ const (
 
 	// membershipSessionPolicySize is what the replicated session policy
 	// occupies: SessionExpiryEntries(8) + MaxTotalSessions(8) +
-	// MaxSessionsPerClient(8).
-	membershipSessionPolicySize = 3 * 8 // 24 bytes
+	// MaxSessionsPerClient(8) + MaxSessionsPerOwner(8).
+	membershipSessionPolicySize = 4 * 8 // 32 bytes
 
 	// membershipFixedSize is the wire size of the whole fixed region, and thus
 	// the offset the six-map region begins at.
-	membershipFixedSize = sessionPolicyOffset + membershipSessionPolicySize // 49 bytes
+	membershipFixedSize = sessionPolicyOffset + membershipSessionPolicySize // 57 bytes
 )
 
-// SessionPolicy is the shard's replicated session configuration: the three
+// SessionPolicy is the shard's replicated session configuration: the four
 // limits the deterministic apply path reads. They are replicated for the same
 // reason the witness policy is — every replica must evaluate them identically
 // or the state machines diverge with every Raft invariant intact:
@@ -116,11 +117,13 @@ const (
 //   - ExpiryEntries is the interval of rsm.StateMachine.Apply's expiry
 //     checkpoint walk. Two replicas with different intervals expire different
 //     sessions at different log indexes.
-//   - MaxTotalSessions bounds session.Manager.Register. A replica that refuses
-//     a registration its peers admit answers ResultSessionExpired for every
-//     later entry of that session while they apply it normally.
-//   - MaxSessionsPerClient bounds the per-session response cache
+//   - MaxTotalSessions bounds session.Manager.Register shard-wide. A replica
+//     that refuses a registration its peers admit answers ResultSessionExpired
+//     for every later entry of that session while they apply it normally.
+//   - MaxSessionsPerClient bounds the per-session RESPONSE CACHE
 //     (CanRecord/RecordResult), and diverges the same way.
+//   - MaxSessionsPerOwner bounds session.Manager.Register per OWNER, and is
+//     what stops one principal consuming the whole table.
 type SessionPolicy struct {
 	// ExpiryEntries is the session inactivity threshold in applied log
 	// entries. Zero means expiry is disabled for the shard — an explicit,
@@ -128,10 +131,37 @@ type SessionPolicy struct {
 	ExpiryEntries uint64
 	// MaxTotalSessions is the cap on concurrently registered sessions.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the cap on cached responses retained per
-	// session (config.Config.MaxSessionsPerClient; the name predates the
-	// wiring).
+	// MaxSessionsPerClient is the RESPONSE-CACHE DEPTH: the maximum number of
+	// cached results one registered session retains for duplicate detection
+	// (session.Manager.CanRecord/RecordResult). It is NOT, and has never been,
+	// a limit on how many sessions anything may hold.
+	//
+	// The name is wrong and is kept only because the wire format is pinned:
+	// it is the mirror of config.Config.MaxSessionsPerClient, which chose the
+	// name before the field was wired to the response cache. Read it as
+	// "max responses per session". The cap the name suggests is
+	// MaxSessionsPerOwner, which is a different field with a different meaning
+	// and a different failure mode — mixing the two up caps a shard at a
+	// response depth or lets one client pin the whole session table, and both
+	// have happened here before.
 	MaxSessionsPerClient uint64
+	// MaxSessionsPerOwner is the cap on how many sessions may be concurrently
+	// registered under ONE owner — the principal an embedder declares in
+	// Entry.OwnerID.
+	//
+	// It exists because MaxTotalSessions alone is a shard-wide bound and
+	// nothing more: a client that mints session IDs (clientID is eight bytes
+	// the caller picks) registers until the table is full and every other
+	// tenant on the shard loses at-most-once delivery. That is a denial of
+	// service available to anyone with propose rights, and the shard-wide cap
+	// is precisely the thing being exhausted, so it cannot also be the defence.
+	//
+	// ZERO DISABLES IT. Sessions whose Entry.OwnerID is zero — every session
+	// registered by an embedder that does not declare owners, which is all of
+	// them before this field existed — are not counted against any owner and
+	// are never refused by this limit. The cap is opt-in from both ends: the
+	// embedder must supply an owner and the shard must commit a non-zero value.
+	MaxSessionsPerOwner uint64
 }
 
 // IsSet reports whether this value is a policy the shard actually committed,
@@ -153,9 +183,10 @@ func (p SessionPolicy) IsSet() bool {
 // replicas, plus the shard's replicated witness policy and session policy.
 // The wire format encodes a version byte and the fixed fields
 // (ConfigChangeID, MaxWitnesses, RequireFullReplicaMajority,
-// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient) followed by
-// six maps (Addresses, Observers, Witnesses, Removed, Identities,
-// RemovedIdentities), each with sorted keys for deterministic output.
+// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient,
+// MaxSessionsPerOwner) followed by six maps (Addresses, Observers, Witnesses,
+// Removed, Identities, RemovedIdentities), each with sorted keys for
+// deterministic output.
 type Membership struct {
 	// ConfigChangeID is the log index of the configuration change
 	// that produced this membership.
@@ -177,15 +208,20 @@ type Membership struct {
 	// Non-zero in every committed policy, which is what makes it the
 	// policy-present discriminator.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the shard's replicated cap on responses cached
-	// per session.
+	// MaxSessionsPerClient is the shard's replicated RESPONSE-CACHE DEPTH — the
+	// number of cached results one session retains, not a session count. See
+	// SessionPolicy.MaxSessionsPerClient for why the name says otherwise.
+	MaxSessionsPerClient uint64
+	// MaxSessionsPerOwner is the shard's replicated cap on concurrent sessions
+	// per declared owner (Entry.OwnerID); zero disables it. See
+	// SessionPolicy.MaxSessionsPerOwner.
 	//
-	// These three are seeded at bootstrap from config.Config and are replicated
+	// These four are seeded at bootstrap from config.Config and are replicated
 	// for the reason SessionPolicy documents: the apply path reads them, so a
 	// per-node value diverges the state machine silently. Unlike the witness
 	// policy they have no config-change type yet — they are bootstrap-only, see
 	// SessionPolicy.
-	MaxSessionsPerClient uint64
+	MaxSessionsPerOwner uint64
 	// Addresses maps replica IDs to network addresses for full voting members.
 	Addresses map[uint64]string
 	// Observers maps replica IDs to network addresses for non-voting observers.
@@ -271,12 +307,13 @@ type Membership struct {
 
 // SessionPolicy returns the shard's replicated session policy. The result
 // reports IsSet false for a configuration that never had one committed — the
-// fixed region is always present, so an absent policy is 24 zero bytes.
+// fixed region is always present, so an absent policy is 32 zero bytes.
 func (m *Membership) SessionPolicy() SessionPolicy {
 	return SessionPolicy{
 		ExpiryEntries:        m.SessionExpiryEntries,
 		MaxTotalSessions:     m.MaxTotalSessions,
 		MaxSessionsPerClient: m.MaxSessionsPerClient,
+		MaxSessionsPerOwner:  m.MaxSessionsPerOwner,
 	}
 }
 
@@ -285,13 +322,14 @@ func (m *Membership) SetSessionPolicy(p SessionPolicy) {
 	m.SessionExpiryEntries = p.ExpiryEntries
 	m.MaxTotalSessions = p.MaxTotalSessions
 	m.MaxSessionsPerClient = p.MaxSessionsPerClient
+	m.MaxSessionsPerOwner = p.MaxSessionsPerOwner
 }
 
 // Size returns the total marshaled size of the membership in bytes, in the
 // current (membershipFormatVersion) layout.
 // Format: [Version:1][ConfigChangeID:8][MaxWitnesses:8]
 // [RequireFullReplicaMajority:8][SessionExpiryEntries:8][MaxTotalSessions:8]
-// [MaxSessionsPerClient:8]
+// [MaxSessionsPerClient:8][MaxSessionsPerOwner:8]
 // [Addresses map][Observers map][Witnesses map][Removed boolMap]
 // [Identities map][RemovedIdentities map]
 func (m *Membership) Size() int {
@@ -359,6 +397,7 @@ func (m *Membership) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
 	putUint64(buf[sessionPolicyOffset+16:], m.MaxSessionsPerClient)
+	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
 	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
 	offset += putMap(buf[offset:], m.Observers)
@@ -422,6 +461,7 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	decoded.SessionExpiryEntries = getUint64(buf[sessionPolicyOffset:])
 	decoded.MaxTotalSessions = getUint64(buf[sessionPolicyOffset+8:])
 	decoded.MaxSessionsPerClient = getUint64(buf[sessionPolicyOffset+16:])
+	decoded.MaxSessionsPerOwner = getUint64(buf[sessionPolicyOffset+24:])
 	offset := membershipFixedSize
 	var n int
 	var err error
@@ -467,6 +507,7 @@ func (m *Membership) Reset() {
 	m.SessionExpiryEntries = 0
 	m.MaxTotalSessions = 0
 	m.MaxSessionsPerClient = 0
+	m.MaxSessionsPerOwner = 0
 	m.Addresses = nil
 	m.Observers = nil
 	m.Witnesses = nil

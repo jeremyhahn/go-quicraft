@@ -31,16 +31,16 @@ import (
 // preserving all session state including response history, respondedTo,
 // and lastActiveIndex.
 func TestSession_SaveAndRestore(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	// Register sessions with varying state.
-	if err := m.Register(10, 100); err != nil {
+	if err := m.Register(10, 0, 100); err != nil {
 		t.Fatalf("Register(10): %v", err)
 	}
-	if err := m.Register(20, 200); err != nil {
+	if err := m.Register(20, 0, 200); err != nil {
 		t.Fatalf("Register(20): %v", err)
 	}
-	if err := m.Register(30, 300); err != nil {
+	if err := m.Register(30, 0, 300); err != nil {
 		t.Fatalf("Register(30): %v", err)
 	}
 
@@ -70,7 +70,7 @@ func TestSession_SaveAndRestore(t *testing.T) {
 	}
 
 	// Unmarshal into a new manager.
-	restored := NewManager(100, 100)
+	restored := NewManager(100, 100, 0)
 	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}
@@ -137,14 +137,14 @@ func TestSession_SaveAndRestore(t *testing.T) {
 // TestSession_SaveAndRestore_EmptyManager verifies that an empty manager
 // can be saved and restored correctly.
 func TestSession_SaveAndRestore_EmptyManager(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	var buf bytes.Buffer
 	if err := m.MarshalTo(&buf); err != nil {
 		t.Fatalf("MarshalTo: %v", err)
 	}
 
-	restored := NewManager(100, 100)
+	restored := NewManager(100, 100, 0)
 	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}
@@ -161,8 +161,8 @@ func TestSession_SaveAndRestore_EmptyManager(t *testing.T) {
 // TestSession_ResponseCanBeAdded verifies that individual responses can
 // be added to a session and subsequently found via CheckDuplicate.
 func TestSession_ResponseCanBeAdded(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 100); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 100); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestSession_ResponseCanBeAdded(t *testing.T) {
 // TestSession_ResponseCanBeAdded_UnregisteredSessionReturnsError verifies
 // that adding a response to an unregistered session returns ErrSessionNotFound.
 func TestSession_ResponseCanBeAdded_UnregisteredSessionReturnsError(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
 	err := m.RecordResult(999, 1, 0, 100, sm.Result{Value: 1})
 	if !errors.Is(err, ErrSessionNotFound) {
@@ -205,8 +205,8 @@ func TestSession_ResponseCanBeAdded_UnregisteredSessionReturnsError(t *testing.T
 // TestSession_CachedResponseCleared verifies that advancing respondedTo
 // clears cached responses with seriesID <= respondedTo.
 func TestSession_CachedResponseCleared(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 100); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 100); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -261,8 +261,8 @@ func TestSession_CachedResponseCleared(t *testing.T) {
 // TestSession_ResponseLookup verifies that duplicate detection correctly
 // returns cached results and identifies new vs. duplicate proposals.
 func TestSession_ResponseLookup(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 100); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 100); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -312,7 +312,7 @@ func TestSession_ResponseLookup(t *testing.T) {
 // TestSession_VersionValidation_TooManySessions verifies that deserializing
 // snapshot data with numSessions exceeding maxTotal produces a BoundsError.
 func TestSession_VersionValidation_TooManySessions(t *testing.T) {
-	m := NewManager(2, 10) // maxTotal = 2
+	m := NewManager(2, 10, 0) // maxTotal = 2
 
 	// Craft a snapshot with numSessions = 100 (exceeds limit of 2).
 	var buf bytes.Buffer
@@ -349,7 +349,7 @@ func TestSession_VersionValidation_TooManySessions(t *testing.T) {
 // deserializing snapshot data with numResponses per session exceeding
 // maxResponses produces a BoundsError.
 func TestSession_VersionValidation_TooManyResponses(t *testing.T) {
-	m := NewManager(100, 2) // maxResponses = 2
+	m := NewManager(100, 2, 0) // maxResponses = 2
 
 	// Craft a valid snapshot with 1 session that has 50 responses.
 	var buf bytes.Buffer
@@ -362,6 +362,10 @@ func TestSession_VersionValidation_TooManyResponses(t *testing.T) {
 	// clientID = 1
 	var u64 [8]byte
 	binary.LittleEndian.PutUint64(u64[:], 1)
+	buf.Write(u64[:])
+
+	// ownerID = 0 (no owner declared)
+	binary.LittleEndian.PutUint64(u64[:], 0)
 	buf.Write(u64[:])
 
 	// registeredIndex = 0
@@ -393,7 +397,7 @@ func TestSession_VersionValidation_TooManyResponses(t *testing.T) {
 // TestSession_VersionValidation_TruncatedData verifies that deserializing
 // truncated snapshot data produces an UnmarshalError.
 func TestSession_VersionValidation_TruncatedData(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	// Only 2 bytes of a 4-byte header.
 	err := m.UnmarshalFrom(bytes.NewReader([]byte{0x01, 0x00}))
@@ -415,9 +419,9 @@ func TestSession_VersionValidation_TruncatedData(t *testing.T) {
 // advancing respondedTo (which evicts cached responses), the remaining
 // responses survive a snapshot round-trip in the correct order.
 func TestSession_SaveRestoreWithEvictionOrdering(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
-	if err := m.Register(10, 0); err != nil {
+	if err := m.Register(10, 0, 0); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -438,7 +442,7 @@ func TestSession_SaveRestoreWithEvictionOrdering(t *testing.T) {
 	if err := m.MarshalTo(&buf); err != nil {
 		t.Fatalf("MarshalTo: %v", err)
 	}
-	restored := NewManager(100, 100)
+	restored := NewManager(100, 100, 0)
 	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}
@@ -474,9 +478,9 @@ func TestSession_SaveRestoreWithEvictionOrdering(t *testing.T) {
 // large Data payloads survive a snapshot round-trip without truncation
 // or corruption.
 func TestSession_SaveRestoreLargeResponseData(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
-	if err := m.Register(10, 0); err != nil {
+	if err := m.Register(10, 0, 0); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -495,7 +499,7 @@ func TestSession_SaveRestoreLargeResponseData(t *testing.T) {
 		t.Fatalf("MarshalTo: %v", err)
 	}
 
-	restored := NewManager(100, 100)
+	restored := NewManager(100, 100, 0)
 	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}
@@ -528,7 +532,7 @@ func TestSession_SaveRestoreLargeResponseData(t *testing.T) {
 // returns an error when the session body is truncated after the header
 // declares one session.
 func TestSession_UnmarshalTruncatedSessionBody(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	// Craft valid header: numSessions = 1.
 	var buf bytes.Buffer
@@ -559,7 +563,7 @@ func TestSession_UnmarshalTruncatedSessionBody(t *testing.T) {
 // TestSession_UnmarshalFromEmptyReader verifies that UnmarshalFrom returns
 // an UnmarshalError when given an empty reader (no header at all).
 func TestSession_UnmarshalFromEmptyReader(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	err := m.UnmarshalFrom(bytes.NewReader(nil))
 	if err == nil {
@@ -580,7 +584,7 @@ func TestSession_UnmarshalFromEmptyReader(t *testing.T) {
 // returns a BoundsError when a single response's data length exceeds the
 // hardcoded maxResponseDataSize limit (64 MiB).
 func TestSession_UnmarshalResponseDataExceedsMax(t *testing.T) {
-	m := NewManager(100, 100)
+	m := NewManager(100, 100, 0)
 
 	var buf bytes.Buffer
 	var b4 [4]byte
@@ -592,6 +596,10 @@ func TestSession_UnmarshalResponseDataExceedsMax(t *testing.T) {
 
 	// clientID = 1
 	binary.LittleEndian.PutUint64(b8[:], 1)
+	buf.Write(b8[:])
+
+	// ownerID = 0 (no owner declared)
+	binary.LittleEndian.PutUint64(b8[:], 0)
 	buf.Write(b8[:])
 
 	// registeredIndex = 0
@@ -643,8 +651,8 @@ func TestSession_UnmarshalResponseDataExceedsMax(t *testing.T) {
 // completely replaces the manager's existing sessions with the snapshot
 // state, removing any pre-existing sessions.
 func TestSession_RestoreReplacesExistingState(t *testing.T) {
-	m1 := NewManager(100, 100)
-	if err := m1.Register(10, 0); err != nil {
+	m1 := NewManager(100, 100, 0)
+	if err := m1.Register(10, 0, 0); err != nil {
 		t.Fatalf("Register(10): %v", err)
 	}
 	if err := m1.RecordResult(10, 1, 0, 100, sm.Result{Value: 100}); err != nil {
@@ -658,8 +666,8 @@ func TestSession_RestoreReplacesExistingState(t *testing.T) {
 	}
 
 	// m2 has a completely different session.
-	m2 := NewManager(100, 100)
-	if err := m2.Register(99, 0); err != nil {
+	m2 := NewManager(100, 100, 0)
+	if err := m2.Register(99, 0, 0); err != nil {
 		t.Fatalf("Register(99): %v", err)
 	}
 	if err := m2.RecordResult(99, 1, 0, 100, sm.Result{Value: 999}); err != nil {

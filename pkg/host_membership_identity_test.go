@@ -75,6 +75,7 @@ func identityProtoMembership() proto.Membership {
 		SessionExpiryEntries: 7000,
 		MaxTotalSessions:     8192,
 		MaxSessionsPerClient: 32,
+		MaxSessionsPerOwner:  11,
 	}
 }
 
@@ -134,11 +135,14 @@ func TestMembershipConvertersRoundTripIdentities(t *testing.T) {
 	}
 	if got.SessionExpiryEntries != want.SessionExpiryEntries ||
 		got.MaxTotalSessions != want.MaxTotalSessions ||
-		got.MaxSessionsPerClient != want.MaxSessionsPerClient {
+		got.MaxSessionsPerClient != want.MaxSessionsPerClient ||
+		got.MaxSessionsPerOwner != want.MaxSessionsPerOwner {
 		t.Fatalf("round-trip lost the replicated session policy: "+
-			"expiry=%d total=%d perClient=%d, want %d/%d/%d",
+			"expiry=%d total=%d perClient=%d perOwner=%d, want %d/%d/%d/%d",
 			got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxSessionsPerClient,
-			want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient)
+			got.MaxSessionsPerOwner,
+			want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient,
+			want.MaxSessionsPerOwner)
 	}
 }
 

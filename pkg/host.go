@@ -4820,7 +4820,32 @@ func rejectSessionsOnDisk(ns *nodeState) error {
 // sm.DiskStateMachine: an on-disk state machine cannot carry the session table
 // across a restart, so a registered session would silently stop existing on any
 // replica that restarts. Use Host.GetNoOPSession on those shards.
+//
+// The session declares no owner, so it is exempt from the shard's per-owner
+// session cap. Use GetNewSessionWithOwner to declare one.
 func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error) {
+	return h.GetNewSessionWithOwner(ctx, shardID, 0)
+}
+
+// GetNewSessionWithOwner creates a new client session that declares ownerID as
+// the principal holding it, so it counts against — and is limited by — the
+// shard's replicated per-owner session cap
+// (config.Config.MaxSessionsPerOwner). It is otherwise identical to
+// GetNewSession, including the generated client ID.
+//
+// Registration fails with a *SessionError wrapping ErrInvalidOperation when the
+// owner is already at the cap, which is the same failure a shard-wide
+// exhaustion produces: the apply path refuses the registration, returns an
+// empty result, and the mismatch against the expected client ID is what this
+// call observes. It is a REPLICATED refusal — every replica reaches it from the
+// log alone — not a leader-local admission decision.
+//
+// An ownerID of zero declares no owner and is exactly GetNewSession. See
+// NewSessionWithOwner for what belongs in this value and why the cap is only as
+// trustworthy as the embedder's own authentication.
+func (h *Host) GetNewSessionWithOwner(
+	ctx context.Context, shardID, ownerID uint64,
+) (*Session, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -4842,7 +4867,7 @@ func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, err
 		uint64(buf[3])<<24 | uint64(buf[4])<<32 | uint64(buf[5])<<40 |
 		uint64(buf[6])<<48 | uint64(buf[7])<<56
 
-	session := newSession(shardID, clientID)
+	session := newSession(shardID, clientID, ownerID)
 	session.PrepareForRegister()
 
 	// Propose session registration through Raft.
@@ -5019,10 +5044,22 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 	}
 
 	// Build a session entry: empty Cmd, session fields populated.
+	//
+	// OwnerID is stamped here, at propose time, which is the only place it can
+	// enter replicated state. The apply path reads it back out of the committed
+	// entry to decide the per-owner session cap, so it has to be a fact the log
+	// carries rather than one this node knows — a replica replaying this entry
+	// after a restart has no connection, no caller and no Session object, and
+	// must still reach the same verdict. See proto.Entry.OwnerID.
+	//
+	// It rides on unregister entries too, harmlessly: the apply path reads
+	// OwnerID only when registering, and the session's own recorded owner (not
+	// this field) is what releases the slot on unregister.
 	entry := proto.Entry{
 		ClientID:    session.ClientID(),
 		SeriesID:    session.SeriesID(),
 		RespondedTo: session.RespondedTo(),
+		OwnerID:     session.OwnerID(),
 	}
 	return h.proposeEntry(ctx, ns, session.ShardID(), entry)
 }
@@ -5117,6 +5154,7 @@ func configSessionPolicy(cfg config.Config) proto.SessionPolicy {
 		ExpiryEntries:        cfg.SessionExpiryEntries,
 		MaxTotalSessions:     cfg.MaxTotalSessions,
 		MaxSessionsPerClient: cfg.MaxSessionsPerClient,
+		MaxSessionsPerOwner:  cfg.MaxSessionsPerOwner,
 	}
 }
 
@@ -5132,6 +5170,7 @@ func protoMembershipToPublic(pm *proto.Membership) *Membership {
 		SessionExpiryEntries:       pm.SessionExpiryEntries,
 		MaxTotalSessions:           pm.MaxTotalSessions,
 		MaxSessionsPerClient:       pm.MaxSessionsPerClient,
+		MaxSessionsPerOwner:        pm.MaxSessionsPerOwner,
 		Nodes:                      make(map[uint64]string, len(pm.Addresses)),
 		Observers:                  make(map[uint64]string, len(pm.Observers)),
 		Witnesses:                  make(map[uint64]string, len(pm.Witnesses)),
@@ -5830,6 +5869,7 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))
@@ -8851,6 +8891,7 @@ func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

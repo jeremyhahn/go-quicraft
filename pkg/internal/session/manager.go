@@ -34,12 +34,38 @@ type Manager struct {
 	sessions     map[uint64]*clientSession
 	maxTotal     uint64 // maximum total sessions per shard
 	maxResponses uint64 // maximum cached responses per session
+	maxPerOwner  uint64 // maximum concurrent sessions per owner; 0 disables
+
+	// ownerCounts is the secondary index the per-owner cap is decided from:
+	// ownerID -> number of live sessions registered under it. It is DERIVED
+	// state, reconstructible from sessions alone, and exists only so Register
+	// is O(1) instead of a scan of the whole table on every registration — the
+	// apply path runs this per committed entry.
+	//
+	// Being derived, it has exactly one correctness requirement: every mutation
+	// of sessions must move it in step. Register adds, Unregister and
+	// ExpireSessions subtract, and UnmarshalFrom rebuilds it from the decoded
+	// table rather than trusting anything on the wire. A count that drifts
+	// above the truth refuses registrations the shard should admit — and it
+	// would drift identically on every replica only by luck, so the divergence
+	// this whole policy exists to prevent would come back through the index.
+	//
+	// The zero owner is never a key here: an unset owner is not capped, so
+	// counting it would be pure cost.
+	ownerCounts map[uint64]uint64
 }
 
 // NewManager creates a session manager with the given limits.
 // maxTotal controls the total number of concurrent sessions per shard.
 // maxResponses controls the maximum cached responses per session.
-func NewManager(maxTotal, maxResponses uint64) *Manager {
+// maxPerOwner controls the maximum concurrent sessions one owner may hold;
+// zero disables the per-owner cap.
+//
+// maxTotal and maxResponses substitute a default when zero because no caller
+// can mean "admit nothing" by either. maxPerOwner does NOT, because zero has a
+// meaning there — the cap is off — and that is the state every shard
+// bootstrapped before the field existed is in.
+func NewManager(maxTotal, maxResponses, maxPerOwner uint64) *Manager {
 	if maxTotal == 0 {
 		maxTotal = 16384
 	}
@@ -50,55 +76,116 @@ func NewManager(maxTotal, maxResponses uint64) *Manager {
 		sessions:     make(map[uint64]*clientSession),
 		maxTotal:     maxTotal,
 		maxResponses: maxResponses,
+		maxPerOwner:  maxPerOwner,
+		ownerCounts:  make(map[uint64]uint64),
 	}
 }
 
-// SetLimits replaces the manager's limits. Both are load-bearing for apply
-// determinism — Register refuses past maxTotal and the response cache is
-// bounded by maxResponses, and a replica that refuses what its peers admit
-// diverges — so they are the shard's REPLICATED values, and this exists for
-// the one moment a replica learns them: a state machine created before its
-// shard's configuration was known (see rsm.StateMachine.refreshSessionPolicy).
+// SetLimits replaces the manager's limits. All three are load-bearing for apply
+// determinism — Register refuses past maxTotal and past maxPerOwner, and the
+// response cache is bounded by maxResponses, and a replica that refuses what
+// its peers admit diverges — so they are the shard's REPLICATED values, and
+// this exists for the one moment a replica learns them: a state machine created
+// before its shard's configuration was known (see
+// rsm.StateMachine.refreshSessionPolicy).
 //
-// A zero is ignored for the same reason NewManager substitutes a default for
-// it: no caller can mean "admit nothing".
+// A zero maxTotal or maxResponses is ignored for the same reason NewManager
+// substitutes a default for it: no caller can mean "admit nothing". maxPerOwner
+// is assigned unconditionally, because zero is a real value there — the cap
+// off — and ignoring it would make "the shard committed no per-owner cap"
+// impossible to express once any non-zero value had been seen.
 //
 // Existing sessions are left alone. Lowering maxTotal below the current count
 // therefore does not evict anyone; it stops further registrations, which is
 // the same rule Register already applies to a table that filled up. Callers
 // must invoke this from the apply goroutine, like every other Manager method.
-func (m *Manager) SetLimits(maxTotal, maxResponses uint64) {
+func (m *Manager) SetLimits(maxTotal, maxResponses, maxPerOwner uint64) {
 	if maxTotal != 0 {
 		m.maxTotal = maxTotal
 	}
 	if maxResponses != 0 {
 		m.maxResponses = maxResponses
 	}
+	m.maxPerOwner = maxPerOwner
 }
 
-// Register creates a new session for the given client ID. The index
-// parameter is the log index of the register entry, used as the
-// initial activity marker for deterministic expiry. Returns
-// ErrSessionLimitExceeded if the total session limit is reached, or
-// ErrSessionAlreadyExists if the client is already registered.
-func (m *Manager) Register(clientID uint64, index uint64) error {
+// Register creates a new session for the given client ID, owned by ownerID.
+// The index parameter is the log index of the register entry, used as the
+// initial activity marker for deterministic expiry.
+//
+// ownerID is the principal the embedder declared for this session
+// (proto.Entry.OwnerID). Zero means no owner was declared: the session is not
+// counted against, and is never refused by, the per-owner cap. Every session
+// registered before that field existed is in exactly that state, which is why
+// zero cannot be treated as an owner in its own right — doing so would pool
+// every ownerless session on the shard under one key and refuse them all at
+// the cap.
+//
+// Returns ErrSessionAlreadyExists if the client is already registered, or
+// ErrSessionLimitExceeded if either the shard-wide total or this owner's
+// concurrent-session cap is reached. The two exhaustion cases deliberately
+// report the SAME sentinel: the caller (rsm.StateMachine.Apply) must treat a
+// refused registration identically whatever refused it, and every replica
+// reaches the same verdict from the same log because both limits are
+// replicated state and both counters are derived from the applied entries
+// alone. A distinct error would invite a distinct code path, and a code path
+// only one replica takes is the divergence this cap exists to prevent.
+func (m *Manager) Register(clientID, ownerID, index uint64) error {
 	if _, exists := m.sessions[clientID]; exists {
 		return ErrSessionAlreadyExists
 	}
 	if uint64(len(m.sessions)) >= m.maxTotal {
 		return ErrSessionLimitExceeded
 	}
-	m.sessions[clientID] = newClientSession(clientID, index)
+	// The per-owner gate is checked AFTER the shard-wide one so that a full
+	// table reports the same way it always has regardless of ownership, and
+	// only when both pass is anything mutated — a partially applied
+	// registration would desynchronize ownerCounts from sessions.
+	if m.ownerCapped(ownerID) {
+		return ErrSessionLimitExceeded
+	}
+	m.sessions[clientID] = newClientSession(clientID, ownerID, index)
+	if ownerID != noOwnerID {
+		m.ownerCounts[ownerID]++
+	}
 	return nil
+}
+
+// ownerCapped reports whether ownerID already holds the maximum number of
+// concurrent sessions. An unset owner and a zero cap are both exemptions, and
+// both are the pre-existing behaviour rather than special cases: a shard that
+// committed no per-owner cap, or an embedder that declares no owner, gets the
+// bound this manager has always had — maxTotal — and nothing more.
+func (m *Manager) ownerCapped(ownerID uint64) bool {
+	if ownerID == noOwnerID || m.maxPerOwner == 0 {
+		return false
+	}
+	return m.ownerCounts[ownerID] >= m.maxPerOwner
+}
+
+// releaseOwner drops one session from ownerID's count, deleting the key when it
+// reaches zero so the index cannot outgrow the set of owners that actually hold
+// sessions. Every removal from m.sessions must call this; see Manager.ownerCounts.
+func (m *Manager) releaseOwner(ownerID uint64) {
+	if ownerID == noOwnerID {
+		return
+	}
+	if n := m.ownerCounts[ownerID]; n > 1 {
+		m.ownerCounts[ownerID] = n - 1
+	} else {
+		delete(m.ownerCounts, ownerID)
+	}
 }
 
 // Unregister removes the session for the given client ID. Returns
 // ErrSessionNotFound if the client is not registered.
 func (m *Manager) Unregister(clientID uint64) error {
-	if _, exists := m.sessions[clientID]; !exists {
+	sess, exists := m.sessions[clientID]
+	if !exists {
 		return ErrSessionNotFound
 	}
 	delete(m.sessions, clientID)
+	m.releaseOwner(sess.ownerID)
 	return nil
 }
 
@@ -270,9 +357,15 @@ func (m *Manager) ExpireSessions(currentIndex, inactivityThreshold uint64, maxEx
 		candidates = candidates[:maxExpire]
 	}
 
-	// Delete in deterministic order.
+	// Delete in deterministic order, releasing each session's owner slot as it
+	// goes. Expiry is the one removal path that is not driven by an explicit
+	// client action, so forgetting it here would leak owner counts upward until
+	// a long-lived shard refused every registration from an owner that in fact
+	// holds none.
 	for _, clientID := range candidates {
+		sess := m.sessions[clientID]
 		delete(m.sessions, clientID)
+		m.releaseOwner(sess.ownerID)
 	}
 
 	return candidates
@@ -291,9 +384,15 @@ func (m *Manager) MaxResponses() uint64 {
 // MarshalTo serializes all session state to the writer for snapshot
 // inclusion. The format is:
 // [numSessions:4][session1][session2]...
-// Each session: [clientID:8][registeredIndex:8][respondedTo:8][numResponses:4]
+// Each session: [clientID:8][ownerID:8][registeredIndex:8][respondedTo:8]
 //
-//	[{seriesID:8, value:8, dataLen:4, data:N}...][lastActiveIndex:8]
+//	[numResponses:4][{seriesID:8, value:8, dataLen:4, data:N}...]
+//	[lastActiveIndex:8]
+//
+// ownerCounts is NOT written. It is derived state, and UnmarshalFrom rebuilds
+// it by counting the decoded sessions — which is both smaller and safer than
+// persisting it, because a restored count can then never disagree with the
+// table it describes.
 func (m *Manager) MarshalTo(w io.Writer) error {
 	// Write number of sessions.
 	var buf [8]byte
@@ -326,6 +425,18 @@ func marshalSession(w io.Writer, sess *clientSession) error {
 	binary.LittleEndian.PutUint64(buf[:8], sess.clientID)
 	if _, err := w.Write(buf[:8]); err != nil {
 		return &MarshalError{Op: "write clientID", Err: err}
+	}
+
+	// ownerID. It must survive the snapshot or the per-owner cap silently
+	// resets on every restore: the restored sessions would all read as
+	// ownerless, their owners' counts would come back at zero, and a replica
+	// that recovered from a snapshot would admit registrations its peers refuse
+	// — the exact divergence the cap is replicated to avoid. The wire format is
+	// pinned at v1 pre-release, so the layout is changed in place and both sides
+	// are updated in lockstep.
+	binary.LittleEndian.PutUint64(buf[:8], sess.ownerID)
+	if _, err := w.Write(buf[:8]); err != nil {
+		return &MarshalError{Op: "write ownerID", Err: err}
 	}
 
 	// registeredIndex. It must survive the snapshot or the incarnation floor
@@ -425,14 +536,29 @@ func (m *Manager) UnmarshalFrom(r io.Reader) error {
 	// and whatever the caller does after the error — inconsistent with the
 	// pre-recovery user-SM state. Building aside keeps recovery atomic.
 	staged := make(map[uint64]*clientSession, numSessions)
+	stagedOwners := make(map[uint64]uint64)
 	for i := uint32(0); i < numSessions; i++ {
 		sess, err := unmarshalSession(r, m.maxResponses)
 		if err != nil {
 			return err
 		}
 		staged[sess.clientID] = sess
+		if sess.ownerID != noOwnerID {
+			stagedOwners[sess.ownerID]++
+		}
 	}
+	// The owner index is REBUILT from the decoded table, never read from the
+	// stream. Recomputing it costs one pass over sessions already in hand and
+	// makes a disagreement between the count and the table unrepresentable —
+	// whereas a persisted count is one more thing a corrupt or truncated
+	// snapshot can get wrong, in a way no bounds check would catch and that
+	// would show up only as registrations refused on one replica.
+	//
+	// It is swapped in alongside sessions, so the same all-or-nothing property
+	// UnmarshalFrom already had covers both: a mid-stream failure leaves the
+	// live table AND its index exactly as they were.
 	m.sessions = staged
+	m.ownerCounts = stagedOwners
 	return nil
 }
 
@@ -447,6 +573,12 @@ func unmarshalSession(r io.Reader, maxResponses uint64) (*clientSession, error) 
 		return nil, &UnmarshalError{Op: "read clientID", Err: err}
 	}
 	clientID := binary.LittleEndian.Uint64(buf[:8])
+
+	// ownerID — the per-owner cap's key. See marshalSession.
+	if _, err := io.ReadFull(r, buf[:8]); err != nil {
+		return nil, &UnmarshalError{Op: "read ownerID", Err: err}
+	}
+	ownerID := binary.LittleEndian.Uint64(buf[:8])
 
 	// registeredIndex — the incarnation floor. See marshalSession.
 	if _, err := io.ReadFull(r, buf[:8]); err != nil {
@@ -523,6 +655,7 @@ func unmarshalSession(r io.Reader, maxResponses uint64) (*clientSession, error) 
 
 	return &clientSession{
 		clientID:        clientID,
+		ownerID:         ownerID,
 		registeredIndex: registeredIndex,
 		respondedTo:     respondedTo,
 		responses:       responses,

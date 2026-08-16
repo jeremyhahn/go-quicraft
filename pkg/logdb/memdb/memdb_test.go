@@ -379,23 +379,29 @@ func TestIterateEntriesMaxSizeLimit(t *testing.T) {
 		entries[i] = logdb.Entry{
 			Index: uint64(i + 1),
 			Term:  1,
-			Cmd:   make([]byte, 100), // Each entry = 76 + 100 = 176 bytes.
+			Cmd:   make([]byte, 100),
 		}
 	}
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: entries},
 	})
 
-	// Request all 10 entries but limit to 360 bytes (fits 2 entries at 176 each).
-	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, 360)
+	// Derived from logdb.EntryOverheadBytes rather than a literal: the budget
+	// is defined in terms of that constant, so a layout change must move the
+	// expectation with it instead of failing here as a stale number.
+	perEntry := uint64(logdb.EntryOverheadBytes + 100)
+	budget := 2*perEntry + perEntry/2 // room for 2, not 3
+
+	// Request all 10 entries but limit the budget to two entries' worth.
+	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, budget)
 	if err != nil {
 		t.Fatalf("IterateEntries() error: %v", err)
 	}
 	if len(got) != 2 {
-		t.Errorf("IterateEntries() with maxSize=360: got %d entries, want 2", len(got))
+		t.Errorf("IterateEntries() with maxSize=%d: got %d entries, want 2", budget, len(got))
 	}
-	if size != 352 { // 2 * 176
-		t.Errorf("IterateEntries() size = %d, want 352", size)
+	if want := 2 * perEntry; size != want {
+		t.Errorf("IterateEntries() size = %d, want %d", size, want)
 	}
 }
 
@@ -462,7 +468,7 @@ func TestIterateEntriesAccumulatesSize(t *testing.T) {
 	db := New()
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("hello")}, // 76 + 5 = 81
+			{Index: 1, Term: 1, Cmd: []byte("hello")},
 		}},
 	})
 
@@ -470,9 +476,9 @@ func TestIterateEntriesAccumulatesSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IterateEntries() error: %v", err)
 	}
-	// Initial size 100 + entry size 81 = 181
-	if size != 181 {
-		t.Errorf("IterateEntries() size = %d, want 181", size)
+	// Initial size 100 + one entry's overhead + len("hello").
+	if want := uint64(100 + logdb.EntryOverheadBytes + 5); size != want {
+		t.Errorf("IterateEntries() size = %d, want %d", size, want)
 	}
 }
 
@@ -1288,7 +1294,7 @@ func TestIterateEntriesPartialRange(t *testing.T) {
 
 func TestEntrySizeCalculation(t *testing.T) {
 	db := New()
-	cmd := make([]byte, 24) // 76 + 24 = 100 bytes per entry.
+	cmd := make([]byte, 24)
 	db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
 			{Index: 1, Term: 1, Cmd: cmd},
@@ -1301,8 +1307,8 @@ func TestEntrySizeCalculation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IterateEntries() error: %v", err)
 	}
-	if size != 300 { // 3 entries * 100 bytes
-		t.Errorf("size = %d, want 300", size)
+	if want := uint64(3 * (logdb.EntryOverheadBytes + 24)); size != want {
+		t.Errorf("size = %d, want %d", size, want)
 	}
 }
 

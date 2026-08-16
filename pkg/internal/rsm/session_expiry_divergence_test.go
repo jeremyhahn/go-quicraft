@@ -301,7 +301,7 @@ func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 	// The registration bound moved too: with the replicated MaxTotalSessions of
 	// 22 the twelfth session is admitted, where the local 11 would refuse it.
 	for i := uint64(1); i <= 12; i++ {
-		if err := rsm.Sessions().Register(i, 1); err != nil {
+		if err := rsm.Sessions().Register(i, 0, 1); err != nil {
 			t.Fatalf("Register #%d = %v; the replicated MaxTotalSessions of %d "+
 				"must admit it, the local %d would not",
 				i, err, replicated.MaxTotalSessions, local.MaxTotalSessions)

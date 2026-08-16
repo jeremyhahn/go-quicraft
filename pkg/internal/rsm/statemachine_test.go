@@ -454,7 +454,7 @@ func TestApply_ZeroCopySessionResultIsDeepCopied(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(10, 0); err != nil {
+	if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -588,7 +588,7 @@ func TestStateMachineApply(t *testing.T) {
 		defer rsm.Close()
 
 		// Register client session.
-		if err := rsm.Sessions().Register(100, 0); err != nil {
+		if err := rsm.Sessions().Register(100, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -721,7 +721,7 @@ func TestStateMachineApply(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(200, 0); err != nil {
+		if err := rsm.Sessions().Register(200, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -800,7 +800,7 @@ func TestStateMachineSnapshotRecover(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register session and apply data.
-		if err := rsm1.Sessions().Register(50, 0); err != nil {
+		if err := rsm1.Sessions().Register(50, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -2972,7 +2972,7 @@ func TestApply_SessionExpiryDisabled(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -3006,10 +3006,10 @@ func TestApply_MultipleSessionsInBatch(t *testing.T) {
 		defer rsm.Close()
 
 		// Register two sessions.
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := rsm.Sessions().Register(20, 0); err != nil {
+		if err := rsm.Sessions().Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -3068,7 +3068,7 @@ func TestSnapshot_OnDiskSMWithOpenRecovery(t *testing.T) {
 		}
 
 		// Register session and apply data.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -4060,7 +4060,7 @@ func TestApply_UserSMUpdateErrorPropagatesWithSessionEntries(t *testing.T) {
 		defer rsm.Close()
 
 		// Register a session first.
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -4096,7 +4096,7 @@ func TestApply_LargeResultData(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -4195,7 +4195,7 @@ func TestApply_AllSessionDuplicatesBatch(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -4244,7 +4244,7 @@ func TestApply_SessionManagedEntryWithEmptyCmd(t *testing.T) {
 		}
 		defer rsm.Close()
 
-		if err := rsm.Sessions().Register(10, 0); err != nil {
+		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -4618,7 +4618,7 @@ func TestApply_InBatchDuplicateAppliedOnce(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(7, 0); err != nil {
+	if err := rsm.Sessions().Register(7, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -4687,7 +4687,7 @@ func TestApply_BatchExceedsMaxResponses(t *testing.T) {
 	}
 	defer rsm.Close()
 
-	if err := rsm.Sessions().Register(9, 0); err != nil {
+	if err := rsm.Sessions().Register(9, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -4860,7 +4860,7 @@ func TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched(t *testing
 	// A snapshot whose session table holds clientID 4242.
 	source := newRecoverTestSM(t, false)
 	const snapClientID uint64 = 4242
-	if err := source.sessions.Register(snapClientID, 1); err != nil {
+	if err := source.sessions.Register(snapClientID, 0, 1); err != nil {
 		t.Fatalf("Register on source: %v", err)
 	}
 	var snap bytes.Buffer
@@ -4872,7 +4872,7 @@ func TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched(t *testing
 	// The target holds a DIFFERENT live session and refuses the user restore.
 	target := newRecoverTestSM(t, true)
 	const liveClientID uint64 = 99
-	if err := target.sessions.Register(liveClientID, 1); err != nil {
+	if err := target.sessions.Register(liveClientID, 0, 1); err != nil {
 		t.Fatalf("Register on target: %v", err)
 	}
 

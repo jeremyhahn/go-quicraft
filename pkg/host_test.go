@@ -1536,7 +1536,7 @@ func TestCloseSession_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	_, err = h.CloseSession(context.Background(), 1, session)
 	if !errors.Is(err, ErrClosed) {
 		t.Errorf("CloseSession error = %v, want ErrClosed", err)
@@ -2819,7 +2819,7 @@ func TestCloseSession_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	session := newSession(999, 100)
+	session := newSession(999, 100, 0)
 	_, err = h.CloseSession(context.Background(), 999, session)
 	if !errors.Is(err, ErrShardNotFound) {
 		t.Errorf("CloseSession error = %v, want ErrShardNotFound", err)
@@ -10216,7 +10216,7 @@ func TestProposeWithSession_WrongShard(t *testing.T) {
 	h.updateNodeLeader(1, 1, 1)
 
 	// Session for shard 2, but only shard 1 exists.
-	session := newSession(2, 100)
+	session := newSession(2, 100, 0)
 	session.PrepareForPropose()
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrShardNotFound) {
@@ -10232,7 +10232,7 @@ func TestProposeWithSession_RegisterMode(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 1, 1)
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForRegister()
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrInvalidSession) {
@@ -10248,7 +10248,7 @@ func TestProposeWithSession_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 	_, err = h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrClosed) {
@@ -10270,7 +10270,7 @@ func TestProposeWithSession_DrainingHost(t *testing.T) {
 		t.Fatalf("Drain failed: %v", drainErr)
 	}
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrDraining) {
@@ -10286,7 +10286,7 @@ func TestProposeWithSession_EntryTooLarge(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 1, 1)
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 	bigCmd := make([]byte, scfg.MaxEntrySize+1)
 	_, err := h.ProposeWithSession(context.Background(), session, bigCmd)
@@ -10302,7 +10302,7 @@ func TestProposeWithSession_NotLeader(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrNotLeader) {
@@ -10318,7 +10318,7 @@ func TestProposeWithSession_Success(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	waitForLeader(t, h, 1)
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 
 	rs, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
@@ -10385,7 +10385,7 @@ func TestSyncProposeWithSession_Timeout_SessionUnchanged(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	// Don't wait for leader — leaderID=0 means proposal fails fast.
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 
 	seriesBefore := session.SeriesID()
@@ -10468,7 +10468,7 @@ func TestSyncProposeWithSession_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	session := newSession(1, 100)
+	session := newSession(1, 100, 0)
 	session.PrepareForPropose()
 	_, err = h.SyncProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrClosed) {
@@ -16395,7 +16395,7 @@ func TestCloseSession_WrongShardInSession(t *testing.T) {
 
 	// Create a session for shard 99 (non-existent), then try to close
 	// it on shard 1 -- ValidForSessionOp will fail.
-	session := newSession(99, 12345)
+	session := newSession(99, 12345, 0)
 	session.PrepareForPropose()
 
 	_, err = h.CloseSession(context.Background(), 1, session)
@@ -17286,7 +17286,7 @@ func TestProposeWithSession_DiskFull(t *testing.T) {
 	waitForLeader(t, h, 1)
 
 	// Create a valid session.
-	session := newSession(1, 12345)
+	session := newSession(1, 12345, 0)
 	session.PrepareForPropose()
 
 	// Set diskFull flag.
@@ -17433,7 +17433,7 @@ func TestProposeWithSession_WitnessReturnsInvalidOperation(t *testing.T) {
 	ns := testLoadNode(h, 1)
 	ns.cfg.IsWitness = true
 
-	session := newSession(1, 12345)
+	session := newSession(1, 12345, 0)
 	session.PrepareForPropose()
 
 	ctx := context.Background()
@@ -17657,7 +17657,7 @@ func TestRegisterSession_DrainingReturnsErrDraining(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
-	session := newSession(1, 12345)
+	session := newSession(1, 12345, 0)
 	h.draining.Store(true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

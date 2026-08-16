@@ -93,6 +93,7 @@ func TestReconstructShardMembership_PreservesNonVoterRolesAndPolicy(t *testing.T
 		ExpiryEntries:        9999,
 		MaxTotalSessions:     64,
 		MaxSessionsPerClient: 4,
+		MaxSessionsPerOwner:  6,
 	})
 
 	ldb := bootstrapLogDBFor(t, want)
@@ -133,8 +134,9 @@ func TestReconstructShardMembership_PreservesNonVoterRolesAndPolicy(t *testing.T
 			got.MaxWitnesses, got.RequireFullReplicaMajority)
 	}
 	if sp := got.SessionPolicy(); sp.ExpiryEntries != 9999 ||
-		sp.MaxTotalSessions != 64 || sp.MaxSessionsPerClient != 4 {
-		t.Fatalf("session policy = %+v, want {9999, 64, 4}: it is replicated "+
+		sp.MaxTotalSessions != 64 || sp.MaxSessionsPerClient != 4 ||
+		sp.MaxSessionsPerOwner != 6 {
+		t.Fatalf("session policy = %+v, want {9999, 64, 4, 6}: it is replicated "+
 			"state, so a reverted value expires different sessions at the same "+
 			"log index on different replicas", sp)
 	}

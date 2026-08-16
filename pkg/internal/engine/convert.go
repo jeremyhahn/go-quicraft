@@ -21,8 +21,13 @@ import (
 
 // protoEntryToLogDB converts a proto.Entry to a logdb.Entry. All fields
 // are copied, including the session fields (Key, ClientID, SeriesID,
-// RespondedTo): they must survive the WAL round-trip or session dedup
+// RespondedTo, OwnerID): they must survive the WAL round-trip or session dedup
 // (at-most-once delivery) silently breaks across crash recovery.
+//
+// This function is field-by-field and therefore does NOT fail to compile when a
+// field is added to either type — a new field simply stops being written, and
+// the omission surfaces only as a behaviour change after a restart. Every
+// addition to proto.Entry must be added here in the same change.
 func protoEntryToLogDB(e *proto.Entry) logdb.Entry {
 	return logdb.Entry{
 		Index:       e.Index,
@@ -32,6 +37,7 @@ func protoEntryToLogDB(e *proto.Entry) logdb.Entry {
 		ClientID:    e.ClientID,
 		SeriesID:    e.SeriesID,
 		RespondedTo: e.RespondedTo,
+		OwnerID:     e.OwnerID,
 		Cmd:         e.Cmd,
 	}
 }
@@ -64,6 +70,7 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

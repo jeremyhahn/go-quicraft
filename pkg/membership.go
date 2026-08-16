@@ -49,11 +49,12 @@ type Membership struct {
 	// Host.RequestUpdateWitnessPolicy.
 	RequireFullReplicaMajority bool
 
-	// SessionExpiryEntries, MaxTotalSessions and MaxSessionsPerClient are the
-	// shard's replicated SESSION POLICY: the three limits the deterministic
-	// apply path reads. They are seeded at bootstrap from the founder's
-	// Config (Config.SessionExpiryEntries, Config.MaxTotalSessions,
-	// Config.MaxSessionsPerClient) and are replicated because a replica that
+	// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient and
+	// MaxSessionsPerOwner are the shard's replicated SESSION POLICY: the four
+	// limits the deterministic apply path reads. They are seeded at bootstrap
+	// from the founder's Config (Config.SessionExpiryEntries,
+	// Config.MaxTotalSessions, Config.MaxSessionsPerClient,
+	// Config.MaxSessionsPerOwner) and are replicated because a replica that
 	// evaluated them from its own configuration would expire different
 	// sessions at different log indexes and diverge its state machine
 	// silently.
@@ -64,7 +65,7 @@ type Membership struct {
 	// which case the shard's value is the one that governs and the node logs
 	// the disagreement at startup.
 	//
-	// A shard bootstrapped before the policy was replicated reports all three
+	// A shard bootstrapped before the policy was replicated reports all four
 	// as zero: it has no committed policy and every replica is still running
 	// on its own configuration. There is currently NO config change that
 	// alters these after bootstrap.
@@ -72,9 +73,16 @@ type Membership struct {
 	// MaxTotalSessions is the replicated cap on concurrently registered
 	// sessions. Zero means the shard committed no session policy at all.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the replicated cap on responses cached per
-	// session.
+	// MaxSessionsPerClient is the replicated RESPONSE-CACHE DEPTH: how many
+	// cached results ONE session retains for duplicate detection. Despite the
+	// name it does not limit sessions at all — MaxSessionsPerOwner is the
+	// per-principal session cap, and MaxTotalSessions the shard-wide one.
 	MaxSessionsPerClient uint64
+	// MaxSessionsPerOwner is the replicated cap on how many sessions one owner
+	// (the principal an embedder declares when registering) may hold
+	// concurrently. Zero means the shard committed no per-owner cap, which is
+	// also how a shard bootstrapped before the field existed reports.
+	MaxSessionsPerOwner uint64
 
 	// Identities maps replicaID to the stable node identity the shard has
 	// COMMITTED for it — the value that node reports from Host.NodeIdentity.

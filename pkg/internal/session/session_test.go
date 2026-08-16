@@ -22,7 +22,7 @@ import (
 
 func TestNewClientSession(t *testing.T) {
 	t.Run("creates session with correct ID and index", func(t *testing.T) {
-		sess := newClientSession(42, 100)
+		sess := newClientSession(42, 0, 100)
 		if sess.clientID != 42 {
 			t.Errorf("clientID = %d, want 42", sess.clientID)
 		}
@@ -38,8 +38,8 @@ func TestNewClientSession(t *testing.T) {
 	})
 
 	t.Run("different IDs create distinct sessions", func(t *testing.T) {
-		s1 := newClientSession(1, 0)
-		s2 := newClientSession(2, 0)
+		s1 := newClientSession(1, 0, 0)
+		s2 := newClientSession(2, 0, 0)
 		if s1.clientID == s2.clientID {
 			t.Error("sessions should have different clientIDs")
 		}
@@ -48,35 +48,35 @@ func TestNewClientSession(t *testing.T) {
 
 func TestClientSessionIsExpired(t *testing.T) {
 	t.Run("not expired when recently active", func(t *testing.T) {
-		sess := newClientSession(1, 1000)
+		sess := newClientSession(1, 0, 1000)
 		if sess.isExpired(1050, 100) {
 			t.Error("session active at index 1000 should not be expired at index 1050 with threshold 100")
 		}
 	})
 
 	t.Run("expired when inactive beyond threshold", func(t *testing.T) {
-		sess := newClientSession(1, 100)
+		sess := newClientSession(1, 0, 100)
 		if !sess.isExpired(300, 100) {
 			t.Error("session active at index 100 should be expired at index 300 with threshold 100")
 		}
 	})
 
 	t.Run("not expired at boundary", func(t *testing.T) {
-		sess := newClientSession(1, 100)
+		sess := newClientSession(1, 0, 100)
 		if sess.isExpired(200, 100) {
 			t.Error("session should not be expired at exact threshold boundary")
 		}
 	})
 
 	t.Run("not expired when threshold is zero", func(t *testing.T) {
-		sess := newClientSession(1, 0)
+		sess := newClientSession(1, 0, 0)
 		if sess.isExpired(1000000, 0) {
 			t.Error("session should never expire when threshold is 0")
 		}
 	})
 
 	t.Run("not expired when current index is behind last active", func(t *testing.T) {
-		sess := newClientSession(1, 500)
+		sess := newClientSession(1, 0, 500)
 		if sess.isExpired(100, 10) {
 			t.Error("session should not be expired when current index < lastActiveIndex")
 		}
@@ -85,7 +85,7 @@ func TestClientSessionIsExpired(t *testing.T) {
 
 func TestClientSessionTouchIndex(t *testing.T) {
 	t.Run("updates lastActiveIndex", func(t *testing.T) {
-		sess := newClientSession(1, 100)
+		sess := newClientSession(1, 0, 100)
 		sess.touchIndex(200)
 		if sess.lastActiveIndex != 200 {
 			t.Errorf("lastActiveIndex = %d, want 200", sess.lastActiveIndex)
@@ -93,7 +93,7 @@ func TestClientSessionTouchIndex(t *testing.T) {
 	})
 
 	t.Run("prevents expiration", func(t *testing.T) {
-		sess := newClientSession(1, 100)
+		sess := newClientSession(1, 0, 100)
 		sess.touchIndex(950)
 		if sess.isExpired(1000, 100) {
 			t.Error("session should not be expired after touchIndex")
@@ -101,7 +101,7 @@ func TestClientSessionTouchIndex(t *testing.T) {
 	})
 
 	t.Run("does not decrease lastActiveIndex", func(t *testing.T) {
-		sess := newClientSession(1, 500)
+		sess := newClientSession(1, 0, 500)
 		sess.touchIndex(300)
 		if sess.lastActiveIndex != 500 {
 			t.Errorf("lastActiveIndex = %d, want 500 (should not decrease)", sess.lastActiveIndex)
@@ -111,7 +111,7 @@ func TestClientSessionTouchIndex(t *testing.T) {
 
 func TestClientSessionEvictUpTo(t *testing.T) {
 	t.Run("evicts entries up to respondedTo", func(t *testing.T) {
-		sess := newClientSession(1, 0)
+		sess := newClientSession(1, 0, 0)
 		sess.responses[1] = sm.Result{Value: 1}
 		sess.responses[2] = sm.Result{Value: 2}
 		sess.responses[3] = sm.Result{Value: 3}
@@ -134,7 +134,7 @@ func TestClientSessionEvictUpTo(t *testing.T) {
 	})
 
 	t.Run("no-op when nothing to evict", func(t *testing.T) {
-		sess := newClientSession(1, 0)
+		sess := newClientSession(1, 0, 0)
 		sess.responses[5] = sm.Result{Value: 5}
 		sess.evictUpTo(3) // all series are > 3
 		if len(sess.responses) != 1 {
@@ -143,7 +143,7 @@ func TestClientSessionEvictUpTo(t *testing.T) {
 	})
 
 	t.Run("evicts all when respondedTo is high", func(t *testing.T) {
-		sess := newClientSession(1, 0)
+		sess := newClientSession(1, 0, 0)
 		sess.responses[1] = sm.Result{Value: 1}
 		sess.responses[2] = sm.Result{Value: 2}
 		sess.evictUpTo(100)

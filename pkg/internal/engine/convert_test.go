@@ -497,6 +497,7 @@ func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
 		SessionExpiryEntries:       5000,
 		MaxTotalSessions:           4096,
 		MaxSessionsPerClient:       64,
+		MaxSessionsPerOwner:        16,
 		Addresses:                  map[uint64]string{1: "a1", 2: "a2"},
 		Observers:                  map[uint64]string{3: "o3"},
 		Witnesses:                  map[uint64]string{4: "w4"},
@@ -518,6 +519,7 @@ func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
 		{"SessionExpiryEntries", lm.SessionExpiryEntries, uint64(5000)},
 		{"MaxTotalSessions", lm.MaxTotalSessions, uint64(4096)},
 		{"MaxSessionsPerClient", lm.MaxSessionsPerClient, uint64(64)},
+		{"MaxSessionsPerOwner", lm.MaxSessionsPerOwner, uint64(16)},
 		{"Addresses[1]", lm.Addresses[1], "a1"},
 		{"Addresses[2]", lm.Addresses[2], "a2"},
 		{"Observers[3]", lm.Observers[3], "o3"},
@@ -567,12 +569,39 @@ func TestProtoMembershipToLogDB_MapsAreDeepCopied(t *testing.T) {
 // places; this is what stops a fifth field from silently reaching only some
 // of them.
 func TestLogDBMembershipFieldCount(t *testing.T) {
-	const mapped = 12
+	const mapped = 13
 	if got := reflect.TypeOf(logdb.Membership{}).NumField(); got != mapped {
 		t.Fatalf("logdb.Membership has %d fields, but the converters map %d.\n"+
 			"Adding a field means updating every converter — engine/convert.go, "+
 			"host.go protoMembershipToLogDB, host.go logdbMembershipToProto, and "+
 			"the inline map in messagehandler.go — and their round-trip tests, "+
 			"then bumping this count.", got, mapped)
+	}
+}
+
+// TestEntryFieldCount is the same guard for the entry types, which have the
+// same hazard and more copy sites.
+//
+// proto.Entry and logdb.Entry are converted field by field in five hand-written
+// places, none of which fails to compile when a field is added: engine's
+// protoEntryToLogDB, both directions in logdb/reader.go, and the WAL record
+// encoder and replayer in logdb/waldb/db.go. A field that reaches only some of
+// them does not error — it round-trips as zero, which for a session field means
+// at-most-once delivery or a replicated apply-path limit silently changing
+// behaviour after a restart. Both types are pinned because the converters
+// require them to stay in step.
+func TestEntryFieldCount(t *testing.T) {
+	const mapped = 9
+	if got := reflect.TypeOf(proto.Entry{}).NumField(); got != mapped {
+		t.Fatalf("proto.Entry has %d fields, but the converters map %d.\n"+
+			"Adding a field means updating protoEntryToLogDB, both conversions "+
+			"in logdb/reader.go, writeEntryChunk and replayEntries in "+
+			"logdb/waldb/db.go, entryHeaderSize and Entry.MarshalTo/UnmarshalFrom/"+
+			"Reset in proto, and entryRecordHeaderSize in waldb — then bumping "+
+			"this count.", got, mapped)
+	}
+	if got := reflect.TypeOf(logdb.Entry{}).NumField(); got != mapped {
+		t.Fatalf("logdb.Entry has %d fields, proto.Entry has %d. The converters "+
+			"are field-by-field, so the two must stay in step.", got, mapped)
 	}
 }

@@ -199,13 +199,10 @@ func (s *membershipSnapshot) isRemovedIdentity(identity string) bool {
 // toProto converts the snapshot to a proto.Membership value. The maps
 // are deep-copied to prevent external mutation of the immutable snapshot.
 func (s *membershipSnapshot) toProto() proto.Membership {
-	return proto.Membership{
+	m := proto.Membership{
 		ConfigChangeID:             s.configChangeID,
 		MaxWitnesses:               s.maxWitnesses,
 		RequireFullReplicaMajority: s.requireFullReplicaMajority,
-		SessionExpiryEntries:       s.sessionPolicy.ExpiryEntries,
-		MaxTotalSessions:           s.sessionPolicy.MaxTotalSessions,
-		MaxSessionsPerClient:       s.sessionPolicy.MaxSessionsPerClient,
 		Addresses:                  copyStringMap(s.addresses),
 		Observers:                  copyStringMap(s.observers),
 		Witnesses:                  copyStringMap(s.witnesses),
@@ -213,6 +210,14 @@ func (s *membershipSnapshot) toProto() proto.Membership {
 		Identities:                 copyStringMap(s.identities),
 		RemovedIdentities:          copyStringMap(s.removedIdentities),
 	}
+	// The policy moves as ONE value rather than field by field. This site
+	// silently dropped a policy field once already: it listed the three that
+	// existed when it was written, so a fourth was added to proto.SessionPolicy,
+	// compiled cleanly here, and vanished on every path that reads membership
+	// back out of the raft layer. SetSessionPolicy is total over the struct, so
+	// the next field to be added cannot be forgotten in this direction.
+	m.SetSessionPolicy(s.sessionPolicy)
+	return m
 }
 
 // membership tracks the current cluster membership configuration. It maintains

@@ -24,7 +24,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestNewSession_Fields(t *testing.T) {
-	s := newSession(10, 20)
+	s := newSession(10, 20, 0)
 	if s.ShardID() != 10 {
 		t.Errorf("ShardID = %d, want 10", s.ShardID())
 	}
@@ -40,7 +40,7 @@ func TestNewSession_Fields(t *testing.T) {
 }
 
 func TestNewSession_InvalidZeroClientID(t *testing.T) {
-	s := newSession(5, 0)
+	s := newSession(5, 0, 0)
 	if !s.IsNoOPSession() {
 		t.Error("session with clientID 0 should be a no-op session")
 	}
@@ -60,7 +60,7 @@ func TestNewNoOPSession_Fields(t *testing.T) {
 }
 
 func TestNewNoOPSession_IsNotRegularSession(t *testing.T) {
-	regular := newSession(1, 100)
+	regular := newSession(1, 100, 0)
 	noop := NewNoOPSession(1)
 
 	if regular.IsNoOPSession() {
@@ -76,7 +76,7 @@ func TestNewNoOPSession_IsNotRegularSession(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrepareForPropose_SetsFirstProposal(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	if s.SeriesID() != 0 {
 		t.Fatalf("initial SeriesID = %d, want 0", s.SeriesID())
 	}
@@ -89,7 +89,7 @@ func TestPrepareForPropose_SetsFirstProposal(t *testing.T) {
 }
 
 func TestProposalCompleted_AdvancesSeriesID(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	if s.SeriesID() != SeriesIDFirstProposal {
 		t.Fatalf("SeriesID = %d, want %d", s.SeriesID(), SeriesIDFirstProposal)
@@ -107,7 +107,7 @@ func TestProposalCompleted_AdvancesSeriesID(t *testing.T) {
 }
 
 func TestProposalCompleted_Monotonic(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	for i := uint64(0); i < 100; i++ {
 		expected := SeriesIDFirstProposal + i
@@ -119,7 +119,7 @@ func TestProposalCompleted_Monotonic(t *testing.T) {
 }
 
 func TestProposalCompleted_ConcurrentContiguousAdvance(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 
 	const goroutines = 100
@@ -154,7 +154,7 @@ func TestProposalCompleted_ConcurrentContiguousAdvance(t *testing.T) {
 func TestProposalCompleted_ConcurrentInvariant(t *testing.T) {
 	// Verify that after N concurrent completions, the invariant
 	// respondedTo == seriesID - 1 holds and seriesID advanced exactly N.
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 
 	const goroutines = 500
@@ -185,7 +185,7 @@ func TestProposalCompleted_ConcurrentInvariant(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrepareForRegister_SetsSentinel(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	s.ProposalCompleted()
 	s.SetRespondedTo(1)
@@ -202,7 +202,7 @@ func TestPrepareForRegister_SetsSentinel(t *testing.T) {
 }
 
 func TestPrepareForRegister_DistinctFromUnregister(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForRegister()
 	regID := s.SeriesID()
 
@@ -225,7 +225,7 @@ func TestPrepareForRegister_DistinctFromUnregister(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPrepareForUnregister_SetsSentinel(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	s.ProposalCompleted()
 	s.SetRespondedTo(2)
@@ -242,7 +242,7 @@ func TestPrepareForUnregister_SetsSentinel(t *testing.T) {
 }
 
 func TestPrepareForUnregister_Fresh(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForUnregister()
 	if s.SeriesID() != SeriesIDForUnregister {
 		t.Errorf("SeriesID = %d, want %d", s.SeriesID(), SeriesIDForUnregister)
@@ -254,14 +254,14 @@ func TestPrepareForUnregister_Fresh(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestValidForSessionOp_CorrectShard(t *testing.T) {
-	s := newSession(5, 100)
+	s := newSession(5, 100, 0)
 	if !s.ValidForSessionOp(5) {
 		t.Error("session should be valid for its own shard")
 	}
 }
 
 func TestValidForSessionOp_WrongShard(t *testing.T) {
-	s := newSession(5, 100)
+	s := newSession(5, 100, 0)
 	if s.ValidForSessionOp(10) {
 		t.Error("session should not be valid for a different shard")
 	}
@@ -279,7 +279,7 @@ func TestValidForSessionOp_NoOpSession(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSetRespondedTo_MonotonicallyAdvances(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 
 	s.SetRespondedTo(5)
 	if s.RespondedTo() != 5 {
@@ -300,7 +300,7 @@ func TestSetRespondedTo_MonotonicallyAdvances(t *testing.T) {
 }
 
 func TestSetRespondedTo_ConcurrentSafety(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	const goroutines = 50
 
 	var wg sync.WaitGroup
@@ -320,7 +320,7 @@ func TestSetRespondedTo_ConcurrentSafety(t *testing.T) {
 }
 
 func TestSetRespondedTo_SameValueIsNoOp(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.SetRespondedTo(5)
 	s.SetRespondedTo(5)
 	if s.RespondedTo() != 5 {
@@ -333,14 +333,14 @@ func TestSetRespondedTo_SameValueIsNoOp(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSession_ShardID(t *testing.T) {
-	s := newSession(42, 100)
+	s := newSession(42, 100, 0)
 	if s.ShardID() != 42 {
 		t.Errorf("ShardID = %d, want 42", s.ShardID())
 	}
 }
 
 func TestSession_ClientID(t *testing.T) {
-	s := newSession(1, 999)
+	s := newSession(1, 999, 0)
 	if s.ClientID() != 999 {
 		t.Errorf("ClientID = %d, want 999", s.ClientID())
 	}
@@ -358,7 +358,7 @@ func TestIsNoOPSession_True(t *testing.T) {
 }
 
 func TestIsNoOPSession_False(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	if s.IsNoOPSession() {
 		t.Error("regular session should return false")
 	}
@@ -369,7 +369,7 @@ func TestIsNoOPSession_False(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestValidForProposal_ValidSession(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	if !s.ValidForProposal(1) {
 		t.Error("valid session should return true")
@@ -377,7 +377,7 @@ func TestValidForProposal_ValidSession(t *testing.T) {
 }
 
 func TestValidForProposal_WrongShard(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	if s.ValidForProposal(2) {
 		t.Error("wrong shard should return false")
@@ -392,7 +392,7 @@ func TestValidForProposal_NoOpSession(t *testing.T) {
 }
 
 func TestValidForProposal_RegisterMode(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForRegister()
 	if s.ValidForProposal(1) {
 		t.Error("register mode should return false")
@@ -400,7 +400,7 @@ func TestValidForProposal_RegisterMode(t *testing.T) {
 }
 
 func TestValidForProposal_UnregisterMode(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForUnregister()
 	if s.ValidForProposal(1) {
 		t.Error("unregister mode should return false")
@@ -408,7 +408,7 @@ func TestValidForProposal_UnregisterMode(t *testing.T) {
 }
 
 func TestValidForProposal_RespondedToExceedsSeriesID(t *testing.T) {
-	s := newSession(1, 100)
+	s := newSession(1, 100, 0)
 	s.PrepareForPropose()
 	// Force respondedTo > seriesID (broken invariant).
 	s.respondedTo.Store(SeriesIDFirstProposal + 1)

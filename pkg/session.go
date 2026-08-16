@@ -51,17 +51,27 @@ const (
 // Fields are unexported to prevent direct mutation which would break
 // deduplication invariants.
 type Session struct {
-	shardID     uint64
-	clientID    uint64
+	shardID  uint64
+	clientID uint64
+	// ownerID is the principal the embedder declares owns this session. It is
+	// read once, at registration, and stamped into the replicated register
+	// entry (proto.Entry.OwnerID) where the shard's per-owner session cap is
+	// evaluated against it. It is immutable after construction for the same
+	// reason clientID is: changing it would not migrate the session between
+	// owners, it would only make the local value disagree with what the log
+	// committed. Zero means no owner was declared.
+	ownerID     uint64
 	seriesID    atomic.Uint64
 	respondedTo atomic.Uint64
 }
 
-// newSession creates a Session for the given shard and client.
-func newSession(shardID, clientID uint64) *Session {
+// newSession creates a Session for the given shard and client, owned by
+// ownerID (zero for none).
+func newSession(shardID, clientID, ownerID uint64) *Session {
 	return &Session{
 		shardID:  shardID,
 		clientID: clientID,
+		ownerID:  ownerID,
 	}
 }
 
@@ -69,10 +79,36 @@ func newSession(shardID, clientID uint64) *Session {
 // The clientID must not be zero; zero is reserved for no-op sessions.
 // The session is created in an unregistered state. The caller must register
 // it through the Raft consensus group before using it for proposals.
+//
+// The session declares no owner and is therefore exempt from the shard's
+// per-owner session cap. Use NewSessionWithOwner to declare one.
 func NewSession(shardID, clientID uint64) *Session {
 	return &Session{
 		shardID:  shardID,
 		clientID: clientID,
+	}
+}
+
+// NewSessionWithOwner creates a tracked Session that declares ownerID as the
+// principal holding it, so the session counts against — and is limited by —
+// the shard's replicated per-owner cap
+// (config.Config.MaxSessionsPerOwner).
+//
+// The owner is whatever the EMBEDDER decides identifies a principal: a tenant
+// ID, an account number, a hash of an authenticated subject. This library
+// cannot derive it, because it authenticates nodes rather than clients and a
+// clientID is eight bytes the caller chooses. It follows that the cap is only
+// as trustworthy as the embedder's own authentication: a caller free to pick
+// any ownerID is free to evade the cap, so the value must come from something
+// the embedder verified, not from the client.
+//
+// An ownerID of zero is identical to NewSession — no owner declared, no cap
+// applied.
+func NewSessionWithOwner(shardID, clientID, ownerID uint64) *Session {
+	return &Session{
+		shardID:  shardID,
+		clientID: clientID,
+		ownerID:  ownerID,
 	}
 }
 
@@ -94,6 +130,12 @@ func (s *Session) ShardID() uint64 {
 // ClientID returns the unique client identifier for this session.
 func (s *Session) ClientID() uint64 {
 	return s.clientID
+}
+
+// OwnerID returns the principal the embedder declared owns this session, or
+// zero if none was declared. See NewSessionWithOwner.
+func (s *Session) OwnerID() uint64 {
+	return s.ownerID
 }
 
 // SeriesID returns the current series ID. Each proposal increments this

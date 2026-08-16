@@ -15,10 +15,10 @@
 package proto
 
 // Entry is the fundamental unit of replication in the Raft log. It contains
-// 8 fixed fields and one variable-length command payload. The wire format
-// uses a 60-byte fixed header (entryHeaderSize) followed by the command data:
+// 9 fixed fields and one variable-length command payload. The wire format
+// uses a 68-byte fixed header (entryHeaderSize) followed by the command data:
 //
-//	[Term:8][Index:8][Type:8][Key:8][ClientID:8][SeriesID:8][RespondedTo:8][CmdLen:4][Cmd:N]
+//	[Term:8][Index:8][Type:8][Key:8][ClientID:8][SeriesID:8][RespondedTo:8][OwnerID:8][CmdLen:4][Cmd:N]
 //
 // Entry.Type encodes both the entry type (lower 4 bits) and compression flag
 // (bit 4). Always mask with EntryTypeMask before comparing entry types.
@@ -40,15 +40,46 @@ type Entry struct {
 	SeriesID uint64
 	// RespondedTo is the highest responded-to series for this client.
 	RespondedTo uint64
+	// OwnerID identifies the PRINCIPAL that owns the session this entry
+	// registers — the embedder's tenant, account, or connection identity — and
+	// is the key the per-owner concurrent-session cap is counted against (see
+	// SessionPolicy.MaxSessionsPerOwner and session.Manager.Register).
+	//
+	// It is here, in the replicated entry, and not derived at the leader,
+	// because the cap is a STATE MACHINE decision: every replica must accept or
+	// refuse a registration identically from the log alone, and a leader-local
+	// fact — the authenticated peer on the connection that carried the proposal
+	// — is not in the log and is not the same on a replica replaying it after a
+	// restart. Anything the apply path consults must ride in the entry.
+	//
+	// It is SUPPLIED BY THE EMBEDDER (Host.GetNewSessionWithOwner,
+	// NewSessionWithOwner). This library has no notion of who a client is: a
+	// clientID is eight bytes the caller chooses, so it cannot be used to group
+	// sessions by principal, and the engine must not invent an identity it
+	// cannot authenticate. An embedder that has one — a tenant ID, a subject
+	// from a verified token — passes it in and gets the cap; one that does not
+	// passes nothing.
+	//
+	// ZERO MEANS UNSET, and an unset owner is never counted or capped. That is
+	// what keeps every existing embedder working unchanged: a session registered
+	// without an owner behaves exactly as it did before this field existed. It
+	// is deliberately NOT a security boundary on its own — the value is whatever
+	// the embedder claims — so the cap it drives limits resource consumption per
+	// declared owner, and is only as trustworthy as the embedder's own
+	// authentication.
+	//
+	// Only session-registration entries carry a meaningful value; the apply path
+	// reads it in no other branch.
+	OwnerID uint64
 	// Cmd is the state machine command payload. After UnmarshalFrom,
 	// Cmd aliases the source buffer (zero-copy). The caller must copy
 	// if the data needs to outlive the buffer.
 	Cmd []byte
 }
 
-// entryHeaderSize is the fixed portion of the wire format: 7 uint64 fields
-// (56 bytes) plus a 4-byte uint32 cmd length prefix.
-const entryHeaderSize = 7*8 + 4 // 60 bytes
+// entryHeaderSize is the fixed portion of the wire format: 8 uint64 fields
+// (64 bytes) plus a 4-byte uint32 cmd length prefix.
+const entryHeaderSize = 8*8 + 4 // 68 bytes
 
 // Size returns the total marshaled size of the entry in bytes.
 func (e *Entry) Size() int {
@@ -78,8 +109,9 @@ func (e *Entry) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[32:], e.ClientID)
 	putUint64(buf[40:], e.SeriesID)
 	putUint64(buf[48:], e.RespondedTo)
-	putUint32(buf[56:], uint32(len(e.Cmd)))
-	copy(buf[60:], e.Cmd)
+	putUint64(buf[56:], e.OwnerID)
+	putUint32(buf[64:], uint32(len(e.Cmd)))
+	copy(buf[entryHeaderSize:], e.Cmd)
 	return required, nil
 }
 
@@ -99,7 +131,8 @@ func (e *Entry) UnmarshalFrom(buf []byte) (int, error) {
 	e.ClientID = getUint64(buf[32:])
 	e.SeriesID = getUint64(buf[40:])
 	e.RespondedTo = getUint64(buf[48:])
-	cmdLen := getUint32(buf[56:])
+	e.OwnerID = getUint64(buf[56:])
+	cmdLen := getUint32(buf[64:])
 	// Validate cmdLen before any allocation or slice creation.
 	// MaxEntrySize (8MB) fits in uint32, so no overflow risk.
 	if cmdLen > MaxEntrySize {
@@ -117,7 +150,7 @@ func (e *Entry) UnmarshalFrom(buf []byte) (int, error) {
 		return 0, ErrInvalidEntryType
 	}
 	if cmdLen > 0 {
-		e.Cmd = buf[60:total] // zero-copy: aliases source buffer
+		e.Cmd = buf[entryHeaderSize:total] // zero-copy: aliases source buffer
 	} else {
 		e.Cmd = nil
 	}
@@ -187,5 +220,6 @@ func (e *Entry) Reset() {
 	e.ClientID = 0
 	e.SeriesID = 0
 	e.RespondedTo = 0
+	e.OwnerID = 0
 	e.Cmd = nil
 }

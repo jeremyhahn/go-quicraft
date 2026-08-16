@@ -67,8 +67,8 @@ func FuzzManagerMarshalRoundTrip(f *testing.F) {
 			logIndex     = 10
 		)
 
-		original := NewManager(maxTotal, maxResponses)
-		if err := original.Register(clientID, logIndex); err != nil {
+		original := NewManager(maxTotal, maxResponses, 0)
+		if err := original.Register(clientID, 0, logIndex); err != nil {
 			t.Fatalf("Register(%d): %v", clientID, err)
 		}
 
@@ -84,7 +84,7 @@ func FuzzManagerMarshalRoundTrip(f *testing.F) {
 		}
 
 		// Unmarshal into a fresh manager with the same limits.
-		restored := NewManager(maxTotal, maxResponses)
+		restored := NewManager(maxTotal, maxResponses, 0)
 		if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 			t.Fatalf("UnmarshalFrom: %v", err)
 		}
@@ -125,7 +125,7 @@ func FuzzManagerMarshalRoundTrip(f *testing.F) {
 		}
 
 		// Unmarshal once more and marshal again to verify stability.
-		restored2 := NewManager(maxTotal, maxResponses)
+		restored2 := NewManager(maxTotal, maxResponses, 0)
 		if err := restored2.UnmarshalFrom(bytes.NewReader(buf2.Bytes())); err != nil {
 			t.Fatalf("second UnmarshalFrom: %v", err)
 		}
@@ -181,7 +181,7 @@ func FuzzManagerUnmarshalCrash(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		mgr := NewManager(256, 128)
+		mgr := NewManager(256, 128, 0)
 		// Must not panic. Errors are expected for malformed input.
 		_ = mgr.UnmarshalFrom(bytes.NewReader(data))
 	})
@@ -222,8 +222,8 @@ func FuzzSessionSentinelBoundary(f *testing.F) {
 			return
 		}
 
-		mgr := NewManager(maxTotal, maxResponses)
-		if err := mgr.Register(clientID, logIndex); err != nil {
+		mgr := NewManager(maxTotal, maxResponses, 0)
+		if err := mgr.Register(clientID, 0, logIndex); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 
@@ -257,7 +257,7 @@ func FuzzSessionSentinelBoundary(f *testing.F) {
 			t.Fatalf("MarshalTo: %v", err)
 		}
 
-		restored := NewManager(maxTotal, maxResponses)
+		restored := NewManager(maxTotal, maxResponses, 0)
 		if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 			t.Fatalf("UnmarshalFrom: %v", err)
 		}
@@ -314,8 +314,8 @@ func FuzzCheckDuplicateConsistency(f *testing.F) {
 			logIndex     = 10
 		)
 
-		mgr := NewManager(maxTotal, maxResponses)
-		if err := mgr.Register(clientID, logIndex); err != nil {
+		mgr := NewManager(maxTotal, maxResponses, 0)
+		if err := mgr.Register(clientID, 0, logIndex); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 

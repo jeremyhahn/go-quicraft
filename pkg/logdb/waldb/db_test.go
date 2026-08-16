@@ -2460,11 +2460,11 @@ func TestMembershipSizeHelper(t *testing.T) {
 		// All nil maps.
 	}
 	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1) +
-	// 6 map count headers * 4 bytes each + the 24-byte session policy
-	// = 18 + 24 + 24 = 66. The fifth map is Identities and the sixth is
+	// 6 map count headers * 4 bytes each + the 32-byte session policy
+	// = 18 + 24 + 32 = 74. The fifth map is Identities and the sixth is
 	// RemovedIdentities; the session policy sits between them.
-	if got := membershipSize(m); got != 66 {
-		t.Fatalf("membershipSize(empty)=%d, want 66", got)
+	if got := membershipSize(m); got != 74 {
+		t.Fatalf("membershipSize(empty)=%d, want 74", got)
 	}
 	// membershipSize is what this binary WRITES; minMembershipSize is the floor
 	// for what it will READ. With one layout and every field written
@@ -2549,7 +2549,7 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(buf[16:], 1)               // raftIndex
 		binary.LittleEndian.PutUint64(buf[24:], 1)               // term
 		binary.LittleEndian.PutUint64(buf[32:], 0)               // entryType
-		binary.LittleEndian.PutUint32(buf[72:], oversizedCmdLen) // cmdLen
+		binary.LittleEndian.PutUint32(buf[80:], oversizedCmdLen) // cmdLen
 
 		if err := s.replayEntries(buf, 0); !errors.Is(err, ErrCmdTooLarge) {
 			t.Fatalf("replayEntries = %v, want ErrCmdTooLarge", err)
@@ -2586,8 +2586,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(totalBuf[16:], 10)                    // raftIndex
 		binary.LittleEndian.PutUint64(totalBuf[24:], 1)                     // term
 		binary.LittleEndian.PutUint64(totalBuf[32:], 0)                     // entryType
-		binary.LittleEndian.PutUint32(totalBuf[72:], uint32(len(validCmd))) // cmdLen
-		copy(totalBuf[76:], validCmd)                                       // cmd
+		binary.LittleEndian.PutUint32(totalBuf[80:], uint32(len(validCmd))) // cmdLen
+		copy(totalBuf[entryRecordHeaderSize:], validCmd)                    // cmd
 		// Oversized entry at position validEntrySize.
 		pos := validEntrySize
 		binary.LittleEndian.PutUint64(totalBuf[pos:], 1)                  // shardID
@@ -2595,7 +2595,7 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(totalBuf[pos+16:], 11)              // raftIndex
 		binary.LittleEndian.PutUint64(totalBuf[pos+24:], 1)               // term
 		binary.LittleEndian.PutUint64(totalBuf[pos+32:], 0)               // entryType
-		binary.LittleEndian.PutUint32(totalBuf[pos+72:], oversizedCmdLen) // cmdLen
+		binary.LittleEndian.PutUint32(totalBuf[pos+80:], oversizedCmdLen) // cmdLen
 
 		if err := s.replayEntries(totalBuf, 0); !errors.Is(err, ErrCmdTooLarge) {
 			t.Fatalf("replayEntries = %v, want ErrCmdTooLarge", err)
@@ -2638,8 +2638,8 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 		binary.LittleEndian.PutUint64(buf[16:], 1)      // raftIndex
 		binary.LittleEndian.PutUint64(buf[24:], 5)      // term
 		binary.LittleEndian.PutUint64(buf[32:], 0)      // entryType
-		binary.LittleEndian.PutUint32(buf[72:], cmdLen) // cmdLen
-		copy(buf[76:], cmd)
+		binary.LittleEndian.PutUint32(buf[80:], cmdLen) // cmdLen
+		copy(buf[entryRecordHeaderSize:], cmd)
 
 		if err := s.replayEntries(buf, 0); err != nil {
 			t.Fatalf("replayEntries = %v, want nil for valid entry", err)
@@ -2865,7 +2865,7 @@ func TestReplayEntriesCmdLenBoundaryOverflow(t *testing.T) {
 	binary.LittleEndian.PutUint64(buf[16:], 1)          // raftIndex
 	binary.LittleEndian.PutUint64(buf[24:], 1)          // term
 	binary.LittleEndian.PutUint64(buf[32:], 0)          // entryType
-	binary.LittleEndian.PutUint32(buf[72:], 0xFFFFFFFF) // cmdLen = MaxUint32
+	binary.LittleEndian.PutUint32(buf[80:], 0xFFFFFFFF) // cmdLen = MaxUint32
 
 	if err := s.replayEntries(buf, 0); !errors.Is(err, ErrCmdTooLarge) {
 		t.Fatalf("replayEntries = %v, want ErrCmdTooLarge for MaxUint32 cmdLen", err)
@@ -3513,22 +3513,48 @@ func BenchmarkDBIterateEntries(b *testing.B) {
 	}
 }
 
+// blockNextSegment makes the shard's NEXT segment creation fail, for every
+// euid including root, and closes the active segment so that creation is what
+// the next write attempts.
+//
+// The batch-rollback tests below all need exactly one shard in a batch to fail
+// its WAL write. They used to arrange that by chmod'ing the shard directory to
+// 0444, which only denies a NON-root euid: root bypasses the permission bits,
+// so under a CI container running as root the sabotaged write SUCCEEDED, the
+// batch did not fail, and every rollback assertion after it was vacuous. The
+// tests therefore carried a skipIfRoot guard — which meant the rollback gate
+// was silently absent in the one environment CI actually uses.
+//
+// Pre-creating a DIRECTORY at the path of the next segment file removes the
+// euid from the question entirely: createSegment opens that path with
+// O_RDWR|O_CREATE, and open(2) on a directory with write intent is EISDIR for
+// root exactly as it is for anyone else. The failure lands in the same place
+// the chmod produced it (ensureActiveSegment -> createSegment -> a
+// *SegmentCreateError), so the tests below assert on the same path they always
+// did, now in every environment.
+func blockNextSegment(t *testing.T, s *walShard) {
+	t.Helper()
+	s.mu.Lock()
+	if s.activeSegment != nil {
+		s.activeSegment.Close()
+		s.activeSegment = nil
+	}
+	blocked := filepath.Join(s.dir, segmentFilename(s.nextSegmentID))
+	s.mu.Unlock()
+
+	if err := os.Mkdir(blocked, 0700); err != nil {
+		t.Fatalf("blockNextSegment: %v", err)
+	}
+	// Remove it again so the deferred DB.Close, and any later reopen, see a
+	// shard directory holding only real segment files.
+	t.Cleanup(func() { os.Remove(blocked) })
+}
+
 // TestSaveStatePartialWriteDiscardsGhostRecords verifies that when a batch
 // write fails mid-way through processing updates, previously buffered
 // records from successful shards are discarded. This prevents ghost records
 // from being fsynced on the next successful SaveState call.
-// skipIfRoot skips tests that depend on read-only directory permissions
-// being enforced; root (the euid in CI job containers) bypasses permission
-// bits, so the write the test expects to fail would succeed.
-func skipIfRoot(t *testing.T) {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("read-only directory semantics do not apply to root")
-	}
-}
-
 func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
-	skipIfRoot(t)
 	dir := t.TempDir()
 	// Use sync disabled so we can observe buffer behavior without I/O noise.
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(2*1024))
@@ -3580,23 +3606,9 @@ func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 		t.Fatalf("SaveState shard2 init: %v", err)
 	}
 
-	// Close the active segment to force a write error.
-	shard2.mu.Lock()
-	if shard2.activeSegment != nil {
-		shard2.activeSegment.Close()
-		shard2.activeSegment = nil
-	}
-	// Create a read-only file to block segment creation.
-	shardDir := shard2.dir
-	shard2.mu.Unlock()
-
-	// Make the shard directory read-only to prevent segment creation.
-	if err := os.Chmod(shardDir, 0444); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() {
-		os.Chmod(shardDir, 0755)
-	})
+	// Close shard 2's active segment and block the replacement, so its next
+	// write fails inside ensureActiveSegment.
+	blockNextSegment(t, shard2)
 
 	// Attempt a batch where shard 1 succeeds then shard 2 fails.
 	failBatch := []logdb.Update{
@@ -3647,7 +3659,6 @@ func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 // write fails and discard succeeds, the original write error is returned
 // unwrapped (not wrapped in BatchWriteError).
 func TestSaveStatePartialWriteReturnsOriginalError(t *testing.T) {
-	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(2*1024))
 	if err != nil {
@@ -3667,23 +3678,10 @@ func TestSaveStatePartialWriteReturnsOriginalError(t *testing.T) {
 		t.Fatalf("SaveState init: %v", err)
 	}
 
-	// Close the active segment and make dir read-only to force failure.
+	// Close shard 2's active segment and block the replacement to force
+	// failure.
 	shard2Idx := uint16(2 % DefaultShardCount)
-	shard2 := db.shards[shard2Idx]
-	shard2.mu.Lock()
-	if shard2.activeSegment != nil {
-		shard2.activeSegment.Close()
-		shard2.activeSegment = nil
-	}
-	shardDir := shard2.dir
-	shard2.mu.Unlock()
-
-	if err := os.Chmod(shardDir, 0444); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() {
-		os.Chmod(shardDir, 0755)
-	})
+	blockNextSegment(t, db.shards[shard2Idx])
 
 	// First update to shard 1 (succeeds), second to shard 2 (fails).
 	failBatch := []logdb.Update{
@@ -3801,7 +3799,6 @@ func TestRotateSegmentNoSyncMode(t *testing.T) {
 // readable. This tests the two-phase in-memory update design: in-memory
 // maps are only updated after all WAL writes and sync succeed.
 func TestSaveStateMidBatchFailureNoPhantomEntries(t *testing.T) {
-	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
@@ -3848,19 +3845,7 @@ func TestSaveStateMidBatchFailureNoPhantomEntries(t *testing.T) {
 
 	// Sabotage shard 2 to force failure.
 	shard2Idx := uint16(2 % DefaultShardCount)
-	shard2 := db.shards[shard2Idx]
-	shard2.mu.Lock()
-	if shard2.activeSegment != nil {
-		shard2.activeSegment.Close()
-		shard2.activeSegment = nil
-	}
-	shard2Dir := shard2.dir
-	shard2.mu.Unlock()
-
-	if err := os.Chmod(shard2Dir, 0444); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() { os.Chmod(shard2Dir, 0755) })
+	blockNextSegment(t, db.shards[shard2Idx])
 
 	// Attempt a batch where shard 1 writes succeed at WAL level but
 	// shard 2 fails. The shard 1 entries/state must NOT be readable.
@@ -3909,7 +3894,6 @@ func TestSaveStateMidBatchFailureNoPhantomEntries(t *testing.T) {
 // metadata from a successful shard is not visible when a later shard
 // in the same batch fails.
 func TestSaveStateMidBatchFailureNoPhantomSnapshots(t *testing.T) {
-	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
@@ -3929,18 +3913,7 @@ func TestSaveStateMidBatchFailureNoPhantomSnapshots(t *testing.T) {
 
 	// Sabotage shard 2.
 	shard2Idx := uint16(2 % DefaultShardCount)
-	shard2 := db.shards[shard2Idx]
-	shard2.mu.Lock()
-	if shard2.activeSegment != nil {
-		shard2.activeSegment.Close()
-		shard2.activeSegment = nil
-	}
-	shard2Dir := shard2.dir
-	shard2.mu.Unlock()
-	if err := os.Chmod(shard2Dir, 0444); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() { os.Chmod(shard2Dir, 0755) })
+	blockNextSegment(t, db.shards[shard2Idx])
 
 	// Batch with snapshot on shard 1, entries on shard 2 (fails).
 	failBatch := []logdb.Update{
@@ -3974,7 +3947,6 @@ func TestSaveStateMidBatchFailureNoPhantomSnapshots(t *testing.T) {
 // later shard in the batch fails, the newly created segment's data is
 // properly rolled back via the checkpoint captured after segment creation.
 func TestSaveStateLazyShardCheckpointOnFailure(t *testing.T) {
-	skipIfRoot(t)
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(4*1024))
 	if err != nil {
@@ -4004,18 +3976,7 @@ func TestSaveStateLazyShardCheckpointOnFailure(t *testing.T) {
 
 	// Sabotage shard 4.
 	shard4Idx := uint16(4 % DefaultShardCount)
-	shard4 := db.shards[shard4Idx]
-	shard4.mu.Lock()
-	if shard4.activeSegment != nil {
-		shard4.activeSegment.Close()
-		shard4.activeSegment = nil
-	}
-	shard4Dir := shard4.dir
-	shard4.mu.Unlock()
-	if err := os.Chmod(shard4Dir, 0444); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() { os.Chmod(shard4Dir, 0755) })
+	blockNextSegment(t, db.shards[shard4Idx])
 
 	// Batch: shard 3 (lazy, first write) then shard 4 (fails).
 	failBatch := []logdb.Update{

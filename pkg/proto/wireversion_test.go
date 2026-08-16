@@ -212,7 +212,8 @@ const membershipGoldenFixedHead = "0807060504030201" + // ConfigChangeID
 // the fixed region. The values are goldenMembershipSessionPolicy.
 const membershipGoldenSessionPolicy = "a086010000000000" + // SessionExpiryEntries = 100000
 	"0040000000000000" + // MaxTotalSessions = 16384
-	"8000000000000000" // MaxSessionsPerClient = 128
+	"8000000000000000" + // MaxSessionsPerClient = 128 (response-cache depth)
+	"4000000000000000" // MaxSessionsPerOwner = 64
 
 // membershipGoldenMaps is the first four maps of the map region.
 const membershipGoldenMaps = "02000000" + // Addresses count
@@ -242,6 +243,7 @@ func goldenMembershipSessionPolicy() SessionPolicy {
 		ExpiryEntries:        100000,
 		MaxTotalSessions:     16384,
 		MaxSessionsPerClient: 128,
+		MaxSessionsPerOwner:  64,
 	}
 }
 
@@ -393,7 +395,8 @@ func TestSnapshotGoldenEncodingUnchanged(t *testing.T) {
 	const snapGolden = "0100000000000000" + "0200000000000000" +
 		"0300000000000000" + "0400000000000000" + // ShardID, ReplicaID, Index, Term
 		"01" + "0700000000000000" + "0000000000000000" + "0000000000000000" + // membership fixed head
-		"0000000000000000" + "0000000000000000" + "0000000000000000" + // membership fixed (session policy)
+		"0000000000000000" + "0000000000000000" + "0000000000000000" +
+		"0000000000000000" + // membership fixed (session policy, four uint64)
 		"01000000" + "0100000000000000" + "03000000" + "613a31" + // Addresses
 		"00000000" + "00000000" + "00000000" + // Observers, Witnesses, Removed
 		"00000000" + "00000000" + // Identities, RemovedIdentities

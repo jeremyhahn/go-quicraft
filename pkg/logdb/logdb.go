@@ -37,7 +37,13 @@ type NodeInfo struct {
 // (waldb entryRecordHeaderSize), so size budgets computed by callers are
 // portable across implementations: the same maxSize admits the same entries
 // regardless of the backing store.
-const EntryOverheadBytes = 76
+//
+// It MUST track waldb.entryRecordHeaderSize exactly. The two are separate
+// constants only because this package cannot import that one, so a layout
+// change has to move both: the WAL charges what it actually writes, and a
+// budget computed from a stale value here admits a different set of entries
+// than the store it is describing.
+const EntryOverheadBytes = 84
 
 // LogDB is the interface for persistent Raft log storage.
 // Implementations must be safe for concurrent use from multiple goroutines.

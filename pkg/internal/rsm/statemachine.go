@@ -254,7 +254,8 @@ func NewStateMachine(
 	// session manager with limits it is about to replace.
 	s.sessionPolicy = s.effectiveSessionPolicy()
 	s.sessions = session.NewManager(
-		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient)
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient,
+		s.sessionPolicy.MaxSessionsPerOwner)
 	s.logPolicyDisagreement(local, s.sessionPolicy)
 	return s, nil
 }
@@ -293,7 +294,8 @@ func (s *StateMachine) refreshSessionPolicy() {
 	}
 	previous := s.sessionPolicy
 	s.sessionPolicy = effective
-	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxSessionsPerClient)
+	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxSessionsPerClient,
+		effective.MaxSessionsPerOwner)
 	s.logPolicyDisagreement(previous, effective)
 }
 
@@ -606,9 +608,17 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 		// Handle session registration: register the client and return
 		// the clientID as the result Value. Skip user SM.
 		if entry.IsNewSessionRequest() {
-			if err := s.sessions.Register(entry.ClientID, entry.Index); err != nil {
-				// Already registered or over the session limit is not fatal —
-				// return an empty result and leave the session table untouched.
+			// entry.OwnerID is read straight from the replicated entry, which is
+			// what makes the per-owner cap a state-machine decision: the same
+			// log produces the same accept/reject on every replica and on every
+			// replay after a restart. Nothing about the connection that carried
+			// the proposal is consulted, because none of it is in the log.
+			if err := s.sessions.Register(entry.ClientID, entry.OwnerID, entry.Index); err != nil {
+				// Already registered, over the shard-wide session limit, or over
+				// the owner's concurrent-session cap — none is fatal. Return an
+				// empty result and leave the session table untouched; the host
+				// layer turns the mismatched result Value into a failed
+				// registration for the caller.
 				results[i] = sm.Result{}
 			} else {
 				if sessionLifecycleAt == nil {
@@ -1064,7 +1074,8 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// advances r to exactly the position the user restore must start from,
 	// whether or not the staged manager is ultimately adopted.
 	staged := session.NewManager(
-		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient)
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient,
+		s.sessionPolicy.MaxSessionsPerOwner)
 	if err := staged.UnmarshalFrom(r); err != nil {
 		return err
 	}

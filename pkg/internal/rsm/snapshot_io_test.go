@@ -157,7 +157,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register session and save snapshot.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -200,7 +200,7 @@ func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register session with cached result and apply data.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -269,7 +269,7 @@ func TestSnapshot_MultipleSessionsMultipleResponses(t *testing.T) {
 
 		// Register 5 sessions.
 		for i := uint64(1); i <= 5; i++ {
-			if err := rsm1.Sessions().Register(i*100, 0); err != nil {
+			if err := rsm1.Sessions().Register(i*100, 0, 0); err != nil {
 				t.Fatalf("Register(%d) = %v", i*100, err)
 			}
 		}
@@ -371,7 +371,7 @@ func TestSnapshot_ConcurrentSaveAndRestore(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -455,10 +455,10 @@ func TestSnapshot_SessionExpiryStatePreserved(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register sessions at different activity levels.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := rsm1.Sessions().Register(20, 0); err != nil {
+		if err := rsm1.Sessions().Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -526,7 +526,7 @@ func TestSnapshot_ResultDataPreserved(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -590,7 +590,7 @@ func TestSnapshot_ConcurrentSMType(t *testing.T) {
 		}
 
 		// Register session and apply data.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -652,7 +652,7 @@ func TestSnapshot_OnDiskSMType(t *testing.T) {
 			t.Fatalf("SMType = %d, want SMTypeOnDisk", rsm1.SMType())
 		}
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -708,10 +708,10 @@ func TestSnapshot_UnregisteredSessionExcluded(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register two sessions.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := rsm1.Sessions().Register(20, 0); err != nil {
+		if err := rsm1.Sessions().Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -774,7 +774,7 @@ func TestSnapshot_MultipleSequentialCycles(t *testing.T) {
 			t.Fatalf("NewStateMachine = %v", err)
 		}
 
-		if err := current.Sessions().Register(10, 0); err != nil {
+		if err := current.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -864,7 +864,7 @@ func TestSnapshot_SaveWithFailingWriter(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -1084,7 +1084,7 @@ func TestSnapshot_LargeSessionCount(t *testing.T) {
 		defer rsm1.Close()
 
 		for i := uint64(1); i <= numSessions; i++ {
-			if err := rsm1.Sessions().Register(i*10, 0); err != nil {
+			if err := rsm1.Sessions().Register(i*10, 0, 0); err != nil {
 				t.Fatalf("Register(%d) = %v", i*10, err)
 			}
 		}
@@ -1358,7 +1358,7 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 		}
 		defer rsm1.Close()
 
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
 		entries := []proto.Entry{
@@ -1383,7 +1383,7 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 		}
 		defer rsm2.Close()
 
-		if err := rsm2.Sessions().Register(99, 0); err != nil {
+		if err := rsm2.Sessions().Register(99, 0, 0); err != nil {
 			t.Fatalf("Register(99) = %v", err)
 		}
 		entries2 := []proto.Entry{
@@ -1522,7 +1522,7 @@ func TestSnapshot_TruncatedSnapshotRejected(t *testing.T) {
 		defer rsm1.Close()
 
 		// Register sessions and apply data to create a non-trivial snapshot.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		entries := []proto.Entry{
@@ -1676,7 +1676,7 @@ func TestSnapshot_RecoverFromCorruptedMiddleBytes(t *testing.T) {
 		defer rsm1.Close()
 
 		// Build non-trivial state.
-		if err := rsm1.Sessions().Register(10, 0); err != nil {
+		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		for i := uint64(1); i <= 10; i++ {

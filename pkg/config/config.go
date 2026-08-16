@@ -34,6 +34,34 @@ const (
 	DefaultMaxSessionsPerClient uint64 = 128
 	DefaultMaxTotalSessions     uint64 = 16384
 
+	// DefaultMaxSessionsPerOwner is the number of concurrent sessions one
+	// declared owner may hold on a shard that does not choose otherwise.
+	//
+	// It is set rather than left at zero (unlimited) because the whole point of
+	// the cap is that MaxTotalSessions cannot defend itself: an owner able to
+	// register 16384 sessions is an owner able to deny at-most-once delivery to
+	// every other tenant on the shard. A default of 128 is two orders of
+	// magnitude below the shard-wide cap, so a shard needs at least ~128
+	// distinct owners before the total is even reachable.
+	//
+	// It costs existing embedders nothing. The cap applies only to sessions
+	// that declare an owner (proto.Entry.OwnerID), and an embedder that does
+	// not use Host.GetNewSessionWithOwner declares none, so every session it
+	// registers is exempt no matter what this value is.
+	DefaultMaxSessionsPerOwner uint64 = 128
+
+	// SessionsPerOwnerUnlimited turns the per-owner session cap off. Assign it
+	// to Config.MaxSessionsPerOwner; leaving that field zero selects
+	// DefaultMaxSessionsPerOwner instead, for the reason SessionExpiryDisabled
+	// gives — an unset field cannot mean both "I did not choose" and "no limit".
+	//
+	// It needs no special case anywhere: it is a cap no shard can reach, since
+	// MaxTotalSessions bounds the whole table far below it, so the per-owner
+	// check is satisfied by every registration the shard-wide check already
+	// admitted. Choosing it means accepting that one principal can consume the
+	// entire session table — see MaxSessionsPerOwner.
+	SessionsPerOwnerUnlimited uint64 = math.MaxUint64
+
 	// DefaultSessionExpiryEntries is the session inactivity threshold, in
 	// applied log entries, that a shard bootstraps with unless the operator
 	// chooses otherwise.
@@ -346,18 +374,50 @@ type Config struct {
 	// Default: 4 GB.
 	MaxSnapshotSize uint64
 
-	// MaxSessionsPerClient is the maximum number of cached RESPONSES retained
-	// per registered session — the depth of the at-most-once dedup cache, not a
-	// count of sessions. Default: 128.
+	// MaxSessionsPerClient is the RESPONSE-CACHE DEPTH: the maximum number of
+	// cached RESPONSES retained per registered session, which is the depth of
+	// the at-most-once dedup cache and not a count of sessions at all.
+	// Default: 128.
 	//
-	// The name predates the wiring and is kept for compatibility: it is passed
-	// to rsm.NewStateMachine as maxResponses, while MaxTotalSessions is the
-	// limit on how many sessions a shard admits.
+	// THE NAME IS WRONG and is kept only because renaming a public field is a
+	// breaking change the pre-release pinning does not cover. Read it as
+	// "MaxResponsesPerSession": it is passed to rsm.NewStateMachine as
+	// maxResponses and reaches session.Manager as the bound on one session's
+	// response map. Nothing about it limits how many sessions exist.
+	//
+	// The two limits it is confused with are both elsewhere and both real:
+	// MaxTotalSessions bounds sessions shard-wide, and MaxSessionsPerOwner
+	// bounds them per declared owner. Transposing this field with either has
+	// happened here before, and neither mistake fails loudly — one caps a shard
+	// at a response depth, the other lets a single client pin the whole session
+	// table.
 	MaxSessionsPerClient uint64
 
 	// MaxTotalSessions is the maximum total sessions per shard across all
 	// clients. Default: 16384.
+	//
+	// It is a shard-wide bound and therefore no defence against a single
+	// principal exhausting it — clientIDs are chosen by the caller, so one
+	// client can register under as many as it likes. MaxSessionsPerOwner is
+	// what bounds that.
 	MaxTotalSessions uint64
+
+	// MaxSessionsPerOwner is the maximum number of concurrent sessions ONE
+	// owner may hold on this shard. Default: 128. Zero disables the cap.
+	//
+	// An "owner" is a principal the EMBEDDER declares when it registers a
+	// session (Host.GetNewSessionWithOwner, NewSessionWithOwner), carried in
+	// the replicated log as proto.Entry.OwnerID. This library cannot derive one
+	// on its own: it authenticates nodes, not clients, and a clientID is eight
+	// bytes the caller picks. Sessions registered without an owner — every
+	// session, for an embedder that does not use those APIs — are exempt.
+	//
+	// Like the other three session limits this is a SEED. It is written into
+	// the shard's initial membership at bootstrap (proto.SessionPolicy) and
+	// from then on every replica applies the committed value, because the apply
+	// path reads it and a per-node value would diverge the state machines. See
+	// SessionExpiryEntries for the same argument at length.
+	MaxSessionsPerOwner uint64
 
 	// SnapshotCompressionType selects the compression algorithm for
 	// snapshot data.
@@ -508,6 +568,15 @@ func (c *Config) SetDefaults() {
 	}
 	if c.MaxTotalSessions == 0 {
 		c.MaxTotalSessions = DefaultMaxTotalSessions
+	}
+	// An unset per-owner cap takes the default rather than meaning "no limit",
+	// following SessionExpiryEntries: the whole reason the field exists is that
+	// an unbounded per-owner count lets one principal exhaust MaxTotalSessions,
+	// so defaulting to unbounded would ship the defect as the default. Removing
+	// the cap is available but has to be asked for — see
+	// SessionsPerOwnerUnlimited.
+	if c.MaxSessionsPerOwner == 0 {
+		c.MaxSessionsPerOwner = DefaultMaxSessionsPerOwner
 	}
 	// An unset expiry threshold takes the default rather than meaning
 	// "disabled": with expiry off, a session whose client dies without

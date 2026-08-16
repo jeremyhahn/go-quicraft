@@ -26,7 +26,7 @@ import (
 
 func TestNewManager(t *testing.T) {
 	t.Run("custom limits", func(t *testing.T) {
-		m := NewManager(100, 50)
+		m := NewManager(100, 50, 0)
 		if m.maxTotal != 100 {
 			t.Errorf("maxTotal = %d, want 100", m.maxTotal)
 		}
@@ -39,7 +39,7 @@ func TestNewManager(t *testing.T) {
 	})
 
 	t.Run("defaults when zero", func(t *testing.T) {
-		m := NewManager(0, 0)
+		m := NewManager(0, 0, 0)
 		if m.maxTotal != 16384 {
 			t.Errorf("maxTotal = %d, want 16384", m.maxTotal)
 		}
@@ -51,8 +51,8 @@ func TestNewManager(t *testing.T) {
 
 func TestManagerRegister(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v, want nil", err)
 		}
 		if !m.IsRegistered(1) {
@@ -64,33 +64,33 @@ func TestManagerRegister(t *testing.T) {
 	})
 
 	t.Run("already exists", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v, want nil", err)
 		}
-		err := m.Register(1, 101)
+		err := m.Register(1, 0, 101)
 		if !errors.Is(err, ErrSessionAlreadyExists) {
 			t.Errorf("Register(1) = %v, want ErrSessionAlreadyExists", err)
 		}
 	})
 
 	t.Run("limit exceeded", func(t *testing.T) {
-		m := NewManager(2, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(2, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
-		if err := m.Register(2, 101); err != nil {
+		if err := m.Register(2, 0, 101); err != nil {
 			t.Fatalf("Register(2) = %v", err)
 		}
-		err := m.Register(3, 102)
+		err := m.Register(3, 0, 102)
 		if !errors.Is(err, ErrSessionLimitExceeded) {
 			t.Errorf("Register(3) = %v, want ErrSessionLimitExceeded", err)
 		}
 	})
 
 	t.Run("sets initial lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 500); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 500); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		sess := m.sessions[1]
@@ -102,8 +102,8 @@ func TestManagerRegister(t *testing.T) {
 
 func TestManagerUnregister(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
 		if err := m.Unregister(1); err != nil {
@@ -118,7 +118,7 @@ func TestManagerUnregister(t *testing.T) {
 	})
 
 	t.Run("not found", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.Unregister(999)
 		if !errors.Is(err, ErrSessionNotFound) {
 			t.Errorf("Unregister(999) = %v, want ErrSessionNotFound", err)
@@ -128,8 +128,8 @@ func TestManagerUnregister(t *testing.T) {
 
 func TestManagerIsRegistered(t *testing.T) {
 	t.Run("registered", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(42, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(42, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if !m.IsRegistered(42) {
@@ -138,7 +138,7 @@ func TestManagerIsRegistered(t *testing.T) {
 	})
 
 	t.Run("not registered", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		if m.IsRegistered(42) {
 			t.Error("IsRegistered(42) = true, want false")
 		}
@@ -147,8 +147,8 @@ func TestManagerIsRegistered(t *testing.T) {
 
 func TestManagerCheckDuplicate(t *testing.T) {
 	t.Run("new proposal not duplicate", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		result, isDup, err := m.CheckDuplicate(1, 5, 101)
@@ -164,8 +164,8 @@ func TestManagerCheckDuplicate(t *testing.T) {
 	})
 
 	t.Run("duplicate detected", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		expected := sm.Result{Value: 42, Data: []byte("data")}
@@ -189,7 +189,7 @@ func TestManagerCheckDuplicate(t *testing.T) {
 	})
 
 	t.Run("unregistered client returns ErrSessionNotFound", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		_, isDup, err := m.CheckDuplicate(999, 1, 100)
 		if !errors.Is(err, ErrSessionNotFound) {
 			t.Errorf("CheckDuplicate(unregistered) err = %v, want ErrSessionNotFound", err)
@@ -200,8 +200,8 @@ func TestManagerCheckDuplicate(t *testing.T) {
 	})
 
 	t.Run("series already responded to returns ErrResponseEvicted", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		// Record result for series 5, advance respondedTo to 5.
@@ -223,8 +223,8 @@ func TestManagerCheckDuplicate(t *testing.T) {
 	})
 
 	t.Run("series equal to respondedTo returns ErrResponseEvicted", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 10}); err != nil {
@@ -245,8 +245,8 @@ func TestManagerCheckDuplicate(t *testing.T) {
 	})
 
 	t.Run("updates lastActiveIndex on duplicate hit", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
@@ -261,8 +261,8 @@ func TestManagerCheckDuplicate(t *testing.T) {
 
 func TestManagerRecordResult(t *testing.T) {
 	t.Run("record and retrieve", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		expected := sm.Result{Value: 100, Data: []byte("result-data")}
@@ -283,8 +283,8 @@ func TestManagerRecordResult(t *testing.T) {
 	})
 
 	t.Run("eviction via respondedTo", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 1, 0, 101, sm.Result{Value: 1}); err != nil {
@@ -336,7 +336,7 @@ func TestManagerRecordResult(t *testing.T) {
 	})
 
 	t.Run("unregistered client returns error", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.RecordResult(999, 1, 0, 100, sm.Result{Value: 1})
 		if !errors.Is(err, ErrSessionNotFound) {
 			t.Errorf("RecordResult(unregistered) = %v, want ErrSessionNotFound", err)
@@ -348,8 +348,8 @@ func TestManagerRecordResult(t *testing.T) {
 
 	t.Run("response limit exceeded", func(t *testing.T) {
 		// maxResponses = 3, fill to capacity then attempt one more.
-		m := NewManager(10, 3)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 3, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		// Fill the response cache to capacity (3 responses, respondedTo=0
@@ -377,8 +377,8 @@ func TestManagerRecordResult(t *testing.T) {
 	t.Run("response limit not exceeded after eviction", func(t *testing.T) {
 		// maxResponses = 3. Fill to capacity, then advance respondedTo
 		// to evict old entries, making room for new ones.
-		m := NewManager(10, 3)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 3, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		for i := uint64(1); i <= 3; i++ {
@@ -406,8 +406,8 @@ func TestManagerRecordResult(t *testing.T) {
 
 	t.Run("response limit at boundary", func(t *testing.T) {
 		// maxResponses = 1. Only one response can be cached at a time.
-		m := NewManager(10, 1)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 1, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 1, 0, 101, sm.Result{Value: 1}); err != nil {
@@ -425,8 +425,8 @@ func TestManagerRecordResult(t *testing.T) {
 	})
 
 	t.Run("updates lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 1, 0, 500, sm.Result{Value: 1}); err != nil {
@@ -440,15 +440,15 @@ func TestManagerRecordResult(t *testing.T) {
 
 func TestManagerCanRecord(t *testing.T) {
 	t.Run("unregistered client", func(t *testing.T) {
-		m := NewManager(10, 3)
+		m := NewManager(10, 3, 0)
 		if err := m.CanRecord(99, 0, 0); !errors.Is(err, ErrSessionNotFound) {
 			t.Errorf("CanRecord(unregistered) = %v, want ErrSessionNotFound", err)
 		}
 	})
 
 	t.Run("room available is non-mutating", func(t *testing.T) {
-		m := NewManager(10, 3)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 3, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 1, 0, 101, sm.Result{Value: 1}); err != nil {
@@ -468,8 +468,8 @@ func TestManagerCanRecord(t *testing.T) {
 	})
 
 	t.Run("full cache rejected", func(t *testing.T) {
-		m := NewManager(10, 3)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 3, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		for i := uint64(1); i <= 3; i++ {
@@ -488,8 +488,8 @@ func TestManagerCanRecord(t *testing.T) {
 	})
 
 	t.Run("pending same-batch peers count toward limit", func(t *testing.T) {
-		m := NewManager(10, 3)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 3, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		// One response cached, two more already admitted this batch =>
@@ -509,12 +509,12 @@ func TestManagerCanRecord(t *testing.T) {
 
 func TestManagerExpireSessions(t *testing.T) {
 	t.Run("expires inactive sessions", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		// Register sessions at low indexes.
-		if err := m.Register(1, 100); err != nil {
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
-		if err := m.Register(2, 100); err != nil {
+		if err := m.Register(2, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -529,9 +529,9 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("respects maxExpire limit", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		for i := uint64(1); i <= 5; i++ {
-			if err := m.Register(i, 100); err != nil {
+			if err := m.Register(i, 0, 100); err != nil {
 				t.Fatalf("Register(%d) = %v", i, err)
 			}
 		}
@@ -552,8 +552,8 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("does not expire active sessions", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 900); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 900); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		// Current index 1000, threshold 1000. Gap is only 100, < 1000.
@@ -564,8 +564,8 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("maxExpire zero returns nil", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		expired := m.ExpireSessions(2000, 1000, 0)
@@ -575,7 +575,7 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("negative maxExpire returns nil", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		expired := m.ExpireSessions(2000, 1000, -1)
 		if expired != nil {
 			t.Errorf("expired = %v, want nil", expired)
@@ -583,8 +583,8 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("zero threshold returns nil", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		expired := m.ExpireSessions(2000, 0, 10)
@@ -594,8 +594,8 @@ func TestManagerExpireSessions(t *testing.T) {
 	})
 
 	t.Run("touch prevents expiry", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		// Record a result at a high index to update activity.
@@ -611,14 +611,14 @@ func TestManagerExpireSessions(t *testing.T) {
 
 	t.Run("deterministic across replicas", func(t *testing.T) {
 		// Two managers simulating two replicas processing the same log.
-		m1 := NewManager(10, 10)
-		m2 := NewManager(10, 10)
+		m1 := NewManager(10, 10, 0)
+		m2 := NewManager(10, 10, 0)
 
 		// Both register the same client at the same index.
-		if err := m1.Register(1, 100); err != nil {
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("m1.Register = %v", err)
 		}
-		if err := m2.Register(1, 100); err != nil {
+		if err := m2.Register(1, 0, 100); err != nil {
 			t.Fatalf("m2.Register = %v", err)
 		}
 
@@ -635,10 +635,10 @@ func TestManagerExpireSessions(t *testing.T) {
 	t.Run("expired sessions sorted by clientID", func(t *testing.T) {
 		// Register sessions with non-sequential clientIDs and verify
 		// the returned slice is sorted in ascending clientID order.
-		m := NewManager(100, 10)
+		m := NewManager(100, 10, 0)
 		ids := []uint64{500, 100, 300, 200, 400}
 		for _, id := range ids {
-			if err := m.Register(id, 10); err != nil {
+			if err := m.Register(id, 0, 10); err != nil {
 				t.Fatalf("Register(%d) = %v", id, err)
 			}
 		}
@@ -673,9 +673,9 @@ func TestManagerExpireSessions(t *testing.T) {
 
 		results := make([][]uint64, numReplicas)
 		for r := 0; r < numReplicas; r++ {
-			m := NewManager(100, 10)
+			m := NewManager(100, 10, 0)
 			for id := uint64(1); id <= numSessions; id++ {
-				if err := m.Register(id, 10); err != nil {
+				if err := m.Register(id, 0, 10); err != nil {
 					t.Fatalf("replica %d: Register(%d) = %v", r, id, err)
 				}
 			}
@@ -709,9 +709,9 @@ func TestManagerExpireSessions(t *testing.T) {
 		// Build identical managers and call ExpireSessions multiple times
 		// to confirm each invocation yields the same result.
 		buildManager := func() *Manager {
-			m := NewManager(100, 10)
+			m := NewManager(100, 10, 0)
 			for id := uint64(10); id <= 60; id += 10 {
-				if err := m.Register(id, 5); err != nil {
+				if err := m.Register(id, 0, 5); err != nil {
 					t.Fatalf("Register(%d) = %v", id, err)
 				}
 			}
@@ -754,16 +754,16 @@ func TestManagerExpireSessions(t *testing.T) {
 
 func TestManagerCount(t *testing.T) {
 	t.Run("empty manager", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		if m.Count() != 0 {
 			t.Errorf("Count() = %d, want 0", m.Count())
 		}
 	})
 
 	t.Run("after registrations", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		for i := uint64(1); i <= 5; i++ {
-			if err := m.Register(i, 100+i); err != nil {
+			if err := m.Register(i, 0, 100+i); err != nil {
 				t.Fatalf("Register(%d) = %v", i, err)
 			}
 		}
@@ -775,14 +775,14 @@ func TestManagerCount(t *testing.T) {
 
 func TestManagerMaxResponses(t *testing.T) {
 	t.Run("returns configured value", func(t *testing.T) {
-		m := NewManager(10, 64)
+		m := NewManager(10, 64, 0)
 		if m.MaxResponses() != 64 {
 			t.Errorf("MaxResponses() = %d, want 64", m.MaxResponses())
 		}
 	})
 
 	t.Run("returns default value", func(t *testing.T) {
-		m := NewManager(10, 0)
+		m := NewManager(10, 0, 0)
 		if m.MaxResponses() != 128 {
 			t.Errorf("MaxResponses() = %d, want 128", m.MaxResponses())
 		}
@@ -791,11 +791,11 @@ func TestManagerMaxResponses(t *testing.T) {
 
 func TestManagerMarshalUnmarshal(t *testing.T) {
 	t.Run("roundtrip with data", func(t *testing.T) {
-		m1 := NewManager(100, 100)
-		if err := m1.Register(1, 100); err != nil {
+		m1 := NewManager(100, 100, 0)
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
-		if err := m1.Register(2, 101); err != nil {
+		if err := m1.Register(2, 0, 101); err != nil {
 			t.Fatalf("Register(2) = %v", err)
 		}
 		if err := m1.RecordResult(1, 10, 0, 102, sm.Result{Value: 100, Data: []byte("hello")}); err != nil {
@@ -813,7 +813,7 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 			t.Fatalf("MarshalTo = %v", err)
 		}
 
-		m2 := NewManager(100, 100)
+		m2 := NewManager(100, 100, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom = %v", err)
 		}
@@ -861,12 +861,12 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 	})
 
 	t.Run("roundtrip empty manager", func(t *testing.T) {
-		m1 := NewManager(100, 100)
+		m1 := NewManager(100, 100, 0)
 		var buf bytes.Buffer
 		if err := m1.MarshalTo(&buf); err != nil {
 			t.Fatalf("MarshalTo = %v", err)
 		}
-		m2 := NewManager(100, 100)
+		m2 := NewManager(100, 100, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom = %v", err)
 		}
@@ -876,8 +876,8 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 	})
 
 	t.Run("roundtrip preserves lastActiveIndex", func(t *testing.T) {
-		m1 := NewManager(100, 100)
-		if err := m1.Register(1, 500); err != nil {
+		m1 := NewManager(100, 100, 0)
+		if err := m1.Register(1, 0, 500); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m1.RecordResult(1, 1, 0, 750, sm.Result{Value: 1}); err != nil {
@@ -889,7 +889,7 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 			t.Fatalf("MarshalTo = %v", err)
 		}
 
-		m2 := NewManager(100, 100)
+		m2 := NewManager(100, 100, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom = %v", err)
 		}
@@ -914,8 +914,8 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 	})
 
 	t.Run("marshal error on write", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		w := &failWriter{failAfter: 0}
@@ -930,7 +930,7 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 	})
 
 	t.Run("unmarshal error on read", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		r := &failReader{}
 		err := m.UnmarshalFrom(r)
 		if err == nil {
@@ -949,7 +949,7 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 		b[0] = 1 // numSessions = 1
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated data")
@@ -958,12 +958,12 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated respondedTo", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 12) // 4 (count) + 8 (clientID) -- missing respondedTo
+		b := make([]byte, 12) // 4 (count) + 8 (clientID) -- missing ownerID
 		b[0] = 1              // numSessions = 1
 		b[4] = 42             // clientID = 42
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated respondedTo")
@@ -972,11 +972,13 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated response count", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 20) // 4 (count) + 8 (clientID) + 8 (respondedTo) -- missing numResponses
+		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
+		// respondedTo(8) -- missing numResponses
+		b := make([]byte, 36)
 		b[0] = 1
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated response count")
@@ -985,12 +987,14 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated seriesID in response", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 32) // 4 (count) + 8 (clientID) + 8 (registeredIndex) + 8 (respondedTo) + 4 (numResponses)
-		b[0] = 1              // numSessions = 1
-		b[28] = 1             // numResponses = 1, but no actual response data
+		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
+		// respondedTo(8) + numResponses(4)
+		b := make([]byte, 40)
+		b[0] = 1  // numSessions = 1
+		b[36] = 1 // numResponses = 1, but no actual response data
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated seriesID")
@@ -999,12 +1003,13 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated result value", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 40) // count + clientID + registeredIndex + respondedTo + numResponses + seriesID -- missing value
-		b[0] = 1              // numSessions = 1
-		b[28] = 1             // numResponses = 1
+		// ... through seriesID -- missing the result value
+		b := make([]byte, 48)
+		b[0] = 1  // numSessions = 1
+		b[36] = 1 // numResponses = 1
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated result value")
@@ -1013,12 +1018,13 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated data length", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 48) // ... + seriesID + value -- missing dataLen
-		b[0] = 1              // numSessions
-		b[28] = 1             // numResponses
+		// ... + seriesID + value -- missing dataLen
+		b := make([]byte, 56)
+		b[0] = 1  // numSessions
+		b[36] = 1 // numResponses
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated data length")
@@ -1027,13 +1033,13 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 
 	t.Run("unmarshal truncated data payload", func(t *testing.T) {
 		var buf bytes.Buffer
-		b := make([]byte, 52)
+		b := make([]byte, 60)
 		b[0] = 1  // numSessions
-		b[28] = 1 // numResponses
-		b[48] = 5 // dataLen = 5, but no data follows
+		b[36] = 1 // numResponses
+		b[56] = 5 // dataLen = 5, but no data follows
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated data payload")
@@ -1043,12 +1049,14 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 	t.Run("unmarshal truncated lastActiveIndex", func(t *testing.T) {
 		// Valid session with 0 responses but missing lastActiveIndex.
 		var buf bytes.Buffer
-		b := make([]byte, 24) // count(4) + clientID(8) + respondedTo(8) + numResponses(4)
-		b[0] = 1              // numSessions = 1
-		b[20] = 0             // numResponses = 0
+		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
+		// respondedTo(8) + numResponses(4)
+		b := make([]byte, 40)
+		b[0] = 1  // numSessions = 1
+		b[36] = 0 // numResponses = 0
 		buf.Write(b)
 
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		err := m.UnmarshalFrom(&buf)
 		if err == nil {
 			t.Fatal("UnmarshalFrom should fail on truncated lastActiveIndex")
@@ -1094,7 +1102,7 @@ func TestUnmarshalError(t *testing.T) {
 
 func TestManagerMarshalWriterFailures(t *testing.T) {
 	t.Run("fail writing session count", func(t *testing.T) {
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		w := &failWriter{failAfter: 0}
 		err := m.MarshalTo(w)
 		if err == nil {
@@ -1103,8 +1111,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing clientID", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		w := &failWriter{failAfter: 1} // fail on second write
@@ -1115,8 +1123,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing respondedTo", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		w := &failWriter{failAfter: 2}
@@ -1127,8 +1135,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing response count", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		w := &failWriter{failAfter: 3}
@@ -1139,8 +1147,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing seriesID", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
@@ -1154,8 +1162,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing result value", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
@@ -1169,8 +1177,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing data length", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
@@ -1184,8 +1192,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing data payload", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
@@ -1199,8 +1207,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 	})
 
 	t.Run("fail writing lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
@@ -1216,8 +1224,8 @@ func TestManagerMarshalWriterFailures(t *testing.T) {
 
 func TestDeduplicationEndToEnd(t *testing.T) {
 	t.Run("same proposal applied only once", func(t *testing.T) {
-		m := NewManager(100, 100)
-		if err := m.Register(1, 100); err != nil {
+		m := NewManager(100, 100, 0)
+		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -1271,7 +1279,7 @@ func (r *failReader) Read(p []byte) (int, error) {
 func TestUnmarshalFrom_BoundsCheckNumSessions(t *testing.T) {
 	t.Run("exceeds maxTotal", func(t *testing.T) {
 		// Manager with maxTotal=5. Forge a stream claiming 10 sessions.
-		m := NewManager(5, 10)
+		m := NewManager(5, 10, 0)
 		var buf bytes.Buffer
 		b := make([]byte, 4)
 		binary.LittleEndian.PutUint32(b, 10) // numSessions = 10
@@ -1301,11 +1309,11 @@ func TestUnmarshalFrom_BoundsCheckNumSessions(t *testing.T) {
 
 	t.Run("at maxTotal boundary succeeds", func(t *testing.T) {
 		// Create a manager with maxTotal=2, marshal 2 sessions, unmarshal.
-		m1 := NewManager(2, 10)
-		if err := m1.Register(1, 100); err != nil {
+		m1 := NewManager(2, 10, 0)
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
-		if err := m1.Register(2, 101); err != nil {
+		if err := m1.Register(2, 0, 101); err != nil {
 			t.Fatalf("Register(2) = %v", err)
 		}
 		var buf bytes.Buffer
@@ -1313,7 +1321,7 @@ func TestUnmarshalFrom_BoundsCheckNumSessions(t *testing.T) {
 			t.Fatalf("MarshalTo = %v", err)
 		}
 
-		m2 := NewManager(2, 10)
+		m2 := NewManager(2, 10, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom should succeed at boundary: %v", err)
 		}
@@ -1324,7 +1332,7 @@ func TestUnmarshalFrom_BoundsCheckNumSessions(t *testing.T) {
 
 	t.Run("max uint32 numSessions", func(t *testing.T) {
 		// Forge a stream with numSessions = 4294967295 (max uint32).
-		m := NewManager(100, 10)
+		m := NewManager(100, 10, 0)
 		var buf bytes.Buffer
 		b := make([]byte, 4)
 		binary.LittleEndian.PutUint32(b, 0xFFFFFFFF)
@@ -1344,7 +1352,7 @@ func TestUnmarshalFrom_BoundsCheckNumResponses(t *testing.T) {
 	t.Run("exceeds maxResponses", func(t *testing.T) {
 		// Manager with maxResponses=3. Forge a stream with 1 session
 		// claiming 100 responses.
-		m := NewManager(10, 3)
+		m := NewManager(10, 3, 0)
 		var buf bytes.Buffer
 
 		// numSessions = 1
@@ -1355,6 +1363,10 @@ func TestUnmarshalFrom_BoundsCheckNumResponses(t *testing.T) {
 		// clientID = 1
 		b = make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, 1)
+		buf.Write(b)
+
+		// ownerID = 0 (no owner declared)
+		b = make([]byte, 8)
 		buf.Write(b)
 
 		// registeredIndex = 0
@@ -1391,8 +1403,8 @@ func TestUnmarshalFrom_BoundsCheckNumResponses(t *testing.T) {
 
 	t.Run("at maxResponses boundary succeeds", func(t *testing.T) {
 		// maxResponses=3, create session with exactly 3 responses.
-		m1 := NewManager(10, 3)
-		if err := m1.Register(1, 100); err != nil {
+		m1 := NewManager(10, 3, 0)
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		for i := uint64(1); i <= 3; i++ {
@@ -1405,7 +1417,7 @@ func TestUnmarshalFrom_BoundsCheckNumResponses(t *testing.T) {
 			t.Fatalf("MarshalTo = %v", err)
 		}
 
-		m2 := NewManager(10, 3)
+		m2 := NewManager(10, 3, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom should succeed at boundary: %v", err)
 		}
@@ -1416,7 +1428,7 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 	t.Run("exceeds maxResponseDataSize", func(t *testing.T) {
 		// Forge a stream with 1 session, 1 response, with
 		// dataLen = maxResponseDataSize + 1.
-		m := NewManager(10, 10)
+		m := NewManager(10, 10, 0)
 		var buf bytes.Buffer
 
 		// numSessions = 1
@@ -1427,6 +1439,10 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 		// clientID = 1
 		b = make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, 1)
+		buf.Write(b)
+
+		// ownerID = 0 (no owner declared)
+		b = make([]byte, 8)
 		buf.Write(b)
 
 		// registeredIndex = 0
@@ -1480,8 +1496,8 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 
 	t.Run("zero dataLen succeeds", func(t *testing.T) {
 		// Normal roundtrip with a result that has no data.
-		m1 := NewManager(10, 10)
-		if err := m1.Register(1, 100); err != nil {
+		m1 := NewManager(10, 10, 0)
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m1.RecordResult(1, 1, 0, 101, sm.Result{Value: 99}); err != nil {
@@ -1491,7 +1507,7 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 		if err := m1.MarshalTo(&buf); err != nil {
 			t.Fatalf("MarshalTo = %v", err)
 		}
-		m2 := NewManager(10, 10)
+		m2 := NewManager(10, 10, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom should succeed: %v", err)
 		}
@@ -1506,8 +1522,8 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 
 	t.Run("valid data within limit", func(t *testing.T) {
 		// Result with 1KB data payload - well within the 64MiB limit.
-		m1 := NewManager(10, 10)
-		if err := m1.Register(1, 100); err != nil {
+		m1 := NewManager(10, 10, 0)
+		if err := m1.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		data := make([]byte, 1024)
@@ -1521,7 +1537,7 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 		if err := m1.MarshalTo(&buf); err != nil {
 			t.Fatalf("MarshalTo = %v", err)
 		}
-		m2 := NewManager(10, 10)
+		m2 := NewManager(10, 10, 0)
 		if err := m2.UnmarshalFrom(&buf); err != nil {
 			t.Fatalf("UnmarshalFrom should succeed: %v", err)
 		}
@@ -1590,12 +1606,12 @@ func TestManager_ExpireSessions_DeterministicAcrossReplicas(t *testing.T) {
 	// The pattern is identical across both replicas.
 	buildManager := func(t *testing.T) *Manager {
 		t.Helper()
-		m := NewManager(maxTotal, maxResponses)
+		m := NewManager(maxTotal, maxResponses, 0)
 
 		// Stale sessions: registered at low indexes, will be expired.
 		staleIDs := []uint64{300, 100, 500, 200, 400}
 		for _, id := range staleIDs {
-			if err := m.Register(id, 10); err != nil {
+			if err := m.Register(id, 0, 10); err != nil {
 				t.Fatalf("Register(%d) = %v", id, err)
 			}
 		}
@@ -1603,7 +1619,7 @@ func TestManager_ExpireSessions_DeterministicAcrossReplicas(t *testing.T) {
 		// Active sessions: registered at recent indexes, will NOT be expired.
 		activeIDs := []uint64{600, 700, 800}
 		for _, id := range activeIDs {
-			if err := m.Register(id, currentIndex-100); err != nil {
+			if err := m.Register(id, 0, currentIndex-100); err != nil {
 				t.Fatalf("Register(%d) = %v", id, err)
 			}
 		}
@@ -1671,10 +1687,10 @@ func TestManager_ExpireSessions_DeterministicAcrossReplicas(t *testing.T) {
 // re-registered after being unregistered, and that the new session starts
 // fresh with no cached responses from the previous session.
 func TestManager_ReRegisterAfterUnregister(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
 	// Register, record a result, then unregister.
-	if err := m.Register(42, 100); err != nil {
+	if err := m.Register(42, 0, 100); err != nil {
 		t.Fatalf("Register(1st) = %v", err)
 	}
 	if err := m.RecordResult(42, 1, 0, 200, sm.Result{Value: 99}); err != nil {
@@ -1685,7 +1701,7 @@ func TestManager_ReRegisterAfterUnregister(t *testing.T) {
 	}
 
 	// Re-register with the same clientID.
-	if err := m.Register(42, 300); err != nil {
+	if err := m.Register(42, 0, 300); err != nil {
 		t.Fatalf("Register(2nd) = %v", err)
 	}
 
@@ -1702,12 +1718,12 @@ func TestManager_ReRegisterAfterUnregister(t *testing.T) {
 // TestManager_ReRegisterAfterUnregister_ReturnsError verifies that
 // re-registering without unregistering first returns ErrSessionAlreadyExists.
 func TestManager_ReRegisterAfterUnregister_ReturnsError(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
-	if err := m.Register(42, 100); err != nil {
+	if err := m.Register(42, 0, 100); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
-	err := m.Register(42, 200)
+	err := m.Register(42, 0, 200)
 	if err != ErrSessionAlreadyExists {
 		t.Fatalf("Register(duplicate) = %v, want ErrSessionAlreadyExists", err)
 	}
@@ -1718,11 +1734,11 @@ func TestManager_ReRegisterAfterUnregister_ReturnsError(t *testing.T) {
 // ErrSessionLimitExceeded.
 func TestManager_SessionLimitBoundary(t *testing.T) {
 	const maxTotal = 3
-	m := NewManager(maxTotal, 10)
+	m := NewManager(maxTotal, 10, 0)
 
 	// Register exactly maxTotal sessions.
 	for id := uint64(1); id <= maxTotal; id++ {
-		if err := m.Register(id, 100); err != nil {
+		if err := m.Register(id, 0, 100); err != nil {
 			t.Fatalf("Register(%d) = %v", id, err)
 		}
 	}
@@ -1731,7 +1747,7 @@ func TestManager_SessionLimitBoundary(t *testing.T) {
 	}
 
 	// One more should fail.
-	err := m.Register(maxTotal+1, 100)
+	err := m.Register(maxTotal+1, 0, 100)
 	if err != ErrSessionLimitExceeded {
 		t.Fatalf("Register(over limit) = %v, want ErrSessionLimitExceeded", err)
 	}
@@ -1746,9 +1762,9 @@ func TestManager_SessionLimitBoundary(t *testing.T) {
 // can only advance forward. A RecordResult with a lower respondedTo does
 // not regress the session's respondedTo marker.
 func TestManager_RespondedToMonotonicallyAdvances(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
-	if err := m.Register(1, 100); err != nil {
+	if err := m.Register(1, 0, 100); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -1796,8 +1812,8 @@ func TestManager_RespondedToMonotonicallyAdvances(t *testing.T) {
 // TestManager_ExpireSessionsZeroMaxExpire verifies that ExpireSessions
 // returns nil when maxExpire is zero, even when there are stale sessions.
 func TestManager_ExpireSessionsZeroMaxExpire(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 0); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -1814,8 +1830,8 @@ func TestManager_ExpireSessionsZeroMaxExpire(t *testing.T) {
 // TestManager_ExpireSessionsNegativeMaxExpire verifies that
 // ExpireSessions handles a negative maxExpire gracefully.
 func TestManager_ExpireSessionsNegativeMaxExpire(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 0); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 0); err != nil {
 		t.Fatalf("Register = %v", err)
 	}
 
@@ -1828,7 +1844,7 @@ func TestManager_ExpireSessionsNegativeMaxExpire(t *testing.T) {
 // TestManager_CheckDuplicateUnregistered verifies that CheckDuplicate
 // returns ErrSessionNotFound for a session that was never registered.
 func TestManager_CheckDuplicateUnregistered(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
 	_, isDup, err := m.CheckDuplicate(999, 1, 100)
 	if !errors.Is(err, ErrSessionNotFound) {
@@ -1845,10 +1861,10 @@ func TestManager_CheckDuplicateUnregistered(t *testing.T) {
 func TestManager_MarshalUnmarshalManySessionsWithResponses(t *testing.T) {
 	const numSessions = 50
 	const numResponses = 10
-	m := NewManager(1000, 1000)
+	m := NewManager(1000, 1000, 0)
 
 	for id := uint64(1); id <= numSessions; id++ {
-		if err := m.Register(id, id*10); err != nil {
+		if err := m.Register(id, 0, id*10); err != nil {
 			t.Fatalf("Register(%d) = %v", id, err)
 		}
 		for sid := uint64(1); sid <= numResponses; sid++ {
@@ -1866,7 +1882,7 @@ func TestManager_MarshalUnmarshalManySessionsWithResponses(t *testing.T) {
 	}
 
 	// Unmarshal into a new manager.
-	restored := NewManager(1000, 1000)
+	restored := NewManager(1000, 1000, 0)
 	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}

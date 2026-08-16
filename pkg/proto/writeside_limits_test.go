@@ -243,6 +243,7 @@ func marshalMembershipUnchecked(t *testing.T, m Membership) []byte {
 	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
 	putUint64(buf[sessionPolicyOffset+16:], m.MaxSessionsPerClient)
+	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
 	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
 	offset += putMap(buf[offset:], m.Observers)

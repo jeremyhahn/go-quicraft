@@ -27,17 +27,17 @@ import (
 
 func TestSessionLRU_EvictionOrder(t *testing.T) {
 	t.Run("sessions with lowest lastActiveIndex expire first", func(t *testing.T) {
-		m := NewManager(100, 10)
+		m := NewManager(100, 10, 0)
 
 		// Register sessions with different activity levels.
 		// Session 30 is most stale, session 10 most recent.
-		if err := m.Register(10, 900); err != nil {
+		if err := m.Register(10, 0, 900); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := m.Register(20, 500); err != nil {
+		if err := m.Register(20, 0, 500); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
-		if err := m.Register(30, 100); err != nil {
+		if err := m.Register(30, 0, 100); err != nil {
 			t.Fatalf("Register(30) = %v", err)
 		}
 
@@ -78,11 +78,11 @@ func TestSessionLRU_EvictionOrder(t *testing.T) {
 	})
 
 	t.Run("recently touched sessions survive eviction of stale ones", func(t *testing.T) {
-		m := NewManager(100, 10)
+		m := NewManager(100, 10, 0)
 
 		// Register 5 sessions at index 0.
 		for id := uint64(1); id <= 5; id++ {
-			if err := m.Register(id, 0); err != nil {
+			if err := m.Register(id, 0, 0); err != nil {
 				t.Fatalf("Register(%d) = %v", id, err)
 			}
 		}
@@ -130,16 +130,16 @@ func TestSessionLRU_EvictionOrder(t *testing.T) {
 
 func TestSessionLRU_OrderingPreservedAfterRestore(t *testing.T) {
 	t.Run("expiry order is deterministic after marshal-unmarshal", func(t *testing.T) {
-		m1 := NewManager(100, 10)
+		m1 := NewManager(100, 10, 0)
 
 		// Register sessions with varying activity.
-		if err := m1.Register(10, 0); err != nil {
+		if err := m1.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := m1.Register(20, 0); err != nil {
+		if err := m1.Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
-		if err := m1.Register(30, 0); err != nil {
+		if err := m1.Register(30, 0, 0); err != nil {
 			t.Fatalf("Register(30) = %v", err)
 		}
 
@@ -155,7 +155,7 @@ func TestSessionLRU_OrderingPreservedAfterRestore(t *testing.T) {
 		}
 
 		// Unmarshal into new manager.
-		m2 := NewManager(100, 10)
+		m2 := NewManager(100, 10, 0)
 		if err := m2.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 			t.Fatalf("UnmarshalFrom = %v", err)
 		}
@@ -188,8 +188,8 @@ func TestSessionLRU_OrderingPreservedAfterRestore(t *testing.T) {
 	})
 
 	t.Run("response cache preserved after save-restore enables dedup", func(t *testing.T) {
-		m1 := NewManager(100, 10)
-		if err := m1.Register(10, 0); err != nil {
+		m1 := NewManager(100, 10, 0)
+		if err := m1.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 		if err := m1.RecordResult(10, 5, 0, 100, sm.Result{Value: 42, Data: []byte("cached-data")}); err != nil {
@@ -201,7 +201,7 @@ func TestSessionLRU_OrderingPreservedAfterRestore(t *testing.T) {
 		if err := m1.MarshalTo(&buf); err != nil {
 			t.Fatalf("MarshalTo = %v", err)
 		}
-		m2 := NewManager(100, 10)
+		m2 := NewManager(100, 10, 0)
 		if err := m2.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
 			t.Fatalf("UnmarshalFrom = %v", err)
 		}
@@ -229,11 +229,11 @@ func TestSessionLRU_OrderingPreservedAfterRestore(t *testing.T) {
 
 func TestSessionLRU_MutabilityAndIsolation(t *testing.T) {
 	t.Run("recording result for one session does not affect another", func(t *testing.T) {
-		m := NewManager(100, 10)
-		if err := m.Register(10, 0); err != nil {
+		m := NewManager(100, 10, 0)
+		if err := m.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := m.Register(20, 0); err != nil {
+		if err := m.Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -265,11 +265,11 @@ func TestSessionLRU_MutabilityAndIsolation(t *testing.T) {
 	})
 
 	t.Run("unregistering one session does not affect another", func(t *testing.T) {
-		m := NewManager(100, 10)
-		if err := m.Register(10, 0); err != nil {
+		m := NewManager(100, 10, 0)
+		if err := m.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := m.Register(20, 0); err != nil {
+		if err := m.Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -289,11 +289,11 @@ func TestSessionLRU_MutabilityAndIsolation(t *testing.T) {
 	})
 
 	t.Run("respondedTo advancement for one session does not affect another", func(t *testing.T) {
-		m := NewManager(100, 10)
-		if err := m.Register(10, 0); err != nil {
+		m := NewManager(100, 10, 0)
+		if err := m.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register(10) = %v", err)
 		}
-		if err := m.Register(20, 0); err != nil {
+		if err := m.Register(20, 0, 0); err != nil {
 			t.Fatalf("Register(20) = %v", err)
 		}
 
@@ -339,8 +339,8 @@ func TestSessionLRU_MutabilityAndIsolation(t *testing.T) {
 
 func TestSessionLRU_ResponseEvictionBoundary(t *testing.T) {
 	t.Run("evictUpTo at exact boundary evicts matching seriesID", func(t *testing.T) {
-		m := NewManager(100, 10)
-		if err := m.Register(10, 0); err != nil {
+		m := NewManager(100, 10, 0)
+		if err := m.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 
@@ -381,8 +381,8 @@ func TestSessionLRU_ResponseEvictionBoundary(t *testing.T) {
 
 	t.Run("response limit with eviction allows continued operation", func(t *testing.T) {
 		// maxResponses = 2.
-		m := NewManager(100, 2)
-		if err := m.Register(10, 0); err != nil {
+		m := NewManager(100, 2, 0)
+		if err := m.Register(10, 0, 0); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
 

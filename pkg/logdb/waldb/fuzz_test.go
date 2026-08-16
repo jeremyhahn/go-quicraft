@@ -188,7 +188,7 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 
 		// Build the entry payload: [payloadType:1][ShardID:8][ReplicaID:8]
 		// [Index:8][Term:8][Type:8][Key:8][ClientID:8][SeriesID:8]
-		// [RespondedTo:8][CmdLen:4][Cmd:N]
+		// [RespondedTo:8][OwnerID:8][CmdLen:4][Cmd:N]
 		payloadSize := 1 + entryRecordHeaderSize + len(cmd)
 		payload := make([]byte, payloadSize)
 		payload[0] = payloadTypeEntries
@@ -201,8 +201,9 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		binary.LittleEndian.PutUint64(payload[49:], shardID+1)   // ClientID
 		binary.LittleEndian.PutUint64(payload[57:], term+1)      // SeriesID
 		binary.LittleEndian.PutUint64(payload[65:], term)        // RespondedTo
-		binary.LittleEndian.PutUint32(payload[73:], uint32(len(cmd)))
-		copy(payload[77:], cmd)
+		binary.LittleEndian.PutUint64(payload[73:], term+2)      // OwnerID
+		binary.LittleEndian.PutUint32(payload[81:], uint32(len(cmd)))
+		copy(payload[1+entryRecordHeaderSize:], cmd)
 
 		// Encode as a WAL record.
 		buf := make([]byte, recordHeaderSize+payloadSize)
@@ -241,7 +242,8 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		gotClientID := binary.LittleEndian.Uint64(data[48:])
 		gotSeriesID := binary.LittleEndian.Uint64(data[56:])
 		gotRespondedTo := binary.LittleEndian.Uint64(data[64:])
-		gotCmdLen := binary.LittleEndian.Uint32(data[72:])
+		gotOwnerID := binary.LittleEndian.Uint64(data[72:])
+		gotCmdLen := binary.LittleEndian.Uint32(data[80:])
 
 		if gotKey != raftIndex+1 {
 			t.Fatalf("key: got %d, want %d", gotKey, raftIndex+1)
@@ -254,6 +256,9 @@ func FuzzEntryRecordRoundTrip(f *testing.F) {
 		}
 		if gotRespondedTo != term {
 			t.Fatalf("respondedTo: got %d, want %d", gotRespondedTo, term)
+		}
+		if gotOwnerID != term+2 {
+			t.Fatalf("ownerID: got %d, want %d", gotOwnerID, term+2)
 		}
 
 		if gotShardID != shardID {

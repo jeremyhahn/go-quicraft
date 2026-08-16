@@ -148,7 +148,7 @@ func TestOpenFailsOnOversizedReplayCmdLen(t *testing.T) {
 	binary.LittleEndian.PutUint64(payload[9:], 1)                      // replicaID
 	binary.LittleEndian.PutUint64(payload[17:], 1)                     // raftIndex
 	binary.LittleEndian.PutUint64(payload[25:], 1)                     // term
-	binary.LittleEndian.PutUint32(payload[1+72:], uint32(maxCmdLen+1)) // cmdLen
+	binary.LittleEndian.PutUint32(payload[1+80:], uint32(maxCmdLen+1)) // cmdLen
 	writeRawShardRecord(t, dir, 1, payload)
 
 	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -175,7 +175,7 @@ func TestReplayEntriesTruncatedCmdIsFatal(t *testing.T) {
 	binary.LittleEndian.PutUint64(buf[8:], 1)    // replicaID
 	binary.LittleEndian.PutUint64(buf[16:], 1)   // raftIndex
 	binary.LittleEndian.PutUint64(buf[24:], 1)   // term
-	binary.LittleEndian.PutUint32(buf[72:], 8)   // cmdLen
+	binary.LittleEndian.PutUint32(buf[80:], 8)   // cmdLen
 	if err := s.replayEntries(buf, 0); !errors.Is(err, ErrTruncatedEntryRecord) {
 		t.Fatalf("replayEntries = %v, want ErrTruncatedEntryRecord", err)
 	}

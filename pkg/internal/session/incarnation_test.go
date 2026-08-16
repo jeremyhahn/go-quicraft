@@ -41,17 +41,17 @@ import (
 // error raised anywhere. The incarnation floor closes it: an entry below the
 // index that created the current incarnation belongs to a previous one.
 func TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation(t *testing.T) {
-	m := NewManager(10, 10)
+	m := NewManager(10, 10, 0)
 
 	// The client's FIRST incarnation, registered at index 10, proposes at 20.
-	if err := m.Register(1, 10); err != nil {
+	if err := m.Register(1, 0, 10); err != nil {
 		t.Fatalf("Register (first incarnation): %v", err)
 	}
 	// It expires and is re-registered at a much later index.
 	if err := m.Unregister(1); err != nil {
 		t.Fatalf("Unregister: %v", err)
 	}
-	if err := m.Register(1, 5000); err != nil {
+	if err := m.Register(1, 0, 5000); err != nil {
 		t.Fatalf("Register (second incarnation): %v", err)
 	}
 
@@ -75,8 +75,8 @@ func TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation(t *testing.T) {
 // replicated state. If it did not survive marshalling, it would vanish on
 // exactly the restart-then-stale-commit path it exists to close.
 func TestRegisteredIndex_SurvivesASnapshot(t *testing.T) {
-	m := NewManager(10, 10)
-	if err := m.Register(1, 5000); err != nil {
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 0, 5000); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestRegisteredIndex_SurvivesASnapshot(t *testing.T) {
 	if err := m.MarshalTo(&buf); err != nil {
 		t.Fatalf("MarshalTo: %v", err)
 	}
-	restored := NewManager(10, 10)
+	restored := NewManager(10, 10, 0)
 	if err := restored.UnmarshalFrom(&buf); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)
 	}

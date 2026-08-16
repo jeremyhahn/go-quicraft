@@ -242,7 +242,8 @@ func TestEntryCmdSizeExceedsMax(t *testing.T) {
 	putUint64(buf[32:], 0) // ClientID
 	putUint64(buf[40:], 0) // SeriesID
 	putUint64(buf[48:], 0) // RespondedTo
-	putUint32(buf[56:], MaxEntrySize+1)
+	putUint64(buf[56:], 0) // OwnerID
+	putUint32(buf[64:], MaxEntrySize+1)
 	var e Entry
 	_, err := e.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrEntrySizeLimitExceeded) {
@@ -262,7 +263,7 @@ func TestEntryZeroCopyCmd(t *testing.T) {
 	var e2 Entry
 	e2.UnmarshalFrom(buf)
 	// Verify zero-copy: Cmd should alias buf
-	if &e2.Cmd[0] != &buf[60] {
+	if &e2.Cmd[0] != &buf[entryHeaderSize] {
 		t.Fatal("Cmd is not aliased into source buffer (not zero-copy)")
 	}
 }
