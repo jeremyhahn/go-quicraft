@@ -74,7 +74,14 @@ say() { echo ">> $*"; }
 stage() {
   # Refuse to stage over an active run: rsync --delete below would clobber the
   # suite's working tree mid-flight.
-  if ssh "$HOST" "pgrep -f perfcompare >/dev/null 2>&1"; then
+  #
+  # The bracket around the first character is load-bearing. `pgrep -f` matches
+  # full command lines, and ssh runs this check via `bash -c '<the command>'`,
+  # so a plain `pgrep -f perfcompare` MATCHES ITSELF -- the guard fired on every
+  # invocation and staging could never proceed. `[p]erfcompare` is a regex that
+  # matches the text "perfcompare" while the command line carrying it does not
+  # contain that text, so the check sees real runs and not its own shell.
+  if ssh "$HOST" "pgrep -f '[p]erfcompare' >/dev/null 2>&1"; then
     echo "ERROR: a perfcompare run is active on $HOST; refusing to stage" >&2
     exit 1
   fi
