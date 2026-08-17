@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1-alpha] - 2026-08-17
+
+The first publishable 0.5.x. Identical library content to 0.5.0-alpha — whose
+release pipeline failed its own fuzz gate — plus the two fixes that failure
+exposed. **See 0.5.0-alpha below for the breaking format changes and the
+migration; they apply to this version.**
+
+`v0.5.0-alpha` is not withdrawn: Go module versions are immutable and it is
+already resolvable, so the tag stays where it is rather than being moved. It
+simply never completed its release pipeline. Depend on 0.5.1-alpha.
+
+### Fixed
+
+- **A fuzz harness built a membership its own decoder would refuse.**
+  `FuzzMembershipRoundTrip` clamped an address to exactly `MaxAddressLength` and
+  then derived identity values as `"spki:" + addr`, five bytes over — and
+  `Identities` is bounded on both the read and write sides. It surfaced only now
+  because this round gave `Membership.MarshalTo` the write-side bound it lacked;
+  before that the encoder silently produced frames it could not parse back. The
+  minimised input is committed as a corpus seed.
+
+- **The release fuzz gate failed on its own scheduling, and could not be run
+  locally.** Go's fuzzing coordinator can lose its shutdown RPC and report a bare
+  `context deadline exceeded` after the full budget has elapsed, with no crash
+  and no reproducer — indistinguishable from a finding at a glance. It reproduces
+  on an idle host running one target at a time, so the previously assumed cause
+  (cross-job contention) was wrong.
+
+  The gate now separates the two on the signal Go itself gives: a crash always
+  writes a reproducer, so `Failing input written to` fails immediately and is
+  never retried, while the no-reproducer deadline case is retried and anything
+  else fails as unrecognised. A real crash cannot be retried away, because the
+  retry is conditioned on the absence of the artefact a crash produces.
+
+  It also moved out of inline workflow shell into `make ci-fuzz-mutation`, so the
+  gate that blocks a release can be reproduced by the developer whose release it
+  blocked, and it now runs as part of `make ci-full`.
+
 ## [0.5.0-alpha] - 2026-08-17
 
 A full-codebase review and remediation round: 6 critical, 31 high and roughly 60
