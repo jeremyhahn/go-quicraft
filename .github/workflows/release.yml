@@ -203,24 +203,15 @@ jobs:
       - name: Seed and committed-corpus pass
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
 
+      # Runs the same Makefile target a developer runs (devops.md §4). This was
+      # inline shell, which meant the release gate could not be reproduced
+      # locally at all — and it failed release 425 on the coordinator shutdown
+      # artefact, not on a finding. ci-fuzz-mutation separates the two on the
+      # signal Go itself gives: a crash always writes a reproducer, so only the
+      # no-reproducer deadline case is retried, and a real crash cannot be
+      # retried away.
       - name: Bounded mutation pass
-        run: |
-          set -euo pipefail
-          TARGETS="$(go test -tags=quicraft_fuzz -list='^Fuzz' '${{ matrix.package }}' | grep '^Fuzz' || true)"
-          if [ -z "${TARGETS}" ]; then
-            echo "FAIL: no fuzz targets found in ${{ matrix.package }}"
-            exit 1
-          fi
-          # -parallel bounds the fuzzing WORKERS per job. Left at its default
-          # it is GOMAXPROCS, so each job alone would claim the whole runner
-          # and six of them would treble-book it. Two apiece keeps every job
-          # making progress without the coordinator losing its workers to the
-          # scheduler at shutdown.
-          for target in ${TARGETS}; do
-            echo "==> ${target}"
-            go test -tags=quicraft_fuzz -count=1 -run='^$' -parallel=2 \
-              -fuzz="^${target}\$" -fuzztime=10s '${{ matrix.package }}'
-          done
+        run: make ci-fuzz-mutation FUZZ_MUT_PKGS='${{ matrix.package }}'
 
   modules:
     name: Gate - sibling modules build

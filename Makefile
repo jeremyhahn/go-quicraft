@@ -493,6 +493,78 @@ ci-fuzz-seeds:
 	$(GO) test -race -count=1 $(FUZZ_TAGS) -run=Fuzz ./...
 
 # ============================================================================
+# Bounded mutation fuzzing — the release gate
+#
+# This is a REGRESSION gate, not a fuzzing campaign: a short mutation budget per
+# target, enough to catch a codec change that the committed corpus does not
+# already encode. The real campaign is fuzz.yml's nightly schedule.
+#
+# It lives here rather than inline in release.yml so CI runs the target a
+# developer runs (devops.md §4). It previously existed only as shell inside the
+# workflow, which meant the release gate could not be reproduced locally at all.
+#
+# # Why the retry, and why it is not a weakened gate
+#
+# Go's fuzzing coordinator can lose its shutdown RPC to the scheduler and report
+# a bare "context deadline exceeded" AFTER the full -fuzztime has elapsed. It
+# reads exactly like a crash and is not one. -parallel bounds the workers, which
+# reduced it, but it still occurs — reproduced on an IDLE host running one target
+# at a time, so it is not cross-job contention.
+#
+# A gate that fails randomly is not a stricter gate, it is a gate people re-run
+# until it passes. So the two outcomes are separated on the signal Go itself
+# gives: a crash ALWAYS writes a reproducer and says "Failing input written to".
+#
+#   - that string present            -> real finding, fail immediately, never retry
+#   - absent, deadline message only  -> shutdown artefact, retry
+#   - anything else                  -> unknown failure, fail
+#
+# A real crash therefore cannot be retried away, because the retry is gated on
+# the ABSENCE of the reproducer Go writes for one.
+# ============================================================================
+
+FUZZ_MUT_PKGS ?= ./pkg/proto ./pkg/internal/transport ./pkg/internal/session \
+                 ./pkg/internal/raft ./pkg/logdb/waldb ./pkg/seal
+FUZZ_MUT_TIME  ?= 10s
+FUZZ_MUT_TRIES ?= 3
+
+.PHONY: ci-fuzz-mutation
+ci-fuzz-mutation:
+	@set -u; overall=0; \
+	for pkg in $(FUZZ_MUT_PKGS); do \
+		targets=$$($(GO) test $(FUZZ_TAGS) -list='^Fuzz' "$$pkg" | grep '^Fuzz' || true); \
+		if [ -z "$$targets" ]; then \
+			echo "FAIL: no fuzz targets found in $$pkg"; overall=1; continue; \
+		fi; \
+		for t in $$targets; do \
+			try=1; \
+			while : ; do \
+				out=$$($(GO) test $(FUZZ_TAGS) -count=1 -run='^$$' -parallel=2 \
+					-fuzz="^$$t\$$" -fuzztime=$(FUZZ_MUT_TIME) "$$pkg" 2>&1) && break; \
+				if echo "$$out" | grep -q 'Failing input written to'; then \
+					echo "FAIL: $$pkg $$t found a crash"; \
+					echo "$$out" | tail -20; overall=1; break; \
+				fi; \
+				if ! echo "$$out" | grep -q 'context deadline exceeded'; then \
+					echo "FAIL: $$pkg $$t failed for an unrecognised reason"; \
+					echo "$$out" | tail -20; overall=1; break; \
+				fi; \
+				if [ $$try -ge $(FUZZ_MUT_TRIES) ]; then \
+					echo "FAIL: $$pkg $$t hit the coordinator shutdown artefact $(FUZZ_MUT_TRIES) times"; \
+					echo "  No reproducer was written, so this is infrastructure, not a finding,"; \
+					echo "  but it is failing the gate rather than being silently ignored."; \
+					overall=1; break; \
+				fi; \
+				echo "  retry $$try/$(FUZZ_MUT_TRIES): $$pkg $$t (coordinator shutdown, no reproducer)"; \
+				try=$$((try+1)); \
+			done; \
+		done; \
+		echo "ok $$pkg"; \
+	done; \
+	if [ $$overall -ne 0 ]; then exit 1; fi; \
+	echo "All bounded mutation fuzz targets passed"
+
+# ============================================================================
 # ErrorFS I/O Error Injection (Phase 3)
 # ============================================================================
 
@@ -825,8 +897,8 @@ ci: fmt no-mutants vet lint security build test
 # ============================================================================
 
 .PHONY: ci-full
-ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-integration ci-netfault
-	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + all modules)"
+ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci-netfault
+	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + fuzz mutation + all modules)"
 
 # ============================================================================
 # Heavyweight test offload to omega (198.51.100.90)
