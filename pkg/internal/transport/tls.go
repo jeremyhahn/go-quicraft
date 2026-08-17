@@ -67,7 +67,7 @@ type tlsPair struct {
 // It fails fast when the bundle contains no block that could issue a
 // certificate: with no usable issuer, OCSP requests would name the wrong CA
 // (a permanent silent no-op under soft-fail, a total handshake outage under
-// EnforceRevocation) and every CRL signature check would fail.
+// enforcement) and every CRL signature check would fail.
 func parseCACertificates(caPEM []byte) ([]*x509.Certificate, error) {
 	var issuers []*x509.Certificate
 	rest := caPEM
@@ -108,9 +108,11 @@ func parseCACertificates(caPEM []byte) ([]*x509.Certificate, error) {
 
 // buildMTLSTLS builds a TLS pair from provided mTLS certificate material.
 // Both server and client verify peers using the configured CA. When a
-// revocation checker is provided, a VerifyPeerCertificate callback is
-// installed on both server and client configs to reject revoked peer
-// certificates during the TLS handshake.
+// revocation checker is provided, a VerifyConnection callback is installed on
+// both server and client configs to reject revoked peer certificates. The
+// callback is deliberately VerifyConnection and not VerifyPeerCertificate:
+// the latter is skipped on resumed TLS sessions, which would let a revoked
+// peer keep reconnecting via session resumption.
 func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, error) {
 	// The node leaf comes from a pre-built Certificate when supplied (e.g. a
 	// hardware-signer-backed key that cannot be exported to PEM), otherwise
@@ -152,7 +154,7 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 	// This ensures revocation checks happen even for TLS session resumption.
 	var verifyConn func(tls.ConnectionState) error
 	if checker != nil {
-		cfg := checker.CfgRef()
+		onRevoked := checker.OnCertRevoked()
 		verifyConn = func(cs tls.ConnectionState) error {
 			// Only revocation-check the LEAF certificate (PeerCertificates[0]).
 			// The leaf is the end-entity cert that authenticates the peer; it is
@@ -183,8 +185,8 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			}
 			if revoked {
 				serial := leaf.SerialNumber.Text(16)
-				if cfg.OnCertRevoked != nil {
-					cfg.OnCertRevoked(serial)
+				if onRevoked != nil {
+					onRevoked(serial)
 				}
 				return &revocation.CertificateRevokedError{Serial: serial}
 			}

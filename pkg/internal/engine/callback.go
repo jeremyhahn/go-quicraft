@@ -51,7 +51,8 @@ import (
 //     including StopShard. They are NOT ordered relative to the inline methods.
 //   - Invoked INLINE on the producing worker: OnApplied, OnCommitted,
 //     OnReadyToRead, OnProposalFailed, OnReadIndexBatched, OnReadIndexFailed,
-//     OnSnapshotCompleted, OnSnapshotRejected, OnCampaignSkipped. These resolve
+//     OnSnapshotCompleted, OnSnapshotRejected, and OnCampaignSkipped were it
+//     ever invoked (it is not — see its declaration). These resolve
 //     registered client requests and carry happens-before requirements with
 //     raft.Peer.Handle (see OnReadIndexBatched), so they cannot be queued behind
 //     user code. Implementations must not call back into a synchronous Host API
@@ -101,11 +102,25 @@ type Callback interface {
 	// so the counter stays exact. MUST be non-blocking.
 	OnCampaignLaunched(shardID, replicaID, term uint64)
 
-	// OnCampaignSkipped is called by the step worker when an election is
-	// skipped because uncommitted config change entries exist between
-	// committed and lastIndex. Elections during membership transitions
-	// can violate the overlap guarantee. This is a COLD path.
-	// MUST be non-blocking.
+	// OnCampaignSkipped is RESERVED and is NEVER INVOKED. No code in this
+	// package calls it, so an implementation of it receives nothing:
+	// `git grep -n OnCampaignSkipped -- pkg/` finds only this declaration,
+	// the Host forwarder and test doubles.
+	//
+	// It was intended to report a refused election. Every campaign-refusal
+	// branch lives in pkg/internal/raft (startElection, handleTimeoutNow:
+	// selfRemoved, roleMismatch, joining, an unresolved stale config tail,
+	// an unreadable own-log term); that package holds no reference to this
+	// Callback and has no path to reach it, so all of those log and return
+	// silently. Wiring the hook needs a raft-to-engine notification path
+	// that does not exist today.
+	//
+	// It stays on the interface so that path, if built, has a destination.
+	// Do NOT build monitoring on it: the conditions it would report are
+	// exactly the ones that leave a shard leaderless while quorum looks
+	// intact, and silence here is indistinguishable from health. Use the
+	// leader ID or shard health instead. Were it ever called it would be a
+	// COLD path and MUST be non-blocking.
 	OnCampaignSkipped(shardID, replicaID, term uint64)
 
 	// OnSnapshotRejected is called when a snapshot request is rejected by

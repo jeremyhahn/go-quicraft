@@ -320,7 +320,7 @@ func TestApplyWorkerDispatcherPanicRecovery_NormalFlowUnaffected(t *testing.T) {
 	goodApplier := newTestApplier(goodSM)
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(nil, goodApplier, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, goodApplier, nil, nodeCfg, nil, "", nil)
 
 	cfg := newTestHostConfig()
 	ldb := newTestLogDB()

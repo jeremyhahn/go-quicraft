@@ -1526,92 +1526,35 @@ func (e *SegmentCorruptionError) Unwrap() error {
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
-	// payloadTypeEntriesV1 is the legacy entry format (44-byte header,
-	// no session fields). It is never written anymore; encountering it
-	// during replay is a fatal recovery error (see replayRecord) because
-	// replaying it would zero the session fields and silently break
-	// at-most-once delivery. The byte value stays reserved so a V1 WAL
-	// is detected explicitly instead of being misparsed.
-	payloadTypeEntriesV1 byte = 0x01
-	payloadTypeState     byte = 0x02
-	// payloadTypeSnapshotV1 is the original snapshot format (no
-	// MaxWitnesses/PolicyFlags in the membership section). It is never
-	// written anymore; encountering it during replay is a fatal recovery
-	// error (see replayRecord) because a V1 record has no version
-	// discriminator of its own and misparsing it with the current layout
-	// would garble the witness policy or silently drop the node's
-	// membership. The byte value stays reserved so a V1 WAL is detected
-	// explicitly instead of being misparsed.
-	payloadTypeSnapshotV1 byte = 0x03
+	// RETIRED, NEVER REALLOCATED: 0x01, 0x03, 0x07, 0x08, 0x09, 0x0a.
+	//
+	// Each named an entry or snapshot layout whose fields have since moved. A
+	// record still carrying one cannot be read by the current decoder, and the
+	// danger is not that it fails -- it is that it does not. The offsets shift
+	// rather than run off the end, so a stale record can satisfy every length
+	// check and decode into plausible garbage.
+	//
+	// They are left UNALLOCATED rather than named, so replayRecord's default
+	// case refuses them with the standard ErrUnknownPayloadType. There is no
+	// per-layout error to keep in step with a layout nobody can read: the only
+	// remedy any of them has is to wipe the data directory and re-sync from
+	// peers.
+	//
+	// Reallocating one of these bytes would make a stale record indistinguishable
+	// from a current one, which is exactly how the 0x07 and 0x0a collisions
+	// happened. Take the next free value instead.
+	payloadTypeState      byte = 0x02
 	payloadTypeBootstrap  byte = 0x04
 	payloadTypeCompact    byte = 0x05
 	payloadTypeRemoveNode byte = 0x06
-	// payloadTypeEntries is the current entry format (76-byte header
-	// including the four session fields).
-	payloadTypeEntries byte = 0x07
-	// payloadTypeSnapshotV2 is the witness-policy snapshot format, whose
-	// membership section carries MaxWitnesses and PolicyFlags but no
-	// leading version byte. It is never written anymore and is fatal on
-	// replay for the same reason as V1: its membership section starts with
-	// ConfigChangeID, so parsing it with the V3 layout would consume that
-	// field's low byte as a version byte and shift every subsequent read.
-	payloadTypeSnapshotV2 byte = 0x08
-	// payloadTypeSnapshotV3 is the membership-version-byte snapshot format,
-	// whose fixed region ends at FilePathLen with no Compression field. It
-	// is never written anymore and is fatal on replay: its FilePathLen sits
-	// where the V4 layout reads Compression, so parsing it with the current
-	// layout would read the path length as a compression type and then slice
-	// the record at the wrong offset.
-	payloadTypeSnapshotV3 byte = 0x09
-	// payloadTypeSnapshot is the current snapshot format, which adds the
-	// artifact Compression field to the fixed region. The distinct payload
-	// type is the record-level version discriminator, matching the
-	// payloadTypeEntriesV1/payloadTypeEntries precedent.
-	payloadTypeSnapshot byte = 0x0a
+	// payloadTypeEntries is the current entry format (84-byte header --
+	// entryRecordHeaderSize -- including the five session fields
+	// Key, ClientID, SeriesID, RespondedTo and OwnerID).
+	payloadTypeEntries byte = 0x0b
+	// payloadTypeSnapshot is the current snapshot format, whose membership
+	// section closes with a four-field session policy tail.
+	payloadTypeSnapshot byte = 0x0c
 )
-
-// ErrLegacyEntryFormat is returned when recovery encounters a WAL entry
-// record written in the pre-session-field (V1) format. Such a WAL cannot
-// be replayed safely: V1 records lack the Key/ClientID/SeriesID/
-// RespondedTo fields, so replaying them would disable session dedup for
-// every recovered entry. The node must be restored from a snapshot or
-// re-synced from its peers.
-var ErrLegacyEntryFormat = errors.New(
-	"waldb: WAL contains legacy (pre-session-field) entry records; " +
-		"restore from snapshot or re-sync this node from its peers")
-
-// ErrLegacySnapshotFormat is returned when recovery encounters a WAL
-// snapshot record written in the pre-witness-policy (V1) layout. Such a
-// record cannot be replayed safely: it lacks the MaxWitnesses/PolicyFlags
-// fields and carries no version discriminator, so parsing it with the
-// current layout would either be rejected as truncated (silently starting
-// the node with EMPTY membership and no snapshot) or misparse the
-// membership maps. The node must be restored from a snapshot or re-synced
-// from its peers.
-var ErrLegacySnapshotFormat = errors.New(
-	"waldb: WAL contains legacy (pre-witness-policy) snapshot records; " +
-		"restore from snapshot or re-sync this node from its peers")
-
-// ErrLegacySnapshotFormatV2 is returned when recovery encounters a WAL
-// snapshot record written in the witness-policy (V2) layout, whose
-// membership section has no leading version byte. Parsing it with the
-// current layout would consume the ConfigChangeID low byte as the section
-// version and shift every subsequent field, so it is rejected outright.
-// The node must be restored from a snapshot or re-synced from its peers.
-var ErrLegacySnapshotFormatV2 = errors.New(
-	"waldb: WAL contains legacy (pre-membership-version-byte) snapshot " +
-		"records; restore from snapshot or re-sync this node from its peers")
-
-// ErrLegacySnapshotFormatV3 is returned when recovery encounters a WAL
-// snapshot record written in the pre-compression (V3) layout. Its fixed
-// region has no Compression field, so parsing it with the current layout
-// would consume FilePathLen as the compression type and slice the filepath
-// at the wrong offset. Recovering the snapshot's compression by guessing is
-// exactly the failure this field exists to prevent, so the record is
-// rejected outright.
-var ErrLegacySnapshotFormatV3 = errors.New(
-	"waldb: WAL contains legacy (pre-compression-field) snapshot records; " +
-		"restore from snapshot or re-sync this node from its peers")
 
 // ErrUnsupportedSnapshotCompression is returned when a snapshot record
 // declares a compression algorithm this binary cannot decompress. Recovering
@@ -1649,10 +1592,6 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 		if rerr := s.replayEntries(data, segID); rerr != nil {
 			return 0, "", rerr
 		}
-	case payloadTypeEntriesV1:
-		// Gate the legacy on-disk format hard: misparsing a V1 record with
-		// the V2 layout would garble indices and zero session fields.
-		return 0, "", ErrLegacyEntryFormat
 	case payloadTypeState:
 		// Fatal for the same reason as an entry batch, only worse: a skipped
 		// State record lets an OLDER state win last-writer-wins replay,
@@ -1667,20 +1606,6 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 		if rerr := s.replaySnapshot(data, segID); rerr != nil {
 			return 0, "", rerr
 		}
-	case payloadTypeSnapshotV1:
-		// Gate the legacy snapshot layout hard: a V1 record parsed with
-		// the current layout would be dropped as truncated, silently
-		// booting the node with empty membership and no snapshot.
-		return 0, "", ErrLegacySnapshotFormat
-	case payloadTypeSnapshotV2:
-		// Same gate for the witness-policy layout that predates the
-		// membership version byte.
-		return 0, "", ErrLegacySnapshotFormatV2
-	case payloadTypeSnapshotV3:
-		// Same gate for the layout that predates the artifact Compression
-		// field: its fixed region is two bytes shorter, so every offset from
-		// FilePathLen onward would be misread.
-		return 0, "", ErrLegacySnapshotFormatV3
 	case payloadTypeBootstrap:
 		if rerr := s.replayBootstrap(data, segID); rerr != nil {
 			return 0, "", rerr
@@ -1708,7 +1633,7 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 	return skipped, "", nil
 }
 
-// Entry encoding layout (payloadTypeEntries, format V2):
+// Entry encoding layout (payloadTypeEntries, format V3):
 // [ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8]
 // [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][OwnerID:8][CmdLen:4][Cmd:N]
 const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 84 bytes
@@ -3728,7 +3653,7 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 	// split across several records. A record spends recordHeaderSize bytes in
 	// every block it spans and may pad the block it starts in, so the usable
 	// payload is strictly LESS than the segment size. Raft's batch cap counts
-	// neither that framing nor the 76-byte per-entry header, so without
+	// neither that framing nor the 84-byte per-entry header, so without
 	// splitting a batch raft legitimately produced -- a lagging follower
 	// catching up on many small entries is the realistic case -- would fail
 	// permanently with ErrRecordTooLarge and this node could never persist it.

@@ -71,9 +71,11 @@ type MTLSConfig struct {
 }
 
 // RevocationConfig holds certificate revocation checking configuration.
-// When set on TransportConfig, the transport installs a
-// VerifyPeerCertificate callback that rejects revoked peer certificates
-// at TLS handshake time. CRL files are periodically reloaded from disk
+// When set on TransportConfig, the transport installs a VerifyConnection
+// callback that rejects revoked peer certificates at TLS handshake time.
+// VerifyConnection rather than VerifyPeerCertificate is deliberate: the
+// latter is skipped on resumed TLS sessions, which would let a peer whose
+// certificate was revoked after its first handshake keep reconnecting. CRL files are periodically reloaded from disk
 // for hot-reload support without requiring a restart.
 type RevocationConfig struct {
 	// CRLPaths are file paths to PEM-encoded CRL files. These files are
@@ -142,8 +144,12 @@ type TransportConfig struct {
 	// multiplexing shard traffic. Default: 16.
 	StreamPoolSize int
 
-	// MaxStreamPoolSize is the upper bound for stream pool auto-scaling
-	// under load. Default: 256.
+	// MaxStreamPoolSize is the upper bound for StreamPoolSize. Default: 256.
+	//
+	// There is no auto-scaling. The pool is fixed at StreamPoolSize for the
+	// lifetime of the connection -- streamIndexFor reads it as a constant --
+	// and this field exists only so Validate can reject a StreamPoolSize
+	// above it.
 	MaxStreamPoolSize int
 
 	// MaxSnapshotReceiveRate is the maximum inbound snapshot bandwidth in

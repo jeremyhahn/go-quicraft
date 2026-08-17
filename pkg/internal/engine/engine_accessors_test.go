@@ -42,9 +42,9 @@ func TestEngine_GlobalSafePurgeFloor_SpansEveryLoadedShard(t *testing.T) {
 	}
 
 	e.LoadNode(NewNode(nil, nil, nil,
-		config.Config{ShardID: 1, ReplicaID: 1}, 0, nil, base, nil))
+		config.Config{ShardID: 1, ReplicaID: 1}, nil, base, nil))
 	e.LoadNode(NewNode(nil, nil, nil,
-		config.Config{ShardID: 2, ReplicaID: 1}, 0, nil, base, nil))
+		config.Config{ShardID: 2, ReplicaID: 1}, nil, base, nil))
 
 	// Shard 2 holds the older epoch. A per-shard (rather than global) floor
 	// would report 7 and purge epoch 4, destroying shard 2's snapshot.
@@ -160,7 +160,7 @@ func TestSaveSnapshot_UnresolvedShardBarrierWritesNothing(t *testing.T) {
 	// The state machine holds a recognisable secret, so a leaked artifact is
 	// identifiable as such rather than merely present.
 	secret := []byte("PLAINTEXT-USER-COMMAND-9")
-	node := NewNode(nil, nil, nil, cfg, 100, &largeSaveSnapshotter{data: secret}, base, nil)
+	node := NewNode(nil, nil, nil, cfg, &largeSaveSnapshotter{data: secret}, base, nil)
 
 	_, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   9,
@@ -228,7 +228,7 @@ func grepTreeForBytes(t *testing.T, root string, want []byte) string {
 func TestNode_SnapshotSaveDir_MatchesPoolLayout(t *testing.T) {
 	base := t.TempDir()
 	node := NewNode(nil, nil, nil,
-		config.Config{ShardID: 4, ReplicaID: 6}, 0, nil, base, nil)
+		config.Config{ShardID: 4, ReplicaID: 6}, nil, base, nil)
 
 	got := node.SnapshotSaveDir(77)
 	want := snapshotSaveDir(base, 4, 6, 77)
@@ -303,7 +303,7 @@ func TestStepWorker_DrainTick_ConsumesPendingTick(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	sw.loadNode(NewNode(peer, nil, lr, cfg, 100, nil, "", nil))
+	sw.loadNode(NewNode(peer, nil, lr, cfg, nil, "", nil))
 
 	tickC := make(chan time.Time, 1)
 	ticker := &time.Ticker{C: tickC}

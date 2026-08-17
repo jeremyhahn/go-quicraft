@@ -58,7 +58,7 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	applier := &slowUnloadApplier{started: make(chan struct{})}
 	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(nil, applier, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Feed a committed batch directly to the apply worker's channel so the
@@ -108,7 +108,7 @@ func TestEngine_UnloadNode_ReleasesGateParkedApply(t *testing.T) {
 	applier := &slowUnloadApplier{started: make(chan struct{})}
 	nodeCfg := config.Config{ShardID: 8, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(nil, applier, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Hold the saving gate so the apply goroutine parks BEFORE touching the

@@ -24,8 +24,9 @@ import (
 // not import quicraft). The quicraft package defines equivalent errors
 // for the public API; these are the engine-internal variants.
 var (
-	// ErrShardFailed is returned when the state machine circuit breaker
-	// has tripped due to repeated apply failures.
+	// ErrShardFailed is the identity of a shard whose failure latch has
+	// tripped. It is never returned directly: *SMPanicError matches it through
+	// its own Is method, which is how the condition reaches a caller.
 	ErrShardFailed = errors.New("engine: shard failed (SM circuit breaker tripped)")
 
 	// ErrStopped is returned when an operation is interrupted because
@@ -159,33 +160,6 @@ func (e *ApplyError) Error() string {
 // Unwrap returns the underlying error.
 func (e *ApplyError) Unwrap() error {
 	return e.Err
-}
-
-// CircuitBreakerError is returned when the apply circuit breaker trips for a
-// shard. The current policy is fail-fast: the breaker trips on the FIRST
-// SM.Apply error (MaxApplyRetries is reserved, not yet consulted).
-type CircuitBreakerError struct {
-	ShardID          uint64
-	ReplicaID        uint64
-	ConsecutiveFails uint64
-	LastErr          error
-}
-
-// Error returns a human-readable description of the circuit breaker trip.
-func (e *CircuitBreakerError) Error() string {
-	return fmt.Sprintf(
-		"engine: circuit breaker tripped for shard %d replica %d after %d consecutive failures: %s",
-		e.ShardID, e.ReplicaID, e.ConsecutiveFails, e.LastErr.Error())
-}
-
-// Unwrap returns the underlying error.
-func (e *CircuitBreakerError) Unwrap() error {
-	return e.LastErr
-}
-
-// Is reports whether target matches the sentinel ErrShardFailed error.
-func (e *CircuitBreakerError) Is(target error) bool {
-	return target == ErrShardFailed
 }
 
 // SnapshotDuplicateError is returned when a snapshot request is submitted

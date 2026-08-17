@@ -84,7 +84,7 @@ func saveEncryptedTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLo
 		CompactionOverhead:      50,
 		SnapshotCompressionType: compression,
 	}
-	node := NewNode(nil, nil, nil, cfg, state, ss, baseDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 	if err := p.requestSnapshot(snapshotRequest{
 		shardID: shardID, replicaID: replicaID, node: node, save: true,
 	}); err != nil {
@@ -119,7 +119,7 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 		CompactionOverhead:      50,
 		SnapshotCompressionType: compression,
 	}
-	node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 	if err := p.requestSnapshot(snapshotRequest{
 		shardID: shardID, replicaID: replicaID, node: node, save: false,
 	}); err != nil {

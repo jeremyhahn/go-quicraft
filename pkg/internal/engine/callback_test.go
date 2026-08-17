@@ -320,7 +320,7 @@ func TestApplyWorker_CallbackFiresOnSuccessfulApply(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Send an item with committed entries.
 	node.commitPending.Store(true)
@@ -404,7 +404,7 @@ func TestApplyWorker_OnAppliedNotCalledOnApplyError(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
@@ -471,7 +471,7 @@ func TestApplyWorker_NilCallbackDoesNotPanic(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	node.commitPending.Store(true)
 	item := applyPool.Get().(*applyItem)
@@ -526,7 +526,7 @@ func TestApplyWorker_CallbackMultipleShards(t *testing.T) {
 		testSm := newTestSM()
 		rsmSM := newTestApplier(testSm)
 		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
-		node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+		node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 		node.commitPending.Store(true)
 		item := applyPool.Get().(*applyItem)
@@ -778,7 +778,7 @@ func TestStepWorker_OnCampaignLaunched_FiredOnElection(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick enough times to trigger the election timeout. A 3-node cluster
@@ -831,7 +831,7 @@ func TestStepWorker_OnCampaignLaunched_NotFiredWithoutElection(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick to become leader (single-node self-elects).
@@ -866,7 +866,7 @@ func TestStepWorker_OnCampaignLaunched_NilCallback(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick to trigger election.
@@ -907,7 +907,7 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 
 	cfg := config.Config{ShardID: 42, ReplicaID: 7}
 	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	// Seed the applied frontier so the batch below continues at
 	// lastApplied+1; otherwise the apply gap check rejects it before
 	// SM.Apply is ever called and this test would pass vacuously.
@@ -1004,7 +1004,7 @@ func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Seed the applied frontier so the batch below continues at
 	// lastApplied+1; otherwise the apply gap check rejects it before
@@ -1073,7 +1073,7 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	// Seed the applied frontier so the batch below continues at
 	// lastApplied+1; otherwise the apply gap check rejects it before
 	// SM.Apply is ever called and this test would pass vacuously.
@@ -1144,7 +1144,7 @@ func TestApplyWorker_ApplyError_FailsFast(t *testing.T) {
 			errorsCh <- info.Err
 		},
 	}
-	node := NewNode(nil, rsmSM, nil, cfg, 3, nil, "", listener)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", listener)
 
 	go aw.run()
 

@@ -261,9 +261,8 @@ func TestCRLReloadReadFailureKeepsPreviousSet(t *testing.T) {
 	crlPath := writeCRLFile(t, dir, "crl.pem", crlData)
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{crlPath},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{crlPath},
+		Mode:     ModeCRL,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("ReloadCRLs: %v", err)
@@ -471,9 +470,13 @@ func TestCRLNonCRLPEMBlocksIgnored(t *testing.T) {
 
 // TestAddRevokedSerial verifies that programmatically added serials
 // are detected by IsRevoked.
+//
+// The checker has no CRL file, so soft-fail is what makes "not revoked yet"
+// an admission rather than a missing-source rejection; the admin path is the
+// only source of truth here and it is asked for explicitly.
 func TestAddRevokedSerial(t *testing.T) {
 	ca := newTestCA(t)
-	checker := NewChecker(Config{Mode: ModeCRL}, ca.cert)
+	checker := NewChecker(Config{Mode: ModeCRL, AllowSoftFail: true}, ca.cert)
 
 	leaf := ca.issueLeaf(t, 999)
 	serial := leaf.SerialNumber.Text(16)
@@ -561,10 +564,12 @@ func TestIsRevokedCRLMode(t *testing.T) {
 }
 
 // TestIsRevokedUnknownCertPasses verifies that an unknown certificate
-// (not in CRL) passes in default mode.
+// (not in CRL) passes in default mode under soft-fail, which is what the
+// original assertion always described: with no source configured, admitting
+// the peer is the soft-fail behaviour and nothing else.
 func TestIsRevokedUnknownCertPasses(t *testing.T) {
 	ca := newTestCA(t)
-	checker := NewChecker(Config{Mode: ModeAny}, ca.cert)
+	checker := NewChecker(Config{Mode: ModeAny, AllowSoftFail: true}, ca.cert)
 
 	leaf := ca.issueLeaf(t, 12345)
 	revoked, err := checker.IsRevoked(leaf)
@@ -609,21 +614,20 @@ func TestIsRevokedModeAnyFallback(t *testing.T) {
 // Enforcement tests
 // ---------------------------------------------------------------------------
 
-// TestEnforceRevocationStrictMode verifies that EnforceRevocation rejects
+// TestEnforcedRevocationStrictMode verifies that enforcement rejects
 // connections when OCSP is unreachable.
-func TestEnforceRevocationStrictMode(t *testing.T) {
+func TestEnforcedRevocationStrictMode(t *testing.T) {
 	ca := newTestCA(t)
 	checker := NewChecker(Config{
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	leaf := ca.issueLeaf(t, 42)
 	_, err := checker.IsRevoked(leaf)
 	if err == nil {
-		t.Fatal("expected error with EnforceRevocation and unreachable OCSP")
+		t.Fatal("expected error with enforcement and unreachable OCSP")
 	}
 	if !errors.Is(err, ErrOCSPUnavailable) {
 		t.Fatalf("expected ErrOCSPUnavailable, got %v", err)
@@ -638,7 +642,7 @@ func TestSoftFailAllowsUnknown(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
-		EnforceRevocation:  false, // soft-fail
+		AllowSoftFail:      true, // soft-fail
 	}, ca.cert)
 
 	leaf := ca.issueLeaf(t, 42)
@@ -651,20 +655,19 @@ func TestSoftFailAllowsUnknown(t *testing.T) {
 	}
 }
 
-// TestEnforceRevocationOCSPNoURL verifies that EnforceRevocation with
+// TestEnforcedRevocationOCSPNoURL verifies that enforcement with
 // no OCSP URL configured returns an error in ModeOCSP.
-func TestEnforceRevocationOCSPNoURL(t *testing.T) {
+func TestEnforcedRevocationOCSPNoURL(t *testing.T) {
 	ca := newTestCA(t)
 	checker := NewChecker(Config{
-		Mode:              ModeOCSP,
-		OCSPResponderURL:  "", // no URL
-		EnforceRevocation: true,
+		Mode:             ModeOCSP,
+		OCSPResponderURL: "", // no URL
 	}, ca.cert)
 
 	leaf := ca.issueLeaf(t, 42)
 	_, err := checker.IsRevoked(leaf)
 	if err == nil {
-		t.Fatal("expected error with EnforceRevocation and no OCSP URL")
+		t.Fatal("expected error with enforcement and no OCSP URL")
 	}
 	if !errors.Is(err, ErrOCSPUnavailable) {
 		t.Fatalf("expected ErrOCSPUnavailable, got %v", err)
@@ -836,7 +839,7 @@ func TestOCSPNegativeCacheSuppressesRequeries(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 2,
-		EnforceRevocation:  false, // soft-fail
+		AllowSoftFail:      true, // soft-fail
 	}, ca.cert)
 
 	// First call: responder fails, negative-cached. Soft-fail allows.
@@ -867,7 +870,7 @@ func TestOCSPNegativeCacheSuppressesRequeries(t *testing.T) {
 }
 
 // TestOCSPNegativeCacheStillFailsClosedUnderEnforcement verifies that the
-// negative cache does not weaken fail-closed behavior: under EnforceRevocation
+// negative cache does not weaken fail-closed behavior: under enforcement
 // a cached unavailable result still rejects the peer.
 func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
 	ca := newTestCA(t)
@@ -882,7 +885,6 @@ func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 2,
-		EnforceRevocation:  true, // fail-closed
 	}, ca.cert)
 
 	// First call populates the negative cache and must reject.
@@ -927,7 +929,7 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPCacheSeconds:   300, // long positive TTL
 		OCSPTimeoutSeconds: 2,
-		EnforceRevocation:  false, // soft-fail: the masking risk only matters here
+		AllowSoftFail:      true, // soft-fail: the masking risk only matters here
 	}, ca.cert)
 
 	// Seed an unexpired definitive "revoked" verdict, as if the responder had
@@ -998,9 +1000,8 @@ func TestOCSPNoIssuerCert(t *testing.T) {
 	leaf := ca.issueLeaf(t, 55)
 
 	checker := NewChecker(Config{
-		Mode:              ModeOCSP,
-		OCSPResponderURL:  "http://localhost:1/unused",
-		EnforceRevocation: true,
+		Mode:             ModeOCSP,
+		OCSPResponderURL: "http://localhost:1/unused",
 	}, nil) // nil issuer cert
 
 	_, err := checker.IsRevoked(leaf)
@@ -1100,7 +1101,7 @@ func TestModeBothOCSPUnavailableSoftFail(t *testing.T) {
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
 		Mode:               ModeBoth,
-		EnforceRevocation:  false,
+		AllowSoftFail:      true,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("ReloadCRLs: %v", err)
@@ -1132,7 +1133,6 @@ func TestModeBothOCSPUnavailableEnforced(t *testing.T) {
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
 		Mode:               ModeBoth,
-		EnforceRevocation:  true,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("ReloadCRLs: %v", err)
@@ -1276,7 +1276,7 @@ func TestConcurrentIsRevoked(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestOnCertRevokedCallback verifies that the OnCertRevoked callback
-// is invoked when accessed via CfgRef.
+// is invoked when accessed via OnCertRevoked.
 func TestOnCertRevokedCallback(t *testing.T) {
 	var called atomic.Bool
 	var gotSerial atomic.Value
@@ -1294,12 +1294,14 @@ func TestOnCertRevokedCallback(t *testing.T) {
 	serial := leaf.SerialNumber.Text(16)
 	checker.AddRevokedSerial(serial)
 
-	// The callback is used via CfgRef in the TLS wiring, test it directly.
-	cfg := checker.CfgRef()
-	if cfg.OnCertRevoked == nil {
+	// The callback is reached via Checker.OnCertRevoked in the TLS wiring
+	// (tls.go captures it once when building VerifyConnection); test it the
+	// same way rather than through the config value.
+	onRevoked := checker.OnCertRevoked()
+	if onRevoked == nil {
 		t.Fatal("OnCertRevoked should be set")
 	}
-	cfg.OnCertRevoked(serial)
+	onRevoked(serial)
 
 	if !called.Load() {
 		t.Fatal("OnCertRevoked callback was not called")
@@ -1498,9 +1500,8 @@ func TestCRLSignatureVerificationRejectsForeignCRL(t *testing.T) {
 
 	path := writeCRLFile(t, dir, "forged.crl.pem", rogue.createCRL(t, 55))
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{path},
+		Mode:     ModeCRL,
 	}, ca.cert)
 
 	err := checker.ReloadCRLs()
@@ -1557,9 +1558,8 @@ func TestCRLExpiredNextUpdateFailsClosed(t *testing.T) {
 	path := writeCRLFile(t, dir, "expired.crl.pem", crlData)
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{path},
+		Mode:     ModeCRL,
 	}, ca.cert)
 
 	err := checker.ReloadCRLs()
@@ -1636,7 +1636,6 @@ func TestOCSPStaleResponseTreatedAsUnavailable(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	_, err := checker.IsRevoked(leaf)
@@ -1656,6 +1655,7 @@ func TestOCSPStaleResponseTreatedAsUnavailable(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
+		AllowSoftFail:      true,
 	}, ca.cert)
 	revoked, err := softChecker.IsRevoked(leaf)
 	if err != nil || revoked {
@@ -1892,7 +1892,6 @@ func TestOCSPWorksWithIntermediateIssuedLeaf(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, root.cert, intermediate.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -1908,7 +1907,7 @@ func TestOCSPWorksWithIntermediateIssuedLeaf(t *testing.T) {
 // signed by the issuing intermediate must load successfully when the bundle
 // contains both the root and the intermediate. Verifying only against the
 // root would mark the set stale on every reload interval, so under
-// EnforceRevocation every handshake would fail with ErrCRLStale.
+// enforcement every handshake would fail with ErrCRLStale.
 func TestCRLSignedByIntermediateAccepted(t *testing.T) {
 	root := newTestCA(t)
 	intermediate := newTestIntermediate(t, root)
@@ -1916,9 +1915,8 @@ func TestCRLSignedByIntermediateAccepted(t *testing.T) {
 	path := writeCRLFile(t, dir, "inter.crl.pem", intermediate.createCRL(t, 601))
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{path},
+		Mode:     ModeCRL,
 	}, root.cert, intermediate.cert)
 
 	if err := checker.ReloadCRLs(); err != nil {
@@ -1971,7 +1969,7 @@ func newUnknownOCSPServer(t *testing.T, ca *testCA, queries *atomic.Int64) *http
 }
 
 // TestOCSPUnknownStatusFailsClosedUnderEnforcement is the H1 regression test:
-// RFC 6960 "unknown" is NOT "not revoked". Under EnforceRevocation a leaf the
+// RFC 6960 "unknown" is NOT "not revoked". Under enforcement a leaf the
 // responder has no record of must be rejected, not admitted.
 func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
 	ca := newTestCA(t)
@@ -1985,12 +1983,11 @@ func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
 	if err == nil {
-		t.Fatal("unknown OCSP status must fail closed under EnforceRevocation")
+		t.Fatal("unknown OCSP status must fail closed under enforcement")
 	}
 	if revoked {
 		t.Fatal("unknown status must not be reported as revoked")
@@ -2018,7 +2015,6 @@ func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPCacheSeconds:   3600,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	if _, err := checker.IsRevoked(leaf); err == nil {
@@ -2042,9 +2038,9 @@ func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 }
 
 // TestOCSPUnknownStatusSoftFailAllows documents the soft-fail behaviour: with
-// EnforceRevocation false an unknown status is a status-unavailable result, so
-// the peer is admitted — the same treatment as an unreachable responder,
-// rather than a definitive "not revoked".
+// AllowSoftFail an unknown status is a status-unavailable result, so the peer
+// is admitted — the same treatment as an unreachable responder, rather than a
+// definitive "not revoked".
 func TestOCSPUnknownStatusSoftFailAllows(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 702)
@@ -2057,6 +2053,7 @@ func TestOCSPUnknownStatusSoftFailAllows(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
+		AllowSoftFail:      true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2083,9 +2080,8 @@ func TestReloadCRLsRejectsFileWithNoCRLBlocks(t *testing.T) {
 	path := writeCRLFile(t, dir, "rot.crl.pem", ca.createCRL(t, 800))
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{path},
+		Mode:     ModeCRL,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("initial reload: %v", err)
@@ -2139,9 +2135,8 @@ func TestReloadCRLsRejectsPostDatedCRL(t *testing.T) {
 		pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlDER}))
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths: []string{path},
+		Mode:     ModeCRL,
 	}, ca.cert)
 
 	reloadErr := checker.ReloadCRLs()
@@ -2273,12 +2268,13 @@ func TestConfigValidateRejectsUnsatisfiableModes(t *testing.T) {
 }
 
 // TestConfigValidateAcceptsSatisfiableModes verifies Validate does not reject
-// a correctly-sourced configuration, including the default mode which needs no
-// specific source.
+// a correctly-sourced configuration. The default mode names no specific
+// source, so it is satisfiable either by having a source or by opting into
+// soft-fail; the first two cases cover the latter.
 func TestConfigValidateAcceptsSatisfiableModes(t *testing.T) {
 	tests := []Config{
-		{},
-		{Mode: ModeAny},
+		{AllowSoftFail: true},
+		{Mode: ModeAny, AllowSoftFail: true},
 		{Mode: ModeCRL, CRLPaths: []string{"/tmp/x.crl"}},
 		{Mode: ModeOCSP, OCSPResponderURL: "http://ocsp.example"},
 		{Mode: ModeBoth, OCSPResponderURL: "http://ocsp.example", CRLPaths: []string{"/tmp/x.crl"}},
@@ -2400,17 +2396,16 @@ func TestIssuerForNoUsableIssuer(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestStartWithUnreadableCRLFailsClosed verifies that a failing initial load
-// in Start does not panic and leaves the set stale, so EnforceRevocation
+// in Start does not panic and leaves the set stale, so enforcement
 // rejects peers instead of treating "no CRL loaded" as "nothing revoked".
 func TestStartWithUnreadableCRLFailsClosed(t *testing.T) {
 	ca := newTestCA(t)
 	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{missing},
-		CheckInterval:     time.Hour,
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths:      []string{missing},
+		CheckInterval: time.Hour,
+		Mode:          ModeCRL,
 	}, ca.cert)
 	checker.Start()
 	defer checker.Stop()
@@ -2431,10 +2426,9 @@ func TestReloadLoopMarksStaleOnCorruptedFile(t *testing.T) {
 	path := writeCRLFile(t, dir, "corrupt.crl.pem", ca.createCRL(t, 1300))
 
 	checker := NewChecker(Config{
-		CRLPaths:          []string{path},
-		CheckInterval:     10 * time.Millisecond,
-		Mode:              ModeCRL,
-		EnforceRevocation: true,
+		CRLPaths:      []string{path},
+		CheckInterval: 10 * time.Millisecond,
+		Mode:          ModeCRL,
 	}, ca.cert)
 	checker.Start()
 	defer checker.Stop()
@@ -2483,7 +2477,6 @@ func TestModeBothOCSPOnlyRevokedWins(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
 		Mode:               ModeBoth,
-		EnforceRevocation:  true,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("ReloadCRLs: %v", err)
@@ -2514,7 +2507,6 @@ func TestModeBothBothSourcesCleanPasses(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
 		Mode:               ModeBoth,
-		EnforceRevocation:  true,
 	}, ca.cert)
 	if err := checker.ReloadCRLs(); err != nil {
 		t.Fatalf("ReloadCRLs: %v", err)
@@ -2545,7 +2537,6 @@ func TestModeBothStaleCRLFailsClosed(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
 		Mode:               ModeBoth,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2596,7 +2587,6 @@ func TestModeAnyOCSPUnavailableEnforcedFailsClosed(t *testing.T) {
 		Mode:               ModeAny,
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2618,6 +2608,7 @@ func TestModeAnyOCSPUnavailableSoftFailAllows(t *testing.T) {
 		Mode:               ModeAny,
 		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
 		OCSPTimeoutSeconds: 1,
+		AllowSoftFail:      true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2645,7 +2636,6 @@ func TestModeAnyStaleCRLFailsClosedDespiteGoodOCSP(t *testing.T) {
 		CRLPaths:           []string{missing},
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2665,9 +2655,8 @@ func TestModeAnyStaleCRLWithoutOCSPFailsClosed(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
 
 	checker := NewChecker(Config{
-		Mode:              ModeAny,
-		CRLPaths:          []string{missing},
-		EnforceRevocation: true,
+		Mode:     ModeAny,
+		CRLPaths: []string{missing},
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2694,7 +2683,6 @@ func TestQueryOCSPMalformedResponderURL(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   "http://ocsp.example\n/bad",
 		OCSPTimeoutSeconds: 1,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -2724,7 +2712,6 @@ func TestQueryOCSPTruncatedResponseBody(t *testing.T) {
 		Mode:               ModeOCSP,
 		OCSPResponderURL:   server.URL,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, ca.cert)
 
 	revoked, err := checker.IsRevoked(leaf)

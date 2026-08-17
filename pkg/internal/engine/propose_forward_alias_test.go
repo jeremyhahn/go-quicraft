@@ -77,7 +77,7 @@ func TestStepWorker_CommitPendingProposeBufRecycledAcrossIterations(t *testing.T
 	peer, lr := newTestFollowerPeer(t, 1, 1, 2)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// The commit worker owns the peer; the step worker takes the

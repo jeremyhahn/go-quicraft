@@ -17,6 +17,7 @@ package quicraft
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,6 +44,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -14344,37 +14347,70 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 	if tc.RevocationConfig.OCSPCacheSeconds != 600 {
 		t.Fatalf("OCSPCacheSeconds: got %d, want 600", tc.RevocationConfig.OCSPCacheSeconds)
 	}
-	// Public AllowSoftFail=true maps to internal EnforceRevocation=false.
-	if tc.RevocationConfig.EnforceRevocation {
-		t.Fatal("EnforceRevocation: got true, want false (AllowSoftFail=true opts into soft-fail)")
+	// The public opt-in carries through to the internal config under the
+	// same name and the same sense.
+	if !tc.RevocationConfig.AllowSoftFail {
+		t.Fatal("AllowSoftFail: got false, want true (the operator opted into soft-fail)")
 	}
 }
 
 // TestBuildTransportConfig_RevocationFailsClosedByDefault is the M3 regression
-// test: a RevocationConfig that does not opt into soft-fail must map to
-// EnforceRevocation=true (fail closed), so an unreachable OCSP responder or
-// stale CRL rejects a peer rather than admitting it.
+// test, driven through the CHECKER the mapped config produces rather than
+// through the value of a field. A RevocationConfig that does not opt into
+// soft-fail must reject a peer whose status cannot be established, and the
+// opt-in must still admit it — a checker that simply refuses everything would
+// fail the second arm.
+//
+// The CRL path deliberately does not exist, so no fresh CRL is ever loaded and
+// the status of every certificate is genuinely unknown. The leaf needs no
+// issuer: with no configured CA the checker scopes the lookup to the
+// issuer-agnostic scope, which is exactly the "nothing revoked this, and
+// nothing could tell me otherwise" case.
 func TestBuildTransportConfig_RevocationFailsClosedByDefault(t *testing.T) {
-	hc := config.HostConfig{
-		ListenAddress: ":4001",
-		DeploymentID:  1,
-		TransportConfig: config.TransportConfig{
-			RevocationConfig: &config.RevocationConfig{
-				CRLPaths: []string{"/path/to/crl.pem"},
-				Mode:     "crl",
-				// AllowSoftFail intentionally left unset (default).
+	build := func(t *testing.T, allowSoftFail bool) *revocation.Checker {
+		t.Helper()
+		hc := config.HostConfig{
+			ListenAddress: ":4001",
+			DeploymentID:  1,
+			TransportConfig: config.TransportConfig{
+				RevocationConfig: &config.RevocationConfig{
+					CRLPaths:      []string{filepath.Join(t.TempDir(), "never-published.crl")},
+					Mode:          "crl",
+					AllowSoftFail: allowSoftFail,
+				},
 			},
-		},
-	}
-	hc.SetDefaults()
+		}
+		hc.SetDefaults()
 
-	tc := buildTransportConfig(hc)
-	if tc.RevocationConfig == nil {
-		t.Fatal("expected non-nil RevocationConfig")
+		tc := buildTransportConfig(hc)
+		if tc.RevocationConfig == nil {
+			t.Fatal("expected non-nil RevocationConfig")
+		}
+		return revocation.NewChecker(*tc.RevocationConfig)
 	}
-	if !tc.RevocationConfig.EnforceRevocation {
-		t.Fatal("revocation must fail CLOSED by default (EnforceRevocation=true) when AllowSoftFail is unset")
-	}
+
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(0x5eed)}
+
+	t.Run("default enforces", func(t *testing.T) {
+		revoked, err := build(t, false).IsRevoked(leaf)
+		if revoked {
+			t.Fatal("no CRL was ever loaded, so nothing can report this certificate revoked")
+		}
+		if !errors.Is(err, revocation.ErrCRLStale) {
+			t.Fatalf("IsRevoked = %v, want ErrCRLStale: a Host-configured deployment that "+
+				"did not opt into soft-fail must reject a peer of unknown status", err)
+		}
+	})
+
+	t.Run("AllowSoftFail admits", func(t *testing.T) {
+		revoked, err := build(t, true).IsRevoked(leaf)
+		if err != nil {
+			t.Fatalf("the documented opt-out must admit an unknown-status peer: %v", err)
+		}
+		if revoked {
+			t.Fatal("nothing revoked this certificate")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -18812,13 +18848,17 @@ func TestSyncRemoveData_SuccessAfterStop(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestShardHealth_UnmarshalJSON_UnknownValue(t *testing.T) {
-	var h ShardHealth
-	if err := json.Unmarshal([]byte(`"unknown-value"`), &h); err != nil {
-		t.Fatalf("UnmarshalJSON: %v", err)
+	h := ShardError
+	err := json.Unmarshal([]byte(`"unknown-value"`), &h)
+	// An unrecognized value must be REFUSED, not decoded to ShardHealthy.
+	// ShardHealthy is the zero value, so defaulting to it reports a typo as
+	// perfect health. See TestShardHealth_UnmarshalJSONFailsClosed in
+	// info_test.go for the full statement of the property.
+	if !errors.Is(err, ErrInvalidShardHealth) {
+		t.Fatalf("UnmarshalJSON of an unknown value = %v, want ErrInvalidShardHealth", err)
 	}
-	// Unknown values default to ShardHealthy.
-	if h != ShardHealthy {
-		t.Errorf("ShardHealth = %v, want ShardHealthy for unknown value", h)
+	if h != ShardError {
+		t.Errorf("ShardHealth = %v, want the receiver left untouched (ShardError)", h)
 	}
 }
 

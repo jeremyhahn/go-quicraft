@@ -396,8 +396,18 @@ type raft struct {
 	quiesce quiesceState
 
 	// maxReplicationPayload bounds the total entry bytes in a single
-	// Replicate message. Set from Config.MaxApplyEntrySize (default 64MB,
-	// matching dragonboat). Zero means unlimited (not recommended).
+	// outbound Replicate message. Set from Config.MaxApplyEntrySize, whose
+	// default is config.MaxReplicationPayloadBytes (16711672 bytes, ~15.94MB
+	// -- the largest entry payload that still fits one wire frame);
+	// Config.Validate rejects anything larger. Zero means unlimited (not
+	// recommended).
+	//
+	// This is the ONLY thing Config.MaxApplyEntrySize is wired to. Despite its
+	// name it does NOT size the apply batch: entriesToApply is bounded by the
+	// fixed, non-configurable constant maxEntriesToApplySize (64MiB, log.go).
+	// The two are independent bounds on different things -- this one on an
+	// outbound wire message, that one on an inbound batch handed to the state
+	// machine -- and neither derives from the other.
 	maxReplicationPayload uint64
 
 	// entryCompression indicates whether entry payloads should be

@@ -27,15 +27,12 @@ import (
 
 func TestNewNode_SetsFields(t *testing.T) {
 	cfg := config.Config{ShardID: 10, ReplicaID: 20}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	if n.ShardID() != 10 {
 		t.Errorf("ShardID = %d, want 10", n.ShardID())
 	}
 	if n.ReplicaID() != 20 {
 		t.Errorf("ReplicaID = %d, want 20", n.ReplicaID())
-	}
-	if n.maxApplyRetries != 100 {
-		t.Errorf("maxApplyRetries = %d, want 100", n.maxApplyRetries)
 	}
 }
 
@@ -43,7 +40,7 @@ func TestNewNode_InvalidConfig(t *testing.T) {
 	// Node creation does not validate config, but should still work
 	// with zero values.
 	cfg := config.Config{}
-	n := NewNode(nil, nil, nil, cfg, 0, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	if n.ShardID() != 0 {
 		t.Errorf("ShardID = %d, want 0", n.ShardID())
 	}
@@ -51,7 +48,7 @@ func TestNewNode_InvalidConfig(t *testing.T) {
 
 func TestNode_CommitPending(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.commitPending.Load() {
 		t.Fatal("commitPending should be false initially")
@@ -68,7 +65,7 @@ func TestNode_CommitPending(t *testing.T) {
 
 func TestNode_LastApplied(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.lastApplied.Load() != 0 {
 		t.Fatalf("lastApplied should be 0 initially, got %d", n.lastApplied.Load())
@@ -81,7 +78,7 @@ func TestNode_LastApplied(t *testing.T) {
 
 func TestNode_Failed(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.IsFailed() {
 		t.Fatal("node should not be failed initially")
@@ -94,7 +91,7 @@ func TestNode_Failed(t *testing.T) {
 
 func TestNode_Stop(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Stop should close the channel.
 	n.Stop()
@@ -120,7 +117,7 @@ func TestNode_HandleError_WithListener(t *testing.T) {
 		},
 	}
 	cfg := config.Config{ShardID: 5, ReplicaID: 6}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	n := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	n.handleError(&ApplyError{ShardID: 5, ReplicaID: 6, Err: ErrStopped})
 	if !called.Load() {
 		t.Fatal("expected OnShardFailed callback to be invoked")
@@ -129,7 +126,7 @@ func TestNode_HandleError_WithListener(t *testing.T) {
 
 func TestNode_HandleError_NilListener(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	// Should not panic with nil listener.
 	n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
 }
@@ -138,14 +135,14 @@ func TestNode_HandleError_ListenerWithoutCallback(t *testing.T) {
 	// Listener configured but OnShardFailed is nil.
 	listener := &config.EventListener{}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	n := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	// Should not panic.
 	n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
 }
 
 func TestNode_Accessors(t *testing.T) {
 	cfg := config.Config{ShardID: 7, ReplicaID: 8}
-	n := NewNode(nil, nil, nil, cfg, 50, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.Peer() != nil {
 		t.Error("Peer should be nil")
@@ -164,7 +161,7 @@ func TestNode_Accessors(t *testing.T) {
 
 func TestNode_StopC(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	stopC := n.StopC()
 	select {
@@ -186,7 +183,7 @@ func TestNode_StopC(t *testing.T) {
 func TestNode_CacheLinePadding(t *testing.T) {
 	// Verify padding sizes are correct for cache-line isolation.
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// commitPending: atomic.Bool (1 byte) + 127 bytes padding = 128 bytes.
 	// lastApplied: atomic.Uint64 (8 bytes) + 120 bytes padding = 128 bytes.
@@ -209,7 +206,7 @@ func TestNode_CacheLinePadding(t *testing.T) {
 
 func TestNode_DeliverProposal_Success(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	entries := []proto.Entry{
 		{Key: 1, Cmd: []byte("cmd1")},
@@ -232,7 +229,7 @@ func TestNode_DeliverProposal_Success(t *testing.T) {
 
 func TestNode_DeliverProposal_QueueFull(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Fill the queue to capacity (defaultProposalQueueSize = 256).
 	bigBatch := make([]proto.Entry, defaultProposalQueueSize)
@@ -253,7 +250,7 @@ func TestNode_DeliverProposal_QueueFull(t *testing.T) {
 
 func TestNode_CommittedIndex_InitiallyZero(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if got := n.CommittedIndex(); got != 0 {
 		t.Fatalf("CommittedIndex() = %d, want 0 on new node", got)
@@ -262,7 +259,7 @@ func TestNode_CommittedIndex_InitiallyZero(t *testing.T) {
 
 func TestNode_SetCommittedIndex_StoresAndLoads(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	const want uint64 = 42
 	n.SetCommittedIndex(want)
@@ -273,7 +270,7 @@ func TestNode_SetCommittedIndex_StoresAndLoads(t *testing.T) {
 
 func TestNode_CommittedIndex_Monotonic(t *testing.T) {
 	cfg := config.Config{ShardID: 3, ReplicaID: 5}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	indices := []uint64{1, 10, 100, 1000}
 	for _, idx := range indices {
@@ -288,7 +285,7 @@ func TestNode_CommittedIndex_ConcurrentSafe(t *testing.T) {
 	// Verify that concurrent reads and writes do not race. Run with
 	// the race detector enabled (go test -race) for full coverage.
 	cfg := config.Config{ShardID: 2, ReplicaID: 2}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	var wg sync.WaitGroup
 	const iterations = 1000
@@ -317,7 +314,7 @@ func TestNode_CommittedIndex_ConcurrentSafe(t *testing.T) {
 
 func TestNode_DrainProposals_Empty(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	buf := make([]proto.Entry, 0, 8)
 	result := n.DrainProposals(buf)
@@ -328,7 +325,7 @@ func TestNode_DrainProposals_Empty(t *testing.T) {
 
 func TestNode_DrainProposals_ReusesBuf(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.DeliverProposal([]proto.Entry{{Key: 1}, {Key: 2}})
 	first := n.DrainProposals(nil)
@@ -349,7 +346,7 @@ func TestNode_DrainProposals_ReusesBuf(t *testing.T) {
 
 func TestNode_DeliverProposal_Concurrent(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	const numGoroutines = 8
 	const entriesPerGoroutine = 30
@@ -396,7 +393,7 @@ func TestNode_DeliverProposal_Concurrent(t *testing.T) {
 
 func TestNode_DeliverReadIndex_Success(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	ok := n.DeliverReadIndex(42)
 	if !ok {
@@ -419,7 +416,7 @@ func TestNode_DeliverReadIndex_Success(t *testing.T) {
 
 func TestNode_DeliverReadIndex_QueueFull(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Fill the queue to capacity (defaultReadIndexQueueSize = 4096).
 	for i := uint64(0); i < defaultReadIndexQueueSize; i++ {
@@ -438,7 +435,7 @@ func TestNode_DeliverReadIndex_QueueFull(t *testing.T) {
 
 func TestNode_DrainReadIndex_Empty(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	buf := make([]uint64, 0, 8)
 	result := n.DrainReadIndex(buf)
@@ -449,7 +446,7 @@ func TestNode_DrainReadIndex_Empty(t *testing.T) {
 
 func TestNode_DrainReadIndex_ReusesBuf(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.DeliverReadIndex(10)
 	n.DeliverReadIndex(20)
@@ -471,7 +468,7 @@ func TestNode_DrainReadIndex_ReusesBuf(t *testing.T) {
 
 func TestNode_DeliverReadIndex_Concurrent(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	const numGoroutines = 8
 	const keysPerGoroutine = 50
@@ -518,7 +515,7 @@ func TestNode_IsMember_NilPeer(t *testing.T) {
 	// When peer is nil, IsMember should return true (cannot verify,
 	// allow message through to avoid blocking during initialization).
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if !n.IsMember(42) {
 		t.Error("IsMember should return true when peer is nil")
@@ -549,7 +546,7 @@ func TestNode_IsMember_UnknownReplicaRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPeer failed: %v", err)
 	}
-	n := NewNode(peer, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(peer, nil, nil, cfg, nil, "", nil)
 
 	// Known members should pass.
 	if !n.IsMember(1) {
@@ -571,7 +568,7 @@ func TestNode_IsMember_UnknownReplicaRejected(t *testing.T) {
 
 func TestNode_SetNotifyCommit_EnablesFlag(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Default should be false.
 	if n.notifyCommit {
@@ -586,7 +583,7 @@ func TestNode_SetNotifyCommit_EnablesFlag(t *testing.T) {
 
 func TestNode_SetNotifyCommit_DisablesFlag(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.SetNotifyCommit(true)
 	n.SetNotifyCommit(false)
@@ -601,7 +598,7 @@ func TestNode_SetNotifyCommit_DisablesFlag(t *testing.T) {
 
 func TestNode_TryStartSnapshot_FirstCallSucceeds(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if !n.TryStartSnapshot() {
 		t.Fatal("first TryStartSnapshot should succeed")
@@ -610,7 +607,7 @@ func TestNode_TryStartSnapshot_FirstCallSucceeds(t *testing.T) {
 
 func TestNode_TryStartSnapshot_SecondCallFails(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if !n.TryStartSnapshot() {
 		t.Fatal("first TryStartSnapshot should succeed")
@@ -622,7 +619,7 @@ func TestNode_TryStartSnapshot_SecondCallFails(t *testing.T) {
 
 func TestNode_ClearSnapshotting_AllowsRetry(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if !n.TryStartSnapshot() {
 		t.Fatal("first TryStartSnapshot should succeed")
@@ -637,7 +634,7 @@ func TestNode_ClearSnapshotting_AllowsRetry(t *testing.T) {
 
 func TestNode_ClearSnapshotting_Idempotent(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Clearing when not snapshotting should not panic or cause issues.
 	n.ClearSnapshotting()
@@ -655,7 +652,7 @@ func TestNode_ClearSnapshotting_Idempotent(t *testing.T) {
 
 func TestNode_DiagRaftState_NilPeer(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	term, committed, processed, lastIdx, msgs, state := n.DiagRaftState()
 	if term != 0 || committed != 0 || processed != 0 || lastIdx != 0 || msgs != 0 {
@@ -671,7 +668,7 @@ func TestNode_DiagRaftState_WithPeer(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	n := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	n := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	// DiagRaftState reads an eventually-consistent snapshot published by
 	// the step worker under raftMu (reading Peer.r from a foreign
@@ -703,7 +700,7 @@ func TestNode_DiagRaftState_WithPeer(t *testing.T) {
 
 func TestNode_DiagRemotes_NilPeer(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	result := n.DiagRemotes()
 	if result != "nil" {
@@ -715,7 +712,7 @@ func TestNode_DiagRemotes_WithNonLeaderPeer(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	n := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	n := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	// Publish a snapshot as the step worker would (no step worker runs in
 	// this unit test); see TestNode_DiagRaftState_WithPeer.
@@ -737,7 +734,7 @@ func TestNode_DiagRemotes_WithNonLeaderPeer(t *testing.T) {
 
 func TestNode_Snapshotter_Nil(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.Snapshotter() != nil {
 		t.Fatal("Snapshotter should be nil when not configured")
@@ -746,7 +743,7 @@ func TestNode_Snapshotter_Nil(t *testing.T) {
 
 func TestNode_SnapshotDir_ReturnsConfiguredPath(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "/tmp/snapshots/shard1", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "/tmp/snapshots/shard1", nil)
 
 	if n.SnapshotDir() != "/tmp/snapshots/shard1" {
 		t.Fatalf("SnapshotDir = %q, want /tmp/snapshots/shard1", n.SnapshotDir())
@@ -755,7 +752,7 @@ func TestNode_SnapshotDir_ReturnsConfiguredPath(t *testing.T) {
 
 func TestNode_SnapshotDir_EmptyString(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.SnapshotDir() != "" {
 		t.Fatalf("SnapshotDir = %q, want empty string", n.SnapshotDir())
@@ -768,7 +765,7 @@ func TestNode_SnapshotDir_EmptyString(t *testing.T) {
 
 func TestNode_LastSnapshotIndex_DefaultZero(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.LastSnapshotIndex() != 0 {
 		t.Fatalf("LastSnapshotIndex should be 0 initially, got %d", n.LastSnapshotIndex())
@@ -777,7 +774,7 @@ func TestNode_LastSnapshotIndex_DefaultZero(t *testing.T) {
 
 func TestNode_LastSnapshotIndex_AfterStore(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.lastSnapshotIndex.Store(500)
 	if n.LastSnapshotIndex() != 500 {
@@ -791,7 +788,7 @@ func TestNode_LastSnapshotIndex_AfterStore(t *testing.T) {
 
 func TestNode_Recovering_DefaultFalse(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if n.IsRecovering() {
 		t.Fatal("IsRecovering should be false initially")
@@ -800,7 +797,7 @@ func TestNode_Recovering_DefaultFalse(t *testing.T) {
 
 func TestNode_SetRecovering_RoundTrip(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.SetRecovering(true)
 	if !n.IsRecovering() {
@@ -815,7 +812,7 @@ func TestNode_SetRecovering_RoundTrip(t *testing.T) {
 
 func TestNode_DiagState_IncludesReadIndexQ(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if d := n.DiagState(); d.ReadIndexQLen != 0 {
 		t.Fatalf("readIndexQ should be 0 initially, got %d", d.ReadIndexQLen)
@@ -834,7 +831,7 @@ func TestNode_DiagState_IncludesReadIndexQ(t *testing.T) {
 // and cannot tell whether a snapshot gate is holding it.
 func TestNode_DiagState_ReportsSnapshotGates(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	if d := n.DiagState(); d.Recovering || d.Saving || d.ApplyInFlight != 0 {
 		t.Fatalf("fresh node reported gates %+v", d)
@@ -866,7 +863,7 @@ func TestNode_DiagState_ReportsSnapshotGates(t *testing.T) {
 // only increases and never decreases, even under concurrent access.
 func TestNode_LastAppliedMonotonicallyIncreasing(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Advance lastApplied in sequence.
 	for _, idx := range []uint64{1, 5, 10, 20, 50, 100} {
@@ -909,7 +906,7 @@ func TestNode_LastAppliedMonotonicallyIncreasing(t *testing.T) {
 // that the test pattern correctly rejects a decreasing lastApplied.
 func TestNode_LastAppliedMonotonicallyIncreasing_InvalidDecrease(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	n.lastApplied.Store(500)
 
@@ -939,7 +936,7 @@ func TestNode_QuiesceCanBeDisabled(t *testing.T) {
 		ReplicaID: 1,
 		Quiesce:   false,
 	}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	gotCfg := n.Config()
 	if gotCfg.Quiesce {
@@ -955,7 +952,7 @@ func TestNode_QuiesceCanBeDisabled_Enabled(t *testing.T) {
 		ReplicaID: 1,
 		Quiesce:   true,
 	}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	gotCfg := n.Config()
 	if !gotCfg.Quiesce {
@@ -977,7 +974,7 @@ func TestNode_ExitQuiesceOnConfigChange(t *testing.T) {
 		ReplicaID: 1,
 		Quiesce:   true,
 	}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Deliver a config change entry.
 	ccEntry := proto.Entry{
@@ -1008,7 +1005,7 @@ func TestNode_ExitQuiesceOnConfigChange_NormalEntryAlsoAccepted(t *testing.T) {
 		ReplicaID: 1,
 		Quiesce:   true,
 	}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	entries := []proto.Entry{
 		{Type: proto.EntryNormal, Key: 1, Cmd: []byte("data")},
@@ -1035,7 +1032,7 @@ func TestNode_ExitQuiesceOnConfigChange_NormalEntryAlsoAccepted(t *testing.T) {
 // queue enforces total count limits.
 func TestNode_PayloadTooBig(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Create an entry with a large payload.
 	largeCmd := make([]byte, 1024*1024) // 1 MiB
@@ -1066,7 +1063,7 @@ func TestNode_PayloadTooBig(t *testing.T) {
 // queue is full, even small entries are rejected.
 func TestNode_PayloadTooBig_QueueOverflow(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Fill the queue to capacity.
 	batch := make([]proto.Entry, defaultProposalQueueSize)

@@ -58,7 +58,7 @@ func TestApplyWorker_RecoverFromSMPanic(t *testing.T) {
 	}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, panicker, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, panicker, nil, cfg, nil, "", listener)
 
 	// Start the apply worker.
 	go aw.run()
@@ -151,14 +151,14 @@ func TestApplyWorker_RecoverFromSMPanic_ShardContinuesAfterPanic(t *testing.T) {
 	panicker := &panicApplier{panicValue: "shard1-panic"}
 	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg1.SetDefaults()
-	node1 := NewNode(nil, panicker, nil, cfg1, 100, nil, "", nil)
+	node1 := NewNode(nil, panicker, nil, cfg1, nil, "", nil)
 
 	// Shard 2: working state machine.
 	goodSM := newTestSM()
 	goodApplier := newTestApplier(goodSM)
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg2.SetDefaults()
-	node2 := NewNode(nil, goodApplier, nil, cfg2, 100, nil, "", nil)
+	node2 := NewNode(nil, goodApplier, nil, cfg2, nil, "", nil)
 
 	go aw.run()
 
@@ -253,7 +253,7 @@ func TestApplyWorker_DispatchSkipsUnloadedShard(t *testing.T) {
 	goodApplier := newTestApplier(goodSM)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, goodApplier, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, goodApplier, nil, cfg, nil, "", nil)
 
 	// Start the dispatcher.
 	go aw.run()
@@ -404,7 +404,7 @@ func TestApplyWorker_UnloadThenReload(t *testing.T) {
 	goodApplier := newTestApplier(goodSM)
 	cfg := config.Config{ShardID: 5, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, goodApplier, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, goodApplier, nil, cfg, nil, "", nil)
 
 	go aw.run()
 
@@ -493,7 +493,7 @@ initialApplied:
 	goodApplier2 := newTestApplier(goodSM2)
 	cfg2 := config.Config{ShardID: 5, ReplicaID: 1}
 	cfg2.SetDefaults()
-	node2 := NewNode(nil, goodApplier2, nil, cfg2, 100, nil, "", nil)
+	node2 := NewNode(nil, goodApplier2, nil, cfg2, nil, "", nil)
 	// Host.StartShard seeds the new incarnation's applied marker from raft's
 	// processed marker before LoadNode. Index 2 was dropped by the unloaded
 	// guard above and re-offered to this incarnation as part of its recovered
@@ -574,7 +574,7 @@ func TestApplyWorker_UnloadedMapCleanup(t *testing.T) {
 	for i := uint64(1); i <= 100; i++ {
 		cfg := config.Config{ShardID: i, ReplicaID: 1}
 		cfg.SetDefaults()
-		node := NewNode(nil, goodApplier, nil, cfg, 100, nil, "", nil)
+		node := NewNode(nil, goodApplier, nil, cfg, nil, "", nil)
 		node.commitPending.Store(true)
 
 		item := applyPool.Get().(*applyItem)
@@ -663,7 +663,7 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	testSm := newTestSM()
 	cfg := config.Config{ShardID: 7, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, newTestApplier(testSm), nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, newTestApplier(testSm), nil, cfg, nil, "", nil)
 
 	// The shard was unloaded, then re-loaded, and the new incarnation's first
 	// committed batch follows immediately.
@@ -771,7 +771,7 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	testSm := newTestSM()
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, newTestApplier(testSm), nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, newTestApplier(testSm), nil, cfg, nil, "", nil)
 	node.SeedLastApplied(5, 1)
 
 	go aw.run()
@@ -831,7 +831,7 @@ func TestApplyWorker_GapDetection_FailsShardWhenNothingApplied(t *testing.T) {
 	testSm := newTestSM()
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, newTestApplier(testSm), nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, newTestApplier(testSm), nil, cfg, nil, "", nil)
 	// A fresh shard: nothing recovered, nothing applied.
 	node.SeedLastApplied(0, 0)
 

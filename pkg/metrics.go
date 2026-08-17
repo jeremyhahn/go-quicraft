@@ -109,9 +109,11 @@ type TransportMetrics interface {
 	// IncMessagesDropped counts a Raft message the transport discarded
 	// instead of delivering. reason comes from a closed set defined by the
 	// transport: "unresolved_target", "queue_full", "stream_unavailable",
-	// "write_failed", "marshal_failed", "protocol_violation". shardID and to
-	// are both 0 for "protocol_violation", where the frame is discarded
-	// before its messages are parsed.
+	// "write_failed", "marshal_failed", "protocol_violation", "unsendable",
+	// "peer_rejected". Implementations must treat it as a metric label and
+	// must not derive new label values from it. shardID and to are both 0
+	// for "protocol_violation", where the frame is discarded before its
+	// messages are parsed.
 	IncMessagesDropped(shardID, to uint64, reason string)
 }
 

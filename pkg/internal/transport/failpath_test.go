@@ -656,7 +656,7 @@ func TestSnapshotReceiver_ReleaseUnknownPeerIsNoop(t *testing.T) {
 // tolerance for non-certificate PEM blocks. Operators routinely concatenate
 // keys, CRLs or DH parameters into a bundle; treating such a block as fatal
 // (or, worse, as an issuer) would either refuse a valid bundle at startup or
-// wire revocation to a bogus issuer, which under EnforceRevocation is a total
+// wire revocation to a bogus issuer, which under enforcement is a total
 // handshake outage.
 func TestParseCACertificates_SkipsNonCertificateBlocks(t *testing.T) {
 	caPEM, caKeyPEM, _, _ := generateTestCertPair(t)

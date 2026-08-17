@@ -34,7 +34,6 @@ func newTestHostConfig() config.HostConfig {
 		MaxApplyWorkers:      2,
 		CommitCBufferSize:    16,
 		ShutdownTimeout:      5 * time.Second,
-		MaxApplyRetries:      100,
 		MaxTotalInMemLogSize: 4 * 1024 * 1024 * 1024,
 		DeploymentID:         1,
 	}
@@ -114,7 +113,7 @@ func TestEngine_LoadNode(t *testing.T) {
 	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Node should be in the correct worker.
@@ -134,7 +133,7 @@ func TestEngine_LoadMultipleNodes(t *testing.T) {
 
 	for i := range 10 {
 		nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-		node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+		node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 		e.LoadNode(node)
 	}
 
@@ -156,7 +155,7 @@ func TestEngine_UnloadNode(t *testing.T) {
 	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	e.UnloadNode(10)
@@ -225,7 +224,7 @@ func TestEngine_OrderedShutdown(t *testing.T) {
 
 	// Load a node.
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Notify work and proceed directly to shutdown -- the shutdown
@@ -259,7 +258,7 @@ func TestEngine_StopCallsNodeStop(t *testing.T) {
 	nodes := make([]*Node, 3)
 	for i := range nodes {
 		nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-		nodes[i] = NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+		nodes[i] = NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 		e.LoadNode(nodes[i])
 	}
 
@@ -333,7 +332,7 @@ func TestEngine_WorkerPartitioning(t *testing.T) {
 
 	for _, tt := range tests {
 		nodeCfg := config.Config{ShardID: tt.shardID, ReplicaID: 1}
-		node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+		node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 		e.LoadNode(node)
 
 		sw := e.StepWorker(tt.workerID)
@@ -354,7 +353,7 @@ func TestEngine_SnapshotPoolIntegration(t *testing.T) {
 	sp := e.SnapshotPool()
 
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	err := sp.requestSnapshot(snapshotRequest{
 		shardID: 1, replicaID: 1, node: node, save: true,
@@ -394,7 +393,7 @@ func TestEngine_GetNode_Loaded(t *testing.T) {
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 42, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(n)
 
 	got := e.GetNode(42)
@@ -411,7 +410,7 @@ func TestEngine_GetNode_AfterUnload(t *testing.T) {
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 42, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(n)
 	e.UnloadNode(42)
 
@@ -437,7 +436,7 @@ func TestEngine_DeliverMessage_Loaded(t *testing.T) {
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(n)
 
 	msg := proto.Message{Type: proto.Heartbeat, From: 2, To: 1}
@@ -461,7 +460,7 @@ func TestEngine_DeliverMessage_InboxFull(t *testing.T) {
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
 
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(n)
 
 	// Fill the inbox.
@@ -485,7 +484,7 @@ func TestEngine_DeliverMessage_InboxFull(t *testing.T) {
 
 func TestNode_Deliver_Success(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
 	ok := n.Deliver(msg)
@@ -496,7 +495,7 @@ func TestNode_Deliver_Success(t *testing.T) {
 
 func TestNode_Deliver_InboxFull(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
 	for i := 0; i < defaultInboxQueueSize; i++ {
@@ -510,7 +509,7 @@ func TestNode_Deliver_InboxFull(t *testing.T) {
 
 func TestNode_DrainInbox_Empty(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	buf := n.DrainInbox(nil)
 	if len(buf) != 0 {
@@ -520,7 +519,7 @@ func TestNode_DrainInbox_Empty(t *testing.T) {
 
 func TestNode_DrainInbox_Multiple(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	for i := 0; i < 5; i++ {
 		n.Deliver(proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: uint64(i + 1)})
@@ -545,7 +544,7 @@ func TestNode_DrainInbox_Multiple(t *testing.T) {
 
 func TestNode_DrainInbox_ReusesBuffer(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 
 	// Pre-allocate a buffer with capacity.
 	buf := make([]proto.Message, 0, 16)
@@ -602,7 +601,7 @@ func TestEngine_RequestSnapshot_WithPeer(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, nil, lr, nodeCfg, 100, nil, "/tmp/snap", nil)
+	node := NewNode(peer, nil, lr, nodeCfg, nil, "/tmp/snap", nil)
 	e.LoadNode(node)
 
 	err := e.RequestSnapshot(1, 1, node, SnapshotRequestOption{})
@@ -631,7 +630,7 @@ func TestEngine_RequestSnapshot_DuplicateRejected(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, nil, lr, nodeCfg, 100, nil, "/tmp/snap", nil)
+	node := NewNode(peer, nil, lr, nodeCfg, nil, "/tmp/snap", nil)
 	e.LoadNode(node)
 
 	// First request should succeed.
@@ -663,7 +662,7 @@ func TestEngine_RequestSnapshot_NilPeer(t *testing.T) {
 	defer e.Stop()
 
 	nodeCfg := config.Config{ShardID: 2, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "/tmp/snap", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "/tmp/snap", nil)
 	e.LoadNode(node)
 
 	// When peer is nil, RequestSnapshot should still submit (term=0).
@@ -693,7 +692,7 @@ func TestEngine_RequestSnapshotRecovery_Success(t *testing.T) {
 	defer e.Stop()
 
 	nodeCfg := config.Config{ShardID: 3, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "/tmp/snap", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "/tmp/snap", nil)
 	e.LoadNode(node)
 
 	err := e.RequestSnapshotRecovery(3, 1, node)
@@ -741,12 +740,12 @@ func TestCommitWorker_ClearBatchCommitPending(t *testing.T) {
 		inBatch := make([]*Node, 3)
 		for i := range inBatch {
 			nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-			inBatch[i] = NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+			inBatch[i] = NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 			inBatch[i].commitPending.Store(true)
 			cw.batch = append(cw.batch, proto.Update{ShardID: nodeCfg.ShardID})
 			cw.batchNodes = append(cw.batchNodes, inBatch[i])
 		}
-		outside := NewNode(nil, nil, nil, config.Config{ShardID: 9, ReplicaID: 1}, 100, nil, "", nil)
+		outside := NewNode(nil, nil, nil, config.Config{ShardID: 9, ReplicaID: 1}, nil, "", nil)
 		outside.commitPending.Store(true)
 
 		cw.clearBatchCommitPending(ws)
@@ -804,7 +803,7 @@ func TestEngine_RequestSnapshotRecovery_DuplicateRejected(t *testing.T) {
 	defer e.Stop()
 
 	nodeCfg := config.Config{ShardID: 4, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "/tmp/snap", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "/tmp/snap", nil)
 	e.LoadNode(node)
 
 	err := e.RequestSnapshotRecovery(4, 1, node)
@@ -953,7 +952,7 @@ func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 
 	// Load a node so clearCommitPending has work.
 	nodeCfg := config.Config{ShardID: 0, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	node.commitPending.Store(true)
 	e.LoadNode(node)
 
@@ -973,7 +972,7 @@ func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 	ldb.setSaveError(errors.New("disk error"))
 
 	cfg2 := config.Config{ShardID: 1, ReplicaID: 1}
-	node2 := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	node2 := NewNode(nil, nil, nil, cfg2, nil, "", nil)
 	node2.commitPending.Store(true)
 	e.LoadNode(node2)
 
@@ -1028,7 +1027,7 @@ func TestEngine_RunStepWorkerOnce_PanicPath(t *testing.T) {
 	// set, recorded as enqueuingNode) when the panic hit. This is the ONE node
 	// clearStepCommitPending unwedges after a step-worker panic.
 	nodeCfg := config.Config{ShardID: 0, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
 	sw.enqueuingNode = node
@@ -1081,7 +1080,7 @@ func TestEngine_RunCommitWorkerLoop_PanicAndShutdown(t *testing.T) {
 	ldb.setSaveError(errors.New("disk error"))
 
 	nodeCfg := config.Config{ShardID: 0, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Send a commit item that will trigger SaveState error -> retryWait -> retryHookForTest panic.
@@ -1284,14 +1283,14 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 	cw := e.CommitWorker(0)
 
 	// batched is the node whose update is in the batch when the panic hits.
-	batched := NewNode(nil, nil, nil, config.Config{ShardID: 1, ReplicaID: 1}, 100, nil, "", nil)
+	batched := NewNode(nil, nil, nil, config.Config{ShardID: 1, ReplicaID: 1}, nil, "", nil)
 	batched.commitPending.Store(true)
 	e.LoadNode(batched)
 
 	// enqueueing stands in for a node the step worker is mid-enqueue for:
 	// commitPending is set, but its item has not reached commitC yet, so it
 	// is in neither the channel nor the batch.
-	enqueueing := NewNode(nil, nil, nil, config.Config{ShardID: 2, ReplicaID: 1}, 100, nil, "", nil)
+	enqueueing := NewNode(nil, nil, nil, config.Config{ShardID: 2, ReplicaID: 1}, nil, "", nil)
 	enqueueing.commitPending.Store(true)
 	e.LoadNode(enqueueing)
 
@@ -1381,12 +1380,12 @@ func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
 	ldb.setSaveError(errors.New("disk error"))
 
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	node.commitPending.Store(true)
 	e.LoadNode(node)
 
 	// A queued item that must be drained by the recovery.
-	stale := NewNode(nil, nil, nil, config.Config{ShardID: 3, ReplicaID: 1}, 100, nil, "", nil)
+	stale := NewNode(nil, nil, nil, config.Config{ShardID: 3, ReplicaID: 1}, nil, "", nil)
 	stale.commitPending.Store(true)
 	e.LoadNode(stale)
 	cw.commitC <- &commitItem{update: proto.Update{ShardID: 3, ReplicaID: 1}, node: stale}

@@ -67,7 +67,7 @@ func TestNode_RedeliverPreservesOrigin(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := config.Config{ShardID: 1, ReplicaID: 1}
 			cfg.SetDefaults()
-			node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+			node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 			msg := proto.Message{
 				Type:     proto.InstallSnapshot,
@@ -126,7 +126,7 @@ func TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPeer failed: %v", err)
 	}
-	node := NewNode(peer, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, nil, cfg, nil, "", nil)
 
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

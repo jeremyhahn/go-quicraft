@@ -49,7 +49,7 @@ func TestStepWorker_PreVoteLeavesNodeWhileCommitPending(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// The commit/apply pipeline owns the node, exactly as it does under

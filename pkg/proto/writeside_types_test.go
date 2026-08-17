@@ -16,7 +16,6 @@ package proto
 
 import (
 	"errors"
-	"strings"
 	"testing"
 )
 
@@ -26,8 +25,13 @@ import (
 // writeside_limits_test.go covers the LENGTH limits each encoder must mirror.
 // These are the remaining asymmetries: the two enum ranges the decoders check
 // and the encoders did not, the reserved bits of Entry.Type that neither end
-// checked, the last putMap caller without the write-side map limits, and the
-// embedded Snapshot that Message.MarshalTo discarded without saying so.
+// checked, and the embedded Snapshot that Message.MarshalTo discarded without
+// saying so.
+//
+// The write-side map limits themselves (ErrAddressTooLong,
+// ErrTooManyMembershipEntries) are pinned on Membership in
+// writeside_limits_test.go, which reaches the same checkWritableMap/putMap/getMap
+// helpers on the durable path.
 // ---------------------------------------------------------------------------
 
 // TestEntryMarshalRefusesTypesUnmarshalRefuses drives the durable round trip.
@@ -150,68 +154,6 @@ func TestMessageBatchMarshalRejectsInvalidNestedTypes(t *testing.T) {
 		if _, err := mb.MarshalTo(buf); !errors.Is(err, ErrInvalidEntryType) {
 			t.Fatalf("MarshalTo: got %v, want ErrInvalidEntryType", err)
 		}
-	})
-}
-
-// TestBootstrapMarshalRefusesWhatGetMapRefuses closes the last putMap caller
-// without the write-side map limits.
-//
-// Bootstrap is PERSISTED to LogDB during shard initialization, and its
-// Addresses map comes from the operator, so an over-length address bootstrapped
-// the shard successfully and made every subsequent read of that record fail —
-// the same durable-but-unreadable failure Membership.checkWritable exists to
-// prevent, on the same shared decoder.
-func TestBootstrapMarshalRefusesWhatGetMapRefuses(t *testing.T) {
-	t.Run("address over MaxAddressLength", func(t *testing.T) {
-		b := Bootstrap{Addresses: map[uint64]string{
-			1: "127.0.0.1:5001",
-			2: strings.Repeat("x", MaxAddressLength+1),
-		}}
-		buf := make([]byte, b.Size())
-		if _, err := b.MarshalTo(buf); !errors.Is(err, ErrAddressTooLong) {
-			t.Fatalf("MarshalTo: got %v, want ErrAddressTooLong", err)
-		}
-
-		// The read side refuses the same bytes: encode by hand to show the two
-		// ends genuinely agree, which is the whole point of the write check.
-		raw := make([]byte, b.Size())
-		off := putMap(raw, b.Addresses)
-		putBool(raw[off:], b.Join)
-		putUint64(raw[off+8:], b.Type)
-		var decoded Bootstrap
-		if _, err := decoded.UnmarshalFrom(raw); !errors.Is(err, ErrAddressTooLong) {
-			t.Fatalf("UnmarshalFrom(hand-encoded): got %v, want ErrAddressTooLong", err)
-		}
-	})
-
-	t.Run("entry count over MaxMembershipEntries", func(t *testing.T) {
-		addrs := make(map[uint64]string, MaxMembershipEntries+1)
-		for i := uint64(0); i <= MaxMembershipEntries; i++ {
-			addrs[i+1] = "a"
-		}
-		b := Bootstrap{Addresses: addrs}
-		buf := make([]byte, b.Size())
-		if _, err := b.MarshalTo(buf); !errors.Is(err, ErrTooManyMembershipEntries) {
-			t.Fatalf("MarshalTo: got %v, want ErrTooManyMembershipEntries", err)
-		}
-	})
-
-	t.Run("the limits exactly are accepted", func(t *testing.T) {
-		b := Bootstrap{
-			Addresses: map[uint64]string{1: strings.Repeat("x", MaxAddressLength)},
-			Join:      true,
-			Type:      OnDiskStateMachine,
-		}
-		buf := make([]byte, b.Size())
-		n, err := b.MarshalTo(buf)
-		if err != nil {
-			t.Fatalf("MarshalTo at exactly MaxAddressLength: %v", err)
-		}
-		var decoded Bootstrap
-		if _, err := decoded.UnmarshalFrom(buf[:n]); err != nil {
-			t.Fatalf("UnmarshalFrom at exactly MaxAddressLength: %v", err)
-		}
-		assertBootstrapEqual(t, &b, &decoded)
 	})
 }
 

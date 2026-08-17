@@ -98,6 +98,20 @@ func sentinelTable() []sentinelClassification {
 		{"ErrTooManyWitnesses", ErrTooManyWitnesses, false},
 		{"ErrBreaksFullReplicaMajority", ErrBreaksFullReplicaMajority, false},
 		{"ErrRemoveLastFullReplica", ErrRemoveLastFullReplica, false},
+		// Membership validation rejections. Every one describes the request
+		// itself, not a condition on this host, so the IDENTICAL request fails
+		// forever: the caller must re-read the membership and build a
+		// different one.
+		{"ErrNodeNotFound", ErrNodeNotFound, false},
+		{"ErrNodeAlreadyExists", ErrNodeAlreadyExists, false},
+		{"ErrNodeRemoved", ErrNodeRemoved, false},
+		{"ErrRemoveLastVoter", ErrRemoveLastVoter, false},
+		{"ErrTooManyVotingMembers", ErrTooManyVotingMembers, false},
+		{"ErrZeroReplicaID", ErrZeroReplicaID, false},
+		{"ErrEmptyAddress", ErrEmptyAddress, false},
+		// A malformed health value in a decoded document does not become
+		// well-formed by decoding it again.
+		{"ErrInvalidShardHealth", ErrInvalidShardHealth, false},
 		{"ErrNonVotingRoleInMembers", ErrNonVotingRoleInMembers, false},
 		{"ErrImportLayoutUnknown", ErrImportLayoutUnknown, false},
 		{"ErrImportMembershipInvalid", ErrImportMembershipInvalid, false},

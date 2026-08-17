@@ -118,7 +118,7 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 		const legacyHeaderSize = 44
 		cmd := []byte("legacy")
 		rec := make([]byte, 1+legacyHeaderSize+len(cmd))
-		rec[0] = payloadTypeEntriesV1
+		rec[0] = 0x01                                             // retired entry payload type, pinned as a literal
 		binary.LittleEndian.PutUint64(rec[1:], 1)                 // shardID
 		binary.LittleEndian.PutUint64(rec[9:], 1)                 // replicaID
 		binary.LittleEndian.PutUint64(rec[17:], 1)                // index
@@ -128,8 +128,8 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 		copy(rec[45:], cmd)
 
 		_, _, err := s.replayRecord(rec, 0)
-		if !errors.Is(err, ErrLegacyEntryFormat) {
-			t.Fatalf("replayRecord(V1) err = %v, want ErrLegacyEntryFormat", err)
+		if !errors.Is(err, ErrUnknownPayloadType) {
+			t.Fatalf("replayRecord(0x01) err = %v, want ErrUnknownPayloadType", err)
 		}
 		if len(s.entries) != 0 {
 			t.Fatal("no entries must be replayed from a legacy record")
@@ -154,7 +154,7 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 			t.Fatalf("createSegment: %v", err)
 		}
 		payload := make([]byte, 1+44)
-		payload[0] = payloadTypeEntriesV1
+		payload[0] = 0x01                             // retired entry payload type, pinned as a literal
 		binary.LittleEndian.PutUint64(payload[1:], 0) // shardID 0 -> shard-0
 		binary.LittleEndian.PutUint64(payload[9:], 1) // replicaID
 		if _, err := seg.Write(payload); err != nil {
@@ -171,8 +171,8 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 		if err == nil {
 			t.Fatal("Open succeeded on a WAL with legacy entry records, want error")
 		}
-		if !errors.Is(err, ErrLegacyEntryFormat) {
-			t.Fatalf("Open err = %v, want ErrLegacyEntryFormat in chain", err)
+		if !errors.Is(err, ErrUnknownPayloadType) {
+			t.Fatalf("Open err = %v, want ErrUnknownPayloadType in chain", err)
 		}
 	})
 }

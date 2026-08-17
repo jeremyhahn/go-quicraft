@@ -123,7 +123,7 @@ func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 	peer, lr := newPiggybackFollower(t, ldb, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	// Cycle 1: the leader replicates entries 1-3 and commits nothing yet.
 	// Running them through the real processBatch is what makes indices 1-3
@@ -254,7 +254,7 @@ func TestPiggyback_FailedStatePersistKeepsStateUnacknowledged(t *testing.T) {
 	peer, lr := newPiggybackFollower(t, ldb, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	// Make entries 1-3 durable, leaving entriesToSave() empty. That matters:
 	// with unsaved entries present the ordered messages would be withheld by

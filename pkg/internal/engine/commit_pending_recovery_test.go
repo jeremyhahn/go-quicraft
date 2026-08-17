@@ -29,7 +29,7 @@ func newCommitPendingLeader(t *testing.T, sw *stepWorker, shardID, replicaID uin
 	peer, lr := newTestVoterPeer(t, shardID, replicaID, 3)
 	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 	granter := uint64(2)
 	if replicaID == 2 {
@@ -207,7 +207,7 @@ func TestEngine_UnloadNodeReleasesGlobalRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPeer: %v", err)
 	}
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// Charge the limiter: only a leader appends proposals to its in-memory log.

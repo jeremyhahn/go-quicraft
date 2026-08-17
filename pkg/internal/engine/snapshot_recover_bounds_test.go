@@ -85,7 +85,7 @@ func newRecoveryTestNode(t *testing.T, shardID, replicaID uint64,
 	if err != nil {
 		t.Fatalf("NewPeer: %v", err)
 	}
-	return NewNode(peer, nil, lr, cfg, 100, ss, t.TempDir(), nil), peer
+	return NewNode(peer, nil, lr, cfg, ss, t.TempDir(), nil), peer
 }
 
 // installSnapshotIntoLog advances the peer's committed AND processed markers

@@ -42,7 +42,7 @@ func TestRecovering_BlocksEntryApplication(t *testing.T) {
 	rsmSM := newTestApplier(goodSM)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Set recovering BEFORE sending the apply item. This simulates
 	// snapshot recovery starting before entries arrive.
@@ -130,7 +130,7 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 	// Create a node without a snapshotter -- recoverSnapshot returns
 	// nil immediately (no-op for witness nodes), but the recovering
 	// flag lifecycle is still exercised.
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Verify initial state.
 	if node.IsRecovering() {
@@ -195,7 +195,7 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	rsmSM := newTestApplier(goodSM)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Start the apply worker.
 	go aw.run()
@@ -286,7 +286,7 @@ func TestRecovering_StepWorkerSuppressesOnlyCommittedEntries(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 	tickPeerToLeader(peer)
 
@@ -386,7 +386,7 @@ func TestRecovering_FlagOnlySetsForRecoveryNotSave(t *testing.T) {
 	// Create a node without a snapshotter. For save requests, this
 	// will return early with an error (no snapshotter), but the
 	// recovering flag behavior is what we are testing.
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Submit a SAVE request (not recovery).
 	err := p.requestSnapshot(snapshotRequest{
@@ -437,7 +437,7 @@ func TestRecovering_SnapshotPoolSetsRecoveringBeforeExecution(t *testing.T) {
 	cfg.SetDefaults()
 
 	// Use a node without a snapshotter (recovery is a no-op).
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Submit recovery.
 	err := p.requestSnapshot(snapshotRequest{
@@ -488,7 +488,7 @@ func TestRecovering_WorkSignalNotifiedAfterRecovery(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Submit recovery.
 	err := p.requestSnapshot(snapshotRequest{
@@ -526,7 +526,7 @@ func TestRecovering_WorkSignalNotifiedAfterRecovery(t *testing.T) {
 // accessor methods and the initial state of the recovering flag.
 func TestRecovering_NodeAccessors(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Initial state should be false.
 	if node.IsRecovering() {
@@ -568,7 +568,7 @@ func TestRecovering_ApplyWorkerDoesNotParkEmptyBatch(t *testing.T) {
 	goodSM := newTestSM()
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, newTestApplier(goodSM), nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, newTestApplier(goodSM), nil, cfg, nil, "", nil)
 	node.SetRecovering(true)
 
 	go aw.run()
@@ -622,7 +622,7 @@ func TestRecovering_CommitWorkerSkipsPiggyback(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	node.SetRecovering(true)
 

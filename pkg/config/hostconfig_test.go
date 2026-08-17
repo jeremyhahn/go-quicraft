@@ -67,9 +67,6 @@ func TestHostConfig_SetDefaults(t *testing.T) {
 		if hc.ShutdownTimeout != DefaultShutdownTimeout {
 			t.Errorf("ShutdownTimeout = %v, want %v", hc.ShutdownTimeout, DefaultShutdownTimeout)
 		}
-		if hc.MaxApplyRetries != DefaultMaxApplyRetries {
-			t.Errorf("MaxApplyRetries = %d, want %d", hc.MaxApplyRetries, DefaultMaxApplyRetries)
-		}
 		if hc.MaxTotalInMemLogSize != 0 {
 			t.Errorf("MaxTotalInMemLogSize = %d, want 0 (disabled by default)", hc.MaxTotalInMemLogSize)
 		}
@@ -82,7 +79,6 @@ func TestHostConfig_SetDefaults(t *testing.T) {
 			MaxApplyWorkers:      4,
 			CommitCBufferSize:    128,
 			ShutdownTimeout:      10 * time.Second,
-			MaxApplyRetries:      50,
 			MaxTotalInMemLogSize: 2 * 1024 * 1024 * 1024,
 		}
 		hc.SetDefaults()
@@ -101,9 +97,6 @@ func TestHostConfig_SetDefaults(t *testing.T) {
 		}
 		if hc.ShutdownTimeout != 10*time.Second {
 			t.Errorf("ShutdownTimeout = %v, want 10s", hc.ShutdownTimeout)
-		}
-		if hc.MaxApplyRetries != 50 {
-			t.Errorf("MaxApplyRetries = %d, want 50", hc.MaxApplyRetries)
 		}
 		if hc.MaxTotalInMemLogSize != 2*1024*1024*1024 {
 			t.Errorf("MaxTotalInMemLogSize = %d, want %d", hc.MaxTotalInMemLogSize, 2*1024*1024*1024)
@@ -349,23 +342,6 @@ func TestHostConfig_Validate_ShutdownTimeout(t *testing.T) {
 	t.Run("valid ShutdownTimeout", func(t *testing.T) {
 		hc := validHostConfig()
 		hc.ShutdownTimeout = 5 * time.Second
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-}
-
-func TestHostConfig_Validate_MaxApplyRetries(t *testing.T) {
-	t.Run("zero MaxApplyRetries", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxApplyRetries = 0
-		err := hc.Validate()
-		assertValidationError(t, err, "MaxApplyRetries")
-	})
-
-	t.Run("valid MaxApplyRetries", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxApplyRetries = 1
 		if err := hc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
 		}

@@ -7821,9 +7821,9 @@ func TestFix21_Peer_Handle_InstallSnapshot_RejectedDoesNotSetPendingSnapshot(t *
 func TestSendAppend_UsesMaxReplicationPayload(t *testing.T) {
 	// Create a raft as leader with a small maxReplicationPayload so that
 	// sendAppend cannot fit all entries into one Replicate message. Each
-	// Entry has a fixed 60-byte header plus Cmd bytes. We set the payload
+	// Entry has a fixed 68-byte header plus Cmd bytes. We set the payload
 	// limit to 200 bytes and append entries with 100-byte commands, so
-	// each entry is 160 bytes. Two entries = 320 bytes > 200, meaning
+	// each entry is 168 bytes. Two entries = 336 bytes > 200, meaning
 	// the second entry should be excluded from the first batch (but the
 	// first entry always fits because limitEntrySize includes at least
 	// one entry).
@@ -7852,7 +7852,7 @@ func TestSendAppend_UsesMaxReplicationPayload(t *testing.T) {
 	}
 
 	// Append several entries with 100-byte commands. Each entry is
-	// 60 (header) + 100 (cmd) = 160 bytes. We need enough entries
+	// 68 (header) + 100 (cmd) = 168 bytes. We need enough entries
 	// so that the total exceeds 200 bytes (more than 1 entry).
 	totalEntries := 5
 	cmd := make([]byte, 100)
@@ -7904,7 +7904,7 @@ func TestSendAppend_UsesMaxReplicationPayload(t *testing.T) {
 
 	// The message should have fewer entries than the total available
 	// (totalEntries + 1 noop = totalEntries+1 entries starting from
-	// index 2). At 160 bytes per entry and 200 byte limit, only 1
+	// index 2). At 168 bytes per entry and 200 byte limit, only 1
 	// entry fits. limitEntrySize includes the first entry always,
 	// then stops when total exceeds maxSize.
 	availableEntries := r.log.lastIndex() - 1 // entries from index 2 onward
@@ -9285,7 +9285,7 @@ func TestHasConfigChangeToApplyBoundedScan(t *testing.T) {
 // TestSendAppendPipelining verifies that sendAppend sends multiple Replicate
 // messages in a single call when the follower is far behind and the inflight
 // window has capacity. With a small maxReplicationPayload (200 bytes) and
-// entries of 160 bytes each (60-byte header + 100-byte Cmd), each batch fits
+// entries of 168 bytes each (68-byte header + 100-byte Cmd), each batch fits
 // only one entry. With 5 entries to send, sendAppend should produce 5
 // Replicate messages filling the pipeline without waiting for acks.
 func TestSendAppendPipelining(t *testing.T) {
@@ -9307,7 +9307,7 @@ func TestSendAppendPipelining(t *testing.T) {
 		t.Fatal("expected leader state after election")
 	}
 
-	// Append 5 entries with 100-byte commands. Each entry is 160 bytes,
+	// Append 5 entries with 100-byte commands. Each entry is 168 bytes,
 	// so each batch holds exactly 1 entry at 200-byte payload limit.
 	totalEntries := 5
 	cmd := make([]byte, 100)
@@ -9416,7 +9416,7 @@ func TestSendAppendPipeliningStopsAtInflightLimit(t *testing.T) {
 
 	replicateMsgs := collectMessages(r, proto.Replicate)
 
-	// With a payload of 200 bytes and 160-byte entries, each batch holds
+	// With a payload of 200 bytes and 168-byte entries, each batch holds
 	// 1 entry. The inflight window capacity is 4, so we expect exactly 4
 	// Replicate messages — pipelining stops at the inflight limit.
 	if len(replicateMsgs) != 4 {

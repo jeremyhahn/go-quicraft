@@ -27,7 +27,6 @@ const (
 	DefaultMaxApplyWorkers      int           = 0 // 0 = auto = runtime.NumCPU()
 	DefaultCommitCBufferSize    int           = 64
 	DefaultShutdownTimeout      time.Duration = 30 * time.Second
-	DefaultMaxApplyRetries      uint64        = 100
 	DefaultMaxTotalInMemLogSize uint64        = 0
 )
 
@@ -142,10 +141,17 @@ type EventListener struct {
 	OnLeaderLost       func(info EventShardInfo)
 	OnCampaignLaunched func(info EventShardInfo)
 
-	// OnCampaignSkipped is called when an election is skipped because
-	// uncommitted config change entries exist between committed and
-	// lastIndex. Elections during membership transitions can violate
-	// the overlap guarantee.
+	// OnCampaignSkipped NEVER FIRES. A callback installed here is never
+	// called. The forwarding from the engine down to this field is complete
+	// and correct, but nothing in the engine invokes the hook it forwards,
+	// so no event is ever produced.
+	//
+	// It was intended to report an election the replica refused to start.
+	// Do NOT build alerting on it: the conditions it would report are the
+	// ones that leave a shard without a leader while quorum looks intact,
+	// and silence here is indistinguishable from health. Detect a
+	// leaderless shard with Host.GetLeaderID or ShardInfo.Health ==
+	// ShardNoLeader instead.
 	OnCampaignSkipped func(info EventShardInfo)
 
 	OnSnapshotRejected func(info SnapshotInfo)
@@ -299,10 +305,6 @@ type HostConfig struct {
 	// proposal timeouts. Never use in production.
 	NoSyncWAL bool
 
-	// MaxApplyRetries is the maximum consecutive SM.Apply() failures
-	// before the circuit breaker trips. Default: 100.
-	MaxApplyRetries uint64
-
 	// MaxTotalInMemLogSize is the maximum total in-memory log size across
 	// all shards. When exceeded, the global rate limiter rejects new
 	// proposals with ErrSystemBusy. Default: 0 (disabled).
@@ -368,9 +370,6 @@ func (hc *HostConfig) SetDefaults() {
 	if hc.ShutdownTimeout == 0 {
 		hc.ShutdownTimeout = DefaultShutdownTimeout
 	}
-	if hc.MaxApplyRetries == 0 {
-		hc.MaxApplyRetries = DefaultMaxApplyRetries
-	}
 	hc.TransportConfig.SetDefaults()
 	hc.LogConfig.SetDefaults()
 }
@@ -415,9 +414,6 @@ func (hc *HostConfig) Validate() error {
 	}
 	if hc.ShutdownTimeout <= 0 {
 		return newValidationError("ShutdownTimeout", "must be > 0")
-	}
-	if hc.MaxApplyRetries == 0 {
-		return newValidationError("MaxApplyRetries", "must be > 0")
 	}
 	if err := hc.TransportConfig.Validate(); err != nil {
 		return err

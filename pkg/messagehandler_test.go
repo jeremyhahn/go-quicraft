@@ -110,7 +110,7 @@ func newEngineNodeWithFullMembership(t *testing.T, shardID, replicaID uint64, ms
 	if err != nil {
 		t.Fatalf("NewPeer failed: %v", err)
 	}
-	return engine.NewNode(peer, nil, lr, cfg, 100, nil, t.TempDir(), nil)
+	return engine.NewNode(peer, nil, lr, cfg, nil, t.TempDir(), nil)
 }
 
 func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters map[uint64]string) *engine.Node {
@@ -135,7 +135,7 @@ func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters
 	// roots it at NodeHostDir/snapshots/shard-N). The inbound-snapshot receiver
 	// now derives its on-disk path from node.SnapshotSaveDir, so tests assert
 	// against that rather than a hardcoded NodeHostDir path.
-	return engine.NewNode(peer, nil, lr, cfg, 100, nil, t.TempDir(), nil)
+	return engine.NewNode(peer, nil, lr, cfg, nil, t.TempDir(), nil)
 }
 
 // TestHostMessageHandler_HandleMessage_AuthorizedMember verifies that

@@ -92,7 +92,7 @@ const (
 	// up quickly. This cache only suppresses re-queries; it never turns an
 	// unavailable result into "revoked" or "good".
 	//
-	// Soft-fail tradeoff: under EnforceRevocation=false, a cached unavailable
+	// Soft-fail tradeoff: under AllowSoftFail, a cached unavailable
 	// entry causes the peer to be accepted (status unknown). After the
 	// responder recovers and would report a cert as revoked, that revocation
 	// can go undetected for at most ocspUnavailableTTL (until the negative
@@ -101,8 +101,8 @@ const (
 	// definition no fresh verdict to act on. It is NOT a masking of a verdict
 	// already known to this checker — a definitive cached "revoked" (or
 	// "good") is never overwritten by a later unavailable result (see
-	// checkOCSPRaw). Under EnforceRevocation=true the cached unavailable entry
-	// fails closed regardless.
+	// checkOCSPRaw). Under enforcement the cached unavailable entry fails
+	// closed regardless.
 	ocspUnavailableTTL = 10 * time.Second
 
 	// revocationClockSkew is the allowance applied when comparing CRL/OCSP
@@ -149,10 +149,21 @@ type Config struct {
 	// Mode determines the revocation checking strategy. Default: "any".
 	Mode Mode
 
-	// EnforceRevocation rejects peers when revocation status is unknown
-	// (OCSP unreachable, no CRL). Default: false (soft-fail allows
-	// connections when revocation status cannot be determined).
-	EnforceRevocation bool
+	// AllowSoftFail, when true, admits a peer whose revocation status cannot
+	// be determined (OCSP responder unreachable, CRL stale or unreadable, no
+	// revocation source configured at all). A definitive "revoked" verdict
+	// still rejects regardless of this flag.
+	//
+	// THE ZERO VALUE ENFORCES. Fail-closed is intrinsic to this package: a
+	// Config nobody configured rejects unknown status, and soft-fail has to
+	// be asked for. Every construction path — Host, an embedding of the
+	// transport, a tool, a test — therefore inherits the safe posture, rather
+	// than the posture depending on one caller remembering to set a field.
+	//
+	// The name and sense match config.RevocationConfig.AllowSoftFail, which
+	// is the operator-facing knob, so the two layers cannot drift apart
+	// through a mistaken negation.
+	AllowSoftFail bool
 
 	// OnCertRevoked is called when a certificate is found to be revoked
 	// during a TLS handshake. The serial number is passed as a lowercase
@@ -160,10 +171,17 @@ type Config struct {
 	OnCertRevoked func(serial string)
 }
 
+// enforcing reports whether a revocation status that cannot be determined
+// must reject the peer. It is the inverse of AllowSoftFail, named for the
+// policy the call sites apply so none of them has to spell the negation.
+func (c *Config) enforcing() bool {
+	return !c.AllowSoftFail
+}
+
 // Validate reports whether the selected Mode has the sources it requires.
 // Call SetDefaults first. Without this check a mode can be silently
 // unsatisfiable: ModeBoth/ModeOCSP with no responder URL fails every
-// handshake under EnforceRevocation, and ModeCRL/ModeBoth with no CRL file
+// handshake under enforcement, and ModeCRL/ModeBoth with no CRL file
 // can never observe a file-published revocation.
 func (c *Config) Validate() error {
 	if !IsValidMode(c.Mode) {
@@ -187,7 +205,7 @@ func (c *Config) Validate() error {
 	// not revoked. Reject that only when enforcing — soft-fail is the
 	// documented opt-out for "revocation status may be unknown", which
 	// includes having no source at all.
-	if (c.Mode == ModeAny || c.Mode == "") && c.EnforceRevocation &&
+	if (c.Mode == ModeAny || c.Mode == "") && c.enforcing() &&
 		len(c.CRLPaths) == 0 && c.OCSPResponderURL == "" {
 		return ErrNoRevocationSources
 	}
@@ -241,7 +259,7 @@ type Checker struct {
 	// unparseable file). While false, the previous set keeps serving
 	// revocations (a stale "revoked" is still trustworthy) but a
 	// not-found result cannot be trusted as "not revoked"; under
-	// EnforceRevocation that surfaces as ErrCRLStale.
+	// enforcement that surfaces as ErrCRLStale.
 	crlCurrent bool
 
 	// ocspMu protects ocspCache.
@@ -418,7 +436,7 @@ func (c *Checker) reloadLoop() {
 // silently un-revoke every certificate listed in the unreadable file — a
 // transiently missing file, permission change, or NFS blip must never
 // widen access. A failed reload also marks the set as stale (see
-// crlCurrent), which EnforceRevocation surfaces as a handshake failure
+// crlCurrent), which enforcement surfaces as a handshake failure
 // until a reload succeeds. Because the loop re-runs every CheckInterval,
 // a CRL that passes its NextUpdate while loaded is detected within one
 // interval and the set goes stale — a frozen CRL file cannot serve an
@@ -484,7 +502,7 @@ func (c *Checker) ReloadCRLs() error {
 				return &CRLNotYetValidError{Path: path, ThisUpdate: crl.ThisUpdate}
 			}
 			// A CRL past NextUpdate no longer proves anything about serials
-			// it does not list; mark stale so EnforceRevocation fails closed
+			// it does not list; mark stale so enforcement fails closed
 			// until the CA publishes a fresh CRL. (The previous revoked set
 			// is kept: a stale "revoked" remains trustworthy.)
 			if !crl.NextUpdate.IsZero() && now.After(crl.NextUpdate.Add(revocationClockSkew)) {
@@ -590,11 +608,11 @@ func (c *Checker) RevokedCount() int {
 // IsRevoked checks whether the given certificate has been revoked.
 // Returns (true, nil) if revoked, (false, nil) if not revoked or status
 // unknown in soft-fail mode, or (false, error) if the status could not
-// be established and EnforceRevocation is true.
+// be established and the config enforces (AllowSoftFail is false).
 //
 // A "revoked" verdict from ANY consulted source always wins, in every
 // mode. "Unknown" (stale CRL, unreachable OCSP responder) is governed by
-// EnforceRevocation: fail closed when enforcing, accept when soft-fail.
+// AllowSoftFail: fail closed when enforcing, accept when soft-fail.
 func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
 	scope := c.scopeFor(cert)
@@ -605,8 +623,21 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 		if revoked {
 			return true, nil
 		}
-		if c.cfg.EnforceRevocation && crlErr != nil {
-			return false, crlErr
+		if c.cfg.enforcing() {
+			if crlErr != nil {
+				return false, crlErr
+			}
+			// No CRL file: this mode consulted nothing, so "not found" is
+			// not evidence of "not revoked" — checkCRLStatus cannot even
+			// report staleness without a path to go stale. Config.Validate
+			// rejects the combination up front; this is the runtime backstop
+			// for a checker constructed without it (or whose paths were lost
+			// in a refactor), so the gap surfaces as a handshake failure
+			// instead of admitting every revoked certificate in silence.
+			// ModeOCSP, ModeBoth and ModeAny already fail closed here.
+			if len(c.cfg.CRLPaths) == 0 {
+				return false, ErrNoRevocationSources
+			}
 		}
 		return false, nil
 
@@ -640,8 +671,8 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 			return true, nil
 		}
 		// Neither source reported revoked. Unknown status from either
-		// source is per EnforceRevocation.
-		if c.cfg.EnforceRevocation {
+		// source is per AllowSoftFail.
+		if c.cfg.enforcing() {
 			if crlErr != nil {
 				return false, crlErr
 			}
@@ -661,7 +692,7 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 			if ocspErr == nil && ocspRevoked {
 				return true, nil
 			}
-			if c.cfg.EnforceRevocation {
+			if c.cfg.enforcing() {
 				// Unknown from either source fails closed: a revocation
 				// could be hiding behind the stale CRL or the
 				// unreachable responder.
@@ -674,7 +705,7 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 			}
 			return false, nil
 		}
-		if c.cfg.EnforceRevocation {
+		if c.cfg.enforcing() {
 			if crlErr != nil {
 				return false, crlErr
 			}
@@ -723,9 +754,9 @@ func (c *Checker) checkCRLStatus(scope, serial string) (bool, error) {
 
 // checkOCSP queries the OCSP responder for the certificate's revocation
 // status, using the cache when available. When the OCSP check fails
-// (unreachable, no URL, no issuer cert), behavior depends on
-// EnforceRevocation: if true, returns the error (fail closed, including on a
-// negative-cache hit); if false (soft-fail), returns (false, nil).
+// (unreachable, no URL, no issuer cert), behavior depends on AllowSoftFail:
+// when unset (enforcing) it returns the error (fail closed, including on a
+// negative-cache hit); under soft-fail it returns (false, nil).
 //
 // In soft-fail mode an unavailable result accepts the peer, so a revocation
 // the responder would report only after it recovers can go undetected for at
@@ -736,7 +767,7 @@ func (c *Checker) checkCRLStatus(scope, serial string) (bool, error) {
 func (c *Checker) checkOCSP(cert *x509.Certificate) (bool, error) {
 	revoked, err := c.checkOCSPRaw(cert)
 	if err != nil {
-		if c.cfg.EnforceRevocation {
+		if c.cfg.enforcing() {
 			return false, err
 		}
 		return false, nil
@@ -926,7 +957,7 @@ func (c *Checker) queryOCSP(cert, issuerCert *x509.Certificate) (bool, time.Time
 	// must never be cached as one: doing so admits a leaf the responder does
 	// not know and pins that admission for the full cache TTL. Returning an
 	// error routes it through the short-TTL negative cache and fails closed
-	// under EnforceRevocation.
+	// under enforcement.
 	switch ocspResp.Status {
 	case ocsp.Revoked:
 		return true, ocspResp.NextUpdate, nil
@@ -953,7 +984,7 @@ func (c *Checker) ocspRequestTimeout() time.Duration {
 // time; since that gives a replayed response no expiry, a bounded maximum
 // age (ocspNoNextUpdateMaxAge) is applied instead. A stale or not-yet-valid
 // response returns a typed error so callers treat the status as
-// unavailable (fail-closed under EnforceRevocation), never as "good".
+// unavailable (fail-closed under enforcement), never as "good".
 func validateOCSPFreshness(resp *ocsp.Response, now time.Time) error {
 	if resp.ThisUpdate.IsZero() || now.Add(revocationClockSkew).Before(resp.ThisUpdate) {
 		return &OCSPResponseStaleError{
@@ -982,8 +1013,17 @@ func validateOCSPFreshness(resp *ocsp.Response, now time.Time) error {
 	return nil
 }
 
-// CfgRef returns a reference to the checker's config for wiring into the
-// TLS callback. This avoids copying the OnCertRevoked callback.
-func (c *Checker) CfgRef() *Config {
-	return &c.cfg
+// OnCertRevoked returns the configured revocation-notification callback, or nil
+// when none was set. It is the single field the TLS wiring needs from the
+// config.
+//
+// This deliberately returns the callback rather than a *Config. The previous
+// CfgRef handed out a mutable pointer to the checker's own config, so any
+// holder could flip AllowSoftFail on a live checker while IsRevoked was reading
+// it concurrently -- an unsynchronised write whose losing side is a silent
+// downgrade from fail-closed to fail-open. Nothing needed that reach: the only
+// caller wanted OnCertRevoked. Handing out the callback removes the write path
+// instead of documenting it.
+func (c *Checker) OnCertRevoked() func(string) {
+	return c.cfg.OnCertRevoked
 }

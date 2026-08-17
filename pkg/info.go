@@ -67,6 +67,12 @@ func (h ShardHealth) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON decodes a JSON string back into a ShardHealth value.
+//
+// An unrecognized string is rejected with *InvalidShardHealthError and leaves
+// the receiver untouched. It is NOT decoded to ShardHealthy: that is the zero
+// value and the most reassuring state this type has, so defaulting to it would
+// report a shard as healthy on the strength of a typo, a truncated payload, or
+// a health state a newer binary knows and this one does not.
 func (h *ShardHealth) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -74,8 +80,7 @@ func (h *ShardHealth) UnmarshalJSON(data []byte) error {
 	}
 	v, ok := shardHealthValues[s]
 	if !ok {
-		*h = ShardHealthy
-		return nil
+		return &InvalidShardHealthError{Value: s}
 	}
 	*h = v
 	return nil

@@ -376,9 +376,10 @@ type Config struct {
 
 	// RevocationConfig holds optional certificate revocation checking
 	// configuration. When non-nil, a revocation.Checker is created and
-	// wired into the TLS VerifyPeerCertificate callback to reject
-	// revoked peer certificates during handshake. CRL files are
-	// periodically reloaded from disk for hot-reload support.
+	// wired into the TLS VerifyConnection callback to reject revoked peer
+	// certificates. VerifyConnection, not VerifyPeerCertificate: the latter
+	// is skipped on resumed sessions, so resumption would bypass revocation.
+	// CRL files are periodically reloaded from disk for hot-reload support.
 	RevocationConfig *revocation.Config
 
 	// EventListener holds optional event callbacks for connection and

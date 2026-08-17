@@ -72,7 +72,7 @@ func newRecoverFixture(t *testing.T, payload []byte, recordedSize uint64) *recov
 	pool := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
 	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
 	ss := newSnapshotTestSnapshotter(0)
-	node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 
 	return &recoverFixture{
 		pool:     pool,
@@ -247,7 +247,7 @@ func newSaveFixtureWithMembership(
 	t.Cleanup(func() { close(stopC) })
 	pool := newSnapshotPool(2, newSnapshotTestLogDB(), nil, nil, nil, stopC, nil)
 	ss := newSnapshotTestSnapshotter(lastApplied)
-	node := NewNode(peer, nil, lr, cfg, 0, ss, t.TempDir(), nil)
+	node := NewNode(peer, nil, lr, cfg, ss, t.TempDir(), nil)
 
 	return pool, snapshotRequest{
 		shardID: shardID, replicaID: replicaID, node: node, save: true,

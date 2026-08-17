@@ -57,36 +57,6 @@ func TestApplyError_Unwrap(t *testing.T) {
 	}
 }
 
-func TestCircuitBreakerError_Error(t *testing.T) {
-	inner := errors.New("permanent failure")
-	e := &CircuitBreakerError{
-		ShardID:          5,
-		ReplicaID:        6,
-		ConsecutiveFails: 100,
-		LastErr:          inner,
-	}
-	msg := e.Error()
-	if !contains(msg, "circuit breaker") || !contains(msg, "shard 5") {
-		t.Fatalf("error message missing expected content: %s", msg)
-	}
-}
-
-func TestCircuitBreakerError_Is(t *testing.T) {
-	inner := errors.New("failure")
-	e := &CircuitBreakerError{LastErr: inner}
-	if !errors.Is(e, ErrShardFailed) {
-		t.Fatal("expected CircuitBreakerError to match ErrShardFailed")
-	}
-}
-
-func TestCircuitBreakerError_Unwrap(t *testing.T) {
-	inner := errors.New("failure")
-	e := &CircuitBreakerError{LastErr: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
 func TestSnapshotDuplicateError_Error(t *testing.T) {
 	e := &SnapshotDuplicateError{ShardID: 10}
 	msg := e.Error()

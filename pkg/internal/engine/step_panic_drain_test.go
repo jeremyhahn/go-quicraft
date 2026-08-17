@@ -64,7 +64,8 @@ func TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker(t *testin
 	for i := range queued {
 		shardID := uint64(i + 1)
 		node := NewNode(nil, nil, nil, config.Config{ShardID: shardID, ReplicaID: 1},
-			100, nil, "", nil)
+			nil, "", nil)
+
 		e.LoadNode(node)
 		node.commitPending.Store(true)
 		item := sw.getCommitSlot(shardID)
@@ -78,7 +79,8 @@ func TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker(t *testin
 	// sent. Nothing else will ever clear it.
 	midShard := uint64(4)
 	midNode := NewNode(nil, nil, nil, config.Config{ShardID: midShard, ReplicaID: 1},
-		100, nil, "", nil)
+		nil, "", nil)
+
 	e.LoadNode(midNode)
 	midNode.commitPending.Store(true)
 	sw.enqueuingNode = midNode

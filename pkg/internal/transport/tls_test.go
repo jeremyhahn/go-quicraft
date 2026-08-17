@@ -443,8 +443,11 @@ func TestVerifyConnectionAcceptsGood(t *testing.T) {
 	block, _ := pem.Decode(caCertPEM)
 	caCert, _ := x509.ParseCertificate(block.Bytes)
 
+	// No CRL file is configured, so soft-fail is what makes "no serial added"
+	// an admission: an enforcing checker with nothing to consult rejects.
 	checker := revocation.NewChecker(revocation.Config{
-		Mode: revocation.ModeCRL,
+		Mode:          revocation.ModeCRL,
+		AllowSoftFail: true,
 	}, caCert)
 	// No serials added -- all certs are good.
 

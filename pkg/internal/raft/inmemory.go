@@ -34,7 +34,7 @@ const (
 )
 
 // getEntrySliceInMemSize returns the total in-memory size of the given
-// entry slice. This includes the fixed header (60 bytes per entry) and
+// entry slice. This includes the fixed header (68 bytes per entry) and
 // the variable-length Cmd payload.
 func getEntrySliceInMemSize(entries []proto.Entry) uint64 {
 	if len(entries) == 0 {

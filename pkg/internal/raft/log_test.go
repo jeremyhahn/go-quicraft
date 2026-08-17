@@ -336,7 +336,7 @@ func TestRaftLog_Entries_WithSizeLimit(t *testing.T) {
 	}
 	l := newTestRaftLog(entries)
 
-	// Size of one entry: entryHeaderSize + 100 = 160 bytes.
+	// Size of one entry: entryHeaderSize + 100 = 168 bytes.
 	// Request maxSize that fits ~2 entries.
 	result, err := l.entries(1, 4, 300)
 	if err != nil {
@@ -1070,8 +1070,8 @@ func TestRaftLog_LimitEntrySize_LimitsCorrectly(t *testing.T) {
 		{Index: 2, Term: 1, Cmd: make([]byte, 100)},
 		{Index: 3, Term: 1, Cmd: make([]byte, 100)},
 	}
-	// Each entry is entryHeaderSize + 100 = 160 bytes.
-	// Limit to 250 bytes: first entry (160) fits, second would push to 320.
+	// Each entry is entryHeaderSize + 100 = 168 bytes.
+	// Limit to 250 bytes: first entry (168) fits, second would push to 336.
 	result := limitEntrySize(entries, 250)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 entry with limit 250, got %d", len(result))

@@ -401,11 +401,19 @@ func firstDecodableAt(t *testing.T, path string, from int64) (int64, int) {
 // that hold the old bytes are wiped. A bump here is therefore never the right
 // response to a framing change before 1.0, and this is what says so at the one
 // place a bump would be typed.
+//
+// That policy needs each layout change to stay detectable, and detection lives
+// at the RECORD level: a format whose layout changes retires its payload-type
+// byte and takes a new one, so the old byte is refused by name on replay (see
+// payloadTypeEntriesV2 and payloadTypeSnapshotV4). A 0.4.x directory passes the
+// marker gate — both builds record 1 — and is refused at its first legacy
+// record. Reaching for this constant instead is what this test exists to stop.
 func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 	if walFormatVersion != 1 {
 		t.Fatalf("walFormatVersion = %d, want 1: every format is pinned at 1 until "+
 			"the first production release, and a pre-release framing change is made "+
-			"IN PLACE rather than by bumping this constant (see "+
+			"IN PLACE, with detection carried by retiring the record's payload-type "+
+			"byte rather than by bumping this constant (see "+
 			"docs/operations/compatibility.md)", walFormatVersion)
 	}
 }
@@ -426,6 +434,8 @@ func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 // ceiling. A gate written as a range would pass a one-sided test while silently
 // admitting the other side.
 func TestOpen_ForeignFormatVersionIsRefusedByName(t *testing.T) {
+	// 1 leads the sweep: it is the version 0.4.x stamped, so it is the one
+	// foreign value a real operator will actually present to this build.
 	for _, recorded := range []uint32{0, 2, 3, 5, 255, 1 << 16, math.MaxUint32} {
 		t.Run("version_"+itoa(int(recorded)), func(t *testing.T) {
 			if recorded == walFormatVersion {

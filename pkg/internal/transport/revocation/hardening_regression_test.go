@@ -31,16 +31,21 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestValidateRejectsEnforcedRevocationWithoutSource pins the fail-closed
-// default. RevocationConfig{} selects ModeAny and enforcement, and ModeAny
-// names no specific source, so the per-mode source checks never fire: the
-// checker consults nothing and reports EVERY certificate as not revoked for
-// the process lifetime, with no error, log or metric.
+// default. Config{} selects ModeAny, and the zero value of AllowSoftFail
+// ENFORCES; ModeAny names no specific source, so the per-mode source checks
+// never fire and, without this rejection, the checker would consult nothing
+// and report EVERY certificate as not revoked for the process lifetime, with
+// no error, log or metric.
+//
+// Neither case mentions AllowSoftFail. Enforcement is what the zero value
+// means, and spelling it out here would hide a regression that quietly
+// restored the old soft-fail default.
 func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 	for _, mode := range []Mode{"", ModeAny} {
-		cfg := Config{Mode: mode, EnforceRevocation: true}
+		cfg := Config{Mode: mode}
 		cfg.SetDefaults()
 		if err := cfg.Validate(); !errors.Is(err, ErrNoRevocationSources) {
-			t.Fatalf("Mode %q enforcing with no CRL and no responder: Validate() = %v, want ErrNoRevocationSources", mode, err)
+			t.Fatalf("Mode %q with no CRL and no responder: Validate() = %v, want ErrNoRevocationSources", mode, err)
 		}
 	}
 }
@@ -51,10 +56,10 @@ func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 // mode that DOES name a source stays valid.
 func TestValidateKeepsNoRevocationOptOutUsable(t *testing.T) {
 	cases := []Config{
-		{},              // soft-fail, no source
-		{Mode: ModeAny}, // soft-fail, no source
-		{Mode: ModeAny, EnforceRevocation: true, CRLPaths: []string{"/tmp/x.crl"}},
-		{Mode: ModeAny, EnforceRevocation: true, OCSPResponderURL: "http://ocsp.example"},
+		{AllowSoftFail: true},                // opted into soft-fail, no source
+		{Mode: ModeAny, AllowSoftFail: true}, // opted into soft-fail, no source
+		{Mode: ModeAny, CRLPaths: []string{"/tmp/x.crl"}},
+		{Mode: ModeAny, OCSPResponderURL: "http://ocsp.example"},
 	}
 	for i, cfg := range cases {
 		cfg.SetDefaults()
@@ -68,11 +73,15 @@ func TestValidateKeepsNoRevocationOptOutUsable(t *testing.T) {
 // built without Validate (or whose CRLPaths were dropped in a refactor): the
 // enforcing ModeAny path must surface the missing source instead of returning
 // "not revoked" for every certificate.
+//
+// The Config is left entirely zero-valued, so this is also the assertion that
+// the ZERO VALUE ENFORCES, made on observable behaviour: were the default to
+// revert to soft-fail, IsRevoked would return (false, nil) here.
 func TestIsRevokedFailsClosedWithoutSource(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 4242)
 
-	checker := NewChecker(Config{EnforceRevocation: true}, ca.cert)
+	checker := NewChecker(Config{}, ca.cert)
 	revoked, err := checker.IsRevoked(leaf)
 	if revoked {
 		t.Fatal("no source configured: nothing can report a certificate revoked")
@@ -88,7 +97,7 @@ func TestIsRevokedSoftFailWithoutSourceAdmits(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 4243)
 
-	checker := NewChecker(Config{EnforceRevocation: false}, ca.cert)
+	checker := NewChecker(Config{AllowSoftFail: true}, ca.cert)
 	revoked, err := checker.IsRevoked(leaf)
 	if err != nil {
 		t.Fatalf("soft-fail with no source must admit: %v", err)
@@ -105,7 +114,7 @@ func TestIsRevokedWithoutSourceStillHonoursProgrammaticRevocation(t *testing.T) 
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 4244)
 
-	checker := NewChecker(Config{EnforceRevocation: true}, ca.cert)
+	checker := NewChecker(Config{}, ca.cert)
 	checker.AddRevokedSerial(leaf.SerialNumber.Text(16))
 
 	revoked, err := checker.IsRevoked(leaf)
@@ -114,6 +123,94 @@ func TestIsRevokedWithoutSourceStillHonoursProgrammaticRevocation(t *testing.T) 
 	}
 	if !revoked {
 		t.Fatal("programmatically revoked serial reported as not revoked")
+	}
+}
+
+// sourcelessModes lists every mode together with the typed error an enforcing
+// checker owes when that mode has nothing to consult. It is one table rather
+// than one test per mode because the property under test is the CONSISTENCY:
+// a mode that quietly stops failing closed is a hole exactly the size of the
+// mode, and ModeCRL was such a hole — checkCRLStatus reports staleness only
+// when CRLPaths is non-empty, so ModeCRL with no path consulted nothing and
+// answered "not revoked" for every certificate.
+var sourcelessModes = []struct {
+	mode Mode
+	want error
+}{
+	{ModeCRL, ErrNoRevocationSources},
+	{ModeOCSP, ErrOCSPUnavailable},
+	{ModeBoth, ErrOCSPUnavailable},
+	{ModeAny, ErrNoRevocationSources},
+	{"", ErrNoRevocationSources}, // the empty string selects ModeAny
+}
+
+// TestIsRevokedFailsClosedInEveryModeWithoutSource pins that no mode admits a
+// peer it could not check. None of these configs sets AllowSoftFail, so the
+// test also fails if the zero value ever means soft-fail again.
+func TestIsRevokedFailsClosedInEveryModeWithoutSource(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 4246)
+
+	for _, tc := range sourcelessModes {
+		checker := NewChecker(Config{Mode: tc.mode}, ca.cert)
+		revoked, err := checker.IsRevoked(leaf)
+		if revoked {
+			t.Fatalf("mode %q: nothing was consulted, so nothing can report a certificate revoked", tc.mode)
+		}
+		if !errors.Is(err, tc.want) {
+			t.Fatalf("mode %q with no source: IsRevoked error = %v, want %v", tc.mode, err, tc.want)
+		}
+	}
+}
+
+// TestIsRevokedSoftFailAdmitsInEveryModeWithoutSource is the positive control
+// for the table above: the same sourceless configs admit the peer once
+// soft-fail is asked for. Without it, a checker that simply refused every
+// certificate would satisfy the fail-closed assertions.
+func TestIsRevokedSoftFailAdmitsInEveryModeWithoutSource(t *testing.T) {
+	ca := newTestCA(t)
+	leaf := ca.issueLeaf(t, 4247)
+
+	for _, tc := range sourcelessModes {
+		checker := NewChecker(Config{Mode: tc.mode, AllowSoftFail: true}, ca.cert)
+		revoked, err := checker.IsRevoked(leaf)
+		if err != nil {
+			t.Fatalf("mode %q under soft-fail must admit an unknown-status peer: %v", tc.mode, err)
+		}
+		if revoked {
+			t.Fatalf("mode %q: nothing revoked this certificate", tc.mode)
+		}
+	}
+}
+
+// TestIsRevokedModeCRLWithSourceStillAdmits keeps the ModeCRL backstop from
+// degenerating into a blanket rejection: an enforcing checker with a CRL that
+// loaded successfully must still admit a certificate the CRL does not list.
+func TestIsRevokedModeCRLWithSourceStillAdmits(t *testing.T) {
+	ca := newTestCA(t)
+	revokedLeaf := ca.issueLeaf(t, 4248)
+	cleanLeaf := ca.issueLeaf(t, 4249)
+
+	path := writeCRLFile(t, t.TempDir(), "published.crl.pem", ca.createCRL(t, 4248))
+	checker := NewChecker(Config{Mode: ModeCRL, CRLPaths: []string{path}}, ca.cert)
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+
+	revoked, err := checker.IsRevoked(cleanLeaf)
+	if err != nil {
+		t.Fatalf("a loaded CRL is a source; an unlisted certificate must be admitted: %v", err)
+	}
+	if revoked {
+		t.Fatal("the CRL does not list this certificate")
+	}
+
+	revoked, err = checker.IsRevoked(revokedLeaf)
+	if err != nil {
+		t.Fatalf("IsRevoked(revokedLeaf): %v", err)
+	}
+	if !revoked {
+		t.Fatal("a certificate listed on the loaded CRL must be reported revoked")
 	}
 }
 
@@ -254,7 +351,6 @@ func TestOCSPCacheScopedToIssuingCA(t *testing.T) {
 		OCSPResponderURL:   server.URL,
 		OCSPCacheSeconds:   3600,
 		OCSPTimeoutSeconds: 5,
-		EnforceRevocation:  true,
 	}, root.cert, interA.cert, interB.cert)
 
 	// Populate the cache with interA's "good" verdict first.

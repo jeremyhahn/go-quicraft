@@ -684,7 +684,7 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 	saveShard := func(p *snapshotPool, shardID, replicaID, state uint64) {
 		ss := newSnapshotTestSnapshotter(state)
 		cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-		node := NewNode(nil, nil, nil, cfg, state, ss, baseDir, nil)
+		node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 		if err := p.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node, save: true}); err != nil {
 			t.Fatalf("save request (shard %d): %v", shardID, err)
 		}
@@ -721,7 +721,7 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 	recoverShard := func(p *snapshotPool, shardID, replicaID, wantState uint64) {
 		ss := newSnapshotTestSnapshotter(0)
 		cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-		node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+		node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 		if err := p.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node, save: false}); err != nil {
 			t.Fatalf("recover request (shard %d): %v", shardID, err)
 		}

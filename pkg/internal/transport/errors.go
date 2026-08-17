@@ -267,7 +267,8 @@ func (e *ChunkFilepathTooLongError) Is(target error) bool {
 }
 
 // ChunkDataTooLargeError is returned when a deserialized snapshot chunk's
-// Data payload exceeds the maximum allowed size (64MB).
+// Data payload exceeds the maximum allowed size
+// (proto.MaxSnapshotChunkDataLen, 8MB).
 type ChunkDataTooLargeError struct {
 	ShardID uint64
 	Length  int

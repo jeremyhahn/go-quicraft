@@ -68,7 +68,7 @@ func TestSavingGateQuiescesApplies(t *testing.T) {
 
 	probe := &gateProbeSM{}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, probe, nil, cfg, 10, nil, "", nil)
+	node := NewNode(nil, probe, nil, cfg, nil, "", nil)
 
 	runDone := make(chan struct{})
 	go func() {
@@ -156,7 +156,7 @@ func TestSavingGateAndDrainConsistency(t *testing.T) {
 
 	probe := &gateProbeSM{}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, probe, nil, cfg, 10, nil, "", nil)
+	node := NewNode(nil, probe, nil, cfg, nil, "", nil)
 
 	runDone := make(chan struct{})
 	go func() {
@@ -236,7 +236,7 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 
 	rec := &countingSM{}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rec, nil, cfg, 10, nil, "", nil)
+	node := NewNode(nil, rec, nil, cfg, nil, "", nil)
 
 	runDone := make(chan struct{})
 	go func() {

@@ -16,9 +16,94 @@ package quicraft
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// allShardHealthValues is every ShardHealth the type defines. A round-trip
+// test that enumerates a subset silently stops covering whatever is added
+// next, which is how ShardRecovering and ShardSnapshotting reached the type
+// with no JSON coverage at all.
+var allShardHealthValues = []ShardHealth{
+	ShardHealthy,
+	ShardNoLeader,
+	ShardLagging,
+	ShardUnloaded,
+	ShardError,
+	ShardRecovering,
+	ShardSnapshotting,
+}
+
+// TestShardHealth_JSONRoundTrip pins that MarshalJSON and UnmarshalJSON agree
+// for EVERY value the type defines, and that the name tables are complete in
+// both directions.
+func TestShardHealth_JSONRoundTrip(t *testing.T) {
+	if len(shardHealthNames) != len(allShardHealthValues) ||
+		len(shardHealthValues) != len(allShardHealthValues) {
+		t.Fatalf("name tables hold %d/%d entries, want %d: a value was added without its JSON mapping",
+			len(shardHealthNames), len(shardHealthValues), len(allShardHealthValues))
+	}
+	for _, want := range allShardHealthValues {
+		data, err := json.Marshal(want)
+		if err != nil {
+			t.Fatalf("MarshalJSON(%d): %v", want, err)
+		}
+		if string(data) == `""` {
+			t.Fatalf("MarshalJSON(%d) produced an empty name; the value has no shardHealthNames entry", want)
+		}
+		var got ShardHealth
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("UnmarshalJSON(%s): %v", data, err)
+		}
+		if got != want {
+			t.Errorf("round trip of %d through %s = %d, want %d", want, data, got, want)
+		}
+	}
+}
+
+// TestShardHealth_UnmarshalJSONFailsClosed pins the direction an unrecognized
+// health value must fail in.
+//
+// ShardHealthy is the ZERO value, so decoding an unknown string to it is a
+// fail-open on a health signal: a typo in a monitoring payload, a truncated
+// field, or a state a newer binary knows and this one does not all read back as
+// "this shard is fine". The decode must refuse and leave the receiver alone.
+func TestShardHealth_UnmarshalJSONFailsClosed(t *testing.T) {
+	for _, s := range []string{"", "healty", "HEALTHY", "unknown-value", "0"} {
+		data, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("marshal fixture %q: %v", s, err)
+		}
+		h := ShardError
+		err = h.UnmarshalJSON(data)
+		if !errors.Is(err, ErrInvalidShardHealth) {
+			t.Errorf("UnmarshalJSON(%s) = %v, want ErrInvalidShardHealth", data, err)
+		}
+		var invalid *InvalidShardHealthError
+		if !errors.As(err, &invalid) || invalid.Value != s {
+			t.Errorf("UnmarshalJSON(%s) error does not carry the offending value %q: %v", data, s, err)
+		}
+		if h != ShardError {
+			t.Errorf("UnmarshalJSON(%s) overwrote the receiver with %v; a refused decode must not assign", data, h)
+		}
+	}
+}
+
+// TestShardInfo_HealthFieldFailsClosed pins that the refusal survives at the
+// level a monitoring tool actually decodes: a whole ShardInfo document. Without
+// this, a per-value test can pass while the enclosing struct swallows the
+// error and hands back a ShardInfo reporting a healthy shard.
+func TestShardInfo_HealthFieldFailsClosed(t *testing.T) {
+	var info ShardInfo
+	err := json.Unmarshal([]byte(`{"shard_id":7,"health":"healty"}`), &info)
+	if !errors.Is(err, ErrInvalidShardHealth) {
+		t.Fatalf("decoding a ShardInfo with a misspelled health = %v, want ErrInvalidShardHealth", err)
+	}
+	if info.Health != ShardHealthy {
+		t.Fatalf("Health = %v, want the untouched zero value", info.Health)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // ShardHealth constants
@@ -66,6 +151,8 @@ func TestShardHealth_String(t *testing.T) {
 		{ShardLagging, "lagging"},
 		{ShardUnloaded, "unloaded"},
 		{ShardError, "error"},
+		{ShardRecovering, "recovering"},
+		{ShardSnapshotting, "snapshotting"},
 	}
 
 	for _, tc := range tests {
@@ -305,7 +392,10 @@ func TestShardHealth_UnmarshalJSON(t *testing.T) {
 		{`"lagging"`, ShardLagging},
 		{`"unloaded"`, ShardUnloaded},
 		{`"error"`, ShardError},
-		{`"unknown"`, ShardHealthy}, // unknown defaults to healthy
+		{`"recovering"`, ShardRecovering},
+		{`"snapshotting"`, ShardSnapshotting},
+		// An unknown name is NOT in this table: it is refused, not decoded.
+		// See TestShardHealth_UnmarshalJSONFailsClosed.
 	}
 
 	for _, tc := range tests {
@@ -315,22 +405,6 @@ func TestShardHealth_UnmarshalJSON(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("UnmarshalJSON(%s) = %v, want %v", tc.input, got, tc.want)
-		}
-	}
-}
-
-func TestShardHealth_JSONRoundTrip(t *testing.T) {
-	for _, h := range []ShardHealth{ShardHealthy, ShardNoLeader, ShardLagging, ShardUnloaded, ShardError} {
-		data, err := json.Marshal(h)
-		if err != nil {
-			t.Fatalf("Marshal(%v) error: %v", h, err)
-		}
-		var got ShardHealth
-		if err := json.Unmarshal(data, &got); err != nil {
-			t.Fatalf("Unmarshal(%s) error: %v", data, err)
-		}
-		if got != h {
-			t.Errorf("round-trip: got %v, want %v", got, h)
 		}
 	}
 }
@@ -345,6 +419,8 @@ func TestShardHealth_MarshalJSON(t *testing.T) {
 		{ShardLagging, `"lagging"`},
 		{ShardUnloaded, `"unloaded"`},
 		{ShardError, `"error"`},
+		{ShardRecovering, `"recovering"`},
+		{ShardSnapshotting, `"snapshotting"`},
 	}
 
 	for _, tc := range tests {

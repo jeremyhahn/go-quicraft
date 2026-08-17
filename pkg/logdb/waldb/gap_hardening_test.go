@@ -121,7 +121,7 @@ func findRawShardRecord(t *testing.T, walDir string, shardIdx int, payloadType b
 func TestOpenFailsOnTruncatedEntryBatch(t *testing.T) {
 	dir := t.TempDir()
 
-	// Payload type + 40 garbage bytes: shorter than the 76-byte entry header.
+	// Payload type + 40 garbage bytes: shorter than the 84-byte entry header.
 	payload := make([]byte, 1+40)
 	payload[0] = payloadTypeEntries
 	writeRawShardRecord(t, dir, 1, payload)
@@ -398,13 +398,13 @@ func TestReencryptPropagatesCompactionFloor(t *testing.T) {
 // TestOpenFailsOnLegacySnapshotFormat verifies that a snapshot record with
 // the reserved V1 payload type fails recovery with ErrLegacySnapshotFormat
 // instead of soft-skipping it and booting the node with empty membership.
-func TestOpenFailsOnLegacySnapshotFormat(t *testing.T) {
+func TestOpenFailsOnRetiredSnapshotPayloadType0x03(t *testing.T) {
 	dir := t.TempDir()
 
 	// A V1-layout snapshot record: base header + zero fpLen + old membership
 	// section (ConfigChangeID + four empty map counts, no witness fields).
 	payload := make([]byte, 1+snapshotRecordBaseSize+8+4*4)
-	payload[0] = payloadTypeSnapshotV1
+	payload[0] = 0x03                               // retired snapshot payload type, pinned as a literal
 	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
 	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
 	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
@@ -412,24 +412,24 @@ func TestOpenFailsOnLegacySnapshotFormat(t *testing.T) {
 	writeRawShardRecord(t, dir, 1, payload)
 
 	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if !errors.Is(err, ErrLegacySnapshotFormat) {
-		t.Fatalf("Open = %v, want ErrLegacySnapshotFormat", err)
+	if !errors.Is(err, ErrUnknownPayloadType) {
+		t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
 	}
 }
 
-// TestOpenFailsOnLegacySnapshotFormatV2 verifies that a snapshot record in
-// the witness-policy (V2) layout — whose membership section has no version
-// byte — fails recovery with ErrLegacySnapshotFormatV2 instead of being
-// parsed with the current layout, which would consume the ConfigChangeID
-// low byte as a version byte and shift every later field.
-func TestOpenFailsOnLegacySnapshotFormatV2(t *testing.T) {
+// TestOpenFailsOnRetiredSnapshotPayloadType0x08 verifies that a snapshot
+// record carrying the retired 0x08 payload type fails recovery with
+// ErrUnknownPayloadType instead of being parsed with the current layout, which
+// would consume the ConfigChangeID low byte as a version byte and shift every
+// later field.
+func TestOpenFailsOnRetiredSnapshotPayloadType0x08(t *testing.T) {
 	dir := t.TempDir()
 
 	// A V2-layout snapshot record: base header + zero fpLen + membership
 	// section without the leading version byte
 	// (ConfigChangeID + MaxWitnesses + PolicyFlags + four empty map counts).
 	payload := make([]byte, 1+snapshotRecordBaseSize+8+8+1+4*4)
-	payload[0] = payloadTypeSnapshotV2
+	payload[0] = 0x08                               // retired snapshot payload type, pinned as a literal
 	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
 	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
 	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
@@ -437,8 +437,8 @@ func TestOpenFailsOnLegacySnapshotFormatV2(t *testing.T) {
 	writeRawShardRecord(t, dir, 1, payload)
 
 	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if !errors.Is(err, ErrLegacySnapshotFormatV2) {
-		t.Fatalf("Open = %v, want ErrLegacySnapshotFormatV2", err)
+	if !errors.Is(err, ErrUnknownPayloadType) {
+		t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
 	}
 }
 

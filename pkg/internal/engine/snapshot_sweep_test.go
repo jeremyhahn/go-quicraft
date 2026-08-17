@@ -175,7 +175,7 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
 	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
 	ss := newSnapshotTestSnapshotter(0)
-	node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 
 	if err := p.recoverSnapshot(snapshotRequest{
 		shardID: shardID, replicaID: replicaID, node: node, save: false,
@@ -308,7 +308,7 @@ func TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock(t *testing.T) {
 
 			cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
 			ss := newSnapshotTestSnapshotter(0)
-			node := NewNode(nil, nil, nil, cfg, 0, ss, baseDir, nil)
+			node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
 
 			if err := p.recoverSnapshot(snapshotRequest{
 				shardID: shardID, replicaID: replicaID, node: node, save: false,

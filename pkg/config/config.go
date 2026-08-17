@@ -360,9 +360,16 @@ type Config struct {
 	// Default: 8 MB.
 	MaxEntrySize uint64
 
-	// MaxApplyEntrySize is the maximum total bytes of entries in a single
-	// SM.Update() call. It also bounds the leader's replication payload, so it
-	// can never exceed MaxReplicationPayloadBytes.
+	// MaxApplyEntrySize bounds the leader's replication payload: it is wired
+	// to raft's maxReplicationPayload and nothing else, so it caps the entries
+	// carried by one outbound Replicate message. It can never exceed
+	// MaxReplicationPayloadBytes.
+	//
+	// Despite the name it does NOT bound a single SM.Update() call. The apply
+	// batch is bounded by maxEntriesToApplySize, a fixed 64 MiB constant in
+	// pkg/internal/raft/log.go that no configuration feeds. The two are
+	// independent limits on different things, and reading this field as an
+	// apply-batch bound has repeatedly misled both readers and source comments.
 	//
 	// Default: MaxReplicationPayloadBytes (16711672 bytes, ~15.94 MB). NOT
 	// 64 MB — validateSizeLimits refuses anything above the replication bound,

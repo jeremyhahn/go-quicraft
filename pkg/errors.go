@@ -127,8 +127,12 @@ var (
 	// a shard that is already running on this host.
 	ErrShardAlreadyExists = errors.New("quicraft: shard already exists")
 
-	// ErrShardFailed is returned when the state machine circuit breaker
-	// has tripped due to repeated apply failures.
+	// ErrShardFailed is returned when the shard's failure latch has tripped
+	// and the shard is offline until it is reloaded or recovered from a
+	// snapshot. Apply is fail-fast: the FIRST failure latches, and there is
+	// no retry count to configure. An SM.Update that returns an error instead
+	// reaches the caller wrapping the state machine's own error, which is the
+	// more specific answer.
 	ErrShardFailed = errors.New("quicraft: shard failed (SM circuit breaker tripped)")
 
 	// ErrInvalidConfig is returned when a configuration value fails
@@ -317,9 +321,17 @@ var (
 )
 
 // Membership validation sentinels surfaced by the membership-change API
-// (RequestAddWitness, RequestRemoveNode, and their Sync variants). These
+// (RequestAddNode, RequestAddObserver, RequestAddWitness, RequestRemoveNode,
+// RequestDeleteNode, their *WithIdentity forms and their Sync variants). These
 // alias the internal raft sentinels so external callers can match the
 // rejections with errors.Is instead of string comparison.
+//
+// The alias is the SAME error value the raft package returns, not a copy with
+// the same text, so errors.Is matches through the wrapping the config-change
+// funnel applies. That identity is the whole point: pkg/internal/raft is
+// unimportable from outside this module, so before these aliases existed a
+// downstream consumer could only string-match a rejection it is expected to
+// handle programmatically.
 var (
 	// ErrTooManyWitnesses is returned when a witness add would exceed the
 	// shard's WitnessConfig.MaxWitnesses cap.
@@ -335,6 +347,38 @@ var (
 	// remove the shard's only full replica; witnesses cannot become
 	// leader, so the shard would be permanently headless.
 	ErrRemoveLastFullReplica = raft.ErrRemoveLastFullReplica
+
+	// ErrNodeNotFound is returned when a removal targets a replica that is
+	// not in the shard's current membership. The removal is refused rather
+	// than committed as a no-op, so the caller learns its view is stale.
+	ErrNodeNotFound = raft.ErrNodeNotFound
+
+	// ErrNodeAlreadyExists is returned when an add targets a replica that is
+	// already a member of the shard in the role being requested.
+	ErrNodeAlreadyExists = raft.ErrNodeAlreadyExists
+
+	// ErrNodeRemoved is returned when an add targets a replica ID that this
+	// shard previously removed. Replica IDs are never recycled: re-adding one
+	// would let a node that still holds the old identity's log rejoin.
+	ErrNodeRemoved = raft.ErrNodeRemoved
+
+	// ErrRemoveLastVoter is returned when a config change would remove the
+	// shard's last voting member, leaving it unable to elect a leader.
+	ErrRemoveLastVoter = raft.ErrRemoveLastVoter
+
+	// ErrTooManyVotingMembers is returned when an add would take the shard
+	// past 64 voting members. ReadIndex quorum tracking is a uint64 bitfield,
+	// so a 65th voter would alias another voter's bit and break the quorum
+	// count.
+	ErrTooManyVotingMembers = raft.ErrTooManyVotingMembers
+
+	// ErrZeroReplicaID is returned when a config change names replica ID 0,
+	// which is the reserved "no replica" value and can never be a member.
+	ErrZeroReplicaID = raft.ErrZeroReplicaID
+
+	// ErrEmptyAddress is returned when an add carries an empty address. A
+	// member with no address is unreachable and cannot be replicated to.
+	ErrEmptyAddress = raft.ErrEmptyAddress
 )
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
@@ -527,7 +571,7 @@ func (e *SnapshotFailedError) Is(target error) bool {
 
 // CorruptConfigEntryError reports a COMMITTED config-carrying entry whose
 // payload this binary cannot decode, detected by the Host's routing mirror of
-// the membership fold. It is terminal: the shard's circuit breaker is tripped
+// the membership fold. It is terminal: the shard's failure latch is tripped
 // and the error is delivered through EventListener.OnShardFailed.
 //
 // The bytes are replicated state every peer can read and this replica cannot,
@@ -1011,6 +1055,33 @@ func (e *ImportSnapshotDirExistsError) Is(target error) bool {
 	return target == ErrImportSnapshotDirExists
 }
 
+// ErrInvalidShardHealth is the sentinel for *InvalidShardHealthError.
+var ErrInvalidShardHealth = errors.New("quicraft: unrecognized shard health value")
+
+// InvalidShardHealthError is returned by ShardHealth.UnmarshalJSON when the
+// JSON string names no ShardHealth value.
+//
+// It fails rather than defaulting because ShardHealthy is the zero value and
+// therefore the reassuring one: decoding an unrecognized string to it turns a
+// typo, a truncated field, or a payload written by a newer binary that knows a
+// health state this one does not into a report of a perfectly healthy shard.
+// A health signal must never degrade towards "fine" — the failure mode is a
+// monitor that stays green through the incident it exists to catch.
+type InvalidShardHealthError struct {
+	// Value is the string that was decoded.
+	Value string
+}
+
+// Error returns a human-readable description of the unrecognized value.
+func (e *InvalidShardHealthError) Error() string {
+	return fmt.Sprintf("quicraft: unrecognized shard health value %q", e.Value)
+}
+
+// Is reports whether target matches the sentinel ErrInvalidShardHealth.
+func (e *InvalidShardHealthError) Is(target error) bool {
+	return target == ErrInvalidShardHealth
+}
+
 // temporaryErrors is the complete set of sentinels Temporary reports true for.
 //
 // Membership is decided per sentinel, never by pattern: an error belongs here
@@ -1041,8 +1112,8 @@ func (e *ImportSnapshotDirExistsError) Is(target error) bool {
 //     and the error cannot tell the two apart, so it fails fast.
 //   - ErrDiskFull, ErrLogDBWrite: storage faults that need operator action.
 //     Retrying writes into a full or failing volume makes the incident worse.
-//   - ErrShardFailed: the state-machine circuit breaker latched after repeated
-//     apply failures and does not reset on its own.
+//   - ErrShardFailed: the state-machine failure latch tripped on the first
+//     apply failure and does not reset on its own.
 var temporaryErrors = [...]error{
 	// Rate limiting and backpressure. ErrSystemBusy is a *BusyError that
 	// matches ErrBusy, so the global limiter is covered by the same entry.

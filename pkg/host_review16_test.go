@@ -137,6 +137,10 @@ func TestClose_ConcurrentCallersAllWaitAndReport(t *testing.T) {
 // write an errors.Is against any of these — and the public sentinels that
 // describe these exact conditions (ErrStopped, ErrSnapshotRecoveryFailed) had
 // no producer anywhere in the library as a result.
+// errApplyRowInner is the state machine error carried by the *engine.ApplyError
+// row of TestTranslateSnapshotError.
+var errApplyRowInner = errors.New("quicraft_test: state machine refused the entry")
+
 func TestTranslateSnapshotError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -157,9 +161,30 @@ func TestTranslateSnapshotError(t *testing.T) {
 			want: ErrStopped,
 		},
 		{
+			// *engine.SMPanicError is the ONLY type the engine constructs that
+			// matches engine.ErrShardFailed (apply.go builds one in the apply
+			// worker's recover block). *engine.ApplyError, the other terminal
+			// apply error, carries no Is method and so reaches the caller as
+			// itself — see the ApplyError row below.
 			name: "a latched shard becomes the public ErrShardFailed",
-			in:   &engine.CircuitBreakerError{ShardID: 1, ReplicaID: 1, LastErr: errors.New("apply")},
+			in:   &engine.SMPanicError{ShardID: 1, ReplicaID: 1, Value: "apply"},
 			want: ErrShardFailed,
+		},
+		{
+			// The counterpart of the row above: a state machine that RETURNS an
+			// error is not remapped. Its *engine.ApplyError wraps the state
+			// machine's own error, which is strictly more informative than the
+			// sentinel, so translateSnapshotError passes it through.
+			name: "an apply failure keeps the state machine's own error",
+			in:   &engine.ApplyError{ShardID: 1, ReplicaID: 1, Err: errApplyRowInner},
+			want: errApplyRowInner,
+			check: func(t *testing.T, got error) {
+				if errors.Is(got, ErrShardFailed) {
+					t.Errorf("got %v, which now matches ErrShardFailed; "+
+						"*engine.ApplyError has no Is method and must not be "+
+						"remapped onto the panic sentinel", got)
+				}
+			},
 		},
 		{
 			name: "corrupt frames become the public ErrSnapshotCorrupt",

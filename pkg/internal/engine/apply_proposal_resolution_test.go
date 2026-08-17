@@ -43,7 +43,7 @@ func TestApplyWorker_DiscardItemFailsProposals(t *testing.T) {
 
 	cfg := config.Config{ShardID: 9, ReplicaID: 2}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -106,7 +106,7 @@ func TestApplyWorker_SMPanicFailsProposals(t *testing.T) {
 	}
 	cfg := config.Config{ShardID: 3, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, &panicApplier{panicValue: "boom"}, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, &panicApplier{panicValue: "boom"}, nil, cfg, nil, "", listener)
 
 	go aw.run()
 

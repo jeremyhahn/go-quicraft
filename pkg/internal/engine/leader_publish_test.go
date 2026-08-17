@@ -119,7 +119,7 @@ func TestStepWorker_Tick_PublishesCheckQuorumStepDown(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	driveToLeader(t, peer, 1, 2)
@@ -176,7 +176,7 @@ func TestStepWorker_CommitPendingInbox_PublishesLeaderChange(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Campaign to pre-candidate/candidate WITHOUT the winning vote, using only
@@ -292,7 +292,7 @@ func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	cb := &lockProbeCallback{Callback: newTestCallback(), node: node}
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
@@ -348,7 +348,7 @@ func TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu(t *testing.T
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	cb := &lockProbeCallback{Callback: newTestCallback(), node: node}
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
@@ -399,7 +399,7 @@ func TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering(t *
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	node.commitPending.Store(true)
@@ -435,7 +435,7 @@ func TestCommitPendingInbox_Phase1OnlyStepDownIsPublished(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	driveToLeader(t, peer, 1, 2)

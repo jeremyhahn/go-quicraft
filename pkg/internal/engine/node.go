@@ -262,17 +262,13 @@ type Node struct {
 	// forbids (see the diagSnap comment above).
 	processedIndex atomic.Uint64
 
-	// maxApplyRetries is carried from config.Config.MaxApplyRetries and is
-	// RESERVED for a future apply-retry circuit breaker; it is not yet consulted.
-	// The current policy is FAIL-FAST: failApply marks the shard failed on the
-	// FIRST SM.Apply (or decompression) error and does NOT advance lastApplied —
-	// a deterministic apply failure cannot be made to succeed by retrying, and
-	// advancing past a failed entry would diverge this state machine from its
-	// peers, breaking Raft state-machine safety.
-	maxApplyRetries uint64
-
-	// failed indicates whether the circuit breaker has tripped. When
-	// true, the step worker skips this shard entirely.
+	// failed indicates whether the shard-failure latch has tripped. The apply
+	// policy is FAIL-FAST: failApply sets it on the FIRST SM.Apply (or
+	// decompression) error and does NOT advance lastApplied — a deterministic
+	// apply failure cannot be made to succeed by retrying, and advancing past a
+	// failed entry would diverge this state machine from its peers, breaking
+	// Raft state-machine safety. While true, the step worker skips this shard
+	// entirely.
 	failed atomic.Bool
 
 	// listener is the event listener for error and lifecycle callbacks.
@@ -376,26 +372,24 @@ func NewNode(
 	sm Applier,
 	logReader *logdb.LogReader,
 	cfg config.Config,
-	maxApplyRetries uint64,
 	snapshotter Snapshotter,
 	snapshotDir string,
 	listener *config.EventListener,
 ) *Node {
 	n := &Node{
-		shardID:         cfg.ShardID,
-		replicaID:       cfg.ReplicaID,
-		peer:            peer,
-		sm:              sm,
-		logReader:       logReader,
-		cfg:             cfg,
-		proposalQ:       queue.NewEntryQueue[proto.Entry](64, defaultProposalQueueSize),
-		inboxQ:          queue.NewEntryQueue[proto.Message](64, defaultInboxQueueSize),
-		readIndexQ:      queue.NewEntryQueue[uint64](16, defaultReadIndexQueueSize),
-		maxApplyRetries: maxApplyRetries,
-		snapshotter:     snapshotter,
-		snapshotDir:     snapshotDir,
-		listener:        listener,
-		stopC:           make(chan struct{}),
+		shardID:     cfg.ShardID,
+		replicaID:   cfg.ReplicaID,
+		peer:        peer,
+		sm:          sm,
+		logReader:   logReader,
+		cfg:         cfg,
+		proposalQ:   queue.NewEntryQueue[proto.Entry](64, defaultProposalQueueSize),
+		inboxQ:      queue.NewEntryQueue[proto.Message](64, defaultInboxQueueSize),
+		readIndexQ:  queue.NewEntryQueue[uint64](16, defaultReadIndexQueueSize),
+		snapshotter: snapshotter,
+		snapshotDir: snapshotDir,
+		listener:    listener,
+		stopC:       make(chan struct{}),
 	}
 	return n
 }
@@ -588,12 +582,12 @@ func (n *Node) SeedLastApplied(idx, term uint64) {
 	n.lastSnapshotIndex.Store(idx)
 }
 
-// IsFailed returns true if the circuit breaker has tripped.
+// IsFailed returns true if the shard-failure latch has tripped.
 func (n *Node) IsFailed() bool {
 	return n.failed.Load()
 }
 
-// Fail trips the circuit breaker for this shard and reports err through the
+// Fail trips the shard-failure latch for this shard and reports err through the
 // node's error handler, exactly as failApply and failCommit do for a terminal
 // apply or commit error. The shard stays offline until it is reloaded or
 // recovered from a snapshot; there is no automatic reset, deliberately.

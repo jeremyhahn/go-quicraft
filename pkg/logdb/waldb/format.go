@@ -65,28 +65,34 @@ const (
 	walFormatMagic = "QRWALFMT"
 
 	// walFormatVersion is the version of the WAL on-disk format as a whole
-	// (block framing plus record framing). It is PINNED at 1 for the whole
-	// pre-release period, like every other format in this repository: a layout
-	// change is made IN PLACE at version 1, the consuming repositories are
-	// updated in the same change, and development data directories are wiped
-	// and re-synced rather than migrated. See docs/operations/compatibility.md
-	// and the compatibility contract in the pkg/proto package comment.
+	// (block framing plus record framing). It is compared for EXACT equality
+	// before a single segment byte is read: a directory written under any other
+	// framing misparses from its very first chunk, every chunk fails CRC, the
+	// clean prefix is empty, and — with nothing decodable above the damage —
+	// the torn-tail path would truncate the whole file to zero and delete every
+	// segment above it. A silent misparse presented as a repair is the one
+	// outcome this gate exists to make impossible.
 	//
-	// The number is 1 because the project is pre-release, not because the
-	// framing is the first one ever written: earlier development commits wrote
-	// a 7-byte chunk header under other numbers, and those bytes are gone with
-	// the dev directories that held them. Today's framing is the 11-byte header
+	// The number stays 1 for the whole pre-release period and moves for the
+	// first production public release. Layout changes are made IN PLACE at the
+	// pinned version and development data directories are wiped and re-synced
+	// rather than migrated.
+	//
+	// That policy needs the individual layout changes to stay detectable, and
+	// detection lives at the RECORD level rather than here. When the entry
+	// record header grew from 76 to 84 bytes and the snapshot record's session
+	// policy tail from 24 to 32, the payload-type bytes were reused, so an old
+	// record was either misparsed in silence or reported as corruption. That is
+	// fixed by retiring the old bytes rather than by moving this constant: the
+	// current formats carry new payload types and the retired values are left
+	// unallocated, so a record still carrying one is refused with
+	// ErrUnknownPayloadType. An old directory therefore passes this gate — every
+	// build records 1 — and is refused when its first stale record is replayed.
+	//
+	// Earlier development commits wrote a 7-byte chunk header under other
+	// numbers, and those bytes are gone with the dev directories that held
+	// them. Today's framing is the 11-byte header
 	// [CRC32:4][Len:2][Type:1][DurSeq:4].
-	//
-	// The CHECK is what matters, not the value, and it is retained in full
-	// force. A directory written under any other framing misparses from its
-	// very first chunk, every chunk fails CRC, the clean prefix is empty, and —
-	// with nothing decodable above the damage — the torn-tail path would
-	// truncate the whole file to zero and delete every segment above it. That
-	// is the one unacceptable outcome, a silent misparse presented as a repair,
-	// so the version is compared for EXACT equality before a single segment
-	// byte is read. The pinning ends at the first production release, and this
-	// gate is the mechanism that bump will use.
 	walFormatVersion uint32 = 1
 
 	// walFormatSize is the exact on-disk length of the marker.

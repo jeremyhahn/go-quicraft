@@ -207,7 +207,7 @@ func TestStepWorker_LoadAndUnloadNode(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	sw.nodesMu.RLock()
@@ -247,7 +247,7 @@ func TestStepWorker_UnloadCleansUpMaps(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Populate commitSlots and prevLeaders.
@@ -324,7 +324,7 @@ func TestStepWorker_SkipsFailedNodes(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.failed.Store(true)
 	sw.loadNode(node)
 
@@ -346,7 +346,7 @@ func TestCommitWorker_ProcessBatch_Success(t *testing.T) {
 	cw.noRetryDelay = true
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// We need a peer for Commit. Since we cannot easily construct one
@@ -398,7 +398,7 @@ func TestCommitWorker_ProcessBatch_SaveStateError(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], proto.Update{ShardID: 1, ReplicaID: 1})
@@ -456,7 +456,7 @@ func TestCommitWorker_DrainCommitC(t *testing.T) {
 	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Pre-fill commitC with items.
 	for i := range 5 {
@@ -489,7 +489,7 @@ func TestApplyWorker_Dispatch_CreatesShardGoroutine(t *testing.T) {
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -532,7 +532,7 @@ func TestApplyWorker_SequentialPerShard(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Send multiple items for the same shard via applyC.
 	for i := range 5 {
@@ -599,7 +599,7 @@ func TestApplyWorker_FailFast(t *testing.T) {
 		},
 	}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 3, nil, "", listener)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", listener)
 
 	// A single failing item must trip fail-fast.
 	node.commitPending.Store(true)
@@ -654,7 +654,7 @@ func TestApplyWorker_ClearsCommitPendingOnEmptyEntries(t *testing.T) {
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -712,7 +712,7 @@ func TestApplyWorker_DrainOnShutdown(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Pre-fill applyC with items.
 	for i := range 5 {
@@ -765,7 +765,7 @@ func TestApplyWorker_FanOut_MultipleShards(t *testing.T) {
 		sms[i] = newTestSM()
 		rsmSM := newTestApplier(sms[i])
 		cfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-		nodes[i] = NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+		nodes[i] = NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	}
 
 	// Send items for all 4 shards via applyC.
@@ -833,7 +833,8 @@ func TestApplyWorker_SemaphoreLimitsConcurrency(t *testing.T) {
 	// Create 4 items for 4 different shards and send via applyC.
 	for i := range 4 {
 		node := NewNode(nil, rsmSM, nil,
-			config.Config{ShardID: uint64(i + 1), ReplicaID: 1}, 100, nil, "", nil)
+			config.Config{ShardID: uint64(i + 1), ReplicaID: 1}, nil, "", nil)
+
 		node.commitPending.Store(true)
 		item := applyPool.Get().(*applyItem)
 		item.update = proto.Update{
@@ -889,7 +890,7 @@ func TestApplyWorker_SuccessfulAppliesAdvance(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 10, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Start the apply worker dispatcher loop.
 	runDone := make(chan struct{})
@@ -941,7 +942,7 @@ func TestApplyWorker_FailFastHaltsShard(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 10, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	runDone := make(chan struct{})
 	go func() {
@@ -980,7 +981,7 @@ func TestApplyWorker_RemoveShardChan(t *testing.T) {
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -1020,7 +1021,7 @@ func TestApplyWorker_RemoveShardChan_ExistingShard(t *testing.T) {
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
 	cfg := config.Config{ShardID: 42, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -1076,7 +1077,7 @@ func TestCommitWorker_RunDrainsAndStops(t *testing.T) {
 	}()
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	commitC <- &commitItem{
@@ -1112,11 +1113,11 @@ func TestStepWorker_TickSkipsNilPeer(t *testing.T) {
 
 	// Load one node with nil peer and one failed node.
 	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
-	node1 := NewNode(nil, nil, nil, cfg1, 100, nil, "", nil)
+	node1 := NewNode(nil, nil, nil, cfg1, nil, "", nil)
 	sw.loadNode(node1)
 
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
-	node2 := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	node2 := NewNode(nil, nil, nil, cfg2, nil, "", nil)
 	node2.failed.Store(true)
 	sw.loadNode(node2)
 
@@ -1133,7 +1134,7 @@ func TestStepWorker_ProcessReady_SkipsNilPeer(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Signal work for shard 1.
@@ -1160,7 +1161,7 @@ func TestStepWorker_ProcessReady_SkipsFailedNode(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.failed.Store(true)
 	sw.loadNode(node)
 
@@ -1204,7 +1205,7 @@ func TestStepWorker_ProcessReady_SkipsCommitPending(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
 
@@ -1271,7 +1272,7 @@ func TestStepWorker_Tick_RunsDuringCommitPending(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	// Set commitPending to simulate the commit worker owning this peer.
 	// Tick must still run to maintain leader heartbeat liveness. Prior to
@@ -1304,7 +1305,7 @@ func TestStepWorker_Tick_InvokesPeerTick(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick enough times to trigger an election in a single-node cluster.
@@ -1332,7 +1333,7 @@ func TestStepWorker_ProcessReady_FullPipeline(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick the peer until it becomes leader.
@@ -1394,7 +1395,7 @@ func TestStepWorker_ProcessReady_SendsMessages(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick to become leader.
@@ -1431,7 +1432,7 @@ func TestStepWorker_ProcessReady_DrainsInbox(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick to become leader.
@@ -1467,7 +1468,7 @@ func TestStepWorker_ProcessReady_CommitCBlocking_StopC(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1516,7 +1517,7 @@ func TestStepWorker_ProcessReady_NoUpdate(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick to become leader and drain the initial update (election produces
@@ -1574,7 +1575,7 @@ func TestStepWorker_ProcessReady_LeaderChangeNotFired_WhenUnchanged(t *testing.T
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1630,7 +1631,7 @@ func TestCommitWorker_ProcessBatch_SuccessPath(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -1699,7 +1700,7 @@ func TestCommitWorker_ProcessBatch_NilLogDB(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -1743,7 +1744,7 @@ func TestCommitWorker_ProcessBatch_AlwaysForwards(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -1795,7 +1796,7 @@ func TestCommitWorker_DrainAndProcess(t *testing.T) {
 		peer, lr := newTestPeer(t, shardID, 1)
 		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
 		cfg.SetDefaults()
-		node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+		node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 		node.commitPending.Store(true)
 
 		tickPeerToLeader(peer)
@@ -1894,7 +1895,7 @@ func TestApplyWorker_AutoSnapshot_ClearsSnapshottingOnPoolFull(t *testing.T) {
 	sp := newSnapshotPool(1, ldb, nil, nil, nil, stopC, nil)
 	// Pre-fill requestC to make it full.
 	dummyCfg := config.Config{ShardID: 999, ReplicaID: 1}
-	dummyNode := NewNode(nil, nil, nil, dummyCfg, 100, nil, "", nil)
+	dummyNode := NewNode(nil, nil, nil, dummyCfg, nil, "", nil)
 	_ = sp.requestSnapshot(snapshotRequest{
 		shardID: 999, replicaID: 1, node: dummyNode, save: true,
 	})
@@ -1906,7 +1907,7 @@ func TestApplyWorker_AutoSnapshot_ClearsSnapshottingOnPoolFull(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1, SnapshotEntries: 5}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, t.TempDir(), nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, t.TempDir(), nil)
 
 	// Apply 5 entries to trigger auto-snapshot (SnapshotEntries=5).
 	node.commitPending.Store(true)
@@ -1979,7 +1980,7 @@ func TestCommitWorker_YieldFn_CalledBetweenReceiveAndDrain(t *testing.T) {
 	ldb.setSaveError(errors.New("test yield error"))
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Start the worker.
@@ -2069,7 +2070,7 @@ func TestCommitWorker_YieldAccumulatesLargerBatches(t *testing.T) {
 		peer, lr := newTestPeer(t, shardID, 1)
 		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
 		cfg.SetDefaults()
-		node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+		node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 		shards[i] = shardInfo{peer: peer, node: node}
 		tickPeerToLeader(peer)
 	}
@@ -2142,7 +2143,7 @@ func TestCommitWorker_FlatBuf_UsedInProcessBatch(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -2270,7 +2271,7 @@ func TestCommitWorker_SkipApplyWhenNoCommittedEntries(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -2344,7 +2345,7 @@ func TestCommitWorker_NoSkipApplyWhenCommittedEntriesPresent(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -2520,7 +2521,7 @@ func TestCommitWorker_Metrics_BatchSize(t *testing.T) {
 	cw.yieldFn = func() {}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Set up batch with 3 updates. processBatch records batch size
@@ -2557,7 +2558,7 @@ func TestCommitWorker_Metrics_BatchSizeNil(t *testing.T) {
 	cw.yieldFn = func() {}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], proto.Update{ShardID: 1, ReplicaID: 1})
@@ -2588,7 +2589,7 @@ func TestCommitWorker_Metrics_CommitLatency(t *testing.T) {
 	cw.yieldFn = func() {}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Populate commitTimes manually as run() would.
@@ -2626,7 +2627,7 @@ func TestApplyWorker_Metrics_ApplyLatency(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -2679,7 +2680,7 @@ func TestApplyWorker_Metrics_ApplyLatencyNil(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -2736,7 +2737,7 @@ func TestCommitWorker_Metrics_RunIntegration(t *testing.T) {
 	cw.yieldFn = func() {}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Send an item to commitC.
@@ -2797,7 +2798,7 @@ func TestCommitWorker_SendsOrderedMessagesAfterSaveState(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -2879,7 +2880,7 @@ func TestCommitWorker_OrderedMsgsNotSentOnSaveStateError(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], proto.Update{ShardID: 1, ReplicaID: 1})
@@ -2921,7 +2922,7 @@ func TestCommitWorker_OrderedMsgsNilSender(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -3216,7 +3217,7 @@ func TestCommitWorker_OrderedMsgsBuf_ClearedEachBatch(t *testing.T) {
 	peer1, lr1 := newTestPeer(t, 1, 1)
 	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg1.SetDefaults()
-	node1 := NewNode(peer1, nil, lr1, cfg1, 100, nil, "", nil)
+	node1 := NewNode(peer1, nil, lr1, cfg1, nil, "", nil)
 	node1.commitPending.Store(true)
 
 	tickPeerToLeader(peer1)
@@ -3252,7 +3253,7 @@ func TestCommitWorker_OrderedMsgsBuf_ClearedEachBatch(t *testing.T) {
 	peer2, lr2 := newTestPeer(t, 2, 1)
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg2.SetDefaults()
-	node2 := NewNode(peer2, nil, lr2, cfg2, 100, nil, "", nil)
+	node2 := NewNode(peer2, nil, lr2, cfg2, nil, "", nil)
 	node2.commitPending.Store(true)
 
 	tickPeerToLeader(peer2)
@@ -3314,7 +3315,7 @@ func TestCommitWorker_SaveStateError_CompletesPendingProposals(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	// Set up a batch with committed entries that have proposal keys.
@@ -3388,11 +3389,11 @@ func TestCommitWorker_SaveStateError_MultipleShards(t *testing.T) {
 
 	// Set up 2 shards in the batch.
 	cfg1 := config.Config{ShardID: 10, ReplicaID: 1}
-	node1 := NewNode(nil, nil, nil, cfg1, 100, nil, "", listener)
+	node1 := NewNode(nil, nil, nil, cfg1, nil, "", listener)
 	node1.commitPending.Store(true)
 
 	cfg2 := config.Config{ShardID: 20, ReplicaID: 2}
-	node2 := NewNode(nil, nil, nil, cfg2, 100, nil, "", listener)
+	node2 := NewNode(nil, nil, nil, cfg2, nil, "", listener)
 	node2.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0],
@@ -3473,7 +3474,7 @@ func TestCommitWorker_SaveStateError_NoCommittedEntries(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	// No committed entries in this update.
@@ -3511,7 +3512,7 @@ func TestCommitWorker_SaveStateError_NilCallback(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], proto.Update{
@@ -3553,7 +3554,7 @@ func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	oldSM := newTestApplier(newTestSM())
-	oldNode := NewNode(oldPeer, oldSM, oldLR, cfg, 100, nil, "", nil)
+	oldNode := NewNode(oldPeer, oldSM, oldLR, cfg, nil, "", nil)
 	oldNode.commitPending.Store(true)
 
 	tickPeerToLeader(oldPeer)
@@ -3586,7 +3587,7 @@ func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 	// Create the NEW incarnation: fresh peer with committed=0.
 	newPeer, newLR := newTestPeer(t, 1, 1)
 	newSM := newTestApplier(newTestSM())
-	newNode := NewNode(newPeer, newSM, newLR, cfg, 100, nil, "", nil)
+	newNode := NewNode(newPeer, newSM, newLR, cfg, nil, "", nil)
 	newNode.commitPending.Store(true)
 
 	tickPeerToLeader(newPeer)
@@ -3667,9 +3668,9 @@ func TestCommitWorker_ProcessBatch_StaleIncarnation_Error(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 
-	node1 := NewNode(peer1, newTestApplier(newTestSM()), lr1, cfg, 100, nil, "", nil)
+	node1 := NewNode(peer1, newTestApplier(newTestSM()), lr1, cfg, nil, "", nil)
 	node1.commitPending.Store(true)
-	node2 := NewNode(peer2, newTestApplier(newTestSM()), lr2, cfg, 100, nil, "", nil)
+	node2 := NewNode(peer2, newTestApplier(newTestSM()), lr2, cfg, nil, "", nil)
 	node2.commitPending.Store(true)
 
 	tickPeerToLeader(peer1)
@@ -3825,7 +3826,7 @@ func TestCommitWorker_PiggybackHappyPath(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	node.SetNotifyCommit(true)
 
@@ -3906,7 +3907,7 @@ func TestCommitWorker_PiggybackNoEntries(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Create an update with only state (no entries, no committed entries).
@@ -3972,7 +3973,7 @@ func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	listener := &config.EventListener{
 		OnShardFailed: func(_ config.ShardFailedInfo) {},
 	}
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", listener)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	// Fail the SECOND SaveState. The first persists the batch; the second is
@@ -4059,7 +4060,7 @@ func TestCommitWorker_PiggybackMessageOrdering(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], update)
@@ -4150,7 +4151,7 @@ func TestCommitWorker_PiggybackMetrics(t *testing.T) {
 	rsmSM := newTestApplier(testSm)
 	cfg := config.Config{ShardID: 42, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Verify no metrics before.
@@ -4207,7 +4208,7 @@ func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T)
 	nodes := make(map[uint64]*Node)
 	for i := uint64(1); i <= 5; i++ {
 		cfg := config.Config{ShardID: i, ReplicaID: 1}
-		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 		node.commitPending.Store(true)
 		sw.loadNode(node)
 		nodes[i] = node
@@ -4444,7 +4445,7 @@ func TestApplyWorker_Dispatch_SkipsUnloadedShard(t *testing.T) {
 	aw.unloaded.add(42)
 
 	cfg := config.Config{ShardID: 42, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -4547,7 +4548,7 @@ func TestExecutePiggyback_WithOnCommittedCallback(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	node.SetNotifyCommit(true)
 
@@ -4609,7 +4610,7 @@ func TestExecutePiggyback_NoMessages(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Persist the term-opening no-op through a real GetUpdate/Commit
@@ -4665,7 +4666,7 @@ func TestExecutePiggyback_OnlyOrderedMessages(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Persist the term-opening no-op through a real GetUpdate/Commit
@@ -4729,7 +4730,7 @@ func TestCommitWorker_ProcessBatch_NilLogDB_ForwardsPiggyback(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Propose and get an update.
@@ -4778,7 +4779,7 @@ func TestApplyWorker_Dispatch_Backpressure(t *testing.T) {
 	goodSM := newTestSM()
 	rsmSM := newTestApplier(goodSM)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	// Start the dispatcher so shard goroutines are created.
 	runDone := make(chan struct{})
@@ -4841,7 +4842,7 @@ func TestApplyWorker_SMPanic_MarksNodeFailed(t *testing.T) {
 		},
 	}
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", listener)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
 	item := applyPool.Get().(*applyItem)
@@ -4919,7 +4920,7 @@ func TestCommitWorker_DrainCommitC_WithMetrics(t *testing.T) {
 	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, metrics)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	now := time.Now()
 	commitC <- &commitItem{
@@ -5085,7 +5086,7 @@ func TestCommitWorker_ProcessBatch_SkipsUnloadedShard(t *testing.T) {
 	cw.unloaded.add(1)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], proto.Update{
@@ -5131,7 +5132,7 @@ func TestStepWorker_ProcessCommitPendingInbox_WithProposals(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Make the peer a leader.
@@ -5189,7 +5190,7 @@ func TestStepWorker_ProcessCommitPendingInbox_WithInboxMessages(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5231,7 +5232,7 @@ func TestStepWorker_ProcessCommitPendingInbox_InstallSnapshotDeferred(t *testing
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5272,7 +5273,7 @@ func TestStepWorker_ProcessCommitPendingInbox_EmptyQueues(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5304,7 +5305,7 @@ func TestStepWorker_DrainAndHandleInbox_SuccessPath(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5346,7 +5347,7 @@ func TestStepWorker_DrainAndHandleInbox_DebugLogging(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5382,7 +5383,7 @@ func TestStepWorker_DrainAndHandleInbox_HandleError(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -5428,7 +5429,7 @@ func TestExecutePiggyback_ApplyCFull_BlockingSend(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	tickPeerToLeader(peer)
 
@@ -5495,7 +5496,7 @@ func TestExecutePiggyback_ApplyCFull_StopC(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	tickPeerToLeader(peer)
 
@@ -5562,7 +5563,7 @@ func TestSaveSnapshot_MaxSnapshotSizeExceeded(t *testing.T) {
 
 	// Create a snapshotter that writes more data than the limit.
 	ss := &largeSaveSnapshotter{data: make([]byte, 100)} // 100 bytes > 10 byte limit
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	_, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5610,7 +5611,7 @@ func TestSaveSnapshot_NilSnapshotter(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil) // nil snapshotter
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil) // nil snapshotter
 
 	_, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5638,7 +5639,7 @@ func TestSaveSnapshot_ZeroLastApplied(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &zeroAppliedSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, "", nil)
+	node := NewNode(nil, nil, nil, cfg, ss, "", nil)
 
 	idx, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5678,7 +5679,7 @@ func TestSaveSnapshot_SaveError(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &errorSaveSnapshotter{err: errors.New("save failed")}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	_, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5729,7 +5730,7 @@ func TestSaveSnapshot_SnappyCompression(t *testing.T) {
 	}
 	cfg.SetDefaults()
 	ss := &largeSaveSnapshotter{data: []byte("compressible data for snappy test")}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	idx, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5771,7 +5772,7 @@ func TestSaveSnapshot_FullPipeline(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	tickPeerToLeader(peer)
 
-	node := NewNode(peer, nil, lr, cfg, 100, ss, snapDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, snapDir, nil)
 
 	idx, err := pool.saveSnapshot(snapshotRequest{
 		shardID:       1,
@@ -5813,7 +5814,7 @@ func TestSaveSnapshot_LogDBSaveError(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &largeSaveSnapshotter{data: []byte("data")}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	_, err := pool.saveSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5854,7 +5855,7 @@ func TestRecoverSnapshot_NilSnapshotter(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil) // nil snapshotter
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil) // nil snapshotter
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5880,7 +5881,7 @@ func TestRecoverSnapshot_GetSnapshotError(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &zeroAppliedSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5920,7 +5921,7 @@ func TestRecoverSnapshot_ZeroIndex(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &zeroAppliedSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5958,7 +5959,7 @@ func TestRecoverSnapshot_FileNotExist(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &zeroAppliedSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -5996,7 +5997,7 @@ func TestRecoverSnapshot_RecoverError(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &errorRecoverSnapshotter{err: errors.New("recovery failed")}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -6055,7 +6056,7 @@ func TestRecoverSnapshot_SuccessUpdatesNodeState(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	ss := &noopSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 
 	err := pool.recoverSnapshot(snapshotRequest{
 		shardID:   1,
@@ -6107,7 +6108,7 @@ func TestApplyWorker_RunShardApply_EmptyEntries(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := &applyItem{
@@ -6149,7 +6150,7 @@ func TestApplyWorker_RunShardApply_RecoveringSkipsApply(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	node.SetRecovering(true) // simulate snapshot recovery in progress
 
@@ -6237,7 +6238,7 @@ func TestApplyWorker_RunShardApply_AutoSnapshot(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	node.lastSnapshotIndex.Store(0) // no previous snapshot
 
@@ -6292,7 +6293,7 @@ func TestApplyWorker_RunShardApply_DecompressError(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Create an entry with the compress flag set but invalid Snappy data.
@@ -6366,7 +6367,7 @@ func TestApplyWorker_RunShardApply_ApplyError(t *testing.T) {
 	testSm := newTestSM()
 	testSm.setApplyError(errors.New("apply failed"))
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	item := &applyItem{
@@ -6425,7 +6426,7 @@ func TestApplyWorker_RunShardApply_ApplyErrorCircuitBreaker(t *testing.T) {
 	testSm := newTestSM()
 	testSm.setApplyError(errors.New("persistent failure"))
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(nil, rsmSM, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
 	item := &applyItem{
 		update: proto.Update{
@@ -6464,11 +6465,11 @@ func TestRequestSnapshot_PoolBusy(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node1 := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node1 := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg2.SetDefaults()
-	node2 := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	node2 := NewNode(nil, nil, nil, cfg2, nil, "", nil)
 
 	// Fill the request channel by submitting a request.
 	err1 := pool.requestSnapshot(snapshotRequest{
@@ -6503,7 +6504,7 @@ func TestRequestSnapshot_Duplicate(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// First request succeeds.
 	err := pool.requestSnapshot(snapshotRequest{
@@ -6545,7 +6546,7 @@ func TestStepWorker_CommitMemoryMode_StopC(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -6585,7 +6586,7 @@ func TestStepWorker_CommitMemoryMode_SuccessPath(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -6632,7 +6633,7 @@ func TestStepWorker_EnqueueForCommit_StopC(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	close(stopC)
@@ -6667,7 +6668,7 @@ func TestCommitWorker_ProcessBatch_ApplyCStopC(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	tickPeerToLeader(peer)
@@ -6759,7 +6760,7 @@ func TestStepWorker_EnqueueForCommit_WithMessages(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -6813,7 +6814,7 @@ func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.SetRecovering(true) // simulate snapshot recovery in progress
 	sw.loadNode(node)
 
@@ -6957,7 +6958,7 @@ func TestCommitWorker_PeerCommitError_FailsShard(t *testing.T) {
 	peer, lr, u := newCommitFailurePeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	node.commitPending.Store(true)
 	cw.batch = append(cw.batch[:0], u)
@@ -6998,7 +6999,7 @@ func TestExecutePiggyback_CommitError_FailsShard(t *testing.T) {
 	peer, lr, u := newCommitFailurePeer(t, 2, 1)
 	cfg := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	node.commitPending.Store(true)
 	if cont := cw.executePiggyback(node, u); !cont {
@@ -7062,13 +7063,13 @@ func TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail(t *testing.T) {
 	}
 	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg1.SetDefaults()
-	head := NewNode(peer, nil, lr, cfg1, 100, nil, "", nil)
+	head := NewNode(peer, nil, lr, cfg1, nil, "", nil)
 	head.commitPending.Store(true)
 
 	// Tail item: never reached, because the head early-returns.
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg2.SetDefaults()
-	tail := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	tail := NewNode(nil, nil, nil, cfg2, nil, "", nil)
 	tail.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], u2, proto.Update{ShardID: 2, ReplicaID: 1})
@@ -7106,12 +7107,12 @@ func TestCommitWorker_ProcessBatch_PiggybackShutdownAbandonsBatchTail(t *testing
 	peer, lr, update, _ := setupPiggybackPeer(t, 1, 1)
 	cfg1 := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg1.SetDefaults()
-	head := NewNode(peer, nil, lr, cfg1, 100, nil, "", nil)
+	head := NewNode(peer, nil, lr, cfg1, nil, "", nil)
 	head.commitPending.Store(true)
 
 	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
 	cfg2.SetDefaults()
-	tail := NewNode(nil, nil, nil, cfg2, 100, nil, "", nil)
+	tail := NewNode(nil, nil, nil, cfg2, nil, "", nil)
 	tail.commitPending.Store(true)
 
 	cw.batch = append(cw.batch[:0], update, proto.Update{ShardID: 2, ReplicaID: 1})

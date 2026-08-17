@@ -283,7 +283,7 @@ func TestPinBalance_SaveSnapshot_FullCycleReturnsToZero(t *testing.T) {
 			snapshotter := &bulkSnapshotter{bytes: snapshotEncryptChunkSize*3 + 77}
 			snapshotter.lastApplied.Store(200)
 			snapshotter.state.Store(42)
-			node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+			node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 			inner := &rotateAfterNBarrier{testBarrier: newTestBarrier(3), rotateAfter: tc.rotateAfter}
 			barrier := newPinCountBarrier(inner)
@@ -322,7 +322,7 @@ func TestPinBalance_SaveSnapshot_EncryptFailureReturnsToZero(t *testing.T) {
 	snapshotter := &snapshotTestSnapshotter{}
 	snapshotter.lastApplied.Store(200)
 	snapshotter.state.Store(42)
-	node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 	inner := &failAfterNBarrier{testBarrier: newTestBarrier(4), failAfter: 0}
 	barrier := newPinCountBarrier(inner)

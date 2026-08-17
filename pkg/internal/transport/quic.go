@@ -60,9 +60,11 @@ const sendWriteDeadline = 2 * time.Second
 const sendQueueIdleTimeout = 60 * time.Second
 
 // snapshotChunkWriteDeadline is the maximum time for a single chunk write
-// on the snapshot send path. Snapshot chunks can be up to 64MB each, so
-// this deadline is much larger than sendWriteDeadline. If the receiver is
-// slow or the network stalls, the deadline prevents indefinite blocking
+// on the snapshot send path. A chunk carries far more bytes than a Raft
+// message -- the sender emits 2MiB chunks and the receiver accepts up to
+// proto.MaxSnapshotChunkDataLen (8MB) -- so this deadline is much larger
+// than sendWriteDeadline. If the receiver is slow or the network stalls,
+// the deadline prevents indefinite blocking
 // that would hold a snapshotTracker slot and make Stop() hang forever.
 const snapshotChunkWriteDeadline = 30 * time.Second
 
@@ -444,7 +446,8 @@ func NewQUICTransport(
 	}
 
 	// Create the revocation checker when configured. The checker is
-	// passed to buildMTLSTLS to wire VerifyPeerCertificate on both
+	// passed to buildMTLSTLS to wire VerifyConnection (not
+	// VerifyPeerCertificate, which resumed sessions skip) on both
 	// server and client TLS configs. The WHOLE CA bundle is parsed and
 	// handed to the checker, which selects the actual issuer per leaf and
 	// per CRL: TLS verifies against every block in the bundle
@@ -798,8 +801,8 @@ func (t *QUICTransport) Addr() net.Addr {
 //
 // This non-blocking design ensures the step worker's tick/processReady
 // loop is never stalled by transport operations (QUIC dial, stream open,
-// stream write with 5s deadline), preventing heartbeat starvation and
-// cascading multi-node stalls.
+// stream write with the 2s sendWriteDeadline), preventing heartbeat
+// starvation and cascading multi-node stalls.
 //
 // Each message is deep-copied (entries and their Cmd payloads, and the
 // snapshot metadata's membership maps and checksum) before enqueueing into

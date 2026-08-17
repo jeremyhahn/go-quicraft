@@ -45,7 +45,7 @@ package proto
 // validating it against maxStateMachineType — a range check on a value no code
 // path could set. The kind of state machine a shard runs is a property of the
 // LOCAL process (it is chosen by the StateMachineFactory the host was
-// constructed with, and proto.Bootstrap already records it durably), not of an
+// constructed with, and logdb.Bootstrap already records it durably), not of an
 // artifact streamed from a peer, so there is no reader for it to grow either.
 // Removing it orphaned maxStateMachineType in constants.go and
 // InvalidSnapshotTypeError in errors.go, which went with it.

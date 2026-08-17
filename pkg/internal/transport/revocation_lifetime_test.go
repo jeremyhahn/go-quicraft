@@ -29,10 +29,15 @@ import (
 // needed here: the unit under test is revokeCheckConnections, and
 // AddRevokedSerial is the checker's own admin entry point. Going through the
 // config would test config validation, not connection eviction.
+//
+// The checker opts into soft-fail for the same reason. revokeCheckConnections
+// treats a checker ERROR as grounds to close, so an enforcing checker with no
+// source would tear the connection down for the missing source and the test
+// would pass without the revocation having done anything.
 func transportPairWithRevocation(t testing.TB) (*QUICTransport, *QUICTransport, func()) {
 	t.Helper()
 	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler())
-	t1.revocationChecker = revocation.NewChecker(revocation.Config{})
+	t1.revocationChecker = revocation.NewChecker(revocation.Config{AllowSoftFail: true})
 	return t1, t2, cleanup
 }
 

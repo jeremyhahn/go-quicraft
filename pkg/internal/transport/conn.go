@@ -682,8 +682,9 @@ func (t *QUICTransport) forgetPeerIncarnation(target string) {
 //
 // The connection behind a pooled stream must be verified alive before the
 // stream is handed out. Without that check a cached stream on a dead
-// connection blocks for the full write deadline (5s) before failing, which is
-// long enough for the peer to time out and start an unnecessary election.
+// connection blocks for the full write deadline (sendWriteDeadline, 2s) before
+// failing, which is long enough to burn a meaningful share of the peer's
+// election timeout and risk an unnecessary election.
 //
 // When the cached entry is unusable this evicts exactly as much state as the
 // failure warrants — see the three cases below — and reports false, leaving

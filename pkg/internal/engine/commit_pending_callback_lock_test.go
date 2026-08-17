@@ -92,7 +92,7 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, shardID, replicaID, 3)
 	nodeCfg := config.Config{ShardID: shardID, ReplicaID: replicaID}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, nil, "", nil)
 
 	cb := &raftMuProbeCallback{node: node}
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)

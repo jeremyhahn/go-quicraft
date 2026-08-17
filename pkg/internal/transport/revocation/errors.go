@@ -16,8 +16,9 @@
 // and OCSP responders with hot-reload support. CRL files are periodically
 // reloaded from disk using content-hash change detection, and OCSP responses
 // are cached with configurable TTL. The checker integrates with the TLS
-// handshake via VerifyPeerCertificate to reject revoked peer certificates
-// at connection time without requiring a restart.
+// handshake via VerifyConnection -- which, unlike VerifyPeerCertificate, also
+// runs for resumed sessions -- to reject revoked peer certificates at
+// connection time without requiring a restart.
 package revocation
 
 import (
@@ -33,7 +34,7 @@ var (
 	ErrCertificateRevoked = errors.New("revocation: certificate is revoked")
 
 	// ErrOCSPUnavailable is returned when the OCSP responder is unreachable
-	// and EnforceRevocation is true.
+	// and revocation is enforced.
 	ErrOCSPUnavailable = errors.New("revocation: OCSP responder unavailable")
 
 	// ErrInvalidCRL is returned when a CRL file cannot be parsed.
@@ -45,7 +46,7 @@ var (
 	// cached failure from a fresh transport error for diagnostics.
 	ErrOCSPNegativeCached = errors.New("revocation: OCSP responder recently unavailable (negative-cached)")
 
-	// ErrCRLStale is returned (under EnforceRevocation) when a
+	// ErrCRLStale is returned (under enforcement) when a
 	// certificate's revocation status cannot be established because no
 	// fresh CRL is loaded: either the initial load has not succeeded yet,
 	// or the most recent reload failed (unreadable, unparseable, forged,
@@ -63,7 +64,7 @@ var (
 	// ErrCRLExpired is returned when a CRL is past its NextUpdate time.
 	// A frozen CRL file would otherwise serve an ever-staler view of
 	// revocations indefinitely; expiry marks the set stale so
-	// EnforceRevocation fails closed until a fresh CRL is published.
+	// enforcement fails closed until a fresh CRL is published.
 	ErrCRLExpired = errors.New("revocation: CRL past its NextUpdate; revocation status unknown")
 
 	// ErrOCSPResponseStale is returned when an OCSP response fails
@@ -76,7 +77,7 @@ var (
 	// "unknown" for a certificate. Unknown is NOT "not revoked": the
 	// responder has no record of the certificate, so its status cannot be
 	// established. It must route through the status-unavailable path so
-	// EnforceRevocation fails closed and the verdict is never cached as good.
+	// enforcement fails closed and the verdict is never cached as good.
 	ErrOCSPStatusUnknown = errors.New("revocation: OCSP responder reported status unknown")
 
 	// ErrNoCRLInFile is returned when a configured CRL file contains no
@@ -305,7 +306,7 @@ var ErrNoOCSPResponderURL = &ConfigError{Field: "OCSPResponderURL", Message: "no
 var ErrNoIssuerCertificate = &ConfigError{Field: "IssuerCertificate", Message: "no issuer certificate configured for OCSP"}
 
 // ErrNoCRLSources is returned by Config.Validate when the selected mode
-// consults CRLs but no CRL file is configured. Under EnforceRevocation such
+// consults CRLs but no CRL file is configured. Under enforcement such
 // a mode fails every handshake; under soft-fail it is a silent no-op.
 var ErrNoCRLSources = &ConfigError{Field: "CRLPaths", Message: "selected mode requires at least one CRL file"}
 
@@ -315,9 +316,11 @@ var ErrNoCRLSources = &ConfigError{Field: "CRLPaths", Message: "selected mode re
 var ErrInvalidRevocationMode = &ConfigError{Field: "Mode", Message: "unrecognized revocation mode"}
 
 // ErrNoRevocationSources is returned when revocation is enforced (fail
-// closed) under the source-agnostic default mode but neither a CRL file nor
-// an OCSP responder is configured. That combination consults nothing and
-// returns "not revoked" for every certificate — no error, no log, no metric —
+// closed) but the selected mode has no source to consult: the
+// source-agnostic default mode with neither a CRL file nor an OCSP
+// responder, or ModeCRL with no CRL file. Either combination consults
+// nothing and would otherwise return "not revoked" for every certificate —
+// no error, no log, no metric —
 // which silently disables the only mechanism that evicts an unexpired
 // compromised node certificate. A deployment that genuinely wants no
 // revocation checking leaves RevocationConfig unset or opts into soft-fail.

@@ -254,7 +254,7 @@ func TestSnapshotPool_SaveSnapshot_Success(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -323,7 +323,7 @@ func TestSnapshotPool_SaveSnapshot_NilSnapshotter(t *testing.T) {
 	p.start(&wg)
 
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -367,7 +367,7 @@ func TestSnapshotPool_SaveSnapshot_ExceedsMaxSnapshotSize(t *testing.T) {
 	// trigger the too-large check.
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, MaxSnapshotSize: 4}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -423,7 +423,7 @@ func TestSnapshotPool_SaveSnapshot_MaxSnapshotSizeZeroDisablesCheck(t *testing.T
 	// sets it to 4GB, but 0 here means not set).
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, MaxSnapshotSize: 0}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -458,7 +458,7 @@ func TestSnapshotPool_SaveSnapshot_ZeroLastApplied(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(0) // zero means nothing to snapshot
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, t.TempDir(), nil)
+	node := NewNode(nil, nil, nil, cfg, ss, t.TempDir(), nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -501,7 +501,7 @@ func TestSnapshotPool_RecoverSnapshot_Success(t *testing.T) {
 	// First, save a snapshot to create the data on disk.
 	saveSS := newSnapshotTestSnapshotter(200)
 	cfg := config.Config{ShardID: 5, ReplicaID: 2, CompactionOverhead: 50}
-	saveNode := NewNode(nil, nil, nil, cfg, 100, saveSS, tmpDir, nil)
+	saveNode := NewNode(nil, nil, nil, cfg, saveSS, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 5, replicaID: 2, node: saveNode, save: true,
@@ -520,7 +520,7 @@ func TestSnapshotPool_RecoverSnapshot_Success(t *testing.T) {
 
 	// Now recover into a fresh snapshotter.
 	recoverSS := newSnapshotTestSnapshotter(0)
-	recoverNode := NewNode(nil, nil, nil, cfg, 100, recoverSS, tmpDir, nil)
+	recoverNode := NewNode(nil, nil, nil, cfg, recoverSS, tmpDir, nil)
 
 	err = p.requestSnapshot(snapshotRequest{
 		shardID: 5, replicaID: 2, node: recoverNode, save: false,
@@ -568,7 +568,7 @@ func TestSnapshotPool_RecoverSnapshot_NoSnapshot(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(0)
 	cfg := config.Config{ShardID: 5, ReplicaID: 2}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, t.TempDir(), nil)
+	node := NewNode(nil, nil, nil, cfg, ss, t.TempDir(), nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 5, replicaID: 2, node: node, save: false,
@@ -598,7 +598,7 @@ func TestSnapshotPool_RecoverSnapshot_NilSnapshotter(t *testing.T) {
 	p.start(&wg)
 
 	cfg := config.Config{ShardID: 5, ReplicaID: 2}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, t.TempDir(), nil)
+	node := NewNode(nil, nil, nil, cfg, nil, t.TempDir(), nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 5, replicaID: 2, node: node, save: false,
@@ -629,7 +629,7 @@ func TestSnapshotPool_RecoverSnapshot_NilLogDB(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(0)
 	cfg := config.Config{ShardID: 5, ReplicaID: 2}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, t.TempDir(), nil)
+	node := NewNode(nil, nil, nil, cfg, ss, t.TempDir(), nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 5, replicaID: 2, node: node, save: false,
@@ -659,7 +659,7 @@ func TestSnapshotPool_PerShardDedup(t *testing.T) {
 
 	// Do NOT start workers yet so the request stays in-flight.
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 10, replicaID: 1, node: node, save: true,
@@ -697,7 +697,7 @@ func TestSnapshotPool_DedupClearedAfterCompletion(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(50)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	// First request.
 	err := p.requestSnapshot(snapshotRequest{
@@ -747,7 +747,7 @@ func TestSnapshotPool_ConcurrentRequests_DifferentShards(t *testing.T) {
 	for i := range numShards {
 		ss := newSnapshotTestSnapshotter(uint64(100 + i))
 		cfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1, CompactionOverhead: 50}
-		node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+		node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 		err := p.requestSnapshot(snapshotRequest{
 			shardID:   uint64(i + 1),
 			replicaID: 1,
@@ -791,7 +791,7 @@ func TestSnapshotPool_RequestFull_ReturnsError(t *testing.T) {
 	p := newSnapshotPool(1, nil, nil, nil, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 1, replicaID: 1, node: node, save: true,
@@ -851,7 +851,7 @@ func TestSnapshotPool_CallbackFiredOnSave(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(42)
 	cfg := config.Config{ShardID: 7, ReplicaID: 1, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 7, replicaID: 1, node: node, save: true,
@@ -903,7 +903,7 @@ func TestSnapshotPool_GarbageCollection(t *testing.T) {
 	// Create 5 snapshots sequentially. Only 3 should be retained.
 	for i := uint64(1); i <= 5; i++ {
 		ss := newSnapshotTestSnapshotter(i * 100)
-		node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+		node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 		err := p.requestSnapshot(snapshotRequest{
 			shardID: 1, replicaID: 1, node: node, save: true,
 		})
@@ -954,7 +954,7 @@ func TestSnapshotPool_MetadataWritten(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(42)
 	cfg := config.Config{ShardID: 7, ReplicaID: 3, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 7, replicaID: 3, node: node, save: true,
@@ -1454,7 +1454,7 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			}
 
 			ss := newSnapshotTestSnapshotter(100)
-			saveNode := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+			saveNode := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 			if err := p.requestSnapshot(snapshotRequest{
 				shardID: 10, replicaID: 1, node: saveNode, save: true,
@@ -1522,7 +1522,7 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			// same compression setting: the reader chain must undo the writer
 			// chain exactly.
 			recoverSS := newSnapshotTestSnapshotter(0)
-			recoverNode := NewNode(nil, nil, nil, cfg, 100, recoverSS, tmpDir, nil)
+			recoverNode := NewNode(nil, nil, nil, cfg, recoverSS, tmpDir, nil)
 
 			if err := p.requestSnapshot(snapshotRequest{
 				shardID: 10, replicaID: 1, node: recoverNode, save: false,
@@ -2031,7 +2031,7 @@ func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(50)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID: 1, replicaID: 1, node: node, save: true,
@@ -2178,7 +2178,8 @@ func TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge(t *testing.T) 
 func snapshotDirNode(baseDir string, shardID, replicaID uint64) *Node {
 	return NewNode(nil, nil, nil,
 		config.Config{ShardID: shardID, ReplicaID: replicaID},
-		0, nil, baseDir, nil)
+		nil, baseDir, nil)
+
 }
 
 // wireSnapshotNodes installs a node enumerator on the pool so the global
@@ -2292,7 +2293,7 @@ func TestSnapshotPool_PurgeWiredAfterSave(t *testing.T) {
 	for i := uint64(1); i <= 4; i++ {
 		ss := newSnapshotTestSnapshotter(i * 100)
 		cfg := config.Config{ShardID: 1, ReplicaID: 1, CompactionOverhead: 10}
-		node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+		node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 		err := p.requestSnapshot(snapshotRequest{
 			shardID: 1, replicaID: 1, node: node, save: true,
 		})
@@ -3106,7 +3107,7 @@ func TestSnapshotPool_SaveSnapshot_PersistsMembership(t *testing.T) {
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   shardID,
@@ -3168,7 +3169,7 @@ func TestSnapshotPool_SaveSnapshot_NilPeer_EmptyMembership(t *testing.T) {
 	var shardID, replicaID uint64 = 20, 2
 	ss := newSnapshotTestSnapshotter(50)
 	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   shardID,
@@ -3250,7 +3251,7 @@ func TestSnapshotPool_SaveSnapshot_MembershipMultiNode(t *testing.T) {
 	}
 
 	ss := newSnapshotTestSnapshotter(200)
-	node := NewNode(peer, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
 
 	err = p.requestSnapshot(snapshotRequest{
 		shardID:   shardID,
@@ -3602,7 +3603,7 @@ func TestSnapshotPool_Metrics_IncSnapshot(t *testing.T) {
 
 	snapshotter := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 7, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, nil, tmpDir, nil)
 	node.snapshotter = snapshotter
 
 	err := p.requestSnapshot(snapshotRequest{
@@ -3644,7 +3645,7 @@ func TestSnapshotPool_Metrics_NilSafe(t *testing.T) {
 
 	snapshotter := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 7, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, nil, tmpDir, nil)
 	node.snapshotter = snapshotter
 
 	err := p.requestSnapshot(snapshotRequest{
@@ -3735,7 +3736,7 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 	// at request creation time (before pool dispatch) to eliminate the
 	// data race between the snapshot pool worker and step worker.
 	ss := newSnapshotTestSnapshotter(100)
-	node := NewNode(peer, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
 
 	err = pool.requestSnapshot(snapshotRequest{
 		shardID:       shardID,
@@ -3787,7 +3788,7 @@ func TestSnapshotPool_SaveSnapshot_NilPeerTermZero(t *testing.T) {
 	cfg := config.Config{ShardID: 20, ReplicaID: 1, CompactionOverhead: 10}
 	cfg.SetDefaults()
 	// Node with nil peer.
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := pool.requestSnapshot(snapshotRequest{
 		shardID:   20,
@@ -3872,7 +3873,7 @@ func TestSnapshotRequest_AppliedToTermCarriedInRequest(t *testing.T) {
 	}
 
 	ss := newSnapshotTestSnapshotter(100)
-	node := NewNode(peer, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
 
 	// Capture the term at creation time, as production code does.
 	capturedTerm := peer.AppliedToTerm()
@@ -3931,7 +3932,7 @@ func TestSnapshotRequest_ZeroTermWhenNoPeer(t *testing.T) {
 	ss := newSnapshotTestSnapshotter(50)
 	cfg := config.Config{ShardID: 25, ReplicaID: 1, CompactionOverhead: 10}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	// With nil peer, appliedToTerm is zero (the default).
 	err := pool.requestSnapshot(snapshotRequest{
@@ -4017,7 +4018,7 @@ func TestSnapshotRequest_TermOverridesStaleValue(t *testing.T) {
 	}
 
 	ss := newSnapshotTestSnapshotter(100)
-	node := NewNode(peer, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
 
 	// Capture term 5 at request creation time. Even if the peer's
 	// appliedToTerm changes later, the snapshot must use term 5.
@@ -4079,7 +4080,7 @@ func TestSnapshotPool_SaveSnapshot_CreateSnapshotOutOfDate(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(100) // will save at index 100
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	node := NewNode(nil, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, lr, cfg, ss, tmpDir, nil)
 
 	err := pool.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -4133,7 +4134,7 @@ func TestSnapshotPool_SaveSnapshot_CreateSnapshotSuccess(t *testing.T) {
 
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	node := NewNode(nil, nil, lr, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, lr, cfg, ss, tmpDir, nil)
 
 	err := pool.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -4224,7 +4225,7 @@ func TestSnapshotPool_SaveSnapshot_NoPartialFileOnError(t *testing.T) {
 	saveErr := &ErrSnapshotSaveFailed{Msg: "simulated state machine failure"}
 	ss := newFailingSnapshotter(100, saveErr)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 
 	err := p.requestSnapshot(snapshotRequest{
 		shardID:   10,
@@ -4473,7 +4474,7 @@ func TestSaveSnapshot_CompactionOverheadOverride(t *testing.T) {
 	snapshotter.lastApplied.Store(200)
 	snapshotter.state.Store(42)
 
-	node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 	ldb := newSnapshotTestLogDB()
 	stopC := make(chan struct{})
@@ -4521,7 +4522,7 @@ func TestSaveSnapshot_CompactionOverheadDefault(t *testing.T) {
 	snapshotter.lastApplied.Store(200)
 	snapshotter.state.Store(42)
 
-	node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 	ldb := newSnapshotTestLogDB()
 	stopC := make(chan struct{})
@@ -4567,7 +4568,7 @@ func TestSaveSnapshot_WithExportPath(t *testing.T) {
 	snapshotter.lastApplied.Store(100)
 	snapshotter.state.Store(77)
 
-	node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 	ldb := newSnapshotTestLogDB()
 	stopC := make(chan struct{})
@@ -4608,7 +4609,7 @@ func TestSaveSnapshot_WithExportPath_InvalidDir(t *testing.T) {
 	snapshotter.lastApplied.Store(100)
 	snapshotter.state.Store(77)
 
-	node := NewNode(nil, nil, nil, cfg, 100, snapshotter, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
 	ldb := newSnapshotTestLogDB()
 	stopC := make(chan struct{})
@@ -4675,7 +4676,7 @@ func TestHandleRequest_PanicRecovery_SaveRequest(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	snapDir := t.TempDir()
-	node := NewNode(nil, nil, nil, cfg, 100, &panickingSnapshotter{}, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, &panickingSnapshotter{}, snapDir, nil)
 	node.snapshotting.Store(true)
 
 	err := pool.requestSnapshot(snapshotRequest{
@@ -4748,7 +4749,7 @@ func TestHandleRequest_PanicRecovery_RecoverRequest(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, &panickingSnapshotter{}, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, &panickingSnapshotter{}, snapDir, nil)
 	node.snapshotting.Store(true) // pre-set so we can poll for completion
 
 	err := pool.requestSnapshot(snapshotRequest{
@@ -4812,7 +4813,7 @@ func TestHandleRequest_CompletedCFull_DropsResult(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Submit a save request (no snapshotter -> will return error but
 	// still try to send on completedC which is full).
@@ -4879,7 +4880,7 @@ func TestHandleRequest_PanicRecovery_PostCompletionCallback(t *testing.T) {
 	cfg.SetDefaults()
 	// No snapshotter: saveSnapshot returns an error, so handleSnapshot
 	// completes and the panic can only come from the completion callback.
-	node := NewNode(nil, nil, nil, cfg, 100, nil, t.TempDir(), nil)
+	node := NewNode(nil, nil, nil, cfg, nil, t.TempDir(), nil)
 	node.snapshotting.Store(true)
 	pool.inFlight.Store(uint64(1), struct{}{})
 
@@ -4916,7 +4917,7 @@ func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
 
 		cfg := config.Config{ShardID: 7, ReplicaID: 1}
 		cfg.SetDefaults()
-		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 		if !node.TryStartSnapshot() {
 			t.Fatal("TryStartSnapshot should succeed on a fresh node")
 		}
@@ -4953,7 +4954,7 @@ func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
 
 		cfg := config.Config{ShardID: 8, ReplicaID: 1}
 		cfg.SetDefaults()
-		node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 		if !node.TryStartSnapshot() {
 			t.Fatal("TryStartSnapshot should succeed on a fresh node")
 		}

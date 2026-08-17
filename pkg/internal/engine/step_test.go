@@ -223,7 +223,7 @@ func TestStepWorker_ProposalBatching(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick the peer until it becomes leader in this single-node cluster.
@@ -304,7 +304,7 @@ func TestStepWorker_ProposalBatching_NoProposals(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -359,7 +359,7 @@ func TestStepWorker_ProposalBatching_OnlyProposals(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -415,7 +415,7 @@ func TestStepWorker_ProposalBatching_MultiEntryPropose(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -475,7 +475,7 @@ func TestStepWorker_ProposalQueue_SeparateFromInbox(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -537,7 +537,7 @@ func TestStepWorker_ProposalQueue_EmptyQueueNoOp(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -601,7 +601,7 @@ func TestStepWorker_MemoryMode_BypassesCommitC(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick the peer until it becomes leader in this single-node cluster.
@@ -664,7 +664,7 @@ func TestStepWorker_MemoryMode_StopC_ClearsState(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -798,7 +798,7 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain any residual state from the election through processReady
@@ -892,7 +892,7 @@ func TestStepWorker_CommitPendingInbox_EmptyInbox(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
 
@@ -923,7 +923,7 @@ func TestStepWorker_CommitPendingInbox_SendsMessages(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick peer to become leader (grant votes).
@@ -986,7 +986,7 @@ func TestStepWorker_CommitPendingInbox_NilPeerSkipped(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
 
@@ -1010,7 +1010,7 @@ func TestStepWorker_FlushReadIndex_UnconditionalCall(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1073,7 +1073,7 @@ func TestStepWorker_ReadIndexBatching_SingleKey(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1126,7 +1126,7 @@ func TestStepWorker_ReadIndexBatching_MultipleKeys(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1198,7 +1198,7 @@ func TestStepWorker_ReadIndexBatching_NilCallback(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1249,7 +1249,7 @@ func TestStepWorker_ReadIndexBatching_CommitPending(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain any residual state from the election.
@@ -1312,7 +1312,7 @@ func TestStepWorker_ReadIndexBatching_EmptyQueue(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1428,7 +1428,7 @@ func TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle(t *testing.T
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1552,7 +1552,7 @@ func TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending(t *testi
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain election state.
@@ -1652,7 +1652,7 @@ func TestProcessReady_WALMode_SplitsFreeOrderFromOrderedMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1722,7 +1722,7 @@ func TestProcessReady_WALMode_FreeOrderSentBeforeCommitC(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -1876,7 +1876,7 @@ func TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim(t *testing.T) {
 	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	ws.Notify(1)
@@ -2025,7 +2025,7 @@ func TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
 	update := proto.Update{ShardID: 1}
 	update.Messages = append(update.Messages, persistBeforeRespondFixture.messages...)
@@ -2092,7 +2092,7 @@ func TestCommitMemoryMode_OrderedMessagesSentAfterCommit(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2182,7 +2182,7 @@ func TestProcessReady_WALMode_EmptyMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2235,7 +2235,7 @@ func TestTick_CommitPending_FiltersFreeOrderOnly(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2337,7 +2337,7 @@ func TestCommitMemoryMode_SplitsFreeOrderFromOrderedMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2480,7 +2480,7 @@ func TestCommitMemoryMode_NoMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2563,7 +2563,7 @@ func TestCommitMemoryMode_CommitError_OrderedNotSent(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2655,7 +2655,7 @@ func TestCommitMemoryMode_OnlyFreeOrderMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2742,7 +2742,7 @@ func TestCommitMemoryMode_OnlyOrderedMessages(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2833,7 +2833,7 @@ func TestCommitMemoryMode_EndToEnd_MessageOrdering(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -2961,7 +2961,7 @@ func TestCommitMemoryMode_CommitError_HandleErrorCalled(t *testing.T) {
 
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", listener)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", listener)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -3071,7 +3071,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshot(t *testing.T) {
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain any residual state from the election.
@@ -3150,7 +3150,7 @@ func TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers(t
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain election state.
@@ -3252,7 +3252,7 @@ func TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered(t *testing.T) 
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Fill the inbox to capacity so the next Deliver returns false.
@@ -3323,7 +3323,7 @@ func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 	sw.loadNode(node)
 
@@ -3387,7 +3387,7 @@ func TestStepWorker_InstallSnapshot_ProcessedDuringNormalProcessReady(t *testing
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// The peer starts as follower in a multi-node cluster.
@@ -3450,7 +3450,7 @@ func TestStepWorker_CommitPendingInbox_HeartbeatsProcessedDuringCommitPending(t 
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick peer to become leader (grant votes).
@@ -3522,7 +3522,7 @@ func TestStepWorker_ReadIndexFailed_CompletesAllKeys(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Deliver 4 ReadIndex keys. The first is the batch key, the rest
@@ -3588,7 +3588,7 @@ func TestStepWorker_ReadIndexFailed_SingleKey(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Deliver a single ReadIndex key.
@@ -3636,7 +3636,7 @@ func TestStepWorker_ReadIndexFailed_NilCallback(t *testing.T) {
 	peer, lr := newMultiNodeTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	for i := uint64(1); i <= 3; i++ {
@@ -3671,7 +3671,7 @@ func TestStepWorker_ReadIndexFailed_CommitPending_CompletesAllKeys(t *testing.T)
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Set commitPending to enter the fast path.
@@ -3855,7 +3855,7 @@ func TestDrainAndHandleProposals_MultipleEntries(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -3901,7 +3901,7 @@ func TestDrainAndHandleProposals_EmptyQueue(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -3926,7 +3926,7 @@ func TestDrainAndHandleProposals_WithMetrics(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	tickPeerToLeader(peer)
@@ -3973,7 +3973,7 @@ func TestDrainAndHandleProposals_ErrorCallback(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Deliver a proposal to a follower peer (no leader known).
@@ -4004,7 +4004,7 @@ func TestDrainTick_ConsumesPendingTick(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// drainTick performs a non-blocking select on ticker.C: if a tick is
@@ -4103,7 +4103,7 @@ func TestDrainTick_AdvancesElection(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// drainTick calls sw.tick() when a tick is pending. To advance the
@@ -4140,7 +4140,7 @@ func TestLoadNode_AddsNodeToWorkerMap(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	sw.loadNode(node)
 
@@ -4165,7 +4165,7 @@ func TestLoadNode_NilPeerSkipsCallbackWiring(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
 
 	cfg := config.Config{ShardID: 99, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
 	// Should not panic with nil peer.
 	sw.loadNode(node)
@@ -4196,7 +4196,7 @@ func TestProcessCallbacks_DetectsCampaignLaunch(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	update := proto.Update{
@@ -4229,7 +4229,7 @@ func TestProcessCallbacks_DetectsCampaignLaunchWithMetrics(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	update := proto.Update{
@@ -4261,7 +4261,7 @@ func TestProcessCallbacks_NoCallbackOnNonElectionMessages(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	update := proto.Update{
@@ -4301,7 +4301,7 @@ func TestProcessReady_RecoveringNodeDrainsInbox(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	// Mark node as recovering.
 	node.recovering.Store(true)
@@ -4354,7 +4354,7 @@ func TestDrainAndProcess_WithPendingItems(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Drain the initial election update from the peer.
@@ -4420,7 +4420,7 @@ func TestDrainAndProcess_WithMetrics(t *testing.T) {
 
 	cfg := config.Config{ShardID: 5, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Drain the initial election update.
@@ -4482,7 +4482,7 @@ func TestDrainAndProcess_WithOrderedMessages(t *testing.T) {
 
 	cfg := config.Config{ShardID: 3, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Drain election update.
@@ -4554,7 +4554,7 @@ func TestExecutePiggyback_WithFreeOrderMessages(t *testing.T) {
 
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Persist the term-opening no-op through a real GetUpdate/Commit
@@ -4623,7 +4623,7 @@ func TestExecutePiggyback_PersistFailureNoApply(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// Make the peer a leader so Commit() succeeds.
@@ -4671,7 +4671,7 @@ func TestProcessReady_CommitPendingDrainsInbox(t *testing.T) {
 	peer, lr := newTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	tickPeerToLeader(peer)
 
@@ -4732,7 +4732,7 @@ func TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop(t *testin
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain election state.
@@ -4816,7 +4816,7 @@ func TestStepWorker_CommitPendingInbox_DeferredSnapshotReinjected(t *testing.T) 
 	cfg.SetDefaults()
 	testSm := newTestSM()
 	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Drain election state.
@@ -4874,7 +4874,7 @@ func TestCommitMemoryMode_CommitError_FailsShard(t *testing.T) {
 	peer, lr, update := newCommitFailurePeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	if stopped := sw.commitMemoryMode(node, update); stopped {
@@ -4921,7 +4921,7 @@ func TestProcessReady_CommitCFull_FlushesFreeOrderMessages(t *testing.T) {
 	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
 	// Tick the leader so heartbeats accumulate in the peer. commitPending

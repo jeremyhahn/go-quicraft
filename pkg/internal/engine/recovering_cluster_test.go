@@ -188,7 +188,7 @@ func newTestCluster(t *testing.T, shardID uint64, n int, opts ...clusterOption) 
 		}
 
 		e := NewEngine(hostCfg, ldb, c.router, nil, nil, nil)
-		node := NewNode(peer, applier, lr, cfg, 100, nil, "", nil)
+		node := NewNode(peer, applier, lr, cfg, nil, "", nil)
 		e.LoadNode(node)
 		c.router.register(replicaID, e)
 		e.Start()

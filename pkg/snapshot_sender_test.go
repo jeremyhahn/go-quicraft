@@ -68,7 +68,7 @@ func newMinimalEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node 
 		ShardID:   shardID,
 		ReplicaID: replicaID,
 	}
-	return engine.NewNode(nil, nil, nil, cfg, 100, nil, t.TempDir(), nil)
+	return engine.NewNode(nil, nil, nil, cfg, nil, t.TempDir(), nil)
 }
 
 // TestSplitSnapshotMessage_EmptySnapshot verifies that an InstallSnapshot

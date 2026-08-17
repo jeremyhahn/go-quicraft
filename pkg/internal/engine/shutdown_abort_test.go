@@ -86,7 +86,7 @@ func TestCommitWorker_SaveStateRetryCancelledOnShutdown(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 7, ReplicaID: 3}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	rig.cw.batch = append(rig.cw.batch[:0], proto.Update{
@@ -176,7 +176,7 @@ func TestCommitWorker_ApplyHandoffAbortedOnShutdown(t *testing.T) {
 	tickPeerToLeader(peer)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, 100, nil, "", nil)
+	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 
 	update := committedUpdateFromPeer(t, peer)
 	node.commitPending.Store(true)
@@ -337,7 +337,7 @@ func TestEngine_Stop_SurvivesMalformedNodeEntry(t *testing.T) {
 	e.Start()
 
 	nodeCfg := config.Config{ShardID: 3, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	// A value of the wrong type: the range callback must skip it.
@@ -382,7 +382,7 @@ func TestCommitWorker_SaveStateFailure_FailsUncommittedProposals(t *testing.T) {
 	}
 
 	cfg := config.Config{ShardID: 7, ReplicaID: 3}
-	node := NewNode(nil, nil, nil, cfg, 100, nil, "", nil)
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	node.commitPending.Store(true)
 
 	// An in-flight proposal: appended, not yet committed.

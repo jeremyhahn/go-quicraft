@@ -53,7 +53,7 @@ func newResaveFixtureDB(t *testing.T, lastApplied uint64,
 	cfg.SetDefaults()
 
 	sm := newSnapshotTestSnapshotter(lastApplied)
-	node := NewNode(nil, nil, nil, cfg, 100, sm, snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, sm, snapDir, nil)
 	ldb := newSnapshotTestLogDB()
 	var poolDB logdb.LogDB = ldb
 	if wrap != nil {
@@ -359,7 +359,7 @@ func TestSaveSnapshot_SMErrorLeavesNoPlaintextDirectory(t *testing.T) {
 	cfg.SetDefaults()
 
 	errSave := &ErrSnapshotSaveFailed{Msg: "simulated state machine failure"}
-	node := NewNode(nil, nil, nil, cfg, 100, newFailingSnapshotter(300, errSave), snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, newFailingSnapshotter(300, errSave), snapDir, nil)
 	stopC := make(chan struct{})
 	defer close(stopC)
 	pool := newSnapshotPool(1, newSnapshotTestLogDB(), nil, nil, nil, stopC, nil)
@@ -386,7 +386,7 @@ func TestSaveSnapshot_MetadataErrorLeavesNoDirectory(t *testing.T) {
 	cfg := config.Config{ShardID: 5, ReplicaID: 2, CompactionOverhead: 10}
 	cfg.SetDefaults()
 
-	node := NewNode(nil, nil, nil, cfg, 100, newSnapshotTestSnapshotter(150), snapDir, nil)
+	node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(150), snapDir, nil)
 	stopC := make(chan struct{})
 	defer close(stopC)
 	pool := newSnapshotPool(1, newSnapshotTestLogDB(), nil, nil, nil, stopC, nil)

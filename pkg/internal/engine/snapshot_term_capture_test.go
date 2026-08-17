@@ -92,7 +92,7 @@ func TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate(t *testing.T) {
 	ss := &termShiftSnapshotter{shiftIndex: 105, shiftTerm: 7}
 	ss.lastApplied.Store(100)
 	cfg := config.Config{ShardID: 21, ReplicaID: 1, CompactionOverhead: 50}
-	node := NewNode(nil, nil, nil, cfg, 100, ss, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
 	// Applied frontier at capture time: (index=100, term=3).
 	node.SeedLastApplied(100, 3)
 	ss.node.Store(node)
@@ -215,7 +215,7 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	saver := &rsmLikeSnapshotter{}
 	saver.lastApplied.Store(100)
 	saver.state.Store(100)
-	saveNode := NewNode(nil, nil, nil, cfg, 100, saver, tmpDir, nil)
+	saveNode := NewNode(nil, nil, nil, cfg, saver, tmpDir, nil)
 	saveNode.SeedLastApplied(100, 2)
 	if err := p.requestSnapshot(snapshotRequest{
 		shardID: 33, replicaID: 1, node: saveNode, save: true,
@@ -236,7 +236,7 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	recoverer := &rsmLikeSnapshotter{}
 	recoverer.lastApplied.Store(40)
 	recoverer.state.Store(40)
-	node := NewNode(nil, nil, nil, cfg, 100, recoverer, tmpDir, nil)
+	node := NewNode(nil, nil, nil, cfg, recoverer, tmpDir, nil)
 	node.SeedLastApplied(40, 1)
 	if err := p.requestSnapshot(snapshotRequest{
 		shardID: 33, replicaID: 1, node: node, save: false,

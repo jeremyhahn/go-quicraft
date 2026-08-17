@@ -1613,7 +1613,7 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 	}
 }
 
-// failShardOnCorruptConfig trips the shard's circuit breaker for a committed
+// failShardOnCorruptConfig trips the shard's failure latch for a committed
 // config-carrying entry whose payload does not decode, and reports it through
 // the engine's terminal-error path so an operator sees it as a shard failure
 // rather than one ERROR line in a log.
@@ -2108,9 +2108,12 @@ func (c *hostEngineCallback) OnCampaignLaunched(shardID, replicaID, term uint64)
 	)
 }
 
-// OnCampaignSkipped is called by the step worker when an election is
-// skipped because uncommitted config change entries exist between
-// committed and lastIndex. This is a cold path.
+// OnCampaignSkipped is DEAD CODE at runtime: the engine never invokes it,
+// so neither this method nor the EventListener.OnCampaignSkipped callback it
+// forwards to is ever reached in production. The plumbing is kept complete
+// and correct so that a future raft-to-engine notification path has a
+// working destination — see engine.Callback.OnCampaignSkipped for why no
+// such path exists today. Its unit tests exercise it by calling it directly.
 func (c *hostEngineCallback) OnCampaignSkipped(shardID, replicaID, term uint64) {
 	if el := c.h.cfg.EventListener; el != nil && el.OnCampaignSkipped != nil {
 		el.OnCampaignSkipped(config.EventShardInfo{
@@ -2119,7 +2122,7 @@ func (c *hostEngineCallback) OnCampaignSkipped(shardID, replicaID, term uint64) 
 			Term:      term,
 		})
 	}
-	c.h.logger.Info("campaign skipped: pending config change",
+	c.h.logger.Info("campaign skipped",
 		"shard", shardID,
 		"replica", replicaID,
 		"term", term,
@@ -2318,13 +2321,18 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		return ErrDecompressionBomb
 	}
 	if errors.Is(err, engine.ErrShardFailed) {
-		// The apply circuit breaker latched — a state-machine panic
-		// (*engine.SMPanicError) or a repeated apply failure
-		// (*engine.CircuitBreakerError), both of which match this sentinel
-		// through their own Is methods. The shard is offline until it is
-		// reloaded or recovered, which is exactly what the public
-		// ErrShardFailed tells the caller; leaving the engine error to escape
-		// meant no caller could tell a latched shard from a transient refusal.
+		// The shard-failure latch tripped. The two errors the apply path
+		// produces for it are *engine.SMPanicError (a state machine that
+		// panicked) and *engine.ApplyError (a state machine that returned an
+		// error, or a decompression failure); of those only *engine.SMPanicError
+		// carries an Is method matching this sentinel, so only a panic arrives
+		// here. *engine.ApplyError reaches the caller as itself, wrapping the
+		// state machine's own error, which is the more specific answer.
+		//
+		// The shard is offline until it is reloaded or recovered, which is
+		// exactly what the public ErrShardFailed tells the caller; leaving the
+		// engine error to escape meant no caller could tell a latched shard from
+		// a transient refusal.
 		return ErrShardFailed
 	}
 	if errors.Is(err, raft.ErrPendingConfigChange) {
@@ -3847,7 +3855,6 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		stateMachine, // rsm.StateMachine implements engine.Applier
 		lr,
 		cfg,
-		h.cfg.MaxApplyRetries,
 		stateMachine, // rsm.StateMachine implements engine.Snapshotter
 		snapshotDir,
 		h.cfg.EventListener,
@@ -4569,6 +4576,25 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 		return nil, ErrShardNotReady
 	}
 
+	// Refuse immediately once the shard failure latch has tripped.
+	//
+	// The latch is terminal: an SM.Apply error or a state-machine panic takes
+	// the node offline and the step worker skips it from then on (see
+	// engine.Node.Fail / IsFailed). Without this gate the proposal is accepted,
+	// registered in the pending map, delivered to an inbox nothing drains, and
+	// answered only when the sweeper reclaims it at its deadline -- so every
+	// call after the failure blocks for its full timeout and reports what looks
+	// like a slow shard. shardHealth already reads IsFailed and reports
+	// ShardError for exactly this state; the propose path is where a caller
+	// finds out without polling health.
+	//
+	// This is a refusal, not a retry hint: ErrShardFailed is deliberately not
+	// in temporaryErrors, because the shard stays failed until it is reloaded
+	// or recovered and a retry loop against it would spin forever.
+	if engNode.IsFailed() {
+		return nil, ErrShardFailed
+	}
+
 	// Check per-shard rate limiter.
 	if peer := engNode.Peer(); peer != nil {
 		if shardRL := peer.RateLimiter(); shardRL != nil && shardRL.IsLimited() {
@@ -4797,14 +4823,17 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	return rs, nil
 }
 
-// QueryLocalNode reads local SM state via SM.Lookup. NOT linearizable on
-// its own. For linearizable reads, prefer SyncRead.
+// QueryLocalNode reads this replica's state machine via SM.Lookup, bypassing
+// Raft entirely. No consensus check of any kind is performed: the local SM is
+// read as-is, so the result is NOT linearizable and carries no recency
+// guarantee. For linearizable reads use SyncRead; for a read that at least
+// reflects everything committed when it started, use FollowerRead.
 //
-// QueryLocalNode and StaleRead are semantically equivalent: both perform
-// an unguarded local SM lookup without any consensus check. They exist as
-// separate methods for API compatibility with dragonboat's NodeHost
-// interface, where QueryLocalNode was the original name and StaleRead
-// was added later as a more descriptive alias.
+// This is the implementation shared with StaleRead, which is the same
+// operation named for its consistency rather than for the bypass. Callers
+// choosing between them should pick StaleRead unless they specifically mean
+// "read this replica's SM directly"; QueryLocalNode exists for API
+// compatibility with dragonboat's NodeHost, where it was the original name.
 func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
 	// Reads honour an already-cancelled context before touching the state
 	// machine, so cancellation is a strict "do not execute this read"
@@ -4834,40 +4863,19 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 	return ns.rsm.Lookup(ctx, query)
 }
 
-// StaleRead reads local SM state directly without any consensus check.
-// The result may be arbitrarily stale.
+// StaleRead reads this replica's state machine directly, without any
+// consensus check. It is an eventually-consistent read: the result reflects
+// whatever this replica has applied so far and may be arbitrarily stale — a
+// partitioned or lagging replica can serve data from an old term indefinitely,
+// and reads issued in sequence are not guaranteed to be monotonic. Use it only
+// where staleness is acceptable. For linearizable reads use SyncRead.
 //
-// StaleRead and QueryLocalNode are semantically equivalent: both perform
-// an unguarded local SM lookup. They exist as separate methods for API
-// compatibility. StaleRead is the preferred name as it clearly
-// communicates the staleness guarantee (or lack thereof).
+// StaleRead is the preferred name for this operation because it states the
+// guarantee (or lack of one) at the call site. It is exactly QueryLocalNode,
+// which names the same operation after its mechanism, and delegates to it so
+// the two can never drift apart.
 func (h *Host) StaleRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
-	// Reads honour an already-cancelled context before touching the state
-	// machine, so cancellation is a strict "do not execute this read"
-	// boundary rather than a suggestion. Without this a cancelled read still
-	// reached the SM and returned data — and on the byte-key path the SM's
-	// Lookup takes no context at all, so nothing downstream could refuse it.
-	if err := ctx.Err(); err != nil {
-		return nil, mapContextError(err)
-	}
-	if h.closed.Load() {
-		return nil, ErrClosed
-	}
-
-	ns, err := h.getNode(shardID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Shard is stopping/stopped: its state machine may be closing.
-	if ns.stopped.Load() {
-		return nil, ErrClosed
-	}
-	if ns.rsm == nil {
-		return nil, ErrShardNotReady
-	}
-
-	return ns.rsm.Lookup(ctx, query)
+	return h.QueryLocalNode(ctx, shardID, query)
 }
 
 // FollowerRead reads from the local state machine after ensuring the local
@@ -5471,10 +5479,16 @@ func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error) 
 }
 
 // RequestLeaderTransfer requests leadership transfer to a specific replica.
-// Pass targetReplicaID=0 to transfer to the most up-to-date follower.
-// This is fire-and-forget: the method returns immediately, and the
-// transfer completes asynchronously via the raft state machine.
-// The context is checked for cancellation before delivery.
+// targetReplicaID MUST name a current voting replica. There is no automatic
+// target selection: passing 0 does NOT transfer to the most up-to-date
+// follower, it returns *InvalidMemberError. A removed replica, an observer
+// and a witness are each rejected with *InvalidMemberError, and a replica
+// this shard has never seen with *ReplicaNotFoundError. Naming the current
+// leader is an idempotent no-op success.
+//
+// This is otherwise fire-and-forget: once the target validates, the method
+// returns immediately and the transfer completes asynchronously via the raft
+// state machine. The context is checked for cancellation before delivery.
 func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplicaID uint64) error {
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
@@ -8918,7 +8932,7 @@ func (h *Host) shardHealth(ns *nodeState, leaderID, lastApplied uint64) ShardHea
 		return stored
 	}
 	// The engine trips node.failed on a Peer.Commit error or an apply gap
-	// (the apply circuit breaker). The shard is wedged at that point: every
+	// (the shard failure latch). The shard is wedged at that point: every
 	// proposal times out, so HealthCheck must report degraded rather than ok.
 	if engNode.IsFailed() {
 		return ShardError
@@ -9045,9 +9059,11 @@ func buildTransportConfig(hc config.HostConfig) transport.Config {
 			CheckInterval:      rc.CheckInterval,
 			Mode:               revocation.Mode(rc.Mode),
 			// Fail closed by default: the checker enforces unless the operator
-			// explicitly opted into soft-fail. See RevocationConfig.AllowSoftFail.
-			EnforceRevocation: !rc.AllowSoftFail,
-			OnCertRevoked:     rc.OnCertRevoked,
+			// explicitly opted into soft-fail. The internal field carries the
+			// same name and sense as the public one, so this is a copy rather
+			// than a negation that could be dropped or inverted by mistake.
+			AllowSoftFail: rc.AllowSoftFail,
+			OnCertRevoked: rc.OnCertRevoked,
 		}
 	}
 

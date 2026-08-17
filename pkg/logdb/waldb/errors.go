@@ -134,7 +134,9 @@ var (
 	ErrSegmentTooSmallForEntry = errors.New(
 		"waldb: max file size must span at least two blocks")
 
-	// ErrInvalidMaxBatchSize is returned when Options.MaxBatchSize is not positive.
+	// ErrInvalidMaxBatchSize is returned when Options.MaxBatchSize is not
+	// positive. Open never returns it: MaxBatchSize is vestigial and has no
+	// functional Option, so only Options.Validate can produce this.
 	ErrInvalidMaxBatchSize = errors.New("waldb: max batch size must be positive")
 
 	// ErrDiskFull is returned when the WAL directory has reached or

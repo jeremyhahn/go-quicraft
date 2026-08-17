@@ -186,7 +186,7 @@ func newJoiningEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node 
 		t.Fatalf("NewPeer: %v", err)
 	}
 	peer.MarkJoining()
-	return engine.NewNode(peer, nil, lr, cfg, 100, nil, t.TempDir(), nil)
+	return engine.NewNode(peer, nil, lr, cfg, nil, t.TempDir(), nil)
 }
 
 // TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot pins the join

@@ -15,7 +15,7 @@ import (
 // One Update used to become exactly one record, and a record must fit inside
 // one segment. The usable payload is strictly less than the segment size (a
 // record spends recordHeaderSize in every block it spans), and the WAL adds a
-// 76-byte header per entry that raft's batch cap does not account for. So raft
+// 84-byte header per entry that raft's batch cap does not account for. So raft
 // could hand the WAL a batch it would reject with ErrRecordTooLarge -- a
 // PERMANENT error, deliberately not retried or rotated -- and the node could
 // never persist it. A lagging follower catching up on many small entries is

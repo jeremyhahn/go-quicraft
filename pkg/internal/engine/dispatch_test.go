@@ -79,7 +79,7 @@ func TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock(t *testing.
 
 	nodeCfg := config.Config{ShardID: shardID, ReplicaID: replicaID}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
 	e.Start()
@@ -140,7 +140,7 @@ func TestNode_HandleError_DoesNotRunListenerOnCallerGoroutine(t *testing.T) {
 	}
 
 	nodeCfg := config.Config{ShardID: 3, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, 100, nil, "", listener)
+	node := NewNode(nil, nil, nil, nodeCfg, nil, "", listener)
 	e.LoadNode(node)
 
 	returned := make(chan struct{})
@@ -306,7 +306,7 @@ func TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull(t *testing.T) {
 	peer, lr := newTestVoterPeer(t, 1, 1, 3)
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, 100, nil, "", nil)
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, nil, "", nil)
 	sw.loadNode(node)
 	driveToLeader(t, peer, 1, 2)
 

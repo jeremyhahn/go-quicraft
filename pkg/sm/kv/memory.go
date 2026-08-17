@@ -72,11 +72,17 @@ func handleDelete(m *MemoryStore, cmd Command) sm.Result {
 	return sm.Result{Value: 1}
 }
 
-// MemoryStore is a simple in-memory KV state machine. A RWMutex protects
-// the data map because SaveSnapshot may be called from the engine's snapshot
-// pool concurrently with Update. Although QuicRaft serializes Update and Lookup
-// calls, the mutex provides additional safety and allows SaveSnapshot to take a
-// read lock without blocking Update.
+// MemoryStore is a simple in-memory KV state machine. A RWMutex protects the
+// data map and the cmds scratch slice.
+//
+// Inside a shard the mutex is not what separates reads from applies: QuicRaft
+// serializes Update against Lookup on this tier, and the RSM adapter enforces
+// that by holding its readGuard for writing across Apply and for reading across
+// Lookup/NALookup/NALookupBuf/GetHash. SaveSnapshot on this tier likewise runs
+// with applies drained under the engine's saving gate. The mutex is kept
+// because MemoryStore is an exported type usable outside a shard, because it
+// lets SaveSnapshot deep-copy under a read lock rather than serializing to the
+// writer under one, and as defence in depth if the adapter's guard changes.
 type MemoryStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte
