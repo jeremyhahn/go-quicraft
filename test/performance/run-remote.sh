@@ -57,7 +57,14 @@ PERF_SYSTEMS="${PERF_SYSTEMS:-all}"
 # Scratch dir on the bench host for every engine's WAL (bind-mounted into each
 # container as /bench-tmp), so fsync I/O lands on the storage tier you mean to
 # characterize rather than on a container overlay.
-BENCH_TMPDIR="${BENCH_TMPDIR:-/mnt/disk1/bench-tmp}"
+#
+# The default must be creatable by the login user on ANY bench host, which is
+# why it is under $HOME rather than a mount point. It used to default to
+# /mnt/disk1/bench-tmp, a path that exists on one particular server; everywhere
+# else `mkdir -p` failed on the missing mount and the run never started.
+# Override it to put the WAL on the storage tier you actually mean to
+# characterize -- $HOME is correct for portability, not necessarily for I/O.
+BENCH_TMPDIR="${BENCH_TMPDIR:-\$HOME/bench-tmp}"
 # Target platform for the cross-built orchestrator. The bench host needs Docker
 # but no Go toolchain.
 PERF_GOOS="${PERF_GOOS:-linux}"
@@ -120,11 +127,40 @@ env_capture() {
 
 run() {
   say "launching suite on $HOST (profile=$PROFILE systems=$PERF_SYSTEMS benchtime=$BENCHTIME WAL=$BENCH_TMPDIR)"
-  ssh "$HOST" "mkdir -p '$BENCH_TMPDIR' && cd '$REMOTE_PERF' && \
-    BENCH_TMPDIR='$BENCH_TMPDIR' \
-    nohup ./perfcompare --benchtime='$BENCHTIME' --timeout='$PERF_TIMEOUT' \
-      --profile='$PROFILE_REL' $PERF_SYSTEMS > bench-run.log 2>&1 & \
+
+  # Preflight the scratch directory in its OWN command, not as the head of a
+  # backgrounded && chain. It used to be `mkdir -p ... && cd ... && nohup ... &`,
+  # where the & backgrounds the WHOLE list: a mkdir that failed took the launch
+  # with it silently, and the `echo $!` that followed still wrote a pidfile --
+  # for the subshell, not for perfcompare. A failed launch was therefore
+  # indistinguishable from a running one, and `wait` sat tailing a log that
+  # would never be created against a pid that was already gone.
+  if ! ssh "$HOST" "mkdir -p \"$BENCH_TMPDIR\"" 2>&1; then
+    echo "ERROR: cannot create the scratch directory $BENCH_TMPDIR on $HOST." >&2
+    echo "       Set BENCH_TMPDIR to a path the login user can create." >&2
+    exit 1
+  fi
+
+  # The cd is confined to a SUBSHELL, and the subshell execs the binary, so $!
+  # is perfcompare's own pid rather than a wrapper's. Confining it matters:
+  # $RUN_PID and $RUN_LOG are relative to the login home, so a cd left in the
+  # foreground would make the pidfile write land somewhere that does not exist
+  # and silently produce no pidfile at all.
+  ssh "$HOST" "( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
+      exec nohup ./perfcompare --benchtime='$BENCHTIME' --timeout='$PERF_TIMEOUT' \
+        --profile='$PROFILE_REL' $PERF_SYSTEMS ) > '$RUN_LOG' 2>&1 & \
     echo \$! > '$RUN_PID'; echo \"PID \$(cat '$RUN_PID')\""
+
+  # Confirm it is actually running. Launching and reporting a pid proves only
+  # that a fork happened; a binary that dies on its first flag leaves the same
+  # trace. Count the live process, and show the log if it is already gone.
+  sleep 3
+  if ! ssh "$HOST" "pid=\$(cat '$RUN_PID' 2>/dev/null); \
+      [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null"; then
+    echo "ERROR: the suite exited immediately on $HOST. Its output:" >&2
+    ssh "$HOST" "tail -40 '$RUN_LOG' 2>/dev/null || echo '(no $RUN_LOG was created)'" >&2
+    exit 1
+  fi
 }
 
 wait_for_run() {
