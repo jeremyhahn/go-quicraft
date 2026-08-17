@@ -1134,3 +1134,102 @@ func TestConformanceSaveStateBelowFloorRejectsTheWholeBatch(t *testing.T) {
 		}
 	})
 }
+
+// TestConformanceCompactPreservesEverythingAboveTheFloor pins what Compact is
+// allowed to touch, which nothing asserted in either backend.
+//
+// Compact reclaims storage the compaction floor has already made unreachable.
+// It is NOT a delete: everything above the floor, plus the hard state, the
+// snapshot record and the bootstrap record — none of which the floor covers at
+// all — must survive it untouched. memdb implements it as a literal no-op and
+// waldb as segment garbage collection, so the two can drift silently.
+//
+// The gap was measurable: rewriting memdb's Compact to drop the node's entries,
+// hard state and snapshot left the whole memdb suite and the whole conformance
+// suite green, because the only test of Compact asserted its return value.
+// Losing the hard state that way is a lost vote, which permits a second vote in
+// the same term.
+func TestConformanceCompactPreservesEverythingAboveTheFloor(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		const shardID, replicaID = uint64(1), uint64(1)
+
+		var entries []logdb.Entry
+		for i := uint64(1); i <= 10; i++ {
+			entries = append(entries, logdb.Entry{Index: i, Term: 2, Cmd: []byte("payload")})
+		}
+		state := logdb.State{Term: 2, Vote: 3, Commit: 10}
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: shardID, ReplicaID: replicaID, State: state, Entries: entries,
+		}}); err != nil {
+			t.Fatalf("SaveState: %v", err)
+		}
+		if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
+			Index: 4, Term: 2,
+			Membership: logdb.Membership{Addresses: map[uint64]string{1: "a", 2: "b"}},
+		}); err != nil {
+			t.Fatalf("SaveSnapshot: %v", err)
+		}
+		if err := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+			Addresses: map[uint64]string{1: "a"}, Type: 5,
+		}); err != nil {
+			t.Fatalf("SaveBootstrap: %v", err)
+		}
+
+		// Compact with NO floor set must reclaim nothing at all.
+		if err := db.Compact(shardID, replicaID); err != nil {
+			t.Fatalf("Compact (no floor): %v", err)
+		}
+		assertIntact := func(phase string, wantFirst uint64) {
+			t.Helper()
+			first, span, err := db.EntryRange(shardID, replicaID)
+			if err != nil {
+				t.Fatalf("%s: EntryRange: %v", phase, err)
+			}
+			if first != wantFirst || first+span-1 != 10 {
+				t.Fatalf("%s: entries are [%d,%d] after Compact, want [%d,10]: Compact "+
+					"reclaimed entries the compaction floor had not released",
+					phase, first, first+span-1, wantFirst)
+			}
+			got, _, err := db.IterateEntries(nil, 0, shardID, replicaID, wantFirst, 11, 0)
+			if err != nil {
+				t.Fatalf("%s: IterateEntries: %v", phase, err)
+			}
+			if uint64(len(got)) != 11-wantFirst {
+				t.Fatalf("%s: read %d entries, want %d", phase, len(got), 11-wantFirst)
+			}
+			for _, e := range got {
+				if !bytes.Equal(e.Cmd, []byte("payload")) {
+					t.Fatalf("%s: entry %d payload changed to %q", phase, e.Index, e.Cmd)
+				}
+			}
+			st, _, err := db.ReadState(shardID, replicaID)
+			if err != nil {
+				t.Fatalf("%s: ReadState after Compact: %v (the hard state does not sit "+
+					"below any compaction floor and must survive)", phase, err)
+			}
+			if st != state {
+				t.Fatalf("%s: hard state after Compact = %+v, want %+v: losing a vote "+
+					"this way permits a second vote in the same term", phase, st, state)
+			}
+			ss, err := db.GetSnapshot(shardID, replicaID)
+			if err != nil || ss.Index != 4 {
+				t.Fatalf("%s: snapshot after Compact = %+v, err %v; want index 4",
+					phase, ss.Index, err)
+			}
+			bs, ok, err := db.GetBootstrap(shardID, replicaID)
+			if err != nil || !ok || bs.Type != 5 {
+				t.Fatalf("%s: bootstrap after Compact = %+v ok=%v err=%v", phase, bs, ok, err)
+			}
+		}
+		assertIntact("no floor", 1)
+
+		// With a floor at 4, Compact may release entries 1..4 and nothing else.
+		if err := db.RemoveEntriesTo(shardID, replicaID, 4); err != nil {
+			t.Fatalf("RemoveEntriesTo: %v", err)
+		}
+		if err := db.Compact(shardID, replicaID); err != nil {
+			t.Fatalf("Compact (floor 4): %v", err)
+		}
+		assertIntact("floor 4", 5)
+	})
+}

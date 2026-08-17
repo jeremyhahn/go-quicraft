@@ -805,7 +805,7 @@ build-fips:
 # dependency vulnerabilities. Run `make nancy` explicitly where credentials
 # are configured. This is not a reduction in coverage — with a 401 the scan
 # was never running, it was only reporting that it had.
-ci: fmt vet lint security build test
+ci: fmt no-mutants vet lint security build test
 	@echo "CI pipeline passed"
 
 # ============================================================================
@@ -970,6 +970,41 @@ lint:
 .PHONY: vet
 vet:
 	$(GOVET) ./...
+
+# ============================================================================
+# Mutation-marker guard
+#
+# Mutation testing is how correctness is verified in this repository: a fix is
+# not trusted until the defect it closes has been re-introduced and the test
+# seen to fail. That workflow edits PRODUCTION code and relies on restoring it
+# afterwards -- and a restore that never happens is invisible, because a
+# disabled guard makes tests pass, not fail.
+#
+# It has already happened once. A `if false {` around the rollback fsync in
+# waldb reached a commit: a failed SaveState whose bytes had reached the medium
+# through ordinary writeback could be resurrected by a crash and replayed as
+# committed entries the caller had been told were REJECTED. Every suite stayed
+# green, because the site had no test -- which is precisely why it was being
+# mutated.
+#
+# So the guard is mechanical rather than a matter of remembering. Test files are
+# excluded: `if false` is legitimate there (pinning a compile-time branch), and
+# a mutation left in a test file cannot silently weaken production behaviour.
+# ============================================================================
+.PHONY: no-mutants
+no-mutants:
+	@found=$$(grep -rnE '\bif false \{|\bMUTANT\b|\bMUTATION\b' \
+		--include='*.go' pkg/ test/ contrib/ 2>/dev/null \
+		| grep -v '_test\.go:' || true); \
+	if [ -n "$$found" ]; then \
+		echo "FAIL: mutation markers left in production code:"; \
+		echo "$$found"; \
+		echo ""; \
+		echo "A mutation that is never restored disables a guard silently --"; \
+		echo "the suite goes GREEN, which is the opposite of a visible failure."; \
+		exit 1; \
+	fi; \
+	echo "No mutation markers in production code"
 
 .PHONY: fmt
 fmt:

@@ -968,7 +968,7 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int, cl
 		}
 		// fsync the truncation so a crash right after rollback cannot resurrect
 		// the discarded batch bytes (which would replay "rolled back" records).
-		if false {
+		if !s.noSync {
 			if err := s.f.Sync(); err != nil {
 				return &SegmentDiscardError{SegmentID: s.id, Err: err}
 			}

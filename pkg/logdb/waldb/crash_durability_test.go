@@ -1243,9 +1243,21 @@ func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
 	// Shard A is listed FIRST and writes successfully; shard B then fails
 	// permanently, because a record whose framed size exceeds the whole segment
 	// can never fit. The batch is rolled back, shard A included.
+	//
+	// Shard A gets TWO updates, and that is load-bearing. A batch never flushes
+	// a partial block, so the LAST record it writes always keeps its final
+	// chunk in the block buffer and never reaches the medium; recovery discards
+	// an unassembled First/Middle run without a word, so a single-record batch
+	// looks correctly rolled back whether or not the rollback was ever made
+	// durable. The second update's writes seal the blocks holding the first
+	// update's record, which is what puts a COMPLETE, replayable record from a
+	// failed batch on the disk — the only thing the rollback's flush can be
+	// tested against.
 	err := db.SaveState([]logdb.Update{
-		{ShardID: shardA, ReplicaID: replicaID, State: logdb.State{Term: 2, Vote: 2, Commit: 2},
-			Entries: []logdb.Entry{entry(shardA, 2, 4000)}},
+		{ShardID: shardA, ReplicaID: replicaID,
+			Entries: []logdb.Entry{entry(shardA, 2, 2000)}},
+		{ShardID: shardA, ReplicaID: replicaID, State: logdb.State{Term: 2, Vote: 2, Commit: 3},
+			Entries: []logdb.Entry{entry(shardA, 3, 2000)}},
 		{ShardID: shardB, ReplicaID: replicaID,
 			Entries: []logdb.Entry{entry(shardB, 2, 2*maxFile)}},
 	})

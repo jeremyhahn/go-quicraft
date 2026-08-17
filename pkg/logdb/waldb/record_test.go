@@ -19,6 +19,8 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
 // TestEncodeDecodeSmallRecord verifies round-trip encoding and decoding of a
@@ -384,5 +386,35 @@ func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
 	}
 	if consumed != recordHeaderSize+len(data) {
 		t.Fatalf("consumed = %d, want %d", consumed, recordHeaderSize+len(data))
+	}
+}
+
+// TestEntryOverheadBytesTracksTheRecordHeader pins the two constants that must
+// agree across a package boundary they cannot see each other over.
+//
+// logdb.EntryOverheadBytes is the per-entry overhead every LogDB charges
+// against the IterateEntries maxSize budget, and its documentation states it
+// MUST equal waldb's entryRecordHeaderSize — the bytes this package actually
+// writes per entry. They are separate constants only because pkg/logdb cannot
+// import this one (waldb imports logdb, so the dependency runs the other way),
+// which means the compiler cannot hold them together and only a test can.
+//
+// Drift is not cosmetic. waldb charges what it really wrote (indexEntry.Size)
+// while memdb and every caller computing a budget charge EntryOverheadBytes, so
+// the same maxSize admits a different set of entries depending on the backend —
+// and a replication batch sized against the wrong figure either overshoots the
+// transport's limit or ships short reads forever.
+//
+// This assertion lives here because this is the only package where both names
+// are in scope.
+func TestEntryOverheadBytesTracksTheRecordHeader(t *testing.T) {
+	if entryRecordHeaderSize != logdb.EntryOverheadBytes {
+		t.Fatalf("waldb.entryRecordHeaderSize = %d but logdb.EntryOverheadBytes = %d.\n\n"+
+			"These must be equal. waldb charges the bytes it actually wrote, every "+
+			"other LogDB and every caller computing a size budget charges "+
+			"logdb.EntryOverheadBytes, so while they differ the same maxSize admits "+
+			"a different set of entries depending on which backend answers. Whichever "+
+			"one changed, change the other in the same commit.",
+			entryRecordHeaderSize, logdb.EntryOverheadBytes)
 	}
 }

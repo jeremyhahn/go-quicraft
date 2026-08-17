@@ -3689,3 +3689,243 @@ func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
 		t.Fatalf("recorded snapshot = %d after a legitimate advance, want 60", got.Index)
 	}
 }
+
+// rangeRecordingLogDB records every (low, high) IterateEntries is asked for and
+// serves nothing. It exists so a test can assert what the LogReader asked the
+// backend, not merely what it returned: the two range guards below are reached
+// indirectly whatever they are set to, so the returned error alone cannot tell
+// a working guard from a broken one.
+type rangeRecordingLogDB struct {
+	LogDB
+	calls [][2]uint64
+}
+
+func (r *rangeRecordingLogDB) IterateEntries(entries []Entry, size uint64,
+	_ uint64, _ uint64, low uint64, high uint64, _ uint64) ([]Entry, uint64, error) {
+	r.calls = append(r.calls, [2]uint64{low, high})
+	return entries, size, ErrUnavailable
+}
+
+// TestLogReaderRangeBoundariesAreExact pins the two range comparisons in
+// getRangeLockedInto that no test could fail on: widening either by one index
+// left the pkg/logdb and pkg/internal/raft suites green.
+//
+// Neither can be pinned on the returned error, and that is the whole difficulty.
+// Both guards are backstopped by something further down that happens to return
+// the same error for the same input, so a widened guard still LOOKS right:
+// an inverted range underflows `high-low`, is silently rewritten to a huge
+// range, and then fails on a cache miss; an over-long range fails when the
+// backend has nothing at the missing index. What actually changes is the range
+// the reader ASKS FOR, so that is what is asserted here.
+func TestLogReaderRangeBoundariesAreExact(t *testing.T) {
+	const marker, count = uint64(10), uint64(5) // available: [11,15]
+
+	newRecording := func(t *testing.T) (*LogReader, *rangeRecordingLogDB) {
+		t.Helper()
+		rec := &rangeRecordingLogDB{}
+		lr := NewLogReader(1, 1, rec)
+		if err := lr.ApplySnapshot(proto.Snapshot{Index: marker, Term: 1}); err != nil {
+			t.Fatalf("ApplySnapshot: %v", err)
+		}
+		if err := lr.SetRange(marker+1, count); err != nil {
+			t.Fatalf("SetRange: %v", err)
+		}
+		if first, last := lr.IndexRange(); first != marker+1 || last != marker+count {
+			t.Fatalf("fixture: range [%d,%d], want [%d,%d]",
+				first, last, marker+1, marker+count)
+		}
+		rec.calls = nil
+		return lr, rec
+	}
+
+	t.Run("inverted_range_never_reaches_the_backend", func(t *testing.T) {
+		lr, rec := newRecording(t)
+		// low == high is an empty but well-formed range; low > high is inverted.
+		// Without the guard `high - low` underflows, the cap rewrites high to
+		// low+maxEntries, and the reader asks the backend for a range of
+		// billions of entries starting in the middle of the log.
+		if _, err := lr.GetRange(14, 13, 0); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("GetRange(14,13) = %v, want ErrUnavailable", err)
+		}
+		if len(rec.calls) != 0 {
+			t.Fatalf("an INVERTED range was passed through to the backend as %v: "+
+				"`high - low` underflowed and the cap rewrote high, so the reader "+
+				"asked for a slab of the log rather than refusing a caller bug",
+				rec.calls)
+		}
+	})
+
+	t.Run("high_bound_is_last_plus_one", func(t *testing.T) {
+		lr, rec := newRecording(t)
+		// high is exclusive, so lastIndex+1 is the largest legal value.
+		if _, err := lr.GetRange(11, 16, 0); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("GetRange(11,16) = %v; the fixture backend serves nothing, so "+
+				"ErrUnavailable is expected — but it must come from the BACKEND", err)
+		}
+		if len(rec.calls) != 1 || rec.calls[0] != [2]uint64{11, 16} {
+			t.Fatalf("the whole available range [11,16) was not passed to the "+
+				"backend; calls = %v", rec.calls)
+		}
+
+		lr, rec = newRecording(t)
+		if _, err := lr.GetRange(11, 17, 0); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("GetRange(11,17) (one past the end) = %v, want ErrUnavailable", err)
+		}
+		if len(rec.calls) != 0 {
+			t.Fatalf("a range running PAST the last available index was passed to "+
+				"the backend as %v: the reader asked for entries this replica does "+
+				"not have, and whatever the backend returns for them would be served "+
+				"to raft as log content", rec.calls)
+		}
+	})
+}
+
+// TestLogReaderCompactRefusesOutOfRangeIndexes pins Compact's outcome at both
+// ends of its range.
+//
+// Its two explicit guards (`index < markerIndex` and `index > lastIndex()`) are
+// REDUNDANT and cannot be pinned individually: widening either one leaves the
+// behaviour unchanged, because the termLocked call immediately below repeats the
+// same bounds through getRangeLockedInto and returns the same error for the same
+// input. That is a genuine defence-in-depth, not a coverage gap, and this test
+// therefore asserts the OUTCOME both paths must produce rather than which line
+// produced it — including that a refused Compact leaves the range untouched,
+// which matters because the update it guards (`lr.length -= index - markerIndex`)
+// underflows on unsigned arithmetic.
+func TestLogReaderCompactRefusesOutOfRangeIndexes(t *testing.T) {
+	const marker, count = uint64(10), uint64(5) // available: [11,15]
+
+	build := func(t *testing.T) *LogReader {
+		t.Helper()
+		lr := NewLogReader(1, 1, nil)
+		if err := lr.ApplySnapshot(proto.Snapshot{Index: marker, Term: 1}); err != nil {
+			t.Fatalf("ApplySnapshot: %v", err)
+		}
+		ents := make([]proto.Entry, 0, count)
+		for i := uint64(1); i <= count; i++ {
+			ents = append(ents, proto.Entry{Index: marker + i, Term: 1})
+		}
+		if err := lr.Append(ents); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		return lr
+	}
+
+	t.Run("below_the_marker", func(t *testing.T) {
+		lr := build(t)
+		if err := lr.Compact(marker); err != nil {
+			t.Fatalf("Compact(%d) (at the marker) = %v, want nil", marker, err)
+		}
+		lr = build(t)
+		if err := lr.Compact(marker - 1); !errors.Is(err, ErrCompacted) {
+			t.Fatalf("Compact(%d) (below the marker) = %v, want ErrCompacted",
+				marker-1, err)
+		}
+		if first, last := lr.IndexRange(); first != marker+1 || last != marker+count {
+			t.Fatalf("a refused Compact changed the range to [%d,%d]: the marker "+
+				"moved backwards and `length -= index - markerIndex` underflowed",
+				first, last)
+		}
+	})
+
+	t.Run("above_the_last_index", func(t *testing.T) {
+		lr := build(t)
+		last := marker + count
+		if err := lr.Compact(last); err != nil {
+			t.Fatalf("Compact(%d) (exactly the last index) = %v, want nil", last, err)
+		}
+		lr = build(t)
+		if err := lr.Compact(last + 1); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Compact(%d) (one past the last index) = %v, want ErrUnavailable",
+				last+1, err)
+		}
+		if first, l := lr.IndexRange(); first != marker+1 || l != last {
+			t.Fatalf("a refused Compact changed the range to [%d,%d]", first, l)
+		}
+	})
+}
+
+// failingSaveStateLogDB refuses every SaveState and serves nothing, so a test
+// can observe what the reader registered in memory when the durable write did
+// not happen.
+type failingSaveStateLogDB struct {
+	LogDB
+	err   error
+	calls int
+}
+
+func (f *failingSaveStateLogDB) SaveState([]Update) error {
+	f.calls++
+	return f.err
+}
+
+func (f *failingSaveStateLogDB) IterateEntries(entries []Entry, size uint64,
+	_ uint64, _ uint64, _ uint64, _ uint64, _ uint64) ([]Entry, uint64, error) {
+	return entries, size, ErrUnavailable
+}
+
+// TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails pins the
+// ordering PersistBootstrap's contract rests on: the durable write happens
+// FIRST, and the in-memory registration only if it succeeded.
+//
+// Reversing the two — registering the entries and caching their terms before
+// calling SaveState — left pkg/logdb, pkg/internal/raft and pkg/internal/engine
+// all green, so the ordering was free to flip. It must not, and the reason is
+// what the reader becomes if it does: a failed bootstrap write leaves the reader
+// reporting a range the LogDB does not hold and answering Term() for an index
+// that was never persisted, while GetRange for the same index goes to storage
+// and fails. The two views of the log disagree, and the disagreement is exactly
+// the window in which raft would use a term for an entry that does not exist.
+//
+// This is the general invariant in its one testable instance: the reader's
+// caches may LAG storage, never lead it.
+func TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails(t *testing.T) {
+	injected := errors.New("reader_test: bootstrap write refused")
+	db := &failingSaveStateLogDB{err: injected}
+	lr := NewLogReader(1, 1, db)
+
+	beforeFirst, beforeLast := lr.IndexRange()
+
+	err := lr.PersistBootstrap(
+		[]proto.Entry{{Index: 1, Term: 3, Type: 1, Cmd: []byte("initial-membership")}},
+		proto.State{Term: 3, Vote: 1, Commit: 1},
+	)
+	if !errors.Is(err, injected) {
+		t.Fatalf("PersistBootstrap = %v, want the injected write error", err)
+	}
+	if db.calls != 1 {
+		t.Fatalf("SaveState was called %d times, want exactly 1", db.calls)
+	}
+
+	if first, last := lr.IndexRange(); first != beforeFirst || last != beforeLast {
+		t.Fatalf("the reader registered a range [%d,%d] (was [%d,%d]) after the "+
+			"durable write FAILED: it now reports entries the LogDB does not hold, "+
+			"and the in-memory view of the log leads storage instead of lagging it",
+			first, last, beforeFirst, beforeLast)
+	}
+	if term, err := lr.Term(1); err == nil {
+		t.Fatalf("Term(1) returned %d after the bootstrap write failed; want an "+
+			"error. The term cache was populated for an entry that was never "+
+			"persisted, so Term() answers for an index GetRange cannot serve",
+			term)
+	}
+	if st, _ := lr.NodeState(); st.Term != 0 || st.Commit != 0 {
+		t.Fatalf("hard state advanced to %+v after the bootstrap write failed", st)
+	}
+
+	// The same call succeeds once the write does, so the guard is an ordering
+	// requirement and not a refusal to bootstrap.
+	db.err = nil
+	if err := lr.PersistBootstrap(
+		[]proto.Entry{{Index: 1, Term: 3, Type: 1, Cmd: []byte("initial-membership")}},
+		proto.State{Term: 3, Vote: 1, Commit: 1},
+	); err != nil {
+		t.Fatalf("PersistBootstrap after the write succeeds: %v", err)
+	}
+	if first, last := lr.IndexRange(); first != 1 || last != 1 {
+		t.Fatalf("range after a successful bootstrap = [%d,%d], want [1,1]", first, last)
+	}
+	if term, err := lr.Term(1); err != nil || term != 3 {
+		t.Fatalf("Term(1) after a successful bootstrap = (%d, %v), want (3, nil)", term, err)
+	}
+}

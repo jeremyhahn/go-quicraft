@@ -712,16 +712,25 @@ func TestEntryRangeEmptyNodeReturnsZero(t *testing.T) {
 	}
 }
 
+// TestEntryRangeAfterCompaction checks the range AND that the range agrees with
+// what the log will actually serve. Reporting the right numbers is only half of
+// it: EntryRange is what a recovering LogReader initialises its bounds from, so
+// a range that names entries the store then refuses is worse than a wrong
+// count — the caller reads a gap where it was told there was a log.
 func TestEntryRangeAfterCompaction(t *testing.T) {
 	db := New()
 	entries := make([]logdb.Entry, 10)
 	for i := range entries {
-		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1}
+		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1, Cmd: []byte("c")}
 	}
-	db.SaveState([]logdb.Update{
+	if err := db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-	db.RemoveEntriesTo(1, 1, 5)
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if err := db.RemoveEntriesTo(1, 1, 5); err != nil {
+		t.Fatalf("RemoveEntriesTo: %v", err)
+	}
 
 	first, length, err := db.EntryRange(1, 1)
 	if err != nil {
@@ -732,6 +741,29 @@ func TestEntryRangeAfterCompaction(t *testing.T) {
 	}
 	if length != 5 {
 		t.Errorf("EntryRange() length = %d, want 5", length)
+	}
+
+	// The advertised range must be readable in full.
+	got, _, err := db.IterateEntries(nil, 0, 1, 1, first, first+length, 0)
+	if err != nil {
+		t.Fatalf("IterateEntries over the range EntryRange just advertised "+
+			"([%d,%d)): %v", first, first+length, err)
+	}
+	if uint64(len(got)) != length {
+		t.Fatalf("EntryRange advertised %d entries but only %d are readable",
+			length, len(got))
+	}
+	for i, e := range got {
+		if want := first + uint64(i); e.Index != want {
+			t.Fatalf("entry %d of the advertised range has index %d, want %d",
+				i, e.Index, want)
+		}
+	}
+	// And the compacted prefix must read as compacted, not as merely absent:
+	// raft falls back to InstallSnapshot on ErrCompacted and retries forever
+	// on ErrUnavailable.
+	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 6, 0); !errors.Is(err, logdb.ErrCompacted) {
+		t.Fatalf("reading the compacted prefix = %v, want ErrCompacted", err)
 	}
 }
 
@@ -844,10 +876,17 @@ func TestRemoveEntriesToIndexZeroIsNoOp(t *testing.T) {
 
 // --- Compact ---
 
+// TestCompactIsNoOp covers one narrow contract point: Compact on a node this
+// store has never heard of succeeds rather than erroring. That it does not
+// DISTURB a populated node is a cross-backend property and is asserted in
+// TestConformanceCompactPreservesEverythingAboveTheFloor; asserting it here as
+// well would only duplicate it. Keeping the scope explicit matters because this
+// test used to be the only test of Compact in the package, and a Compact
+// rewritten to delete the node's entries, hard state and snapshot passed it.
 func TestCompactIsNoOp(t *testing.T) {
 	db := New()
 	if err := db.Compact(1, 1); err != nil {
-		t.Errorf("Compact() = %v, want nil", err)
+		t.Errorf("Compact() on an unknown node = %v, want nil", err)
 	}
 }
 
