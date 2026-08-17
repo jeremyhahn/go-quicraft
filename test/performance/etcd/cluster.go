@@ -17,12 +17,12 @@ package etcd_perf
 import (
 	"context"
 	"fmt"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 )
@@ -124,18 +124,14 @@ func (c *EtcdCluster) waitForLeader(timeout time.Duration) (*etcdClusterNode, er
 	}
 }
 
-// freeTCPPort binds and immediately releases a TCP port on localhost,
-// returning the address string. This is used to allocate unique ports
-// for each cluster node's transport listener.
+// freeTCPPort reserves a loopback address for a cluster node's transport
+// listener. The node binds by address, not by inherited listener, so the port
+// must be chosen before the node exists; benchutil.ReserveTCPPort picks one
+// from outside the kernel's ephemeral range so no outbound connection can be
+// assigned it in the gap. See benchutil/port.go for the failure this replaced.
 func freeTCPPort(b *testing.B) string {
 	b.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to find free port: %v", err)
-	}
-	addr := l.Addr().String()
-	l.Close()
-	return addr
+	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
 
 // SetupEtcdCluster creates an N-node etcd/raft cluster with TCP+TLS

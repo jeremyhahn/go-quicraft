@@ -1,91 +1,172 @@
 #!/usr/bin/env bash
-# run-remote.sh — provision the fairness-normalized benchmark suite onto a
-# dedicated bench server and run it in Docker.
+# run-remote.sh — measure a machine profile on the machine it names.
 #
-# The bench server has Docker but no Go/Rust toolchain, so the perfcompare
-# orchestrator is cross-compiled locally and shipped alongside the source. The
-# dragonboat fork used to be pre-staged into .build-cache/dragonboat because it
-# was consumable only as a directory; it is a published module now and the
-# remote Docker build fetches it like any other dependency.
+# One command drives the whole thing:
 #
-# Usage:
-#   ./run-remote.sh stage     # rsync repo to the server
-#   ./run-remote.sh run       # start the full 30s suite in the background
-#   ./run-remote.sh status    # tail the remote run log
-#   ./run-remote.sh fetch     # copy JSON results back into ./results
+#   make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+#
+# which is this script's "all": stage the working tree onto the target, capture
+# the target's specifications, run the benchmark suite there, fetch the results
+# AND the capture back into profiles/<name>/, and regenerate that profile's
+# documents locally.
+#
+# The profile name is an argument because it cannot be derived. lscpu describes
+# hardware; it does not know which of our machines is the desktop-class
+# reference box and which is the dual-socket server. Everything else about the
+# machine IS derived, on the target, at run time — see capture-env.sh — so the
+# specification table beside a number is never hand-maintained and can never go
+# stale.
+#
+# The benchmark itself runs under nohup on the target and this script tails it.
+# A dropped ssh session therefore costs you the tail, not the run; reconnect
+# with './run-remote.sh status' or './run-remote.sh wait'.
+#
+# Individual phases, for when you want just one:
+#
+#   ./run-remote.sh stage      rsync the working tree to the target
+#   ./run-remote.sh env        capture the target's specs into the profile
+#   ./run-remote.sh run        start the suite there, in the background
+#   ./run-remote.sh wait       stream the remote log until the run exits
+#   ./run-remote.sh status     tail the remote log once
+#   ./run-remote.sh fetch      copy results and env.json back
+#   ./run-remote.sh generate   regenerate this profile's documents locally
 set -euo pipefail
 
-# ssh destination of the machine that runs the suite. Same variable name as the
+# ssh destination of the machine being measured. Same variable name as the
 # bench-compare harness (scripts/bench-compare.sh) so one export covers both.
-# Unlike bench-compare this suite has no local mode: it rsyncs a working tree and
-# drives Docker on the target, so a host is always required. There is no default
-# — export PERF_HOST=user@host for your own bench machine.
-HOST="${PERF_HOST:?PERF_HOST is required (ssh destination of the bench server, e.g. user@host)}"
+# There is no default: a benchmark whose machine is implicit is a benchmark
+# whose numbers cannot be interpreted.
+HOST="${PERF_HOST:?PERF_HOST is required (ssh destination of the bench machine, e.g. user@host)}"
+
+# The machine profile these results belong to. Operator-supplied, always.
+PROFILE="${PERF_PROFILE:?PERF_PROFILE is required (machine profile name, e.g. omega or r640)}"
+
 # Staging directory on the bench host. Relative paths resolve against the remote
 # login's home directory (both ssh and rsync do this); override with an absolute
 # path if the staging tree belongs elsewhere.
 REMOTE_DIR="${REMOTE_DIR:-bench/go-quicraft}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PERF_DIR="$REPO_ROOT/test/performance"
 BENCHTIME="${BENCHTIME:-30s}"
 PERF_TIMEOUT="${PERF_TIMEOUT:-7200s}"
-# NVMe-backed scratch dir on the bench host. All engines write their WAL here
-# (bind-mounted into each container as /bench-tmp) so fsync I/O lands on NVMe,
-# matching the production storage tier and the prior R640 baseline.
+# Systems to run, and the systems the generated documents must cover. Narrow it
+# explicitly when a profile is genuinely missing an engine; generation refuses
+# to run — rather than quietly write a partial set — if anything named here has
+# no results.
+PERF_SYSTEMS="${PERF_SYSTEMS:-all}"
+# Scratch dir on the bench host for every engine's WAL (bind-mounted into each
+# container as /bench-tmp), so fsync I/O lands on the storage tier you mean to
+# characterize rather than on a container overlay.
 BENCH_TMPDIR="${BENCH_TMPDIR:-/mnt/disk1/bench-tmp}"
+# Target platform for the cross-built orchestrator. The bench host needs Docker
+# but no Go toolchain.
+PERF_GOOS="${PERF_GOOS:-linux}"
+PERF_GOARCH="${PERF_GOARCH:-amd64}"
+
+PROFILE_REL="profiles/$PROFILE"
+LOCAL_PROFILE="$PERF_DIR/$PROFILE_REL"
+REMOTE_PERF="$REMOTE_DIR/test/performance"
+RUN_LOG="$REMOTE_PERF/bench-run.log"
+RUN_PID="$REMOTE_PERF/bench-run.pid"
+
+say() { echo ">> $*"; }
 
 stage() {
-  # Refuse to stage over an active run: rsync --delete below would clobber
-  # the suite's working tree and results mid-flight.
+  # Refuse to stage over an active run: rsync --delete below would clobber the
+  # suite's working tree mid-flight.
   if ssh "$HOST" "pgrep -f perfcompare >/dev/null 2>&1"; then
     echo "ERROR: a perfcompare run is active on $HOST; refusing to stage" >&2
     exit 1
   fi
 
-  echo ">> cross-building perfcompare (linux/amd64)"
-  ( cd "$REPO_ROOT/test/performance" && GOWORK=off GOOS=linux GOARCH=amd64 \
-      go build -o /tmp/perfcompare.linux ./cmd/perfcompare/ )
+  say "cross-building perfcompare ($PERF_GOOS/$PERF_GOARCH)"
+  ( cd "$PERF_DIR" && GOWORK=off GOOS="$PERF_GOOS" GOARCH="$PERF_GOARCH" \
+      go build -o "$PERF_DIR/perfcompare.remote" ./cmd/perfcompare/ )
 
-  echo ">> rsyncing repo -> $HOST:$REMOTE_DIR"
+  say "rsyncing working tree -> $HOST:$REMOTE_DIR"
   ssh "$HOST" "mkdir -p '$REMOTE_DIR'"
-  # Include .git (the orchestrator's findRepoRoot needs it); skip
-  # heavy/irrelevant trees. The remote results dir and run log are excluded so
-  # --delete never destroys data from previous runs when re-staging.
+  # .git is included: the orchestrator's findRepoRoot locates the Docker build
+  # context by it. The profiles tree is excluded in both directions — on the
+  # target it is output only, so --delete can never reach back and destroy a
+  # stored result or a hand-written analysis.
   rsync -a --delete \
     --exclude 'test/performance/openraft/target/' \
+    --exclude 'test/performance/profiles/' \
+    --exclude 'test/performance/perfcompare' \
+    --exclude 'test/performance/perfcompare.remote' \
     --exclude 'build/' \
-    --exclude 'test/performance/results/' \
+    --exclude '.build-cache/' \
     --exclude 'test/performance/bench-run.log' \
     "$REPO_ROOT/" "$HOST:$REMOTE_DIR/"
-  scp /tmp/perfcompare.linux "$HOST:$REMOTE_DIR/test/performance/perfcompare"
-  ssh "$HOST" "chmod +x '$REMOTE_DIR/test/performance/perfcompare'"
-  echo ">> stage complete"
+  scp -q "$PERF_DIR/perfcompare.remote" "$HOST:$REMOTE_PERF/perfcompare"
+  ssh "$HOST" "chmod +x '$REMOTE_PERF/perfcompare' '$REMOTE_PERF/capture-env.sh'"
+  rm -f "$PERF_DIR/perfcompare.remote"
+  say "stage complete"
+}
+
+env_capture() {
+  say "capturing $PROFILE specifications on $HOST"
+  ssh "$HOST" "mkdir -p '$REMOTE_PERF/$PROFILE_REL' && \
+    cd '$REMOTE_PERF' && ./capture-env.sh '$PROFILE' > '$PROFILE_REL/env.json'"
+  ssh "$HOST" "cat '$REMOTE_PERF/$PROFILE_REL/env.json'"
 }
 
 run() {
-  echo ">> launching full suite on $HOST (benchtime=$BENCHTIME, WAL on $BENCH_TMPDIR)"
-  ssh "$HOST" "mkdir -p '$BENCH_TMPDIR' && cd '$REMOTE_DIR/test/performance' && \
+  say "launching suite on $HOST (profile=$PROFILE systems=$PERF_SYSTEMS benchtime=$BENCHTIME WAL=$BENCH_TMPDIR)"
+  ssh "$HOST" "mkdir -p '$BENCH_TMPDIR' && cd '$REMOTE_PERF' && \
     BENCH_TMPDIR='$BENCH_TMPDIR' \
     nohup ./perfcompare --benchtime='$BENCHTIME' --timeout='$PERF_TIMEOUT' \
-      --json-dir=results all > bench-run.log 2>&1 & echo \"PID \$!\""
-  echo ">> started; use './run-remote.sh status' to watch"
+      --profile='$PROFILE_REL' $PERF_SYSTEMS > bench-run.log 2>&1 & \
+    echo \$! > '$RUN_PID'; echo \"PID \$(cat '$RUN_PID')\""
+}
+
+wait_for_run() {
+  say "streaming $RUN_LOG until the run exits"
+  # tail --pid returns when the benchmark process does, so this blocks for
+  # exactly as long as the run and no longer.
+  ssh "$HOST" "pid=\$(cat '$RUN_PID' 2>/dev/null); \
+    if [ -z \"\$pid\" ]; then echo 'no recorded run'; exit 1; fi; \
+    tail -n +1 -f --pid=\"\$pid\" '$RUN_LOG'"
 }
 
 status() {
-  ssh "$HOST" "tail -40 '$REMOTE_DIR/test/performance/bench-run.log'; \
-    echo '--- json ---'; ls -la '$REMOTE_DIR/test/performance/results/' 2>/dev/null || true"
+  ssh "$HOST" "tail -40 '$RUN_LOG' 2>/dev/null; echo '--- results ---'; \
+    ls -la '$REMOTE_PERF/$PROFILE_REL/results/' 2>/dev/null || echo 'none yet'"
 }
 
 fetch() {
-  mkdir -p "$REPO_ROOT/test/performance/results"
-  rsync -a "$HOST:$REMOTE_DIR/test/performance/results/" \
-    "$REPO_ROOT/test/performance/results/"
-  echo ">> fetched results into test/performance/results/"
+  mkdir -p "$LOCAL_PROFILE/results"
+  say "fetching results and env.json into $PROFILE_REL/"
+  # No --delete: the local profile also holds analysis.md, which is the human's
+  # and has never been on the target.
+  rsync -a "$HOST:$REMOTE_PERF/$PROFILE_REL/results/" "$LOCAL_PROFILE/results/"
+  rsync -a "$HOST:$REMOTE_PERF/$PROFILE_REL/env.json" "$LOCAL_PROFILE/env.json"
+  ls -la "$LOCAL_PROFILE"
 }
 
-case "${1:-}" in
-  stage) stage ;;
-  run) run ;;
-  status) status ;;
-  fetch) fetch ;;
-  *) echo "usage: $0 {stage|run|status|fetch}" >&2; exit 1 ;;
+generate() {
+  say "regenerating $PROFILE_REL documents"
+  ( cd "$PERF_DIR" && GOWORK=off go build -o perfcompare ./cmd/perfcompare/ && \
+    ./perfcompare generate --profile="$PROFILE_REL" --systems="$PERF_SYSTEMS" )
+}
+
+all() {
+  stage
+  env_capture
+  run
+  wait_for_run
+  fetch
+  generate
+}
+
+case "${1:-all}" in
+  all)      all ;;
+  stage)    stage ;;
+  env)      env_capture ;;
+  run)      run ;;
+  wait)     wait_for_run ;;
+  status)   status ;;
+  fetch)    fetch ;;
+  generate) generate ;;
+  *) echo "usage: $0 {all|stage|env|run|wait|status|fetch|generate}" >&2; exit 1 ;;
 esac

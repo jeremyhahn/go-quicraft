@@ -106,7 +106,6 @@ INT_TEST_DIR    := ./test/integration
 PERF_DIR        := ./test/performance
 PERF_DRAGONBOAT := $(PERF_DIR)/dragonboat
 PERF_ETCD       := $(PERF_DIR)/etcd
-PERF_RESULTS    := ./results
 
 # ============================================================================
 # Primary targets
@@ -124,9 +123,12 @@ clean:
 	$(GO) clean ./...
 	rm -rf $(COVER_DIR) $(BUILD_DIR)/quicraft *.log *.test *.out *.prof .build-cache
 	rm -rf test/performance/openraft/target
-	rm -rf test/performance/profiles
-	rm -rf test/performance/results/results test/performance/charts/charts
-	rm -f test/performance/perfcompare test/performance/cmd/perfcompare/perfcompare
+	@# test/performance/profiles/ is DATA, not build output: stored result JSON,
+	@# captured machine specifications, and the hand-written analysis.md of a
+	@# machine that is currently offline and cannot be re-measured. `clean` used
+	@# to delete the whole tree. It does not go near it now.
+	rm -f test/performance/perfcompare test/performance/perfcompare.remote
+	rm -f test/performance/cmd/perfcompare/perfcompare
 	rm -f test/performance/quicraft/*.prof test/performance/quicraft/*.test
 	rm -f contrib/dragonboat/*.test
 
@@ -602,18 +604,49 @@ PERF_CMD := $(PERF_DIR)/cmd/perfcompare
 # github.com/jeremyhahn/dragonboat/v4, pinned in
 # test/performance/dragonboat/go.mod. It needs no local checkout and no
 # DRAGONBOAT_SRC override.
+#
+# Everything these targets store lives under a MACHINE PROFILE,
+# test/performance/profiles/<name>/. Two are tracked long-term: omega, a
+# single-socket desktop-grade box, and r640, a dual-socket server-grade box. A
+# throughput number is a property of the machine as much as of the code, so
+# there is no profile-less place to put one.
+#
+# PERF_PROFILE is required by every target that reads or writes stored results,
+# and has no default. The name cannot be inferred from the hardware — lscpu
+# cannot tell you which of your machines is the reference desktop — so the
+# operator supplies it, and capture-env.sh derives everything else on the target.
 SYSTEMS ?= all
 BENCHTIME ?= 30s
 PERF_TIMEOUT ?= 3600s
 PERF_EXTRA ?=
+PERF_PROFILE ?=
+# Systems to run, and the systems the generated documents must cover.
+# Generation refuses to run if anything named here has no results, so a profile
+# that is genuinely missing an engine is narrowed explicitly:
+#   make perf-generate PERF_PROFILE=omega PERF_SYSTEMS=quicraft,dragonboat,openraft
+PERF_SYSTEMS ?= all
+# ssh destination for the remote targets, e.g. PERF_HOST=jhahn@198.51.100.90.
+PERF_HOST ?=
+
+PROFILE_DIR = profiles/$(PERF_PROFILE)
 
 # Internal: common perfcompare flags.
 PERF_FLAGS = --benchtime=$(BENCHTIME) --timeout=$(PERF_TIMEOUT) $(PERF_EXTRA)
+
+# Internal: refuse to touch a nameless profile. Writing results into a directory
+# whose machine nobody recorded is how a number ends up uninterpretable.
+REQUIRE_PROFILE = @if [ -z "$(PERF_PROFILE)" ]; then \
+	echo "PERF_PROFILE is required (e.g. PERF_PROFILE=omega). Profiles: $$(ls $(PERF_DIR)/profiles 2>/dev/null | tr '\n' ' ')"; \
+	exit 1; fi
 
 .PHONY: perf-build
 perf-build:
 	cd $(PERF_DIR) && $(GO) build -o perfcompare ./cmd/perfcompare/
 
+# ----------------------------------------------------------------------------
+# Ad-hoc runs. These print a terminal report and store nothing, so they need no
+# profile: nothing they produce can later be mistaken for a machine's record.
+# ----------------------------------------------------------------------------
 .PHONY: perf-quicraft
 perf-quicraft: perf-build
 	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) quicraft
@@ -638,63 +671,68 @@ perf-compare: perf-build
 perf-compare-all: perf-build
 	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) all
 
-.PHONY: perf-compare-all-visualize
-perf-compare-all-visualize: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --visualize --chart-dir test/performance/charts/ all
+# ----------------------------------------------------------------------------
+# Profile pipeline: run into a profile, then generate that profile's documents.
+#
+#   make perf-all PERF_PROFILE=omega
+#   make perf-run PERF_PROFILE=omega PERF_SYSTEMS=etcd     # one engine
+#   make perf-generate PERF_PROFILE=omega
+# ----------------------------------------------------------------------------
+.PHONY: perf-run
+perf-run: perf-build
+	$(REQUIRE_PROFILE)
+	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --profile=$(PROFILE_DIR) $(PERF_SYSTEMS)
 
-# Compare QuicRaft against a specific system (runs both sequentially, then shows side-by-side)
-.PHONY: perf-compare-etcd
-perf-compare-etcd: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --visualize --chart-dir test/performance/charts/etcd/ quicraft etcd
-
-.PHONY: perf-compare-dragonboat
-perf-compare-dragonboat: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --visualize --chart-dir test/performance/charts/dragonboat/ quicraft dragonboat
-
-.PHONY: perf-compare-openraft
-perf-compare-openraft: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --visualize --chart-dir test/performance/charts/openraft/ quicraft openraft
-
-# Run all systems, generate charts, and render markdown docs from templates.
-# Runs each system exactly once, saves JSON results, generates pairwise SVG charts,
-# then renders markdown templates (README.md, etcd.md, dragonboat.md, openraft.md).
-# Use BENCHTIME=1s for a quick run, or PERF_EXTRA=--no-build to skip Docker rebuilds.
-# Example: make perf-docs BENCHTIME=1s PERF_EXTRA=--no-build
-.PHONY: perf-docs
-perf-docs: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --visualize --pairwise-charts --chart-dir=charts/ --json-dir=$(PERF_RESULTS) all
-	cd $(PERF_DIR) && ./perfcompare generate --results-dir=$(PERF_RESULTS) --output-dir=. --chart-dir=charts/
-
-# Run-once pipeline: run each system ONCE, save JSON, then generate all docs.
-# Phase 1: Run individual systems and save JSON results.
-.PHONY: perf-run-quicraft
-perf-run-quicraft: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --json-dir=$(PERF_RESULTS) quicraft
-
-.PHONY: perf-run-etcd
-perf-run-etcd: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --json-dir=$(PERF_RESULTS) etcd
-
-.PHONY: perf-run-dragonboat
-perf-run-dragonboat: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --json-dir=$(PERF_RESULTS) dragonboat
-
-.PHONY: perf-run-openraft
-perf-run-openraft: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --json-dir=$(PERF_RESULTS) openraft
-
-.PHONY: perf-run-all
-perf-run-all: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --json-dir=$(PERF_RESULTS) all
-
-# Phase 2: Generate all markdown docs + SVG charts from stored JSON results.
+# Regenerates <system>.md and every chart in the profile from its stored JSON.
+# analysis.md is hand-written and is never touched.
 .PHONY: perf-generate
 perf-generate: perf-build
-	cd $(PERF_DIR) && ./perfcompare generate --results-dir=$(PERF_RESULTS) --output-dir=. --chart-dir=charts/
+	$(REQUIRE_PROFILE)
+	cd $(PERF_DIR) && ./perfcompare generate --profile=$(PROFILE_DIR) --systems=$(PERF_SYSTEMS)
 
-# Full pipeline: run all systems once, then generate all docs.
 .PHONY: perf-all
-perf-all: perf-run-all perf-generate
+perf-all: perf-run perf-generate
+
+# Capture a machine's specifications into a profile. With PERF_HOST it captures
+# the remote machine; without, this one. Either way the values are derived where
+# the benchmarks run, never typed in.
+.PHONY: perf-env
+perf-env:
+	$(REQUIRE_PROFILE)
+	@mkdir -p $(PERF_DIR)/$(PROFILE_DIR)
+	@if [ -n "$(PERF_HOST)" ]; then \
+		ssh -o BatchMode=yes $(PERF_HOST) 'bash -s $(PERF_PROFILE)' \
+			< $(PERF_DIR)/capture-env.sh > $(PERF_DIR)/$(PROFILE_DIR)/env.json; \
+	else \
+		$(PERF_DIR)/capture-env.sh $(PERF_PROFILE) > $(PERF_DIR)/$(PROFILE_DIR)/env.json; \
+	fi
+	@cat $(PERF_DIR)/$(PROFILE_DIR)/env.json
+
+# The whole pipeline against any machine, in one command: stage the working
+# tree, capture the target's specs, run the suite, fetch results AND env.json
+# back into profiles/<name>/, regenerate that profile's documents.
+#
+#   make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+#
+# The remote run is detached, so a dropped ssh costs the tail and not the run;
+# reattach with 'test/performance/run-remote.sh wait'. Knobs: BENCHTIME,
+# PERF_TIMEOUT, PERF_SYSTEMS, BENCH_TMPDIR, REMOTE_DIR.
+.PHONY: perf-remote
+perf-remote:
+	$(REQUIRE_PROFILE)
+	@if [ -z "$(PERF_HOST)" ]; then \
+		echo "PERF_HOST is required (e.g. PERF_HOST=user@host)"; exit 1; fi
+	PERF_HOST=$(PERF_HOST) PERF_PROFILE=$(PERF_PROFILE) PERF_SYSTEMS=$(PERF_SYSTEMS) \
+		BENCHTIME=$(BENCHTIME) PERF_TIMEOUT=$(PERF_TIMEOUT) \
+		$(PERF_DIR)/run-remote.sh all
+
+# Reattach to, or inspect, a run already in flight on PERF_HOST.
+.PHONY: perf-remote-status
+perf-remote-status:
+	$(REQUIRE_PROFILE)
+	@if [ -z "$(PERF_HOST)" ]; then \
+		echo "PERF_HOST is required (e.g. PERF_HOST=user@host)"; exit 1; fi
+	PERF_HOST=$(PERF_HOST) PERF_PROFILE=$(PERF_PROFILE) $(PERF_DIR)/run-remote.sh status
 
 # ============================================================================
 # Coverage
@@ -877,8 +915,47 @@ build-fips:
 # dependency vulnerabilities. Run `make nancy` explicitly where credentials
 # are configured. This is not a reduction in coverage — with a 401 the scan
 # was never running, it was only reporting that it had.
-ci: fmt no-mutants vet lint security build test
+ci: fmt no-mutants check-tool-versions vet lint security build test
 	@echo "CI pipeline passed"
+
+# ============================================================================
+# Analyser-version guard
+#
+# GOLANGCI_VERSION is the single source of truth, but three files cannot read a
+# make variable — .github/workflows/quality.yml and the two devcontainer
+# Dockerfiles each carry a literal pin. They had drifted to THREE different
+# versions at once (Makefile/quality.yml v2.12.2, .devcontainer/Dockerfile
+# v2.11.1, Dockerfile.dev and install-tools v2.7.2), which is the failure mode
+# the remote-tools comment describes: an analyser of the wrong version is worse
+# than none, because it gates on a different rule set while looking like it
+# passed. golangci-lint v2 also moved flags and changed which linters are on by
+# default, so this is not cosmetic drift.
+#
+# Mechanical rather than a matter of remembering, for the same reason
+# no-mutants is. The floor matters: a discovery that finds nothing must fail,
+# or a renamed file silently turns this into a gate over an empty set.
+# ============================================================================
+.PHONY: check-tool-versions
+check-tool-versions:
+	@pins=$$(git grep -hoE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
+		.github .devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
+	count=$$(printf '%s\n' "$$pins" | grep -c . || true); \
+	if [ "$$count" -lt 1 ]; then \
+		echo "FAIL: found no golangci-lint version pins at all."; \
+		echo "      Discovery has broken and this gate is verifying nothing."; \
+		exit 1; \
+	fi; \
+	if [ "$$pins" != "$(GOLANGCI_VERSION)" ]; then \
+		echo "FAIL: golangci-lint pins disagree with GOLANGCI_VERSION=$(GOLANGCI_VERSION):"; \
+		git grep -nE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
+			.github .devcontainer Makefile; \
+		echo ""; \
+		echo "Every literal pin must equal GOLANGCI_VERSION. A developer or a"; \
+		echo "container linting on a different version gates on a different rule"; \
+		echo "set from CI while looking like it passed the same gate."; \
+		exit 1; \
+	fi; \
+	echo "golangci-lint pins agree ($(GOLANGCI_VERSION))"
 
 # ============================================================================
 # Full CI pipeline, including every build-tagged suite.
@@ -1230,10 +1307,17 @@ install-trivy:
 install-nancy:
 	$(GO) install github.com/sonatype-nexus-community/nancy@latest
 
+# golangci-lint is installed at $(GOLANGCI_VERSION), not at a second hardcoded
+# version. This recipe said v2.7.2 while GOLANGCI_VERSION and quality.yml said
+# v2.12.2, so a developer who ran `make install-tools` and then `make lint`
+# gated against a different rule set from CI while looking like they had passed
+# the same gate. That is the exact failure remote-tools was hardened against —
+# see the note above it: an analyser of the wrong version is worse than none.
+# `make check-tool-versions` now enforces this mechanically.
 .PHONY: install-tools
 install-tools: install-gosec install-govulncheck install-trivy install-nancy
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin v2.7.2
-	@echo "All CI tools installed"
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_VERSION)
+	@echo "All CI tools installed ($(GOLANGCI_VERSION))"
 
 # ============================================================================
 # Docker
@@ -1325,13 +1409,18 @@ help:
 	@echo "  perf-dragonboat              Run Dragonboat benchmarks"
 	@echo "  perf-openraft                Run OpenRaft (Rust) benchmarks"
 	@echo "  perf-compare                 Compare systems (SYSTEMS=\"quicraft etcd\")"
-	@echo "  perf-compare-etcd            Compare QuicRaft vs etcd + generate charts"
-	@echo "  perf-compare-dragonboat      Compare QuicRaft vs Dragonboat + generate charts"
-	@echo "  perf-compare-openraft        Compare QuicRaft vs OpenRaft + generate charts"
 	@echo "  perf-compare-all             Compare all systems"
-	@echo "  perf-compare-all-visualize   Compare all + generate SVG charts"
-	@echo "  perf-docs                    Run all systems once + generate pairwise charts"
-	@echo "    Flags: BENCHTIME=1s PERF_EXTRA=--no-build"
+	@echo "  (the four above store nothing and need no profile)"
+	@echo ""
+	@echo "Machine profiles (PERF_PROFILE is required; no default):"
+	@echo "  perf-run                     Run into profiles/<name>/results"
+	@echo "  perf-generate                Generate that profile's documents + charts"
+	@echo "  perf-all                     perf-run then perf-generate"
+	@echo "  perf-env                     Capture a machine's specs into the profile"
+	@echo "  perf-remote                  Stage, capture, run, fetch and generate, on PERF_HOST"
+	@echo "  perf-remote-status           Tail a remote run already in flight"
+	@echo "    Flags: PERF_PROFILE=omega PERF_HOST=user@host PERF_SYSTEMS=all"
+	@echo "           BENCHTIME=30s PERF_TIMEOUT=7200s PERF_EXTRA=--no-build"
 	@echo ""
 	@echo "Coverage (minimum $(COVER_MIN)%):"
 	@echo "  coverage               Run total coverage report"
@@ -1355,6 +1444,7 @@ help:
 	@echo ""
 	@echo "Linting:"
 	@echo "  lint                   Run golangci-lint"
+	@echo "  check-tool-versions    Assert every golangci-lint pin matches GOLANGCI_VERSION"
 	@echo "  vet                    Run go vet"
 	@echo "  fmt                    Check gofmt formatting"
 	@echo ""

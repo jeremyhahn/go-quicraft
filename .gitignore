@@ -9,7 +9,13 @@ data/
 # Performance test generated artifacts
 test/performance/openraft/target/
 test/performance/perfcompare
-test/performance/profiles/
+test/performance/perfcompare.remote
+
+# test/performance/profiles/ is NOT ignored. It was, back when it was scratch
+# output. It now holds the measured data of record: the stored result JSON, the
+# machine specifications captured on each target, the generated comparison
+# documents, and analysis.md — including the R640 baseline, whose machine is
+# offline and whose numbers exist nowhere else.
 
 # Snapshot trees a test accidentally rooted at the package directory instead of
 # t.TempDir(). Ignored so they can never be committed again; a test that needs

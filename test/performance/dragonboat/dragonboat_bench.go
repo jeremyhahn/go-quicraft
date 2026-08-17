@@ -17,7 +17,6 @@ package dragonboat_perf
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,12 +49,6 @@ const (
 	// dbReplicaID is the replica ID for the single-node benchmark.
 	dbReplicaID uint64 = 1
 
-	// dbAddr is the address for the single-node Dragonboat host.
-	// Dragonboat does not support port 0 (auto-assign), so we use a
-	// fixed port. The election benchmark creates multiple hosts
-	// sequentially so reuse is safe.
-	dbAddr = "127.0.0.1:63100"
-
 	// dbRTT is the RTT in milliseconds for Dragonboat benchmarks.
 	dbRTT uint64 = 1
 
@@ -82,10 +75,12 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 	}
 	certs := generateTLSCerts(b, tlsDir, 1)
 
+	addr := freeTCPPort(b)
+
 	nhCfg := dbconfig.NodeHostConfig{
 		WALDir:         dir + "/wal",
 		NodeHostDir:    dir + "/data",
-		RaftAddress:    dbAddr,
+		RaftAddress:    addr,
 		RTTMillisecond: dbRTT,
 		MutualTLS:      true,
 		CAFile:         certs[0].CAFile,
@@ -107,7 +102,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 	}
 
 	members := map[uint64]dragonboat.Target{
-		dbReplicaID: dbAddr,
+		dbReplicaID: addr,
 	}
 
 	createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
@@ -306,10 +301,12 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	}
 	certs := generateTLSCerts(b, tlsDir, 1)
 
+	addr := freeTCPPort(b)
+
 	nhCfg := dbconfig.NodeHostConfig{
 		WALDir:         dir + "/wal",
 		NodeHostDir:    dir + "/data",
-		RaftAddress:    dbAddr,
+		RaftAddress:    addr,
 		RTTMillisecond: dbRTT,
 		MutualTLS:      true,
 		CAFile:         certs[0].CAFile,
@@ -324,7 +321,7 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	defer nh.Close()
 
 	members := map[uint64]dragonboat.Target{
-		dbReplicaID: dbAddr,
+		dbReplicaID: addr,
 	}
 
 	createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
@@ -449,16 +446,15 @@ func (c *BenchCluster) Leader() *dragonboat.NodeHost {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// freeTCPPort finds a free TCP port on localhost for Dragonboat transport.
+// freeTCPPort reserves a loopback address for a Dragonboat transport listener.
+// Dragonboat binds by address rather than by inherited listener, so the port
+// has to be chosen before the NodeHost exists; benchutil.ReserveTCPPort picks
+// one from outside the kernel's ephemeral range so no outbound connection can
+// be assigned it in the gap. See benchutil/port.go for the failure this
+// replaced.
 func freeTCPPort(b *testing.B) string {
 	b.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to find free port: %v", err)
-	}
-	addr := l.Addr().String()
-	l.Close()
-	return addr
+	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
 
 // SetupDragonboatCluster creates a multi-node Dragonboat cluster with
@@ -544,19 +540,28 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	}
 
 	// Warmup proposal with retry to ensure all TLS connections are fully
-	// established before timing begins.
+	// established before timing begins. The retry budget is benchutil's, shared
+	// with every other engine, and a warmup that never succeeds is fatal HERE.
+	// It used to be swallowed: the loop broke on success and fell through on
+	// exhaustion either way, so an unready cluster was handed to the caller and
+	// surfaced later as a misleading downstream error — that is how
+	// BenchmarkStaleRead_5N_Dragonboat came to report "seed propose failed:
+	// request dropped as the shard is not ready" instead of naming the setup
+	// that had already failed.
 	session := hosts[leaderIdx].GetNoOPSession(dbShardID)
 	warmupCmd := encodeKVCmd([]byte("warmup"), []byte("ok"))
-	for attempt := 0; attempt < 10; attempt++ {
+	warmupErr := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
 		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, warmupErr := hosts[leaderIdx].SyncPropose(warmupCtx, session, warmupCmd)
-		warmupCancel()
-		if warmupErr == nil {
-			break
+		defer warmupCancel()
+		_, err := hosts[leaderIdx].SyncPropose(warmupCtx, session, warmupCmd)
+		return err
+	})
+	if warmupErr != nil {
+		for _, h := range hosts {
+			h.Close()
 		}
-		warmupTimer := time.NewTimer(100 * time.Millisecond)
-		<-warmupTimer.C
-		warmupTimer.Stop()
+		b.Fatalf("%d-node cluster warmup propose failed after %d attempts: %v",
+			numNodes, benchutil.WarmupAttempts, warmupErr)
 	}
 
 	return &BenchCluster{

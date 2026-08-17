@@ -1,12 +1,34 @@
 # QuicRaft Performance Profiling Analysis
 
-- Profiling Duration: 233.06s
-- Total CPU Samples:  467.21s (200.47% utilization, multi-core)
-- Profile Files: Generated via `Reproducing This Profile` section below
+## Provenance
+
+Read this first. The profile below carries no recorded hardware.
+
+| Field | Value |
+|---|---|
+| Committed | 2026-03-18, commit 3d92cd2 |
+| Machine | **not recorded** |
+| Go version | not recorded |
+| Profiling duration | 233.06 s |
+| Total CPU samples | 467.21 s (200.47% utilization, multi-core) |
+
+Commit 3d92cd2 is the same commit that recorded the R640 benchmark set in
+[README.md](README.md), which makes the R640 the likely source, but nothing in
+the profile confirms it and the file has not been touched since. Absolute
+`ns/op` is a property of the machine, so every timing number here is
+uninterpretable without that attribution: treat them as ratios and shapes, not
+as values you can compare against a run on known hardware.
+
+The percentages, `B/op` and `allocs/op` figures are far more portable than the
+timings. Allocation counts are deterministic for a given build, so those are the
+parts of this document worth trusting. The next profile run should be captured
+with the same provenance header the `bench-compare` harness emits (machine, CPU
+model, governor, load, Go version, commit) so this caveat is not needed again.
+See [docs/performance/benchmarking.md](../../docs/performance/benchmarking.md).
 
 ## Summary
 
-QUIC transport I/O and Go runtime scheduling are the dominant CPU consumers, accounting for ~57% of CPU time. Context and timer allocations on the read path are the primary memory hotspots. LeaseRead delivers a 30-34x throughput improvement over standard ReadIndex by eliminating the heartbeat round-trip.
+QUIC transport I/O and Go runtime scheduling are the dominant CPU consumers, accounting for ~57% of CPU time. Context and timer allocations on the read path are the primary memory hotspots. LeaseRead is roughly 30x the throughput of standard ReadIndex in this profile, because it removes the heartbeat round-trip.
 
 ## CPU Profile
 

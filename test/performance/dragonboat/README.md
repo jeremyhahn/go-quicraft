@@ -36,7 +36,8 @@ For complete multi-node results and full analysis, see [../dragonboat.md](../dra
 ## Running
 
 ```bash
-make perf-compare-dragonboat
+make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat
+make perf-generate PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat
 ```
 
 Or manually:

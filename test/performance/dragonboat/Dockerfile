@@ -11,7 +11,7 @@
 # happens to be checked out on the build host.
 #
 # Usage (via Makefile):
-#   make perf-compare-dragonboat
+#   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat
 
 FROM golang:1.26.6 AS builder
 

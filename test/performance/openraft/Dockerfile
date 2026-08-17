@@ -4,7 +4,7 @@
 # tree is available.  The Makefile drives this build.
 #
 # Usage (via Makefile):
-#   make perf-compare-openraft
+#   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,openraft
 
 FROM rust:latest AS builder
 

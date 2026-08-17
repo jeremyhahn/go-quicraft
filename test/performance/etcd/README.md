@@ -19,7 +19,8 @@ Each benchmark is run in two storage modes:
 ## Running
 
 ```bash
-make perf-compare-etcd
+make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,etcd
+make perf-generate PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,etcd
 ```
 
 Or manually:
