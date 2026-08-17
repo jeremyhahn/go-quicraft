@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0-alpha] - 2026-08-17
+
+A full-codebase review and remediation round: 6 critical, 31 high and roughly 60
+medium/low findings closed across 42 commits. Every fix was mutation-verified —
+the defect it closes was re-introduced and the test watched to fail — and the
+whole gate runs green, including a new network-partition suite.
+
+**A minor bump, not a patch, because on-disk and wire formats changed in place.**
+
+### BREAKING — existing data will not load
+
+Formats are pinned at v1 until production release, so layouts change in place
+rather than gaining version negotiation. A 0.4.x data directory is not readable
+by this version.
+
+- `proto.Entry` header 60 → 68 bytes (`OwnerID` at +56)
+- `proto.SessionPolicy` 24 → 32 bytes (`MaxSessionsPerOwner`)
+- `proto.Snapshot`: `Compression` added; `Type`, `Imported` and `Witness`
+  removed — all three were written or reserved and never read
+- WAL entry record 76 → 84 bytes; WAL membership tail 66 → 74 bytes
+- `EntryOverheadBytes` 76 → 84
+
+**Migration:** wipe the data directory, or export snapshots with 0.4.x and
+re-import. Sealed barrier state migrates in place: `sealedStateMACVersion` moved
+1 → 2 to cover the new load-generation counter, and a pre-fence blob is
+recognised once and restamped automatically on the next persist.
+
+### Fixed — safety
+
+- **`InstallSnapshot` installed its sender as leader with no term or leadership
+  check**, above the stale-snapshot rejection. Any replica could replace another
+  replica's log and suppress its elections. `handleHeartbeat` already gated
+  exactly this on a strictly weaker message.
+- **ReadIndex confirmed linearizable reads with a heartbeat context the leader
+  never issued.** One stale or forged response acknowledged every pending read,
+  including reads whose confirming heartbeat had not been broadcast — with the
+  leader's own self-ack, already a quorum of two.
+- **An update lost between extraction and `SaveState` left the peer claiming
+  durability it did not have.** Because `ReadOnly` is derived from that diff, the
+  next update skipped the WAL as well: a vote answered from memory and never
+  written.
+- **A membership in a peer's snapshot was unbounded**, so 65 voters panicked the
+  step worker and every shard it owned. Reachable despite the origin gate,
+  because the receive path rebuilds the message locally.
+- **An over-cap membership already persisted panicked the node on every
+  restart** with no way out. It now fails that one shard; the host stays up.
+- **`configChangeIndex` could regress**, permanently wedging membership changes
+  on the shard. Three writers, only one monotonic.
+- **`handleTimeoutNow` burned a term it could not campaign with**, unseating a
+  healthy leader for nothing.
+- **`ReconstructMembership` silently skipped an undecodable committed config
+  change**, letting two replicas rebuild different memberships from one log.
+
+### Fixed — durability and data loss
+
+- **A re-delivered `InstallSnapshot` truncated the live snapshot** before
+  validating anything, and the failure path deleted a directory it had not
+  created. Receives now stage and publish by rename.
+- **A rollback truncation was not fsynced**, so a crash could resurrect bytes
+  from a batch the caller was told had failed.
+- **`FileSize` was recorded with every snapshot and never verified**, so a
+  truncated file recovered as if complete.
+- **Snapshots recorded a membership from the future** — folded at commit time,
+  indexed at apply time.
+- **A `SaveState` at or below the compaction floor destroyed the live suffix**;
+  both backends now reject it.
+- **Read paths handed callers live aliases** of the log served to followers.
+- **memdb `Compact` could drop entries, hard state and snapshot** with the whole
+  conformance suite green. Losing hard state that way is a lost vote.
+
+### Fixed — security
+
+- **Decode amplified 9.77× on membership-dense frames**, and the receive budget
+  charged wire bytes, so a 256 MB limit admitted frames occupying ~2 GB. Bounded
+  at 8× and charged accordingly.
+- **Two barriers loaded from one sealed blob derived the same DEK** with
+  independent nonce counters. A load-generation fence makes the second loader a
+  loud failure.
+- **The nonce tracker disabled itself at its ceiling** — reporting zero tracked,
+  and returning nil for a repeat of a nonce it still held. It now saturates.
+- **`Encrypt`/`Decrypt` had no length bound**; an oversized frame panicked inside
+  `crypto/cipher`.
+- **One peer could pin the entire snapshot receive budget** — the cap bounded
+  slots, not bytes.
+- **Inbound connections from removed peers were unreclaimable**, and close
+  reason phrases leaked the authorization verdict to the peer.
+- **One embedder could exhaust a shard's session table.** Sessions are now capped
+  per embedder-supplied `OwnerID`, enforced from replicated state.
+
+### Added
+
+- **Quorum-loss recovery.** `WithImportMembership` reconstitutes a shard whose
+  quorum is permanently lost — previously impossible, since removing a dead
+  replica requires the quorum that is gone. Deliberately unsafe and documented as
+  such, with a runbook.
+- **Per-follower replication progress** on `ShardInfo.Replicas` (match, state,
+  paused, active, inflights) — previously reachable only by parsing a debug
+  string.
+- **A real network-partition suite.** Every prior "partition" test killed a
+  process, so a live-but-deposed leader could not be constructed anywhere.
+  Weakening the election quorum to `n/2` passed 18 of 19 linearizability tests;
+  it is now caught in 1.1s.
+- **`make no-mutants`**, guarding against mutation-testing edits reaching a
+  commit. It exists because one did: an `if false` disabled a durability fsync
+  and every suite stayed green, since an unrestored mutation makes tests pass.
+- **`make remote-<target>`**, running heavyweight suites on a dedicated host.
+
+### Fixed — tests that could not fail
+
+The dominant defect class this round. Among them: the election-safety test passed
+with one-vote-per-term removed entirely (5/5); persist-before-respond had four
+tests and none could fail; both determinism sorts in the session encoder were
+deletable with the suite green; membership tests asserted one replica, so a
+config change failing on a follower was invisible; `make security` reported "All
+security scans passed" with a scanner absent; and the coverage gate passed with
+no coverage data at all.
+
 ## [0.4.2-alpha] - 2026-08-15
 
 Release-workflow fixes only. Nothing outside `.github/workflows/` differs from
