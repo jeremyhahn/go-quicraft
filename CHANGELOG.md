@@ -5,6 +5,52 @@ All notable changes to QuicRaft will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1-alpha] - 2026-08-17
+
+### Fixed - consensus safety
+
+- **A follower could accept an AppendEntries that opened a hole in its log.**
+  `raftLog.term()` had no upper bound: above the in-memory tail it fell through
+  to the LogReader unconditionally, while `lastIndex()` prefers the in-memory
+  tail whenever the buffer is non-empty. The two disagree inside one window --
+  a conflicting append discards the in-memory suffix immediately, but the
+  LogReader only learns of the truncation a whole commit/apply/fsync cycle
+  later, and until then it still serves the SUPERSEDED terms for entries the
+  replica has already thrown away.
+
+  So `matchTerm` could pass against an entry the follower no longer held, and
+  the append that followed was asked to write past its own tail. Observed in
+  production shape as `invariant violated: gapped merge past in-memory tail`,
+  which panicked the step worker; the worker restarted and the shard never
+  regained a leader, because a peer that can trigger the condition once
+  triggers it on every retransmission.
+
+  The silent variant is the more serious one. The empty-buffer branch below
+  that assertion reaches the same state through the same unbounded lookup and
+  takes the hole WITHOUT asserting -- the replica then acknowledges a
+  `lastIndex` covering entries it holds nothing for, and the leader counts that
+  phantom match toward quorum.
+
+  `term()` now reports `ErrUnavailable` above `lastIndex()`, restoring an
+  invariant the log already claimed. That routes the message into
+  `handleAppend`'s existing shorter-log branch, which was written for exactly
+  this case and had been unreachable, so the leader gets a `lastIndex` hint and
+  backtracks. No effect on a leader, which never truncates its own log. The
+  assertion was NOT relaxed: it was correct, and the code reaching it was not.
+
+  Reachable in production; it needs a leader change followed by a Replicate
+  landing in the just-discarded suffix within one commit cycle. Load only
+  widens the window. Found by the comparison benchmark under sustained
+  multi-node load, which no unit, integration or fuzz gate reproduces.
+
+### Fixed
+
+- `pkg/internal/raft`'s `testLogDB` declared `IndexRange() == (0, 0)` -- "I hold
+  nothing" -- while serving terms for indices 1..4, an impossible LogReader that
+  four tests were built on. Two of them would have kept passing while no longer
+  exercising the error translation they exist for. The fixture was corrected
+  rather than the production semantics it misdescribed.
+
 ## [0.6.0-alpha] - 2026-08-17
 
 Breaking in both directions against `0.5.x`. On disk, the WAL payload type bytes

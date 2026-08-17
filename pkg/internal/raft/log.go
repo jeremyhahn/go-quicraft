@@ -336,10 +336,37 @@ func (l *raftLog) lastTerm() (uint64, bool) {
 // translation, getConflictIndex and tryCommit fail to recognize compacted
 // entries from the real LogReader and produce false conflicts or missed
 // commits.
+//
+// The LogDB fallback is bounded ABOVE by lastIndex(), because the LogReader is
+// not authoritative there and lags in the unsafe direction. A conflicting
+// append (tryAppend -> inMemory.merge) and a snapshot restore both DISCARD the
+// in-memory suffix immediately, while the LogReader only learns of the
+// truncation a whole commit/apply/fsync cycle later, when the commit worker
+// reaches Peer.Commit -> logReader.Append. Until then the reader still serves
+// the superseded terms, and every message the step worker drains from the inbox
+// is handled inside that window.
+//
+// Unbounded, the fallback contradicts lastIndex(), which already prefers the
+// in-memory tail whenever the buffer is non-empty. matchTerm inherits the
+// contradiction: a delayed or duplicated Replicate whose prevLogIndex sits in
+// the discarded suffix passes the Log Matching check against an entry this
+// replica has thrown away. getConflictIndex then reports the first genuinely
+// new entry as the conflict, tryAppend hands it to inMemory.merge past the
+// in-memory tail, and merge asserts (a hole in the log) -- taking the step
+// worker down on a message a PEER chose, which is an availability primitive.
+// Were the buffer empty instead of non-empty, merge would open that hole
+// silently and the replica would ACK indices it holds nothing for.
 func (l *raftLog) term(index uint64) (uint64, error) {
 	// Check in-memory first.
 	if t, ok := l.inmem.term(index); ok {
 		return t, nil
+	}
+	// Nothing above the end of the log has a term; see above for why the
+	// LogReader may still claim otherwise. Reporting it as unavailable is what
+	// handleAppend's shorter-log branch already expects, so the leader gets the
+	// lastIndex hint and backtracks instead of being falsely acknowledged.
+	if index > l.lastIndex() {
+		return 0, ErrUnavailable
 	}
 	// Fall back to LogDB.
 	t, err := l.logdb.Term(index)

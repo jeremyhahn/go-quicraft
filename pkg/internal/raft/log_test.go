@@ -165,9 +165,17 @@ func (lr *testLogReader) Compact(index uint64) error {
 // testLogDB is a minimal LogReader implementation for testing specific
 // term/getRange behaviors. Only the methods set via function fields are
 // active; all other methods return zero values or nil errors.
+//
+// A stub that answers Term or GetRange for an index MUST also declare a range
+// covering it via indexRangeFn. raftLog.term bounds its LogDB fallback by
+// lastIndex(), which reads IndexRange, so a stub reporting the empty range
+// (0, 0) while serving terms for indices 1..N describes a LogReader that cannot
+// exist -- and the resulting test proves nothing about the fallback it means to
+// exercise.
 type testLogDB struct {
-	termFn     func(index uint64) (uint64, error)
-	getRangeFn func(low, high, maxSize uint64) ([]proto.Entry, error)
+	termFn       func(index uint64) (uint64, error)
+	getRangeFn   func(low, high, maxSize uint64) ([]proto.Entry, error)
+	indexRangeFn func() (uint64, uint64)
 }
 
 func (db *testLogDB) Term(index uint64) (uint64, error) {
@@ -194,7 +202,12 @@ func (db *testLogDB) Snapshot() proto.Snapshot               { return proto.Snap
 func (db *testLogDB) CreateSnapshot(ss proto.Snapshot) error { return nil }
 func (db *testLogDB) ApplySnapshot(ss proto.Snapshot) error  { return nil }
 func (db *testLogDB) Compact(index uint64) error             { return nil }
-func (db *testLogDB) IndexRange() (uint64, uint64)           { return 0, 0 }
+func (db *testLogDB) IndexRange() (uint64, uint64) {
+	if db.indexRangeFn != nil {
+		return db.indexRangeFn()
+	}
+	return 0, 0
+}
 
 // newTestRaftLog creates a raftLog with pre-populated entries for testing.
 func newTestRaftLog(entries []proto.Entry) *raftLog {
@@ -1289,6 +1302,10 @@ func TestRaftLog_Term_TranslatesLogDBErrCompacted(t *testing.T) {
 		termFn: func(index uint64) (uint64, error) {
 			return 0, logdb.ErrCompacted
 		},
+		// Index 5 is compacted, so the log starts above it and runs to 10.
+		// term()'s LogDB fallback is bounded by lastIndex(), so the stub has
+		// to describe a log that still holds something.
+		indexRangeFn: func() (uint64, uint64) { return 6, 10 },
 	}
 	l := &raftLog{
 		logdb: db,
@@ -1312,6 +1329,11 @@ func TestRaftLog_Term_TranslatesLogDBErrUnavailable(t *testing.T) {
 		termFn: func(index uint64) (uint64, error) {
 			return 0, logdb.ErrUnavailable
 		},
+		// Index 5 is inside the declared range, so the error under test comes
+		// from the stub's Term and not from term()'s own lastIndex bound --
+		// which would report ErrUnavailable without ever calling the stub,
+		// making the translation this test covers unreachable.
+		indexRangeFn: func() (uint64, uint64) { return 1, 10 },
 	}
 	l := &raftLog{
 		logdb: db,
@@ -1386,6 +1408,8 @@ func TestRaftLog_GetConflictIndex_LogDBCompactedSkipped(t *testing.T) {
 			}
 			return 0, logdb.ErrUnavailable
 		},
+		// Entries 1..3 are compacted and 4 is the last one the log holds.
+		indexRangeFn: func() (uint64, uint64) { return 4, 4 },
 	}
 	l := &raftLog{
 		logdb: db,
@@ -1424,6 +1448,11 @@ func TestRaftLog_TryCommit_LogDBCompacted(t *testing.T) {
 		termFn: func(index uint64) (uint64, error) {
 			return 0, logdb.ErrCompacted
 		},
+		// Index 5 is compacted, so the log starts above it. Without a declared
+		// range term() reports ErrUnavailable from its lastIndex bound and
+		// tryCommit takes the plain-error path instead of the compacted one
+		// this test is about.
+		indexRangeFn: func() (uint64, uint64) { return 6, 10 },
 	}
 	l := &raftLog{
 		logdb:     db,

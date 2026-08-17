@@ -3,7 +3,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26.6-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.6.0--alpha-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.6.1--alpha-orange.svg)](VERSION)
 
 A multi-group Raft consensus library for Go with QUIC transport and at-rest encryption.
 

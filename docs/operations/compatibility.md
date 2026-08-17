@@ -9,7 +9,7 @@ upgrade actually involves today.
 `pkg/internal/engine/snapshot_meta.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`,
 `VERSION`
 
-The current version is **0.6.0-alpha**, published 2026-08-17. It breaks both `0.4.x`
+The current version is **0.6.1-alpha**, published 2026-08-17. It breaks both `0.4.x`
 and `0.5.x` on-disk data; see the upgrade section below.
 
 ## Stability guarantee
@@ -452,7 +452,7 @@ Three requirements are satisfied STRUCTURALLY rather than by a declared
 implements-clause, so a Go type check will not catch a type that fails them.
 Two fail at `waldb.Open`; one is a constant whose zero value is easy to
 misread. All three date from `0.3.0-alpha` and all three still hold at
-`0.6.0-alpha`. Older API breaks are recorded only in the CHANGELOG.
+`0.6.1-alpha`. Older API breaks are recorded only in the CHANGELOG.
 
 ### `waldb.FS` requires `Rename(oldpath, newpath string) error`
 
