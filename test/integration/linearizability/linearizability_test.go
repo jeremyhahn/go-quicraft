@@ -1183,6 +1183,28 @@ func TestLinearizability_5Node_Normal(t *testing.T) {
 // let two candidates each collect a "majority" and lead the same term. The
 // leader/term guard samples every host on every poll and fails immediately if
 // that ever happens, including while the killed leader is rejoining.
+//
+// # What this test does NOT cover, and where that lives
+//
+// It cannot detect the loss of the one-vote-per-term rule itself. That was
+// measured, not assumed: with the r.vote test deleted from canVote in
+// handleVoteRequest — so a replica grants every candidate that asks, in any
+// term — this test passed three runs out of three with a clean porcupine
+// verdict on roughly 7000 operations each.
+//
+// The reason is structural rather than a matter of tuning. This test kills the
+// leader and lets ONE clean election run, and a single election never asks a
+// voter for a second vote in a term it has already voted in. Reaching that code
+// path at all requires two candidates alive in the same term, which stopNode
+// cannot produce (a killed replica campaigns for nothing) and which PreVote,
+// the CheckQuorum vote drop, and the new leader's no-op entry each independently
+// prevent from arising by accident.
+//
+// Constructing it needs the network-fault injector, so the assertion lives in
+// TestElectionSafety_SpentTermCannotBeWonTwice in test/integration/e2e, built
+// under the quicraft_netfault tag. It spends a term's votes on a candidate that
+// is structurally unable to win with them and asserts that nothing else can win
+// that term. Do not read the presence of this test as covering that invariant.
 func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 	const (
 		numNodes   = 4

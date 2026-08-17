@@ -130,6 +130,13 @@ addLoop:
 	// Wait for the cluster to stabilize with 4 members.
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[newLeaderIdx], shardID, 4, membershipTimeout)
+
+	// And on every replica still running, not just on the one that accepted
+	// the change. A membership change proposed during an election is exactly
+	// where a replica can be left behind: it may have been mid-campaign, or
+	// catching up, when the entry committed.
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
 	t.Logf("cluster stabilized with 4 members, new leader: node[%d]", newLeaderIdx)
 
 	// Verify the new node catches up on all baseline data.
@@ -264,6 +271,8 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 	// Wait for membership to reach 4.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
 
 	// Phase 3: Write additional entries after the membership change.
 	postData := proposeNEntries(t, cluster, trackers, shardID, 5, "post-add")

@@ -63,6 +63,12 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 	// Wait for the cluster to recognize 4 voting members.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
+
+	// The leader is the replica that proposed the change, so asking only the
+	// leader whether it happened is close to asking nothing. Assert that every
+	// live replica, the joiner included, ended up on the same configuration.
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
 	t.Logf("phase 2: membership size confirmed as 4")
 
 	// Verify the new node receives all pre-existing data via log replay
@@ -100,6 +106,8 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 	// Wait for the leader to reflect 3 voting members.
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 3, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID, []uint64{1, 2, 3},
+		[]uint64{newReplicaID}, membershipTimeout)
 	t.Logf("phase 4: membership size confirmed as 3")
 
 	// Stop the removed node so it does not interfere with further
@@ -182,6 +190,12 @@ func TestHostAPI_MembershipChange_AddNodeWhileWriting(t *testing.T) {
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
 
+	// A node added under concurrent write traffic is a replica that may have
+	// been busy applying user entries when the config change committed. Assert
+	// every live replica ended up with the same configuration anyway.
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
+
 	// Write more data after the node was added.
 	postAddData := proposeNEntries(t, cluster, trackers, shardID, 10, "post-add-load")
 	for k, v := range postAddData {
@@ -252,10 +266,21 @@ func TestHostAPI_MembershipChange_RemoveFollower(t *testing.T) {
 	// Wait for membership to reflect 2 nodes.
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 2, membershipTimeout)
-	t.Logf("membership size confirmed as 2 after removing node[%d]", followerIdx)
 
-	// Mark the removed node as stopped so helpers skip it.
+	// Mark the removed node as stopped so helpers skip it, then assert both
+	// survivors agree the shard is now two voters. A survivor still holding the
+	// three-voter configuration would size quorum over a replica that no longer
+	// exists.
 	cluster.stopNode(followerIdx)
+	var survivors []uint64
+	for i := range cluster.hosts {
+		if replicaID := uint64(i + 1); replicaID != followerReplicaID {
+			survivors = append(survivors, replicaID)
+		}
+	}
+	waitForMembershipConverged(t, cluster, shardID, survivors,
+		[]uint64{followerReplicaID}, membershipTimeout)
+	t.Logf("membership size confirmed as 2 after removing node[%d]", followerIdx)
 
 	// Write more data to the 2-node cluster.
 	postRemoveData := proposeNEntries(t, cluster, trackers, shardID, 5, "post-remove")
@@ -334,6 +359,13 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
 
+	// A joiner that caught up by SNAPSHOT rebuilt its configuration from the
+	// snapshot's membership record rather than by replaying config entries,
+	// which is a second, independent path to the same state. Assert it arrived
+	// at the same configuration as everyone else.
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
+
 	// Verify the new node has all data (received via snapshot).
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, initialData, membershipTimeout)
 
@@ -375,6 +407,8 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 3, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID, []uint64{1, 2, 3},
+		[]uint64{newReplicaID}, membershipTimeout)
 
 	// Final write to confirm the 3-node cluster is healthy.
 	proposeAndWait(t, cluster, trackers, shardID, "final-check", "ok")

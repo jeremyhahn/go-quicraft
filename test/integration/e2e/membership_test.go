@@ -67,6 +67,12 @@ func TestE2E_AddNode_ThreeToFour(t *testing.T) {
 	}
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
 
+	// The leader is the replica that PROPOSED the change, so asking it whether
+	// the change happened proves the least. Assert the whole shard converged on
+	// the same configuration, including the node that just joined.
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
+
 	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
 	if err != nil {
 		t.Fatalf("GetShardMembership failed: %v", err)
@@ -131,6 +137,18 @@ func TestE2E_RemoveNode_FourToThree(t *testing.T) {
 		}
 	}
 	waitForMembershipSize(t, cluster.hosts[liveIdx], shardID, 3, membershipTimeout)
+
+	// A removal that lands on the leader and not on a follower leaves that
+	// follower sizing every quorum over four voters while the shard runs on
+	// three. Assert every surviving replica dropped the same one.
+	var survivors []uint64
+	for i := range cluster.hosts {
+		if replicaID := uint64(i + 1); replicaID != removedReplicaID {
+			survivors = append(survivors, replicaID)
+		}
+	}
+	waitForMembershipConverged(t, cluster, shardID, survivors,
+		[]uint64{removedReplicaID}, membershipTimeout)
 
 	// Propose 5 more entries with a different prefix and verify on remaining 3.
 	postRemoveExpected := proposeNEntries(t, cluster, trackers, shardID, 5, "rm4to3-post")
@@ -197,6 +215,8 @@ func TestE2E_AddNode_FiveToSix(t *testing.T) {
 		t.Fatalf("no leader found after adding node")
 	}
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 6, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, 4, 5, newReplicaID}, nil, membershipTimeout)
 
 	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
 	if err != nil {
@@ -251,18 +271,23 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, addedReplicaID, allExpected, membershipTimeout)
 	t.Logf("phase 2: all 10 entries verified on 4 nodes")
 
-	// Verify membership is 4 before removal. Query the leader (an existing
-	// node) because the joining node only learns full membership via snapshot.
-	// Without log compaction triggering a snapshot, the joining node's
-	// membership only contains config change entries from the log (its own
-	// AddNode), not the bootstrap members that were set via SetMembership.
-	// This is consistent with TestE2E_AddNode_ThreeToFour and
-	// TestE2E_AddNode_FiveToSix which also query the leader.
+	// Verify membership is 4 before removal, on every replica rather than only
+	// on the leader.
+	//
+	// This used to query the leader alone, on the stated grounds that a joining
+	// node learns the full membership only from a snapshot. That has not been
+	// true since initial membership became a committed EntryInitialMembership
+	// at log index 1: a joiner replays that entry like any other and ends up
+	// with the same configuration as everyone else. Asserting it here is what
+	// keeps that guarantee honest — if a joiner ever again comes up knowing
+	// only its own AddNode, this fails instead of being documented around.
 	leaderIdx = cluster.findLeader(shardID)
 	if leaderIdx < 0 {
 		t.Fatalf("no leader found for membership verification")
 	}
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID,
+		[]uint64{1, 2, 3, addedReplicaID}, nil, membershipTimeout)
 
 	// Phase 3: Remove the added node (4->3), propose 5 more, verify on remaining 3.
 	leaderIdx = cluster.findLeader(shardID)
@@ -278,6 +303,8 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	// Wait for membership to shrink to 3.
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 3, membershipTimeout)
+	waitForMembershipConverged(t, cluster, shardID, []uint64{1, 2, 3},
+		[]uint64{addedReplicaID}, membershipTimeout)
 
 	phase3Expected := proposeNEntries(t, cluster, trackers, shardID, 5, "phase3")
 	for k, v := range phase3Expected {
@@ -340,6 +367,19 @@ func TestE2E_RemoveNode_ThenPropose(t *testing.T) {
 	// Wait for the 2-node cluster to stabilize with a leader.
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 2, membershipTimeout)
+
+	// Both survivors must agree that the shard is now two voters. This is the
+	// case where a divergent follower is most dangerous: with a 3-voter
+	// configuration still in its head, a survivor sizes quorum at 2 out of 3
+	// and would count a vote from a replica that no longer exists.
+	var survivors []uint64
+	for i := range cluster.hosts {
+		if replicaID := uint64(i + 1); replicaID != removedReplicaID {
+			survivors = append(survivors, replicaID)
+		}
+	}
+	waitForMembershipConverged(t, cluster, shardID, survivors,
+		[]uint64{removedReplicaID}, membershipTimeout)
 	t.Logf("cluster stabilized with 2 nodes, leader at node[%d]", leaderIdx)
 
 	// Propose 10 entries on the 2-node cluster (quorum=2).

@@ -33,6 +33,7 @@ import (
 	"math/big"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1229,6 +1230,134 @@ func waitForMembershipSize(
 			return len(m.Nodes) == expectedSize
 		},
 	)
+}
+
+// waitForMembershipConverged waits until EVERY live replica reports exactly
+// wantNodes as its voting members and at least wantRemoved as removed.
+//
+// waitForMembershipSize above asks ONE host — in practice the leader, which is
+// the replica that proposed the change and therefore the one guaranteed to have
+// applied it. The failure worth catching is the opposite: a config change that
+// commits and applies on the leader but never lands on a follower. That
+// follower goes on sizing quorums over a configuration the shard has left,
+// which is how a minority comes to believe it has a majority. A single-replica
+// assertion cannot see it.
+//
+// Convergence rather than instantaneous agreement is the property: followers
+// apply the change when the entry commits on them, a replication round trip
+// behind the leader. The timeout is what distinguishes trailing from diverged.
+// Stopped replicas are skipped — a dead node holds no configuration.
+func waitForMembershipConverged(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	wantNodes []uint64,
+	wantRemoved []uint64,
+	timeout time.Duration,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var diag string
+	for {
+		diag = membershipDivergence(cluster, shardID, wantNodes, wantRemoved)
+		if diag == "" {
+			t.Logf("membership converged on every live replica: nodes=%v removed=%v",
+				wantNodes, wantRemoved)
+			return
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		<-timer.C
+		timer.Stop()
+	}
+	t.Fatalf("membership did not converge on every live replica within %v "+
+		"(want nodes=%v, removed=%v):%s", timeout, wantNodes, wantRemoved, diag)
+}
+
+// membershipDivergence describes how the live replicas' configurations differ
+// from the expected one, or returns the empty string when they all agree.
+func membershipDivergence(
+	cluster *testCluster,
+	shardID uint64,
+	wantNodes []uint64,
+	wantRemoved []uint64,
+) string {
+	cluster.hostsMu.RLock()
+	hosts := make([]*quicraft.Host, len(cluster.hosts))
+	copy(hosts, cluster.hosts)
+	cluster.hostsMu.RUnlock()
+
+	var sb strings.Builder
+	for i, h := range hosts {
+		if h == nil || cluster.stopped[i].Load() {
+			continue
+		}
+		// A replica that is itself in wantRemoved is excluded. Convergence is a
+		// property of the CURRENT configuration, and a removed replica is
+		// outside it: once the removal commits the leader stops replicating to
+		// it, so whether it ever learns of its own eviction depends on where it
+		// happened to be in the replication stream when the entry committed.
+		// Requiring it to agree asserts on a race, not on a property — and
+		// asserting on a race is how a suite ends up with a test that fails a
+		// few times in a hundred and gets dismissed as flaky.
+		//
+		// Every replica still IN the configuration is required to converge.
+		// That is the divergence being hunted: a config change that applies on
+		// the leader and silently fails on a follower.
+		if slices.Contains(wantRemoved, uint64(i+1)) {
+			continue
+		}
+		m, err := h.GetShardMembership(shardID)
+		if err != nil {
+			fmt.Fprintf(&sb, "\n  node[%d]: GetShardMembership failed: %v", i, err)
+			continue
+		}
+		var missing, unexpected, notRemoved []uint64
+		for _, id := range wantNodes {
+			if _, ok := m.Nodes[id]; !ok {
+				missing = append(missing, id)
+			}
+		}
+		for id := range m.Nodes {
+			if !slices.Contains(wantNodes, id) {
+				unexpected = append(unexpected, id)
+			}
+		}
+		for _, id := range wantRemoved {
+			if _, ok := m.Removed[id]; !ok {
+				notRemoved = append(notRemoved, id)
+			}
+		}
+		if len(missing) == 0 && len(unexpected) == 0 && len(notRemoved) == 0 {
+			continue
+		}
+		slices.Sort(unexpected)
+		fmt.Fprintf(&sb, "\n  node[%d]: has nodes=%v", i, sortedReplicaIDs(m.Nodes))
+		if len(missing) > 0 {
+			fmt.Fprintf(&sb, " (missing %v)", missing)
+		}
+		if len(unexpected) > 0 {
+			fmt.Fprintf(&sb, " (unexpected %v)", unexpected)
+		}
+		if len(notRemoved) > 0 {
+			fmt.Fprintf(&sb, " (not in removed set: %v)", notRemoved)
+		}
+	}
+	return sb.String()
+}
+
+// sortedReplicaIDs returns a membership map's replica IDs in ascending order so
+// that failure messages are stable across runs.
+func sortedReplicaIDs(m map[uint64]string) []uint64 {
+	ids := make([]uint64, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // ---------------------------------------------------------------------------
