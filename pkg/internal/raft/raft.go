@@ -3175,6 +3175,30 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 // Snapshot handling
 // --------------------------------------------------------------------------
 
+// snapshotVotingBitCount returns how many ReadIndex ackBits positions the given
+// membership would consume on this replica. It deliberately mirrors the
+// arithmetic of rebuildRemotesFromMembership followed by rebuildReplicaToBit —
+// remotes are Addresses minus self, witnesses are Witnesses minus self, plus
+// one bit for self — rather than counting the maps directly, because the two
+// differ whenever the snapshot names a configuration this replica is not in,
+// and it is rebuildReplicaToBit's count that has to be bounded. Observers are
+// excluded for the same reason they are there: they get no bit.
+func snapshotVotingBitCount(m proto.Membership, self uint64) int {
+	// Self always occupies bit 0, whether or not the membership lists it.
+	count := 1
+	for id := range m.Addresses {
+		if id != self {
+			count++
+		}
+	}
+	for id := range m.Witnesses {
+		if id != self {
+			count++
+		}
+	}
+	return count
+}
+
 // handleSnapshot processes an InstallSnapshot message on a follower.
 // Per Raft Figure 13: if existing log entry has same index and term as
 // snapshot's last included entry, retain log entries following it.
@@ -3217,7 +3241,39 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 // installs (messagehandler's post-receive and its persisted re-delivery) carry
 // the sending leader's replica ID in From, so they pass exactly when the wire
 // message that triggered them would have.
+//
+// SIZE. A membership naming more voting members than the ReadIndex ackBits word
+// can address is refused here, alongside the sender check and for the same
+// reason: this is the one place a configuration enters the shard WITHOUT having
+// passed an admission check. Proposals are bounded by
+// validateConfigChangePolicy, bootstrap and import by Host's MaxVotingMembers
+// checks; a snapshot's membership is bounded by nothing between the wire and
+// rebuildRemotesFromMembership — proto decodes up to MaxMembershipEntries
+// (10000) of them. Accepting one installed the whole map and returned success,
+// and the damage surfaced later and elsewhere, as rebuildReplicaToBit's
+// assertion panicking the step worker the next time this replica won an
+// election. Being an assertion, it was fatal every time, so a single such
+// snapshot cost the shard every future election on this replica.
+//
+// This is a REJECTION rather than a clamp because there is no correct way to
+// serve a configuration that does not fit: dropping members to make it fit
+// computes quorum over a set no committed entry put there, which is a
+// split-brain, not a degradation. A legitimate leader cannot produce this
+// message — the admission checks it passed to hold that configuration are the
+// same bound — so the cost of refusing is zero and the sender is by definition
+// buggy or hostile.
 func (r *raft) handleSnapshot(msg proto.Message) error {
+	if bits := snapshotVotingBitCount(msg.Snapshot.Membership, r.replicaID); bits > maxVotingMembers {
+		slog.Error("dropped install snapshot naming more voting members than the ReadIndex ackBits word can address",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"voting_members", bits,
+			"max_voting_members", maxVotingMembers,
+			"snapshot_index", msg.Snapshot.Index,
+			"snapshot_term", msg.Snapshot.Term)
+		return ErrTooManyVotingMembers
+	}
 	if r.leaderID != noLeader && msg.From != r.leaderID {
 		slog.Warn("dropped install snapshot from a replica that is not this shard's leader",
 			"shard", r.shardID,

@@ -23,6 +23,35 @@ package invariant
 // Example:
 //
 //	invariant.Assert(index >= 0, "index must be non-negative")
+//
+// # Never assert on a value a peer chose
+//
+// Everything in the consensus engine that calls this runs on the raft step
+// worker, which serves messages from remote replicas. Before adding a call,
+// answer one question: can the asserted condition be made false by a field a
+// PEER controls?
+//
+// If yes, this is the wrong tool, however impossible the state looks. A panic
+// here kills the step worker; the engine recovers and restarts it, but the
+// shard stalls while it does, and a peer that can trigger the condition once
+// can trigger it on every retry — turning a message into an availability
+// primitive. Such a condition must be a check at the point the message is
+// handled, returning a typed error and logging at slog.Error, so that the
+// MESSAGE dies instead of the worker. handleSnapshot's voting-member gate is
+// the worked example: a snapshot naming more than MaxVotingMembers voters used
+// to install the whole configuration and then panic rebuildReplicaToBit on
+// this replica's next election, permanently.
+//
+// If no — the condition relates only to state this replica computed itself —
+// keep it fatal. Continuing past a broken local invariant in a consensus
+// engine corrupts the log or the quorum arithmetic silently, which is strictly
+// worse than crashing.
+//
+// Note that "the data arrived in a peer message" and "the peer controls the
+// condition" are different questions. Most of the assertions in the raft log
+// sit on peer-driven paths but restate a relation the code establishes a few
+// lines earlier (a caller's range guard, a contiguity precheck), and those are
+// correctly fatal: no message can falsify them without a local bug first.
 func Assert(condition bool, msg string) {
 	if !condition {
 		panic("invariant violated: " + msg)

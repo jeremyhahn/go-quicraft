@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -359,6 +360,201 @@ func TestVotingMemberCapRejectsSixtyFifthVoter(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSnapshotMembershipOverVotingCapIsRejected covers the OTHER way a
+// configuration larger than the ackBits word reaches this replica: not as a
+// proposal it could refuse, but as the membership embedded in a snapshot.
+//
+// handleSnapshot's non-matching branch feeds ss.Membership straight into
+// rebuildRemotesFromMembership, which is the set rebuildReplicaToBit is then
+// computed over. That membership is chosen entirely by the sender: the raw
+// wire InstallSnapshot is blocked by the process-local origin gate, but the
+// snapshot RECEIVE pipeline reassembles the streamed chunks and rebuilds the
+// message locally with `Membership: first.Membership` — the peer's bytes,
+// carrying the peer's map, now stamped OriginLocal. Nothing between the wire
+// and here bounds it: proto's decode limit is MaxMembershipEntries (10000),
+// and the only MaxVotingMembers admission checks in the repository are in
+// StartShard and ImportSnapshot, neither of which is on this path.
+//
+// Before the gate this test pins, that message installed 65 remotes and
+// returned success. The panic came later and somewhere else — in
+// rebuildReplicaToBit, the moment this replica next became leader — which is
+// why it reads as a shard that mysteriously cannot elect rather than as a bad
+// message. This is the one assertion in the package a peer can reach.
+func TestSnapshotMembershipOverVotingCapIsRejected(t *testing.T) {
+	r := newTestRaft(1)
+	r.becomeFollower(1, 2)
+	remotesBefore := len(r.remotes)
+
+	addrs := make(map[uint64]string, maxVotingMembers+1)
+	for id := uint64(1); id <= uint64(maxVotingMembers)+1; id++ {
+		addrs[id] = fmt.Sprintf("addr%d", id)
+	}
+
+	err := r.step(proto.Message{
+		Type:   proto.InstallSnapshot,
+		Origin: proto.OriginLocal,
+		From:   2,
+		To:     1,
+		Term:   1,
+		Snapshot: proto.Snapshot{
+			Index:      10,
+			Term:       1,
+			Membership: proto.Membership{Addresses: addrs},
+		},
+	})
+	if !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("a snapshot naming %d voting members was accepted (err = %v): "+
+			"rebuildRemotesFromMembership installs the whole map, and "+
+			"rebuildReplicaToBit then panics the step worker on every "+
+			"election this replica wins",
+			maxVotingMembers+1, err)
+	}
+
+	// Rejection must be total. A partially adopted configuration is worse
+	// than the panic: quorum() would be computed over a set no committed
+	// entry put there.
+	if len(r.remotes) != remotesBefore {
+		t.Fatalf("remotes = %d, want %d: the rejected snapshot's membership "+
+			"was installed anyway", len(r.remotes), remotesBefore)
+	}
+	if r.log.committed != 0 {
+		t.Fatalf("committed = %d, want 0: the rejected snapshot advanced the "+
+			"commit index", r.log.committed)
+	}
+
+	// The replica must still be usable. The whole point of dropping the
+	// message rather than asserting is that this election does not panic.
+	electLeader(r)
+	if r.state != leader {
+		t.Fatalf("state = %v, want leader: the shard did not recover from the "+
+			"rejected snapshot", r.state)
+	}
+}
+
+// TestSnapshotMembershipAtVotingCapIsAccepted is the other half of the gate
+// above, and the half a clumsy bound breaks: a shard running the maximum
+// supported configuration must still be able to receive a snapshot. A gate
+// that rejects at the cap instead of above it makes 64-member shards
+// unrecoverable, which is a worse failure than the one it was added to stop.
+//
+// The second case is why snapshotVotingBitCount cannot simply count the maps.
+// A snapshot naming 64 voters NONE of which is this replica still consumes 65
+// bit positions, because rebuildReplicaToBit unconditionally seats self at bit
+// 0 whether or not the configuration lists it — which is exactly the state a
+// replica removed while it lagged comes back to. Counting len(Addresses) would
+// wave that one through and leave the panic in place for it.
+func TestSnapshotMembershipAtVotingCapIsAccepted(t *testing.T) {
+	t.Run("64 voters including self is accepted", func(t *testing.T) {
+		r := newTestRaft(1)
+		r.becomeFollower(1, 2)
+
+		addrs := make(map[uint64]string, maxVotingMembers)
+		for id := uint64(1); id <= uint64(maxVotingMembers); id++ {
+			addrs[id] = fmt.Sprintf("addr%d", id)
+		}
+		if got := snapshotVotingBitCount(proto.Membership{Addresses: addrs}, 1); got != maxVotingMembers {
+			t.Fatalf("snapshotVotingBitCount = %d, want %d", got, maxVotingMembers)
+		}
+
+		err := r.step(proto.Message{
+			Type:   proto.InstallSnapshot,
+			Origin: proto.OriginLocal,
+			From:   2,
+			To:     1,
+			Term:   1,
+			Snapshot: proto.Snapshot{
+				Index:      10,
+				Term:       1,
+				Membership: proto.Membership{Addresses: addrs},
+			},
+		})
+		if err != nil {
+			t.Fatalf("a snapshot naming exactly %d voting members was rejected "+
+				"(err = %v): a shard at the supported maximum cannot receive a "+
+				"snapshot, so it can never recover a lagging replica",
+				maxVotingMembers, err)
+		}
+		if r.log.committed != 10 {
+			t.Fatalf("committed = %d, want 10: the snapshot was not applied",
+				r.log.committed)
+		}
+	})
+
+	t.Run("64 voters excluding self needs 65 bits and is rejected", func(t *testing.T) {
+		r := newTestRaft(1)
+		r.becomeFollower(1, 2)
+
+		addrs := make(map[uint64]string, maxVotingMembers)
+		for id := uint64(2); id <= uint64(maxVotingMembers)+1; id++ {
+			addrs[id] = fmt.Sprintf("addr%d", id)
+		}
+		if len(addrs) != maxVotingMembers {
+			t.Fatalf("fixture: %d addresses, want %d", len(addrs), maxVotingMembers)
+		}
+		if got := snapshotVotingBitCount(proto.Membership{Addresses: addrs}, 1); got != maxVotingMembers+1 {
+			t.Fatalf("snapshotVotingBitCount = %d, want %d: self is seated at "+
+				"bit 0 whether or not the configuration lists it",
+				got, maxVotingMembers+1)
+		}
+
+		err := r.step(proto.Message{
+			Type:   proto.InstallSnapshot,
+			Origin: proto.OriginLocal,
+			From:   2,
+			To:     1,
+			Term:   1,
+			Snapshot: proto.Snapshot{
+				Index:      10,
+				Term:       1,
+				Membership: proto.Membership{Addresses: addrs},
+			},
+		})
+		if !errors.Is(err, ErrTooManyVotingMembers) {
+			t.Fatalf("err = %v, want ErrTooManyVotingMembers: %d voters none of "+
+				"which is this replica still needs %d bit positions",
+				err, maxVotingMembers, maxVotingMembers+1)
+		}
+	})
+
+	t.Run("witnesses count toward the same word", func(t *testing.T) {
+		// Witnesses vote, so rebuildReplicaToBit seats them too. A gate that
+		// looked only at Addresses would let a membership of 40 voters and 40
+		// witnesses through, which needs 81 bits.
+		addrs := make(map[uint64]string, 40)
+		for id := uint64(1); id <= 40; id++ {
+			addrs[id] = fmt.Sprintf("addr%d", id)
+		}
+		wits := make(map[uint64]string, 40)
+		for id := uint64(41); id <= 80; id++ {
+			wits[id] = fmt.Sprintf("wit%d", id)
+		}
+		m := proto.Membership{Addresses: addrs, Witnesses: wits}
+		if got := snapshotVotingBitCount(m, 1); got != 80 {
+			t.Fatalf("snapshotVotingBitCount = %d, want 80 (39 remotes + 40 "+
+				"witnesses + self)", got)
+		}
+
+		r := newTestRaft(1)
+		r.becomeFollower(1, 2)
+		err := r.step(proto.Message{
+			Type:   proto.InstallSnapshot,
+			Origin: proto.OriginLocal,
+			From:   2,
+			To:     1,
+			Term:   1,
+			Snapshot: proto.Snapshot{
+				Index:      10,
+				Term:       1,
+				Membership: m,
+			},
+		})
+		if !errors.Is(err, ErrTooManyVotingMembers) {
+			t.Fatalf("err = %v, want ErrTooManyVotingMembers: witnesses occupy "+
+				"ackBits positions too", err)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
