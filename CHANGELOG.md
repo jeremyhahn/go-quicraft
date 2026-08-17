@@ -5,20 +5,262 @@ All notable changes to QuicRaft will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0-alpha] - 2026-08-17
+
+Breaking in both directions against `0.5.x`. On disk, the WAL payload type bytes
+were renumbered, so a WAL written by this build is unreadable by `0.5.1-alpha`
+and a `0.5.x` WAL is refused here. In the API, `HostConfig.MaxApplyRetries`,
+`engine.CircuitBreakerError` and `proto.Bootstrap` were removed and the
+revocation checker's enforcement field was renamed and inverted, so an embedder
+setting any of them no longer compiles. Wipe data directories and rebuild every
+node and consuming service from one commit.
+
+### Changed — comparison benchmarks are stored per machine profile
+
+- **Every stored benchmark result now belongs to a named machine profile, and
+  the machine's specifications are captured on that machine rather than typed
+  in.** `test/performance/profiles/<name>/` holds `env.json` (captured by
+  `capture-env.sh` **on the target**, at run time), `results/*.json`, generated
+  `charts/`, generated `<system>.md` documents, and a hand-written
+  `analysis.md`. Two profiles are tracked long-term: `omega` (single-socket,
+  desktop-grade) and `r640` (dual-socket, server-grade).
+
+  The profile name is an operator argument with no default, because it cannot be
+  derived: `lscpu` describes hardware but does not know which machine is the
+  reference desktop. Everything else is derived on the target, so a
+  specification table beside a number can no longer go stale or be edited into
+  something the hardware never was. A field the capture could not obtain is
+  stored empty and renders as **not captured** — never as a zero, which would be
+  indistinguishable from a measurement.
+
+- **One command measures any machine:**
+  `make perf-remote PERF_HOST=user@host PERF_PROFILE=omega`. It stages the
+  working tree, captures `env.json` there, runs the suite in Docker, fetches the
+  results *and* the capture back into the profile, and regenerates that
+  profile's documents. This replaced `run-remote.sh`'s four disjoint
+  subcommands with one pipeline; the phases remain available individually, and
+  the remote run stays detached so a dropped ssh costs the log tail, not the run.
+
+- **`analysis.md` is structurally protected.** The single document write path
+  refuses that filename outright, so no generator change can reach it. Generated
+  documents are disposable and say so in their own text.
+
+- **A system with no results now produces no document at all** rather than one
+  of `N/A` rows, which at a glance is indistinguishable from a real result of
+  zero. A stale document for a system that is no longer measured is deleted.
+  Generation still refuses to run when a system it was asked to cover is
+  missing; `PERF_SYSTEMS` narrows it explicitly, and the documents it writes
+  name the gap on their face. `omega` currently has no `etcd.md` for this
+  reason.
+
+- **The R640 baseline was preserved verbatim.** Those numbers were never
+  captured as JSON and existed only as rendered markdown; reconstructing JSON by
+  parsing the tables would have put a lossily transcribed baseline into a file
+  the project treats as measured data. `test/performance/README.md`, `etcd.md`,
+  `dragonboat.md` and `openraft.md` were moved byte for byte into
+  `profiles/r640/analysis.md`, verified with `cmp`, and their charts moved to
+  `profiles/r640/charts/` so every relative image link still resolves. The
+  harness fairness audit and scenario definitions moved with them and apply to
+  every profile.
+
+- **Two `.gitignore` rules were deleting the data.** The root ignored
+  `test/performance/profiles/` and the local file ignored `results/`, so stored
+  results and captures were invisible to git. `make clean` also did
+  `rm -rf test/performance/profiles`. All three are fixed: the profiles tree is
+  data, not build output.
+
+- Removed the `perf-compare-{etcd,dragonboat,openraft}` and
+  `perf-compare-all-visualize` targets, whose `--chart-dir` paths were
+  repo-relative while the command ran from `test/performance/`, so they wrote
+  into `test/performance/test/performance/charts/` — `clean` had a line removing
+  the resulting `charts/charts` and `results/results` directories. `perf-docs`
+  and the four `perf-run-<system>` targets collapsed into `perf-run`,
+  `perf-generate` and `perf-all`, each taking `PERF_PROFILE` and `PERF_SYSTEMS`.
+
+### BREAKING — WAL payload type bytes renumbered
+
+- **A 0.4.x WAL is now refused by name instead of misparsed.**
+  `payloadTypeEntries` moved `0x07` → **`0x0b`** and `payloadTypeSnapshot`
+  `0x0a` → **`0x0c`**. The retired values are left unallocated and never
+  reallocated, so a record still carrying one fails replay with the standard
+  `ErrUnknownPayloadType` rather than being misparsed.
+
+  0.5.0 grew the entry record header 76 → 84 bytes (`OwnerID`) and the snapshot
+  record's membership session-policy tail 24 → 32 (`MaxSessionsPerOwner`)
+  without allocating new payload-type bytes, against this codebase's own
+  precedent that a record layout change always takes one. Measured before the
+  fix: a 0.4.x entry record decoded with `err == nil`, `OwnerID` came back as
+  `0x4443424100000018` — the record's own `CmdLen` followed by four command
+  bytes — and the command reached the state machine truncated from 24 bytes to
+  16. A 0.4.x snapshot record usually failed as truncated, which is a corruption
+  diagnosis for a version mismatch; in one realistic shape it was accepted in
+  silence with a fabricated `MaxSessionsPerOwner` and a `RemovedIdentities`
+  deny-list read eight bytes off, populated with a replica nobody had removed.
+  That list is checked against the authenticated connection identity, so
+  misreading it revokes a revocation.
+
+  `walFormatVersion` stays at **1**. The pre-release pinning policy holds, and
+  detection belongs at the record level, where the layout actually changed. A
+  0.4.x directory therefore opens cleanly and fails at the first legacy record.
+
+  **The renumbering breaks compatibility in both directions.** A WAL written by
+  this build is not readable by 0.5.1-alpha either: `0x0b` and `0x0c` fail there
+  with `ErrUnknownPayloadType`. Wipe the data directory and re-sync.
+
+### Changed
+
+- **`sm.StateMachine`'s serialization promise is enforced rather than merely
+  documented.** `rsm.StateMachine.Apply` now takes the adapter's `readGuard` for
+  writing, so it excludes `Lookup`, `NALookup`, `NALookupBuf` and `GetHash`. The
+  promise — "QuicRaft serializes all method calls, Update and Lookup are never
+  called concurrently" — was inherited from dragonboat and never implemented
+  here: `Apply` and `Lookup` both took `RLock`, which excludes neither from the
+  other. `apply_lookup_exclusion_test.go` pins the contract; with the old
+  `RLock` it reports 10,017 overlaps, with the write lock zero.
+
+  `GetHash` now takes the guard for reading and checks `closed`. It previously
+  took no guard at all, so a replica-divergence check could hash a half-applied
+  batch and report a mismatch that does not exist, and could read a closed state
+  machine.
+
+  **Embedders relying on concurrent reads during catch-up will notice this as
+  read latency.** `SyncRead`, `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`,
+  `StaleRead` and `StaleReadBuf` all park behind an in-flight `Apply`, which on
+  a catching-up follower can carry up to `maxEntriesToApplySize` (64 MiB) of
+  entries, and `sync.RWMutex` has no context-aware acquire, so a read's deadline
+  is not observed while it is blocked on the lock. The guard lives on the
+  adapter rather than per tier, so `ConcurrentStateMachine` and
+  `DiskStateMachine` get the same exclusion even though their contracts promise
+  concurrent reads. Keep implementing those two tiers concurrency-safe: the
+  contract is what they are held to, and the adapter may stop excluding them.
+
+### Removed
+
+- **`config.HostConfig.MaxApplyRetries` is gone, along with
+  `config.DefaultMaxApplyRetries` and `engine.CircuitBreakerError`.** The field
+  was defaulted to 100, validated (`Validate` rejected 0) and carried all the
+  way into `engine.Node` — and then never read by anything. No apply-retry
+  policy was ever implemented for it to configure.
+
+  **This breaks any embedder that sets the field: the code no longer
+  compiles.** That is the intended outcome. A setting that silently does nothing
+  is worse than one that is absent, because the name invites operators to tune
+  it during an incident and to build failure handling around retries that never
+  happen. Deleting it makes the absence checkable at build time. The removal is
+  compile-time only — no on-disk format, wire format or runtime behaviour
+  changes with it, and a config that never set the field needs no edit.
+
+  **Shard-failure behaviour is unchanged and was never governed by the field.**
+  Apply is fail-fast: the FIRST `SM.Apply()` (or entry-decompression) error
+  fails the shard, `lastApplied` is deliberately not advanced, the batch's
+  pending proposals are failed, and `EventListener.OnShardFailed` fires. The
+  shard stays offline until it is reloaded or recovered from a snapshot. That is
+  a Raft state-machine safety requirement, not a tuning choice: a deterministic
+  apply failure cannot be made to succeed by retrying, and advancing
+  `lastApplied` past a batch this replica skipped would diverge it from its
+  peers. `ErrShardFailed`, `*engine.ApplyError`, `*engine.SMPanicError` and
+  `OnShardFailed` are all untouched;
+  `host_applyfailfast_test.go` pins the policy by counting how many times a
+  poisoned entry is offered to the state machine (exactly one) rather than by
+  reading the engine's own flags.
+
+  `engine.CircuitBreakerError` went with it: it was the error that retry policy
+  would have reported, was never constructed anywhere, and so could not reach
+  any caller. `*engine.SMPanicError` remains the type that matches
+  `ErrShardFailed`.
+
+- **`proto.Bootstrap` and its codec are gone.** The type had **no production
+  caller anywhere in the repository**: nothing outside `pkg/proto`'s own tests
+  ever constructed or decoded it, and no downstream consumer imported it. Its
+  `Size`/`MarshalTo`/`UnmarshalFrom`/`Reset` methods, `bootstrap_test.go` and
+  the `writeside_types_test.go` block that covered it are removed with it.
+
+  **The record LogDB persists is `logdb.Bootstrap`
+  (`pkg/logdb/types.go:186`), and it is unaffected.** It is written through
+  `SaveBootstrap`/`GetBootstrap` in each backend's own layout, it carries a
+  `DataDir` field `proto.Bootstrap` never had, and no on-disk byte was ever in
+  the `proto.Bootstrap` shape. Shard bootstrap, restart and `ImportSnapshot`
+  behaviour are all unchanged.
+
+  The type's doc comment and its test both used to assert it was "PERSISTED to
+  LogDB during shard initialization", which was never true of *this* type and
+  made an unused encoding read as load-bearing.
+
+  The write-side map limits the removed test pinned (`ErrAddressTooLong`,
+  `ErrTooManyMembershipEntries`, plus the hand-encoded read-side refusal) are
+  not lost: `checkWritableMap`, `putMap` and `getMap` are shared, and
+  `writeside_limits_test.go` pins all three on `Membership`, where the same
+  helpers are on the durable path.
+
+  This is a breaking change to an exported API. Pre-1.0, and no caller exists
+  to break.
 
 ## [0.5.1-alpha] - 2026-08-17
 
-The first publishable 0.5.x. Identical library content to 0.5.0-alpha — whose
-release pipeline failed its own fuzz gate — plus the two fixes that failure
-exposed. **See 0.5.0-alpha below for the breaking format changes and the
-migration; they apply to this version.**
+The first publishable 0.5.x. Identical library content to 0.5.0-alpha, whose
+release pipeline failed its own fuzz gate, plus the three fixes that failure and
+the pre-tag measurement exposed.
+
+**This version cannot read a 0.4.x data directory.** `proto.Entry`'s header went
+60 → 68 bytes, the WAL entry record 76 → 84, and the sealed-state MAC v1 → v2.
+There is no in-place upgrade: wipe the data directory, or export snapshots with
+0.4.x and re-import. See 0.5.0-alpha below for the full list and the migration.
 
 `v0.5.0-alpha` is not withdrawn: Go module versions are immutable and it is
 already resolvable, so the tag stays where it is rather than being moved. It
 simply never completed its release pipeline. Depend on 0.5.1-alpha.
 
+### Fixed — security
+
+- **Certificate revocation was fail-closed only by the grace of one caller.**
+  `revocation.Config.EnforceRevocation` is renamed to **`AllowSoftFail`** with
+  the inverted sense, matching the name and meaning of the operator-facing
+  `config.RevocationConfig.AllowSoftFail`. The zero value now **enforces**:
+  a `revocation.Config` nobody configured rejects a peer whose status cannot be
+  determined, and soft-fail has to be asked for.
+
+  Before this, the safe state was the one you had to remember. `Host` set
+  `EnforceRevocation: !rc.AllowSoftFail` when it built the transport config, and
+  that single line was the whole reason deployments failed closed; every other
+  construction path — an embedding of the transport, a tool, a test standing in
+  for one — silently got soft-fail, which admits a peer whose certificate may
+  have been revoked. The two layers also disagreed by name, so the mapping was a
+  negation that could be dropped or inverted without anything noticing.
+
+  **Deployments configured through `Host` are unaffected**, in either posture:
+  `Host` now copies `AllowSoftFail` across instead of negating it, and the
+  resulting checker behaves exactly as before. **Embedders that construct
+  `revocation.Config` directly move from soft-fail to fail-closed** unless they
+  set `AllowSoftFail: true`. The field lives in an internal package, so this is
+  a source-compatible change for anyone using the public API.
+
+- **`ModeCRL` with no CRL file consulted nothing and reported every certificate
+  as not revoked.** `checkCRLStatus` can only report staleness when `CRLPaths`
+  is non-empty, so under enforcement a checker in `"crl"` mode with no path
+  returned `(false, nil)` for every peer — no error, no log, no metric — while
+  `"ocsp"`, `"both"` and `"any"` all failed closed in the same situation.
+  `IsRevoked` now returns `ErrNoRevocationSources` there, matching the `"any"`
+  branch it was already meant to parallel. `Config.Validate` rejects the
+  combination at startup; this is the runtime backstop for a checker built
+  without it, or whose paths were lost in a refactor. A verdict the checker
+  actually holds — a programmatic `AddRevokedSerial` — still wins over the
+  missing-source error.
+
 ### Fixed
+
+- **Proposals to a failed shard are refused immediately instead of timing out.**
+  Once the shard failure latch trips — an `SM.Apply` error or a state-machine
+  panic — the step worker skips the node, but the propose path did not check.
+  Every later proposal was accepted, registered as pending, delivered to an
+  inbox nothing drains, and answered only when the sweeper reclaimed it at its
+  deadline. A permanently dead shard therefore presented as a slow one, and
+  `HealthCheck` was the only place that told the truth. `Host.proposeEntry` now
+  returns `ErrShardFailed` as soon as the latch is set.
+
+  `ErrShardFailed` remains deliberately absent from `Temporary`: the shard stays
+  failed until it is reloaded or recovered, so a retry loop against it would
+  never terminate. The identity of the *first* failing proposal is unchanged —
+  it still carries the state machine's own error.
 
 - **A fuzz harness built a membership its own decoder would refuse.**
   `FuzzMembershipRoundTrip` clamped an address to exactly `MaxAddressLength` and
@@ -45,6 +287,30 @@ simply never completed its release pipeline. Depend on 0.5.1-alpha.
   gate that blocks a release can be reproduced by the developer whose release it
   blocked, and it now runs as part of `make ci-full`.
 
+- **19 of the 21 `errfs` fault-injection tests could not inject on a flush.**
+  They ran with `WithNoSync(true)`, so no fault could land there, and the sweeps
+  self-calibrated onto whichever operation happened to fail instead. A broken
+  injector does not announce itself: it injects nothing, and every suite built on
+  it passes against a healthy system.
+
+### Added
+
+- **Unit tests for the fault injectors themselves**, in the ordinary build rather
+  than behind the tags of the suites that consume them. `errfs`: that `injectAt`
+  fires on the Nth operation exactly, that `OnlyOps` restricts which operation can
+  fire, that `Times` bounds injection so a recovery path is observable, that
+  `ShortWrite` disturbs the medium before failing, and that a misspelled operation
+  name panics rather than matching nothing. `netfault`: the directional property
+  asymmetric partitions depend on, that `Isolate` cuts both directions, that
+  `Partition` cuts across the split without cutting within either side, that
+  `Heal` clears everything, that cuts are node-level rather than per-shard, and
+  that the copy-on-write publication is race-free against the send path.
+
+  This is also what restored the release coverage floor. The round's production
+  changes had taken the module total to 90.7%, below the 91% gate — found by
+  measuring before tagging rather than by a failed release — and it is back above
+  the floor by covering code that needed it rather than by lowering the threshold.
+
 ## [0.5.0-alpha] - 2026-08-17
 
 A full-codebase review and remediation round: 6 critical, 31 high and roughly 60
@@ -66,6 +332,8 @@ by this version.
   removed — all three were written or reserved and never read
 - WAL entry record 76 → 84 bytes; WAL membership tail 66 → 74 bytes
 - `EntryOverheadBytes` 76 → 84
+- Sealed barrier state MAC v1 → v2 (`sealedStateMACVersion`), so that the new
+  load-generation counter is covered. This one migrates in place; the rest do not
 
 **Migration:** wipe the data directory, or export snapshots with 0.4.x and
 re-import. Sealed barrier state migrates in place: `sealedStateMACVersion` moved
@@ -861,7 +1129,7 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 - **`quicraft.Temporary(err) bool` and `quicraft.NotLeader(err) (replicaID uint64, ok bool)` classify the package's ~60 sentinels.** The package mixed transient conditions (`ErrTimeout`, `ErrSystemBusy`, `ErrShardNotReady`, `ErrNotLeader`) and permanent ones (`ErrShardNotFound`, `ErrInvalidOperation`, `ErrRejected`, `ErrClosed`) with nothing distinguishing them, so a caller could not ask "should I retry?" without string-matching or enumerating sentinels — and four downstream products would each have re-derived the classification and disagreed.
 
-  Every sentinel is classified deliberately, not by pattern. `Temporary` is true only for conditions that clear on their own without operator or caller intervention: `ErrBusy`/`ErrSystemBusy`, `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrRotateInProgress`, `ErrSnapshotInProgress`. **Everything else is permanent, including errors this package never produced** — retrying a permanent failure forever converts one bad request into sustained load and hides the real fault. Several plausible-looking candidates are excluded on purpose and the reason is recorded next to each in `pkg/errors.go`: `ErrStaleConfigChange` (the identical request fails forever; the caller must re-read membership and build a new one), `ErrDraining` (a one-way transition into shutdown), `ErrCanceled` (the caller's own decision, whereas a server-side deadline surfaces as `ErrTimeout`), `ErrSessionLimitExceeded`, `ErrBarrierSealed`, `ErrShardBarrierUnresolved`, `ErrDiskFull`, `ErrLogDBWrite` and `ErrShardFailed`.
+  Every sentinel is classified deliberately, not by pattern. `Temporary` is true only for conditions that clear on their own without operator or caller intervention: `ErrBusy`/`ErrSystemBusy`, `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrSnapshotInProgress`. **Everything else is permanent, including errors this package never produced** — retrying a permanent failure forever converts one bad request into sustained load and hides the real fault. Several plausible-looking candidates are excluded on purpose and the reason is recorded next to each in `pkg/errors.go`: `ErrStaleConfigChange` (the identical request fails forever; the caller must re-read membership and build a new one), `ErrDraining` (a one-way transition into shutdown), `ErrCanceled` (the caller's own decision, whereas a server-side deadline surfaces as `ErrTimeout`), `ErrSessionLimitExceeded`, `ErrBarrierSealed`, `ErrShardBarrierUnresolved`, `ErrDiskFull`, `ErrLogDBWrite` and `ErrShardFailed`.
 
   `NotLeader` surfaces `NotLeaderError.LeaderID` so callers redirect without type-asserting; `ok` is true for any not-leader error and `replicaID` is 0 when the leader is unknown. Both use `errors.Is`/`errors.As`, so wrapped errors and the typed errors' `Is` methods (`*BusyError`, `*NotLeaderError`) classify correctly. A table test asserts every exported sentinel, and a companion test parses `errors.go` and fails when it declares an exported `Err*` var the table does not classify — so a sentinel added later cannot become silently permanent without someone deciding that it should be.
 

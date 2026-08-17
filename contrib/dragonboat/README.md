@@ -4,4 +4,6 @@ This is a [Dragonboat](https://github.com/lni/dragonboat) compatible shim for [Q
 
 No [pebble](https://github.com/cockroachdb/pebble) dependency.
 
-See the [QuicRaft vs Dragonboat](../../test/performance/dragonboat.md) doc for performance comparisons.
+See the per-machine [QuicRaft vs Dragonboat](../../test/performance/profiles/omega/dragonboat.md)
+document for performance comparisons; other machines are under
+`test/performance/profiles/`.
