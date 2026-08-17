@@ -496,6 +496,29 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 
 	// Initialize remotes from membership.
 	r.initRemotes(membership)
+	// Refuse to build a replica whose recovered configuration does not fit the
+	// ReadIndex ackBits word, rather than building it and panicking later.
+	//
+	// This is the DURABLE form of the fault and the one an operator cannot
+	// escape on their own. StartShard and ImportSnapshot bound the member map
+	// at admission, but a configuration that got past them — through a build
+	// without those checks, or through a snapshot accepted before
+	// handleSnapshot gained its gate — is written to LogDB and recovered here
+	// on every start. As an assertion downstream it panicked the node each
+	// time, so the shard could not be started, could not be removed through a
+	// running host, and took every other shard on that step worker with it.
+	// Returning here fails exactly this shard: StartShard reports the error,
+	// the host stays up, and the operator can remove or repair the replica.
+	if n := r.votingBitCount(); n > maxVotingMembers {
+		slog.Error("refusing to start shard: recovered membership exceeds the ReadIndex ackBits word",
+			"shard", cfg.ShardID,
+			"replica", cfg.ReplicaID,
+			"voting_members", n,
+			"max_voting_members", maxVotingMembers,
+			"remotes", len(r.remotes),
+			"witnesses", len(r.witnesses))
+		return nil, ErrTooManyVotingMembers
+	}
 	// Seed the replicated witness-policy mirror from the recovered (or
 	// bootstrap-seeded) membership; kept in sync by the peer thereafter.
 	r.maxWitnesses = membership.MaxWitnesses
@@ -812,8 +835,25 @@ func (r *raft) becomePreCandidate() {
 
 // becomeLeader transitions the node to the leader state. Appends a
 // no-op entry to establish leadership and initializes remote tracking.
-func (r *raft) becomeLeader() {
+//
+// Returns ErrTooManyVotingMembers when the voting set does not fit the
+// ReadIndex ackBits word. The check is FIRST, before any field is written, so a
+// refused promotion leaves the replica exactly as it was and the caller can
+// simply not seat it as leader. It cannot be folded into the
+// rebuildReplicaToBit call further down: by then stepFunc, state, leaderID and
+// every remote's progress have already been reset, and the transition would
+// have to be unwound rather than declined.
+func (r *raft) becomeLeader() error {
 	invariant.Assert(r.state != follower, "follower cannot become leader directly")
+	if n := r.votingBitCount(); n > maxVotingMembers {
+		slog.Error("refusing leadership: voting set exceeds the ReadIndex ackBits word, this shard cannot serve linearizable reads and must not lead",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"voting_members", n,
+			"max_voting_members", maxVotingMembers,
+			"term", r.term)
+		return ErrTooManyVotingMembers
+	}
 	r.stepFunc = stepLeader
 	r.tickFunc = tickLeader
 	r.state = leader
@@ -881,7 +921,13 @@ func (r *raft) becomeLeader() {
 	}
 
 	// Build replicaToBit mapping for zero-allocation ReadIndex ack tracking.
-	r.rebuildReplicaToBit()
+	// The guard at the top of this function already established that the set
+	// fits, and nothing between the two changes it, so this cannot fail; the
+	// error is propagated rather than dropped so the two stay coupled if one
+	// of them is ever moved.
+	if err := r.rebuildReplicaToBit(); err != nil {
+		return err
+	}
 
 	// Append a no-op entry to commit entries from previous terms.
 	noop := proto.Entry{
@@ -901,6 +947,7 @@ func (r *raft) becomeLeader() {
 		"replica", r.replicaID,
 		"term", r.term,
 		"last_index", r.log.lastIndex())
+	return nil
 }
 
 // --------------------------------------------------------------------------
@@ -2026,7 +2073,25 @@ func (r *raft) checkElectionResult() bool {
 			"votes_needed", q,
 			"duration_ticks", electionDuration,
 		)
-		r.becomeLeader()
+		if err := r.becomeLeader(); err != nil {
+			// The election was won but leadership cannot be taken. Fall back
+			// to the same state a LOST election produces: follower at this
+			// term with no leader. Nothing has been mutated (becomeLeader
+			// declines before its first write), so this is a clean decline
+			// rather than an unwind.
+			//
+			// The shard is separately failed by whichever growth site let the
+			// oversized configuration in — Peer.syncRaftRemotes returns the
+			// same error out through Peer.Commit, and newRaft refuses to
+			// start at all — so this branch is a backstop that keeps the step
+			// worker alive, not the place the operator finds out.
+			slog.Error("won the election but cannot take leadership",
+				"shard", r.shardID,
+				"replica", r.replicaID,
+				"term", r.term,
+				"error", err)
+			r.becomeFollower(r.term, noLeader)
+		}
 		return true
 	case voteLost:
 		// Lost: revert to follower. Log election completion metrics.
@@ -4315,6 +4380,16 @@ func (r *raft) resetLeaseAcks() {
 	}
 }
 
+// votingBitCount returns how many ReadIndex ackBits positions this replica's
+// CURRENT voting set occupies: every remote, every witness, and self, which is
+// seated at bit 0 whether or not the configuration lists this replica.
+// It is the exact quantity rebuildReplicaToBit is bounded by, factored out so
+// that the places which can GROW that set check the same number the place which
+// consumes it does.
+func (r *raft) votingBitCount() int {
+	return len(r.remotes) + len(r.witnesses) + 1
+}
+
 // rebuildReplicaToBit constructs the replicaToBit mapping from the current
 // set of all voting members (remotes + witnesses + self). Both ReadIndex
 // and LeaseRead use the unified quorum (remotes + witnesses + self) because
@@ -4324,10 +4399,32 @@ func (r *raft) resetLeaseAcks() {
 //
 // Called from becomeLeader on initial leadership and from
 // syncRaftRemotes when membership changes during leadership.
-func (r *raft) rebuildReplicaToBit() {
-	votingCount := len(r.remotes) + len(r.witnesses) + 1
-	invariant.Assert(votingCount <= maxVotingMembers,
-		"cluster exceeds 64 voting members: ReadIndex ackBits is uint64, bit positions would alias and break quorum checks")
+//
+// Returns ErrTooManyVotingMembers rather than asserting when the voting set
+// does not fit the ackBits word. It used to be an invariant.Assert, which
+// panicked the raft STEP WORKER — a goroutine shared by every shard that
+// worker owns, and joined by Host.Close — over a fault that concerns exactly
+// one shard. Worse, the condition is durable: a membership persisted over the
+// cap panicked the node again on every restart, with no operator action that
+// could clear it. The three places that can grow the voting set all check the
+// bound before they mutate (newRaft, Peer.syncRaftRemotes, and handleSnapshot's
+// gate), so reaching this return means one of them was bypassed; it is a
+// backstop, and it fails the shard rather than the process. Truncating the map
+// to fit is NOT an option: bit positions above 63 would alias onto live ones
+// and two distinct replicas would ack into the same bit, satisfying a ReadIndex
+// quorum that a majority never granted.
+func (r *raft) rebuildReplicaToBit() error {
+	votingCount := r.votingBitCount()
+	if votingCount > maxVotingMembers {
+		slog.Error("voting set exceeds the ReadIndex ackBits word: refusing to build the ack map",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"voting_members", votingCount,
+			"max_voting_members", maxVotingMembers,
+			"remotes", len(r.remotes),
+			"witnesses", len(r.witnesses))
+		return ErrTooManyVotingMembers
+	}
 	r.replicaToBit = make(map[uint64]uint8, votingCount)
 	var bit uint8
 	r.replicaToBit[r.replicaID] = bit
@@ -4360,6 +4457,7 @@ func (r *raft) rebuildReplicaToBit() {
 	if len(r.pendingReadIndex) > 0 {
 		r.readIndexBroadcastPending = true
 	}
+	return nil
 }
 
 // hardState returns the current hard state for persistence.

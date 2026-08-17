@@ -554,7 +554,12 @@ func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 	}
 	if changed {
 		p.publishMembership()
-		p.syncRaftRemotes()
+		// First fault wins: a decode failure already recorded in fatal
+		// describes the entry that stopped the replay, which is more specific
+		// than the configuration it left behind.
+		if err := p.syncRaftRemotes(); err != nil && fatal == nil {
+			fatal = err
+		}
 		p.clearJoiningIfKnown()
 	}
 	if folded > p.configFoldedThrough {
@@ -801,7 +806,13 @@ func (p *Peer) Handle(msg proto.Message) error {
 			}
 			// Publish immutable snapshot for concurrent readers.
 			p.publishMembership()
-			p.syncRaftRemotes()
+			// handleSnapshot refuses an over-cap membership before it can be
+			// adopted, so this is a backstop; it is folded into err rather
+			// than returned early so the leader-ID publication below still
+			// runs, exactly as it does for a step error.
+			if syncErr := p.syncRaftRemotes(); syncErr != nil && err == nil {
+				err = syncErr
+			}
 			// Snapshot delivers the full cluster membership. A joining
 			// node now has complete membership knowledge and can enforce
 			// per-shard message authorization.
@@ -957,10 +968,63 @@ func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 	return m.validate(cc)
 }
 
+// membershipVotingBitCount returns how many ReadIndex ackBits positions the
+// peer's CURRENT membership would occupy once mirrored into the raft layer:
+// every voter and every witness other than this replica, plus self, which
+// rebuildReplicaToBit seats at bit 0 unconditionally. It counts the membership
+// rather than the raft maps because it must be answerable BEFORE syncRaftRemotes
+// mutates them.
+func (p *Peer) membershipVotingBitCount() int {
+	count := 1
+	for id := range p.membership.addresses {
+		if id != p.replicaID {
+			count++
+		}
+	}
+	for id := range p.membership.witnesses {
+		if id != p.replicaID {
+			count++
+		}
+	}
+	return count
+}
+
 // syncRaftRemotes synchronizes the raft state machine's remote tracking
 // maps from the peer's membership. This ensures the raft layer tracks
 // the correct set of peers after config changes.
-func (p *Peer) syncRaftRemotes() {
+//
+// Returns ErrTooManyVotingMembers when the applied membership names more
+// voting members than the ReadIndex ackBits word can address. Every caller is
+// on an error-returning path that the engine already treats as terminal for
+// the shard (processConfigChanges documents this: "The engine's failCommit
+// treats it as the fault it is"), so the shard is marked failed and reported
+// through EventListener.OnShardFailed while the host and its other shards keep
+// running. That replaced an invariant.Assert one frame down in
+// rebuildReplicaToBit, which took the whole step worker instead.
+//
+// The check runs BEFORE any of the raft maps are touched, deliberately. The
+// membership itself has already been applied — it is committed replicated
+// state and rolling it back would be a divergence — but the raft mirror is
+// local, and leaving it on the last configuration that fit is what makes this
+// fail CLOSED: the shard stops with a coherent voting set rather than a
+// half-synced one, and no ReadIndex is ever answered from a truncated bitmap.
+//
+// The leader propose gate (validateConfigChangePolicy) is what normally stops
+// such a configuration ever being proposed, and the committed-replay path
+// deliberately does not re-validate, because refusing an already-committed
+// entry there would make replicas diverge. Failing the shard is the honest
+// response to a committed entry this build cannot represent.
+func (p *Peer) syncRaftRemotes() error {
+	if n := p.membershipVotingBitCount(); n > maxVotingMembers {
+		slog.Error("shard membership exceeds the ReadIndex ackBits word: failing the shard rather than mirroring a voting set that cannot be tracked",
+			"shard", p.shardID,
+			"replica", p.replicaID,
+			"voting_members", n,
+			"max_voting_members", maxVotingMembers,
+			"voters", len(p.membership.addresses),
+			"witnesses", len(p.membership.witnesses))
+		return ErrTooManyVotingMembers
+	}
 	nextIdx := p.r.log.lastIndex() + 1
 
 	// Add new remotes. An observer being promoted to voter keeps its
@@ -1064,9 +1128,12 @@ func (p *Peer) syncRaftRemotes() {
 	// When the node is leader, rebuild quorum and lease tracking maps
 	// so that new voting members' heartbeat acks count correctly.
 	if p.r.state == leader {
-		p.r.rebuildReplicaToBit()
+		if err := p.r.rebuildReplicaToBit(); err != nil {
+			return err
+		}
 		p.syncLeaseAcks()
 	}
+	return nil
 }
 
 // syncLeaseAcks drops remoteLastAck entries for replicas that left the
@@ -1247,7 +1314,16 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) error {
 		// last coherent configuration is the one its readers see, then fail.
 		if needsSync {
 			p.publishMembership()
-			p.syncRaftRemotes()
+			// The shard is already failing on fatal, which names the corrupt
+			// entry and is the more useful diagnosis; this one is logged
+			// rather than substituted. The raft mirror is left on the last
+			// configuration that fit either way.
+			if syncErr := p.syncRaftRemotes(); syncErr != nil {
+				slog.Error("membership mirror not synced while failing the shard",
+					"shard", p.shardID,
+					"replica", p.replicaID,
+					"error", syncErr)
+			}
 			p.clearJoiningIfKnown()
 		}
 		return fatal
@@ -1266,7 +1342,13 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) error {
 	if needsSync {
 		// Publish immutable snapshot for concurrent readers.
 		p.publishMembership()
-		p.syncRaftRemotes()
+		// Terminal for this shard: a committed configuration this build cannot
+		// represent. Returning here reaches the engine's failCommit, which
+		// marks the node failed and fires OnShardFailed, exactly as it does
+		// for a config entry that will not decode.
+		if err := p.syncRaftRemotes(); err != nil {
+			return err
+		}
 		// A committed entry that gave this replica a membership beyond itself
 		// ends the joining window: it now knows every member and can enforce
 		// per-shard authorization. The bootstrap EntryInitialMembership is the

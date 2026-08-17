@@ -17,6 +17,7 @@ package raft
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 
@@ -8894,56 +8895,43 @@ func TestResetLeaseAcks_NilMap(t *testing.T) {
 // Test: H3 - replicaToBit 64-member guard
 // ---------------------------------------------------------------------------
 
-// TestBecomeLeader_PanicsWithTooManyVotingMembers verifies that becomeLeader
-// panics when the cluster exceeds 64 voting members. The ackBits bitfield is
-// a uint64, so positions 0..63 are the maximum. Exceeding this would cause
-// bit aliasing and break ReadIndex quorum checks.
-func TestBecomeLeader_PanicsWithTooManyVotingMembers(t *testing.T) {
+// TestBecomeLeader_RefusesTooManyVotingMembers pins what replaced the panic
+// this test used to assert.
+//
+// The ackBits bitfield is a uint64, so positions 0..63 are all there are, and a
+// 65th voting member cannot be tracked. That was enforced by an
+// invariant.Assert in rebuildReplicaToBit, which panicked the raft STEP WORKER
+// — a goroutine shared by every shard it owns, and joined by Host.Close — over
+// a fault confined to one shard. Because the offending membership is durable,
+// it panicked again on every restart, so the node could not be brought up to
+// repair it.
+//
+// The refusal now happens at the constructor: newRaft will not build a replica
+// whose recovered configuration does not fit, so NewPeer returns the error and
+// StartShard fails this shard while the host stays up. becomeLeader keeps an
+// independent guard as a backstop (see
+// TestBecomeLeaderDeclinesOverCapVotingSet), but it is not reachable through
+// this path any more — there is no replica to campaign with.
+func TestBecomeLeader_RefusesTooManyVotingMembers(t *testing.T) {
 	// Create a membership with 65 voting members (self + 64 remotes).
 	members := make(map[uint64]string, 65)
 	for i := uint64(1); i <= 65; i++ {
-		members[i] = "addr" + string(rune('0'+i%10))
+		members[i] = fmt.Sprintf("addr%d", i)
 	}
 
 	cfg := raftTestCfgPreVote(1, 1, false)
 	logdb := newTestLogReaderWithMembership(members)
+
+	// Must not panic, and must not hand back a usable replica.
 	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("newRaft failed: %v", err)
+	if !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("newRaft with 65 voting members returned %v, want "+
+			"ErrTooManyVotingMembers", err)
 	}
-
-	// becomeLeader should panic because 65 voting members exceed the
-	// 64-bit ackBits capacity.
-	defer func() {
-		rec := recover()
-		if rec == nil {
-			t.Fatal("expected panic from becomeLeader with 65 voting members")
-		}
-		msg, ok := rec.(string)
-		if !ok {
-			t.Fatalf("expected string panic, got %T: %v", rec, rec)
-		}
-		if !contains(msg, "64 voting members") {
-			t.Fatalf("panic message should mention 64 voting members, got: %s", msg)
-		}
-	}()
-
-	r.becomeCandidate()
-	// Grant enough votes for majority (33 of 65).
-	for id := uint64(2); id <= 34; id++ {
-		if stepErr := r.step(proto.Message{
-			Type: proto.RequestVoteResp,
-			From: id,
-			Term: r.term,
-		}); stepErr != nil {
-			t.Fatalf("step vote from %d: %v", id, stepErr)
-		}
-		if r.state == leader {
-			break
-		}
+	if r != nil {
+		t.Fatal("newRaft returned a replica alongside the error: it would " +
+			"campaign and take down the step worker on the first election")
 	}
-
-	// If we reach here without panic, the deferred check will catch it.
 }
 
 // TestBecomeLeader_SucceedsWithExactly64VotingMembers verifies that a cluster
@@ -8995,21 +8983,6 @@ func TestBecomeLeader_SucceedsWithExactly64VotingMembers(t *testing.T) {
 		}
 		seen[bit] = id
 	}
-}
-
-// contains checks if s contains substr. Helper to avoid importing strings
-// in a test file that does not already import it.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------

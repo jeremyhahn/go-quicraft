@@ -557,6 +557,265 @@ func TestSnapshotMembershipAtVotingCapIsAccepted(t *testing.T) {
 	})
 }
 
+// TestOverCapStoredMembershipRefusesShardStartup covers the DURABLE form of an
+// oversized configuration, which is the one an operator could not escape.
+//
+// StartShard and ImportSnapshot bound the member map at admission, but a
+// configuration that got past them — an older build, or a snapshot accepted
+// before handleSnapshot gained its gate — is written to LogDB and recovered on
+// every start. While rebuildReplicaToBit asserted, that recovery panicked the
+// step worker as soon as the replica campaigned: the shard could not be
+// started, could not be repaired through a running host, and took every other
+// shard owned by the same worker down with it. On every restart, forever.
+//
+// newRaft now refuses to build the replica, so NewPeer returns the error,
+// StartShard reports it as a HostInitError, and the host stays up with its
+// other shards running.
+func TestOverCapStoredMembershipRefusesShardStartup(t *testing.T) {
+	overCap := make(map[uint64]string, maxVotingMembers+1)
+	for id := uint64(1); id <= uint64(maxVotingMembers)+1; id++ {
+		overCap[id] = fmt.Sprintf("addr%d", id)
+	}
+
+	r, err := newRaft(raftTestCfg(1, 1), newTestLogReaderWithMembership(overCap))
+	if !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("newRaft with a stored %d-voter membership returned %v, want "+
+			"ErrTooManyVotingMembers: the replica is built and panics the step "+
+			"worker the moment it campaigns, on every restart",
+			maxVotingMembers+1, err)
+	}
+	if r != nil {
+		t.Fatal("a raft was returned alongside the error: a half-built replica " +
+			"with an untrackable voting set must not escape the constructor")
+	}
+
+	// The same refusal has to reach the caller StartShard actually uses,
+	// because that is what decides whether the host survives.
+	peer, err := NewPeer(raftTestCfg(1, 1), newTestLogReaderWithMembership(overCap), nil)
+	if !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("NewPeer returned %v, want ErrTooManyVotingMembers", err)
+	}
+	if peer != nil {
+		t.Fatal("NewPeer returned a peer alongside the error")
+	}
+
+	// The bound is not off by one: a shard running the maximum supported
+	// configuration must still start.
+	atCap := make(map[uint64]string, maxVotingMembers)
+	for id := uint64(1); id <= uint64(maxVotingMembers); id++ {
+		atCap[id] = fmt.Sprintf("addr%d", id)
+	}
+	okRaft, err := newRaft(raftTestCfg(1, 1), newTestLogReaderWithMembership(atCap))
+	if err != nil {
+		t.Fatalf("newRaft with a stored %d-voter membership returned %v, want "+
+			"success: a shard at the supported maximum cannot be started",
+			maxVotingMembers, err)
+	}
+	if okRaft == nil {
+		t.Fatal("newRaft returned no raft and no error")
+	}
+}
+
+// TestCommittedOverCapConfigChangeFailsShardNotWorker covers the other
+// residual: a 65th voter that is already COMMITTED.
+//
+// The propose gate (validateConfigChangePolicy) stops an honest leader
+// producing one, and the committed-replay path deliberately does not
+// re-validate — refusing an already-committed entry there would make replicas
+// diverge. So a compromised or older leader can still land one in the log, and
+// every replica must then do something with an entry this build cannot
+// represent.
+//
+// The answer is to fail THE SHARD, not the worker. Peer.syncRaftRemotes
+// returns the error up through processConfigChanges and Peer.Commit, which is
+// the path the engine's failCommit already treats as terminal: node.failed is
+// set and EventListener.OnShardFailed fires, while the host and every other
+// shard on that step worker keep running. Previously this was an
+// invariant.Assert one frame down.
+func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
+	p := newTestMultiNodeLeaderPeer(t)
+
+	// Grow the configuration to exactly the cap. Every one of these is legal
+	// and must be accepted, which also proves the guard is not simply
+	// rejecting everything.
+	idx := p.r.log.lastIndex()
+	for id := uint64(4); id <= uint64(maxVotingMembers); id++ {
+		idx++
+		if err := p.membership.apply(proto.ConfigChange{
+			Type:      proto.AddNode,
+			ReplicaID: id,
+			Address:   fmt.Sprintf("addr%d", id),
+		}, idx); err != nil {
+			t.Fatalf("apply AddNode %d: %v", id, err)
+		}
+		if err := p.syncRaftRemotes(); err != nil {
+			t.Fatalf("syncRaftRemotes at %d voting members: %v", id, err)
+		}
+	}
+	if got := p.r.votingBitCount(); got != maxVotingMembers {
+		t.Fatalf("fixture: votingBitCount = %d, want %d", got, maxVotingMembers)
+	}
+	remotesAtCap := len(p.r.remotes)
+	bitsAtCap := len(p.r.replicaToBit)
+
+	// Now the 65th, as a COMMITTED entry: membership.apply does not
+	// re-validate, by design, so it lands.
+	idx++
+	if err := p.membership.apply(proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: uint64(maxVotingMembers) + 1,
+		Address:   "addr65",
+	}, idx); err != nil {
+		t.Fatalf("apply the over-cap AddNode: %v", err)
+	}
+
+	err := p.syncRaftRemotes()
+	if !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("syncRaftRemotes with a committed %dth voter returned %v, want "+
+			"ErrTooManyVotingMembers: the engine never learns the shard is "+
+			"unusable and rebuildReplicaToBit panics the step worker instead",
+			maxVotingMembers+1, err)
+	}
+
+	// Fail CLOSED. The raft mirror must be left on the last configuration
+	// that fit — not half-synced, and above all not serving ReadIndex out of
+	// a bitmap that cannot address every voter.
+	if len(p.r.remotes) != remotesAtCap {
+		t.Fatalf("remotes = %d, want %d: the oversized configuration was "+
+			"mirrored into the raft layer anyway", len(p.r.remotes), remotesAtCap)
+	}
+	if len(p.r.replicaToBit) != bitsAtCap {
+		t.Fatalf("replicaToBit has %d entries, want %d: an ack map was built "+
+			"for a voting set that does not fit the word", len(p.r.replicaToBit), bitsAtCap)
+	}
+
+	// And the failure must be reportable rather than fatal: the peer is still
+	// a live object the engine can mark failed and unload.
+	if !p.IsLeader() {
+		t.Fatal("the peer stopped being leader: the shard should be failed by " +
+			"the engine, not torn down inside raft")
+	}
+}
+
+// TestOverCapConfigChangeSurfacesThroughPeerCommit is the wiring test for the
+// one above, and it exists because the one above does not cover the wiring.
+//
+// TestCommittedOverCapConfigChangeFailsShardNotWorker calls syncRaftRemotes
+// directly, so it proves the guard fires and fails closed but says nothing
+// about whether the error ever LEAVES the raft package. Deleting the
+// `return err` in processConfigChanges — the single line that carries it to
+// the engine — left that test green. Without this one, the shard would be
+// silently unfailed: the engine would commit normally, the operator would get
+// no OnShardFailed, and the replica would carry on with a raft mirror
+// permanently behind its own committed membership.
+//
+// So this drives the real path a follower takes: a committed
+// EntryConfigChange arrives by Replicate, and the error has to come out of
+// Peer.Commit, which is what the engine's failCommit is watching.
+func TestOverCapConfigChangeSurfacesThroughPeerCommit(t *testing.T) {
+	// A follower already at the supported maximum.
+	atCap := proto.Membership{Addresses: make(map[uint64]string, maxVotingMembers)}
+	for id := uint64(1); id <= uint64(maxVotingMembers); id++ {
+		atCap.Addresses[id] = fmt.Sprintf("addr%d", id)
+	}
+	p := newTestPeer(t, testConfig(), proto.State{}, atCap)
+
+	// Seed the log so the Replicate below has a matching prevLogIndex.
+	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
+
+	cc := proto.ConfigChange{
+		Type:      proto.AddNode,
+		ReplicaID: uint64(maxVotingMembers) + 1,
+		Address:   "addr65",
+	}
+	buf := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(buf); err != nil {
+		t.Fatalf("marshal config change: %v", err)
+	}
+
+	// The leader replicates the over-cap config change and commits it. A
+	// follower has no propose gate to refuse it: this is exactly the entry a
+	// compromised or older leader can land.
+	if err := p.Handle(proto.Message{
+		Type:     proto.Replicate,
+		From:     2,
+		To:       1,
+		ShardID:  1,
+		Term:     1,
+		LogIndex: 1,
+		LogTerm:  1,
+		Commit:   2,
+		Entries: []proto.Entry{
+			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: buf},
+		},
+	}); err != nil {
+		t.Fatalf("Handle(Replicate): %v", err)
+	}
+
+	// Drive the engine's GetUpdate -> Commit contract until Commit reports the
+	// fault. It takes more than one cycle: entries persist first, then surface
+	// as committed entries on a later cycle.
+	var commitErr error
+	for range 10 {
+		if !p.HasUpdate(0) {
+			break
+		}
+		update, err := p.GetUpdate(true, 0)
+		if err != nil {
+			t.Fatalf("GetUpdate: %v", err)
+		}
+		if commitErr = p.Commit(update); commitErr != nil {
+			break
+		}
+	}
+
+	if !errors.Is(commitErr, ErrTooManyVotingMembers) {
+		t.Fatalf("Peer.Commit returned %v, want ErrTooManyVotingMembers.\n"+
+			"The committed %dth voter never reaches the engine, so failCommit "+
+			"never runs: node.failed stays false, OnShardFailed never fires, "+
+			"and this replica keeps serving with a raft mirror that is "+
+			"permanently behind its own committed membership",
+			commitErr, maxVotingMembers+1)
+	}
+}
+
+// TestBecomeLeaderDeclinesOverCapVotingSet pins the backstop directly.
+//
+// Every growth site now checks the bound, so this state is unreachable through
+// the ordinary paths — which is exactly why it is worth a test that constructs
+// it by hand. The requirement is that leadership is REFUSED rather than taken
+// with a truncated bitmap, and that nothing panics.
+func TestBecomeLeaderDeclinesOverCapVotingSet(t *testing.T) {
+	r := newTestRaft(1)
+	for id := uint64(4); id <= uint64(maxVotingMembers)+1; id++ {
+		r.remotes[id] = newRemote(1, maxInflightMsgs)
+	}
+	if got := r.votingBitCount(); got <= maxVotingMembers {
+		t.Fatalf("fixture: votingBitCount = %d, want > %d", got, maxVotingMembers)
+	}
+
+	r.becomeCandidate()
+	if err := r.becomeLeader(); !errors.Is(err, ErrTooManyVotingMembers) {
+		t.Fatalf("becomeLeader returned %v, want ErrTooManyVotingMembers", err)
+	}
+	// Declined, not half-applied: becomeLeader must not have written a thing.
+	if r.state == leader {
+		t.Fatal("the replica became leader with a voting set that does not fit " +
+			"the ackBits word")
+	}
+
+	// checkElectionResult must turn the refusal into the same state a lost
+	// election produces, so the step worker carries on.
+	r.becomeCandidate()
+	for id := range r.remotes {
+		r.votes[id] = true
+	}
+	r.checkElectionResult()
+	if r.state == leader {
+		t.Fatal("checkElectionResult seated a leader whose voting set does not fit")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // A joining node's own election timer
 // ---------------------------------------------------------------------------

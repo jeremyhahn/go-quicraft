@@ -1599,7 +1599,10 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 				c.h.releaseRemovedMemberConn(shardID, cc.ReplicaID, removedAddr)
 			}
 		}
-		ns.configChangeIndex.Store(entry.Index)
+		// Monotonic: a snapshot install may already have reconciled this shard
+		// to a HIGHER config-change index, and an apply landing afterwards must
+		// not walk it back. See advanceConfigChangeIndex.
+		advanceConfigChangeIndex(ns, entry.Index)
 		c.h.logger.Info("membership changed",
 			"shard", shardID,
 			"replica", ns.replicaID,
@@ -2058,13 +2061,32 @@ func (c *hostEngineCallback) reconcileMembershipFromPeer(shardID uint64, ns *nod
 	// keeps RequestAddNode/RemoveNode's staleness guard round-tripping after a
 	// snapshot install. Never regress it: a concurrent higher incremental apply
 	// must win.
+	advanceConfigChangeIndex(ns, pm.ConfigChangeID)
+}
+
+// advanceConfigChangeIndex raises ns.configChangeIndex to idx, never lowering
+// it.
+//
+// configChangeIndex is the log index of the last applied config change, and it
+// is the value RequestAddNode/RequestRemoveNode check a caller's Expected
+// against. Every writer must therefore be monotonic, because a value that goes
+// BACKWARDS rejects the very number SyncGetShardMembership just reported —
+// wedging every membership change on that shard until something else happens to
+// advance it.
+//
+// It exists because only one of the three writers was monotonic. The snapshot
+// reconcile path used a never-regress compare-and-swap and explained why, while
+// the incremental OnApplied path stored unconditionally, so an apply landing
+// after a snapshot install undid it. Both now go through here, and there is no
+// second copy of the loop to drift out of step with the first.
+func advanceConfigChangeIndex(ns *nodeState, idx uint64) {
 	for {
 		cur := ns.configChangeIndex.Load()
-		if pm.ConfigChangeID <= cur {
-			break
+		if idx <= cur {
+			return
 		}
-		if ns.configChangeIndex.CompareAndSwap(cur, pm.ConfigChangeID) {
-			break
+		if ns.configChangeIndex.CompareAndSwap(cur, idx) {
+			return
 		}
 	}
 }
@@ -3784,7 +3806,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// last applied config change — the exact value SyncGetShardMembership
 	// reports and callers pass back — so seeding it makes the guard round-trip.
 	if pm := peer.GetMembership(); pm.ConfigChangeID > 0 {
-		ns.configChangeIndex.Store(pm.ConfigChangeID)
+		advanceConfigChangeIndex(ns, pm.ConfigChangeID)
 	}
 
 	// Atomically store the nodeState, detecting concurrent StartShard
