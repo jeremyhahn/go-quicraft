@@ -22,6 +22,13 @@ import (
 	"testing"
 )
 
+// identityPrefix is the scheme prefix the identity shapes below build their
+// values from. It is a named constant because its LENGTH matters: Identities
+// and RemovedIdentities are bounded by MaxAddressLength on both the read and
+// write sides, so anything derived from a clamped address must leave room for
+// it.
+const identityPrefix = "spki:"
+
 // FuzzEntryRoundTrip verifies that Entry marshal/unmarshal round-trips
 // preserve all fields for arbitrary valid inputs.
 func FuzzEntryRoundTrip(f *testing.F) {
@@ -613,8 +620,17 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 		maxWitnesses uint64, requireFullMajority bool) {
 
 		// Clamp address values to valid length.
-		if len(addrVal) > MaxAddressLength {
-			addrVal = addrVal[:MaxAddressLength]
+		//
+		// addrVal is clamped to leave room for the "spki:" prefix the identity
+		// shapes below build from it. Clamping it to exactly MaxAddressLength
+		// made "spki:"+addrVal five bytes too long, and Identities is bounded by
+		// MaxAddressLength on BOTH sides — so the harness was constructing a
+		// membership the decoder would refuse, and asserting the encoder emit
+		// it. That went unnoticed until MarshalTo grew the matching write-side
+		// bound; before that the encoder produced a frame its own decoder could
+		// not read, which is the durability bug the bound exists to prevent.
+		if len(addrVal) > MaxAddressLength-len(identityPrefix) {
+			addrVal = addrVal[:MaxAddressLength-len(identityPrefix)]
 		}
 		if len(obsVal) > MaxAddressLength {
 			obsVal = obsVal[:MaxAddressLength]
@@ -637,8 +653,8 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 				// The authorization maps and the replicated session policy.
 				// No shape carried them, so the comparisons below could not
 				// observe a converter or codec that dropped either.
-				Identities:           map[uint64]string{addrKey: "spki:" + addrVal},
-				RemovedIdentities:    map[uint64]string{removedKey: "spki:removed"},
+				Identities:           map[uint64]string{addrKey: identityPrefix + addrVal},
+				RemovedIdentities:    map[uint64]string{removedKey: identityPrefix + "removed"},
 				SessionExpiryEntries: ccID,
 				MaxTotalSessions:     maxWitnesses + 1,
 				MaxSessionsPerClient: maxWitnesses + 2,
