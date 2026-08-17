@@ -425,8 +425,7 @@ prefix, an inline Membership, and variable-length trailing fields.
  +-------------------+----------------------------------------------+
                      |
  +--- Filepath (len+data) ---+--- FileSize (8) ---+
- +--- Type (8) ---+--- Imported (8) ---+--- OnDiskIndex (8) ---+
- +--- Witness (8) ---+--- Epoch (8) ---+
+ +--- OnDiskIndex (8) ---+--- Epoch (8) ---+--- Compression (8) ---+
 ```
 
 ### Field Layout
@@ -440,21 +439,38 @@ prefix, an inline Membership, and variable-length trailing fields.
 | Variable   | Membership  | var     | struct | Cluster membership (see below)   |
 | Variable   | Filepath    | 4+N     | string | Snapshot data file path          |
 | Fixed      | FileSize    | 8       | uint64 | Snapshot file size in bytes      |
-| Fixed      | Type        | 8       | uint64 | State machine type code          |
-| Fixed      | Imported    | 8       | bool   | External import flag             |
 | Fixed      | OnDiskIndex | 8       | uint64 | On-disk SM tracked index         |
-| Fixed      | Witness     | 8       | bool   | Witness replica flag             |
 | Fixed      | Epoch       | 8       | uint64 | Barrier encryption epoch (0 = plaintext) |
+| Fixed      | Compression | 8       | uint64 | `config.CompressionType` the data file was written with |
 
-Minimum size: 32 bytes (the 4 leading fixed fields). The trailing 5 fixed
-fields (Type, Imported, OnDiskIndex, Witness, Epoch) contribute 40 bytes.
-`Type` is validated against `maxStateMachineType` on both write and read;
-an out-of-range value returns an `*InvalidSnapshotTypeError`.
+Minimum size: 32 bytes (the 4 leading fixed fields). The trailing 3 fixed
+fields (OnDiskIndex, Epoch, Compression) contribute 24 bytes.
 `IsEmpty()` returns true when both `Index` and `Term` are zero.
+
+### The removed Type and Witness fields
+
+Snapshot also carried `Type` (a state machine type code) and `Witness` (a
+witness-replica flag) in this trailing block, and both were **removed**.
+
+`Type` had no writer anywhere in the repository, so it was zero on every
+snapshot ever produced, while both `MarshalTo` and `UnmarshalFrom` spent a
+comparison range-checking it against `maxStateMachineType`. Which kind of
+state machine a shard runs is a property of the local process -- it comes from
+the `StateMachineFactory` the host was built with, and `Bootstrap.Type` already
+records it durably -- not of an artifact streamed from a peer, so no reader
+was going to appear for it either. Removing it also removed
+`maxStateMachineType` and the `*InvalidSnapshotTypeError` it raised.
+
+`Witness` was written (the leader set it in the same branch that clears
+`Filepath` and zeroes `FileSize` for a witness target) and read by nothing. An
+empty `Filepath` is already the repository-wide test for a metadata-only
+snapshot, so a second independently-settable statement of the same fact could
+only ever be a way for the two to disagree.
 
 ### The removed Checksum field
 
-Snapshot carried a `Checksum []byte` between `FileSize` and `Type` through
+Snapshot carried a `Checksum []byte` between `FileSize` and the trailing
+fixed block through
 an earlier pre-release layout, and it was **removed**. It was decoded, bounded
 and copied out of the pooled receive buffer on every message, and it was
 never computed and never verified anywhere in the repository -- so it was
@@ -1017,13 +1033,12 @@ All errors are package-level sentinel values (not `fmt.Errorf`):
 | `ErrDuplicateMapKey`           | A membership map repeats a key                    |
 | `ErrUnsupportedVersion`        | `BinVer != WireVersion`, or a `Membership` section version byte that is not 1 |
 
-Two errors are typed rather than sentinel, and both match a sentinel under
+One error is typed rather than sentinel, and it matches a sentinel under
 `errors.Is`:
 
 | Error                                 | Matches                    | Condition                                          |
 |---------------------------------------|----------------------------|----------------------------------------------------|
 | `*UnsupportedMembershipVersionError`  | `ErrUnsupportedVersion`    | Membership version byte is not `1`; names the version found and the one supported |
-| `*InvalidSnapshotTypeError`           | `ErrInvalidSnapshotType`   | `Snapshot.Type` above `maxStateMachineType`        |
 
 ## Zero-Copy Semantics
 

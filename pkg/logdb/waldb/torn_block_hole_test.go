@@ -381,3 +381,143 @@ func TestSegment_RepairOffsetIsTheFirstHoleNotTheLast(t *testing.T) {
 		t.Fatalf("repaired segment holds %d records, want 1", len(again))
 	}
 }
+
+// TestSegment_ShortNonZeroRemainderIsDamageNotPadding pins what a remainder too
+// small to hold a header actually means, which follows from the writer rather
+// than from taste.
+//
+// segment.Write starts a chunk only when recordHeaderSize+1 bytes are free, and
+// a chunk fills every byte it claims. The walk can therefore reach a remainder
+// of 1..recordHeaderSize-1 bytes only because padAndFlushBlock put it there —
+// and it pads with ZEROS. So an all-zero short remainder is legal padding, and a
+// short remainder containing any non-zero byte is a shape this writer cannot
+// produce: a torn final flush, or damage to the padding of an interior block.
+//
+// Recovery used to `break` on it, which was untested in either direction and
+// wrong in the interior case: the scan strode to the next block with no hole
+// recorded and replayed every record above the damage, manufacturing exactly
+// the Raft log gap the prefix rule exists to prevent.
+func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
+	const blockSize = 1024
+	// A record that leaves a 5-byte remainder in its block: too small for a
+	// header, and below the maximum legal padding, so only its CONTENT can
+	// distinguish padding from damage.
+	const remainder = 5
+	payload := bytes.Repeat([]byte{0x3C}, blockSize-remainder-recordHeaderSize)
+
+	// The legal control: the same layout with the remainder left as zeros must
+	// still recover cleanly, so the test cannot pass by flagging everything.
+	t.Run("zero_remainder_is_padding", func(t *testing.T) {
+		dir := t.TempDir()
+		file := make([]byte, 2*blockSize)
+		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, payload)
+		if err != nil {
+			t.Fatalf("encodeRecord: %v", err)
+		}
+		if blockSize-n != remainder {
+			t.Fatalf("fixture: remainder is %d bytes, want %d", blockSize-n, remainder)
+		}
+		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, payload); err != nil {
+			t.Fatalf("encodeRecord(block 1): %v", err)
+		}
+		path := filepath.Join(dir, segmentFilename(1))
+		if err := os.WriteFile(path, file, 0o600); err != nil {
+			t.Fatalf("write segment: %v", err)
+		}
+
+		rs := openSegmentForTest(t, dir, 1, blockSize)
+		defer rs.Close()
+		got, _, err := rs.ReadAll()
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if rs.stoppedAtCorruption {
+			t.Fatal("a block padded with zeros to a 5-byte remainder — exactly what " +
+				"padAndFlushBlock writes — was reported as corruption")
+		}
+		if len(got) != 2 {
+			t.Fatalf("recovered %d records, want 2", len(got))
+		}
+	})
+
+	// The interior case: the padding zeros are overwritten with garbage, and a
+	// record sits in the block above. Replaying that record would create a gap.
+	t.Run("interior_non_zero_remainder_stops_recovery", func(t *testing.T) {
+		dir := t.TempDir()
+		file := make([]byte, 2*blockSize)
+		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, payload)
+		if err != nil {
+			t.Fatalf("encodeRecord: %v", err)
+		}
+		copy(file[n:blockSize], []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01})
+		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, payload); err != nil {
+			t.Fatalf("encodeRecord(block 1): %v", err)
+		}
+		path := filepath.Join(dir, segmentFilename(1))
+		if err := os.WriteFile(path, file, 0o600); err != nil {
+			t.Fatalf("write segment: %v", err)
+		}
+
+		rs := openSegmentForTest(t, dir, 1, blockSize)
+		defer rs.Close()
+		got, end, err := rs.ReadAll()
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if !rs.stoppedAtCorruption {
+			t.Fatalf("a %d-byte non-zero remainder in an INTERIOR block was accepted "+
+				"as end-of-block padding: ReadAll returned %d records, so the record "+
+				"in the block ABOVE the damage was replayed and the log now has a "+
+				"hole where the damage is, with nothing to tell the caller",
+				remainder, len(got))
+		}
+		if len(got) != 1 {
+			t.Fatalf("recovered %d records across the damage, want only the "+
+				"1-record clean prefix", len(got))
+		}
+		if end != int64(n) {
+			t.Fatalf("clean-prefix end = %d, want %d (the first byte of the damaged "+
+				"remainder)", end, n)
+		}
+		// One unsynced generation, so this is repairable by truncation.
+		if rs.ackedDataAfterCorruption || rs.sequenceRegression {
+			t.Fatalf("evidence flags set for a single-generation segment: acked=%v "+
+				"regression=%v", rs.ackedDataAfterCorruption, rs.sequenceRegression)
+		}
+	})
+
+	// The torn-tail case: the same damage at end of file, with nothing above.
+	// Recovery must cut it off rather than leave it in a file it has just
+	// declared repaired.
+	t.Run("trailing_non_zero_remainder_is_truncated", func(t *testing.T) {
+		dir := t.TempDir()
+		buf := make([]byte, blockSize)
+		n, err := encodeRecord(buf, RecordFull, 0, payload)
+		if err != nil {
+			t.Fatalf("encodeRecord: %v", err)
+		}
+		file := append(buf[:n], 0xDE, 0xAD, 0xBE, 0xEF, 0x01)
+		path := filepath.Join(dir, segmentFilename(1))
+		if err := os.WriteFile(path, file, 0o600); err != nil {
+			t.Fatalf("write segment: %v", err)
+		}
+
+		rs := openSegmentForTest(t, dir, 1, blockSize)
+		defer rs.Close()
+		got, end, err := rs.ReadAll()
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if !rs.stoppedAtCorruption {
+			t.Fatal("a torn fragment shorter than a record header at end of file was " +
+				"accepted as a clean end-of-records, so recovery reported the segment " +
+				"as needing no repair and left the fragment in it")
+		}
+		if len(got) != 1 {
+			t.Fatalf("recovered %d records, want 1", len(got))
+		}
+		if end != int64(n) {
+			t.Fatalf("clean-prefix end = %d, want %d (the fragment must be cut off)", end, n)
+		}
+	})
+}

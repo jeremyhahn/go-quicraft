@@ -622,12 +622,15 @@ func TestEntryFieldCount(t *testing.T) {
 // is handed to it raw; FileSize zero makes this replica ship a metadata-only
 // snapshot that erases the receiving follower's state.
 //
-// The counts differ on purpose. Snapshot has three wire-only fields with no
-// logdb counterpart — Type, Witness and the identity pair ShardID/ReplicaID
-// (LogDB keys records by shard and replica instead of storing them) — so the
-// guard pins each side separately rather than requiring them to match.
+// The counts differ on purpose. proto.Snapshot carries the identity pair
+// ShardID/ReplicaID, which has no logdb counterpart (LogDB keys records by
+// shard and replica instead of storing them), while logdb.Snapshot carries a
+// Type this side does not (proto.Snapshot.Type was removed: it had no writer
+// anywhere, so it round-tripped as zero on every snapshot the engine ever
+// produced). So the guard pins each side separately rather than requiring
+// them to match.
 func TestSnapshotFieldCount(t *testing.T) {
-	const protoMapped = 12
+	const protoMapped = 10
 	if got := reflect.TypeOf(proto.Snapshot{}).NumField(); got != protoMapped {
 		t.Fatalf("proto.Snapshot has %d fields, but the converters map %d.\n"+
 			"Adding or removing one means updating protoSnapshotToLogDB, the "+

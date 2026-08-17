@@ -19,8 +19,8 @@ Core principles:
 
 Unit tests run locally with race detection enabled (`go test -race -count=1`). The Makefile enforces 91%+ coverage per package.
 
-25 package test targets:
-- Core: `test-proto`, `test-config`, `test-queue`, `test-stopper`, `test-invariant`
+22 package test targets:
+- Core: `test-proto`, `test-config`, `test-queue`, `test-invariant`
 - Storage: `test-logdb`, `test-raft`, `test-waldb`, `test-seal`
 - State machine: `test-rsm`, `test-session`, `test-snapshot`, `test-sm`
 - Engine: `test-engine`, `test-registry`, `test-transport`

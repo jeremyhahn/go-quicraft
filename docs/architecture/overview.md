@@ -67,7 +67,6 @@ each with its own state machine, log, and membership. It provides:
 - `pkg/internal/session/` — Client session manager (at-most-once delivery)
 - `pkg/internal/registry/` — (shardID, replicaID) → address mapping
 - `pkg/internal/queue/` — Double-buffered MPSC queues, ReadyMap
-- `pkg/internal/stopper/` — Graceful shutdown coordination
 - `pkg/internal/server/` — Global rate limiter
 - `pkg/internal/invariant/` — Debug assertions
 - `pkg/internal/transport/revocation/` — Certificate revocation (CRL, OCSP)

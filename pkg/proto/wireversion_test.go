@@ -402,8 +402,14 @@ func TestSnapshotGoldenEncodingUnchanged(t *testing.T) {
 		"00000000" + "00000000" + // Identities, RemovedIdentities
 		"00000000" + // Filepath length
 		"0000000000000000" + // FileSize
-		"0000000000000000" + // Type
-		"0000000000000000" + "0000000000000000" + // OnDiskIndex, Witness
+		// Three fields left this layout, shortening the vector by 8 bytes each:
+		// Type (no writer anywhere and no reader), Witness (written by raft but
+		// never read, and the fact it stated is already carried by the empty
+		// Filepath the same branch produces), and Imported (whose only writer
+		// set it from "this save is an EXPORT" — the opposite of its documented
+		// meaning). Acknowledging the change HERE, deliberately, is exactly what
+		// this golden test exists for.
+		"0000000000000000" + // OnDiskIndex
 		"0000000000000000" + "0000000000000000" // Epoch, Compression
 	if got := hex.EncodeToString(sbuf[:sn]); got != snapGolden {
 		t.Fatalf("Snapshot encoding changed:\n got %s\nwant %s", got, snapGolden)

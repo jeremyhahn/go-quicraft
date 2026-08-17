@@ -103,10 +103,6 @@ var (
 	// allocation or offset math.
 	ErrChunkSizeMismatch = errors.New("proto: chunk size does not match data length")
 
-	// ErrInvalidSnapshotType is the sentinel for InvalidSnapshotTypeError.
-	// Use errors.Is to match.
-	ErrInvalidSnapshotType = errors.New("proto: invalid snapshot state machine type")
-
 	// ErrSnapshotWithoutPosition is returned by Message.MarshalTo when the
 	// embedded Snapshot carries content but has zero Index and zero Term.
 	// The message layout signals snapshot presence with Snapshot.IsEmpty,
@@ -141,21 +137,4 @@ func (e *UnsupportedMembershipVersionError) Error() string {
 // so existing errors.Is checks on the wire-version sentinel keep working.
 func (e *UnsupportedMembershipVersionError) Is(target error) bool {
 	return target == ErrUnsupportedVersion
-}
-
-// InvalidSnapshotTypeError is returned when a Snapshot.Type field does
-// not match any known state machine type constant (RegularStateMachine,
-// ConcurrentStateMachine, OnDiskStateMachine).
-type InvalidSnapshotTypeError struct {
-	Type uint64
-}
-
-// Error returns a human-readable description of the invalid snapshot type.
-func (e *InvalidSnapshotTypeError) Error() string {
-	return fmt.Sprintf("proto: invalid snapshot state machine type: %d", e.Type)
-}
-
-// Is reports whether target matches the sentinel ErrInvalidSnapshotType error.
-func (e *InvalidSnapshotTypeError) Is(target error) bool {
-	return target == ErrInvalidSnapshotType
 }

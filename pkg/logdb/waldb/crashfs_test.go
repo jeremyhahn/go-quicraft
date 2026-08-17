@@ -130,6 +130,12 @@ const (
 	crashOpSync
 	crashOpDirSync
 	crashOpRemove
+	// crashOpWriteAtDone fires AFTER a WriteAt has applied. Every other op
+	// fires before, which is what a hook wanting to cut power mid-operation
+	// needs; a hook wanting to model writeback flushing what was just written
+	// needs the opposite, and firing before would flush the state as it was one
+	// write earlier.
+	crashOpWriteAtDone
 )
 
 // crashHook runs immediately BEFORE the intercepted operation applies, and
@@ -315,6 +321,26 @@ func (c *crashFS) entryChainDurableLocked(path string) bool {
 			return true
 		}
 		path = parent
+	}
+}
+
+// Writeback promotes a file's current LIVE image to DURABLE without any fsync,
+// modelling the page cache writing dirty pages back on its own schedule.
+//
+// It is the event crashWriteback cannot express. crashWriteback is a verdict
+// applied AT the crash, computed from the live image as it stands then; real
+// writeback happens at an arbitrary EARLIER moment, and what it wrote stays on
+// the medium even if the file is subsequently truncated. That ordering is
+// exactly what makes a rollback's fsync load-bearing: bytes a failed batch
+// wrote can reach the disk on their own, so truncating them out of the live
+// image is not enough — the truncation itself has to be made durable, or the
+// crash brings them back.
+func (c *crashFS) Writeback(path string) {
+	name := filepath.Clean(path)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n, ok := c.nodes[name]; ok && !n.dir {
+		n.durable = append([]byte(nil), n.live...)
 	}
 }
 
@@ -547,6 +573,16 @@ var (
 func (f *crashFile) staleLocked() bool { return f.gen != f.fs.gen }
 
 func (f *crashFile) WriteAt(p []byte, off int64) (int, error) {
+	n, err := f.writeAt(p, off)
+	if err == nil {
+		f.fs.fire(crashOpWriteAtDone, f.path)
+	}
+	return n, err
+}
+
+// writeAt applies the write; WriteAt wraps it so the completion hook runs
+// outside the filesystem lock, like every other hook.
+func (f *crashFile) writeAt(p []byte, off int64) (int, error) {
 	f.fs.fire(crashOpWriteAt, f.path)
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()

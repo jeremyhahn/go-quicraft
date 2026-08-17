@@ -2514,9 +2514,12 @@ func makeMetadataEntries(entries []proto.Entry) []proto.Entry {
 }
 
 // sendSnapshot sends a snapshot to the given peer. For witness targets,
-// the snapshot file data is stripped (Filepath cleared, FileSize zeroed,
-// Witness flag set) since witnesses only need the metadata (Index, Term,
-// Membership) for election participation.
+// the snapshot file data is stripped (Filepath cleared, FileSize zeroed)
+// since witnesses only need the metadata (Index, Term, Membership) for
+// election participation. The empty Filepath IS the statement that this
+// transfer carries no payload — forEachSnapshotChunk branches on exactly
+// that to emit a single metadata-only chunk — so nothing else has to be
+// stamped to say so.
 func (r *raft) sendSnapshot(to uint64) {
 	rm := r.getRemote(to)
 	if rm == nil {
@@ -2552,7 +2555,6 @@ func (r *raft) sendSnapshot(to uint64) {
 	if _, isWitness := r.witnesses[to]; isWitness {
 		snap.Filepath = ""
 		snap.FileSize = 0
-		snap.Witness = true
 	}
 
 	// Hint carries the transfer sequence; the transport echoes it back in

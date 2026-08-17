@@ -62,6 +62,12 @@ type LogDB interface {
 	// snapshot for the node, the snapshot metadata (including its
 	// Membership) is persisted exactly as SaveSnapshot would persist it;
 	// stale snapshots in an Update are silently ignored.
+	//
+	// An Update whose first entry sits at or below the node's compaction
+	// floor is REFUSED with ErrEntriesBelowCompactionFloor, and the whole
+	// batch is rejected without storing any of it. Those indexes are already
+	// deleted, so honouring the write would replace the live suffix above the
+	// floor with entries nothing can serve; see the sentinel's documentation.
 	SaveState(updates []Update) error
 
 	// IterateEntries returns log entries in the range [low, high) for the
@@ -83,6 +89,14 @@ type LogDB interface {
 	//   - A stored range that does not begin exactly at low, or that is
 	//     missing an interior index, returns ErrLogGapDetected — a log
 	//     hole must never be served as a silently shortened result.
+	//
+	// Implementations must not return an Entry whose Cmd aliases their own
+	// storage: the returned payloads are the caller's to keep and to modify.
+	// This is the mirror of the no-aliasing rule SaveState states above, and it
+	// matters more, because what a caller would be writing through into is the
+	// live log this replica serves to its followers and replays to itself on
+	// restart. See CopyEntryCmd. (The rule covers the entries a successful call
+	// APPENDS; on an error return the whole result must be discarded.)
 	IterateEntries(entries []Entry, size uint64, shardID uint64, replicaID uint64,
 		low uint64, high uint64, maxSize uint64) ([]Entry, uint64, error)
 

@@ -34,9 +34,7 @@ func TestSnapshotMarshalUnmarshalRoundTrip(t *testing.T) {
 		},
 		Filepath:    "/snapshots/shard-1/snap-100.dat",
 		FileSize:    1024 * 1024,
-		Type:        RegularStateMachine,
 		OnDiskIndex: 99,
-		Witness:     false,
 		Epoch:       7,
 		Compression: 1,
 	}
@@ -75,7 +73,6 @@ func TestSnapshotMarshalUnmarshalAllBoolsTrue(t *testing.T) {
 		Filepath:    "snap.dat",
 		FileSize:    100,
 		OnDiskIndex: 49,
-		Witness:     true,
 	}
 	buf := make([]byte, s.Size())
 	s.MarshalTo(buf)
@@ -134,9 +131,7 @@ func TestSnapshotReset(t *testing.T) {
 		Term:        5,
 		Filepath:    "/path",
 		FileSize:    1024,
-		Type:        1,
 		OnDiskIndex: 99,
-		Witness:     true,
 		Epoch:       3,
 		Compression: 1,
 	}
@@ -145,8 +140,8 @@ func TestSnapshotReset(t *testing.T) {
 		t.Fatal("Reset snapshot should be empty")
 	}
 	if s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
-		s.FileSize != 0 || s.Type != 0 || s.OnDiskIndex != 0 ||
-		s.Witness || s.Epoch != 0 || s.Compression != 0 {
+		s.FileSize != 0 || s.OnDiskIndex != 0 ||
+		s.Epoch != 0 || s.Compression != 0 {
 		t.Fatal("Reset did not clear all fields")
 	}
 }
@@ -313,14 +308,8 @@ func assertSnapshotEqual(t *testing.T, want, got *Snapshot) {
 	if got.FileSize != want.FileSize {
 		t.Fatalf("FileSize: got %d, want %d", got.FileSize, want.FileSize)
 	}
-	if got.Type != want.Type {
-		t.Fatalf("Type: got %d, want %d", got.Type, want.Type)
-	}
 	if got.OnDiskIndex != want.OnDiskIndex {
 		t.Fatalf("OnDiskIndex: got %d, want %d", got.OnDiskIndex, want.OnDiskIndex)
-	}
-	if got.Witness != want.Witness {
-		t.Fatalf("Witness: got %v, want %v", got.Witness, want.Witness)
 	}
 	if got.Compression != want.Compression {
 		t.Fatalf("Compression: got %d, want %d", got.Compression, want.Compression)

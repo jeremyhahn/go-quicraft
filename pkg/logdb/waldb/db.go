@@ -3141,6 +3141,39 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		}
 	}()
 
+	// Refuse the whole batch, before anything is written, if any Update carries
+	// entries at or below its node's compaction floor. Those indexes are
+	// already deleted, and storing them would truncate-and-append over the LIVE
+	// suffix above the floor — destroying entries this replica still serves —
+	// while leaving EntryRange reporting a first index that IterateEntries then
+	// refuses as ErrCompacted. It is always a caller bug: raft sends a lagging
+	// follower an InstallSnapshot rather than entries beneath its own floor.
+	//
+	// Checked here, under every touched shard's mu and before Phase 1, so the
+	// rejection costs no WAL write and no rollback. Reading compactedTo under
+	// shard.mu alone is sufficient for the same reason RemoveEntriesTo relies
+	// on: every mutator of it holds shard.mu as well.
+	for i := range updates {
+		u := &updates[i]
+		if len(u.Entries) == 0 {
+			continue
+		}
+		shard := db.getShard(u.ShardID)
+		key := nodeKey{ShardID: u.ShardID, ReplicaID: u.ReplicaID}
+		floor, ok := shard.compactedTo[key]
+		if !ok {
+			continue
+		}
+		if first := u.Entries[0].Index; first <= floor {
+			return &logdb.EntriesBelowCompactionFloorError{
+				ShardID:     u.ShardID,
+				ReplicaID:   u.ReplicaID,
+				FirstIndex:  first,
+				CompactedTo: floor,
+			}
+		}
+	}
+
 	// Phase 1: Write all records to their shards WITHOUT fsyncing. All touched
 	// shard locks are already held.
 	for i := range updates {
@@ -4204,7 +4237,12 @@ func (db *DB) IterateEntries(
 			break
 		}
 
-		entries = append(entries, e)
+		// The stored Entry is copied out with its OWN payload. Appending it as
+		// held would hand the caller a slice header pointing straight at this
+		// shard's in-memory log — the log served to followers and replayed on
+		// restart — and one write-through would corrupt it silently. See
+		// logdb.CopyEntryCmd.
+		entries = append(entries, logdb.CopyEntryCmd(e))
 		totalSize += entryBytes
 		expected++
 	}

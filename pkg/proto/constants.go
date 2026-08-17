@@ -291,10 +291,6 @@ const (
 // Used in UnmarshalFrom validation instead of referencing AddWitness directly.
 const maxConfigChangeType = UpdateWitnessPolicy
 
-// maxStateMachineType is the upper bound for valid Snapshot.Type values.
-// Used in UnmarshalFrom validation to reject unknown state machine types.
-const maxStateMachineType = OnDiskStateMachine
-
 // messageTypeNames maps message type constants to human-readable names.
 var messageTypeNames = map[uint64]string{
 	LocalTick:          "LocalTick",

@@ -242,3 +242,31 @@ type Update struct {
 	// Snapshot contains snapshot metadata to persist.
 	Snapshot Snapshot
 }
+
+// CopyEntryCmd returns e with its Cmd payload replaced by a private copy, or
+// unchanged when there is no payload to copy.
+//
+// It is the READ-side counterpart of the deep copy every LogDB already performs
+// on the write side, and it exists for the same reason pointed the other way.
+// A backend stores entries in memory and serves them from there; returning the
+// stored Entry by value copies the slice HEADER but not the bytes, so the
+// caller and the store end up sharing one payload array. Nothing stops the
+// caller writing through it — and what it would be writing into is the live log
+// this replica serves to its followers, and replays to itself on restart. The
+// corruption would be silent, unattributable, and would differ per replica,
+// which is the worst shape a consensus bug can take.
+//
+// Copying per entry rather than once per batch is deliberate. One shared
+// backing array would save allocations, but a caller that retains a SINGLE
+// entry's Cmd — a state machine storing a value, say — would then pin the whole
+// batch's payloads for as long as it holds that one entry. Per-entry copies
+// make the retained memory exactly what was retained.
+func CopyEntryCmd(e Entry) Entry {
+	if len(e.Cmd) == 0 {
+		return e
+	}
+	cmd := make([]byte, len(e.Cmd))
+	copy(cmd, e.Cmd)
+	e.Cmd = cmd
+	return e
+}

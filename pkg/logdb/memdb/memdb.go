@@ -122,12 +122,43 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	if m.closed.Load() {
 		return logdb.ErrClosed
 	}
+	// Validate the WHOLE batch before applying any of it. SaveState is
+	// specified to be atomic, and a floor violation found half-way through
+	// would otherwise leave the updates before it stored and the ones after it
+	// not — the caller's error return would then describe a batch that had
+	// partly happened.
 	for i := range updates {
 		u := &updates[i]
-		m.withNode(u.ShardID, u.ReplicaID, func(nd *nodeData) error {
+		if len(u.Entries) == 0 {
+			continue
+		}
+		if nd := m.getNode(u.ShardID, u.ReplicaID); nd != nil {
+			nd.mu.RLock()
+			floor := nd.compactedTo
+			nd.mu.RUnlock()
+			if first := u.Entries[0].Index; first <= floor {
+				return &logdb.EntriesBelowCompactionFloorError{
+					ShardID:     u.ShardID,
+					ReplicaID:   u.ReplicaID,
+					FirstIndex:  first,
+					CompactedTo: floor,
+				}
+			}
+		}
+	}
+
+	for i := range updates {
+		u := &updates[i]
+		// The error is the whole point of withNode: it reports that the node
+		// was unlinked (RemoveNodeData) between resolving it and taking its
+		// lock. Discarding it here would return nil to a caller whose batch was
+		// silently dropped — precisely the race withNode exists to close.
+		if err := m.withNode(u.ShardID, u.ReplicaID, func(nd *nodeData) error {
 			m.applyUpdate(nd, u)
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -379,7 +410,11 @@ func (m *MemDB) IterateEntries(
 			break
 		}
 
-		entries = append(entries, e)
+		// Copied out with its own payload: the slice held here is this store's
+		// live log, and a caller writing through the returned Cmd would be
+		// rewriting the entries this replica serves and replays. See
+		// logdb.CopyEntryCmd.
+		entries = append(entries, logdb.CopyEntryCmd(e))
 		size += entryBytes
 		expected++
 	}

@@ -493,7 +493,11 @@ func TestSnapshotReceive_FailurePropagation(t *testing.T) {
 		match string
 		wants string
 	}{
-		{name: "mkdir_fails", op: opMkdirAll, match: "snapshot-", wants: "mkdir"},
+		// The receive stages in a sibling of the canonical directory, so the
+		// directory it creates up front is the shard/replica base, not
+		// "snapshot-<index>".
+		{name: "mkdir_fails", op: opMkdirAll, match: "replica-", wants: "mkdir"},
+		{name: "stage_fails", op: opMkdirTemp, match: "replica-", wants: "stage"},
 		{name: "create_fails", op: opOpenFile, match: "snapshot.dat", wants: "create"},
 		{name: "write_fails", op: opWrite, match: "snapshot.dat", wants: "write"},
 		{name: "data_fsync_fails", op: opSync, match: "snapshot.dat", wants: "sync"},
@@ -504,6 +508,12 @@ func TestSnapshotReceive_FailurePropagation(t *testing.T) {
 		// data_fsync_fails above, which are now the encrypting write itself.
 		{name: "metadata_write_fails", op: opWrite, match: "snapshot.meta", wants: "metadata"},
 		{name: "metadata_fsync_fails", op: opSync, match: "snapshot.meta", wants: "metadata"},
+		// The publishing rename is the step that makes the canonical name
+		// appear. A failure there must reach the caller: the artifact is
+		// written and fsynced but nothing references it, so a receive that
+		// reported success would leave the follower permanently behind with a
+		// staging directory nothing enumerates.
+		{name: "publish_fails", op: opRename, match: "snapshot-", wants: "publish"},
 		{name: "directory_fsync_fails", op: opDirSync, match: "snapshot-", wants: "sync_dir"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

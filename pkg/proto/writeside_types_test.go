@@ -235,9 +235,7 @@ func TestMessageMarshalRefusesPositionlessSnapshot(t *testing.T) {
 			Membership: Membership{Addresses: map[uint64]string{1: "node-1:5000"}},
 		}},
 		{"epoch only", Snapshot{Epoch: 7}},
-		{"witness flag only", Snapshot{Witness: true}},
 		{"on-disk index only", Snapshot{OnDiskIndex: 99}},
-		{"state machine type only", Snapshot{Type: OnDiskStateMachine}},
 		{"compression only", Snapshot{Compression: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

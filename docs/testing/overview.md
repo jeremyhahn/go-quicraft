@@ -474,7 +474,6 @@ verification goes through the Makefile targets, on omega.
 | `test-proto`      | `./pkg/proto/...`                  |
 | `test-config`     | `./pkg/config/...`                 |
 | `test-queue`      | `./pkg/internal/queue/...`         |
-| `test-stopper`    | `./pkg/internal/stopper/...`       |
 | `test-invariant`  | `./pkg/internal/invariant/...`     |
 | `test-logdb`      | `./pkg/logdb/...`                  |
 | `test-raft`       | `./pkg/internal/raft/...`          |

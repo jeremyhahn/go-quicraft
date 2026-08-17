@@ -1168,3 +1168,129 @@ func TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash(t *testing.T)
 		}
 	}
 }
+
+// TestWALCrashDurability_RolledBackBatchStaysRolledBack pins the fsync inside
+// segment.DiscardPending, which no test held: deleting it left the whole
+// waldb suite and the errfs suite green.
+//
+// When one shard of a SaveState batch fails, every shard that already wrote is
+// rolled back by truncating its segment to the pre-batch checkpoint. The
+// truncation alone is not enough. Nothing says the discarded bytes are still
+// only in the page cache — writeback flushes dirty pages on its own schedule,
+// with no fsync involved — so they may already be on the medium when the
+// rollback happens. Truncating the live image does not unwrite them; only
+// flushing the truncation does. Without that flush a crash restores the file
+// as writeback left it, and recovery replays records from a batch the caller
+// was explicitly told had FAILED, as committed entries.
+//
+// crashFS.Writeback supplies the missing event: the batch's bytes reach the
+// medium BEFORE the failure, exactly as a real page-cache flush would.
+func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
+	const (
+		root      = "/mnt/rollback-durability"
+		blockSize = 1024
+		maxFile   = 64 * 1024
+		replicaID = 7
+		// Shard IDs 1 and 2 hash to different WAL shards, so one SaveState
+		// spans two segment files and the second can fail after the first has
+		// written.
+		shardA, shardB = uint64(1), uint64(2)
+	)
+	dir := filepath.Join(root, "wal")
+	cfs := newCrashFS(root)
+
+	open := func() *DB {
+		t.Helper()
+		db, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return db
+	}
+	entry := func(shardID, index uint64, size int) logdb.Entry {
+		cmd := make([]byte, size)
+		for i := range cmd {
+			cmd[i] = byte(shardID*13 + index + uint64(i))
+		}
+		return logdb.Entry{Index: index, Term: 1, Cmd: cmd}
+	}
+
+	db := open()
+
+	// One acknowledged batch, so both shards have a durable checkpoint.
+	if err := db.SaveState([]logdb.Update{
+		{ShardID: shardA, ReplicaID: replicaID, State: logdb.State{Term: 1, Vote: 1, Commit: 1},
+			Entries: []logdb.Entry{entry(shardA, 1, 2000)}},
+		{ShardID: shardB, ReplicaID: replicaID, State: logdb.State{Term: 1, Vote: 1, Commit: 1},
+			Entries: []logdb.Entry{entry(shardB, 1, 2000)}},
+	}); err != nil {
+		t.Fatalf("acked batch: %v", err)
+	}
+
+	segA := onlySegmentPath(t, cfs, filepath.Join(dir, shardDirName(int(shardA%DefaultShardCount))))
+
+	// Writeback flushes shard A's dirty pages the moment the batch below writes
+	// them — before the batch fails, and with no fsync involved.
+	// crashOpWriteAtDone, not crashOpWriteAt: the flush has to capture what the
+	// write just put in the page cache, and every other hook fires BEFORE its
+	// operation applies.
+	cfs.setHook(func(op crashOp, path string) {
+		if op == crashOpWriteAtDone && path == segA {
+			cfs.Writeback(segA)
+		}
+	})
+
+	// Shard A is listed FIRST and writes successfully; shard B then fails
+	// permanently, because a record whose framed size exceeds the whole segment
+	// can never fit. The batch is rolled back, shard A included.
+	err := db.SaveState([]logdb.Update{
+		{ShardID: shardA, ReplicaID: replicaID, State: logdb.State{Term: 2, Vote: 2, Commit: 2},
+			Entries: []logdb.Entry{entry(shardA, 2, 4000)}},
+		{ShardID: shardB, ReplicaID: replicaID,
+			Entries: []logdb.Entry{entry(shardB, 2, 2*maxFile)}},
+	})
+	cfs.setHook(nil)
+	if err == nil {
+		t.Fatal("the batch carrying an unfittable record returned success")
+	}
+	if !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("SaveState = %v, want ErrRecordTooLarge", err)
+	}
+
+	// Power loss right after the failed batch.
+	cfs.Crash()
+
+	reopened := open()
+	defer reopened.Close()
+
+	first, span, rerr := reopened.EntryRange(shardA, replicaID)
+	if rerr != nil {
+		t.Fatalf("EntryRange(shardA): %v", rerr)
+	}
+	if first != 1 || span != 1 {
+		t.Fatalf("shard A came back holding entries [%d,%d] after a crash that "+
+			"followed a FAILED batch, want only the acknowledged entry 1.\n\n"+
+			"The rolled-back record was written, reached the medium through "+
+			"ordinary writeback, and the rollback's truncation was never flushed — "+
+			"so the crash restored it and recovery replayed, as a committed entry, "+
+			"a write the caller was told had failed.", first, first+span-1)
+	}
+
+	// The acknowledged entry is intact, and the hard state did not advance to
+	// the failed batch's term.
+	got, gerr := reopened.GetEntries(shardA, replicaID, 1, 2, 0)
+	if gerr != nil || len(got) != 1 {
+		t.Fatalf("GetEntries(shardA): %d entries, err %v", len(got), gerr)
+	}
+	if want := entry(shardA, 1, 2000); !crashDurEntriesEqual(want, got[0]) {
+		t.Fatal("the acknowledged entry did not survive the rollback and crash")
+	}
+	st, _, serr := reopened.ReadState(shardA, replicaID)
+	if serr != nil {
+		t.Fatalf("ReadState(shardA): %v", serr)
+	}
+	if st.Term != 1 || st.Commit != 1 {
+		t.Fatalf("shard A hard state = %+v after a failed batch and a crash, want "+
+			"term 1 commit 1: the failed batch's state was resurrected", st)
+	}
+}

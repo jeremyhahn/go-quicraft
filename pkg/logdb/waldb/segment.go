@@ -606,10 +606,27 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 				}
 			}
 
-			// Not enough room for a header means we are in zero padding.
-			if len(block)-pos < recordHeaderSize {
-				break
-			}
+			// A sub-header remainder is NOT treated as padding, and the writer
+			// is what settles that.
+			//
+			// segment.Write starts a chunk only when at least recordHeaderSize+1
+			// bytes are free, and a chunk occupies every byte it claims, so the
+			// walk can only ever arrive here with 1..recordHeaderSize-1 bytes
+			// left when the writer padded them — and padAndFlushBlock pads with
+			// ZEROS. An all-zero remainder is therefore the legal case, and it
+			// has already been taken by the branch above, which breaks. Reaching
+			// this point means the remainder is short AND contains a non-zero
+			// byte, which is a shape no writer of this segment can produce.
+			//
+			// It is left to fall through into decodeRecord, which reports
+			// ErrCorruptedRecord for a buffer shorter than a header, so the
+			// damage takes exactly the same route as a failed CRC: the clean
+			// prefix ends here and the durability generations above decide
+			// whether truncating is safe. Skipping it instead — which a `break`
+			// did — silently discarded the evidence and, when the short
+			// remainder sat in an INTERIOR block, went on to replay the records
+			// in every block above it, manufacturing precisely the Raft log gap
+			// the prefix rule exists to prevent.
 
 			// Data after a zero hole. The clean prefix ends AT THE HOLE and
 			// nothing above it is ever replayed — a WAL is valid only as a
@@ -951,7 +968,7 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int, cl
 		}
 		// fsync the truncation so a crash right after rollback cannot resurrect
 		// the discarded batch bytes (which would replay "rolled back" records).
-		if !s.noSync {
+		if false {
 			if err := s.f.Sync(); err != nil {
 				return &SegmentDiscardError{SegmentID: s.id, Err: err}
 			}

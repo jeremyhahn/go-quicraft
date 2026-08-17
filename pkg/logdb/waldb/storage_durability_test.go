@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -617,5 +618,119 @@ func TestSaveSnapshot_RejectsZeroIndex(t *testing.T) {
 	}
 	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: 0}); !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
 		t.Fatalf("SaveSnapshot(Index=0) over a stored snapshot = %v, want ErrSnapshotOutOfDate", err)
+	}
+}
+
+// TestOpen_FailedOpenDoesNotAccumulateEmptySegments covers closeAfterFailedOpen,
+// which had no test of any kind: deleting its removal, and deleting the
+// emptiness guard that protects it, both left the whole suite green.
+//
+// Every Open creates a fresh active segment for each shard whose directory
+// already exists. When a LATER shard then fails the open, the segments the
+// earlier shards just created are brand-new empty files nobody will ever read.
+// Working through a fail-closed condition means opening repeatedly, so without
+// the cleanup each attempt leaves one dead file per shard behind — and those
+// files are not inert: recover() advances nextSegmentID past every segment it
+// observes, so they permanently inflate the ID space of a database that is
+// already in trouble.
+//
+// The directory fsync at the end of that cleanup is deliberately NOT asserted
+// here. It is best-effort by construction — its failure is logged at Debug and
+// swallowed — and correctly so: the file it makes durable is EMPTY, the open
+// failed, and a crash that resurrects the dirent costs one stray empty segment
+// and nothing else. Pinning it would test that a call happens, not that
+// anything is true.
+func TestOpen_FailedOpenDoesNotAccumulateEmptySegments(t *testing.T) {
+	dir := t.TempDir()
+	// Shard IDs 1 and 2 hash to WAL shards 1 and 2, and Open walks shards in
+	// ascending index order, so shard 1 is opened (and creates its new segment)
+	// before shard 2 fails.
+	const first, second, replicaID = uint64(1), uint64(2), uint64(1)
+
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.SaveEntries(first, replicaID, makeEntries(1, 2, 1)); err != nil {
+		t.Fatalf("SaveEntries(first): %v", err)
+	}
+	if err := db.SaveEntries(second, replicaID, makeEntries(1, 2, 1)); err != nil {
+		t.Fatalf("SaveEntries(second): %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	firstDir := filepath.Join(dir, shardDirName(int(first%DefaultShardCount)))
+	secondDir := filepath.Join(dir, shardDirName(int(second%DefaultShardCount)))
+
+	// Sabotage the SECOND shard's next segment: a directory at the path
+	// createSegment will open with O_RDWR is EISDIR for every euid, root
+	// included.
+	blocked := filepath.Join(secondDir, segmentFilename(1))
+	if err := os.Mkdir(blocked, 0700); err != nil {
+		t.Fatalf("sabotage: %v", err)
+	}
+
+	countSegments := func(d string) int {
+		t.Helper()
+		des, err := os.ReadDir(d)
+		if err != nil {
+			t.Fatalf("ReadDir(%s): %v", d, err)
+		}
+		n := 0
+		for _, de := range des {
+			if de.IsDir() {
+				continue
+			}
+			if _, ok := parseSegmentFilename(de.Name()); ok {
+				n++
+			}
+		}
+		return n
+	}
+
+	if got := countSegments(firstDir); got != 1 {
+		t.Fatalf("fixture: shard %s holds %d segments before the failed opens, want 1",
+			firstDir, got)
+	}
+
+	// Repeatedly fail to open, exactly as an operator working through a
+	// fail-closed condition would.
+	const attempts = 4
+	for i := 0; i < attempts; i++ {
+		bad, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
+		if err == nil {
+			bad.Close()
+			t.Fatalf("attempt %d: Open succeeded despite the sabotaged segment path", i)
+		}
+		if got := countSegments(firstDir); got != 1 {
+			t.Fatalf("after %d failed open(s) the earlier shard holds %d segment "+
+				"files, want 1: each failed open left behind the empty segment it "+
+				"created, and recover() will advance nextSegmentID past every one "+
+				"of them on the next successful open", i+1, got)
+		}
+	}
+
+	// The populated segment must be untouched — the cleanup removes only the
+	// empty file this open created, never one holding records.
+	if err := os.Remove(blocked); err != nil {
+		t.Fatalf("un-sabotage: %v", err)
+	}
+	good, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
+	if err != nil {
+		t.Fatalf("Open after removing the sabotage: %v", err)
+	}
+	defer good.Close()
+	for _, sid := range []uint64{first, second} {
+		got, err := good.GetEntries(sid, replicaID, 1, 3, 0)
+		if err != nil {
+			t.Fatalf("GetEntries(shard %d): %v", sid, err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("shard %d recovered %d entries after %d failed opens, want 2: "+
+				"the failed-open cleanup deleted a segment that held records",
+				sid, len(got), attempts)
+		}
 	}
 }

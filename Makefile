@@ -79,7 +79,6 @@ INT_COMPOSE   := $(DOCKER_DIR)/docker-compose.integration.yml
 PKG_PROTO       := ./pkg/proto/...
 PKG_CONFIG      := ./pkg/config/...
 PKG_QUEUE       := ./pkg/internal/queue/...
-PKG_STOPPER     := ./pkg/internal/stopper/...
 PKG_INVARIANT   := ./pkg/internal/invariant/...
 PKG_LOGDB       := ./pkg/logdb/...
 PKG_RAFT        := ./pkg/internal/raft/...
@@ -150,10 +149,6 @@ test-config:
 .PHONY: test-queue
 test-queue:
 	$(GOTEST) $(PKG_QUEUE)
-
-.PHONY: test-stopper
-test-stopper:
-	$(GOTEST) $(PKG_STOPPER)
 
 .PHONY: test-invariant
 test-invariant:
@@ -711,10 +706,6 @@ coverage-config: | $(COVER_DIR)
 coverage-queue: | $(COVER_DIR)
 	$(call run-coverage,queue,$(PKG_QUEUE))
 
-.PHONY: coverage-stopper
-coverage-stopper: | $(COVER_DIR)
-	$(call run-coverage,stopper,$(PKG_STOPPER))
-
 .PHONY: coverage-invariant
 coverage-invariant: | $(COVER_DIR)
 	$(call run-coverage,invariant,$(PKG_INVARIANT))
@@ -1177,7 +1168,7 @@ help:
 	@echo "Unit Tests:"
 	@echo "  test                   Run all unit tests with race detector"
 	@echo "  test-<pkg>             Run tests for a specific package"
-	@echo "    packages: proto, config, queue, stopper, invariant, logdb,"
+	@echo "    packages: proto, config, queue, invariant, logdb,"
 	@echo "              raft, waldb, seal, rsm, session, snapshot,"
 	@echo "              registry, engine, transport, quicraft, errors, sm,"
 	@echo "              server, writemode"
@@ -1238,7 +1229,7 @@ help:
 	@echo "Coverage (minimum $(COVER_MIN)%):"
 	@echo "  coverage               Run total coverage report"
 	@echo "  coverage-<pkg>         Run coverage for a specific package"
-	@echo "    packages: proto, config, queue, stopper, invariant, logdb,"
+	@echo "    packages: proto, config, queue, invariant, logdb,"
 	@echo "              raft, waldb, seal, rsm, session, snapshot,"
 	@echo "              registry, engine, transport, quicraft, errors, sm,"
 	@echo "              server, writemode"

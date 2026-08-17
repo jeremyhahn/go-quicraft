@@ -5226,8 +5226,16 @@ func TestRaft_SendWitnessAppend_FallsBackToSnapshotWhenCompacted(t *testing.T) {
 	electLeader(r)
 	r.drainMessages()
 
-	// Set a snapshot so sendSnapshot has something to send.
-	r.log.inmem.snapshot = &proto.Snapshot{Index: 3, Term: 1}
+	// Set a snapshot so sendSnapshot has something to send. The payload
+	// fields are populated deliberately: stripping them is the whole
+	// assertion below, and a source snapshot with an empty Filepath would
+	// satisfy it without sendSnapshot doing anything at all.
+	r.log.inmem.snapshot = &proto.Snapshot{
+		Index:    3,
+		Term:     1,
+		Filepath: "/path/to/snapshot.dat",
+		FileSize: 1024000,
+	}
 
 	// Set witness next to 1 (behind compaction point).
 	r.witnesses[20].next = 1
@@ -5247,9 +5255,6 @@ func TestRaft_SendWitnessAppend_FallsBackToSnapshotWhenCompacted(t *testing.T) {
 			}
 			if s.Snapshot.FileSize != 0 {
 				t.Fatal("witness snapshot should have zero FileSize")
-			}
-			if !s.Snapshot.Witness {
-				t.Fatal("witness snapshot should have Witness=true")
 			}
 		}
 	}
@@ -5281,7 +5286,6 @@ func TestRaft_SendSnapshot_WitnessStripped(t *testing.T) {
 		Term:     2,
 		Filepath: "/path/to/snapshot.dat",
 		FileSize: 1024000,
-		Witness:  false,
 	}
 
 	r.sendSnapshot(20)
@@ -5310,10 +5314,6 @@ func TestRaft_SendSnapshot_WitnessStripped(t *testing.T) {
 		t.Fatalf("expected zero FileSize for witness snapshot, got %d",
 			witnessSnap.Snapshot.FileSize)
 	}
-	if !witnessSnap.Snapshot.Witness {
-		t.Fatal("expected Witness=true for witness snapshot")
-	}
-
 	// Metadata should be preserved.
 	if witnessSnap.Snapshot.Index != 10 {
 		t.Fatalf("expected snapshot Index 10, got %d", witnessSnap.Snapshot.Index)
@@ -5349,9 +5349,6 @@ func TestRaft_SendSnapshot_NonWitnessNotStripped(t *testing.T) {
 	if snaps[0].Snapshot.FileSize != 1024000 {
 		t.Fatalf("expected FileSize preserved for non-witness, got %d",
 			snaps[0].Snapshot.FileSize)
-	}
-	if snaps[0].Snapshot.Witness {
-		t.Fatal("non-witness snapshot should not have Witness=true")
 	}
 }
 

@@ -373,9 +373,12 @@ func (s *fuzzStream) snapshot(shardID uint64) proto.Snapshot {
 	}
 	ss.Membership.ConfigChangeID = s.u64()
 	ss.Membership.MaxWitnesses = s.u64()
+	// The flags byte is still CONSUMED in full even though only bit 0x01 is
+	// assigned today: bit 0x04 used to set the removed proto.Snapshot.Witness.
+	// Skipping the read instead would shift every following field by one byte
+	// and make the stored corpus decode into a different message sequence.
 	flags := s.next()
 	ss.Membership.RequireFullReplicaMajority = flags&0x01 != 0
-	ss.Witness = flags&0x04 != 0
 	ss.Membership.Addresses = s.idMap()
 	ss.Membership.Observers = s.idMap()
 	ss.Membership.Witnesses = s.idMap()

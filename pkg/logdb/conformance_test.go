@@ -872,3 +872,265 @@ func TestConformanceClosedErrors(t *testing.T) {
 		}
 	})
 }
+
+// TestConformanceIterateEntriesDoesNotAliasStoredPayloads pins the read-side
+// half of the no-aliasing rule.
+//
+// The write-side half has always been asserted: SaveState deep-copies Cmd, so a
+// caller reusing its buffers cannot rewrite the stored log. The read side had
+// no such rule and no such test. Both backends served the stored Entry by
+// value, which copies the slice HEADER and not the bytes, so the caller and the
+// store shared one payload array — and what a caller writing through it would
+// be corrupting is the live in-memory log this replica serves to its followers
+// and replays to itself on restart. Nothing would report it, nothing would
+// attribute it, and every replica would corrupt differently.
+//
+// The test writes through the returned payload and then re-reads. A store that
+// aliases hands back the mutated bytes the second time.
+func TestConformanceIterateEntriesDoesNotAliasStoredPayloads(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		const shardID, replicaID = uint64(1), uint64(1)
+
+		want := []byte("the-committed-command-bytes")
+		entries := []logdb.Entry{
+			{Index: 1, Term: 1, Cmd: append([]byte(nil), want...)},
+			{Index: 2, Term: 1, Cmd: append([]byte(nil), want...)},
+		}
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: shardID, ReplicaID: replicaID, Entries: entries,
+		}}); err != nil {
+			t.Fatalf("SaveState: %v", err)
+		}
+
+		first, _, err := db.IterateEntries(nil, 0, shardID, replicaID, 1, 3, 0)
+		if err != nil {
+			t.Fatalf("IterateEntries: %v", err)
+		}
+		if len(first) != 2 {
+			t.Fatalf("IterateEntries returned %d entries, want 2", len(first))
+		}
+
+		// The caller owns what it was handed, and does what an owner may do.
+		for i := range first {
+			for j := range first[i].Cmd {
+				first[i].Cmd[j] = 'X'
+			}
+		}
+
+		second, _, err := db.IterateEntries(nil, 0, shardID, replicaID, 1, 3, 0)
+		if err != nil {
+			t.Fatalf("IterateEntries (re-read): %v", err)
+		}
+		if len(second) != 2 {
+			t.Fatalf("re-read returned %d entries, want 2", len(second))
+		}
+		for _, e := range second {
+			if !bytes.Equal(e.Cmd, want) {
+				t.Fatalf("entry %d came back as %q after the CALLER wrote through the "+
+					"payload of an earlier read; the store handed out a slice aliasing "+
+					"its own log, so a caller mutating what it was given rewrites the "+
+					"committed entries this replica serves to followers and replays on "+
+					"restart. want %q", e.Index, e.Cmd, want)
+			}
+		}
+
+		// Two reads of the same entry must not share memory with each other
+		// either: a caller holding results from two calls may write through one.
+		if len(first[0].Cmd) > 0 && len(second[0].Cmd) > 0 &&
+			&first[0].Cmd[0] == &second[0].Cmd[0] {
+			t.Fatal("two separate reads of the same entry returned the SAME backing " +
+				"array; writing through one result silently rewrites the other")
+		}
+	})
+}
+
+// TestConformanceGetEntriesDoesNotAliasStoredPayloads is the same rule for
+// waldb's GetEntries convenience wrapper, which is the call the apply path
+// actually uses. It shares IterateEntries' implementation, so this guards
+// against the wrapper acquiring its own path later.
+func TestConformanceGetEntriesDoesNotAliasStoredPayloads(t *testing.T) {
+	dir := t.TempDir()
+	db, err := waldb.Open(dir, waldb.WithNoSync(true))
+	if err != nil {
+		t.Fatalf("waldb.Open: %v", err)
+	}
+	defer db.Close()
+
+	const shardID, replicaID = uint64(3), uint64(1)
+	want := []byte("apply-path-command")
+	if err := db.SaveEntries(shardID, replicaID, []logdb.Entry{
+		{Index: 1, Term: 1, Cmd: append([]byte(nil), want...)},
+	}); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	got, err := db.GetEntries(shardID, replicaID, 1, 2, 0)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("GetEntries: %d entries, err %v", len(got), err)
+	}
+	for j := range got[0].Cmd {
+		got[0].Cmd[j] = 'Z'
+	}
+
+	again, err := db.GetEntries(shardID, replicaID, 1, 2, 0)
+	if err != nil || len(again) != 1 {
+		t.Fatalf("GetEntries (re-read): %d entries, err %v", len(again), err)
+	}
+	if !bytes.Equal(again[0].Cmd, want) {
+		t.Fatalf("the stored entry came back as %q after a caller wrote through an "+
+			"earlier GetEntries result; the apply path aliases the live log", again[0].Cmd)
+	}
+}
+
+// TestConformanceSaveStateBelowCompactionFloorIsRefused pins the rejection both
+// backends now perform, and the state that made it necessary.
+//
+// The measured behaviour before the fix, identical in memdb and waldb: with
+// entries [10..20] stored and the floor at 9, a SaveState starting at index 5
+// returned nil, DESTROYED the live suffix [10..20] (truncate-and-append
+// replaces everything from the first new index onward), and left the store
+// describing itself inconsistently — EntryRange answered (5, 2) while
+// IterateEntries(5, ...) refused the very range it had just advertised with
+// ErrCompacted. Nothing reported any of it.
+//
+// A write below the floor is always a caller bug: those indexes are provably
+// applied and already deleted, raft sends a lagging follower an InstallSnapshot
+// rather than entries beneath its own floor, and a local proposer never
+// proposes below its applied index. So it fails loudly, and — this is the part
+// that matters — it fails without storing anything.
+func TestConformanceSaveStateBelowCompactionFloorIsRefused(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		const shardID, replicaID = uint64(1), uint64(1)
+
+		var live []logdb.Entry
+		for i := uint64(10); i <= 20; i++ {
+			live = append(live, logdb.Entry{Index: i, Term: 1, Cmd: []byte("live")})
+		}
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: shardID, ReplicaID: replicaID, Entries: live,
+		}}); err != nil {
+			t.Fatalf("SaveState(live): %v", err)
+		}
+		if err := db.RemoveEntriesTo(shardID, replicaID, 9); err != nil {
+			t.Fatalf("RemoveEntriesTo(9): %v", err)
+		}
+
+		err := db.SaveState([]logdb.Update{{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Entries: []logdb.Entry{
+				{Index: 5, Term: 2, Cmd: []byte("below-floor")},
+				{Index: 6, Term: 2, Cmd: []byte("below-floor")},
+			},
+		}})
+		if !errors.Is(err, logdb.ErrEntriesBelowCompactionFloor) {
+			t.Fatalf("SaveState at index 5 with the floor at 9 = %v, want "+
+				"ErrEntriesBelowCompactionFloor: index 5 is provably applied and "+
+				"already deleted, and storing it replaces the live suffix [10,20] "+
+				"with entries the store will then refuse to serve", err)
+		}
+
+		// The typed error must say WHICH write was refused, or the caller bug
+		// can be observed but not located.
+		var detail *logdb.EntriesBelowCompactionFloorError
+		if !errors.As(err, &detail) {
+			t.Fatalf("error carries no *EntriesBelowCompactionFloorError: %v", err)
+		}
+		if detail.ShardID != shardID || detail.ReplicaID != replicaID ||
+			detail.FirstIndex != 5 || detail.CompactedTo != 9 {
+			t.Fatalf("refusal detail = %+v, want shard %d replica %d first 5 floor 9",
+				detail, shardID, replicaID)
+		}
+
+		// Nothing was stored, and the live suffix is untouched.
+		first, span, err := db.EntryRange(shardID, replicaID)
+		if err != nil {
+			t.Fatalf("EntryRange after the refusal: %v", err)
+		}
+		if first != 10 || span != 11 {
+			t.Fatalf("EntryRange = (%d, %d) after the refused write, want (10, 11): "+
+				"the refused batch was partly stored and the live suffix is gone",
+				first, span)
+		}
+		got, _, err := db.IterateEntries(nil, 0, shardID, replicaID, 10, 21, 0)
+		if err != nil {
+			t.Fatalf("IterateEntries(10,21) after the refusal: %v (the live suffix "+
+				"the refused write would have destroyed is no longer readable)", err)
+		}
+		if len(got) != 11 {
+			t.Fatalf("read %d live entries after the refusal, want 11", len(got))
+		}
+		for _, e := range got {
+			if !bytes.Equal(e.Cmd, []byte("live")) {
+				t.Fatalf("entry %d was overwritten by the refused batch: %q", e.Index, e.Cmd)
+			}
+		}
+
+		// A write at the first index ABOVE the floor is still accepted, so the
+		// guard is a boundary and not a blanket refusal.
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: shardID, ReplicaID: replicaID,
+			Entries: []logdb.Entry{{Index: 10, Term: 3, Cmd: []byte("legal")}},
+		}}); err != nil {
+			t.Fatalf("SaveState at index 10 (floor+1) = %v, want success: the guard "+
+				"must reject at-or-below the floor, not above it", err)
+		}
+		// ...and exactly AT the floor is refused.
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: shardID, ReplicaID: replicaID,
+			Entries: []logdb.Entry{{Index: 9, Term: 3, Cmd: []byte("at-floor")}},
+		}}); !errors.Is(err, logdb.ErrEntriesBelowCompactionFloor) {
+			t.Fatalf("SaveState at index 9 (exactly the floor) = %v, want "+
+				"ErrEntriesBelowCompactionFloor; index 9 was removed by the "+
+				"compaction that set the floor", err)
+		}
+	})
+}
+
+// TestConformanceSaveStateBelowFloorRejectsTheWholeBatch pins the atomicity of
+// the refusal.
+//
+// SaveState is specified to persist a batch atomically. A floor violation found
+// part-way through must therefore reject the batch, not the update: storing the
+// updates that came before it and refusing the rest would return an error
+// describing a write that had partly happened, which no caller can unwind.
+func TestConformanceSaveStateBelowFloorRejectsTheWholeBatch(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
+		const replicaID = uint64(1)
+		const goodShard, badShard = uint64(1), uint64(2)
+
+		// badShard gets a compaction floor; goodShard has none.
+		if err := db.SaveState([]logdb.Update{{
+			ShardID: badShard, ReplicaID: replicaID,
+			Entries: []logdb.Entry{{Index: 10, Term: 1, Cmd: []byte("x")}},
+		}}); err != nil {
+			t.Fatalf("SaveState(seed): %v", err)
+		}
+		if err := db.RemoveEntriesTo(badShard, replicaID, 9); err != nil {
+			t.Fatalf("RemoveEntriesTo: %v", err)
+		}
+
+		// goodShard's update is FIRST, so a per-update implementation stores it
+		// before it ever reaches the violation.
+		err := db.SaveState([]logdb.Update{
+			{ShardID: goodShard, ReplicaID: replicaID,
+				Entries: []logdb.Entry{{Index: 1, Term: 1, Cmd: []byte("first")}}},
+			{ShardID: badShard, ReplicaID: replicaID,
+				Entries: []logdb.Entry{{Index: 5, Term: 1, Cmd: []byte("below")}}},
+		})
+		if !errors.Is(err, logdb.ErrEntriesBelowCompactionFloor) {
+			t.Fatalf("SaveState = %v, want ErrEntriesBelowCompactionFloor", err)
+		}
+
+		first, span, rerr := db.EntryRange(goodShard, replicaID)
+		if rerr != nil {
+			t.Fatalf("EntryRange(goodShard): %v", rerr)
+		}
+		if first != 0 || span != 0 {
+			t.Fatalf("the shard listed BEFORE the offending update holds [%d,%d] "+
+				"after a batch that returned an error: the refusal was applied per "+
+				"update instead of per batch, so SaveState reported a failure for a "+
+				"write that partly happened", first, first+span-1)
+		}
+	})
+}

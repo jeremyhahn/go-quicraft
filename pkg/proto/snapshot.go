@@ -20,7 +20,7 @@ package proto
 //
 //	[ShardID:8][ReplicaID:8][Index:8][Term:8][Membership:var]
 //	[Filepath:len+data][FileSize:8]
-//	[Type:8][OnDiskIndex:8][Witness:8][Epoch:8][Compression:8]
+//	[OnDiskIndex:8][Epoch:8][Compression:8]
 //
 // # The removed Imported field
 //
@@ -37,17 +37,38 @@ package proto
 // with its consumer in the same change, and with a logdb.Snapshot counterpart so
 // it survives a restart.
 //
-// Type and Witness are in the same condition and are NOT removed here. Type has
-// no writer anywhere and is therefore zero on every snapshot ever produced,
-// while both MarshalTo and UnmarshalFrom validate it against
-// maxStateMachineType — a range check on a value no code path can set; removing
-// it orphans that constant and the InvalidSnapshotTypeError it raises, which
-// live in other files. Witness IS written (the leader sets it when it strips
-// the data file for a witness peer) and read by nothing; the fact it states is
-// already carried by the empty Filepath the same branch produces, and the layer
-// that could act on the disagreement it would reveal — a stripped snapshot
-// arriving at a replica that does not consider itself a witness — is the raft
-// role-mismatch check, not this type.
+// # The removed Type field
+//
+// Type claimed to name the state machine kind (regular/concurrent/on-disk) and
+// had NO writer anywhere in the repository: it was zero on every snapshot ever
+// produced, while both MarshalTo and UnmarshalFrom spent a comparison
+// validating it against maxStateMachineType — a range check on a value no code
+// path could set. The kind of state machine a shard runs is a property of the
+// LOCAL process (it is chosen by the StateMachineFactory the host was
+// constructed with, and proto.Bootstrap already records it durably), not of an
+// artifact streamed from a peer, so there is no reader for it to grow either.
+// Removing it orphaned maxStateMachineType in constants.go and
+// InvalidSnapshotTypeError in errors.go, which went with it.
+//
+// # The removed Witness field
+//
+// Witness WAS written — sendSnapshot set it in the same three-line branch that
+// cleared Filepath and zeroed FileSize when the target was a witness — and read
+// by nothing. It is not merely unused but redundant: an empty Filepath is
+// ALREADY the repository-wide discriminator for a metadata-only snapshot
+// (forEachSnapshotChunk branches on it to emit the single empty chunk, and
+// recoverLogReader documents that leaving Filepath empty is what turns a
+// replica into a state eraser), so a second, independently-settable statement
+// of the same fact could only ever be a way for the two to disagree.
+//
+// Empty Filepath is deliberately the WIDER predicate: it also covers a state
+// machine that genuinely saved nothing. That is the right shape here, because
+// every consumer acts on "is there payload to stream", not on "was the peer a
+// witness". The one question Witness could have answered that Filepath cannot —
+// a stripped snapshot arriving at a replica that does not consider itself a
+// witness — is a role disagreement, and the raft role-mismatch check
+// (checkSelfRole) owns that, working from replicated membership rather than
+// from a flag the sender chooses.
 //
 // # The removed Checksum field
 //
@@ -92,12 +113,8 @@ type Snapshot struct {
 	Filepath string
 	// FileSize is the size of the snapshot data file in bytes.
 	FileSize uint64
-	// Type identifies the state machine type.
-	Type uint64
 	// OnDiskIndex is the index tracked for on-disk state machines.
 	OnDiskIndex uint64
-	// Witness indicates whether this is a witness replica snapshot.
-	Witness bool
 	// Epoch is the barrier encryption epoch used when this snapshot was
 	// saved. Zero indicates no encryption (plaintext snapshot). This field
 	// must be propagated through the snapshot transfer pipeline so the
@@ -122,25 +139,21 @@ func (s *Snapshot) Size() int {
 	// Membership (variable)
 	// Filepath: 4-byte len + data
 	// FileSize: 8
-	// Type, OnDiskIndex, Witness, Epoch, Compression: 5 * 8
+	// OnDiskIndex, Epoch, Compression: 3 * 8
 	return 4*8 + s.Membership.Size() +
 		(4 + len(s.Filepath)) + 8 +
-		5*8
+		3*8
 }
 
 // MarshalTo writes the snapshot metadata into buf and returns bytes written.
 // buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
-// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen,
-// InvalidSnapshotTypeError for a Type UnmarshalFrom would reject, or whatever
+// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen, or whatever
 // the embedded Membership's own write-side limits report — the read side's
 // checks applied on write, so this type cannot emit metadata it refuses to
 // read back.
 func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
 	if len(s.Filepath) > MaxFilepathLen {
 		return 0, ErrFilepathTooLong
-	}
-	if s.Type > maxStateMachineType {
-		return 0, &InvalidSnapshotTypeError{Type: s.Type}
 	}
 	required := s.Size()
 	if len(buf) < required {
@@ -159,11 +172,7 @@ func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
 	offset += putString(buf[offset:], s.Filepath)
 	putUint64(buf[offset:], s.FileSize)
 	offset += 8
-	putUint64(buf[offset:], s.Type)
-	offset += 8
 	putUint64(buf[offset:], s.OnDiskIndex)
-	offset += 8
-	putBool(buf[offset:], s.Witness)
 	offset += 8
 	putUint64(buf[offset:], s.Epoch)
 	offset += 8
@@ -201,18 +210,11 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	s.FileSize = getUint64(buf[offset:])
 	offset += 8
-	// 5 trailing fixed fields: Type, OnDiskIndex, Witness, Epoch, Compression
-	if len(buf) < offset+5*8 {
+	// 3 trailing fixed fields: OnDiskIndex, Epoch, Compression
+	if len(buf) < offset+3*8 {
 		return 0, ErrBufferTooSmall
 	}
-	s.Type = getUint64(buf[offset:])
-	if s.Type > maxStateMachineType {
-		return 0, &InvalidSnapshotTypeError{Type: s.Type}
-	}
-	offset += 8
 	s.OnDiskIndex = getUint64(buf[offset:])
-	offset += 8
-	s.Witness = getBool(buf[offset:])
 	offset += 8
 	s.Epoch = getUint64(buf[offset:])
 	offset += 8
@@ -241,8 +243,8 @@ func (s *Snapshot) IsEmpty() bool {
 // Message cannot encode and would otherwise discard in silence.
 func (s *Snapshot) hasContentBeyondPosition() bool {
 	return s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
-		s.FileSize != 0 || s.Type != 0 || s.OnDiskIndex != 0 ||
-		s.Witness || s.Epoch != 0 || s.Compression != 0 ||
+		s.FileSize != 0 || s.OnDiskIndex != 0 ||
+		s.Epoch != 0 || s.Compression != 0 ||
 		!s.Membership.isZero()
 }
 
@@ -255,9 +257,7 @@ func (s *Snapshot) Reset() {
 	s.Membership.Reset()
 	s.Filepath = ""
 	s.FileSize = 0
-	s.Type = 0
 	s.OnDiskIndex = 0
-	s.Witness = false
 	s.Epoch = 0
 	s.Compression = 0
 }

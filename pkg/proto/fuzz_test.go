@@ -364,20 +364,19 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		uint64(math.MaxUint64), "/a", uint64(1),
 		[]byte{0xFF}, uint64(ConcurrentStateMachine), true, uint64(math.MaxUint64), true, uint64(math.MaxUint64))
 
-	// The []byte parameter fed Snapshot.Checksum, which was removed from the
-	// wire format (never computed, never verified — see the Snapshot type doc). It is kept in the signature, unnamed, so the seed
-	// corpus already in testdata/fuzz/FuzzSnapshotRoundTrip keeps parsing: the
-	// corpus file format is positional and dropping an argument would make every
-	// stored case unreadable, losing the inputs rather than the field.
+	// Four parameters are unnamed because the fields they fed no longer exist:
+	// the []byte fed Snapshot.Checksum, the uint64 after it fed Snapshot.Type,
+	// and the two bools fed Imported and Witness — all removed from the wire
+	// format (never computed, never read; see the Snapshot type doc). They are
+	// kept in the signature so the seed corpus already in
+	// testdata/fuzz/FuzzSnapshotRoundTrip keeps parsing: the corpus file format
+	// is positional, and dropping an argument would make every stored case
+	// unreadable, losing the inputs rather than the fields.
 	f.Fuzz(func(t *testing.T, shardID, replicaID, index, term,
 		ccID uint64, filepath string, fileSize uint64,
-		_ []byte, smType uint64, imported bool,
-		onDiskIndex uint64, witness bool, epoch uint64) {
+		_ []byte, _ uint64, _ bool,
+		onDiskIndex uint64, _ bool, epoch uint64) {
 
-		// Clamp state machine type to valid range.
-		if smType > maxStateMachineType {
-			smType = smType % (maxStateMachineType + 1)
-		}
 		// Clamp filepath length.
 		if len(filepath) > MaxFilepathLen {
 			filepath = filepath[:MaxFilepathLen]
@@ -397,9 +396,7 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 			},
 			Filepath:    filepath,
 			FileSize:    fileSize,
-			Type:        smType,
 			OnDiskIndex: onDiskIndex,
-			Witness:     witness,
 			Epoch:       epoch,
 		}
 
@@ -442,14 +439,8 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		if s.FileSize != s2.FileSize {
 			t.Fatalf("FileSize mismatch: %d != %d", s.FileSize, s2.FileSize)
 		}
-		if s.Type != s2.Type {
-			t.Fatalf("Type mismatch: %d != %d", s.Type, s2.Type)
-		}
 		if s.OnDiskIndex != s2.OnDiskIndex {
 			t.Fatalf("OnDiskIndex mismatch: %d != %d", s.OnDiskIndex, s2.OnDiskIndex)
-		}
-		if s.Witness != s2.Witness {
-			t.Fatalf("Witness mismatch: %v != %v", s.Witness, s2.Witness)
 		}
 		if s.Epoch != s2.Epoch {
 			t.Fatalf("Epoch mismatch: %d != %d", s.Epoch, s2.Epoch)
