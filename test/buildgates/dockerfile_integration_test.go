@@ -23,11 +23,13 @@
 package buildgates
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -160,7 +162,13 @@ func runStubbedBuild(t *testing.T, body, stub string) buildOutcome {
 	binPath := filepath.Join(dir, "integration-tests")
 	env := append(os.Environ(), "BUILD="+buildPath, "BIN="+binPath)
 
-	cmd := exec.Command("sh", "-c", stubCompileCommand(t, body))
+	// A bounded context, not context.Background: the shell under test is the
+	// error-handling half of a Dockerfile RUN, and a construct that hangs
+	// rather than exiting would otherwise stall the suite with no output.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", stubCompileCommand(t, body))
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 
@@ -170,7 +178,7 @@ func runStubbedBuild(t *testing.T, body, stub string) buildOutcome {
 	// entrypoint is `exec "$@"` from /bin/sh, so this is the real path.
 	runs := false
 	if _, statErr := os.Stat(binPath); statErr == nil {
-		runs = exec.Command("sh", "-c", binPath).Run() == nil
+		runs = exec.CommandContext(ctx, "sh", "-c", binPath).Run() == nil
 	}
 	return buildOutcome{exitedZero: err == nil, binaryRuns: runs, output: string(out)}
 }

@@ -1192,16 +1192,26 @@ func (s *StateMachine) Close() error {
 	s.closed = true
 	s.readGuard.Unlock()
 
-	// Then wait out a snapshot that is STREAMING. It released readGuard at
-	// capture so applies could resume, so readGuard alone no longer proves no
-	// save is in flight — streamGuard is what carries that now. Taken after
-	// readGuard, per the documented lock order.
+	// Then close the user SM while HOLDING streamGuard, which waits out a
+	// snapshot that is STREAMING. The gated save released readGuard at capture
+	// so applies could resume, so readGuard alone no longer proves no save is
+	// in flight — streamGuard is what carries that now. Taken after readGuard,
+	// per the documented lock order.
+	//
+	// Held ACROSS the close rather than acquired and released as a barrier: a
+	// bare Lock/Unlock pair is an empty critical section, which reads as a
+	// mistake and is one staticcheck flags (SA2001). Holding it also closes a
+	// real gap — a save that had not yet taken its read lock could otherwise
+	// slip in between the barrier and the close and stream from a closed SM.
+	// It cannot deadlock: sm.Close does not call back into a guarded method,
+	// and any save that acquires the guard afterwards sees closed and returns
+	// ErrClosed.
 	//
 	// This is a wait, not a cancellation: the engine closes the node's stopC
 	// before Close runs, which aborts an in-flight save promptly via the
 	// stopper checks, and this blocks only until that unwinds.
 	s.streamGuard.Lock()
-	s.streamGuard.Unlock()
+	defer s.streamGuard.Unlock()
 
 	return s.sm.Close(context.Background())
 }

@@ -617,110 +617,144 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
 	scope := c.scopeFor(cert)
 
+	// Dispatch only. Each mode's policy lives in its own method: the bodies
+	// differ in which sources they consult and in what a "not found" means
+	// when nothing was consulted, and inlining all four put this function over
+	// the cyclomatic limit without making any one policy easier to read.
 	switch c.cfg.Mode {
 	case ModeCRL:
-		revoked, crlErr := c.checkCRLStatus(scope, serial)
-		if revoked {
-			return true, nil
-		}
-		if c.cfg.enforcing() {
-			if crlErr != nil {
-				return false, crlErr
-			}
-			// No CRL file: this mode consulted nothing, so "not found" is
-			// not evidence of "not revoked" — checkCRLStatus cannot even
-			// report staleness without a path to go stale. Config.Validate
-			// rejects the combination up front; this is the runtime backstop
-			// for a checker constructed without it (or whose paths were lost
-			// in a refactor), so the gap surfaces as a handshake failure
-			// instead of admitting every revoked certificate in silence.
-			// ModeOCSP, ModeBoth and ModeAny already fail closed here.
-			if len(c.cfg.CRLPaths) == 0 {
-				return false, ErrNoRevocationSources
-			}
-		}
-		return false, nil
-
+		return c.isRevokedCRL(scope, serial)
 	case ModeOCSP:
-		// The programmatic revoked set (AddRevokedSerial, the runtime admin
-		// revocation path) is consulted in every mode. Ignoring it here would
-		// make an operator-issued revocation a silent no-op whenever OCSP is
-		// the selected mode. CRL staleness is NOT consulted: this mode does
-		// not derive its verdict from CRL files.
-		c.mu.RLock()
-		_, revoked := c.revokedSet[scopedSerial(scope, serial)]
-		if !revoked {
-			_, revoked = c.revokedSet[scopedSerial(anyIssuerScope, serial)]
-		}
-		c.mu.RUnlock()
-		if revoked {
-			return true, nil
-		}
-		return c.checkOCSP(cert)
-
+		return c.isRevokedOCSP(cert, scope, serial)
 	case ModeBoth:
-		// Revoked-by-either wins. (Requiring agreement of both sources
-		// would let a CRL-revoked certificate slide through on a stale
-		// OCSP "good".)
-		crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
-		if crlRevoked {
-			return true, nil
-		}
-		ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
-		if ocspErr == nil && ocspRevoked {
-			return true, nil
-		}
-		// Neither source reported revoked. Unknown status from either
-		// source is per AllowSoftFail.
-		if c.cfg.enforcing() {
-			if crlErr != nil {
-				return false, crlErr
-			}
-			if ocspErr != nil {
-				return false, ocspErr
-			}
-		}
-		return false, nil
-
+		return c.isRevokedBoth(cert, scope, serial)
 	default: // ModeAny
-		crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
-		if crlRevoked {
-			return true, nil
+		return c.isRevokedAny(cert, scope, serial)
+	}
+}
+
+// noSourceBackstop reports the missing-source failure when enforcement is on
+// and this checker holds no CRL path to consult.
+//
+// It exists because "serial not found" is only evidence of "not revoked" when
+// something was actually consulted. checkCRLStatus cannot even report
+// staleness without a path to go stale, so with no paths configured it returns
+// a clean not-found that is indistinguishable from a real answer.
+// Config.Validate rejects the combination up front; this is the runtime
+// backstop for a checker constructed without it, or whose paths were lost in a
+// refactor, so the gap surfaces as a handshake failure rather than admitting
+// every revoked certificate in silence.
+func (c *Checker) noSourceBackstop() error {
+	if len(c.cfg.CRLPaths) == 0 {
+		return ErrNoRevocationSources
+	}
+	return nil
+}
+
+// isRevokedCRL consults CRL state only.
+func (c *Checker) isRevokedCRL(scope, serial string) (bool, error) {
+	revoked, crlErr := c.checkCRLStatus(scope, serial)
+	if revoked {
+		return true, nil
+	}
+	if c.cfg.enforcing() {
+		if crlErr != nil {
+			return false, crlErr
 		}
-		if c.cfg.OCSPResponderURL != "" {
-			ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
-			if ocspErr == nil && ocspRevoked {
-				return true, nil
-			}
-			if c.cfg.enforcing() {
-				// Unknown from either source fails closed: a revocation
-				// could be hiding behind the stale CRL or the
-				// unreachable responder.
-				if ocspErr != nil {
-					return false, ocspErr
-				}
-				if crlErr != nil {
-					return false, crlErr
-				}
-			}
-			return false, nil
+		if err := c.noSourceBackstop(); err != nil {
+			return false, err
 		}
-		if c.cfg.enforcing() {
-			if crlErr != nil {
-				return false, crlErr
-			}
-			// No CRL file and no responder: this mode consulted nothing, so
-			// "not found" is not evidence of "not revoked". Config.Validate
-			// rejects the combination up front; this is the runtime backstop
-			// for a checker constructed without it (or whose paths were lost
-			// in a refactor), so the gap surfaces as a handshake failure
-			// instead of admitting every revoked certificate in silence.
-			if len(c.cfg.CRLPaths) == 0 {
-				return false, ErrNoRevocationSources
-			}
+	}
+	return false, nil
+}
+
+// isRevokedOCSP consults OCSP, plus the programmatic revoked set.
+//
+// The programmatic set (AddRevokedSerial, the runtime admin revocation path) is
+// consulted in every mode; ignoring it here would make an operator-issued
+// revocation a silent no-op whenever OCSP is the selected mode. CRL staleness
+// is NOT consulted: this mode does not derive its verdict from CRL files.
+func (c *Checker) isRevokedOCSP(cert *x509.Certificate, scope, serial string) (bool, error) {
+	c.mu.RLock()
+	_, revoked := c.revokedSet[scopedSerial(scope, serial)]
+	if !revoked {
+		_, revoked = c.revokedSet[scopedSerial(anyIssuerScope, serial)]
+	}
+	c.mu.RUnlock()
+	if revoked {
+		return true, nil
+	}
+	return c.checkOCSP(cert)
+}
+
+// isRevokedBoth consults CRL and OCSP, revoked-by-either.
+//
+// Requiring agreement of both sources would let a CRL-revoked certificate
+// slide through on a stale OCSP "good". Unknown status from either source is
+// per AllowSoftFail.
+func (c *Checker) isRevokedBoth(cert *x509.Certificate, scope, serial string) (bool, error) {
+	crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
+	if crlRevoked {
+		return true, nil
+	}
+	ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
+	if ocspErr == nil && ocspRevoked {
+		return true, nil
+	}
+	if c.cfg.enforcing() {
+		if crlErr != nil {
+			return false, crlErr
 		}
+		if ocspErr != nil {
+			return false, ocspErr
+		}
+	}
+	return false, nil
+}
+
+// isRevokedAny consults whichever sources are configured.
+//
+// With a responder configured, unknown from either source fails closed under
+// enforcement: a revocation could be hiding behind the stale CRL or the
+// unreachable responder. With no responder it degenerates to the CRL policy,
+// including the missing-source backstop.
+func (c *Checker) isRevokedAny(cert *x509.Certificate, scope, serial string) (bool, error) {
+	crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
+	if crlRevoked {
+		return true, nil
+	}
+	if c.cfg.OCSPResponderURL == "" {
+		return c.isRevokedCRLTail(crlErr)
+	}
+
+	ocspRevoked, ocspErr := c.checkOCSPRaw(cert)
+	if ocspErr == nil && ocspRevoked {
+		return true, nil
+	}
+	if c.cfg.enforcing() {
+		if ocspErr != nil {
+			return false, ocspErr
+		}
+		if crlErr != nil {
+			return false, crlErr
+		}
+	}
+	return false, nil
+}
+
+// isRevokedCRLTail applies the enforcement tail shared by the CRL-only paths:
+// a CRL error wins, then the missing-source backstop.
+func (c *Checker) isRevokedCRLTail(crlErr error) (bool, error) {
+	if !c.cfg.enforcing() {
 		return false, nil
 	}
+	if crlErr != nil {
+		return false, crlErr
+	}
+	if err := c.noSourceBackstop(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // checkCRLStatus tests whether the serial is in the revoked set. The
