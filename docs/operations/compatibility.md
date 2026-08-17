@@ -4,16 +4,20 @@ What this library promises across versions, what it does not, and what an
 upgrade actually involves today.
 
 **Sources:** `pkg/proto/constants.go`, `pkg/proto/membership.go`,
-`pkg/internal/transport/frame.go`, `pkg/logdb/waldb/db.go`,
-`pkg/internal/engine/snapshot_meta.go`, `pkg/seal/strategy.go`, `CHANGELOG.md`
+`pkg/proto/entry.go`, `pkg/internal/transport/frame.go`,
+`pkg/logdb/waldb/db.go`, `pkg/logdb/waldb/format.go`,
+`pkg/internal/engine/snapshot_meta.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`,
+`VERSION`
+
+The current version is **0.6.0-alpha**, published 2026-08-17. It breaks both `0.4.x`
+and `0.5.x` on-disk data; see the upgrade section below.
 
 ## Stability guarantee
 
-go-quicraft is **pre-1.0**. Under semantic versioning that means the minor
-version may break anything, and it does: `0.2.0-alpha` broke the on-disk format,
-and `0.3.0-alpha` breaks it again (positional AEAD binding, a new
-`snapshot.meta` layout, and an 11-byte WAL chunk header carrying a durability
-sequence).
+go-quicraft is **pre-1.0 alpha software**. Under semantic versioning the minor
+version may break anything, and every minor release so far has broken the
+on-disk format: `0.2.0-alpha`, `0.3.0-alpha`, `0.4.0-alpha` and `0.5.0-alpha`
+each did.
 
 Concretely, before 1.0:
 
@@ -22,11 +26,23 @@ Concretely, before 1.0:
 | Exported Go API (`pkg`, `pkg/config`, `pkg/sm`, `pkg/seal`, `pkg/logdb`) | **None between minor versions.** Signature and semantic changes are called out in CHANGELOG under BREAKING |
 | On-disk format (WAL chunk framing, WAL records, snapshots, `snapshot.meta`, sealed root key) | **None between minor versions.** A format break means wipe-and-resync — see [Upgrade path](#upgrade-path) |
 | Wire format between nodes | Exact-match only. Mixed-version clusters are not supported at any version |
-| Patch releases (`0.2.0` → `0.2.1`) | No intentional API or format break. Read the CHANGELOG anyway |
+| Patch releases (`0.5.0` → `0.5.1`) | No intentional API or format break. Read the CHANGELOG anyway |
 
 There is no long-term-support line, no deprecation window, and no compatibility
 shim. Downstream products (go-qrdb, go-xkms, go-quicbaas, go-trusted-ca) pin an
 exact version and upgrade deliberately.
+
+### Which released versions actually exist
+
+`v0.4.0-alpha` and `v0.5.0-alpha` are resolvable Go module versions whose
+release pipelines never completed, so neither was published. Both tags stay
+where they are rather than being moved: module versions are immutable, go-qrdb
+had already recorded `v0.4.0-alpha` in its `go.sum`, and repointing a checksummed
+tag fails a downstream build with a security error. **Depend on `v0.5.1-alpha`.**
+
+`v0.5.1-alpha` carries identical library content to `v0.5.0-alpha` plus two
+fixes to the release gate itself, so the breaking format changes described in
+the `0.5.0-alpha` CHANGELOG entry apply in full to `0.5.1-alpha`.
 
 If a v2+ line is ever cut, the module path takes the `/v2` suffix as Go
 requires; the release workflow refuses a `v2+` tag without it.
@@ -146,17 +162,24 @@ The v1 layout, field by field:
 | 25 | 8 | `SessionExpiryEntries` |
 | 33 | 8 | `MaxTotalSessions` |
 | 41 | 8 | `MaxSessionsPerClient` |
-| 49 | var | `Addresses` map |
+| 49 | 8 | `MaxSessionsPerOwner` |
+| 57 | var | `Addresses` map |
 | — | var | `Observers` map |
 | — | var | `Witnesses` map |
 | — | var | `Removed` bool map |
 | — | var | `Identities` map |
 | — | var | `RemovedIdentities` map |
 
-The fixed region is **49 bytes** and an empty section is **73**: the fixed
-region plus six 4-byte map count prefixes. Every map is written unconditionally,
-so an empty map is four zero bytes rather than an absent field, and an unset
-session policy is 24 zero bytes rather than an absent one.
+The fixed region is **57 bytes** (`membershipFixedSize`, `pkg/proto/membership.go:109`)
+and an empty section is **81**: the fixed region plus six 4-byte map count
+prefixes. Every map is written unconditionally, so an empty map is four zero
+bytes rather than an absent field, and an unset session policy is 32 zero bytes
+rather than an absent one.
+
+`MaxSessionsPerOwner` was added at `0.5.0-alpha`, in place, at version 1. That
+moved the six-map region from offset 49 to 57 without changing the version byte,
+which is the pinning policy working exactly as designed and exactly as
+dangerously: see [What 0.5.x does when it meets 0.4.x data](#what-05x-does-when-it-meets-04x-data).
 
 An unset session policy is still distinguishable from a committed one that
 disables expiry: `MaxTotalSessions` can never legitimately be zero in a
@@ -208,13 +231,16 @@ straight-line from a fixed offset and a grown fixed region would move every map.
 | — | var | `Witnesses` map |
 | — | var | `Removed` map |
 | — | var | `Identities` map |
-| — | 24 | Session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient` |
+| — | 32 | Session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`, `MaxSessionsPerOwner` |
 | — | var | `RemovedIdentities` map |
 
-Its fixed region is **18 bytes** and an empty section is **66** — which is also
-the read floor replay enforces before it looks at the version byte. The two
+Its fixed region is **18 bytes** (`membershipFixedSize`, `pkg/logdb/waldb/db.go:1933`)
+and an empty section is **74** (`minMembershipSize`, `db.go:1944`) — which is
+also the read floor replay enforces before it looks at the version byte. The two
 numbers are equal by construction: one layout, every field unconditional, so the
-smallest thing that may be READ is exactly the size of what is WRITTEN.
+smallest thing that may be READ is exactly the size of what is WRITTEN. A
+section shorter than 74 bytes fails with `ErrTruncatedSnapshotRecord` before the
+version byte is read.
 
 #### The transport version is a SUPREMUM
 
@@ -266,6 +292,16 @@ no durability sequence — and under the pinning policy that change was made in
 place, with the dev directories that held the old framing wiped rather than
 migrated.
 
+**The marker did once catch a real skew, and it no longer does.** Builds before
+`0.4.0-alpha` wrote version **2**; `0.4.0-alpha` renumbered it to 1 under the
+pinning policy, so a pre-0.4 directory is refused with `*WALFormatVersionError`
+naming 2 and 1. Every build from `0.4.0-alpha` onward writes 1, which means a
+`0.4.x` directory opened by `0.5.x` **passes this check** even though its record
+payloads are unreadable. Do not treat a clean marker check as evidence that a
+data directory matches the binary. What catches that boundary is the
+payload-type ladder in [section 5](#5-wal-payload-type-bytes--persisted-fatal-on-replay-ladder),
+one layer down, at the first record replayed.
+
 It is gated on **exact equality** in both directions, and unlike the
 payload-type ladder it cannot be a per-record decision: the framing is what
 tells you where records begin, so there is no record to inspect until it has
@@ -313,27 +349,52 @@ type byte, is what detects it.
 
 | Byte | Constant | Status on replay |
 |---|---|---|
-| `0x01` | `payloadTypeEntriesV1` | **Fatal** — `ErrLegacyEntryFormat`. No session fields, so replay would disable at-most-once delivery |
+| `0x01` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named an entry format with no session fields, so replay would disable at-most-once delivery |
 | `0x02` | `payloadTypeState` | Current |
-| `0x03` | `payloadTypeSnapshotV1` | **Fatal** — `ErrLegacySnapshotFormat`. No `MaxWitnesses`/policy flags and no version discriminator |
+| `0x03` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a snapshot format with no `MaxWitnesses`/policy flags |
 | `0x04` | `payloadTypeBootstrap` | Current |
 | `0x05` | `payloadTypeCompact` | Current |
 | `0x06` | `payloadTypeRemoveNode` | Current |
-| `0x07` | `payloadTypeEntries` | Current entry format (76-byte header, four session fields) |
-| `0x08` | `payloadTypeSnapshotV2` | **Fatal** — `ErrLegacySnapshotFormatV2`. Membership section starts at `ConfigChangeID`, so V3 parsing would eat its low byte as a version byte |
-| `0x09` | `payloadTypeSnapshotV3` | **Fatal** — `ErrLegacySnapshotFormatV3`. `FilePathLen` sits where the current layout reads `Compression` |
-| `0x0a` | `payloadTypeSnapshot` | **Current snapshot format** — adds artifact `Compression` to the fixed region |
+| `0x07` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a 76-byte entry header, so `OwnerID` would be read from the record's own `CmdLen` plus four command bytes and the command length then taken from inside the command |
+| `0x08` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. Its membership section started at `ConfigChangeID`, so current parsing would eat its low byte as a version byte |
+| `0x09` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. Its `FilePathLen` sat where the current layout reads `Compression` |
+| `0x0a` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a three-field session policy tail, so `MaxSessionsPerOwner` would be read from the `RemovedIdentities` count and the deny-list located eight bytes late |
+| `0x0b` | `payloadTypeEntries` | **Current entry format** — 84-byte record header, five session fields (`Key`, `ClientID`, `SeriesID`, `RespondedTo`, `OwnerID`) |
+| `0x0c` | `payloadTypeSnapshot` | **Current snapshot format** — artifact `Compression` in the fixed region, four-field session policy tail |
 
 Every fatal error names the same remedy: **restore from a snapshot, or re-sync
 this node from its peers.** Old byte values stay reserved forever so a legacy
 WAL is *detected* rather than misparsed.
 
+The ladder only discriminates layouts that were given a NEW byte, and with every
+version number pinned it is the ONLY thing that discriminates a `0.4.x` record
+at all. `0x07` and `0x0a` changed layout in place at `0.5.0-alpha` and were
+therefore blind to exactly the boundary they were needed for; retiring them and
+moving the current formats to `0x0b` and `0x0c` is what restored the rule. See
+[What 0.5.x does when it meets 0.4.x data](#what-05x-does-when-it-meets-04x-data)
+for what the blind window actually produced.
+
+The renumbering cuts both ways: a WAL written by this build reads as
+`ErrUnknownPayloadType` under `0.5.1-alpha`, which knows `0x0b` and `0x0c` as
+nothing at all. That is a wipe in either direction, which is the pre-release
+posture regardless.
+
+An unknown byte fails with `ErrUnknownPayloadType`; the dominant real cause of
+that is still not a version skew but opening a **keyed** WAL with
+`barrier == nil`, which makes every record decode as type `0x00`.
+
 ### 6. `snapshot.meta` — persisted, self-describing, append-only
 
-The record beside every snapshot artifact. Current records carry a `QRSNAPMD`
-magic, a uint16 body version (**1**), a reserved uint16 and a uint32 body length
-ahead of the fields, for 72 bytes total. Because the body length is recorded, a
-reader can distinguish a field that is ABSENT from bytes that are CORRUPT.
+The record beside every snapshot artifact. Current records carry a 16-byte
+header — `QRSNAPMD` magic, a uint16 body version (**1**), a reserved uint16 and
+a uint32 body length — ahead of a 72-byte body of nine little-endian uint64
+fields (`Index`, `Term`, `ShardID`, `ReplicaID`, `CreatedAt`, `Epoch`,
+`Compression`, `DataLen`, `DataHash`), for **88 bytes** total. Because the body
+length is recorded, a reader can distinguish a field that is ABSENT from bytes
+that are CORRUPT.
+
+This is the one format here whose discriminator does its job across a version
+change, because the body length is in-band and the rule below is honoured.
 
 Body fields are **append-only**: appending one bumps the version and leaves
 every existing offset alone. Changing an existing field's meaning is not
@@ -360,18 +421,46 @@ barrier's configured setting. `SetSealedRootKey` rejects a blob whose
 `HKDFVersion` is newer than the running build, and one whose `Algorithm`
 disagrees with the barrier configuration (`AlgorithmMismatchError`).
 
-## Breaking for embedders (`0.3.0-alpha`)
+#### `state_mac` moved to v2, and it migrates itself
 
-These break code that COMPILES against the previous release. They are listed
-separately from the format breaks above because a Go type check will not catch
-them: two are satisfied structurally at runtime, and one is a constant whose
-numeric value moved. Each fails at node startup, not at build time.
+`sealedStateMACVersion` (`pkg/seal/barrier.go:2334`) is the version byte of the
+canonical encoding the metadata MAC covers. It went **1 → 2** at
+`0.5.0-alpha` to bring `LoadGeneration` into the covered set, because the
+barrier now refuses to encrypt on the strength of that counter and an
+unauthenticated plaintext field would be a passphrase-free way to stop a node
+writing.
 
-### `waldb.FS` gained `Rename(oldpath, newpath string) error`
+**This is the one 0.4.x → 0.5.x carry-over that does not need a wipe.**
+`verifySealedStateMAC` accepts a valid v1 tag once, logs it, and restamps at v2
+on the next persist. Verifying the old version is not a downgrade: forging
+either tag needs the same HKDF-derived MAC key, which comes from the root key
+the sealing strategy just recovered, and what v1 leaves uncovered is a field a
+pre-fence blob does not carry at all.
+
+Two things follow for an operator. First, keep the sealed root key across a
+0.4.x → 0.5.x replacement even though everything else is wiped. Second, if you
+persist `SealedRootKeyData()` yourself, persist it again after the first
+successful unseal, or every subsequent start pays the legacy path.
+
+A blob with **no** MAC at all is a different case and is still refused with
+`ErrSealedStateUnauthenticated` — see the one-start migration in the
+[0.3.x boundary notes](#version-boundaries-before-04x).
+
+## Interface requirements for embedders
+
+Three requirements are satisfied STRUCTURALLY rather than by a declared
+implements-clause, so a Go type check will not catch a type that fails them.
+Two fail at `waldb.Open`; one is a constant whose zero value is easy to
+misread. All three date from `0.3.0-alpha` and all three still hold at
+`0.6.0-alpha`. Older API breaks are recorded only in the CHANGELOG.
+
+### `waldb.FS` requires `Rename(oldpath, newpath string) error`
 
 Any type implementing `waldb.FS` — test doubles, instrumented filesystems, the
-error-injection harnesses downstream products build — must add `Rename`. Passing
-one to `waldb.Open` via `WithFS` will not compile until it does.
+error-injection harnesses downstream products build — must provide `Rename`
+along with `OpenFile`, `Open`, `MkdirAll`, `ReadDir`, `Stat` and `Remove`
+(`pkg/logdb/waldb/fs.go:73`). Passing one to `waldb.Open` via `WithFS` will not
+compile until it does.
 
 `Rename` is required rather than optional because the WAL geometry marker
 (`WALFORMAT`) is published by writing a temporary file, fsyncing it, and renaming
@@ -380,11 +469,11 @@ unobservable; an optional interface with an in-place fallback would restore
 exactly the torn state the rename removes. Delegate to `os.Rename` (or model
 rename's atomicity) and the requirement is satisfied.
 
-### The barrier interface `waldb` asserts gained `ContextBindingResolved() bool`
+### The barrier interface `waldb` asserts requires `ContextBindingResolved() bool`
 
-`waldb` asserts an unexported interface on the DYNAMIC type of the barrier passed
-to `WithBarrier`. A barrier written against the previous release still compiles,
-then fails at `Open`.
+`waldb` asserts an unexported interface on the DYNAMIC type of the barrier
+passed to `WithBarrier` (`pkg/logdb/waldb/db.go:141`). A barrier missing the
+method compiles fine, then fails at `Open`.
 
 The method must report whether `SupportsContextAAD()` is currently an ANSWER
 rather than the absence of one — true whenever the barrier is unsealed with its
@@ -400,64 +489,43 @@ false — such a barrier does support context-bound encryption).
 
 `*seal.Barrier` implements it already; only out-of-tree barriers are affected.
 
-### `seal.ContextBinding` constants shifted by one
+### `seal.ContextBinding`'s zero value is `Unresolved`, not a binding
 
-`ContextBindingUnresolved` was inserted as the new zero value, so every other
-constant moved up:
-
-| Constant | Was | Is |
+| Constant | Value | Meaning |
 |---|---|---|
-| `ContextBindingUnresolved` | — | 0 |
-| `ContextBindingBarrier` | 0 | 1 |
-| `ContextBindingDelegated` | 1 | 2 |
-| `ContextBindingUnsupported` | 2 | 3 |
-| `ContextBindingPlaintext` | 3 | 4 |
+| `ContextBindingUnresolved` | 0 | No answer yet: the barrier is sealed or uninitialized. `Binds()` is **false** |
+| `ContextBindingBarrier` | 1 | Barrier folds the caller's context into its own AEAD's AAD (software path) |
+| `ContextBindingDelegated` | 2 | A delegated hardware/KMS encryptor owns the binding |
+| `ContextBindingUnsupported` | 3 | The encryptor cannot bind context |
+| `ContextBindingPlaintext` | 4 | Not encrypting |
 
 Compare against the named constants, never the numbers, and do not persist or
-transmit the numeric value. Code that stored a `ContextBinding` as an integer
-will read every value back as the wrong binding.
+transmit the numeric value.
 
-The semantic change matters as much as the renumbering: a sealed or uninitialized
-barrier used to report `ContextBindingBarrier`, so `Binds()` was **true** for it.
-It now reports `ContextBindingUnresolved` and `Binds()` is **false**. Any consumer
-that caches the capability must re-ask after `Unseal` instead of latching what a
-sealed barrier said.
-
-**Ship together.** The `waldb` guard that refuses a sealed barrier
-(`ErrBarrierContextUnresolved`) closes a hole the `ContextBindingUnresolved` state
-opens. Reverting `pkg/seal/barrier_binding.go` on its own, with that guard in
-place, makes every encrypted WAL refuse to open.
+The trap is the zero value. A barrier legitimately spends time at
+`Unresolved` — a node may start sealed and be unsealed later, which is the whole
+point of the start-then-unseal flow — so **any consumer that caches the
+capability must re-ask after `Unseal`** rather than latching what a sealed
+barrier said. `Binds()` is false for `Unresolved`, which keeps the fail-safe
+direction for callers that only ask the predicate.
 
 ### `seal.NewBarrier` returns `(*Barrier, error)`
 
-It used to return `*Barrier` and PANIC on an invalid configuration — an unknown
-algorithm, or a non-FIPS-approved cipher while FIPS mode is active. A panic in an
-exported constructor takes down the embedding process, and those two conditions
-are exactly what a configuration read from a file, an API request, or per-tenant
-settings produces. Calling `BarrierConfig.Validate` first was a convention, not a
-guarantee.
+An invalid configuration — an unknown algorithm, or a non-FIPS-approved cipher
+under FIPS mode — is an error, never a panic. Those are exactly the conditions a
+configuration read from a file, an API request, or per-tenant settings produces,
+and a panic in an exported constructor takes down the embedding process.
 
-This one DOES fail at build time, unlike the three above.
+| Constructor | Signature | Use when |
+|---|---|---|
+| `seal.NewBarrier(cfg)` | `(*Barrier, error)` | Config assembled at runtime — surface the error |
+| `seal.MustNewBarrier(cfg)` | `*Barrier` | Config from compile-time constants; panics, `regexp.MustCompile` precedent |
+| `seal.NewEpochBarrier` / `seal.MustNewEpochBarrier` | aliases | Same functions under the epoch-barrier name |
+| `crypto.NewBarrier` / `crypto.MustNewBarrier` | aliases | `pkg/crypto` re-exports both |
 
-| Call site | Change |
-|---|---|
-| Config assembled at runtime | `b, err := seal.NewBarrier(cfg)` — surface the error |
-| Config from compile-time constants | `b := seal.MustNewBarrier(cfg)` — panics, `regexp.MustCompile` precedent |
-| `seal.NewEpochBarrier` | Alias of `NewBarrier`; changes signature with it. `MustNewEpochBarrier` added |
-| `crypto.NewBarrier` | Re-exports the new signature. `crypto.MustNewBarrier` added |
-
-`BarrierConfig.Validate` is unchanged and stays exported, but it is now an
-admission-time convenience rather than a safety requirement: `NewBarrier` applies
-the same rules and returns the same error identity, so forgetting it no longer
-risks a panic.
-
-**Known downstream call sites:** `go-qrdb/pkg/seal/barrier.go` (inside
-`NewStorageBarrier`, which already returns an error — the new error threads
-straight through) and `go-qrdb/pkg/seal/strategy.go`, whose
-`var NewEpochBarrier = quicraftseal.NewBarrier` re-export changes signature with
-it and so breaks go-qrdb's own API surface. go-xkms and go-quicbaas are
-unaffected: their `seal.NewBarrier` is their own package's four-argument
-function, and neither imports `go-quicraft/pkg/seal`.
+`BarrierConfig.Validate` stays exported but is an admission-time convenience
+rather than a safety requirement: `NewBarrier` applies the same rules and
+returns the same error identity, so skipping it no longer risks a panic.
 
 ## Node identities and `RequireMemberIdentity`
 
@@ -655,11 +723,13 @@ far), the procedure per node is:
 1. Confirm the remaining nodes hold a quorum without this one.
 2. Stop the node.
 3. Delete its `WALDir` and `NodeHostDir` contents. Keep the sealed root key
-   **only** if the release notes do not list an encryption break; the AAD
-   binding change in `0.3.0-alpha` makes existing ciphertext unreadable
-   regardless of the key. Deleting the WAL directory means deleting the
+   unless the release notes list an encryption break: the AAD binding change in
+   `0.3.0-alpha` makes existing ciphertext unreadable regardless of the key,
+   while the `0.4.x` → `0.5.x` `state_mac` bump migrates itself and the key
+   should be carried across. Deleting the WAL directory means deleting the
    `WALFORMAT` marker with it — leaving segments behind without it is refused
-   (`ErrWALFormatMissing`), by design, since their chunk framing is the old one.
+   (`ErrWALFormatMissing`), by design, since nothing then records their chunk
+   framing.
 4. Start the node on the new version and let it re-sync from the leader via
    snapshot + log replay.
 5. Wait for `ShardInfo.Health` to leave `recovering` and `LastApplied` to catch
@@ -678,62 +748,124 @@ from an application-level backup taken before the upgrade. `waldb.Reencrypt`
 re-serializes every record and is the supported path for a **barrier** migration
 specifically — it is not a format migration tool.
 
-### `0.2.0-alpha` → `0.3.0-alpha`
+### `0.4.x` and `0.5.x` → `0.6.0-alpha`
 
-Four independent on-disk formats changed, so a `0.2.0-alpha` data directory is
-unreadable in every one of its parts. Follow the rolling-replacement procedure
-above. What an operator will actually SEE, so a fail-closed refusal is not
-mistaken for corruption:
+**0.5.x breaks all 0.4.x on-disk data. There is no in-place upgrade.** Follow
+the rolling-replacement procedure above, or rebuild the cluster from scratch.
 
-| Symptom at start-up | Meaning |
+Every format version still reads 1 on both sides, so no version number records
+this break. The WAL payload-type bytes do, since the current entry and snapshot
+formats were renumbered when their layouts changed. The layouts moved underneath
+the version numbers:
+
+| Layout | 0.4.x | 0.5.x |
+|---|---|---|
+| `proto.Entry` header | 60 bytes | **68** — `OwnerID` added at +56 |
+| WAL entry record header | 76 bytes | **84** — `logdb.EntryOverheadBytes` moved with it |
+| WAL entry payload type | `0x07` | **`0x0b`** — `0x07` retired and left unallocated |
+| `proto.SessionPolicy` | 24 bytes | **32** — `MaxSessionsPerOwner` |
+| `proto.Membership` fixed region | 49 bytes | **57** — the six-map region moved with it |
+| `waldb` membership section minimum | 66 bytes | **74** |
+| WAL snapshot payload type | `0x0a` | **`0x0c`** — `0x0a` retired and left unallocated |
+| `proto.Snapshot` | `Type`, `Imported`, `Witness` | those three **removed** (written or reserved, never read); `Compression` **added** |
+| `snapshot.meta` body | 7 fields | **9** — `DataLen` and `DataHash`, version bumped, old records still read |
+| Sealed root key `state_mac` | v1 | **v2** — covers `LoadGeneration`; **migrates itself** |
+
+Two of those need separate treatment. The `snapshot.meta` record is
+self-describing and genuinely backward compatible: old records keep working
+until their snapshot directory rolls off. The sealed root key migrates in place;
+**keep it** through the wipe (see [`state_mac` moved to
+v2](#state_mac-moved-to-v2-and-it-migrates-itself)). Everything else in the
+table is a wipe.
+
+#### What 0.5.x does when it meets 0.4.x data
+
+`Open` succeeds and **recovery fails at the first legacy record**, with
+`ErrUnknownPayloadType`. The error names the unreadable record
+they found and both name the remedy: restore from a snapshot, or re-sync from
+peers.
+
+No version gate is involved, and none was ever going to be. Every version number
+here is pinned at 1 for the pre-release period, so both builds stamp the same
+value in every one of them:
+
+| Check | Verdict on a 0.4.x directory |
 |---|---|
-| `ErrWALFormatMissing` | WAL segments written before the format marker existed. Expected on every `0.2.0-alpha` directory. Delete the WAL directory. |
-| `*WALFormatVersionError` | A marker from another build's on-disk format. Same remedy; the message names both the version found and the version this build reads, so it is distinguishable from damage. |
-| `ErrLegacySnapshotFormat` / `...V2` / `...V3` | A WAL snapshot record from an older payload-type generation. |
-| `ErrDecryptionFailed` on every read | The at-rest AAD binding changed. The key is fine; the ciphertext is not readable. Wipe, do not hunt for a key problem. |
+| `WALFORMAT` marker version | **Passes.** Both builds write 1 |
+| WAL chunk framing (11-byte header) | **Passes.** Unchanged since 0.4.0 |
+| `Membership` section version byte | **Passes.** Both builds write 1 |
+| `MessageBatch.BinVer` on the wire | **Passes.** Both builds stamp `WireVersion` = 1 |
+| **WAL payload type byte** | **Refuses.** `0x07` and `0x0a` are retired and left unallocated, so a record carrying either fails replay with `ErrUnknownPayloadType` |
 
-None of these is recoverable in place and none should be retried. All four are
-deliberate refusals — the alternative for each was a silent misparse, and for
-the WAL specifically a misparse would have presented as a torn tail and
-truncated the whole log to zero.
+That last row is the whole gate. It is the payload-type ladder doing the job the
+pinned version numbers deliberately do not do, which is why a layout change must
+always take a new type byte.
 
-Source compatibility is a separate question and is better than the format break
-suggests: `go-qrdb`, `go-xkms` and `go-quicbaas` build against `0.3.0-alpha`
-without source changes. The interface additions in that release's `BREAKING`
-section (`waldb.FS.Rename`, `walContextBarrier.ContextBindingResolved`,
-`SecurityMetrics.IncUnauthorizedMessageDropped`'s `reason` parameter) affect
-only embedders that IMPLEMENT those interfaces. Verify with a build before
-concluding you are unaffected.
+**`0.5.1-alpha` itself does not have this gate.** The renumbering landed after
+the release. A `0.5.1-alpha` binary still writes `0x07`/`0x0a` and reads a 0.4.x
+record with them, so everything in the next subsection applies to it. The
+renumbering also runs the other way: a WAL written by a current build is
+`ErrUnknownPayloadType` under `0.5.1-alpha`, which has never heard of `0x0b` or
+`0x0c`.
 
-### `0.3.0-alpha` → `0.3.1-alpha`
+##### What it did before the payload types were renumbered
 
-`0.3.1-alpha` was a CI and test-infrastructure release. It changed no wire
-format, no persisted format and no public API. A `0.3.0-alpha` data directory is
-read by `0.3.1-alpha` unchanged, and the two versions interoperate on the wire.
+Recorded because the failure was not "it errors cleanly", and because the same
+shape returns the moment a layout is changed in place again.
 
-Upgrade in place, node by node, with no wipe. It is the only boundary in this
-project's history where that is true.
+`0.5.0-alpha` grew the entry record header 76 → 84 bytes and the snapshot
+record's session policy tail 24 → 32 while leaving both payload-type bytes where
+they were. Measured against real 0.4.x records:
 
-### `0.3.1-alpha` → next release
+- **An entry record was accepted with `err == nil`.** `OwnerID` decoded as
+  `0x4443424100000018` — the record's own `CmdLen` concatenated with the first
+  four bytes of its command — and `CmdLen` was then read from four bytes further
+  into the command. The command reached the state machine truncated from 24
+  bytes to 16. `OwnerID` is the session admission grouping key, and every replica
+  has to agree on it.
+- **A snapshot record usually failed as truncated**, which is a corruption
+  diagnosis for what is really a version mismatch. In one realistic shape it was
+  accepted in silence, with a fabricated `MaxSessionsPerOwner` and a
+  `RemovedIdentities` deny-list read eight bytes off, populated with a replica
+  nobody had removed. That list is checked against the authenticated connection
+  identity, so misreading it revokes a revocation.
 
-**This one is a format break in both directions, and there is no rolling
-upgrade.** Follow the rolling-replacement procedure above.
+The wire has no equivalent gate and still does not: a 0.4.x and a 0.5.x node
+accept each other's `BinVer` and then disagree about what the bytes mean.
+Replace every node in the cluster, and rebuild every consuming repository, from
+one commit.
 
-**Every format version was reset to 1 and pinned there** under the policy in
-[Format versions are PINNED AT 1](#format-versions-are-pinned-at-1-until-the-first-production-release).
-The version numbers therefore do NOT record the break — the layouts changed
-underneath them, and both the old and the new binary stamp 1.
+#### Migration
 
-| What changed | Consequence |
+Two supported routes, in preference order:
+
+1. **Wipe and re-sync.** Rolling replacement per the procedure above, keeping
+   the sealed root key. Cheapest, and the only route if the shard is healthy.
+2. **Export under 0.4.x, import under 0.5.x.** Take `Host.ExportSnapshot` per
+   shard while still running 0.4.x, replace every binary, then
+   `Host.ImportSnapshot` onto empty data directories. Use this when the cluster
+   is being rebuilt wholesale, or when you need a restore point that outlives
+   the upgrade window.
+
+There is no third route. `waldb.Reencrypt` re-serializes every record and is the
+supported path for a **barrier** migration; it is not a format migration tool
+and it will not read 0.4.x records.
+
+### Version boundaries before `0.4.x`
+
+Recorded here only so an old directory's failure mode is identifiable. All of
+them are wipe-and-resync; none has a migration.
+
+| Boundary | Nature |
 |---|---|
-| `proto.WireVersion` pinned to 1; the transport layout changed | Old and new nodes exchange **no** usable Raft traffic, and the mismatch does not announce itself as a version error. Both ends must be replaced together. |
-| `Membership` layout: six maps including `RemovedIdentities`, session policy in the fixed region | An existing log, snapshot or WAL from an earlier commit does **not** replay. Wipe and re-sync. |
-| `waldb` membership section: same collapse to version 1, exact-match gate | Same. The read floor rose to the current 66-byte minimum, so a shorter section is a torn record. |
-| `Snapshot.Checksum` removed | Transport-layout change. Never computed, never verified — see the `proto.Snapshot` type doc. |
-| Write-side limits added | `Membership.MarshalTo` now refuses what its own decoder would reject (`ErrTooManyMembershipEntries`, `ErrAddressTooLong`) instead of producing a durable-but-unreadable bootstrap entry. |
+| `0.2.0-alpha` → `0.3.0-alpha` | Four on-disk formats changed. Symptoms: `ErrWALFormatMissing` (segments predate the marker), `ErrUnknownPayloadType`, and `ErrDecryptionFailed` on every read from the at-rest AAD binding change |
+| `0.3.0-alpha` → `0.3.1-alpha` | CI and test infrastructure only. **The one boundary in this project's history with no wipe** — same formats, same API, wire-interoperable |
+| `0.3.1-alpha` → `0.4.0-alpha` | Every format version pinned at 1, and the multi-version machinery removed. The `WALFORMAT` marker specifically went **2 → 1**, so a pre-0.4 WAL directory is refused with `*WALFormatVersionError` naming both. `proto.Membership` grew `RemovedIdentities`; `proto.ConfigChange` stopped being length-discriminated; `Snapshot.Checksum` removed |
+| `0.4.0-alpha` → `0.4.1-alpha` → `0.4.2-alpha` | Release-gate and CI repairs. No format change; upgrade in place |
 
-Two changes are **source-compatible but break at run time**, which is the
-dangerous shape — nothing fails to compile:
+Four `0.4.0-alpha` changes are **source-compatible but fail at run time**, which
+is the dangerous shape — nothing fails to compile. They still apply on any jump
+from 0.3.x:
 
 | Symptom | Meaning | Remedy |
 |---|---|---|
@@ -741,26 +873,48 @@ dangerous shape — nothing fails to compile:
 | `ErrSealedStateUnauthenticated` after a password change, rekey, key import or Shamir re-split | The embedder re-wrapped the root key itself. A `SealingStrategy` returns only the ciphertext and its own strategy fields, so the assembled blob carries no MAC — and an absent MAC is refused exactly like a stripped one. Not a migration problem: the blob was written by a current build. | Stamp before persisting. With the barrier unsealed, `(*Barrier).StampSealedStateMAC(sealed)`; when the root key is in hand but no barrier is unsealed yet (the import case), `StampSealedStateMACWithRootKey(rootKey, deploymentID, sealed)`. Stamp LAST — the MAC covers the ciphertext too. |
 | `ErrSessionsUnsupportedOnDisk` from a call that used to succeed | Client sessions on an `sm.DiskStateMachine` shard. They silently diverged the cluster before, because the session table lives only in the snapshot stream and an on-disk SM never takes the recover path on restart. | Use NO-OP sessions (`Host.GetNoOPSession`) and make the operations idempotent. |
 | `ErrKDFNotFIPSApproved` on unseal | An Argon2id-wrapped blob under FIPS mode; unsealing re-derives the same wrapping key. | Unseal once with FIPS **off**, re-seal with `NewSoftwareStrategyFIPS` (PBKDF2-SHA256), which unseals identically in either mode. |
-| Nonce tracking silently absent | `BarrierConfig.NonceTracking` is now `*bool`. As a plain `bool` its zero value meant "off"; as a pointer, nil means "use the default", which is **enabled**. | Nothing, unless you relied on the old zero-value behaviour. Disable deliberately with `BoolPtr(false)`; read the effective value with `GetNonceTracking()`. |
-
-Also source-breaking for embedders: `StopShard` and `Host.Close` now return
-errors they previously swallowed (`Close` reports a drain that timed out);
-`batch.EncodeBatch` returns `([]byte, error)`; and
-`proto.MaxChecksumLen` / `proto.ErrChecksumTooLong` are removed.
 
 ### Before upgrading
 
 - Read the `BREAKING` section of every CHANGELOG entry between your version and
   the target. Format breaks are recorded there and nowhere else.
-- Export a snapshot per shard (`Host.ExportSnapshot`) if you need a restore
-  point. `Host.ImportSnapshot` on a fresh disaster-recovery host requires
+- Export a snapshot per shard (`Host.ExportSnapshot(ctx, shardID, w)`) if you
+  need a restore point, **while still running the old version**.
+  `Host.ImportSnapshot` on a fresh disaster-recovery host requires
   `WithImportDataDir` — see [Deployment](deployment.md#disaster-recovery-importing-a-snapshot).
 - Verify the target version starts against an EMPTY data directory in staging
   first. A format break shows up at open time, not at first write.
+- Rebuild every consuming repository from the same commit. go-qrdb, go-xkms,
+  go-quicbaas and go-trusted-ca read and write these layouts too, and a repo
+  built against the old one produces bytes this build cannot parse while
+  stamping the same version number.
 
 ## Downgrades
 
-Not supported at any version boundary. The `snapshot.meta` magic and the WAL
-payload-type ladder both make a newer directory unreadable to an older binary,
-and neither fails in a way an operator can repair in place. Downgrading means
-wipe-and-restore from a backup taken on the older version.
+Not supported at any version boundary. Downgrading means wipe-and-restore from a
+backup taken on the older version.
+
+Two mechanisms make a current directory unreadable to an older binary, and
+neither fails in a way an operator can repair in place:
+
+- **`snapshot.meta`.** The magic-and-version prefix is read as corrupt by a
+  binary that predates it. That is fail-safe where it lands (it suppresses DEK
+  purging) but it is not a recovery.
+- **The WAL payload-type ladder.** An older binary meets a type byte it does not
+  know and fails closed.
+
+Everything else fails the way a downgrade always fails here: the older binary
+accepts the version numbers, misreads the layouts, and produces a corruption
+error from the record parser. Take the backup first.
+
+---
+
+## Cross-References
+
+- [Deployment](deployment.md) -- configuration reference, directory layout, disaster recovery
+- [Lifecycle](lifecycle.md) -- startup, crash recovery, WAL replay, shutdown ordering
+- [Wire format](../protocol/wire-format.md) -- byte-level layouts of every proto type
+- [WAL Persistence](../storage/wal.md) -- segment and chunk framing, the `WALFORMAT` marker
+- [Encryption](../security/encryption.md) -- barrier, epochs, sealed root key, AAD binding
+- [Key custody](../security/key-custody.md) -- sealing strategies and the Layer-1 boundary
+- [API reference](../api/reference.md) -- exported surface and error types

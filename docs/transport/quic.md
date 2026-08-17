@@ -2,35 +2,53 @@
 
 ## Overview
 
-QuicRaft uses QUIC exclusively for peer-to-peer communication. There is no
-TCP fallback. QUIC was chosen because it provides:
+QuicRaft uses QUIC exclusively for peer-to-peer communication. **There is no
+TCP fallback and no insecure mode**: `Config.Validate` refuses to build a
+transport without mTLS material, and every connection is mutually
+authenticated. The properties that made QUIC the right substrate:
 
-- **Built-in TLS 1.3**: every connection is encrypted, no bolt-on TLS wrapper
-- **Stream multiplexing**: thousands of Raft shards share a single UDP socket
-  without head-of-line blocking between shards
-- **0-RTT reconnection**: optional fast reconnect for trusted networks (disabled
-  by default due to replay risk per RFC 9001)
-- **Connection migration**: tolerates IP changes (container rescheduling)
+- **Built-in TLS 1.3.** Encryption is part of the connection, not a wrapper
+  around it, and the handshake carries the client certificate.
+- **Stream multiplexing.** Every shard on a host shares one UDP socket, and all
+  traffic to a given peer address shares one cached outbound connection whose
+  streams are keyed by shard. A large replication burst on one shard does not
+  head-of-line block another shard's heartbeats. (Each node dials the other
+  independently, so a healthy pair normally holds two connections, one in each
+  direction.)
+- **Session resumption.** The client config keeps a 256-entry LRU session cache,
+  so a reconnect costs one round trip instead of two.
+
+0-RTT exists as a config knob (`Enable0RTT`) but buys this library nothing and
+is off by default. 0-RTT data is replayable (RFC 9001 §8), the dial path uses
+`Dial` rather than `DialEarly` so this node never *sends* early data, and the
+receive path refuses any message frame or snapshot that arrived over 0-RTT.
+Turning it on only opens a replay surface for non-quicraft clients.
 
 The transport is implemented in `pkg/internal/transport/` as a concrete
-`QUICTransport` type (no interface -- single implementation, hot-path
-efficiency). The underlying QUIC library is quic-go.
+`QUICTransport` type. There is no `Transport` interface: the engine holds
+`*QUICTransport` directly, because there is one implementation and the send path
+is hot. The underlying QUIC library is
+[quic-go](https://github.com/quic-go/quic-go) **v0.59.1** (see `go.mod`).
 
 Source files:
 
-| File               | Responsibility                                 |
-|--------------------|------------------------------------------------|
-| `quic.go`          | QUICTransport struct, Start/Stop, Send/SendSnapshot |
-| `conn.go`          | Connection pool, dial, singleflight coalescing |
-| `recv.go`          | Accept loop, stream dispatch, message/snapshot handlers |
-| `frame.go`         | Frame wire format (header marshal/unmarshal)   |
-| `flags.go`         | FlagSnapshot constant                          |
-| `tls.go`           | mTLS certificate builder (`buildMTLSTLS`, `RequireAndVerifyClientCert`, no insecure fallback) |
-| `config.go`        | TransportConfig, defaults, validation          |
-| `handler.go`       | MessageHandler interface                       |
-| `snapshot_header.go`| SnapshotHeader wire format (48 bytes)         |
-| `snapshot_recv.go` | Snapshot receiver with rate limiting           |
-| `errors.go`        | Typed transport errors (DialError, FrameDecompressError, sentinels) |
+| File                  | Responsibility                                              |
+|-----------------------|-------------------------------------------------------------|
+| `quic.go`             | `QUICTransport` struct, Start/Stop, Send, send queues, SendSnapshot |
+| `conn.go`             | Connection pool, dial, stream pool, peer incarnations, certificate exclusivity |
+| `recv.go`             | Accept loop, stream dispatch, message-frame decode, peer identity |
+| `heartbeat.go`        | Pre-serialized heartbeat fast path                          |
+| `frame.go`            | Frame wire format, send-side framing admission (`sendableGroup`) |
+| `flags.go`            | `FlagSnapshot`, the one frame flag defined outside `frame.go` |
+| `tls.go`              | mTLS config builder (`buildMTLSTLS`), CA bundle parsing, revocation callback |
+| `revocation/`         | CRL/OCSP checker with hot reload and negative caching       |
+| `config.go`           | Internal `Config`, defaults, validation, metric label sets  |
+| `handler.go`          | `MessageHandler` and `PeerAuth`                             |
+| `snapshot_header.go`  | `SnapshotHeader` wire format (48 bytes, big-endian)         |
+| `snapshot_recv.go`    | Snapshot receiver: concurrency, memory, rate and liveness bounds |
+| `shutdown_tracker.go` | Lock-free in-flight counter that can reject new work atomically |
+| `errors.go`           | Typed transport errors and QUIC application error codes     |
+| `netfault_on.go` / `netfault_off.go` | Build-tagged (`quicraft_netfault`) partition injector; compiled away in normal builds |
 
 ## Connection Management
 
@@ -42,6 +60,7 @@ Source files:
 type QUICTransport struct {
     connMu    sync.RWMutex
     conns     map[string]*quic.Conn   // target address -> QUIC connection
+    connEpoch map[string]uint64       // target address -> peer boot epoch it was dialed under
     dialGroup singleflight.Group      // coalesce concurrent dials
     // ...
 }
@@ -49,41 +68,107 @@ type QUICTransport struct {
 
 Source: `pkg/internal/transport/conn.go`
 
+`conns` and `connEpoch` are written and deleted at exactly the same sites under
+`connMu`, so they never diverge. `connEpoch` is what makes restart detection
+complete; see [Rolling restart detection](#rolling-restart-detection) below.
+
 **Lookup (fast path)**: `RLock`, map lookup, verify `conn.Context()` is
-not done. If alive, return immediately.
+not done. If alive, return immediately. If done, the connection is removed and
+its pooled streams evicted before the dial.
 
 **Dial (slow path)**: `singleflight.Group` ensures only one goroutine dials
 a given target. Other callers block on the same flight and receive the
-shared result.
+shared result. The dial deadline is `dialTimeout` (5 s) and derives from
+`shutdownCtx`, so `Stop` unblocks it.
 
 ```
 getConnection(target)
     |-- RLock: check conns[target]
     |   |-- alive? return
-    |   |-- dead? removeConnection(target)
+    |   |-- dead? removeConnection + evictStreamsForTarget
     |-- dialGroup.Do(target, dialConnection)
     |   |-- net.ResolveUDPAddr
-    |   |-- net.SplitHostPort(target) -> host (fallback "localhost" if empty)
+    |   |-- net.SplitHostPort(target) -> host   (empty host => ErrEmptyDialHost)
+    |   |-- dialEpoch = knownPeerEpoch(target)  // captured BEFORE the dial
     |   |-- clientTLS.ServerName = host
     |   |-- quicTr.Dial(ctx, addr, clientTLS, quicCfg)
-    |   |-- Lock: conns[target] = conn
+    |   |-- Lock: re-check cache, then conns[target] = conn
+    |   |             connEpoch[target] = dialEpoch
+    |   |-- go preOpenHeartbeatStream(target, conn)
     |-- return conn
 ```
 
-**Extraction of server name:** `dialConnection` uses `net.SplitHostPort(target)`
-to extract the hostname, then sets `clientTLS.ServerName = host` for mTLS
-verification. If `SplitHostPort` fails (malformed target), a `DialError` is
-returned with diagnostic context. For targets without an explicit port, the
-hostname is extracted via fallback parsing.
+**Server name and the empty-host rule.** `dialConnection` extracts the host with
+`net.SplitHostPort(target)` and sets `clientTLS.ServerName = host`, which is what
+makes the peer's SANs load bearing. A malformed target returns a `DialError`.
+An *empty* host is refused with `ErrEmptyDialHost` rather than defaulted:
+verifying a peer certificate against an implicit `"localhost"` would mask a
+misconfigured address and silently fail SAN matching against real
+hostname or IP certificates.
 
-**Stale connection eviction:** A background goroutine (`connectionCleanup`)
-scans connections every 30 seconds and removes those whose `Context()` is done
-(closed by peer, idle timeout, or transport error). The same sweep reaps peer
-incarnation records (below) for addresses that have neither a cached outbound
-nor any traffic for `peerIncarnationRetention` (5 minutes), so the map cannot
-grow without bound across membership churn.
+**Dial race.** `singleflight` coalesces only overlapping dials. A dial that
+starts just after another completed reaches the insert with the cache already
+populated, so `dialConnection` re-checks under `connMu` and keeps the live
+winner, closing the loser with `QUICErrDuplicateDial`. Overwriting would leak
+the cached connection, which keep-alives would then hold open forever with its
+pre-opened streams diverging from the pool's bookkeeping.
 
-**Rolling restart detection:** Every `MessageBatch` carries the sender's
+**Background cleanup.** One goroutine (`connectionCleanup`) runs every
+`connectionCleanupInterval` (30 s) and performs four sweeps:
+
+- `cleanStaleConnections` drops pooled outbounds whose `Context()` is done,
+  evicts their streams, and fires `OnConnectionFailed` — all outside `connMu`,
+  because that lock is on every shard's send path and the listener callback is
+  user code of unbounded duration.
+- `reapPeerIncarnations` forgets a peer's incarnation record once the address has
+  had neither a cached outbound nor traffic for `peerIncarnationRetention`
+  (10 × the interval, so 5 minutes).
+- `revokeCheckConnections` re-runs the revocation verdict against every live
+  inbound and outbound leaf. `VerifyConnection` fires only at handshake, so
+  without this a certificate revoked after admission would keep its session for
+  the life of the process.
+- `reapIdleInboundConns` closes inbound connections that have carried no frame
+  for `inboundIdleRetention` (also 5 minutes). Nothing else can reclaim them:
+  this node's keep-alive (10 s) sits below `MaxIdleTimeout` (30 s), so QUIC's
+  idle timeout never fires on an accepted connection.
+
+The stamp used by the idle sweep is taken on every *frame*, not on stream
+acceptance. Senders cache and reuse one stream across bursts, so a connection
+carrying continuous replication traffic can accept no new stream for hours.
+
+A committed membership removal reaches both halves: `CloseTarget` tears down the
+outbound and `closeInboundFromPeer` closes every inbound whose verified leaf
+covers the removed address. Matching there is by **certificate**, not by remote
+address: a connection's remote address carries the peer's ephemeral source port,
+which never equals the Raft address a membership change names.
+
+### Connection close codes
+
+`CloseWithError` codes are what a peer sees when this node drops a connection.
+The reason *phrase* travels to the peer verbatim, so for the security verdicts
+it is redacted (`closeReasonRedacted`) and the detail is logged locally instead;
+the code stays distinct per verdict because that is the protocol contract.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0x1` | `QUICErrShutdown` | Graceful transport shutdown, or an outbound evicted as predating the peer's current incarnation |
+| `0x2` | `QUICErrConnLimitReached` | `MaxIncomingConnections` exhausted |
+| `0x3` | `QUICErrIPLimitReached` | `MaxConnectionsPerIP` exhausted |
+| `0x4` | `QUICErrDuplicateDial` | This dial lost a race; the cached connection is being reused |
+| `0x5` | `QUICErrPromiscuousCert` | The peer's leaf also covers this node's own host |
+| `0x6` | `QUICErrRevoked` | The peer's certificate is no longer admissible |
+| `0x7` | `QUICErrInboundIdle` | Reclaimed after `inboundIdleRetention` with no frames |
+| `0x8` | `QUICErrPeerRemoved` | A committed membership change removed this peer |
+
+Stream-level codes: `QUICStreamErrReceiverGone` (`0x1`) means this receiver has
+abandoned the stream, `QUICStreamErrShutdown` (`0x2`) cancels a snapshot write
+during shutdown, and `QUICStreamErrFrameRejected` (`0x3`) means the frame was
+unacceptable but the connection is fine — see
+[Failed write handling](#stream-pool-and-heartbeat-streams).
+
+### Rolling restart detection
+
+Every `MessageBatch` carries the sender's
 `SourceEpoch` — a per-process boot epoch — and every outbound records, in
 `connEpoch`, the epoch its target was believed to be running when it was
 dialed. On receive, `evictStaleOutboundOnRecv` evicts the cached outbound when
@@ -111,66 +196,103 @@ when the claimed target's host appears in the inbound connection's verified
 peer certificate. The dead-outbound branch is exempt — a spoofed batch cannot
 make our own outbound's context `Done`.
 
-**Connection liveness:** Before returning a cached connection, `getStream`
-fast-checks `conn.Context().Done()` to verify the connection is still alive.
-If done, the connection is removed and a fresh dial is triggered.
-
 ### Stream Pool and Heartbeat Streams
 
-Streams are pooled to reduce per-message overhead. The pool is sized with
-`StreamPoolSize` (default 16) and auto-scales up to `MaxStreamPoolSize` (256).
+Streams are pooled to reduce per-message overhead. The pool holds
+`StreamPoolSize` (default 16) indices per target. `MaxStreamPoolSize` (default
+256) is only the validation ceiling `StreamPoolSize` is checked against — **the
+pool does not auto-scale**, and nothing in the transport grows it at runtime.
 
-Stream index assignment:
+Stream index assignment (`streamIndexFor`):
 
-- **Heartbeats**: always use stream index 0 (persistent, low-latency priority path)
-- **Data messages**: `idx = (shardID % (poolSize - 1)) + 1`
+- **Heartbeats**: always stream index 0.
+- **Data messages**: `idx = (shardID % (poolSize - 1)) + 1`, or 0 when
+  `poolSize <= 1`.
 
-A per-target shard bucket (16 shards, power of two) is selected by
-`idx & (streamShardCount - 1)` to reduce mutex contention.
+The pool itself is sharded into `streamShardCount` (16, a power of two) buckets
+selected by `idx & (streamShardCount - 1)`, each with its own mutex, to reduce
+contention between concurrent senders.
 
-**Persistent heartbeat streams:** Stream 0 is pre-opened and kept alive for
-the lifetime of the connection. This eliminates the OpenStreamSync overhead
-for heartbeats, enabling low-latency heartbeat delivery (critical for leader
-election latency).
+**Persistent heartbeat streams.** Stream 0 is pre-opened by a goroutine spawned
+from the dial path (`preOpenHeartbeatStream`, 5 s deadline) and kept for the
+life of the connection, keeping `OpenStreamSync` off the heartbeat and ReadIndex
+critical path. Failure to pre-open is non-fatal; the first heartbeat opens it
+lazily.
 
-Stream acquisition uses double-checked locking:
+**Streams are judged by their owning connection, not the cached one.** Each
+shard bucket keeps an `owners` map alongside `streams`, recording the
+`*quic.Conn` each pooled stream was opened on. In the peer-restart window a
+delayed pre-open can store a stream opened on a now-closed connection while a
+fresh one is already cached for the same target. Comparing against the cached
+connection alone would hand out that dead stream, the write would fail, and the
+failure path would then tear down the *healthy* connection.
 
-1. `RLock` -- check pool for stream
-2. If miss: get connection, `OpenStreamSync`, `Lock`, double-check, store
+`cachedStream` therefore resolves three cases:
 
-**Failed write handling:** On `Write` or `SetWriteDeadline` failure, the
-entire connection (all streams and the connection itself) is evicted via
-`evictStreamsForTarget()`. This ensures no stale streams remain after a
-connection drops. The next send attempt dials a fresh connection and opens
-new streams.
+| Owner state | Action |
+|-------------|--------|
+| Owner is the cached conn and alive | Return the stream (after re-checking it is still the cached entry) |
+| Owner is the cached conn and dead | Evict the connection and all its streams; redial |
+| Owner is some other conn, or none is cached | Evict just that stream; the slow path opens a fresh one on the current connection |
+
+**Failed write handling.** A `SetWriteDeadline` or `Write` failure evicts the
+whole connection and all its streams (`removeAndCloseConnection` +
+`evictStreamsForTarget`), so the next send dials fresh. The one exception is a
+stream reset carrying `QUICStreamErrFrameRejected`: the peer's decoder refused
+the frame, which proves the connection is alive, so only the batch is dropped
+and only that stream is replaced (`evictStream`). Treating it as a dead
+connection is what turns one unacceptable batch into a dial storm.
 
 ### QUIC Configuration
 
-Source: `pkg/internal/transport/quic.go`
+Source: `pkg/internal/transport/quic.go`, `NewQUICTransport`
 
 ```go
-quicCfg := &quic.Config{
+qcfg := &quic.Config{
     MaxIdleTimeout:             30 * time.Second,
     HandshakeIdleTimeout:       5 * time.Second,
-    MaxIncomingStreams:         int64(maxIncomingStreams), // see below
-    MaxIncomingUniStreams:      -1,         // disabled
+    MaxIncomingStreams:         int64(maxIncomingStreams), // derived, see below
+    MaxIncomingUniStreams:      -1,                        // disabled
     KeepAlivePeriod:            10 * time.Second,
-    InitialStreamReceiveWindow: 2 << 20,    // 2 MB
-    MaxStreamReceiveWindow:     8 << 20,    // 8 MB
-    MaxConnectionReceiveWindow: 32 << 20,   // 32 MB
-    Allow0RTT:                  cfg.Enable0RTT,
+    InitialStreamReceiveWindow: initialStreamReceiveWindow, // 2 MB
+    MaxStreamReceiveWindow:     maxStreamReceiveWindow,     // 8 MB
+    MaxConnectionReceiveWindow: connectionReceiveWindow(
+        cfg.MaxMessageReceiveMemory, cfg.MaxIncomingConnections), // derived
+    Allow0RTT: cfg.Enable0RTT,
 }
 ```
 
-`MaxIncomingStreams` is not a fixed constant. It is computed in
-`NewQUICTransport` as `MaxStreamsPerConnection + MaxConcurrentSnapshotRecv`,
-with a floor of `StreamPoolSize + snapshotStreamHeadroom` (4), so the
-advertised incoming-stream budget matches the receiver's combined data +
-snapshot processing capacity (see [Stream Isolation](#stream-isolation-data-vs-snapshot)).
+Two of these are derived rather than constant.
 
-**UDP buffer tuning:** The transport exposes `UDPRecvBufSize` and `UDPSendBufSize`
-configuration (default 7 MB each) to allow platforms with high throughput to
-tune kernel socket buffers. These are applied to the listener socket.
+`MaxIncomingStreams` is `MaxStreamsPerConnection + MaxConcurrentSnapshotRecv`,
+floored at `StreamPoolSize + snapshotStreamHeadroom` (4). Snapshot streams are
+charged to a separate semaphore for the duration of their transfer, so the
+advertised budget has to cover both; the floor stops an operator who raises
+`StreamPoolSize` from starving a peer's snapshot stream on flow control. (An
+earlier hardcoded 4096 advertised far more streams than the receiver could
+service.) See [Stream Isolation](#stream-isolation-data-vs-snapshot).
+
+`MaxConnectionReceiveWindow` is `MaxMessageReceiveMemory / MaxIncomingConnections`,
+floored at the 8 MB per-stream window and capped at 32 MB. quic-go buffers bytes
+before the application reads them, so a window fixed independently of the
+application budget multiplies by `MaxIncomingConnections` into memory that
+budget does not cover — 32 MB × 256 connections is 8 GB against a 256 MB budget.
+The floor means the QUIC-level footprint is not strictly inside the budget for
+small budgets; it is bounded and documented rather than silently unbounded.
+
+A receive window also caps a connection at `window / RTT`. At the defaults the
+derivation floors at 8 MB, which sustains roughly 134 Gbps at a 0.5 ms same-AZ
+RTT but caps a 10 Gbps path beyond about 6.7 ms RTT. Cross-region deployments on
+10 GbE or faster should raise `MaxMessageReceiveMemory` (or lower
+`MaxIncomingConnections`) to widen the window.
+
+**UDP buffer tuning.** `Start` sets `SO_REUSEADDR`, `SO_RCVBUF`
+(`UDPRecvBufSize`, default 7 MB) and `SO_SNDBUF` (`UDPSendBufSize`, default
+7 MB) on the listening socket through a `net.ListenConfig` control function. A
+`setsockopt` failure is logged at WARN naming `net.core.rmem_max` /
+`net.core.wmem_max` rather than failing startup, so a host with tight sysctls
+runs with the OS default instead of refusing to boot. Setting either to 0 skips
+the call.
 
 ## Send Path
 
@@ -182,9 +304,10 @@ Engine Step Worker
     |  sender.Send(msgs []proto.Message)
     v
 QUICTransport.Send()
-    |-- for each msg: deep-copy entries (break alias with reusable proposeBuf)
-    |-- addr = registry.Resolve(msg.ShardID, msg.To)
-    |-- enqueueToTarget(addr, msg)               // non-blocking enqueue
+    |-- for each msg: deep-copy entries + snapshot membership maps
+    |   (break alias with the step worker's reusable proposeBuf)
+    |-- addr = registry.Resolve(msg.ShardID, msg.To)   // miss => drop, "unresolved_target"
+    |-- enqueueToTarget(addr, msg)                     // non-blocking enqueue
     v
 sendQueue (per target: data channel cap 2048 + heartbeat channel cap 64)
     |
@@ -192,39 +315,88 @@ sendQueue (per target: data channel cap 2048 + heartbeat channel cap 64)
 sendQueueWorker
     |-- read first message, then drain buffered messages into a batch
     |   (heartbeats drained before data; up to 16 hb / 256 data per batch)
-    |-- sendBatch(target, msgs)
-        |-- build MessageBatch{BinVer, DeploymentID, SourceAddress, Requests}
-        |-- bufPtr = getBuf(size + FrameHeaderSize)  // sync.Pool
-        |-- mb.MarshalTo(payloadBuf)                 // serialize into pooled buffer
-        |-- optionally: compress with Snappy (unless DisableCompression)
-        |-- MarshalFrame(buf, payload, flags)        // prepend frame header
-        |-- stream = getStream(target, shardID, isHeartbeat)
-        |-- stream.SetWriteDeadline(now + 2s)
-        |-- stream.Write(buf[:frameSize])
-        |-- putBuf(bufPtr)                           // return to pool
+    |-- sendToTarget: heartbeat-only batch -> sendHeartbeatBatch (fast path)
+    |                 otherwise            -> sendBatch
+    v
+sendBatch(target, msgs)
+    |-- loop: sendableGroup(headerSize, msgs) -> how many fit ONE frame
+    |   |-- msgs[0] unframeable? drop it ("unsendable"), continue
+    |   |-- sendFrame(target, msgs[:n], payloadSize)
+    v
+sendFrame
+    |-- build MessageBatch{BinVer, DeploymentID, SourceEpoch, SourceAddress, Requests}
+    |-- bufPtr = getBuf(size + FrameHeaderSize)   // sync.Pool
+    |-- mb.MarshalTo(payloadBuf)
+    |-- non-heartbeat && !DisableCompression: Snappy encode; keep only if smaller
+    |-- MarshalFrame(buf, payload, flags)         // prepend the 8-byte header
+    |-- stream = getStream(target, shardID, isHeartbeat)
+    |-- stream.SetWriteDeadline(now + sendWriteDeadline)   // 2s
+    |-- stream.Write(buf[:frameSize])
+    |-- putBuf(bufPtr)
 ```
 
 Key properties:
 
-- **Non-blocking enqueue**: `Send` only deep-copies entries and enqueues onto
-  the per-target `sendQueue` channel; it never dials, opens streams, or writes.
-  This keeps the engine step worker from stalling on transport I/O.
-- **Best-effort drop on full**: if a target's channel is full, the message is
-  dropped (a backpressure event is logged) and Raft retransmits it on the next
-  heartbeat/replicate cycle.
-- **Per-target send queues**: each target address has its own buffered queue and
-  a dedicated background `sendQueueWorker` that batches and delivers messages.
-  Slow targets cannot block sends to fast targets.
-- **Target batching**: a worker drains all buffered messages for its target into
-  one `MessageBatch`/frame before writing.
-- **Buffer pooling**: `sync.Pool` with initial capacity `SendBatchMaxSize + FrameHeaderSize`.
-  Buffers exceeding a threshold are not returned to the pool.
-- **Compression**: Snappy compression is applied by default. Disable via
-  `config.TransportConfig.DisableCompression` for CPU-constrained environments.
-- **Heartbeat priority**: heartbeats use stream index 0 (persistent pre-opened stream),
-  separate from data streams, enabling low-latency leader heartbeats.
-- **Write deadline**: 2-second deadline per stream write. On failure, the entire
-  connection and all its streams are evicted; the next send dials fresh.
+- **Non-blocking enqueue.** `Send` deep-copies and enqueues; it never dials,
+  opens streams, or writes. The step worker cannot stall on transport I/O.
+- **Deep copy is not optional.** `Entry.Cmd` aliases the step worker's reusable
+  `proposeBuf`, and `proto.Snapshot` embeds `Membership`'s six maps, which
+  `MarshalTo` ranges over on the async send path. A caller mutating those in
+  place would be an unrecoverable "concurrent map iteration and map write" fatal
+  error that the worker's `recover` cannot catch.
+- **Best-effort drop on full.** A full channel drops the message, counts
+  `queue_full`, and Raft retransmits on the next heartbeat or replicate cycle.
+- **Per-target send queues.** Each target address gets its own buffered queue and
+  a dedicated `sendQueueWorker`, so a slow target cannot block a fast one.
+- **A batch is a coalescing artifact, never all-or-nothing.** Messages whose
+  combined marshaled size exceeds `MaxFrameSize` are split across consecutive
+  frames on the same ordered stream rather than dropped together.
+- **Unsendable messages are dropped before the write.** A message with more than
+  `proto.MaxEntriesPerMessage` (10000) entries, or larger on its own than a
+  frame, is refused by `sendBatch` and logged at ERROR with the drop reason
+  `unsendable`. Writing it would make the peer's decoder reset the stream, which
+  the sender can only read as an I/O failure, so the identical batch would be
+  retried forever. See [Replication payload sizing](#replication-payload-sizing).
+- **Buffer pooling.** `sync.Pool` with initial capacity
+  `SendBatchMaxSize + FrameHeaderSize`; buffers above `maxPoolBufSize` (256 KB)
+  are left for GC. A separate pool recycles Snappy encode destinations.
+- **Compression.** Snappy is applied to non-heartbeat frames by default, and the
+  compressed payload is kept only when it is actually smaller. Heartbeats skip
+  it (under 200 bytes, where Snappy costs more latency than it saves).
+  `TransportConfig.DisableCompression` turns it off entirely.
+- **Heartbeat fast path.** A heartbeat-only batch uses `sendHeartbeatBatch`,
+  which writes through a `MessageBatch` header prefix pre-serialized once in
+  `Start` (`BinVer`, `DeploymentID`, `SourceEpoch`, `SourceAddress`), computes
+  the frame size from the constant `proto.HeartbeatMessageSize` (100 bytes), and
+  skips compression. The wire result is an ordinary `FlagNone` frame.
+- **Write deadline.** `sendWriteDeadline` is 2 s, kept short so a peer restart is
+  detected quickly instead of stalling replication.
+
+### Replication payload sizing
+
+`MaxReplicationPayloadBytes` (`pkg/internal/transport/frame.go`) is the largest
+raw entry payload one replication batch may carry and still fit a frame:
+
+```
+MaxFrameSize - FrameHeaderSize - batchFramingReserve
+  = 16777216  - 8               - 65536
+  = 16711672 bytes (~15.94 MB)
+```
+
+Raft's `maxReplicationPayload` is `Config.MaxApplyEntrySize`, whose default is
+this constant (`config.DefaultMaxApplyEntrySize`), and `config.Validate` rejects
+any larger value with `*MaxApplyEntrySizeExceededError`. `pkg/config` carries a
+duplicate of the constant with a compile-time assertion that fails the build if
+the two ever drift, because `pkg/internal/transport` imports `pkg/config` and
+the dependency cannot go the other way.
+
+The clamp is load bearing. An oversized message is dropped by the send path,
+raft does not advance the follower's next index, so it rebuilds the identical
+oversized message on every replicate cycle and the follower never catches up —
+no backoff, no batch-size reduction, and no snapshot fallback, because the
+entries are still present. `proto.MaxEntriesPerMessage` is the other half of the
+same contract: a byte-bounded batch of tiny entries can still exceed the
+decoder's entry-count limit with the same outcome.
 
 ### Per-Target Send Queues and Idle Pruning
 
@@ -259,22 +431,73 @@ channel.
 
 ### Snapshot Send
 
-Source: `pkg/internal/transport/quic.go`, `SendSnapshot()`
+Source: `pkg/internal/transport/quic.go`, `SendSnapshot` and
+`SendSnapshotStreaming`
 
-Snapshots are streamed over QUIC using a dedicated bidirectional stream
-(not the pooled message streams):
+Snapshots use a dedicated bidirectional stream, never the pooled message
+streams:
 
-1. Resolve target address from registry
-2. Get connection to target
-3. `conn.OpenStreamSync` -- fresh bidirectional stream
-4. Write `SnapshotHeader` (48 bytes) as first frame with `FlagSnapshot` set
-5. Write each `SnapshotChunk` as a subsequent frame
-6. Await receiver acknowledgment before closing the stream
+1. `snapshotTracker.TryAdd()` — refused with `ErrStreamClosed` once `Stop` has
+   begun, which is what lets shutdown wait for in-flight transfers without a
+   `WaitGroup.Add`/`Wait` race.
+2. Resolve the target address from the registry.
+3. Get (or dial) the connection.
+4. `conn.OpenStreamSync` on a context derived from `shutdownCtx` with a 60 s
+   timeout covering the stream handshake.
+5. Write the 48-byte `SnapshotHeader` as the first frame, **with `FlagSnapshot`
+   set**. This flag is what routes the stream to the snapshot handler.
+6. Write each `SnapshotChunk` as a subsequent frame with `FlagNone`. Only the
+   header frame carries `FlagSnapshot`.
+7. Close the stream (deferred).
 
-The sender enforces a write deadline to prevent hanging on unresponsive receivers.
-Snapshots may be interrupted if the receiver fails to acknowledge chunks within
-the deadline, freeing the stream and allowing the step worker to retry the
-InstallSnapshot message.
+**There is no in-stream acknowledgment.** The sender writes the chunks and
+closes; it does not wait for the receiver to confirm them. Delivery is confirmed
+at the raft layer instead, through the `SnapshotStatus` path described in
+[Snapshot transfer sequencing](#snapshot-transfer-sequencing).
+
+**Deadlines.** Every chunk write is preceded by
+`SetWriteDeadline(now + snapshotChunkWriteDeadline)` (30 s), far longer than the
+2 s message deadline because a chunk can be megabytes. Without it a stalled
+`WriteFrame` would hold a `snapshotTracker` slot and make `Stop` hang forever.
+
+**Shutdown interlock.** `cancelSnapshotWriteOnStop` arms a watcher that calls
+`stream.CancelWrite` when `stopC` closes, so `Stop` does not wait out a 30 s
+per-chunk deadline. The returned release func is idempotent and disarms under a
+mutex, and both send paths call it **explicitly after the last chunk, before any
+success bookkeeping**. Without that ordering, a `close(stopC)` landing between
+the final write and the deferred release would let the watcher reset a stream
+that already carried the whole snapshot — discarding the peer's buffered data
+while the sender reported `OnSnapshotSent` and incremented `IncSnapshotsSent`.
+
+**Streaming variant.** `SendSnapshotStreaming(meta, produce)` takes a
+`SnapshotChunkProducer` that emits chunks one at a time through a callback, so
+at most one chunk (typically 2 MB) is resident regardless of snapshot size.
+`SendSnapshot`, which takes a fully materialized `[]proto.SnapshotChunk`, is the
+older form and requires the whole snapshot in memory.
+
+**Confidentiality in transit** comes from QUIC's mandatory TLS 1.3 plus mTLS.
+There is no application-layer encryption of chunk payloads on top of it. At-rest
+snapshot encryption is the barrier's job; see
+[Encryption](../security/encryption.md).
+
+### Snapshot transfer sequencing
+
+`msg.Hint` on an `InstallSnapshot` message carries `raft.snapshotSeq`, a
+monotonically increasing counter local to the sending raft instance, stamped by
+`sendSnapshot` and recorded on the remote's `snapshotSeq` by
+`becomeSnapshot`. It is a **transfer sequence number, not a log index**.
+
+When the `SnapshotStatus` comes back, raft accepts it only when
+`rm.state == remoteSnapshot && msg.Hint == rm.snapshotSeq`; anything else is a
+status for a superseded attempt and is discarded. That is what disambiguates
+re-sends of the same snapshot *index*, which are otherwise indistinguishable.
+
+`deliverSnapshotControl` (`pkg/messagehandler.go`) retries one-shot snapshot
+control messages `snapshotCtrlDeliverAttempts` (5) times with a
+`snapshotCtrlDeliverBackoff` (100 ms) pause, because these messages have no
+protocol-level retransmission: a dropped status leaves the leader's remote
+paused in snapshot state with no ack countdown armed. Full state-machine detail
+lives in [Raft Protocol](../raft/protocol.md).
 
 ## Receive Path
 
@@ -286,54 +509,98 @@ QUIC Listener
     v
 acceptLoop()  [scoped by shutdownCtx]
     |-- sem = make(chan struct{}, MaxIncomingConnections)
-    |-- listener.Accept() -> conn
-    |-- sem acquire (block if at limit)
+    |-- listener.Accept(shutdownCtx) -> conn
+    |-- ipTracker.tryAcquire(ip)                  // MaxConnectionsPerIP
+    |-- refuseInboundPromiscuousCert(conn)        // peer cert must not cover US
+    |-- sem acquire (NON-blocking; refuse at limit)
     |-- go handleConnection(conn)
     v
 handleConnection(conn)  [scoped by conn.Context()]
+    |-- acquirePeerMsgBudgetRef(conn)             // per-PEER receive sub-budget
+    |-- inboundConns.Store(conn, &inboundConnState{})  // reclaim policies
     |-- streamSem = make(chan struct{}, MaxStreamsPerConnection)   // data streams
     |-- snapSem   = make(chan struct{}, MaxConcurrentSnapshotRecv) // snapshot streams
-    |-- loop: conn.AcceptStream() -> stream
-    |-- streamSem acquire (block if at data-stream limit)
-    |-- go handleStream(stream, streamSem, snapSem)
+    |-- loop: conn.AcceptStream(connCtx) -> stream
+    |-- streamSem acquire (or connCtx done)
+    |-- go handleStream(conn, stream, activity, streamSem, snapSem)
     v
-handleStream(stream, streamSem, snapSem)
+handleStream(...)
     |-- loop:
-    |   |-- stream.SetReadDeadline(now + 30s)
-    |   |-- ReadFrameHeader(stream) -> (length, flags)   // streamSem held
+    |   |-- readFrameHeaderResilient(idleTimeout=30s, activeTimeout=30s)
+    |   |     |-- clean idle boundary on a LIVE conn -> errStreamIdle, keep stream
+    |   |     |-- partial header -> finish under the active deadline
+    |   |-- activity.touch(now)              // stamps the connection as live
     |   |-- if flags & FlagSnapshot:
-    |   |       release streamSem; acquire snapSem (non-blocking)
+    |   |       handoffToSnapSem: release streamSem, non-blocking acquire snapSem
     |   |       handleSnapshotStream, return
-    |   |-- handleMessageFrame(stream, length)
+    |   |-- if conn.ConnectionState().Used0RTT: refuse (replayable), return
+    |   |-- handleMessageFrame(conn, stream, length, flags)
     v
-handleMessageFrame(stream, length)
-    |-- buf = getRecvBuf(length)            // sync.Pool
+handleMessageFrame(...)
+    |-- reserveMsgRecvBudget(length)         // aggregate MaxMessageReceiveMemory
+    |-- reserveConnMsgRecvBudget(conn, length)  // per-peer sub-budget
+    |-- buf = getRecvBuf(length)             // sync.Pool
     |-- io.ReadFull(stream, payload)
-    |-- optionally: decompress if FlagCompressed set
-    |-- batch.UnmarshalFrom(payload)
-    |-- validate DeploymentID (cross-cluster rejection)
-    |-- validate message count <= 10000
-    |
-    |-- ** CRITICAL: Entry.Cmd copy for buffer safety **
-    |-- for each msg.Entries[j].Cmd:
-    |       cp = make([]byte, len(cmd))
-    |       copy(cp, cmd)                   // break zero-copy alias
-    |       entry.Cmd = cp
-    |
-    |-- putRecvBuf(buf)                     // return to pool
-    |-- handler.HandleMessage(batch)
+    |-- if FlagCompressed: bound declared size, charge the delta, Snappy decode
+    |-- batch.UnmarshalFrom(payload)         // pooled *proto.MessageBatch
+    |-- reject any msg with ShardID == 0
+    |-- validate DeploymentID               // cross-deployment rejection, FIRST
+    |-- clear SourceAddress unless the peer cert covers it
+    |-- evictStaleOutboundOnRecv(SourceAddress, SourceEpoch, conn)
+    |-- validate message count <= proto.MaxMessagesPerBatch
+    |-- bulk-copy every Entry.Cmd out of the pooled buffer (ONE allocation)
+    |-- putRecvBuf(buf); return the Snappy buffer
+    |-- handler.HandleMessage(batch, PeerAuth{Identity, AuthorizesAddress})
     v
 hostMessageHandler.HandleMessage()
-    |-- for each msg in batch.Requests:
-    |       engine.DeliverMessage(msg.ShardID, msg)
-    |       engine.NotifyWork(msg.ShardID)
+    |-- bind msg.From to the peer's committed identity (or address)
+    |-- engine.DeliverMessage(msg.ShardID, msg); engine.NotifyWork(msg.ShardID)
 ```
 
-**Connection limits:** `acceptLoop` enforces `MaxIncomingConnections` (default 256)
-via a semaphore and a per-IP connection limit (`MaxConnectionsPerIP`, default 16)
-via an `ipConnTracker`. If the global limit is reached the connection is rejected
-with `QUICErrConnLimitReached`; if the per-IP limit is reached it is rejected with
+**Connection limits.** `acceptLoop` enforces `MaxIncomingConnections` (default
+256) via a semaphore and `MaxConnectionsPerIP` (default 16) via an
+`ipConnTracker`. Both acquisitions are non-blocking: at the global limit the
+connection is closed with `QUICErrConnLimitReached`, at the per-IP limit with
 `QUICErrIPLimitReached`.
+
+**Idle streams are kept open on purpose.** `StreamReadIdleTimeout` (30 s) bounds
+how long a read waits *at a clean frame boundary* before re-checking the
+connection's liveness — it is not a stream lifetime. A sender caches and reuses
+one stream across bursts, so abandoning an idle stream on a live connection puts
+the leader back to writing into a stream nobody drains: proposals stop
+committing and never self-heal. Only a dead connection or a half-delivered frame
+stalling past `frameReadActiveTimeout` (30 s) ends a stream. The cost is that
+each accepted stream pins one goroutine and one `MaxStreamsPerConnection` slot
+until its connection closes, bounding worst-case goroutines from authenticated
+peers at `MaxIncomingConnections × MaxStreamsPerConnection` (65536 at the
+defaults).
+
+**Frame rejection keeps the connection.** When a frame is refused for a protocol
+violation the stream is abandoned with `QUICStreamErrFrameRejected` as the
+STOP_SENDING code, so the peer can tell "your frame was unacceptable" from "this
+receiver is gone" and drop only the batch. `stream.CancelRead` is called on
+every exit path because quic-go's `stream.Close` closes the send direction only;
+leaving the receive direction open would black-hole up to
+`MaxStreamReceiveWindow` of the peer's traffic while its `sendBatch` reported
+success.
+
+**Receive-budget exhaustion is transient.** `handleMessageFrame` drains the frame
+body and returns `ErrMessageRecvMemoryBudgetExceeded`, and `handleStream`
+*continues* rather than tearing the stream down. Tearing it down would fail the
+peer's next write, evict the whole connection, and turn one peer's burst into
+cluster-wide connection churn for every other peer sharing the budget.
+
+**Peer-driven logs are sampled.** Every warning reachable from the receive path
+is triggerable at frame rate by one authenticated peer, and slog's default
+handler writes synchronously to stderr under a single mutex — an unsampled line
+there puts a write syscall on the raft receive path and serializes every other
+log call in the process behind it. Each is gated by `logSampled` at
+`protocolViolationLogInterval` (10 s) and paired with an unconditional counter
+(`recvBudgetDrops`, `zeroShardDrops`, `spoofedSourceClears`,
+`snapshotStreamDrops`, `zeroRTTRefusals`, `peerFrameRejections`) so the sampled
+line can carry the true total. The rate-limit stamps are per transport instance,
+not package-global: many transports run in one process during tests and
+in-process multi-node deployments.
 
 **Accept-loop resilience:** Each accept iteration runs inside a deferred panic
 recovery boundary (`acceptLoopIteration`). A recovered panic is logged with a
@@ -372,30 +639,83 @@ raises `StreamPoolSize` cannot starve a peer's snapshot stream on QUIC flow
 control. (The previous hardcoded limit of 4096 advertised far more streams than
 the receiver could actually service.)
 
+### Receive Memory Budgets
+
+A frame's buffer is allocated from its *declared* length before the body is
+read, so without an aggregate cap an authenticated peer can open many streams
+that each declare `MaxFrameSize` and withhold the body, pinning 16 MB per stream
+until the read deadline. Two budgets bound that:
+
+- **`msgRecvBudget`** is the host-wide `MaxMessageReceiveMemory` (default
+  256 MB). A frame reserves its length before allocating and releases on
+  dispatch.
+- **`connMsgBudget`** is a per-peer sub-budget capped at `maxConnMsgRecv`
+  (`MaxMessageReceiveMemory / 4`, floored at one maximum frame plus its
+  decompression delta so a legal frame always fits).
+
+The sub-budget is keyed on the peer's **authenticated node identity**, not on
+`*quic.Conn`. Keying it on the connection did not achieve what its name said:
+`MaxConnectionsPerIP` is 16, so one peer opened four connections, saturated four
+separate sub-budgets, drove the global budget to zero, and every other peer's
+frames were silently dropped. Reproduced with 16 streams and 128 bytes of
+traffic, since the frame header alone reserves the declared length. Entries are
+refcounted by live connection and removed when the last one closes.
+
+Compression is charged honestly. Snappy reaches ratios above 1000:1, so a
+compressed frame reserves the compressed length up front and then reserves the
+**positive delta to the declared decompressed length** before decoding, with
+balanced deferred releases on every exit path. Charging only the compressed
+length would defeat the aggregate budget entirely.
+
 ### Entry.Cmd Buffer Safety
 
-`Entry.UnmarshalFrom` uses zero-copy: `Cmd` aliases the source buffer.
-The receive buffer is pooled and reused. If `Cmd` slices were passed to
-the engine without copying, the step worker would read stale/overwritten
-data when it processes the inbox later.
+`Entry.UnmarshalFrom` is zero-copy: `Cmd` aliases the source buffer. The receive
+buffer is pooled and recycled while the step worker still reads those fields
+asynchronously, so any alias left behind would be read after the buffer had been
+handed to another frame.
 
-The receive path copies every `Entry.Cmd` before returning the buffer to
-the pool:
+The receive path detaches every `Cmd` into **one bulk allocation** before
+returning the buffer, reducing N allocations per frame to 1:
 
 ```go
+totalCmdBytes := 0
 for i := range batch.Requests {
     for j := range batch.Requests[i].Entries {
-        cmd := batch.Requests[i].Entries[j].Cmd
-        if len(cmd) > 0 {
-            cp := make([]byte, len(cmd))
-            copy(cp, cmd)
-            batch.Requests[i].Entries[j].Cmd = cp
+        totalCmdBytes += len(batch.Requests[i].Entries[j].Cmd)
+    }
+}
+if totalCmdBytes > 0 {
+    bulk := make([]byte, totalCmdBytes)
+    off := 0
+    for i := range batch.Requests {
+        for j := range batch.Requests[i].Entries {
+            cmd := batch.Requests[i].Entries[j].Cmd
+            if len(cmd) > 0 {
+                copy(bulk[off:], cmd)
+                batch.Requests[i].Entries[j].Cmd = bulk[off : off+len(cmd) : off+len(cmd)]
+                off += len(cmd)
+            }
         }
     }
 }
 ```
 
+`Cmd` is now the only such alias on a decoded `Message`. `Snapshot.Filepath` and
+every membership map own their storage already (their decoders copy), and
+`Snapshot.Checksum` — the other former alias — was removed from the wire format
+in an earlier pre-release layout change.
+
 Source: `pkg/internal/transport/recv.go`, `handleMessageFrame()`
+
+The same reasoning governs the read side that feeds `sendAppend`.
+`LogReader.protoEntryBuf` (`pkg/logdb/reader.go`) is retained by `GetRange`'s
+caller past the lock, and sharing it across the four goroutines that could reach
+the reader was a live data race. It is now confined to the single goroutine that
+owns `GetRange` — the step worker on a running shard, and `StartShard` before
+that worker exists, which never overlap. Every other reader takes a separate
+path: `termLocked` has its own `termLogdbBuf`/`termProtoBuf` and never retains a
+result, and `GetRangeCopy` copies under the lock into a private buffer. See
+[Engine Pipeline](../engine/pipeline.md) and [WAL Storage](../storage/wal.md).
 
 ### Snapshot Receive
 
@@ -415,18 +735,63 @@ type SnapshotHeader struct {
 }
 ```
 
+All six fields are big-endian. `Epoch` is the barrier encryption epoch the
+snapshot was saved under (0 means plaintext); the receiver persists it to LogDB
+so recovery can decrypt, and registers it with the barrier's `EpochTracker`
+while the transfer is in flight so the key is not purged underneath it.
+
 Source: `pkg/internal/transport/snapshot_header.go`
 
-The `snapshotReceiver` enforces concurrency and resource limits:
+The `snapshotReceiver` enforces host-wide limits:
 
-- **MaxConcurrentSnapshotReceives** (default 4): Maximum parallel snapshot
-  downloads. New requests block until an in-flight receive completes.
-- **MaxSnapshotReceiveMemory** (default 1 GB): Total memory budget for all
-  in-flight snapshot chunks. As chunks arrive, they consume budget; stale
-  chunks free budget when discarded.
-- **MaxSnapshotReceiveRate** (default 256 MB/s): Bandwidth throttling per
-  receiver. The receive loop paces chunk reads by sleeping proportional to each
-  chunk's size (`rateLimitChunkSleep`).
+- **MaxConcurrentSnapshotReceives** (default 4): parallel inbound transfers,
+  across every peer.
+- **MaxSnapshotReceiveMemory** (default 1 GB): total in-flight chunk memory.
+  A chunk is charged its frame length *plus* its retained
+  `proto.SnapshotChunk` struct, because `receiveChunks` accumulates every
+  accepted chunk for the whole transfer — charging the frame length alone
+  under-counted residency by roughly 2.6x for minimum-size chunks and let
+  concurrent transfers hold multiples of the configured budget.
+- **MaxSnapshotReceiveRate** (default 256 MB/s): the receive loop paces chunk
+  reads by sleeping proportional to each chunk's size (`rateLimitChunkSleep`).
+
+...and per-peer sub-limits on top of them, because a host-global semaphore and
+budget are both holdable in full by one peer, after which every legitimate
+snapshot to a recovering follower is dropped and the shard cannot restore
+quorum:
+
+- `maxPerPeer` = `ceil(MaxConcurrentSnapshotRecv / 2)` concurrent transfers.
+- `maxPerPeerMemory`, derived from the global budget in the same proportion
+  (`perPeerSnapshotMemory`), floored so one maximum-size legal chunk always
+  fits and clamped to the global budget. Without it a peer entitled to two of
+  four slots could still charge the *whole* budget against either one.
+
+Both are keyed on `snapshotFairnessKey`, derived from the peer's authenticated
+certificate rather than from anything the peer picks per connection. Keying a
+fairness limit on an `ip:port` makes it a formality.
+
+**Whole-transfer liveness.** The per-frame read deadline is reset every
+iteration, so on its own it bounds nothing: a peer emitting one frame header
+just inside each deadline holds a concurrency slot indefinitely. Four bounds
+close that:
+
+| Bound | Value | Purpose |
+|-------|-------|---------|
+| `transferBudget` | derived, clamped to [`minSnapshotTransferDuration` 5 min, `maxSnapshotTransferDuration` 1 h] | Absolute deadline, scaled from the declared work at `snapshotTransferRateMultiple` (16) times the configured rate limit |
+| `snapshotProgressGracePeriod` | 60 s | Grace before the throughput floor applies, absorbing stream setup and sender disk reads |
+| `minSnapshotReceiveBytesPerSec` | 1024 | Average throughput required past the grace period; far below any real link, it only evicts a peer trickling bytes to hold a slot |
+| `maxConsecutiveZeroLengthFrames` | 8 | A legitimate sender emits none, so a run of them is a peer burning the declared `ChunkCount` |
+
+Every rejection routes through `rejectSnapshotStream`, which fires
+`OnSnapshotRejected` and increments `IncSnapshotsRejected` with a reason from a
+closed label set (`shutdown`, `concurrency_limit`, `memory_budget`, `liveness`,
+`malformed`, `io_error`, `policy`). The set is closed deliberately: the label
+feeds Prometheus, and a per-transfer string would create unbounded child series.
+A silent return would leave the sender waiting out its ack timeout with no local
+record of why the transfer never landed.
+
+**0-RTT snapshots are refused** under the `policy` reason, for the same replay
+reason message frames are.
 
 **Rate-limit bounds:** A per-chunk sleep is capped at `maxRateLimitChunkSleep`
 (5 s) so a pathologically small configured rate cannot compute a multi-day sleep
@@ -488,26 +853,36 @@ and rejected by `Validate` at any other value. It prevents decompression bombs
 without being a per-node tunable: the send path admits frames against the
 `MaxFrameSize` constant, so a receiver configured lower would refuse frames
 every peer considers valid — and because a frame rejection deliberately keeps
-the connection (see "Peer frame rejection"), that replica would silently stop
+the connection (see [Failed write handling](#stream-pool-and-heartbeat-streams)),
+that replica would silently stop
 replicating. Nothing is bought by lowering it either, since a peer wanting this
 node to buffer 16 MB can simply send an uncompressed 16 MB frame.
 
 ### Frame Flags
 
 ```go
+// frame.go
 type FrameFlags byte
 
 const (
-    FlagNone       FrameFlags = 0x00  // regular message batch (optionally compressed)
+    FlagNone       FrameFlags = 0x00  // regular message batch, uncompressed
     FlagCompressed FrameFlags = 0x01  // Snappy-compressed payload
-    FlagSnapshot   FrameFlags = 0x02  // snapshot header/chunk stream
+)
+
+// flags.go
+const (
+    FlagSnapshot FrameFlags = 0x02  // opens a snapshot stream
 )
 ```
 
-The `FlagCompressed` bit is set when the payload has been compressed with
-Snappy. The receiver decompresses before unmarshaling. `FlagSnapshot` indicates
-the first frame of a snapshot stream (SnapshotHeader) and subsequent chunk
-frames on the same stream.
+`FlagCompressed` is set when the payload was compressed with Snappy; the
+receiver decompresses before unmarshaling.
+
+`FlagSnapshot` marks **only the first frame** of a snapshot stream, the one
+carrying the `SnapshotHeader`. It is what routes the stream to
+`handleSnapshotStream`. Every subsequent chunk frame on that stream is written
+with `FlagNone` — both `SendSnapshot` and `SendSnapshotStreaming` call
+`WriteFrame(stream, chunkBuf, FlagNone)`.
 
 ### MessageBatch Wire Format
 
@@ -563,18 +938,28 @@ Source: `pkg/proto/message.go`
 
 Source: `pkg/proto/entry.go`
 
-60-byte fixed header + variable-length command:
+**68-byte** fixed header (`entryHeaderSize` = 8 uint64 fields + a uint32 length
+prefix) followed by the variable-length command:
 
 ```
-+------+-------+------+-----+----------+----------+-------------+---------+------+
-| Term | Index | Type | Key | ClientID | SeriesID | RespondedTo | CmdLen  | Cmd  |
-|  :8  |  :8   |  :8  | :8  |    :8    |    :8    |     :8      |  :4(u32)| :N   |
-+------+-------+------+-----+----------+----------+-------------+---------+------+
++------+-------+------+-----+----------+----------+-------------+---------+---------+-----+
+| Term | Index | Type | Key | ClientID | SeriesID | RespondedTo | OwnerID | CmdLen  | Cmd |
+|  :8  |  :8   |  :8  | :8  |    :8    |    :8    |     :8      |   :8    | :4(u32) | :N  |
++------+-------+------+-----+----------+----------+-------------+---------+---------+-----+
 ```
 
-- `CmdLen` validated against `MaxEntrySize` (8 MB) before buffer access
-- `Cmd` is zero-copy aliased into the source buffer after `UnmarshalFrom`
-- `Type` lower 4 bits: entry type; bit 4: compression flag
+- `CmdLen` is validated against `MaxEntrySize` (8 MB) before buffer access.
+- `Cmd` is zero-copy aliased into the source buffer after `UnmarshalFrom`; the
+  transport detaches it (see [Entry.Cmd Buffer Safety](#entrycmd-buffer-safety)).
+- `Type` lower 4 bits are the entry type, bit 4 is the compression flag. Bits 5
+  and above are reserved and **rejected** at both `MarshalTo` and
+  `UnmarshalFrom` rather than masked away — masking would let a sender attach 59
+  bits of its own and have this build silently agree to a type it read as
+  something else.
+- `OwnerID` is the principal the embedder declared for the session a
+  registration entry creates, and is the key the per-owner session cap is
+  counted against. Zero means unset. Only session-registration entries carry a
+  meaningful value. See [Session Deduplication](../sessions/deduplication.md).
 
 ## TLS Configuration
 
@@ -586,9 +971,14 @@ fallback mode. Certificate material is provided via `config.TransportConfig`:
 ```go
 // Public API (pkg/config/transportconfig.go)
 type MTLSConfig struct {
-    CACert []byte  // PEM-encoded CA certificate
+    CACert []byte  // PEM-encoded CA certificate (ALWAYS required)
     Cert   []byte  // PEM-encoded node certificate
     Key    []byte  // PEM-encoded private key
+
+    // Certificate, when non-nil, replaces the PEM Cert/Key pair. Its
+    // PrivateKey may be any crypto.Signer, including a TPM/HSM-resident
+    // key that cannot be exported to PEM. CACert is still required.
+    Certificate *tls.Certificate
 }
 
 type RevocationConfig struct {
@@ -610,22 +1000,58 @@ type TransportConfig struct {
 }
 ```
 
-**TLS properties:**
+`TransportConfig.Validate` rejects incomplete material at the config boundary
+rather than letting it surface as an opaque handshake error: it requires a
+CA bundle that parses, and either a `Certificate` whose `PrivateKey` is a
+non-nil `crypto.Signer` or a `Cert`/`Key` pair that trial-parses as a keypair.
 
-- **Server mode**: `RequireAndVerifyClientCert`, verifies peer certificate
-  against CA pool
-- **Client mode**: verifies server certificate against CA pool, presents own cert
-- **ALPN**: `"quicraft"` (Application-Layer Protocol Negotiation)
-- **Minimum TLS version**: 1.3
-- **Certificate revocation**: optional CRL file support with hot-reload, or
-  OCSP responder integration for runtime revocation checks
+The `Certificate` field is what makes a TPM- or HSM-resident transport key
+usable: its `PrivateKey` may be any `crypto.Signer`, so the key never has to
+exist as PEM bytes. `buildMTLSTLS` parses the leaf from DER when the pre-built
+certificate does not populate `Leaf`, and rejects one whose leaf cannot be parsed
+at all — the startup SAN-exclusivity precondition below cannot be evaluated
+without it. This is the transport's own key, separate from the barrier root key;
+see [Key Custody](../security/key-custody.md#delegated-hardware-mode) for the
+at-rest side.
 
-**Certificate revocation:** When `RevocationConfig` is set, a `VerifyConnection`
+**TLS properties** (`buildMTLSTLS`):
+
+- **Server config**: `ClientAuth: tls.RequireAndVerifyClientCert`, with the CA
+  bundle as both `RootCAs` and `ClientCAs`.
+- **Client config**: verifies the server against the same pool and presents the
+  node's own certificate. `ServerName` is set per dial from the target host.
+- **ALPN**: `"quicraft"`.
+- **Minimum version**: TLS 1.3 (`MinVersion: tls.VersionTLS13`).
+- **Curve preference**: `X25519` only. ML-KEM hybrid post-quantum negotiation
+  costs roughly 5% for intra-cluster traffic where both endpoints are ours;
+  X25519 gives 128-bit security and is the fastest ECDH curve. No cipher suites
+  are configured explicitly — TLS 1.3 suite selection is left to `crypto/tls`.
+  FIPS-mode cipher selection is a *sealing-layer* concern, not a transport one;
+  see [Encryption](../security/encryption.md).
+- **Session resumption**: the client keeps a
+  `tls.NewLRUClientSessionCache(256)`, cutting a reconnect from two round trips
+  to one. Revocation still applies on resumption, because the callback is
+  `VerifyConnection` (below).
+
+**CA bundle parsing.** `parseCACertificates` parses *every* CERTIFICATE block in
+the bundle and keeps those able to issue. TLS verification consumes the whole
+bundle via `AppendCertsFromPEM`, so revocation must be able to select the same
+issuer the peer's leaf was actually signed by — in a root plus
+issuing-intermediate PKI that is never the first block. A bundle with no usable
+issuer is a fatal startup error (`CACertificateParseError`): OCSP requests would
+otherwise name the wrong CA, which is a permanent silent no-op under soft-fail
+and a total handshake outage when revocation is enforced.
+
+**Certificate revocation.** When `RevocationConfig` is set, a `VerifyConnection`
 callback is installed on both the server and client `tls.Config`.
 `VerifyConnection` (rather than `VerifyPeerCertificate`) is used deliberately
 because it runs on **all** connections including resumed TLS sessions, so
 revocation is still enforced on session resumption.
 
+- **Empty peer-certificate sets fail closed.** `ErrNoPeerCertificate` is
+  returned rather than nil. Mandatory mTLS makes this unreachable today, but
+  returning nil would encode "no cert ⇒ accept", a latent fail-open if the TLS
+  config ever changed.
 - **Leaf-only checking:** Only the leaf certificate (`PeerCertificates[0]`) is
   revocation-checked, not the entire presented chain. The leaf is the end-entity
   certificate that authenticates the peer and the one that gets revoked when a
@@ -651,10 +1077,29 @@ revocation is still enforced on session resumption.
   making the responder look unreachable. A definitive "revoked" verdict rejects
   either way.
 
-  The internal `revocation.Config` carries the inverted field
-  (`EnforceRevocation`), which the host derives as
-  `EnforceRevocation: !rc.AllowSoftFail`. It is not reachable from
-  `pkg/config` — do not write it into a `config.RevocationConfig` literal.
+  The internal `revocation.Config` carries a field of the same name and the
+  same sense, so the host copies `AllowSoftFail` across rather than negating
+  it. Fail-closed is therefore intrinsic to the checker: a zero-valued
+  `revocation.Config` enforces no matter which code built it, and soft-fail
+  has to be asked for.
+- **Mode must name a source it can consult.** `Validate` rejects an unrecognised
+  `Mode` (a typo like `"CRL"` or `"strict"` would otherwise silently select the
+  default), requires `CRLPaths` for `"crl"`/`"both"` and `OCSPResponderURL` for
+  `"ocsp"`/`"both"`, and rejects the default `"any"` mode with neither source
+  configured while `AllowSoftFail` is false. That last combination admits every
+  revoked certificate for the process lifetime with no error, no log and no
+  metric — the exact failure revocation exists to prevent. At runtime the
+  checker repeats the check for whichever mode it was given: under enforcement,
+  a mode with no usable source returns an error rather than "not revoked", so a
+  checker built without `Validate` cannot become a silent no-op.
+- **Revocation is re-checked after admission.** `VerifyConnection` fires only at
+  handshake, so `revokeCheckConnections` re-runs the verdict against every live
+  inbound and outbound leaf on the 30 s cleanup tick and closes any that is no
+  longer admissible with `QUICErrRevoked`. A checker *error* is treated the same
+  as revoked, matching the handshake posture. Post-revocation survival is
+  therefore bounded by one tick rather than by the process lifetime.
+  The verdict is logged locally and deliberately kept out of the
+  CONNECTION_CLOSE reason phrase, which travels to the peer verbatim.
 
 All nodes in a cluster must share the same CA certificate for mutual
 verification.
@@ -765,8 +1210,8 @@ a concrete type (no interface) for hot-path efficiency.
 
 ```go
 type Registry struct {
-    mu        sync.RWMutex
-    addresses map[NodeInfo]string
+    addresses sync.Map     // NodeInfo -> string
+    count     atomic.Int64
 }
 
 type NodeInfo struct {
@@ -775,18 +1220,39 @@ type NodeInfo struct {
 }
 ```
 
-Operations:
+`Resolve` runs on every message the transport sends, so the backing store is a
+`sync.Map` rather than a mutex-guarded map: a lookup is an atomic pointer read
+from the read-only map with no lock acquisition. Mutations take the slower
+`Store`/`Delete` path, which is fine because they happen only on membership
+change.
 
-| Method     | Lock    | Description                               |
-|------------|---------|-------------------------------------------|
-| `Resolve`  | RLock   | Look up address, return NodeNotFoundError |
-| `Register` | Lock    | Add or update address                     |
-| `Remove`   | Lock    | Delete entry (no-op if absent)            |
-| `Count`    | RLock   | Number of registered nodes                |
+| Method                | Description                                            |
+|-----------------------|--------------------------------------------------------|
+| `Resolve`             | Look up an address; returns `*NodeNotFoundError` on miss |
+| `Register`            | Add or overwrite an address                            |
+| `RegisterIfAbsent`    | `LoadOrStore`: establish a mapping only if none exists  |
+| `Remove`              | Delete an entry (no-op if absent)                       |
+| `CompareAndRemove`    | `CompareAndDelete`: roll back a speculative pre-register |
+| `CompareAndRegister`  | `CompareAndSwap`: restore a prior mapping on rollback   |
+| `AddressInUse`        | Whether *any* shard still resolves a replica to an address |
+| `Count`               | Number of registered nodes                              |
+
+The compare-and-swap variants are not conveniences. A sender the committed
+configuration does not name may **establish** a mapping but must never
+**replace** one, and doing that as a separate Resolve-then-Register is not
+atomic: two concurrent receives for the same `(shard, replica)` both see no
+entry, both register, and the loser's address silently replaces the winner's —
+exactly the hijack the check exists to deny. `RegisterIfAbsent` closes that
+window, leaving `Register` and `CompareAndRegister` as the only paths that can
+replace an established mapping.
+
+`AddressInUse` exists because one QUIC connection is keyed by **address** and
+multiplexed across every shard talking to that host. Before a caller tears a
+connection down for one shard's committed removal, it has to establish that no
+other shard still resolves a replica to the same address.
 
 The registry is populated by `Host.StartShard()` when members are registered,
-and cleaned by `Host.StopShard()` when a shard is unloaded. The transport
-calls `Resolve` on every `Send` to map `(ShardID, To)` to a target address.
+and cleaned by `Host.StopShard()` when a shard is unloaded.
 
 ### Address Resolution Flow
 
@@ -801,50 +1267,88 @@ QUICTransport.Send()
 per-target sendQueue -> sendQueueWorker drains/batches -> sendBatch
 ```
 
-The registry is populated by `Host.StartShard()` when members are registered,
-and cleaned by `Host.StopShard()` when a shard is unloaded.
+A `Resolve` miss is not an error condition: it recurs for every message aimed at
+a removed or not-yet-registered replica during membership churn, so the message
+is dropped at Debug level and counted as `unresolved_target`.
 
 ## Transport Configuration Summary
 
 `TransportConfig` fields (with defaults):
 
-| Field                           | Type    | Default        | Description                          |
-|---------------------------------|---------|----------------|--------------------------------------|
-| `MTLSConfig`                    | pointer | required       | mTLS certificate material            |
-| `RevocationConfig`              | pointer | nil            | Optional CRL/OCSP revocation         |
-| `StreamPoolSize`                | int     | 16             | Initial stream pool size             |
-| `MaxStreamPoolSize`             | int     | 256            | Maximum stream pool size             |
-| `MaxSnapshotReceiveRate`        | int64   | 256 MB/s       | Snapshot bandwidth limit             |
-| `MaxConcurrentSnapshotReceives` | int     | 4              | Parallel snapshot downloads          |
-| `MaxSnapshotReceiveMemory`      | int64   | 1 GB           | Total snapshot buffer budget         |
-| `MaxDecompressedSize`           | uint32  | 16 MB (pinned) | Decompression size limit; must equal `MaxFrameSize` |
-| `MaxConnectionsPerIP`           | int     | 16             | Concurrent connections per IP        |
-| `MaxIncomingConnections`        | int     | 256            | Total incoming connection limit      |
-| `SendBatchMaxSize`              | int     | 64 KB          | Max bytes per send batch             |
-| `UDPRecvBufSize`                | int     | 7 MB           | Kernel receive buffer size           |
-| `UDPSendBufSize`                | int     | 7 MB           | Kernel send buffer size              |
-| `Enable0RTT`                    | bool    | false          | 0-RTT reconnection (replay risk)     |
-| `DisableCompression`            | bool    | false          | Disable Snappy compression           |
+| Field                           | Type          | Default        | Description                          |
+|---------------------------------|---------------|----------------|--------------------------------------|
+| `MTLSConfig`                    | pointer       | required       | mTLS certificate material; required unless `TransportDisabled` |
+| `RevocationConfig`              | pointer       | nil            | Optional CRL/OCSP revocation         |
+| `StreamPoolSize`                | int           | 16             | Streams per connection; index 0 is the heartbeat stream |
+| `MaxStreamPoolSize`             | int           | 256            | Validation ceiling for `StreamPoolSize` (the pool does not auto-scale) |
+| `MaxStreamsPerConnection`       | int           | 256            | Concurrent inbound data-stream goroutines per connection |
+| `StreamReadIdleTimeout`         | time.Duration | 30 s           | Idle re-check interval at a clean frame boundary; not a stream lifetime |
+| `MaxSnapshotReceiveRate`        | int64         | 256 MB/s       | Inbound snapshot bandwidth; non-zero values below 64 KB/s are rejected |
+| `MaxConcurrentSnapshotReceives` | int           | 4              | Parallel inbound snapshot transfers  |
+| `MaxSnapshotReceiveMemory`      | int64         | 1 GB           | Total in-flight snapshot chunk budget |
+| `MaxMessageReceiveMemory`       | int64         | 256 MB         | Aggregate in-flight message-frame buffer budget; also derives the QUIC per-connection receive window |
+| `MaxDecompressedSize`           | uint32        | 16 MB (pinned) | Decompression size limit; must equal `MaxFrameSize` |
+| `MaxConnectionsPerIP`           | int           | 16             | Concurrent inbound connections per source IP |
+| `MaxIncomingConnections`        | int           | 256            | Total inbound connection limit       |
+| `SendBatchMaxSize`              | int           | 64 KB          | Initial send-buffer pool capacity    |
+| `UDPRecvBufSize`                | int           | 7 MB           | `SO_RCVBUF`; 0 uses the OS default   |
+| `UDPSendBufSize`                | int           | 7 MB           | `SO_SNDBUF`; 0 uses the OS default   |
+| `Enable0RTT`                    | bool          | false          | 0-RTT reconnection; replayable, and the receive path refuses 0-RTT frames anyway |
+| `DisableCompression`            | bool          | false          | Disable Snappy compression           |
+| `TransportDisabled`             | bool          | false          | Skip mTLS validation and skip building the transport (same effect as `WithoutTransport()`) |
+| `RequireMemberIdentity`         | bool          | false          | Drop quorum-bearing traffic from members with no committed node identity, instead of falling back to the address check |
+
+The internal `transport.Config` adds two fields the public struct does not
+expose directly: `ListenAddress` and `AdvertiseAddress`, both supplied by the
+host from `HostConfig`. `AdvertiseAddress` takes priority over the OS-reported
+socket address when stamping `MessageBatch.SourceAddress`, which is what lets a
+node behind NAT or in a container advertise a reachable external address rather
+than `0.0.0.0` or `[::]`.
 
 ## Transport Metrics
 
-The transport can emit metrics via the `TransportMetrics` interface if configured:
+The transport emits metrics through `quicraft.TransportMetrics`
+(`pkg/metrics.go`) when one is configured; when nil, collection is skipped
+entirely:
 
 ```go
 type TransportMetrics interface {
     ObserveSendLatency(d time.Duration)
-    IncMessagesSent(shardID, to uint64, msgType uint8)
-    IncMessagesReceived(shardID, from uint64, msgType uint8)
-    IncSnapshotsSent(shardID uint64, bytes int64, duration time.Duration)
-    IncSnapshotsReceived(shardID uint64, bytes int64, duration time.Duration)
+    IncMessagesSent(shardID, to uint64, msgType uint64)
+    IncMessagesReceived(shardID, from uint64, msgType uint64)
+    IncSnapshotsSent(shardID uint64, bytes int64, d time.Duration)
+    IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
+    IncSnapshotsRejected(shardID uint64, reason string)
+    IncMessagesDropped(shardID, to uint64, reason string)
 }
 ```
 
-These callbacks allow integrating with external observability platforms
-(Prometheus, Datadog, etc.) for monitoring transport behavior.
+The two `reason` arguments come from closed sets defined by the transport and
+must be treated as metric labels, never as free-form strings — deriving new
+label values from them creates unbounded Prometheus child series.
+
+| Counter | Reasons |
+|---------|---------|
+| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy` |
+| `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected` |
+
+`shardID` is 0 for `IncSnapshotsRejected` when the transfer failed before its
+header parsed, and both `shardID` and `to` are 0 for `protocol_violation`, where
+the frame is discarded before its messages are parsed.
+
+Beyond the metrics interface, `QUICTransport` keeps unconditional atomic
+counters for the sampled diagnostics (`PeerFrameRejections()` is exported;
+`recvBudgetDrops`, `zeroShardDrops`, `spoofedSourceClears`,
+`snapshotStreamDrops` and `zeroRTTRefusals` are reported inside the sampled log
+lines), plus `ConnectionCount()`, `StreamCount()` and `SendQueueCount()`.
 
 ## Cross-References
 
 - [Architecture Overview](../architecture/overview.md) -- system overview, data flow, configuration
-- [Snapshot Management](../snapshots/overview.md) -- snapshot streaming and persistence
-- [Encryption and Security](../encryption/overview.md) -- mTLS setup and key rotation
+- [Wire Format](../protocol/wire-format.md) -- MessageBatch, Message, Entry and Membership encodings
+- [Raft Protocol](../raft/protocol.md) -- snapshot state machine, `SnapshotStatus` sequencing, replication
+- [Engine Pipeline](../engine/pipeline.md) -- step workers, ready loop, LogReader buffer ownership
+- [Encryption](../security/encryption.md) -- barrier epochs, at-rest snapshot and WAL sealing
+- [Compatibility](../operations/compatibility.md) -- wire-version pinning, node identities
+- [Session Deduplication](../sessions/deduplication.md) -- Entry session fields and at-most-once delivery
+- [Deployment](../operations/deployment.md) -- certificate issuance, per-node SAN requirements

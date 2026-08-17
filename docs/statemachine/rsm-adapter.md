@@ -1,197 +1,227 @@
-# RSM Adapter Layer
+# RSM adapter layer
 
 ## Purpose
 
-The RSM adapter (`pkg/internal/rsm/`) bridges the engine's apply pipeline to user-implemented state machines. Users implement one of three public interfaces in `pkg/sm/` -- `StateMachine`, `ConcurrentStateMachine`, or `DiskStateMachine` -- and the adapter wraps whichever variant behind a unified internal interface (`smWrapper`). This lets the engine pipeline call a single `Apply()` method without caring which state machine tier is underneath.
+The RSM adapter (`pkg/internal/rsm`) sits between the engine's apply pipeline and user-implemented state machines. You implement one of the three public interfaces in `pkg/sm`; the adapter wraps whichever it is behind an unexported `smWrapper`, so the pipeline calls one `Apply` method without caring which tier is underneath.
 
-The adapter owns three responsibilities beyond delegation:
+Beyond delegation it owns four things:
 
-1. **Session lifecycle** -- routes register/unregister entries to the session manager instead of the user SM
-2. **Duplicate detection** -- checks the session cache before forwarding proposals to the user SM
-3. **Snapshot coordination** -- serializes session state alongside SM state in a single snapshot stream
+1. **Session lifecycle.** Register and unregister entries go to the session manager, not to your state machine.
+2. **Duplicate detection.** The session cache is consulted before a proposal reaches your state machine, and an admission gate runs before that.
+3. **Deterministic session expiry.** The committed batch is split at fixed log-index checkpoints so expiry cannot depend on how a replica happened to group entries.
+4. **Snapshot coordination.** Session state is serialized alongside your state in one stream, with a gate that releases applies as soon as the point-in-time is captured.
 
 Source files:
 
 | File | Role |
 |------|------|
-| `pkg/internal/rsm/statemachine.go` | `StateMachine` struct, `Apply`, `Lookup`, snapshot, `wrapStateMachine` |
-| `pkg/internal/rsm/adapter.go` | `smWrapper` interface, three wrapper types, DRY helpers |
-| `pkg/internal/rsm/errors.go` | Typed sentinel errors |
-| `pkg/sm/interfaces.go` | Public SM interfaces |
-| `pkg/sm/createfunc.go` | `CreateFunc` factory types |
-| `pkg/internal/session/manager.go` | Session manager |
-| `pkg/internal/session/session.go` | Per-client session state |
+| `pkg/internal/rsm/statemachine.go` | `StateMachine` struct, `Apply`, `applyBatch`, lookups, snapshot, `wrapStateMachine` |
+| `pkg/internal/rsm/adapter.go` | `smWrapper`, the three wrapper types, the shared optional-interface helpers |
+| `pkg/internal/rsm/errors.go` | sentinel errors |
+| `pkg/sm/interfaces.go` | the three public interfaces plus `Hasher`, `NALookup`, `NALookupInto` |
+| `pkg/sm/types.go` | `Entry`, `Result`, the reserved result constants |
+| `pkg/sm/createfunc.go` | `CreateFunc` and the typed wrappers |
+| `pkg/sm/cached.go`, `pkg/sm/lru.go` | `CachedDiskStateMachine` and its LRU |
+| `pkg/internal/session/manager.go` | session manager |
+| `pkg/internal/session/session.go` | per-client session state |
 
-## Type Detection
+## Type detection
 
-### The Interface Hierarchy Problem
+### Why the order matters
 
-Go's `DiskStateMachine` is a strict superset of `ConcurrentStateMachine` -- it has all the same methods (`Update`, `Lookup`, `PrepareSnapshot`, `SaveSnapshot`, `RecoverFromSnapshot`, `Close`) plus `Open` and `Sync`. A naive type switch checking `ConcurrentStateMachine` first would match a `DiskStateMachine` and wrap it with the wrong adapter, losing the `Open` and `Sync` calls.
+`DiskStateMachine`'s method set is a strict superset of `ConcurrentStateMachine`'s: it has `Update`, `Lookup`, `PrepareSnapshot`, `SaveSnapshot`, `RecoverFromSnapshot` and `Close`, plus `Open` and `Sync`. A type switch that checked `ConcurrentStateMachine` first would match an on-disk state machine and wrap it with the wrong adapter, silently dropping `Open` and `Sync`. Dropping `Open` means the applied index the store recovered from its own durable state is never adopted, and the replica re-applies from wherever the log happens to start.
 
-### wrapStateMachine()
-
-The one-time type switch in `wrapStateMachine()` checks **most-specific first**:
+### wrapStateMachine
 
 ```go
 func wrapStateMachine(raw interface{}) (smWrapper, SMType, error) {
-    switch typed := raw.(type) {
-    case sm.DiskStateMachine:         // most specific -- has Open + Sync
-        return &onDiskSMWrapper{sm: typed}, SMTypeOnDisk, nil
-    case sm.ConcurrentStateMachine:   // middle -- has PrepareSnapshot
-        return &concurrentSMWrapper{sm: typed}, SMTypeConcurrent, nil
-    case sm.StateMachine:             // least specific -- basic interface
-        return &regularSMWrapper{sm: typed}, SMTypeRegular, nil
-    default:
-        return nil, 0, ErrInvalidSMType
-    }
+	switch typed := raw.(type) {
+	case sm.DiskStateMachine:       // most specific: Open + Sync
+		return &onDiskSMWrapper{sm: typed}, SMTypeOnDisk, nil
+	case sm.ConcurrentStateMachine: // middle: PrepareSnapshot
+		return &concurrentSMWrapper{sm: typed}, SMTypeConcurrent, nil
+	case sm.StateMachine:           // least specific
+		return &regularSMWrapper{sm: typed}, SMTypeRegular, nil
+	default:
+		return nil, 0, ErrInvalidSMType
+	}
 }
 ```
 
-The type code enum:
+| Code | Constant | `String()` | Interface |
+|------|----------|-----------|-----------|
+| 0 | `SMTypeRegular` | `"regular"` | `StateMachine` |
+| 1 | `SMTypeConcurrent` | `"concurrent"` | `ConcurrentStateMachine` |
+| 2 | `SMTypeOnDisk` | `"on-disk"` | `DiskStateMachine` |
 
-| Code | Const | String | SM Type |
-|------|-------|--------|---------|
-| 0 | `SMTypeRegular` | `"regular"` | `StateMachine` (in-memory, serialized access) |
-| 1 | `SMTypeConcurrent` | `"concurrent"` | `ConcurrentStateMachine` (concurrent Lookup) |
-| 2 | `SMTypeOnDisk` | `"on-disk"` | `DiskStateMachine` (own persistent storage) |
+`SMType.TypeCode()` returns the numeric code for serialization into `logdb.Bootstrap.Type` and `ShardInfo.StateMachineType`. `proto.StateMachineTypeName(uint64)` converts a wire-format code back to the readable name.
 
-`SMType` implements `String()` for log output and `TypeCode()` for serialization into `logdb.Bootstrap.Type` and `ShardInfo.StateMachineType`. The proto package provides `StateMachineTypeName(uint64)` for converting wire-format type codes back to human-readable names.
+### Construction
 
-### Factory Flow
-
-`NewStateMachine()` calls the user's `CreateFunc`, then `wrapStateMachine()` on the returned value:
-
-```
-sm.CreateFunc(shardID, replicaID)
-         |
-         v
-   raw interface{}
-         |
-    wrapStateMachine()
-         |
-         v
-   smWrapper + smType
-         |
-         v
-   rsm.StateMachine{sm: wrapper, sessions: NewManager(...)}
+```go
+func NewStateMachine(
+	shardID, replicaID uint64,
+	createFn sm.CreateFunc,
+	snapshotDir string,
+	local proto.SessionPolicy,
+	replicated func() proto.SessionPolicy,
+	zeroCopyEntryCmd bool,
+) (*StateMachine, error)
 ```
 
-The `CreateFunc` type (`func(shardID, replicaID uint64) interface{}`) returns an untyped value. Type-safe wrappers (`sm.NewCreateFunc`, `sm.NewConcurrentCreateFunc`, `sm.NewDiskCreateFunc`) catch type errors at compile time by accepting typed factory functions and boxing the return value.
+The factory is called once, `wrapStateMachine` runs once on its result, and every later call is a direct method call on the concrete wrapper.
 
-## smWrapper Internal Interface
+The two policy arguments are deliberately asymmetric. `local` is this node's own configuration and is used only while the shard has no replicated policy of its own: a shard bootstrapped before the policy became replicated state, or a `join=true` replica that has not yet received the shard's configuration. `replicated` returns the shard's committed policy and always wins, even when it is the looser of the two. That is not a preference, it is the only choice that terminates. A replica that enforced its own stricter limit would refuse registrations its peers admit and then answer `ResultSessionExpired` for entries the rest of the shard applies normally. A local limit can only be proposed, at bootstrap.
 
-All three wrapper types implement `smWrapper`, which is the engine-facing contract:
+The policy also travels as one value rather than as adjacent `uint64` parameters, because the previous signature let a caller transpose `MaxTotalSessions` and `MaxSessionsPerClient` and compile cleanly, capping a shard at a response depth or letting one client pin the whole session table.
+
+`refreshSessionPolicy` re-reads the replicated policy at the top of every `Apply` and again before snapshot recovery, so a replica that learns its configuration late (a joiner replicating the shard's `EntryInitialMembership`, or one adopting an `InstallSnapshot`) converges without a restart. This is safe only because the replicated policy is bootstrap-only. If a config change that alters it is ever added, this has to become adoption from the apply stream itself, decoded out of the committed entry at the exact index where it applies, or two replicas with a lagging apply path would switch policies at different points in the log.
+
+## The internal wrapper interface
 
 ```go
 type smWrapper interface {
-    Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error)
-    Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error
-    Lookup(ctx context.Context, query interface{}) (interface{}, error)
-    NALookup(key []byte) ([]byte, bool, error)          // (result, supported, error)
-    NALookupInto(key, dst []byte) ([]byte, bool, error) // (result, supported, error)
-    GetHash() (uint64, bool, error)                     // (hash, supported, error)
-    SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
-    saveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
-    RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
-    Close(ctx context.Context) error
-    Type() SMType
+	Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error)
+	Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error
+	Lookup(ctx context.Context, query interface{}) (interface{}, error)
+	NALookup(key []byte) ([]byte, bool, error)          // (result, supported, error)
+	NALookupInto(key, dst []byte) ([]byte, bool, error) // (result, supported, error)
+	GetHash() (uint64, bool, error)                     // (hash, supported, error)
+	SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
+	saveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
+	RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
+	Close(ctx context.Context) error
+	Type() SMType
 }
 ```
 
-The type switch happens once at construction. All subsequent calls go through direct method calls on the concrete wrapper, eliminating interface dispatch overhead on the hot path.
-
-`saveSnapshotGated` writes the user SM snapshot and invokes `afterCapture` (when non-nil) exactly once after the point-in-time is captured and before the potentially-long streaming begins. For regular in-memory state machines the whole save *is* the capture, so it fires at the end; for concurrent and on-disk state machines it fires after `PrepareSnapshot`, so the caller can release the apply gate while the immutable snapshot streams.
-
-> **This is an INTERNAL interface, not the contract you implement.** `smWrapper` is unexported and lives in `pkg/internal/rsm`, so it is not importable. The three-value `(value, supported, error)` shape belongs to the wrapper: the `bool` reports whether the *user's* state machine implemented the optional interface, and it is supplied by the wrapper's own type assertion.
+> **This is not the interface you implement.** `smWrapper` is unexported and lives in `pkg/internal/rsm`, so it is not importable. The three-value `(value, supported, error)` shape belongs to the wrapper: the `bool` reports whether *your* state machine implemented the optional interface, and it comes from the wrapper's own type assertion.
 >
-> The interfaces a user state machine implements are **two-value** — `sm.Hasher` is `GetHash() (uint64, error)` and `sm.NALookup` is `BytesLookup(key []byte) ([]byte, error)`. Implementing the three-value form satisfies nothing, produces no compile error, and leaves the optional path silently never invoked. See [State Machine Interfaces](interfaces.md).
+> What you implement is two-valued. `sm.Hasher` is `GetHash() (uint64, error)` and `sm.NALookup` is `BytesLookup(key []byte) ([]byte, error)`. Writing the three-value form satisfies nothing, produces no compile error, and leaves the optimized path silently never invoked. See [State machine interfaces](interfaces.md#optional-interfaces).
 
-## Apply Pipeline
+`saveSnapshotGated` writes your snapshot and invokes `afterCapture` exactly once, after the point-in-time is captured and before the streaming begins. For a regular in-memory state machine the whole save *is* the capture, so it fires at the end. For concurrent and on-disk machines it fires right after `PrepareSnapshot`, which lets the caller release the apply gate while the immutable snapshot streams.
 
-### Entry Flow Diagram
+## Apply pipeline
+
+`Apply` is called by the engine's apply worker with the committed batch and a pre-allocated `[]sm.Result` of the same length.
+
+### Preconditions
+
+Two checks run before a single entry is classified.
+
+**Read guard, held for writing.** `Apply` takes the state machine's `readGuard` in **write** mode and returns `ErrClosed` if `Close` already ran.
+
+The write mode is the enforcement of `sm.StateMachine`'s published contract: QuicRaft serializes all method calls, and `Update` and `Lookup` are never called concurrently. Every read entry point takes the same guard for reading, so an apply excludes them all. See [Lookup concurrency](interfaces.md#lookup-concurrency) for the tier-by-tier consequences and the latency it adds.
+
+The guard also carries the closed check. The engine's synchronous `UnloadNode` guarantees no `Apply` is in flight when `Close` runs, so that part is defence in depth, but holding the guard forces `Close` to wait out an in-flight `Apply` rather than closing the state machine underneath it.
+
+**Contiguity guard.** The batch must not start above `lastApplied + 1`, or `Apply` returns `ErrApplyGap` and fails the shard.
+
+`lastApplied` is not bookkeeping here. It is the lower bound of the expiry checkpoint walk below, so a batch that leaves a hole beneath it makes this replica evaluate expiry over a different index range than the replicas that applied the same log contiguously. That diverges the state machines with every Raft invariant intact. A hole has two causes and both are fatal: committed entries were dropped before reaching the state machine, or `lastApplied` was never seeded from the index the shard resumed at. Failing loudly is the point; the alternative is a replica that quietly answers `ResultSessionExpired` for entries its peers apply normally.
+
+The engine's apply worker makes the same assertion one layer down against its own counter, as an equality rather than an upper bound, because the two layers see different streams: the worker filters entries at or below its marker before checking, whereas an already-applied entry that reaches the adapter is the documented on-disk replay case and stays a no-op (`pkg/internal/engine/apply.go:718`).
+
+### Deterministic expiry segmentation
+
+Apply batching is replica-local. It varies with message timing, restart replay and the recovery skip-prefix filter. Evaluating session expiry at the last index of whatever batch happened to arrive would let two replicas expire a session at different points and diverge permanently.
+
+So `Apply` evaluates expiry only at fixed log-index checkpoints, at multiples of the shard's replicated inactivity threshold, and splits the incoming entries at those checkpoints:
 
 ```
-Engine Apply Worker
-       |
-       |  rsm.StateMachine.Apply([]proto.Entry, []sm.Result)
-       v
-  +--------------------------------------------+
-  |  For each proto.Entry:                     |
-  |                                            |
-  |  0a. IsConfigChange()?                     |
-  |     YES -> result = {} ; continue          |
-  |           (applied by processConfigChanges)|
-  |                                            |
-  |  0b. non-session & empty Cmd (no-op)?      |
-  |     YES -> result = {} ; continue          |
-  |           (leader election no-op entry)    |
-  |                                            |
-  |  1. IsNewSessionRequest()?                 |
-  |     YES -> sessions.Register(clientID)     |
-  |            result = {Value: clientID}      |
-  |            continue (skip user SM)         |
-  |                                            |
-  |  2. IsEndOfSessionRequest()?               |
-  |     YES -> sessions.Unregister(clientID)   |
-  |            result = {Value: clientID}      |
-  |            continue (skip user SM)         |
-  |                                            |
-  |  3. IsSessionManaged()?                    |
-  |     YES -> sessions.CheckDuplicate()       |
-  |            duplicate? -> return cached     |
-  |            session error? -> SESSION_EXPIRED|
-  |            sessions.CanRecord() (admission)|
-  |            over capacity? -> SESSION_EXPIRED|
-  |              (reject, do NOT apply)        |
-  |            else: admittedThisBatch[cid]++  |
-  |                                            |
-  |  4. Forward to user SM                     |
-  |     append to smEntries/smResults/indexMap |
-  +--------------------------------------------+
-       |
-       |  smWrapper.Update(ctx, smEntries, smResults)
-       v
-  +--------------------------------------------+
-  |  Copy results back to original positions   |
-  |  Record results in session cache           |
-  |  Update lastApplied (atomic)               |
-  +--------------------------------------------+
+interval  = sessionPolicy.ExpiryEntries
+prevIndex = lastApplied
+for k := prevIndex/interval + 1; k <= lastIndex/interval; k++ {
+    boundary = k * interval
+    applyBatch(entries at or below boundary)   // flush first
+    sessions.ExpireSessions(boundary, interval, maxExpirePerCheckpoint())
+}
+applyBatch(remaining entries above the last boundary)
+advanceLastApplied(lastIndex)
 ```
 
-### Session Entry Detection
+Each expiry therefore runs against session state as of exactly the entries at or below the checkpoint index. When expiry is disabled (`ExpiryEntries == 0`) the whole batch goes through `applyBatch` once with no segmentation overhead.
 
-Session management entries are identified by sentinel `SeriesID` values on `proto.Entry`:
+**Your `Update` can be called more than once per committed batch.** Each call receives a contiguous run and is all-or-nothing on its own.
+
+`maxExpirePerCheckpoint()` caps the reclaim per checkpoint at `MaxTotalSessions / 8`, with a floor of 64. Scaling to the replicated capacity rather than a fixed 64 bounds the drain of a full table at eight inactivity windows for any configured capacity. At the defaults a fixed 64 would need 256 windows, which is 25.6 million applied entries during which every new `GetNewSession` on the shard fails, reachable by nothing worse than a rolling deploy of a service that does not close its sessions.
+
+### Entry classification
+
+```
+For each proto.Entry in the segment:
+
+  IsConfigChange() or IsInitialMembership()?
+      result = {} ; skip user SM
+      (membership is applied by processConfigChanges before entries reach here;
+       the Cmd is a marshaled config change or Membership, not a user command)
+
+  non-session, non-lifecycle, empty Cmd?
+      result = {} ; skip user SM
+      (the leader's no-op entry, committed on election to advance commit index)
+
+  IsNewSessionRequest()?
+      sessions.Register(clientID, ownerID, index)
+      ok:  result = {Value: clientID} ; record lifecycle transition
+      err: result = {}
+      skip user SM
+
+  IsEndOfSessionRequest()?
+      sessions.Unregister(clientID)
+      ok:  result = {Value: clientID} ; record lifecycle transition
+      err: result = {Value: ResultSessionExpired}
+      skip user SM
+
+  IsSessionManaged()?
+      sessions.CheckDuplicate(clientID, seriesID, index)
+        session error        -> result = {Value: ResultSessionExpired} ; skip
+        duplicate            -> result = owned copy of cached result ; skip
+      in-batch duplicate?    -> mirror the first occurrence's result ; skip
+      sessions.CanRecord(clientID, respondedTo, admittedThisBatch[clientID])
+        over capacity        -> result = {Value: ResultSessionExpired} ; skip
+        admitted             -> admittedThisBatch[clientID]++ ; record in batchSeen
+
+  forward to user SM
+      append to smEntries / smResults / indexMap
+
+Then:
+  smWrapper.Update(ctx, smEntries, smResults)
+  copy results back to their original positions
+  cache each session-managed result (deep-copied)
+  resolve in-batch mirrors
+```
+
+### Session entry detection
+
+Session entries are identified by sentinel values on `proto.Entry` (`pkg/proto/constants.go:413`):
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `NotSessionManagedClientID` | `0` | Entry bypasses session deduplication |
-| `SessionSeriesIDForRegister` | `math.MaxUint64 - 1` | Register new client session |
-| `SessionSeriesIDForUnregister` | `math.MaxUint64` | Unregister client session |
+| `NotSessionManagedClientID` | `0` | the entry bypasses session deduplication |
+| `SessionSeriesIDForRegister` | `math.MaxUint64 - 1` | register a client session |
+| `SessionSeriesIDForUnregister` | `math.MaxUint64` | unregister a client session |
 
-Entry helper methods on `proto.Entry`:
+Helper methods on `proto.Entry`:
 
-- `IsNewSessionRequest()` -- `!IsConfigChange() && len(Cmd) == 0 && ClientID != 0 && SeriesID == SessionSeriesIDForRegister`
-- `IsEndOfSessionRequest()` -- `!IsConfigChange() && len(Cmd) == 0 && ClientID != 0 && SeriesID == SessionSeriesIDForUnregister`
-- `IsSessionManaged()` -- `ClientID != 0`
+- `IsSessionManaged()` is `ClientID != NotSessionManagedClientID`
+- `IsNewSessionRequest()` is `!IsConfigChange() && len(Cmd) == 0 && ClientID != 0 && SeriesID == SessionSeriesIDForRegister`
+- `IsEndOfSessionRequest()` is the same with `SessionSeriesIDForUnregister`
 
-### Type Conversion
+`Register` also reads `entry.OwnerID` straight from the replicated entry, which is what makes the per-owner session cap a state machine decision: the same log produces the same accept or reject on every replica and on every replay after a restart. Nothing about the connection that carried the proposal is consulted, because none of it is in the log.
 
-The adapter converts `proto.Entry` (internal, Raft-aware) to `sm.Entry` (public, user-facing). The user SM never sees Raft-internal fields:
+### proto.Entry to sm.Entry
 
-| proto.Entry field | sm.Entry field | Notes |
-|-------------------|----------------|-------|
-| `Index` | `Index` | Preserved |
-| `Cmd` | `Cmd` | Preserved (owned copy by default; aliased in zero-copy mode — see below) |
-| `Term` | -- | Excluded (SMs are term-agnostic) |
-| `Key` | -- | Internal dedup key |
-| `ClientID` | -- | Session routing |
-| `SeriesID` | -- | Session sequencing |
-| `RespondedTo` | -- | Session eviction marker |
-| `Type` | -- | Entry type flags |
+| `proto.Entry` field | `sm.Entry` field | Why |
+|---------------------|------------------|-----|
+| `Index` | `Index` | preserved |
+| `Cmd` | `Cmd` | preserved; owned copy by default, aliased under `ZeroCopyEntryCmd` |
+| `Term` | dropped | state machines are term-agnostic |
+| `Type` | dropped | entry type flags |
+| `Key` | dropped | internal dedup key |
+| `ClientID`, `SeriesID`, `RespondedTo`, `OwnerID` | dropped | session routing, sequencing, eviction watermark, owner cap |
 
-### Buffer Reuse
+Because whole classes of entry are filtered out, the `Index` values in one `[]sm.Entry` are strictly increasing but not contiguous.
 
-`Apply()` reuses three pre-allocated buffers across calls via `[:0]` reset:
+### Buffer reuse
 
 ```go
 smEntries := s.smEntryBuf[:0]
@@ -199,130 +229,129 @@ smResults := s.smResultBuf[:0]
 indexMap  := s.indexMapBuf[:0]
 ```
 
-- `smEntries` -- `[]sm.Entry` passed to the user SM
-- `smResults` -- `[]sm.Result` filled by the user SM
-- `indexMap` -- `[]int` maps smResults indices back to the original `results` positions
+`indexMap` maps a position in `smResults` back to its position in the caller's `results`. All three are retained at their grown capacity for the next call. Safe because `Apply` runs on a single apply goroutine per shard and the buffers are fully consumed before it returns.
 
-This is safe because `Apply()` is called from a single apply goroutine per shard and the buffers are fully consumed before `Apply()` returns. Buffers grow on demand and are retained at their grown capacity for subsequent calls.
+### Zero-copy and result caching
 
-### Zero-Copy Entry Cmd and Session-Result Safety
+`StateMachine.zeroCopyEntryCmd` mirrors `Config.ZeroCopyEntryCmd`:
 
-`StateMachine.zeroCopyEntryCmd` (mirrors `Config.ZeroCopyEntryCmd`) controls how `Apply()` hands the command payload to the user SM:
+- **`false` (default):** for each non-empty `Cmd`, `Apply` allocates an owned copy before building the `sm.Entry`, so the state machine may retain it past `Update`.
+- **`true`:** `sm.Entry.Cmd` aliases the engine's pooled `CommittedEntries` buffer directly. The state machine must copy `Cmd` if it retains it, because the engine recycles that buffer after the apply.
 
-- **Default (`false`):** for each non-empty `Cmd`, `Apply()` makes a fresh owned copy before placing it on `sm.Entry`, so the SM may retain it past `Update()`.
-- **Zero-copy (`true`):** `sm.Entry.Cmd` aliases the engine's pooled `CommittedEntries` buffer directly (zero-alloc). The SM **MUST** copy `Cmd` if it retains it beyond `Update()`, because the engine recycles that buffer after the apply.
+Result data gets copied on the way into the session cache regardless of the mode, for two independent reasons (`pkg/internal/rsm/statemachine.go:815`):
 
-Zero-copy aliasing also affects **session results**. A session-managed entry's result is cached in the session manager, which outlives the `Apply()` call. In zero-copy mode a user SM may return a `sm.Result` whose `Data` aliases the same recycled entry buffer; caching that alias directly would let a later apply corrupt the cached response and break at-most-once delivery. To prevent this, when zero-copy mode is enabled and the result has non-empty `Data`, `Apply()` **deep-copies `cached.Data` into owned memory before calling `sessions.RecordResult`**:
+1. The same `smResults[j].Data` was just handed to the client through `results[origIdx]`. If the application mutates that buffer it corrupts the replica-local dedup cache and, through `MarshalTo`, the next snapshot. That is a determinism hazard, not just a data race.
+2. In zero-copy mode the state machine may have returned `Data` aliasing the pooled buffer the engine is about to recycle.
 
-```go
-if s.zeroCopyEntryCmd && len(cached.Data) > 0 {
-    owned := make([]byte, len(cached.Data))
-    copy(owned, cached.Data)
-    cached.Data = owned
-}
-```
+The client keeps the original buffer; only the cached copy is owned. Cached results handed back on a duplicate hit are likewise copied out of the cache before being written into `results` (`pkg/internal/rsm/statemachine.go:694`).
 
-The default (non-zero-copy) path already hands the SM owned command memory, so it skips this extra copy and is not penalized.
-
-### Duplicate Detection Flow
-
-For session-managed entries (non-register, non-unregister):
+### Duplicate detection
 
 ```
 sessions.CheckDuplicate(clientID, seriesID, index)
-       |
-       |-- session error (not found / response evicted)? -> SESSION_EXPIRED
-       |-- seriesID <= respondedTo? -> client already acked, not a dup
-       |-- found in response cache? -> return cached result (duplicate)
-       |-- not found? -> new proposal, ADMISSION GATE then forward to user SM
+   |-- ErrSessionNotFound / ErrResponseEvicted -> ResultSessionExpired
+   |-- found in response cache                 -> return the cached result
+   |-- not found                               -> new proposal, go to the admission gate
 ```
 
-### Session Admission Gate (CanRecord)
+`ErrResponseEvicted` means the series already completed and its cached response was evicted because `seriesID <= respondedTo`. Both error cases map to `ResultSessionExpired` per Raft PhD figure 6.1 step 3: "Reply SESSION_EXPIRED if no record of clientId or if response for client's sequenceNum already discarded."
 
-A new (non-duplicate) session series is **admitted before** it is forwarded to the user SM:
+### In-batch duplicates
 
-```
-sessions.CanRecord(clientID, seriesID, respondedTo, admittedThisBatch[clientID])
-       |
-       |-- response cache has room? -> admittedThisBatch[clientID]++ ; forward to user SM
-       |-- over capacity?           -> result = SESSION_EXPIRED ; do NOT apply to user SM
-```
+A client may retry a request whose original proposal has not yet committed. If both the original and the retry commit and land in the same apply batch, both carry the same `(clientID, seriesID)` and neither is in the session table yet, so `CheckDuplicate` reports both as new. Applying both would run the operation twice.
 
-This check runs **before** the user SM mutation. The reason is at-most-once delivery: `RecordResult` only runs after the batched `Update`, so if the response cache is already full (a misbehaving client not advancing its `respondedTo` watermark), applying the entry without being able to cache its result would let a later replay find no cached response and re-apply the mutation. Rejecting it up front — treated as `SESSION_EXPIRED`, identical to an evicted response per Raft PhD Figure 6.1 step 3 — keeps the entry from ever mutating the state machine.
+`batchSeen` maps `(clientID, seriesID)` to the entry index of the first occurrence within the batch. A later occurrence is recorded in `mirrors` and skips the user state machine entirely; after `Update` returns, each mirror copies the result of its first occurrence. The mirror does not call `RecordResult` again, since the first occurrence already cached that response and a second record could push a genuine new series out of the cache.
 
-Because `RecordResult` runs only after the whole batch's `Update`, the gate must also account for series already admitted earlier in the *same* batch. `admittedThisBatch` is a per-client counter (a `map[uint64]uint64`, lazily allocated on first session-managed entry) that `CanRecord` adds to the in-cache count, so a batch of new series cannot collectively overflow the cache. The check is deterministic across replicas (index/series driven, no wall clock).
+This check runs *before* the admission gate. A retry that lands in the same batch as its original consumes no new cache slot, so gating it could reject it as "cache full", and applying it would mutate the state machine a second time.
 
-After the user SM processes the entry, the result is recorded:
+### The admission gate
 
 ```
-sessions.RecordResult(clientID, seriesID, respondedTo, result)
-       |
-       |-- advance respondedTo watermark
-       |-- evict cached responses with seriesID <= respondedTo
-       |-- check response cache limit (returns ErrResponseLimitExceeded if full)
-       |-- store result in session cache
+sessions.CanRecord(clientID, respondedTo, admittedThisBatch[clientID])
+   |-- room in the response cache -> admittedThisBatch[clientID]++ ; forward to user SM
+   |-- over capacity              -> ResultSessionExpired ; do NOT apply
 ```
 
-### lastApplied Tracking
+The gate runs before the state machine mutation, and that ordering is the whole point. `RecordResult` only runs after the batched `Update`. If the response cache is already full (a client not advancing its `respondedTo` watermark), applying the entry without being able to cache its result would let a later replay find no cached response and re-apply the mutation. Rejecting up front, treated identically to an evicted response, keeps the entry from ever reaching the state machine.
 
-After processing the batch, `Apply()` atomically stores the highest entry index as `lastApplied`:
+`admittedThisBatch` is a per-client counter, lazily allocated on the first session-managed entry, added to the in-cache count by `CanRecord` so a batch of new series cannot collectively overflow the cache. It is index- and series-driven with no wall clock, so it is deterministic across replicas.
+
+### Sessions that change within one batch
+
+`sessionLifecycleAt` maps a client ID to the entry index of the most recent successful `Register` or `Unregister` in this batch. An entry admitted earlier in the batch can reach `RecordResult` after the session it was admitted against is gone, replaced or removed by a later entry in the same batch.
+
+An entry whose client has a lifecycle transition at a *higher* index than its own must not record a response. The entry was legally applied, since it precedes the transition in the log, so its result stands. But for a closed session the cache is moot, and for a re-registered client ID, caching into the replacement session would deduplicate a future proposal of that series which the replacement session never applied.
+
+A successful `Register` or `Unregister` also drops that client's `batchSeen` and `admittedThisBatch` entries. A fresh session incarnation starts its series numbering over, so stale in-batch bookkeeping from a prior incarnation would either mirror the new session's first proposal to the wrong result or reject it against a stale count.
+
+### Recording results
+
+```
+sessions.RecordResult(clientID, seriesID, respondedTo, index, result)
+   |-- advance the respondedTo watermark
+   |-- evict cached responses with seriesID <= respondedTo
+   |-- store the result in the session cache
+```
+
+`ErrSessionNotFound` here is tolerated and logged: a missing session is a property of the committed log, not an infrastructure failure, so returning it would fail the shard deterministically on every replica. The `sessionLifecycleAt` check already covers every in-batch removal path; the tolerance is defence in depth against a future path that drops a session mid-batch. Any other error is an invariant violation and stays fatal. `ErrResponseLimitExceeded` is unreachable from here, because the `CanRecord` gate already refused anything that could not be cached.
+
+### lastApplied
 
 ```go
-if len(entries) > 0 {
-    lastIndex := entries[len(entries)-1].Index
-    if lastIndex > s.lastApplied.Load() {
-        s.lastApplied.Store(lastIndex)
-    }
+func (s *StateMachine) advanceLastApplied(idx uint64) {
+	if idx > s.lastApplied.Load() {
+		s.lastApplied.Store(idx)
+	}
 }
 ```
 
-Uses `atomic.Uint64` because `LastApplied()` may be read concurrently from the snapshot pool worker goroutine.
+Stored atomically because `LastApplied()` is read from the snapshot pool worker goroutine.
 
-## Session Integration
+`SetLastApplied(idx)` exists because nothing else sets this counter on a resume. `Open` seeds it from an on-disk state machine's own durable position, and `RecoverFromSnapshot` does not set it at all: the session table travels in the snapshot stream, this counter does not. The two callers are the engine's snapshot pool, after `RecoverFromSnapshot` installs state at `idx`, and `Host.StartShard`, beside the engine node's `SeedLastApplied` on the restart path.
 
-The adapter delegates all session lifecycle operations to `session.Manager` rather than the user SM:
+Both matter for the same two reasons. The counter is the index source for the next snapshot save, so a snapshot taken before the next `Apply` would otherwise pair a stale index with post-recovery state. And it is the lower bound of the expiry checkpoint walk, so a stale value re-walks checkpoints the shard already walked, and `ExpireSessions` is capped per call, so the re-walk deletes sessions the rest of the shard still holds. The contiguity guard is what makes an unseeded counter fail instead of diverge.
 
-### Registration
+## Read paths
 
-When `entry.IsNewSessionRequest()` is true:
+`Lookup`, `NALookup`, `NALookupBuf` and `GetHash` all take the `readGuard` in read mode and return `ErrClosed` if `Close` already ran. In-memory backends do not self-track closure and would otherwise return stale data after `Close`. Because `Apply` holds the same guard for writing, none of the four can run while an apply is in flight.
 
-1. Call `sessions.Register(entry.ClientID)`
-2. On success: `results[i] = sm.Result{Value: entry.ClientID}`
-3. On `ErrSessionAlreadyExists`: `results[i] = sm.Result{}` (not fatal)
-4. Skip user SM entirely
+### Lookup
 
-### Unregistration
+```go
+func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error)
+```
 
-When `entry.IsEndOfSessionRequest()` is true:
+For a `[]byte` query it tries `NALookup` first and falls through to the generic `Lookup` when the state machine does not implement `sm.NALookup`. The read guard serializes this against `Apply`, which holds the same mutex for writing, so a user `Lookup` never overlaps a user `Update`.
 
-1. Call `sessions.Unregister(entry.ClientID)`
-2. On success: `results[i] = sm.Result{Value: entry.ClientID}`
-3. On `ErrSessionNotFound`: `results[i] = sm.Result{Value: sm.ResultSessionExpired}` (not fatal) -- signalled the same way as session-managed entries with an unregistered session, so the host layer translates it to `ErrSessionExpired` → `ErrRejected`
-4. Skip user SM entirely
+### NALookupBuf
 
-### Why Not Fatal
+```go
+func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), supported bool, err error)
+```
 
-Register/unregister errors (already exists, not found) are not propagated as fatal. These are idempotent operations -- a duplicate register after snapshot recovery or a double-unregister from a retry should not crash the node. A failed register reports `sm.Result{}` (no effect), while a failed unregister reports `sm.Result{Value: sm.ResultSessionExpired}` so the host layer surfaces it as `ErrRejected` to the caller.
+The pooled path behind `Host.SyncReadBuf` and `Host.StaleReadBuf`. It takes a `[]byte` from `lookupBufPool` (initial capacity 256, pooled as `*[]byte` so the pool entry does not escape), calls `sm.NALookupInto`, and hands back the filled slice with a release function. When the state machine does not implement `NALookupInto` it falls back to `NALookup` with a no-op release.
 
-### Session Manager Limits
+Two properties are load-bearing:
 
-| Limit | Default | Error |
-|-------|---------|-------|
-| Max sessions per shard | 16,384 | `ErrSessionLimitExceeded` |
-| Max cached responses per session | 128 | `ErrResponseLimitExceeded` |
+- **The read guard is dropped before returning, not held for the lifetime of the buffer.** `release` is called by application code, so a caller that never releases would otherwise pin the read lock forever. Once `Close` queues as a writer, every subsequent lookup on the shard queues behind it. Holding it is also unnecessary, because the `sm.NALookupInto` contract requires implementations to copy into `dst`, so the returned slice does not alias state machine memory.
+- **`release` is guarded by a `sync.Once` covering the whole body, `Put` included.** Guarding only part of it would let a double release put the same pointer into the pool twice, after which two goroutines hold the same buffer and silently overwrite each other's read results.
 
-`ErrResponseLimitExceeded` is propagated from `Apply()` as a fatal error, indicating a misbehaving client that is not advancing its `respondedTo` watermark.
+### GetHash
 
-## Snapshot Operations
+Delegates through the wrapper's type assertion and reports `(0, false, nil)` when the state machine does not implement `sm.Hasher`. `Host.StateMachineHash` pairs the hash with the applied index so a cross-replica comparison is meaningful.
 
-### Snapshot Format
+It takes the read guard for the same reason `Lookup` does. Without it, the hash was computed concurrently with `Apply`, so a divergence check could observe a half-applied batch and report a mismatch that does not exist, and concurrently with `Close`, reading a closed state machine.
+
+## Snapshots
+
+### Format
 
 ```
 +-----------------------------------+
-| Session data (Manager.MarshalTo)  |
+| session data (Manager.MarshalTo)  |
 |   [numSessions:4]                 |
 |   [session1][session2]...         |
-|   Each session:                   |
+|   each session:                   |
 |     [clientID:8]                  |
 |     [respondedTo:8]               |
 |     [numResponses:4]              |
@@ -330,195 +359,128 @@ Register/unregister errors (already exists, not found) are not propagated as fat
 |       dataLen:4, data:N}...]      |
 |     [lastActiveIndex:8]           |
 +-----------------------------------+
-| User SM data (smWrapper snapshot) |
+| user SM data (smWrapper snapshot) |
 +-----------------------------------+
 ```
 
-Session data is written first, user SM data second. The format uses little-endian encoding with deterministic ordering (client IDs and series IDs sorted before serialization).
+Little-endian throughout, with client IDs and series IDs sorted before serialization so identical session tables produce identical bytes.
 
-### SaveSnapshot
-
-```go
-func (s *StateMachine) SaveSnapshot(ctx, w, stopper) error {
-    // 1. Check for cancellation
-    // 2. Serialize session state -> w
-    // 3. Delegate to smWrapper.SaveSnapshot -> w
-}
-```
-
-The three wrapper types handle `SaveSnapshot` differently:
-
-| Wrapper | SaveSnapshot Behavior |
-|---------|----------------------|
-| `regularSMWrapper` | Direct delegation to `sm.SaveSnapshot(ctx, w, stopper)` |
-| `concurrentSMWrapper` | Two-phase: `PrepareSnapshot()` then `SaveSnapshot(ctx, snapCtx, w, stopper)` |
-| `onDiskSMWrapper` | Three-phase: `Sync()` then `PrepareSnapshot()` then `SaveSnapshot(ctx, snapCtx, w, stopper)` |
-
-The two-phase approach for `ConcurrentStateMachine` allows capturing a point-in-time snapshot context on the apply worker goroutine (while `Update` is paused), then writing the snapshot data asynchronously without blocking further `Update` calls.
-
-The three-phase approach for `DiskStateMachine` adds `Sync()` before `PrepareSnapshot()` to flush pending writes to durable storage, ensuring the snapshot reflects a consistent state.
-
-### RecoverFromSnapshot
+### Save
 
 ```go
-func (s *StateMachine) RecoverFromSnapshot(ctx, r, stopper) error {
-    // 1. Check for cancellation
-    // 2. Deserialize session state <- r  (replaces all sessions)
-    // 3. Delegate to smWrapper.RecoverFromSnapshot <- r
-}
+func (s *StateMachine) SaveSnapshot(ctx, w, stopper) error
+func (s *StateMachine) SaveSnapshotGated(ctx, w, stopper, afterCapture func()) error
 ```
 
-Session state is read first, then user SM state. The session manager's `UnmarshalFrom` clears all existing sessions and replaces them with the deserialized state.
+`SaveSnapshot` is `SaveSnapshotGated` with a nil callback. The gated form is what the engine uses (`pkg/internal/engine/snapshot_pool.go:976`).
 
-### Cancellation
+Order of operations: check the closed guard, check the stopper, marshal the session table, then delegate to `smWrapper.saveSnapshotGated`. The session manager is not safe for concurrent use, so its `MarshalTo` must run with applies quiesced, which is the caller's gate. If the save errors before the capture completes, `afterCapture` is never called.
 
-Both `SaveSnapshot` and `RecoverFromSnapshot` check the stopper channel before starting. If already closed, they return `ErrStopped` immediately. The stopper channel is also passed through to the user SM for periodic cancellation checks during long-running snapshot operations.
+The engine sets the node's saving flag and waits for the apply drain before calling in, then passes `release` as `afterCapture` (`pkg/internal/engine/snapshot_pool.go:701`). The deferred release is a backstop that covers every error path.
 
-## Optional Interfaces
+| Wrapper | What `saveSnapshotGated` does | When the engine's apply gate is released |
+|---------|-------------------------------|------------------------------------------|
+| `regularSMWrapper` | `sm.SaveSnapshot(ctx, w, stopper)` | after the whole save |
+| `concurrentSMWrapper` | `PrepareSnapshot()`, then `SaveSnapshot(ctx, snapCtx, w, stopper)` | after `PrepareSnapshot` |
+| `onDiskSMWrapper` | `Sync()`, `PrepareSnapshot()`, then `SaveSnapshot(ctx, snapCtx, w, stopper)` | after `PrepareSnapshot` |
 
-### NALookup
+A regular state machine has no point-in-time prepare and is not safe against a concurrent `Update`, so its whole in-memory save is the consistent capture. For the other two the capture is cheap and the stream is not, which is the reason the split exists: a large on-disk snapshot is not meant to pause the shard's applies for the duration of its transfer.
 
-The `sm.NALookup` interface provides zero-allocation byte-slice lookups for hot paths, avoiding the heap allocation from `interface{}` boxing in the standard `Lookup` method:
+The column says apply *gate* rather than applies for a reason. `SaveSnapshotGated` holds the `readGuard` in read mode for the whole call, streaming included, and `Apply` takes that guard for writing. So on the concurrent and on-disk wrappers the gate is released after `PrepareSnapshot` as the table says, and an apply arriving during the stream still blocks on the guard until the stream ends. Reads queue behind that apply.
+
+### Recover
 
 ```go
-type NALookup interface {
-    BytesLookup(key []byte) ([]byte, error)
-}
+func (s *StateMachine) RecoverFromSnapshot(ctx, r, stopper) error
 ```
 
-The adapter wraps this with a `(value, supported, error)` return pattern:
+1. Closed guard, then stopper check.
+2. `refreshSessionPolicy()`. `UnmarshalFrom` bounds-checks the table against the manager's limits, and the table was written by a replica applying the *shard's* policy. Checking it against this node's configuration instead would reject a snapshot the rest of the shard considers well-formed, and that rejection is fatal to recovery. For a replica bootstrapped by an `InstallSnapshot` this is also the first point at which any policy is known.
+3. Decode the session table into a **staged** manager.
+4. `smWrapper.RecoverFromSnapshot`.
+5. Only on success, adopt the staged manager.
+
+Staging is what makes recovery all-or-nothing. Decoding straight into the live table replaced it before the user restore ran; if the user restore then failed on a truncated payload, the node kept user data from index N beside session metadata from a later index M. A client retry could be answered from a cached result for an operation the state machine never applied, or a cached response could vanish and let a duplicate command execute twice. Neither surfaces an error anywhere. The reader is sequential, so staging costs nothing: `UnmarshalFrom` advances `r` to exactly the position the user restore must start from whether or not the staged table is adopted.
+
+## Optional interface plumbing
+
+Three package-level helpers in `adapter.go` do the type assertion once and are shared by all three wrappers, so there is one copy of the dispatch rather than nine:
 
 ```go
-func naLookup(underlying interface{}, key []byte) ([]byte, bool, error) {
-    na, ok := underlying.(sm.NALookup)
-    if !ok {
-        return nil, false, nil     // not supported, no error
-    }
-    result, err := na.BytesLookup(key)
-    if err != nil {
-        return nil, true, err      // supported, but errored
-    }
-    return result, true, nil       // supported, success
-}
+func naLookup(underlying interface{}, key []byte) ([]byte, bool, error)
+func naLookupInto(underlying interface{}, key, dst []byte) ([]byte, bool, error)
+func getHash(underlying interface{}) (uint64, bool, error)
 ```
 
-The `Lookup` method on `rsm.StateMachine` uses NALookup as a fast path when the query is a `[]byte`:
-
-```go
-func (s *StateMachine) Lookup(ctx, query) (interface{}, error) {
-    if key, ok := query.([]byte); ok {
-        result, supported, err := s.sm.NALookup(key)
-        if err != nil { return nil, err }
-        if supported { return result, nil }
-    }
-    return s.sm.Lookup(ctx, query)
-}
-```
-
-### GetHash
-
-The `sm.Hasher` interface computes a deterministic hash of state machine state for cross-replica consistency verification:
-
-```go
-type Hasher interface {
-    GetHash() (uint64, error)
-}
-```
-
-Wrapped identically:
-
-```go
-func getHash(underlying interface{}) (uint64, bool, error) {
-    h, ok := underlying.(sm.Hasher)
-    if !ok {
-        return 0, false, nil       // not supported
-    }
-    hash, err := h.GetHash()
-    if err != nil {
-        return 0, true, err        // supported, but errored
-    }
-    return hash, true, nil         // supported, success
-}
-```
-
-### The Three-Value Return Pattern
-
-Both optional interfaces follow the same convention:
+Each follows the same convention:
 
 | Return | Meaning |
 |--------|---------|
-| `(zero, false, nil)` | SM does not implement the interface |
-| `(value, true, nil)` | SM implements it, call succeeded |
-| `(zero, true, err)` | SM implements it, call failed |
+| `(zero, false, nil)` | the state machine does not implement the interface |
+| `(value, true, nil)` | it does, and the call succeeded |
+| `(zero, true, err)` | it does, and the call failed |
 
-This allows callers to distinguish "not supported" from "supported but errored" without introducing a separate capability-check method.
+That lets callers tell "not supported" from "supported but errored" without a separate capability-check method.
 
-## DRY Helpers
+## Errors
 
-The `naLookup()` and `getHash()` package-level functions in `adapter.go` are shared by all three wrapper types. Without these helpers, each wrapper would need its own copy of the type-assertion-and-dispatch logic:
-
-```go
-// Used by regularSMWrapper, concurrentSMWrapper, and onDiskSMWrapper
-func (w *regularSMWrapper) NALookup(key []byte) ([]byte, bool, error) {
-    return naLookup(w.sm, key)  // shared helper
-}
-func (w *concurrentSMWrapper) NALookup(key []byte) ([]byte, bool, error) {
-    return naLookup(w.sm, key)  // same helper
-}
-func (w *onDiskSMWrapper) NALookup(key []byte) ([]byte, bool, error) {
-    return naLookup(w.sm, key)  // same helper
-}
-```
-
-This eliminated 6 copy-pasted method bodies (3 wrappers x 2 optional interfaces) in favor of 2 shared functions.
-
-## Error Propagation
-
-### RSM Sentinel Errors
-
-Defined in `pkg/internal/rsm/errors.go`:
+### Adapter sentinels (`pkg/internal/rsm/errors.go`)
 
 | Error | When |
 |-------|------|
-| `ErrInvalidSMType` | `CreateFunc` returns a type that does not implement any known SM interface |
-| `ErrClosed` | Operation attempted on a closed state machine |
-| `ErrStopped` | Stopper channel closed during snapshot operation |
+| `ErrInvalidSMType` | `CreateFunc` returned a type implementing none of the three interfaces |
+| `ErrStopped` | the stopper channel was already closed when a snapshot operation started |
+| `ErrClosed` | `Apply`, a read, or a snapshot operation was attempted on a closed state machine |
+| `ErrApplyGap` | the offered batch does not start at `lastApplied + 1` |
 
-### Session Sentinel Errors
+These are defined here rather than in the public `quicraft` package (`pkg/`) to avoid an import cycle. `Host.StartShard` translates `rsm.ErrInvalidSMType` into the public `quicraft.ErrInvalidSMType` (`pkg/host.go:3494`).
 
-Defined in `pkg/internal/session/errors.go`:
+### Session sentinels (`pkg/internal/session/errors.go`)
 
 | Error | When |
 |-------|------|
-| `ErrSessionLimitExceeded` | Shard has reached max sessions (default 16,384) |
-| `ErrSessionNotFound` | Operation on a non-existent client session |
-| `ErrSessionAlreadyExists` | Registering an already-registered client |
-| `ErrResponseLimitExceeded` | Session response cache full (client not advancing respondedTo) |
+| `ErrSessionLimitExceeded` | the shard is at `MaxTotalSessions` |
+| `ErrSessionNotFound` | an operation named a client session that does not exist |
+| `ErrSessionAlreadyExists` | registering an already-registered client |
+| `ErrResponseLimitExceeded` | a session's response cache is full |
+| `ErrResponseEvicted` | the series already completed and its response was evicted |
+| `ErrSnapshotCorrupted` | sentinel behind `BoundsError` for `errors.Is` checks on a malformed session table |
 
-### Propagation Rules
+### Propagation rules
 
-- Errors from `smWrapper.Update()` propagate directly from `Apply()` -- the engine treats these as fatal for the shard.
-- `ErrResponseLimitExceeded` from `sessions.RecordResult()` propagates from `Apply()` -- indicates a misbehaving client.
-- Session register/unregister errors (`ErrSessionAlreadyExists`, `ErrSessionNotFound`) are handled inline -- not propagated as fatal. A failed register yields `sm.Result{}`; a failed unregister yields `sm.Result{Value: sm.ResultSessionExpired}`. These are idempotent and expected during replay.
-- Errors from `SaveSnapshot`, `RecoverFromSnapshot`, and `Close` propagate directly to the engine.
-- The RSM never swallows errors with `_`. All error returns from user SM methods and session operations are either propagated or explicitly handled.
+- Errors from `smWrapper.Update` propagate straight out of `Apply`; the engine treats them as fatal for the shard.
+- `ErrApplyGap` fails the shard, deliberately.
+- Register and unregister errors are handled inline and never fatal. They are idempotent operations expected during replay: a duplicate register after snapshot recovery, or a double unregister from a retry, must not kill the node. A failed register yields `sm.Result{}`; a failed unregister yields `sm.Result{Value: sm.ResultSessionExpired}`, so the host layer surfaces it as `ErrSessionExpired` and then `ErrRejected` to the caller.
+- `ErrSessionNotFound` from `RecordResult` is logged and swallowed. Any other `RecordResult` error is fatal.
+- Errors from `SaveSnapshot`, `RecoverFromSnapshot` and `Close` propagate to the engine.
+- Nothing is discarded into `_`.
 
-## Wrapper Behavior Summary
+## Wrapper behavior summary
 
-| Method | regularSMWrapper | concurrentSMWrapper | onDiskSMWrapper |
-|--------|-----------------|---------------------|-----------------|
-| `Open` | no-op `(0, nil)` | no-op `(0, nil)` | delegates to `sm.Open()` |
+| Method | `regularSMWrapper` | `concurrentSMWrapper` | `onDiskSMWrapper` |
+|--------|--------------------|-----------------------|-------------------|
+| `Open` | no-op `(0, nil)` | no-op `(0, nil)` | delegates to `sm.Open` |
 | `Update` | delegates | delegates | delegates |
 | `Lookup` | delegates | delegates | delegates |
-| `NALookup` | `naLookup(sm, key)` | `naLookup(sm, key)` | `naLookup(sm, key)` |
-| `GetHash` | `getHash(sm)` | `getHash(sm)` | `getHash(sm)` |
-| `SaveSnapshot` | direct | `PrepareSnapshot` + `SaveSnapshot(snapCtx)` | `Sync` + `PrepareSnapshot` + `SaveSnapshot(snapCtx)` |
+| `NALookup` | `naLookup(sm, key)` | same | same |
+| `NALookupInto` | `naLookupInto(sm, key, dst)` | same | same |
+| `GetHash` | `getHash(sm)` | same | same |
+| `saveSnapshotGated` | save, then `afterCapture` | `PrepareSnapshot`, `afterCapture`, save | `Sync`, `PrepareSnapshot`, `afterCapture`, save |
 | `RecoverFromSnapshot` | delegates | delegates | delegates |
 | `Close` | delegates | delegates | delegates |
-| `Type` | `smTypeRegular` | `smTypeConcurrent` | `smTypeOnDisk` |
+| `Type` | `SMTypeRegular` | `SMTypeConcurrent` | `SMTypeOnDisk` |
 
-## Cross-References
+## Inspection accessor
 
-- [Architecture Overview](../architecture/overview.md) -- system overview and data flow
-- [Engine Pipeline](../engine/pipeline.md) -- apply worker that calls `rsm.StateMachine.Apply()`
-- [Session Management](../sessions/deduplication.md) -- session manager internals
+`StateMachine.Sessions()` returns the live `session.Manager`, the same object `Apply`, `RecoverFromSnapshot` and `SaveSnapshotGated` mutate. `session.Manager` is not safe for concurrent use, and there is no lock here to make it so. Every method on it, including the read-only-looking `Count` and `IsRegistered`, may be called only when no apply and no snapshot save can be in flight for the shard.
+
+It has no production caller. It exists for tests in this package and for the host's session-policy tests, which assert the limits the apply path actually resolved. A future caller wanting one of these numbers on a live shard needs a value snapshotted on the apply goroutine, not this pointer.
+
+## Cross-references
+
+- [State machine interfaces](interfaces.md), the contract this adapter enforces
+- [KV backends](kv-backends.md), two implementations of it
+- [Engine pipeline](../engine/pipeline.md), the apply worker and the snapshot pool
+- [Session deduplication](../sessions/deduplication.md), the session manager internals
+- [Raft protocol](../raft/protocol.md), snapshot transfer and membership changes
+- [Public API](../api/reference.md), `Host.StartShard` and the read methods

@@ -1,6 +1,15 @@
 # Lifecycle Management
 
-This document describes the complete lifecycle of a QuicRaft host: startup, shard initialization, crash recovery, and graceful shutdown. Every section reflects the actual production code paths rather than design intent.
+The lifecycle of a QuicRaft host: startup, shard initialization, crash recovery,
+graceful shutdown, and the runbook for a shard that has lost quorum. Each
+sequence below is traced from the code, not from design intent.
+
+This is alpha software at `0.5.1-alpha`. The shutdown and recovery paths
+described here are exercised by the integration and fault-injection suites, but
+the format situation those suites do not cover is in
+[Compatibility and Upgrades](compatibility.md): a data directory written by
+`0.4.x` is not readable here, and the failure is a corruption-shaped error
+rather than a version mismatch.
 
 ## Source Files
 
@@ -27,8 +36,9 @@ This document describes the complete lifecycle of a QuicRaft host: startup, shar
 NewHost(cfg, opts...)
   |
   |  1. cfg.SetDefaults() + cfg.Validate()
-  |     - Reject invalid WALDir, NodeHostDir, RaftAddress, RTTMillisecond
-  |     - Worker counts default to GOMAXPROCS when 0
+  |     - Reject empty WALDir, NodeHostDir, RaftAddress, ListenAddress
+  |     - Reject DeploymentID 0 unless AllowZeroDeploymentID
+  |     - NumWorkers and MaxApplyWorkers default to runtime.NumCPU()
   |
   |  2. Configure logger
   |     - WithLogger(l) installs caller-provided *slog.Logger
@@ -137,8 +147,13 @@ StartShard(members, join, create, cfg)
   |  4. Recover LogReader from LogDB (see Crash Recovery below)
   |     - h.recoverLogReader(lr, shardID, replicaID)
   |
-  |  5. Set initial membership (unless joining existing cluster)
-  |     - lr.SetMembership(proto.Membership{Addresses: members})
+  |  5. Set initial membership (first start, non-join only)
+  |     - lr.SetMembership(initialMembership) from the members map,
+  |       Config.Witness and Config.MemberIdentities
+  |     - Written down as a committed EntryInitialMembership at
+  |       log index 1 -- membership lives IN the log, not out of band
+  |     - On a restart the membership is RECONSTRUCTED from the log
+  |       (that entry plus every committed config change) instead
   |
   |  6. Create Raft peer
   |     - raft.NewPeer(cfg, lr, globalRL)
@@ -231,12 +246,14 @@ waldb.Open(dir)
       |      |         |    Decrypt if barrier configured
       |      |         |    replayRecord(data, segID)
       |      |         |      dispatch on payload type byte:
-      |      |         |        0x01: entries  -> rebuild entry map + index
-      |      |         |        0x02: state    -> restore hard state
-      |      |         |        0x03: snapshot -> restore snapshot metadata
+      |      |         |        0x02: state     -> restore hard state
       |      |         |        0x04: bootstrap -> restore bootstrap info
-      |      |         |        0x05: compact  -> replay compaction markers
-      |      |         |        0x06: remove   -> replay node removal
+      |      |         |        0x05: compact   -> replay compaction markers
+      |      |         |        0x06: remove    -> replay node removal
+      |      |         |        0x0b: entries   -> rebuild entry map + index
+      |      |         |        0x0c: snapshot  -> restore snapshot metadata
+      |      |         |        0x01/0x03/0x07/0x08/0x09/0x0a: legacy -> FATAL
+      |      |         |        anything else: ErrUnknownPayloadType (FATAL)
       |      |
       |      |  4. Track nextSegmentID = max(segID) + 1
       |      |  5. ensureActiveSegment() if recovered data exists
@@ -245,7 +262,33 @@ waldb.Open(dir)
       |    Lazy initialization -- directory created on first write
 ```
 
-The WAL shards rebuild all in-memory state (entries, hard state, bootstraps, snapshots, compaction markers) purely from segment replay. No separate metadata file is needed.
+The WAL shards rebuild all in-memory state (entries, hard state, bootstraps,
+snapshots, compaction markers) purely from segment replay. No separate metadata
+file is needed. The one thing a segment does not carry about itself — the block
+grid and the chunk framing — lives in the `WALFORMAT` marker at the WAL root,
+which is read before any segment byte.
+
+**Every decode failure during replay is fatal, and that is deliberate.** A
+malformed entry batch, a bad state record and an unreadable snapshot record all
+abort recovery rather than being skipped. Skipping any of them is worse than
+failing: a skipped entry batch leaves a silent hole in the log that is later
+served to followers as a shortened, nil-error range (a Log Matching violation);
+a skipped state record lets an older `Term`/`Vote` win last-writer-wins replay,
+which permits a double vote in one term (an Election Safety violation); and a
+skipped snapshot record boots the node with empty membership.
+
+`ErrUnknownPayloadType` has one dominant real-world cause, and it is not a
+version skew: **opening a keyed WAL with `barrier == nil`.** Barrier ciphertext
+begins with an 8-byte big-endian epoch whose first byte is `0x00` for any
+realistic epoch, so with no decrypt attempted every record decodes as payload
+type `0x00`. If those were skipped the node would boot as a brand-new empty
+replica that votes with no memory of prior votes. Check your barrier wiring
+before you suspect disk corruption.
+
+The other way to reach it is a downgrade: `0x0b` and `0x0c` are the current
+entry and snapshot types, and a binary predating that renumbering knows neither.
+A directory written by a newer build is not readable by an older one, which the
+pre-release wipe-and-resync posture already assumes.
 
 ### On-Disk State Machine Recovery
 
@@ -377,10 +420,19 @@ The `HandleSnapshot` method in `pkg/messagehandler.go` handles the follower-side
 The snapshot pool's `recoverSnapshot` then:
 
 1. Read snapshot metadata from LogDB (index, term, filepath, epoch)
-2. Decrypt data file in-place if epoch > 0 and barrier is available
-3. Open data file, apply Snappy decompression if configured
-4. Call `snapshotter.RecoverFromSnapshot(ctx, reader, node.stopC)`
-5. Update `node.lastApplied` and `node.lastSnapshotIndex`
+2. Verify `snapshot.dat` against the `DataLen` and `DataHash` recorded in
+   `snapshot.meta` (xxhash64 of the file **as stored**, so before decryption and
+   before decompression)
+3. Decrypt data file in-place if epoch > 0 and barrier is available
+4. Open data file, apply Snappy decompression if configured
+5. Call `snapshotter.RecoverFromSnapshot(ctx, reader, node.stopC)`
+6. Update `node.lastApplied` and `node.lastSnapshotIndex`
+
+Step 2 is skipped for a `snapshot.meta` record written before those fields
+existed (`DataHashRecorded` is false). Such a record is not an error — it is a
+pre-`0.5.0` artifact and recovers unverified — but it means a truncated file
+from that era still recovers as if complete. Snapshots taken by this build are
+verified.
 
 ---
 
@@ -450,18 +502,31 @@ Two preconditions are not enforceable by the library and are yours to establish:
    and matches `ErrImportMembershipInvalid`; none is silently resolved, because
    a configuration accepted by accident is not detectable afterwards.
 
-5. **Restart the survivors** with a `Config` whose membership matches the map
-   you imported. The shard elects among the survivors and resumes.
+5. **Restart the survivors** with `StartShard(survivors, false, create, cfg)`,
+   passing the same map you imported. The shard elects among the survivors and
+   resumes.
 
-6. **Re-add replacements normally** with `RequestAddReplica` once the shard has
-   a leader. From this point ordinary membership change applies again.
+6. **Re-add replacements normally** with `RequestAddNode` (or
+   `SyncRequestAddNode`) once the shard has a leader. From this point ordinary
+   membership change applies again.
 
 ### Verifying the outcome
 
-`ShardInfo.Replicas` reports each follower's `Match`, replication `State` and
-`Active` flag, so you can confirm the recovered configuration is replicating
-rather than merely elected. `Host.StateMachineHash` compares state machines
-across replicas if you need to establish that the survivors agree.
+`ShardInfo.Replicas` reports each follower's `Match`, `Next`, replication
+`State` (`probe` / `replicate` / `snapshot`), `Paused`, `Active` and `Inflights`,
+so you can confirm the recovered configuration is replicating rather than merely
+elected.
+
+Two traps in reading it: the slice is **empty on a follower**, and it is empty
+on the first call for a shard because publication happens on the next tick. An
+empty `Replicas` therefore means "ask the leader, and ask again", not "no
+followers".
+
+`Host.StateMachineHash(shardID)` returns `(hash, appliedIndex, ok, err)` for
+comparing state machines across replicas. Compare hashes only at the **same**
+`appliedIndex`; a mismatch at different indexes means one replica is behind, not
+that they diverged. `ok` is false when the state machine does not implement
+hashing.
 
 ---
 
@@ -787,7 +852,7 @@ The apply worker is fail-fast: any terminal apply-path error takes the shard off
 - An SM panic during `Apply()` is recovered, sets `node.failed`, and reports `SMPanicError` (same offline outcome).
 - The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the shard entirely. Recovery requires operator intervention: stop and restart (reload) the shard, or recover it from a snapshot.
 
-The `MaxApplyRetries` / `DefaultMaxApplyRetries` config field and the `node.applyRetries`/`maxApplyRetries` fields still exist but are no longer consulted on the apply path — the apply path is now unconditionally fail-fast.
+There is no retry budget to configure. `HostConfig.MaxApplyRetries` and `config.DefaultMaxApplyRetries` existed through 0.5.1-alpha, were never consulted by the apply path, and have been removed.
 
 LogDB write failures (`SaveState`) — both retry exhaustion and shutdown cancellation during a retry backoff — funnel through `failBatchSaveState`: for every node in the batch it marks `failed = true`, clears `commitPending`, reports `SaveStateError`, and fails the batch's pending proposals (`OnProposalFailed`) so callers do not hang until their context deadline. The node is left permanently failed (recover by reloading the shard) because its Raft state advanced past stable storage.
 
@@ -804,3 +869,15 @@ LogDB write failures (`SaveState`) — both retry exhaustion and shutdown cancel
 4. **Node.stopC for cancellation**: Snapshot save and recover operations select on `node.stopC` for cancellation. `Engine.Stop()` closes all node `stopC` channels first, before stopping any worker tier, to unblock in-flight snapshot operations.
 
 5. **Apply worker wg.Wait()**: The apply worker waits for all per-shard goroutines to complete their current `SM.Apply()` call before returning from `run()`. This prevents `Engine.Stop()` from returning while state machine writes are still in progress.
+
+---
+
+## Cross-References
+
+- [Deployment](deployment.md) -- configuration reference, monitoring, tuning, disaster recovery
+- [Compatibility and Upgrades](compatibility.md) -- format versions, what breaks across a version boundary
+- [Engine Pipeline](../engine/pipeline.md) -- step/commit/apply worker internals
+- [WAL Persistence](../storage/wal.md) -- segment format, chunk framing, compaction
+- [Raft protocol](../raft/protocol.md) -- election safety, snapshot control, membership
+- [State machine interfaces](../statemachine/interfaces.md) -- `Open`, `Update`, `SaveSnapshot`, `RecoverFromSnapshot` contracts
+- [Testing infrastructure](../testing/infrastructure.md) -- fault injection, partition primitive, linearizability suite

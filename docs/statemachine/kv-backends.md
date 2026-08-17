@@ -1,247 +1,266 @@
-# KV Store Backends
+# KV store backends
 
 ## Overview
 
-The `pkg/sm/kv/` package provides two reference state machine implementations for QuicRaft: an in-memory store and a sharded concurrent store. Both implement the KV command protocol, optional `sm.Hasher` and `sm.NALookup` interfaces, and a binary snapshot format. They serve as production-ready examples of the state machine contract and as ready-to-use backends for applications built on QuicRaft.
+`pkg/sm/kv` provides two reference state machine implementations: an in-memory store and a sharded concurrent store. Both speak the same binary command protocol, implement the optional `sm.Hasher`, `sm.NALookup` and `sm.NALookupInto` interfaces, and use the same snapshot format. They are usable as-is, and they are the shortest worked examples of the contract described in [State machine interfaces](interfaces.md).
 
-Source: `pkg/sm/kv/`
+There is no `DiskStateMachine` backend in this repository. The PebbleDB-backed store lives in [go-qrdb](https://github.com/jeremyhahn/go-qrdb).
 
-## State Machine Interface Recap
+Source: `pkg/sm/kv/`.
 
-QuicRaft defines three state machine tiers in `pkg/sm/interfaces.go`, detected at startup via type assertion on the value returned by `sm.CreateFunc`:
+## Which tier each one is
 
-| Tier | Interface | Type Code | Key Properties |
-|------|-----------|-----------|----------------|
-| In-memory | `sm.StateMachine` | 0 | Serialized access for `Update`/`Lookup`. `SaveSnapshot` may run concurrently from snapshot pool. |
-| Concurrent | `sm.ConcurrentStateMachine` | 1 | `Lookup` concurrent with `Update`. Two-phase snapshot via `PrepareSnapshot`. |
-| On-disk | `sm.DiskStateMachine` | 2 | Owns persistent storage. `Open`/`Sync` lifecycle. Idempotent replay. |
+| Store | Interface | Type code | What that buys you |
+|-------|-----------|-----------|--------------------|
+| `MemoryStore` | `sm.StateMachine` | 0 | `SaveSnapshot` runs with applies quiesced, so the save is the point-in-time |
+| `ConcurrentStore` | `sm.ConcurrentStateMachine` | 1 | two-phase snapshot: `PrepareSnapshot` under the apply gate, streaming afterwards |
 
-Two optional interfaces are detected via type assertion:
+Both are found by type assertion on the value returned by `sm.CreateFunc` (`pkg/internal/rsm/statemachine.go:335`).
 
-- `sm.Hasher` -- `GetHash() (uint64, error)` for cross-replica consistency checks.
-- `sm.NALookup` -- `BytesLookup(key []byte) ([]byte, error)` for zero-allocation reads.
+Both take locks, but only `ConcurrentStore` is required to. The RSM adapter serializes `Update` against `Lookup` for every tier today, so `MemoryStore`'s mutex is no longer what keeps a read off a half-applied batch. `ConcurrentStore` is held to its interface's contract, which promises concurrent reads during `Update` whatever the adapter happens to do. See [Lookup concurrency](interfaces.md#lookup-concurrency).
 
-Both KV backends implement `sm.Hasher` and `sm.NALookup`. There is no `DiskStateMachine` KV backend at this time.
+## Command protocol
 
-## Command Protocol
-
-Source: `pkg/sm/kv/protocol.go`
-
-All KV operations use a compact binary encoding. The wire format is:
+Source: `pkg/sm/kv/protocol.go`.
 
 ```
 [op:1][keyLen:2 LE][key:keyLen][value:remaining]
 ```
 
-### Layout
+| Field | Size | Encoding | Description |
+|-------|------|----------|-------------|
+| `op` | 1 byte | unsigned | operation code |
+| `keyLen` | 2 bytes | little-endian | key length |
+| `key` | `keyLen` | raw bytes | key |
+| `value` | remainder | raw bytes | value, for the write ops |
 
-| Field    | Size      | Encoding       | Description                        |
-|----------|-----------|----------------|------------------------------------|
-| `op`     | 1 byte    | unsigned       | Operation code (1=Put, 2=Get, 3=Delete) |
-| `keyLen` | 2 bytes   | little-endian  | Length of the key                   |
-| `key`    | `keyLen`  | raw bytes      | Key data                           |
-| `value`  | remainder | raw bytes      | Value data (Put only)              |
+The header is 3 bytes. `MaxKeyLength` is 65535 (the uint16 ceiling). Value length is implicit: `len(data) - 3 - keyLen`.
 
-The fixed header is 3 bytes (`headerSize`). Maximum key length is 65535 bytes (uint16). Value length is implicit: `len(data) - headerSize - keyLen`.
-
-### Operation Codes
+### Operation codes
 
 ```go
 const (
-    OpPut    byte = 1  // Store key-value pair
-    OpGet    byte = 2  // Reserved for read queries (no-op in Update)
-    OpDelete byte = 3  // Remove a key
+	OpPut         byte = 1 // store a key-value pair
+	OpGet         byte = 2 // reserved for read queries; no-op in Update
+	OpDelete      byte = 3 // remove a key
+	OpPutIfAbsent byte = 4 // store only when the key is absent
 )
 ```
 
-`OpGet` is a no-op when processed through `Update` because reads are served through the `Lookup` path, not through Raft proposals.
+`OpGet` does nothing in `Update`, because reads go through `Lookup` rather than through Raft proposals. It exists so a caller can encode a read with the same helper family.
 
-### Encoder Functions
+`OpPutIfAbsent` is the reason this protocol has a conditional write at all. The existence check runs inside `Update`, on every replica, against the replicated state at that log position, so every replica reaches the same answer. Evaluating it on the proposer instead (read, decide, propose a plain `OpPut`) leaves a window between the read and the commit in which a second proposer interleaves and both writes succeed.
+
+Result codes for the conditional path:
 
 ```go
-func EncodePut(key, value []byte) ([]byte, error)  // [1][keyLen:2 LE][key][value]
-func EncodeGet(key []byte) ([]byte, error)         // [2][keyLen:2 LE][key]
-func EncodeDelete(key []byte) ([]byte, error)      // [3][keyLen:2 LE][key]
+const (
+	ResultStored    uint64 = 1 // this entry created the key
+	ResultNotStored uint64 = 0 // the key already existed
+)
 ```
+
+Both are successful applications. "Not stored" is an answer, not an error, so it must not stall consensus.
+
+### Encoders
+
+```go
+func EncodePut(key, value []byte) ([]byte, error)
+func EncodePutIfAbsent(key, value []byte) ([]byte, error)
+func EncodeGet(key []byte) ([]byte, error)
+func EncodeDelete(key []byte) ([]byte, error)
+```
+
+Each returns `*KeyTooLongError` when `len(key) > MaxKeyLength`. `EncodePutIfAbsent` produces the same wire shape as `EncodePut` and differs only in the opcode, so a reader that predates it rejects the command as an unknown op rather than silently applying a conditional write unconditionally.
 
 ### Decoder
 
 ```go
+type Command struct {
+	Op    byte
+	Key   []byte
+	Value []byte
+}
+
 func DecodeCommand(data []byte) (Command, error)
 ```
 
-Returns `*InvalidCommandError` for:
-- Data shorter than 3 bytes (`headerSize`)
-- Unknown operation code (outside 1-3 range)
-- Key length exceeding available data
+`Key` and `Value` are sub-slices of `data`. Under `Config.ZeroCopyEntryCmd` that means they alias engine memory, so copy anything you keep. Both stores clear their decode scratch slices at the end of `Update` for exactly this reason.
 
-The decoded `Command` struct:
+`DecodeCommand` returns `*InvalidCommandError` for data shorter than 3 bytes, an opcode outside 1-4, or a key length that runs past the end of the buffer.
 
-```go
-type Command struct {
-    Op    byte
-    Key   []byte
-    Value []byte
-}
-```
+### Lookup queries
 
-### Lookup Queries
-
-`Lookup` accepts three query types, dispatched by type assertion:
-
-| Query Type   | Behavior                                         |
-|--------------|--------------------------------------------------|
-| `[]byte`     | Returns value for key, or `*KeyNotFoundError`    |
-| `string`     | Converted to `[]byte`, same behavior             |
-| `ListQuery`  | Returns `[]string` of keys matching prefix, sorted |
+| Query type | Behavior |
+|------------|----------|
+| `[]byte` | value for the key, or `*KeyNotFoundError` |
+| `string` | converted to `[]byte`, same behavior |
+| `ListQuery` | `[]string` of keys with the prefix, sorted |
 
 ```go
 type ListQuery struct {
-    Prefix string
+	Prefix string
 }
 ```
 
-`ListQuery` always returns a non-nil `[]string` (empty slice when no matches).
+`ListQuery` always returns a non-nil slice, empty when nothing matches. Anything else returns `*InvalidCommandError`.
+
+`ListQuery` is passed through `Lookup` and never encoded, so there is no `EncodeList`. Listing is a read, not a proposal.
+
+## Update: decode, then mutate
+
+Both stores run `Update` in two passes, and the split is not stylistic.
+
+Pass one decodes every entry and touches nothing. An entry whose payload fails to decode gets `sm.ResultInvalidCommand` written into its result slot and is marked to be skipped.
+
+Pass two applies. The handlers cannot fail, so no error return is possible after the first mutation and the all-or-nothing contract of `Update` holds without a rollback path.
+
+This is also why an undecodable payload does not produce an `Update` error. The entry is already committed, so returning an error would fail the shard deterministically on every replica and wedge it forever on replay (`pkg/sm/kv/memory.go:95`).
 
 ## MemoryStore
 
-Source: `pkg/sm/kv/memory.go`
-
-`MemoryStore` implements `sm.StateMachine` with a `sync.RWMutex`-protected `map[string][]byte`. A mutex is required because `Lookup` and `SaveSnapshot` run on separate goroutines from `Update`: `Lookup` is called from client request goroutines (`SyncRead`, `QueryLocalNode`, `StaleRead`), while `Update` runs on the engine's apply worker. `SaveSnapshot` may also overlap with `Update` when triggered by the engine's snapshot pool. The `RWMutex` allows concurrent readers (`Lookup`, `BytesLookup`, `GetHash`, `SaveSnapshot`) while serializing writes (`Update`, `RecoverFromSnapshot`, `Close`).
-
-### Structure
+Source: `pkg/sm/kv/memory.go`.
 
 ```go
 type MemoryStore struct {
-    mu   sync.RWMutex
-    data map[string][]byte
+	mu   sync.RWMutex
+	data map[string][]byte
+	cmds []Command // decode scratch, reused across Update calls
 }
+
+func NewMemoryStore() *MemoryStore
 ```
 
-### Update Dispatch
+The `RWMutex` no longer separates reads from applies. `Lookup`, `BytesLookup`, `BytesLookupInto` and `GetHash` do arrive on client request goroutines rather than on the apply worker, but the RSM adapter takes its `readGuard` for writing across `Update` and for reading across all four, so none of them can overlap an apply. `SaveSnapshot` on this tier runs with applies quiesced under the engine's saving gate as well.
 
-Operations are dispatched via a map-based handler table for O(1) lookup:
+What the mutex still buys: `MemoryStore` is an ordinary exported type that nothing stops you using outside a shard, and the `cmds` decode scratch slice reused across `Update` calls is guarded by it. Inside the adapter it is defence in depth. The read lock in `SaveSnapshot` also lets the deep copy finish before serialization starts, so the write phase never holds a lock across I/O.
+
+### Update dispatch
+
+Operations are dispatched through a map, so adding an opcode does not touch the loop:
 
 ```go
 type opHandlerFunc func(m *MemoryStore, cmd Command) sm.Result
 
 var opHandlers = map[byte]opHandlerFunc{
-    OpPut:    handlePut,
-    OpGet:    handleGetNoop,
-    OpDelete: handleDelete,
+	OpPut:         handlePut,
+	OpGet:         handleGetNoop,
+	OpDelete:      handleDelete,
+	OpPutIfAbsent: handlePutIfAbsent,
 }
 ```
 
-Each handler returns an `sm.Result`:
+| Operation | `Result.Value` | `Result.Data` |
+|-----------|----------------|---------------|
+| Put | `len(value)` | nil |
+| PutIfAbsent | `ResultStored` (1) or `ResultNotStored` (0) | nil |
+| Get | 0 | nil |
+| Delete | 1 | nil |
+| undecodable payload | `sm.ResultInvalidCommand` | nil |
 
-| Operation | Result.Value           | Result.Data |
-|-----------|------------------------|-------------|
-| Put       | `len(value)` (bytes written) | nil   |
-| Get       | 0 (no-op)              | nil         |
-| Delete    | 1 (success)            | nil         |
+Put and PutIfAbsent copy the value before storing, so nothing in the map aliases an entry buffer.
 
-Put copies the value before storing to avoid aliasing the entry's `Cmd` buffer.
+### Reads
 
-### Lookup
-
-`Lookup` acquires a read lock and returns a copy of the stored value, preventing callers from mutating internal state. Both the `Lookup` and `BytesLookup` paths hold `mu.RLock` for the duration of the read and allocate a copy before returning.
+`Lookup` and `BytesLookup` hold the read lock and return an owned copy, so a caller cannot mutate stored state through the returned slice. `BytesLookupInto` copies into the caller's buffer instead, growing it with `append`, which is what lets `Host.SyncReadBuf` and `Host.StaleReadBuf` drop the adapter's read guard before handing the slice out.
 
 ### GetHash
 
-Computes a deterministic xxhash64 over sorted key-value pairs. Keys are sorted lexicographically, then each key and value is fed into the hasher in order. Two stores with identical data produce identical hashes regardless of insertion order.
+The hash is xxhash64 over key-value pairs in sorted key order, with a fixed-width uint64 little-endian length prefix before both the key and the value:
 
 ```go
-func (m *MemoryStore) GetHash() (uint64, error) {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-
-    h := xxhash.New()
-    keys := make([]string, 0, len(m.data))
-    for k := range m.data {
-        keys = append(keys, k)
-    }
-    sort.Strings(keys)
-    for _, k := range keys {
-        _, _ = h.Write([]byte(k))
-        _, _ = h.Write(m.data[k])
-    }
-    return h.Sum64(), nil
+func hashLenPrefixed(h *xxhash.Digest, key string, val []byte) error {
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(key)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	if _, err := h.WriteString(key); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(val)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	if _, err := h.Write(val); err != nil {
+		return &HashWriteError{Err: err}
+	}
+	return nil
 }
 ```
 
-### Use Case
+The length prefixes are not decoration. Without them the concatenated stream is ambiguous: `{"user": "1"}` and `{"use": "r1"}` hash identically, so genuine divergence goes undetected by the one API that exists to detect it. Both stores share this helper so they produce the same hash for the same logical contents.
 
-Testing, small datasets, and scenarios where all state fits comfortably in memory. Simplest implementation path for custom state machines.
+Sorting makes the hash independent of insertion order, which is what `Host.StateMachineHash` needs for a cross-replica comparison to mean anything.
 
 ## ConcurrentStore
 
-Source: `pkg/sm/kv/concurrent.go`
-
-`ConcurrentStore` implements `sm.ConcurrentStateMachine` with sharded locking for concurrent read access during writes.
-
-### Structure
+Source: `pkg/sm/kv/concurrent.go`.
 
 ```go
 const numBuckets = 16
 
 type bucket struct {
-    mu   sync.RWMutex
-    data map[string][]byte
+	mu   sync.RWMutex
+	data map[string][]byte
 }
 
 type ConcurrentStore struct {
-    buckets [numBuckets]bucket
+	buckets [numBuckets]bucket
+	ops     []decodedOp // decode scratch, reused across Update calls
 }
+
+func NewConcurrentStore() *ConcurrentStore
 ```
 
-Keys are assigned to buckets via `xxhash64(key) % 16`. This distributes load across 16 independent RWMutex-protected maps.
+Keys land in a bucket by `xxhash64(key) % 16`.
 
-### Concurrency Model
+### Locking
 
-| Method | Lock Type | Scope |
-|--------|-----------|-------|
-| `Update` (Put/Delete) | Write lock | Single bucket per entry |
-| `Lookup` (single key) | Read lock  | Single bucket |
-| `Lookup` (ListQuery)  | Read lock  | All 16 buckets |
-| `BytesLookup`         | Read lock  | Single bucket |
-| `GetHash`             | Read lock  | All buckets (two passes) |
-| `PrepareSnapshot`     | Read lock  | All 16 buckets |
-| `RecoverFromSnapshot` | Write lock | All 16 buckets |
-| `Close`               | Write lock | All 16 buckets |
+| Method | Lock | Scope |
+|--------|------|-------|
+| `Update` | write | every bucket the batch touches, all held together for the whole apply pass |
+| `Lookup` (single key) | read | one bucket |
+| `Lookup` (`ListQuery`) | read | all 16 |
+| `BytesLookup`, `BytesLookupInto` | read | one bucket |
+| `GetHash` | read | all 16, held for the whole computation |
+| `PrepareSnapshot` | read | all 16 |
+| `RecoverFromSnapshot` | write | all 16, after the stream has been fully parsed |
+| `Close` | write | one bucket at a time |
 
-`Update` acquires and releases the write lock per-entry, not per-batch. This allows concurrent `Lookup` calls to read from unaffected buckets while a batch is being applied.
+`Update` takes the write locks of all affected buckets before it mutates anything and releases them only after the last entry, so a concurrent `Lookup` never observes a half-applied batch. Every multi-bucket path acquires in ascending index order, which is what makes deadlock impossible.
+
+`GetHash` holds all 16 read locks for the whole computation rather than per key. Releasing and re-acquiring would let an `Update` interleave and produce a hash of a state no replica ever held, which reads as divergence that does not exist.
 
 ### PrepareSnapshot
 
-Acquires read locks on all 16 buckets simultaneously, deep-copies every key-value pair into a flat `map[string][]byte`, then releases all locks. The returned clone is passed to `SaveSnapshot` which runs on a separate goroutine without holding any locks.
-
 ```go
 func (cs *ConcurrentStore) PrepareSnapshot() (interface{}, error) {
-    for i := range cs.buckets {
-        cs.buckets[i].mu.RLock()
-    }
-    clone := make(map[string][]byte)
-    for i := range cs.buckets {
-        for k, v := range cs.buckets[i].data {
-            cp := make([]byte, len(v))
-            copy(cp, v)
-            clone[k] = cp
-        }
-    }
-    for i := range cs.buckets {
-        cs.buckets[i].mu.RUnlock()
-    }
-    return clone, nil
+	for i := range cs.buckets {
+		cs.buckets[i].mu.RLock()
+	}
+	clone := make(map[string][]byte)
+	for i := range cs.buckets {
+		for k, v := range cs.buckets[i].data {
+			cp := make([]byte, len(v))
+			copy(cp, v)
+			clone[k] = cp
+		}
+	}
+	for i := range cs.buckets {
+		cs.buckets[i].mu.RUnlock()
+	}
+	return clone, nil
 }
 ```
 
-### Use Case
+The returned flat map is what `SaveSnapshot` serializes, on a different goroutine, holding no locks. `SaveSnapshot` returns `*InvalidCommandError` if it is handed anything other than a `map[string][]byte`.
 
-Read-heavy workloads where `Lookup` must not block on `Update`. The 16-bucket sharding reduces write contention compared to a single `sync.RWMutex`. The two-phase snapshot design ensures that `SaveSnapshot` never blocks `Update`.
+The clone costs O(n) memory for the duration of the stream. That is the price of not pausing applies while a large snapshot is written.
 
-## Snapshot Format
+## Snapshot format
 
-Both backends use the same binary snapshot format:
+Both stores write the same layout:
 
 ```
 [count:4 LE][entry_1][entry_2]...[entry_N]
@@ -253,125 +272,106 @@ Each entry:
 [keyLen:4 LE][key:keyLen][valLen:4 LE][val:valLen]
 ```
 
-All lengths are `uint32` little-endian. The format is not sorted; iteration order depends on Go's map randomization. Recovery reads `count` first, then reads exactly that many entries.
+All lengths are little-endian uint32.
 
-### SaveSnapshot
+`MemoryStore.SaveSnapshot` emits pairs in sorted key order. Ranging a map directly produces different bytes on each run for identical state, which defeats byte-level snapshot comparison, deduplication, and any digest an operator wants to compare across replicas. The decoder is order-independent, so the ordering affects only what is written.
 
-1. Write `uint32(len(data))` as the entry count.
-2. For each key-value pair, check the stopper channel, then write key length, key bytes, value length, value bytes.
-3. Returns `context.Canceled` if the stopper channel is closed.
+`ConcurrentStore.SaveSnapshot` currently ranges its cloned map directly and therefore does *not* produce byte-stable output. Recovery is unaffected; only byte-level comparison of two snapshots is.
 
-### RecoverFromSnapshot
+### Save
 
-1. Read the `uint32` entry count.
-2. Reset internal storage (`MemoryStore` replaces the map; `ConcurrentStore` locks all buckets, clears all maps, reads entries into the correct buckets by rehashing each key, then unlocks all buckets).
-3. For each entry, check the stopper channel, then read key/value lengths and data.
-4. Returns `context.Canceled` if the stopper channel is closed.
-5. Returns an error on truncated data or I/O failure.
+1. Write `uint32(len(data))`.
+2. For each pair, check the stopper, then write key length, key, value length, value.
+3. Return `context.Canceled` if the stopper closed mid-stream.
 
-## Factory Functions
+### Recover
 
-Source: `pkg/sm/kv/factory.go`
+Both stores parse the entire stream into staging structures before touching live state, so a truncated or corrupt snapshot returns an error and leaves the existing data intact. `MemoryStore` swaps in one new map; `ConcurrentStore` takes all 16 write locks and swaps in 16 staged maps.
 
-Factory functions wrap the concrete constructors into `sm.CreateFunc` values suitable for `Host.StartShard`:
+Two bounds guard the untrusted length prefixes, because a snapshot arrives from a peer over the transport:
+
+- `keyLen > MaxKeyLength` (65535) and `valLen > MaxValueLength` (64 MiB) both return `errCorruptSnapshotLength` instead of attempting the allocation.
+- The `count` prefix is not used directly as a map capacity. It is capped at `maxSnapshotMapHint` (1,048,576) for the pre-allocation; the map still grows past that if the snapshot genuinely holds more, and a count larger than the stream simply ends the loop early at EOF.
+
+`MaxValueLength` is a denial-of-service ceiling, not the largest writable value. A KV value always travels inside one proposal's `Entry.Cmd`, which the engine caps at `proto.MaxEntrySize` (8 MiB) at propose time and the WAL caps at the same figure, so a legitimately stored value can never approach 64 MiB. Keeping the recovery bound above the write-time limit means tightening `MaxEntrySize` cannot retroactively make an already-persisted snapshot unrecoverable.
+
+## Factory functions
+
+Source: `pkg/sm/kv/factory.go`.
 
 ```go
 func NewMemoryCreateFunc() sm.CreateFunc {
-    return sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-        return NewMemoryStore()
-    })
+	return sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
+		return NewMemoryStore()
+	})
 }
 
 func NewConcurrentCreateFunc() sm.CreateFunc {
-    return sm.NewConcurrentCreateFunc(func(shardID, replicaID uint64) sm.ConcurrentStateMachine {
-        return NewConcurrentStore()
-    })
+	return sm.NewConcurrentCreateFunc(func(_, _ uint64) sm.ConcurrentStateMachine {
+		return NewConcurrentStore()
+	})
 }
 ```
 
-The type-safe wrapper functions (`sm.NewCreateFunc`, `sm.NewConcurrentCreateFunc`) catch interface mismatches at compile time. The engine inspects the returned concrete type at startup to determine which state machine tier to use.
-
-### Usage Example
+The typed wrappers turn an interface mismatch into a compile error instead of an `ErrInvalidSMType` at shard start.
 
 ```go
 members := map[uint64]string{1: "10.0.0.1:4001", 2: "10.0.0.2:4001", 3: "10.0.0.3:4001"}
-shardCfg := config.Config{ShardID: 100, ReplicaID: 1}
+cfg := config.Config{ShardID: 100, ReplicaID: 1}
 
-// In-memory backend
-err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg)
-
-// Concurrent backend
-err := host.StartShard(members, false, kv.NewConcurrentCreateFunc(), shardCfg)
+err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), cfg)
+// or
+err = host.StartShard(members, false, kv.NewConcurrentCreateFunc(), cfg)
 ```
 
-## Error Handling
+## Errors
 
-Source: `pkg/sm/kv/errors.go`
-
-Two typed error types cover all error conditions:
-
-### KeyNotFoundError
-
-Returned by `Lookup` and `BytesLookup` when the requested key does not exist.
+Source: `pkg/sm/kv/errors.go`.
 
 ```go
-type KeyNotFoundError struct {
-    Key string
-}
-
-func (e *KeyNotFoundError) Error() string {
-    return "kv: key not found: " + e.Key
-}
+type KeyNotFoundError struct{ Key string }
+type InvalidCommandError struct{ Reason string }
+type KeyTooLongError struct{ Length int }
+type HashWriteError struct{ Err error } // implements Unwrap
 ```
 
-### InvalidCommandError
+| Type | Raised by | When |
+|------|-----------|------|
+| `*KeyNotFoundError` | `Lookup`, `BytesLookup`, `BytesLookupInto` | key absent |
+| `*InvalidCommandError` | `DecodeCommand` | payload under 3 bytes, unknown opcode, key length past end of data |
+| `*InvalidCommandError` | `Lookup` | query is not `[]byte`, `string` or `ListQuery` |
+| `*InvalidCommandError` | `ConcurrentStore.SaveSnapshot` | `snapshotCtx` is not a `map[string][]byte` |
+| `*KeyTooLongError` | the four `Encode*` functions | key over `MaxKeyLength` |
+| `*HashWriteError` | `GetHash` | the xxhash digest returned a write error |
 
-Returned by `DecodeCommand` and `Update` for malformed commands, and by `Lookup` for unsupported query types.
+A decode failure inside `Update` does not surface as an error at all. It becomes `sm.ResultInvalidCommand` in that entry's result slot.
 
-```go
-type InvalidCommandError struct {
-    Reason string
-}
-
-func (e *InvalidCommandError) Error() string {
-    return "kv: invalid command: " + e.Reason
-}
-```
-
-Conditions that produce `InvalidCommandError`:
-
-| Caller | Condition |
-|--------|-----------|
-| `DecodeCommand` | Data shorter than 3 bytes |
-| `DecodeCommand` | Unknown operation code |
-| `DecodeCommand` | Key length exceeds data |
-| `MemoryStore.Update` | `DecodeCommand` failure propagated |
-| `MemoryStore.Lookup` | Query is not `[]byte`, `string`, or `ListQuery` |
-| `ConcurrentStore.SaveSnapshot` | `snapshotCtx` is not `map[string][]byte` |
-
-## Interface Compliance
-
-Both backends declare compile-time interface assertions:
+## Interface compliance
 
 ```go
 // MemoryStore
 var (
-    _ sm.StateMachine = (*MemoryStore)(nil)
-    _ sm.Hasher       = (*MemoryStore)(nil)
-    _ sm.NALookup     = (*MemoryStore)(nil)
+	_ sm.StateMachine = (*MemoryStore)(nil)
+	_ sm.Hasher       = (*MemoryStore)(nil)
+	_ sm.NALookup     = (*MemoryStore)(nil)
+	_ sm.NALookupInto = (*MemoryStore)(nil)
 )
 
 // ConcurrentStore
 var (
-    _ sm.ConcurrentStateMachine = (*ConcurrentStore)(nil)
-    _ sm.Hasher                 = (*ConcurrentStore)(nil)
-    _ sm.NALookup               = (*ConcurrentStore)(nil)
+	_ sm.ConcurrentStateMachine = (*ConcurrentStore)(nil)
+	_ sm.Hasher                 = (*ConcurrentStore)(nil)
+	_ sm.NALookup               = (*ConcurrentStore)(nil)
+	_ sm.NALookupInto           = (*ConcurrentStore)(nil)
 )
 ```
 
-## Cross-References
+Worth copying into your own state machine. The optional interfaces are found by type assertion at runtime, so a signature that drifts by one argument compiles cleanly and leaves the optimized path silently unused forever.
 
-- [Architecture](../architecture/overview.md) -- State machine interfaces, factory registration, engine pipeline
-- [Engine Pipeline](../engine/pipeline.md) -- How Update/Lookup/Snapshot calls are scheduled by workers
-- [Session](../sessions/deduplication.md) -- At-most-once delivery, session-managed entries skipped by SM
-- [Operations](../operations/deployment.md) -- CLI `--sm-type` flag, deployment configuration
+## Cross-references
+
+- [State machine interfaces](interfaces.md), the contract both stores implement
+- [RSM adapter](rsm-adapter.md), what calls `Update`, `Lookup` and the snapshot methods
+- [Engine pipeline](../engine/pipeline.md), how apply and snapshot work is scheduled
+- [Session deduplication](../sessions/deduplication.md), at-most-once delivery around these calls
+- [Deployment](../operations/deployment.md), configuration and CLI options

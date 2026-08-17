@@ -4,7 +4,10 @@ Client sessions in QuicRaft provide **at-most-once proposal delivery** by tracki
 
 **Reference:** Raft PhD thesis Figure 6.1 (session-based client interaction)
 
-**Source:** `pkg/session.go`, `pkg/host.go`, `pkg/internal/session/manager.go`, `pkg/internal/rsm/statemachine.go`, `pkg/proto/entry.go`, `pkg/proto/constants.go`
+**Source:** `pkg/session.go`, `pkg/host.go`, `pkg/internal/session/manager.go`,
+`pkg/internal/session/session.go`, `pkg/internal/rsm/statemachine.go`,
+`pkg/proto/entry.go`, `pkg/proto/constants.go`, `pkg/proto/membership.go`
+(`SessionPolicy`)
 
 ## Overview
 
@@ -36,18 +39,39 @@ The session manager on every replica caches the result for each (clientID, serie
 
 ```go
 session, err := host.GetNewSession(ctx, shardID)
+
+// ...or, declaring the principal the session belongs to:
+session, err := host.GetNewSessionWithOwner(ctx, shardID, tenantID)
 ```
 
-`GetNewSession` creates a new session by generating a cryptographically random 64-bit clientID and proposing a register entry through Raft. All replicas apply the registration to their local session manager before the method returns. The flow:
+`GetNewSession` generates a cryptographically random 64-bit clientID and
+proposes a register entry through Raft. The registration is committed and
+applied before the method returns. The flow:
 
-1. Generate random 64-bit clientID
-2. Set seriesID to sentinel `SeriesIDForRegister` (math.MaxUint64-1)
-3. Propose registration entry: `Entry{ClientID, SeriesID=MaxUint64-1, Cmd: nil}`
-4. Block until entry is committed and applied across the quorum
-5. Advance seriesID to 1 via `PrepareForPropose()`
-6. Return active session to caller
+1. Generate a random 64-bit clientID (`crypto/rand`).
+2. `PrepareForRegister()`: seriesID becomes `SeriesIDForRegister`
+   (`math.MaxUint64 - 1`), respondedTo is cleared.
+3. Propose `Entry{ClientID, OwnerID, SeriesID: SeriesIDForRegister, Cmd: nil}`.
+4. Block until the entry is committed and applied.
+5. Verify the applied result's `Value` equals the clientID. A mismatch means the
+   apply path refused the registration and produces a `*SessionError` wrapping
+   `ErrInvalidOperation`.
+6. `PrepareForPropose()`: advance seriesID to `SeriesIDFirstProposal` (1).
 
-Alternative: Use `host.RegisterSession(ctx, session)` to register a pre-created session.
+`GetNewSessionWithOwner` is identical except that it stamps `Entry.OwnerID`, so
+the session counts against the shard's replicated per-owner cap. An `ownerID` of
+zero declares no owner and is exactly `GetNewSession`. See
+[Owners and the per-owner cap](#owners-and-the-per-owner-cap).
+
+**Sessions are refused on disk-backed state machines.** `GetNewSession` returns
+`ErrSessionsUnsupportedOnDisk` when the shard's state machine is an
+`sm.DiskStateMachine`: an on-disk SM cannot carry the session table across a
+restart, so a registered session would silently stop existing on any replica
+that restarted. Use `Host.GetNoOPSession` on those shards.
+
+Alternative: `host.RegisterSession(ctx, session)` registers a pre-created
+`Session`, which is how a client that persists its own clientID survives its own
+restart.
 
 ### 2. Deduplicated Proposals
 
@@ -61,13 +85,23 @@ err := host.ProposeWithSession(ctx, session, cmd)
 result, err := host.SyncProposeWithSession(ctx, session, cmd)
 ```
 
-The session's seriesID starts at 1 and advances with each proposal. After each result, update the session:
+The session's seriesID starts at 1 and advances with each proposal. After each
+result, update the session:
 
 ```go
-session.ProposalCompleted()  // atomically: respondedTo = seriesID; seriesID++
+session.ProposalCompleted()  // CAS-claim seriesID, then advance respondedTo to it
 ```
 
-The `respondedTo` field tracks the highest seriesID the client has acknowledged. The session manager uses this to evict stale cached results—once the client confirms seriesID N, all results for seriesID <= N can be discarded.
+`ProposalCompleted` claims the current seriesID with a CAS loop and then advances
+`respondedTo` **monotonically** to the claimed value. A plain store would let a
+goroutine that won an earlier CAS but ran its store later regress `respondedTo`
+below a higher completion, breaking the `respondedTo == seriesID - 1` invariant
+under concurrent completions.
+
+The `respondedTo` field tracks the highest seriesID the client has acknowledged,
+and it rides on every subsequent entry. The session manager uses it to evict
+stale cached results: once the client confirms seriesID N, all results for
+seriesID <= N are discarded.
 
 ### 3. Session Closure through Raft
 
@@ -84,9 +118,15 @@ Session control operations use sentinel values at the top of the uint64 range to
 **Source:** `pkg/session.go`, `pkg/proto/constants.go`
 
 ```go
-SeriesIDForRegister   = math.MaxUint64 - 1  // 0xFFFFFFFFFFFFFFFE
-SeriesIDForUnregister = math.MaxUint64       // 0xFFFFFFFFFFFFFFFF
-SeriesIDFirstProposal = 1
+// Public API (pkg/session.go)
+SeriesIDForRegister   uint64 = math.MaxUint64 - 1  // 0xFFFFFFFFFFFFFFFE
+SeriesIDForUnregister uint64 = math.MaxUint64      // 0xFFFFFFFFFFFFFFFF
+SeriesIDFirstProposal uint64 = 1
+
+// Wire-level equivalents (pkg/proto/constants.go), used by the Entry helpers
+SessionSeriesIDForRegister   uint64 = 1<<64 - 2
+SessionSeriesIDForUnregister uint64 = 1<<64 - 1
+NotSessionManagedClientID    uint64 = 0
 ```
 
 Normal proposals use seriesID starting at 1 and incrementing. The sentinels occupy the top of the uint64 range, so a client cannot collide with them for 2^64 - 3 proposals.
@@ -106,19 +146,21 @@ The RSM routes entries to the session manager or user state machine based on ses
 ```go
 // True if entry has a real clientID (not a no-op session)
 func (e *Entry) IsSessionManaged() bool {
-    return e.ClientID != 0
+    return e.ClientID != NotSessionManagedClientID
 }
 
 // True if entry is a register request
 func (e *Entry) IsNewSessionRequest() bool {
     return !e.IsConfigChange() && len(e.Cmd) == 0 &&
-        e.ClientID != 0 && e.SeriesID == math.MaxUint64-1
+        e.ClientID != NotSessionManagedClientID &&
+        e.SeriesID == SessionSeriesIDForRegister
 }
 
 // True if entry is an unregister request
 func (e *Entry) IsEndOfSessionRequest() bool {
     return !e.IsConfigChange() && len(e.Cmd) == 0 &&
-        e.ClientID != 0 && e.SeriesID == math.MaxUint64
+        e.ClientID != NotSessionManagedClientID &&
+        e.SeriesID == SessionSeriesIDForUnregister
 }
 ```
 
@@ -131,38 +173,96 @@ func (e *Entry) IsEndOfSessionRequest() bool {
 
 **Source:** `pkg/internal/rsm/statemachine.go`
 
-The RSM `Apply` method processes entries in the order they appear in the batch, routing based on session type:
+`Apply` first checks batch contiguity against `lastApplied` (a gap returns
+`ErrApplyGap`), then adopts the shard's replicated session policy
+(`refreshSessionPolicy`) so the limits this batch is evaluated against are the
+*shard's* and not this node's. It then segments the batch at expiry checkpoints
+and hands each segment to `applyBatch`. See
+[Deterministic expiry](#deterministic-expiry).
+
+`applyBatch` classifies entries in order:
 
 ```
-for entry in batch:
+for i, entry in segment:
+    if entry.IsConfigChange() or entry.IsInitialMembership():
+        results[i] = {}                       # membership is applied elsewhere
+        continue
+    if not session-managed and len(entry.Cmd) == 0:
+        results[i] = {}                       # leader no-op entry
+        continue
+
     if entry.IsNewSessionRequest():
-        sessions.Register(clientID)
+        sessions.Register(clientID, entry.OwnerID, entry.Index)
+        # on success: results[i].Value = clientID, and any in-batch dedup
+        # bookkeeping for this clientID is discarded (new incarnation)
+        continue
 
-    elif entry.IsEndOfSessionRequest():
+    if entry.IsEndOfSessionRequest():
         sessions.Unregister(clientID)
+        # on failure: results[i] = SESSION_EXPIRED
+        continue
 
-    elif entry.IsSessionManaged():
+    if entry.IsSessionManaged():
         result, isDup, err := sessions.CheckDuplicate(clientID, seriesID, index)
-        if err != nil:                 // ErrSessionNotFound / ErrResponseEvicted
+        if err != nil:                        # ErrSessionNotFound / ErrResponseEvicted
             results[i] = SESSION_EXPIRED
             continue
         if isDup:
-            results[i] = result        // cached, skip SM
+            results[i] = owned copy of result # cached, skip the user SM
             continue
-        // Capacity gate BEFORE mutating the user SM.
-        if sessions.CanRecord(clientID, seriesID, respondedTo, admittedThisBatch[clientID]) != nil:
-            results[i] = SESSION_EXPIRED   // ErrResponseLimitExceeded
-            continue
-        admittedThisBatch[clientID]++
-        smEntries = append(smEntries, entry)  // add to user SM batch
-        // After SM completes:
-        sessions.RecordResult(clientID, seriesID, respondedTo, index, result)
 
-    else:  // clientID == 0, no-op session
-        smEntries = append(smEntries, entry)  // No deduplication
+        # In-batch duplicate: a retry that committed alongside its original.
+        # MUST be checked before the capacity gate and before admittedThisBatch++.
+        if firstIdx, seen := batchSeen[clientID][seriesID]; seen:
+            mirrors[i] = firstIdx             # copy the first occurrence's result
+            continue
+
+        # Capacity gate BEFORE mutating the user SM.
+        if sessions.CanRecord(clientID, entry.RespondedTo,
+                              admittedThisBatch[clientID]) != nil:
+            results[i] = SESSION_EXPIRED      # ErrResponseLimitExceeded
+            continue
+
+        admittedThisBatch[clientID]++
+        batchSeen[clientID][seriesID] = i
+        smEntries = append(smEntries, entry)
+        continue
+
+    smEntries = append(smEntries, entry)      # clientID == 0, no deduplication
+
+# after the batched user-SM Update:
+#   RecordResult for each admitted entry, UNLESS sessionLifecycleAt[clientID] > i
+#   then resolve mirrors[] from the first occurrences' results
 ```
 
-The Apply method pre-allocates buffers (`smEntryBuf`, `smResultBuf`, `indexMapBuf`) which are reused across batches via slice truncation (`[:0]`), avoiding heap allocations since Apply runs from a single apply goroutine per shard.
+Three pieces of batch-scoped state carry the correctness of this loop.
+
+**`batchSeen` / `mirrors` — in-batch duplicates.** A client may retry a request
+whose original proposal has not yet committed. If both commit into the same apply
+batch they carry the same `(clientID, seriesID)` and neither is in the session
+table yet, so `CheckDuplicate` reports *both* as new and the user operation would
+run twice. `batchSeen` records the entry index of the first occurrence; later
+occurrences are recorded in `mirrors` and copy that result without re-applying.
+The check runs **before** the capacity gate because a retry consumes no new cache
+slot — the first occurrence already accounts for it — so gating it could
+spuriously reject it as "cache full".
+
+**`admittedThisBatch` — projected capacity.** `RecordResult` runs only after the
+batched user-SM `Update`, so the capacity gate must count new series for the same
+client already admitted earlier in this batch. Without it, a batch of new series
+could collectively overflow the response cache.
+
+**`sessionLifecycleAt` — lifecycle transitions inside a batch.** An entry
+admitted earlier in the batch may reach `RecordResult` after the session it was
+admitted against is gone, replaced or removed by a later entry in the *same*
+batch. An entry whose clientID has a transition at a higher index than its own
+does not record a response: for a closed session the cache is moot, and for a
+re-registered clientID, caching into the replacement would deduplicate a future
+proposal of that series which the replacement session never applied.
+
+`applyBatch` reuses three buffers (`smEntryBuf`, `smResultBuf`, `indexMapBuf`)
+via `[:0]` truncation. That is safe because `Apply` runs on a single apply
+goroutine per shard.
 
 ### Response Cache Overflow Preserves At-Most-Once
 
@@ -170,62 +270,202 @@ A new (non-duplicate) session series that cannot be cached is **rejected as `SES
 
 This is the correct behavior per Raft PhD Figure 6.1, step 3 (treat a missing cache record as `SESSION_EXPIRED`). Applying an over-capacity entry without being able to cache its result would break at-most-once: a later replay would find no cached response to deduplicate against and re-apply the mutation. Rejecting it up front keeps the entry from ever mutating the state machine.
 
-The gate is deterministic across replicas (it is driven by log index, seriesID, and `respondedTo` — no wall clock). It also accounts for `admittedThisBatch[clientID]`, the count of new series for the same client already admitted earlier in the current batch but not yet recorded (`RecordResult` runs only after the batched user-SM `Update`). Without that count, a single batch of new series could collectively overflow the cache.
+The gate is deterministic across replicas: it is driven by the entry's
+`RespondedTo` and the cache contents, with no wall clock anywhere. It also
+accounts for `admittedThisBatch[clientID]`, the count of new series for the same
+client already admitted earlier in the current batch but not yet recorded
+(`RecordResult` runs only after the batched user-SM `Update`). Without that
+count, a single batch of new series could collectively overflow the cache.
+
+The entry's own seriesID is not part of the question — `CanRecord` asks whether
+the cache has **room** after eviction, and a new response always consumes a slot.
+A duplicate seriesID never reaches the gate, having been answered from the cache
+(or mirrored from an earlier occurrence in the same batch) already.
 
 ## Session Manager
 
 **Source:** `pkg/internal/session/manager.go`
 
-The session manager is per-shard and tracks all active client sessions and their result caches. It is accessed only from the apply goroutine, so it does not require locks.
+The session manager is per-shard and tracks all active client sessions and their
+result caches. It is accessed only from the apply goroutine, so it holds no
+locks.
+
+Per-session state (`clientSession`):
+
+| Field | Purpose |
+|-------|---------|
+| `clientID` | The session key |
+| `ownerID` | The principal declared at registration; retained for the life of the session because removal has to return the slot to the right owner |
+| `registeredIndex` | Log index of the Register entry that created **this incarnation** |
+| `respondedTo` | Highest series the client has acknowledged |
+| `responses` | `seriesID -> sm.Result` dedup cache |
+| `lastActiveIndex` | Log index of last activity, for deterministic expiry |
 
 ### Core Operations
 
-**Register:** Creates a new session for a clientID.
-- Returns `ErrSessionAlreadyExists` if the clientID is already registered
-- Returns `ErrSessionLimitExceeded` if the shard exceeds `MaxTotalSessions` (default 16,384)
+**`Register(clientID, ownerID, index)`** creates a session.
+- `ErrSessionAlreadyExists` if the clientID is already registered.
+- `ErrSessionLimitExceeded` if the shard is at `MaxTotalSessions` **or** the
+  owner is at `MaxSessionsPerOwner`. Both exhaustion cases report the *same*
+  sentinel on purpose: the caller must treat a refused registration identically
+  whatever refused it, and a distinct error would invite a distinct code path —
+  and a code path only one replica takes is the divergence the cap exists to
+  prevent.
+- `index` becomes both `registeredIndex` and `lastActiveIndex`.
 
-**CheckDuplicate:** Checks if a proposal is a duplicate.
-- Returns `ErrSessionNotFound` if the clientID is not registered (maps to `SESSION_EXPIRED`)
-- If `seriesID <= respondedTo`: Returns `ErrResponseEvicted` (client already acknowledged this and the cached response was evicted; maps to `SESSION_EXPIRED` per PhD Figure 6.1 step 3)
-- If `seriesID` is in the result cache: Returns cached result and `true`
-- Otherwise: Returns `false` with no error (proposal is new, subject to the capacity gate, then added to the SM batch)
+**`CheckDuplicate(clientID, seriesID, index)`** classifies a proposal.
+- `ErrSessionNotFound` if the clientID is not registered.
+- `ErrSessionNotFound` if `index < registeredIndex` — the **incarnation floor**.
+  An entry below the index that created this incarnation belongs to a *previous*
+  one: the session expired and the client re-registered under an ID it had
+  persisted (`Host.RegisterSession` accepts a caller-supplied ID, which is the
+  documented way a client survives its own restart). The new incarnation starts
+  with `respondedTo` zero and an empty cache, so without this the stale entry
+  looks brand new and is applied a second time — at-most-once broken with no
+  error raised anywhere. The comparison is index-based, so it is deterministic
+  and replicated for free.
+- `ErrResponseEvicted` if `seriesID <= respondedTo`: the client already
+  acknowledged this and the cached response was evicted.
+- Cached result and `true` if `seriesID` is in the response cache (and
+  `lastActiveIndex` is advanced).
+- `false` with no error if the proposal is new.
 
-**CanRecord:** Read-only capacity check run before applying a new series.
-- Mirrors `RecordResult`'s `respondedTo` advance and eviction, but mutates nothing
-- Takes a `pending` count of same-client new series already admitted in the current batch
-- Returns `ErrResponseLimitExceeded` if the cache would still be full after eviction (so the caller rejects the entry as `SESSION_EXPIRED` before mutating the user SM)
-- Returns `ErrSessionNotFound` if clientID is not registered
+Both errors map to `SESSION_EXPIRED` per PhD Figure 6.1 step 3.
 
-**RecordResult:** Stores the proposal result after SM application.
-- Advances `respondedTo` and evicts acknowledged responses (where seriesID <= respondedTo) before caching
-- Advances the activity marker (`lastActiveIndex`) before the limit check, so an active-but-full session is not treated as idle by deterministic expiry
-- Returns `ErrResponseLimitExceeded` if the response cache is full after eviction
-- Returns `ErrSessionNotFound` if clientID is not registered
+**`CanRecord(clientID, respondedTo, pending)`** is a read-only capacity check run
+before applying a new series.
+- Mirrors `RecordResult`'s `respondedTo` advance and eviction, mutating nothing.
+- `pending` is the count of same-client new series already admitted in the
+  current batch.
+- `ErrResponseLimitExceeded` if `surviving + pending >= maxResponses`.
+- `ErrSessionNotFound` if the clientID is not registered.
+- The entry's own seriesID is deliberately **not** a parameter: the question is
+  whether the cache has room after eviction, and a new response always consumes
+  a slot. A duplicate seriesID is answered from the cache by the dedup path and
+  never reaches this check.
 
-**Unregister:** Removes a session and all its cached results.
-- Called when an unregister entry is applied
-- Returns `ErrSessionNotFound` if the session does not exist
+**`RecordResult(clientID, seriesID, respondedTo, index, result)`** caches a
+result after SM application.
+- Advances `respondedTo`, then evicts every cached response at or below it.
+- Advances `lastActiveIndex` **before** the limit check, so an active-but-full
+  session is not treated as idle by deterministic expiry.
+- `ErrResponseLimitExceeded` if the cache is still full after eviction;
+  `ErrSessionNotFound` if the clientID is not registered.
 
-**ExpireSessions:** Periodically removes sessions idle for too many log entries.
-- Takes parameters `(currentIndex, inactivityThreshold, maxExpire)`: a session is expired when it has been inactive for more than `inactivityThreshold` entries relative to `currentIndex`; `maxExpire` caps the number removed per call
-- Returns nil immediately if `maxExpire <= 0` or `inactivityThreshold == 0`
-- Returns slice of expired clientIDs
-- Uses index-based `lastActiveIndex` instead of wall-clock time for determinism
-- Collects all expired candidates, sorts them by clientID, then applies the `maxExpire` limit so every replica selects and removes the identical subset at the same Raft index regardless of map iteration order
+**`Unregister(clientID)`** removes a session and its cached results, releasing
+the owner slot. `ErrSessionNotFound` if it does not exist.
+
+**`ExpireSessions(currentIndex, inactivityThreshold, maxExpire)`** removes idle
+sessions and returns the expired clientIDs.
+- Returns nil immediately if `maxExpire <= 0` or `inactivityThreshold == 0`.
+- A session is expired when `currentIndex - lastActiveIndex > inactivityThreshold`.
+- Collects **all** candidates, sorts them by clientID, and only then applies the
+  `maxExpire` limit, so every replica selects and removes the identical subset at
+  the same Raft index regardless of Go's randomized map iteration order.
+- Releases each expired session's owner slot. Expiry is the one removal path not
+  driven by an explicit client action, so missing it would leak owner counts
+  upward until a long-lived shard refused every registration from an owner that
+  in fact holds none.
+
+**`SetLimits(maxTotal, maxResponses, maxPerOwner)`** replaces the manager's
+limits. It exists for the one moment a replica learns them: a state machine
+created before its shard's committed configuration was known
+(`rsm.StateMachine.refreshSessionPolicy`). A zero `maxTotal` or `maxResponses`
+is ignored, because no caller can mean "admit nothing" by either; `maxPerOwner`
+is assigned unconditionally, because zero is a real value there — the cap off.
+Existing sessions are left alone, so lowering `maxTotal` below the current count
+stops further registrations rather than evicting anyone.
+
+### Owners and the per-owner cap
+
+`MaxTotalSessions` is a shard-wide bound and therefore no defence against a
+single principal exhausting it: a clientID is eight bytes the caller picks, so
+one client can register under as many as it likes until the table is full and
+every other tenant on the shard loses at-most-once delivery. That is a denial of
+service available to anyone with propose rights, and the shard-wide cap is
+precisely the thing being exhausted, so it cannot also be the defence.
+
+`MaxSessionsPerOwner` (default 128, zero disables) bounds concurrent sessions per
+declared **owner**. The owner is whatever the embedder decides identifies a
+principal — a tenant ID, an account number, a hash of a verified subject — passed
+to `Host.GetNewSessionWithOwner` / `NewSessionWithOwner` and carried in the
+replicated log as `Entry.OwnerID`.
+
+Two properties matter:
+
+- **It is a state-machine decision, not a leader-local one.** The owner rides in
+  the entry because every replica must accept or refuse a registration
+  identically from the log alone, including on replay after a restart. The
+  authenticated peer on the connection that carried the proposal is not in the
+  log and is not the same on a replica replaying it.
+- **It is only as trustworthy as the embedder's own authentication.** This
+  library authenticates *nodes*, not clients, and cannot derive an owner. A
+  caller free to pick any `ownerID` is free to evade the cap, so the value must
+  come from something the embedder verified.
+
+`ownerID == 0` means unset. Such sessions are neither counted nor capped, which
+is what keeps embedders that do not use the owner APIs working unchanged.
+
+The manager keeps `ownerCounts` (ownerID -> live session count) as a **derived**
+secondary index so `Register` is O(1) rather than a full scan on every
+registration. Being derived, it has one correctness requirement: every mutation
+of `sessions` moves it in step. `UnmarshalFrom` rebuilds it by counting the
+decoded table rather than trusting anything on the wire — a persisted count is
+one more thing a corrupt snapshot can get wrong, in a way no bounds check would
+catch and that would show up only as registrations refused on one replica.
 
 ### Error Types
 
 | Error | Scenario |
 |-------|----------|
 | `ErrSessionAlreadyExists` | Register a clientID that is already active |
-| `ErrSessionNotFound` | Unregister or CheckDuplicate on a non-existent clientID |
-| `ErrSessionLimitExceeded` / `ErrTooManySessions` | Shard exceeds `MaxTotalSessions` |
+| `ErrSessionNotFound` | Unregister or CheckDuplicate on a non-existent clientID, or an entry below the session's `registeredIndex` |
+| `ErrSessionLimitExceeded` | Shard at `MaxTotalSessions`, or owner at `MaxSessionsPerOwner`. `quicraft.ErrTooManySessions` is a legacy alias for the public form |
 | `ErrResponseLimitExceeded` | `CanRecord`/`RecordResult`: cache full after eviction (maps to `SESSION_EXPIRED`) |
 | `ErrResponseEvicted` | `CheckDuplicate`: seriesID already acknowledged and response evicted (maps to `SESSION_EXPIRED`) |
-| `ErrSessionExpired` | Proposal references a session that expired and was removed |
-| `SessionExpiredError` | Wraps ShardID and ClientID for diagnostic purposes |
+| `ErrSnapshotCorrupted` | Sentinel for `*BoundsError`, raised when a snapshot's decoded counts exceed the configured or hardcoded limits |
+| `ErrSessionExpired` | Public: a proposal referenced a session that expired or was removed |
+| `ErrSessionsUnsupportedOnDisk` | Public: `GetNewSession` on a shard backed by an `sm.DiskStateMachine` |
+| `ErrInvalidSession` | Public: `CloseSession` on a no-op session |
+| `*SessionExpiredError` | Public: wraps ShardID and ClientID; `errors.Is` matches `ErrSessionExpired` |
+
+The `pkg/internal/session` sentinels are separate from the `quicraft` package's
+to avoid an import cycle (quicraft imports session transitively via rsm).
 
 **Source:** `pkg/errors.go`, `pkg/internal/session/errors.go`
+
+## Deterministic expiry
+
+**Session expiry is driven by log index, never by wall-clock time.** That is not
+a performance choice; it is what makes expiry a state-machine operation at all.
+Every replica applies the same entries in the same order, so an index-driven rule
+expires the same sessions at the same point in the log on every replica. A
+wall-clock rule would not: two replicas would expire different sessions at
+different moments, and from then on one answers a session-managed proposal from
+its response cache while the other reports the session expired. That is a
+permanent state-machine divergence that **no Raft invariant detects** — the logs
+agree, the commit indexes agree, and the state machines do not.
+
+Expiry runs at fixed **checkpoints**: the multiples of `SessionExpiryEntries`
+that fall in `(prevIndex, lastIndex]`, where `prevIndex` is the last index
+applied before this `Apply` call. For each checkpoint, `Apply` first flushes
+every not-yet-applied entry at or below the checkpoint index, then runs
+`ExpireSessions(boundary, interval, maxExpirePerCheckpoint)` — so expiry always
+observes a fully-applied session table as of that exact index. The trailing
+segment above the last checkpoint is flushed afterwards; its checkpoint is
+reached in a future `Apply`. When expiry is disabled the whole batch goes through
+in one shot, keeping the segmentation off the hot path.
+
+The checkpoint set continues seamlessly across `Apply` calls and across restart,
+but **only because `lastApplied` is explicitly seeded** on the two paths that
+resume a state machine (`Host.StartShard` and the engine's `InstallSnapshot`
+recovery, both via `SetLastApplied`). `RecoverFromSnapshot` does not restore it:
+the session table is in the snapshot stream, this counter is not. A replica
+resuming with it left at zero would re-walk every checkpoint its peers already
+walked, and since `ExpireSessions` is capped per call, the re-walk would delete
+sessions the shard still holds. The contiguity guard at the top of `Apply`
+(`ErrApplyGap`) is what makes that unseeded state fail loudly instead of
+diverging silently.
 
 ## Snapshot Integration
 
@@ -237,15 +477,41 @@ Session state is persisted in snapshots so that deduplication state survives rec
 
 Session data is serialized as:
 ```
-[numSessions:4 bytes]
-  for each session:
-    [clientID:8][respondedTo:8][numResponses:4]
-      for each cached response:
-        [seriesID:8][result value:variable length]
-    [lastActiveIndex:8]  // index-based, not wall-clock
+[numSessions:4]
+  for each session (client IDs written in sorted order):
+    [clientID:8][ownerID:8][registeredIndex:8][respondedTo:8][numResponses:4]
+      for each cached response (series IDs in sorted order):
+        [seriesID:8][result.Value:8][dataLen:4][data:dataLen]
+    [lastActiveIndex:8]     // index-based, not wall-clock
 ```
 
-All integers use little-endian encoding.
+All integers are little-endian. `ownerCounts` is **not** written — it is derived
+state, and `UnmarshalFrom` rebuilds it from the decoded table so a restored count
+cannot disagree with the table it describes.
+
+`ownerID` and `registeredIndex` both have to survive the snapshot:
+
+- Without `ownerID`, restored sessions would all read as ownerless, their owners'
+  counts would come back at zero, and a replica that recovered from a snapshot
+  would admit registrations its peers refuse.
+- Without `registeredIndex`, the incarnation floor in `CheckDuplicate` would
+  disappear on restore — which is exactly the path (restart, then a stale entry
+  commits) the floor exists to close.
+
+Both were added by changing the layout in place, because every wire format in
+this repository is pinned at v1 for the pre-release period and consumers are
+updated in lockstep. See [Compatibility](../operations/compatibility.md).
+
+`UnmarshalFrom` bounds-checks everything it decodes against the configured
+limits, so a corrupted or malicious snapshot cannot drive an allocation:
+`numSessions <= maxTotal`, `numResponses <= maxResponses`, and
+`dataLen <= maxResponseDataSize` (64 MiB). Violations return a `*BoundsError`,
+which `errors.Is` matches against `ErrSnapshotCorrupted`.
+
+Decoding parses into a **staging map** and swaps it in only after the whole
+stream parses cleanly. Populating the live table incrementally would, on a
+mid-stream failure, leave the node with a hybrid of new sessions and whatever
+the caller did after the error, inconsistent with the pre-recovery user-SM state.
 
 ### Save Path
 
@@ -298,23 +564,61 @@ No-op sessions have a fixed `clientID` of 0. Entries with `clientID == 0` skip d
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `MaxSessionsPerClient` | 128 | Maximum cached responses per session |
+| `MaxSessionsPerClient` | 128 | Maximum cached **responses** per session |
 | `MaxTotalSessions` | 16,384 | Maximum concurrent sessions per shard |
-| `SessionExpiryEntries` | 100,000 | Index-based TTL for automatic session expiry (`config.SessionExpiryDisabled` turns it off) |
+| `MaxSessionsPerOwner` | 128 | Maximum concurrent sessions per declared owner; 0 disables the cap |
+| `SessionExpiryEntries` | 100,000 | Index-based inactivity threshold for automatic expiry (`config.SessionExpiryDisabled` turns it off) |
 
-**Note:** `MaxSessionsPerClient` limits the per-session response cache; `MaxTotalSessions` limits the total number of active sessions.
+**`MaxSessionsPerClient` is misnamed and does not limit sessions.** It is the
+response-cache depth — the number of cached results one registered session
+retains — and reaches `session.Manager` as `maxResponses`. Read it as
+"MaxResponsesPerSession". The name is kept only because renaming a public field
+is a breaking change the pre-release pinning does not cover, and the same name
+appears in `proto.SessionPolicy` because the wire format is pinned too.
+Transposing it with `MaxTotalSessions` or `MaxSessionsPerOwner` has happened
+here before and neither mistake fails loudly: one caps a shard at a response
+depth, the other lets a single client pin the whole session table.
 
-**All three are SEEDS, not the values the apply path uses.** They are replicated: a founding replica writes them into the shard's initial membership at bootstrap (`proto.SessionPolicy`, carried in `proto.Membership` alongside the witness policy), and from then on every replica applies the COMMITTED values. That is what makes expiry deterministic in practice and not merely in principle — the apply path derives its expiry checkpoints from the threshold and refuses registrations past `MaxTotalSessions`, so two replicas evaluating different values expire different sessions or disagree on whether a session exists, and diverge permanently with every Raft invariant intact.
+**Zero does not mean "off" for `SessionExpiryEntries`.** `SetDefaults` reads an
+unset field as "I did not choose" and substitutes the default, because one value
+cannot mean both that and "never expire anything". Assign
+`config.SessionExpiryDisabled` (`math.MaxUint64`) to disable expiry — an
+explicit, replicated choice. `Validate` rejects values below 100 (a threshold
+that short expires sessions faster than a slow client can round-trip) and warns
+when the value exceeds a non-zero `SnapshotEntries`, so expiry runs at least once
+per snapshot interval and the session table cannot grow unboundedly between
+snapshots. When expiry is disabled, a client that registers and dies without
+`CloseSession` leaks an entry that is serialized into every subsequent snapshot
+and counts against `MaxTotalSessions` forever.
+
+**All four are SEEDS, not the values the apply path uses.** They are replicated:
+a founding replica writes them into the shard's initial membership at bootstrap
+(`proto.SessionPolicy`, carried in `proto.Membership` alongside the witness
+policy), and from then on every replica applies the COMMITTED values. That is
+what makes expiry deterministic in practice and not merely in principle — the
+apply path derives its expiry checkpoints from the threshold, refuses
+registrations past `MaxTotalSessions` and `MaxSessionsPerOwner`, and bounds the
+response cache by `MaxSessionsPerClient`. Two replicas evaluating different
+values expire different sessions or disagree on whether a session exists, and
+diverge permanently with every Raft invariant intact.
+
+`SessionPolicy.IsSet()` distinguishes a committed policy from the zero value a
+membership section written without one decodes to, using `MaxTotalSessions` as
+the discriminator: `Validate` rejects a zero `MaxTotalSessions` and `SetDefaults`
+fills it, so every seeded policy carries a non-zero cap. That is what lets
+`ExpiryEntries == 0` keep its own meaning — expiry explicitly disabled
+cluster-wide — instead of being read as an absent policy and silently falling
+back to whatever the local node happens to be configured with.
 
 Consequences for an operator:
 
-- All founders must supply the same three values, for the same reason they must supply the same witness policy: a differing value produces a different index-1 entry.
+- All founders must supply the same four values, for the same reason they must supply the same witness policy: a differing value produces a different index-1 entry.
 - A node whose `Config` disagrees with what its shard committed applies the shard's values and logs the disagreement at WARN. It does not refuse to start — the committed value can only be changed through consensus.
 - `Host.GetShardMembership` reports the committed policy, which is how you check what a shard is actually running.
 - There is no config change for these yet: the committed policy is fixed for the life of the shard. Raising `MaxTotalSessions` on a running shard is not currently possible.
 - A shard bootstrapped by a pre-policy build has no committed policy, and its membership section does not decode at all under this build — every format is pinned at version 1 and gated on exact equality, so a section written before the session policy existed is refused rather than read at the wrong offsets. Wipe the data directory and re-sync; see [Compatibility](../operations/compatibility.md).
 
-See `docs/operations/deployment.md`.
+See [Deployment](../operations/deployment.md).
 
 ## Thread Safety and Concurrency
 
@@ -348,26 +652,43 @@ With deduplication, the second proposal returns the cached result immediately wi
 ## End-to-End Flow
 
 ### 1. Registration
-1. Client calls `host.GetNewSession(ctx, shardID)`
-2. Host generates random clientID
-3. Host proposes register entry with seriesID=MaxUint64-1
-4. Raft replicates to all replicas
-5. Each replica applies the entry and creates a session in the manager
-6. Host returns active session with seriesID advanced to 1
+1. Client calls `host.GetNewSession(ctx, shardID)` (or `...WithOwner`).
+2. Host generates a random clientID.
+3. Host proposes a register entry with `SeriesID = SeriesIDForRegister` and
+   `OwnerID` set.
+4. Raft replicates to all replicas.
+5. Each replica applies the entry and registers the session, subject to
+   `MaxTotalSessions` and `MaxSessionsPerOwner`.
+6. Host checks the applied result's `Value` against the clientID and returns the
+   active session with seriesID advanced to 1.
 
 ### 2. Deduplicated Proposal
-1. Client calls `host.ProposeWithSession(ctx, session, cmd)`
-2. Host sets entry fields: ClientID, SeriesID, Cmd
-3. Raft replicates entry to followers
+1. Client calls `host.ProposeWithSession(ctx, session, cmd)`.
+2. Host sets `ClientID`, `SeriesID`, `RespondedTo` and `Cmd` on the entry.
+3. Raft replicates the entry to followers.
 4. Each replica applies:
-   - Calls `CheckDuplicate(clientID, seriesID)`
-   - If hit: returns cached result, skips SM
-   - If miss: updates SM, calls `RecordResult` to cache
-5. Client receives result
-6. Client calls `session.ProposalCompleted()` to advance counters
+   - `CheckDuplicate(clientID, seriesID, index)`.
+   - Hit: return an **owned copy** of the cached result and skip the user SM.
+     The copy matters — the cache outlives this `Apply` and is serialized into
+     snapshots, so handing the client the cache's backing array would let
+     application-side mutation corrupt the dedup cache and the snapshot.
+   - Miss: gate on `CanRecord`, apply to the user SM, then `RecordResult`.
+5. Client receives the result.
+6. Client calls `session.ProposalCompleted()` to advance the counters.
 
 ### 3. Session Closure
-1. Client calls `host.CloseSession(ctx, shardID, session)`
-2. Host proposes unregister entry with seriesID=MaxUint64
-3. Raft replicates to all replicas
-4. Each replica applies and removes the session, freeing cached results
+1. Client calls `host.CloseSession(ctx, shardID, session)`.
+2. Host proposes an unregister entry with `SeriesID = SeriesIDForUnregister`.
+3. Raft replicates to all replicas.
+4. Each replica applies and removes the session, freeing its cached results and
+   releasing its owner slot.
+
+## Cross-References
+
+- [API Reference](../api/reference.md) -- `Session`, `Host` session methods
+- [RSM Adapter](../statemachine/rsm-adapter.md) -- how `Apply` drives the user state machine
+- [State Machine Interfaces](../statemachine/interfaces.md) -- `sm.Result`, `sm.DiskStateMachine`
+- [Wire Format](../protocol/wire-format.md) -- `Entry` session fields and the `Membership` session policy
+- [Raft Protocol](../raft/protocol.md) -- commit, apply and snapshot ordering
+- [Compatibility](../operations/compatibility.md) -- wire-format pinning and the session-policy layout change
+- [Deployment](../operations/deployment.md) -- choosing the session limits for a shard

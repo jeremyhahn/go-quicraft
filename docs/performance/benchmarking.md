@@ -49,9 +49,9 @@ The same effect is reproducible on demand. Comparing `HEAD~1` against `HEAD` for
 two proto benchmarks *that neither commit touches*, on a busy machine:
 
 ```
-benchmark                     baseline ns/op  current ns/op      delta
-BenchmarkEntryMarshalTo                  8.7            7.2    -17.44%
-BenchmarkMessageMarshalTo               26.2           29.2    +11.16%
+benchmark                                      baseline ns/op  current ns/op      delta        n
+BenchmarkEntryMarshalTo                                   8.7            7.2    -17.44%        5
+BenchmarkMessageMarshalTo                                26.2           29.2    +11.16%        5
 ```
 
 Both numbers are pure noise. A double-digit delta from an unreplicated run
@@ -118,7 +118,7 @@ duration such as `1s`:
 ```
 ERROR: BENCH_ITERS must be a fixed iteration count ending in 'x' (got '1s').
        A duration lets the two sides run different iteration counts, which makes
-       the samples incomparable.
+       the samples incomparable. Use e.g. BENCH_ITERS=100000x.
 ```
 
 With `-benchtime=1s`, Go keeps adding iterations until the wall clock elapses.
@@ -172,13 +172,60 @@ under `/tmp` on the target, and are deleted when the run ends.
 
 Additional script-level knobs: `BENCH_OUT_DIR` (artifact directory, defaults to
 a timestamped dir under `build/bench-compare/`), `BENCH_KEEP_WORKTREE=1` (keep
-the baseline worktree between runs to skip a rebuild), and
-`BENCH_WORKTREE_ROOT` (where that worktree lives, default
-`build/bench-worktrees/`).
+the baseline worktree between runs to skip a rebuild), `BENCH_WORKTREE_ROOT`
+(where that worktree lives, default `build/bench-worktrees/`), and
+`BASELINE_DIR` (where `bench-baseline` writes, default
+`test/performance/baselines`). These are read from the environment rather than
+declared in the Makefile, but make exports command-line variables, so
+`make bench-compare BENCH_KEEP_WORKTREE=1` reaches the script.
 
-`PERF_HOST` names the *execution location* and is shared with the other perf
-harness in this repo (`test/performance/run-remote.sh`). The `BENCH_*` variables
-configure the *measurement* and are specific to `bench-compare`.
+`PERF_HOST` names the *execution location* and is the one variable shared with
+the other perf harness in this repo (`test/performance/run-remote.sh`, driven by
+`make perf-remote`, which requires it and has no local mode). The variables above
+configure the *measurement* and are read only by `bench-compare`. `run-remote.sh`
+has its own unrelated `BENCHTIME`, `PERF_TIMEOUT`, `PERF_SYSTEMS`,
+`PERF_PROFILE` and `BENCH_TMPDIR`; the shared prefix is not a shared setting.
+
+## The comparison harness (`make perf-*`)
+
+`bench-compare` answers "did this change regress QuicRaft against itself".
+The comparison harness under `test/performance/` answers "how does QuicRaft
+compare to etcd-io/raft, Dragonboat and OpenRaft", and it is a different tool
+with a different unit of storage: the **machine profile**.
+
+```bash
+# Everything, against any machine, in one command.
+make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+
+# On this machine.
+make perf-all      PERF_PROFILE=omega                   # run, store, generate
+make perf-run      PERF_PROFILE=omega PERF_SYSTEMS=etcd # one engine
+make perf-generate PERF_PROFILE=omega                   # documents from stored JSON
+make perf-env      PERF_PROFILE=omega                   # capture this machine's specs
+
+# Ad-hoc: terminal report only, stores nothing, needs no profile.
+make perf-compare-all
+make perf-compare SYSTEMS="quicraft etcd"
+```
+
+`PERF_PROFILE` is required by everything that reads or writes stored results and
+has no default, because a throughput number without its machine cannot be
+interpreted. Two profiles are tracked long-term: `omega` (single-socket,
+desktop-grade) and `r640` (dual-socket, server-grade).
+
+`make perf-remote` stages the working tree onto the target, runs
+`capture-env.sh` **there** to record the machine into `env.json`, runs the suite
+in Docker, fetches the results and the capture back into
+`test/performance/profiles/<name>/`, and regenerates that profile's documents.
+The remote run is detached; `make perf-remote-status` or
+`test/performance/run-remote.sh wait` reattaches to one in flight.
+
+Inside a profile, `<system>.md` and `charts/` are generated and disposable,
+while `analysis.md` is hand-written and is never written by any tool. A system
+with no stored results produces no document at all rather than a document of
+`N/A` rows, and generation refuses to run if any system it was asked to cover is
+missing — narrow it explicitly with `PERF_SYSTEMS` when the gap is intended. See
+[test/performance/README.md](../../test/performance/README.md).
 
 ### Tuning `BENCH_ITERS`
 
@@ -348,7 +395,7 @@ which is worse than having no baseline at all:
 
 ```
 # quicraft benchmark run
-# generated:     2026-08-04T19:29:54Z
+# generated:     2026-08-04T19:32:33Z
 # mode:          baseline
 # run-host:      omega  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
@@ -357,7 +404,7 @@ which is worse than having no baseline at all:
 # loadavg:       0.02 0.12 0.13  (at start of run)
 # build-host:    vm-host-1
 # go-version:    go version go1.26.5 linux/amd64
-# current-ref:   64bc288...  [clean (pinned to HEAD)]
+# current-ref:   64bc2882844a4109c698b99ef022ef9219a391ef  [clean (pinned to HEAD (64bc288))]
 # packages:      ./pkg/internal/raft/ ./pkg/internal/engine/
 # bench-filter:  .
 # rounds:        10 (interleaved)
@@ -423,8 +470,8 @@ percentage-delta table and says so:
 
 ```
 # benchstat unavailable - median/delta fallback (no statistics)
-benchmark                     baseline ns/op  current ns/op      delta        n
-BenchmarkEntryMarshalTo                  8.7            7.2    -17.44%        5
+benchmark                                      baseline ns/op  current ns/op      delta        n
+BenchmarkEntryMarshalTo                                   8.7            7.2    -17.44%        5
 ```
 
 The fallback is **substantially weaker**: no confidence intervals, no
@@ -447,8 +494,11 @@ are not. It exits non-zero on:
 - `BENCH_ITERS` given as a duration instead of a fixed count;
 - a baseline package that fails to build at the baseline revision (e.g. the
   package was added after it);
-- a `BENCH_FILTER` that matches no benchmarks, which is otherwise
-  indistinguishable from "no regression".
+- a `BENCH_FILTER` that matches no benchmarks anywhere in `BENCH_PKGS`, which is
+  otherwise indistinguishable from "no regression". Note the gap: the check is
+  on the combined output, so a filter that matches in one package and not
+  another still passes. If you narrow `BENCH_FILTER`, confirm the run produced
+  samples from every package you expected.
 
 Cleanup runs on every exit path: the baseline git worktree is removed (unless
 `BENCH_KEEP_WORKTREE=1`), local test binaries are deleted, and the remote temp

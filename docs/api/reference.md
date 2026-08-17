@@ -2,7 +2,21 @@
 
 Source: `github.com/jeremyhahn/go-quicraft/pkg`
 
-The `quicraft` package is the public entry point for QuicRaft, a multi-group Raft consensus library. One `Host` per process manages shard lifecycle, proposals, linearizable reads, sessions, membership, snapshots, and shutdown. The library uses QUIC transport, custom binary encoding, and fixed-layout serialization for zero-copy reads and high throughput.
+The `quicraft` package is the public entry point. One `Host` per process manages shard lifecycle, proposals, linearizable reads, sessions, membership, snapshots, and shutdown. Transport is QUIC only; there is no TCP fallback.
+
+The supported surface:
+
+| Package | Import path | Contains |
+|---|---|---|
+| `quicraft` | `.../pkg` | `Host`, `RequestState`, `Session`, `Membership`, errors, metrics |
+| `config` | `.../pkg/config` | `HostConfig`, `Config`, `TransportConfig`, `EventListener` |
+| `sm` | `.../pkg/sm` | The three state machine interfaces and their factory helpers |
+| `proto` | `.../pkg/proto` | Wire types a caller sees: `Entry` (from `QueryRaftLog`), message/config-change type constants |
+| `seal` | `.../pkg/seal` | The Layer-1 at-rest encryptor (`EpochBarrier`) behind `WithBarrier` |
+
+Everything under `pkg/internal/` is off limits and its identifiers cannot be imported, which matters in one place: several membership validation errors originate there. See [Membership validation errors](#membership-validation-errors).
+
+**What this library does not do.** There is no peer discovery, no bootstrap orchestration, no cluster manager. `Host.StartShard` takes the member set you hand it. Deciding which nodes exist and which shards they carry belongs to the layer above (in this stack, go-qrdb).
 
 ## Host
 
@@ -18,16 +32,28 @@ Creates a Host with the given configuration. Validates the config, creates or lo
 
 **HostOption functions:**
 
-| Option                | Description                                          |
-|-----------------------|------------------------------------------------------|
-| `WithLogDB(l)`        | Custom LogDB. Default: WAL-based from HostConfig dirs |
-| `WithMemoryLogDB()`   | In-memory LogDB (benchmarks, CI/CD, ephemeral nodes)  |
-| `WithBarrier(b)`      | At-rest encryption. Barrier must be initialized/unsealed |
-| `WithMetrics(c)`      | Enable metrics collection via MetricsCollector        |
-| `WithLogger(l)`       | Custom `*slog.Logger`. Default: built from LogConfig  |
-| `WithoutTransport()`  | No-op sender (single-node testing only)               |
+| Option                     | Signature                          | Description                                              |
+|----------------------------|------------------------------------|----------------------------------------------------------|
+| `WithLogDB(l)`             | `logdb.LogDB`                      | Custom LogDB. Default: WAL-based from the HostConfig dirs |
+| `WithMemoryLogDB()`        | --                                 | In-memory LogDB (benchmarks, CI, ephemeral nodes)         |
+| `WithBarrier(b)`           | `Barrier`                          | Host-wide at-rest encryption. Must be initialized and unsealed |
+| `WithShardBarriers(fn)`    | `func(shardID uint64) Barrier`     | Per-shard at-rest encryption. See below                  |
+| `WithMetrics(c)`           | `MetricsCollector`                 | Metrics collection                                        |
+| `WithLogger(l)`            | `*slog.Logger`                     | Custom logger. Default: built from `LogConfig`            |
+| `WithoutTransport()`       | --                                 | No-op sender; messages are dropped. Single-node testing only |
 
-**Errors:** `*HostInitError` wrapping the component name and underlying error. Returns `*config.ValidationError` if config is invalid.
+**`WithShardBarriers`** seals each shard under its own barrier, so one tenant's key purge can never remove an epoch another tenant's snapshots still reference. The resolver returning `nil` for a shard falls back to the `WithBarrier` barrier; when there is no host-wide barrier, the miss fails closed with `ErrShardBarrierUnresolved` rather than writing that one tenant in plaintext. Key rotation for per-shard barriers is the caller's responsibility -- the host's rotation loop only rotates the `WithBarrier` barrier.
+
+Per-shard barriers also constrain the LogDB, because the default WAL takes a single host-wide key:
+
+| Error                          | Condition                                                                   |
+|--------------------------------|-----------------------------------------------------------------------------|
+| `ErrShardBarriersPlaintextWAL` | The LogDB does not report `logdb.AtRestBarrierEncrypted` or `AtRestNonDurable`, and no `WithBarrier` was supplied. Snapshots would be encrypted while every log entry stayed plaintext |
+| `ErrShardBarrierLogDBMismatch` | The LogDB stores this shard's records under a different barrier than the resolver returned |
+
+Supplying `WithLogDB` is not by itself a mitigation: an unencrypted `waldb.Open(dir)` produces exactly the state `ErrShardBarriersPlaintextWAL` exists to prevent. For genuine per-shard WAL keys the LogDB must implement `logdb.PerBarrierEpochAwareLogDB`.
+
+**Errors:** `*config.ValidationError` when the config is invalid; otherwise `*HostInitError` naming the component that failed and wrapping its error.
 
 ### Shard Lifecycle
 
@@ -37,22 +63,32 @@ Creates a Host with the given configuration. Validates the config, creates or lo
 func (h *Host) StartShard(members map[uint64]string, join bool, create sm.CreateFunc, cfg config.Config) error
 ```
 
-Starts a Raft shard on this host. `members` maps replicaID to address for initial cluster members. `join` is true when joining an existing cluster (skip bootstrap). `create` is the state machine factory. `cfg.ShardID` and `cfg.ReplicaID` must both be non-zero.
+Starts a Raft shard on this host. `members` maps replicaID to address. `join` is true when this replica is joining a shard that already exists, in which case `members` may be empty and the configuration arrives by replication. `create` is the state machine factory. `cfg.ShardID` and `cfg.ReplicaID` must both be non-zero.
 
-The method detects the SM type via probe instance, creates a LogReader, Raft Peer, RSM, and engine Node, then loads the node into the engine pipeline. Registers all members in the address registry and notifies the engine to begin processing.
+On a first start the member set is not an out-of-band seed. It is committed as an `EntryInitialMembership` entry at log index 1, so membership is a function of the log from the very first entry and a restart recovers it from durable state rather than from whatever map the caller happens to pass. Every founding replica (`join=false`) must therefore be given an identical `members` map, an identical `cfg.Witness` policy and an identical `cfg.MemberIdentities`: founders that disagree produce different index-1 entries, and Log Matching never reconciles them.
+
+On a **restart** the map must still list every current member, non-voters included, or they disappear from this replica's routing until the configuration is recovered.
 
 **Errors:**
 
-| Error                | Condition                                      |
-|----------------------|------------------------------------------------|
-| `ErrClosed`          | Host is closed                                 |
-| `ErrInvalidConfig`   | ShardID==0, ReplicaID==0, or validation fails  |
-| `ErrShardAlreadyExists` | Shard already loaded on this host           |
-| `ErrInvalidSMType`   | CreateFunc returns nil or unknown SM type      |
-| `*HostInitError`     | Peer, SM, or LogDB initialization failed       |
-| `ErrLogDBWrite`      | Bootstrap save failed                          |
+| Error                          | Condition                                                        |
+|--------------------------------|------------------------------------------------------------------|
+| `ErrClosed`                    | Host is closed                                                   |
+| `ErrInvalidConfig`             | `ShardID == 0`, `ReplicaID == 0`, or `cfg.Validate()` failed     |
+| `ErrShardAlreadyExists`        | Shard already loaded on this host                                |
+| `*EmptyMembersError`           | Bootstrap with an empty `members` map                            |
+| `*SelfNotInMembersError`       | `cfg.ReplicaID` absent from `members` on a bootstrap             |
+| `*InvalidMemberError`          | A member has a zero replica ID, an empty or malformed address, or a duplicate address. Matches `errors.Is(err, ErrInvalidMember)` |
+| `*NonVotingRoleInMembersError` | `cfg.IsWitness` or `cfg.IsObserver` set while this replica appears in `members` |
+| `*BootstrapEntryMissingError`  | The durable log holds something other than the founding configuration at the bootstrap index |
+| `ErrInvalidSMType`             | `CreateFunc` returned nil or a type implementing none of the three SM interfaces |
+| `ErrRecoveredTermUnknown`      | An on-disk SM recovered to an index whose Raft term cannot be resolved |
+| `*HostInitError`               | Peer, state machine, snapshot recovery, or LogDB initialization failed. `Field` names which |
+| `ErrLogDBWrite`                | Bootstrap save failed                                            |
 
-**Concurrency:** Acquires `nodesMu` write lock. Safe for concurrent calls with different shardIDs.
+`*NonVotingRoleInMembersError` applies only to a first start. `members` seeds the full voter set, so a witness or observer named there is a full voter in the configuration the whole shard agrees on: the leader replicates entry payloads to it, it counts toward every quorum, and only this host's local read gate still behaves like a non-voter. Bootstrap the voters first, then start the replica with `join=true` and add it with `RequestAddWitness` or `RequestAddObserver`.
+
+**Concurrency:** Safe for concurrent calls with different shard IDs.
 
 #### StopShard
 
@@ -60,9 +96,9 @@ The method detects the SM type via probe instance, creates a LogReader, Raft Pee
 func (h *Host) StopShard(shardID uint64) error
 ```
 
-Stops all replicas of the given shard. Fails all pending proposals, reads, and snapshots with `ErrAborted`. Unloads the engine node and removes registry entries.
+Stops all replicas of the given shard, completing every pending proposal, read and snapshot with `ErrAborted`, then unloading the engine node and removing its registry entries. A non-nil return after teardown began is the state machine's `Close` error, which for an on-disk state machine is its backing store's final flush.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`.
+**Errors:** `ErrClosed`, `ErrShardNotFound`. A shard already being torn down by a concurrent `StopShard` or `Close` also returns `ErrShardNotFound`, since teardown is claimed once.
 
 ### Proposal Path
 
@@ -74,24 +110,26 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 
 Submits an asynchronous proposal through Raft. Returns a `*RequestState` that the caller must poll via `Result()` and release via `Release()`.
 
-Validates: host not closed/draining, shard exists, entry size within `MaxEntrySize`, local node is leader, global and per-shard rate limiters not exceeded, engine node ready.
-
-Generates a monotonic `proposalKey`, registers in `pendingProposals` before delivering to the engine inbox (single-owner invariant on Peer), then wakes the step worker.
+A proposal is **not** rejected merely because this replica is a follower. It fails fast only when no leader is known at all; when a leader is known, the engine forwards the entry. An empty `cmd` is legal and commits as a no-op entry that never reaches the state machine, which is how you force a current-term committed entry after an election without inventing a throwaway payload (the ReadIndex warmup of Raft PhD 6.4).
 
 **Errors:**
 
-| Error                   | Condition                                    |
-|-------------------------|----------------------------------------------|
-| `ErrClosed`             | Host closed                                  |
-| `ErrDraining`           | Host in drain mode                           |
-| `ErrShardNotFound`      | Shard not loaded                             |
-| `*EntryTooLargeError`   | `len(cmd) > MaxEntrySize`                    |
-| `*NotLeaderError`       | Local node is not leader (carries leader hint)|
-| `ErrSystemBusy`         | Global rate limit or inbox full              |
-| `*BusyError`            | Per-shard rate limit exceeded                |
-| `ErrShardNotReady`      | Engine node or Peer not initialized          |
+| Error                   | Condition                                                            |
+|-------------------------|----------------------------------------------------------------------|
+| `ErrCanceled` / `ErrTimeout` | `ctx` was already done on entry                                 |
+| `ErrClosed`             | Host closed                                                          |
+| `ErrDraining`           | Host in drain mode                                                   |
+| `ErrShardNotFound`      | Shard not loaded                                                     |
+| `ErrInvalidOperation`   | This replica is a witness; witnesses store no log data               |
+| `ErrDiskFull`           | The WAL directory reached `MaxWALDiskSize`                           |
+| `*EntryTooLargeError`   | `len(cmd)` exceeds `min(MaxProposalPayloadSize, MaxEntrySize)`       |
+| `*NotLeaderError`       | No leader is known. `LeaderID` is 0 and `LeaderAddress` empty         |
+| `ErrSystemBusy`         | Global rate limit (`MaxTotalInMemLogSize`) exceeded                   |
+| `*BusyError`            | Per-shard rate limit (`MaxInMemLogSize`) exceeded                    |
+| `ErrShardNotReady`      | Engine node or Peer not initialized                                  |
+| `ErrDropped`            | The engine inbox is full                                             |
 
-**Concurrency:** Safe for concurrent calls. Each call gets a unique `proposalKey` via `atomic.Uint64`.
+**Concurrency:** Safe for concurrent calls.
 
 #### SyncPropose
 
@@ -109,7 +147,11 @@ Returns `sm.Result{Value, Data}` from the state machine.
 func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []byte) (*RequestState, error)
 ```
 
-Submits an asynchronous session-managed proposal for at-most-once delivery. The session tracks the series ID for deduplication. The caller must call `session.ProposalCompleted()` after a successful result.
+Submits an asynchronous session-managed proposal for at-most-once delivery. The session tracks the series ID for deduplication. The caller must call `session.ProposalCompleted()` after a successful result, or the series ID goes stale and no further proposal on that session succeeds.
+
+On error the session state is untouched, so the same session can retry the same command; that is the point of the session.
+
+Returns `ErrSessionsUnsupportedOnDisk` on a shard whose state machine is an `sm.DiskStateMachine`. A no-op session is unaffected. See [Sessions and on-disk state machines](#sessions-and-on-disk-state-machines).
 
 #### SyncProposeWithSession
 
@@ -117,7 +159,7 @@ Submits an asynchronous session-managed proposal for at-most-once delivery. The 
 func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd []byte) (sm.Result, error)
 ```
 
-Synchronous wrapper around `ProposeWithSession`. Blocks until the result is available. Automatically calls `session.ProposalCompleted()` on success.
+Synchronous wrapper around `ProposeWithSession`. Blocks until the result is available and calls `session.ProposalCompleted()` for you on success.
 
 ### Linearizable Read Path
 
@@ -131,7 +173,7 @@ Submits a ReadIndex request to confirm leadership via heartbeat quorum. Returns 
 
 Witnesses cannot serve reads (`ErrInvalidOperation`). Observers and followers forward the ReadIndex to the leader.
 
-**Errors:** Same as `Propose` except no entry-size or per-shard rate limit check. `ErrInvalidOperation` if called on a witness.
+**Errors:** `ErrCanceled` / `ErrTimeout` (context already done), `ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrInvalidOperation` (witness), `ErrShardNotReady`, `ErrSystemBusy` (read queue full). There is no entry-size or per-shard rate-limit check on this path. `ErrReadIndexNotReady` arrives on the `RequestState` rather than from this call when the leader has not yet committed an entry in its current term.
 
 #### SyncRead
 
@@ -147,15 +189,26 @@ Performs a linearizable read in a single call:
 
 Returns the query result from the state machine. This is the strongest consistency guarantee: the read reflects all writes committed before it.
 
+Step 3 acquires the RSM adapter's read guard, which an in-flight `Apply` holds for writing. On a follower catching up, that apply can carry up to 64 MiB of entries, and `sync.RWMutex` offers no context-aware acquire, so `ctx`'s deadline is not observed while the call is blocked on the lock. The same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and `StaleReadBuf`. The guard is on the adapter, so this is not something a tier choice avoids today; see [Lookup concurrency](../statemachine/interfaces.md#lookup-concurrency).
+
 #### SyncReadBuf
 
 ```go
 func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (result []byte, release func(), err error)
 ```
 
-Zero-allocation variant of `SyncRead` for state machines implementing the `NALookup` interface. Returns a borrowed byte slice and a release function. The caller must call release to restore the buffer to the pool.
+Pooled-buffer variant of `SyncRead` for `[]byte` key queries. The caller **must** call `release()` when done, after which `result` must not be touched. Use it where the result is consumed immediately, such as being written into a response.
 
-**Errors:** Same as `SyncRead`. Returns `ErrInvalidOperation` if the SM does not implement `NALookup`.
+The allocation-free path requires the state machine to implement `sm.NALookupInto`. When it does not, the call still works -- it falls back to `Lookup` and allocates. `ErrInvalidOperation` comes back only when that fallback returns something other than `[]byte`, in which case the query belongs on `SyncRead`.
+
+```go
+result, release, err := host.SyncReadBuf(ctx, shardID, key)
+if err != nil {
+    return err
+}
+defer release()
+// use result before returning
+```
 
 #### StaleRead
 
@@ -163,7 +216,7 @@ Zero-allocation variant of `SyncRead` for state machines implementing the `NALoo
 func (h *Host) StaleRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error)
 ```
 
-Reads local SM state directly via `SM.Lookup`. **NOT linearizable** -- the result may be arbitrarily stale. For linearizable reads, use `SyncRead`. Identical to `QueryLocalNode`.
+Reads local state machine state directly via `SM.Lookup`. **Not linearizable** -- the result may be arbitrarily stale. Behaviorally identical to `QueryLocalNode`; both names exist for compatibility with different callers. Use `SyncRead` when you need linearizability, or `FollowerRead` for something in between.
 
 #### StaleReadBuf
 
@@ -171,7 +224,19 @@ Reads local SM state directly via `SM.Lookup`. **NOT linearizable** -- the resul
 func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (result []byte, release func(), err error)
 ```
 
-Zero-allocation variant of `StaleRead` for state machines implementing `NALookup`. Returns a borrowed byte slice and a release function.
+Pooled-buffer variant of `StaleRead`, with the same buffer ownership rules and the same `sm.NALookupInto` fallback behavior as `SyncReadBuf`.
+
+#### FollowerRead
+
+```go
+func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error)
+```
+
+Reads local state after waiting for the local state machine to apply up to this replica's current **committed** index. No quorum round-trip is performed, so this is not linearizable: the committed index it waits for may itself be behind the leader. What it does give you is a read that never reflects less than what this replica already knows is committed, which is stronger than `StaleRead` and cheaper than `SyncRead`.
+
+The wait polls at 1 ms for the first 50 attempts, then backs off to 20 ms. It terminates on shard or host shutdown even when `ctx` carries no deadline.
+
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrInvalidOperation` (witness), `ErrTimeout` / `ErrCanceled` from `ctx`.
 
 #### QueryLocalNode
 
@@ -179,9 +244,9 @@ Zero-allocation variant of `StaleRead` for state machines implementing `NALookup
 func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interface{}) (interface{}, error)
 ```
 
-Reads local SM state via `SM.Lookup`. **NOT linearizable** -- the result may be stale. For linearizable reads, use `SyncRead`.
+Reads local state machine state via `SM.Lookup`. **Not linearizable**. Behaviorally identical to `StaleRead`.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`.
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrCanceled`/`ErrTimeout` from `ctx`. All read paths check an already-done context before touching the state machine, so cancellation is a hard "do not execute this read" boundary rather than a suggestion.
 
 ### Leader Transfer
 
@@ -189,9 +254,19 @@ Reads local SM state via `SM.Lookup`. **NOT linearizable** -- the result may be 
 func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplicaID uint64) error
 ```
 
-Requests leadership transfer. Pass `targetReplicaID=0` to transfer to the most up-to-date follower. Fire-and-forget: returns immediately, transfer completes asynchronously.
+Requests leadership transfer to a specific replica. Fire-and-forget: the call returns as soon as the request is delivered, and the transfer completes asynchronously through the Raft state machine. Watch `GetLeaderID` or the `OnLeaderUpdated` event to observe the outcome.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `*NotLeaderError`, `ErrShardNotReady`, `ErrSystemBusy`.
+`targetReplicaID` must name a current **voting** member. It is validated here rather than only in the Raft layer, because the Raft layer's rejection surfaces asynchronously in the step worker where it can only be logged, and returning nil to the caller would falsely report success.
+
+| `targetReplicaID`            | Result                                                    |
+|------------------------------|-----------------------------------------------------------|
+| `0`                          | `*InvalidMemberError` -- rejected, not "pick a follower"   |
+| This replica                 | `nil`. The requested end state already holds               |
+| An observer or witness       | `*InvalidMemberError`. Neither can become leader           |
+| A removed replica            | `*InvalidMemberError`                                      |
+| Unknown to this shard        | `*ReplicaNotFoundError`                                    |
+
+**Errors:** the table above, plus `ErrClosed`, `ErrShardNotFound`, `*NotLeaderError`, `ErrShardNotReady`, `ErrSystemBusy`, and `ErrCanceled`/`ErrTimeout` from `ctx`.
 
 ### Membership Operations
 
@@ -213,30 +288,71 @@ func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64,
 | `RequestAddObserver`| `AddNonVoting`     | Add non-voting observer (receives log)|
 | `RequestAddWitness` | `AddWitness`       | Add voting witness (no SM)            |
 
-All share `requestConfigChange()` which serializes a `proto.ConfigChange`, wraps it in an `EntryConfigChange` entry, and delivers via the engine inbox.
+Each serializes a `proto.ConfigChange`, wraps it in an `EntryConfigChange` entry, and delivers it through the engine inbox. The change takes effect at commit, not at apply.
 
-**Pre-validation:** Before the change is proposed, `requestConfigChange()` validates it against the current published membership snapshot via `Peer.ValidateConfigChange()`. An invalid change returns promptly with a typed error instead of being delivered and then leaving the caller's `*RequestState` to hang until its deadline. The proposal path itself reaches `membership.apply` directly and deliberately does **not** re-check the voting-member cap (so committed changes always replay deterministically), which is why the cap and other invariants are enforced here at request time. Validation runs against the lock-free atomic membership snapshot, so it is conservative: a config change that commits concurrently may produce a benign false rejection, which the caller resolves by re-reading the membership and retrying.
+The `configChangeIndex` parameter is an optimistic concurrency guard. Pass 0 to skip the check, or pass the `ConfigChangeID` from `SyncGetShardMembership` so a request built against a membership that has since moved is rejected instead of applied.
 
-Validation errors (from `pkg/internal/raft`):
+**Pre-validation.** The request is checked against the current membership before it is proposed, so an invalid change fails the call instead of hanging the caller's `*RequestState` until its deadline. The check has to live here: the commit-time apply path deliberately does not re-validate, because a replica that refused an already-committed entry would diverge from its peers. Validation reads a lock-free membership snapshot, so it is conservative -- a config change committing concurrently can produce a false rejection, which the caller resolves by re-reading the membership and retrying.
 
-| Error                       | Condition                                                             |
-|-----------------------------|-----------------------------------------------------------------------|
-| `ErrZeroReplicaID`          | `replicaID == 0`                                                      |
-| `ErrEmptyAddress`           | Add operation with an empty address                                  |
-| `ErrNodeNotFound`           | Remove targets a replica that is not a current member                |
-| `ErrNodeAlreadyExists`      | Add targets a replica already present as voter or witness            |
-| `ErrNodeRemoved`            | Add/remove targets a replica that was previously removed (tombstone) |
-| `ErrTooManyVotingMembers`   | Add/AddWitness would exceed the 64 voting-member cap                  |
-| `ErrRemoveLastFullReplica`  | Remove targets the last full (non-witness) voting replica            |
-| `ErrRemoveLastVoter`        | Remove targets the last voting member (witness-only edge case)       |
+#### Membership validation errors
 
-> **Behavior change:** `RequestRemoveNode` for a replica that is not a current member now returns `ErrNodeNotFound`. Previously this was a silent no-op success.
+These sentinels are declared in `pkg/internal/raft`, which external code cannot import. Three of them are re-exported from `quicraft` and can be matched with `errors.Is`:
 
-**Errors:** Validation errors above, plus the same delivery errors as `Propose` (requires leader, rate limit checks, inbox capacity). `*StaleConfigChangeError` if `configChangeIndex` does not match the current `ConfigChangeID`. `*HostInitError` if config change serialization fails.
+| Error                          | Condition                                                                 |
+|--------------------------------|---------------------------------------------------------------------------|
+| `ErrTooManyWitnesses`          | A witness add would exceed the shard's replicated `MaxWitnesses`          |
+| `ErrBreaksFullReplicaMajority` | The change would leave the full replicas unable to form a quorum on their own, violating the shard's `RequireFullReplicaMajority` policy |
+| `ErrRemoveLastFullReplica`     | The change would remove the shard's only full replica. Witnesses cannot become leader, so the shard would be permanently headless |
 
-**Concurrency:** When `OrderedConfigChange` is true (default), only one membership change is processed at a time per shard.
+The remaining validation failures are returned but have no importable sentinel. They are listed here so the messages are recognizable; do not match them by string, and open an issue if you need one of them as a typed error:
 
-The `configChangeIndex` parameter provides an optimistic concurrency guard: pass 0 to skip the check, or pass the `ConfigChangeID` from `SyncGetShardMembership` to reject stale requests.
+| Message fragment                   | Condition                                                             |
+|------------------------------------|-----------------------------------------------------------------------|
+| `replica ID must be non-zero`      | `replicaID == 0`                                                      |
+| `address required for add`         | Add operation with an empty address                                   |
+| `target node not found`            | Remove targets a replica that is not a current member                 |
+| `node already exists`              | Add targets a replica already present as a voter or witness           |
+| `node was previously removed`      | Add or remove targets a replica carrying a removal tombstone          |
+| `exceeds 64 voting members`        | The add would exceed `raft.MaxVotingMembers` (64). The bound comes from the ReadIndex quorum bitfield, which is a `uint64` |
+| `cannot remove last voting member` | Remove targets the last voting member                                 |
+
+Removing a replica that is not a current member is an error, not a silent success.
+
+**Other errors:** the delivery errors `Propose` returns (`ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrSystemBusy`, `ErrCanceled`/`ErrTimeout` for an already-done context) plus `*NotLeaderError` -- unlike `Propose`, a config change is refused outright on a non-leader rather than forwarded. `*StaleConfigChangeError` when `configChangeIndex` does not match. `*HostInitError` when serialization fails.
+
+An add also re-runs the certificate-exclusivity precondition for the address it introduces, which is the only point at which a grow-by-join deployment can be checked at all: `StartShard` sees only the initial members map, and a joiner's map is empty.
+
+**Concurrency:** with `OrderedConfigChange` true (the default), one membership change is in flight per shard at a time.
+
+#### Config Changes With Node Identity
+
+```go
+func (h *Host) RequestAddNodeWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) (*RequestState, error)
+func (h *Host) RequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) (*RequestState, error)
+func (h *Host) RequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) (*RequestState, error)
+func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) error
+```
+
+Commits a stable **node identity** for the replica alongside its address. `identity` is the value that node returns from `Host.NodeIdentity`: the SHA-256 of its leaf certificate's SubjectPublicKeyInfo. Once committed, every replica authorizes that replica's quorum-bearing messages by comparing this identity against the authenticated identity of the connection they arrive on, and stops using its address as an authorization input.
+
+That closes two holes at once. A wildcard or shared-SAN certificate no longer lets one peer assert another's `msg.From`, and a replica can change address without its votes and acks going uncounted.
+
+The identity has to come from outside the cluster -- from the operator or the provisioning system that issued the certificate. It is deliberately not captured from the joining node's own connection: the only evidence available at that point is the certificate's address coverage, so a holder of a promiscuous certificate could claim the target's address and have its own identity committed for that replica ID, locking the legitimate node out with the very mechanism meant to protect it. A node is also customarily added before it is started, so there is often no connection to capture.
+
+An empty `identity` commits no identity and is exactly the non-identity variant. Bootstrap-time identities are seeded through `config.Config.MemberIdentities`.
+
+Set `TransportConfig.RequireMemberIdentity` only after `Membership.Identities` covers every entry in `Nodes`, `Observers` and `Witnesses`; until then, uncovered replicas are refused rather than falling back to the address check.
+
+#### Witness Policy
+
+```go
+func (h *Host) RequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) (*RequestState, error)
+func (h *Host) SyncRequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) error
+```
+
+Replaces the shard's witness policy. The policy is **replicated state** living in `proto.Membership`, not node-local configuration: it travels through Raft as an `UpdateWitnessPolicy` config change so every replica adopts it at the same log position. `config.Config.Witness` is only the bootstrap seed; editing it on a running node changes nothing.
+
+The new policy must be satisfied by the current membership. Tightening a policy the shard already violates is rejected with `ErrTooManyWitnesses` or `ErrBreaksFullReplicaMajority` -- reshape the membership first, then tighten.
 
 #### Sync Config Changes
 
@@ -247,7 +363,7 @@ func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID ui
 func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
 ```
 
-Synchronous wrappers around the async config change methods. Block until the config change is applied.
+Synchronous wrappers around the async config change methods. Block until the config change is applied. Note the name asymmetry: the remove variant is `SyncRequestDeleteNode`, not `SyncRequestRemoveNode`.
 
 #### Membership Queries
 
@@ -256,7 +372,7 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 func (h *Host) GetShardMembership(shardID uint64) (*Membership, error)
 ```
 
-`SyncGetShardMembership` performs a linearizable membership read (ReadIndex round-trip). `GetShardMembership` reads the local in-memory membership without a quorum check (may be stale).
+`SyncGetShardMembership` performs a linearizable membership read (ReadIndex round-trip). `GetShardMembership` reads the local in-memory membership without a quorum check and may be stale.
 
 ### Snapshots
 
@@ -266,11 +382,25 @@ func (h *Host) GetShardMembership(shardID uint64) (*Membership, error)
 func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (*RequestState, error)
 ```
 
-Requests an on-demand snapshot for the given shard. Returns a `*RequestState` whose `Value` field carries the snapshot index on success.
+Requests an on-demand snapshot for the given shard. Returns a `*RequestState` whose `Value` field carries the snapshot index on success. A shard holds one snapshot slot; a second concurrent request is refused rather than queued.
 
-Atomically claims the shard's snapshotting slot via `TryStartSnapshot()`.
+```go
+type SnapshotOption struct {
+    ExportPath                 string // absolute dir; also marks the snapshot as exported
+    CompactionOverhead         uint64 // applied only when OverrideCompactionOverhead is true
+    OverrideCompactionOverhead bool
+    Exported                   bool   // set automatically from ExportPath; callers rarely set it
+}
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`.
+func (o *SnapshotOption) IsExport() bool
+func (o *SnapshotOption) Validate() error
+
+var DefaultSnapshotOption = SnapshotOption{}
+```
+
+The zero value uses shard defaults. With `ExportPath` set the snapshot is written to that directory *and* to the standard snapshot directory, so log compaction still advances. `Validate` returns `*SnapshotOptionError`, which matches `errors.Is(err, ErrInvalidSnapshotOption)`.
+
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `*SnapshotOptionError`.
 
 #### SyncRequestSnapshot
 
@@ -286,47 +416,91 @@ Synchronous wrapper around `RequestSnapshot`. Blocks until the snapshot complete
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error
 ```
 
-Streams the latest snapshot data to the provided writer. Reads from LogDB metadata to locate the snapshot file on disk.
+Streams a self-describing snapshot artifact for the shard to the writer. The shard must have at least one snapshot recorded in LogDB.
 
-Exported snapshots are always **plaintext**. When a barrier (at-rest encryption) is configured, the on-disk `snapshot.dat` is stored in the encrypted frame format. If the snapshot was encrypted (`Epoch > 0`), a barrier is configured, and the barrier is not sealed, `ExportSnapshot` decrypts the frames to plaintext before writing them to the writer; otherwise the bytes are copied verbatim. This matches `ImportSnapshot`, which stores its input verbatim with `Epoch=0` (the no-decrypt recovery path), making export → import a lossless round-trip across hosts with independent barrier keys.
+The artifact is a versioned header -- magic, version, the original `Index`, `Term`, `OnDiskIndex` and `Membership` -- followed by the snapshot data. The header is what makes the round-trip lossless: it preserves the logical snapshot identity so `ImportSnapshot` reconstructs the *same* snapshot on the destination host rather than a different one that happens to hold the same bytes. Emitting only the raw data, as an earlier version did, dropped membership and reset the Raft index and term.
 
-> **Corrected behavior:** Previously the raw on-disk ciphertext was exported, so importing it into a host with a different barrier key (or feeding it back through `RecoverFromSnapshot`, which would not decrypt `Epoch=0` data) corrupted the round-trip. Export now emits decryptable plaintext.
+The data section is always **plaintext**. When a barrier is configured, the on-disk `snapshot.dat` is stored in encrypted frames and this method decrypts them first. The decrypting barrier is resolved per shard, so a snapshot sealed under a `WithShardBarriers` key exports correctly instead of being handed to the wrong host-wide barrier.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSnapshotNotFound`, plus any barrier decryption or `ctx.Err()` error.
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSnapshotNotFound`, `ErrSnapshotEncryptedBarrierUnavailable` (the snapshot is encrypted but no barrier is configured or the barrier is sealed -- it fails rather than emitting ciphertext), plus barrier decryption and `ctx` errors.
 
 #### ImportSnapshot
 
 ```go
-func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader) error
+func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, opts ...ImportOption) error
+
+func WithImportDataDir(dir string) ImportOption
+func WithImportMembership(members map[uint64]string) ImportOption
 ```
 
-Imports a snapshot from the reader. The shard **must be stopped** before calling. Writes snapshot data to disk verbatim and records metadata in LogDB for recovery on next `StartShard`.
+Imports an artifact produced by `ExportSnapshot`. The shard **must be stopped** on this host before calling. The header is parsed to recover the original `Index`/`Term`/`OnDiskIndex`/`Membership`, the remaining bytes are written as `snapshot.dat`, and the snapshot is recorded in LogDB so the next `StartShard` recovers that same logical snapshot.
 
-The imported metadata is recorded with `Epoch=0`, marking the data as **plaintext**: recovery (`StartShard` → `RecoverFromSnapshot`) must not attempt to decrypt it. This pairs with `ExportSnapshot`, which always emits plaintext. The recorded `Term` is set to `1` (the minimum valid term) so the snapshot is not treated as uninitialized by the Raft engine.
+The on-disk directory is named by the artifact's own snapshot index, the way every other snapshot writer names one, so the import takes its rightful place in the shard's ordered snapshot tree instead of sorting as the oldest. The artifact is written to the canonical snapshot path, which is what makes it visible to snapshot garbage collection and to the directory scan that computes the DEK purge floor.
 
-**Errors:** `ErrClosed`, `ErrInvalidOperation` (shard running or no LogDB), `ErrShardNotFound`, plus any `ctx.Err()` or filesystem/LogDB error.
+Because the destination path is derived from the artifact's index, an import can resolve to a path it does not own -- an operator retry, a peer's artifact at an index this replica also reached, a concurrent second import. So the import never writes through that path. It stages into a temporary directory it provably owns and renames into place once the artifact is complete and durable.
+
+**Layout discovery.** The snapshot tree root comes from the `Config.DataDir` that `StartShard` recorded in the LogDB bootstrap record. A shard started with `join=true` records none, and a record predating the `DataDir` field carries none; both fail closed with `ErrImportLayoutUnknown` unless you state the layout with `WithImportDataDir`. Pass `WithImportDataDir("")` to assert the shard has no `DataDir`. A supplied value contradicting the recorded one is refused rather than silently resolved.
+
+**Errors:**
+
+| Error                             | Condition                                                          |
+|-----------------------------------|--------------------------------------------------------------------|
+| `ErrClosed`                       | Host closed                                                        |
+| `ErrInvalidOperation`             | Shard still running, or no LogDB                                   |
+| `*ImportLayoutUnknownError`       | Layout not discoverable and none supplied                          |
+| `*ImportDataDirMismatchError`     | `WithImportDataDir` disagrees with the recorded `DataDir`          |
+| `*ImportSnapshotOutOfDateError`   | The artifact's index does not advance the recorded snapshot        |
+| `*ImportSnapshotDirExistsError`   | The destination directory exists. Clearing it is an operator decision; an import never removes a directory it did not create |
+| `*ImportMembershipInvalidError`   | `WithImportMembership` broke a rule (see below)                    |
+| `*SnapshotTooLargeError`          | The artifact exceeds `config.DefaultMaxSnapshotSize` (4 GB). The shard is stopped, so its own `MaxSnapshotSize` is not available and the package default is the ceiling |
+| `*SnapshotArtifactError`          | The artifact header is malformed or truncated                      |
+
+Each `Import*Error` matches a corresponding `ErrImport*` sentinel with `errors.Is`.
+
+**`WithImportMembership` is a disaster-recovery tool and it is unsafe by design.** It replaces the membership carried by the artifact, which is the only way to recover a shard whose quorum is permanently lost: removing dead replicas is a config change, a config change is a log entry, and committing one needs the quorum that no longer exists. Restoring a snapshot does not help either, because the snapshot carries the same configuration.
+
+Rewriting membership discards Raft's safety argument. Excluded replicas may hold committed entries this snapshot does not, and nothing will ever reconcile that -- committed writes can be silently lost. Use it only when the alternative is losing the shard, and only once you have established the excluded replicas are permanently gone rather than merely unreachable.
+
+The procedure: stop every surviving replica, export from the most up-to-date one, and import on each survivor with **the same** map naming only the survivors. Different maps on different survivors is split-brain by construction. The map is the complete new voting set; observers and witnesses from the artifact are dropped, shard policy (session limits, witness policy) is preserved, and the importing replica must appear in the map.
 
 ### Informational
 
 ```go
 func (h *Host) ID() string
 func (h *Host) RaftAddress() string
+func (h *Host) NodeIdentity() string
 func (h *Host) ShardCount() int
 func (h *Host) GetLeaderID(shardID uint64) (leaderID uint64, known bool, err error)
 func (h *Host) GetLeaderIDAndTerm(shardID uint64) (leaderID, term uint64, known bool, err error)
 func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
 func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
+func (h *Host) IsShardJoining(shardID uint64) bool
+func (h *Host) StateMachineHash(shardID uint64) (hash, appliedIndex uint64, ok bool, err error)
 ```
 
-`GetLeaderID` and `GetLeaderIDAndTerm` return from local atomic state and may be stale. `GetNodeHostInfo` returns a snapshot of all loaded shards. Pass `NodeHostInfoOption{SkipLogInfo: true}` for faster health-check queries.
+`GetLeaderID` and `GetLeaderIDAndTerm` read local atomic state and may be stale. `GetNodeHostInfo` returns a snapshot of all loaded shards; pass `NodeHostInfoOption{SkipLogInfo: true}` to omit the per-shard log info, which is the expensive part.
+
+`NodeIdentity` returns this host's stable identity: the SHA-256 of its leaf certificate's SubjectPublicKeyInfo. It is stable across certificate renewal on the same keypair and changes only when the keypair does. It is safe to log, print and copy -- it is a hash of a public key -- and it is what you feed to `Config.MemberIdentities` or `RequestAddNodeWithIdentity`. It returns `""` under `WithoutTransport`, which has no certificate.
+
+`IsShardJoining` reports whether a shard started with `join=true` is still in its bootstrap window, meaning it has not yet accepted its first snapshot. Once it has, the shard leaves that window for the life of the process. Use it to tell when a dynamically added replica has caught up enough to be treated as an established member on future restarts.
+
+`StateMachineHash` exists to detect the one failure Raft cannot: a state machine that is not a deterministic function of the log. Consensus keeps agreeing on the entry sequence while replicas derive different state from it, and the first symptom is usually a linearizable read returning different values depending on which replica served it. `ok` is false when the state machine does not implement `sm.Hasher`, which is an absence of the facility rather than an error. Compare across replicas **at the same applied index** -- that is what the returned index is for. Implementations must make the hash order-independent or it reports divergence that does not exist. It hashes the whole state machine, so it is a diagnostic, not a hot path.
 
 ### Health Check
 
 ```go
 func (h *Host) HealthCheck() *HealthStatus
+
+type HealthStatus struct {
+    Status        string      `json:"status"`           // "ok", "degraded", "sealed", "unhealthy"
+    BarrierSealed bool        `json:"barrier_sealed"`
+    DiskOK        bool        `json:"disk_ok"`
+    ShardCount    int         `json:"shard_count"`
+    Shards        []ShardInfo `json:"shards,omitempty"`
+}
 ```
 
-Returns a point-in-time health assessment:
+Returns a point-in-time health assessment. The precedence is fixed in this order, so a sealed barrier reports `"sealed"` regardless of shard state:
 
 | Status      | Condition                              | HTTP Code |
 |-------------|----------------------------------------|-----------|
@@ -335,7 +509,7 @@ Returns a point-in-time health assessment:
 | `"degraded"` | Any shard has `ShardError` health     | 503       |
 | `"ok"`      | All shards healthy                     | 200       |
 
-Checks barrier state, disk full flag, and per-shard health.
+Only `ShardError` degrades the aggregate. A shard reporting `ShardNoLeader`, `ShardLagging`, `ShardRecovering` or `ShardSnapshotting` still leaves the host `"ok"` -- inspect `Shards` if you need to alert on those. `DiskOK` is reported but does not affect `Status`.
 
 ### Encryption / Barrier
 
@@ -344,9 +518,28 @@ func (h *Host) EmergencySeal() error
 func (h *Host) IsSealed() bool
 ```
 
-`EmergencySeal` immediately seals the barrier without waiting for in-flight operations. All subsequent operations fail with `ErrBarrierSealed`. For security incident response.
+`EmergencySeal` seals the barrier immediately, without waiting for in-flight operations. Subsequent operations that need key material fail with `ErrBarrierSealed`. It is for security incident response, so the abruptness is the point.
 
-`IsSealed` returns false if no barrier is configured.
+`IsSealed` returns false when no barrier is configured.
+
+The `Barrier` interface is declared in the `quicraft` package rather than imported, to break an import cycle. `seal.EpochBarrier` satisfies it. Its surface: `IsSealed`, `Seal`, `Encrypt`/`Decrypt`, `EncryptWithEpoch`, `DecryptForEpoch`, the context-AAD variants `EncryptWithEpochContext`/`DecryptWithContext`, `IsHardwareMode`, `SupportsContextAAD`, `Rotate`, `PurgeEpochsBefore`, `RegisterInFlightEpoch`/`DeregisterInFlightEpoch`, `CurrentEpoch` and `ShouldRotateKey`.
+
+`IsHardwareMode` says only that sealing is delegated to an external encryptor. Use `SupportsContextAAD` to learn whether that encryptor can actually authenticate the caller context snapshot frames are bound to: it is true for a software barrier and for a delegated encryptor that carries AAD end to end, false for one that cannot and in no-encryption mode. That is a capability of the deployment's barrier, never a per-artifact choice. `DecryptWithContext` has no weaker retry -- a different context, or none where one was present, fails authentication, because the fallback is the vulnerability.
+
+#### ReencryptSnapshotFile
+
+```go
+func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
+    srcBarrier, dstBarrier Barrier) (uint64, error)
+```
+
+Re-keys a snapshot data file from one barrier to another: every frame is decrypted under `srcBarrier` and re-encrypted under `dstBarrier`, streamed through an in-memory pipe so a large snapshot never loads fully into memory and its plaintext never lands on disk. Returns the destination's **minimum** at-rest epoch across the written frames, which is the value to record as the snapshot's `Epoch` so the DEK-purge floor protects every frame. It is 0 for an empty source or a plaintext destination.
+
+`shardID`, `replicaID` and `index` are required, not optional: snapshot frames are bound to their position through the AEAD context AAD, and there is no weaker fallback for a caller that omits them.
+
+A **nil** barrier denotes a plaintext side. A non-nil but **sealed** barrier does not -- it means encryption is configured but temporarily unavailable, and it returns `ErrSnapshotBarrierSealed` rather than falling through. Reading an encrypted source under a sealed barrier would copy ciphertext and record it as plaintext; a sealed destination would durably downgrade a snapshot that must be encrypted at rest.
+
+The write is atomic and crash-safe: output goes to a temporary file in the destination's directory, is fsynced, then renamed, and the directory chain is fsynced before success is reported. On any failure before the rename the temp file is removed and both paths are left untouched. The one exception is a directory fsync that fails *after* the rename, which returns `*SnapshotCommittedNotDurableError` carrying the real epoch alongside the error.
 
 ### Data Removal
 
@@ -385,7 +578,7 @@ Triggers explicit log compaction for the given shard/replica pair. This reclaims
 func (h *Host) HasNodeInfo(shardID, replicaID uint64) bool
 ```
 
-Returns true if metadata exists for the given shard/replica pair on disk.
+Returns true when bootstrap information for the shard/replica pair exists in LogDB. False when the host is closed or the replica has never been bootstrapped here.
 
 ### Log Access
 
@@ -393,7 +586,7 @@ Returns true if metadata exists for the given shard/replica pair on disk.
 func (h *Host) GetLogReader(shardID uint64) (ReadonlyLogReader, error)
 ```
 
-Returns a `ReadonlyLogReader` for direct log access. The reader is point-in-time; call again to see new entries.
+Returns a read-only view of the shard's Raft log: range and node state, no mutation. The values its methods return reflect the log at call time.
 
 **Errors:** `ErrClosed`, `ErrShardNotFound`.
 
@@ -403,9 +596,9 @@ Returns a `ReadonlyLogReader` for direct log access. The reader is point-in-time
 func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex, lastIndex, maxSize uint64) ([]proto.Entry, error)
 ```
 
-Queries a range of Raft log entries. `maxSize` limits the total returned bytes. Returns entries in the requested range, or as many as fit in `maxSize`.
+Queries a range of Raft log entries. `maxSize` limits the total returned bytes; the call returns as many entries from the range as fit.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`.
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrInvalidRange` (`firstIndex >= lastIndex`, or `maxSize == 0`), `ErrCanceled`/`ErrTimeout` from `ctx`, plus LogDB errors such as `logdb.ErrCompacted` when the range has been compacted away.
 
 #### GetLogRange
 
@@ -423,9 +616,14 @@ Returns the first and last log indices for the shard.
 func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQLen int, inboxLen int, pendingProposals int, err error)
 func (h *Host) DiagRaftState(shardID uint64) (term, committed, processed, lastIdx uint64, msgs int, state string, err error)
 func (h *Host) DiagRemotes(shardID uint64) (string, error)
+func (h *Host) DiagShardGates(shardID uint64) (recovering, saving bool, applyInFlight int64, err error)
 ```
 
 Low-level diagnostics for troubleshooting. `DiagPipelineState` shows commit queuing, proposal queue depth, and inbox backlog. `DiagRaftState` shows Raft term, commit index, processed index, log size, and state string (Follower/Candidate/Leader). `DiagRemotes` returns a textual representation of peer replication states.
+
+`DiagShardGates` reports the two gates that suspend state machine work. While `recovering` is true the state machine is being replaced by a received snapshot: the replica applies nothing and extracts no committed entries, though it keeps voting and replicating. While `saving` is true a snapshot capture has quiesced applies. `applyInFlight` is the drain counter both gates wait on; a non-zero value with a gate up means the drain has not finished. Both states also surface as `ShardInfo.Health`.
+
+For structured peer replication state, prefer `ShardInfo.Replicas` over parsing `DiagRemotes`.
 
 ### Shutdown
 
@@ -436,7 +634,9 @@ func (h *Host) Drain() error
 func (h *Host) IsDraining() bool
 ```
 
-`Drain` transitions to drain mode: new proposals and ReadIndex requests are rejected with `ErrDraining`. In-flight work is allowed to complete. Blocks until all pending proposals, reads, and snapshots complete, or `ShutdownTimeout` expires (`ErrShutdownTimeout`). Idempotent.
+`Drain` transitions to drain mode: new proposals, ReadIndex requests, session operations and config changes are rejected with `ErrDraining`. In-flight work is allowed to complete. Blocks until all pending proposals, reads, and snapshots complete, or `ShutdownTimeout` expires (`ErrShutdownTimeout`). Idempotent.
+
+Drain is **irreversible**. There is no resume; a host that needs to accept proposals again has to be recreated. The wait is event-driven off a pending-operation counter, not a poll loop.
 
 `IsDraining` returns true if the host is in drain mode.
 
@@ -446,9 +646,15 @@ func (h *Host) IsDraining() bool
 func (h *Host) Close() error
 ```
 
-Shuts down the host. Calls `Drain()` first, then stops the key rotation goroutine, transport, engine, all nodes, closes LogDB, and seals the barrier. Idempotent via `sync.Once`.
+Shuts down the host. Shutdown always runs to completion; the returned error is the `errors.Join` of everything that failed along the way -- an incomplete drain, each state machine's `Close`, the LogDB `Close`, the barrier `Seal`. `errors.Is` reaches each cause.
 
-**Shutdown order:** Drain -> Key rotation stop -> Transport stop -> Engine stop -> Node cleanup -> LogDB close -> Barrier seal.
+Treat a non-nil return as a durability signal, not as noise. For an on-disk state machine this `Close` is the backing store's final flush, so it is the last chance the embedding application has to learn that writes were lost.
+
+A concurrent or repeated `Close` **blocks** until the shutdown already running has finished and then returns that same error. It does not return nil early.
+
+**Shutdown order:** Drain -> key rotation stop -> pending-request sweeper stop -> engine stop -> in-flight snapshot sends drain -> transport stop -> pending requests failed with `ErrClosed` -> state machines closed -> LogDB close -> barrier seal.
+
+The engine stops before the transport on purpose: the engine's step workers are the only producers of snapshot sends, so stopping them first means the send drain that follows races with no new sends, and the transport is still up while those sends complete.
 
 ## RequestState
 
@@ -460,10 +666,12 @@ Tracks a single asynchronous request through the Raft pipeline. Callers obtain a
 
 ### Lifecycle
 
-1. **Created** by `newRequestState` from a `sync.Pool` with a pre-allocated buffered channel (capacity 1)
-2. **Pending** -- registered in the Host's `pendingProposals`, `pendingReads`, or `pendingSnapshots` map, keyed by a unique monotonic `proposalKey`
-3. **Completed** -- the engine callback (`OnApplied`, `OnReadyToRead`, `OnSnapshotCompleted`, or `OnLeaderUpdated`) sends a `RequestResult` to the channel via `complete()`
-4. **Released** -- caller calls `Release()` to return the object to the pool
+1. **Created** from a `sync.Pool` with a pre-allocated buffered channel of capacity 1
+2. **Pending** -- registered in the shard's pending-proposal, pending-read or pending-snapshot map under a unique monotonic key
+3. **Completed** -- an engine callback sends exactly one `RequestResult` on the channel
+4. **Released** -- the caller calls `Release()`
+
+`RequestState` is safe for a single goroutine. Do not share one across goroutines without external synchronization.
 
 ### Methods
 
@@ -493,13 +701,15 @@ Only signaled when `NotifyCommit` is enabled on the host. When disabled, this ch
 func (rs *RequestState) ApplyResultC() <-chan RequestResult
 ```
 
-Returns a read-only channel that receives the full state machine apply result. Identical to `ResultC()` and always returns the `completedC` channel. Provided for clarity when both `CommittedC()` and the apply result are needed in the same select.
+Returns a read-only channel that receives the full state machine apply result. It returns the same channel as `ResultC()` and exists for readability when both `CommittedC()` and the apply result appear in one `select`.
 
 ```go
 func (rs *RequestState) Release()
 ```
 
-Returns the `RequestState` to the pool. Idempotent. After release, `Result()` returns `ErrReleased` and `ResultC()` returns nil.
+Marks the `RequestState` released by the caller. Idempotent. After release, `Result()` returns `ErrReleased` and `ResultC()` returns nil.
+
+The object goes back to the pool only when the caller has released it **and** every pending-map reference is gone. That matters for the common case where a `Sync*` caller times out and releases while the request is still registered: recycling early would hand the same object to a new request and deliver a stale result into it. The late completion or sweep drops the final reference and recycles then.
 
 ```go
 func (rs *RequestState) Key() uint64
@@ -510,7 +720,7 @@ Accessors for the request key and deadline.
 
 ### Pool Pattern
 
-`NewRequestStatePool()` creates a `sync.Pool` that produces `RequestState` objects with pre-allocated channels. Each `nodeState` holds its own pool. The pool pattern reduces GC pressure on the proposal hot path.
+`NewRequestStatePool()` creates a `sync.Pool` producing `RequestState` objects with their result and committed channels already allocated. Each shard holds its own pool, which keeps the proposal hot path off the allocator. It is exported so an embedder building its own request plumbing on top of the pipeline can reuse the same pooling; ordinary callers never need it.
 
 ## RequestResult
 
@@ -530,11 +740,13 @@ For ReadIndex: `Value` carries the confirmed read index.
 
 For snapshots: `Value` carries the snapshot index on success.
 
-On failure: `Err` carries the error (`*NotLeaderError`, `ErrAborted`, `ErrTimeout`, etc.).
+On failure: `Err` carries the error (`*NotLeaderError`, `ErrAborted`, `ErrTimeout`, `ErrReadIndexNotReady`, `ErrSessionExpired`, and so on). Classify it with `MaybeApplied`, `Temporary` and `NotLeader` rather than by comparing against sentinels yourself.
 
 ## Session API
 
-Sessions provide **at-most-once** proposal semantics. The session manager uses `(clientID, seriesID)` to detect and deduplicate retransmissions.
+Sessions provide **at-most-once** proposal semantics. The session manager keys on `(clientID, seriesID)` to detect and deduplicate retransmissions, so a retry after an ambiguous failure applies the command once rather than twice. Session state is replicated, and expiry is measured in applied log entries rather than wall-clock time so every replica expires the same session at the same index.
+
+Sessions are unavailable on shards backed by an `sm.DiskStateMachine`; see [Sessions and on-disk state machines](#sessions-and-on-disk-state-machines).
 
 ### Session Type
 
@@ -548,6 +760,7 @@ Fields are unexported to prevent mutation that would break deduplication. Access
 func (s *Session) ShardID() uint64
 func (s *Session) ClientID() uint64
 func (s *Session) SeriesID() uint64
+func (s *Session) OwnerID() uint64
 func (s *Session) RespondedTo() uint64
 func (s *Session) IsNoOPSession() bool
 ```
@@ -556,12 +769,17 @@ func (s *Session) IsNoOPSession() bool
 
 ```go
 func NewSession(shardID, clientID uint64) *Session
+func NewSessionWithOwner(shardID, clientID, ownerID uint64) *Session
 func NewNoOPSession(shardID uint64) *Session
 ```
 
-`NewSession` creates a tracked Session for the given shard and client ID. The clientID must not be zero; zero is reserved for no-op sessions. The session is created in an unregistered state.
+`NewSession` creates a tracked Session for the given shard and client ID. The client ID must not be zero; zero is reserved for no-op sessions. The session starts unregistered and must be registered through Raft before use.
 
-`NewNoOPSession` creates a no-op session with clientID=0 that bypasses deduplication.
+`NewSessionWithOwner` declares a principal holding the session, so it counts against the shard's replicated `MaxSessionsPerOwner`. An `ownerID` of zero is identical to `NewSession`.
+
+The owner is whatever the **embedder** decides identifies a principal: a tenant ID, an account number, a hash of an authenticated subject. This library cannot derive it -- it authenticates nodes, not clients, and a client ID is eight bytes the caller chooses. The cap is therefore only as trustworthy as the embedder's own authentication: a caller free to pick any `ownerID` is free to evade it, so the value must come from something the embedder verified rather than from the client.
+
+`NewNoOPSession` creates a no-op session with client ID 0 that bypasses deduplication entirely.
 
 ### Registration Flow
 
@@ -569,30 +787,35 @@ Session registration and unregistration are proposed through Raft consensus so a
 
 ```go
 func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error)
+func (h *Host) GetNewSessionWithOwner(ctx context.Context, shardID, ownerID uint64) (*Session, error)
 ```
 
-1. Generates a cryptographic random `clientID` (8 bytes from `crypto/rand`)
-2. Sets `seriesID = SeriesIDForRegister` (sentinel: `math.MaxUint64-1`)
-3. Proposes registration through Raft via `proposeSession`
+1. Draws a client ID from `crypto/rand`, rejecting zero
+2. Sets `seriesID = SeriesIDForRegister`
+3. Proposes registration through Raft
 4. Blocks until committed and applied
-5. Validates result (`Value == clientID`)
-6. Sets `seriesID = SeriesIDFirstProposal` (1) for normal proposals
+5. Validates the result carries the expected client ID
+6. Sets `seriesID = SeriesIDFirstProposal` for normal proposals
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `*NotLeaderError`, `ErrSystemBusy`, `*SessionError`.
+Zero is rejected at step 1 because it is the "no session" marker on the wire. A session minted with it is structurally a no-op session and the failure is silent in both directions: the registration entry is skipped by the state machine, and the caller's own `result.Value != clientID` check is satisfied by `0 != 0`. `GetNewSession` would return success and hand back a session whose every later proposal is unsessioned, with at-most-once delivery quietly off. If the CSPRNG returns zero on every attempt it is not producing entropy at all, and the call fails with `ErrEntropyDegenerate` rather than looping.
+
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSessionsUnsupportedOnDisk`, `*NotLeaderError`, `ErrSystemBusy`, `*SessionError` (wrapping `ErrEntropyDegenerate`, or `ErrInvalidOperation` when the owner is at its cap).
+
+A per-owner cap rejection is a **replicated** refusal: every replica reaches it from the log alone, rather than it being a leader-local admission decision.
 
 ```go
 func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session, error)
 ```
 
-Registers a pre-created session through Raft. Returns the session on success.
+Registers a pre-created session through Raft, preserving its existing client ID rather than generating one. Used by adapters that create sessions with caller-specified client IDs. The session must have a non-zero client ID and belong to the given shard. On success it is prepared for normal proposals.
 
 ```go
 func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Session) (*RequestState, error)
 ```
 
-Proposes unregistration through Raft. Sets `seriesID = SeriesIDForUnregister` (sentinel: `math.MaxUint64`). Returns a `*RequestState`.
+Proposes unregistration through Raft, setting `seriesID = SeriesIDForUnregister`. Returns a `*RequestState` that resolves when the unregistration is committed and applied.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrInvalidOperation` (nil session), `ErrInvalidSession` (wrong shard or no-op session).
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSessionsUnsupportedOnDisk`, `ErrInvalidOperation` (nil session), `ErrInvalidSession` (wrong shard, or a no-op session).
 
 ### No-Op Sessions
 
@@ -600,7 +823,7 @@ Proposes unregistration through Raft. Sets `seriesID = SeriesIDForUnregister` (s
 func (h *Host) GetNoOPSession(shardID uint64) *Session
 ```
 
-Returns a no-op session with `clientID=0`. No-op sessions bypass deduplication entirely. Use only for idempotent operations.
+Returns a no-op session with client ID 0. No-op sessions bypass deduplication entirely, so use them only where the operation is idempotent. They need no registration and are the only session form available on a shard backed by an `sm.DiskStateMachine`.
 
 ### Session Constants
 
@@ -617,13 +840,14 @@ func (s *Session) PrepareForPropose()
 func (s *Session) ProposalCompleted()
 func (s *Session) PrepareForRegister()
 func (s *Session) PrepareForUnregister()
+func (s *Session) SetRespondedTo(seriesID uint64)
 ```
 
 `PrepareForPropose()` sets the session for normal proposal mode, advancing seriesID to `SeriesIDFirstProposal`.
 
 `ProposalCompleted()` advances the series ID and updates respondedTo after a proposal completes.
 
-`PrepareForRegister()` and `PrepareForUnregister()` set up the session for registration/unregistration operations.
+`PrepareForRegister()` and `PrepareForUnregister()` set the sentinel series IDs for registration and unregistration. `SetRespondedTo()` updates the highest acknowledged series ID; the host calls it internally, and you need it only when driving the session lifecycle by hand.
 
 ### Session Validation
 
@@ -640,70 +864,110 @@ func (s *Session) ValidForProposal(shardID uint64) bool
 
 ```go
 type Membership struct {
-    ConfigChangeID uint64                // Raft log index of this config change
-    Nodes          map[uint64]string     // Full voting members (replicaID -> addr)
-    Observers      map[uint64]string     // Non-voting learners (replicaID -> addr)
-    Witnesses      map[uint64]string     // Voting members without SM (replicaID -> addr)
-    Removed        map[uint64]struct{}   // Removed replica IDs
+    ConfigChangeID uint64              // Raft log index of the config change that produced this
+    Nodes          map[uint64]string   // Full voting members (replicaID -> addr)
+    Observers      map[uint64]string   // Non-voting learners
+    Witnesses      map[uint64]string   // Voting members without a state machine
+    Removed        map[uint64]struct{} // Removal tombstones
+
+    // Replicated witness policy. Changed via Host.RequestUpdateWitnessPolicy.
+    MaxWitnesses               uint64  // 0 = no explicit cap
+    RequireFullReplicaMajority bool
+
+    // Replicated session policy. Seeded from the founder's Config at
+    // bootstrap; no config change alters these afterwards.
+    SessionExpiryEntries uint64
+    MaxTotalSessions     uint64
+    MaxSessionsPerClient uint64
+    MaxSessionsPerOwner  uint64
+
+    // Committed node identities. Sparse: a replica absent from this map
+    // has none. replicaID -> the value that node reports from NodeIdentity.
+    Identities map[uint64]string
 }
-```
 
-Describes the current cluster membership for a shard. Returned by `Host.SyncGetShardMembership`.
-
-```go
-func (m *Membership) ConfigChangeIndex() uint64
-```
-
-Returns the `ConfigChangeID`. This alias exists for backward compatibility.
-
-```go
 func NewMembership() *Membership
+func (m *Membership) ConfigChangeIndex() uint64 // alias for ConfigChangeID
 ```
 
-Creates a Membership with all maps initialized to empty.
+The committed cluster membership for a shard, returned by `Host.SyncGetShardMembership` and `Host.GetShardMembership`. `NewMembership` returns a value with every map initialized.
+
+**Session policy is replicated, not node-local.** A replica evaluating these limits from its own configuration would expire different sessions at different log indexes and diverge its state machine silently, so the founder's values are committed at bootstrap and every replica reads the shard's copy. They are exposed here so an operator can see what the shard actually committed rather than what any one node is configured with. The two differ exactly when someone edited a node's `Config` after bootstrap, in which case the shard's value governs and the node logs the disagreement at startup. A shard bootstrapped before the policy was replicated reports all four as zero.
+
+Note the naming: `MaxSessionsPerClient` is the **response-cache depth**, how many cached results one session retains for duplicate detection. It does not limit sessions. `MaxSessionsPerOwner` is the per-principal session cap and `MaxTotalSessions` the shard-wide one.
+
+**`Identities` is how you verify an identity migration is complete.** Every entry in `Nodes`, `Observers` and `Witnesses` must appear here before you set `TransportConfig.RequireMemberIdentity`; until then, a replica absent from the map is authorized by its committed address instead, or refused outright once that setting is on.
 
 ## Error Types
 
 ### Classification helpers
 
-Do not re-derive "is this retryable?" from the sentinel list — every consumer
-that does will disagree with the others. Two helpers answer it:
+Do not re-derive "is this retryable?" from the sentinel list -- every consumer
+that does will disagree with the others. Three helpers answer it:
 
 ```go
+func MaybeApplied(err error) bool
 func Temporary(err error) bool
 func NotLeader(err error) (replicaID uint64, ok bool)
 ```
 
-`Temporary` reports whether the IDENTICAL request, unchanged, can succeed on
-retry once a transient condition clears with no operator or caller
-intervention. It is true for `ErrBusy`, `ErrSystemBusy`, `ErrTimeout`,
-`ErrAborted`, `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`,
-`ErrNotLeader`, `ErrReadIndexNotReady`, `ErrRotateInProgress` and
-`ErrSnapshotInProgress`.
+All three use `errors.Is`/`errors.As`, so wrapped errors classify correctly. A
+nil error is not temporary, not maybe-applied and not a not-leader error.
+
+**`MaybeApplied` first.** It reports whether the request had already been
+delivered to Raft when it failed, so the entry may still commit and apply.
+`Temporary` answers "is it reasonable to retry?" and says nothing about "did it
+happen?", and for a consensus library those are different questions with
+different consequences. A proposal that reached the log and then lost its wait
+-- leadership moved, the deadline elapsed, the shard closed -- is exactly this
+case, and retrying it without a client session can apply the command twice
+because an unsessioned proposal carries client ID 0 and nothing deduplicates
+it. Such errors are wrapped in `*MaybeAppliedError`, which preserves every
+existing `errors.Is` result, so a caller that ignores the type behaves as
+before.
+
+**`Temporary`** reports whether the identical request, unchanged, can succeed on
+retry once a transient condition clears without operator or caller
+intervention. It is true for exactly these: `ErrBusy` (and therefore
+`ErrSystemBusy`, which is a `*BusyError`), `ErrTimeout`, `ErrAborted`,
+`ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`,
+`ErrReadIndexNotReady`, `ErrSnapshotInProgress`.
 
 **Everything else is permanent, including errors this package never produced.**
 Retrying a permanent failure forever turns one bad request into sustained load
-and hides the real fault. Some exclusions are deliberate and worth knowing:
-`ErrStaleConfigChange` is permanent because the identical request fails forever
-— re-read membership with `SyncGetShardMembership` and build a NEW request;
-`ErrDraining` is a one-way transition into shutdown, so retry a different host;
-`ErrCanceled` is the caller's own decision, whereas a deadline that elapses
-server-side surfaces as `ErrTimeout`.
+and hides the real fault. Some exclusions look retryable at a glance and are
+not:
 
-`NotLeader` returns `ok == true` for any not-leader error — the bare
-`ErrNotLeader` sentinel or a `*NotLeaderError` — and `replicaID` is the leader
-this replica believes is current, or **0 when the leader is unknown**. Treat
-`(0, true)` as "retry, but discover the leader yourself". Every not-leader
-error is also `Temporary`, so gate a retry loop on `Temporary` and use
-`NotLeader` only to pick a target.
+| Excluded                     | Why                                                                 |
+|------------------------------|---------------------------------------------------------------------|
+| `ErrCanceled`                | The caller's own decision. A deadline that elapses server-side surfaces as `ErrTimeout`, which is temporary |
+| `ErrDraining`                | A one-way transition into shutdown. Retry a different host          |
+| `ErrStaleConfigChange`       | The identical request fails forever. Re-read membership with `SyncGetShardMembership` and build a new request |
+| `ErrSessionLimitExceeded`    | Whether it clears depends on `SessionExpiryEntries` and on clients closing sessions. A retry loop against a client that leaks sessions spins forever |
+| `ErrBarrierSealed`           | Clearing it requires an operator unseal ceremony                    |
+| `ErrShardBarrierUnresolved`  | A resolver miss can mean "tenant not provisioned yet" (clears) or "misconfigured" (never clears), and the error cannot tell them apart |
+| `ErrDiskFull`, `ErrLogDBWrite` | Storage faults needing operator action. Retrying into a full or failing volume makes the incident worse |
+| `ErrShardFailed`             | The state-machine failure latch tripped and does not reset on its own |
 
-Both use `errors.Is`/`errors.As`, so a wrapped error and the typed errors'
-`Is` methods classify correctly.
+**`NotLeader`** returns `ok == true` for any not-leader error, whether the bare
+`ErrNotLeader` sentinel or a `*NotLeaderError`. `replicaID` is the leader this
+replica believes is current, or **0 when the leader is unknown**. Treat
+`(0, true)` as "retry, but discover the leader yourself". Every not-leader error
+is also `Temporary`, so gate the retry loop on `Temporary` and use `NotLeader`
+only to pick a target.
 
 ```go
 for {
-    err := host.SyncPropose(ctx, session, cmd)
-    if err == nil || !quicraft.Temporary(err) {
+    _, err := host.SyncPropose(ctx, shardID, cmd)
+    if err == nil {
+        return nil
+    }
+    if quicraft.MaybeApplied(err) {
+        // The entry may already be in the log. Retrying an unsessioned
+        // proposal here can double-apply it: use a session, or verify.
+        return err
+    }
+    if !quicraft.Temporary(err) {
         return err
     }
     if leaderID, ok := quicraft.NotLeader(err); ok && leaderID != 0 {
@@ -715,48 +979,120 @@ for {
 
 ### Sentinel Errors
 
-All sentinel errors use the `"quicraft:"` prefix. Check with `errors.Is()`.
+All sentinel errors declared here use the `"quicraft:"` prefix. Check with `errors.Is()`.
 
-| Error                     | Returned When                                       |
-|---------------------------|-----------------------------------------------------|
-| `ErrClosed`               | Operation on a closed Host                          |
-| `ErrDraining`             | New work submitted during drain                     |
-| `ErrTimeout`              | Request deadline expired                            |
-| `ErrCanceled`             | Request canceled via context                        |
-| `ErrRejected`             | Proposal rejected (e.g., config change in progress) |
-| `ErrAborted`              | Internal state transition (leadership change, stop) |
-| `ErrDropped`              | Proposal dropped (queue overflow, shutdown)         |
-| `ErrShardNotFound`        | Shard not loaded on this Host                       |
-| `ErrShardNotStarted`      | Shard registered but not initialized                |
-| `ErrShardNotReady`        | Shard initializing, cannot serve requests           |
-| `ErrShardAlreadyExists`   | StartShard for an already-running shard             |
-| `ErrShardFailed`          | SM circuit breaker tripped                          |
-| `ErrBusy`                 | Per-shard in-memory log exceeded MaxInMemLogSize    |
-| `ErrSystemBusy`           | Global rate limit exceeded or inbox full            |
-| `ErrNotLeader`            | Sentinel for `errors.Is()` matching                 |
-| `ErrInvalidConfig`        | Config validation failure                           |
-| `ErrInvalidOperation`     | Invalid for current state (e.g., witness read)      |
-| `ErrInvalidSMType`        | CreateFunc returns unrecognized type                |
-| `ErrInvalidSession`       | Wrong shard or no-op session for session op         |
-| `ErrReleased`             | Result/ResultC on released RequestState             |
-| `ErrLogDBWrite`           | LogDB write failure                                 |
-| `ErrShutdownTimeout`      | Drain exceeded ShutdownTimeout                      |
-| `ErrEntryTooLarge`        | Sentinel for `errors.Is()` matching                 |
-| `ErrSnapshotNotFound`     | No snapshot available on disk                       |
-| `ErrSnapshotInProgress`   | Snapshot already in progress for this shard         |
-| `ErrSnapshotRecoveryFailed` | Snapshot restore corruption/incompatibility       |
-| `ErrBarrierSealed`        | Operation while barrier is sealed                   |
-| `ErrBarrierNotInit`       | Barrier not initialized                             |
-| `ErrDiskFull`             | WAL directory at configured max size                |
-| `ErrDecryptionFailed`     | Corrupted ciphertext or wrong key                   |
-| `ErrRotateInProgress`     | Concurrent key rotation attempt                     |
-| `ErrDecompressionBomb`    | Decompressed payload exceeds limit                  |
-| `ErrSessionLimitExceeded` | Per-client or total session limit reached           |
-| `ErrSessionNotFound`      | Referenced session does not exist                   |
-| `ErrSessionAlreadyExists` | Registering a duplicate session                     |
-| `ErrResponseLimitExceeded`| Session response cache full                         |
-| `ErrStopped`              | Stopper channel closed                              |
-| `ErrReadIndexNotReady`    | Leader has no committed entry in current term       |
+#### Host and request lifecycle
+
+| Error                | Returned When                                                       |
+|----------------------|---------------------------------------------------------------------|
+| `ErrClosed`          | Operation on a closed Host, or the request never started            |
+| `ErrDraining`        | New work submitted during drain                                     |
+| `ErrStopped`         | The shard or engine stopped underneath an in-progress snapshot save or recovery. Distinct from `ErrClosed` |
+| `ErrShutdownTimeout` | Drain exceeded `ShutdownTimeout`                                    |
+
+#### Request outcome
+
+| Error         | Returned When                                          |
+|---------------|---------------------------------------------------------|
+| `ErrTimeout`  | Request deadline expired                                |
+| `ErrCanceled` | Request canceled via context                            |
+| `ErrRejected` | Proposal rejected, e.g. a config change already in progress |
+| `ErrAborted`  | Internal state transition such as a leadership change   |
+| `ErrDropped`  | Proposal dropped: queue overflow or shutdown            |
+| `ErrReleased` | `Result`/`ResultC` on an already-released `RequestState` |
+
+#### Shard state
+
+| Error                   | Returned When                                     |
+|-------------------------|---------------------------------------------------|
+| `ErrShardNotFound`      | Shard not loaded on this Host                     |
+| `ErrShardNotStarted`    | Shard registered but not initialized              |
+| `ErrShardNotReady`      | Shard initializing, cannot serve requests         |
+| `ErrShardAlreadyExists` | `StartShard` for an already-running shard         |
+| `ErrShardNotStopped`    | `RemoveData` for a shard still loaded             |
+| `ErrShardFailed`        | State machine panicked; the shard failure latch tripped |
+| `ErrReplicaNotFound`    | Replica ID does not match the replica on this host |
+
+#### Backpressure and leadership
+
+| Error                  | Returned When                                                |
+|------------------------|--------------------------------------------------------------|
+| `ErrBusy`              | Per-shard in-memory log exceeded `MaxInMemLogSize`           |
+| `ErrSystemBusy`        | Global limit `MaxTotalInMemLogSize` exceeded. It is a `*BusyError`, so `errors.Is(err, ErrBusy)` is also true |
+| `ErrDiskFull`          | WAL directory reached `MaxWALDiskSize`                       |
+| `ErrNotLeader`         | Sentinel form of `*NotLeaderError`                           |
+| `ErrReadIndexNotReady` | Leader has no committed entry in its current term            |
+
+#### Validation
+
+| Error                       | Returned When                                                |
+|-----------------------------|--------------------------------------------------------------|
+| `ErrInvalidConfig`          | Config validation failure                                    |
+| `ErrInvalidOperation`       | Invalid for the current state, e.g. a witness read or propose |
+| `ErrInvalidSMType`          | `CreateFunc` returned a type implementing none of the SM interfaces |
+| `ErrInvalidSession`         | Wrong shard, or a no-op session used for a session operation |
+| `ErrInvalidRange`           | Log query with `firstIndex >= lastIndex` or `maxSize == 0`   |
+| `ErrInvalidMember`          | Sentinel form of `*InvalidMemberError`                       |
+| `ErrEntryTooLarge`          | Sentinel form of `*EntryTooLargeError`                       |
+| `ErrStaleConfigChange`      | Sentinel form of `*StaleConfigChangeError`                   |
+| `ErrNonVotingRoleInMembers` | Sentinel form of `*NonVotingRoleInMembersError`              |
+| `ErrInvalidSnapshotOption`  | Sentinel form of `*SnapshotOptionError`                      |
+| `ErrRecoveredTermUnknown`   | An on-disk SM's recovered applied index has no resolvable Raft term. Seeding term 0 would make `isUpToDate` grant a vote to every candidate, so the shard start fails instead |
+
+#### Membership policy
+
+Aliases of the internal raft sentinels, matchable with `errors.Is`.
+
+| Error                          | Returned When                                                 |
+|--------------------------------|---------------------------------------------------------------|
+| `ErrTooManyWitnesses`          | Witness add would exceed the shard's replicated `MaxWitnesses` |
+| `ErrBreaksFullReplicaMajority` | Change would leave full replicas unable to form a quorum      |
+| `ErrRemoveLastFullReplica`     | Change would remove the shard's only full replica             |
+
+#### Sessions
+
+| Error                          | Returned When                                              |
+|--------------------------------|------------------------------------------------------------|
+| `ErrSessionLimitExceeded`      | Shard-wide or per-owner session limit reached. `ErrTooManySessions` is a legacy alias for the same value |
+| `ErrSessionNotFound`           | Referenced session does not exist                          |
+| `ErrSessionExpired`            | Sentinel form of `*SessionExpiredError`                    |
+| `ErrSessionAlreadyExists`      | Registering a duplicate session                            |
+| `ErrResponseLimitExceeded`     | Session response cache full                                |
+| `ErrSessionsUnsupportedOnDisk` | Any session entry point on a shard backed by an `sm.DiskStateMachine` |
+| `ErrEntropyDegenerate`         | The system CSPRNG returned the rejected value on every attempt while minting a client ID |
+
+#### Snapshot errors
+
+| Error                                   | Returned When                                                  |
+|-----------------------------------------|----------------------------------------------------------------|
+| `ErrSnapshotNotFound`                   | No snapshot available on disk                                  |
+| `ErrSnapshotInProgress`                 | The shard's snapshot slot is taken                             |
+| `ErrSnapshotRecoveryFailed`             | Snapshot restore corruption or incompatibility. Produced as `*SnapshotFailedError` with `Recovery` set |
+| `ErrSnapshotTooLarge`                   | Sentinel form of `*SnapshotTooLargeError`                      |
+| `ErrSnapshotSizeMismatch`               | On-disk size disagrees with the `FileSize` in the message      |
+| `ErrSnapshotCorrupt`                    | Corrupt or oversized frame length prefix during decryption     |
+| `ErrSnapshotDestinationRecorded`        | A received snapshot's canonical directory is the one LogDB records as this replica's live snapshot |
+| `ErrSnapshotBarrierSealed`              | A snapshot could not be **written** because the shard's barrier is configured but sealed |
+| `ErrSnapshotEncryptedBarrierUnavailable` | An encrypted snapshot could not be **read** because no barrier is configured for the shard or it is sealed |
+| `ErrImportLayoutUnknown`                | Sentinel form of `*ImportLayoutUnknownError`                   |
+| `ErrImportDataDirMismatch`              | Sentinel form of `*ImportDataDirMismatchError`                 |
+| `ErrImportSnapshotDirExists`            | Sentinel form of `*ImportSnapshotDirExistsError`               |
+| `ErrImportMembershipInvalid`            | Sentinel form of `*ImportMembershipInvalidError`               |
+
+`*ImportSnapshotOutOfDateError` deliberately has no local sentinel: it matches `logdb.ErrSnapshotOutOfDate`, which every LogDB backend returns for the same condition.
+
+#### Encryption and storage
+
+| Error                          | Returned When                                                    |
+|--------------------------------|------------------------------------------------------------------|
+| `ErrBarrierSealed`             | Encrypt or decrypt while the barrier is sealed. Re-exported from `pkg/seal` |
+| `ErrBarrierNotInit`            | Barrier has no sealing strategy. Re-exported from `pkg/seal`     |
+| `ErrDecryptionFailed`          | Corrupted ciphertext or wrong key. Re-exported from `pkg/seal`   |
+| `ErrShardBarriersPlaintextWAL` | `WithShardBarriers` over a LogDB that would store plaintext      |
+| `ErrShardBarrierUnresolved`    | The per-shard resolver returned nil and there is no host-wide barrier |
+| `ErrShardBarrierLogDBMismatch` | The LogDB stores this shard under a different barrier than the resolver returned |
+| `ErrLogDBWrite`                | LogDB write failure                                              |
+| `ErrDecompressionBomb`         | Decompressed payload exceeds the configured limit                |
 
 ### Structured Error Types
 
@@ -770,7 +1106,9 @@ type NotLeaderError struct {
 }
 ```
 
-Returned by `Propose`, `ReadIndex`, membership operations, and `RequestLeaderTransfer` when the local node is not the leader. Carries leader hint for immediate client redirect. Satisfies `errors.Is(err, ErrNotLeader)`.
+Returned by membership operations and `RequestLeaderTransfer` on a non-leader, and by `Propose` when no leader is known at all. Carries a hint so the client can redirect without a discovery round. Satisfies `errors.Is(err, ErrNotLeader)`.
+
+Prefer `NotLeader(err)` over a type assertion: it also matches the bare sentinel, and it returns `(0, true)` when the leader is unknown, which is the case you must not treat as an address.
 
 #### EntryTooLargeError
 
@@ -781,7 +1119,7 @@ type EntryTooLargeError struct {
 }
 ```
 
-Returned by `Propose` when `len(cmd) > MaxEntrySize`. Satisfies `errors.Is(err, ErrEntryTooLarge)`.
+Returned by `Propose` when `len(cmd)` exceeds `min(MaxProposalPayloadSize, MaxEntrySize)`. `MaxSize` reports the effective limit that was applied, not either configured value on its own. Satisfies `errors.Is(err, ErrEntryTooLarge)`.
 
 #### BusyError
 
@@ -790,10 +1128,13 @@ type BusyError struct {
     ShardID     uint64
     CurrentSize uint64
     MaxSize     uint64
+    // Has unexported fields.
 }
 ```
 
 Returned by `Propose` when the per-shard in-memory log exceeds `MaxInMemLogSize`. Satisfies `errors.Is(err, ErrBusy)`.
+
+`ErrSystemBusy` is itself a `*BusyError`, so the global limiter and the per-shard limiter are both caught by a single `errors.Is(err, ErrBusy)` check.
 
 #### SessionError
 
@@ -805,17 +1146,18 @@ type SessionError struct {
 }
 ```
 
-Wraps session operation failures. Implements `Unwrap()`.
+Wraps a session register or unregister failure. `Err` is the underlying cause: `ErrInvalidOperation` when the shard or the owner is at its session cap, `ErrEntropyDegenerate` when the CSPRNG failed to mint a client ID. Implements `Unwrap()`.
 
 #### SessionExpiredError
 
 ```go
 type SessionExpiredError struct {
+    ShardID  uint64
     ClientID uint64
 }
 ```
 
-Returned when a session is expired on the leader. Satisfies `errors.Is(err, ErrSessionExpired)`.
+Returned when a session-managed proposal references a client ID whose session is no longer registered, after expiry or a snapshot restore that did not include it. Satisfies `errors.Is(err, ErrSessionExpired)`.
 
 #### ShardNotStoppedError
 
@@ -837,19 +1179,19 @@ type ReplicaNotFoundError struct {
 }
 ```
 
-Returned when a replica ID does not match the local replica. Satisfies `errors.Is(err, ErrReplicaNotFound)`.
+Returned when a replica ID does not match the local replica (`StopReplica`, `RequestCompaction`) or names no member of the shard (`RequestLeaderTransfer`). Satisfies `errors.Is(err, ErrReplicaNotFound)`.
 
 #### StaleConfigChangeError
 
 ```go
 type StaleConfigChangeError struct {
-    ShardID        uint64
-    ExpectedIndex  uint64
-    CurrentIndex   uint64
+    ShardID  uint64
+    Expected uint64 // the shard's current ConfigChangeID
+    Got      uint64 // the configChangeIndex the caller supplied
 }
 ```
 
-Returned when a config change index guard fails. Satisfies `errors.Is(err, ErrStaleConfigChange)`.
+Returned when the config change index guard fails. Satisfies `errors.Is(err, ErrStaleConfigChange)`. Re-read the membership with `SyncGetShardMembership` and build a fresh request; retrying the identical one fails forever.
 
 #### HostInitError
 
@@ -866,34 +1208,97 @@ Wraps component initialization failures in `NewHost` and `StartShard`. Implement
 
 ```go
 type SnapshotSendError struct {
-    To  uint64
-    Err error
+    ShardID   uint64
+    ReplicaID uint64
+    Op        string // which step of the send failed
+    Err       error
 }
 ```
 
-Returned when a snapshot send fails. Carries the target replica ID and underlying error. Implements `Unwrap()`.
+Returned when a snapshot send fails. Implements `Unwrap()`.
 
 #### SnapshotReceiveError
 
 ```go
 type SnapshotReceiveError struct {
-    From uint64
-    Err  error
+    ShardID   uint64
+    ReplicaID uint64
+    Op        string // which step of the receive failed
+    Err       error
 }
 ```
 
-Returned when a snapshot receive fails. Carries the sender replica ID and underlying error. Implements `Unwrap()`.
+Returned when a snapshot receive fails. Implements `Unwrap()`.
+
+#### SnapshotFailedError
+
+```go
+type SnapshotFailedError struct {
+    ShardID   uint64
+    ReplicaID uint64
+    Recovery  bool // true when installing an artifact, false when writing one out
+    Err       error
+}
+```
+
+Satisfies `errors.Is(err, ErrSnapshotRecoveryFailed)` when `Recovery` is true. Implements `Unwrap()`, so the underlying engine cause stays reachable.
+
+#### SnapshotTooLargeError
+
+```go
+type SnapshotTooLargeError struct {
+    ShardID uint64
+    MaxSize uint64
+}
+```
+
+Satisfies `errors.Is(err, ErrSnapshotTooLarge)`.
+
+#### SnapshotArtifactError
+
+```go
+type SnapshotArtifactError struct {
+    Reason string // "read header", "bad magic", "decode membership", ...
+    Err    error
+}
+```
+
+The export artifact header is malformed or truncated. Implements `Unwrap()`.
+
+#### SnapshotOptionError
+
+```go
+type SnapshotOptionError struct {
+    Field  string
+    Reason string
+}
+```
+
+Returned by `SnapshotOption.Validate()`. Satisfies `errors.Is(err, ErrInvalidSnapshotOption)`.
+
+#### SnapshotCommittedNotDurableError
+
+```go
+type SnapshotCommittedNotDurableError struct {
+    Path  string // destination artifact, which already holds the migration
+    Epoch uint64 // the destination's minimum at-rest epoch
+    Err   error
+}
+```
+
+Returned by `ReencryptSnapshotFile` for the one failure that does not leave the destination untouched: a directory fsync that failed *after* the rename. The artifact is committed but not proven durable. The caller must record `Epoch` -- dropping it lets the next DEK purge orphan the artifact's key -- and treat the migration as unverified until it re-checks the destination. Implements `Unwrap()`.
 
 #### UnauthorizedMessageError
 
 ```go
 type UnauthorizedMessageError struct {
-    From uint64
-    To   uint64
+    ShardID uint64
+    From    uint64
+    MsgType uint64
 }
 ```
 
-Returned when a message is received from an unauthorized source.
+An inbound Raft message failed shard-membership authorization.
 
 #### TypeAssertionError
 
@@ -911,20 +1316,23 @@ Wraps internal type assertion failures for debugging.
 
 ```go
 type LoopPanicError struct {
-    Loop  string
-    Panic interface{}
+    LoopName string
+    Value    any
+    Stack    []byte
 }
 ```
 
-Wraps recovered panics from goroutine loops.
+Wraps a recovered panic from a goroutine loop, with the stack captured at recovery.
 
 #### EmptyMembersError
 
 ```go
-type EmptyMembersError struct {}
+type EmptyMembersError struct {
+    ShardID uint64
+}
 ```
 
-Returned when initializing a shard with no members.
+Returned when bootstrapping a shard with no members.
 
 #### SelfNotInMembersError
 
@@ -943,11 +1351,81 @@ Returned when the local replica is not in the initial members list.
 type InvalidMemberError struct {
     ShardID   uint64
     ReplicaID uint64
-    Addr      string
+    Address   string
+    Reason    string
 }
 ```
 
-Returned when a member address is invalid or empty.
+A member in the initial members map has a zero replica ID, an empty or malformed address, or an address another member already claims. Satisfies `errors.Is(err, ErrInvalidMember)`.
+
+#### NonVotingRoleInMembersError
+
+```go
+type NonVotingRoleInMembersError struct {
+    ShardID   uint64
+    ReplicaID uint64
+    Role      string // "witness" or "observer"
+}
+```
+
+`StartShard` was asked to bootstrap a witness or observer through the initial members map, which seeds the full voter set. Satisfies `errors.Is(err, ErrNonVotingRoleInMembers)`.
+
+#### MaybeAppliedError
+
+```go
+type MaybeAppliedError struct{ Err error }
+```
+
+Wraps an error whose request had already been submitted to Raft when it failed, so the entry may still commit and apply. Use `MaybeApplied(err)` rather than a type assertion. Wrapping preserves every existing `errors.Is`, `Temporary` and `NotLeader` result. Implements `Unwrap()`.
+
+#### BootstrapEntryMissingError
+
+```go
+type BootstrapEntryMissingError struct {
+    Index     uint64 // the bootstrap membership index inspected
+    EntryType uint64 // the masked entry type actually found there
+}
+```
+
+The durable log holds something other than the founding configuration at the bootstrap index. Config-in-log is the only bootstrap this library performs, so every shard it creates commits an `EntryInitialMembership` there before anything else can be appended; anything else means the log was damaged. The remedy is operational: restore this replica's data directory from backup, or wipe it and re-add the replica with `join=true` so the configuration arrives by replication. Rebuilding membership from the caller's `members` map instead would silently drop witnesses, observers, removal tombstones, committed identities and replicated policy.
+
+#### CorruptConfigEntryError
+
+```go
+type CorruptConfigEntryError struct {
+    ShardID uint64
+    Index   uint64
+    Kind    string // "config change" or "bootstrap membership"
+    Err     error
+}
+```
+
+A committed configuration entry failed to decode. Surfaced through the shard's failure path rather than returned from a call. Implements `Unwrap()`.
+
+#### Import errors
+
+```go
+type ImportLayoutUnknownError struct{ ShardID, ReplicaID uint64 }
+type ImportDataDirMismatchError struct {
+    ShardID, ReplicaID uint64
+    Declared, Recorded string
+}
+type ImportSnapshotDirExistsError struct {
+    ShardID, ReplicaID, Index uint64
+    Dir                       string
+}
+type ImportSnapshotOutOfDateError struct {
+    ShardID, ReplicaID uint64
+    Index              uint64 // the artifact's snapshot index
+    Recorded           uint64 // the index already recorded in LogDB
+}
+type ImportMembershipInvalidError struct {
+    ShardID, ReplicaID uint64
+    Reason             string
+}
+```
+
+See [ImportSnapshot](#importsnapshot). Each matches its `ErrImport*` sentinel, except `ImportSnapshotOutOfDateError`, which matches `logdb.ErrSnapshotOutOfDate`.
 
 ## Metrics Interface
 
@@ -958,23 +1436,33 @@ type MetricsCollector interface {
     RaftMetrics
     LogDBMetrics
     TransportMetrics
+    SecurityMetrics
+
+    RegisterShard(shardID uint64)
+    UnregisterShard(shardID uint64)
 }
 ```
 
-Composes three sub-interfaces. Passed to `WithMetrics()`. Internally, QuicRaft passes only the relevant sub-interface to each component.
+Composes four sub-interfaces plus the two shard-lifecycle hooks. Passed to `WithMetrics()`. Internally only the relevant sub-interface is threaded into each component: `RaftMetrics` into the engine, `TransportMetrics` into the transport, `LogDBMetrics` into the WAL.
 
-### RaftMetrics (8 methods)
+`RegisterShard` and `UnregisterShard` exist so implementations can pre-bind per-shard metrics once at shard start instead of doing a label lookup on every hot-path call. `PrometheusMetricsCollector` is the reference implementation of that pattern.
 
-| Method                      | Signature                                           |
-|-----------------------------|-----------------------------------------------------|
-| `ObserveProposalLatency`    | `(shardID uint64, d time.Duration)`                 |
-| `ObserveCommitLatency`      | `(shardID uint64, d time.Duration)`                 |
-| `ObserveApplyLatency`       | `(shardID uint64, d time.Duration)`                 |
-| `IncProposalDropped`        | `(shardID uint64)`                                  |
-| `ObserveProposalBatchSize`  | `(shardID uint64, size int)`                        |
-| `ObserveCommitBatchSize`    | `(size int)`                                        |
-| `IncElection`               | `(shardID uint64)`                                  |
-| `IncSnapshot`               | `(shardID uint64)`                                  |
+### RaftMetrics (10 methods)
+
+| Method                      | Signature                            |
+|-----------------------------|--------------------------------------|
+| `ObserveProposalLatency`    | `(shardID uint64, d time.Duration)`  |
+| `ObserveCommitLatency`      | `(shardID uint64, d time.Duration)`  |
+| `ObserveApplyLatency`       | `(shardID uint64, d time.Duration)`  |
+| `ObserveReadIndexLatency`   | `(shardID uint64, d time.Duration)`  |
+| `IncProposalDropped`        | `(shardID uint64)`                   |
+| `ObserveProposalBatchSize`  | `(shardID uint64, size int)`         |
+| `ObserveCommitBatchSize`    | `(size int)`                         |
+| `IncElection`               | `(shardID uint64)`                   |
+| `IncSnapshot`               | `(shardID uint64)`                   |
+| `IncPiggybackCommit`        | `(shardID uint64)`                   |
+
+`ObserveReadIndexLatency` covers the full ReadIndex round-trip: heartbeat quorum plus any wait for the state machine to catch up. A piggyback commit is one the commit worker detected and applied in the same cycle, saving a second pipeline traversal.
 
 ### LogDBMetrics (4 methods)
 
@@ -985,15 +1473,49 @@ Composes three sub-interfaces. Passed to `WithMetrics()`. Internally, QuicRaft p
 | `ObserveCompactionLatency`| `(d time.Duration)`    |
 | `IncWriteBytes`           | `(n int64)`            |
 
-### TransportMetrics (5 methods)
+### TransportMetrics (7 methods)
 
-| Method                   | Signature                                                  |
-|--------------------------|------------------------------------------------------------|
-| `ObserveSendLatency`     | `(d time.Duration)`                                        |
-| `IncMessagesSent`        | `(shardID, to uint64, msgType uint64)`                     |
-| `IncMessagesReceived`    | `(shardID, from uint64, msgType uint64)`                   |
-| `IncSnapshotsSent`       | `(shardID uint64, bytes int64, d time.Duration)`           |
-| `IncSnapshotsReceived`   | `(shardID uint64, bytes int64, d time.Duration)`           |
+| Method                   | Signature                                        |
+|--------------------------|--------------------------------------------------|
+| `ObserveSendLatency`     | `(d time.Duration)`                              |
+| `IncMessagesSent`        | `(shardID, to uint64, msgType uint64)`           |
+| `IncMessagesReceived`    | `(shardID, from uint64, msgType uint64)`         |
+| `IncSnapshotsSent`       | `(shardID uint64, bytes int64, d time.Duration)` |
+| `IncSnapshotsReceived`   | `(shardID uint64, bytes int64, d time.Duration)` |
+| `IncSnapshotsRejected`   | `(shardID uint64, reason string)`                |
+| `IncMessagesDropped`     | `(shardID, to uint64, reason string)`            |
+
+Both `reason` arguments come from closed sets fixed by the transport. Treat them as metric labels and never derive new label values from them.
+
+| Method                 | Valid `reason` values                                                                   |
+|------------------------|------------------------------------------------------------------------------------------|
+| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy` |
+| `IncMessagesDropped`   | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected` |
+
+`shardID` is 0 when a snapshot was rejected before its header parsed; `shardID` and `to` are both 0 for `protocol_violation`.
+
+`unsendable` and `peer_rejected` are worth separating from the rest in an alerting rule. `unsendable` is a message no peer can accept -- more entries than `proto.MaxEntriesPerMessage`, or larger on its own than a frame -- refused by the send path before it is written, so retrying it unchanged can never succeed. `peer_rejected` is a batch the peer's decoder refused via a stream reset: the connection is healthy and only the frame was unacceptable, which usually means a version skew between the two ends. The `IncMessagesDropped` doc comment in `pkg/metrics.go` currently lists only the first six.
+
+### SecurityMetrics (2 methods)
+
+| Method                           | Signature                                 |
+|----------------------------------|-------------------------------------------|
+| `IncUnauthorizedMessageDropped`  | `(shardID, from uint64, reason string)`   |
+| `IncUnauthorizedSnapshotDropped` | `(shardID, from uint64)`                  |
+
+These are counted rather than only logged because every increment is either a misconfigured cluster or an injection attempt by an authenticated-but-compromised peer, and both need an alerting rule. The split by `reason` is operational: one aggregate counter cannot tell a rolling membership change from an attack.
+
+| `reason`            | Meaning                                                                                    |
+|---------------------|--------------------------------------------------------------------------------------------|
+| `unknown_member`    | The benign config-change window: a voter added by a change this replica has not applied yet. It rises and falls on its own |
+| `identity_mismatch` | The strongest signal here. Committed membership records a node identity for the claimed replica and the connection presented a different one, so the sender does not hold that replica's private key. A forged `From`, or a stale identity after a key rotation. Never routine |
+| `missing_identity`  | The shard records no identity for a replica and `RequireMemberIdentity` is set. A migration gap, not an attack -- commit the identity with `RequestAddNodeWithIdentity` |
+| `address_mismatch`  | Fallback path: the certificate does not cover the committed address                        |
+| `shared_address`    | Fallback path: one address is configured for two active members                            |
+| `removed_replica`   | The sender was removed from the shard                                                      |
+| `misrouted`         | The message names a shard this host does not serve                                         |
+
+The dropped sender's replica ID is deliberately not a Prometheus label. It is by definition not a current member and arrives unauthenticated, so an attacker could emit arbitrarily many distinct values and create unbounded, never-reclaimed child series. It is in the drop log line for forensics.
 
 ### NoOpMetricsCollector
 
@@ -1001,7 +1523,29 @@ Composes three sub-interfaces. Passed to `WithMetrics()`. Internally, QuicRaft p
 type NoOpMetricsCollector struct{}
 ```
 
-All 17 methods are no-ops. Embed and override selectively to avoid implementing the full interface.
+Every method is a no-op. Embed it and override selectively rather than implementing the full interface, which also keeps your implementation compiling when a method is added.
+
+### SampledMetricsCollector
+
+```go
+type SampledMetricsCollector struct {
+    MetricsCollector
+    SampleRate uint64 // inverse rate: 100 records 1 observation in 100
+    // Has unexported fields.
+}
+
+func NewSampledMetricsCollector(inner MetricsCollector, sampleRate uint64) *SampledMetricsCollector
+```
+
+Embeds another collector and thins the two hottest **histogram** observations, commit latency and apply latency, to 1 in `SampleRate`. A `sampleRate` of 0 becomes 100. Sampling a histogram costs resolution but keeps the distribution representative.
+
+Counters are never sampled. A sampled `Counter.Inc()` would make every `*_total` series under-report by `SampleRate`, and every `rate()` built on it would be off by orders of magnitude, so message send and receive counts forward every call. Each sampled metric owns its own counter: a single shared counter would make the sampling decision depend on the interleaving of the two metrics, and with an even rate and a strictly alternating call pattern one metric would be sampled always and the other never.
+
+### Panic containment
+
+A caller-supplied `MetricsCollector` is wrapped internally so a panic inside it cannot unwind an engine worker. Panics are counted and logged at the first occurrence and then at powers of two, because a collector that panics on every call is on the Raft receive path and an unsampled log line there is its own denial of service. `NoOpMetricsCollector` and an already-wrapped collector are passed through unwrapped.
+
+The interface is deliberately not documented as "must not panic": a library cannot enforce that, and a metrics backend that panics on a full buffer or a closed registry is an ordinary bug rather than a contract violation.
 
 ### PrometheusMetricsCollector
 
@@ -1035,6 +1579,8 @@ Production implementation using `prometheus/client_golang`. All metrics are regi
 | `transport` | `quicraft_transport_send_latency_seconds` | Histogram | --                        |
 | `transport` | `quicraft_transport_messages_sent_total`  | Counter   | --                        |
 | `transport` | `quicraft_transport_messages_received_total` | Counter | --                       |
+| `transport` | `quicraft_transport_messages_sent_detailed_total` | Counter | `shard_id`, `to`, `msg_type` |
+| `transport` | `quicraft_transport_messages_received_detailed_total` | Counter | `shard_id`, `from`, `msg_type` |
 | `transport` | `quicraft_transport_snapshots_sent_total` | Counter   | `shard_id*`               |
 | `transport` | `quicraft_transport_snapshots_sent_bytes` | Histogram | `shard_id*`               |
 | `transport` | `quicraft_transport_snapshots_received_total` | Counter | `shard_id*`             |
@@ -1044,6 +1590,8 @@ Production implementation using `prometheus/client_golang`. All metrics are regi
 | `security`  | `quicraft_security_unauthorized_messages_dropped_total` | Counter | `shard_id`, `reason` |
 | `security`  | `quicraft_security_unauthorized_snapshots_dropped_total` | Counter | `shard_id`        |
 | `metrics`   | `quicraft_metrics_per_shard_enabled`      | Gauge     | --                        |
+
+The two `*_detailed_total` series are emitted only when `collector.EnablePerMessageMetrics` is set to true after construction. They are off by default because they are per-message on the hot path and their label set is the product of shard count, membership size and message type.
 
 Latency buckets: 100us to 10s. Batch size buckets: 1 to 1024 (powers of 2). Snapshot byte buckets: 1KB to 1GB.
 
@@ -1057,96 +1605,146 @@ Source: `pkg/config/hostconfig.go`
 |-------------------------|-----------------|----------------------|------------------------------------------|
 | `WALDir`                | `string`        | (required)           | Write-ahead log directory                |
 | `NodeHostDir`           | `string`        | (required)           | Metadata, snapshots, host ID             |
-| `RaftAddress`           | `string`        | `""`                 | External address seen by peers           |
+| `RaftAddress`           | `string`        | (required)           | External address peers dial              |
 | `ListenAddress`         | `string`        | (required)           | Local bind address (host:port)           |
-| `RTTMillisecond`        | `uint64`        | `200`                | Estimated round-trip time (ms)           |
-| `DeploymentID`          | `uint64`        | (required)           | Cluster identity token                   |
+| `RTTMillisecond`        | `uint64`        | `200`                | Estimated round-trip time (ms). Must be 1..60000 |
+| `DeploymentID`          | `uint64`        | (required, non-zero) | Cluster identity token                   |
+| `AllowZeroDeploymentID` | `bool`          | `false`              | Permits `DeploymentID == 0`. Development and testing only |
+| `HostID`                | `string`        | `""`                 | Host identifier. When empty, generated or loaded from `NodeHostDir/host.id` |
 | `NumWorkers`            | `uint64`        | `runtime.NumCPU()`   | Workers per tier                         |
 | `MaxApplyWorkers`       | `int`           | `runtime.NumCPU()`   | Max concurrent apply goroutines          |
 | `CommitCBufferSize`     | `int`           | `64`                 | Commit channel buffer size               |
 | `ShutdownTimeout`       | `time.Duration` | `30s`                | Graceful shutdown timeout                |
 | `MaxWALDiskSize`        | `uint64`        | `0` (unlimited)      | Max WAL directory size (bytes)           |
 | `NoSyncWAL`             | `bool`          | `false`              | Disable WAL fdatasync (testing only)     |
-| `MaxApplyRetries`       | `uint64`        | `100`                | Reserved; apply errors are fail-fast (see note) |
 | `MaxTotalInMemLogSize`  | `uint64`        | `0` (disabled)       | Global rate limiter threshold (bytes)    |
-| `KeyRotationInterval`   | `time.Duration` | `0` (disabled)       | Barrier key rotation interval            |
-| `MaxRetainedEpochs`     | `uint64`        | `0` (retain all)     | Barrier epochs retained after compaction |
-| `NotifyCommit`          | `bool`          | `false`              | Early WAL-durable notifications          |
-| `EventListener`         | `*EventListener`| `nil`                | Event callbacks                          |
+| `KeyRotationInterval`   | `time.Duration` | `0` (disabled)       | Scheduled barrier key rotation interval  |
+| `MaxRetainedEpochs`     | `uint64`        | `0` (retain all)     | Barrier epochs retained after rotation   |
+| `NotifyCommit`          | `bool`          | `false`              | Enables `RequestState.CommittedC()`      |
+| `EventListener`         | `*EventListener`| `nil`                | Event callbacks. Nil means zero overhead |
 | `TransportConfig`       | `TransportConfig`| (see below)         | Transport tuning                         |
 | `LogConfig`             | `LogConfig`     | text/info            | Logging format and level                 |
 
-> **`MaxApplyRetries` note:** Apply is now **fail-fast** — the first `SM.Apply()` or decompression error marks the shard failed (it goes offline until reload or snapshot recovery) and `lastApplied` is not advanced. The field is still present and validated (must be `> 0`), but it no longer gates an apply retry loop or circuit-breaker threshold; nothing in the apply path currently consumes it. Advancing `lastApplied` past a failed batch would diverge the state machine from its peers, so retrying in place is not done.
+`RaftAddress` and `ListenAddress` are separate because they differ under NAT, port mapping and containers: peers dial `RaftAddress`, the listener binds `ListenAddress`.
 
-> **`NoSyncWAL` note:** Disables `fdatasync` on Raft WAL segment writes, trading durability for throughput. Intended only for test environments where filesystem (e.g. overlay2/Docker) fsync latency causes proposal timeouts. Never enable in production.
+`KeyRotationInterval` of 0 disables *scheduled* rotation only. Invocation-threshold rotation, which enforces the NIST SP 800-38D AEAD budget, still runs whenever a barrier is configured. A recommended production value is 24 hours. It requires `WithBarrier` and is ignored otherwise.
+
+> **Apply failure note:** Apply is **fail-fast**, and there is no setting that changes that. The first `SM.Update()` or decompression error marks the shard failed -- it goes offline until reload or snapshot recovery -- and `lastApplied` is not advanced. Advancing `lastApplied` past a failed batch would diverge this state machine from its peers, so retrying in place is not done. A `MaxApplyRetries` field existed through 0.5.1-alpha and never had any effect; it was removed.
+
+> **`NoSyncWAL` note:** Disables `fdatasync` on Raft WAL segment writes, trading durability for throughput. Intended only for test environments where filesystem fsync latency (overlay2 under Docker, for instance) causes proposal timeouts. Never enable in production.
 
 ### Config (per-shard)
 
 Source: `pkg/config/config.go`
 
-| Field                   | Type              | Default    | Description                              |
-|-------------------------|-------------------|------------|------------------------------------------|
-| `ShardID`               | `uint64`          | (required) | Globally unique shard identifier         |
-| `ReplicaID`             | `uint64`          | (required) | Unique replica ID within the shard       |
-| `IsObserver`            | `bool`            | `false`    | Non-voting learner                       |
-| `IsWitness`             | `bool`            | `false`    | Voting member, no state machine          |
-| `CheckQuorum`           | `*bool`           | `nil` = on | Leader step-down on quorum loss          |
-| `PreVote`               | `*bool`           | `nil` = on | Pre-vote protocol extension              |
-| `OrderedConfigChange`   | `*bool`           | `nil` = on | Serialize membership changes             |
-| `ElectionRTT`           | `uint64`          | `10`       | Election timeout in RTT multiples        |
-| `HeartbeatRTT`          | `uint64`          | `1`        | Heartbeat interval in RTT multiples      |
-| `SnapshotEntries`       | `uint64`          | `0`        | Auto-snapshot interval (0 = disabled)    |
-| `CompactionOverhead`    | `uint64`          | `5000`     | Entries retained after compaction        |
-| `MaxInMemLogSize`       | `uint64`          | `0`        | Per-shard rate limit threshold (bytes)   |
-| `MaxEntrySize`          | `uint64`          | `8 MB`     | Maximum proposal payload                 |
-| `MaxApplyEntrySize`     | `uint64`          | `16711672` | Max batch size per SM.Update call (`MaxReplicationPayloadBytes`, ~15.9 MiB) |
-| `MaxSnapshotSize`       | `uint64`          | `4 GB`     | Maximum snapshot file size               |
-| `MaxSessionsPerClient`  | `uint64`          | `128`      | Cached responses retained per session (bootstrap seed; replicated) |
-| `MaxTotalSessions`      | `uint64`          | `16384`    | Per-shard total session limit (bootstrap seed; replicated) |
-| `SessionExpiryEntries`  | `uint64`          | `100000`   | Session inactivity threshold in log entries (bootstrap seed; replicated). `config.SessionExpiryDisabled` turns expiry off |
-| `Quiesce`               | `bool`            | `false`    | Quiescence for idle shards               |
-| `ZeroCopyEntryCmd`      | `bool`            | `false`    | Zero-copy Entry.Cmd (unsafe if retained) |
-| `LeaseRead`             | `bool`            | `false`    | Enable lease-based reads (PhD 6.4)       |
+| Field                    | Type             | Default        | Description                              |
+|--------------------------|------------------|----------------|------------------------------------------|
+| `ShardID`                | `uint64`         | (required)     | Globally unique shard identifier         |
+| `ReplicaID`              | `uint64`         | (required)     | Unique replica ID within the shard       |
+| `IsObserver`             | `bool`           | `false`        | Non-voting learner. Join-only, see below |
+| `IsWitness`              | `bool`           | `false`        | Voting member with no state machine. Join-only, see below |
+| `Witness`                | `WitnessConfig`  | zero value     | Seeds the shard's replicated witness policy at bootstrap |
+| `MemberIdentities`       | `map[uint64]string` | `nil`       | Seeds the shard's replicated node identities at bootstrap |
+| `CheckQuorum`            | `*bool`          | `nil` = on     | Leader steps down on quorum loss. Disabling is unsafe |
+| `PreVote`                | `*bool`          | `nil` = on     | Pre-vote extension. Disabling is unsafe  |
+| `OrderedConfigChange`    | `*bool`          | `nil` = on     | Serialize membership changes             |
+| `ElectionRTT`            | `uint64`         | `10`           | Election timeout in `RTTMillisecond` multiples |
+| `HeartbeatRTT`           | `uint64`         | `1`            | Heartbeat interval in `RTTMillisecond` multiples |
+| `SnapshotEntries`        | `uint64`         | `100000`       | Applied entries between automatic snapshots. `config.SnapshotsDisabled` turns them off |
+| `CompactionOverhead`     | `uint64`         | `5000`         | Entries retained after compaction        |
+| `MaxInMemLogSize`        | `uint64`         | `0` (disabled) | Per-shard rate limit threshold (bytes)   |
+| `MaxProposalPayloadSize` | `uint64`         | `8 MB`         | User-facing proposal cap. May not exceed `proto.MaxEntrySize` |
+| `MaxEntrySize`           | `uint64`         | `8 MB`         | Transport and storage entry cap; also the decompression ceiling on apply |
+| `MaxApplyEntrySize`      | `uint64`         | `16711672`     | Replication batch chunk size (`config.MaxReplicationPayloadBytes`, ~15.94 MB) |
+| `MaxSnapshotSize`        | `uint64`         | `4 GB`         | Maximum snapshot file size               |
+| `MaxSessionsPerClient`   | `uint64`         | `128`          | Cached responses retained per session. Bootstrap seed; replicated |
+| `MaxTotalSessions`       | `uint64`         | `16384`        | Shard-wide session cap. Bootstrap seed; replicated |
+| `MaxSessionsPerOwner`    | `uint64`         | `128`          | Per-owner session cap. `config.SessionsPerOwnerUnlimited` removes it. Bootstrap seed; replicated |
+| `SessionExpiryEntries`   | `uint64`         | `100000`       | Session inactivity threshold in log entries. `config.SessionExpiryDisabled` turns expiry off. Bootstrap seed; replicated |
+| `Quiesce`                | `bool`           | `false`        | Quiescence for idle shards               |
+| `ZeroCopyEntryCmd`       | `bool`           | `false`        | `sm.Entry.Cmd` aliases an internal buffer. Unsafe if retained past `Update` |
+| `LeaseRead`              | `bool`           | `false`        | Lease-based reads (Raft PhD 6.4). Requires `CheckQuorum` |
+| `DataDir`                | `string`         | `""`           | Absolute root for this shard's on-disk state machine data. Empty places it under `NodeHostDir` |
+
+**Zero no longer means "off".** `SnapshotEntries`, `SessionExpiryEntries` and `MaxSessionsPerOwner` all take their default when left at zero, and each has a named sentinel for disabling. An unset field cannot mean both "I did not choose" and "never do this", and in each case the previous zero-means-off behavior shipped a defect as the default:
+
+- Never snapshotting is not a viable steady state. The log and restart replay grow without bound, and in this implementation the snapshot-directory GC, the epoch purge floor and the at-rest barrier all advance only inside a snapshot save. A shard that never snapshots never reclaims a directory, never zeroes an old epoch's DEK, and never asks its barrier to encrypt anything.
+- A client that registers a session and dies without `CloseSession` leaks an entry that is serialized into every subsequent snapshot and counts against `MaxTotalSessions` forever. Nothing else reclaims it.
+- An owner able to register 16384 sessions is an owner able to deny at-most-once delivery to every other tenant on the shard.
+
+`SessionExpiryEntries` is measured in log entries, not time, so the wall-clock window scales inversely with throughput: generous on a quiet shard, and still about ten seconds of client silence on one sustaining 10k entries/s.
+
+`MaxProposalPayloadSize` and `MaxEntrySize` are both enforced at `Propose`; the effective limit is the minimum of the two. Set the former to impose a tighter user-facing cap while leaving the latter at the transport default.
 
 > **`IsObserver` / `IsWitness` are join-only.** The authoritative role lives in
-> REPLICATED membership (`Membership.Observers` / `Membership.Witnesses`), not in
-> the local config. The `members` map passed to `StartShard` seeds
-> `Membership.Addresses` — the **full voter set** — on every replica that lists
-> it, so a witness or observer named there is a full voter in the configuration
-> the whole shard agrees on: the leader replicates full entry payloads to it, it
-> counts toward every quorum, and only this host's local read gate still behaves
-> like a witness. `StartShard` rejects that shape with
-> `*NonVotingRoleInMembersError`. Bootstrap the voters first, then start the
-> replica with `join=true` and add it with `RequestAddWitness` /
+> replicated membership (`Membership.Observers` / `Membership.Witnesses`), not in
+> the local config. These bits only tell the local replica what it was started
+> as. The `members` map passed to `StartShard` seeds the **full voter set** on
+> every replica that lists it, so a witness or observer named there is a full
+> voter in the configuration the whole shard agrees on: the leader replicates
+> full entry payloads to it, it counts toward every quorum, and only this host's
+> local read gate still behaves like a non-voter. `StartShard` rejects that shape
+> with `*NonVotingRoleInMembersError`. Bootstrap the voters first, then start the
+> replica with `join=true` and add it with `RequestAddWitness` or
 > `RequestAddObserver`.
 >
 > On a **restart** the same map must list every current member, non-voters
 > included, or they vanish from this replica's routing and remotes. The
-> rejection therefore applies only to a first start (no persisted state). The
+> rejection therefore applies only to a first start with no persisted state. The
 > seeded voter placement that results is provisional: the committed
 > `AddWitness` / `AddNonVoting` entries replay at commit time and move each
 > replica to its real role (see "Convergent Apply" in
-> `docs/raft/protocol.md`).
+> [raft/protocol.md](../raft/protocol.md)).
+
+### WitnessConfig
+
+Source: `pkg/config/config.go`
+
+```go
+type WitnessConfig struct {
+    MaxWitnesses               int    // 0 = no explicit cap; negative is a validation error
+    RequireFullReplicaMajority *bool  // nil = true
+}
+
+func (w WitnessConfig) GetRequireFullReplicaMajority() bool
+```
+
+`Config.Witness` **seeds** the policy at bootstrap and nothing more. From then on the policy is replicated state in `proto.Membership`, changed only through `Host.RequestUpdateWitnessPolicy`. Editing this struct on a running node has no effect, and a restart recovers the replicated value rather than the local one.
+
+`RequireFullReplicaMajority` rejects any config change -- witness add or full-replica removal -- that would leave the full, data-bearing replicas unable to form a quorum over the voting set. Adding a third witness to {3 full + 2 witnesses} is rejected because 3 full is below the quorum of 4; {2 full + 1 witness} is allowed because 2 >= 2. This is a bound on membership *shape* only: even in a compliant membership a commit can still rest on leader-plus-witnesses when the other full replicas lag.
 
 ### TransportConfig
 
 Source: `pkg/config/transportconfig.go`
 
-| Field                          | Type            | Default     | Description                       |
-|--------------------------------|-----------------|-------------|-----------------------------------|
-| `StreamPoolSize`               | `int`           | `16`        | QUIC streams per connection       |
-| `MaxStreamPoolSize`            | `int`           | `256`       | Upper bound for stream pool       |
-| `MaxSnapshotReceiveRate`       | `int64`         | `256 MB/s`  | Inbound snapshot bandwidth limit (floor 64 KB/s) |
-| `MaxConcurrentSnapshotReceives`| `int`           | `4`         | Concurrent inbound snapshots      |
-| `MaxSnapshotReceiveMemory`     | `int64`         | `1 GB`      | Total snapshot receive buffer     |
-| `MaxDecompressedSize`          | `uint32`        | `16 MB`     | Max Snappy decompressed payload; pinned to the frame size (any other value is a validation error) |
-| `MaxConnectionsPerIP`          | `int`           | `16`        | Connections per source IP         |
-| `MaxIncomingConnections`       | `int`           | `256`       | Total inbound connections         |
-| `SendBatchMaxSize`             | `int`           | `64 KB`     | Max send buffer before flush      |
-| `Enable0RTT`                   | `bool`          | `false`     | QUIC 0-RTT (replayable, caution)  |
-| `DisableCompression`           | `bool`          | `false`     | Disable Snappy compression        |
+| Field                          | Type               | Default     | Description                       |
+|--------------------------------|--------------------|-------------|-----------------------------------|
+| `MTLSConfig`                   | `*MTLSConfig`      | `nil`       | CA cert plus either a PEM `Cert`/`Key` pair or a pre-built `*tls.Certificate`. Required unless `TransportDisabled` |
+| `RevocationConfig`             | `*RevocationConfig`| `nil`       | CRL paths, OCSP responder, check interval, fail-open/closed mode |
+| `RequireMemberIdentity`        | `bool`             | `false`     | Refuse a member with no committed node identity instead of falling back to the address check |
+| `StreamPoolSize`               | `int`              | `16`        | QUIC streams per connection       |
+| `MaxStreamPoolSize`            | `int`              | `256`       | Upper bound for the stream pool   |
+| `MaxStreamsPerConnection`      | `int`              | `256`       | QUIC stream limit advertised per connection |
+| `StreamReadIdleTimeout`        | `time.Duration`    | `30s`       | Idle read timeout on a stream (0 uses the default) |
+| `MaxSnapshotReceiveRate`       | `int64`            | `256 MB/s`  | Inbound snapshot bandwidth limit (floor 64 KB/s) |
+| `MaxConcurrentSnapshotReceives`| `int`              | `4`         | Concurrent inbound snapshots      |
+| `MaxSnapshotReceiveMemory`     | `int64`            | `1 GB`      | Total snapshot receive buffer     |
+| `MaxMessageReceiveMemory`      | `int64`            | `256 MB`    | Total inbound message buffer      |
+| `MaxDecompressedSize`          | `uint32`           | `16 MB`     | Max Snappy decompressed payload. Pinned to the frame size; any other value is a validation error |
+| `MaxConnectionsPerIP`          | `int`              | `16`        | Connections per source IP         |
+| `MaxIncomingConnections`       | `int`              | `256`       | Total inbound connections         |
+| `SendBatchMaxSize`             | `int`              | `64 KB`     | Max send buffer before flush      |
+| `UDPRecvBufSize`               | `int`              | `7 MB`      | UDP receive buffer, within typical `rmem_max` |
+| `UDPSendBufSize`               | `int`              | `7 MB`      | UDP send buffer, within typical `wmem_max` |
+| `Enable0RTT`                   | `bool`             | `false`     | QUIC 0-RTT. Replayable; requires `MTLSConfig` |
+| `DisableCompression`           | `bool`             | `false`     | Disable Snappy compression        |
+| `TransportDisabled`            | `bool`             | `false`     | Skip mTLS validation and transport construction. Equivalent to `WithoutTransport()` |
 
-> **`MaxSnapshotReceiveRate` note:** `0` selects the default (256 MB/s). A non-zero value below the floor `MinMaxSnapshotReceiveRate` (64 KB/s = `64 * 1024`) is rejected by `TransportConfig.Validate`, and negative values are also rejected. The floor exists because a pathologically small rate would make the receiver's proportional-sleep limiter compute multi-day per-chunk sleeps while holding the snapshot concurrency semaphore and memory budget. As defense-in-depth, each per-chunk rate-limit sleep is additionally capped at `maxRateLimitChunkSleep` (5 s); the configured rate is still honored on average across chunks.
+> **`MaxDecompressedSize` note:** `Validate` rejects any value other than `DefaultMaxDecompressedSize`. The send path admits frames against that same constant, so a lower value silently rejects frames every peer considers valid and stops replication to this node. It is a field for forward compatibility, not a tuning knob.
+
+> **`MaxSnapshotReceiveRate` note:** `0` selects the default (256 MB/s). A non-zero value below the floor `MinMaxSnapshotReceiveRate` (64 KB/s = `64 * 1024`) is rejected by `TransportConfig.Validate`, and negative values are also rejected. The floor exists because a pathologically small rate would make the receiver's proportional-sleep limiter compute multi-day per-chunk sleeps while holding the snapshot concurrency semaphore and memory budget. As defense in depth, each per-chunk rate-limit sleep is additionally capped at 5 s; the configured rate is still honored on average across chunks.
+
+mTLS is mandatory whenever the transport is enabled and there is no insecure fallback, so `Validate` rejects empty or malformed certificate material at the config boundary rather than letting it surface as an opaque handshake failure at runtime. A pre-built `Certificate` must carry a `crypto.Signer` private key, which is what lets a TPM- or PKCS#11-backed key work.
 
 ## State Machine Registration
 
@@ -1176,11 +1774,17 @@ type CreateConcurrentStateMachineFunc func(shardID, replicaID uint64) Concurrent
 type CreateDiskStateMachineFunc func(shardID, replicaID uint64) DiskStateMachine
 ```
 
+### Determinism is mandatory
+
+`Update` must be a pure function of (current state, entries). Every replica applies the identical entry sequence and must reach byte-identical state. In particular `Update` must not read wall-clock time, `math/rand`, environment variables, host identity, `GOMAXPROCS` or any other per-node value, and must not let Go's randomized map-iteration order affect the state it produces or the `Result`s it returns.
+
+A violation is **not** detected by Raft. Consensus keeps agreeing on the log while replicas silently diverge in the state they derive from it, and the first symptom is usually a linearizable read returning different values depending on which replica served it. Implement `sm.Hasher` and compare replicas with `Host.StateMachineHash` if you need to detect it. The requirement is identical for all three interfaces.
+
 ### State Machine Interfaces
 
-Three tiers, detected by `detectSMType()` at `StartShard` time:
+Three tiers, detected by type assertion at `StartShard` time:
 
-**StateMachine** (type code 0) -- All state in memory. Serialized access.
+**StateMachine** (type code 0) -- All state in memory. Serialized access: `Update` and `Lookup` are never called concurrently, enforced by the RSM adapter's `readGuard`. Local reads therefore wait on an in-flight apply; see [Lookup concurrency](../statemachine/interfaces.md#lookup-concurrency).
 
 ```go
 type StateMachine interface {
@@ -1192,7 +1796,7 @@ type StateMachine interface {
 }
 ```
 
-**ConcurrentStateMachine** (type code 1) -- Concurrent Lookup during Update. Two-phase snapshotting.
+**ConcurrentStateMachine** (type code 1) -- Contracted for concurrent Lookup during Update, so it must synchronize itself. Two-phase snapshotting. The adapter's guard currently serializes this tier as well, which does not relax the contract.
 
 ```go
 type ConcurrentStateMachine interface {
@@ -1204,6 +1808,8 @@ type ConcurrentStateMachine interface {
     Close(ctx context.Context) error
 }
 ```
+
+`Update` must be all-or-nothing: either every entry is applied and every `results[i]` written, or the state machine reverts to its pre-call state and returns an error. Partial application is not supported, and an error is fatal to the shard -- see the apply failure note.
 
 **DiskStateMachine** (type code 2) -- Backed by persistent storage. Must handle idempotent replay after crash.
 
@@ -1234,14 +1840,63 @@ type Result struct {
 }
 ```
 
-`Entry.CopyCmd()` returns an owned copy when `ZeroCopyEntryCmd` is enabled.
+`Entry.Cmd` is an owned copy by default. When `Config.ZeroCopyEntryCmd` is true it aliases an internal buffer that is reused after `Update` returns; call `Entry.CopyCmd()` for an owned copy if the data must outlive the call.
+
+Two `Result.Value` codes are reserved by the RSM layer and must not be produced by application code:
+
+| Constant                | Value             | Meaning                                                    |
+|-------------------------|-------------------|-------------------------------------------------------------|
+| `ResultSessionExpired`  | `MaxUint64 - 2`   | The entry referenced an unregistered client ID. The host translates it into `ErrSessionExpired` |
+| `ResultInvalidCommand`  | `MaxUint64 - 3`   | The committed entry's payload could not be decoded          |
+
+`ResultInvalidCommand` exists because a committed entry must be applied deterministically on every replica. Returning an `Update` error for a malformed payload would mark the shard failed and wedge it permanently on replay, so the entry yields this per-entry result and leaves the store unchanged instead.
+
+### Sessions and on-disk state machines
+
+A shard backed by an `sm.DiskStateMachine` supports **no-op sessions only**. `GetNewSession`, `GetNewSessionWithOwner`, `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession` and `CloseSession` all return `ErrSessionsUnsupportedOnDisk` there. Use `Host.GetNoOPSession` and make the operations idempotent, which is the same constraint dragonboat places on `IOnDiskStateMachine`.
+
+The reason is `Open`. The session table is replicated state that travels only inside the snapshot stream, so it is restored by `RecoverFromSnapshot` -- and a `DiskStateMachine` reporting a non-zero applied index from `Open` never takes that path on restart, because recovering would replace its database files and roll it back to the snapshot index. The replica would come up with the right data and no sessions at all, then answer `ResultSessionExpired` for entries its peers apply normally. The client sees success because the leader completed the proposal from its own apply. That is permanent, silent divergence.
+
+The refusal is a local, API-boundary decision reading only the state machine's own type, which is fixed for the life of the shard by the `sm.CreateFunc` passed to `StartShard`.
 
 ### Optional Interfaces
 
-Detected via type assertion on the SM instance:
+Detected via type assertion on the state machine instance:
 
-- `Hasher` -- `GetHash() (uint64, error)` for cross-replica consistency checks
-- `NALookup` -- `BytesLookup(key []byte) ([]byte, error)` for zero-alloc reads
+| Interface      | Method                                          | Purpose                                     |
+|----------------|-------------------------------------------------|---------------------------------------------|
+| `Hasher`       | `GetHash() (uint64, error)`                     | Backs `Host.StateMachineHash`               |
+| `NALookup`     | `BytesLookup(key []byte) ([]byte, error)`       | Byte-key reads without `interface{}` boxing |
+| `NALookupInto` | `NALookup` + `BytesLookupInto(key, dst []byte) ([]byte, error)` | The allocation-free path used by `SyncReadBuf` and `StaleReadBuf` |
+
+`BytesLookupInto` must copy the value into `dst`, growing it with `append` if needed, and return the populated sub-slice. Ownership of the returned slice belongs to the caller; the implementation must not retain a reference to it. A `Hasher` implementation must be order-independent -- both reference stores in `pkg/sm/kv` sort before hashing -- or it reports divergence that does not exist.
+
+### CachedDiskStateMachine
+
+```go
+func NewCachedDiskStateMachine(inner DiskStateMachine, cfg CacheConfig) (*CachedDiskStateMachine, error)
+
+type CacheConfig struct {
+    MaxEntries   int              // must be > 0
+    ExtractKV    EntryKeyFunc     // required
+    EntryApplied EntryAppliedFunc // optional, but see below
+}
+
+type EntryKeyFunc func(cmd []byte) (key string, value []byte)
+type EntryAppliedFunc func(cmd []byte, result Result) bool
+```
+
+Wraps a `DiskStateMachine` with a write-through LRU cache in front of disk reads, and implements `NALookup`. `CacheStats()` returns cumulative hits and misses.
+
+`ExtractKV` returns `("", nil)` to skip an entry, and a non-empty key with a nil value to signal a cache delete.
+
+**Conditional writes need `EntryApplied`.** The cache is populated from the value `ExtractKV` pulls out of the *command*, not from the store. For an unconditional write those agree. For a compare-and-set, put-if-absent or delete-if-match they do not: the command carries a value the store may have declined, and caching it would let a later `Lookup` return a value the store never held. Nothing here can infer the answer, because the outcome encoding is the state machine's own. `ResultInvalidCommand` is excluded from caching whether or not the predicate is set, and a predicate cannot opt back into it.
+
+Invalidation happens before the inner write, not after. Repopulating afterwards would leave a window in which a `Lookup` racing `Update` returns the stale pre-write value from the cache while the write is already durable underneath. Deleting first degrades that window to a cache miss.
+
+Cache hits return an owned copy. Handing out the live cache buffer would let a caller that mutates or pools the returned slice corrupt the cached value for every future reader.
+
+`NewCachedDiskStateMachine` returns `*CacheMaxEntriesError` or `*InvalidCacheConfigError`. `BytesLookup` returns `*UnsupportedLookupResultError` when the wrapped `Lookup` answers with a type the byte-oriented path cannot represent, rather than `(nil, nil)` -- which would be indistinguishable from a genuine empty value and from a missing key.
 
 ## Event Listener
 
@@ -1260,9 +1915,12 @@ Holds per-type optional callbacks. Only non-nil callbacks are invoked. Callbacks
 | `OnLeaderUpdated`      | `LeaderInfo`      | Leader change detected for a shard           |
 | `OnLeaderLost`         | `EventShardInfo`  | Local node lost leadership                   |
 | `OnCampaignLaunched`   | `EventShardInfo`  | Election campaign started                    |
+| `OnCampaignSkipped`    | `EventShardInfo`  | **Never fires.** See below                   |
 | `OnSnapshotRejected`   | `SnapshotInfo`    | Snapshot rejected by follower                |
 | `OnProposalDropped`    | `EventShardInfo`  | Proposal dropped (queue full, etc.)          |
 | `OnReadIndexDropped`   | `EventShardInfo`  | ReadIndex request dropped                    |
+
+> **`OnCampaignSkipped` is currently inert.** The field exists on `EventListener`, the host forwards it correctly, and the engine's `Callback` interface declares it, but no engine code invokes it. A listener wired to it receives nothing. Do not build a leaderless-shard alert on it: the conditions it would report are exactly the ones that leave a shard without a leader while quorum looks intact, and silence there is indistinguishable from health. Use `GetLeaderID` or `ShardInfo.Health == ShardNoLeader` instead until it is emitted.
 
 ### System Events
 
@@ -1272,12 +1930,18 @@ Holds per-type optional callbacks. Only non-nil callbacks are invoked. Callbacks
 | `OnNodeUnloaded`          | `EventShardInfo`  | Shard node unloaded                       |
 | `OnMembershipChanged`     | `EventShardInfo`  | Membership config change applied          |
 | `OnNodeDeleted`           | `EventShardInfo`  | Node data removed from disk               |
+| `OnNodeHostShuttingDown`  | `func()`          | Host shutdown started                     |
 | `OnConnectionEstablished` | `ConnectionInfo`  | QUIC connection established to peer       |
 | `OnConnectionFailed`      | `ConnectionInfo`  | QUIC connection attempt failed            |
+| `OnSnapshotSendStarted`   | `SnapshotInfo`    | Snapshot transfer started                 |
 | `OnSnapshotSent`          | `SnapshotInfo`    | Snapshot transfer sent                    |
+| `OnSnapshotSendAborted`   | `SnapshotInfo`    | Snapshot transfer abandoned               |
 | `OnSnapshotReceived`      | `SnapshotInfo`    | Snapshot transfer received                |
+| `OnSnapshotRecovered`     | `SnapshotInfo`    | State machine restored from a snapshot    |
 | `OnSnapshotCreated`       | `SnapshotInfo`    | On-demand or auto snapshot completed      |
+| `OnSnapshotCompacted`     | `SnapshotInfo`    | Old snapshot directories reclaimed        |
 | `OnLogCompacted`          | `EventShardInfo`  | Log compaction completed                  |
+| `OnLogDBCompacted`        | `EventShardInfo`  | LogDB compaction completed                |
 
 ### Failure Events
 
@@ -1335,7 +1999,7 @@ falls back to `ShardHealthy` for anything else.
 | Constant | JSON / `String()` | Meaning |
 |---|---|---|
 | `ShardHealthy` | `healthy` | Known leader, apply pipeline running. Zero value. |
-| `ShardNoLeader` | `no-leader` | No leader known — election or partition |
+| `ShardNoLeader` | `no-leader` | No leader known: election in progress, or a partition |
 | `ShardLagging` | `lagging` | Apply index significantly behind the commit index |
 | `ShardUnloaded` | `unloaded` | Shard is not loaded on this host |
 | `ShardError` | `error` | Fatal state machine or LogDB failure |
@@ -1343,33 +2007,58 @@ falls back to `ShardHealthy` for anything else.
 | `ShardSnapshotting` | `snapshotting` | Snapshot capture in progress; applies are quiesced |
 
 `ShardHealthy` is the zero value, so a `ShardInfo` you never populated reports
-healthy — check `ShardUnloaded` explicitly rather than testing against the zero
+healthy. Check `ShardUnloaded` explicitly rather than testing against the zero
 value.
 
 ### ShardInfo
 
 ```go
 type ShardInfo struct {
-    ShardID              uint64
-    ReplicaID            uint64
-    LeaderID             uint64
-    Term                 uint64
-    IsLeader             bool
-    IsObserver           bool
-    IsWitness            bool
-    StateMachineType     uint64
-    StateMachineTypeName string
-    Pending              uint64
-    Nodes                map[uint64]string
-    Observers            map[uint64]string
-    Witnesses            map[uint64]string
-    Health               ShardHealth
-    LastApplied          uint64
-    ConfigChangeIndex    uint64
+    ShardID              uint64             `json:"shard_id"`
+    ReplicaID            uint64             `json:"replica_id"`
+    LeaderID             uint64             `json:"leader_id"`
+    Term                 uint64             `json:"term"`
+    IsLeader             bool               `json:"is_leader"`
+    IsObserver           bool               `json:"is_observer"`
+    IsWitness            bool               `json:"is_witness"`
+    StateMachineType     uint64             `json:"state_machine_type"`
+    StateMachineTypeName string             `json:"state_machine_type_name"`
+    Pending              uint64             `json:"pending"`
+    Nodes                map[uint64]string  `json:"nodes"`
+    Health               ShardHealth        `json:"health"`
+    LastApplied          uint64             `json:"last_applied"`
+    ConfigChangeIndex    uint64             `json:"config_change_index"`
+    Replicas             []ReplicaProgress  `json:"replicas,omitempty"`
 }
 ```
 
-Point-in-time snapshot of a shard's state. Returned by `GetShardInfo`.
+Point-in-time snapshot of a shard's state, returned by `GetShardInfo`. It is a copy and is not live-updated: `LeaderID` and `Pending` reflect the state at call time. `StateMachineType` is 0 regular, 1 concurrent, 2 on-disk.
+
+`Nodes` covers all known members; use `SyncGetShardMembership` when you need observers and witnesses broken out separately.
+
+`Replicas` is empty on a follower, which tracks no such state, and empty on the first call for a shard because publication is opt-in and the next tick has not run yet.
+
+### ReplicaProgress
+
+```go
+type ReplicaProgress struct {
+    ReplicaID  uint64 `json:"replica_id"`
+    Match      uint64 `json:"match"`
+    Next       uint64 `json:"next"`
+    State      string `json:"state"`      // "probe", "replicate", "snapshot"
+    Paused     bool   `json:"paused"`
+    Active     bool   `json:"active"`
+    Inflights  int    `json:"inflights"`
+    IsWitness  bool   `json:"is_witness"`
+    IsObserver bool   `json:"is_observer"`
+}
+```
+
+One follower's replication position as the leader understands it. Every field is the leader's local belief, which is what makes it useful for diagnosing a stall: a follower stuck in `probe` with a stale `Match` is a different problem from one that is merely behind, and one pinned at the inflight limit is flow-controlled rather than slow.
+
+`Active` is the field to check before taking another replica down. An inactive follower -- one that has not responded within the election timeout -- still counts in the configuration but not toward a live quorum.
+
+This is the structured form of what `DiagRemotes` renders as a debug string.
 
 ### NodeHostInfoOption
 
@@ -1379,19 +2068,19 @@ type NodeHostInfoOption struct {
 }
 ```
 
-Options for `GetNodeHostInfo`. `SkipLogInfo=true` skips log information for faster responses.
+Options for `GetNodeHostInfo`. `SkipLogInfo = true` omits `LogInfo`, which is the expensive part of the call.
 
 ### NodeHostInfo
 
 ```go
 type NodeHostInfo struct {
-    NodeID      string
-    RaftAddress string
-    Shards      []ShardInfo
+    RaftAddress   string           `json:"raft_address"`
+    ShardInfoList []ShardInfo      `json:"shard_info_list"`
+    LogInfo       []logdb.NodeInfo `json:"log_info,omitempty"`
 }
 ```
 
-Snapshot of all shards on the host.
+Snapshot of all shards on the host. `LogInfo` is nil when `SkipLogInfo` was set.
 
 ### LogRange
 
@@ -1402,35 +2091,47 @@ type LogRange struct {
 }
 ```
 
-First and last indices in the Raft log.
+First and last available entry indices in the Raft log, both inclusive.
 
 ### ReadonlyLogReader
 
-Provides read-only access to committed Raft log entries.
+```go
+type ReadonlyLogReader interface {
+    GetRange() (firstIndex uint64, lastIndex uint64)
+    NodeState() (lastIndex uint64, term uint64)
+}
+```
+
+Read-only view of a shard's Raft log state. The surface is deliberately minimal: it inspects range and node state and permits no mutation.
 
 ## Usage Patterns
 
 ### Synchronous Propose
 
 ```go
-host, _ := quicraft.NewHost(hostCfg, quicraft.WithBarrier(barrier))
+host, err := quicraft.NewHost(hostCfg, quicraft.WithBarrier(barrier))
+if err != nil {
+    return err
+}
 defer host.Close()
 
 create := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
     return newKVStore()
 })
 
-host.StartShard(members, false, create, shardCfg)
+if err := host.StartShard(members, false, create, shardCfg); err != nil {
+    return err
+}
 
-result, err := host.SyncPropose(ctx, shardID, []byte("key=value"))
+result, err := host.SyncPropose(ctx, shardCfg.ShardID, []byte("key=value"))
 if err != nil {
     var nle *quicraft.NotLeaderError
-    if errors.As(err, &nle) {
-        // Redirect to nle.LeaderAddress
+    if errors.As(err, &nle) && nle.LeaderAddress != "" {
+        // redirect to nle.LeaderAddress
     }
-    // Handle error
+    return err
 }
-// result.Value, result.Data available
+// result.Value, result.Data
 ```
 
 ### Asynchronous Propose
@@ -1460,6 +2161,7 @@ value, err := host.SyncRead(ctx, shardID, "my-key")
 if err != nil {
     return err
 }
+fmt.Println(value)
 ```
 
 ### Session-Based At-Most-Once Propose
@@ -1483,22 +2185,34 @@ if err != nil {
     return err
 }
 session.ProposalCompleted()
+fmt.Println(result.Value)
 ```
+
+`SyncProposeWithSession` does the same thing in one call and advances the session for you.
 
 ### Membership Change
 
+Read the current membership first so the change carries a `configChangeIndex` and a concurrent change is rejected rather than merged blindly.
+
 ```go
-rs, err := host.RequestAddNode(ctx, shardID, newReplicaID, "10.0.0.4:4001", 0)
+mship, err := host.SyncGetShardMembership(ctx, shardID)
 if err != nil {
     return err
 }
-defer rs.Release()
 
-result, err := rs.Result()
-if err != nil {
+err = host.SyncRequestAddNode(ctx, shardID, newReplicaID,
+    "10.0.0.4:4001", mship.ConfigChangeID)
+switch {
+case err == nil:
+case errors.Is(err, quicraft.ErrStaleConfigChange):
+    // someone else changed the membership; re-read and rebuild
+    return err
+default:
     return err
 }
 ```
+
+Pass 0 as the last argument to skip the guard.
 
 ### Graceful Shutdown
 
@@ -1514,7 +2228,7 @@ if err := host.Close(); err != nil {
 }
 ```
 
-### Health Check
+### Health Endpoint
 
 ```go
 status := host.HealthCheck()
@@ -1526,14 +2240,63 @@ if status.Status != "ok" {
 ### Prometheus Metrics
 
 ```go
-metrics := quicraft.NewPrometheusMetricsCollector()
-host, _ := quicraft.NewHost(hostCfg, quicraft.WithMetrics(metrics))
+metrics := quicraft.NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{
+    PerShardMetrics: true,
+})
+host, err := quicraft.NewHost(hostCfg, quicraft.WithMetrics(metrics))
+if err != nil {
+    return err
+}
 
-// Expose metrics endpoint
 http.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+```
+
+`NewPrometheusMetricsCollector()` uses the zero `MetricsConfig`, which leaves `PerShardMetrics` off and aggregates the volume and latency telemetry to one host-level series per metric. The mode is fixed at construction, because a Prometheus vector's label set is decided when the vector is built.
+
+### Snapshot Export and Import
+
+```go
+// Source host: shard may be running.
+f, err := os.Create("/backup/shard-7.snap")
+if err != nil {
+    return err
+}
+if err := host.ExportSnapshot(ctx, 7, f); err != nil {
+    f.Close()
+    return err
+}
+if err := f.Close(); err != nil {
+    return err
+}
+
+// Destination host: the shard MUST be stopped.
+r, err := os.Open("/backup/shard-7.snap")
+if err != nil {
+    return err
+}
+defer r.Close()
+if err := dest.ImportSnapshot(ctx, 7, r); err != nil {
+    return err
+}
+// Next StartShard recovers from the imported snapshot.
 ```
 
 ## Cross-References
 
 - [Architecture Overview](../architecture/overview.md) -- System design, data flow, package structure
+- [Engine Pipeline](../engine/pipeline.md) -- Step, commit and apply workers behind `Propose`
+- [Raft Protocol](../raft/protocol.md) -- Election and log safety, config-in-log, convergent apply, snapshot ack/retry
+- [State Machine Interfaces](../statemachine/interfaces.md) -- Choosing among the three tiers
+- [RSM Adapter](../statemachine/rsm-adapter.md) -- What sits between the engine and your `sm` implementation
+- [KV Backends](../statemachine/kv-backends.md) -- The reference stores in `pkg/sm/kv`
+- [Session Deduplication](../sessions/deduplication.md) -- At-most-once semantics and index-based expiry
 - [Transport](../transport/quic.md) -- QUIC transport, connection management, frame format
+- [Wire Format](../protocol/wire-format.md) -- Entry and message layouts behind `proto`
+- [WAL Storage](../storage/wal.md) -- LogDB and the write-ahead log
+- [Encryption](../security/encryption.md) -- Barrier, epochs, and the Layer-1 boundary
+- [Key Custody](../security/key-custody.md) -- Who owns which key, and what this library deliberately does not hold
+- [Deployment](../operations/deployment.md) -- Metrics cardinality, alerting, sizing
+- [Lifecycle](../operations/lifecycle.md) -- Start, join, drain, shutdown
+- [Compatibility](../operations/compatibility.md) -- On-disk and wire format compatibility
+- [Bootstrap and Discovery](../discovery/bootstrap.md) -- Where the member set comes from
+- [Testing](../testing/overview.md) -- Test infrastructure and fault injection

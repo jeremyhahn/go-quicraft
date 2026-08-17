@@ -44,6 +44,7 @@ New to QuicRaft? Start here:
 | Document | Description |
 |----------|-------------|
 | [At-rest Encryption](security/encryption.md) | Barrier seal/unseal, algorithm-agile AEAD encryption, epoch-based key rotation, FIPS 140 |
+| [Key Custody](security/key-custody.md) | Pluggable root-key storage: sealing strategies, TPM, HSM/PKCS#11, cloud KMS |
 
 ## Sessions & Discovery
 

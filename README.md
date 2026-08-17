@@ -3,11 +3,11 @@
 
 [![Go](https://img.shields.io/badge/Go-1.26.6-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.3.1--alpha-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.6.0--alpha-orange.svg)](VERSION)
 
 A multi-group Raft consensus library for Go with QUIC transport and at-rest encryption.
 
-QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/) with full spec compliance against both the [extended Raft paper](docs/references/raft.pdf) and the [Ongaro PhD thesis](docs/references/OngaroPhD.pdf). The implementation is verified by 5,400+ tests across 27 packages at 91.5% aggregate coverage, including a Porcupine-based linearizability test suite. Per-package coverage varies -- see [Test Coverage](#test-coverage) for the packages that sit below the aggregate.
+QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/), audited against the [extended Raft paper](docs/references/raft.pdf) and the [Ongaro PhD thesis](docs/references/OngaroPhD.pdf). It carries 6,500+ test functions and 37 fuzz targets across 27 packages, including a Porcupine-based linearizability suite, at 91.2% aggregate statement coverage. Coverage is uneven -- see [Test Coverage](#test-coverage) for the packages below the project's own floor.
 
 ## Installation
 
@@ -19,8 +19,19 @@ Requires Go 1.26.6 or later. The public API lives under
 `github.com/jeremyhahn/go-quicraft/pkg`.
 
 > **Alpha software.** This is a `0.x` release. The on-disk and on-wire formats
-> are not yet stable and have broken across releases; see
-> [CHANGELOG.md](CHANGELOG.md) and
+> are not yet stable and have broken across releases.
+>
+> **0.5.x cannot read a 0.4.x data directory.** The `proto.Entry` header went
+> from 60 to 68 bytes, the WAL entry record from 76 to 84, and the sealed-state
+> MAC from v1 to v2. There is no in-place upgrade and no dual-read path: wipe
+> the data directory, or export snapshots with 0.4.x and re-import. Sealed
+> barrier state is the one exception: a pre-fence blob is recognised once and
+> restamped on the next persist. Every wire and persisted format stays pinned
+> at version 1 until the first production release, so a layout change is made in
+> place and the version number does not record it. Build every node and every
+> consuming service from one commit.
+>
+> See [CHANGELOG.md](CHANGELOG.md) and
 > [docs/operations/compatibility.md](docs/operations/compatibility.md) before
 > upgrading.
 
@@ -28,12 +39,13 @@ Requires Go 1.26.6 or later. The public API lives under
 
 - **Multi-group Raft** -- Thousands of independent Raft groups per process with a double-buffered ReadyMap for O(1) shard dispatch
 - **Minimal dependencies** -- No external or embedded database dependencies for Raft log storage
-- **QUIC transport** -- Built on [quic-go](https://github.com/quic-go/quic-go) with mTLS, multiplexed streams, and 0-RTT reconnection
-- **Custom binary wire format** -- Fixed-layout little-endian encoding with zero-copy semantics; no protobuf dependency
+- **QUIC transport** -- Built on [quic-go](https://github.com/quic-go/quic-go) with mandatory mTLS and multiplexed streams. There is no TCP fallback. 0-RTT is deliberately not used: the dial path never sends early data, and message frames that arrive over 0-RTT are refused because early data is replayable
+- **Custom binary wire format** -- Fixed-layout little-endian encoding with zero-copy semantics; nothing on the wire is protobuf
 - **At-rest encryption** -- Authenticated encryption (AES-GCM or ChaCha20-Poly1305) with automatic hardware detection, barrier/seal/unseal pattern, epoch-based key rotation, and FIPS 140 build support
 - **Sharded WAL** -- 16-shard write-ahead log for parallel persistence with fdatasync durability
-- **Full Raft spec** -- Leader election, log replication, membership changes, snapshots, ReadIndex, LeaseRead, PreVote, leadership transfer, CheckQuorum
-- **Client sessions** -- At-most-once delivery with deterministic expiry and deduplication across replicas (PhD Figure 6.1)
+- **Raft protocol features** -- Leader election, log replication, membership changes, snapshots, ReadIndex, LeaseRead, PreVote, leadership transfer, CheckQuorum
+- **Client sessions** -- At-most-once delivery with deduplication across replicas (PhD Figure 6.1). Expiry is index-based, so every replica expires the same session at the same log index
+- **Witness replicas** -- Metadata-only voting members that carry Index/Term without the command payload. They count toward both the election and the commit quorum, and the policy bounding them is replicated state in `proto.Membership`
 - **Three state machine types** -- `StateMachine`, `ConcurrentStateMachine`, and `DiskStateMachine` interfaces for different workload profiles
 - **Cluster primitives** -- explicit per-shard member maps via StartShard; discovery and bootstrap orchestration live in go-qrdb
 - **Observability** -- Prometheus metrics for proposals, commits, elections, snapshots, transport, and WAL operations
@@ -128,6 +140,10 @@ QuicRaft supports three write durability modes. Pick the one that matches your l
 ```go
 // Sync write -- blocks until quorum commit + SM apply (~10-30ms)
 result, err := host.SyncPropose(ctx, shardID, cmd)
+if err != nil {
+    return err
+}
+fmt.Println("state machine returned:", result.Value)
 
 // Async variant -- returns immediately, result arrives on channel
 rs, err := host.Propose(ctx, shardID, cmd)
@@ -169,6 +185,7 @@ case <-rs.CommittedC():
 case result := <-rs.ApplyResultC():
     // Full quorum commit + SM apply (~10-30ms). Use this channel
     // when you need the applied result or read-after-write safety.
+    return result.Err
 case <-ctx.Done():
     return ctx.Err()
 }
@@ -179,7 +196,12 @@ case <-ctx.Done():
 > **Delivery is at-least-once, not at-most-once.** The aggregator proposes a raw encoded batch with no client session, so nothing deduplicates a retry. A flush that fails with `FlushError.Indeterminate` may nonetheless have committed, and retrying re-applies every command in that batch. A batched proposal also cannot report a per-item apply failure: the aggregate result is shared by every co-batched caller. Use `SyncProposeWithSession` for operations that are not idempotent.
 
 ```go
-import "github.com/jeremyhahn/go-quicraft/pkg/batch"
+import (
+    "errors"
+    "time"
+
+    "github.com/jeremyhahn/go-quicraft/pkg/batch"
+)
 
 // *Host.SyncPropose returns (sm.Result, error); Proposer wants error alone,
 // so the Host is wrapped. The discarded Result is the limitation above: a
@@ -221,6 +243,12 @@ Four read modes, from strongest to fastest:
 | Stale | Eventual | ~0.01ms (local SM query) | `StaleRead` |
 | Local | None (bypass Raft) | ~0.01ms | `QueryLocalNode` |
 
+The latency figures above and in the durability-mode section are order-of-magnitude
+guidance for a 3-node cluster on a low-latency LAN, not measurements you should plan
+capacity against. They move with network RTT, disk fsync latency, state-machine cost
+and shard count. Measure your own deployment; `test/performance/` holds the
+comparative suite and the hardware each published result was produced on.
+
 ```go
 // ReadIndex -- linearizable. Confirms leadership via heartbeat quorum,
 // then queries the state machine. Default mode.
@@ -236,6 +264,10 @@ shardCfg := config.Config{
     ReplicaID: 1,
     LeaseRead: true, // Requires CheckQuorum, which is on by default (CheckQuorum is a *bool; nil = enabled)
 }
+if err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg); err != nil {
+    return err
+}
+
 // SyncRead is the same call -- LeaseRead is transparent to the caller.
 val, err = host.SyncRead(ctx, shardID, []byte("mykey"))
 
@@ -342,6 +374,8 @@ Peer discovery (static / multicast / DNS SRV / token), quorum validation, and bo
 
 QuicRaft encrypts WAL entries and snapshots at rest using a barrier/seal/unseal pattern inspired by HashiCorp Vault. The barrier generates a random root key, derives per-epoch data encryption keys (DEKs) via HKDF, and supports automatic key rotation with epoch-based purging.
 
+The barrier owns no storage of its own. `BarrierConfig.StatePersister` is how the sealed root key reaches durable storage, and a real deployment must set it: without one, `Rotate` and `PurgeEpochsBefore` fail closed with `ErrNoStatePersister`, the load-generation fence that catches a second process loading the same sealed state is inert, and the first `Unseal` after a restart leaves the barrier able to read but not write.
+
 **AES-256-GCM** -- hardware-accelerated on CPUs with AES-NI (most modern x86_64):
 
 ```go
@@ -350,20 +384,66 @@ import (
     "encoding/json"
     "log"
     "os"
+    "path/filepath"
 
     quicraft "github.com/jeremyhahn/go-quicraft/pkg"
     "github.com/jeremyhahn/go-quicraft/pkg/config"
     "github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
+const sealedPath = "/var/data/quicraft/sealed-root-key.json"
+
+// persistSealedState is the BarrierConfig.StatePersister for this deployment.
+// Returning nil has to mean the blob is durable: the barrier activates a new
+// epoch on that nil, and data written under an epoch the persisted blob does
+// not name is unreadable after a restart. It is called with the barrier's
+// write lock held, so it must not call back into the barrier.
+func persistSealedState(sealed *seal.SealedRootKey) error {
+    blob, err := json.Marshal(sealed)
+    if err != nil {
+        return err
+    }
+    dir := filepath.Dir(sealedPath)
+    f, err := os.CreateTemp(dir, ".sealed-root-key-*")
+    if err != nil {
+        return err
+    }
+    defer os.Remove(f.Name())
+    if _, err := f.Write(blob); err != nil {
+        f.Close()
+        return err
+    }
+    if err := f.Chmod(0o600); err != nil {
+        f.Close()
+        return err
+    }
+    if err := f.Sync(); err != nil {
+        f.Close()
+        return err
+    }
+    if err := f.Close(); err != nil {
+        return err
+    }
+    if err := os.Rename(f.Name(), sealedPath); err != nil {
+        return err
+    }
+    d, err := os.Open(dir)
+    if err != nil {
+        return err
+    }
+    defer d.Close()
+    return d.Sync()
+}
+
 func main() {
     // Create barrier with AES-256-GCM. NewBarrier returns an error for an
     // invalid config (unknown algorithm, non-FIPS cipher under FIPS mode);
     // seal.MustNewBarrier is the panicking form for compile-time constants.
     barrier, err := seal.NewBarrier(seal.BarrierConfig{
-        Algorithm:     seal.AlgAES256GCM,
-        DeploymentID:  1,
-        NonceTracking: true,
+        Algorithm:      seal.AlgAES256GCM,
+        DeploymentID:   1,
+        NonceTracking:  seal.BoolPtr(true), // *bool; nil also means enabled
+        StatePersister: persistSealedState,
     })
     if err != nil {
         log.Fatal(err)
@@ -385,13 +465,11 @@ func main() {
         log.Fatal(err)
     }
 
-    // Persist the sealed root key -- the caller's responsibility. Lose it and
-    // the data directory can never be unsealed again.
-    blob, err := json.Marshal(barrier.SealedRootKeyData())
-    if err != nil {
-        log.Fatal(err)
-    }
-    if err := os.WriteFile("/var/data/quicraft/sealed-root-key.json", blob, 0o600); err != nil {
+    // Initialize is the one path that does not call the persister, so the
+    // bootstrap write is explicit. Every later write -- Unseal, Rotate,
+    // PurgeEpochsBefore -- goes through StatePersister. Lose this blob and the
+    // data directory can never be unsealed again.
+    if err := persistSealedState(barrier.SealedRootKeyData()); err != nil {
         log.Fatal(err)
     }
 
@@ -416,37 +494,43 @@ func main() {
 
 ```go
 barrier, err := seal.NewBarrier(seal.BarrierConfig{
-    Algorithm:     seal.AlgChaCha20Poly1305,
-    DeploymentID:  1,
-    NonceTracking: true,
+    Algorithm:      seal.AlgChaCha20Poly1305,
+    DeploymentID:   1,
+    NonceTracking:  seal.BoolPtr(true),
+    StatePersister: persistSealedState,
 })
 if err != nil {
     log.Fatal(err)
 }
 ```
 
-**Auto-select** -- let QuicRaft choose the optimal algorithm based on hardware detection:
+**Auto-select** -- let QuicRaft choose the algorithm from CPU feature detection. Pin the algorithm explicitly for any data directory that may outlive the host that wrote it: the choice is part of the key derivation, so a directory restored onto a machine without AES-NI otherwise reads back as `ErrDecryptionFailed`.
 
 ```go
 barrier, err := seal.NewBarrier(seal.BarrierConfig{
-    Algorithm:     seal.SelectOptimalAlgorithm(false), // AES-256-GCM if AES-NI, else ChaCha20
-    DeploymentID:  1,
-    NonceTracking: true,
+    Algorithm:      seal.SelectOptimalAlgorithm(false), // AES-256-GCM if AES-NI, else ChaCha20
+    DeploymentID:   1,
+    NonceTracking:  seal.BoolPtr(true),
+    StatePersister: persistSealedState,
 })
 if err != nil {
     log.Fatal(err)
 }
+```
 
-// Or use the convenience constructor. MustNewBarrier panics instead of
-// returning an error, which is appropriate only for a compile-time config.
-barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
+`DefaultBarrierConfig` is the same thing with fewer keystrokes. It fills in the algorithm and nonce tracking but leaves `StatePersister` nil, so set that before constructing. `MustNewBarrier` panics rather than returning an error, which suits a compile-time config only.
+
+```go
+cfg := seal.DefaultBarrierConfig(1)
+cfg.StatePersister = persistSealedState
+barrier := seal.MustNewBarrier(cfg)
 ```
 
 **Unseal on restart** -- load the persisted sealed root key and unseal the barrier before starting the host:
 
 ```go
 // Load the sealed root key written at Initialize time.
-blob, err := os.ReadFile("/var/data/quicraft/sealed-root-key.json")
+blob, err := os.ReadFile(sealedPath)
 if err != nil {
     log.Fatal(err)
 }
@@ -455,7 +539,14 @@ if err := json.Unmarshal(blob, sealed); err != nil {
     log.Fatal(err)
 }
 
-barrier := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
+// The same StatePersister as at Initialize time. Unseal writes through it on
+// every load to claim the load generation, and again for the rotation it
+// performs because the loaded epoch's spent AEAD invocation budget cannot be
+// known across a restart. Without a persister the barrier comes up read-only:
+// it will decrypt, and every Encrypt fails closed.
+cfg := seal.DefaultBarrierConfig(1)
+cfg.StatePersister = persistSealedState
+barrier := seal.MustNewBarrier(cfg)
 if err := barrier.SetSealedRootKey(sealed); err != nil {
     log.Fatal(err)
 }
@@ -490,7 +581,9 @@ log.Printf("rotated to epoch %d, purged %d old DEKs", newEpoch, purged)
 
 Purge only up to an epoch no live WAL segment or snapshot still needs — a purged DEK is not recoverable. See [Encryption](docs/security/encryption.md) for how the host computes that floor.
 
-This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPassphrase`, Argon2id / PBKDF2-FIPS) and `StrategyNone`. `SealingStrategy` is a pluggable interface, and the hardware and cloud backends that implement it — TPM2, PKCS#11, AWS KMS, GCP KMS, Azure Key Vault, HashiCorp Vault — live in **go-xkms**; Shamir secret sharing and share custody live in **go-qrdb**. The consensus engine never persists Shamir shares. Strategy selection is always explicit; there is no preference order and no auto-ranking.
+This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPassphrase`, Argon2id / PBKDF2-FIPS) and `StrategyNone`. `SealingStrategy` is a pluggable interface, and the hardware and cloud backends that implement it (TPM2, PKCS#11, AWS KMS, GCP KMS, Azure Key Vault, HashiCorp Vault) live in **go-xkms**; Shamir secret sharing and share custody live in **go-qrdb**. The consensus engine never persists Shamir shares. Strategy selection is always explicit; there is no preference order and no auto-ranking.
+
+**The filesystem is one option, not the design.** The examples above write a JSON file because that is the shortest thing that works, but neither half of root-key custody is fixed. Where the sealed blob lives is `BarrierConfig.StatePersister`, an arbitrary function, and `seal.StorageBackend` covers the case where a key-value store rather than a file holds it. What protects the root key is the `SealingStrategy`: a passphrase and Argon2id here, or a wrapping key held in a TPM, an HSM or a cloud KMS through go-xkms. A strategy may also return a `BarrierEncryptor`, which hands the data-path encryption to that backend instead of the barrier's own epoch DEKs. See [Key custody](docs/security/key-custody.md) for the combinations and what each one buys.
 
 ## Build
 
@@ -498,33 +591,49 @@ This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPa
 make build      # Compile all packages
 make test       # Run unit tests with race detector
 make lint       # Run golangci-lint
-make coverage   # Generate coverage report
-make ci         # Full CI: fmt, vet, lint, gosec, vuln, trivy, nancy, build, test
+make coverage   # Generate coverage report and enforce the floor
+make ci         # fmt, no-mutants, vet, lint, security scans, build, test
+make ci-full    # ci plus the build-tagged suites: modules, errfs, fuzz, integration, netfault
 make build-fips # Build with GOFIPS140=v1.0.0
 ```
 
+`make ci` runs `go test` with no build tags, which leaves out the integration,
+fault-injection and fuzz suites. `make ci-full` is the one that matches CI.
+The security scans are gosec, govulncheck, `go mod verify` and trivy; nancy is
+deliberately not among them, because it needs OSS Index credentials and fails
+the same way whether it found something or could not reach the service. Run
+`make nancy` separately where those credentials exist.
+
 ## Testing
 
-QuicRaft has 5,400+ tests across 27 packages.
+QuicRaft has 6,500+ test functions and 37 fuzz targets across 27 packages.
 
 ### Test Coverage
 
-Aggregate coverage is **91.5%**. Per-package coverage is enforced by the
-Makefile against per-package thresholds, and four packages currently sit
-below the aggregate:
+The Makefile enforces one floor, `COVER_MIN = 91`, and applies it to every
+coverage target rather than tuning a threshold per package. The module total
+clears it. Several packages measured on their own do not:
 
 | Package | Coverage |
 |---------|----------|
-| `pkg/logdb` | 85.2% |
-| `pkg/logdb/waldb` | 88.3% |
-| `pkg/internal/transport` | 89.2% |
-| `pkg/internal/engine` | 90.4% |
-| **Aggregate** | **91.5%** |
+| `pkg/internal/registry` | 78.4% |
+| `pkg/internal/transport` | 88.8% |
+| `pkg/internal/engine` | 89.1% |
+| `pkg/logdb/waldb` | 89.2% |
+| `pkg/logdb` | 90.0% |
+| `pkg/batch` | 90.5% |
+| `pkg` | 90.8% |
+| **Module total** | **91.2%** |
 
-These are the durability and transport layers, which is worth stating plainly
-rather than rounding away: the packages furthest from the aggregate are the
-ones whose failure modes are hardest to recover from. Raising them is tracked
-work, not a settled state.
+Measured at 0.5.1-alpha with `go test -coverprofile ./...`, which is the scope
+`make coverage` uses: no build tags, so the integration and fault-injection
+suites are excluded and only the code they exercise indirectly shows up.
+
+`pkg/internal/registry` is 37 statements, so a single uncovered line moves it
+several points. The gaps that matter are the WAL, the QUIC transport and the
+engine pipeline, and they are worth stating rather than rounding away: those
+are the layers whose failure modes are hardest to recover from. Raising them is
+tracked work, not a settled state.
 
 ```bash
 # Unit tests (run on host)
@@ -541,7 +650,7 @@ make integration-test-e2e              # Multi-node E2E cluster tests
 make integration-test-linearizability  # Porcupine linearizability verification
 
 # Fuzz testing
-make fuzz-all                          # All fuzz targets (proto, transport, WAL, seal, session)
+make fuzz-all                          # All fuzz targets (proto, transport, WAL, seal, session, raft)
 make errfs-waldb                       # WAL I/O error injection tests
 
 # Benchmarks
@@ -555,8 +664,9 @@ make coverage                          # Total coverage report
 make coverage-<pkg>                    # Per-package coverage
 
 # Performance comparison (QuicRaft vs etcd vs Dragonboat vs OpenRaft)
-make perf-compare-all                  # Run all systems
-make perf-docs                         # Run all + generate charts and docs
+make perf-compare-all                          # Run all systems, print a report
+make perf-all PERF_PROFILE=omega               # Run + store + generate, for one machine profile
+make perf-remote PERF_HOST=user@host PERF_PROFILE=omega  # Same, on another machine
 ```
 
 ## Documentation
@@ -580,6 +690,7 @@ Full documentation lives in [docs/](docs/README.md), organized by component:
 
 **Security & Sessions**
 - [At-rest Encryption](docs/security/encryption.md) -- Barrier/seal/unseal, key rotation, FIPS 140
+- [Key Custody](docs/security/key-custody.md) -- Where the sealed root key lives and what protects it
 - [Session Deduplication](docs/sessions/deduplication.md) -- At-most-once delivery, client sessions
 
 **Operations**

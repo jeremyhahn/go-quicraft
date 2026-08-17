@@ -2,6 +2,15 @@
 
 This document describes the performance techniques implemented in QuicRaft, covering zero-allocation hot paths, compression, rate limiting, memory budget enforcement, and transport-level optimizations.
 
+**On the numbers in this document.** Allocation counts (`B/op`, `allocs/op`) are
+deterministic for a given build and are quoted here without qualification.
+Timings and CPU percentages are not: absolute `ns/op` is a property of the
+machine, and the few quoted below predate any provenance discipline in this
+repository, so the hardware that produced them was not recorded. They are
+flagged where they appear. New measurements belong in
+[benchmarking.md](benchmarking.md), which records machine, governor, load, Go
+version and commit alongside every sample.
+
 ## Hot Path Overview
 
 The critical path for a proposal flows through every layer of the system:
@@ -19,7 +28,7 @@ Each layer is designed for zero or near-zero allocations in steady state.
 
 ### Entry Serialization (Zero-Copy)
 
-The `proto.Entry` type uses a custom fixed-layout binary format with a 60-byte header (7 uint64 fields + 1 uint32 CmdLen). Serialization avoids reflection, protobuf, and dynamic allocation.
+The `proto.Entry` type uses a custom fixed-layout binary format with a 68-byte header (8 uint64 fields + 1 uint32 CmdLen). Serialization avoids reflection, protobuf, and dynamic allocation.
 
 `MarshalTo(buf []byte)` writes directly into the caller's buffer using `binary.LittleEndian` and `copy()`. `UnmarshalFrom(buf []byte)` reads fields in place and zero-copy aliases `Entry.Cmd` into the source buffer. No allocation occurs for the payload. The receiver must copy `Cmd` before reusing the buffer.
 
@@ -47,7 +56,7 @@ Source: `pkg/internal/raft/raft.go`
 
 The step worker reuses a single `inboxBuf []proto.Message` slice across all shard inbox drains. `DrainInbox()` resets the slice to `[:0]` and appends, reusing the backing array.
 
-Source: `pkg/internal/engine/node.go`
+Source: `pkg/internal/engine/step.go` (field and buffer), `pkg/internal/engine/node.go` (`DrainInbox`)
 
 ### Transport Buffer Pools
 
@@ -57,13 +66,15 @@ Source: `pkg/internal/transport/quic.go`
 
 ### ReadIndex Zero-Allocation Tracking
 
-Heartbeat acknowledgments for ReadIndex quorum confirmation use a `uint64` bitfield instead of a map. Each voting replica is assigned a bit position (0..63) via `replicaToBit`, built once during `becomeLeader()`. Ack processing is a single bitwise OR and increment -- zero allocation, O(1) per response.
+Heartbeat acknowledgments for ReadIndex quorum confirmation use a `uint64` bitfield instead of a map. Each voting replica is assigned a bit position (0..63) via `replicaToBit`, built in `becomeLeader()` and rebuilt by `rebuildReplicaToBit` when membership changes mid-term. Ack processing is a single bitwise OR and increment -- zero allocation, O(1) per response.
 
 Source: `pkg/internal/raft/raft.go`
 
-### SwapBuffer Queue
+### SwapBuffer Queue (not currently on any hot path)
 
-The `SwapBuffer[T]` generic queue uses a lock-protected write buffer that is atomically swapped with a fresh slice on read. The caller owns the returned slice. The backing array grows as needed but is never shrunk during normal operation, avoiding repeated allocation under steady load.
+The `SwapBuffer[T]` generic queue uses a lock-protected write buffer that is swapped with the previously returned read buffer, so a fresh slice is allocated only on the first `Swap`. The caller owns the returned slice until the next `Swap` recycles it. The backing array grows as needed but is never shrunk during normal operation.
+
+`git grep SwapBuffer -- '*.go'` returns hits only inside `pkg/internal/queue` and its own tests. Nothing in the engine, raft, transport, or host layer uses it. It is described here because it exists, not because it carries traffic; the proposal path uses `EntryQueue[T]` (see [Double-Buffered MPSC Proposal Queue](#double-buffered-mpsc-proposal-queue-o19)).
 
 Source: `pkg/internal/queue/swapbuffer.go`
 
@@ -107,7 +118,7 @@ Each shard maintains an `InMemRateLimiter` that tracks the in-memory Raft log si
 - **Release**: all tracked sizes drop below 70% of `MaxInMemLogSize`
 - **Debounce**: state transitions require at least `ChangeTickThreshold` (10) ticks between changes
 
-The limiter is single-threaded (owned by the raft state machine goroutine) and requires no synchronization. Follower feedback is sent via `RateLimit` messages every election timeout. The leader records each follower's reported in-memory log size and considers it when evaluating rate limit thresholds. Stale follower entries are garbage collected after `gcTick` (3) ticks without an update.
+Every mutation runs on the raft state machine goroutine, so the accounting needs no lock. The read side is not lock-free: `IsLimited()` is called from other goroutines and reads a `cachedLimited` atomic that the owning goroutine publishes. Follower feedback is sent via `RateLimit` messages every election timeout. The leader records each follower's reported in-memory log size and considers it when evaluating rate limit thresholds. Stale follower entries are garbage collected after `gcTick` (3) ticks without an update.
 
 Source: `pkg/internal/server/rate.go`
 
@@ -194,6 +205,9 @@ have pending work.
 
 One `sync.Mutex` guards one live map, `ready`. `maps [2]` holds the two maps that
 alternate as the live one; `index` says which of the pair is currently live.
+`NewReadyMap` allocates three maps, not two: the initial `ready` is a third map
+that the first `Swap` hands to the caller and never reinstalls. From the second
+swap onward the rotation is strictly between the pair.
 
 `Set(shardID)` takes the mutex, inserts, and releases it. The critical section is
 a single map insert, which is why one lock suffices: contention is on the *lock*,
@@ -236,13 +250,13 @@ This ensures heartbeats are never blocked by large Replicate messages on the sam
 
 Stream creation uses double-checked locking: the fast path acquires a read lock to check for an existing stream, and the slow path opens a new stream under a write lock with a re-check to handle races.
 
-When a write fails, `evictStreamsForTarget()` removes and closes all streams for the target. When a connection dies, `evictStreamsForTarget()` bulk-removes all streams for that target, ensuring subsequent calls open fresh streams on a new connection rather than using stale handles.
+Eviction is scoped to the failure. A peer that rejects a frame costs only that stream: `evictStream()` removes the single entry and leaves the connection and its other streams alone. A write failure or a dead connection goes wider, and `evictStreamsForTarget()` bulk-removes every stream for that target so subsequent calls open fresh streams on a new connection rather than reusing stale handles.
 
 ### Send Path
 
 `Send()` does not group or fan out. It walks the messages once, deep-copies each message's entries and snapshot references (breaking the alias with the step worker's reusable `proposeBuf`), resolves the target address from the registry, and enqueues the message on that target's `sendQueue` — a non-blocking hand-off to a per-target channel pair (data, cap 2048; heartbeat, cap 64).
 
-Batching happens in the per-target `sendQueueWorker` goroutine, which drains its queues and coalesces up to 16 heartbeats or 256 data messages into one batch. Heartbeats are drained before data by a non-blocking priority select, so a replication backlog cannot delay heartbeats past the election timeout. Each batch is framed (`FrameHeaderSize` + payload), optionally Snappy compressed, and written to the pooled stream in a single write call. A worker exits after `sendQueueIdleTimeout` of inactivity, so removed peers do not leak goroutines.
+Batching happens in the per-target `sendQueueWorker` goroutine, which drains its queues and coalesces up to 16 heartbeats or 256 data messages into one batch. Heartbeats are drained before data by a non-blocking priority select, so a replication backlog cannot delay heartbeats past the election timeout. Each batch is framed (`FrameHeaderSize` + payload) and optionally Snappy compressed. A batch that fits in one frame is one write to the pooled stream; `sendBatch` splits an oversized batch across as many frames as it needs, one write each. A worker exits after `sendQueueIdleTimeout` (60s) of inactivity, so removed peers do not leak goroutines.
 
 See [QUIC Transport: Send Path](../transport/quic.md#send-path) for the full sequence.
 
@@ -270,18 +284,20 @@ Source: `pkg/internal/raft/raft.go`
 
 ### P0: LogReader termRingBuffer
 
-The `LogReader` maintains a term cache so that `Term(index)` lookups avoid hitting LogDB. The original implementation used `map[uint64]uint64`, which required iterating up to 100K entries in `trimTermMap()` on every `appliedLogTo` call. Under concurrent load this consumed 82% of CPU.
+The `LogReader` maintains a term cache so that `Term(index)` lookups avoid hitting LogDB. The original implementation used `map[uint64]uint64`, which required iterating up to 100K entries in `trimTermMap()` on every `appliedLogTo` call. A profile taken at the time attributed 82% of CPU to it under concurrent load; the machine was not recorded, so read that as "it dominated the profile", not as a portable figure.
 
-The replacement `termRingBuffer` is a fixed-capacity circular buffer of `(index, term)` pairs stored in a flat `[100000]termEntry` slice (1.6 MB). Entries are appended at the tail and the buffer wraps when full, evicting the oldest entries automatically. Operations are:
+The replacement `termRingBuffer` is a fixed-capacity circular buffer of `(index, term)` pairs held in a single `[]termRingEntry` slice of `maxTermCacheEntries` (100,000) elements, allocated once at 1.6 MB. Entries are appended at the tail and the buffer wraps when full, evicting the oldest entries automatically. Operations are:
 - **Append**: O(1) -- write at `(head + count) % cap`, increment count
 - **Lookup**: O(log n) -- binary search over the logical window
-- **TrimTo**: O(log n) -- binary search to find the cut point, advance head
+- **trimTo**: O(log n) -- binary search to find the cut point, advance head
 
 Source: `pkg/logdb/reader.go`
 
 ### P1: inMemory Lazy Compaction
 
-The `inMemory` struct in the raft log tracks entries pending persistence and application. A `wastedPrefix` counter now tracks how many entries have been logically truncated without physically reallocating the slice. Compaction triggers only when `wastedPrefix >= len(entries)` or `wastedPrefix >= 512`, reducing allocation frequency by approximately 128x under steady load.
+The `inMemory` struct in the raft log tracks entries pending persistence and application. A `wastedPrefix` counter tracks how many entries have been logically truncated without physically reallocating the slice.
+
+Compaction requires *both* thresholds to be met: `wastedPrefix >= entrySliceSize` (512) and `wastedPrefix >= 2*len(entries)`. Requiring twice the live length means the copy is amortized against at least as much dead space as live data. A separate fast path releases the backing array outright when no live entries remain.
 
 Source: `pkg/internal/raft/inmemory.go`
 
@@ -325,7 +341,7 @@ Sources: `pkg/internal/engine/commit.go`, `pkg/internal/engine/convert.go`
 
 ### Double-Buffered MPSC Proposal Queue (O19)
 
-Proposals now bypass the Go buffered channel (`inboxC`) and use a dedicated `EntryQueue[T]` double-buffered MPSC queue. It is guarded by a `sync.Mutex`, not lock-free; the win is amortization, not lock elimination. The queue has bounded capacity (`maxLen=256`) with backpressure -- `Add()` returns false at capacity, signaling the caller to return `ErrSystemBusy`. The double-buffer swap means producers hold the lock only for a slice append (typically <50ns), and the consumer acquires the lock once per drain cycle. This eliminates channel serialization under 8+ concurrent writers.
+Proposals now bypass the Go buffered channel (`inboxC`) and use a dedicated `EntryQueue[T]` double-buffered MPSC queue. It is guarded by a `sync.Mutex`, not lock-free; the win is amortization, not lock elimination. The queue has bounded capacity (`maxLen=256`) with backpressure -- `Add()` returns false at capacity, signaling the caller to return `ErrSystemBusy`. The double-buffer swap means producers hold the lock only for a slice append, and the consumer acquires the lock once per drain cycle. This eliminates channel serialization under 8+ concurrent writers.
 
 Sources: `pkg/internal/queue/entryqueue.go`, `pkg/internal/engine/node.go`, `pkg/internal/engine/step.go`
 
@@ -337,13 +353,17 @@ Sources: `pkg/internal/raft/raft.go`, `pkg/config/config.go`
 
 ### Persistent Heartbeat Streams (O21)
 
-`dialConnection()` spawns `preOpenHeartbeatStream()` asynchronously after establishing a QUIC connection. This pre-opens a QUIC stream at index 0 (the heartbeat stream slot) and stores it in the sharded stream pool. This eliminates the ~20-40us `OpenStreamSync` latency on the first heartbeat send, which sits on the critical path for ReadIndex and liveness detection.
+`dialConnection()` spawns `preOpenHeartbeatStream()` asynchronously after establishing a QUIC connection. This pre-opens a QUIC stream at index 0 (the heartbeat stream slot) and stores it in the sharded stream pool. This removes the `OpenStreamSync` round-trip from the first heartbeat send, which sits on the critical path for ReadIndex and liveness detection. The cost it saves was measured once at 20-40us on unrecorded hardware; the shape of the saving (one stream-open round-trip) is the durable claim, not the figure.
 
 Source: `pkg/internal/transport/conn.go`
 
 ## Benchmark Results
 
-For current benchmark results, pairwise comparisons (vs Dragonboat v4, etcd/raft, OpenRaft), and per-scenario breakdowns, see the performance documentation directory.
+For pairwise comparisons against Dragonboat v4, etcd/raft and OpenRaft, and for
+per-scenario breakdowns, see [test/performance/README.md](../../test/performance/README.md).
+That file states which machine and which date each set of numbers came from, and
+which comparisons between them are legitimate. Two datasets exist and they are
+not interchangeable.
 
 Changes to the hot paths described above must be benchmarked before merge. See [Benchmark Regression Testing](benchmarking.md) for `make bench-compare`, the stored baselines under `test/performance/baselines/`, and why a single `make bench-<pkg>` run cannot answer the question.
 

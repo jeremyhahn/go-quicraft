@@ -1,8 +1,19 @@
 # Operations
 
-This document covers deployment, monitoring, configuration tuning, and day-to-day administration of QuicRaft clusters.
+Deployment, monitoring, configuration tuning, and day-to-day administration of
+QuicRaft clusters.
 
-**Sources:** `pkg/host.go`, `pkg/config/`, `pkg/metrics.go`, `pkg/metrics_prometheus.go`, `pkg/logdb/waldb/diskmon.go`, `pkg/seal/barrier.go`, `pkg/internal/server/rate.go`
+**Sources:** `pkg/host.go`, `pkg/config/`, `pkg/metrics.go`, `pkg/metrics_prometheus.go`, `pkg/logdb/waldb/diskmon.go`, `pkg/seal/barrier.go`, `pkg/internal/server/rate.go`, `Makefile`
+
+> **This is alpha software at `0.5.1-alpha`.** Wire and on-disk formats are
+> pinned at version 1 and change **in place**, so two builds from different
+> commits can be mutually unreadable while both report version 1. There is no
+> rolling upgrade across a format change and no migration tooling; every minor
+> release so far has required wiping data directories. Before you plan a
+> deployment lifecycle around this, read
+> [Compatibility and Upgrades](compatibility.md) — particularly
+> [what 0.5.x does when it meets 0.4.x data](compatibility.md#what-05x-does-when-it-meets-04x-data),
+> which is not a clean refusal.
 
 ## Deployment
 
@@ -51,17 +62,31 @@ For discovery-driven formation (multicast/DNS/token/static-with-quorum), use go-
 
 ```
 /var/lib/quicraft/
-  wal/                     # WAL segments (write-intensive, use fast disk)
-    shard-0/               # 16 WAL shards by shardID hash
+  wal/                       # WAL segments (write-intensive, use fast disk)
+    WALFORMAT                # 16-byte geometry+framing marker, read before any segment
+    shard-0/                 # 16 WAL shards, shard index = shardID hash
     shard-1/
     ...
-  nodehost/                # Metadata, snapshots, host ID
-    host.id                # 128-bit hex host identifier (0600 perms)
+    shard-15/
+  nodehost/                  # Metadata, snapshots, host ID
+    host.id                  # 128-bit hex host identifier (0600 perms, enforced on read)
     snapshots/
       shard-100/
-        snapshot-00000000001000/
-          snapshot.dat
+        replica-3/
+          snapshot-00000000000000001000/   # index, zero-padded to 20 digits
+            snapshot.dat
+            snapshot.meta
 ```
+
+Directories are created with mode 0750. The `WALFORMAT` marker is written before
+the first segment exists and is checked before any segment byte is read; a
+populated WAL directory with no marker is refused rather than replayed. Never
+delete segments while leaving the marker, or the marker while leaving segments.
+
+A shard with a non-empty `Config.DataDir` puts its snapshots under that path
+instead of under `NodeHostDir`. `ImportSnapshot` needs to know which, so keep the
+`DataDir` value with your restore procedure — see [Disaster
+recovery](#disaster-recovery-importing-a-snapshot).
 
 **Production recommendation:** Place `WALDir` and `NodeHostDir` on separate physical disks to isolate WAL write I/O from snapshot reads.
 
@@ -120,23 +145,23 @@ Source: `pkg/config/hostconfig.go`
 | `WALDir` | string | (required) | Write-ahead log directory |
 | `NodeHostDir` | string | (required) | Metadata, snapshots, host ID directory |
 | `ListenAddress` | string | (required) | Local QUIC bind address |
-| `RaftAddress` | string | `""` | Address seen by peers (may differ behind NAT) |
-| `RTTMillisecond` | uint64 | `200` | Estimated round-trip time (ms). LAN: 1-5, WAN: 100-300 |
-| `DeploymentID` | uint64 | (required) | Cluster isolation token. Prevents cross-cluster traffic |
+| `RaftAddress` | string | (required) | Address seen by peers (may differ from `ListenAddress` behind NAT). `Validate` rejects an empty value |
+| `RTTMillisecond` | uint64 | `200` | Estimated round-trip time (ms). LAN: 1-5, WAN: 100-300. Capped at 60000 |
+| `DeploymentID` | uint64 | (required, must be > 0) | Cluster isolation token. Prevents cross-cluster traffic |
 | `NumWorkers` | uint64 | `runtime.NumCPU()` | Workers per tier (step, commit, apply) |
 | `MaxApplyWorkers` | int | `runtime.NumCPU()` | Max concurrent per-shard apply goroutines |
 | `CommitCBufferSize` | int | `64` | Commit channel buffer depth |
 | `ShutdownTimeout` | Duration | `30s` | Max wait for graceful drain on Close() |
 | `MaxWALDiskSize` | uint64 | `0` (unlimited) | WAL directory size limit in bytes |
-| `MaxApplyRetries` | uint64 | `100` | SM.Apply circuit breaker threshold |
+| `NoSyncWAL` | bool | `false` | Skip fsync after WAL writes. **Testing only — this discards Raft's durability guarantee** |
 | `MaxTotalInMemLogSize` | uint64 | `0` (disabled) | Global rate limiter threshold (bytes) |
 | `AllowZeroDeploymentID` | bool | `false` | Allow unset DeploymentID (unsafe in production) |
 | `NotifyCommit` | bool | `false` | Fire OnCommit callbacks |
 | `HostID` | string | (auto-generated) | Unique host identifier (empty = generate on first boot) |
 | `EventListener` | *EventListener | `nil` | Callback handlers |
 | `TransportConfig` | TransportConfig | (required for multi-node) | QUIC transport configuration |
-| `KeyRotationInterval` | Duration | `0` (disabled) | Auto barrier epoch rotation interval. Recommended: 24h |
-| `MaxRetainedEpochs` | uint64 | `0` (retain all) | Barrier epochs to retain after compaction |
+| `KeyRotationInterval` | Duration | `0` (disabled) | Auto barrier epoch rotation interval. A non-zero value must be >= 1s. Recommended: 24h |
+| `MaxRetainedEpochs` | uint64 | `0` (retain all) | Barrier epochs to retain after compaction. `Validate` warns when key rotation is on and this is 0 |
 | `LogConfig` | LogConfig | text/info | Format: text/json, Level: debug/info/warn/error |
 
 ### Config (per-shard)
@@ -145,30 +170,42 @@ Source: `pkg/config/config.go`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `ShardID` | uint64 | (set by StartShard) | Shard identifier (caller-provided) |
-| `ReplicaID` | uint64 | (set by StartShard) | Replica identifier (caller-provided) |
+| `ShardID` | uint64 | (required, > 0) | Shard identifier (caller-provided) |
+| `ReplicaID` | uint64 | (required, > 0, <= MaxUint32) | Replica identifier (caller-provided) |
 | `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Join-only: never list it in the `StartShard` members map — see below |
 | `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only). Join-only: never list it in the `StartShard` members map — see below |
+| `Witness` | WitnessConfig | zero | Bootstrap seed for the shard's replicated witness policy. After bootstrap the policy lives in `proto.Membership` |
+| `MemberIdentities` | map[uint64]string | `nil` | Bootstrap seed for committed node identities. **Every founder must pass an identical map** |
 | `CheckQuorum` | *bool | `nil` = enabled | Leader steps down on quorum loss (safety-critical). Set with `config.BoolPtr(false)` to disable |
 | `PreVote` | *bool | `nil` = enabled | Pre-vote prevents disruptive elections (safety-critical). Set with `config.BoolPtr(false)` to disable |
 | `ElectionRTT` | uint64 | `10` | Election timeout in RTT multiples (must be >= 5) |
 | `HeartbeatRTT` | uint64 | `1` | Heartbeat interval in RTT multiples |
-| `SnapshotEntries` | uint64 | `0` (disabled) | Entries between auto-snapshots |
+| `SnapshotEntries` | uint64 | `100000` | Entries between auto-snapshots. **Zero does NOT disable it** — assign `config.SnapshotsDisabled` for manual-only |
 | `CompactionOverhead` | uint64 | `5000` | Entries retained after compaction |
 | `MaxInMemLogSize` | uint64 | `0` (disabled) | Per-shard in-memory log rate limit (bytes) |
-| `MaxProposalPayloadSize` | uint64 | `8 MB` | Max individual proposal size |
-| `MaxEntrySize` | uint64 | `8 MB` | Max entry size in log |
-| `MaxApplyEntrySize` | uint64 | `16,711,672` (~15.9 MiB) | Max batch size per SM.Update call (replication chunk size) |
-| `MaxSnapshotSize` | uint64 | `4 GB` | Max snapshot file size |
-| `MaxSessionsPerClient` | uint64 | `128` | Cached responses retained per session (bootstrap seed; replicated) |
+| `MaxProposalPayloadSize` | uint64 | `8388608` (8 MiB) | Max individual proposal size |
+| `MaxEntrySize` | uint64 | `8388608` (8 MiB) | Max entry size in log |
+| `MaxApplyEntrySize` | uint64 | `16711672` (~15.94 MiB) | Max batch size per SM.Update call (replication chunk size). Cannot exceed `config.MaxReplicationPayloadBytes` |
+| `MaxSnapshotSize` | uint64 | `4294967296` (4 GiB) | Max snapshot file size |
+| `MaxSessionsPerClient` | uint64 | `128` | Cached responses retained per session, despite the name (bootstrap seed; replicated) |
 | `MaxTotalSessions` | uint64 | `16384` | Per-shard total session limit (bootstrap seed; replicated) |
+| `MaxSessionsPerOwner` | uint64 | `128` | Concurrent sessions one embedder-supplied `OwnerID` may hold. `config.SessionsPerOwnerUnlimited` disables (bootstrap seed; replicated) |
 | `SnapshotCompressionType` | CompressionType | `NoCompression` | Snapshot compression: `NoCompression` or `Snappy` |
 | `EntryCompressionType` | CompressionType | `NoCompression` | Entry compression: `NoCompression` or `Snappy` |
 | `Quiesce` | bool | `false` | Quiescence for idle shards |
 | `OrderedConfigChange` | *bool | `nil` = enabled | Serialize membership changes (required for safety). Set with `config.BoolPtr(false)` to disable |
 | `ZeroCopyEntryCmd` | bool | `false` | Zero-copy entry data (SM must copy if retained) |
-| `SessionExpiryEntries` | uint64 | `100000` | Bootstrap seed for the shard's replicated expiry threshold; `config.SessionExpiryDisabled` turns expiry off |
+| `SessionExpiryEntries` | uint64 | `100000` | Bootstrap seed for the shard's replicated expiry threshold; `config.SessionExpiryDisabled` turns expiry off. A non-zero value must be >= 100 |
 | `LeaseRead` | bool | `false` | Lease-based reads (no heartbeat RTT, requires CheckQuorum) |
+| `DataDir` | string | `""` | Per-shard data directory. Empty puts the shard under the host's `NodeHostDir`; a non-empty value must be absolute. Recorded in the bootstrap record and used by `ImportSnapshot` |
+
+Three fields use a sentinel rather than zero to mean "off", because an unset
+field cannot mean both "I did not choose" and "never do this":
+`SnapshotEntries` → `config.SnapshotsDisabled`, `SessionExpiryEntries` →
+`config.SessionExpiryDisabled`, `MaxSessionsPerOwner` →
+`config.SessionsPerOwnerUnlimited`. All three sentinels are `math.MaxUint64`.
+Leaving any of them zero selects the default in the table, not the disabled
+behaviour.
 
 #### Starting a witness or an observer
 
@@ -182,7 +219,11 @@ metadata-only stripping), it counts as a full replica for
 `RequireFullReplicaMajority` and toward every quorum, it consumes full-replica
 disk, and the only witness-like behaviour left is this host refusing the reads
 you wanted it to serve. `StartShard` rejects that shape with
-`*NonVotingRoleInMembersError`.
+`*NonVotingRoleInMembersError` (sentinel `ErrNonVotingRoleInMembers`).
+
+The check applies to a **first start only**. On a restart the membership is
+reconstructed from the log, so the committed configuration governs and the local
+`IsWitness` / `IsObserver` bit is not re-validated against the passed map.
 
 Use the two-step flow:
 
@@ -199,21 +240,26 @@ Source: `pkg/config/transportconfig.go`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `MTLSConfig` | *MTLSConfig | (required) | Mutual TLS certificates and key |
+| `MTLSConfig` | *MTLSConfig | (required unless `TransportDisabled`) | Mutual TLS certificates and key |
 | `RevocationConfig` | *RevocationConfig | `nil` | Optional CRL/OCSP certificate revocation checks |
 | `StreamPoolSize` | int | `16` | QUIC streams per connection |
 | `MaxStreamPoolSize` | int | `256` | Upper bound for stream pool auto-scaling |
-| `MaxSnapshotReceiveRate` | int64 | `256 MB/s` | Inbound snapshot bandwidth per connection |
+| `MaxStreamsPerConnection` | int | `256` | Peer-facing cap on concurrent streams per QUIC connection |
+| `StreamReadIdleTimeout` | Duration | `30s` | Idle timeout on a stream read before it is abandoned |
+| `MaxSnapshotReceiveRate` | int64 | `268435456` (256 MiB/s) | Inbound snapshot bandwidth per connection |
 | `MaxConcurrentSnapshotReceives` | int | `4` | Concurrent inbound snapshot streams |
-| `MaxSnapshotReceiveMemory` | int64 | `1 GB` | Total snapshot receive buffer |
-| `MaxDecompressedSize` | uint32 | `16 MB` | Max Snappy decompressed frame size; pinned — must equal the frame size or startup fails |
+| `MaxSnapshotReceiveMemory` | int64 | `1073741824` (1 GiB) | Total snapshot receive byte budget |
+| `MaxMessageReceiveMemory` | int64 | `268435456` (256 MiB) | Total in-flight inbound message byte budget |
+| `MaxDecompressedSize` | uint32 | `16777216` (16 MiB) | Max Snappy decompressed frame size; pinned — `Validate` requires exact equality with the default, so it is not tunable |
 | `MaxConnectionsPerIP` | int | `16` | Per-source-IP connection limit |
 | `MaxIncomingConnections` | int | `256` | Total inbound connection limit |
-| `SendBatchMaxSize` | int | `64 KB` | Max send buffer size before flush |
-| `UDPRecvBufSize` | int | `7 MB` | UDP receive socket buffer size |
-| `UDPSendBufSize` | int | `7 MB` | UDP send socket buffer size |
+| `SendBatchMaxSize` | int | `65536` (64 KiB) | Max send buffer size before flush |
+| `UDPRecvBufSize` | int | `7340032` (7 MiB) | UDP receive socket buffer size |
+| `UDPSendBufSize` | int | `7340032` (7 MiB) | UDP send socket buffer size |
 | `Enable0RTT` | bool | `false` | QUIC 0-RTT (replayable; trusted networks only) |
 | `DisableCompression` | bool | `false` | Disable message batch compression |
+| `TransportDisabled` | bool | `false` | Single-node mode. Set by `WithoutTransport()`; relaxes the mTLS requirement |
+| `RequireMemberIdentity` | bool | `false` | Drop quorum-bearing traffic from members with no committed node identity. See [Compatibility](compatibility.md#enabling-requirememberidentity) before enabling |
 
 ### MTLSConfig
 
@@ -221,36 +267,54 @@ Source: `pkg/config/transportconfig.go`
 
 ```go
 type MTLSConfig struct {
-    CACert []byte  // PEM-encoded CA certificate
-    Cert   []byte  // PEM-encoded node certificate
-    Key    []byte  // PEM-encoded private key
+    CACert      []byte           // PEM-encoded CA certificate (always required)
+    Cert        []byte           // PEM-encoded node certificate
+    Key         []byte           // PEM-encoded private key
+    Certificate *tls.Certificate // Pre-built leaf, as an alternative to Cert/Key
 }
 ```
 
-All three fields are required for multi-node deployments. QuicRaft enforces mutual TLS with certificate verification on both client and server sides. See [Encryption](../security/encryption.md) for key management workflows.
+`CACert` is always required and must parse. Supply the leaf either as
+`Cert`+`Key` PEM or as a pre-built `Certificate`; when `Certificate` is set,
+`Cert` and `Key` may be empty and its `PrivateKey` must satisfy
+`crypto.Signer`. The `Certificate` form is what a deployment backed by an HSM or
+a KMS uses, since the private key never becomes PEM.
+
+QuicRaft enforces mutual TLS with certificate verification on both client and
+server sides. **There is no TCP fallback and no unauthenticated mode**: a
+multi-node host without a usable `MTLSConfig` fails `Validate` and never starts.
+See [Encryption](../security/encryption.md) for key management workflows.
 
 ### RevocationConfig (optional)
 
 ```go
 type RevocationConfig struct {
-    CRLPaths           []string      // Paths to CRL files
-    OCSPResponderURL   string        // OCSP responder endpoint
-    OCSPCacheSeconds   int           // Default: 300
-    OCSPTimeoutSeconds int           // Default: 5
-    CheckInterval      time.Duration // Default: 60s
-    Mode               string        // "crl"/"ocsp"/"both"/"any"
-    AllowSoftFail      bool          // ADMIT peers whose status is unknown (default false)
-    OnCertRevoked      func(...)     // Callback when cert is revoked
+    CRLPaths           []string           // Paths to CRL files
+    OCSPResponderURL   string             // OCSP responder endpoint
+    OCSPCacheSeconds   int                // 0 -> 300
+    OCSPTimeoutSeconds int                // 0 -> 5
+    CheckInterval      time.Duration      // 0 -> 60s
+    Mode               string             // "" (= "any") / "crl" / "ocsp" / "both" / "any"
+    AllowSoftFail      bool               // ADMIT peers whose status is unknown (default false)
+    OnCertRevoked      func(serial string) // Callback; serial is lowercase hex
 }
 ```
 
-Enables certificate revocation checking via CRL and/or OCSP. Optional; used only if present.
+Enables certificate revocation checking via CRL and/or OCSP. Optional; used only
+if present.
+
+`Mode` defaults to `"any"` when left empty, and any other unrecognised value is
+rejected by `Validate`. `"crl"` and `"both"` require a non-empty `CRLPaths`;
+`"ocsp"` and `"both"` require `OCSPResponderURL`. The three numeric zero values
+are **not** filled in by `pkg/config` — they are substituted inside the
+transport's revocation checker, so reading them back from your `HostConfig` will
+still show zero.
 
 **Operational behavior:**
 
 - **Leaf-only checks:** Only the peer's leaf (end-entity) certificate is revocation-checked, not the full presented chain. The leaf is what gets revoked when a node is decommissioned or compromised; the CA chain is governed by the CA's own lifecycle. This avoids per-handshake OCSP latency for rarely-changing intermediate/root certificates. Checks run via the TLS `VerifyConnection` callback, so they also apply to resumed TLS sessions.
 - **OCSP negative cache:** When an OCSP responder is unreachable (down, timeout, network error), the failure is cached for a short 10 s window. During that window, reconnect handshakes do not re-query the dead responder, so they avoid adding the full `OCSPTimeoutSeconds` to every handshake while the responder is down. The negative cache only suppresses re-queries — it never reports a cert as "good" or "revoked" — and its TTL is far shorter than the positive-result cache (`OCSPCacheSeconds`, default 300 s), so the responder is retried promptly once it recovers.
-- **Fail-closed by default:** peers are rejected when revocation status cannot be determined (responder down, CRL stale or unreadable, no revocation source configured). The knob is `AllowSoftFail`, and its zero value (`false`) is the fail-closed posture — a `RevocationConfig` you never touch enforces revocation. Setting `AllowSoftFail: true` inverts that and admits unknown-status peers, so an attacker whose certificate was revoked can keep connecting by making the responder appear unreachable. A definitive "revoked" verdict rejects either way. (There is an `EnforceRevocation` field on the transport's internal `revocation.Config`, derived as `!AllowSoftFail`; it is not settable from `pkg/config`.)
+- **Fail-closed by default:** peers are rejected when revocation status cannot be determined (responder down, CRL stale or unreadable, no revocation source configured). The knob is `AllowSoftFail`, and its zero value (`false`) is the fail-closed posture — a `RevocationConfig` you never touch enforces revocation. Setting `AllowSoftFail: true` inverts that and admits unknown-status peers, so an attacker whose certificate was revoked can keep connecting by making the responder appear unreachable. A definitive "revoked" verdict rejects either way. (The transport's internal `revocation.Config` carries an `AllowSoftFail` field of the same sense, which the host copies across; a zero-valued internal config enforces too, so the fail-closed posture does not depend on the mapping.)
 
 ## Monitoring
 
@@ -390,7 +454,12 @@ Status resolution order:
 3. `"degraded"` -- any shard has `ShardError` health (503)
 4. `"ok"` -- all shards healthy (200)
 
-Per-shard health values: `healthy`, `no-leader`, `lagging`, `unloaded`, `error`.
+Per-shard health values (`ShardHealth`, `pkg/info.go:24`): `healthy`,
+`no-leader`, `lagging`, `unloaded`, `error`, `recovering`, `snapshotting`. Only
+`error` contributes to a `degraded` host status.
+
+`ShardHealth.UnmarshalJSON` decodes an unrecognised string to `healthy` rather
+than erroring, so do not round-trip health through JSON to detect a typo.
 
 ### EventListener Callbacks
 
@@ -404,14 +473,16 @@ cfg.EventListener = &config.EventListener{
     OnLeaderUpdated:      func(info config.LeaderInfo) { /* ... */ },
     OnLeaderLost:         func(info config.EventShardInfo) { /* ... */ },
     OnCampaignLaunched:   func(info config.EventShardInfo) { /* ... */ },
-    OnCampaignSkipped:    func(info config.EventShardInfo) { /* ... */ },
 
     // Snapshot operations
-    OnSnapshotCreated:    func(info config.SnapshotInfo) { /* ... */ },
-    OnSnapshotSent:       func(info config.SnapshotInfo) { /* ... */ },
-    OnSnapshotReceived:   func(info config.SnapshotInfo) { /* ... */ },
-    OnSnapshotRecovered:  func(info config.SnapshotInfo) { /* ... */ },
-    OnSnapshotRejected:   func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotCreated:     func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotSendStarted: func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotSent:        func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotSendAborted: func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotReceived:    func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotRecovered:   func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotRejected:    func(info config.SnapshotInfo) { /* ... */ },
+    OnSnapshotCompacted:   func(info config.SnapshotInfo) { /* ... */ },
 
     // System events
     OnNodeHostShuttingDown: func() { /* ... */ },
@@ -435,14 +506,32 @@ cfg.EventListener = &config.EventListener{
 }
 ```
 
-`config.EventListener` is a **struct of optional func fields**, not an
+`config.EventListener` is a **struct of 26 optional func fields**, not an
 interface: set only the callbacks you need and leave the rest nil. Only
-non-nil callbacks are invoked.
+non-nil callbacks are invoked. `OnNodeHostShuttingDown` is the only one that
+takes no argument.
+
+> **`OnCampaignSkipped` is declared but never fires. Do not build on it.**
+> The field exists on `config.EventListener`, the plumbing behind it is
+> complete, and nothing ever calls it: `git grep -n OnCampaignSkipped -- pkg/`
+> returns the interface declaration, the `hostEngineCallback` implementation,
+> and test doubles. There is no production call site.
+>
+> It is left out of the example above because of *which* conditions it claims
+> to report. Every campaign-refusal branch in `startElection` and
+> `handleTimeoutNow` (`pkg/internal/raft/raft.go:1568+`) logs and returns
+> without notifying the engine — `selfRemoved`, `roleMismatch`, `joining`, an
+> unresolved stale config tail, and an unreadable own-log term. Those are
+> precisely the states that leave a shard leaderless while quorum looks intact.
+> Wiring this listener buys silence during the incident it appears to explain.
+>
+> Detect those conditions from the logs and from `ShardInfo` (`Health`
+> reaching `no-leader` with no `elections_total` increment) instead.
 
 Most shard-scoped callbacks share one payload type, `config.EventShardInfo`
-(`ShardID`, `ReplicaID`, `LeaderID`, `Term`). There is no per-event info
-type for membership changes, proposal drops or read-index drops. The
-specialized payloads are:
+(`ShardID`, `ReplicaID`, `LeaderID`, `Term`; `LeaderID` is 0 when no leader is
+known). There is no per-event info type for membership changes, proposal drops
+or read-index drops. The specialized payloads are:
 
 | Type | Fields |
 |------|--------|
@@ -451,6 +540,10 @@ specialized payloads are:
 | `config.ShardFailedInfo` | `ShardID`, `ReplicaID`, `Err` |
 | `config.DiskInfo` | `WALDir`, `UsedBytes`, `MaxBytes`, `Shards` |
 | `config.ConnectionInfo` | `Address`, `Err` |
+
+`config.LeaderInfo` and `config.EventShardInfo` carry the same four field names
+in a different declaration order, so construct them with field names rather than
+positionally.
 
 Callbacks are invoked **synchronously on engine worker goroutines and must
 not block.** In particular they run outside the per-node `raftMu`, and code
@@ -587,7 +680,40 @@ Source: `pkg/config/config.go`, `pkg/internal/rsm/statemachine.go`
 
 Client sessions provide at-most-once delivery semantics. Sessions are registered and unregistered through Raft proposals (not local-only), ensuring all replicas agree on the set of active sessions.
 
-**Session limits:** `MaxTotalSessions` (default 16384) limits the number of sessions a shard admits; a registration past it is rejected with `ErrSessionLimitExceeded`. `MaxSessionsPerClient` (default 128) does NOT limit sessions despite its name — it is the depth of the per-session response cache, and an over-limit response is rejected with `ErrResponseLimitExceeded`. Both are bootstrap seeds for the shard's REPLICATED session policy, not per-node settings: see the note below.
+**Session limits.** Three replicated limits, none of which means quite what its
+name suggests:
+
+| Field | Default | What it actually bounds |
+|---|---|---|
+| `MaxTotalSessions` | 16384 | Sessions a shard admits, shard-wide. Over-limit registration is rejected with `ErrSessionLimitExceeded` |
+| `MaxSessionsPerClient` | 128 | **Not a session count.** The depth of the per-session response cache; an over-limit response is rejected with `ErrResponseLimitExceeded` |
+| `MaxSessionsPerOwner` | 128 | Concurrent sessions one embedder-supplied `OwnerID` may hold. Over-limit yields a `*SessionError` wrapping `ErrInvalidOperation` |
+
+All three are bootstrap seeds for the shard's REPLICATED session policy, not
+per-node settings: see the note below.
+
+**Owner-scoped sessions.** `MaxTotalSessions` alone lets one embedder exhaust a
+shard's whole session table, so sessions can be attributed to an owner:
+
+```go
+// Owner-scoped: counts against MaxSessionsPerOwner for ownerID.
+session, err := host.GetNewSessionWithOwner(ctx, shardID, ownerID)
+
+// Unowned: no owner declared, so no per-owner cap applies.
+session, err := host.GetNewSession(ctx, shardID)
+```
+
+The library **cannot derive** an `OwnerID` — it authenticates nodes, not
+clients — so its trustworthiness is entirely yours. Use a tenant ID, an account
+number, or a hash of an authenticated subject. An `OwnerID` of 0 means "no owner
+declared" and is exempt from the cap, so a deployment that wants the cap
+enforced must supply a non-zero owner on every session it opens. The value is
+immutable after construction, stamped into the replicated register entry as
+`proto.Entry.OwnerID`, and the cap is enforced by the deterministic apply path
+on every replica rather than as a leader-local admission decision.
+
+On an `sm.DiskStateMachine` shard, every session form except `GetNoOPSession`
+returns `ErrSessionsUnsupportedOnDisk`.
 
 **Automatic session expiry:** `SessionExpiryEntries` controls deterministic cleanup of abandoned sessions. Sessions that have not been active within this many applied log entries are expired during the apply path. Expiry is driven by log index, not wall-clock time, and the threshold is replicated, so every replica expires the same sessions at the same point in the log. The default is 100,000 entries.
 
@@ -597,13 +723,13 @@ shardCfg := config.Config{
 }
 ```
 
-> **The three session limits are REPLICATED, and the `Config` fields are only the bootstrap seed.** `SessionExpiryEntries`, `MaxTotalSessions` and `MaxSessionsPerClient` all drive the deterministic apply path — the expiry checkpoints are multiples of the threshold, registrations are refused past `MaxTotalSessions`, and the response cache is bounded by `MaxSessionsPerClient` — so two replicas evaluating different values expire different sessions or disagree on whether a session exists at all. One then answers a session-managed proposal from its response cache while the other reports the session expired: a permanent state-machine divergence that no Raft invariant detects, because the log, the commit index and the applied index are identical on both sides.
+> **The four session limits are REPLICATED, and the `Config` fields are only the bootstrap seed.** `SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient` and `MaxSessionsPerOwner` all drive the deterministic apply path — the expiry checkpoints are multiples of the threshold, registrations are refused past `MaxTotalSessions`, and the response cache is bounded by `MaxSessionsPerClient` — so two replicas evaluating different values expire different sessions or disagree on whether a session exists at all. One then answers a session-managed proposal from its response cache while the other reports the session expired: a permanent state-machine divergence that no Raft invariant detects, because the log, the commit index and the applied index are identical on both sides.
 >
 > A founding replica therefore writes all three into the shard's initial membership, and every replica applies the committed values. What this means operationally:
 >
 > - **All founders must supply the same values.** A differing value produces a different index-1 entry, exactly as it does for the witness policy.
 > - **A node whose configuration disagrees with its shard applies the shard's values** and logs the disagreement at WARN, naming both. It does not refuse to start: the committed value can only be changed through consensus, so refusing would strand the node. Grep for `applying the shard's replicated session policy` after a config change to see whether a node's edit actually took effect.
-> - **`Host.GetShardMembership` reports the committed policy** (`SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`), which is the value that governs.
+> - **`Host.GetShardMembership` reports the committed policy** (`SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`, `MaxSessionsPerOwner`), which is the value that governs.
 > - **There is no config change for these yet.** The committed policy is fixed for the life of the shard, so `MaxTotalSessions` cannot be raised on a running shard. Size it at bootstrap.
 > - **A shard bootstrapped by an earlier build carries no policy** and its replicas keep using local configuration; for those shards the old rule — set the values identically on every replica, and nothing enforces it — still applies.
 
@@ -709,20 +835,40 @@ newEpoch, err := barrier.Rotate()
 After compaction removes old WAL segments and snapshots, purge their DEKs:
 
 ```go
-barrier.PurgeEpochsBefore(minEpoch)
+purged, err := barrier.PurgeEpochsBefore(minEpoch) // returns the count purged
 ```
 
-Epochs with in-flight snapshot transfers (registered via `RegisterInFlightEpoch`) are protected from purging. The current epoch is never purged.
+Epochs with in-flight snapshot transfers (registered via `RegisterInFlightEpoch`)
+are protected from purging. The current epoch is never purged.
+
+**Get `minEpoch` wrong and the data is gone.** Purging the key that decrypts a
+snapshot still on disk makes that snapshot permanently unreadable, and nothing
+detects it until a recovery tries. The floor scan walks the snapshot tree, so an
+imported snapshot outside that tree is invisible to it — which is why
+`ImportSnapshot` refuses to guess a layout rather than writing somewhere the
+scan will not look. See
+[Disaster recovery](#disaster-recovery-importing-a-snapshot).
 
 ### Emergency Seal
 
 For security incident response, immediately seal the barrier to make all at-rest data inaccessible:
 
 ```go
-host.EmergencySeal()
+if err := host.EmergencySeal(); err != nil {
+    slog.Error("emergency seal failed", "err", err)
+}
 ```
 
-All in-flight operations fail with `ErrBarrierSealed`. Normal shutdown via `Host.Close()` seals the barrier automatically after draining the pipeline.
+All in-flight operations fail with `ErrBarrierSealed`, including a snapshot save
+that was already in progress. Normal shutdown via `Host.Close()` seals the
+barrier automatically after draining the pipeline; `EmergencySeal` skips the
+drain, which is the point.
+
+`Host` exposes no unseal counterpart — only `IsSealed()` to observe the state.
+The embedder still holds the `*seal.Barrier` it passed to `WithBarrier`, so
+recovery goes through that object's `Unseal`, which needs the strategy and
+credentials again. Keep them reachable by whatever runs your incident response,
+or the seal is one-way until a restart.
 
 ## Graceful Shutdown
 
@@ -867,7 +1013,12 @@ Each also has an identity-carrying variant that commits the replica's stable
 cryptographic node identity alongside its address --
 `RequestAddNodeWithIdentity`, `RequestAddObserverWithIdentity`,
 `RequestAddWitnessWithIdentity` -- taking `(ctx, shardID, replicaID, addr,
-identity string, configChangeIndex uint64)`.
+identity string, configChangeIndex uint64)`. Obtain the identity from the target
+host's `Host.NodeIdentity()`.
+
+Only the node form has a synchronous identity variant
+(`SyncRequestAddNodeWithIdentity`). For observers and witnesses, use the async
+form and wait on the returned `*RequestState`.
 
 Note the asymmetric naming: the async remove is `RequestRemoveNode`, while
 the synchronous form is `SyncRequestDeleteNode`. There is no
@@ -924,8 +1075,15 @@ aliasing with internal state. Its fields:
 | `SessionExpiryEntries` | `uint64` | Replicated session expiry threshold |
 | `MaxTotalSessions` | `uint64` | Replicated cap on registered sessions |
 | `MaxSessionsPerClient` | `uint64` | Replicated cap on cached responses per session |
+| `MaxSessionsPerOwner` | `uint64` | Replicated cap on concurrent sessions per `OwnerID` |
 | `Identities` | `map[uint64]string` | Committed node identity per replica (sparse) |
-| `RemovedIdentities` | `map[uint64]string` | Identity each removed replica held at removal |
+
+`ConfigChangeIndex()` is a method returning the `ConfigChangeID` field; the
+field and the accessor differ by one word, which is easy to mistype.
+
+The public `Membership` does **not** expose `RemovedIdentities`. That map exists
+in the wire and persisted `proto.Membership` and drives the removal deny-list,
+but the host-level view does not surface it.
 
 The witness and session policy fields are exposed so an operator can read
 what a shard actually **committed**, rather than what any one node happens to
@@ -984,7 +1142,7 @@ Increase `ElectionRTT` if experiencing spurious elections due to GC pauses or di
 
 **`MaxTotalInMemLogSize` (global):** When total in-memory log size across all shards exceeds this threshold, the global rate limiter rejects `Propose()` with `ErrSystemBusy`. Set to 0 (default) to disable.
 
-**`MaxApplyRetries`:** Circuit breaker threshold for `SM.Apply()` failures. If a shard's state machine consistently fails to apply entries, after this many consecutive failures, the shard transitions to error state and is no longer available. Default: 100.
+**Apply failures are not tunable.** There is no apply-retry setting: the apply path is unconditionally fail-fast, so the first `SM.Apply()` error fails the shard, with no retry and no consecutive-failure threshold. A `MaxApplyRetries` field existed through 0.5.1-alpha and never had any effect; it was removed. See [Lifecycle](lifecycle.md#error-handling-and-shard-failure).
 
 ### Compression
 
@@ -1001,7 +1159,16 @@ The transport layer also compresses message batches with Snappy. Compression is 
 
 ### Snapshot Tuning
 
-**`SnapshotEntries`:** Number of applied entries between auto-snapshots. Set to 0 to rely on manual snapshots only. When non-zero, must be greater than `CompactionOverhead`. A typical production value is 100000-1000000 depending on entry size.
+**`SnapshotEntries` (100000 default):** Applied entries between auto-snapshots.
+Must be greater than `CompactionOverhead`. A typical production value is
+100000-1000000 depending on entry size.
+
+**Zero does not disable it.** An unset field is read as "I did not choose" and
+gets the 100000 default, because never compacting the log is not a default any
+Raft deployment survives — and in this implementation it additionally stops
+snapshot directories being reclaimed, old epoch keys being purged, and the
+at-rest barrier ever being invoked. Assign `config.SnapshotsDisabled` to take
+responsibility for calling `Host.RequestSnapshot` yourself.
 
 **`CompactionOverhead` (5000 default):** Entries retained after log compaction for slow follower catch-up. Increase if followers frequently need snapshot transfers due to truncated logs.
 
@@ -1033,46 +1200,68 @@ Enable `LeaseRead: true` on a shard config to use lease-based reads (PhD 6.4 opt
 
 ## Build and CI
 
-Source: `Makefile`, `.github/workflows/ci.yml`
+Source: `Makefile`, `.github/workflows/`
 
-The Makefile `ci` target is the single source of truth for the CI pipeline. The GitHub Actions workflow mirrors this exact sequence:
+The Makefile is the single source of truth; the workflows call the same targets.
+There are two gates, and the difference between them matters:
 
 ```
-fmt → vet → lint → gosec → vuln → trivy → build → test
+make ci       = fmt → no-mutants → vet → lint → security → build → test
+make ci-full  = ci → ci-modules → ci-errfs → ci-fuzz-seeds
+                   → ci-fuzz-mutation → ci-integration → ci-netfault
 ```
 
-### Running Locally
+**`make ci` proves less than it looks like it proves.** Its `test` step is
+`go test ./...` with no build tags, and the Go toolchain does not warn when a
+build constraint excludes a file — it just compiles a smaller program. That
+quietly skipped the integration tests, the errfs fault-injection tests and every
+fuzz target, and computed the coverage threshold over what was left. `ci-full`
+is what `.github/workflows/ci.yml` runs and what a release must pass.
+
+`make no-mutants` sits inside `ci` for a related reason: a mutation-testing edit
+(`if false` around a durability fsync) once reached a commit with every suite
+green, because an unrestored mutation makes tests pass rather than fail.
+
+### Running locally
 
 ```bash
-# Full pipeline in devcontainer (recommended):
-make ci
-
-# Full pipeline on host (requires tools installed):
-make ci-local
-
-# Install all CI tools:
+make ci          # the cheap gate
+make ci-full     # everything, including integration and fuzz
 make install-tools
 ```
 
-### Security Scanners
+Heavyweight targets under `-race` stand up multi-node QUIC clusters and will
+flake on a workstation that is also running editors and browsers — the 30-second
+catch-up waits in the snapshot tests are the usual casualty, and the failures
+look like Raft defects. Offload them:
 
-| Tool | Target | Description |
+```bash
+make remote-ci-full      # run the full gate on the designated spare host
+make remote-<target>     # any target, run there instead of here
+```
+
+### Security scanners
+
+`make security` runs `gosec`, `govulncheck`, `go mod verify` and `trivy fs`.
+
+| Target | Tool | Scope |
 |---|---|---|
-| `gosec` | `make gosec` | Go source security analysis (SARIF output in CI) |
-| `govulncheck` | `make vuln` | Stdlib and dependency vulnerability check |
-| `trivy` | `make trivy` | Filesystem scan for CRITICAL/HIGH vulnerabilities |
-| `trivy-image` | `make trivy-image` | Docker image scan |
-| `golangci-lint` | `make lint` | Comprehensive Go linter suite (5m timeout) |
+| `make gosec` | gosec | Go source security analysis. Deliberately scans more than the CI job does |
+| `make vuln` | govulncheck | Stdlib and dependency vulnerabilities |
+| `make modverify` | `go mod verify` | Module integrity against `go.sum`, before any scanner reads the cache |
+| `make trivy` | Trivy | Filesystem scan for CRITICAL/HIGH |
+| `make nancy` | Nancy | Dependency vulnerability cross-check |
+| `make trivy-image` | Trivy | Container image scan. **Not** part of `security` — run it separately |
+| `make security-sarif` | gosec | SARIF output for CI upload |
+| `make lint` | golangci-lint | Linter suite (5m timeout) |
 
-gosec exclusions are documented in the Makefile header. All TLS connections use verified mTLS.
+gosec exclusions are documented in the Makefile header. All TLS connections use
+verified mTLS.
 
 ### Docker CI Image
 
-The CI Dockerfile (`.devcontainer/Dockerfile.dev`) pre-installs:
-- golangci-lint v2.7.2
-- gosec (latest)
-- govulncheck (latest)
-- Trivy (latest)
+The CI Dockerfile (`.devcontainer/Dockerfile.dev`) pre-installs golangci-lint
+v2.7.2 (pinned), plus gosec, govulncheck, nancy and Trivy at `@latest`.
 
 ## FIPS 140 Build
 
@@ -1106,8 +1295,14 @@ A version byte is stored in the sealed metadata so that data sealed with one KDF
 
 ## Cross-References
 
+- [Lifecycle](lifecycle.md) -- startup, shard init, crash recovery, shutdown, quorum-loss runbook
+- [Compatibility and Upgrades](compatibility.md) -- format versions, upgrade paths, node identities
 - [Architecture](../architecture/overview.md) -- system overview, data flow, package structure
 - [WAL Persistence](../storage/wal.md) -- WAL format, segments, compaction
 - [Engine Pipeline](../engine/pipeline.md) -- step/commit/apply workers
 - [Transport](../transport/quic.md) -- QUIC transport, connection management
 - [Encryption](../security/encryption.md) -- barrier internals, key derivation, ciphertext format
+- [Key custody](../security/key-custody.md) -- sealing strategies and where custody lives
+- [Sessions](../sessions/deduplication.md) -- at-most-once delivery, session tables
+- [Raft protocol](../raft/protocol.md) -- elections, replication, snapshot control
+- [API reference](../api/reference.md) -- full exported surface

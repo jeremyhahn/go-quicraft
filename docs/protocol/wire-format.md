@@ -11,9 +11,11 @@ generation. The design priorities are:
   (stored as `uint64` 0 or 1). This eliminates branching during decode and
   makes field offsets statically known for fixed-header types.
 
-- **Zero-copy where possible** -- `Entry.Cmd` aliases the source buffer
-  after `UnmarshalFrom`. The caller must copy before returning the buffer
-  to a pool (the transport receive path does this).
+- **Zero-copy where possible** -- `Entry.Cmd`, `SnapshotChunk.Data` and
+  `SnapshotFile.Metadata` alias the source buffer after `UnmarshalFrom`.
+  The caller must copy before returning the buffer to a pool. See
+  [Buffer Ownership Rules](#buffer-ownership-rules) for the lifetime
+  contract each consumer has to honour.
 
 - **Deterministic encoding** -- Go maps have nondeterministic iteration
   order. All map types (`map[uint64]string`, `map[uint64]bool`) are
@@ -22,12 +24,14 @@ generation. The design priorities are:
 
 - **Bounded sizes** -- every variable-length field is validated against a
   hard limit during unmarshal before any allocation occurs. This prevents
-  memory exhaustion from crafted payloads.
+  memory exhaustion from crafted payloads. The same limits are applied on
+  the **write** side, so no type in this package can emit bytes its own
+  decoder refuses.
 
 - **Hand-written codecs** -- every type implements `MarshalTo(buf []byte)
   (int, error)` and `UnmarshalFrom(buf []byte) (int, error)`. No
-  reflection, no code generation, no external dependencies beyond
-  `encoding/binary` and `sort`.
+  reflection, no code generation, no dependencies outside the standard
+  library (`encoding/binary`, `sort`, `math`, `errors`, `fmt`).
 
 Source: `pkg/proto/`
 
@@ -58,6 +62,15 @@ Both use a 4-byte `uint32` length prefix. `getBytes` returns a slice that
 aliases the source buffer. `getString` copies via `string(buf[4:total])`
 because Go strings are immutable.
 
+Both take a `maxLen` and the sentinel to report when the prefix exceeds it,
+so a field reports its own error (`ErrAddressTooLong`, `ErrFilepathTooLong`,
+`ErrMetadataTooLong`, `ErrChunkDataTooLong`) and `errors.Is` discriminates
+per field. `maxLen` is **always** applied: a limit of zero admits only an
+empty payload rather than meaning "unlimited". Both also reject a length
+prefix above `math.MaxInt32` before any narrowing conversion, because
+`int(len)` is negative for those values on a 32-bit platform and would turn
+the bounds check into a slice panic.
+
 ### Map Types
 
 **`map[uint64]string`** (Membership address maps):
@@ -71,7 +84,12 @@ because Go strings are immutable.
 
 Keys are sorted ascending via `sort.Slice`. Count is validated against
 `MaxMembershipEntries` (10,000) and each value length against
-`MaxAddressLength` (256) before allocation during unmarshal.
+`MaxAddressLength` (256) before allocation during unmarshal. The count is
+also cross-checked against the bytes remaining in the buffer
+(`count * mapEntryMinBytes`, where `mapEntryMinBytes` is 12) so a short
+buffer claiming a large count cannot drive the `make()`. A repeated key
+returns `ErrDuplicateMapKey`: `putMap` writes each key exactly once in
+ascending order, so a repeat is a non-canonical encoding.
 
 **`map[uint64]bool`** (Membership removed set):
 
@@ -82,13 +100,17 @@ Keys are sorted ascending via `sort.Slice`. Count is validated against
   ...
 ```
 
-Fixed 16 bytes per entry (key + bool-as-uint64). Keys sorted ascending.
+Fixed 16 bytes per entry (key + bool-as-uint64), `boolMapEntryBytes`. Keys
+sorted ascending, duplicates rejected with `ErrDuplicateMapKey`.
+
+`checkWritableMap` and `checkWritableBoolMap` apply the same count and value
+limits before `putMap`/`putBoolMap` write anything.
 
 ## Entry Wire Format
 
 Source: `pkg/proto/entry.go`
 
-Entry is the fundamental unit of replication. It has a 60-byte fixed header
+Entry is the fundamental unit of replication. It has a 68-byte fixed header
 followed by a variable-length command payload.
 
 ```
@@ -100,10 +122,10 @@ followed by a variable-length command payload.
  +-------------------+-------------------+-------------------+
  |    Key (8)        |   ClientID (8)    |   SeriesID (8)    |
  +-------------------+-------------------+-------------------+
-48                  56  60
- +-------------------+----+-------------------------------...
- | RespondedTo (8)   |CmdL|  Cmd (CmdLen bytes)
- +-------------------+----+-------------------------------...
+48                  56                  64  68
+ +-------------------+-------------------+----+---------------...
+ | RespondedTo (8)   |    OwnerID (8)    |CmdL|  Cmd (CmdLen bytes)
+ +-------------------+-------------------+----+---------------...
 ```
 
 ### Field Offset Table
@@ -117,22 +139,61 @@ followed by a variable-length command payload.
 | 32     | 8    | ClientID    | uint64   | Session client ID                  |
 | 40     | 8    | SeriesID    | uint64   | Session series ID                  |
 | 48     | 8    | RespondedTo | uint64   | Highest responded-to series        |
-| 56     | 4    | CmdLen      | uint32   | Length of Cmd payload              |
-| 60     | N    | Cmd         | []byte   | State machine command (zero-copy)  |
+| 56     | 8    | OwnerID     | uint64   | Principal owning the session (0 = unset) |
+| 64     | 4    | CmdLen      | uint32   | Length of Cmd payload              |
+| 68     | N    | Cmd         | []byte   | State machine command (zero-copy)  |
 
-Total header: `7 * 8 + 4 = 60 bytes`. Total size: `60 + len(Cmd)`.
+Total header: `entryHeaderSize = 8*8 + 4 = 68 bytes`
+(`pkg/proto/entry.go:86`). Total size: `68 + len(Cmd)`.
+
+This is the layout as of 0.5.0-alpha. The header was 60 bytes in 0.4.x, with
+`CmdLen` at offset 56 and no `OwnerID`; a 0.4.x reader given a 0.5.x entry
+reads `OwnerID`'s low four bytes as `CmdLen`. The two releases share no
+on-disk data. See [Compatibility](../operations/compatibility.md).
+
+### OwnerID
+
+`OwnerID` names the principal that owns the session an entry registers -- the
+embedder's tenant, account or connection identity -- and is the key the
+per-owner concurrent-session cap counts against
+(`Membership.MaxSessionsPerOwner`, `session.Manager.Register`).
+
+It rides in the replicated entry rather than being derived at the leader
+because the cap is a state machine decision: every replica has to accept or
+refuse a registration identically from the log alone, and a leader-local fact
+is not in the log and is not available to a replica replaying after a restart.
+
+The value is supplied by the embedder (`Host.GetNewSessionWithOwner`,
+`NewSessionWithOwner`). This library has no notion of who a client is, and a
+`ClientID` is eight bytes the caller chooses, so it cannot serve to group
+sessions by principal. **Zero means unset**, and an unset owner is never
+counted or capped. Only session-registration entries carry a meaningful
+value; no other apply-path branch reads it.
+
+`OwnerID` is not a security boundary on its own -- the value is whatever the
+embedder claims -- so the cap it drives is only as trustworthy as the
+embedder's own authentication.
 
 ### Type Field Encoding
 
 The `Type` field is a uint64 that encodes two pieces of information:
 
-- **Lower 4 bits** (`Type & 0x0F`): the entry type
-- **Bit 4** (`Type & 0x10`): the compression flag
+- **Lower 4 bits** (`Type & EntryTypeMask`, 0x0F): the entry type
+- **Bit 4** (`Type & EntryCompressFlag`, 0x10): the compression flag
 
 ```
   Bit:  63 .......................... 5   4        3   2   1   0
        [           reserved           ] [compress] [  entry type ]
 ```
+
+Bits 5 and above are reserved and must be zero. They are **rejected**, not
+masked away, at both ends: `isValidEntryType` (`pkg/proto/entry.go:110`) is
+called by `MarshalTo` and by `UnmarshalFrom`, and either returns
+`ErrInvalidEntryType` if `Type & entryTypeReservedMask` is non-zero. Masking
+would let a sender attach 59 bits of its own and have the receiver agree to a
+type it read as something else, on an entry that is then committed to the
+Raft log and replayed forever. Rejecting also keeps `Type` byte-stable across
+a round trip, which the fuzz round-trip targets assert.
 
 Entry type constants:
 
@@ -144,21 +205,25 @@ Entry type constants:
 | 3     | `EntryMetadata`          | Witness metadata entry (Index+Term only, no `Cmd`) |
 | 4     | `EntryInitialMembership` | Bootstrap membership (`Cmd` = marshaled `Membership`) |
 
-`UnmarshalFrom` rejects any masked type outside this set with
-`ErrInvalidEntryType`. A reader that omits `EntryInitialMembership` cannot
-replay any shard's log: every shard writes that entry at log index 1 on
-first start, so the very first entry a replica reads back is refused.
+Both `MarshalTo` and `UnmarshalFrom` reject any masked type outside this set
+with `ErrInvalidEntryType`. A reader that omits `EntryInitialMembership`
+cannot replay any shard's log: every shard writes that entry at log index 1
+on first start, so the very first entry a replica reads back is refused.
 
-Compression constants:
+Mask constants (`pkg/proto/constants.go:241`):
 
 | Constant            | Value  | Description                         |
 |---------------------|--------|-------------------------------------|
-| `NoCompression`     | 0x00   | No compression applied              |
-| `Snappy`            | 0x01   | Snappy compression algorithm        |
 | `EntryTypeMask`     | 0x0F   | Mask to extract entry type          |
 | `EntryCompressFlag` | 0x10   | Bit 4 indicates Cmd is compressed   |
 
 Always mask before comparing: `entryType := e.Type & EntryTypeMask`
+
+The flag records only *that* `Cmd` is compressed, not with what. The
+algorithm is `config.CompressionType` (`config.NoCompression` = 0,
+`config.Snappy` = 1), which is a local configuration value and is not carried
+on an Entry. It reaches the wire only as `Snapshot.Compression`, which
+describes a snapshot data file rather than an entry payload.
 
 ### Session Sentinel Values
 
@@ -172,21 +237,33 @@ Special `SeriesID` values identify session lifecycle entries:
 
 ### Validation Rules
 
+`UnmarshalFrom`:
+
 - `CmdLen > MaxEntrySize` (8 MB) returns `ErrEntrySizeLimitExceeded`
-- `buf` shorter than `entryHeaderSize` (60) returns `ErrBufferTooSmall`
-- `buf` shorter than `60 + CmdLen` returns `ErrBufferTooSmall`
-- Unknown entry type (after masking) returns `ErrInvalidEntryType`
+- `buf` shorter than `entryHeaderSize` (68) returns `ErrBufferTooSmall`
+- `buf` shorter than `68 + CmdLen` returns `ErrBufferTooSmall`
+- Unknown entry type, or any reserved bit set, returns `ErrInvalidEntryType`
+
+`MarshalTo` applies the same three bounds: `len(Cmd) > MaxEntrySize` returns
+`ErrEntrySizeLimitExceeded`, an invalid `Type` returns `ErrInvalidEntryType`,
+and a buffer shorter than `Size()` returns `ErrBufferTooSmall`. An entry is
+committed to the Raft log before any peer parses it, so an encoder that could
+emit a type its own decoder rejects would write an entry every replica faults
+on forever.
 
 ### Zero-Copy Semantics
 
 After `UnmarshalFrom`, `Entry.Cmd` is a slice that aliases the source buffer:
 
 ```go
-e.Cmd = buf[60:total] // zero-copy: aliases source buffer
+e.Cmd = buf[entryHeaderSize:total] // zero-copy: aliases source buffer
 ```
 
+A zero-length `Cmd` decodes to `nil`, not to an empty non-nil slice.
+
 The caller must copy `Cmd` before returning the buffer to a pool. The
-transport receive path (`recv.go`) performs this copy explicitly.
+transport receive path (`pkg/internal/transport/recv.go`) performs this copy
+explicitly; see [Buffer Ownership Rules](#buffer-ownership-rules).
 
 ## Message Wire Format
 
@@ -233,11 +310,26 @@ entry list and an optional inline snapshot.
 | 72     | 8    | Reject     | bool    | uint64    | Rejection flag (0 or 1)          |
 | 80     | 8    | Hint       | uint64  | uint64    | Type-specific hint data          |
 
-Fixed header: `11 * 8 = 88 bytes`.
+Fixed header: `messageFixedSize = 11 * 8 = 88 bytes`
+(`pkg/proto/message.go:98`).
 
 Note that `Reject` is a Go `bool` but encoded as `uint64` on the wire
 to maintain fixed-width alignment. The `putBool`/`getBool` functions handle
 the conversion.
+
+### Message.Origin is not on the wire
+
+`Message` carries a twelfth field, `Origin` (`MessageOrigin`, a `uint8`),
+which is **process-local and deliberately absent from the layout**.
+`MarshalTo` never writes it, `UnmarshalFrom` sets it to `OriginRemote`
+explicitly, and `Reset` zeroes it. `OriginRemote` is the zero value, so a
+message decoded from the network -- or recycled through the message pool --
+is untrusted by construction and no peer can forge a local origin.
+
+Only in-process injectors stamp `OriginLocal`, through
+`Node.DeliverLocal`/`Engine.DeliverLocal`. Locally injected messages carry no
+term and are exempt from the term gate in `raft.step`, which is why that
+exemption must not be reachable from the wire.
 
 ### Variable Portion
 
@@ -249,6 +341,16 @@ After the 88-byte fixed header:
 [HasSnapshot:8]           -- bool as uint64 (0 = no snapshot, 1 = snapshot follows)
 [Snapshot]                -- present only if HasSnapshot != 0
 ```
+
+`HeartbeatMessageSize` (`pkg/proto/message.go:105`) is the smallest valid
+message: `88 + 4 + 8 = 100 bytes`, a heartbeat with no entries and no
+snapshot. `MessageBatch` reuses it as `minMessageWireSize` when it
+cross-checks a request count against the remaining frame bytes.
+
+The snapshot presence flag is derived from `Snapshot.IsEmpty()`, which tests
+only `Index` and `Term`. A snapshot with a filepath, membership and size but
+no log position would therefore encode as absent and be discarded whole, so
+`MarshalTo` refuses it with `ErrSnapshotWithoutPosition` instead.
 
 ### Message Type Constants
 
@@ -283,16 +385,26 @@ After the 88-byte fixed header:
 | 26    | `RequestPreVoteResp` | Pre-vote response                        |
 | 27    | `RateLimit`          | Rate limit notification                  |
 
-Validation: `Message.Type > RateLimit` returns `ErrInvalidMessageType`.
+Validation: `Message.Type > RateLimit` returns `ErrInvalidMessageType`, on
+both write and read.
 
 ### Validation Rules
+
+`UnmarshalFrom`:
 
 - Buffer shorter than 92 bytes (88 header + 4 entries count) returns
   `ErrBufferTooSmall`
 - `Message.Type > RateLimit` (27) returns `ErrInvalidMessageType`
-- `EntriesCount > maxMessagesPerBatch` (10,000) returns `ErrTooManyMessages`
+- `EntriesCount > MaxEntriesPerMessage` (10,000) returns `ErrTooManyMessages`
+- `EntriesCount * entryHeaderSize` greater than the bytes remaining returns
+  `ErrBufferTooSmall`, before the `Entries` slice is allocated
 - Each entry is validated recursively via `Entry.UnmarshalFrom`
 - Snapshot section requires at least 8 bytes for the `HasSnapshot` flag
+
+`MarshalTo` mirrors the first two and adds `ErrSnapshotWithoutPosition`.
+A producer therefore learns at the sender that its message is unparseable,
+rather than having every peer drop the frame -- a rejection the sender cannot
+tell apart from a broken connection.
 
 ### Slice Reuse
 
@@ -308,6 +420,14 @@ if cap(m.Entries) >= int(entryCount) {
 
 This avoids allocation when a pooled `Message` already has sufficient
 capacity from a previous use.
+
+`Reset` drops an `Entries` slice whose capacity exceeds `maxRetainedEntries`
+(1024) rather than truncating it, so a pooled message cannot retain
+attacker-influenced capacity. `UnmarshalFrom` admits up to
+`MaxEntriesPerMessage` (10,000) entries while a steady-state append carries
+at most `batch.DefaultMaxBatchSize` (1000) proposals, so the bound sits above
+the legitimate working set and a normal replication message still reuses its
+backing array.
 
 ## MessageBatch Wire Format
 
@@ -368,15 +488,28 @@ The receiver validates fields in order during `UnmarshalFrom`:
 
 3. **Request count**: `ReqCount > MaxMessagesPerBatch` (10,000) returns
    `ErrTooManyMessages`. The count is then checked for consistency with the
-   bytes remaining in the frame -- `ReqCount * minMessageWireSize` must not
-   exceed them -- so a short frame claiming thousands of requests cannot
-   drive the slice allocation before failing.
+   bytes remaining in the frame -- `ReqCount * minMessageWireSize` (100)
+   must not exceed them -- so a short frame claiming thousands of requests
+   cannot drive the slice allocation before failing. Without it a 32-byte
+   frame claiming 10,000 requests allocates roughly 2.8 MB before the
+   decode fails, and the transport's receive-memory budget charges only the
+   frame length.
 
 4. **Cumulative size**: after unmarshaling each message, the running byte
    offset is checked against `MaxBatchSize` (64 MB). Exceeding returns
    `ErrBatchSizeLimitExceeded`.
 
 5. Each message is validated recursively via `Message.UnmarshalFrom`.
+
+`MarshalTo` mirrors the count and address bounds, returning
+`ErrTooManyMessages` and `ErrAddressTooLong`. It does not stamp `BinVer`; the
+caller sets it.
+
+`Reset` drops a `Requests` slice whose capacity exceeds
+`maxRetainedRequests` (256), and resets each retained message in turn so
+`Message.maxRetainedEntries` is actually applied. Truncating `Requests`
+alone would leave the backing array holding messages whose `Entries` slices
+are still live.
 
 ### DeploymentID
 
@@ -443,45 +576,46 @@ prefix, an inline Membership, and variable-length trailing fields.
 | Fixed      | Epoch       | 8       | uint64 | Barrier encryption epoch (0 = plaintext) |
 | Fixed      | Compression | 8       | uint64 | `config.CompressionType` the data file was written with |
 
-Minimum size: 32 bytes (the 4 leading fixed fields). The trailing 3 fixed
-fields (OnDiskIndex, Epoch, Compression) contribute 24 bytes.
-`IsEmpty()` returns true when both `Index` and `Term` are zero.
+`UnmarshalFrom` requires 32 bytes before reading the four leading fields, and
+re-checks the remaining length before `FileSize` and again before the
+trailing 24-byte block. The smallest complete encoding is **149 bytes**: 32
+leading + 81 for an empty `Membership` + 4 for an empty `Filepath` + 8 for
+`FileSize` + 24 for the trailing block.
 
-### The removed Type and Witness fields
+`IsEmpty()` returns true when both `Index` and `Term` are zero. That is the
+whole test, deliberately: a snapshot is identified by the `(Index, Term)` it
+covers, and one that covers nothing is not a snapshot regardless of what else
+is filled in. `Message.MarshalTo` uses it as the presence flag for the
+embedded snapshot, which is why `hasContentBeyondPosition` exists -- see
+`ErrSnapshotWithoutPosition` above.
 
-Snapshot also carried `Type` (a state machine type code) and `Witness` (a
-witness-replica flag) in this trailing block, and both were **removed**.
+`Compression` is a `config.CompressionType` widened to uint64 (the package
+cannot import config, because config imports it). It records what the
+**writer** did, so a recovery has to take it from the artifact's own record
+rather than from the reader's configuration. A compressed artifact read as
+uncompressed is fed to the state machine as garbage.
 
-`Type` had no writer anywhere in the repository, so it was zero on every
-snapshot ever produced, while both `MarshalTo` and `UnmarshalFrom` spent a
-comparison range-checking it against `maxStateMachineType`. Which kind of
-state machine a shard runs is a property of the local process -- it comes from
-the `StateMachineFactory` the host was built with, and `Bootstrap.Type` already
-records it durably -- not of an artifact streamed from a peer, so no reader
-was going to appear for it either. Removing it also removed
-`maxStateMachineType` and the `*InvalidSnapshotTypeError` it raised.
+### Fields removed from this layout
 
-`Witness` was written (the leader set it in the same branch that clears
-`Filepath` and zeroes `FileSize` for a witness target) and read by nothing. An
-empty `Filepath` is already the repository-wide test for a metadata-only
-snapshot, so a second independently-settable statement of the same fact could
-only ever be a way for the two to disagree.
+Four fields rode earlier pre-release versions of this layout and are gone.
+None of them can be reintroduced without a layout change, and nothing in the
+repository reads their absence.
 
-### The removed Checksum field
+| Field                | Why it went |
+|----------------------|-------------|
+| `Imported bool`      | Read by nothing outside marshal/unmarshal/`IsEmpty`/`Reset`, and its single writer set it from the save request's `exported` flag -- close to the opposite of what the name claimed |
+| `Type uint64`        | No writer anywhere in the repository, so it was zero on every snapshot produced, while both codecs range-checked it against `maxStateMachineType`. Which state machine a shard runs is a property of the local process (`StateMachineFactory`, and `logdb.Bootstrap.Type` records it durably), not of an artifact streamed from a peer |
+| `Witness bool`       | Written by `sendSnapshot` and read by nothing. An empty `Filepath` is already the repository-wide test for a metadata-only snapshot, so a second independently-settable statement of the same fact could only ever disagree with the first |
+| `Checksum []byte`    | Decoded, bounded and copied out of the pooled receive buffer on every message, and never computed and never verified anywhere |
 
-Snapshot carried a `Checksum []byte` between `FileSize` and the trailing
-fixed block through
-an earlier pre-release layout, and it was **removed**. It was decoded, bounded
-and copied out of the pooled receive buffer on every message, and it was
-never computed and never verified anywhere in the repository -- so it was
-empty on every real snapshot, and the receive path paid an allocation and
-two copies per message to keep an empty slice alive.
+Removing `Type` also removed `maxStateMachineType` and
+`*InvalidSnapshotTypeError`.
 
-It was removed rather than implemented because a field named `Checksum` that
-rides the wire and is never checked reads as an integrity control to anyone
-auditing the format, and an integrity control that does not exist is worse
-than an absent one. Populating it properly is not a codec change: the value
-has to be computed over the final artifact bytes (post-compression,
+`Checksum` was removed rather than implemented because a field of that name
+that rides the wire and is never checked reads as an integrity control to
+anyone auditing the format, and an integrity control that does not exist is
+worse than an absent one. Populating it properly is not a codec change: the
+value has to be computed over the final artifact bytes (post-compression,
 post-encryption), stamped where the artifact is produced, and verified in
 three separate consumers (recovery, streamed receive, `ImportSnapshot`).
 
@@ -499,11 +633,18 @@ witnesses, removed replicas, committed node identities, and the replicated
 witness and session policies. All six maps use deterministic sorted-key
 encoding.
 
-Membership is the one type in this package that is **persisted** as well as
-transmitted -- it is written to the WAL, into snapshot records and exported
-snapshot artifacts, and into the `EntryInitialMembership` entry at log index
-1. It therefore carries its own layout version byte, independent of
+Membership is the type in this package whose bytes are **persisted** as well
+as transmitted. It is marshaled into the `Cmd` of the
+`EntryInitialMembership` entry at log index 1, which then lives in the log
+for the life of the shard, and into the header of an exported snapshot
+artifact (`pkg/host.go:5780`). Those bytes outlive the binary that wrote
+them, so the section carries its own layout version byte, independent of
 `WireVersion`. See [Version Compatibility](#version-compatibility) below.
+
+The WAL's own membership section is a **different layout** with a separate
+discriminator, `waldb.membershipSectionVersion`
+(`pkg/logdb/waldb/db.go:1922`). It is not this encoding, and the two version
+bytes are independent. See [WAL Persistence](../storage/wal.md).
 
 The layout, at version **1**:
 
@@ -516,7 +657,11 @@ The layout, at version **1**:
  +-------------------------+-------------------+-------------------+
  | SessionExpiryEntries(8) | MaxTotalSessions  | MaxSessionsPerCli |
  +-------------------------+-------------------+-------------------+
-49
+49                       57
+ +-------------------------+
+ |  MaxSessionsPerOwner(8) |
+ +-------------------------+
+57
  +-----------------------+
  |  Addresses map        |  -- map[uint64]string, sorted by key
  +-----------------------+
@@ -543,12 +688,55 @@ The layout, at version **1**:
 | 25     | 8    | SessionExpiryEntries         | uint64 | Replicated session inactivity threshold |
 | 33     | 8    | MaxTotalSessions             | uint64 | Replicated cap on registered sessions |
 | 41     | 8    | MaxSessionsPerClient         | uint64 | Replicated cap on cached responses per session |
+| 49     | 8    | MaxSessionsPerOwner          | uint64 | Replicated cap on sessions per declared owner |
 
-Fixed region: `membershipFixedSize = 49 bytes`. An empty membership --
-all six maps present but zero-length -- is **73 bytes** (49 + 6 x 4). Every
-map is written unconditionally, so an empty map is four zero bytes rather
-than an absent field, and an unset session policy is 24 zero bytes rather
-than an absent one.
+Fixed region: `membershipFixedSize = sessionPolicyOffset (25) +
+membershipSessionPolicySize (32) = 57 bytes`
+(`pkg/proto/membership.go:96-110`). An empty membership -- all six maps
+present but zero-length -- is **81 bytes** (57 + 6 x 4). Every map is written
+unconditionally, so an empty map is four zero bytes rather than an absent
+field, and an unset session policy is 32 zero bytes rather than an absent
+one.
+
+The session-policy offset and its size are named separately from the total
+rather than folded into one constant, so that a future version growing the
+fixed region has to state its own offsets. The way that goes wrong is a
+single shared size constant silently reading one layout's first map count as
+another's last fixed field.
+
+`UnmarshalFrom` checks the version byte, then requires
+`membershipFixedSize + 4` bytes (the fixed region plus the first map count)
+before reading any field.
+
+### The replicated session policy
+
+The four session fields are the shard's `SessionPolicy`. They are replicated
+for the same reason the witness policy is: the deterministic apply path reads
+them, so a per-node value diverges the state machines with every Raft
+invariant intact.
+
+| Field                  | What it bounds |
+|------------------------|----------------|
+| `SessionExpiryEntries` | The interval of `rsm.StateMachine.Apply`'s expiry checkpoint walk. Two replicas with different intervals expire different sessions at different log indexes |
+| `MaxTotalSessions`     | `session.Manager.Register`, shard-wide. A replica that refuses a registration its peers admit answers `ResultSessionExpired` for every later entry of that session |
+| `MaxSessionsPerClient` | The per-session **response cache** depth (`CanRecord`/`RecordResult`) |
+| `MaxSessionsPerOwner`  | `session.Manager.Register` per owner (`Entry.OwnerID`); zero disables it |
+
+`MaxSessionsPerClient` is misnamed and the name is kept only because the wire
+format is pinned. It is the mirror of `config.Config.MaxSessionsPerClient`,
+which chose the name before the field was wired to the response cache. Read
+it as "max responses per session". The cap the name suggests is
+`MaxSessionsPerOwner`, a different field with a different failure mode.
+
+`MaxTotalSessions` is the policy-present discriminator: `config.Validate`
+rejects a zero value and `SetDefaults` fills it, so every seeded policy
+carries a non-zero cap. That is what lets `SessionExpiryEntries == 0` keep
+its own meaning -- expiry explicitly disabled cluster-wide -- instead of
+being read as an absent policy that falls back to local configuration.
+`SessionPolicy.IsSet()` tests exactly this.
+
+Unlike the witness policy, these four have no config-change type. They are
+seeded at bootstrap from `config.Config` and are not changeable thereafter.
 
 The version byte is the sole layout discriminator. Membership is always
 embedded in a larger buffer, so neither a length check nor a trailing-byte
@@ -624,9 +812,13 @@ could not replay its own log. A source-level test enforces the separation.
 
 - Count validated against `MaxMembershipEntries` (10,000)
 - Each value length validated against `MaxAddressLength` (256). This applies
-  to `Identities` and `RemovedIdentities` too: `getMap` is shared by all four
+  to `Identities` and `RemovedIdentities` too: `getMap` is shared by all five
   string maps, and `MaxNodeIdentityLength` has the same value, so nothing is
-  admitted or refused differently.
+  admitted or refused differently. `Membership.checkWritable` reports
+  `ErrAddressTooLong` for all five on the write side for the same reason --
+  naming a different sentinel there would mean marshal and unmarshal
+  disagreed about a refusal they agree on.
+- Duplicate key returns `ErrDuplicateMapKey`
 - Empty map: 4 bytes (the count prefix alone)
 
 Both limits are mirrored on the **write** side by `MarshalTo`. A codec that
@@ -696,10 +888,19 @@ entry. It describes a membership change operation.
 | 44+N   | 8    | RequireFullReplicaMajority | bool   | New policy for `UpdateWitnessPolicy` |
 | 52+N   | 4+M  | NodeIdentity               | string | Committed node identity (always present; `M` may be 0) |
 
-Fixed portion: `configChangeFixedSize = 6*8 + 4 = 52 bytes` -- the six
-uint64-width fields plus the 4-byte address length prefix. The trailing
-`NodeIdentity` adds its own 4-byte length prefix plus its bytes. The prefix is
-**unconditional**: an empty identity is four zero bytes, never a shorter buffer.
+Fixed portion: `configChangeFixedSize = 6*8 + 4 = 52 bytes`
+(`pkg/proto/configchange.go:77`) -- the six uint64-width fields plus the
+4-byte address length prefix. The trailing `NodeIdentity` adds its own 4-byte
+length prefix plus its bytes. The prefix is **unconditional**: an empty
+identity is four zero bytes, never a shorter buffer. The smallest complete
+encoding is therefore **56 bytes**, an empty address and an empty identity.
+
+`UnmarshalFrom` decodes into a local and assigns the receiver only on
+success. Writing fields into the receiver as they were parsed left a failure
+part-way through holding the new `ConfigChangeID`, `Type`, `ReplicaID` and
+`Address` bolted onto the old `NodeIdentity` -- a mixture describing no
+configuration any writer produced, and a stale identity beside a new target
+is the same shape `Membership.UnmarshalFrom` was hardened against.
 
 `NodeIdentity` is the stable cryptographic node identity to commit for the
 replica being added. It travels through consensus alongside `Address` so the
@@ -815,17 +1016,27 @@ The `Update` struct is the primary data structure flowing between the
 engine step, commit, and apply workers. It is **never serialized to the
 wire** -- it is passed by reference within the same process. It aggregates:
 
+- `ShardID`, `ReplicaID` -- which replica produced the update
+- `State` -- hard state to persist
+- `FirstIndex`, `LastIndex` -- the log range covered by `EntriesToSave`
 - `EntriesToSave` -- log entries to persist
 - `CommittedEntries` -- entries ready to apply to the state machine
 - `Messages` -- Raft messages to send via transport
 - `Snapshot` -- snapshot metadata to persist
 - `UpdateCommit` -- commit tracking state
+- `LastApplied` -- highest applied log index
 - `ReadyToRead` -- confirmed read index requests
 - `ReadOnly` -- flag for engine to bypass commit/apply pipeline
 
 The `ReadOnly` flag is set by `Peer.GetUpdate` when the update contains
 only `ReadyToRead` states with no entries, state changes, or snapshots.
 The step worker bypasses the commit/apply pipeline for read-only updates.
+
+`Update` also holds an unexported `committedEntriesPooled *[]Entry`. When the
+Raft log's `entriesToApply` sets it via `SetCommittedEntriesPooled`, the apply
+worker returns the slice through `ReleaseCommittedEntries` after applying.
+`CommittedEntries` must be a sub-slice of that pooled slice, and must not be
+accessed after the release.
 
 ## SnapshotFile Wire Format
 
@@ -843,6 +1054,11 @@ SnapshotFile carries metadata for an external file included in a snapshot.
 | Fixed    | FileSize | 8    | uint64 | File size in bytes                |
 | Fixed    | FileID   | 8    | uint64 | Unique file identifier            |
 | Variable | Metadata | 4+N  | []byte | Application-defined metadata      |
+
+Smallest encoding: 24 bytes (both variable fields empty). `Metadata` is
+returned by `getBytes` and **aliases the source buffer** after
+`UnmarshalFrom`, like `Entry.Cmd`. `MarshalTo` mirrors both bounds,
+returning `ErrFilepathTooLong` and `ErrMetadataTooLong`.
 
 ## SnapshotChunk Wire Format
 
@@ -876,7 +1092,15 @@ Membership and optional FileInfo.
 ```
 
 Minimum header: 72 bytes (9 fixed uint64 fields before the first
-variable-length Filepath).
+variable-length Filepath). Smallest complete encoding: **217 bytes** --
+72 + 4 (empty `Filepath`) + 24 (`FileChunkID`, `FileChunkCount`,
+`HasFileInfo`) + 81 (empty `Membership`) + 32 (`OnDiskIndex`,
+`DeploymentID`, `BinVer`, `Epoch`) + 4 (empty `Data`).
+
+`Data` is returned by `getBytes` and **aliases the source buffer** after
+`UnmarshalFrom`, like `Entry.Cmd`. On the transport receive path the buffer
+is pooled and returned before the handler runs, so the caller must copy
+anything it keeps.
 
 `Epoch` sits between `BinVer` and `Data`. It is the barrier encryption epoch
 the snapshot was saved under (0 = plaintext), and the receiver needs it to
@@ -894,28 +1118,24 @@ is ever written to disk. `BinVer` is required: an unstamped chunk (`BinVer`
 0) is indistinguishable from a v1 sender's.
 
 `ChunkSize` is redundant with the length prefix on `Data`. When a sender
-populates it (non-zero), the receiver requires it to agree with the actual
-payload length and returns `ErrChunkSizeMismatch` otherwise. A zero value
+populates it (non-zero), both codecs require it to agree with the actual
+payload length and return `ErrChunkSizeMismatch` otherwise. A zero value
 means "unspecified" and consumers fall back to `len(Data)`.
 
-## Bootstrap Wire Format
+`MarshalTo` also applies `MaxFilepathLen` and `MaxSnapshotChunkDataLen`, but
+it checks the destination buffer size **first**, so a short buffer reports
+`ErrBufferTooSmall` ahead of any field bound. It deliberately does **not**
+validate `BinVer`: the reader's version gate has to be exercisable by a test
+that marshals an unstamped chunk, and both production producers
+(`emptySnapshotChunk`, `forEachSnapshotChunk`) already stamp `WireVersion`.
 
-Source: `pkg/proto/bootstrap.go`
+## State Machine Type Constants
 
-Bootstrap contains the initial cluster configuration persisted to LogDB
-during shard initialization.
+Source: `pkg/proto/constants.go`
 
-```
- +--- Addresses map ---+--- Join (8) ---+--- Type (8) ---+
-```
-
-| Section  | Field     | Size | Type              | Description                     |
-|----------|-----------|------|-------------------|---------------------------------|
-| Variable | Addresses | var  | map[uint64]string | Initial replica-to-address map  |
-| Fixed    | Join      | 8    | bool              | Joining existing cluster flag   |
-| Fixed    | Type      | 8    | uint64            | State machine type code         |
-
-State machine type constants:
+These are not a layout of their own. They are the values carried by
+`logdb.Bootstrap.Type` and reported as `ShardInfo.StateMachineType`, and
+`proto.StateMachineTypeName` names them.
 
 | Value | Constant                   | Description           |
 |-------|----------------------------|-----------------------|
@@ -923,21 +1143,28 @@ State machine type constants:
 | 1     | `ConcurrentStateMachine`   | Concurrent SM         |
 | 2     | `OnDiskStateMachine`       | Persistent SM         |
 
+### Types removed from this package
+
+| Type              | Why it went |
+|-------------------|-------------|
+| `proto.Bootstrap` | No production caller anywhere: only `pkg/proto`'s own tests constructed or decoded it. The record LogDB persists is `logdb.Bootstrap` (`pkg/logdb/types.go:186`), written through `SaveBootstrap`/`GetBootstrap` in each backend's own layout, and it carries a `DataDir` field this type never had. Nothing on disk was ever in the `proto.Bootstrap` shape |
+
 ## Size Limits and Constants
 
 | Constant                  | Value      | Enforced In              | Description                      |
 |---------------------------|------------|--------------------------|----------------------------------|
 | `WireVersion`             | 1          | `MessageBatch.UnmarshalFrom`, `SnapshotChunk.UnmarshalFrom` | Current transport wire format version (exact match) |
-| `MaxEntrySize`            | 8 MB       | `Entry.UnmarshalFrom`    | Max `Entry.Cmd` payload          |
+| `MaxEntrySize`            | 8 MB       | `Entry` (both codecs)    | Max `Entry.Cmd` payload          |
 | `MaxBatchSize`            | 64 MB      | `MessageBatch.UnmarshalFrom` | Max cumulative batch size    |
-| `MaxAddressLength`        | 256 bytes  | `getString`, `getMap`    | Max node address string          |
-| `MaxNodeIdentityLength`   | 256 bytes  | `ConfigChange`           | Max committed node identity string |
+| `MaxAddressLength`        | 256 bytes  | `getString`, `getMap`, `checkWritableMap` | Max node address string |
+| `MaxNodeIdentityLength`   | 256 bytes  | `ConfigChange` (both codecs) | Max committed node identity string |
 | `MaxFilepathLen`          | 4096 bytes | `Snapshot`, `SnapshotChunk`, `SnapshotFile` | Max filepath string |
-| `MaxMetadataLen`          | 64 KB      | `SnapshotFile.UnmarshalFrom` | Max application metadata     |
-| `MaxSnapshotChunkDataLen` | 8 MB       | `SnapshotChunk.UnmarshalFrom` | Max chunk payload (= `MaxEntrySize`) |
-| `MaxMessagesPerBatch`     | 10,000     | `MessageBatch.UnmarshalFrom` | Max messages per batch       |
-| `MaxEntriesPerMessage`    | 10,000     | `Message.UnmarshalFrom`  | Max log entries per message      |
-| `MaxMembershipEntries`    | 10,000     | `getMap`, `getBoolMap`   | Max entries per membership map   |
+| `MaxMetadataLen`          | 64 KB      | `SnapshotFile` (both codecs) | Max application metadata     |
+| `MaxSnapshotChunkDataLen` | 8 MB       | `SnapshotChunk` (both codecs) | Max chunk payload (= `MaxEntrySize`) |
+| `MaxMessagesPerBatch`     | 10,000     | `MessageBatch` (both codecs) | Max messages per batch       |
+| `MaxEntriesPerMessage`    | 10,000     | `Message` (both codecs)  | Max log entries per message      |
+| `MaxMembershipEntries`    | 10,000     | `getMap`, `getBoolMap`, `checkWritable*` | Max entries per membership map |
+| `MaxDecodeMemoryFactor`   | 8          | not a runtime check      | Heap bytes one decode may allocate, as a multiple of the frame's wire length |
 
 All limits are validated **before** allocation during `UnmarshalFrom`.
 This prevents a crafted payload from exhausting memory by claiming a
@@ -948,6 +1175,32 @@ large count and triggering a proportional `make()`.
 decoder. A producer that exceeds one emits a payload every peer rejects, and
 a rejection is indistinguishable from a broken connection at the sender.
 Producers MUST bound themselves by these values.
+
+### MaxDecodeMemoryFactor
+
+A wire-byte budget is not a memory budget. The decoded form of a frame is
+materially larger than the frame: a 100-byte heartbeat becomes a 320-byte
+`Message` in a slice, and a membership map entry costs 12 bytes on the wire
+and roughly 57 in a Go map. The transport reserves the **frame length**
+against `MaxMessageReceiveMemory` before reading the body, so an operator
+sizing that budget has to multiply by this factor to know what the process
+will actually hold. A frame admitted under a 256 MB budget can occupy up to
+2 GB of heap.
+
+The bound is measured rather than derived. `TestDecodeMemoryAmplification`
+builds the densest frames the format admits and fails if any exceeds it; the
+measured worst case is 5.1x, on a batch of small messages each carrying a
+snapshot whose membership maps hold a single entry (a one-entry Go map owns a
+whole 8-slot group). The headroom above that covers the Go runtime's map
+layout, which this package neither controls nor can assert at compile time.
+It is not headroom for adding allocations: 8 was already exceeded once, at
+9.8x, by a decoder that clamped its map size hint and paid for the growth.
+
+`getMap` and `getBoolMap` therefore size their maps **once**, from the wire
+count, after the count has been cross-checked against the remaining buffer.
+Clamping the hint to 64 and letting the map grow touches roughly twice the
+memory the final map occupies and keeps every superseded table live until the
+next GC.
 
 ## MarshalTo / UnmarshalFrom Pattern
 
@@ -1031,6 +1284,7 @@ All errors are package-level sentinel values (not `fmt.Errorf`):
 | `ErrTooManyMessages`           | Message/entry count exceeds limit                 |
 | `ErrTooManyMembershipEntries`  | Membership map count exceeds limit                |
 | `ErrDuplicateMapKey`           | A membership map repeats a key                    |
+| `ErrSnapshotWithoutPosition`   | `Message.MarshalTo`: the embedded `Snapshot` has content but zero `Index` and `Term` |
 | `ErrUnsupportedVersion`        | `BinVer != WireVersion`, or a `Membership` section version byte that is not 1 |
 
 One error is typed rather than sentinel, and it matches a sentinel under
@@ -1049,7 +1303,7 @@ source buffer:
 
 ```go
 if cmdLen > 0 {
-    e.Cmd = buf[60:total] // zero-copy: aliases source buffer
+    e.Cmd = buf[entryHeaderSize:total] // zero-copy: aliases source buffer
 }
 ```
 
@@ -1059,7 +1313,7 @@ returned to a pool or reused until all references to `Cmd` are released.
 
 ### When Copies Are Required
 
-The transport receive path (`internal/transport/recv.go`) must copy
+The transport receive path (`pkg/internal/transport/recv.go`) must copy
 `Entry.Cmd` before returning the receive buffer to the pool. Without
 the copy, a slow consumer could hold a reference to `Cmd` that aliases
 a buffer already reused by the next receive.
@@ -1105,24 +1359,41 @@ Transport receive buffer --> UnmarshalFrom --> Entry.Cmd aliases buffer
 ### Transport Boundary (Inbound)
 
 After `UnmarshalFrom`, `Entry.Cmd` aliases the transport receive buffer.
-The transport receive path (`pkg/internal/transport/recv.go`) explicitly
-copies every `Entry.Cmd` before returning the receive buffer to the pool:
+The transport receive path (`pkg/internal/transport/recv.go:1022`) copies
+every `Entry.Cmd` into **one** allocation before returning the receive buffer
+to the pool: it sums the command lengths across the whole batch, allocates
+once, then re-points each `Cmd` at a three-index slice of that block.
 
 ```go
+totalCmdBytes := 0
 for i := range batch.Requests {
     for j := range batch.Requests[i].Entries {
-        cmd := batch.Requests[i].Entries[j].Cmd
-        if len(cmd) > 0 {
-            cp := make([]byte, len(cmd))
-            copy(cp, cmd)
-            batch.Requests[i].Entries[j].Cmd = cp
+        totalCmdBytes += len(batch.Requests[i].Entries[j].Cmd)
+    }
+}
+if totalCmdBytes > 0 {
+    bulk := make([]byte, totalCmdBytes)
+    off := 0
+    for i := range batch.Requests {
+        for j := range batch.Requests[i].Entries {
+            cmd := batch.Requests[i].Entries[j].Cmd
+            if len(cmd) > 0 {
+                copy(bulk[off:], cmd)
+                batch.Requests[i].Entries[j].Cmd = bulk[off : off+len(cmd) : off+len(cmd)]
+                off += len(cmd)
+            }
         }
     }
 }
 ```
 
-Without this copy, a slow consumer could read stale or overwritten `Cmd`
+One allocation per frame instead of N cuts GC pressure on the receive hot
+path. Without the copy, a slow consumer could read stale or overwritten `Cmd`
 data from a buffer already reused by the next receive.
+
+`Cmd` is the only such alias left on a decoded `Message`.
+`Snapshot.Filepath` and every membership map are copied by their own decoders
+(`getString`, `getMap`), so they own their storage already.
 
 ### LogDB Boundary (Outbound)
 
@@ -1153,12 +1424,15 @@ apply) marshals or copies data at boundaries.
 
 The `Cmd` length prefix uses `uint32` (4 bytes, max ~4 GB). `MaxEntrySize`
 is 8 MB. Using `uint64` would add 4 bytes to every entry for a limit that
-is 500x beyond the configured maximum. If `MaxEntrySize` ever needs to
-exceed 4 GB (highly unlikely for Raft proposals), the `WireVersion`
-mechanism can introduce a new encoding with a `uint64` length field.
-Until then, `uint32` saves 4 bytes per entry on the hot path.
+is 500x beyond the configured maximum, so `uint32` saves 4 bytes per entry
+on the hot path.
 
-Source: `pkg/proto/constants.go` -- `MaxEntrySize uint32 = 8 * 1024 * 1024`
+`Entry` carries no version byte of its own, so widening the prefix would be
+an in-place layout change like any other: every consumer rebuilt in lockstep
+pre-release, or a `WireVersion` bump plus a persisted discriminator after
+1.0. Nothing about the current encoding makes it cheap.
+
+Source: `pkg/proto/constants.go:131` -- `MaxEntrySize uint32 = 8 * 1024 * 1024`
 
 ## MessageBatch Size Enforcement
 
@@ -1167,8 +1441,8 @@ message and compares it against `MaxBatchSize` (64 MB). The comparison
 uses `uint64` arithmetic to prevent silent truncation:
 
 ```go
-if uint64(offset) > MaxBatchSize {
-    return 0, ErrBatchSizeLimitExceeded
+func exceedsMaxBatchSize(offset int) bool {
+    return uint64(offset) > MaxBatchSize
 }
 ```
 
@@ -1177,6 +1451,16 @@ cumulative offset of a batch with many large messages can exceed 4 GB.
 A `uint32` cast of the offset would silently wrap, bypassing the size
 limit entirely. The `uint64` comparison ensures the check is accurate
 on all platforms.
+
+The comparison is a named function rather than an inline expression because
+the regression it guards needs a 4 GB frame to reach through
+`UnmarshalFrom`, and no test can allocate one.
+`TestExceedsMaxBatchSizeDoesNotTruncate` calls it directly, at an offset the
+decoder cannot be driven to.
+The test it replaced asserted `uint32(1<<32+1) == 1` and
+`uint64(1<<32+1) > MaxBatchSize` -- two facts about Go's arithmetic, true
+whatever this package does, so it could not have failed if the cast came
+back.
 
 Source: `pkg/proto/messagebatch.go`, `pkg/proto/constants.go`
 
@@ -1195,18 +1479,27 @@ Within that, the package still carries **two independent version
 namespaces**. Neither may be derived from the other, and a bump to one must
 never change how the other is read.
 
-**Transport-scoped: `WireVersion` = 1.** Stamped into `MessageBatch.BinVer`
-and `SnapshotChunk.BinVer`, and mirrored by the frame header byte in
-`internal/transport`. Both ends of a QUIC connection are live processes, so a
-mismatch costs one rejected connection and nothing durable. Gated on **exact
-equality** -- a peer speaking another dialect is refused outright rather than
-misparsed.
+**Transport-scoped: `proto.WireVersion` = 1.** Stamped into
+`MessageBatch.BinVer` and `SnapshotChunk.BinVer`. Both ends of a QUIC
+connection are live processes, so a mismatch costs one rejected connection
+and nothing durable. Gated on **exact equality** -- a peer speaking another
+dialect is refused outright rather than misparsed.
 
-**Persisted-scoped: the `Membership` version byte = 1.** Written to the WAL,
-into snapshot records and exported snapshot artifacts, and into the
-`EntryInitialMembership` entry at log index 1. Those bytes outlive the
-process -- and the binary -- that wrote them, which is why the format carries
-an explicit discriminator at all. Also gated on exact equality.
+A third constant, `transport.WireVersion = 0x01`
+(`pkg/internal/transport/frame.go:46`), is the version byte of the 8-byte
+frame header that wraps a marshaled `MessageBatch`
+(`[Magic:2][Version:1][Flags:1][Length:4]`). It is a separate constant that
+happens to hold the same value, gated on exact equality by
+`ValidateFrameHeader`, and is documented in
+[Transport](../transport/quic.md).
+
+**Persisted-scoped: the `Membership` version byte = 1.** Written into the
+`EntryInitialMembership` entry at log index 1 and into the exported snapshot
+artifact header. Those bytes outlive the process -- and the binary -- that
+wrote them, which is why the format carries an explicit discriminator at all.
+Also gated on exact equality. The WAL's own membership section uses a
+separate layout and a separate version byte
+(`waldb.membershipSectionVersion`).
 
 The distinction is not stylistic, and it is why the two survive as separate
 constants while holding the same value. If the persisted version were derived
@@ -1254,14 +1547,20 @@ per-release procedure and the version history.
 ### No Reserved Padding
 
 The fixed-layout encoding does not include reserved padding bytes for
-future fields. When a new field is needed, the relevant version constant is
-incremented. Padding would waste space on every entry in the hot path -- at
-100K entries/sec, even 8 bytes of padding equals 800 KB/sec of wasted I/O
-and storage.
+future fields. Pre-release, a new field is added by changing the layout in
+place and rebuilding every consumer; after 1.0 it will mean a version bump
+and a decode path for the old layout. Padding would waste space on every
+entry in the hot path -- at 100K entries/sec, even 8 bytes of padding equals
+800 KB/sec of wasted I/O and storage.
+
+`Entry.Type` is the one exception, and it is not padding: its upper 59 bits
+are reserved and **rejected** rather than ignored, so they buy no forward
+compatibility at all. See [Type Field Encoding](#type-field-encoding).
 
 ## Cross-References
 
 - [Architecture Overview](../architecture/overview.md) -- system overview and data flow
+- [Compatibility](../operations/compatibility.md) -- the version-pinning policy and per-release upgrade procedure
 - [WAL Persistence](../storage/wal.md) -- how serialized entries are stored
 - [Engine Pipeline](../engine/pipeline.md) -- Update flow between workers
 - [Transport](../transport/quic.md) -- how MessageBatch frames are sent via QUIC

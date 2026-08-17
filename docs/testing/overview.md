@@ -2,21 +2,37 @@
 
 ## Philosophy
 
-QuicRaft follows test-driven development with per-package coverage targets enforced by the Makefile. Tests are written to catch real regressions, not to pad coverage numbers. Every function has at least two corresponding tests: one for the success path and one for error handling with invalid input.
+Tests are written to catch real regressions, not to pad coverage numbers. Two
+rules outrank the coverage percentage, and both come from something that went
+wrong here:
 
-Core principles:
+**A regression test must be seen to fail before the fix.** Write the test,
+revert the fix hunk, watch it fail, then put the fix back. Three regression
+tests once shipped that passed against unfixed code, each with a claim
+attached that it covered the bug. If you cannot make a test fail, say so in the
+pull request instead of implying it was verified.
 
-- **Unit tests run fast**: in-memory, no host modifications, no blocking ops
+**Count passes, never the absence of failures.** A bisect here once read
+"setup failed" as "0 failures". A run that emitted no FAIL lines because it
+never compiled is indistinguishable, in a grep, from a clean run.
+
+The rest:
+
+- **Unit tests run fast**: in memory, no host modifications, no blocking ops
 - **Integration tests use real resources**: QUIC transport, multi-node clusters
-- **No skip guards or `-short` flags**: every test always runs
 - **Meaningful assertions**: typed error checks, value validation, state inspection
-- **Race detection on by default**: `go test -race -count=1`
+- **Race detection always on**: `go test -race -count=1 -v`
+
+There is no `-short` mode. Two `testing.Short()` guards exist in
+`pkg/logdb/waldb/crash_test.go` and never fire, because no Makefile target
+passes the flag. About two dozen `t.Skip` calls exist across the tree, mostly
+for environment-dependent cases.
 
 ## Test Categories
 
 ### Unit Tests
 
-Invoked via `make test` (or `make test-<package>` for a single package). The Makefile defines `GOTEST := go test -race -count=1`, so every unit test run includes the race detector and disables result caching.
+Invoked via `make test` (or `make test-<package>` for a single package). The Makefile defines `GOTEST := go test -race -count=1 -v`, so every unit test run includes the race detector and disables result caching.
 
 Unit tests:
 
@@ -27,20 +43,57 @@ Unit tests:
 
 ### Integration and E2E Tests
 
-Invoked via `make integration-test` (or per-suite targets). All integration tests run inside Docker devcontainers, never on the host OS. Tests are gated by the `//go:build integration` build tag and a 300-second timeout.
-
-Integration test suites:
+Four packages under `test/integration/`, all gated by `//go:build integration`:
+`raft/` (30 tests), `host/` (43), `e2e/` (63) and `linearizability/` (19).
+There is no bootstrap suite and no `integration-test-bootstrap` target.
 
 | Makefile Target                  | Suite                     | Description                              |
 |----------------------------------|---------------------------|------------------------------------------|
-| `integration-test`               | All                       | Run all integration tests in devcontainer |
+| `integration-test`               | All                       | All four packages, in the devcontainer   |
 | `integration-test-raft`          | `test/integration/raft/`  | Multi-node Raft protocol (leadership, reads, snapshots, stress) |
-| `integration-test-host`          | `test/integration/host/`  | Host API: SyncPropose, SyncRead, StaleRead, membership |
-| `integration-test-e2e`           | `test/integration/e2e/`   | Full cluster E2E over Docker Compose (3 nodes) |
-| `integration-test-bootstrap`     | `test/integration/bootstrap/` | Bootstrap and discovery integration  |
-| `integration-test-linearizability` | `test/integration/linearizability/` | porcupine linearizability verification |
+| `integration-test-host`          | `test/integration/host/`  | Host API: SyncPropose, SyncRead, StaleRead, LeaseRead, membership, rolling restart |
+| `integration-test-linearizability` | `test/integration/linearizability/` | Porcupine verification and chaos soaks |
+| `integration-test-e2e`           | `test/integration/e2e/`   | The same e2e package, run in a Docker Compose stack |
+| `ci-integration`                 | All                       | Same suite on the host, byte-identical to the `integration` job in ci.yml |
+| `ci-netfault`                    | `test/integration/e2e/`   | Adds `quicraft_netfault`: real link-level partitions between live replicas |
 
-The E2E suite uses `.devcontainer/docker-compose.integration.yml` which spins up a 3-node QuicRaft cluster with health checks, then runs a test-runner container that waits for all nodes to be healthy before executing tests.
+`integration-test` and `ci-integration` both pass `-p 1`, deliberately. Each
+package stands up multi-node QUIC clusters under `-race`, and four of them
+running concurrently starve CPU enough that the 30-second snapshot catch-up
+waits expire. Every package is stable standalone; the failures are contention,
+not defects. Because `-p 1` makes all four share one deadline, the timeouts are
+900s in the devcontainer and 1800s in CI. An earlier 300s cap failed the suite
+with a timeout panic and zero test failures, which reads as a product bug
+rather than as a budget.
+
+`make integration-test-e2e` brings up
+`.devcontainer/docker-compose.integration.yml`, now a single test-runner
+container. The three unused node containers it used to declare were removed:
+nothing read the environment variables they were given, they named a build stage
+that does not exist, and there is no node server binary for them to run. The e2e
+tests stand up their own clusters through `newTestCluster` — real `quicraft.Host`
+instances over real QUIC with mandatory mTLS on loopback — so the container's
+contribution is the pinned toolchain and tuned UDP buffers, not topology.
+
+The build step in that image previously swallowed compile failures and installed
+an empty executable, letting the run exit 0 having tested nothing; see
+[infrastructure.md](infrastructure.md) for the shell-precedence detail and what
+replaced it.
+
+### Fault Injection
+
+Two injectors, each behind its own build tag, each with tests of its own so it
+cannot quietly stop injecting:
+
+- `test/errfs` (`quicraft_errfs`) fails filesystem operations under the WAL and
+  LogDB: the Nth call, only a named operation, a bounded number of times, or a
+  short write. 23 tests drive recovery through it; 13 untagged tests check the
+  injector itself and run in `make test`.
+- `test/netfault` (`quicraft_netfault`) drops messages between live replicas.
+  Its 7 tests are untagged and also run in `make test`.
+
+Run via `make errfs-waldb` / `make ci-errfs` and `make ci-netfault`. Details and
+rationale in [Testing Infrastructure](infrastructure.md).
 
 ### Benchmarks
 
@@ -58,9 +111,12 @@ The `test/performance/` directory contains a cross-system benchmark framework th
 | `perf-etcd`                   | etcd/raft benchmarks                           |
 | `perf-dragonboat`             | Dragonboat benchmarks                          |
 | `perf-openraft`               | OpenRaft (Rust) benchmarks                     |
-| `perf-compare-all`            | Compare all systems                            |
-| `perf-compare-all-visualize`  | Compare all + generate SVG charts              |
-| `perf-docs`                   | Run all comparisons + generate charts for docs |
+| `perf-compare-all`            | Compare all systems (terminal report only)     |
+| `perf-all`                    | Run + store + generate for one machine profile |
+| `perf-remote`                 | The same, on another machine (PERF_HOST)       |
+
+Everything that stores a result requires `PERF_PROFILE`; see
+[test/performance/README.md](../../test/performance/README.md).
 
 ## Unit Test Patterns
 
@@ -98,7 +154,8 @@ func newTestHostConfig() config.HostConfig {
         WALDir: "/tmp/test-wal", NodeHostDir: "/tmp/test-node",
         ListenAddress: "127.0.0.1:0", RTTMillisecond: 200,
         NumWorkers: 2, MaxApplyWorkers: 2, CommitCBufferSize: 16,
-        ShutdownTimeout: 5 * time.Second, DeploymentID: 1,
+        ShutdownTimeout: 5 * time.Second,
+        MaxTotalInMemLogSize: 4 * 1024 * 1024 * 1024, DeploymentID: 1,
     }
     cfg.TransportConfig.SetDefaults()
     return cfg
@@ -171,12 +228,20 @@ The `mockLogDB` in `pkg/host_test.go` provides an even lighter mock with injecta
 
 ### Mock State Machines
 
-The `kvStateMachine` is the standard test state machine across both unit and integration tests. It implements `sm.StateMachine` with:
+The `kvStateMachine` is the standard test state machine, defined once per integration package (`test/integration/e2e/helpers_test.go`, `test/integration/host/helpers_test.go`). It implements `sm.StateMachine` with:
 
-- `Update`: Parses `[op:1][keyLen:2][key][value]` wire format, stores in map
+- `Update`: Parses `[op:1][keyLen:2 BigEndian][key][value]`, stores in a map
 - `Lookup`: Returns value by key
 - `SaveSnapshot` / `RecoverFromSnapshot`: Binary serialization of the full map
 - `Close`: No-op
+
+It is not only a map. `checkIndexLocked` enforces strict forward progress of
+the applied index: an index that repeats or rolls back records an apply
+violation, and a jump records a gap counted by `ApplyGaps()`.
+`RecoverCount()` reports how many times the machine was rebuilt from a
+snapshot. A duplicate or reordered apply therefore fails on its own terms,
+rather than being masked by a later write that happens to restore the expected
+value.
 
 A companion `smTracker` wraps the factory to give tests direct access to state machine internals for assertions:
 
@@ -234,67 +299,59 @@ All E2E tests use polling-based wait functions instead of fixed sleeps:
 | Helper                 | Purpose                                              |
 |------------------------|------------------------------------------------------|
 | `waitForClusterLeader` | Polls until one node reports `IsLeader` for a shard  |
-| `waitForCondition`     | Generic poll-until-true with timeout and description |
+| `waitForSingleLeader`  | Polls until exactly one node claims leadership       |
 | `waitForLeader`        | Polls a single host for leader knowledge             |
 | `waitForApplied`       | Polls until a shard's lastApplied reaches a target   |
 | `waitForReplication`   | Polls all live nodes until a key-value appears in SM |
+| `waitForMembershipSize` / `waitForMembershipConverged` | Membership change convergence |
+| `waitForNodeData`      | Polls one node for a key-value                       |
+| `waitForSnapshotArtifact` | Polls a directory for snapshot files on disk      |
+| `waitForCondition` / `waitForConditionDiag` | Generic poll-until-true, with and without diagnostics |
 
 ### Timeout Constants
 
 ```go
-const defaultTimeout        = 10 * time.Second   // standard operation timeout
+const defaultTimeout        = 15 * time.Second   // standard operation timeout
 const leaderElectionTimeout = 5 * time.Second    // leader election wait
-const failoverTimeout       = 15 * time.Second   // failover with old leader timeout
+const failoverTimeout       = 20 * time.Second   // failover: the old leader must time out first
 ```
 
-### E2E Test Suites
+With RTT=50ms and ElectionRTT=10 an election takes roughly 500ms, so
+`leaderElectionTimeout` is 10x headroom for container and CI contention.
 
-E2E tests are organized into the following categories:
+### E2E Test Files
 
-**Cluster formation** (`cluster_test.go`):
-- 3-node and 5-node leader election
-- All-nodes-agree-on-leader convergence
-- Multiple independent shards on one cluster
+`test/integration/e2e/` holds 63 tests. All build under `integration`; two
+files need `quicraft_netfault` as well.
 
-**Replication** (`replication_test.go`):
-- Single entry, sequential entries, concurrent proposals
-- Stale read from follower
-- Large value replication
-- Tests repeated for both 3-node and 5-node clusters
+| File | Tests | Covers |
+|------|-------|--------|
+| `replication_test.go` | 10 | Single entry, sequential, concurrent proposals, stale read, large values, 3N and 5N |
+| `failover_test.go` | 9 | Leader kill and re-election, data survival, proposals after failover, exact-quorum cases |
+| `cluster_test.go` | 6 | 3N/5N election, all-nodes-agree convergence, multiple shards on one cluster |
+| `asymmetric_partition_test.go` | 6 | Leader isolated from a minority / from a majority, follower isolated, snapshot catch-up after |
+| `membership_test.go` | 5 | Add, remove, round-trip, proposal after removal |
+| `membership_election_test.go` | 4 | Elections across a membership change |
+| `barrier_test.go` | 4 | Propose and read through an encrypted barrier, replication, snapshot restore, 5N |
+| `replacement_test.go` | 4 | Replace a follower in 3N and 5N, data integrity, continued writes |
+| `barrier_replacement_test.go` | 3 | Replacement and snapshot catch-up with a barrier, key rotation mid-replacement |
+| `snapshot_catchup_test.go` | 3 | New node catch-up via snapshot, data integrity, 5N |
+| `partition_test.go` | 3 | Minority cannot elect, majority commits, heal and reconverge |
+| `netpartition_test.go` | 3 | `quicraft_netfault`: deposed live leader, asymmetric leader, 2-of-4 cannot elect |
+| `quorum_loss_test.go` | 2 | Writes rejected without quorum, recovery |
+| `election_safety_netfault_test.go` | 1 | `quicraft_netfault`: a spent term cannot be won twice |
 
-**Failover** (`failover_test.go`):
-- Leader kill and re-election
-- Data survival across leader change
-- Proposal acceptance after failover
-- Minority partition (follower loss)
-- 5-node cluster with 1 and 2 node failures (exact quorum test)
-
-**Membership** (`membership_test.go`):
-- Add node, remove node
-- Add/remove round-trip, proposal after removal
-
-**Replacement** (`replacement_test.go`):
-- Replace follower in 3-node and 5-node clusters
-- Data integrity and continued writes after replacement
-
-**Barrier encryption** (`barrier_test.go`):
-- Propose/read through encrypted barrier
-- Replication, snapshot restore, 5-node barrier
-
-**Barrier replacement** (`barrier_replacement_test.go`):
-- Node replacement with barrier, snapshot catch-up with barrier
-- Key rotation during node replacement
-
-**Snapshot catch-up** (`snapshot_catchup_test.go`):
-- New node catch-up via snapshot, data integrity, 5-node catch-up
-
-**Discovery and bootstrap** (`discovery_test.go`):
-- Static discovery peer enumeration
-- 3-node bootstrap formation
+`partition_test.go`, `asymmetric_partition_test.go` and `quorum_loss_test.go`
+create their topologies with `stopNode`, which is a process kill. Only the two
+`quicraft_netfault` files drop packets between replicas that are still running.
+The distinction matters: with the stopNode-only suite, an election quorum
+weakened from a strict majority to `n/2` passed 18 of the 19 linearizability
+tests. See [Testing Infrastructure](infrastructure.md#network-partition-injection).
 
 ### Docker Compose E2E
 
-The `.devcontainer/docker-compose.integration.yml` defines a 3-node cluster where each node runs QuicRaft with static discovery. A test-runner container depends on health checks (`test -f /data/nodehost/host.id`) for all three nodes before executing:
+`.devcontainer/docker-compose.integration.yml` defines a 3-node cluster with
+static discovery, plus a test-runner container gated on all three healthchecks:
 
 ```yaml
 services:
@@ -311,34 +368,43 @@ services:
       node3: { condition: service_healthy }
 ```
 
+The test-runner executes a binary compiled from `./test/integration/e2e/...`,
+which spins up its own loopback clusters and ignores the node containers
+entirely. `.devcontainer/Dockerfile.integration` also swallows a compile failure
+(`2>/dev/null || echo ... && touch /integration-tests`) and substitutes an empty
+executable, so this path can report success having run nothing. Use
+`make ci-integration` when you need the suite to have actually run.
+
 ## Coverage Targets
 
-Per-package coverage targets are enforced by the Makefile `check-coverage` function, which parses `go tool cover -func` output and fails the build if any package drops below the configured threshold.
-
-Running coverage for a single package:
+One threshold, `COVER_MIN = 91`, applied by every coverage target. There is no
+per-package threshold table: `make coverage-raft` and `make coverage` (which
+measures `./...`) are judged against the same number. The CI `test` job repeats
+the same check on the module total.
 
 ```
-make coverage-raft
-
-make coverage
-# Runs total coverage across all packages
+make coverage-raft         # one package
+make coverage              # ./...
 ```
 
-Coverage profiles are written to `build/coverage/<package>.out` and can be viewed with `go tool cover -html=build/coverage/<package>.out`.
+Profiles land in `build/coverage/<label>.out` and open with
+`go tool cover -html=build/coverage/<label>.out`.
 
-Aggregate coverage is **91.5%**. Not every package clears that mark, and the
-ones that do not are the durability and transport layers:
+`check-coverage` guards three ways before it compares, and those guards are the
+gate's history rather than defensive padding. The earlier version went straight
+to `bc`, and on an empty or missing profile the percentage was the empty string,
+`bc` failed printing nothing, the shell test degenerated to `[ -eq 1 ]`, and the
+`if` took the else branch. The gate passed exactly when it had no coverage data
+to judge. A missing or empty profile, or a value that is not a number, now fails
+explicitly. `awk '/^total:/'` replaced `grep total` because the old filter also
+matched functions whose names contain "total", and two matches produced two
+values, which landed back in the same unparseable case.
 
-| Package | Coverage |
-|---------|----------|
-| `pkg/logdb` | 85.2% |
-| `pkg/logdb/waldb` | 88.3% |
-| `pkg/internal/transport` | 89.2% |
-| `pkg/internal/engine` | 90.4% |
-| **Aggregate** | **91.5%** |
-
-Each package is enforced in CI against its own configured threshold, not
-against a single repo-wide 91% floor.
+`-coverpkg=./...` is deliberately not passed. Measured, not assumed: an
+untested package is already in the denominator at 0%, and `-coverpkg` only adds
+credit for statements covered by another package's tests, which moved the same
+tree from 91.3% to 92.0%. Against an unchanged floor that loosens the gate by
+0.7 points, so it is a threshold decision rather than a wiring fix.
 
 ## Benchmark Infrastructure
 
@@ -382,7 +448,7 @@ SaveState, GetEntries, ReadState, IterateEntries.
 
 **Engine benchmarks** (`pkg/internal/engine/`):
 
-ReadyMap Set/Swap, WorkSignal Notify (contended and uncontended), SpinMutex lock/unlock.
+ReadyMap Set / SetAndSwap / ConcurrentSet / SwapEmpty / SwapWithData, WorkSignal Notify (contended and uncontended), and `protoUpdatesToLogDB` buffer reuse at small and large batch sizes.
 
 ### Running Benchmarks
 
@@ -391,12 +457,11 @@ make bench-proto       # Proto marshal/unmarshal
 make bench-raft        # Raft core: Tick, HasUpdate, GetUpdate, compression
 make bench-waldb       # WAL: SaveState, GetEntries, segment write/sync
 make bench-seal        # AEAD encrypt/decrypt at various sizes
-make bench-engine      # ReadyMap, WorkSignal, SpinMutex
+make bench-engine      # ReadyMap, WorkSignal, LogDB update conversion
 make bench-transport   # Frame marshal/unmarshal, header validation
 make bench-quicraft    # Full pipeline: propose, read, leader lookup
 make bench-registry    # Address registry resolve/register
-make bench-discovery   # Static/multicast discovery
-make bench-bootstrap   # Quorum size, leader determination
+make bench-crypto      # GF(256) Shamir primitive
 make bench-server      # Rate limiter
 make bench-writemode   # Write mode benchmarks
 make bench-batch       # Batch processing benchmarks
@@ -404,30 +469,62 @@ make bench-batch       # Batch processing benchmarks
 
 ## Fuzz Testing
 
-Native Go fuzzing targets cover high-risk codec and protocol surfaces:
+37 targets behind `//go:build quicraft_fuzz`, across six packages:
 
-| Target | Coverage |
-|--------|----------|
-| `fuzz-proto` | Entry/Message/Snapshot round-trip |
-| `fuzz-transport` | FrameHeader decode with malformed input |
-| `fuzz-waldb` | WAL record codec and recovery |
-| `fuzz-seal` | AES-GCM encrypt/decrypt across epochs |
-| `fuzz-session` | Session encoding boundaries |
+| Target | Package | Fuzz functions | Surface |
+|--------|---------|----------------|---------|
+| `fuzz-proto` | `pkg/proto` | 13 | Entry, Message, MessageBatch, State, Membership, ConfigChange, Snapshot: round-trip and unmarshal-crash |
+| `fuzz-waldb` | `pkg/logdb/waldb` | 9 | WAL record codec and recovery |
+| `fuzz-transport` | `pkg/internal/transport` | 5 | Frame header decode, message-frame receive path |
+| `fuzz-session` | `pkg/internal/session` | 4 | Session encoding boundaries |
+| `fuzz-seal` | `pkg/seal` | 4 | AES-GCM encrypt/decrypt across epochs |
+| `fuzz-raft` | `pkg/internal/raft` | 2 | Adversarial step sequences, log recovery |
 
-Run via `make fuzz-all` or per-target `make fuzz-<package>`. FUZZ_TIME environment variable controls duration (default 60s).
+All 37 carry `f.Add` seeds. `FUZZ_TIME` sets the per-target mutation budget
+(default 60s). `fuzz-raft` names its two targets explicitly, because
+`go test -fuzz` runs exactly one target per invocation.
+
+The committed corpus is 39 files under `pkg/proto/testdata/fuzz/<Target>/`. No
+other package has promoted a reproducer yet; nightly fuzzing uploads crashers
+as artifacts and committing one is how it becomes a permanent regression test.
+
+Three distinct things, not interchangeable:
+
+| Target | What it does | Where it runs |
+|--------|--------------|---------------|
+| `fuzz-<pkg>`, `fuzz-all` | Mutates for `FUZZ_TIME` per target | Local |
+| `ci-fuzz-seeds` | `-run=Fuzz` with no `-fuzz`: every seed and corpus file once, deterministic, over `./...` | PR gate |
+| `ci-fuzz-mutation` | 10s mutation budget per target | Release gate |
+
+`ci-fuzz-seeds` walks `./...` rather than the six known packages so a new target
+in a seventh cannot go unrun. Unbounded searching lives in
+`.github/workflows/fuzz.yml` on a nightly cron, deliberately off the PR path: a
+crash it finds is a property of the RNG schedule, and failing unrelated pull
+requests at random is how a gate stops being a gate.
 
 ## Error Injection Testing
 
-ErrorFS framework injects I/O failures at the WAL/LogDB layer to verify crash recovery and error propagation without panic:
+`test/errfs` fails filesystem operations under the WAL and LogDB on demand:
+the Nth call, only a named operation, a bounded number of times, or a short
+write that disturbs the delegate before returning the error.
 
 ```
-make errfs-waldb
+make errfs-waldb    # 23 tagged tests, -v (use this when one fails)
+make ci-errfs       # same suite without -v, CI parity
 ```
 
-Tests verify:
-- Failed writes do not corrupt recovery
-- Sync failures propagate as typed errors
-- Re-open succeeds after injected failure
+Both keep `-race`: these tests drive the WAL through injected failures from
+concurrent goroutines, which is where a torn recovery path shows up as a race
+rather than as a wrong answer.
+
+Coverage includes torn tails and repair, a failed fsync losing only
+unacknowledged data, mid-entry write failure, read and `Stat` failure during
+replay, `OpenFile` and `MkdirAll` failure, compaction remove and readdir
+failure, double faults across write and rollback, and idempotent recovery.
+
+A further 13 untagged tests in `errfs_unit_test.go` and `harness_test.go` test
+the injector itself and run in `make test`. An injector that quietly stopped
+injecting would make all 23 tagged tests pass for the wrong reason.
 
 ## Running Heavyweight Suites Off-Box
 
@@ -491,48 +588,65 @@ verification goes through the Makefile targets, on omega.
 | `test-server`     | `./pkg/internal/server/...`        |
 | `test-writemode`  | `./pkg/writemode/...`              |
 | `test-batch`      | `./pkg/batch/...`                  |
+| `test-enclave`    | `./pkg/enclave/...`                |
+| `test-crypto`     | `./pkg/crypto/...`                 |
 
-All unit test targets use `go test -race -count=1`.
+All unit test targets use `go test -race -count=1 -v`.
 
 ### Coverage Targets
 
-Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Outputs profiles to `build/coverage/<package>.out` and enforces the configured minimum threshold. Example: `make coverage-raft`.
+Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Profiles go to `build/coverage/<label>.out` and are enforced against `COVER_MIN` (91). Example: `make coverage-raft`.
 
-`make coverage` runs total coverage across all packages.
+`make coverage` measures `./...` against the same floor.
 
 ### Integration Test Targets
 
-| Target                         | Runs Inside         | Suite                 |
-|--------------------------------|---------------------|-----------------------|
-| `integration-test`             | devcontainer        | All integration tests |
-| `integration-test-raft`        | devcontainer        | Raft protocol         |
-| `integration-test-host`        | devcontainer        | Host API              |
-| `integration-test-bootstrap`   | devcontainer        | Bootstrap/discovery   |
-| `integration-test-e2e`         | Docker Compose      | Multi-node cluster    |
-| `integration-test-linearizability` | devcontainer   | porcupine verification |
+| Target                             | Runs In         | Suite                             |
+|------------------------------------|-----------------|-----------------------------------|
+| `integration-test`                 | devcontainer    | All four packages, `-p 1`, 900s   |
+| `integration-test-raft`            | devcontainer    | Raft protocol                     |
+| `integration-test-host`            | devcontainer    | Host API                          |
+| `integration-test-linearizability` | devcontainer    | Porcupine verification, 600s      |
+| `integration-test-e2e`             | Docker Compose  | e2e package in the compose stack  |
+| `ci-integration`                   | host            | All four packages, `-p 1`, 1800s  |
+| `ci-netfault`                      | host            | e2e package + `quicraft_netfault` |
 
-### ErrorFS Error Injection Targets
+### Fault Injection Targets
 
-| Target       | Description                         |
-|--------------|-------------------------------------|
-| `errfs-waldb` | WAL/LogDB I/O error injection tests |
-
-### Network Partition Targets
-
-| Target | Description |
-|--------|-------------|
-| `ci-netfault` | Partitions between LIVE replicas (`quicraft_netfault`); the only tests that can construct a deposed-but-running leader |
+| Target | Tag | Description |
+|--------|-----|-------------|
+| `errfs-waldb` | `quicraft_errfs` | WAL/LogDB I/O error injection, `-v` |
+| `ci-errfs` | `quicraft_errfs` | Same suite, CI parity |
+| `ci-netfault` | `quicraft_netfault` | Partitions between live replicas; the only tests that can construct a deposed-but-running leader |
 
 ### Fuzz Testing Targets
 
 | Target | Description |
 |--------|-------------|
-| `fuzz-proto` | Entry/Message round-trip |
-| `fuzz-transport` | FrameHeader decode |
-| `fuzz-waldb` | WAL record codec |
-| `fuzz-seal` | AES-GCM crypto |
-| `fuzz-session` | Session encoding |
-| `fuzz-all` | All fuzz targets (FUZZ_TIME=60s) |
+| `fuzz-proto` | 13 codec targets |
+| `fuzz-waldb` | 9 WAL record codec and recovery targets |
+| `fuzz-transport` | 5 frame decode targets |
+| `fuzz-session` | 4 session encoding targets |
+| `fuzz-seal` | 4 AES-GCM targets |
+| `fuzz-raft` | 2 targets, named explicitly |
+| `fuzz-all` | All of the above (FUZZ_TIME=60s each) |
+| `ci-fuzz-seeds` | Seeds and committed corpus only, deterministic, over `./...` |
+| `ci-fuzz-mutation` | 10s bounded mutation per target, release gate |
+
+### CI Pipeline Targets
+
+| Target | Description |
+|--------|-------------|
+| `ci` | `fmt` → `no-mutants` → `vet` → `lint` → `security` → `build` → `test`. Untagged only |
+| `ci-full` | `ci` plus `ci-modules`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`. Matches ci.yml |
+| `ci-modules` | Build and vet every `go.mod` in the tree, with `GOWORK=off` |
+| `remote-<target>` | rsync the working tree to omega and run `<target>` there |
+| `remote-tools` | Provision omega's scanners |
+
+`make ci` stops at `test`, which is `go test ./...` with no build tags. That
+quietly skipped the integration, errfs and fuzz suites and computed the
+coverage threshold over what was left. `ci-full` is what to run before opening
+a pull request; `ci` is the fast inner loop.
 
 ### Docker Targets
 
@@ -548,9 +662,18 @@ Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Ou
 
 | Target | Description                    |
 |--------|--------------------------------|
-| `lint` | `golangci-lint run ./...`      |
+| `lint` | `golangci-lint run --timeout=5m ./...` |
 | `vet`  | `go vet ./...`                 |
 | `fmt`  | Check `gofmt` formatting       |
+| `no-mutants` | Fail if `if false {`, `MUTANT` or `MUTATION` survives in non-test Go under `pkg/`, `test/`, `contrib/` |
+| `security` | `gosec`, `govulncheck`, `go mod verify`, `trivy fs` |
+
+`no-mutants` runs inside `make ci`. Mutation testing is how a fix is verified
+here, and that workflow edits production code: a restore that never happens is
+invisible, because a disabled guard makes tests pass rather than fail. An
+`if false {` around the rollback fsync in waldb once reached a commit, and every
+suite stayed green because the site had no test, which is why it was being
+mutated in the first place.
 
 ## Known Test Patterns and Fixes
 
@@ -627,4 +750,6 @@ for attempt := range 5 {
 - [WAL Persistence](../storage/wal.md) -- WAL internals tested by waldb suite
 - [Engine Pipeline](../engine/pipeline.md) -- Worker pipeline tested by engine suite
 - [Transport](../transport/quic.md) -- QUIC transport tested by transport suite
-- [Testing Infrastructure Roadmap](infrastructure.md) -- Advanced testing: fuzzing, linearizability, error injection
+- [Testing Infrastructure](infrastructure.md) -- fault injectors, fuzzing, linearizability, and why each gate is shaped the way it is
+- [Contributing](../../CONTRIBUTING.md) -- what a change is expected to bring with it
+- [Benchmark Regression Testing](../performance/benchmarking.md) -- the `bench-compare` method

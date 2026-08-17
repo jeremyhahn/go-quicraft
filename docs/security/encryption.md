@@ -1,14 +1,16 @@
 # At-Rest Encryption
 
-At-rest encryption in QuicRaft is built on a **per-node Barrier** that manages AEAD encryption with epoch-based key rotation. All encryption is opt-in. The algorithm is automatically selected based on hardware acceleration availability: AES-256-GCM when AES-NI is detected, ChaCha20-Poly1305 as a portable fallback.
+At-rest encryption in QuicRaft is built on a **per-node Barrier** that manages AEAD encryption with epoch-based key rotation. All encryption is opt-in. `DefaultBarrierConfig` picks the algorithm from the local CPU — AES-256-GCM when AES-NI is present, ChaCha20-Poly1305 otherwise — but that default is only appropriate for data that never outlives the host that wrote it. Pin `BarrierConfig.Algorithm` explicitly; see [Algorithm is a property of the data](#algorithm-is-a-property-of-the-data-not-the-host).
 
 **Key packages:**
-- `pkg/crypto/` — AES-GCM and ChaCha20-Poly1305 AEAD with automatic hardware detection
-- `pkg/seal/` — Barrier/seal/unseal pattern for at-rest key protection
-- `pkg/crypto/shamir/` — Shamir's Secret Sharing for key management
+- `pkg/seal/` — the whole barrier: epoch DEKs, the AEAD data path, sealing strategies, the AEAD safety trackers, the sealed-state format
+- `pkg/crypto/` — a backward-compatibility shim only. It contains six type aliases and two `var` re-exports pointing at `pkg/seal` (`pkg/crypto/crypto.go`). No cipher code lives here.
+- `pkg/crypto/shamir/` — the pure GF(256) `Split`/`Combine` primitive. Custody is not here; see [Shamir](#shamirs-secret-sharing--primitive--interfaces-only).
 - `pkg/enclave/` — memguard-backed in-process memory protection for key material
 
-**Source:** `pkg/seal/barrier.go`, `pkg/seal/barrier_config.go`, `pkg/seal/strategy.go`, `pkg/seal/errors.go`
+**Source:** `pkg/seal/barrier.go`, `pkg/seal/barrier_config.go`, `pkg/seal/barrier_binding.go`, `pkg/seal/strategy.go`, `pkg/seal/algorithm.go`, `pkg/seal/errors.go`
+
+**Related:** [Key custody and the extension points](key-custody.md) — where the sealed blob lives, what protects the root key, and how an embedder overrides both.
 
 ## Overview
 
@@ -37,7 +39,7 @@ The system separates two concerns:
 
 | Layer | Responsibility | Configurable |
 |-------|----------------|--------------|
-| **Barrier** | Derives DEKs via HKDF-SHA256, encrypts/decrypts data with AEAD, manages epoch rotation, auto-detects optimal algorithm | Algorithm, deployment ID, AEAD safety trackers, and the `StatePersister` via `BarrierConfig` |
+| **Barrier** | Derives DEKs via HKDF-SHA256, encrypts/decrypts data with AEAD, manages epoch rotation | Algorithm, deployment ID, AEAD safety trackers, `StatePersister`, and the enforcement flags (`RequireContextAAD`, `RequireFIPS`, `MinEpoch`) via `BarrierConfig` |
 | **SealingStrategy** | Protects the root key at rest (wrapping/unwrapping) | Yes—any backend (software, HSM, TPM2, cloud KMS) |
 
 **The embedder owns durable storage.** The barrier holds sealed state in memory and hands it to a caller-supplied `StatePersister` when that state changes; it never writes a file. Custody of the sealed blob belongs to the host application (go-qrdb), per the Layer-1 boundary.
@@ -46,7 +48,7 @@ The system separates two concerns:
 
 ## Barrier Interface
 
-The Barrier is defined to break import cycles:
+`pkg.Barrier` (`pkg/host.go`, `type Barrier`) is the interface the Host accepts, declared there to break the import cycle. `*seal.Barrier` satisfies it:
 
 ```go
 type Barrier interface {
@@ -54,8 +56,12 @@ type Barrier interface {
     Seal() error
     Encrypt(dst, plaintext []byte) ([]byte, error)
     Decrypt(dst, ciphertext []byte) ([]byte, error)
+    DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
     EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error)
+    EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
     DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
+    IsHardwareMode() bool
+    SupportsContextAAD() bool
     Rotate() (uint64, error)
     PurgeEpochsBefore(minEpoch uint64) (int, error)
     RegisterInFlightEpoch(epoch uint64)
@@ -65,6 +71,8 @@ type Barrier interface {
 }
 ```
 
+`EncryptWithEpochPinnedContext` is deliberately **not** in the interface. It is an optional capability (`atomicEpochPinner` in `pkg/host.go`) that the at-rest encrypt loops use when the barrier provides it, sealing a frame and pinning its epoch under one lock. A `Barrier` without it still works, with a narrow window in which a `Rotate` plus `PurgeEpochsBefore` can drop the DEK of a frame that is already sealed into the artifact.
+
 ## Supported Algorithms
 
 | Algorithm | Key Size | Hardware Acceleration | Default When |
@@ -73,7 +81,22 @@ type Barrier interface {
 | **ChaCha20-Poly1305** | 32 bytes | Software (no hardware acceleration) | **Yes, when no hardware AES** |
 | **XChaCha20-Poly1305** | 32 bytes | Software (large nonce variant) | Manual override only |
 
-Algorithm detection is automatic via `pkg/crypto.SelectOptimalAlgorithm()`. Users can override via `BarrierConfig.Algorithm`.
+`seal.SelectOptimalAlgorithm(isHardwareBacked bool)` (`pkg/seal/algorithm.go`) is what `DefaultBarrierConfig` calls. Under FIPS mode it returns AES-256-GCM unconditionally.
+
+AES-128-GCM (`AlgAES128GCM`, `0x01`) and AES-192-GCM (`AlgAES192GCM`, `0x02`) are also valid `BarrierConfig.Algorithm` values; they are never auto-selected.
+
+### Algorithm is a property of the data, not the host
+
+`Decrypt` selects the AEAD by **epoch**, not from the ciphertext header's `algID` byte, and under HKDFV2 the algorithm is an HKDF domain separator. Both mean a deployment uses one algorithm for the life of its data. Nothing in the WAL or a snapshot names that algorithm in a form a reader can act on.
+
+So the auto-selected default is a trap for any data directory that outlives the host that wrote it: restore it onto a machine without AES-NI, or add a node whose CPU differs, and every read comes back `ErrDecryptionFailed` with nothing to point at.
+
+Two mechanisms narrow that:
+
+- `Initialize` records the choice in `SealedRootKey.Algorithm` (`Barrier.Initialize`).
+- `SetSealedRootKey` rejects a blob whose `Algorithm` disagrees with `BarrierConfig.Algorithm`, returning `*AlgorithmMismatchError` naming both (`Barrier.SetSealedRootKey`). The failure names the algorithm that would work instead of being indistinguishable from tampering.
+
+A zero `Algorithm` means "unrecorded" — a blob written before the field existed. It loads without complaint under whatever the barrier is configured with, which is the pre-existing behaviour and the pre-existing risk. Pin `BarrierConfig.Algorithm` rather than rely on that.
 
 ## Barrier State Machine
 
@@ -84,9 +107,10 @@ type Barrier struct {
     mu       sync.RWMutex
     unsealed atomic.Bool  // fast-path check
 
-    state    barrierState
-    rootKey  *enclave.ProtectedKey  // 32 bytes, encrypted at-rest in memory
-    salt     []byte                 // 32 bytes, used for HKDF
+    state       barrierState
+    rootKey     *enclave.ProtectedKey  // 32 bytes, encrypted at-rest in memory
+    salt        []byte                 // 32 bytes, used for HKDF
+    hkdfVersion HKDFVersion            // DEK-derivation info layout in force
 
     epoch      uint64
     currentDEK *enclave.ProtectedKey  // derived via HKDF
@@ -100,8 +124,18 @@ type Barrier struct {
     lastFailedAt   time.Time
     inFlightMu     sync.Mutex           // separate lock for in-flight tracking
     inFlightEpochs map[uint64]int64     // epoch → refcount
+
+    hwEncryptor SymmetricEncrypter // non-nil = delegated mode
+    binding     ContextBinding     // resolved context-AAD capability
+    plaintextMode bool             // StrategyNone
+
+    loadGeneration uint64      // this barrier's claim on the sealed blob
+    superseded     atomic.Bool // another loader claimed it; fail closed
+    invocationsAuthoritative bool // this process created the epoch
 }
 ```
+
+The field list is trimmed for readability; `type Barrier` in `pkg/seal/barrier.go` is authoritative.
 
 Key material is held in `enclave.ProtectedKey` (`pkg/enclave`), which wraps a
 memguard enclave: the plaintext key exists only inside a guarded, mlock'd
@@ -121,9 +155,14 @@ Uninitialized ──Initialize()──> Unsealed ──Seal()──> Sealed
 
 | Method | Precondition | Action | Postcondition |
 |--------|-------------|--------|---------------|
-| `Initialize(strategy)` | Uninitialized | Generate root key + salt, derive epoch-1 DEK | Unsealed |
-| `Unseal(strategy)` | Sealed | Decrypt root key, re-derive all known epoch DEKs | Unsealed |
-| `Seal()` | Unsealed | Zero root key + all DEKs from memory | Sealed |
+| `Initialize(ctx, strategy, creds)` | Uninitialized | Generate root key + salt, derive epoch-1 DEK, stamp `HKDFVersion`, `Algorithm`, `LoadGeneration=1` and `StateMAC` into the sealed blob | Unsealed |
+| `SetSealedRootKey(sealed)` | Any | Validate and adopt a persisted blob (epoch floor, salt length, `KnownEpochs` bounds, HKDF version, algorithm match, load-generation fence) | Sealed, if it was Uninitialized |
+| `Unseal(ctx, strategy, creds)` | Sealed | Unwrap root key, verify `StateMAC`, claim the blob (`LoadGeneration+1`), re-derive DEKs for all known epochs, then re-establish a sound invocation budget | Unsealed |
+| `Seal()` | Unsealed | Drop root key + all DEK references | Sealed |
+
+`Unseal` does more than the name suggests, and two of the extra steps have visible consequences: it writes to the sealed blob through `StatePersister` before the barrier will encrypt (the [load-generation fence](#the-load-generation-fence)), and it usually **rotates to a fresh epoch** (see [Invocation budget across restarts](#invocation-budget-across-restarts)). Neither happens in delegated or no-encryption mode, both of which return earlier.
+
+`Barrier.Seal()` is exported but production code should go through `Host.Seal()` / `Host.Close()`, which quiesce the pipeline first so the engine does not take an `ErrBarrierSealed` storm (`Barrier.Seal` in `pkg/seal/barrier.go`). Sealing also clears the delegated encryptor and resets `binding` to `ContextBindingUnresolved`: the context-AAD capability is a property of the installed encryptor, so it is re-derived by the next `Unseal` and can legitimately differ.
 
 ## Key Derivation
 
@@ -225,6 +264,13 @@ func (b *Barrier) Rotate() (uint64, error) {
     candidate := cloneSealedRootKey(b.sealed)
     candidate.Epoch = newEpoch
     candidate.KnownEpochs = sortedEpochsWith(b.knownEpochs, newEpoch)
+    // Re-authenticate: Epoch and KnownEpochs are both covered by StateMAC,
+    // and a blob whose MAC covered the OLD values would be rejected by the
+    // next Unseal (correctly — it is indistinguishable from an edited one).
+    if macErr := b.restampStateMACLocked(rootBuf.Bytes(), candidate); macErr != nil {
+        wipeBytes(dek)
+        return 0, macErr
+    }
     if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
         wipeBytes(dek)
         return 0, &StatePersistError{Op: "rotate", Epoch: newEpoch, Err: perr}
@@ -252,9 +298,11 @@ The write lock blocks concurrent `Encrypt`/`Decrypt` calls during rotation. Sinc
 
 **Tracker resets are fail-safe and run last.** The invocation-counter `Reset()` and nonce-tracker `Clear()` happen *after* the epoch commit and never revert it; a failure is logged at `slog.Warn` and `Rotate` still returns `(newEpoch, nil)`. The trackers are shared in-place state with no rollback API — resetting before the commit could hand a still-active old key a freshly zeroed invocation counter, i.e. a second 2^32 budget beyond its AEAD safety limit. After the commit, both failure modes are safe: a non-reset counter only makes the new key re-rotate sooner, and a non-cleared nonce set only yields conservative false-positive reuse rejections. Returning an error alongside a committed epoch is deliberately avoided so a caller cannot retry into a second rotation.
 
-Rotation is rejected with `ErrBarrierSealed` unless the barrier is unsealed, and with `ErrHardwareMode` in hardware mode.
+Rotation is rejected with `ErrBarrierSealed` unless the barrier is unsealed, with `ErrBarrierSuperseded` when another loader has claimed the sealed blob, and with `ErrHardwareMode` in delegated mode. The order of those checks is `sealed → superseded → hardware → nil sealed data → no persister` (`Barrier.rotateLocked`).
 
 On restart, `SetSealedRootKey` restores the persisted known epochs and `Unseal()` re-derives DEKs for all of them.
+
+`Unseal` can rotate too: `rotateLocked` is factored out of `Rotate` precisely so `resolveInvocationBudget` can call it while already holding the write lock.
 
 ### Durable State: StatePersister
 
@@ -273,9 +321,45 @@ The barrier owns no storage. Per the Layer-1 boundary, `pkg/seal` is the encrypt
 - The persister runs **with the barrier's write lock held**. It MUST NOT call back into the same `Barrier` (`Encrypt`, `Rotate`, `SealedRootKeyData`, …) — doing so deadlocks.
 - Returning an error aborts the operation with the previous epoch intact.
 
-**Required for:** `Rotate`, and any `PurgeEpochsBefore` that would actually drop an epoch. Both change state that must survive a restart. `Initialize` does **not** call the persister — the embedder persists `SealedRootKeyData()` directly at bootstrap.
+**Required for three things**, not two:
 
-**Consequence of leaving it nil.** At-rest key rotation is disabled: `Rotate` fails closed with `ErrNoStatePersister` on every call. Encryption continues under the current epoch, but only until the AEAD invocation limit. The default `InvocationLimit` is `DefaultInvocationLimit` = 2^32 (NIST SP 800-38D for random 96-bit nonces); `Encrypt` increments the counter on every call and returns `ErrInvocationLimitExceeded` once the limit would be exceeded, failing every subsequent encrypt until the key is rotated. That end is reached quickly after any restart: with the default in-memory counter, `Unseal` cannot know how many invocations the current epoch already performed before the restart, so it pessimistically seeds the counter to the rotation threshold (default 95%), leaving only the ~5% headroom (≈2×10^8 invocations) before the hard limit. A deployment that leaves `StatePersister` nil therefore burns that headroom and then stops accepting writes.
+1. `Rotate`.
+2. Any `PurgeEpochsBefore` that would actually drop an epoch.
+3. **Every `Unseal` after a restart**, which claims the blob (`LoadGeneration+1`) and then usually rotates.
+
+`Initialize` does **not** call the persister — the embedder persists `SealedRootKeyData()` directly at bootstrap.
+
+**Consequence of leaving it nil.** This is worse than "rotation is disabled", which is how it used to read.
+
+- `Rotate` fails closed with `ErrNoStatePersister` on every call.
+- The load-generation fence is inert. A claim that cannot be written down is not a claim, so a second process loading the same blob is undetectable. `claimLoadGenerationLocked` logs this at WARN (`Barrier.claimLoadGenerationLocked`).
+- **The first `Unseal` after a restart leaves the barrier read-only.** With the default in-memory counter, the invocations already spent under the loaded epoch are not merely unknown but unknowable, and the barrier will not encrypt against a budget nobody can prove. It would rotate to a fresh epoch, but it cannot without a persister, so `resolveInvocationBudget` seeds the counter to the **full** limit and every `Encrypt` returns `ErrInvocationLimitExceeded`. `Decrypt` keeps working: the node can serve its data, it just cannot add to it.
+
+The default `InvocationLimit` is `DefaultInvocationLimit` = 2^32 (NIST SP 800-38D for random 96-bit nonces).
+
+### Invocation budget across restarts
+
+**Source:** `Barrier.resolveInvocationBudget` in `pkg/seal/barrier.go`
+
+With random 96-bit nonces, 2^32 invocations per DEK is a hard nonce-collision bound (collision probability below 2^-32), not advice. A GCM nonce collision yields keystream XOR and recovery of the GHASH authentication key, which is arbitrary forgery of at-rest records.
+
+The default counter is in-memory and does not survive a restart. An earlier design seeded it to the rotation threshold (95%) after an unseal, leaving 5% — over 2×10^8 encryptions — of headroom. That headroom was re-granted in full on *every* restart against the *same* DEK, so roughly 20 restarts of a deployment that never rotates pushed the DEK past 2^32. That behaviour is gone.
+
+`Unseal` now takes one of two sound paths, decided by `resolveInvocationBudget`:
+
+| Condition | Action |
+|---|---|
+| Counting disabled (`InvocationLimit == -1`) | Nothing. The embedder opted out of the bound. |
+| `BarrierConfig.InvocationCounter` injected | Nothing. The injected counter owns persistence and seeding. |
+| This process created the epoch (`Initialize`, or a `Rotate` since) | Nothing. A seal/unseal cycle inside one process must not be disturbed. |
+| `StatePersister` set | **Rotate to a fresh epoch**, inside `Unseal` and under the same write lock. |
+| Otherwise | Seed the counter to the full limit. Every `Encrypt` fails with `ErrInvocationLimitExceeded`; `Decrypt` is unaffected. |
+
+The rotation is performed inside `Unseal` rather than left to an embedder's rotation loop because a loop that reacts a tick later leaves a window in which writes land on the exhausted DEK, and an embedder without such a loop leaves it open forever.
+
+**What the fresh epoch assumes.** The rotated-to epoch is a pure function of the loaded blob (`epoch+1`), and every `deriveDEK` input comes from that blob, so a second process loading the same blob derives the *same* new DEK and also starts from zero. "Count zero" is a claim about this process only. That is what the load-generation fence exists to make visible.
+
+**Side effect worth planning for.** The forced rotation grows `KnownEpochs` by one per restart, and `SetSealedRootKey` refuses a blob naming more than `MaxKnownEpochs` (4096, the `MaxKnownEpochs` constant). Nothing reconciles the two: the bound is a DoS guard against a forged blob, and it also caps legitimate growth. An embedder that never calls `PurgeEpochsBefore` — or one in a crash loop, which reaches 4096 in minutes rather than years — ends up with a node that cannot start at all, needing bespoke tooling to recover (unwrap the root key, trim `KnownEpochs`, re-stamp the MAC). The barrier logs at ERROR once the set passes half the bound.
 
 ### Ciphertext Format
 
@@ -347,8 +431,20 @@ Because the epoch always occupies the fixed 8-byte prefix and the context is app
 - **The context is not stored** in the ciphertext (the wire format is unchanged). The caller must reproduce the exact same context bytes at decrypt time; a mismatched or omitted context fails authentication with the generic `ErrDecryptionFailed`.
 - **Actual contexts.** Both consumers are threaded today, and both use a magic-tagged, fixed-width, **big-endian** layout with no delimiters, so no two distinct positions can produce the same bytes. Snapshot frames pass a 39-byte context, WAL records a 30-byte one; see [Snapshot AAD](#aad-additional-authenticated-data) and [WAL positional binding](#positional-binding-for-wal-records) for the exact byte layouts. This binds each frame to its position and artifact, so same-epoch reorder, splice, and truncation fail authentication.
 - **The magic is a scheme tag, not a version byte.** It is part of the authenticated context rather than a byte on disk, so the scheme identifies itself: a frame sealed under a future layout can never authenticate against this one, and there is no unauthenticated version marker for an attacker to rewrite. There is no epoch-only fallback — a reader that fails to authenticate a frame must **never** retry without the context, because that retry would be the vulnerability.
+- **Truncation is not covered.** Nothing in the AAD names the number of frames or the total length, so every surviving frame of a shortened artifact still authenticates and a reader that stops at EOF sees a complete, shorter artifact. Detecting a removed tail is the caller's job: fold the total frame count into every frame's context, or give the final frame a distinguishable context. **Neither consumer does this today.** The snapshot receive path checks a declared chunk count for the *network* transfer only, and the WAL relies on its own durability-sequence recovery rules. At-rest tail truncation of either artifact is not detected by the AEAD.
 - **Delegated (hardware) mode.** The plain `SymmetricEncrypter` seam takes no AAD. A delegated encryptor that can authenticate AAD end to end declares it by also implementing `AADSymmetricEncrypter`; the barrier then routes the context through `EncryptWithAAD`/`DecryptWithAAD` using the SAME `aadForEpoch(epoch, contextAAD)` bytes the software path builds, so hardware deployments keep their positional binding. An encryptor that does NOT implement it returns `ErrHardwareMode` for a non-empty context (fail-closed) rather than silently dropping the binding; a nil/empty context is delegated unchanged in both cases.
-- **Capability reporting.** `Barrier.SupportsContextAAD()` is what callers gate on (true for software and for a capable delegated encryptor). `Barrier.ContextBinding()` and `Barrier.IsPlaintextMode()` separate "nothing to bind because nothing is encrypted" (`StrategyNone`) from "binding unavailable because the encryptor cannot carry AAD" — `IsHardwareMode()` is true for both and cannot tell them apart.
+- **The declaration is measured, not trusted.** A Go method set is a claim, and the implementations live in other repositories. At `Initialize` and `Unseal` — never on the data path — `verifyAADBinding` (`verifyAADBinding` in `pkg/seal/barrier_binding.go`) runs one encrypt and two decrypts against the delegated encryptor with random 32-byte values: seal a probe under `aadA`, require it to open under `aadA` and return the same bytes, require it to **fail** under an independently drawn `aadB`. An encryptor that accepts the `aad` argument and drops it passes the first two and fails the third. A failing probe is logged at ERROR and the barrier downgrades the encryptor to `ContextBindingUnsupported`, so `RequireContextAAD` then refuses the deployment rather than blessing it.
+- **Capability reporting.** `Barrier.SupportsContextAAD()` is what callers gate on. It is `ContextBinding().Binds()`, and `ContextBinding` has five values:
+
+  | Value | Meaning | `Binds()` |
+  |---|---|---|
+  | `ContextBindingUnresolved` | Barrier not unsealed; no encryptor installed, so the question has no answer yet | false |
+  | `ContextBindingBarrier` | Software path; the barrier folds the context into its own AAD | true |
+  | `ContextBindingDelegated` | Delegated encryptor that implements `AADSymmetricEncrypter` and passed the probe | true |
+  | `ContextBindingUnsupported` | Delegated encryptor with no AAD capability. Data is encrypted; position is not bound | false |
+  | `ContextBindingPlaintext` | `StrategyNone`. No AEAD, no tag, nothing a position could bind to | false |
+
+  `SupportsContextAAD()` is safe to **ask** at any time and unsafe to **remember**: false means either "cannot bind" or "cannot say yet", and the two demand opposite handling. A consumer that caches the answer must gate on `ContextBinding().Resolved()` (or `Barrier.ContextBindingResolved()`, which exists for consumers that assert the barrier structurally and cannot import the `ContextBinding` type) and refuse to record an unresolved one. The capability is valid only while the barrier stays unsealed and can legitimately change across a seal/unseal cycle. `IsHardwareMode()` is true for both `Unsupported` and `Plaintext` and cannot tell them apart; `IsPlaintextMode()` is what separates them.
 - **Startup enforcement.** `BarrierConfig.RequireContextAAD` makes the requirement a deployment property: `Initialize`/`Unseal` fail with `ErrContextAADUnsupported` when the barrier cannot bind context, including `StrategyNone` (requiring authenticated positional binding while selecting no encryption is a misconfiguration). Default `false` preserves existing behavior.
 - **What delegated mode bypasses.** Delegation is total: epoch DEK derivation, the epoch ciphertext header, the nonce-reuse tracker and the NIST SP 800-38D invocation counter are all skipped because the delegated encryptor owns its own key and nonce management. Every barrier setup logs this at WARN, naming what is delegated.
 
@@ -413,10 +509,13 @@ against a defective RNG, not the primary guarantee.
 DEK input is a function of the blob and the forced unseal rotation is
 `epoch+1`, so two barrier instances loaded from the *same* blob derive the
 *same* DEK, each with a zeroed invocation counter and an empty tracker. Neither
-would observe the other's nonces, and the per-key invocation budget is counted
-twice. `MinEpoch` does not guard this (no rollback is involved) and `StateMAC`
-does not either (both copies are authentic). Exactly one process must own a
-sealed blob at a time.
+observes the other's nonces, and the per-key invocation budget is counted
+twice. The [load-generation fence](#the-load-generation-fence) makes that state
+detectable at the next load, but it is not a lock. `MinEpoch` does not guard it
+either (no rollback is involved), and `StateMAC` cannot (both copies are
+authentic). Exactly one process must own a sealed blob at a time, and only an
+exclusive data-directory lock or a compare-and-swap persister makes that a
+guarantee.
 
 ### Methods
 
@@ -541,7 +640,7 @@ The context bytes are built in one place (`walRecordContext`), used by both the 
 
 ## Snapshot Encryption
 
-Snapshots are encrypted as a stream of 64KB chunks. Each chunk is a standard barrier ciphertext frame produced by `barrier.Encrypt`/`EncryptWithEpoch`:
+Snapshots are encrypted as a stream of 64KB chunks. Each chunk is a standard barrier ciphertext frame produced by `EncryptWithEpochPinnedContext` when the barrier implements the atomic pinner, and by a pin-before / encrypt / pin-after sequence when it does not:
 
 ```
 Chunk: [Epoch:8 | AlgID:1 | Nonce:N | Ciphertext:N | Tag:16]
@@ -574,7 +673,10 @@ This makes:
 - **Cross-snapshot substitution** — a wrong `SnapshotIndex` fails authentication.
 - **Cross-replica substitution** — a wrong `ShardID` or `ReplicaID` fails authentication.
 
-Stream **truncation** is additionally guarded at the application layer by verifying `TotalChunkCount` agreement across all chunks.
+**Truncation is not covered by the AAD, and the two places it could happen are guarded differently.**
+
+- *In transit*, the snapshot stream header declares a `ChunkCount` and the receiver refuses a transfer where `len(chunks) != hdr.ChunkCount`, or where the count is zero, or where the stream was marked truncated (`snapshotRecv`, `pkg/internal/transport/snapshot_recv.go`). A separate `maxAdmissibleChunkCount` bound rejects an inflated declared count before any memory is committed.
+- *At rest*, there is **no equivalent**. The encrypted `snapshot.dat` is a bare sequence of length-prefixed frames with no frame count and no terminal marker, and `ChunkSeq` names a frame's position but not how many follow it. An attacker with write access to the file can drop trailing frames, and every surviving frame still authenticates; a reader that stops at EOF sees a complete, shorter snapshot. Detecting that would need a count folded into every frame's context or a distinguishable final frame, and neither is implemented.
 
 `NewSnapshotAAD` first asks the barrier whether it can actually authenticate a caller-supplied context (`SupportsContextAAD`). A barrier that cannot must not be handed one: the write fails closed rather than silently dropping the binding. `ContextBinding()` and `IsPlaintextMode()` separate the two reasons a barrier may be unable to bind — no-encryption mode, where there is no AEAD and nothing a position could be bound to, versus a delegated encryptor that is protecting the data but cannot authenticate where it belongs. Only the second is a security limitation.
 
@@ -582,17 +684,23 @@ Stream **truncation** is additionally guarded at the application layer by verify
 
 **Source:** `pkg/internal/engine/snapshot_pool.go`
 
-The `encryptSnapshotFile` function encrypts a plaintext snapshot data file in-place using an atomic write-to-temp-then-rename pattern. This ensures crash safety — a crash mid-encryption leaves the original plaintext file intact.
+`encryptSnapshotFile(path, shardID, replicaID, index, barrier) (minEpoch uint64, pinned []uint64, err error)` replaces a plaintext snapshot data file with its encrypted form using an atomic write-to-temp-then-rename pattern. A crash mid-encryption leaves the original plaintext file intact.
 
 ```
-1. Read entire plaintext file into memory
-2. Create temporary file (.encrypt-*.tmp) in same directory
-3. For each 64KB chunk of plaintext:
-   a. barrier.Encrypt(nil, chunk) → [Epoch:8 | algID:1 | Nonce:12 | Ciphertext | Tag:16]
+1. Stream the plaintext file in 64KB chunks (one chunk in memory at a time)
+2. Create temporary file in the same directory
+3. For each chunk, with ChunkSeq as its 0-based ordinal:
+   a. barrier.EncryptWithEpochPinnedContext(nil, chunk, NewSnapshotAAD(...))
+      → [Epoch:8 | algID:1 | Nonce:12 | Ciphertext | Tag:16], epoch pinned in-flight
    b. Write frame: [ChunkLen:4 (little-endian) | EncryptedChunk]
 4. fsync the temporary file
 5. Atomic rename: temp file → original path
+6. fsync the directory, so the rename itself is durable
 ```
+
+Step 6 matters: without it a crash can roll the directory entry back to the deleted plaintext temp name even though the encrypted bytes were fsynced.
+
+The returned `pinned` epochs are held in-flight until the snapshot's epoch is durably recorded, so a concurrent `Rotate` plus `PurgeEpochsBefore` cannot drop the DEK of a frame already written into the artifact.
 
 The on-disk format is a sequence of length-prefixed frames:
 
@@ -606,30 +714,27 @@ Each `EncryptedChunk` carries its own epoch and nonce in the standard barrier ci
 
 **Source:** `pkg/internal/engine/snapshot_pool.go`
 
-The `decryptSnapshotFile` function decrypts an encrypted snapshot using a specific epoch's DEK. The epoch is read from the snapshot metadata file (not from the ciphertext frames), enabling multi-epoch support — snapshots encrypted at different epochs coexist on disk.
+`decryptSnapshotToSibling(path, shardID, replicaID, index, epoch, barrier) (tmpPath string, err error)` writes the plaintext to a **new sibling temp file** and returns its path. It does not modify or replace the source: the canonical encrypted `snapshot.dat` is left intact, and the caller removes the temp file once recovery is done.
 
 ```
-1. Read encrypted file into memory
-2. Create temporary file (.decrypt-*.tmp) in same directory
-3. For each frame:
+1. Open the encrypted file (one frame in memory at a time)
+2. Create a sibling temp file in the same directory
+3. For each frame, with ChunkSeq as its 0-based ordinal:
    a. Read 4-byte little-endian frame length
    b. Read encrypted chunk of that length
-   c. barrier.DecryptForEpoch(nil, frame, epoch) → plaintext chunk
+   c. barrier.DecryptWithContext(nil, frame, NewSnapshotAAD(...)) → plaintext
    d. Write plaintext to temp file
 4. fsync the temporary file
-5. Atomic rename: temp file → original path
+5. Return the temp path
 ```
 
-The recovery path in `snapshotPool.recoverSnapshot` checks the epoch from LogDB snapshot metadata. When the epoch is non-zero and a barrier is available, it calls `decryptSnapshotFile` before opening the file for state machine recovery:
+**In-place decryption was deliberately rejected.** Renaming plaintext over `snapshot.dat` is not crash- or retry-safe: a recovery failure or a crash after the rename leaves plaintext on disk while LogDB still records `Epoch > 0`, so every subsequent restart re-attempts decryption on plaintext and fails permanently, losing an otherwise-valid snapshot.
 
-```go
-if logdbSnap.Epoch > 0 && p.barrier != nil && !p.barrier.IsSealed() {
-    decryptErr := p.decryptSnapshotFile(dataPath, logdbSnap.Epoch)
-    // ...
-}
-```
+The `epoch` parameter is **advisory**. Each frame is decrypted with the epoch in its own ciphertext header via `DecryptWithContext`, not with this value; it survives only for log context. The caller uses the recorded epoch solely to decide whether decryption is needed at all (`Epoch > 0`).
 
-This design means the state machine always sees plaintext data during `RecoverFromSnapshot()`, regardless of whether encryption is enabled.
+`shardID`, `replicaID` and `index` must be the identity the frames were sealed under, because they reproduce the positional context AAD. A mismatch fails authentication, and there is no weaker retry — an epoch-only fallback would readmit the frame splicing this binding exists to prevent.
+
+The state machine therefore always sees plaintext during `RecoverFromSnapshot()`, whether or not encryption is enabled.
 
 ### Snapshot Transport Between Nodes
 
@@ -639,7 +744,7 @@ Snapshots are **NOT encrypted at the application layer during transport**. The f
 Leader:
   1. State machine writes plaintext snapshot to disk
   2. Barrier encrypts chunks to at-rest storage (local)
-  3. Leader reads snapshot, calls reencryptReceivedSnapshot to decrypt (plaintext)
+  3. Leader decrypts to a sibling temp file for streaming (decryptSnapshotToSibling)
   4. Sends plaintext chunks via QUIC (mTLS encrypted in transit)
 
 Follower:
@@ -695,6 +800,12 @@ barrier.PurgeEpochsBefore(minEpoch)  // removes DEKs for epochs < minEpoch
 func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
     b.mu.Lock()
     defer b.mu.Unlock()
+
+    if b.state != barrierUnsealed { return 0, ErrBarrierSealed }
+    if b.superseded.Load()        { return 0, ErrBarrierSuperseded }
+    if b.hwEncryptor != nil       { return 0, ErrHardwareMode }
+    if minEpoch > b.epoch         { return 0, ErrPurgeCurrentEpoch }
+
     b.inFlightMu.Lock()
     defer b.inFlightMu.Unlock()
 
@@ -715,6 +826,11 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
     }
     candidate := cloneSealedRootKey(b.sealed)
     candidate.KnownEpochs = sortedEpochsWithout(b.knownEpochs, setOf(purgeable))
+    // KnownEpochs is covered by StateMAC, so a purge must re-stamp it or the
+    // reduced blob fails its own authentication on the next Unseal.
+    if macErr := b.restampStateMACFromEnclaveLocked(candidate); macErr != nil {
+        return 0, macErr
+    }
     if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
         return 0, &StatePersistError{Op: "purge", Epoch: b.epoch, Err: perr}
     }
@@ -823,15 +939,21 @@ type SealedRootKey struct {
     Strategy    StrategyID   // NOT a string; see below
     Version     int          // sealed-blob format version
     Epoch       uint64       // key rotation epoch at time of sealing
-    Salt        []byte       // 32-byte HKDF salt
+    Salt        []byte       // 32-byte HKDF salt (not secret)
     Ciphertext  []byte       // encrypted root key
-    Metadata    []byte       // strategy-specific (key ID, KMS ARN, etc.)
+    Metadata    []byte       // strategy-specific (KDF version byte, key ID, KMS ARN…)
     KnownEpochs []uint64     // all epoch numbers for DEK re-derivation
     KDFVersion  int          // KDF used when sealing (survives a FIPS-mode change)
     HKDFVersion HKDFVersion  // DEK info layout; 0 = pre-versioning, derives as v1
     Algorithm   SymmetricAlgorithm // data-path AEAD the epoch DEKs were derived for
-    // ... plus brute-force backoff state and hardware/Shamir fields; see
-    //     pkg/seal/strategy.go for the authoritative list
+
+    LoadGeneration uint64    // how many times this blob has been claimed
+    StateMAC       []byte    // HMAC-SHA256 authenticating the metadata above
+
+    FailedAttempts     int64 // brute-force backoff, persisted across restarts
+    LastFailedUnixNano int64
+    // ... plus Nonce and the hardware/Shamir fields; see
+    //     type SealedRootKey in pkg/seal/strategy.go for the full list
 }
 ```
 
@@ -844,6 +966,63 @@ implicit preference order and no auto-ranking: the strategy is chosen
 explicitly at barrier or tenant setup.
 
 The `SealingStrategy` ONLY protects the root key. It does not participate in data encryption. Any backend that can wrap/unwrap 32 bytes can serve as a sealing strategy.
+
+## Sealed-State Integrity
+
+The wrapping AEAD covers only `Ciphertext`, and its AAD is the constant strategy name. Every other field on `SealedRootKey` sits in plaintext beside it, bound to nothing. Three mechanisms cover the gap, and each closes a different hole.
+
+### StateMAC: authenticating the metadata
+
+**Source:** `sealedStateMAC` / `sealedStateMACAt` in `pkg/seal/barrier.go`
+
+`StateMAC` is HMAC-SHA256 over a canonical, length-prefixed encoding of the fields that decide how the barrier uses its key, keyed by HKDF-SHA256(rootKey, info=`"quicraft/barrier/state-mac/v1"`). Every variable-length field carries a fixed 8-byte big-endian length prefix, so no field's contents can imitate another's boundary.
+
+**Covered:** `Strategy`, `Version`, `DeploymentID`, `Epoch`, `LoadGeneration`, `Salt`, `KnownEpochs`, `HKDFVersion`, `Algorithm`, `Ciphertext`, `Metadata`, `Nonce`, `HardwarePayload`.
+
+`Ciphertext` is included even though it authenticates itself, so genuine metadata from one blob cannot be paired with a genuine ciphertext from another. `Metadata` is included because it carries the KDF version byte, which selects the unwrapping KDF.
+
+**Not covered, deliberately:** `FailedAttempts` and `LastFailedUnixNano`, which `persistBackoffState` writes after a *failed* unseal — the point at which no root key is available to re-MAC with. Also `CreatedAt`, `ShamirThreshold` and `ShamirTotal`, which are higher-layer custody bookkeeping that go-qrdb owns and may legitimately rewrite.
+
+The field that matters most is `Epoch`. Rewriting it downward resurrects an already-spent DEK alongside a freshly zeroed invocation counter and an empty nonce tracker, which is two independent random-nonce sequences under one key.
+
+`Initialize`, `Rotate` and `PurgeEpochsBefore` all stamp it — every operation that changes a covered field. `Unseal` verifies it once the root key is recovered, **before deriving a single DEK**. A verification failure is deliberately *not* counted as a failed unseal attempt: the credential was correct and the state is not, and driving the brute-force backoff from a file an attacker can write would hand them a lockout primitive.
+
+**Version 2.** The covered-field encoding is versioned by a leading byte, currently `2`. v2 added `LoadGeneration` to the covered set, because the barrier now refuses to encrypt on the strength of that number and leaving it unauthenticated would be a durable, passphrase-free way to stop a node from writing.
+
+A blob stamped under v1 fails the v2 comparison while being entirely authentic. `verifySealedStateMAC` recognises that case — only when `LoadGeneration == 0`, which a pre-fence blob always is — by recomputing under v1, accepting once at WARN, and letting the normal persist path restamp at v2. Accepting v1 is not a downgrade: forging either version needs the same HKDF-derived MAC key, which comes from the root key the strategy just recovered.
+
+**A blob with no MAC at all** is refused with `ErrSealedStateUnauthenticated`. Accepting an absent tag would make the whole mechanism optional at the attacker's discretion: strip the field, keep the forgery. `BarrierConfig.AllowUnauthenticatedSealedState` is the explicit, per-deployment escape hatch for migrating a pre-MAC blob — start once with it set, re-persist `SealedRootKeyData()`, then clear it. It does **not** apply to a blob whose tag is present but wrong.
+
+`StrategyNone` keeps no root key, so it has no MAC and none is expected of it.
+
+### MinEpoch: refusing replay
+
+A MAC cannot detect **replay**. An attacker with write access to the persisted state can restore an older, genuinely-MACed copy of the same blob, resurrecting a retired epoch's DEK with a fresh counter and an empty tracker. Only state the attacker cannot roll back in the same step can catch that, and the barrier holds none — the embedder does.
+
+`BarrierConfig.MinEpoch` is that floor. `SetSealedRootKey` rejects a blob whose `Epoch` is below it with `ErrSealedEpochRollback`. The effective floor is `max(MinEpoch, b.epoch)` when the barrier already holds state: reloading a state older than the one in hand is a rollback whether or not a floor was configured.
+
+Set it to the highest epoch any live WAL segment or retained snapshot still references — the engine already computes exactly this as its global safe-purge floor. Zero disables the check.
+
+`SetSealedRootKey` also enforces, in order (`Barrier.SetSealedRootKey`): non-nil blob, `Epoch > 0`, the rollback floor, 32-byte `Salt`, `len(KnownEpochs) <= MaxKnownEpochs`, no epoch `0` and none above `Epoch` in `KnownEpochs`, `Epoch` present in `KnownEpochs`, `HKDFVersion` not newer than this build, `Algorithm` agreement, and finally the load-generation fence. Epoch `0` is rejected because accepting it is not inert: `Unseal` would derive and install a full epoch-0 DEK, the forced rotation would re-persist it durably, no purge floor could ever retire it, and `b.ciphers[0]` is exactly what a zero-filled ciphertext header decodes to.
+
+### The load-generation fence
+
+**Source:** `Barrier.claimLoadGenerationLocked` in `pkg/seal/barrier.go`; `SealedRootKey.LoadGeneration` in `pkg/seal/strategy.go`
+
+`LoadGeneration` counts how many times a blob has been claimed. `Initialize` stamps 1; every subsequent `Unseal` that can persist writes back `LoadGeneration+1` **before the barrier will encrypt**, so each load leaves a claim in the one place two processes share.
+
+A barrier later handed a blob whose generation exceeds its own claim knows another loader has taken the state. It marks itself superseded **permanently** and returns `*SupersededError` (which is `ErrBarrierSuperseded`). `Encrypt`, `Rotate` and `PurgeEpochsBefore` all refuse from then on; `Decrypt` keeps working. The loaded state is deliberately not adopted — quietly picking up the winner's epoch would make this instance a second writer of the winner's DEK, which is the failure being prevented. A superseded barrier also cannot launder the supersession by sealing and unsealing again.
+
+The ordering is the whole point: the claim must be durable before this barrier can encrypt, or a process that dies between encrypting and persisting leaves a generation on disk that the next loader increments without ever learning a DEK was used under it.
+
+**What it does not do**, stated plainly:
+
+- **It is not continuous.** The generation is compared at load (`SetSealedRootKey`) and enforced at write (`Rotate`, `PurgeEpochsBefore`) or use (the `Encrypt` family, at the single choke point `encryptLocked`). The barrier never re-reads the blob on its own, because that would put a disk read on the encrypt hot path. A barrier superseded while running keeps encrypting until the embedder hands it the newer state.
+- **It is not a lock.** Two loaders that read the same generation before either writes both claim the same number and neither can tell. Detection lands on whichever loader reads after the other has written — the common case of a second process starting later, but not a guarantee.
+- **It is inert in delegated and no-encryption mode**, both of which return from `Unseal` before the claim, for the same reason they bypass the invocation counter and nonce tracker: the delegated encryptor owns its own key.
+- **It is inert without a `StatePersister`.** Logged at WARN.
+
+A generation that goes *backwards* is a rollback of the blob, not a competing claim. It is logged at ERROR and execution continues, because refusing there would let anyone who can restore an old backup stop a node from writing. That case belongs to `MinEpoch`.
 
 ### KnownEpochs Persistence Across Restart
 
@@ -858,6 +1037,8 @@ The `KnownEpochs` field on `SealedRootKey` is the mechanism that preserves epoch
 5. `Unseal()` iterates `b.knownEpochs` and re-derives a DEK + cipher for every historical epoch.
 
 This ensures that after a restart with multiple prior rotations, every historical DEK is available for decrypting old WAL segments and snapshots.
+
+## Strategies: Built-In and Injected
 
 ### Built-In: Software Strategy
 
@@ -884,14 +1065,21 @@ type SoftwareStrategy struct {
 
 The KDF version is stored in `SealedRootKey.Metadata[0]`, enabling cross-version unseal. When the stored version matches the strategy's configured version, the strategy's params are used. When they differ (e.g., FIPS strategy unsealing Argon2id-sealed data), defaults for the stored version are used.
 
-**Argon2id defaults exceed OWASP 2024 minimums** (time=3, memory=64MB) because the sealed root key is a high-value offline attack target. The ~200ms unseal cost is negligible (happens once at startup).
+**Argon2id defaults exceed OWASP 2024 minimums** (time=3, memory=64MB) because the sealed root key is a high-value offline attack target. Measured on a 2025 desktop CPU (Core Ultra 9 285K), one derivation at the defaults takes about 93 ms; slower hardware will be several times that. It happens once at startup.
+
+`DeriveKey` also enforces a work-factor floor and returns `ErrKDFWeakParams` below it: Argon2id `time >= 2`, `memory >= 32 MiB`, `threads >= 1`, and `KeyLen >= 16` with a salt of at least 16 bytes for any KDF.
 
 **PBKDF2 defaults** use 600,000 iterations per NIST SP 800-132 recommendations for FIPS compliance.
 
 Constructors:
-- `NewSoftwareStrategy(passphrase)` — auto-selects KDF based on `FIPSEnabled()`
-- `NewSoftwareStrategyFIPS(passphrase)` — explicit PBKDF2-SHA256
-- `NewSoftwareStrategyWithParams(passphrase, time, memory, threads)` — custom Argon2id tuning
+- `NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error)` — auto-selects the KDF from `FIPSEnabled()`
+- `NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error)` — explicit PBKDF2-SHA256
+- `NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)` — custom Argon2id tuning. Refused with `ErrKDFNotFIPSApproved` when FIPS mode is active, since it names Argon2id explicitly.
+- `NewDeferredSoftwareStrategy() *SoftwareStrategy` — no passphrase at construction; it is taken from `Credentials.Secret` at seal/unseal time. For flows where the strategy is built before the operator has supplied anything.
+
+**FIPS mode** (`FIPSEnabled()`, `pkg/seal/fips.go`) is detected from `crypto/fips140.Enabled()` with the `GOFIPS140` environment variable as a fallback (the literal value `off` counts as disabled). It constrains two things: the KDF (`DefaultKDFVersion` selects PBKDF2-SHA256 and `DeriveKey` refuses Argon2id) and the data-path cipher (`SelectOptimalAlgorithm` returns AES-256-GCM unconditionally, and `BarrierConfig.Validate` rejects ChaCha20/XChaCha20 with `ErrAlgorithmNotFIPSApproved`).
+
+Because that detection is environmental, a `false` return means either "FIPS was not requested" or "FIPS was requested and this binary has no module" — and the second **fails open** onto Argon2id and possibly ChaCha20-Poly1305. `BarrierConfig.RequireFIPS` turns the ambiguity into a refusal at `NewBarrier` (`ErrFIPSUnavailable`). Set it if you need FIPS.
 
 ### Hardware-Backed Strategies
 
@@ -902,23 +1090,18 @@ Constructors:
 > **go-xkms**, and `shamir` in **go-qrdb**, injected via the `SealingStrategy` interface. There is
 > no built-in strategy catalog or preference-order default in L1; selection is always explicit.
 
-The `SealingStrategy` interface supports arbitrary backends without touching the core:
+The `SealingStrategy` interface supports arbitrary backends without touching the core. The core QuicRaft module has zero dependency on any external key management system.
 
-```go
-// Example: PKCS#11 / HSM
-type PKCS11Strategy struct { /* session, keyID */ }
-func (s *PKCS11Strategy) Seal(rootKey []byte) (*SealedRootKey, error)   { /* HSM wrap */ }
-func (s *PKCS11Strategy) Unseal(sealed *SealedRootKey) ([]byte, error) { /* HSM unwrap */ }
-func (s *PKCS11Strategy) Close() error                                  { /* close session */ }
+**A hardware strategy has two very different modes**, and which one it is in is decided entirely by what its `BarrierEncryptor` returns:
 
-// Example: TPM 2.0
-type TPM2Strategy struct { /* device handle */ }
+| `BarrierEncryptor` returns | What the hardware protects | Barrier's own data path |
+|---|---|---|
+| `(nil, nil)` | The **root key only**. The barrier still derives epoch DEKs from it via HKDF and encrypts with its own AEAD. | Fully active: epoch header, nonce tracker, invocation counter, context AAD, `Rotate`, `PurgeEpochsBefore`. |
+| a non-nil `SymmetricEncrypter` | The **entire data path**. The root key need never enter process memory. | Entirely bypassed. `Rotate` and `PurgeEpochsBefore` return `ErrHardwareMode`. Context AAD survives only if the encryptor implements `AADSymmetricEncrypter` and passes the probe. |
 
-// Example: AWS KMS / GCP KMS / Azure Key Vault
-type CloudKMSStrategy struct { /* client, key ARN */ }
-```
+As of this writing, every production caller of go-xkms's `NewTPM2Strategy`, `NewPKCS11Strategy` and `NewCloudKMSStrategy` passes a nil encryptor (`go-xkms/pkg/server/seal_strategies.go`, `go-xkms/pkg/seal/autodetect.go`), which is the first row. So hardware deployments today wrap the root key in the TPM or HSM and keep the barrier's full AEAD stack, including positional context AAD. The delegated path exists and is exercised by tests; it is not the default shape of a hardware deployment.
 
-Custom `SealingStrategy` implementations can be provided by external modules (e.g., PKCS#11, TPM 2.0, cloud KMS). The core QuicRaft module has zero dependency on any external key management system.
+Which of the two you want is a real decision, not a detail. See [Key custody](key-custody.md#delegated-hardware-mode) for the tradeoff.
 
 ## Shamir's Secret Sharing — primitive + interfaces only
 
@@ -963,8 +1146,10 @@ The **Shamir sealing strategy** (splitting the root key), **share custody**, the
 **M-of-N quorum/unseal orchestration**, and the **Security-Officer CSR challenge-response
 ceremony** are NOT part of the consensus engine. They are a database-server / custody
 concern and live in **go-qrdb** (`pkg/seal` strategies + `pkg/ceremony`). The consensus
-engine never persists Shamir shares. See the coordination repo's
-`docs/05-seal-barrier-architecture.md` / `docs/09-identity-barrier-unification-plan.md`.
+engine never persists Shamir shares. go-qrdb declares `StrategyShamir` and owns the
+`StrategyID` namespace and the barrier registry (`go-qrdb/pkg/seal/strategy_shamir.go`,
+`strategy_registry.go`); the ceremony lives in `go-qrdb/pkg/ceremony`. See
+[Key custody](key-custody.md#what-go-quicraft-does-not-ship) for the boundary in one place.
 
 ## Enclave Integration
 
@@ -1028,13 +1213,17 @@ All barriers must be initialized and unsealed before use.
 host, _ := quicraft.NewHost(cfg)
 
 // Single host-wide barrier, software-sealed:
-strategy, _ := seal.NewSoftwareStrategy([]byte("passphrase"))
+passphrase := []byte("passphrase")
+strategy, _ := seal.NewSoftwareStrategy(passphrase)
 bcfg := seal.DefaultBarrierConfig(deploymentID)
-bcfg.StatePersister = saveSealedBlob // REQUIRED for Rotate / PurgeEpochsBefore
+bcfg.Algorithm = seal.AlgAES256GCM // pin it; the default reads the local CPU
+bcfg.StatePersister = saveSealedBlob // REQUIRED for Rotate, for a purging
+                                     // PurgeEpochsBefore, and for every Unseal
+                                     // after a restart
 barrier, err := seal.NewBarrier(bcfg) // returns an error for an invalid config;
                                       // seal.MustNewBarrier panics instead, for
                                       // compile-time-constant configs only
-barrier.Initialize(ctx, strategy, seal.Credentials{})
+barrier.Initialize(ctx, strategy, seal.Credentials{Secret: passphrase})
 saveSealedBlob(barrier.SealedRootKeyData()) // bootstrap blob: persisted by the embedder
 host, _ := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 
@@ -1075,7 +1264,7 @@ Host.Close():
 
 **Source:** `pkg/seal/barrier.go`
 
-After 5 consecutive failed `Unseal()` attempts:
+After 5 consecutive failed `Unseal()` attempts (`bruteForceThreshold`), a doubling backoff gates the next attempt:
 
 | Attempt | Backoff |
 |---------|---------|
@@ -1084,10 +1273,19 @@ After 5 consecutive failed `Unseal()` attempts:
 | 7 | 2s |
 | 8 | 4s |
 | 9 | 8s |
-| ... | doubles |
-| 15+ | 60s (cap) |
+| 10 | 16s |
+| 11 | 32s |
+| 12+ | 60s (`bruteForceMaxDelay`) |
 
-Counter resets on successful unseal. Primary defense is Argon2id's computational cost (~200ms per attempt).
+Failures at or above 20 (`bruteForceErrorThreshold`) are logged at ERROR rather than WARN.
+
+The counter resets on a successful unseal. It is **persisted** in `SealedRootKey.FailedAttempts` and `LastFailedUnixNano`, so backoff survives a process restart; those two fields are the ones `StateMAC` deliberately does not cover, because they are written on a failed unseal where no root key is available to re-MAC with.
+
+Backoff is measured against the wall clock, so a backward clock step could otherwise lock a node out permanently. `Unseal` treats a negative elapsed time as satisfying the delay and re-anchors `lastFailedAt` to now.
+
+Three things deliberately do **not** count as a failed attempt: a `StateMAC` verification failure (an attacker with write access to the blob would otherwise hold a lockout primitive), a superseded barrier, and — in no-encryption mode — the empty root key that would otherwise trip the 32-byte size gate on every restart.
+
+The primary defence is the KDF's cost, not the backoff. At the Argon2id defaults that is roughly 93 ms per attempt on fast 2025 desktop hardware.
 
 ## Memory Protection
 
@@ -1174,27 +1372,78 @@ func zeroBytes(b []byte) {
 | `ErrNoStatePersister` | `Rotate` (or a purging `PurgeEpochsBefore`) with no `BarrierConfig.StatePersister` |
 | `ErrUnsupportedHKDFVersion` | Sealed blob names a DEK-derivation info layout this build does not implement |
 | `ErrInvocationLimitExceeded` | AEAD invocation limit reached for the epoch; rotation required |
+| `ErrNonceReuse` | The nonce tracker has already recorded this nonce for the epoch |
+| `ErrPlaintextTooLarge` | Frame exceeds the algorithm's maximum message size. Checked before allocating or sealing, because both GCM and ChaCha20-Poly1305 answer an over-long plaintext with a **panic** rather than an error |
+| `ErrBarrierSuperseded` | Another loader claimed this sealed blob. Encrypt/Rotate/Purge refuse permanently; Decrypt is unaffected |
+| `ErrSealedStateUnauthenticated` | Sealed blob has no `StateMAC`, or its MAC does not verify |
+| `ErrSealedEpochRollback` | Blob's `Epoch` is below `BarrierConfig.MinEpoch` (or below the epoch already held) |
+| `ErrTooManyKnownEpochs` | `KnownEpochs` exceeds `MaxKnownEpochs` (4096) |
+| `ErrKnownEpochAboveCurrent` | `KnownEpochs` names an epoch above the blob's `Epoch` |
+| `ErrInvalidSealedEpoch` / `ErrInvalidSealedSalt` / `ErrInvalidSealedEpochs` | Structural validation failures in `SetSealedRootKey` |
+| `ErrNilSealedData` | Operation needs sealed state and there is none |
+| `ErrHardwareMode` | `Rotate`, `PurgeEpochsBefore`, or a non-empty context on an encryptor without AAD capability |
+| `ErrNoBarrierEncryptor` | A strategy that must supply an encryptor returned nil |
+| `ErrContextAADUnsupported` | `RequireContextAAD` is set and the barrier cannot bind context |
+| `ErrAADProbeRoundTrip` / `ErrAADProbeNotBound` | A delegated encryptor declaring `AADSymmetricEncrypter` failed the behavioural probe |
+| `ErrUnsupportedAlgorithm` / `ErrAlgorithmNotFIPSApproved` / `ErrFIPSUnavailable` | `BarrierConfig.Validate` failures |
+| `ErrKDFNotFIPSApproved` / `ErrKDFUnsupportedVersion` / `ErrKDFWeakParams` / `ErrKDFInvalidSalt` / `ErrKDFInvalidPassphrase` | KDF selection and work-factor failures |
+| `ErrNoRootKeyAvailable` | `RootKey()` in no-encryption mode |
+| `ErrInvocationBudgetUnknown` | **Logged, never returned.** The cause recorded when a restart cannot re-establish a provable budget |
 
 ### Typed Errors (with Unwrap)
 
 | Error | Fields |
 |-------|--------|
 | `KeyDerivationError` | Epoch, Err |
-| `StatePersistError` | Op ("rotate"/"purge"), Epoch, Err |
+| `StatePersistError` | Op ("rotate"/"purge"/"claim"), Epoch, Err |
+| `SupersededError` | Observed, Claimed |
+| `AlgorithmMismatchError` | Sealed, Configured |
+| `AADBindingProbeError` | Stage, Err |
+| `TrackerError` | (tracker operation failures) |
 | `Error` | Strategy, Err |
 | `UnsealError` | Strategy, Err |
 | `CipherError` | Err |
 
-## Certificate Revocation (Transport Layer)
+## Transport Layer (in transit)
 
-**Source:** `pkg/config/transportconfig.go`, `pkg/internal/transport/revocation/`
+**Source:** `pkg/internal/transport/tls.go`, `pkg/internal/transport/quic.go`, `pkg/config/transportconfig.go`, `pkg/internal/transport/revocation/`
 
-- RevocationConfig on TransportConfig
-- CRL file hot-reload (SHA-256 hash comparison)
-- OCSP responder support with caching
-- Modes: "crl", "ocsp", "both", "any"
-- Unknown status fails CLOSED by default; `AllowSoftFail: true` opts out
-- OnCertRevoked callback
+At-rest encryption is independent of transport encryption; this section is here so the two are not confused. Snapshots in particular travel as **plaintext over the QUIC session** and are re-encrypted at rest by the receiver under its own barrier.
+
+### mTLS is not optional
+
+There is exactly one TLS-config constructor, `buildMTLSTLS` (`pkg/internal/transport/tls.go`), and the QUIC transport refuses to start without an mTLS config (`ErrMTLSConfigRequired`, `pkg/internal/transport/quic.go`). Fixed, not configurable:
+
+| Setting | Value |
+|---|---|
+| `MinVersion` | TLS 1.3, both directions |
+| `ClientAuth` | `RequireAndVerifyClientCert` against `ClientCAs` |
+| Server verification | `RootCAs` plus per-dial `ServerName`, so hostname verification against the cert SANs is active |
+| ALPN | `NextProtos: ["quicraft"]` |
+| Curve | `X25519` only |
+
+`InsecureSkipVerify` appears nowhere in non-test `pkg/` code, and there is no TCP listener or dialer. `TransportConfig.TransportDisabled` (set by the `WithoutTransport()` host option) skips the mTLS validation, but it also prevents the QUIC transport being constructed at all — that is "no transport", not "QUIC without TLS".
+
+Cipher suites are not restricted, because Go does not expose TLS 1.3 suite selection.
+
+### Peer identity
+
+A node identity is `"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`, derived from the mTLS-verified leaf and never from the message body (`NodeIdentityFromCertificate` in `pkg/internal/transport/recv.go`). It is compared against the committed membership binding in `committedSenderBinding` (`pkg/messagehandler.go`). This is deliberately an SPKI pin rather than a SPIFFE URI SAN, because four downstream products issue these certificates (see the comment above `peerNodeIdentity` in `recv.go`).
+
+Where no identity is committed for a sender, the fallback is a SAN check against the committed Raft address (`inboundAuthorizedFor` in `conn.go`). `TransportConfig.RequireMemberIdentity` (default `false`) drops such messages instead. A peer whose leaf also covers the local node's host is refused at connection setup (`refuseInboundPromiscuousCert` in `conn.go`).
+
+### Certificate revocation
+
+`TransportConfig.RevocationConfig`:
+
+- CRL file hot-reload, detected by SHA-256 comparison of the file contents (`Checker.ReloadCRLs` in `pkg/internal/transport/revocation/checker.go`), polled every `CheckInterval` (default 60s).
+- OCSP via `OCSPResponderURL`, with a response cache bounded at 4096 entries and a TTL of `OCSPCacheSeconds` (default 300).
+- `Mode`: `"crl"`, `"ocsp"`, `"both"`, `"any"`. Default `"any"`.
+- Unknown status fails **closed** by default, and that default is intrinsic rather than conferred by one caller: the internal `revocation.Config` carries `AllowSoftFail` with the same name and sense as the public one, so its zero value enforces and `Host` copies the operator's setting straight across. A checker built by any other path enforces too. Setting `AllowSoftFail: true` opts out.
+- Under enforcement, a mode with no usable source returns `ErrNoRevocationSources` (or an OCSP-unavailable error) from `IsRevoked` rather than "not revoked", in every mode including `"crl"`. `Config.Validate` rejects such a configuration at startup; the runtime check is the backstop for a checker constructed without it.
+- `OnCertRevoked` callback, invoked from `buildMTLSTLS`.
+
+The check is installed as `VerifyConnection`, not `VerifyPeerCertificate`, so resumed sessions are checked too.
 
 ## Security Considerations
 
@@ -1219,6 +1468,20 @@ When both compression and encryption are enabled: **compress-then-encrypt** (Sna
 
 Without a barrier, WAL records are protected only by CRC32 — detects accidental corruption but not intentional tampering. Users needing integrity guarantees should enable the barrier (AES-GCM provides both confidentiality and integrity).
 
+`StrategyNone` is the same situation with an extra sharp edge: the identity encrypter preserves the 8-byte epoch prefix so downstream readers stay well-formed, but nothing is encrypted and snapshot artifacts carry no integrity check at all. `RequireContextAAD` refuses a `StrategyNone` barrier outright rather than treating it as "nothing to bind".
+
+### What is not guaranteed
+
+Collected here so an integrator does not have to infer them from the sections above:
+
+- **Purge is capability revocation, not crypto-shredding.** DEK confidentiality against memory disclosure after a purge is GC-bounded.
+- **Positional AAD does not stop tail truncation, and no consumer compensates.** An at-rest attacker can drop trailing WAL records or snapshot frames and the survivors still authenticate. Closing this needs a frame count or a distinguishable terminal frame folded into the context; neither exists today.
+- **Nonce tracking covers a prefix of each epoch**, not the whole of it. Past 4Mi nonces the tracker saturates.
+- **The load-generation fence is not a lock.** Exclusive ownership of the sealed blob remains the embedder's responsibility.
+- **`StateMAC` cannot detect replay** of an older authentic blob. That is `MinEpoch`'s job, and it must be configured.
+- **Delegated (hardware) mode bypasses every barrier-side AEAD safeguard.** What you get is whatever the injected encryptor provides.
+- **The barrier writes nothing to disk.** Durability, exclusivity, permissions and backup of the sealed blob belong to the embedder. See [Key custody](key-custody.md).
+
 ## Security Logging
 
 All security events logged via `log/slog`:
@@ -1234,6 +1497,19 @@ slog.Error("epoch purge aborted: reduced sealed state not persisted; DEKs retain
 slog.Warn("decryption failed", "err", err)  // intentionally omits epoch
 slog.Info("old DEK purged", "epoch", epoch)
 ```
+
+Several are worth alerting on rather than merely collecting:
+
+| Level | Event | Why it matters |
+|---|---|---|
+| ERROR | `sealed root key was claimed by another loader` | Two processes on one data directory. The barrier has stopped encrypting. |
+| ERROR | `AEAD invocation budget … is unrecoverable … encryption is refused` | No `StatePersister`; the node is read-only until the epoch rotates. |
+| ERROR | `the known-epoch set is approaching the load-time bound` | `PurgeEpochsBefore` is not being called, or the node is crash-looping. The blob will eventually become unloadable. |
+| ERROR | `delegated encryptor declares seal.AADSymmetricEncrypter but does not authenticate the AAD` | The probe caught a false capability claim. |
+| WARN | `barrier sealing is delegated to an external encryptor` | Emitted once per setup, naming exactly what is bypassed. |
+| WARN | `barrier performs NO encryption` | `StrategyNone`. |
+| WARN | `no StatePersister, so the load-generation fence is inert` | |
+| WARN | `sealed root key carries no metadata MAC` | `AllowUnauthenticatedSealedState` is still set. |
 
 No custom callback system — users configure their `slog` handler at startup.
 
@@ -1275,10 +1551,10 @@ Snapshot trigger (appliedIndex > lastSnapshotIndex + interval)
   → Application writes plaintext state
   → 64KB chunks read from snapshot file
   → For each chunk:
-      → barrier.EncryptWithEpoch() → (ciphertext, epoch)
+      → barrier.EncryptWithEpochPinnedContext() → (ciphertext, epoch)
       → Nonce = fresh crypto/rand (random 96-bit)
-      → AAD = [Epoch:8]   (epoch-only by default; optional
-              context-AAD binds [SnapshotIndex | ChunkSeq])
+      → AAD = [Epoch:8 LE] || NewSnapshotAAD(...)  = 47 bytes
+              (magic || ShardID || ReplicaID || SnapshotIndex || ChunkSeq)
   → Encrypted chunks written to snapshot file (at-rest)
 ```
 
