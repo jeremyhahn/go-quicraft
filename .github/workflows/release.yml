@@ -118,7 +118,7 @@ jobs:
   integration:
     name: Gate - integration suite
     runs-on: ubuntu-latest
-    # Runs LAST and alone, for the same reason ci.yml chains its heavy jobs:
+    # Runs alone, for the same reason ci.yml chains its heavy jobs:
     # this suite stands up multi-node QUIC clusters under -race, and its waits
     # are measured in seconds. Fanned out beside six fuzz gates, the errfs
     # suite and the module build on one 20-core self-hosted runner, it lost a
@@ -126,6 +126,8 @@ jobs:
     # release gate failed. The fuzz, errfs and module gates are cheap and
     # stay parallel with each other; nothing here needs their OUTPUT, so the
     # dependency is purely to keep them off the runner at the same time.
+    # `netfault` is chained AFTER this job for the same reason, so the two heavy
+    # QUIC lanes never share the runner either.
     needs: [validate, errfs, fuzz, modules]
     timeout-minutes: 45
     steps:
@@ -142,6 +144,47 @@ jobs:
       # packages under -race starve the runner and flake snapshot catch-up.
       - name: Run integration suite
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
+  # The one lane that can construct a LIVE network partition.
+  #
+  # This gate existed in ci.yml but not here, so it ran on branches and pull
+  # requests and NOT on the tag pipeline that publishes — and a tag can sit on a
+  # commit ci.yml never saw (release branch, cherry-pick, force-push), which is
+  # the whole reason the other gates were moved into this file.
+  #
+  # What it protects is not incremental. Every other "partition" test in the
+  # repository calls stopNode, which is a process kill, so a quorum weakened
+  # from a strict majority to n/2 passed 18 of 19 linearizability tests. This
+  # suite catches that mutant in about 1.1 seconds because it deposes a leader
+  # that is still RUNNING and still believes it leads.
+  #
+  # Serialised behind `integration`, exactly as in ci.yml. `integration` already
+  # waits on errfs/fuzz/modules, so by the time this starts the runner is empty:
+  # adding it lengthens the pipeline by one job but puts nothing new beside the
+  # heavy QUIC lanes. That ordering is deliberate — these tests wait on election
+  # timeouts, and a contended 20-core self-hosted runner turns a real timing
+  # assertion into a flake, which is how the v0.4.0-alpha release gate failed.
+  netfault:
+    name: Gate - network partitions [build tag quicraft_netfault]
+    runs-on: ubuntu-latest
+    needs: [validate, integration]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      # Same Makefile target ci.yml and a developer run. The suite is
+      # self-guarding: every test asserts netfault.BlockedCount() is non-zero,
+      # so a missing build tag fails the job instead of silently exercising a
+      # healthy cluster.
+      - name: Run network-partition suite
+        run: make ci-netfault
 
   errfs:
     name: Gate - errfs injection
@@ -262,7 +305,7 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, quality, integration, errfs, fuzz, modules]
+    needs: [validate, quality, integration, netfault, errfs, fuzz, modules]
     timeout-minutes: 30
     steps:
       - name: Checkout
