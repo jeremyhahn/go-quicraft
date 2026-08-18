@@ -1,4 +1,18 @@
-# Proto Wire Format
+# Wire Protocol — Engineering Contract
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+Import path: `github.com/jeremyhahn/go-quicraft/pkg/proto`
+
+This is the byte-level contract every replica, every WAL segment and every
+snapshot artifact agrees on. It is the file to read before changing any struct
+in `pkg/proto`: a field added in the middle of a fixed header moves every offset
+after it, and the entries already committed to a Raft log are read forever.
+
+Design rationale, rejected alternatives and the scope fence are in
+[`architecture.md`](architecture.md). The Go call surface is in
+[`api.md`](api.md).
 
 ## Design Philosophy
 
@@ -1556,6 +1570,74 @@ entry in the hot path -- at 100K entries/sec, even 8 bytes of padding equals
 `Entry.Type` is the one exception, and it is not padding: its upper 59 bits
 are reserved and **rejected** rather than ignored, so they buy no forward
 compatibility at all. See [Type Field Encoding](#type-field-encoding).
+
+## Configuration
+
+`pkg/proto` reads **no configuration**. It has no keys, no environment
+variables, and no files. Every bound in [Size Limits and
+Constants](#size-limits-and-constants) is a compile-time constant and part of
+the protocol, not a tunable — a producer that raises one locally emits payloads
+every peer rejects.
+
+Two configuration values elsewhere interact with this package and are worth
+naming so they are not mistaken for wire fields:
+
+| Setting | Owner | Relationship |
+|---|---|---|
+| `config.Config.MaxEntrySize` | per-shard config | may not exceed `proto.MaxEntrySize`; the effective proposal cap is `min(MaxProposalPayloadSize, MaxEntrySize)` |
+| `config.TransportConfig.MaxMessageReceiveMemory` | transport | a **wire-byte** budget. Multiply by `MaxDecodeMemoryFactor` to get the heap the process may actually hold. |
+| `config.CompressionType` | per-shard config | selects the algorithm behind `EntryCompressFlag`, which records only *that* `Cmd` is compressed. The algorithm is never carried on an `Entry`. |
+
+## Test Strategy
+
+Targets: `make test-proto`, `make bench-proto`, `make fuzz-proto`.
+
+**Unit** — `pkg/proto/*_test.go`, one file per type plus:
+
+| File | Pins |
+|---|---|
+| `encoding_test.go` | the scalar, string, bytes and map primitives, including the `math.MaxInt32` guard |
+| `allocbounds_test.go` | that limits are checked **before** allocation |
+| `amplification_test.go` | `TestDecodeMemoryAmplification` — builds the densest frames the format admits and fails if any exceeds `MaxDecodeMemoryFactor`. The measured worst case is 5.1x; the bound has already been exceeded once at 9.8x by a decoder that clamped its map size hint. |
+| `partial_decode_test.go` | truncated buffers at every field boundary |
+| `session_owner_layout_test.go` | the 68-byte `Entry` header offsets, `OwnerID` included |
+| `hardening_regression_test.go` | the hardening findings, kept as regressions |
+| `pool_test.go` | `GetEntrySlice` / `PutEntrySlice` reuse |
+| `constants_test.go` | the exported limits and the name/value helpers |
+
+**Fuzz** — eleven targets with checked-in corpora under
+`pkg/proto/testdata/fuzz/`:
+
+`FuzzEntryRoundTrip`, `FuzzEntryUnmarshalCrash`, `FuzzMessageRoundTrip`,
+`FuzzMessageUnmarshalCrash`, `FuzzMessageBatchRoundTrip`,
+`FuzzMessageBatchUnmarshalCrash`, `FuzzSnapshotRoundTrip`,
+`FuzzSnapshotUnmarshalCrash`, `FuzzMembershipRoundTrip`,
+`FuzzConfigChangeRoundTrip`, `FuzzStateRoundTrip`.
+
+The split is deliberate. The `*RoundTrip` targets assert
+`unmarshal(marshal(x)) == x` **byte-stably**, which is what catches a field
+being silently masked instead of rejected. The `*UnmarshalCrash` targets feed
+arbitrary bytes and assert only that nothing panics and nothing allocates
+unboundedly — this decoder's inputs arrive from the network.
+
+**Fault-injection seams**: none, and none are needed. The functions are pure
+and take a `[]byte`; a malformed frame is constructed directly.
+
+**Fixtures**: the fuzz corpora are the fixtures, and they are checked in so a
+crash found once cannot be found again.
+
+## Observability
+
+`pkg/proto` emits **no logs, no metrics and no audit records**. It is a codec on
+the hot path, called once per entry and once per frame; a log line here would be
+one per operation, and a metric would need a counter increment inside the
+tightest loop in the repository.
+
+Decode failures surface as the sentinel errors in [Error
+Types](#error-types) and are logged by the caller that has the context worth
+logging — the transport knows the peer, the WAL knows the segment. The
+transport-level counters that count them are in
+[`../observability/engineering.md`](../observability/engineering.md).
 
 ## Cross-References
 

@@ -1,4 +1,20 @@
-# WAL Persistence Layer
+# Log Storage — Engineering Contract
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
+> `pkg/logdb/memdb` · Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+Import paths:
+`github.com/jeremyhahn/go-quicraft/pkg/logdb` — the `LogDB` interface and the
+storage-layer types
+`github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb` — the durable
+sharded-WAL implementation
+`github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb` — the in-memory
+implementation
+
+Design rationale, rejected alternatives and the scope fence are in
+[`architecture.md`](architecture.md). The Go call surface is summarized in
+[`api.md`](api.md); this document is the implementation contract behind it.
 
 ## Overview
 
@@ -1712,6 +1728,54 @@ When using barrier encryption:
 - Monitor segment creation/deletion rates to tune compaction
 - Verify `ListNodeInfo()` after crash recovery matches the expected set of shards
 - Check `RecoveryResiduals()` after an open. It is empty on a clean recovery and non-empty exactly when the node may have come back shorter than the log it acknowledged
+
+## Observability
+
+**Metrics** — injected, never global. `WithMetrics(m LogDBMetrics)` installs a
+collector; `nil` skips collection entirely, with no cost on the write path.
+
+```go
+type LogDBMetrics interface {
+    ObserveWriteLatency(d time.Duration)
+    ObserveFsyncLatency(d time.Duration)
+    ObserveCompactionLatency(d time.Duration)
+    IncWriteBytes(n int64)
+}
+```
+
+The concrete implementation lives in the public `quicraft` package, to avoid an
+import cycle — see
+[`../observability/engineering.md`](../observability/engineering.md) for the
+Prometheus collector and its metric names.
+
+Write and fsync latency are the two to alert on. They separate "the disk is
+slow" from "the pipeline is slow", which no other signal in this repository
+distinguishes.
+
+**Disk monitoring** — `WithDiskMonitorOpts(maxBytes, ...)` installs a
+`DiskMonitor` with `WithWarningPercent` (default `DefaultWarningPercent` = 0.85)
+and `WithFullPercent` thresholds and the `WithOnWarning` / `WithOnFull` /
+`WithOnRecovery` callbacks. `WithCheckEvery(n)` bounds how often the check
+actually stats the filesystem, and `WithDiskUsageFunc` replaces the stat for
+tests. Once full, proposals are rejected with `ErrDiskFull` rather than the WAL
+filling the volume.
+
+**Logging** — `log/slog`, at the caller's handler. The events worth alerting on:
+
+| Level | Event | Why it matters |
+|---|---|---|
+| ERROR | fsync failure poisoning the DB (`ErrDBPoisoned`) | the store has stopped accepting writes. A failed `fdatasync` may leave the kernel marking dirty pages clean without writing them, so continuing would acknowledge data that is not there. |
+| ERROR | recovery residuals present after `Open` | the node may have come back **shorter than the log it acknowledged**. `RecoveryResiduals()` is empty on a clean recovery and non-empty exactly then. Check it. |
+| ERROR | mid-segment or non-final-segment corruption | `ErrMidSegmentCorruption` / `ErrNonFinalSegmentCorruption` — recovery refuses to guess; see [Recovery](#recovery) and `Repair`. |
+| WARN | disk-usage warning threshold crossed | the volume is filling |
+| WARN | WAL decrypt failure during replay | fatal to the open by design; silently skipping records would be undetected data loss |
+
+**No key material, nonce, or record payload appears in any log line.**
+
+**What is deliberately not instrumented**: per-record counters. The write path is
+the hottest loop in the repository and a counter increment per record would be
+measurable; the latency histograms above cover the same ground at batch
+granularity.
 
 ## Related Documentation
 
