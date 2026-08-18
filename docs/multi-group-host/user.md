@@ -1287,8 +1287,11 @@ cover `pkg/internal/transport`: QUIC packet protection is arbitrary-IV AES-GCM
 by protocol definition (RFC 9001 §5.3, inside `quic-go`) and OCSP `CertID` is
 SHA-1 by protocol definition (RFC 6960 §4.1.1, inside `x/crypto/ocsp`), so a
 process that opens a QUIC connection under `GODEBUG=fips140=only` still fails
-there. Whether a FIPS build ships without a network transport is an open
-owner-level decision (issue #5).
+there. That tree is gated one notch lower instead, by
+`make verify-fips-transport` at `GODEBUG=fips140=on`, and the exemption is
+recorded with its citations in
+[quic-transport/architecture.md](../quic-transport/architecture.md#fips-140-3-exemption-record).
+So go-quicraft is FIPS at rest, not FIPS on the wire.
 
 ### Building
 
@@ -1310,8 +1313,11 @@ cryptographic operation. The check that can actually fail on a non-approved
 primitive is:
 
 ```bash
-# Runs every package inside the FIPS boundary under approved-only enforcement:
+# Every package inside the FIPS boundary, under approved-only enforcement:
 make verify-fips
+
+# The one exempt tree (pkg/internal/transport/...), with the module loaded:
+make verify-fips-transport
 ```
 
 ### KDF Selection

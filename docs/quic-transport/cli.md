@@ -31,10 +31,15 @@ suite. The operations that look like verbs belong elsewhere on purpose:
 | `make fuzz-transport` | frame-header and length-prefix decoding against arbitrary bytes |
 | `make ci-netfault` | the `test/netfault` partition, delay and drop suite |
 
+| `make verify-fips-transport` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips ./pkg/internal/transport/...` |
+
 Note that `make verify-fips` **excludes** `pkg/internal/transport/...` by an
-explicit deny-list. That is not an oversight: QUIC packet protection and OCSP's
-`CertID` cannot be made FIPS-approved from here. See
-[`architecture.md`](architecture.md).
+explicit deny-list, and `make verify-fips-transport` is what covers it instead.
+The exclusion is not an oversight and the substitute is not a formality: QUIC
+packet protection and OCSP's `CertID` cannot be made FIPS-approved from here,
+but everything else on this path can be and is — `fips140=on` is what proves
+the transport's own key exchange is approved. Both run in CI's `fips` job. See
+[FIPS 140-3 exemption record](architecture.md#fips-140-3-exemption-record).
 
 ## Operational levers that are not verbs
 

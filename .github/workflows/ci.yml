@@ -50,6 +50,76 @@ jobs:
         run: |
           GOFIPS140=v1.0.0 CGO_ENABLED=0 go build ./...
 
+  # ==========================================================================
+  # FIPS 140-3 gate
+  #
+  # The `Build FIPS variant` step above only COMPILES against the Go
+  # Cryptographic Module. GOFIPS140 is a build setting and GODEBUG=fips140 is a
+  # RUNTIME setting, so a compile-only check cannot observe a single
+  # cryptographic operation: it stayed green while the mTLS config pinned an
+  # X25519-only curve list, which no process with the module loaded can
+  # complete a handshake with. That defect survived every green `build` job in
+  # this repository's history and was found by the first run of this one.
+  #
+  # fips140=only, not fips140=on: `on` loads the module but still PERMITS
+  # non-approved algorithms, so MD5, SHA-1 and arbitrary-IV AES-GCM all succeed
+  # and the gate reports green on exactly the thing it exists to catch. `only`
+  # makes a non-approved operation error or panic. Ratified by the owner
+  # 2026-08-17 (conventions/configuration.md section 5) and carried by the
+  # portfolio ci-template.
+  #
+  # The steps below are `make` targets, not inline `go test` lines, for the
+  # reason stated on the tagged suites further down: the Makefile is where a
+  # developer reproduces CI, and the mode strings must have ONE definition.
+  # That is also what makes them testable — test/buildgates/fips_gate_test.go
+  # reads the Makefile and this file and fails if the mode is weakened to `on`,
+  # if the approved-only exclusion list grows beyond the one documented tree,
+  # or if that tree stops being covered by a step of its own.
+  #
+  # Do NOT weaken this to `on`, and do NOT add an exclusion to route around a
+  # failure: a red FIPS job is a compliance finding, and the finding is the
+  # deliverable.
+  # ==========================================================================
+  fips:
+    name: FIPS [GODEBUG=fips140=only]
+    runs-on: ubuntu-latest
+    # Last in the heavy chain, for the runner-contention reason documented on
+    # `integration`: this re-runs almost the whole unit suite AND the transport
+    # suite, which stands up QUIC listeners, and overlapping full suites on one
+    # self-hosted runner is what made the 30s snapshot waits flake. Nothing
+    # depends on this job, so the position costs wall clock and nothing else.
+    needs: [quality, build, test, integration, netfault, contrib-dragonboat]
+    # The per-package -timeout inside each make target is the real budget; this
+    # is the outer backstop, sized like `integration` because the same runner
+    # contention stretches it.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The transport suite in the last step starts real QUIC listeners.
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Compile under the module, tagged and untagged
+        run: make build-fips
+
+      # GODEBUG=fips140=only over every package except pkg/internal/transport.
+      - name: Approved-only gate
+        run: make verify-fips
+
+      # pkg/internal/transport under GODEBUG=fips140=on. It is one notch lower
+      # because QUIC packet protection (RFC 9001 s5.3) and the OCSP CertID
+      # (RFC 6960 s4.1.1) are arbitrary-IV AES-GCM and SHA-1 by protocol
+      # definition, both inside dependencies. The exemption is recorded with its
+      # citations in docs/quic-transport/architecture.md; this step is what
+      # keeps the exempt tree gated rather than merely excluded.
+      - name: Exempt transport tree, FIPS mode
+        run: make verify-fips-transport
+
   # The untagged suite. Every job below this one exists because `go test ./...`
   # with NO build tags silently excludes whole test suites: the Go toolchain
   # does not warn that a constrained file was skipped, it simply compiles a

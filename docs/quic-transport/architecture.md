@@ -107,15 +107,37 @@ There is exactly one TLS-config constructor, `buildMTLSTLS`:
 | `ClientAuth` | `RequireAndVerifyClientCert` against `ClientCAs` |
 | Server verification | `RootCAs` plus per-dial `ServerName`, so hostname verification against the SANs is active |
 | ALPN | `NextProtos: ["quicraft"]` |
-| Curve | `X25519` only |
+| Curve | build-dependent: `[X25519, P-256, P-384]` standard, `[P-256, P-384]` with `-tags fips` |
 
 `InsecureSkipVerify` appears nowhere in non-test `pkg/` code. There is no TCP
 listener and no TCP dialer. Cipher suites are not restricted, because Go does
 not expose TLS 1.3 suite selection.
 
-The X25519-only curve list is a deliberate ~5% ML-KEM saving on intra-cluster
-traffic "where we control both endpoints". **X25519 is not FIPS 140-3
-approved**, which couples this pin to the FIPS story below.
+Pinning the curve list at all is a deliberate ~5% ML-KEM saving on
+intra-cluster traffic "where we control both endpoints": naming any group
+suppresses post-quantum hybrid negotiation, and X25519 is the fastest ECDH
+curve at 128-bit security.
+
+**Which** groups is the one build-dependent value in the table, because
+**X25519 is not FIPS 140-3 approved** and the list used to hold nothing else.
+`tls_curves_fips.go` compiles it out of a `-tags fips` build; `tls_curves_nofips.go`
+keeps it in a standard build and adds the NIST curves after it. Neither list has
+a single entry, and that is the load-bearing part: TLS 1.3 needs the two lists
+to INTERSECT, and P-256 is the group they share, so a cluster can be converted
+to FIPS one node at a time instead of all at once.
+
+| client offers ↓ / server offers → | `[X25519, P-256, P-384]` | `[P-256, P-384]` |
+|---|---|---|
+| `[X25519, P-256, P-384]` | X25519 | P-256, after a HelloRetryRequest |
+| `[P-256, P-384]` | P-256 | P-256 |
+
+An `[X25519]`-only list on either side would have an empty intersection with a
+FIPS build, and every such handshake fails with `tls: no supported elliptic
+curves for ECDHE`. That is not hypothetical — it is what the list WAS, and
+because Go filters non-approved groups out of the offer, it also meant a
+process running under `GODEBUG=fips140=on` or `=only` could not complete a
+single intra-cluster handshake. `TestHandshakeCurves_InteroperateAcrossBuilds`
+pins every cell above.
 
 ### Peer identity is an SPKI pin, not a name
 
@@ -174,18 +196,44 @@ A peer must not be able to make this process allocate by asserting a size.
   its at-rest snapshot to a sibling temp file, streams it, and the receiver
   re-encrypts under its **own** barrier. Nodes cannot decrypt each other's
   at-rest data; confidentiality in transit is TLS's, not the barrier's.
-- **The transport is outside the FIPS boundary.**
-  `pkg/internal/transport` and `.../revocation` do not pass
-  `GODEBUG=fips140=only`, and `-tags fips` does not change that: QUIC's packet
-  protection is arbitrary-IV AES-GCM by protocol definition (RFC 9001 §5.3) and
-  OCSP's `CertID` is SHA-1 by protocol definition (RFC 6960 §4.1.1). Both live
-  in dependencies and neither can be made approved from here. `make verify-fips`
-  excludes this tree by an explicit deny-list, so a package added later is
-  inside the gate by default.
+- **The transport runs in FIPS mode but is not approved-only.** See the
+  exemption record below. `-tags fips` makes go-quicraft FIPS **at rest**, and
+  a process that opens a QUIC connection under `GODEBUG=fips140=only` still
+  panics inside the QUIC library.
 
-  **So `-tags fips` makes go-quicraft FIPS at rest, not FIPS on the wire.** A
-  process that opens a QUIC connection in a `fips140=only` environment panics
-  inside the QUIC library.
+## FIPS 140-3 exemption record
+
+This is the authoritative record of why `pkg/internal/transport/...` is the one
+package tree `make verify-fips` does not judge, and what covers it instead. It
+is not a waiver for the tree's own cryptography: the key exchange above is
+approved in a `-tags fips` build, and `make verify-fips-transport` runs the
+whole tree under `GODEBUG=fips140=on`, which is a gate that has already caught
+a real defect.
+
+| | Exemption 1 | Exemption 2 |
+|---|---|---|
+| Primitive | AES-GCM with a caller-supplied IV | SHA-1 |
+| Where | `quic-go` packet protection (`internal/handshake`) | `golang.org/x/crypto/ocsp.CreateRequest` |
+| Reached from | every QUIC connection | `revocation.Checker.queryOCSP` |
+| Mandated by | RFC 9001 §5.3 — each nonce is the packet number XORed into a fixed IV, which `cipher.NewGCMWithRandomNonce` cannot express | RFC 6960 §4.1.1 — `CertID.issuerNameHash` / `issuerKeyHash` |
+| What it protects | nothing regulated; it is the standard's own key-derivation construction | nothing; the hash is an ISSUER IDENTIFIER, matched against a responder's index |
+| Fixable here? | No. In a dependency, and no version of any QUIC library can differ — the wire format requires it | No. In a dependency, and a compliant responder rejects any other hash |
+| Behaviour under `fips140=only` | panics constructing the initial AEAD, before any handshake | panics inside `CreateRequest` |
+| Behaviour under `fips140=on` | permitted | permitted |
+
+Neither is a compliance defect under FedRAMP, PCI DSS or HIPAA: those
+frameworks govern the protection of regulated data, and one of these is the
+protocol's own AEAD construction while the other is an identifier. What they
+do mean is that go-quicraft is **FIPS at rest, not FIPS on the wire** — a
+deployment that must be approved-only end to end has to terminate this
+transport outside the boundary.
+
+The scope is exactly one tree and no more. `make verify-fips` filters it out by
+a deny-list keyed on a single Makefile variable, so a package added tomorrow is
+inside the approved-only gate by default, and
+`test/buildgates/fips_gate_test.go` fails if that list ever grows, if the mode
+is weakened from `only`, or if the excluded tree stops being run by
+`make verify-fips-transport`.
 
 ## Component boundaries
 
@@ -219,4 +267,7 @@ log replication and QUIC transport in `docs/00 §R`.
 - **No authorization beyond membership.** A verified peer that is a committed
   member may send Raft messages. There are no scopes, roles or per-shard
   permissions here.
-- **No FIPS-approved wire.** Stated as a limit, not a footnote.
+- **No approved-only wire.** The transport runs under `GODEBUG=fips140=on` and
+  its own key exchange is approved, but two protocol-mandated primitives in
+  dependencies keep it out of `fips140=only`. Stated as a limit, not a
+  footnote — see [FIPS 140-3 exemption record](#fips-140-3-exemption-record).

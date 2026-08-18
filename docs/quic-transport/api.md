@@ -75,7 +75,8 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg/config`
 
 Everything else about the TLS configuration is **fixed and not exposed**: TLS
 1.3 minimum, `RequireAndVerifyClientCert`, `RootCAs` plus per-dial `ServerName`,
-ALPN `"quicraft"`, X25519 only. See
+ALPN `"quicraft"`, and a pinned curve list that depends on the build tag
+(`[X25519, P-256, P-384]`, or `[P-256, P-384]` with `-tags fips`). See
 [`architecture.md`](architecture.md#the-tls-configuration-is-fixed-not-configurable).
 
 Certificate requirements an issuer must satisfy: each node's leaf must carry a
