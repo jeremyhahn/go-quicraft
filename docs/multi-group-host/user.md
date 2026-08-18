@@ -1,4 +1,12 @@
-# Operations
+# Multi-Group Host — Usage
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg` — deploying, configuring,
+> monitoring and tuning a `Host` · Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+Building and running a `Host`. Feature-specific tasks live in the other
+folders' `user.md` files, which this document links to rather than repeating.
+
 
 Deployment, monitoring, configuration tuning, and day-to-day administration of
 QuicRaft clusters.

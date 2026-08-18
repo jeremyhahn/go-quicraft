@@ -1,4 +1,35 @@
-# Public API Reference
+# Multi-Group Host — API
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg` and `pkg/config` ·
+> Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+## Transport coverage
+
+go-quicraft is a library. **The Go API is the API** — this document is the
+whole of it.
+
+| Transport | This feature |
+|---|---|
+| **Embedded (Go call)** | everything below. This is the transport. |
+| **QUIC** | a peer protocol between replicas of one shard, not a client surface: there is no request an external caller can issue over it. See [`../quic-transport/api.md`](../quic-transport/api.md). |
+| Unix socket | n/a — this repository serves no socket |
+| REST | n/a — this repository exposes no HTTP handler |
+| gRPC | n/a — this repository defines no gRPC service |
+| MCP | n/a — this repository registers no MCP tools |
+
+These are not missing-capability rows. In the portfolio capability register the
+go-quicraft row for Raft consensus, log replication and QUIC transport is marked
+as consumed **by implementing interfaces, not by client calls**, and carries no
+transport tier. Exposing a client transport is the composing layer's job.
+
+## The exposed host surface
+
+`docs/00 §R` states it narrowly: `Host.StartShard`, `GetLeaderID` and replica
+add/remove. Everything else below is the supporting vocabulary for those — the
+proposal and read paths that drive a started shard, the lifecycle that starts
+and stops the process, and the types those signatures name.
+
 
 Source: `github.com/jeremyhahn/go-quicraft/pkg`
 
