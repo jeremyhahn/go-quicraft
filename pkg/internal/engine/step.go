@@ -469,7 +469,18 @@ func (w *stepWorker) processReady() {
 		// the gate clears) instead of entering the commit/apply pipeline.
 		// Everything else in the update — hard state, entries to save,
 		// messages — is protocol-level and must keep flowing.
-		update, err := node.peer.GetUpdate(!node.IsRecovering(), lastApplied)
+		//
+		// snapshotAdoptionPending covers the window BEFORE that gate goes up:
+		// the inbox drain above may have just installed a received snapshot,
+		// which moves the log's processed marker to the snapshot index while
+		// the state machine is still at its old lastApplied. Extracting there
+		// hands the apply worker a batch starting above lastApplied+1 —
+		// ErrApplyGap, and a replica that never applies again the moment it
+		// finishes joining. The snapshot pool cannot raise the recovering gate
+		// until it observes this install, so only a check on the owner's own
+		// goroutine closes it.
+		holdEntries := node.IsRecovering() || node.snapshotAdoptionPending()
+		update, err := node.peer.GetUpdate(!holdEntries, lastApplied)
 		if err != nil {
 			node.handleError(err)
 			continue

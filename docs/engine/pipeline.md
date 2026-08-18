@@ -178,6 +178,8 @@ Atomic flag blocks step worker from concurrent Peer access during commit/apply p
 
 **Failed shard gate**: On any SM.Apply or decompression error (and on SM panic), the apply worker sets `failed = true` immediately — there is no retry counting and no retry budget to configure. The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the node entirely, removing it from the pipeline until operator intervention (reload or snapshot recovery).
 
+**Snapshot adoption gate**: A received `InstallSnapshot` moves the raft log's committed AND processed markers to the snapshot index the instant the step worker steps it, but the state machine adopts that index only when the snapshot pool finishes `RecoverFromSnapshot` and seeds `lastApplied`. Between the two, raft offers committed entries from `snapshotIndex+1` over a `lastApplied` that is still behind — a batch the apply worker refuses as `ErrApplyGap`, taking a replica that had just finished joining permanently out of apply. The `recovering` flag does not cover that window: the pool raises it from its own goroutine and cannot do so until it has observed the install. So both extraction sites — `processReady`'s `GetUpdate` and the commit worker's piggyback — additionally check `snapshotAdoptionPending()` (raft `processed` > `lastApplied`) on the Peer's owning goroutine. Withholding cannot wedge the log: extraction is the only thing that advances `processed`, so the entries are re-offered once the marker is seeded.
+
 **stopC channel**: Closed by `Stop()` to signal cancellation for snapshot operations (used in SaveSnapshot/RecoverFromSnapshot context).
 
 

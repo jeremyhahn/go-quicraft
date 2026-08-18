@@ -709,6 +709,47 @@ func (n *Node) SetRecovering(v bool) {
 	n.recovering.Store(v)
 }
 
+// snapshotAdoptionPending reports whether the raft log's processed marker
+// stands ABOVE the state machine's lastApplied — the state a replica is in
+// between the instant a received snapshot is installed into the log
+// (raftLog.restore sets committed and processed to the snapshot index) and the
+// instant the snapshot pool finishes RecoverFromSnapshot and seeds lastApplied
+// to that same index.
+//
+// Committed entries must not be extracted in that window. Raft offers them
+// from processed+1 — the snapshot index + 1 — while lastApplied is still at
+// its pre-snapshot value, so the batch reaches the apply worker with a hole
+// beneath it and is refused as ErrApplyGap, failing a shard that had just
+// finished joining. The recovering gate does not cover the window: the
+// snapshot pool raises it from its own goroutine and cannot do so until it has
+// OBSERVED the install (awaitRecoverableLog, polled), so every instant between
+// the install and that observation is unguarded — which is precisely the
+// window a leader fills with the entries that follow the snapshot.
+//
+// Withholding extraction cannot wedge the log: extraction is the only thing
+// that advances the processed marker, so the entries stay in the log and are
+// offered again on a later cycle, once recovery seeds lastApplied (or once a
+// failed recovery fails the shard, which the step worker skips entirely).
+//
+// Outside that window the two markers cannot diverge in this direction. The
+// apply worker advances lastApplied to the batch's last index before it clears
+// commitPending, and no extraction happens while commitPending is set; an
+// apply that does NOT advance lastApplied fails the shard.
+//
+// MUST be called with the same exclusive Peer access GetUpdate requires: from
+// the step worker, or from the commit worker under raftMu. It deliberately
+// reads the Peer rather than the published markers peerLogMarkers uses — the
+// snapshot pool must see a stale-and-behind view (never a torn one) from its
+// own goroutine, whereas this gate has to observe an install in the very cycle
+// that performs it, one statement before the extraction it guards.
+func (n *Node) snapshotAdoptionPending() bool {
+	if n.peer == nil {
+		return false
+	}
+	_, processed := n.peer.LogMarkers()
+	return processed > n.lastApplied.Load()
+}
+
 // IsSaving returns true while the snapshot pool is capturing a consistent
 // point-in-time for SaveSnapshot. While saving, the apply worker skips entry
 // application for this node so the snapshot read of shared in-memory state

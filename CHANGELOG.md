@@ -5,6 +5,55 @@ All notable changes to QuicRaft will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed - consensus safety
+
+- **A replica that joined via snapshot transfer stopped applying the moment it
+  caught up.** `raftLog.restore` moves the log's committed AND processed
+  markers to the snapshot index the instant the step worker steps an
+  `InstallSnapshot`, but the state machine adopts that index only later, when
+  the snapshot pool finishes `RecoverFromSnapshot` and seeds `lastApplied`.
+  The pool runs on its own goroutine and cannot even raise the `recovering`
+  gate until it has OBSERVED the install (`awaitRecoverableLog` polls for it),
+  so every instant between the install and that observation was unguarded —
+  and it is exactly the window the leader fills with the entries that follow
+  the snapshot.
+
+  Committed entries extracted in that window start at `snapshotIndex+1` over a
+  `lastApplied` still holding its pre-snapshot value, which is the gap the
+  apply worker exists to refuse:
+
+  ```
+  ERROR committed entry gap before apply shard=1 replica=4
+        last_applied=0 batch_first_index=54
+  ```
+
+  `ErrApplyGap` is terminal by design, so the new replica acknowledged the
+  leader, counted toward quorum and never applied another entry.
+
+  Both extraction sites now also gate on `snapshotAdoptionPending()` — raft's
+  `processed` marker standing above `lastApplied` — read from the Peer on its
+  owning goroutine, one statement before the extraction it guards:
+  `processReady`'s `GetUpdate` and the commit worker's piggyback path. The
+  entries stay in the log and are offered again once recovery seeds the
+  marker; extraction is the only thing that advances `processed`, so
+  withholding them cannot wedge the log.
+
+  No Raft semantics changed: this is the `recovering` gate already documented
+  for this path, applied from the moment the log adopts the snapshot rather
+  than from the moment another goroutine notices. The gap check's
+  `lastApplied == 0` case — whose escape hatch the fourth review round removed
+  on the argument that "processed == 0 implies the first batch starts at index
+  1 on every path" — is correct and stays. Snapshot transfer is the path that
+  argument missed, and the check was reporting a real discontinuity, not
+  causing one.
+
+  Reproduced as `TestIntegration_DB_SnapshotTransferToNewNode`, which failed
+  under load rather than deterministically (1 failure in 20 `-race`
+  iterations); the timing decides whether the pool wins the race, not whether
+  the bug is present.
+
 ## [0.6.1-alpha] - 2026-08-17
 
 ### Fixed - consensus safety

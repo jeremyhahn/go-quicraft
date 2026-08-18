@@ -571,8 +571,10 @@ const (
 	// commitFailed means Peer.Commit returned an error, carried in the
 	// accompanying error value. Nothing was extracted.
 	commitFailed
-	// commitRecovering means the update committed with no entries and a
-	// snapshot recovery owns the state machine, so no piggyback was attempted.
+	// commitRecovering means the update committed with no entries and the
+	// state machine is not ready to receive any: either a snapshot recovery
+	// owns it, or a received snapshot is installed in the log and not yet
+	// adopted by it. No piggyback was attempted.
 	commitRecovering
 	// commitPiggyback means the update committed with no entries and a
 	// piggyback update was requested. The piggyback out-parameter holds it and
@@ -625,7 +627,16 @@ func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (c
 		// unbounded recovery. The step worker suppresses the same
 		// extraction (GetUpdate moreEntriesToApply=false); entries stay
 		// in the log and are re-offered once the gate clears.
-		if node.IsRecovering() {
+		//
+		// snapshotAdoptionPending covers the window BEFORE that gate goes
+		// up. THIS is the update that carries a received snapshot — it has
+		// no committed entries of its own, so it lands here — and the
+		// Peer.Commit above has just handed that snapshot to the LogReader.
+		// The state machine adopts it only when the snapshot pool seeds
+		// lastApplied, so a piggyback extracted now reaches past the
+		// un-adopted snapshot index and produces exactly the gapped batch
+		// the step worker was stopped from producing.
+		if node.IsRecovering() || node.snapshotAdoptionPending() {
 			return commitRecovering, nil
 		}
 		// Piggyback: check if entries became committable during the

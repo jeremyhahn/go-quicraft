@@ -2308,9 +2308,13 @@ func (p *Peer) CommittedIndex() uint64 {
 }
 
 // LogMarkers returns the Raft log's committed and processed markers as a
-// consistent pair. Must only be called from the step worker goroutine (the
-// single-owner invariant CommittedIndex documents); it exists so that owner
-// can PUBLISH both markers for goroutines that may not touch the Peer at all.
+// consistent pair. Must only be called with the same exclusive Peer access
+// Commit requires — the step worker goroutine, or the commit worker under the
+// node's raftMu (the single-owner invariant CommittedIndex documents); it
+// exists so an owner can PUBLISH both markers for goroutines that may not
+// touch the Peer at all, and so an owner about to extract committed entries
+// can tell whether the log has moved its applied frontier out from under the
+// state machine (engine: snapshotAdoptionPending).
 // Unlike DiagRaftState it formats nothing and allocates nothing, so it is
 // cheap enough to call on every tick.
 func (p *Peer) LogMarkers() (committed, processed uint64) {
