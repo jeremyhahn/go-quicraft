@@ -44,7 +44,8 @@ Useful targets:
 | `make ci-netfault` | Partitions between live replicas (`quicraft_netfault`) |
 | `make ci-errfs` | Filesystem fault injection (`quicraft_errfs`) |
 | `make ci-fuzz-seeds` | Every fuzz target against its seeds and committed corpus |
-| `make build-fips` | FIPS 140 build (`GOFIPS140=v1.0.0`) |
+| `make build-fips` | FIPS 140 compile check (`GOFIPS140=v1.0.0`), with and without `-tags fips` |
+| `make verify-fips` | Runs the FIPS boundary under `GODEBUG=fips140=only` (excludes `pkg/internal/transport/...`) |
 | `make bench-<pkg>` | Benchmarks for one package (smoke test only) |
 | `make bench-compare` | Interleaved baseline-vs-working-tree comparison, benchstat |
 | `make remote-<target>` | Run any of the above on omega instead of your workstation |

@@ -661,11 +661,9 @@ func TestSealBarrierSatisfiesContextCapability(t *testing.T) {
 func newBenchBarrier(tb testing.TB) *seal.Barrier {
 	tb.Helper()
 	_ = seal.AllowWeakKDFParams()
-	strategy, err := seal.NewSoftwareStrategyWithParams(
-		[]byte("test-passphrase"), 1, 64*1024, 1,
-	)
+	strategy, err := newTestSealStrategy([]byte("test-passphrase"))
 	if err != nil {
-		tb.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+		tb.Fatalf("newTestSealStrategy: %v", err)
 	}
 	tb.Cleanup(func() { strategy.Close() })
 
@@ -725,11 +723,9 @@ func BenchmarkDBSaveStateEncrypted(b *testing.B) {
 func newSealableTestBarrier(t *testing.T) (*seal.Barrier, seal.SealingStrategy) {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
-	strategy, err := seal.NewSoftwareStrategyWithParams(
-		[]byte("test-passphrase"), 1, 64*1024, 1,
-	)
+	strategy, err := newTestSealStrategy([]byte("test-passphrase"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+		t.Fatalf("newTestSealStrategy: %v", err)
 	}
 	barrier := seal.MustNewBarrier(testBarrierConfig(7))
 	if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {

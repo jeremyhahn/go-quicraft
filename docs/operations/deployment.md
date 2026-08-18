@@ -1267,7 +1267,20 @@ v2.7.2 (pinned), plus gosec, govulncheck, nancy and Trivy at `@latest`.
 
 Source: `pkg/seal/kdf.go`, `pkg/seal/strategy_software.go`
 
-QuicRaft supports FIPS 140 compliant builds using Go's `GOFIPS140` mechanism.
+QuicRaft supports FIPS 140 compliant builds using Go's `GOFIPS140` mechanism,
+and `-tags fips` additionally removes the non-approved algorithms from the
+binary rather than declining them at runtime. See
+[Encryption > FIPS builds](../security/encryption.md#fips-builds--tags-fips)
+for what the tag removes.
+
+**Read the boundary before you claim compliance for a deployment.** `-tags fips`
+covers the data at rest — the seal layer, the WAL, snapshots. It does **not**
+cover `pkg/internal/transport`: QUIC packet protection is arbitrary-IV AES-GCM
+by protocol definition (RFC 9001 §5.3, inside `quic-go`) and OCSP `CertID` is
+SHA-1 by protocol definition (RFC 6960 §4.1.1, inside `x/crypto/ocsp`), so a
+process that opens a QUIC connection under `GODEBUG=fips140=only` still fails
+there. Whether a FIPS build ships without a network transport is an open
+owner-level decision (issue #5).
 
 ### Building
 
@@ -1275,11 +1288,22 @@ QuicRaft supports FIPS 140 compliant builds using Go's `GOFIPS140` mechanism.
 # Standard build (Argon2id KDF):
 make build
 
-# FIPS build (PBKDF2-SHA256 KDF):
+# FIPS compile check, with and without the tag (PBKDF2-SHA256 KDF):
 make build-fips
 
 # Or directly:
 GOFIPS140=v1.0.0 CGO_ENABLED=0 go build ./...
+GOFIPS140=v1.0.0 CGO_ENABLED=0 go build -tags fips ./...
+```
+
+`make build-fips` only *compiles*: this module is a library with no `main`
+package, so it produces no artifact, and `GOFIPS140` by itself never executes a
+cryptographic operation. The check that can actually fail on a non-approved
+primitive is:
+
+```bash
+# Runs every package inside the FIPS boundary under approved-only enforcement:
+make verify-fips
 ```
 
 ### KDF Selection

@@ -15,10 +15,23 @@
 package seal
 
 import (
-	"errors"
+	"crypto/fips140"
 	"os"
 	"testing"
 )
+
+// skipIfModuleActive skips a test whose premise is that this binary has NO
+// active FIPS 140 module, so that clearing GOFIPS140 is enough to make
+// FIPSEnabled report false. Under GOFIPS140=latest the module is active and
+// fips140.Enabled() is true independently of the environment — the condition
+// cannot be constructed, which is the correct outcome and not a failure.
+func skipIfModuleActive(t *testing.T) {
+	t.Helper()
+	if fips140.Enabled() {
+		t.Skip("the Go FIPS 140 module is active in this binary; the " +
+			"environment-only detection path cannot be exercised here")
+	}
+}
 
 func TestFIPSEnabled_WithEnvSet(t *testing.T) {
 	original := os.Getenv(envGOFIPS140)
@@ -37,6 +50,8 @@ func TestFIPSEnabled_WithEnvSet(t *testing.T) {
 }
 
 func TestFIPSEnabled_WithEnvUnset(t *testing.T) {
+	skipIfModuleActive(t)
+
 	original := os.Getenv(envGOFIPS140)
 	t.Cleanup(func() {
 		if original == "" {
@@ -53,6 +68,8 @@ func TestFIPSEnabled_WithEnvUnset(t *testing.T) {
 }
 
 func TestFIPSEnabled_WithEmptyEnv(t *testing.T) {
+	skipIfModuleActive(t)
+
 	original := os.Getenv(envGOFIPS140)
 	t.Cleanup(func() {
 		if original == "" {
@@ -69,6 +86,8 @@ func TestFIPSEnabled_WithEmptyEnv(t *testing.T) {
 }
 
 func TestDefaultKDFVersion_StandardMode(t *testing.T) {
+	skipIfModuleActive(t)
+
 	original := os.Getenv(envGOFIPS140)
 	t.Cleanup(func() {
 		if original == "" {
@@ -79,9 +98,7 @@ func TestDefaultKDFVersion_StandardMode(t *testing.T) {
 	})
 
 	os.Unsetenv(envGOFIPS140)
-	if v := DefaultKDFVersion(); v != KDFArgon2id {
-		t.Fatalf("expected KDFArgon2id (%d), got %d", KDFArgon2id, v)
-	}
+	assertDefaultKDFVersionOutsideFIPS(t)
 }
 
 func TestDefaultKDFVersion_FIPSMode(t *testing.T) {
@@ -120,6 +137,8 @@ func TestFIPSEnabled_NonEmptyArbitraryValue(t *testing.T) {
 // (the old detection treated any non-empty value, including "off", as
 // FIPS mode).
 func TestFIPSEnabledOffValue(t *testing.T) {
+	skipIfModuleActive(t)
+
 	t.Setenv("GOFIPS140", "off")
 	if FIPSEnabled() {
 		t.Fatal("GOFIPS140=off must not enable FIPS mode")
@@ -128,7 +147,9 @@ func TestFIPSEnabledOffValue(t *testing.T) {
 
 // TestFIPSConstrainsDataPathCipher verifies that FIPS mode forces
 // AES-256-GCM from SelectOptimalAlgorithm regardless of AES-NI, and that
-// BarrierConfig.validate rejects the non-approved ChaCha20 family.
+// BarrierConfig.validate refuses the non-approved ChaCha20 family. The REASON
+// it is refused differs by build — policy in a normal build, absence in a
+// -tags fips one — which is what assertChaChaRefusedUnderFIPS captures.
 func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 	t.Setenv("GOFIPS140", "latest")
 
@@ -139,12 +160,7 @@ func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 		t.Fatalf("SelectOptimalAlgorithm(hardware) under FIPS = %v, want AES-256-GCM", alg)
 	}
 
-	for _, alg := range []SymmetricAlgorithm{AlgChaCha20Poly1305, AlgXChaCha20Poly1305} {
-		cfg := BarrierConfig{Algorithm: alg, DeploymentID: 1}
-		if err := cfg.Validate(); !errors.Is(err, ErrAlgorithmNotFIPSApproved) {
-			t.Fatalf("validate(%v) under FIPS = %v, want ErrAlgorithmNotFIPSApproved", alg, err)
-		}
-	}
+	assertChaChaRefusedUnderFIPS(t)
 
 	// AES variants remain valid.
 	for _, alg := range []SymmetricAlgorithm{AlgAES128GCM, AlgAES192GCM, AlgAES256GCM} {
@@ -155,12 +171,10 @@ func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 	}
 }
 
-// TestNonFIPSAllowsChaCha verifies ChaCha20 remains selectable outside
-// FIPS mode.
-func TestNonFIPSAllowsChaCha(t *testing.T) {
+// TestChaChaOutsideFIPS pins what this build does with ChaCha20 when FIPS mode
+// is NOT requested: selectable in a normal build, still absent in a -tags fips
+// one. See assertChaChaOutsideFIPS.
+func TestChaChaOutsideFIPS(t *testing.T) {
 	t.Setenv("GOFIPS140", "")
-	cfg := BarrierConfig{Algorithm: AlgChaCha20Poly1305, DeploymentID: 1}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validate(ChaCha20) outside FIPS = %v, want nil", err)
-	}
+	assertChaChaOutsideFIPS(t)
 }

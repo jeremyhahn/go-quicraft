@@ -1476,9 +1476,17 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 		return nil, ErrPlaintextTooLarge
 	}
 
-	nonceSize := aead.NonceSize()
+	// wireNonceSize is how many nonce bytes THIS FRAME carries ahead of the AEAD
+	// payload, which is zero for a module-nonce AEAD: cipher.NewGCMWithRandomNonce
+	// draws the nonce inside the FIPS module boundary and prepends it to its own
+	// Seal output, reporting NonceSize() == 0 and counting those bytes in
+	// Overhead() instead. The resulting frame is byte-for-byte what the
+	// caller-nonce path below produces, so totalSize, the header, and every
+	// stored blob are unchanged; what changed is who generates the nonce, which
+	// is precisely what SP 800-38D requires. See newAESGCM.
+	wireNonceSize := aead.NonceSize()
 	overhead := aead.Overhead()
-	totalSize := epochSize + algIDSize + nonceSize + len(plaintext) + overhead
+	totalSize := epochSize + algIDSize + wireNonceSize + len(plaintext) + overhead
 
 	// Reuse or allocate dst.
 	var out []byte
@@ -1496,16 +1504,21 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 	// Write algorithm identifier.
 	out[epochSize] = byte(b.config.Algorithm)
 
-	// Generate random nonce.
-	nonce := out[epochSize+algIDSize : epochSize+algIDSize+nonceSize]
-	if _, err := io.ReadFull(b.randReader, nonce); err != nil {
-		return nil, &Error{Strategy: "encrypt", Err: err}
-	}
+	payloadStart := epochSize + algIDSize
 
-	// AEAD safety: nonce reuse detection.
-	if b.nonceTracker != nil {
-		if err := b.nonceTracker.CheckAndRecordNonce(nonce); err != nil {
-			return nil, err
+	// Generate the nonce, unless the AEAD generates its own.
+	var nonce []byte
+	if wireNonceSize > 0 {
+		nonce = out[payloadStart : payloadStart+wireNonceSize]
+		if _, err := io.ReadFull(b.randReader, nonce); err != nil {
+			return nil, &Error{Strategy: "encrypt", Err: err}
+		}
+
+		// AEAD safety: nonce reuse detection.
+		if b.nonceTracker != nil {
+			if err := b.nonceTracker.CheckAndRecordNonce(nonce); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1520,11 +1533,29 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 	// the caller's positional/artifact context.
 	aad := aadForEpoch(epoch, contextAAD)
 
-	// Encrypt in place after epoch+algID+nonce prefix.
-	// G407 false positive: nonce is randomly generated above via io.ReadFull(b.randReader, nonce).
-	// The nonce slice points to a random-filled portion of out[epochSize+algIDSize:epochSize+algIDSize+nonceSize].
-	ciphertextStart := epochSize + algIDSize + nonceSize
+	// Encrypt in place after the epoch+algID (+nonce, when the caller owns it)
+	// prefix. nonce is nil for a module-nonce AEAD, which REQUIRES an empty
+	// nonce argument and panics on any other.
+	// G407 false positive: nonce is either nil or randomly generated above via
+	// io.ReadFull(b.randReader, nonce).
+	ciphertextStart := payloadStart + wireNonceSize
 	aead.Seal(out[ciphertextStart:ciphertextStart], nonce, plaintext, aad) // #nosec G407 -- nonce is random, not hardcoded
+
+	// A module-nonce AEAD only reveals its nonce after the fact, as the leading
+	// bytes of its own output, so reuse detection runs here instead of before
+	// the Seal. The check is still fail-closed — a reused nonce returns the
+	// error and the ciphertext never reaches the caller — but it can no longer
+	// prevent the AEAD invocation that produced it, only refuse to hand it out.
+	// That is the correct trade: the alternative is a caller-chosen IV, which is
+	// the violation this construction exists to remove.
+	if wireNonceSize == 0 && b.nonceTracker != nil {
+		n := b.config.Algorithm.NonceSize()
+		if n > 0 && len(out) >= payloadStart+n {
+			if err := b.nonceTracker.CheckAndRecordNonce(out[payloadStart : payloadStart+n]); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	return out, nil
 }
@@ -1704,6 +1735,25 @@ func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, c
 // epoch-only AAD, so epoch-only ciphertext decrypts unchanged.
 func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg SymmetricAlgorithm, contextAAD []byte) ([]byte, error) {
 	nonceSize := alg.NonceSize()
+
+	// wireNonceSize is how many nonce bytes precede the AEAD payload in the
+	// frame: the full nonce for a caller-nonce AEAD, and none for a module-nonce
+	// AEAD (cipher.NewGCMWithRandomNonce), whose Open consumes the prepended
+	// nonce out of the payload itself. Both spellings describe the SAME bytes in
+	// the same positions, which is why a frame written before this migration and
+	// a frame written after it are indistinguishable on disk and each is
+	// readable by the other's reader.
+	//
+	// activeNonceSize is the nonce WIDTH of the cipher in force, which the
+	// module-nonce AEAD cannot report (it accepts no caller nonce and answers
+	// zero), so the barrier's CONFIGURED algorithm fixes it instead — the header
+	// byte cannot be trusted to, and is compared against it below.
+	wireNonceSize := aead.NonceSize()
+	activeNonceSize := wireNonceSize
+	if activeNonceSize == 0 {
+		activeNonceSize = b.config.Algorithm.NonceSize()
+	}
+
 	// alg comes from the UNAUTHENTICATED algID header byte and never selects the
 	// cipher (the active AEAD is fixed by the authenticated epoch DEK). A tampered
 	// or corrupted algID that names a different nonce-size class (e.g. 24-byte
@@ -1713,13 +1763,18 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 	// nonceSize, so it cannot catch the mismatch. Reject any algID whose nonce
 	// length disagrees with the active cipher, failing closed with the generic
 	// error rather than crashing the process on corrupt WAL/snapshot input.
-	if nonceSize == 0 || nonceSize != aead.NonceSize() {
+	//
+	// A FIPS build reaches this with nonceSize == 0 for any ChaCha20-family
+	// algID, because that family is not registered there — the same fail-closed
+	// rejection, arrived at by the algorithm being absent from the binary.
+	if nonceSize == 0 || nonceSize != activeNonceSize {
 		return nil, ErrDecryptionFailed
 	}
 
 	// Validate that the ciphertext is long enough for the algorithm's nonce
-	// plus at least a tag (overhead).
-	if len(ciphertext) < minCiphertextHeader+nonceSize+aead.Overhead() {
+	// plus at least a tag (overhead). Overhead() already counts the nonce for a
+	// module-nonce AEAD, so the floor is the same 37 bytes either way.
+	if len(ciphertext) < minCiphertextHeader+wireNonceSize+aead.Overhead() {
 		return nil, ErrDecryptionFailed
 	}
 
@@ -1728,8 +1783,11 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 
 	// Extract nonce and encrypted payload (after epoch + algID prefix).
 	nonceStart := epochSize + algIDSize
-	nonce := ciphertext[nonceStart : nonceStart+nonceSize]
-	encrypted := ciphertext[nonceStart+nonceSize:]
+	var nonce []byte
+	if wireNonceSize > 0 {
+		nonce = ciphertext[nonceStart : nonceStart+wireNonceSize]
+	}
+	encrypted := ciphertext[nonceStart+wireNonceSize:]
 
 	// Bound the payload for the same reason encryptLocked bounds the plaintext,
 	// and with more urgency: this input comes off disk or the wire. x/crypto's

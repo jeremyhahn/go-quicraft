@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - FIPS 140-3 compliance
+
+- **`pkg/seal` no longer supplies its own AES-GCM IVs.** `newAESGCM` now builds
+  the cipher with `cipher.NewGCMWithRandomNonce` instead of `cipher.NewGCM`, so
+  the nonce is generated inside the FIPS module boundary. FIPS 140-3 (SP
+  800-38D §8.2.2, CMVP IG C.H) requires exactly that, and Go refuses the old
+  construction under `GODEBUG=fips140=only` — 332 rejections originated here,
+  and every consumer sealing through the barrier inherited them.
+
+  **No stored bytes move.** `NewGCMWithRandomNonce` emits
+  `nonce ‖ ciphertext ‖ tag`, which is byte-for-byte the layout this package
+  already wrote by hand, so the barrier frame
+  (`[epoch:8][algID:1][nonce:12][ct+tag]`) and the sealed-root-key blob
+  (`[KDFSalt:32|Nonce:12|EncryptedRootKey|Tag:16]`) are unchanged, in both
+  directions: an old reader reads new data and a new reader reads old data.
+  There is no envelope version discriminator because there are not two
+  envelopes. `pkg/seal/legacy_format_test.go` proves it against checked-in
+  pre-migration bytes.
+
+  Consumer-visible behaviour changes in one place: `Barrier.Encrypt` no longer
+  draws the data-path nonce from `BarrierConfig`-adjacent randomness, so a
+  failing random source can no longer fail an AES-GCM encryption, and the
+  nonce-reuse tracker records the nonce after the `Seal` rather than before it
+  (still fail-closed — the ciphertext is never returned).
+
+- **New `fips` build tag compiles out every non-approved algorithm.** Built
+  with `-tags fips`, `pkg/seal` contains no ChaCha20-Poly1305 /
+  XChaCha20-Poly1305 (`algorithm_chacha.go`) and no Argon2id
+  (`kdf_argon2.go`); the registries do not hold them, so the refusal is absence
+  rather than a runtime check. **The exported API is unchanged by the tag**:
+  `NewSoftwareStrategyWithParams` still exists and still compiles everywhere,
+  and in a FIPS build returns `ErrKDFUnsupportedVersion` because the deriver it
+  names is absent — a Layer 1 library must not break a consumer's build over a
+  line that consumer already guards at runtime. The wire and metadata identifiers remain defined in every build so a
+  FIPS binary can still name data it cannot read. The untagged build is
+  unchanged and keeps every algorithm. See
+  [docs/security/encryption.md](docs/security/encryption.md#fips-builds---tags-fips);
+  `make build-fips` now compiles both variants.
+
+- **New `make verify-fips`, and `build-fips` is documented as the compile check
+  it has always been.** `build-fips` only proves the tree compiles under
+  `GOFIPS140`; it produces no artifact (this module is a library with no `main`
+  package) and never executes a cryptographic operation, so it cannot fail on a
+  non-approved primitive. `verify-fips` runs `-tags fips` under
+  `GOFIPS140=latest GODEBUG=fips140=only`, which can. Its scope is every package
+  except `pkg/internal/transport/...`, excluded by deny-list so new packages are
+  gated by default: QUIC packet protection is arbitrary-IV AES-GCM by protocol
+  definition (RFC 9001 §5.3, in `quic-go`) and OCSP `CertID` is SHA-1 by
+  protocol definition (RFC 6960 §4.1.1, in `x/crypto/ocsp`). **`-tags fips`
+  therefore makes go-quicraft FIPS at rest, not FIPS on the wire**; the
+  transport's status is an open owner-level decision (issue #5).
+
 ### Fixed - consensus safety
 
 - **A replica that joined via snapshot transfer stopped applying the moment it

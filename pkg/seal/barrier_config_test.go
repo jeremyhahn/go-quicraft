@@ -16,6 +16,7 @@ package seal
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -72,27 +73,35 @@ func TestDefaultBarrierConfig_DeploymentID(t *testing.T) {
 
 // TestBarrierConfig_Validate verifies that a valid config returns nil error.
 func TestBarrierConfig_Validate(t *testing.T) {
-	tests := []struct {
-		name      string
-		algorithm SymmetricAlgorithm
-	}{
-		{"AES128GCM", AlgAES128GCM},
-		{"AES192GCM", AlgAES192GCM},
-		{"AES256GCM", AlgAES256GCM},
-		{"ChaCha20Poly1305", AlgChaCha20Poly1305},
-		{"XChaCha20Poly1305", AlgXChaCha20Poly1305},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range knownAlgorithms {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := BarrierConfig{
-				Algorithm:     tt.algorithm,
+				Algorithm:     tt.alg,
 				DeploymentID:  1,
 				NonceTracking: BoolPtr(true),
 			}
 			err := cfg.Validate()
 			if err != nil {
 				t.Fatalf("validate() failed for valid config: %v", err)
+			}
+		})
+	}
+
+	// An algorithm this build does not register is refused at configuration
+	// time as an unsupported identifier, not as a policy violation — in a FIPS
+	// build the ChaCha20 family is not "disallowed", it is absent. The runtime
+	// FIPS rejection (ErrAlgorithmNotFIPSApproved) is a separate check that
+	// still fires in a non-FIPS build with GOFIPS140 set; see
+	// TestFIPSConstrainsDataPathCipher.
+	for _, alg := range unregisteredAlgorithms {
+		t.Run(fmt.Sprintf("unregistered_%#x", byte(alg)), func(t *testing.T) {
+			cfg := BarrierConfig{
+				Algorithm:     alg,
+				DeploymentID:  1,
+				NonceTracking: BoolPtr(true),
+			}
+			if err := cfg.Validate(); !errors.Is(err, ErrUnsupportedAlgorithm) {
+				t.Fatalf("Validate() = %v, want ErrUnsupportedAlgorithm", err)
 			}
 		})
 	}
@@ -123,9 +132,11 @@ func TestBarrierConfig_Validate_InvalidAlgorithm(t *testing.T) {
 func TestBarrierConfig_Algorithm_Selection(t *testing.T) {
 	cfg := DefaultBarrierConfig(1)
 
-	// SelectOptimalAlgorithm chooses between AES256GCM and ChaCha20Poly1305
-	// based on AES-NI availability
-	validAlgorithms := []SymmetricAlgorithm{AlgAES256GCM, AlgChaCha20Poly1305}
+	// SelectOptimalAlgorithm chooses between AES256GCM and this build's
+	// software fallback based on AES-NI availability. The fallback is
+	// ChaCha20-Poly1305 normally and AES-256-GCM in a -tags fips build, which
+	// has no non-approved cipher to fall back to.
+	validAlgorithms := []SymmetricAlgorithm{AlgAES256GCM, softwareFallbackAlgorithm()}
 
 	found := false
 	for _, validAlg := range validAlgorithms {
@@ -136,7 +147,7 @@ func TestBarrierConfig_Algorithm_Selection(t *testing.T) {
 	}
 
 	if !found {
-		t.Fatalf("algorithm %v is neither AES256GCM nor ChaCha20Poly1305", cfg.Algorithm)
+		t.Fatalf("algorithm %v is neither AES256GCM nor this build's software fallback", cfg.Algorithm)
 	}
 
 	// Ensure the algorithm is valid

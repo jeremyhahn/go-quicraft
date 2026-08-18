@@ -896,12 +896,45 @@ $(COVER_DIR):
 	mkdir -p $(COVER_DIR)
 
 # ============================================================================
-# FIPS build
+# FIPS
+#
+# Two different checks, deliberately named apart, because only one of them can
+# fail on a non-approved primitive.
+#
+# build-fips COMPILES. It proves the tree builds under the Go Cryptographic
+# Module both with and without the `fips` tag. It produces no artifact and makes
+# no compliance claim: this module is a library with no main package, so
+# `go build` over a package pattern discards its output. GOFIPS140 is a build
+# setting and by itself never executes a cryptographic operation.
+#
+# verify-fips RUNS the code under GODEBUG=fips140=only, which rejects every
+# non-approved algorithm at the point of use. That is the compliance check.
+#
+# verify-fips excludes pkg/internal/transport and its subpackages, and does not
+# pretend otherwise. QUIC packet protection is arbitrary-IV AES-GCM by protocol
+# definition (RFC 9001 section 5.3, inside quic-go) and OCSP CertID is SHA-1 by
+# protocol definition (RFC 6960 section 4.1.1, inside x/crypto/ocsp); neither can
+# be made approved from this repository, and whether a FIPS build of this library
+# ships without a network transport is an owner decision, open on issue #5.
+# Until it is made, a FIPS deployment of go-quicraft is FIPS at rest — the seal
+# layer, the WAL and snapshots — and its transport is out of scope. The
+# exclusion is a deny-list of exactly that one tree, so a package added tomorrow
+# is inside the gate by default rather than silently outside it.
 # ============================================================================
+
+# The one package tree outside the approved-only gate. See above.
+FIPS_EXCLUDED := github.com/jeremyhahn/go-quicraft/pkg/internal/transport
 
 .PHONY: build-fips
 build-fips:
 	GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" ./...
+	GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -tags fips -ldflags="$(LDFLAGS)" ./...
+
+.PHONY: verify-fips
+verify-fips:
+	@echo "==> GODEBUG=fips140=only, -tags fips, excluding $(FIPS_EXCLUDED)/..."
+	GOFIPS140=latest GODEBUG=fips140=only $(GO) test -tags fips \
+		$$($(GO) list -tags fips ./... | grep -v '^$(FIPS_EXCLUDED)')
 
 # ============================================================================
 # CI pipeline
@@ -1440,7 +1473,9 @@ help:
 	@echo "  ci-modules             Build and vet every go.mod in the tree"
 	@echo ""
 	@echo "FIPS:"
-	@echo "  build-fips             Build with GOFIPS140=v1.0.0 (PBKDF2-SHA256 KDF)"
+	@echo "  build-fips             Compile check: GOFIPS140=v1.0.0, untagged and -tags fips"
+	@echo "  verify-fips            Compliance check: run -tags fips under GODEBUG=fips140=only"
+	@echo "                         (excludes pkg/internal/transport/... -- see the Makefile)"
 	@echo ""
 	@echo "Linting:"
 	@echo "  lint                   Run golangci-lint"

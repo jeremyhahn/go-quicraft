@@ -49,30 +49,6 @@ func TestNewSoftwareStrategy_NilPassphrase(t *testing.T) {
 	}
 }
 
-func TestNewSoftwareStrategyWithParams_Valid(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 2)
-	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams returned unexpected error: %v", err)
-	}
-	if s.kdfVersion != KDFArgon2id {
-		t.Fatalf("expected KDFArgon2id, got %d", s.kdfVersion)
-	}
-	if s.kdfParams.Time != 1 || s.kdfParams.Memory != 64*1024 || s.kdfParams.Threads != 2 {
-		t.Fatalf("unexpected params: time=%d, memory=%d, threads=%d",
-			s.kdfParams.Time, s.kdfParams.Memory, s.kdfParams.Threads)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("Close returned unexpected error: %v", err)
-	}
-}
-
-func TestNewSoftwareStrategyWithParams_EmptyPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategyWithParams(nil, 1, 64*1024, 2)
-	if !errors.Is(err, ErrInvalidPassphrase) {
-		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
-	}
-}
-
 func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 	original := []byte("my-secret-passphrase")
 	passphrase := make([]byte, len(original))
@@ -119,9 +95,9 @@ func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 func TestSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 	passphrase := []byte("correct-horse-battery-staple")
 	// Use low parameters for fast tests.
-	s, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	s, err := newTestStrategy(passphrase)
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams returned unexpected error: %v", err)
+		t.Fatalf("newTestStrategy returned unexpected error: %v", err)
 	}
 	defer s.Close()
 
@@ -148,8 +124,8 @@ func TestSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 	if len(sealed.Metadata) != metadataKDFVersionLen {
 		t.Fatalf("expected %d-byte metadata, got %d bytes", metadataKDFVersionLen, len(sealed.Metadata))
 	}
-	if KDFVersion(sealed.Metadata[0]) != KDFArgon2id {
-		t.Fatalf("expected KDFArgon2id in metadata, got %d", sealed.Metadata[0])
+	if KDFVersion(sealed.Metadata[0]) != testKDFVersion {
+		t.Fatalf("expected KDF version %d in metadata, got %d", testKDFVersion, sealed.Metadata[0])
 	}
 	// Ciphertext must be at least: kdfSalt(32) + nonce(12) + rootKey(32) + tag(16) = 92
 	minExpected := kdfSaltLen + 12 + 32 + 16
@@ -169,7 +145,7 @@ func TestSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 }
 
 func TestSoftwareStrategy_SealInvalidRootKeySize(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -189,7 +165,7 @@ func TestSoftwareStrategy_SealInvalidRootKeySize(t *testing.T) {
 }
 
 func TestSoftwareStrategy_UnsealWrongPassphrase(t *testing.T) {
-	correct, err := NewSoftwareStrategyWithParams([]byte("correct"), 1, 64*1024, 1)
+	correct, err := newTestStrategy([]byte("correct"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -205,7 +181,7 @@ func TestSoftwareStrategy_UnsealWrongPassphrase(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -222,7 +198,7 @@ func TestSoftwareStrategy_UnsealWrongPassphrase(t *testing.T) {
 }
 
 func TestSoftwareStrategy_UnsealNilSealed(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -235,7 +211,7 @@ func TestSoftwareStrategy_UnsealNilSealed(t *testing.T) {
 }
 
 func TestSoftwareStrategy_UnsealTruncatedCiphertext(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,7 +230,7 @@ func TestSoftwareStrategy_UnsealTruncatedCiphertext(t *testing.T) {
 }
 
 func TestSoftwareStrategy_UnsealCorruptCiphertext(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -280,7 +256,7 @@ func TestSoftwareStrategy_UnsealCorruptCiphertext(t *testing.T) {
 }
 
 func TestSoftwareStrategy_CloseIdempotent(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -294,7 +270,7 @@ func TestSoftwareStrategy_CloseIdempotent(t *testing.T) {
 }
 
 func TestSoftwareStrategy_CloseNilsEnclave(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("secret-passphrase"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("secret-passphrase"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -314,7 +290,7 @@ func TestSoftwareStrategy_CloseNilsEnclave(t *testing.T) {
 
 func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	original := []byte("enclave-test-passphrase")
-	s, err := NewSoftwareStrategyWithParams(original, 1, 64*1024, 1)
+	s, err := newTestStrategy(original)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,7 +310,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 }
 
 func TestSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -430,7 +406,7 @@ func (r *strategyErrReader) Read(p []byte) (int, error) {
 }
 
 func TestSoftwareStrategy_SealRandSaltFails(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,24 +426,45 @@ func TestSoftwareStrategy_SealRandSaltFails(t *testing.T) {
 	}
 }
 
-func TestSoftwareStrategy_SealRandNonceFails(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+// TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader replaces a test
+// that asserted the opposite, because the behaviour it asserted was the FIPS
+// violation this migration removes.
+//
+// SealRootKey used to draw the AES-GCM nonce from s.randReader and hand it to
+// Seal — a caller-supplied IV, which SP 800-38D forbids. The wrapping AEAD is
+// now built by newAESGCM (cipher.NewGCMWithRandomNonce) and generates the nonce
+// itself, so s.randReader supplies the KDF salt and nothing else. A reader that
+// yields exactly the salt and then fails must therefore produce a COMPLETE
+// sealed blob; if it does not, a caller-supplied IV has come back.
+func TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader(t *testing.T) {
+	s, err := newTestStrategy([]byte("test-passphrase"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer s.Close()
 
-	// Inject a failing reader: allow salt (32 bytes) to succeed but fail on nonce.
+	// Yields the salt (32 bytes) and fails on any further read.
 	s.randReader = &strategyErrReader{remaining: kdfSaltLen}
 
 	rootKey := make([]byte, 32)
-	_, err = s.SealRootKey(context.Background(), rootKey, Credentials{})
-	if err == nil {
-		t.Fatal("expected error from Seal with failing rand for nonce")
+	sealed, err := s.SealRootKey(context.Background(), rootKey, Credentials{})
+	if err != nil {
+		t.Fatalf("SealRootKey consumed randomness beyond the KDF salt; the "+
+			"wrapping nonce must be generated inside the module: %v", err)
 	}
-	var sealErr *Error
-	if !errors.As(err, &sealErr) {
-		t.Fatalf("expected *Error, got %T: %v", err, err)
+	wantLen := kdfSaltLen + wrappingGCMNonceSize + len(rootKey) + wrappingGCMTagSize
+	if len(sealed.Ciphertext) != wantLen {
+		t.Fatalf("sealed ciphertext is %d bytes, want %d "+
+			"([KDFSalt:32 | Nonce:12 | EncryptedRootKey:32 | Tag:16])",
+			len(sealed.Ciphertext), wantLen)
+	}
+
+	got, err := s.UnsealRootKey(context.Background(), sealed, Credentials{})
+	if err != nil {
+		t.Fatalf("UnsealRootKey: %v", err)
+	}
+	if !bytes.Equal(got, rootKey) {
+		t.Fatalf("root key roundtrip mismatch: got %x, want %x", got, rootKey)
 	}
 }
 
@@ -540,9 +537,9 @@ func TestSoftwareStrategy_CrossKDFUnseal_MatchingParams(t *testing.T) {
 	}
 
 	// Seal with Argon2id using custom params (time=1, memory=64KB, threads=1).
-	argon2Strategy, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	argon2Strategy, err := newTestStrategy(passphrase)
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 
 	sealed, err := argon2Strategy.SealRootKey(context.Background(), rootKey, Credentials{})
@@ -552,9 +549,9 @@ func TestSoftwareStrategy_CrossKDFUnseal_MatchingParams(t *testing.T) {
 	argon2Strategy.Close()
 
 	// Unseal with a second Argon2id strategy using the same params.
-	argon2Strategy2, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	argon2Strategy2, err := newTestStrategy(passphrase)
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer argon2Strategy2.Close()
 
@@ -569,50 +566,10 @@ func TestSoftwareStrategy_CrossKDFUnseal_MatchingParams(t *testing.T) {
 	}
 }
 
-func TestSoftwareStrategy_CrossKDFUnseal_FIPSMismatch(t *testing.T) {
-	passphrase := []byte("cross-kdf-mismatch")
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	// Seal with Argon2id (custom params: time=1, memory=64KB, threads=1).
-	argon2Strategy, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
-	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
-	}
-
-	sealed, err := argon2Strategy.SealRootKey(context.Background(), rootKey, Credentials{})
-	if err != nil {
-		t.Fatalf("Seal with Argon2id failed: %v", err)
-	}
-	argon2Strategy.Close()
-
-	// Unseal with a FIPS strategy. The metadata says KDFArgon2id and the
-	// FIPS strategy's version is KDFPbkdf2SHA256 (mismatch), so defaults
-	// for Argon2id are used (time=4, memory=128KB). Since the original
-	// was sealed with time=1, memory=64KB, the derived key differs and
-	// the AES-GCM authentication fails.
-	fipsStrategy, err := NewSoftwareStrategyFIPS(passphrase, 1000)
-	if err != nil {
-		t.Fatalf("NewSoftwareStrategyFIPS failed: %v", err)
-	}
-	defer fipsStrategy.Close()
-
-	_, err = fipsStrategy.UnsealRootKey(context.Background(), sealed, Credentials{})
-	if err == nil {
-		t.Fatal("expected unseal to fail: FIPS strategy uses default Argon2id params, not original custom params")
-	}
-	var unsealErr *UnsealError
-	if !errors.As(err, &unsealErr) {
-		t.Fatalf("expected *UnsealError, got %T: %v", err, err)
-	}
-}
-
 func TestSoftwareStrategy_BackwardCompatibility_NoMetadata(t *testing.T) {
 	passphrase := []byte("backward-compat")
 	// Create a strategy with known params.
-	s, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	s, err := newTestStrategy(passphrase)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -646,13 +603,13 @@ func TestSoftwareStrategy_BackwardCompatibility_NoMetadata(t *testing.T) {
 }
 
 func TestSoftwareStrategy_KDFVersion(t *testing.T) {
-	argon2, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	standard, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer argon2.Close()
-	if argon2.KDFVersion() != KDFArgon2id {
-		t.Fatalf("expected KDFArgon2id, got %d", argon2.KDFVersion())
+	defer standard.Close()
+	if standard.KDFVersion() != testKDFVersion {
+		t.Fatalf("expected KDF version %d, got %d", testKDFVersion, standard.KDFVersion())
 	}
 
 	fips, err := NewSoftwareStrategyFIPS([]byte("test"), 1000)
@@ -666,7 +623,7 @@ func TestSoftwareStrategy_KDFVersion(t *testing.T) {
 }
 
 func TestSoftwareStrategy_IDAvailableHardwareBacked(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -719,7 +676,7 @@ func TestSoftwareStrategyFIPS_UnsealWrongPassphrase(t *testing.T) {
 // --- BarrierEncryptor tests ---
 
 func TestSoftwareStrategy_BarrierEncryptor_ReturnsNilNil(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -735,7 +692,7 @@ func TestSoftwareStrategy_BarrierEncryptor_ReturnsNilNil(t *testing.T) {
 }
 
 func TestSoftwareStrategy_BarrierEncryptor_NilRootKey(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -756,7 +713,7 @@ func TestSoftwareStrategy_BarrierEncryptor_NilRootKey(t *testing.T) {
 func TestSoftwareStrategy_UnsealKDFVersionAndParams_UnknownVersion(t *testing.T) {
 	t.Parallel()
 
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -778,7 +735,7 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_UnknownVersion(t *testing.T)
 func TestSoftwareStrategy_UnsealKDFVersionAndParams_EmptyMetadata(t *testing.T) {
 	t.Parallel()
 
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -792,30 +749,6 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_EmptyMetadata(t *testing.T) 
 	}
 	if params.Time != s.kdfParams.Time {
 		t.Fatalf("expected strategy params Time=%d, got %d", s.kdfParams.Time, params.Time)
-	}
-}
-
-func TestSoftwareStrategy_UnsealKDFVersionAndParams_CrossVersionDefaults(t *testing.T) {
-	t.Parallel()
-
-	// Create an Argon2id strategy but present PBKDF2 metadata.
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer s.Close()
-
-	// Metadata says KDFPbkdf2SHA256 but strategy is KDFArgon2id (version mismatch).
-	metadata := []byte{byte(KDFPbkdf2SHA256)}
-	version, params := s.unsealKDFVersionAndParams(metadata)
-
-	if version != KDFPbkdf2SHA256 {
-		t.Fatalf("expected KDFPbkdf2SHA256, got %d", version)
-	}
-	// Should use default FIPS params, not the strategy's Argon2id params.
-	defaultFIPS := DefaultFIPSKDFParams()
-	if params.Iterations != defaultFIPS.Iterations {
-		t.Fatalf("expected default FIPS iterations=%d, got %d", defaultFIPS.Iterations, params.Iterations)
 	}
 }
 

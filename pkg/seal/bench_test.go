@@ -36,9 +36,9 @@ func benchBarrier(b *testing.B) *Barrier {
 	b.Cleanup(func() { slog.SetDefault(prevLogger) })
 
 	barrier := MustNewBarrier(DefaultBarrierConfig(1))
-	s, err := NewSoftwareStrategyWithParams([]byte("bench-passphrase"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("bench-passphrase"))
 	if err != nil {
-		b.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		b.Fatalf("newTestStrategy failed: %v", err)
 	}
 	if err := barrier.Initialize(context.Background(), s, Credentials{}); err != nil {
 		b.Fatalf("Initialize failed: %v", err)
@@ -166,9 +166,9 @@ func BenchmarkBarrier_IsSealed(b *testing.B) {
 }
 
 func BenchmarkSoftwareStrategy_SealUnseal(b *testing.B) {
-	s, err := NewSoftwareStrategyWithParams([]byte("bench"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("bench"))
 	if err != nil {
-		b.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		b.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer s.Close()
 

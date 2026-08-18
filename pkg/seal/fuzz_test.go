@@ -76,7 +76,7 @@ func newFuzzBarrier(t testing.TB) *Barrier {
 
 	barrier := MustNewBarrier(config)
 
-	strategy, err := NewSoftwareStrategyWithParams(fuzzPassphrase, 1, fuzzKDFMemoryKiB, 1)
+	strategy, err := newTestStrategy(fuzzPassphrase)
 	if err != nil {
 		t.Fatalf("fuzz: failed to create software strategy: %v", err)
 	}

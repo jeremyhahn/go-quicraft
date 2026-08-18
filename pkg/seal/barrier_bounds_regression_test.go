@@ -191,19 +191,17 @@ func TestSetSealedRootKeyAcceptsValidKnownEpochs(t *testing.T) {
 // 2^38-64 for both ChaCha20-Poly1305 constructions, so a wrong value here is
 // either a needless rejection or a process crash.
 func TestMaxPlaintextSizePerAlgorithm(t *testing.T) {
-	cases := []struct {
-		alg  SymmetricAlgorithm
-		want uint64
-	}{
-		{AlgAES128GCM, ((1 << 32) - 2) * 16},
-		{AlgAES192GCM, ((1 << 32) - 2) * 16},
-		{AlgAES256GCM, ((1 << 32) - 2) * 16},
-		{AlgChaCha20Poly1305, (1 << 38) - 64},
-		{AlgXChaCha20Poly1305, (1 << 38) - 64},
+	for _, tc := range knownAlgorithms {
+		if got := tc.alg.MaxPlaintextSize(); got != tc.maxPlaintext {
+			t.Errorf("%s MaxPlaintextSize() = %d, want %d", tc.alg, got, tc.maxPlaintext)
+		}
 	}
-	for _, tc := range cases {
-		if got := tc.alg.MaxPlaintextSize(); got != tc.want {
-			t.Errorf("%s MaxPlaintextSize() = %d, want %d", tc.alg, got, tc.want)
+	// An algorithm this build does not register has no ceiling to report, which
+	// is the same answer as for an identifier nobody defined; see
+	// TestUnregisteredAlgorithmsAreRefused.
+	for _, alg := range unregisteredAlgorithms {
+		if got := alg.MaxPlaintextSize(); got != 0 {
+			t.Errorf("unregistered %#x MaxPlaintextSize() = %d, want 0", byte(alg), got)
 		}
 	}
 	if got := SymmetricAlgorithm(0x7f).MaxPlaintextSize(); got != 0 {
@@ -331,11 +329,17 @@ func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
 			"must not claim a detection it did not make")
 	}
 
-	// Same key, same nonce: the AEAD output is identical, which is exactly the
-	// condition the invocation cap and nonce tracker exist to prevent — and
-	// exactly what the fence exposes rather than prevents.
-	first.randReader = fixedNonceReader{0x5A}
-	second.randReader = fixedNonceReader{0x5A}
+	// Same key: each barrier opens the other's frames. That is the shared-DEK
+	// condition the invocation cap and the nonce tracker exist to bound, and
+	// exactly what the fence exposes rather than prevents — two writers each
+	// spending a full SP 800-38D budget against one key, neither able to see
+	// the other's nonces.
+	//
+	// This used to be shown by pinning both barriers' randReader to a constant
+	// and comparing ciphertexts byte for byte. It cannot be shown that way any
+	// more: the AES-GCM nonce is generated inside the FIPS module boundary
+	// (cipher.NewGCMWithRandomNonce), so no test can force two encryptions to
+	// collide. Cross-decryption proves the same shared DEK without needing to.
 	a, err := first.Encrypt(nil, []byte("duplicate writer"))
 	if err != nil {
 		t.Fatalf("first Encrypt: %v", err)
@@ -344,19 +348,22 @@ func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Encrypt: %v", err)
 	}
-	if !bytes.Equal(a, c) {
-		t.Fatalf("two barriers loaded from one blob no longer share an epoch DEK; " +
-			"if that is now prevented rather than merely detected, rewrite this test")
+	if bytes.Equal(a, c) {
+		t.Fatal("two independent encryptions produced identical frames; the " +
+			"module-generated nonce is not varying")
 	}
-}
 
-// fixedNonceReader yields a constant byte pattern so two barriers sharing a DEK
-// also draw the same nonce. Test-only.
-type fixedNonceReader struct{ b byte }
-
-func (f fixedNonceReader) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = f.b
+	fromSecond, err := first.Decrypt(nil, c)
+	if err != nil {
+		t.Fatalf("two barriers loaded from one blob no longer share an epoch DEK "+
+			"(first could not open second's frame); if that is now prevented "+
+			"rather than merely detected, rewrite this test: %v", err)
 	}
-	return len(p), nil
+	fromFirst, err := second.Decrypt(nil, a)
+	if err != nil {
+		t.Fatalf("second could not open first's frame: %v", err)
+	}
+	if !bytes.Equal(fromFirst, []byte("duplicate writer")) || !bytes.Equal(fromSecond, []byte("duplicate writer")) {
+		t.Fatalf("cross-decrypt mismatch: %q / %q", fromFirst, fromSecond)
+	}
 }

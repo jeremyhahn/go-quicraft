@@ -25,19 +25,9 @@ func TestSoftwareAEADProvider_NewAEAD_AllAlgorithms(t *testing.T) {
 
 	provider := NewSoftwareAEADProvider()
 
-	algorithms := []struct {
-		name    string
-		alg     SymmetricAlgorithm
-		keySize int
-	}{
-		{"AES-128-GCM", AlgAES128GCM, 16},
-		{"AES-192-GCM", AlgAES192GCM, 24},
-		{"AES-256-GCM", AlgAES256GCM, 32},
-		{"ChaCha20-Poly1305", AlgChaCha20Poly1305, 32},
-		{"XChaCha20-Poly1305", AlgXChaCha20Poly1305, 32},
-	}
-
-	for _, tc := range algorithms {
+	// The set is build-dependent: a FIPS build registers only the AES-GCM
+	// family. See algorithm_table_fips_test.go.
+	for _, tc := range knownAlgorithms {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 

@@ -594,7 +594,8 @@ make lint       # Run golangci-lint
 make coverage   # Generate coverage report and enforce the floor
 make ci         # fmt, no-mutants, vet, lint, security scans, build, test
 make ci-full    # ci plus the build-tagged suites: modules, errfs, fuzz, integration, netfault
-make build-fips # Build with GOFIPS140=v1.0.0
+make build-fips  # Compile check under GOFIPS140, with and without -tags fips
+make verify-fips # Run the FIPS boundary under GODEBUG=fips140=only
 ```
 
 `make ci` runs `go test` with no build tags, which leaves out the integration,

@@ -177,9 +177,7 @@ func crashWriteSealed(path string, sealed *seal.SealedRootKey) error {
 // re-load it afterwards rather than reuse the object.
 func crashBarrier(sealPath string) (*seal.Barrier, error) {
 	_ = seal.AllowWeakKDFParams()
-	strategy, err := seal.NewSoftwareStrategyWithParams(
-		[]byte(crashPassphrase), 1, 64*1024, 1,
-	)
+	strategy, err := newTestSealStrategy([]byte(crashPassphrase))
 	if err != nil {
 		return nil, err
 	}

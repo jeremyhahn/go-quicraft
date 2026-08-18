@@ -17,7 +17,6 @@ package seal
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
@@ -40,13 +39,14 @@ func newMockAADEncryptor(t *testing.T) *mockAADEncryptor {
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		t.Fatalf("key generation failed: %v", err)
 	}
-	block, err := aes.NewCipher(key)
+	// newAESGCM, not cipher.NewGCM: the mock stands in for a real hardware
+	// encryptor, and a real one has to be FIPS-approved. Its framing below is
+	// written in terms of aead.NonceSize(), so it is correct for a module-nonce
+	// AEAD (which reports 0 and carries the nonce in its own output) without
+	// any special-casing.
+	aead, err := newAESGCM(key)
 	if err != nil {
-		t.Fatalf("aes.NewCipher failed: %v", err)
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		t.Fatalf("cipher.NewGCM failed: %v", err)
+		t.Fatalf("newAESGCM failed: %v", err)
 	}
 	return &mockAADEncryptor{aead: aead}
 }

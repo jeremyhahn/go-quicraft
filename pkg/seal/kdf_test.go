@@ -21,60 +21,6 @@ import (
 	"testing"
 )
 
-func TestDeriveKey_Argon2id(t *testing.T) {
-	passphrase := []byte("test-passphrase-argon2id")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
-
-	key, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("DeriveKey(Argon2id) returned unexpected error: %v", err)
-	}
-	if len(key) != 32 {
-		t.Fatalf("expected 32-byte key, got %d bytes", len(key))
-	}
-}
-
-func TestDeriveKey_Argon2id_Deterministic(t *testing.T) {
-	passphrase := []byte("deterministic-test")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
-
-	key1, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("first DeriveKey failed: %v", err)
-	}
-
-	key2, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("second DeriveKey failed: %v", err)
-	}
-
-	if !bytes.Equal(key1, key2) {
-		t.Fatal("same passphrase and salt should produce identical keys")
-	}
-}
-
 func TestDeriveKey_PBKDF2SHA256(t *testing.T) {
 	passphrase := []byte("test-passphrase-pbkdf2")
 	salt := make([]byte, 32)
@@ -125,42 +71,6 @@ func TestDeriveKey_PBKDF2SHA256_Deterministic(t *testing.T) {
 	}
 }
 
-func TestDeriveKey_CrossVersionDifferentResults(t *testing.T) {
-	passphrase := []byte("cross-version-test")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	argon2Params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
-
-	pbkdf2Params := KDFParams{
-		Iterations: 1000,
-		KeyLen:     32,
-		SaltLen:    32,
-	}
-
-	keyArgon2, err := DeriveKey(passphrase, salt, KDFArgon2id, argon2Params)
-	if err != nil {
-		t.Fatalf("DeriveKey(Argon2id) failed: %v", err)
-	}
-
-	keyPBKDF2, err := DeriveKey(passphrase, salt, KDFPbkdf2SHA256, pbkdf2Params)
-	if err != nil {
-		t.Fatalf("DeriveKey(PBKDF2) failed: %v", err)
-	}
-
-	if bytes.Equal(keyArgon2, keyPBKDF2) {
-		t.Fatal("different KDF versions with same input should produce different keys")
-	}
-}
-
 func TestDeriveKey_DifferentSaltsDifferentKeys(t *testing.T) {
 	passphrase := []byte("salt-test")
 	salt1 := make([]byte, 32)
@@ -172,20 +82,16 @@ func TestDeriveKey_DifferentSaltsDifferentKeys(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
+	// The salt's contribution is a property of DeriveKey, not of one KDF, so
+	// this runs against whichever KDF the build has (see testKDFParams).
+	params := testKDFParams()
 
-	key1, err := DeriveKey(passphrase, salt1, KDFArgon2id, params)
+	key1, err := DeriveKey(passphrase, salt1, testKDFVersion, params)
 	if err != nil {
 		t.Fatalf("DeriveKey with salt1 failed: %v", err)
 	}
 
-	key2, err := DeriveKey(passphrase, salt2, KDFArgon2id, params)
+	key2, err := DeriveKey(passphrase, salt2, testKDFVersion, params)
 	if err != nil {
 		t.Fatalf("DeriveKey with salt2 failed: %v", err)
 	}
@@ -242,15 +148,12 @@ func TestDeriveKey_MinimumSaltLength(t *testing.T) {
 	if _, err := rand.Read(salt); err != nil {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 16,
-	}
+	// The salt floor is enforced before dispatch, so it is checked against
+	// whichever KDF the build has (see testKDFParams).
+	params := testKDFParams()
+	params.SaltLen = 16
 
-	key, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
+	key, err := DeriveKey(passphrase, salt, testKDFVersion, params)
 	if err != nil {
 		t.Fatalf("DeriveKey with 16-byte salt should succeed: %v", err)
 	}
@@ -335,35 +238,12 @@ func TestDeriveKey_PBKDF2_CustomKeyLen(t *testing.T) {
 	}
 }
 
-func TestDeriveKey_Argon2id_CustomKeyLen(t *testing.T) {
-	passphrase := []byte("custom-key-len-argon2")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  64, // Non-standard key length.
-		SaltLen: 32,
-	}
-
-	key, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("DeriveKey with custom KeyLen failed: %v", err)
-	}
-	if len(key) != 64 {
-		t.Fatalf("expected 64-byte key, got %d bytes", len(key))
-	}
-}
-
 // TestKDFParamsBelowFloor verifies the production KDF work-factor floor
 // catches the pathological near-free parameter sets the reviewer flagged
-// (Argon2 Time=1/Memory=1KiB, PBKDF2 Iterations=1, tiny KeyLen) while
-// accepting the defaults. It checks the pure predicate directly so it is
-// independent of the package-wide test bypass.
+// (PBKDF2 Iterations=1, tiny KeyLen) while accepting the defaults. It checks
+// the pure predicate directly so it is independent of the package-wide test
+// bypass. The Argon2id work-factor floors are pinned in
+// TestKDFParamsBelowFloor_Argon2id, which only a non-FIPS build compiles.
 func TestKDFParamsBelowFloor(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -371,12 +251,13 @@ func TestKDFParamsBelowFloor(t *testing.T) {
 		params  KDFParams
 		weak    bool
 	}{
-		{"argon2 default", KDFArgon2id, DefaultKDFParams(), false},
-		{"argon2 trivial memory", KDFArgon2id, KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 32}, true},
-		{"argon2 trivial time", KDFArgon2id, KDFParams{Time: 1, Memory: 128 * 1024, Threads: 1, KeyLen: 32}, true},
-		{"argon2 tiny key", KDFArgon2id, KDFParams{Time: 4, Memory: 128 * 1024, Threads: 4, KeyLen: 8}, true},
 		{"pbkdf2 default", KDFPbkdf2SHA256, DefaultFIPSKDFParams(), false},
 		{"pbkdf2 trivial iters", KDFPbkdf2SHA256, KDFParams{Iterations: 1, KeyLen: 32}, true},
+		// The KeyLen floor is checked before the per-version work factors, so
+		// it bites for every version in every build — including one whose
+		// deriver this build does not compile in.
+		{"tiny key", KDFPbkdf2SHA256, KDFParams{Iterations: 600_000, KeyLen: 8}, true},
+		{"argon2 tiny key", KDFArgon2id, KDFParams{Time: 4, Memory: 128 * 1024, Threads: 4, KeyLen: 8}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -394,8 +275,8 @@ func TestDeriveKeyRejectsWeakParams(t *testing.T) {
 	defer allowWeakKDFParams.Store(prev)
 
 	salt := make([]byte, 32)
-	_, err := DeriveKey([]byte("passphrase"), salt, KDFArgon2id,
-		KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 32})
+	_, err := DeriveKey([]byte("passphrase"), salt, KDFPbkdf2SHA256,
+		KDFParams{Iterations: 1, KeyLen: 32})
 	if !errors.Is(err, ErrKDFWeakParams) {
 		t.Fatalf("DeriveKey(weak) = %v, want ErrKDFWeakParams", err)
 	}

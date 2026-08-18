@@ -733,10 +733,9 @@ func createTestBarrier(t *testing.T) *seal.Barrier {
 	cfg := seal.DefaultBarrierConfig(1)
 	cfg.StatePersister = func(*seal.SealedRootKey) error { return nil }
 	b := seal.MustNewBarrier(cfg)
-	s, err := seal.NewSoftwareStrategyWithParams(
-		[]byte("test-snapshot-sender"), 1, 64*1024, 1)
+	s, err := newTestSealStrategy([]byte("test-snapshot-sender"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams: %v", err)
+		t.Fatalf("newTestSealStrategy: %v", err)
 	}
 	if err := b.Initialize(context.Background(), s, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize: %v", err)

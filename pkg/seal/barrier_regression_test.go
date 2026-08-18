@@ -627,14 +627,10 @@ func TestDeriveDEK_V2SeparatesAlgorithmAndKeySize(t *testing.T) {
 		t.Fatal("v2 layout derived the same key as v1")
 	}
 
-	// ChaCha20 and AES-256 share a key size but must not share a key.
-	v2ChaCha, err := deriveDEK(rootKey, salt, 7, 3, AlgChaCha20Poly1305, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK v2/chacha: %v", err)
-	}
-	if bytes.Equal(v2ChaCha, v2Long) {
-		t.Fatal("v2 layout derived the same key for two different algorithms")
-	}
+	// Two algorithms that share a key size must not share a key. Which pair
+	// that is — and whether one exists at all — depends on the build; see
+	// assertV2SeparatesSameKeySizeAlgorithms.
+	assertV2SeparatesSameKeySizeAlgorithms(t, rootKey, salt, v2Long)
 
 	if _, err := deriveDEK(rootKey, salt, 7, 3, AlgAES256GCM, HKDFVersion(9)); !errors.Is(err, ErrUnsupportedHKDFVersion) {
 		t.Fatalf("deriveDEK(unknown version) = %v, want ErrUnsupportedHKDFVersion", err)

@@ -91,6 +91,23 @@ type InvocationCounter interface {
 // The default SoftwareAEADProvider dispatches to the standard Go crypto
 // library. Consumers may inject hardware-backed implementations (e.g.,
 // go-xkms) via BarrierConfig.AEADProvider.
+//
+// TWO NONCE CONVENTIONS ARE SUPPORTED, and the returned AEAD declares which one
+// it follows through NonceSize():
+//
+//   - NonceSize() > 0 — a caller-nonce AEAD. The barrier draws a nonce of that
+//     width from its own random source, writes it into the frame ahead of the
+//     payload, and passes it to Seal/Open.
+//   - NonceSize() == 0 — a module-nonce AEAD, as returned by
+//     cipher.NewGCMWithRandomNonce. It generates its own nonce, prepends it to
+//     the Seal output, consumes it from the head of the payload on Open, and
+//     counts it in Overhead(). The barrier passes a nil nonce. An implementation
+//     that chooses this MUST prepend exactly alg.NonceSize() bytes, because that
+//     is the width the barrier reports to a reader and the slice it hands the
+//     nonce-reuse tracker.
+//
+// The two produce identical frames for AES-GCM, which is why the wire format is
+// unversioned across the migration; see newAESGCM.
 type AEADProvider interface {
 	NewAEAD(alg SymmetricAlgorithm, key []byte) (cipher.AEAD, error)
 }

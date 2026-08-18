@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -30,6 +29,14 @@ type KDFVersion uint8
 
 const (
 	// KDFArgon2id selects Argon2id for key derivation (standard mode).
+	//
+	// NOT AVAILABLE IN A FIPS BUILD. Argon2id is not a FIPS-approved KDF, so
+	// its implementation lives in kdf_argon2.go behind //go:build !fips and is
+	// not registered in kdfDispatchers when the binary is built with -tags fips;
+	// DeriveKey answers it with ErrKDFUnsupportedVersion there. The identifier
+	// is retained in every build because it is PERSISTED — it is stamped into
+	// SealedRootKey.Metadata, and a FIPS build must still be able to read that
+	// byte and say what it means rather than mis-attribute it to another KDF.
 	KDFArgon2id KDFVersion = 1
 
 	// KDFPbkdf2SHA256 selects PBKDF2-SHA256 for key derivation (FIPS mode).
@@ -45,11 +52,11 @@ const (
 	// key. These floors are conservative lower bounds (well below the
 	// defaults); the test-only escape hatch AllowWeakKDFParams bypasses
 	// them for fast unit tests.
-	minArgon2Time      = 2
-	minArgon2MemoryKiB = 32 * 1024 // 32 MiB
-	minArgon2Threads   = 1
-	minKDFKeyLen       = 16
-	minPBKDF2Iter      = 100_000
+	//
+	// The Argon2id floors live with the Argon2id deriver in kdf_argon2.go, so a
+	// build that cannot derive with Argon2id also carries no dead floor for it.
+	minKDFKeyLen  = 16
+	minPBKDF2Iter = 100_000
 )
 
 // allowWeakKDFParams, when true, bypasses the production KDF work-factor
@@ -89,21 +96,29 @@ func validateKDFParams(version KDFVersion, params KDFParams) error {
 	return nil
 }
 
+// kdfFloorChecks holds, per KDF version, the predicate reporting whether the
+// work factors fall below the production floor. It is keyed the same way as
+// kdfDispatchers and registered from the same place, so a KDF that a build
+// cannot derive with also has no floor to consult — the two tables cannot drift
+// into a state where a version is derivable but unbounded.
+var kdfFloorChecks = map[KDFVersion]func(KDFParams) bool{
+	KDFPbkdf2SHA256: func(params KDFParams) bool { return params.Iterations < minPBKDF2Iter },
+}
+
 // kdfParamsBelowFloor reports whether the parameters fall below the
 // production work-factor floor for the version, independent of the
 // test-only bypass. Exposed (unexported) so the floor can be unit-tested
 // without flipping the package-wide bypass.
+//
+// An unregistered version reports false: it has no floor because it has no
+// deriver, and DeriveKey has already refused it with ErrKDFUnsupportedVersion
+// before the floor is consulted.
 func kdfParamsBelowFloor(version KDFVersion, params KDFParams) bool {
 	if params.KeyLen < minKDFKeyLen {
 		return true
 	}
-	switch version {
-	case KDFArgon2id:
-		return params.Time < minArgon2Time ||
-			params.Memory < minArgon2MemoryKiB ||
-			params.Threads < minArgon2Threads
-	case KDFPbkdf2SHA256:
-		return params.Iterations < minPBKDF2Iter
+	if below, ok := kdfFloorChecks[version]; ok {
+		return below(params)
 	}
 	return false
 }
@@ -131,8 +146,13 @@ type kdfDeriver func(passphrase, salt []byte, params KDFParams) ([]byte, error)
 
 // kdfDispatchers is a map-based dispatch table for KDF algorithms.
 // Uses O(1) constant-time lookup instead of a switch statement.
+//
+// It holds ONLY FIPS-approved KDFs. Argon2id is added by the init in
+// kdf_argon2.go, which is compiled only when the fips build tag is absent, so a
+// FIPS build has no Argon2id deriver to reach: DeriveKey and every strategy
+// constructor go through this table, and an absent entry is a refusal that no
+// configuration can undo.
 var kdfDispatchers = map[KDFVersion]kdfDeriver{
-	KDFArgon2id:     deriveArgon2id,
 	KDFPbkdf2SHA256: derivePBKDF2SHA256,
 }
 
@@ -140,6 +160,12 @@ var kdfDispatchers = map[KDFVersion]kdfDeriver{
 // (non-FIPS) mode. These exceed OWASP 2024 minimums (time=3, memory=64MB)
 // because the sealed root key protects all data at rest and is a high-value
 // offline attack target.
+//
+// The parameters are plain numbers and are described in every build, so a
+// reader of a stored blob can still say what work factors it was sealed under.
+// A build with -tags fips has no Argon2id DERIVER (kdf_argon2.go), so passing
+// these to DeriveKey there returns ErrKDFUnsupportedVersion; use
+// DefaultFIPSKDFParams for anything that must actually derive.
 func DefaultKDFParams() KDFParams {
 	return KDFParams{
 		Time:    4,
@@ -172,14 +198,19 @@ func checkKDFFIPS(version KDFVersion) error {
 	return nil
 }
 
-// DefaultKDFVersion returns KDFPbkdf2SHA256 when FIPS mode is enabled,
-// or KDFArgon2id otherwise. This allows callers to transparently select
-// the appropriate algorithm based on the runtime FIPS policy.
+// DefaultKDFVersion returns KDFPbkdf2SHA256 when FIPS mode is enabled, or the
+// build's standard-mode KDF otherwise. This allows callers to transparently
+// select the appropriate algorithm based on the runtime FIPS policy.
+//
+// In a build with -tags fips there is no standard mode to fall back to:
+// defaultStandardKDFVersion is KDFPbkdf2SHA256 there because Argon2id is not
+// compiled in, so this returns the approved KDF whether or not the GOFIPS140
+// environment says anything.
 func DefaultKDFVersion() KDFVersion {
 	if FIPSEnabled() {
 		return KDFPbkdf2SHA256
 	}
-	return KDFArgon2id
+	return defaultStandardKDFVersion()
 }
 
 // DeriveKey derives a cryptographic key from a passphrase and salt using
@@ -221,12 +252,6 @@ func DeriveKey(passphrase, salt []byte, version KDFVersion, params KDFParams) ([
 	}
 
 	return deriver(passphrase, salt, params)
-}
-
-// deriveArgon2id derives a key using the Argon2id algorithm.
-func deriveArgon2id(passphrase, salt []byte, params KDFParams) ([]byte, error) {
-	key := argon2.IDKey(passphrase, salt, params.Time, params.Memory, params.Threads, params.KeyLen)
-	return key, nil
 }
 
 // derivePBKDF2SHA256 derives a key using PBKDF2 with HMAC-SHA256.

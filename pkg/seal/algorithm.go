@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"runtime"
 
-	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/sys/cpu"
 )
 
@@ -55,10 +54,21 @@ const (
 
 	// AlgChaCha20Poly1305 selects ChaCha20-Poly1305: 32-byte key, 12-byte nonce.
 	// Preferred on hardware without AES-NI acceleration.
+	//
+	// NOT AVAILABLE IN A FIPS BUILD. ChaCha20-Poly1305 is not FIPS-approved, so
+	// the implementation lives in algorithm_chacha.go behind //go:build !fips and
+	// is not registered when the binary is built with -tags fips: Valid() reports
+	// false and newAEADForAlgorithm returns ErrUnsupportedAlgorithm. The
+	// identifier itself is retained in every build because it is a WIRE value —
+	// it appears in the header of data already on disk, and a forensic reader
+	// must still be able to name what it is looking at.
 	AlgChaCha20Poly1305 SymmetricAlgorithm = 0x04
 
 	// AlgXChaCha20Poly1305 selects XChaCha20-Poly1305: 32-byte key, 24-byte nonce.
 	// The extended 192-bit nonce eliminates nonce-collision risk for large key volumes.
+	//
+	// NOT AVAILABLE IN A FIPS BUILD, for the same reason and by the same
+	// mechanism as AlgChaCha20Poly1305.
 	AlgXChaCha20Poly1305 SymmetricAlgorithm = 0x05
 )
 
@@ -88,14 +98,18 @@ const (
 	// invocation to (2^32 - 2) 16-byte blocks, ~64 GiB. crypto/cipher panics
 	// with "crypto/cipher: message too large for GCM" beyond it.
 	maxPlaintextGCM uint64 = ((1 << 32) - 2) * 16
-
-	// maxPlaintextChaCha is the ChaCha20-Poly1305 ceiling used by x/crypto for
-	// BOTH the 12-byte-nonce and the extended-nonce (X) construction, ~256 GiB.
-	// x/crypto panics with "chacha20poly1305: plaintext too large" beyond it.
-	maxPlaintextChaCha uint64 = (1 << 38) - 64
 )
 
 // algorithmParams holds the static parameters for a SymmetricAlgorithm.
+//
+// nonceSize is the nonce width the WIRE FORMAT carries, which is not always
+// what the constructed cipher.AEAD reports. An AES-GCM AEAD built by newAESGCM
+// generates its own nonce and prepends it to its own Seal output, so it reports
+// NonceSize() == 0 and folds those 12 bytes into Overhead(); the frame still
+// contains exactly nonceSize nonce bytes in exactly the same position. Keeping
+// nonceSize as the wire width is what lets the barrier cross-check a header
+// algID against the active cipher, and what keeps SymmetricAlgorithm.NonceSize
+// meaningful to callers reading a frame they did not write.
 type algorithmParams struct {
 	keySize      int
 	nonceSize    int
@@ -106,6 +120,13 @@ type algorithmParams struct {
 
 // algorithmRegistry maps algorithm identifiers to their parameters and
 // constructor functions for O(1) dispatch in newAEADForAlgorithm.
+//
+// It holds ONLY FIPS-approved algorithms. The ChaCha20 family is added by the
+// init in algorithm_chacha.go, which is compiled only when the fips build tag
+// is absent, so a FIPS build has no way to reach a non-approved AEAD: the
+// registry is the single lookup every constructor, key-size check and
+// nonce-width check goes through. Registration, not a runtime branch, is what
+// makes the FIPS build unable to execute the algorithm.
 var algorithmRegistry = map[SymmetricAlgorithm]algorithmParams{
 	AlgAES128GCM: {
 		keySize:      16,
@@ -128,20 +149,6 @@ var algorithmRegistry = map[SymmetricAlgorithm]algorithmParams{
 		name:         "AES-256-GCM",
 		newAEAD:      newAESGCM,
 	},
-	AlgChaCha20Poly1305: {
-		keySize:      chacha20poly1305.KeySize,
-		nonceSize:    chacha20poly1305.NonceSize,
-		maxPlaintext: maxPlaintextChaCha,
-		name:         "ChaCha20-Poly1305",
-		newAEAD:      chacha20poly1305.New,
-	},
-	AlgXChaCha20Poly1305: {
-		keySize:      chacha20poly1305.KeySize,
-		nonceSize:    chacha20poly1305.NonceSizeX,
-		maxPlaintext: maxPlaintextChaCha,
-		name:         "XChaCha20-Poly1305",
-		newAEAD:      chacha20poly1305.NewX,
-	},
 }
 
 // KeySize returns the required key length in bytes for this algorithm.
@@ -153,8 +160,14 @@ func (a SymmetricAlgorithm) KeySize() int {
 	return 0
 }
 
-// NonceSize returns the required nonce length in bytes for this algorithm.
-// Returns 0 for unrecognised algorithm identifiers.
+// NonceSize returns the nonce length in bytes that this algorithm's wire format
+// carries. Returns 0 for unrecognised algorithm identifiers — including, in a
+// FIPS build, the ChaCha20 family, which is not registered there.
+//
+// For AES-GCM this is the width of the nonce the FIPS module generates and
+// prepends to the ciphertext; it is deliberately NOT the same as the
+// cipher.AEAD.NonceSize() of the AEAD returned by newAEADForAlgorithm, which is
+// zero because that AEAD accepts no caller nonce. See algorithmParams.
 func (a SymmetricAlgorithm) NonceSize() int {
 	if p, ok := algorithmRegistry[a]; ok {
 		return p.nonceSize
@@ -200,12 +213,26 @@ func (a SymmetricAlgorithm) Valid() bool {
 // newAESGCM constructs an AES-GCM AEAD. The key length determines the AES
 // variant (128, 192, or 256 bit) because aes.NewCipher selects the variant
 // based on key length, so the same constructor covers all three AES modes.
+//
+// It uses cipher.NewGCMWithRandomNonce, NOT cipher.NewGCM, and that choice is
+// load-bearing rather than stylistic. FIPS 140-3 (SP 800-38D §8.2.2, CMVP IG
+// C.H) requires a GCM IV to be generated INSIDE the module boundary; a nonce
+// drawn by application code and stored beside the ciphertext is the exact
+// construction the requirement prohibits, and Go answers it under
+// GODEBUG=fips140=only with "use of GCM with arbitrary IVs is not allowed".
+//
+// The wire format does not change. NewGCMWithRandomNonce generates a 12-byte
+// nonce per Seal and prepends it to its own output, which is byte-for-byte the
+// layout this package already wrote by hand (nonce ‖ ciphertext ‖ tag), so
+// every AES-GCM blob written before this migration is still readable and every
+// blob written after it is readable by a pre-migration reader. See
+// legacy_format_test.go, which decrypts checked-in pre-migration bytes.
 func newAESGCM(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, &CipherError{Err: err}
 	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := cipher.NewGCMWithRandomNonce(block)
 	if err != nil {
 		return nil, &CipherError{Err: err}
 	}
@@ -268,6 +295,10 @@ func HasAESNI() bool {
 // ChaCha20-Poly1305 is not an approved algorithm, and a "FIPS"
 // deployment silently selecting it on non-AES-NI hardware would violate
 // the deployment's compliance claim.
+//
+// That is the RUNTIME guard, and it is retained. A binary built with -tags fips
+// additionally has no ChaCha20 to select: softwareFallbackAlgorithm returns
+// AES-256-GCM there, because the ChaCha20 implementation is not compiled in.
 func SelectOptimalAlgorithm(isHardwareBacked bool) SymmetricAlgorithm {
 	if FIPSEnabled() {
 		return AlgAES256GCM
@@ -275,5 +306,5 @@ func SelectOptimalAlgorithm(isHardwareBacked bool) SymmetricAlgorithm {
 	if isHardwareBacked || HasAESNI() {
 		return AlgAES256GCM
 	}
-	return AlgChaCha20Poly1305
+	return softwareFallbackAlgorithm()
 }

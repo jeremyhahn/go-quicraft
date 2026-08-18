@@ -16,8 +16,6 @@ package seal
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -103,6 +101,19 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 // ErrKDFNotFIPSApproved rather than quietly wrapping a "FIPS" deployment's root
 // key with a non-approved KDF. Use NewSoftwareStrategyFIPS (PBKDF2-SHA256) or
 // NewSoftwareStrategy (which auto-selects by mode) there.
+//
+// IT EXISTS IN EVERY BUILD, INCLUDING -tags fips, and cannot succeed there. The
+// exported surface of a package must not move with a build tag: a consumer that
+// guards this call behind its own runtime FIPS check would otherwise fail to
+// COMPILE in a FIPS build over a line it never executes, and go-quicraft is a
+// Layer 1 dependency, so that breakage would propagate through every consumer.
+// What the tag removes is the Argon2id DERIVER (kdf_argon2.go), and that is
+// enough: newSoftwareStrategy looks the version up in kdfDispatchers, finds
+// nothing, and returns ErrKDFUnsupportedVersion before any key material or work
+// factor is touched. Absence of the algorithm is what refuses the call, not a
+// policy branch — the same mechanism, and the same error, that DeriveKey gives
+// for KDFArgon2id in a FIPS build. Identifiers and signatures stay; ciphers
+// leave.
 func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error) {
 	params := KDFParams{
 		Time:    time,
@@ -297,34 +308,37 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	}
 	defer wipeBytes(wrappingKey)
 
-	// Create AES-256-GCM cipher.
-	block, err := aes.NewCipher(wrappingKey)
+	// Create AES-256-GCM cipher. newAESGCM builds it with
+	// cipher.NewGCMWithRandomNonce, so the nonce below is generated inside the
+	// FIPS module boundary rather than drawn here and handed in — see newAESGCM
+	// for why SP 800-38D requires that, and why the bytes on disk do not move.
+	aead, err := newAESGCM(wrappingKey)
 	if err != nil {
-		return nil, &CipherError{Err: err}
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, &CipherError{Err: err}
-	}
-
-	// Generate a random nonce.
-	nonce := make([]byte, aead.NonceSize())
-	if _, err := io.ReadFull(s.randReader, nonce); err != nil {
-		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
+		return nil, err
 	}
 
 	// Build ciphertext: [KDFSalt | Nonce | EncryptedRootKey | Tag]
 	// The KDF salt is stored inside the ciphertext so that UnsealRootKey is
 	// self-contained and does not depend on the SealedRootKey.Salt field.
 	//
+	// The nonce is no longer appended here: aead.Seal emits it as the first
+	// wrappingGCMNonceSize bytes of its own output, in the same position the
+	// hand-written append used to put it, so this blob has the identical layout
+	// to every blob this strategy has ever written.
+	//
 	// AAD binds the strategy name to the ciphertext, preventing cross-context
 	// key substitution where a ciphertext sealed by one strategy could be
 	// presented to another.
 	aad := []byte(passphraseStrategyName)
-	ciphertext := make([]byte, kdfSaltLen, kdfSaltLen+aead.NonceSize()+len(rootKey)+aead.Overhead())
+	ciphertext := make([]byte, kdfSaltLen, kdfSaltLen+len(rootKey)+aead.Overhead())
 	copy(ciphertext, salt)
-	ciphertext = append(ciphertext, nonce...)
-	ciphertext = aead.Seal(ciphertext, nonce, rootKey, aad)
+	// G407 false positive: the nil nonce is not a hardcoded IV, it is the
+	// ABSENCE of a caller-supplied one. cipher.NewGCMWithRandomNonce reports
+	// NonceSize() == 0 and panics if handed any nonce at all; it generates one
+	// inside the FIPS module per Seal and prepends it to this output. A nonce
+	// literal here is the construction that rule exists to catch, and is exactly
+	// what this call site removed.
+	ciphertext = aead.Seal(ciphertext, nil, rootKey, aad) // #nosec G407 -- module-generated nonce; see newAESGCM
 
 	// Store KDF version in metadata for cross-version unsealing.
 	metadata := []byte{byte(s.kdfVersion)}
@@ -423,29 +437,28 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	}
 	defer wipeBytes(wrappingKey)
 
-	// Create AES-256-GCM cipher.
-	block, err := aes.NewCipher(wrappingKey)
+	// Create AES-256-GCM cipher (cipher.NewGCMWithRandomNonce; see newAESGCM).
+	aead, err := newAESGCM(wrappingKey)
 	if err != nil {
-		return nil, &CipherError{Err: err}
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, &CipherError{Err: err}
+		return nil, err
 	}
 
-	nonceSize := aead.NonceSize()
-	if len(rest) < nonceSize {
+	// rest is [Nonce | EncryptedRootKey | Tag]. The nonce is not sliced off
+	// here: a module-nonce AEAD expects it at the head of the payload it is
+	// given and consumes it internally, which is the same byte range the
+	// pre-migration code passed separately. Blobs written by either version
+	// therefore open identically — see TestLegacyFormat_UnsealRootKey, which
+	// opens checked-in pre-migration bytes.
+	if len(rest) < wrappingGCMNonceSize+wrappingGCMTagSize {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
 	}
 
-	// Extract nonce and decrypt. The AAD must match the strategy name used
-	// during SealRootKey to authenticate that this ciphertext was produced by the
-	// same strategy type, preventing cross-context key substitution.
+	// Decrypt. The AAD must match the strategy name used during SealRootKey to
+	// authenticate that this ciphertext was produced by the same strategy type,
+	// preventing cross-context key substitution.
 	aad := []byte(passphraseStrategyName)
-	nonce := rest[:nonceSize]
-	encrypted := rest[nonceSize:]
 
-	plaintext, err := aead.Open(nil, nonce, encrypted, aad)
+	plaintext, err := aead.Open(nil, nil, rest, aad)
 	if err != nil {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrDecryptionFailed}
 	}

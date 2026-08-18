@@ -26,10 +26,11 @@ import (
 	"time"
 )
 
-// testStrategy returns a SoftwareStrategy with fast Argon2id params for tests.
+// testStrategy returns a SoftwareStrategy with fast KDF params for tests. The
+// KDF itself depends on the build: see newTestStrategy.
 func testStrategy(t *testing.T) *SoftwareStrategy {
 	t.Helper()
-	s, err := NewSoftwareStrategyWithParams([]byte("test-passphrase"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test-passphrase"))
 	if err != nil {
 		t.Fatalf("failed to create test strategy: %v", err)
 	}
@@ -339,9 +340,9 @@ func TestBarrier_UnsealWrongPassphrase(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong-passphrase"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong-passphrase"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -1009,9 +1010,9 @@ func TestBarrier_BruteForceBackoff(t *testing.T) {
 	now := time.Now()
 	b.timeNow = func() time.Time { return now }
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -1952,9 +1953,9 @@ func TestBarrier_BruteForceHighFailureCount(t *testing.T) {
 	now := time.Now()
 	b.timeNow = func() time.Time { return now }
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -2066,20 +2067,46 @@ func TestBarrier_InitializeRandFailSalt(t *testing.T) {
 
 // TestBarrier_EncryptRandNonceFail tests that Encrypt handles rand failure
 // during nonce generation.
-func TestBarrier_EncryptRandNonceFail(t *testing.T) {
+// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader is the inverse of the
+// test it replaces, and it is deliberately phrased as an assertion about where
+// the nonce comes from rather than about an error.
+//
+// Encrypt used to draw the AES-GCM nonce from b.randReader and hand it to
+// Seal, so a failing reader failed the encryption. That is a caller-supplied
+// IV, which FIPS 140-3 (SP 800-38D, CMVP IG C.H) forbids: the IV must be
+// generated inside the module. cipher.NewGCMWithRandomNonce now generates it,
+// and b.randReader is not on the data path at all — so a reader that cannot
+// produce a single byte must NOT be able to affect Encrypt. If someone
+// reintroduces a caller-supplied IV, this test fails.
+func TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
 
-	// Replace rand reader with one that will fail.
 	b.randReader = &errReader{remaining: 0, err: io.ErrUnexpectedEOF}
 
-	_, err := b.Encrypt(nil, []byte("test"))
-	if err == nil {
-		t.Fatal("expected error from Encrypt with failing rand")
+	ct, err := b.Encrypt(nil, []byte("test"))
+	if err != nil {
+		t.Fatalf("Encrypt drew randomness from randReader; the nonce must come "+
+			"from inside the FIPS module boundary, not from the barrier: %v", err)
 	}
-	var sealErr *Error
-	if !errors.As(err, &sealErr) {
-		t.Fatalf("expected *Error, got %T: %v", err, err)
+
+	pt, err := b.Decrypt(nil, ct)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(pt) != "test" {
+		t.Fatalf("roundtrip mismatch: got %q, want %q", pt, "test")
+	}
+
+	// Two seals under one DEK must still differ, which is the property the
+	// nonce exists to provide and the one a broken reader could have destroyed.
+	other, err := b.Encrypt(nil, []byte("test"))
+	if err != nil {
+		t.Fatalf("second Encrypt: %v", err)
+	}
+	if bytes.Equal(ct, other) {
+		t.Fatal("two seals of the same plaintext under the same DEK produced " +
+			"identical frames; the module-generated nonce is not varying")
 	}
 }
 
@@ -2153,22 +2180,32 @@ func TestBarrier_DoubleCheckPatternEncrypt_FastPath(t *testing.T) {
 	}
 }
 
-// --- EncryptWithEpoch nonce failure propagation ---
+// --- EncryptWithEpoch and the module-generated nonce ---
 
-func TestBarrier_EncryptWithEpochRandNonceFail(t *testing.T) {
+// TestBarrier_EncryptWithEpochDoesNotDrawTheNonceFromRandReader is
+// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader for the epoch-reporting
+// entry point, which funnels through the same encryptLocked. See there for why
+// a failing reader must no longer be able to fail an encryption.
+func TestBarrier_EncryptWithEpochDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
 
-	// Replace rand reader so nonce generation fails.
 	b.randReader = &errReader{remaining: 0, err: io.ErrUnexpectedEOF}
 
-	_, _, err := b.EncryptWithEpoch(nil, []byte("test"))
-	if err == nil {
-		t.Fatal("expected error from EncryptWithEpoch with failing rand")
+	ct, epoch, err := b.EncryptWithEpoch(nil, []byte("test"))
+	if err != nil {
+		t.Fatalf("EncryptWithEpoch drew randomness from randReader: %v", err)
 	}
-	var sealErr *Error
-	if !errors.As(err, &sealErr) {
-		t.Fatalf("expected *Error, got %T: %v", err, err)
+	if epoch != b.CurrentEpoch() {
+		t.Fatalf("EncryptWithEpoch reported epoch %d, want %d", epoch, b.CurrentEpoch())
+	}
+
+	pt, err := b.DecryptForEpoch(nil, ct, epoch)
+	if err != nil {
+		t.Fatalf("DecryptForEpoch: %v", err)
+	}
+	if string(pt) != "test" {
+		t.Fatalf("roundtrip mismatch: got %q, want %q", pt, "test")
 	}
 }
 
@@ -2189,9 +2226,9 @@ func TestBarrier_UnsealFailBelowThreshold(t *testing.T) {
 	now := time.Now()
 	b.timeNow = func() time.Time { return now }
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -2231,9 +2268,9 @@ func TestBarrier_UnsealFailAtThresholdTriggersWarn(t *testing.T) {
 		return now
 	}
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -2266,9 +2303,9 @@ func TestBarrier_UnsealFailAboveErrorThreshold(t *testing.T) {
 		return now
 	}
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -2933,9 +2970,9 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 	now := time.Now()
 	b.timeNow = func() time.Time { return now }
 
-	wrong, err := NewSoftwareStrategyWithParams([]byte("wrong"), 1, 64*1024, 1)
+	wrong, err := newTestStrategy([]byte("wrong"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
+		t.Fatalf("newTestStrategy failed: %v", err)
 	}
 	defer wrong.Close()
 
@@ -3022,7 +3059,7 @@ func TestBarrier_BackoffPersistenceZeroValuesBackwardCompat(t *testing.T) {
 func TestSoftwareStrategy_AADPreventsCrossStrategySubstitution(t *testing.T) {
 	// Verify that tampering with the AAD (by manually constructing a sealed
 	// key with the wrong strategy name at the GCM layer) fails decryption.
-	s, err := NewSoftwareStrategyWithParams([]byte("test-pass"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("test-pass"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3061,7 +3098,7 @@ func TestSoftwareStrategy_AADPreventsCrossStrategySubstitution(t *testing.T) {
 
 func TestSoftwareStrategy_SealUnsealRoundTripWithAAD(t *testing.T) {
 	// Verify that the AAD binding does not break normal Seal/Unseal flow.
-	s, err := NewSoftwareStrategyWithParams([]byte("aad-test"), 1, 64*1024, 1)
+	s, err := newTestStrategy([]byte("aad-test"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

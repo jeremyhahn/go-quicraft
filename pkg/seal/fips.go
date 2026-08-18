@@ -46,6 +46,20 @@ const (
 // second would otherwise fail open onto Argon2id and ChaCha20-Poly1305. A
 // deployment that requires FIPS must say so with BarrierConfig.RequireFIPS,
 // which turns that ambiguity into a refusal at NewBarrier.
+//
+// THIS FUNCTION IS THE RUNTIME POLICY, NOT THE STRONGEST FORM. Everything it
+// governs is a check standing between a caller and an algorithm that is still
+// compiled into the binary. A build with -tags fips removes the algorithms
+// instead: Argon2id (kdf_argon2.go) and the ChaCha20 family
+// (algorithm_chacha.go) are excluded from compilation, so neither this
+// detection nor any configuration can reach them, and the refusals become
+// ErrKDFUnsupportedVersion and ErrUnsupportedAlgorithm. The EXPORTED SURFACE
+// does not move with the tag — NewSoftwareStrategyWithParams still exists in a
+// FIPS build and still compiles at every call site; it simply cannot succeed,
+// because the deriver it names is not there. The AES-GCM data path is FIPS-approved in EVERY
+// build — newAESGCM uses cipher.NewGCMWithRandomNonce unconditionally, because
+// a module-generated IV is required (SP 800-38D) and costs a non-FIPS
+// deployment nothing. See docs/security/encryption.md ("FIPS builds").
 func FIPSEnabled() bool {
 	if fips140.Enabled() {
 		return true

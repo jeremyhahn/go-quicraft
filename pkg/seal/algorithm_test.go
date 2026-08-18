@@ -20,24 +20,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
-
-// knownAlgorithms enumerates all five defined SymmetricAlgorithm constants
-// so table-driven subtests can iterate over them without repetition.
-var knownAlgorithms = []struct {
-	alg       SymmetricAlgorithm
-	name      string
-	keySize   int
-	nonceSize int
-}{
-	{AlgAES128GCM, "AES-128-GCM", 16, 12},
-	{AlgAES192GCM, "AES-192-GCM", 24, 12},
-	{AlgAES256GCM, "AES-256-GCM", 32, 12},
-	{AlgChaCha20Poly1305, "ChaCha20-Poly1305", chacha20poly1305.KeySize, chacha20poly1305.NonceSize},
-	{AlgXChaCha20Poly1305, "XChaCha20-Poly1305", chacha20poly1305.KeySize, chacha20poly1305.NonceSizeX},
-}
 
 // unknownAlg is a SymmetricAlgorithm value that is not registered in the
 // algorithmRegistry and is used to exercise all error/zero-value paths.
@@ -171,15 +154,19 @@ func TestNewAEADForAlgorithm(t *testing.T) {
 					t.Fatal("newAEADForAlgorithm() returned nil AEAD")
 				}
 
-				// The AEAD nonce size must match the algorithm's declared nonce size.
-				if got := aead.NonceSize(); got != tc.nonceSize {
-					t.Fatalf("AEAD.NonceSize() = %d, want %d", got, tc.nonceSize)
+				// A caller-nonce AEAD reports the algorithm's nonce width; a
+				// module-nonce AEAD reports zero, because it accepts no caller
+				// nonce and carries its own inside the payload instead.
+				if got := aead.NonceSize(); got != tc.wantAEADNonceSize() {
+					t.Fatalf("AEAD.NonceSize() = %d, want %d", got, tc.wantAEADNonceSize())
 				}
 
-				// All algorithms use a 16-byte (128-bit) Poly1305 / GCM authentication tag.
-				const wantOverhead = 16
-				if got := aead.Overhead(); got != wantOverhead {
-					t.Fatalf("AEAD.Overhead() = %d, want %d", got, wantOverhead)
+				// Every algorithm uses a 16-byte (128-bit) Poly1305 / GCM
+				// authentication tag; a module-nonce AEAD counts its prepended
+				// nonce in Overhead() on top of that, which is what keeps the
+				// frame size identical to the caller-nonce layout it replaced.
+				if got := aead.Overhead(); got != tc.wantAEADOverhead() {
+					t.Fatalf("AEAD.Overhead() = %d, want %d", got, tc.wantAEADOverhead())
 				}
 			})
 		}
@@ -189,27 +176,61 @@ func TestNewAEADForAlgorithm(t *testing.T) {
 // ----- TestNewAEADForAlgorithm_InvalidKeySize --------------------------------
 
 func TestNewAEADForAlgorithm_InvalidKeySize(t *testing.T) {
-	tests := []struct {
-		alg     SymmetricAlgorithm
-		keySize int // intentionally wrong
-	}{
-		{AlgAES128GCM, 32},        // 32 instead of 16
-		{AlgAES192GCM, 16},        // 16 instead of 24
-		{AlgAES256GCM, 16},        // 16 instead of 32
-		{AlgChaCha20Poly1305, 16}, // 16 instead of 32
-		{AlgXChaCha20Poly1305, 0}, // empty key
-	}
-
-	for _, tc := range tests {
-		t.Run(fmt.Sprintf("%s_keySize_%d", tc.alg, tc.keySize), func(t *testing.T) {
-			key := make([]byte, tc.keySize)
-
-			_, err := newAEADForAlgorithm(tc.alg, key)
+	for _, tc := range knownAlgorithms {
+		// A key length that is valid for SOME algorithm but not this one, so
+		// the rejection comes from the registry's exact-length check rather
+		// than from the underlying cipher refusing a nonsense length.
+		wrong := 16
+		if tc.keySize == 16 {
+			wrong = 32
+		}
+		t.Run(fmt.Sprintf("%s_keySize_%d", tc.alg, wrong), func(t *testing.T) {
+			_, err := newAEADForAlgorithm(tc.alg, make([]byte, wrong))
 			if err == nil {
 				t.Fatal("newAEADForAlgorithm() expected error for wrong key size, got nil")
 			}
 			if !errors.Is(err, ErrInvalidKeySize) {
 				t.Fatalf("errors.Is(err, ErrInvalidKeySize) = false, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("empty key", func(t *testing.T) {
+		_, err := newAEADForAlgorithm(knownAlgorithms[0].alg, nil)
+		if !errors.Is(err, ErrInvalidKeySize) {
+			t.Fatalf("errors.Is(err, ErrInvalidKeySize) = false, got: %v", err)
+		}
+	})
+}
+
+// TestUnregisteredAlgorithmsAreRefused is the assertion that makes the fips
+// build tag mean something. In a FIPS build the ChaCha20 family is defined as a
+// wire identifier but has no entry in algorithmRegistry, because
+// algorithm_chacha.go is not compiled; every accessor must therefore treat it
+// exactly as it treats an identifier nobody has ever defined, and
+// newAEADForAlgorithm must refuse rather than construct.
+//
+// In a non-FIPS build unregisteredAlgorithms is empty and this test is a no-op,
+// which is the correct reading: nothing is excluded there.
+func TestUnregisteredAlgorithmsAreRefused(t *testing.T) {
+	for _, alg := range unregisteredAlgorithms {
+		t.Run(fmt.Sprintf("%#x", byte(alg)), func(t *testing.T) {
+			if alg.Valid() {
+				t.Fatal("Valid() = true for an algorithm this build does not register")
+			}
+			if got := alg.KeySize(); got != 0 {
+				t.Fatalf("KeySize() = %d, want 0", got)
+			}
+			if got := alg.NonceSize(); got != 0 {
+				t.Fatalf("NonceSize() = %d, want 0", got)
+			}
+			if got := alg.MaxPlaintextSize(); got != 0 {
+				t.Fatalf("MaxPlaintextSize() = %d, want 0", got)
+			}
+			// 32 bytes is the correct key length for both excluded algorithms,
+			// so a registry that still held them would succeed here.
+			if _, err := newAEADForAlgorithm(alg, make([]byte, 32)); !errors.Is(err, ErrUnsupportedAlgorithm) {
+				t.Fatalf("newAEADForAlgorithm() = %v, want ErrUnsupportedAlgorithm", err)
 			}
 		})
 	}
@@ -317,14 +338,16 @@ func TestNewAESGCM_AllKeySizes(t *testing.T) {
 				t.Fatal("newAESGCM() returned nil AEAD")
 			}
 
-			// GCM always uses a 12-byte nonce.
-			const wantNonce = 12
-			if got := aead.NonceSize(); got != wantNonce {
-				t.Fatalf("AEAD.NonceSize() = %d, want %d", got, wantNonce)
+			// newAESGCM builds a module-nonce GCM (cipher.NewGCMWithRandomNonce),
+			// which takes no caller nonce at all.
+			if got := aead.NonceSize(); got != 0 {
+				t.Fatalf("AEAD.NonceSize() = %d, want 0 (module-generated nonce)", got)
 			}
 
-			// GCM authentication tag is 16 bytes.
-			const wantOverhead = 16
+			// Overhead is the 12-byte nonce the module prepends plus the
+			// 16-byte GCM tag, which is exactly the number of bytes the
+			// pre-migration framing spent on nonce + tag.
+			const wantOverhead = 12 + aeadTagSize
 			if got := aead.Overhead(); got != wantOverhead {
 				t.Fatalf("AEAD.Overhead() = %d, want %d", got, wantOverhead)
 			}
@@ -361,8 +384,8 @@ func TestAlgorithmRoundtrip(t *testing.T) {
 				t.Fatalf("newAEADForAlgorithm() error: %v", err)
 			}
 
-			// Generate a random nonce of the correct length for this algorithm.
-			nonce := randKey(t, tc.nonceSize)
+			// nil for a module-nonce AEAD, a random nonce otherwise.
+			nonce := tc.sealNonce(t)
 
 			// Encrypt.
 			ciphertext := aead.Seal(nil, nonce, plaintext, additionalData)
@@ -390,7 +413,7 @@ func TestAlgorithmRoundtrip_TamperedCiphertextFails(t *testing.T) {
 	for _, tc := range knownAlgorithms {
 		t.Run(tc.name, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
-			nonce := randKey(t, tc.nonceSize)
+			nonce := tc.sealNonce(t)
 
 			aead, err := newAEADForAlgorithm(tc.alg, key)
 			if err != nil {
@@ -422,7 +445,7 @@ func TestAlgorithmRoundtrip_WrongAdditionalDataFails(t *testing.T) {
 	for _, tc := range knownAlgorithms {
 		t.Run(tc.name, func(t *testing.T) {
 			key := randKey(t, tc.keySize)
-			nonce := randKey(t, tc.nonceSize)
+			nonce := tc.sealNonce(t)
 
 			aead, err := newAEADForAlgorithm(tc.alg, key)
 			if err != nil {

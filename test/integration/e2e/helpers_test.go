@@ -2121,14 +2121,13 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		// Create and initialize a barrier for this node.
 		_ = seal.AllowWeakKDFParams()
 		b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
-		s, err := seal.NewSoftwareStrategyWithParams(
-			[]byte(fmt.Sprintf("test-passphrase-%d", i)), 1, 64*1024, 1)
+		s, err := newTestSealStrategy([]byte(fmt.Sprintf("test-passphrase-%d", i)))
 		if err != nil {
 			// Clean up previously created hosts.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
-			t.Fatalf("NewSoftwareStrategyWithParams[%d]: %v", i, err)
+			t.Fatalf("newTestSealStrategy[%d]: %v", i, err)
 		}
 		if err := b.Initialize(context.Background(), s, seal.Credentials{}); err != nil {
 			for j := 0; j < i; j++ {
@@ -2181,10 +2180,9 @@ func newBarrierForNode(t *testing.T) *countingBarrier {
 	t.Helper()
 	_ = seal.AllowWeakKDFParams()
 	b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
-	s, err := seal.NewSoftwareStrategyWithParams(
-		[]byte("replacement-passphrase"), 1, 64*1024, 1)
+	s, err := newTestSealStrategy([]byte("replacement-passphrase"))
 	if err != nil {
-		t.Fatalf("NewSoftwareStrategyWithParams for replacement: %v", err)
+		t.Fatalf("newTestSealStrategy for replacement: %v", err)
 	}
 	if err := b.Initialize(context.Background(), s, seal.Credentials{}); err != nil {
 		t.Fatalf("barrier.Initialize for replacement: %v", err)

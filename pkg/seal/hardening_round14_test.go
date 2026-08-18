@@ -17,7 +17,6 @@ package seal
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
@@ -130,14 +129,17 @@ func TestSealedStateMAC_CoversEveryField(t *testing.T) {
 	genuine := b.SealedRootKeyData()
 
 	tamper := map[string]func(*SealedRootKey){
-		"epoch":            func(s *SealedRootKey) { s.Epoch = 4 },
-		"known_epochs":     func(s *SealedRootKey) { s.KnownEpochs = []uint64{5} },
-		"salt":             func(s *SealedRootKey) { s.Salt[0] ^= 0xff },
-		"hkdf_version":     func(s *SealedRootKey) { s.HKDFVersion = HKDFV1 },
-		"strategy":         func(s *SealedRootKey) { s.Strategy = StrategyNone },
-		"version":          func(s *SealedRootKey) { s.Version++ },
-		"ciphertext":       func(s *SealedRootKey) { s.Ciphertext[0] ^= 0xff },
-		"metadata":         func(s *SealedRootKey) { s.Metadata = []byte{byte(KDFPbkdf2SHA256)} },
+		"epoch":        func(s *SealedRootKey) { s.Epoch = 4 },
+		"known_epochs": func(s *SealedRootKey) { s.KnownEpochs = []uint64{5} },
+		"salt":         func(s *SealedRootKey) { s.Salt[0] ^= 0xff },
+		"hkdf_version": func(s *SealedRootKey) { s.HKDFVersion = HKDFV1 },
+		"strategy":     func(s *SealedRootKey) { s.Strategy = StrategyNone },
+		"version":      func(s *SealedRootKey) { s.Version++ },
+		"ciphertext":   func(s *SealedRootKey) { s.Ciphertext[0] ^= 0xff },
+		// Appending rather than substituting a specific KDF byte: the
+		// strategy's own KDF is build-dependent, and substituting the value it
+		// already holds would be a no-op tamper that the MAC is right to accept.
+		"metadata":         func(s *SealedRootKey) { s.Metadata = append(bytes.Clone(s.Metadata), 0xFF) },
 		"nonce":            func(s *SealedRootKey) { s.Nonce = []byte{1, 2, 3} },
 		"hardware_payload": func(s *SealedRootKey) { s.HardwarePayload = []byte{9} },
 		"mac":              func(s *SealedRootKey) { s.StateMAC[0] ^= 0xff },
@@ -379,11 +381,10 @@ func newLyingAADEncryptor(t *testing.T) *lyingAADEncryptor {
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		t.Fatalf("key: %v", err)
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		t.Fatalf("aes: %v", err)
-	}
-	aead, err := cipher.NewGCM(block)
+	// newAESGCM, not cipher.NewGCM — see newMockAADEncryptor. The framing in
+	// this mock is expressed via aead.NonceSize() and therefore works for both
+	// the caller-nonce and module-nonce constructions.
+	aead, err := newAESGCM(key)
 	if err != nil {
 		t.Fatalf("gcm: %v", err)
 	}
@@ -552,28 +553,21 @@ func TestFIPS_ConstrainsKDF(t *testing.T) {
 	salt := make([]byte, 32)
 	pass := []byte("a-passphrase-for-the-kdf")
 
-	// Baseline outside FIPS: Argon2id derives normally.
+	// Baseline before FIPS is requested. What "baseline" means is
+	// build-dependent: a normal build derives with Argon2id here, and a build
+	// with -tags fips has no Argon2id at all — see assertArgon2idBaseline.
 	restore := AllowWeakKDFParams()
 	defer restore()
-	if _, err := DeriveKey(pass, salt, KDFArgon2id, DefaultKDFParams()); err != nil {
-		t.Fatalf("DeriveKey(Argon2id) outside FIPS: %v", err)
-	}
+	assertArgon2idBaseline(t, pass, salt)
 
 	t.Setenv(envGOFIPS140, "on")
 	if !FIPSEnabled() {
 		t.Fatal("FIPSEnabled must report true with GOFIPS140 set")
 	}
-	if _, err := DeriveKey(pass, salt, KDFArgon2id, DefaultKDFParams()); !errors.Is(err, ErrKDFNotFIPSApproved) {
-		t.Fatalf("DeriveKey(Argon2id) under FIPS = %v, want ErrKDFNotFIPSApproved", err)
-	}
+	assertArgon2idRefusedUnderFIPS(t, pass, salt)
 	// The approved KDF still works, so the rule is about approval, not breakage.
 	if _, err := DeriveKey(pass, salt, KDFPbkdf2SHA256, DefaultFIPSKDFParams()); err != nil {
 		t.Fatalf("DeriveKey(PBKDF2) under FIPS: %v", err)
-	}
-	// The constructor that hardcoded Argon2id now refuses at construction, which
-	// is the earliest point an operator can act on.
-	if _, err := NewSoftwareStrategyWithParams(pass, 4, 128*1024, 4); !errors.Is(err, ErrKDFNotFIPSApproved) {
-		t.Fatalf("NewSoftwareStrategyWithParams under FIPS = %v, want ErrKDFNotFIPSApproved", err)
 	}
 	// The auto-selecting constructor picks the approved KDF and succeeds.
 	s, err := NewSoftwareStrategy(pass)
