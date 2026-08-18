@@ -493,7 +493,7 @@ older form and requires the whole snapshot in memory.
 **Confidentiality in transit** comes from QUIC's mandatory TLS 1.3 plus mTLS.
 There is no application-layer encryption of chunk payloads on top of it. At-rest
 snapshot encryption is the barrier's job; see
-[Encryption](../security/encryption.md).
+[Encryption](../seal-barrier/architecture.md).
 
 ### Snapshot transfer sequencing
 
@@ -512,7 +512,7 @@ control messages `snapshotCtrlDeliverAttempts` (5) times with a
 `snapshotCtrlDeliverBackoff` (100 ms) pause, because these messages have no
 protocol-level retransmission: a dropped status leaves the leader's remote
 paused in snapshot state with no ack countdown armed. Full state-machine detail
-lives in [Raft Protocol](../raft/protocol.md).
+lives in [Raft Protocol](../raft-consensus/engineering.md).
 
 ## Receive Path
 
@@ -730,7 +730,7 @@ owns `GetRange` — the step worker on a running shard, and `StartShard` before
 that worker exists, which never overlap. Every other reader takes a separate
 path: `termLocked` has its own `termLogdbBuf`/`termProtoBuf` and never retains a
 result, and `GetRangeCopy` copies under the lock into a private buffer. See
-[Engine Pipeline](../engine/pipeline.md) and [WAL Storage](../storage/wal.md).
+[Engine Pipeline](../raft-consensus/engineering.md) and [WAL Storage](../log-storage/engineering.md).
 
 ### Snapshot Receive
 
@@ -919,7 +919,7 @@ Fixed portion: 24 bytes (BinVer + DeploymentID + SourceEpoch).
   legacy decode path, so batches from both older and newer binaries are
   rejected. Note that a matching `BinVer` is not a guarantee that two binaries
   agree on the bytes: pre-release layout changes happen in place at version 1.
-  See [Compatibility](../operations/compatibility.md).
+  See [Compatibility](../compatibility.md).
 - `DeploymentID` validated against transport config (cross-cluster rejection)
 - `SourceEpoch` is the sender's per-process boot epoch. It changes only when
   the sending node restarts, which lets the receiver distinguish a genuine
@@ -974,7 +974,7 @@ prefix) followed by the variable-length command:
 - `OwnerID` is the principal the embedder declared for the session a
   registration entry creates, and is the key the per-owner session cap is
   counted against. Zero means unset. Only session-registration entries carry a
-  meaningful value. See [Session Deduplication](../sessions/deduplication.md).
+  meaningful value. See [Session Deduplication](../client-sessions/engineering.md).
 
 ## TLS Configuration
 
@@ -1026,7 +1026,7 @@ exist as PEM bytes. `buildMTLSTLS` parses the leaf from DER when the pre-built
 certificate does not populate `Leaf`, and rejects one whose leaf cannot be parsed
 at all — the startup SAN-exclusivity precondition below cannot be evaluated
 without it. This is the transport's own key, separate from the barrier root key;
-see [Key Custody](../security/key-custody.md#delegated-hardware-mode) for the
+see [Key Custody](../seal-barrier/user.md#delegated-hardware-mode) for the
 at-rest side.
 
 **TLS properties** (`buildMTLSTLS`):
@@ -1042,7 +1042,7 @@ at-rest side.
   X25519 gives 128-bit security and is the fastest ECDH curve. No cipher suites
   are configured explicitly — TLS 1.3 suite selection is left to `crypto/tls`.
   FIPS-mode cipher selection is a *sealing-layer* concern, not a transport one;
-  see [Encryption](../security/encryption.md).
+  see [Encryption](../seal-barrier/architecture.md).
 - **Session resumption**: the client keeps a
   `tls.NewLRUClientSessionCache(256)`, cutting a reconnect from two round trips
   to one. Revocation still applies on resumption, because the callback is
@@ -1198,7 +1198,7 @@ committed membership records a **node identity** for it. The identity is
 its SANs, so a wildcard certificate proves nothing about it, and unchanged by
 certificate renewal on the same keypair. It reaches membership only through
 consensus and is supplied by an operator, never captured from a connection. See
-[Compatibility](../operations/compatibility.md#node-identities-and-requirememberidentity).
+[Compatibility](../compatibility.md#node-identities-and-requirememberidentity).
 
 The internal transport builds separate server and client `tls.Config`
 instances from the provided PEM material. The `ServerName` field on the client
@@ -1416,11 +1416,11 @@ address, both of which are already public.
 
 ## Cross-References
 
-- [Architecture Overview](../architecture/overview.md) -- system overview, data flow, configuration
-- [Wire Format](../protocol/wire-format.md) -- MessageBatch, Message, Entry and Membership encodings
-- [Raft Protocol](../raft/protocol.md) -- snapshot state machine, `SnapshotStatus` sequencing, replication
-- [Engine Pipeline](../engine/pipeline.md) -- step workers, ready loop, LogReader buffer ownership
-- [Encryption](../security/encryption.md) -- barrier epochs, at-rest snapshot and WAL sealing
-- [Compatibility](../operations/compatibility.md) -- wire-version pinning, node identities
-- [Session Deduplication](../sessions/deduplication.md) -- Entry session fields and at-most-once delivery
-- [Deployment](../operations/deployment.md) -- certificate issuance, per-node SAN requirements
+- [Architecture Overview](../multi-group-host/architecture.md) -- system overview, data flow, configuration
+- [Wire Format](../wire-protocol/engineering.md) -- MessageBatch, Message, Entry and Membership encodings
+- [Raft Protocol](../raft-consensus/engineering.md) -- snapshot state machine, `SnapshotStatus` sequencing, replication
+- [Engine Pipeline](../raft-consensus/engineering.md) -- step workers, ready loop, LogReader buffer ownership
+- [Encryption](../seal-barrier/architecture.md) -- barrier epochs, at-rest snapshot and WAL sealing
+- [Compatibility](../compatibility.md) -- wire-version pinning, node identities
+- [Session Deduplication](../client-sessions/engineering.md) -- Entry session fields and at-most-once delivery
+- [Deployment](../multi-group-host/user.md) -- certificate issuance, per-node SAN requirements

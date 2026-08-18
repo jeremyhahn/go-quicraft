@@ -247,7 +247,7 @@ the minimum message on the wire. The MessageBatch header is `BinVer:8`,
 `DeploymentID:8` and `SourceEpoch:8`, with `BinVer` first so a receiver can
 reject a foreign wire version before parsing anything else.
 
-See [Wire Format](../protocol/wire-format.md) for the full field tables.
+See [Wire Format](../wire-protocol/engineering.md) for the full field tables.
 
 ### QUIC-Only Transport
 
@@ -395,7 +395,7 @@ reentrant, which is why event callbacks are invoked outside it.
 
 There is no apply-retry setting. The apply path is fail-fast: a shard is marked
 failed on the first `SM.Apply` error, with no retry counting. See
-[Engine Pipeline](../engine/pipeline.md).
+[Engine Pipeline](../raft-consensus/engineering.md).
 
 See `pkg/config/hostconfig.go`.
 
@@ -567,8 +567,8 @@ SM implemented the optional interface at all:
 
 That three-value form is an **internal** wrapper (`pkg/internal/rsm`). It is
 not importable and is not the contract you implement. See
-[State Machine Interfaces](../statemachine/interfaces.md) and
-[RSM Adapter](../statemachine/rsm-adapter.md).
+[State Machine Interfaces](../state-machines/engineering.md) and
+[RSM Adapter](../state-machines/engineering.md).
 
 ## Cluster Formation (lives in go-qrdb)
 
@@ -625,7 +625,7 @@ The `Barrier` in `pkg/seal/barrier.go` provides AEAD encryption for WAL data at 
 - x86-64 with AES-NI or ARM64 with crypto extensions → AES-256-GCM
 - Otherwise → ChaCha20-Poly1305, or AES-256-GCM in a build with `-tags fips`,
   which does not compile the ChaCha20 family in at all
-  ([FIPS builds](../security/encryption.md#fips-builds---tags-fips))
+  ([FIPS builds](../seal-barrier/architecture.md#fips-builds---tags-fips))
 - Configurable via `BarrierConfig.Algorithm`
 
 **Design**:
@@ -646,7 +646,7 @@ The `Barrier` in `pkg/seal/barrier.go` provides AEAD encryption for WAL data at 
 **Lifecycle**: Initialize → Unseal → Encrypt/Decrypt → Seal
 
 Root-key custody (where the sealed root key lives: TPM, HSM, KMS, passphrase)
-is pluggable and documented in [Key Custody](../security/key-custody.md). This
+is pluggable and documented in [Key Custody](../seal-barrier/user.md). This
 library names only `StrategyPassphrase` and `StrategyNone`; hardware and cloud
 strategy IDs are owned by go-xkms, and Shamir share custody by go-qrdb.
 
@@ -847,8 +847,8 @@ into it from each founder's local config. Founders that disagree on any of them
 produce byte-different entries at the same `(index=1, term=1)`. AppendEntries
 matches on `(index, term)` alone, so that divergence is never reconciled.
 
-See [Wire Format](../protocol/wire-format.md) for the `Membership` encoding and
-[Session Deduplication](../sessions/deduplication.md) for the session policy.
+See [Wire Format](../wire-protocol/engineering.md) for the `Membership` encoding and
+[Session Deduplication](../client-sessions/engineering.md) for the session policy.
 
 #### Per-node certificate exclusivity is checked, and fails closed
 
@@ -869,7 +869,7 @@ them; deployments that need these controls must give each replica its own host.
 This is a **misconfiguration detector**, not an attack control: a malicious
 joiner never runs it. The enforcing counterpart is on the receive path
 (`refuseInboundPromiscuousCert`). See
-[QUIC Transport](../transport/quic.md#per-node-sans-are-a-hard-deployment-precondition).
+[QUIC Transport](../quic-transport/engineering.md#per-node-sans-are-a-hard-deployment-precondition).
 
 ### Joining is not an authorization bypass
 
@@ -901,7 +901,7 @@ The separation that keeps this safe is between **routing** and
   `missing_identity`), because one aggregate counter cannot tell a rolling
   membership change from an attack.
 
-See [Compatibility](../operations/compatibility.md) for node identities and
+See [Compatibility](../compatibility.md) for node identities and
 `RequireMemberIdentity`.
 
 ### Forming a cluster automatically (go-qrdb)
@@ -927,10 +927,10 @@ To form a multi-node cluster automatically, call go-qrdb's
 
 ### Cross-References
 
-- [API Reference](../api/reference.md) -- `Host.StartShard`, membership requests
-- [Architecture Overview](../architecture/overview.md) -- how a Host, shards and the transport fit together
-- [Raft Protocol](../raft/protocol.md) -- membership changes, config-in-log, witnesses
-- [QUIC Transport](../transport/quic.md) -- certificate exclusivity, sender authorization
-- [Deployment](../operations/deployment.md) -- certificate issuance and per-node SANs
-- [Lifecycle](../operations/lifecycle.md) -- host and shard startup and shutdown
-- [Compatibility](../operations/compatibility.md) -- node identities, wire-format pinning
+- [API Reference](../multi-group-host/api.md) -- `Host.StartShard`, membership requests
+- [Architecture Overview](../multi-group-host/architecture.md) -- how a Host, shards and the transport fit together
+- [Raft Protocol](../raft-consensus/engineering.md) -- membership changes, config-in-log, witnesses
+- [QUIC Transport](../quic-transport/engineering.md) -- certificate exclusivity, sender authorization
+- [Deployment](../multi-group-host/user.md) -- certificate issuance and per-node SANs
+- [Lifecycle](../multi-group-host/engineering.md) -- host and shard startup and shutdown
+- [Compatibility](../compatibility.md) -- node identities, wire-format pinning

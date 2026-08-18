@@ -1,5 +1,16 @@
 # Compatibility and Upgrades
 
+> **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
+> Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+This is a **cross-feature** document. It spans `pkg/proto`, the WAL,
+`snapshot.meta` and the sealed root key, so it sits at the `docs/` root rather
+than inside a feature folder — splitting the upgrade narrative across eleven
+folders would destroy it. Each feature's own compatibility surface is summarized
+in its `api.md` under "Versioning and deprecation" and points here.
+
+
 What this library promises across versions, what it does not, and what an
 upgrade actually involves today.
 
@@ -881,7 +892,7 @@ from 0.3.x:
 - Export a snapshot per shard (`Host.ExportSnapshot(ctx, shardID, w)`) if you
   need a restore point, **while still running the old version**.
   `Host.ImportSnapshot` on a fresh disaster-recovery host requires
-  `WithImportDataDir` — see [Deployment](deployment.md#disaster-recovery-importing-a-snapshot).
+  `WithImportDataDir` — see [Deployment](multi-group-host/user.md#disaster-recovery-importing-a-snapshot).
 - Verify the target version starts against an EMPTY data directory in staging
   first. A format break shows up at open time, not at first write.
 - Rebuild every consuming repository from the same commit. go-qrdb, go-xkms,
@@ -911,10 +922,10 @@ error from the record parser. Take the backup first.
 
 ## Cross-References
 
-- [Deployment](deployment.md) -- configuration reference, directory layout, disaster recovery
-- [Lifecycle](lifecycle.md) -- startup, crash recovery, WAL replay, shutdown ordering
-- [Wire format](../protocol/wire-format.md) -- byte-level layouts of every proto type
-- [WAL Persistence](../storage/wal.md) -- segment and chunk framing, the `WALFORMAT` marker
-- [Encryption](../security/encryption.md) -- barrier, epochs, sealed root key, AAD binding
-- [Key custody](../security/key-custody.md) -- sealing strategies and the Layer-1 boundary
-- [API reference](../api/reference.md) -- exported surface and error types
+- [Deployment](multi-group-host/user.md) -- configuration reference, directory layout, disaster recovery
+- [Lifecycle](multi-group-host/engineering.md) -- startup, crash recovery, WAL replay, shutdown ordering
+- [Wire format](wire-protocol/engineering.md) -- byte-level layouts of every proto type
+- [WAL Persistence](log-storage/engineering.md) -- segment and chunk framing, the `WALFORMAT` marker
+- [Encryption](seal-barrier/architecture.md) -- barrier, epochs, sealed root key, AAD binding
+- [Key custody](seal-barrier/user.md) -- sealing strategies and the Layer-1 boundary
+- [API reference](multi-group-host/api.md) -- exported surface and error types

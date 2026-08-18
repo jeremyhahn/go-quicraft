@@ -99,7 +99,7 @@ rationale in [Testing Infrastructure](infrastructure.md).
 
 Invoked via `make bench-<package>`. The Makefile defines `GOBENCH := go test -run=^$ -bench=. -benchmem`, which excludes unit tests and includes memory allocation reporting.
 
-These targets are smoke tests only: a single unreplicated run whose spread on a loaded machine reaches 5x. To detect an actual hot-path regression use `make bench-compare`, which interleaves a baseline revision against the working tree across many rounds and compares the distributions with benchstat. It runs on the invoking machine by default; `PERF_HOST=user@host` runs the same comparison on a dedicated machine for tighter intervals. See [Benchmark Regression Testing](../performance/benchmarking.md).
+These targets are smoke tests only: a single unreplicated run whose spread on a loaded machine reaches 5x. To detect an actual hot-path regression use `make bench-compare`, which interleaves a baseline revision against the working tree across many rounds and compares the distributions with benchstat. It runs on the invoking machine by default; `PERF_HOST=user@host` runs the same comparison on a dedicated machine for tighter intervals. See [Benchmark Regression Testing](../testing/benchmarking.md).
 
 ### Performance Comparisons
 
@@ -746,10 +746,10 @@ for attempt := range 5 {
 
 ## Cross-References
 
-- [Architecture](../architecture/overview.md) -- Package structure, engine pipeline
-- [WAL Persistence](../storage/wal.md) -- WAL internals tested by waldb suite
-- [Engine Pipeline](../engine/pipeline.md) -- Worker pipeline tested by engine suite
-- [Transport](../transport/quic.md) -- QUIC transport tested by transport suite
+- [Architecture](../multi-group-host/architecture.md) -- Package structure, engine pipeline
+- [WAL Persistence](../log-storage/engineering.md) -- WAL internals tested by waldb suite
+- [Engine Pipeline](../raft-consensus/engineering.md) -- Worker pipeline tested by engine suite
+- [Transport](../quic-transport/engineering.md) -- QUIC transport tested by transport suite
 - [Testing Infrastructure](infrastructure.md) -- fault injectors, fuzzing, linearizability, and why each gate is shaped the way it is
 - [Contributing](../../CONTRIBUTING.md) -- what a change is expected to bring with it
-- [Benchmark Regression Testing](../performance/benchmarking.md) -- the `bench-compare` method
+- [Benchmark Regression Testing](../testing/benchmarking.md) -- the `bench-compare` method

@@ -471,8 +471,8 @@ profile (`make perf-compare-all` for an ad-hoc report;
 documented run).
 
 Full rationale and interpretation guidance:
-[Benchmark Regression Testing](../performance/benchmarking.md) and
-[Performance Architecture](../performance/architecture.md).
+[Benchmark Regression Testing](../testing/benchmarking.md) and
+[Performance Architecture](../multi-group-host/engineering.md).
 
 ## Numbers, as of 0.5.1-alpha
 
@@ -491,9 +491,9 @@ trusting this list.
 
 - [Testing Overview](overview.md) -- commands, unit-test patterns, target reference
 - [Contributing](../../CONTRIBUTING.md) -- what a change is expected to bring with it
-- [Benchmark Regression Testing](../performance/benchmarking.md) -- bench-compare method
-- [Performance Architecture](../performance/architecture.md) -- cross-system framework
-- [Raft Specification](../raft/protocol.md) -- the invariants the suites are checking
-- [Session Management](../sessions/deduplication.md) -- at-most-once delivery
-- [WAL Persistence](../storage/wal.md) -- WAL internals the errfs suite drives
-- [Transport](../transport/quic.md) -- where the netfault hook sits
+- [Benchmark Regression Testing](../testing/benchmarking.md) -- bench-compare method
+- [Performance Architecture](../multi-group-host/engineering.md) -- cross-system framework
+- [Raft Specification](../raft-consensus/engineering.md) -- the invariants the suites are checking
+- [Session Management](../client-sessions/engineering.md) -- at-most-once delivery
+- [WAL Persistence](../log-storage/engineering.md) -- WAL internals the errfs suite drives
+- [Transport](../quic-transport/engineering.md) -- where the netfault hook sits

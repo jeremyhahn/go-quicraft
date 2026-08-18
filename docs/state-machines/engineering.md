@@ -225,7 +225,7 @@ The engine pre-allocates one `[]sm.Result` per shard and reuses it across batche
 
 The guard belongs to the adapter, not to a tier. `ConcurrentStateMachine` and `DiskStateMachine` publish the opposite contract — `Lookup` may be called concurrently with `Update`, and the implementation synchronizes itself — and because there is one guard for all three, they currently get the exclusion too. Do not read that as permission to drop their locking. Those tiers are held to what their doc comments promise, and the adapter is free to stop excluding them.
 
-`kv.MemoryStore` keeps its `RWMutex`, but not for this reason any more. See [MemoryStore](kv-backends.md#memorystore).
+`kv.MemoryStore` keeps its `RWMutex`, but not for this reason any more. See [MemoryStore](engineering.md#memorystore).
 
 ### What the exclusion costs
 
@@ -411,7 +411,7 @@ func NewConcurrentCreateFunc() sm.CreateFunc
 
 There is no `DiskStateMachine` backend in this repository. The PebbleDB-backed store lives in [go-qrdb](https://github.com/jeremyhahn/go-qrdb).
 
-Command encoding, snapshot format, result codes and error types are documented in [KV backends](kv-backends.md).
+Command encoding, snapshot format, result codes and error types are documented in [KV backends](engineering.md).
 
 ## Snapshots
 
@@ -468,20 +468,20 @@ The four session limits are seeds only. They are written into the shard's initia
 
 ### From the session layer (`pkg/internal/session/errors.go`)
 
-`ErrSessionLimitExceeded`, `ErrSessionNotFound`, `ErrSessionAlreadyExists`, `ErrResponseLimitExceeded`, `ErrResponseEvicted`, `ErrSnapshotCorrupted`. None of these are yours to handle: the adapter turns them into `Result` values or handles them inline. See [session deduplication](../sessions/deduplication.md).
+`ErrSessionLimitExceeded`, `ErrSessionNotFound`, `ErrSessionAlreadyExists`, `ErrResponseLimitExceeded`, `ErrResponseEvicted`, `ErrSnapshotCorrupted`. None of these are yours to handle: the adapter turns them into `Result` values or handles them inline. See [session deduplication](../client-sessions/engineering.md).
 
 ### From the KV backends (`pkg/sm/kv/errors.go`)
 
-`*KeyNotFoundError`, `*InvalidCommandError`, `*KeyTooLongError`, `*HashWriteError`. Documented in [KV backends](kv-backends.md).
+`*KeyNotFoundError`, `*InvalidCommandError`, `*KeyTooLongError`, `*HashWriteError`. Documented in [KV backends](engineering.md).
 
 ## Cross-references
 
-- [RSM adapter](rsm-adapter.md), the layer between the apply pipeline and your code
-- [KV backends](kv-backends.md), the two reference implementations
-- [Engine pipeline](../engine/pipeline.md), the apply worker that calls `rsm.StateMachine.Apply`
-- [Session deduplication](../sessions/deduplication.md), the at-most-once protocol
-- [Public API](../api/reference.md), `Host.StartShard`, the read methods, `Host.StateMachineHash`
-- [Architecture overview](../architecture/overview.md)
+- [RSM adapter](engineering.md), the layer between the apply pipeline and your code
+- [KV backends](engineering.md), the two reference implementations
+- [Engine pipeline](../raft-consensus/engineering.md), the apply worker that calls `rsm.StateMachine.Apply`
+- [Session deduplication](../client-sessions/engineering.md), the at-most-once protocol
+- [Public API](../multi-group-host/api.md), `Host.StartShard`, the read methods, `Host.StateMachineHash`
+- [Architecture overview](../multi-group-host/architecture.md)
 
 ---
 
@@ -585,7 +585,7 @@ type smWrapper interface {
 
 > **This is not the interface you implement.** `smWrapper` is unexported and lives in `pkg/internal/rsm`, so it is not importable. The three-value `(value, supported, error)` shape belongs to the wrapper: the `bool` reports whether *your* state machine implemented the optional interface, and it comes from the wrapper's own type assertion.
 >
-> What you implement is two-valued. `sm.Hasher` is `GetHash() (uint64, error)` and `sm.NALookup` is `BytesLookup(key []byte) ([]byte, error)`. Writing the three-value form satisfies nothing, produces no compile error, and leaves the optimized path silently never invoked. See [State machine interfaces](interfaces.md#optional-interfaces).
+> What you implement is two-valued. `sm.Hasher` is `GetHash() (uint64, error)` and `sm.NALookup` is `BytesLookup(key []byte) ([]byte, error)`. Writing the three-value form satisfies nothing, produces no compile error, and leaves the optimized path silently never invoked. See [State machine interfaces](engineering.md#optional-interfaces).
 
 `saveSnapshotGated` writes your snapshot and invokes `afterCapture` exactly once, after the point-in-time is captured and before the streaming begins. For a regular in-memory state machine the whole save *is* the capture, so it fires at the end. For concurrent and on-disk machines it fires right after `PrepareSnapshot`, which lets the caller release the apply gate while the immutable snapshot streams.
 
@@ -599,7 +599,7 @@ Two checks run before a single entry is classified.
 
 **Read guard, held for writing.** `Apply` takes the state machine's `readGuard` in **write** mode and returns `ErrClosed` if `Close` already ran.
 
-The write mode is the enforcement of `sm.StateMachine`'s published contract: QuicRaft serializes all method calls, and `Update` and `Lookup` are never called concurrently. Every read entry point takes the same guard for reading, so an apply excludes them all. See [Lookup concurrency](interfaces.md#lookup-concurrency) for the tier-by-tier consequences and the latency it adds.
+The write mode is the enforcement of `sm.StateMachine`'s published contract: QuicRaft serializes all method calls, and `Update` and `Lookup` are never called concurrently. Every read entry point takes the same guard for reading, so an apply excludes them all. See [Lookup concurrency](engineering.md#lookup-concurrency) for the tier-by-tier consequences and the latency it adds.
 
 The guard also carries the closed check. The engine's synchronous `UnloadNode` guarantees no `Apply` is in flight when `Close` runs, so that part is defence in depth, but holding the guard forces `Close` to wait out an in-flight `Apply` rather than closing the state machine underneath it.
 
@@ -966,12 +966,12 @@ It has no production caller. It exists for tests in this package and for the hos
 
 ### Cross-references
 
-- [State machine interfaces](interfaces.md), the contract this adapter enforces
-- [KV backends](kv-backends.md), two implementations of it
-- [Engine pipeline](../engine/pipeline.md), the apply worker and the snapshot pool
-- [Session deduplication](../sessions/deduplication.md), the session manager internals
-- [Raft protocol](../raft/protocol.md), snapshot transfer and membership changes
-- [Public API](../api/reference.md), `Host.StartShard` and the read methods
+- [State machine interfaces](engineering.md), the contract this adapter enforces
+- [KV backends](engineering.md), two implementations of it
+- [Engine pipeline](../raft-consensus/engineering.md), the apply worker and the snapshot pool
+- [Session deduplication](../client-sessions/engineering.md), the session manager internals
+- [Raft protocol](../raft-consensus/engineering.md), snapshot transfer and membership changes
+- [Public API](../multi-group-host/api.md), `Host.StartShard` and the read methods
 
 ---
 
@@ -980,7 +980,7 @@ It has no production caller. It exists for tests in this package and for the hos
 
 ### Overview
 
-`pkg/sm/kv` provides two reference state machine implementations: an in-memory store and a sharded concurrent store. Both speak the same binary command protocol, implement the optional `sm.Hasher`, `sm.NALookup` and `sm.NALookupInto` interfaces, and use the same snapshot format. They are usable as-is, and they are the shortest worked examples of the contract described in [State machine interfaces](interfaces.md).
+`pkg/sm/kv` provides two reference state machine implementations: an in-memory store and a sharded concurrent store. Both speak the same binary command protocol, implement the optional `sm.Hasher`, `sm.NALookup` and `sm.NALookupInto` interfaces, and use the same snapshot format. They are usable as-is, and they are the shortest worked examples of the contract described in [State machine interfaces](engineering.md).
 
 There is no `DiskStateMachine` backend in this repository. The PebbleDB-backed store lives in [go-qrdb](https://github.com/jeremyhahn/go-qrdb).
 
@@ -995,7 +995,7 @@ Source: `pkg/sm/kv/`.
 
 Both are found by type assertion on the value returned by `sm.CreateFunc` (`pkg/internal/rsm/statemachine.go:335`).
 
-Both take locks, but only `ConcurrentStore` is required to. The RSM adapter serializes `Update` against `Lookup` for every tier today, so `MemoryStore`'s mutex is no longer what keeps a read off a half-applied batch. `ConcurrentStore` is held to its interface's contract, which promises concurrent reads during `Update` whatever the adapter happens to do. See [Lookup concurrency](interfaces.md#lookup-concurrency).
+Both take locks, but only `ConcurrentStore` is required to. The RSM adapter serializes `Update` against `Lookup` for every tier today, so `MemoryStore`'s mutex is no longer what keeps a read off a half-applied batch. `ConcurrentStore` is held to its interface's contract, which promises concurrent reads during `Update` whatever the adapter happens to do. See [Lookup concurrency](engineering.md#lookup-concurrency).
 
 ### Command protocol
 
@@ -1348,11 +1348,11 @@ Worth copying into your own state machine. The optional interfaces are found by 
 
 ### Cross-references
 
-- [State machine interfaces](interfaces.md), the contract both stores implement
-- [RSM adapter](rsm-adapter.md), what calls `Update`, `Lookup` and the snapshot methods
-- [Engine pipeline](../engine/pipeline.md), how apply and snapshot work is scheduled
-- [Session deduplication](../sessions/deduplication.md), at-most-once delivery around these calls
-- [Deployment](../operations/deployment.md), configuration and CLI options
+- [State machine interfaces](engineering.md), the contract both stores implement
+- [RSM adapter](engineering.md), what calls `Update`, `Lookup` and the snapshot methods
+- [Engine pipeline](../raft-consensus/engineering.md), how apply and snapshot work is scheduled
+- [Session deduplication](../client-sessions/engineering.md), at-most-once delivery around these calls
+- [Deployment](../multi-group-host/user.md), configuration and CLI options
 
 ---
 

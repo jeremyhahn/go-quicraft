@@ -152,8 +152,8 @@ while the invariant itself is checked by
 
 ### Wire and persisted formats
 
-Read [docs/protocol/wire-format.md](docs/protocol/wire-format.md) and
-[docs/operations/compatibility.md](docs/operations/compatibility.md) first. The
+Read [docs/wire-protocol/engineering.md](docs/wire-protocol/engineering.md) and
+[docs/compatibility.md](docs/compatibility.md) first. The
 two rules that get broken most often:
 
 1. **The transport version is a SUPREMUM.** Bump `proto.WireVersion` whenever
@@ -195,7 +195,7 @@ Benchmark any change to append, replicate or apply, and include the numbers.
 Interleave the runs (`make bench-baseline` / `bench-compare`) -- a before-run
 followed by an after-run on a machine whose clock governor is `powersave` is
 not a measurement. See
-[docs/performance/benchmarking.md](docs/performance/benchmarking.md).
+[docs/testing/benchmarking.md](docs/testing/benchmarking.md).
 
 ### Public extension points
 
@@ -229,7 +229,7 @@ follow-up work.
 layout table by reading the `MarshalTo` body. Check a signature with `go doc`.
 Confirm a default in `SetDefaults`, which is authoritative over the field's
 own godoc when they disagree. Where two documents disagree,
-`docs/operations/compatibility.md` has historically been the correct one.
+`docs/compatibility.md` has historically been the correct one.
 
 **If you cannot verify a claim, delete it rather than restate it.** An
 unverifiable sentence carried forward is how the documentation drifted in the

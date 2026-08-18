@@ -566,7 +566,7 @@ that is durable but unreadable. An oversized `Cmd` returns `ErrCmdTooLarge`.
 
 Note that this is not the same layout as `proto.Entry`, whose header is 68
 bytes; the two are converted at the storage boundary. See
-[Wire Format](../protocol/wire-format.md) for the proto side.
+[Wire Format](../wire-protocol/engineering.md) for the proto side.
 
 **Hard state** (`payloadTypeState`):
 
@@ -597,7 +597,7 @@ and gated on **exact equality**: every wire and persisted format in this
 repository stays at version 1 until the first production release, and a
 layout change is made in place with dev clusters wiped and re-synced rather
 than migrated (see
-[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)).
+[Compatibility](../compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)).
 A section stamped with anything else was written by a binary built from a
 different pre-release commit and is refused with
 `ErrUnsupportedMembershipVersion` rather than read at these offsets. The
@@ -1045,7 +1045,7 @@ When a `WALBarrier` is configured via `WithBarrier()`, records are encrypted bef
 
 A configured barrier does not by itself mean the records are encrypted. A barrier running `StrategyNone` installs an identity pass-through and the records reach the medium as plaintext. The WAL accepts that deliberately: it is not the layer that decides whether a deployment requires at-rest encryption. What it owes such a caller is the truth, so `AtRestProtection()` reports `AtRestUnprotected` for a plaintext-mode barrier, and the host's at-rest requirement fails closed at the layer that holds the policy.
 
-For the barrier itself (epoch DEKs, HKDF derivation, AEAD selection, rotation and sealing strategies) see [Encryption](../security/encryption.md). What follows is only the WAL side.
+For the barrier itself (epoch DEKs, HKDF derivation, AEAD selection, rotation and sealing strategies) see [Encryption](../seal-barrier/architecture.md). What follows is only the WAL side.
 
 ### Positional context-AAD
 
@@ -1527,7 +1527,7 @@ The report is a property of the **open**, fixed once recovery completed. Nothing
 |---|---|---|
 | `ErrWALGeometryMismatch` (`*WALGeometryMismatchError`) | Configured `BlockSize` differs from the `WALFORMAT` marker | Restore the original `BlockSize`. The error names both values |
 | `ErrWALFormatMalformed` | The marker exists with non-zero bytes that are not our format | Investigate the file. An empty or all-zero marker is read as ABSENT and never raises this |
-| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | The marker records an on-disk format version this build does not read | Wipe the data directory and re-sync. The error names both versions. See [Compatibility](../operations/compatibility.md#4-walformat-marker-version--1--persisted-exact-match-checked-first) |
+| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | The marker records an on-disk format version this build does not read | Wipe the data directory and re-sync. The error names both versions. See [Compatibility](../compatibility.md#4-walformat-marker-version--1--persisted-exact-match-checked-first) |
 | `ErrWALFormatMissing` | The directory holds segments but no marker, so it predates the marker (and the durability sequence) | Wipe the data directory and re-sync. Opening anyway would misparse every chunk and truncate the log to zero |
 | `ErrRecordSequenceRegression` (`*SegmentCorruptionError`) | A record above the damage carries a durability generation lower than the clean prefix — bytes this WAL cannot have written | Re-sync from peers, or authorize `waldb.Repair`. Treat the device as suspect |
 | `ErrMidSegmentCorruption` (`*SegmentCorruptionError`) | Damage below records that a completed `fdatasync` had already acknowledged (they span more than one durability generation) | Re-sync from peers, or authorize `waldb.Repair` — see below |
@@ -1535,7 +1535,7 @@ The report is a property of the **open**, fixed once recovery completed. Nothing
 | `*SegmentReadError` (wrapped in `*RecoveryError`) | A real I/O error (EIO, a failing sector) during the block scan | Hardware fault. Treat the disk as suspect; re-sync from peers |
 | `*WALDecryptError` | A record failed AEAD authentication during replay | Wrong barrier, wrong key epoch, or tampering. Do not retry without the context-AAD |
 | `ErrBarrierContextUnresolved` | A barrier was configured but is still sealed at `Open` | Unseal the barrier **before** opening the WAL |
-| `ErrBarrierContextBindingUnreportable` | The configured barrier lacks `ContextBindingResolved()` | Out-of-tree barrier; add the method. See [Compatibility](../operations/compatibility.md) |
+| `ErrBarrierContextBindingUnreportable` | The configured barrier lacks `ContextBindingResolved()` | Out-of-tree barrier; add the method. See [Compatibility](../compatibility.md) |
 | `ErrBarrierContextUnsupported` | The configured barrier cannot bind caller context at all | Configure a context-capable barrier. There is no epoch-only fallback by design |
 | `ErrBarrierContextBindingChanged` | A shard latched "cannot bind" and the barrier now reports it can | The barrier was sealed and unsealed under a different strategy. Restart the node |
 | `ErrUnknownPayloadType` | A replayed record's leading byte is not a known payload type | Most often a keyed WAL opened with `barrier == nil`, whose ciphertext epoch prefix decodes as `0x00`. Supply the barrier |
@@ -1632,7 +1632,7 @@ The `waldb` package defines `FS` and `File` interfaces that abstract all filesys
 - `Remove(name)` — delete file or empty directory
 - `Rename(oldpath, newpath)` — atomically replace `newpath` with `oldpath` (same directory)
 
-`Rename` is required rather than optional because the `WALFORMAT` marker is published by writing a temp file, fsyncing it and renaming it into place — the construction that makes a partially-written marker unobservable. An optional interface with an in-place fallback would restore the torn state the rename removes, so an FS that cannot rename cannot host a WAL. Adding it is a **breaking change for out-of-tree `FS` implementations**; see [Compatibility](../operations/compatibility.md).
+`Rename` is required rather than optional because the `WALFORMAT` marker is published by writing a temp file, fsyncing it and renaming it into place — the construction that makes a partially-written marker unobservable. An optional interface with an in-place fallback would restore the torn state the rename removes, so an FS that cannot rename cannot host a WAL. Adding it is a **breaking change for out-of-tree `FS` implementations**; see [Compatibility](../compatibility.md).
 
 **File** interface:
 - `Write()`, `WriteAt()`, `Read()`, `ReadAt()` — standard I/O operations. The segment writer uses `WriteAt` exclusively, so the file's implicit position is never disturbed and the block grid stays intact
@@ -1779,9 +1779,9 @@ granularity.
 
 ## Related Documentation
 
-- [Wire Format](../protocol/wire-format.md) -- the canonical byte-layout spec, including `proto.Entry` and `proto.Membership`, which are separate layouts from the ones stored here
-- [Encryption](../security/encryption.md) -- the barrier, epoch DEKs and sealing strategies behind `WALBarrier`
-- [Compatibility and Upgrades](../operations/compatibility.md) -- the pinned-at-1 format policy and the version discriminators that do exist
-- [Raft Protocol](../raft/protocol.md) -- snapshot transfer and the membership state this layer persists
-- [Engine Pipeline](../engine/pipeline.md) -- where the commit worker sits relative to the step and apply workers
+- [Wire Format](../wire-protocol/engineering.md) -- the canonical byte-layout spec, including `proto.Entry` and `proto.Membership`, which are separate layouts from the ones stored here
+- [Encryption](../seal-barrier/architecture.md) -- the barrier, epoch DEKs and sealing strategies behind `WALBarrier`
+- [Compatibility and Upgrades](../compatibility.md) -- the pinned-at-1 format policy and the version discriminators that do exist
+- [Raft Protocol](../raft-consensus/engineering.md) -- snapshot transfer and the membership state this layer persists
+- [Engine Pipeline](../raft-consensus/engineering.md) -- where the commit worker sits relative to the step and apply workers
 - [Testing Infrastructure](../testing/infrastructure.md) -- the `test/errfs` fault-injection harness that exercises these paths

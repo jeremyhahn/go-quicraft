@@ -19,8 +19,8 @@ QuicRaft clusters.
 > rolling upgrade across a format change and no migration tooling; every minor
 > release so far has required wiping data directories. Before you plan a
 > deployment lifecycle around this, read
-> [Compatibility and Upgrades](compatibility.md) — particularly
-> [what 0.5.x does when it meets 0.4.x data](compatibility.md#what-05x-does-when-it-meets-04x-data),
+> [Compatibility and Upgrades](../compatibility.md) — particularly
+> [what 0.5.x does when it meets 0.4.x data](../compatibility.md#what-05x-does-when-it-meets-04x-data),
 > which is not a clean refusal.
 
 ## Deployment
@@ -267,7 +267,7 @@ Source: `pkg/config/transportconfig.go`
 | `Enable0RTT` | bool | `false` | QUIC 0-RTT (replayable; trusted networks only) |
 | `DisableCompression` | bool | `false` | Disable message batch compression |
 | `TransportDisabled` | bool | `false` | Single-node mode. Set by `WithoutTransport()`; relaxes the mTLS requirement |
-| `RequireMemberIdentity` | bool | `false` | Drop quorum-bearing traffic from members with no committed node identity. See [Compatibility](compatibility.md#enabling-requirememberidentity) before enabling |
+| `RequireMemberIdentity` | bool | `false` | Drop quorum-bearing traffic from members with no committed node identity. See [Compatibility](../compatibility.md#enabling-requirememberidentity) before enabling |
 
 ### MTLSConfig
 
@@ -291,7 +291,7 @@ a KMS uses, since the private key never becomes PEM.
 QuicRaft enforces mutual TLS with certificate verification on both client and
 server sides. **There is no TCP fallback and no unauthenticated mode**: a
 multi-node host without a usable `MTLSConfig` fails `Validate` and never starts.
-See [Encryption](../security/encryption.md) for key management workflows.
+See [Encryption](../seal-barrier/architecture.md) for key management workflows.
 
 ### RevocationConfig (optional)
 
@@ -1150,7 +1150,7 @@ Increase `ElectionRTT` if experiencing spurious elections due to GC pauses or di
 
 **`MaxTotalInMemLogSize` (global):** When total in-memory log size across all shards exceeds this threshold, the global rate limiter rejects `Propose()` with `ErrSystemBusy`. Set to 0 (default) to disable.
 
-**Apply failures are not tunable.** There is no apply-retry setting: the apply path is unconditionally fail-fast, so the first `SM.Apply()` error fails the shard, with no retry and no consecutive-failure threshold. A `MaxApplyRetries` field existed through 0.5.1-alpha and never had any effect; it was removed. See [Lifecycle](lifecycle.md#error-handling-and-shard-failure).
+**Apply failures are not tunable.** There is no apply-retry setting: the apply path is unconditionally fail-fast, so the first `SM.Apply()` error fails the shard, with no retry and no consecutive-failure threshold. A `MaxApplyRetries` field existed through 0.5.1-alpha and never had any effect; it was removed. See [Lifecycle](engineering.md#error-handling-and-shard-failure).
 
 ### Compression
 
@@ -1278,7 +1278,7 @@ Source: `pkg/seal/kdf.go`, `pkg/seal/strategy_software.go`
 QuicRaft supports FIPS 140 compliant builds using Go's `GOFIPS140` mechanism,
 and `-tags fips` additionally removes the non-approved algorithms from the
 binary rather than declining them at runtime. See
-[Encryption > FIPS builds](../security/encryption.md#fips-builds--tags-fips)
+[Encryption > FIPS builds](../seal-barrier/architecture.md#fips-builds--tags-fips)
 for what the tag removes.
 
 **Read the boundary before you claim compliance for a deployment.** `-tags fips`
@@ -1327,14 +1327,14 @@ A version byte is stored in the sealed metadata so that data sealed with one KDF
 
 ## Cross-References
 
-- [Lifecycle](lifecycle.md) -- startup, shard init, crash recovery, shutdown, quorum-loss runbook
-- [Compatibility and Upgrades](compatibility.md) -- format versions, upgrade paths, node identities
-- [Architecture](../architecture/overview.md) -- system overview, data flow, package structure
-- [WAL Persistence](../storage/wal.md) -- WAL format, segments, compaction
-- [Engine Pipeline](../engine/pipeline.md) -- step/commit/apply workers
-- [Transport](../transport/quic.md) -- QUIC transport, connection management
-- [Encryption](../security/encryption.md) -- barrier internals, key derivation, ciphertext format
-- [Key custody](../security/key-custody.md) -- sealing strategies and where custody lives
-- [Sessions](../sessions/deduplication.md) -- at-most-once delivery, session tables
-- [Raft protocol](../raft/protocol.md) -- elections, replication, snapshot control
-- [API reference](../api/reference.md) -- full exported surface
+- [Lifecycle](engineering.md) -- startup, shard init, crash recovery, shutdown, quorum-loss runbook
+- [Compatibility and Upgrades](../compatibility.md) -- format versions, upgrade paths, node identities
+- [Architecture](../multi-group-host/architecture.md) -- system overview, data flow, package structure
+- [WAL Persistence](../log-storage/engineering.md) -- WAL format, segments, compaction
+- [Engine Pipeline](../raft-consensus/engineering.md) -- step/commit/apply workers
+- [Transport](../quic-transport/engineering.md) -- QUIC transport, connection management
+- [Encryption](../seal-barrier/architecture.md) -- barrier internals, key derivation, ciphertext format
+- [Key custody](../seal-barrier/user.md) -- sealing strategies and where custody lives
+- [Sessions](../client-sessions/engineering.md) -- at-most-once delivery, session tables
+- [Raft protocol](../raft-consensus/engineering.md) -- elections, replication, snapshot control
+- [API reference](../multi-group-host/api.md) -- full exported surface

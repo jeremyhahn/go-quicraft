@@ -16,7 +16,7 @@ QuicRaft is **alpha software**. There is no long-term support branch and no
 backporting: a security fix is released as the next `0.x` version, and
 upgrading may require a format migration. See
 [CHANGELOG.md](CHANGELOG.md) and
-[docs/operations/compatibility.md](docs/operations/compatibility.md).
+[docs/compatibility.md](docs/compatibility.md).
 
 ## Reporting a Vulnerability
 
@@ -85,7 +85,7 @@ read the linked material before reporting:
 
 - **A plaintext barrier (`seal.None`) provides no at-rest confidentiality or
   integrity.** Snapshot artifacts in particular have no integrity check under
-  it. See [docs/security/encryption.md](docs/security/encryption.md).
+  it. See [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md).
 - **DEK confidentiality after a purge is GC-bounded, not enclave-bounded.**
   `PurgeEpochsBefore` revokes the capability to decrypt; it is not
   crypto-shredding, and neither the standard library nor `x/crypto` offers a
@@ -95,7 +95,7 @@ read the linked material before reporting:
   reorder and splice fail authentication, but nothing names the total frame
   count. Dropping trailing frames leaves every survivor authentic. This is
   known and documented in
-  [docs/security/encryption.md](docs/security/encryption.md); a report
+  [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md); a report
   restating the property adds nothing, but a concrete exploitation path that
   turns it into a safety or confidentiality violation is welcome.
 - **CRC32-C in the WAL detects accidental corruption only.** It is not a
@@ -111,7 +111,7 @@ read the linked material before reporting:
   loader *detectable* -- it fails closed with `ErrBarrierSuperseded` -- but it
   is checked at load and enforced at write, never polled, so it is not a lock.
   Exclusive ownership of the blob is the embedder's to guarantee. See
-  [docs/security/key-custody.md](docs/security/key-custody.md).
+  [docs/seal-barrier/user.md](docs/seal-barrier/user.md).
 - **Delegated (hardware) mode bypasses the barrier's own AEAD safeguards.**
   When a `SealingStrategy` returns a non-nil `BarrierEncryptor`, epoch DEK
   derivation, the ciphertext header, the nonce-reuse tracker and the invocation
@@ -163,7 +163,7 @@ breached, so they are listed here:
   unseal after a restart refuses to encrypt at all, because the loaded epoch's
   spent invocation budget is unknowable. This is the single configuration
   omission with the widest blast radius; see
-  [docs/security/key-custody.md](docs/security/key-custody.md).
+  [docs/seal-barrier/user.md](docs/seal-barrier/user.md).
 - Pin `BarrierConfig.Algorithm` to an explicit value. The default is derived
   from the local CPU, and the algorithm is both an HKDF domain separator and
   the cipher `Decrypt` selects by epoch, so data that outlives one host needs a

@@ -506,7 +506,7 @@ directory is removed over ssh.
 
 ## See also
 
-- [Performance Architecture](architecture.md) -- what the hot paths are and why
+- [Performance Architecture](../multi-group-host/engineering.md) -- what the hot paths are and why
   they are allocation-free
 - [Testing Overview](../testing/overview.md) -- benchmark categories and Makefile
   targets

@@ -163,7 +163,7 @@ Total header: `entryHeaderSize = 8*8 + 4 = 68 bytes`
 This is the layout as of 0.5.0-alpha. The header was 60 bytes in 0.4.x, with
 `CmdLen` at offset 56 and no `OwnerID`; a 0.4.x reader given a 0.5.x entry
 reads `OwnerID`'s low four bytes as `CmdLen`. The two releases share no
-on-disk data. See [Compatibility](../operations/compatibility.md).
+on-disk data. See [Compatibility](../compatibility.md).
 
 ### OwnerID
 
@@ -485,7 +485,7 @@ SourceAddress uses the standard `[Len:4][Data:N]` string encoding.
 the sending node restarts, which lets a receiver tell a genuine peer restart
 apart from a benign re-dial and evict the now-stale cached outbound
 connection promptly instead of waiting for `MaxIdleTimeout`. See
-[Transport](../transport/quic.md) for how the receive path uses it.
+[Transport](../quic-transport/engineering.md) for how the receive path uses it.
 
 ### Validation Rules
 
@@ -658,7 +658,7 @@ them, so the section carries its own layout version byte, independent of
 The WAL's own membership section is a **different layout** with a separate
 discriminator, `waldb.membershipSectionVersion`
 (`pkg/logdb/waldb/db.go:1922`). It is not this encoding, and the two version
-bytes are independent. See [WAL Persistence](../storage/wal.md).
+bytes are independent. See [WAL Persistence](../log-storage/engineering.md).
 
 The layout, at version **1**:
 
@@ -789,7 +789,7 @@ That is the pre-release pinning policy: every wire and persisted format in
 this repository stays at version 1 until the first production release, a
 layout change is made IN PLACE and the consuming repos are rebuilt to match,
 and development clusters are wiped and re-synced rather than migrated. See
-[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)
+[Compatibility](../compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release)
 for the full policy and its consequences -- chiefly that two binaries from
 different pre-release commits may be mutually unreadable while both stamp 1.
 
@@ -1487,7 +1487,7 @@ clusters are wiped and re-synced rather than migrated. The numbers increment
 for the first time at the first production release. The consequence is
 intended and worth stating plainly: two binaries from different pre-release
 commits may be mutually unreadable while both stamp 1. See
-[Compatibility](../operations/compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release).
+[Compatibility](../compatibility.md#format-versions-are-pinned-at-1-until-the-first-production-release).
 
 Within that, the package still carries **two independent version
 namespaces**. Neither may be derived from the other, and a bump to one must
@@ -1505,7 +1505,7 @@ frame header that wraps a marshaled `MessageBatch`
 (`[Magic:2][Version:1][Flags:1][Length:4]`). It is a separate constant that
 happens to hold the same value, gated on exact equality by
 `ValidateFrameHeader`, and is documented in
-[Transport](../transport/quic.md).
+[Transport](../quic-transport/engineering.md).
 
 **Persisted-scoped: the `Membership` version byte = 1.** Written into the
 `EntryInitialMembership` entry at log index 1 and into the exported snapshot
@@ -1555,7 +1555,7 @@ does not move -- and it does not announce itself as a version mismatch, so
 the procedure wipes each node's data directory rather than relying on the
 gate to catch the skew.
 
-See [Compatibility](../operations/compatibility.md) for the authoritative
+See [Compatibility](../compatibility.md) for the authoritative
 per-release procedure and the version history.
 
 ### No Reserved Padding
@@ -1641,9 +1641,9 @@ transport-level counters that count them are in
 
 ## Cross-References
 
-- [Architecture Overview](../architecture/overview.md) -- system overview and data flow
-- [Compatibility](../operations/compatibility.md) -- the version-pinning policy and per-release upgrade procedure
-- [WAL Persistence](../storage/wal.md) -- how serialized entries are stored
-- [Engine Pipeline](../engine/pipeline.md) -- Update flow between workers
-- [Transport](../transport/quic.md) -- how MessageBatch frames are sent via QUIC
-- [Session](../sessions/deduplication.md) -- session management and Entry dedup fields
+- [Architecture Overview](../multi-group-host/architecture.md) -- system overview and data flow
+- [Compatibility](../compatibility.md) -- the version-pinning policy and per-release upgrade procedure
+- [WAL Persistence](../log-storage/engineering.md) -- how serialized entries are stored
+- [Engine Pipeline](../raft-consensus/engineering.md) -- Update flow between workers
+- [Transport](../quic-transport/engineering.md) -- how MessageBatch frames are sent via QUIC
+- [Session](../client-sessions/engineering.md) -- session management and Entry dedup fields

@@ -20,7 +20,7 @@ sequence below is traced from the code, not from design intent.
 This is alpha software at `0.5.1-alpha`. The shutdown and recovery paths
 described here are exercised by the integration and fault-injection suites, but
 the format situation those suites do not cover is in
-[Compatibility and Upgrades](compatibility.md): a data directory written by
+[Compatibility and Upgrades](../compatibility.md): a data directory written by
 `0.4.x` is not readable here, and the failure is a corruption-shaped error
 rather than a version mismatch.
 
@@ -887,12 +887,12 @@ LogDB write failures (`SaveState`) — both retry exhaustion and shutdown cancel
 
 ## Cross-References
 
-- [Deployment](deployment.md) -- configuration reference, monitoring, tuning, disaster recovery
-- [Compatibility and Upgrades](compatibility.md) -- format versions, what breaks across a version boundary
-- [Engine Pipeline](../engine/pipeline.md) -- step/commit/apply worker internals
-- [WAL Persistence](../storage/wal.md) -- segment format, chunk framing, compaction
-- [Raft protocol](../raft/protocol.md) -- election safety, snapshot control, membership
-- [State machine interfaces](../statemachine/interfaces.md) -- `Open`, `Update`, `SaveSnapshot`, `RecoverFromSnapshot` contracts
+- [Deployment](user.md) -- configuration reference, monitoring, tuning, disaster recovery
+- [Compatibility and Upgrades](../compatibility.md) -- format versions, what breaks across a version boundary
+- [Engine Pipeline](../raft-consensus/engineering.md) -- step/commit/apply worker internals
+- [WAL Persistence](../log-storage/engineering.md) -- segment format, chunk framing, compaction
+- [Raft protocol](../raft-consensus/engineering.md) -- election safety, snapshot control, membership
+- [State machine interfaces](../state-machines/engineering.md) -- `Open`, `Update`, `SaveSnapshot`, `RecoverFromSnapshot` contracts
 - [Testing infrastructure](../testing/infrastructure.md) -- fault injection, partition primitive, linearizability suite
 
 ---
@@ -907,7 +907,7 @@ Timings and CPU percentages are not: absolute `ns/op` is a property of the
 machine, and the few quoted below predate any provenance discipline in this
 repository, so the hardware that produced them was not recorded. They are
 flagged where they appear. New measurements belong in
-[benchmarking.md](benchmarking.md), which records machine, governor, load, Go
+[benchmarking.md](../testing/benchmarking.md), which records machine, governor, load, Go
 version and commit alongside every sample.
 
 ### Hot Path Overview
@@ -1157,7 +1157,7 @@ Eviction is scoped to the failure. A peer that rejects a frame costs only that s
 
 Batching happens in the per-target `sendQueueWorker` goroutine, which drains its queues and coalesces up to 16 heartbeats or 256 data messages into one batch. Heartbeats are drained before data by a non-blocking priority select, so a replication backlog cannot delay heartbeats past the election timeout. Each batch is framed (`FrameHeaderSize` + payload) and optionally Snappy compressed. A batch that fits in one frame is one write to the pooled stream; `sendBatch` splits an oversized batch across as many frames as it needs, one write each. A worker exits after `sendQueueIdleTimeout` (60s) of inactivity, so removed peers do not leak goroutines.
 
-See [QUIC Transport: Send Path](../transport/quic.md#send-path) for the full sequence.
+See [QUIC Transport: Send Path](../quic-transport/engineering.md#send-path) for the full sequence.
 
 Source: `pkg/internal/transport/quic.go`, `pkg/internal/transport/conn.go`
 
@@ -1264,7 +1264,7 @@ That file states which machine and which date each set of numbers came from, and
 which comparisons between them are legitimate. Two datasets exist and they are
 not interchangeable.
 
-Changes to the hot paths described above must be benchmarked before merge. See [Benchmark Regression Testing](benchmarking.md) for `make bench-compare`, the stored baselines under `test/performance/baselines/`, and why a single `make bench-<pkg>` run cannot answer the question.
+Changes to the hot paths described above must be benchmarked before merge. See [Benchmark Regression Testing](../testing/benchmarking.md) for `make bench-compare`, the stored baselines under `test/performance/baselines/`, and why a single `make bench-<pkg>` run cannot answer the question.
 
 ### Allocation Budget Summary
 

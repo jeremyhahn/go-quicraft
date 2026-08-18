@@ -220,7 +220,7 @@ Performs a linearizable read in a single call:
 
 Returns the query result from the state machine. This is the strongest consistency guarantee: the read reflects all writes committed before it.
 
-Step 3 acquires the RSM adapter's read guard, which an in-flight `Apply` holds for writing. On a follower catching up, that apply can carry up to 64 MiB of entries, and `sync.RWMutex` offers no context-aware acquire, so `ctx`'s deadline is not observed while the call is blocked on the lock. The same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and `StaleReadBuf`. The guard is on the adapter, so this is not something a tier choice avoids today; see [Lookup concurrency](../statemachine/interfaces.md#lookup-concurrency).
+Step 3 acquires the RSM adapter's read guard, which an in-flight `Apply` holds for writing. On a follower catching up, that apply can carry up to 64 MiB of entries, and `sync.RWMutex` offers no context-aware acquire, so `ctx`'s deadline is not observed while the call is blocked on the lock. The same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and `StaleReadBuf`. The guard is on the adapter, so this is not something a tier choice avoids today; see [Lookup concurrency](../state-machines/engineering.md#lookup-concurrency).
 
 #### SyncReadBuf
 
@@ -1589,7 +1589,7 @@ Production implementation using `prometheus/client_golang`. All metrics are regi
 
 `NewPrometheusMetricsCollector` uses the zero `config.MetricsConfig`, so **`PerShardMetrics` is off** and the volume-and-latency telemetry aggregates to one host-level series per metric. Use `NewPrometheusMetricsCollectorWithConfig` to opt in to a `shard_id` breakdown. The mode is fixed at construction and cannot be changed afterwards.
 
-**Prometheus metric names.** `shard_id*` marks a label present only when `PerShardMetrics` is enabled. See [operations/deployment.md](../operations/deployment.md#metrics-cardinality) for the cardinality budget, the alerting-safe subset, and the full reference including the drop and security counters.
+**Prometheus metric names.** `shard_id*` marks a label present only when `PerShardMetrics` is enabled. See [operations/deployment.md](../multi-group-host/user.md#metrics-cardinality) for the cardinality budget, the alerting-safe subset, and the full reference including the drop and security counters.
 
 | Subsystem   | Metric Name                               | Type      | Labels                    |
 |-------------|-------------------------------------------|-----------|---------------------------|
@@ -1725,7 +1725,7 @@ Source: `pkg/config/config.go`
 > seeded voter placement that results is provisional: the committed
 > `AddWitness` / `AddNonVoting` entries replay at commit time and move each
 > replica to its real role (see "Convergent Apply" in
-> [raft/protocol.md](../raft/protocol.md)).
+> [raft/protocol.md](../raft-consensus/engineering.md)).
 
 ### WitnessConfig
 
@@ -1815,7 +1815,7 @@ A violation is **not** detected by Raft. Consensus keeps agreeing on the log whi
 
 Three tiers, detected by type assertion at `StartShard` time:
 
-**StateMachine** (type code 0) -- All state in memory. Serialized access: `Update` and `Lookup` are never called concurrently, enforced by the RSM adapter's `readGuard`. Local reads therefore wait on an in-flight apply; see [Lookup concurrency](../statemachine/interfaces.md#lookup-concurrency).
+**StateMachine** (type code 0) -- All state in memory. Serialized access: `Update` and `Lookup` are never called concurrently, enforced by the RSM adapter's `readGuard`. Local reads therefore wait on an in-flight apply; see [Lookup concurrency](../state-machines/engineering.md#lookup-concurrency).
 
 ```go
 type StateMachine interface {
@@ -2314,20 +2314,20 @@ if err := dest.ImportSnapshot(ctx, 7, r); err != nil {
 
 ## Cross-References
 
-- [Architecture Overview](../architecture/overview.md) -- System design, data flow, package structure
-- [Engine Pipeline](../engine/pipeline.md) -- Step, commit and apply workers behind `Propose`
-- [Raft Protocol](../raft/protocol.md) -- Election and log safety, config-in-log, convergent apply, snapshot ack/retry
-- [State Machine Interfaces](../statemachine/interfaces.md) -- Choosing among the three tiers
-- [RSM Adapter](../statemachine/rsm-adapter.md) -- What sits between the engine and your `sm` implementation
-- [KV Backends](../statemachine/kv-backends.md) -- The reference stores in `pkg/sm/kv`
-- [Session Deduplication](../sessions/deduplication.md) -- At-most-once semantics and index-based expiry
-- [Transport](../transport/quic.md) -- QUIC transport, connection management, frame format
-- [Wire Format](../protocol/wire-format.md) -- Entry and message layouts behind `proto`
-- [WAL Storage](../storage/wal.md) -- LogDB and the write-ahead log
-- [Encryption](../security/encryption.md) -- Barrier, epochs, and the Layer-1 boundary
-- [Key Custody](../security/key-custody.md) -- Who owns which key, and what this library deliberately does not hold
-- [Deployment](../operations/deployment.md) -- Metrics cardinality, alerting, sizing
-- [Lifecycle](../operations/lifecycle.md) -- Start, join, drain, shutdown
-- [Compatibility](../operations/compatibility.md) -- On-disk and wire format compatibility
-- [Bootstrap and Discovery](../discovery/bootstrap.md) -- Where the member set comes from
+- [Architecture Overview](../multi-group-host/architecture.md) -- System design, data flow, package structure
+- [Engine Pipeline](../raft-consensus/engineering.md) -- Step, commit and apply workers behind `Propose`
+- [Raft Protocol](../raft-consensus/engineering.md) -- Election and log safety, config-in-log, convergent apply, snapshot ack/retry
+- [State Machine Interfaces](../state-machines/engineering.md) -- Choosing among the three tiers
+- [RSM Adapter](../state-machines/engineering.md) -- What sits between the engine and your `sm` implementation
+- [KV Backends](../state-machines/engineering.md) -- The reference stores in `pkg/sm/kv`
+- [Session Deduplication](../client-sessions/engineering.md) -- At-most-once semantics and index-based expiry
+- [Transport](../quic-transport/engineering.md) -- QUIC transport, connection management, frame format
+- [Wire Format](../wire-protocol/engineering.md) -- Entry and message layouts behind `proto`
+- [WAL Storage](../log-storage/engineering.md) -- LogDB and the write-ahead log
+- [Encryption](../seal-barrier/architecture.md) -- Barrier, epochs, and the Layer-1 boundary
+- [Key Custody](../seal-barrier/user.md) -- Who owns which key, and what this library deliberately does not hold
+- [Deployment](../multi-group-host/user.md) -- Metrics cardinality, alerting, sizing
+- [Lifecycle](../multi-group-host/engineering.md) -- Start, join, drain, shutdown
+- [Compatibility](../compatibility.md) -- On-disk and wire format compatibility
+- [Bootstrap and Discovery](../multi-group-host/architecture.md) -- Where the member set comes from
 - [Testing](../testing/overview.md) -- Test infrastructure and fault injection

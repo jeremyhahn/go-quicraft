@@ -2,76 +2,73 @@
 
 Technical documentation for the QuicRaft multi-group Raft consensus library.
 
-## Getting Started
+Documentation follows the **feature-folder convention**: every implemented
+feature has a folder holding five documents — `architecture.md` (design,
+boundaries, rejected alternatives), `engineering.md` (the implementation
+contract), `cli.md`, `api.md`, and `user.md`. The five files together are the
+feature's documentation and its requirements.
 
-New to QuicRaft? Start here:
+**go-quicraft ships no binaries**, so every `cli.md` records that explicitly and
+points at the consuming surface rather than being absent — an absent file cannot
+be told apart from an unwritten one.
 
-1. [Architecture Overview](architecture/overview.md) — how the pieces fit together
-2. [Public API Reference](api/reference.md) — Host methods, configuration, error types
-3. [Deployment Guide](operations/deployment.md) — configuration, monitoring, tuning
+## Start here
 
-## Core
+| If you are… | Read |
+|---|---|
+| new to the library | [multi-group-host/architecture.md](multi-group-host/architecture.md) — also the system overview |
+| writing a state machine | [state-machines/user.md](state-machines/user.md) |
+| deploying it | [multi-group-host/user.md](multi-group-host/user.md) |
+| looking for a function signature | [multi-group-host/api.md](multi-group-host/api.md) |
+| upgrading | [compatibility.md](compatibility.md) |
 
-| Document | Description |
-|----------|-------------|
-| [Architecture Overview](architecture/overview.md) | Package structure, data flow, proposal and read paths |
-| [Raft Protocol](raft/protocol.md) | Elections, replication, snapshots, membership changes, spec compliance |
-| [Engine Pipeline](engine/pipeline.md) | Step, commit, and apply workers, concurrency model, snapshot pool |
+## Features
 
-## Transport & Wire Format
+| Feature | What it covers |
+|---|---|
+| [multi-group-host](multi-group-host/architecture.md) | the `Host`: lifecycle, shard management, proposal and read paths, configuration, the performance contract. The system overview lives here. |
+| [raft-consensus](raft-consensus/architecture.md) | the Raft protocol and the step/commit/apply worker pipeline |
+| [membership-changes](membership-changes/architecture.md) | adding and removing replicas, observers and witnesses, node identity |
+| [quic-transport](quic-transport/architecture.md) | QUIC, mTLS, connection and stream pools, revocation, the node registry |
+| [wire-protocol](wire-protocol/architecture.md) | the binary wire format and the two version namespaces |
+| [log-storage](log-storage/architecture.md) | the 16-shard WAL, the `LogDB` interface, recovery, compaction, repair |
+| [snapshots](snapshots/architecture.md) | creation, streaming, import/export, re-encryption |
+| [state-machines](state-machines/architecture.md) | the three interfaces you implement, the RSM adapter, the reference KV backends |
+| [client-sessions](client-sessions/architecture.md) | at-most-once proposal delivery |
+| [write-batching](write-batching/architecture.md) | the proposal aggregator and the write-durability modes |
+| [seal-barrier](seal-barrier/architecture.md) | at-rest encryption: epoch DEKs, sealing strategies, the AEAD safety bounds |
+| [shamir-primitive](shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive and the share-custody interfaces |
+| [memory-enclave](memory-enclave/architecture.md) | memguard-backed protection for key material in process memory |
+| [observability](observability/architecture.md) | metrics, logging and event notifications |
 
-| Document | Description |
-|----------|-------------|
-| [QUIC Transport](transport/quic.md) | Connection pooling, stream management, frame format, mTLS |
-| [Binary Wire Format](protocol/wire-format.md) | Entry, Message, MessageBatch, and Snapshot encoding, size limits |
+## Cross-feature documents
 
-## Storage
-
-| Document | Description |
-|----------|-------------|
-| [Sharded WAL](storage/wal.md) | Segment format, write and read paths, durability, compaction, crash recovery |
-
-## State Machines
-
-| Document | Description |
-|----------|-------------|
-| [SM Interfaces](statemachine/interfaces.md) | StateMachine, ConcurrentStateMachine, DiskStateMachine contracts |
-| [RSM Adapter](statemachine/rsm-adapter.md) | Type detection, apply pipeline, session routing, snapshot format |
-| [KV Backends](statemachine/kv-backends.md) | Reference MemoryStore and ConcurrentStore implementations |
-
-## Security
-
-| Document | Description |
-|----------|-------------|
-| [At-rest Encryption](security/encryption.md) | Barrier seal/unseal, algorithm-agile AEAD encryption, epoch-based key rotation, FIPS 140 |
-| [Key Custody](security/key-custody.md) | Pluggable root-key storage: sealing strategies, TPM, HSM/PKCS#11, cloud KMS |
-
-## Sessions & Discovery
+These describe the repository rather than one feature, and deliberately sit
+outside the feature folders.
 
 | Document | Description |
-|----------|-------------|
-| [Session Deduplication](sessions/deduplication.md) | At-most-once delivery, client sessions, snapshot integration |
-| [Discovery & Bootstrap (moved to go-qrdb)](discovery/bootstrap.md) | Peer discovery and cluster formation now live in go-qrdb's `pkg/discovery`/`pkg/cluster`; quicraft is Raft-primitives-only |
+|---|---|
+| [Compatibility and Upgrades](compatibility.md) | the pinned-at-1 format policy, every version discriminator that exists, the per-release upgrade path, and the interface requirements for embedders. It spans `pkg/proto`, the WAL, `snapshot.meta` and the sealed root key, so splitting it across feature folders would destroy the upgrade narrative. |
+| [Testing Overview](testing/overview.md) | unit, integration and E2E structure, coverage targets, Makefile targets |
+| [Test Infrastructure](testing/infrastructure.md) | fuzzing, linearizability verification, I/O error injection |
+| [Benchmark Regression Testing](testing/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
 
-## Operations
-
-| Document | Description |
-|----------|-------------|
-| [Public API Reference](api/reference.md) | Host methods, RequestState, Session API, error types |
-| [Deployment Guide](operations/deployment.md) | Configuration, monitoring, tuning, operational practices |
-| [Lifecycle Management](operations/lifecycle.md) | Startup, shutdown, crash recovery, WAL replay |
-| [Compatibility and Upgrades](operations/compatibility.md) | Pre-1.0 stability guarantee, version discriminators, upgrade and downgrade path |
-
-## Performance & Testing
-
-| Document | Description |
-|----------|-------------|
-| [Performance Architecture](performance/architecture.md) | Zero-alloc paths, compression, rate limiting, memory budgets |
-| [Benchmark Regression Testing](performance/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
-| [Testing Overview](testing/overview.md) | Unit, integration, E2E tests, coverage targets, Makefile targets |
-| [Test Infrastructure](testing/infrastructure.md) | Fuzzing, linearizability verification, I/O error injection |
+Per-feature test strategy lives in each feature's `engineering.md`; these three
+describe the harnesses that serve all of them.
 
 ## References
 
 - [Raft Paper (PDF)](references/raft.pdf)
 - [Ongaro PhD Thesis (PDF)](references/OngaroPhD.pdf)
+
+## Migration state
+
+**Complete.** Every implemented feature has a folder with all five files, and
+the pre-convention layout (`docs/architecture/`, `docs/raft/`, `docs/engine/`,
+`docs/transport/`, `docs/protocol/`, `docs/storage/`, `docs/statemachine/`,
+`docs/sessions/`, `docs/security/`, `docs/api/`, `docs/operations/`,
+`docs/discovery/`, `docs/performance/`) has been moved into it — not rewritten.
+`docs/testing/` and `docs/references/` remain as cross-feature material.
+
+A new feature gets a folder from day one. The portfolio view is derived rather
+than maintained: count `docs/*/architecture.md`.

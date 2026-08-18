@@ -509,7 +509,7 @@ cannot disagree with the table it describes.
 
 Both were added by changing the layout in place, because every wire format in
 this repository is pinned at v1 for the pre-release period and consumers are
-updated in lockstep. See [Compatibility](../operations/compatibility.md).
+updated in lockstep. See [Compatibility](../compatibility.md).
 
 `UnmarshalFrom` bounds-checks everything it decodes against the configured
 limits, so a corrupted or malicious snapshot cannot drive an allocation:
@@ -625,9 +625,9 @@ Consequences for an operator:
 - A node whose `Config` disagrees with what its shard committed applies the shard's values and logs the disagreement at WARN. It does not refuse to start — the committed value can only be changed through consensus.
 - `Host.GetShardMembership` reports the committed policy, which is how you check what a shard is actually running.
 - There is no config change for these yet: the committed policy is fixed for the life of the shard. Raising `MaxTotalSessions` on a running shard is not currently possible.
-- A shard bootstrapped by a pre-policy build has no committed policy, and its membership section does not decode at all under this build — every format is pinned at version 1 and gated on exact equality, so a section written before the session policy existed is refused rather than read at the wrong offsets. Wipe the data directory and re-sync; see [Compatibility](../operations/compatibility.md).
+- A shard bootstrapped by a pre-policy build has no committed policy, and its membership section does not decode at all under this build — every format is pinned at version 1 and gated on exact equality, so a section written before the session policy existed is refused rather than read at the wrong offsets. Wipe the data directory and re-sync; see [Compatibility](../compatibility.md).
 
-See [Deployment](../operations/deployment.md).
+See [Deployment](../multi-group-host/user.md).
 
 ## Thread Safety and Concurrency
 
@@ -732,10 +732,10 @@ embedder's own authentication.
 
 ## Cross-References
 
-- [API Reference](../api/reference.md) -- `Session`, `Host` session methods
-- [RSM Adapter](../statemachine/rsm-adapter.md) -- how `Apply` drives the user state machine
-- [State Machine Interfaces](../statemachine/interfaces.md) -- `sm.Result`, `sm.DiskStateMachine`
-- [Wire Format](../protocol/wire-format.md) -- `Entry` session fields and the `Membership` session policy
-- [Raft Protocol](../raft/protocol.md) -- commit, apply and snapshot ordering
-- [Compatibility](../operations/compatibility.md) -- wire-format pinning and the session-policy layout change
-- [Deployment](../operations/deployment.md) -- choosing the session limits for a shard
+- [API Reference](../multi-group-host/api.md) -- `Session`, `Host` session methods
+- [RSM Adapter](../state-machines/engineering.md) -- how `Apply` drives the user state machine
+- [State Machine Interfaces](../state-machines/engineering.md) -- `sm.Result`, `sm.DiskStateMachine`
+- [Wire Format](../wire-protocol/engineering.md) -- `Entry` session fields and the `Membership` session policy
+- [Raft Protocol](../raft-consensus/engineering.md) -- commit, apply and snapshot ordering
+- [Compatibility](../compatibility.md) -- wire-format pinning and the session-policy layout change
+- [Deployment](../multi-group-host/user.md) -- choosing the session limits for a shard

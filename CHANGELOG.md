@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line that consumer already guards at runtime. The wire and metadata identifiers remain defined in every build so a
   FIPS binary can still name data it cannot read. The untagged build is
   unchanged and keeps every algorithm. See
-  [docs/security/encryption.md](docs/security/encryption.md#fips-builds---tags-fips);
+  [docs/seal-barrier/engineering.md](docs/seal-barrier/engineering.md#4-configuration);
   `make build-fips` now compiles both variants.
 
 - **New `make verify-fips`, and `build-fips` is documented as the compile check
