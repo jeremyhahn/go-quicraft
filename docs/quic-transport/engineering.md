@@ -1,4 +1,19 @@
-# QuicRaft QUIC Transport
+# QUIC Transport — Engineering Contract
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
+> `pkg/internal/transport/revocation`, `pkg/internal/registry`,
+> `pkg/internal/netaddr` · Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+These packages are **internal**: they are not importable from outside the
+module. The transport is configured through `config.TransportConfig` and
+`config.MTLSConfig` and driven by the `Host`; there is no `Transport` interface
+to swap and no exported transport type. This document is therefore the
+implementation contract for work *inside* this repository — an embedder's
+surface is [`api.md`](api.md).
+
+Design rationale, rejected alternatives and the scope fence are in
+[`architecture.md`](architecture.md).
 
 ## Overview
 
@@ -1341,6 +1356,63 @@ counters for the sampled diagnostics (`PeerFrameRejections()` is exported;
 `recvBudgetDrops`, `zeroShardDrops`, `spoofedSourceClears`,
 `snapshotStreamDrops` and `zeroRTTRefusals` are reported inside the sampled log
 lines), plus `ConnectionCount()`, `StreamCount()` and `SendQueueCount()`.
+
+## Test Strategy
+
+Targets: `make test-transport`, `make bench-transport`, `make fuzz-transport`,
+`make ci-netfault`.
+
+| Layer | What it covers |
+|---|---|
+| **Unit** (`pkg/internal/transport/*_test.go`) | frame encode/decode, the stream pool, connection admission and per-IP limits, the mTLS config builder, node-identity derivation, the revocation checker's CRL reload and OCSP cache |
+| **Fuzz** (`make fuzz-transport`) | frame-header and length-prefix decoding against arbitrary bytes. The transport is the one place in the repository where the input is genuinely adversarial. |
+| **Integration** (`test/integration`) | real QUIC connections between real hosts, with real certificates |
+| **Fault injection** (`test/netfault`, `make ci-netfault`) | partitions, delays and drops. This is the suite that exercises the paths a unit test cannot reach: a peer that goes away mid-snapshot, a stream that stalls past `StreamReadIdleTimeout`, a connection admitted and then abandoned. |
+
+**Seams for fault injection**: the `netfault` harness sits at the socket, not
+inside the transport — there is no injectable dialer, deliberately, because a
+fake dialer cannot reproduce QUIC's own loss recovery and flow control, which is
+what most transport bugs are actually about.
+
+**Fixtures**: certificates are generated per test run rather than checked in. A
+checked-in key is a real key.
+
+**Coverage note.** `pkg/internal/transport` sits at 88.8%, below the repository's
+own `COVER_MIN = 91` floor, and the module-total gate does not catch it. The WAL,
+the QUIC transport and the engine pipeline are named in `README.md` as the gaps
+that matter, precisely because their failure modes are the hardest to recover
+from. Treat that as tracked work rather than a settled state.
+
+## Observability
+
+**Metrics** — the `TransportMetrics` collector on the `Host`, plus the
+transport's own counters described in [Transport
+Metrics](#transport-metrics): `ConnectionCount()`, `StreamCount()` and
+`SendQueueCount()`. Metric names and the Prometheus collector are in
+[`../observability/engineering.md`](../observability/engineering.md).
+
+The four worth alerting on:
+
+| Signal | Why |
+|---|---|
+| connection count against `MaxIncomingConnections` | at the ceiling, new peers are refused |
+| send-queue depth | a peer that cannot keep up shows here before it shows as a Raft timeout |
+| snapshot receive concurrency against `MaxConcurrentSnapshotReceives` | transfers are queueing |
+| revocation-check failures | under fail-closed defaults these become connection refusals |
+
+**Logging** — `log/slog`. The events worth alerting on:
+
+| Level | Event | Why |
+|---|---|---|
+| ERROR | mTLS handshake refused | a certificate problem, a wrong CA, or a peer whose leaf covers the local node (`refuseInboundPromiscuousCert`) |
+| ERROR | revocation source unavailable under enforcement | `ErrNoRevocationSources` — connections are being refused, and that is the intended behavior |
+| WARN | a message dropped for an unauthorized sender | `RequireMemberIdentity` is on and a peer has no committed identity |
+| WARN | frame rejected for a foreign wire version | two binaries from different builds |
+| WARN | inbound connection refused at a limit | `MaxIncomingConnections` or `MaxConnectionsPerIP` |
+
+**No certificate private key, no session secret, and no message payload appears
+in any log line.** A refused peer is identified by its SPKI identity and its
+address, both of which are already public.
 
 ## Cross-References
 
