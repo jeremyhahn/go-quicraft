@@ -402,7 +402,7 @@ which is worse than having no baseline at all:
 # cpu-count:     20
 # governor:      powersave
 # loadavg:       0.02 0.12 0.13  (at start of run)
-# build-host:    vm-host-1
+# build-host:    <build-host>
 # go-version:    go version go1.26.5 linux/amd64
 # current-ref:   64bc2882844a4109c698b99ef022ef9219a391ef  [clean (pinned to HEAD (64bc288))]
 # packages:      ./pkg/internal/raft/ ./pkg/internal/engine/

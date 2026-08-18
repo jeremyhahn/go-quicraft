@@ -48,7 +48,7 @@ Useful targets:
 | `make verify-fips` | Runs the FIPS boundary under `GODEBUG=fips140=only` (excludes `pkg/internal/transport/...`) |
 | `make bench-<pkg>` | Benchmarks for one package (smoke test only) |
 | `make bench-compare` | Interleaved baseline-vs-working-tree comparison, benchstat |
-| `make remote-<target>` | Run any of the above on omega instead of your workstation |
+| `make remote-<target>` | Run any of the above on a remote build host instead of your workstation |
 
 `make ci` stops at `go test ./...` with no build tags, which excludes the
 integration, netfault, errfs and fuzz suites entirely. `make ci-full` is what
@@ -56,13 +56,14 @@ integration, netfault, errfs and fuzz suites entirely. `make ci-full` is what
 before opening a pull request.
 
 Run the heavy parts off-box. `make remote-<target>` rsyncs your working tree,
-uncommitted edits included, to omega (`jhahn@198.51.100.90`) and runs the
-target there, streaming output back:
+uncommitted edits included, to a remote build host and runs the target there,
+streaming output back. Point it at your own machine with `OMEGA_USER`,
+`OMEGA_HOST` and `OMEGA_DIR`:
 
 ```sh
 make remote-ci-full
 make remote-integration-test
-make remote-tools     # one-time: install the scanners omega lacks
+make remote-tools     # one-time: install the scanners the host lacks
 ```
 
 This is not politeness about shared hardware. Every target runs under `-race`

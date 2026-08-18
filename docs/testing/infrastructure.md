@@ -417,15 +417,15 @@ module is removed on purpose, lower the floor in the same commit.
 
 ## Running heavyweight suites off-box
 
-`make remote-<target>` rsyncs the working tree to omega
-(`jhahn@198.51.100.90`, `~/ci/go-quicraft`) and runs `make <target>` there,
+`make remote-<target>` rsyncs the working tree to a remote build host
+(set by `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR`) and runs `make <target>` there,
 streaming output back. It is a pattern rule, so no target needs enrolling:
 
 ```
 make remote-ci-full            # the whole gate, off-box
 make remote-integration-test
 make remote-test               # or any other target
-make remote-tools              # one-time: install the scanners omega lacks
+make remote-tools              # one-time: install the scanners the host lacks
 make remote-test OMEGA_DIR='~/ci/qr-myfeature'   # avoid colliding with other work
 ```
 
@@ -433,9 +433,9 @@ This exists because every target runs under `-race` and the integration suites
 stand up multi-node QUIC clusters. On a workstation also running editors,
 browsers and agents, that contention expires the 30-second catch-up waits, and
 the resulting failures read as raft defects rather than as the scheduling
-artifacts they are. Chasing them has cost days. omega is the department's
-spare-capacity host and is where the Gitea runner already executes CI, so this
-gives the local inner loop the same machine.
+artifacts they are. Chasing them has cost days. Point the remote host at the
+machine CI already executes on, so the local inner loop and CI agree about what
+a failure means.
 
 The sync uses `--delete`, so a file removed locally cannot linger remotely and
 turn a broken build green. `.git` is excluded deliberately: this ships the
@@ -446,7 +446,7 @@ against this repository's history.
 `make remote-tools` installs govulncheck, gosec, golangci-lint (pinned to
 `GOLANGCI_VERSION`, matching what quality.yml installs) and trivy, and seeds
 `known_hosts`. Every tool is installed unconditionally rather than "if absent",
-because omega had a v1 golangci-lint and a years-old gosec on PATH and
+because the remote host had a v1 golangci-lint and a years-old gosec on PATH and
 `command -v` guards skipped both installs. An analyser of the wrong version
 gates on a different rule set from CI while looking like it passed.
 
