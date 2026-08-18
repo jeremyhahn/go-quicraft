@@ -256,6 +256,73 @@ jobs:
       - name: Bounded mutation pass
         run: make ci-fuzz-mutation FUZZ_MUT_PKGS='${{ matrix.package }}'
 
+  # ==========================================================================
+  # Gate - contrib/dragonboat compatibility
+  #
+  # ci.yml proves the dragonboat compatibility API works on a COMMIT. This
+  # proves it for the tree a tag actually publishes, which is not the same
+  # claim: ci.yml triggers on branches and pull requests only, so a tag on a
+  # release branch, a cherry-pick or a force-pushed-away commit reaches the
+  # module proxy with nothing having exercised the adapter at all. Same
+  # reasoning that moved the integration, netfault, errfs, fuzz and quality
+  # gates into this file.
+  #
+  # THE SAME SUITE AS ci.yml, not a narrower smoke test. Three reasons:
+  #
+  #   1. The smoke test already exists. The `modules` gate above builds and
+  #      vets every module in the tree, contrib/dragonboat included, so a
+  #      narrower job here could only re-prove compilation. What is unproven
+  #      at that point is BEHAVIOUR — and behaviour is the entire content of a
+  #      compatibility layer's promise. A dragonboat program that compiles
+  #      against the adapter and then fails to elect a leader is precisely the
+  #      defect this must catch.
+  #   2. contrib/dragonboat's go.mod `replace`s the parent with `../..`, so it
+  #      is always built against the tree it ships with, never a published
+  #      version. The suite therefore tests the tagged root module directly:
+  #      it is a behavioural gate on the artifact, not on a sibling.
+  #   3. Every other gate in this file is byte-identical to its ci.yml job, on
+  #      purpose. A release-only narrower variant would be a third command pair
+  #      to keep in step with ci.yml and contrib/dragonboat/Makefile, and the
+  #      one that runs rarely is the one that silently rots.
+  #
+  # Cost is ~10 min of wall clock on an otherwise idle runner, paid once per
+  # tag. A tag cannot be retracted — the module proxy caches it — which is the
+  # same trade the bounded mutation-fuzz pass above already makes.
+  #
+  # Serialised behind `netfault`, which is serialised behind `integration`:
+  # this stands up multi-node QUIC clusters through the compatibility API, and
+  # the three heavy QUIC lanes must never share a runner. That ordering is what
+  # ci.yml does and it is why run 418's snapshot-catch-up wait expired.
+  #
+  # Keep each command byte-identical to the matching step in ci.yml and to the
+  # matching `ci-*` target in contrib/dragonboat/Makefile.
+  # ==========================================================================
+  contrib-dragonboat:
+    name: Gate - contrib/dragonboat compatibility [unit + integration]
+    runs-on: ubuntu-latest
+    needs: [validate, netfault]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Run contrib/dragonboat unit tests
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -timeout=900s ./...
+
+      # -p 1 is load-bearing, not caution: every package here spins up
+      # multi-node QUIC clusters under -race, and running them concurrently
+      # starves runner CPU enough to flake the tests with 30s waits.
+      - name: Run contrib/dragonboat integration suite
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
   modules:
     name: Gate - sibling modules build
     runs-on: ubuntu-latest
@@ -305,7 +372,7 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, quality, integration, netfault, errfs, fuzz, modules]
+    needs: [validate, quality, integration, netfault, errfs, fuzz, modules, contrib-dragonboat]
     timeout-minutes: 30
     steps:
       - name: Checkout
