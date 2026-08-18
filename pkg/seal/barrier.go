@@ -2267,8 +2267,8 @@ func (b *Barrier) RootKey() ([]byte, error) {
 }
 
 // RootKeyProtected returns the decrypted root key inside a memory-locked,
-// guard-paged ProtectedBuffer. The barrier must be unsealed. The caller OWNS
-// the buffer and MUST Destroy it when done, which zeroes the memory
+// guard-paged MemoryEnclave. The barrier must be unsealed. The caller OWNS
+// the enclave and MUST Destroy it when done, which zeroes the memory
 // deterministically.
 //
 // It is the form to prefer over RootKey for anything that keeps the key for
@@ -2276,7 +2276,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 // never paged to disk, and Destroy is a real wipe rather than a request to the
 // garbage collector. Returns ErrNoRootKeyAvailable in no-encryption mode, which
 // holds no root key at all.
-func (b *Barrier) RootKeyProtected() (*enclave.ProtectedBuffer, error) {
+func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {

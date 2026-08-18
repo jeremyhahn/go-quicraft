@@ -18,7 +18,15 @@ import "github.com/jeremyhahn/go-quicraft/pkg/enclave"
 
 // ProtectedBuffer is a type alias for backward compatibility. All new
 // code should import pkg/enclave directly.
-type ProtectedBuffer = enclave.ProtectedBuffer
+//
+// The right-hand side names enclave.MemoryEnclave rather than the deprecated
+// enclave.ProtectedBuffer it used to name. Those two ARE the same type — the
+// enclave-side ProtectedBuffer is an alias, not a defined type — so this
+// package's compatibility surface is unchanged and every consumer keeps
+// compiling. What changes is that seal no longer reaches for a name its own
+// author has deprecated, which is what the coordinated bottom-up rename asks
+// of every consumer. The same applies to the four function aliases below.
+type ProtectedBuffer = enclave.MemoryEnclave
 
 // ProtectedKey is a type alias for backward compatibility. All new
 // code should import pkg/enclave directly.
@@ -26,10 +34,10 @@ type ProtectedKey = enclave.ProtectedKey
 
 // Function aliases for backward compatibility.
 var (
-	NewProtectedBuffer          = enclave.NewProtectedBuffer
-	NewProtectedBufferFromBytes = enclave.NewProtectedBufferFromBytes
+	NewProtectedBuffer          = enclave.NewMemoryEnclave
+	NewProtectedBufferFromBytes = enclave.NewMemoryEnclaveFromBytes
 	NewProtectedKey             = enclave.NewProtectedKey
-	SealProtectedBuffer         = enclave.SealProtectedBuffer
+	SealProtectedBuffer         = enclave.SealMemoryEnclave
 )
 
 // wipeBytes securely zeroes a byte slice using memguard's wiping mechanism.

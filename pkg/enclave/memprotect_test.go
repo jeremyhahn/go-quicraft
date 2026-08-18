@@ -563,16 +563,23 @@ func TestMemoryEnclave_FromBytesWipesSourceAndFreezes(t *testing.T) {
 // in every signature — which is what makes the rename non-breaking ahead of
 // the coordinated wave. If someone later turns the alias into a defined type,
 // this stops compiling.
+//
+// The three //nolint:staticcheck directives below are the point of the test,
+// not noise around it. QF1011 reports each explicit type as redundant because
+// it is inferable from the right-hand side — which is TRUE, and is precisely
+// the property being asserted: it is inferable only while the two names denote
+// one type. Letting staticcheck delete the annotations would delete the guard
+// and leave three assignments that check nothing.
 func TestProtectedBufferAliasesMemoryEnclave(t *testing.T) {
-	var e *MemoryEnclave = NewProtectedBuffer(16)
+	var e *MemoryEnclave = NewProtectedBuffer(16) //nolint:staticcheck // QF1011: the explicit type IS the assertion
 	defer e.Destroy()
-	var pb *ProtectedBuffer = e
+	var pb *ProtectedBuffer = e //nolint:staticcheck // QF1011: the explicit type IS the assertion
 	if pb.Size() != 16 {
 		t.Fatalf("expected size=16 through the deprecated alias, got %d", pb.Size())
 	}
 
 	sealed := NewProtectedBufferFromBytes([]byte("sealed through the old name!!!!!"))
-	var alias *ProtectedBuffer = sealed
+	var alias *ProtectedBuffer = sealed //nolint:staticcheck // QF1011: the explicit type IS the assertion
 	if key := SealMemoryEnclave(alias); key == nil {
 		t.Fatal("SealMemoryEnclave rejected a buffer built by the deprecated constructor")
 	}
