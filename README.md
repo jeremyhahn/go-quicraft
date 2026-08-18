@@ -32,7 +32,7 @@ Requires Go 1.26.6 or later. The public API lives under
 > consuming service from one commit.
 >
 > See [CHANGELOG.md](CHANGELOG.md) and
-> [docs/operations/compatibility.md](docs/operations/compatibility.md) before
+> [docs/compatibility.md](docs/compatibility.md) before
 > upgrading.
 
 ## Features
@@ -368,7 +368,7 @@ host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg)
 
 go-quicraft provides only the primitive `Host.StartShard(members, join, createFn, cfg)`, which takes an explicit `map[uint64]string` member map. The caller supplies that map.
 
-Peer discovery (static / multicast / DNS SRV / token), quorum validation, and bootstrap orchestration (discover → quorum → `StartShard`), plus opt-in dynamic membership, live one layer up in **go-qrdb** (`pkg/discovery` + `pkg/cluster`) — the layer that owns the cluster. To form a multi-node cluster automatically, use go-qrdb's `cluster.BootstrapShard` (or run the `qrdbd` daemon, which wraps it). See go-qrdb's `docs/discovery.md`.
+Peer discovery (static / multicast / DNS SRV / token), quorum validation, and bootstrap orchestration (discover → quorum → `StartShard`), plus opt-in dynamic membership, live one layer up in **go-qrdb** (`pkg/discovery` + `pkg/cluster`) — the layer that owns the cluster. To form a multi-node cluster automatically, use go-qrdb's `cluster.BootstrapShard` (or run the `qrdbd` daemon, which wraps it). See go-qrdb's own discovery documentation.
 
 ### At-rest encryption
 
@@ -579,11 +579,11 @@ if err != nil {
 log.Printf("rotated to epoch %d, purged %d old DEKs", newEpoch, purged)
 ```
 
-Purge only up to an epoch no live WAL segment or snapshot still needs — a purged DEK is not recoverable. See [Encryption](docs/security/encryption.md) for how the host computes that floor.
+Purge only up to an epoch no live WAL segment or snapshot still needs — a purged DEK is not recoverable. See [Encryption](docs/seal-barrier/architecture.md) for how the host computes that floor.
 
 This layer ships exactly two sealing strategies: `SoftwareStrategy` (`StrategyPassphrase`, Argon2id / PBKDF2-FIPS) and `StrategyNone`. `SealingStrategy` is a pluggable interface, and the hardware and cloud backends that implement it (TPM2, PKCS#11, AWS KMS, GCP KMS, Azure Key Vault, HashiCorp Vault) live in **go-xkms**; Shamir secret sharing and share custody live in **go-qrdb**. The consensus engine never persists Shamir shares. Strategy selection is always explicit; there is no preference order and no auto-ranking.
 
-**The filesystem is one option, not the design.** The examples above write a JSON file because that is the shortest thing that works, but neither half of root-key custody is fixed. Where the sealed blob lives is `BarrierConfig.StatePersister`, an arbitrary function, and `seal.StorageBackend` covers the case where a key-value store rather than a file holds it. What protects the root key is the `SealingStrategy`: a passphrase and Argon2id here, or a wrapping key held in a TPM, an HSM or a cloud KMS through go-xkms. A strategy may also return a `BarrierEncryptor`, which hands the data-path encryption to that backend instead of the barrier's own epoch DEKs. See [Key custody](docs/security/key-custody.md) for the combinations and what each one buys.
+**The filesystem is one option, not the design.** The examples above write a JSON file because that is the shortest thing that works, but neither half of root-key custody is fixed. Where the sealed blob lives is `BarrierConfig.StatePersister`, an arbitrary function, and `seal.StorageBackend` covers the case where a key-value store rather than a file holds it. What protects the root key is the `SealingStrategy`: a passphrase and Argon2id here, or a wrapping key held in a TPM, an HSM or a cloud KMS through go-xkms. A strategy may also return a `BarrierEncryptor`, which hands the data-path encryption to that backend instead of the barrier's own epoch DEKs. See [Key custody](docs/seal-barrier/user.md) for the combinations and what each one buys.
 
 ## Build
 
@@ -672,39 +672,34 @@ make perf-remote PERF_HOST=user@host PERF_PROFILE=omega  # Same, on another mach
 
 ## Documentation
 
-Full documentation lives in [docs/](docs/README.md), organized by component:
+Full documentation lives in [docs/](docs/README.md), organized by **feature**.
+Every feature has a folder with five documents — `architecture.md`,
+`engineering.md`, `cli.md`, `api.md`, `user.md`.
 
-**Core**
-- [Architecture Overview](docs/architecture/overview.md) -- Package structure, data flow, configuration
-- [Raft Protocol](docs/raft/protocol.md) -- Elections, replication, snapshots, membership changes
-- [Engine Pipeline](docs/engine/pipeline.md) -- Step/commit/apply workers, snapshot pool
+| Feature | What it covers |
+|---|---|
+| [multi-group-host](docs/multi-group-host/architecture.md) | the `Host`: lifecycle, shard management, proposal and read paths, configuration, performance. Start here — it is also the system overview. |
+| [raft-consensus](docs/raft-consensus/architecture.md) | the Raft protocol and the step/commit/apply pipeline |
+| [membership-changes](docs/membership-changes/architecture.md) | replicas, observers, witnesses, node identity |
+| [quic-transport](docs/quic-transport/architecture.md) | QUIC, mTLS, connection and stream pools, revocation |
+| [wire-protocol](docs/wire-protocol/architecture.md) | the binary wire format and its two version namespaces |
+| [log-storage](docs/log-storage/architecture.md) | the 16-shard WAL, `LogDB`, recovery, compaction, repair |
+| [snapshots](docs/snapshots/architecture.md) | creation, streaming, import/export, re-encryption |
+| [state-machines](docs/state-machines/architecture.md) | the three interfaces you implement, the RSM adapter, the KV backends |
+| [client-sessions](docs/client-sessions/architecture.md) | at-most-once proposal delivery |
+| [write-batching](docs/write-batching/architecture.md) | the proposal aggregator and the write-durability modes |
+| [seal-barrier](docs/seal-barrier/architecture.md) | at-rest encryption: epoch DEKs, sealing strategies, FIPS |
+| [shamir-primitive](docs/shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive |
+| [memory-enclave](docs/memory-enclave/architecture.md) | memguard-backed protection for key material |
+| [observability](docs/observability/architecture.md) | metrics, logging, event notifications |
 
-**Infrastructure**
-- [QUIC Transport](docs/transport/quic.md) -- Connection management, frame format, mTLS
-- [Sharded WAL](docs/storage/wal.md) -- Segment format, durability, compaction, recovery
-- [Wire Format](docs/protocol/wire-format.md) -- Binary encoding for Entry, Message, Snapshot
+**Cross-feature**
 
-**State Machines**
-- [SM Interfaces](docs/statemachine/interfaces.md) -- StateMachine, ConcurrentStateMachine, DiskStateMachine
-- [RSM Adapter](docs/statemachine/rsm-adapter.md) -- Type detection, apply pipeline, snapshot format
-- [KV Backends](docs/statemachine/kv-backends.md) -- MemoryStore, ConcurrentStore, command protocol
-
-**Security & Sessions**
-- [At-rest Encryption](docs/security/encryption.md) -- Barrier/seal/unseal, key rotation, FIPS 140
-- [Key Custody](docs/security/key-custody.md) -- Where the sealed root key lives and what protects it
-- [Session Deduplication](docs/sessions/deduplication.md) -- At-most-once delivery, client sessions
-
-**Operations**
-- [Public API](docs/api/reference.md) -- Host methods, RequestState, Session API, error types
-- [Deployment](docs/operations/deployment.md) -- Configuration, monitoring, tuning
-- [Lifecycle](docs/operations/lifecycle.md) -- Startup, shutdown, crash recovery
-- [Discovery & Bootstrap](docs/discovery/bootstrap.md) -- moved to go-qrdb; quicraft exposes Raft primitives only
-
-**Quality**
-- [Performance](docs/performance/architecture.md) -- Zero-alloc paths, compression, rate limiting
+- [Compatibility and Upgrades](docs/compatibility.md) -- format pinning, version discriminators, the upgrade path
+- [Testing](docs/testing/overview.md) -- unit/integration/E2E structure, coverage targets
+- [Test Infrastructure](docs/testing/infrastructure.md) -- fuzzing, linearizability, I/O error injection
 - [Benchmarks](test/performance/README.md) -- QuicRaft vs etcd vs Dragonboat vs OpenRaft comparison
-- [Testing](docs/testing/overview.md) -- Unit/integration/E2E tests, coverage targets
-- [Test Infrastructure](docs/testing/infrastructure.md) -- Fuzzing, linearizability, chaos testing
+- [Benchmark Regression](docs/testing/benchmarking.md) -- `make bench-compare` and stored baselines
 
 ## Architecture
 

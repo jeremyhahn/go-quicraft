@@ -99,7 +99,7 @@ rationale in [Testing Infrastructure](infrastructure.md).
 
 Invoked via `make bench-<package>`. The Makefile defines `GOBENCH := go test -run=^$ -bench=. -benchmem`, which excludes unit tests and includes memory allocation reporting.
 
-These targets are smoke tests only: a single unreplicated run whose spread on a loaded machine reaches 5x. To detect an actual hot-path regression use `make bench-compare`, which interleaves a baseline revision against the working tree across many rounds and compares the distributions with benchstat. It runs on the invoking machine by default; `PERF_HOST=user@host` runs the same comparison on a dedicated machine for tighter intervals. See [Benchmark Regression Testing](../performance/benchmarking.md).
+These targets are smoke tests only: a single unreplicated run whose spread on a loaded machine reaches 5x. To detect an actual hot-path regression use `make bench-compare`, which interleaves a baseline revision against the working tree across many rounds and compares the distributions with benchstat. It runs on the invoking machine by default; `PERF_HOST=user@host` runs the same comparison on a dedicated machine for tighter intervals. See [Benchmark Regression Testing](../testing/benchmarking.md).
 
 ### Performance Comparisons
 
@@ -535,14 +535,16 @@ catch-up waits in the snapshot tests — and those failures read as raft defects
 rather than as the scheduling artefacts they are. Diagnosing them has
 repeatedly cost days.
 
-Run them on **omega** (`198.51.100.90`), the department's spare-capacity host
-and the machine the `omega-docker` Gitea runner already executes CI on:
+Run them on a **remote build host** instead — ideally the same machine CI
+executes on, so a local failure and a CI failure mean the same thing. Configure
+it with `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR`, which the Makefile defaults
+to a site-local machine:
 
 ```
 make remote-ci-full            # the whole gate, off-box
 make remote-test               # any target: remote-<target> runs <target> there
 make remote-integration-test
-make remote-tools              # one-time: install the scanners omega lacks
+make remote-tools              # one-time: install the scanners the host lacks
 ```
 
 `remote-<target>` is a pattern rule, so no target needs enrolling by hand. It
@@ -559,7 +561,7 @@ make remote-test OMEGA_DIR='~/ci/qr-myfeature'
 ```
 
 Targeted single-package runs are fine locally while developing. Final
-verification goes through the Makefile targets, on omega.
+verification goes through the Makefile targets, on the remote host.
 
 ## Makefile Target Reference
 
@@ -640,8 +642,8 @@ Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Pr
 | `ci` | `fmt` → `no-mutants` → `vet` → `lint` → `security` → `build` → `test`. Untagged only |
 | `ci-full` | `ci` plus `ci-modules`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`. Matches ci.yml |
 | `ci-modules` | Build and vet every `go.mod` in the tree, with `GOWORK=off` |
-| `remote-<target>` | rsync the working tree to omega and run `<target>` there |
-| `remote-tools` | Provision omega's scanners |
+| `remote-<target>` | rsync the working tree to the remote build host and run `<target>` there |
+| `remote-tools` | Provision the remote host's scanners |
 
 `make ci` stops at `test`, which is `go test ./...` with no build tags. That
 quietly skipped the integration, errfs and fuzz suites and computed the
@@ -746,10 +748,10 @@ for attempt := range 5 {
 
 ## Cross-References
 
-- [Architecture](../architecture/overview.md) -- Package structure, engine pipeline
-- [WAL Persistence](../storage/wal.md) -- WAL internals tested by waldb suite
-- [Engine Pipeline](../engine/pipeline.md) -- Worker pipeline tested by engine suite
-- [Transport](../transport/quic.md) -- QUIC transport tested by transport suite
+- [Architecture](../multi-group-host/architecture.md) -- Package structure, engine pipeline
+- [WAL Persistence](../log-storage/engineering.md) -- WAL internals tested by waldb suite
+- [Engine Pipeline](../raft-consensus/engineering.md) -- Worker pipeline tested by engine suite
+- [Transport](../quic-transport/engineering.md) -- QUIC transport tested by transport suite
 - [Testing Infrastructure](infrastructure.md) -- fault injectors, fuzzing, linearizability, and why each gate is shaped the way it is
 - [Contributing](../../CONTRIBUTING.md) -- what a change is expected to bring with it
-- [Benchmark Regression Testing](../performance/benchmarking.md) -- the `bench-compare` method
+- [Benchmark Regression Testing](../testing/benchmarking.md) -- the `bench-compare` method

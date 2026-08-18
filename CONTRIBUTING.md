@@ -48,7 +48,7 @@ Useful targets:
 | `make verify-fips` | Runs the FIPS boundary under `GODEBUG=fips140=only` (excludes `pkg/internal/transport/...`) |
 | `make bench-<pkg>` | Benchmarks for one package (smoke test only) |
 | `make bench-compare` | Interleaved baseline-vs-working-tree comparison, benchstat |
-| `make remote-<target>` | Run any of the above on omega instead of your workstation |
+| `make remote-<target>` | Run any of the above on a remote build host instead of your workstation |
 
 `make ci` stops at `go test ./...` with no build tags, which excludes the
 integration, netfault, errfs and fuzz suites entirely. `make ci-full` is what
@@ -56,13 +56,14 @@ integration, netfault, errfs and fuzz suites entirely. `make ci-full` is what
 before opening a pull request.
 
 Run the heavy parts off-box. `make remote-<target>` rsyncs your working tree,
-uncommitted edits included, to omega (`jhahn@198.51.100.90`) and runs the
-target there, streaming output back:
+uncommitted edits included, to a remote build host and runs the target there,
+streaming output back. Point it at your own machine with `OMEGA_USER`,
+`OMEGA_HOST` and `OMEGA_DIR`:
 
 ```sh
 make remote-ci-full
 make remote-integration-test
-make remote-tools     # one-time: install the scanners omega lacks
+make remote-tools     # one-time: install the scanners the host lacks
 ```
 
 This is not politeness about shared hardware. Every target runs under `-race`
@@ -152,8 +153,8 @@ while the invariant itself is checked by
 
 ### Wire and persisted formats
 
-Read [docs/protocol/wire-format.md](docs/protocol/wire-format.md) and
-[docs/operations/compatibility.md](docs/operations/compatibility.md) first. The
+Read [docs/wire-protocol/engineering.md](docs/wire-protocol/engineering.md) and
+[docs/compatibility.md](docs/compatibility.md) first. The
 two rules that get broken most often:
 
 1. **The transport version is a SUPREMUM.** Bump `proto.WireVersion` whenever
@@ -195,7 +196,7 @@ Benchmark any change to append, replicate or apply, and include the numbers.
 Interleave the runs (`make bench-baseline` / `bench-compare`) -- a before-run
 followed by an after-run on a machine whose clock governor is `powersave` is
 not a measurement. See
-[docs/performance/benchmarking.md](docs/performance/benchmarking.md).
+[docs/testing/benchmarking.md](docs/testing/benchmarking.md).
 
 ### Public extension points
 
@@ -229,7 +230,7 @@ follow-up work.
 layout table by reading the `MarshalTo` body. Check a signature with `go doc`.
 Confirm a default in `SetDefaults`, which is authoritative over the field's
 own godoc when they disagree. Where two documents disagree,
-`docs/operations/compatibility.md` has historically been the correct one.
+`docs/compatibility.md` has historically been the correct one.
 
 **If you cannot verify a claim, delete it rather than restate it.** An
 unverifiable sentence carried forward is how the documentation drifted in the
