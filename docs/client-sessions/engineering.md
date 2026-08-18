@@ -1,4 +1,13 @@
-# Session-Based At-Most-Once Delivery
+# Client Sessions — Engineering Contract
+
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
+> `pkg/internal/session`, and the session fields of `pkg/proto` ·
+> Last verified: 2026-08-19
+> Conflicts with this document are defects. Fix them here first.
+
+Design rationale, rejected alternatives and the scope fence are in
+[`architecture.md`](architecture.md). The Go call surface is in
+[`api.md`](api.md).
 
 Client sessions in QuicRaft provide **at-most-once proposal delivery** by tracking (clientID, seriesID) pairs through Raft consensus. Session registration, unregistration, and result caches are replicated across the cluster so all nodes maintain identical deduplication state.
 
@@ -682,6 +691,44 @@ With deduplication, the second proposal returns the cached result immediately wi
 3. Raft replicates to all replicas.
 4. Each replica applies and removes the session, freeing its cached results and
    releasing its owner slot.
+
+## Test Strategy
+
+Target: `make test-session`, plus `make fuzz-session`.
+
+| Layer | Covers |
+|---|---|
+| **Unit** (`pkg/internal/session/*_test.go`) | registration, the response cache, per-owner and per-shard caps, deterministic expiry, the sentinel `SeriesID` handling |
+| **Unit** (`pkg/session_test.go`, `pkg/host_ondisk_sessions_test.go`, `pkg/host_session_policy_test.go`) | the public `Session` type, the on-disk refusal, and replicated policy changes |
+| **Fuzz** (`make fuzz-session`) | session-bearing entry decode |
+| **Integration** | duplicate proposals across a real cluster, and across a leader change |
+
+**What a test here must always assert**: that expiry is driven by *applied
+entries*, never by wall-clock time. A test that sleeps to force expiry is
+testing something the implementation deliberately does not do, and will pass on
+a fast machine while the real mechanism is broken.
+
+**Fault-injection seams**: propose the same `(clientID, seriesID)` twice; restart
+a node mid-series; take a snapshot between the two halves of a series.
+
+## Observability
+
+This feature emits **no metrics of its own**. What is observable, and where:
+
+| Signal | Source |
+|---|---|
+| session count per shard | the host `MetricsCollector`, against `MaxTotalSessions` |
+| a rejected registration | the error returned to the caller — `*SessionError`, `*SessionExpiredError` |
+| a served duplicate | invisible by design; it is indistinguishable from the original from the caller's side, which is the entire point |
+
+**Never log a `ClientID` alongside application data.** A `ClientID` is eight
+bytes the embedder chooses and an `OwnerID` names the embedder's tenant or
+account; both are the embedder's identifiers, not this library's, and this
+library makes no promise about what they contain.
+
+`OwnerID` is **not a security boundary on its own** — the value is whatever the
+embedder claims — so the per-owner cap it drives is only as trustworthy as the
+embedder's own authentication.
 
 ## Cross-References
 
