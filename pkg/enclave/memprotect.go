@@ -15,8 +15,20 @@
 // Package enclave provides userspace memory-protected containers for sensitive
 // cryptographic key material, built on memguard. ProtectedKey keeps a key
 // encrypted at rest in ordinary process memory via memguard.Enclave;
-// ProtectedBuffer provides an mlock'd, guard-paged buffer for the window in
-// which the plaintext key must actually be used.
+// MemoryEnclave is the region of locked memory itself — an mlock'd,
+// guard-paged buffer for the window in which the plaintext key must actually
+// be used.
+//
+// # Vocabulary
+//
+// MemoryEnclave is the portfolio-wide name for "a region of locked, zeroized
+// memory" (owner ruling, 2026-08-18). It replaces this package's original
+// ProtectedBuffer, which survives only as a deprecated alias so that consumers
+// compiled against the old name keep building until the coordinated
+// bottom-up rename wave. Do not introduce Secret, SecureString, SecureBytes or
+// another local synonym for this concept: one name across the stack is what
+// makes the protected-memory audit a grep rather than a re-reading of nine
+// codebases.
 //
 // # The name is not a hardware enclave
 //
@@ -31,7 +43,7 @@
 //
 // # What is actually guaranteed
 //
-//   - ProtectedBuffer: memory is mlock'd (excluded from swap), fenced by guard
+//   - MemoryEnclave: memory is mlock'd (excluded from swap), fenced by guard
 //     pages, and canary-checked, and Destroy WIPES it before unmapping. That
 //     wipe is real and is the strongest guarantee in this package.
 //   - ProtectedKey: the key material is AEAD-encrypted under a per-process
@@ -40,7 +52,7 @@
 //     without that session key, which is never written out and dies with the
 //     process.
 //   - Plaintext exposure is bounded to Open/Destroy windows, during which the
-//     key lives only in a ProtectedBuffer.
+//     key lives only in a MemoryEnclave.
 //
 // # What is NOT guaranteed
 //
@@ -92,11 +104,14 @@ func (e *OpenError) Unwrap() error {
 	return e.Err
 }
 
-// ProtectedBuffer wraps memguard.LockedBuffer for consistent memory protection
-// across all platforms. It provides guard pages, core dump prevention, and
-// guaranteed zeroing on destruction.
+// MemoryEnclave is a region of locked, zeroized memory: it wraps
+// memguard.LockedBuffer for consistent memory protection across all platforms,
+// providing guard pages, core dump prevention, and guaranteed zeroing on
+// destruction. It is where a key, passphrase, token, share or other sensitive
+// material lives for its whole lifetime instead of an ordinary []byte or an
+// un-wipeable string.
 //
-// OWNERSHIP: a ProtectedBuffer's CONTENTS are single-owner. memguard's
+// OWNERSHIP: a MemoryEnclave's CONTENTS are single-owner. memguard's
 // LockedBuffer is not safe for concurrent Destroy/read, so Bytes and Size must
 // not run concurrently with Destroy, and the slice returned by Bytes must not
 // outlive the buffer (Destroy zeroes and unmaps that memory).
@@ -105,33 +120,72 @@ func (e *OpenError) Unwrap() error {
 // ProtectedKey. That makes Destroy single-shot and idempotent under
 // concurrency — exactly one caller reaches memguard, the rest are no-ops — and
 // removes this type's own field race; it does not make the contents shareable.
-type ProtectedBuffer struct {
+//
+// RESOURCE: every MemoryEnclave is one mlock'd allocation, and locked memory is
+// a finite kernel resource (RLIMIT_MEMLOCK). memguard terminates the process
+// when a lock fails, so code that allocates enclaves proportionally to
+// untrusted or operator-supplied input must bound the count and Destroy as it
+// goes rather than at the end.
+type MemoryEnclave struct {
 	buf atomic.Pointer[memguard.LockedBuffer]
 }
 
-// newProtectedBuffer wraps an existing locked buffer.
-func newProtectedBuffer(buf *memguard.LockedBuffer) *ProtectedBuffer {
-	p := &ProtectedBuffer{}
+// ProtectedBuffer is the former name of MemoryEnclave.
+//
+// Deprecated: renamed to MemoryEnclave, which says what the type is — a region
+// of locked, zeroized memory — and matches the name used across the stack. It
+// is an ALIAS, not a distinct type, so existing consumers keep compiling and
+// *ProtectedBuffer and *MemoryEnclave are interchangeable everywhere; the old
+// name is removed in the coordinated bottom-up rename, not before.
+type ProtectedBuffer = MemoryEnclave
+
+// newMemoryEnclave wraps an existing locked buffer.
+func newMemoryEnclave(buf *memguard.LockedBuffer) *MemoryEnclave {
+	p := &MemoryEnclave{}
 	p.buf.Store(buf)
 	return p
 }
 
-// NewProtectedBuffer allocates a memory-protected buffer of the given size.
-// The buffer is locked in memory with guard pages on both sides.
-func NewProtectedBuffer(size int) *ProtectedBuffer {
-	return newProtectedBuffer(memguard.NewBuffer(size))
+// NewMemoryEnclave allocates a region of locked memory of the given size,
+// guard-paged on both sides. The contents are MUTABLE — the caller writes the
+// sensitive material directly into Bytes and should call Freeze once it is
+// final — which is what lets a producer build its output inside the enclave
+// instead of assembling it on the ordinary heap and copying it in.
+func NewMemoryEnclave(size int) *MemoryEnclave {
+	return newMemoryEnclave(memguard.NewBuffer(size))
 }
 
-// NewProtectedBufferFromBytes creates a memory-protected buffer from existing bytes.
-// The source slice is wiped after copying into the protected buffer.
-func NewProtectedBufferFromBytes(data []byte) *ProtectedBuffer {
-	return newProtectedBuffer(memguard.NewBufferFromBytes(data))
+// NewMemoryEnclaveFromBytes moves existing bytes into a region of locked
+// memory. The source slice is WIPED after the copy, and the resulting enclave
+// is frozen read-only.
+//
+// Prefer NewMemoryEnclave and write into it where the material can be produced
+// in place: bytes that reach this constructor already existed unprotected.
+func NewMemoryEnclaveFromBytes(data []byte) *MemoryEnclave {
+	return newMemoryEnclave(memguard.NewBufferFromBytes(data))
+}
+
+// NewProtectedBuffer allocates a memory-protected buffer of the given size.
+//
+// Deprecated: use NewMemoryEnclave. Identical behaviour and identical return
+// type; only the name changed.
+func NewProtectedBuffer(size int) *MemoryEnclave {
+	return NewMemoryEnclave(size)
+}
+
+// NewProtectedBufferFromBytes creates a memory-protected buffer from existing
+// bytes, wiping the source.
+//
+// Deprecated: use NewMemoryEnclaveFromBytes. Identical behaviour and identical
+// return type; only the name changed.
+func NewProtectedBufferFromBytes(data []byte) *MemoryEnclave {
+	return NewMemoryEnclaveFromBytes(data)
 }
 
 // Bytes returns the underlying byte slice, or nil once the buffer has been
 // destroyed. The caller must NOT store this reference beyond the lifetime of
 // the ProtectedBuffer.
-func (p *ProtectedBuffer) Bytes() []byte {
+func (p *MemoryEnclave) Bytes() []byte {
 	buf := p.buf.Load()
 	if buf == nil {
 		return nil
@@ -140,7 +194,7 @@ func (p *ProtectedBuffer) Bytes() []byte {
 }
 
 // Size returns the size of the protected buffer, or 0 once destroyed.
-func (p *ProtectedBuffer) Size() int {
+func (p *MemoryEnclave) Size() int {
 	buf := p.buf.Load()
 	if buf == nil {
 		return 0
@@ -148,10 +202,22 @@ func (p *ProtectedBuffer) Size() int {
 	return buf.Size()
 }
 
+// Freeze makes the enclave's memory read-only. It is the second half of the
+// NewMemoryEnclave pattern: allocate, write the material in place, freeze. A
+// write after Freeze faults, which is the point — the material is final and
+// nothing should be able to mutate it in place. Destroy still works on a
+// frozen enclave (it melts the pages before wiping them). Freeze is a no-op on
+// a nil or already-destroyed enclave.
+func (p *MemoryEnclave) Freeze() {
+	if buf := p.buf.Load(); buf != nil {
+		buf.Freeze()
+	}
+}
+
 // Destroy zeroes and releases the protected memory. Safe to call multiple
 // times and concurrently with Bytes/Size; only the caller that wins the swap
 // destroys the buffer.
-func (p *ProtectedBuffer) Destroy() {
+func (p *MemoryEnclave) Destroy() {
 	if buf := p.buf.Swap(nil); buf != nil {
 		buf.Destroy()
 	}
@@ -164,8 +230,8 @@ func (p *ProtectedBuffer) Destroy() {
 // cannot be erased. Clear revokes the ABILITY to open the key; the enclave's
 // ciphertext remains on the heap until the GC reclaims it, because memguard
 // offers no way to zero it. Callers that need erasure of the plaintext have it
-// already — the plaintext exists only inside the ProtectedBuffer that Open
-// returns, and ProtectedBuffer.Destroy genuinely wipes. Callers that need
+// already — the plaintext exists only inside the MemoryEnclave that Open
+// returns, and MemoryEnclave.Destroy genuinely wipes. Callers that need
 // erasure of the ciphertext cannot get it from this type; treat the key as
 // GC-bounded, not wiped. See the package doc.
 //
@@ -187,9 +253,9 @@ func NewProtectedKey(key []byte) *ProtectedKey {
 	return p
 }
 
-// Open decrypts the key material and returns a ProtectedBuffer.
-// The caller must call Destroy() on the returned buffer when done.
-func (p *ProtectedKey) Open() (*ProtectedBuffer, error) {
+// Open decrypts the key material into a MemoryEnclave.
+// The caller must call Destroy() on the returned enclave when done.
+func (p *ProtectedKey) Open() (*MemoryEnclave, error) {
 	enclave := p.enclave.Load()
 	if enclave == nil {
 		return nil, ErrEnclaveNil
@@ -198,7 +264,7 @@ func (p *ProtectedKey) Open() (*ProtectedBuffer, error) {
 	if err != nil {
 		return nil, &OpenError{Err: err}
 	}
-	return newProtectedBuffer(buf), nil
+	return newMemoryEnclave(buf), nil
 }
 
 // Clear drops the enclave reference so the key can no longer be opened.
@@ -222,12 +288,12 @@ func (p *ProtectedKey) Clear() {
 	p.enclave.Store(nil)
 }
 
-// SealProtectedBuffer creates a new ProtectedKey from a ProtectedBuffer,
-// CONSUMING the buffer: ownership transfers to the returned key and the
+// SealMemoryEnclave creates a new ProtectedKey from a MemoryEnclave,
+// CONSUMING the enclave: ownership transfers to the returned key and the
 // argument is left empty (Bytes returns nil, Size returns 0). Returns nil if
-// the buffer is nil or already consumed/destroyed. Only the caller that wins
+// the enclave is nil or already consumed/destroyed. Only the caller that wins
 // the swap seals; a concurrent second call gets nil.
-func SealProtectedBuffer(buf *ProtectedBuffer) *ProtectedKey {
+func SealMemoryEnclave(buf *MemoryEnclave) *ProtectedKey {
 	if buf == nil {
 		return nil
 	}
@@ -238,6 +304,15 @@ func SealProtectedBuffer(buf *ProtectedBuffer) *ProtectedKey {
 	p := &ProtectedKey{}
 	p.enclave.Store(locked.Seal())
 	return p
+}
+
+// SealProtectedBuffer creates a new ProtectedKey from a MemoryEnclave,
+// consuming it.
+//
+// Deprecated: use SealMemoryEnclave. Identical behaviour; only the name
+// changed.
+func SealProtectedBuffer(buf *MemoryEnclave) *ProtectedKey {
+	return SealMemoryEnclave(buf)
 }
 
 // WipeBytes securely zeroes a byte slice using memguard's wiping mechanism.

@@ -48,6 +48,16 @@ type Share struct {
 	// Total is the N of the M-of-N scheme. Unauthenticated, like Threshold.
 	Total int `json:"total"`
 	// Value is the base64 encoding of [version:1][x:1][y...].
+	//
+	// Deprecated: a Go string is immortal — it cannot be zeroed, so every
+	// share stays readable in the heap until the GC reclaims it, and a
+	// ceremony holding all N shares is the point of widest exposure in the
+	// whole scheme. Use ProtectedShare, whose value lives in an mlock'd,
+	// guard-paged enclave.MemoryEnclave that Destroy genuinely wipes;
+	// SplitProtected and CombineProtected are the Split/Combine equivalents,
+	// and Share.Protect moves an existing Share onto that path. The field
+	// itself remains: this type is still the JSON shape shares are persisted
+	// and distributed in, and removing it would break every consumer at once.
 	Value string `json:"value"`
 	// Metadata is caller-defined and carries no cryptographic meaning.
 	Metadata map[string]string `json:"metadata,omitempty"`
@@ -110,17 +120,8 @@ func (s *Share) Validate() error {
 	if s == nil {
 		return &ValidationError{Field: "share", Reason: "share is nil"}
 	}
-	if s.Index < 1 {
-		return &ValidationError{Field: "index", Reason: fmt.Sprintf("must be >= 1, got %d", s.Index)}
-	}
-	if s.Threshold < 2 {
-		return &ValidationError{Field: "threshold", Reason: fmt.Sprintf("must be >= 2, got %d", s.Threshold)}
-	}
-	if s.Total < s.Threshold {
-		return &ValidationError{Field: "total", Reason: fmt.Sprintf("must be >= threshold %d, got %d", s.Threshold, s.Total)}
-	}
-	if s.Index > s.Total {
-		return &ValidationError{Field: "index", Reason: fmt.Sprintf("must be <= total %d, got %d", s.Total, s.Index)}
+	if err := validateShareHeader(s.Index, s.Threshold, s.Total); err != nil {
+		return err
 	}
 	if s.Value == "" {
 		return &ValidationError{Field: "value", Reason: "cannot be empty"}

@@ -90,6 +90,35 @@ func testOnlyRandReader(r io.Reader) func() {
 	return func() { randReader = prev }
 }
 
+// validateSplitParams checks the scheme parameters every generation path
+// shares. It is the single copy of those rules, used by SplitBytes and by
+// SplitProtected, so the plain and protected generation paths cannot drift
+// into accepting different arguments — the same reason parseRawShare is the
+// single copy of the wire-format rules.
+func validateSplitParams(secret []byte, threshold, total int) error {
+	if threshold < 2 {
+		return &SplitError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
+	}
+	if total < threshold {
+		return &SplitError{Reason: fmt.Sprintf("total shares (%d) must be >= threshold (%d)", total, threshold)}
+	}
+	if threshold > maxShares {
+		return &SplitError{Reason: fmt.Sprintf("threshold cannot exceed %d, got %d", maxShares, threshold)}
+	}
+	if total > maxShares {
+		return &SplitError{Reason: fmt.Sprintf("total shares cannot exceed %d, got %d", maxShares, total)}
+	}
+	if len(secret) == 0 {
+		return &SplitError{Reason: "secret cannot be empty"}
+	}
+	if len(secret) > MaxSecretBytes {
+		return &SplitError{Reason: fmt.Sprintf(
+			"secret is %d bytes, exceeding the %d-byte limit; share a key that envelopes the payload, not the payload",
+			len(secret), MaxSecretBytes)}
+	}
+	return nil
+}
+
 // Split divides a secret into N shares where any M shares can reconstruct it.
 //
 // Each share's Value is the base64 encoding of [version:1][x:1][y...]
@@ -103,6 +132,12 @@ func testOnlyRandReader(r io.Reader) func() {
 // it cannot take away. A ceremony holds all N shares at once, so this is the
 // point of widest exposure in the whole scheme — callers that can keep share
 // material in wipeable buffers should use SplitBytes and feed CombineBytes.
+//
+// Deprecated: the shares this returns carry their value in that un-wipeable
+// string. Use SplitProtected, which returns the same shares with their values
+// in mlock'd, guard-paged buffers that Destroy wipes, or SplitBytes if the
+// caller manages the buffers itself. Split remains for the consumers compiled
+// against it; nothing about the shares it produces has changed.
 func Split(secret []byte, threshold, total int) ([]*Share, error) {
 	values, err := SplitBytes(secret, threshold, total)
 	if err != nil {
@@ -137,25 +172,8 @@ func Split(secret []byte, threshold, total int) ([]*Share, error) {
 //
 // The caller MUST wipe the returned buffers when done with them.
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
-	if threshold < 2 {
-		return nil, &SplitError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
-	}
-	if total < threshold {
-		return nil, &SplitError{Reason: fmt.Sprintf("total shares (%d) must be >= threshold (%d)", total, threshold)}
-	}
-	if threshold > 255 {
-		return nil, &SplitError{Reason: fmt.Sprintf("threshold cannot exceed 255, got %d", threshold)}
-	}
-	if total > 255 {
-		return nil, &SplitError{Reason: fmt.Sprintf("total shares cannot exceed 255, got %d", total)}
-	}
-	if len(secret) == 0 {
-		return nil, &SplitError{Reason: "secret cannot be empty"}
-	}
-	if len(secret) > MaxSecretBytes {
-		return nil, &SplitError{Reason: fmt.Sprintf(
-			"secret is %d bytes, exceeding the %d-byte limit; share a key that envelopes the payload, not the payload",
-			len(secret), MaxSecretBytes)}
+	if err := validateSplitParams(secret, threshold, total); err != nil {
+		return nil, err
 	}
 
 	// Random coefficients: one degree-(threshold-1) polynomial per secret
@@ -218,6 +236,12 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 // using it as the key in an authenticated decrypt that fails on a wrong key.
 // Combine is identical to CombineUnverified; both names are retained to let
 // callers express intent.
+//
+// Deprecated: it reconstructs from shares whose values are un-wipeable Go
+// strings, and returns the secret in an ordinary heap buffer. Use
+// CombineProtected, which reads the share values in place out of protected
+// memory and returns the secret in a buffer the caller can wipe, or
+// CombineBytes if the caller manages the buffers itself.
 func Combine(shares []*Share) ([]byte, error) {
 	return CombineUnverified(shares)
 }
@@ -229,6 +253,10 @@ func Combine(shares []*Share) ([]byte, error) {
 // decrypt that will fail on a wrong key): with fewer-than-threshold
 // genuine shares or a corrupted share, reconstruction yields
 // indistinguishable garbage, not an error.
+//
+// Deprecated: for the reason given on Combine, which this is identical to. Use
+// CombineProtected or CombineBytes. Neither replacement verifies either — no
+// reconstruction here does, and none can (see Combine).
 func CombineUnverified(shares []*Share) ([]byte, error) {
 	if len(shares) == 0 {
 		return nil, &CombineError{Reason: "no shares provided"}
@@ -356,20 +384,48 @@ func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (b
 	return x, y, nil
 }
 
-// interpolateSecret reconstructs the secret via GF(2^8) Lagrange interpolation
-// at x=0 from the public x-coordinates and the per-share y-payloads. The basis
-// coefficients depend only on the public x-coordinates and are computed once;
-// secret-dependent y bytes flow only through constant-time gfMul.
-func interpolateSecret(xs []byte, ys [][]byte, secretLen int) []byte {
+// interpolateSecretInto reconstructs the secret via GF(2^8) Lagrange
+// interpolation at x=0 from the public x-coordinates and the per-share
+// y-payloads, writing it into dst — which is len(secret) bytes and may be
+// memory-protected storage, so the protected reconstruction path never
+// materializes the secret anywhere else. The basis coefficients depend only on
+// the public x-coordinates and are computed once; secret-dependent y bytes flow
+// only through constant-time gfMul.
+//
+// basis and xs are deliberately ORDINARY heap allocations: an x-coordinate is a
+// share index, published with the share and known to anyone holding one, and
+// the Lagrange basis is a function of those indices alone. Nothing derived from
+// the secret is written outside dst.
+func interpolateSecretInto(dst []byte, xs []byte, ys [][]byte) {
 	basis := gfLagrangeZero(xs)
-	secret := make([]byte, secretLen)
-	for b := 0; b < secretLen; b++ {
+	for b := range dst {
 		var v byte
 		for j := range ys {
 			v ^= gfMul(ys[j][b], basis[j])
 		}
-		secret[b] = v
+		dst[b] = v
 	}
+}
+
+// accumulateShareInto adds ONE share's contribution to a partially interpolated
+// secret: dst ^= coeff * y over GF(2^8), where coeff is that share's Lagrange
+// basis value at x=0. It is interpolateSecretInto's inner sum turned inside
+// out, so a caller that cannot afford to hold every decoded y-payload at once
+// (CombineProtected, where each one is locked memory) can fold each share in as
+// it decodes it and reuse the buffer. dst must be zeroed before the first call
+// and is the running total; y must be the same length as dst. Secret-dependent
+// bytes flow only through gfMul, as in interpolateSecretInto.
+func accumulateShareInto(dst, y []byte, coeff byte) {
+	for b := range dst {
+		dst[b] ^= gfMul(y[b], coeff)
+	}
+}
+
+// interpolateSecret is interpolateSecretInto writing into a freshly allocated
+// ordinary heap buffer, for the callers that return one.
+func interpolateSecret(xs []byte, ys [][]byte, secretLen int) []byte {
+	secret := make([]byte, secretLen)
+	interpolateSecretInto(secret, xs, ys)
 	return secret
 }
 

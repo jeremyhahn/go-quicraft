@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Shamir share values in protected memory
+
+- **`ProtectedShare`, the protected-memory counterpart of `Share`
+  (`pkg/crypto/shamir/protected_share.go`).** `Share.Value` is a Go string and
+  a string is immortal: it cannot be zeroed, so every share stays readable in
+  the heap until the collector reclaims it, and a ceremony holding all N shares
+  is the widest exposure in the scheme. A `ProtectedShare` holds its value in
+  an `enclave.MemoryEnclave` — mlock'd, guard-paged, canary-checked, and
+  genuinely wiped by `Destroy`.
+
+  New API, all additive:
+
+  - `SplitProtected(secret, threshold, total)` — `Split` with protected values.
+  - `CombineProtected(shares)` — reconstructs from protected shares and returns
+    the secret in a `*enclave.MemoryEnclave` the caller destroys. The share
+    values are read in place and never copied out of protected memory.
+  - `NewProtectedShare(index, threshold, total, value)` — copies a share value
+    into protected memory and WIPES the source, so custody code can carry share
+    bytes in wipeable buffers from the moment they exist.
+  - `(*Share).Protect()` — the migration bridge for callers that already hold
+    plain shares. It bounds further exposure; it cannot unmake the string.
+  - `(*ProtectedShare)` `Value`, `Destroy`, `Validate`, `String`, `LogValue`,
+    `MarshalJSON`, `UnmarshalJSON`.
+  - `UnmarshalShareSet(data)` and `MaxShareSetBytes` — the bounded ingestion
+    path for a share set arriving from outside the process (below).
+
+  The JSON encoding is byte-for-byte what `Share` produces, so the two types
+  are interchangeable on the wire and a consumer can migrate one call site at a
+  time. `MarshalJSON` is written by hand rather than delegated to
+  `json.Marshal` for the reason the type exists — marshalling through a string
+  field would mint exactly the immortal share string being avoided — and sizes
+  its buffer exactly so no append reallocates and strands an un-wiped copy.
+  `UnmarshalJSON` decodes the value as a `json.RawMessage` for the same reason,
+  and destroys any value the target share already held, because `json.Unmarshal`
+  reuses the elements of a non-empty slice.
+
+  `CombineProtected` holds exactly ONE decoded share at a time, whatever the
+  size of the set: it walks the shares once to validate them and fix the
+  x-coordinates, then again to fold each share's contribution into the result
+  through the reused buffer (`accumulateShareInto`, `interpolateSecretInto`'s
+  inner sum turned inside out). Holding a decoded copy of every share would
+  make the peak locked footprint of a reconstruction proportional to the
+  submitted set — another ~16 MiB for 255 maximum-size shares — and locked
+  memory is the one allocation this process cannot fail gracefully. Decoding
+  base64 twice is cheap; a peak an untrusted set gets to choose is not.
+
+  Both paths are protected-**native**: `SplitProtected` reads the polynomial
+  coefficients straight into locked memory and encodes each share value
+  directly into the locked buffer that share will own, and `CombineProtected`
+  decodes each share value in place into locked memory and interpolates
+  directly into the locked buffer it returns. Neither routes through
+  `SplitBytes` or `CombineBytes`, which by contract hand back ordinary heap
+  buffers: no secret-derived byte is written to unprotected memory on either
+  path, not even to a buffer that is wiped afterwards. Only the share
+  x-coordinates and the Lagrange basis derived from them stay on the ordinary
+  heap — an x-coordinate is a published share index, not secret.
+
+  The rules are still not duplicated: both paths run `parseRawShare`, the
+  single copy of the wire-format rules that `combine` and `CombineBytes` use,
+  so the string and protected paths cannot drift into accepting different share
+  sets, and `validateSplitParams` (extracted from `SplitBytes`, no behaviour
+  change) is the single copy of the scheme-parameter rules. `validateShareHeader`
+  is likewise now the single copy of the index/threshold/total rules, shared by
+  `Share.Validate` and `ProtectedShare.Validate` (no behaviour change).
+
+  Share values are validated against the full standard-base64 grammar —
+  length, alphabet and padding placement — before they enter protected memory,
+  rather than alphabet membership alone: `"A"`, `"===="` and `"A=AA"` are made
+  of legal characters and none of them decodes. The check is exactly what
+  `base64.StdEncoding.Decode` accepts, so it never rejects a share the
+  deprecated `Share` path would take, and it still does not decode (decoding to
+  validate would materialize a second plaintext copy of the payload).
+
+  A share value is also bounded to the encoding of a `MaxSecretBytes` payload
+  **before** any locked memory is allocated for it. On the string path an
+  oversized share costs a heap allocation and `parseRawShare` rejects it during
+  combine; on this path the allocation is `mlock`'d memory, a finite kernel
+  resource whose exhaustion memguard answers by terminating the process, and
+  `UnmarshalJSON` constructs from operator-supplied JSON that a recovery
+  ceremony cannot authenticate before combining it. The bound is exactly the
+  one `parseRawShare` applies, moved ahead of the allocation it has to guard.
+
+  Those bounds are per VALUE, so the two paths that allocate a whole SET price
+  the set itself against `MaxShareSetBytes` — the locked memory this package
+  will spend on one share set — before allocating any of it. `SplitProtected`
+  prices the footprint its arguments imply (coefficients, scratch and every
+  returned value) and returns a `*SplitError` if it does not fit: individually
+  legal arguments multiply, and a 64 KiB secret split 255 ways needs ~16 MiB of
+  polynomial coefficients before a single share exists. And a set decoded from
+  untrusted JSON is bounded by `UnmarshalShareSet`: 255 individually legal shares
+  still add up to ~22 MiB of locked payload, past the 8 MiB `RLIMIT_MEMLOCK` a
+  Linux host commonly defaults to, and `CombineProtected`'s 255-share check
+  runs on shares that have already been allocated. `UnmarshalShareSet` checks
+  the element count (255, the scheme's own limit) and the document size
+  (`MaxShareSetBytes`, 1 MiB) against the UNDECODED document, before the first
+  locked buffer exists, and destroys the accepted prefix if a later element is
+  rejected. Since shares cannot be authenticated before they are combined, a
+  recovery endpoint decodes whatever it is handed, so that ceiling has to be
+  the service's choice rather than the submission's. The budget is stated as
+  policy rather than derived from the scheme: a full 255-share ceremony over a
+  32-byte root key is ~12 KiB of JSON, and a caller that legitimately needs
+  more does its own accounting and decodes share by share with
+  `NewProtectedShare`. `ProtectedShare.UnmarshalJSON` documents that it decodes
+  one share and is not the ingestion path for an untrusted set.
+
+  Two obligations come with the type, both documented on it: every
+  `ProtectedShare` must be destroyed — **including one produced by
+  `json.Unmarshal`**, since decoding is a construction — and each share is one
+  `RLIMIT_MEMLOCK` allocation, so a ceremony should destroy shares as it
+  consumes them rather than at the end.
+
+### Changed — `pkg/enclave`: `ProtectedBuffer` is now `MemoryEnclave`
+
+- **The locked-memory type is named `MemoryEnclave`** (owner ruling,
+  2026-08-18): the name describes the mechanism — a region of locked, zeroized
+  memory — where "buffer", "secret" or "secure string" describe nothing in
+  particular and already mean other things in this stack. One vocabulary across
+  the portfolio is what keeps the protected-memory audit a grep.
+
+  `NewMemoryEnclave`, `NewMemoryEnclaveFromBytes` and `SealMemoryEnclave` join
+  it. **Nothing broke**: `ProtectedBuffer` remains as a type ALIAS and the old
+  constructors as thin wrappers, all marked deprecated, so every consumer —
+  including `seal.ProtectedBuffer`, which re-exports it — keeps compiling and
+  the two names remain interchangeable. Removing the old names belongs to the
+  coordinated bottom-up wave, not here.
+
+- **`(*MemoryEnclave).Freeze`** makes an enclave's memory read-only, completing
+  the allocate → write in place → freeze pattern. It is what lets a producer
+  build its output inside locked memory (as `SplitProtected` now does) and still
+  end up with the read-only buffer `NewMemoryEnclaveFromBytes` would have
+  produced, without the unprotected intermediate copy.
+
 ### Changed - FIPS 140-3 compliance
 
 - **`pkg/seal` no longer supplies its own AES-GCM IVs.** `newAESGCM` now builds
@@ -58,6 +190,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol definition (RFC 6960 §4.1.1, in `x/crypto/ocsp`). **`-tags fips`
   therefore makes go-quicraft FIPS at rest, not FIPS on the wire**; the
   transport's status is an open owner-level decision (issue #5).
+
+### Deprecated — the plain-string Shamir share path
+
+- **`Share.Value`, `Split`, `Combine` and `CombineUnverified` are marked
+  deprecated**, each naming its replacement above. Nothing was removed and no
+  exported signature changed: this release is source- and behaviour-compatible
+  for every existing consumer, and `Share` remains the JSON shape shares are
+  persisted and distributed in. Moving the exported signatures onto the
+  protected types is a breaking change across the whole consumer chain and is
+  deferred to a single coordinated wave (owner ruling, 2026-08-18); this change
+  is the additive half so that new and migrated call sites have somewhere to
+  go.
+
+- `SplitBytes` and `CombineBytes` are **not** deprecated: they remain the path
+  for a caller that manages its own wipeable buffers. `ProtectedShare` is for
+  the caller that wants the buffer managed for it.
 
 ### Fixed - consensus safety
 

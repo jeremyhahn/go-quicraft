@@ -488,3 +488,117 @@ func TestSealProtectedBuffer_ConsumedBufferReturnsNil(t *testing.T) {
 		t.Fatal("second SealProtectedBuffer should return nil for a consumed buffer")
 	}
 }
+
+// TestMemoryEnclave_WriteInPlaceThenFreeze covers the allocate → write in
+// place → freeze pattern that lets a producer build sensitive output inside
+// locked memory instead of assembling it on the ordinary heap and copying it
+// in (see shamir.SplitProtected). A fresh enclave must be writable, and frozen
+// must mean frozen.
+func TestMemoryEnclave_WriteInPlaceThenFreeze(t *testing.T) {
+	e := NewMemoryEnclave(8)
+	if e == nil {
+		t.Fatal("NewMemoryEnclave returned nil")
+	}
+	defer e.Destroy()
+
+	if !e.buf.Load().IsMutable() {
+		t.Fatal("a freshly allocated enclave must be writable, or nothing can be produced in place")
+	}
+	copy(e.Bytes(), []byte("in-place"))
+	if got := string(e.Bytes()); got != "in-place" {
+		t.Fatalf("enclave contents = %q, want %q", got, "in-place")
+	}
+
+	e.Freeze()
+	if e.buf.Load().IsMutable() {
+		t.Fatal("enclave is still mutable after Freeze")
+	}
+	if got := string(e.Bytes()); got != "in-place" {
+		t.Fatalf("Freeze altered the contents: %q", got)
+	}
+
+	// Destroy must still wipe and release a frozen enclave — memguard melts
+	// the pages before wiping them — or freezing would be a memory leak.
+	e.Destroy()
+	if e.Bytes() != nil || e.Size() != 0 {
+		t.Fatal("a frozen enclave survived Destroy")
+	}
+}
+
+// TestMemoryEnclave_FreezeIsSafeOnDestroyed verifies Freeze is a no-op rather
+// than a panic once the enclave is gone: Destroy is single-shot and idempotent,
+// and Freeze must not be the one method that breaks that.
+func TestMemoryEnclave_FreezeIsSafeOnDestroyed(t *testing.T) {
+	e := NewMemoryEnclave(16)
+	e.Destroy()
+	e.Freeze()
+	e.Freeze()
+}
+
+// TestMemoryEnclave_FromBytesWipesSourceAndFreezes verifies the constructor's
+// two contracts at once.
+func TestMemoryEnclave_FromBytesWipesSourceAndFreezes(t *testing.T) {
+	source := []byte("root key material, 32 bytes long")
+	want := append([]byte(nil), source...)
+
+	e := NewMemoryEnclaveFromBytes(source)
+	defer e.Destroy()
+
+	if !bytes.Equal(e.Bytes(), want) {
+		t.Fatalf("enclave contents = %q, want %q", e.Bytes(), want)
+	}
+	for _, b := range source {
+		if b != 0 {
+			t.Fatalf("source slice was not wiped by NewMemoryEnclaveFromBytes: %x", source)
+		}
+	}
+	if e.buf.Load().IsMutable() {
+		t.Error("NewMemoryEnclaveFromBytes must return a frozen enclave")
+	}
+}
+
+// TestProtectedBufferAliasesMemoryEnclave is the compatibility guard for the
+// rename. ProtectedBuffer is an ALIAS, not a distinct type, so a consumer
+// compiled against either name keeps working and the two are interchangeable
+// in every signature — which is what makes the rename non-breaking ahead of
+// the coordinated wave. If someone later turns the alias into a defined type,
+// this stops compiling.
+func TestProtectedBufferAliasesMemoryEnclave(t *testing.T) {
+	var e *MemoryEnclave = NewProtectedBuffer(16)
+	defer e.Destroy()
+	var pb *ProtectedBuffer = e
+	if pb.Size() != 16 {
+		t.Fatalf("expected size=16 through the deprecated alias, got %d", pb.Size())
+	}
+
+	sealed := NewProtectedBufferFromBytes([]byte("sealed through the old name!!!!!"))
+	var alias *ProtectedBuffer = sealed
+	if key := SealMemoryEnclave(alias); key == nil {
+		t.Fatal("SealMemoryEnclave rejected a buffer built by the deprecated constructor")
+	}
+}
+
+// TestSealMemoryEnclaveAndDeprecatedAliasAgree verifies the deprecated wrapper
+// is the same function, not a diverging copy.
+func TestSealMemoryEnclaveAndDeprecatedAliasAgree(t *testing.T) {
+	for name, seal := range map[string]func(*MemoryEnclave) *ProtectedKey{
+		"SealMemoryEnclave":   SealMemoryEnclave,
+		"SealProtectedBuffer": SealProtectedBuffer,
+	} {
+		key := seal(NewMemoryEnclaveFromBytes([]byte("thirty-two bytes of key material")))
+		if key == nil {
+			t.Fatalf("%s returned nil for a live enclave", name)
+		}
+		opened, err := key.Open()
+		if err != nil {
+			t.Fatalf("%s: Open returned unexpected error: %v", name, err)
+		}
+		if got := string(opened.Bytes()); got != "thirty-two bytes of key material" {
+			t.Errorf("%s: opened %q, want the sealed material", name, got)
+		}
+		opened.Destroy()
+		if seal(nil) != nil {
+			t.Errorf("%s(nil) must return nil", name)
+		}
+	}
+}

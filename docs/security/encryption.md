@@ -1245,6 +1245,81 @@ who skips this silently accepts a garbage reconstructed root key. (The
 accumulator/custody machinery that drives this path lives in go-qrdb, not
 here.)
 
+### Share values in protected memory
+
+`Share.Value` is a Go `string`, and a string is immortal: it cannot be zeroed,
+so every share stays readable in the heap until the collector reclaims it. A
+ceremony holding all N shares at once is the widest exposure in the scheme.
+That field, and the `Split` / `Combine` / `CombineUnverified` functions that
+hand out and consume it, are **deprecated**.
+
+The replacement is `ProtectedShare`, whose value lives in an
+`enclave.MemoryEnclave` — mlock'd, guard-paged, canary-checked, and genuinely
+wiped by `Destroy`:
+
+| Deprecated (string custody) | Protected replacement |
+|---|---|
+| `Split` | `SplitProtected` |
+| `Combine`, `CombineUnverified` | `CombineProtected` (returns the secret in a `*enclave.MemoryEnclave`) |
+| `&Share{…, Value: v}` | `NewProtectedShare(index, threshold, total, value)` — wipes the source |
+| an existing `*Share` | `(*Share).Protect()` |
+
+Both protected paths are **native**, not wrappers: `SplitProtected` reads the
+polynomial coefficients into locked memory and encodes each share value
+directly into the locked buffer that share will own, and `CombineProtected`
+decodes each share value in place and interpolates directly into the locked
+buffer it returns. Neither routes through `SplitBytes`/`CombineBytes`, which by
+contract return ordinary heap buffers, so no secret-derived byte is ever
+written to unprotected memory — not even to one that is wiped afterwards. The
+share x-coordinates and the Lagrange basis derived from them are the exception
+and stay on the ordinary heap: an x-coordinate is a published share index, not
+secret material.
+
+`CombineProtected` also holds only **one decoded share at a time**, walking the
+set twice against a single reused buffer rather than keeping every decoded
+payload: the peak locked memory of a reconstruction is a property of the share
+size, not of how many shares were submitted.
+
+`SplitBytes` and `CombineBytes` are unchanged and are still the right path for
+a caller that manages its own wipeable buffers; `ProtectedShare` is for the
+caller that wants the buffer managed for it.
+
+Two obligations come with the protected type:
+
+- **Every `ProtectedShare` must be `Destroy`ed, including one produced by
+  `json.Unmarshal`** — decoding is a construction. An abandoned share holds a
+  locked allocation for the life of the process.
+- **Locked memory is a finite kernel resource** (`RLIMIT_MEMLOCK`), and each
+  share is one locked allocation. Destroy shares as they are consumed rather
+  than at the end of a ceremony.
+
+Because of the second one, the two calls that allocate a whole set price it
+first. `SplitProtected` rejects parameters whose footprint — coefficients,
+scratch and every returned share value — exceeds `MaxShareSetBytes` (1 MiB),
+since individually legal arguments multiply into one no host can lock (a 64 KiB
+secret split 255 ways needs ~16 MiB of coefficients alone) and a failed lock is
+a dead process rather than an error. A full 255-share ceremony over a 32-byte
+root key needs ~24 KiB of that budget; sharing a 4 KiB *payload* 255 ways does
+not fit and should be enveloped under a key that does.
+
+And **shares arriving from outside the process are
+decoded with `UnmarshalShareSet`, not `json.Unmarshal` into a
+`[]*ProtectedShare`.** Shares are unauthenticated by construction — nothing
+about one can be checked until the set is combined — so a recovery endpoint
+necessarily decodes whatever it is handed, and the generic decoder allocates one
+locked buffer per element as it visits them: the submission, not the service,
+would choose how much locked memory to take, and memguard answers a failed lock
+by terminating the process. `UnmarshalShareSet` bounds the element count
+(255, the scheme's own limit) and the document size (`MaxShareSetBytes`, 1 MiB —
+a full 255-share ceremony over a 32-byte root key is ~12 KiB) before it
+allocates any of it, and destroys the accepted prefix if a later element is
+rejected. A ceremony that legitimately needs more than the budget does its own
+accounting and decodes share by share with `NewProtectedShare`.
+
+Nothing was removed and no signature changed: the JSON a `ProtectedShare`
+marshals is byte-for-byte what a `Share` marshals, so the two are
+interchangeable on the wire and a consumer can migrate one call site at a time.
+
 The **Shamir sealing strategy** (splitting the root key), **share custody**, the
 **M-of-N quorum/unseal orchestration**, and the **Security-Officer CSR challenge-response
 ceremony** are NOT part of the consensus engine. They are a database-server / custody
@@ -1266,8 +1341,10 @@ containers for key material in the process's own address space:
 
 - `ProtectedKey` wraps a `memguard.Enclave`, keeping a key encrypted at rest
   in process memory and decrypting it only into a guarded buffer for use.
-- `ProtectedBuffer` provides `mlock`'d, guard-page-protected buffers for
-  temporary access.
+- `MemoryEnclave` provides `mlock`'d, guard-page-protected buffers for
+  temporary access — the region of locked, zeroized memory itself. It was
+  called `ProtectedBuffer`; that name survives as a deprecated alias so
+  consumers keep compiling until the coordinated rename wave.
 - `WipeBytes` zeroes a plain byte slice.
 
 For hardware-backed key protection (TPM 2.0, PKCS#11, cloud KMS), the barrier
