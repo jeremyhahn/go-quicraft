@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0-alpha] - 2026-08-18
+
+MINOR, not PATCH: this release adds exported API (the `ProtectedShare` family,
+`MemoryEnclave` and `Freeze`) and changes cryptographic behaviour on the
+AES-GCM data path. Pre-1.0, MINOR is where added API and breakage live.
+
+The headline for consumers is the FIPS section below. `pkg/seal` no longer
+constructs AES-GCM with a caller-supplied IV, which is what every downstream
+repo running `GODEBUG=fips140=only` was failing on — go-qrdb attributed 205 of
+its FIPS failures, across 14 packages, to this one construction. Stored bytes
+are unchanged in both directions.
+
 ### Added — Shamir share values in protected memory
 
 - **`ProtectedShare`, the protected-memory counterpart of `Share`
@@ -253,6 +265,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under load rather than deterministically (1 failure in 20 `-race`
   iterations); the timing decides whether the pool wins the race, not whether
   the bug is present.
+
+## [0.6.2-alpha] - 2026-08-17
+
+Recorded retroactively on 2026-08-18. This tag was cut without bumping
+`VERSION` (which stayed at `0.6.1-alpha` through the tag) and without a
+CHANGELOG entry. Both are reconciled as of `0.7.0-alpha`, and the release
+workflow now fails a tag whose `VERSION` or CHANGELOG section does not match
+it. The tag itself is immutable and is left as published.
+
+### Fixed - consensus safety
+
+- **A replica could drop committed entries it had not yet applied.** Committed
+  entries are now held until the state machine adopts a snapshot (#4).
+
+### Changed - CI
+
+- `contrib/dragonboat` made report-only rather than a blocking gate.
+- Adopted the SDLC workflows (`codex-review`, `task-worker`, `claude-review`).
 
 ## [0.6.1-alpha] - 2026-08-17
 
