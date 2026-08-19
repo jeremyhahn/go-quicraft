@@ -15,6 +15,7 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
@@ -73,7 +74,14 @@ func handshakeWithCurves(t *testing.T, clientCurves, serverCurves []tls.CurveID)
 		CurvePreferences: clientCurves,
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// The context bounds the dial and both handshakes; the SetDeadline calls
+	// below bound the raw sockets underneath them. Same backstop as before,
+	// expressed through the context-aware APIs the noctx linter requires.
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeDeadline)
+	defer cancel()
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -89,16 +97,17 @@ func handshakeWithCurves(t *testing.T, clientCurves, serverCurves []tls.CurveID)
 		defer raw.Close()
 		_ = raw.SetDeadline(time.Now().Add(handshakeDeadline))
 		conn := tls.Server(raw, serverCfg)
-		serverErr <- conn.Handshake()
+		serverErr <- conn.HandshakeContext(ctx)
 	}()
 
-	raw, err := net.Dial("tcp", ln.Addr().String())
+	var d net.Dialer
+	raw, err := d.DialContext(ctx, "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer raw.Close()
 	_ = raw.SetDeadline(time.Now().Add(handshakeDeadline))
-	clientHandshakeErr := tls.Client(raw, clientCfg).Handshake()
+	clientHandshakeErr := tls.Client(raw, clientCfg).HandshakeContext(ctx)
 
 	// The server error is read first: when a curve list is refused, the client
 	// sees the alert the server sent and the server sees the cause.
