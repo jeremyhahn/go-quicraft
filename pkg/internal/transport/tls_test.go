@@ -552,9 +552,16 @@ func TestVerifyConnectionCallbackInvokesOnCertRevoked(t *testing.T) {
 	}
 }
 
-// TestBuildMTLSTLS_CurvePreferences verifies that buildMTLSTLS sets
-// CurvePreferences to X25519-only on both server and client configs.
-// This avoids the ~5% overhead of ML-KEM post-quantum hybrid negotiation.
+// TestBuildMTLSTLS_CurvePreferences verifies that buildMTLSTLS pins
+// CurvePreferences on BOTH roles — an unpinned list negotiates ML-KEM hybrid
+// key exchange and pays ~5% per handshake — and that what it pins is the list
+// this build is allowed to offer.
+//
+// WHICH list that is depends on the `fips` build tag, so the judgement lives in
+// assertHandshakeCurves (tls_curves_fips_test.go / tls_curves_nofips_test.go).
+// Asserting it here against tls.X25519 is what the test did before the tag
+// existed, and it would have to be deleted rather than re-pointed to build a
+// FIPS variant at all.
 func TestBuildMTLSTLS_CurvePreferences(t *testing.T) {
 	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
 
@@ -574,12 +581,11 @@ func TestBuildMTLSTLS_CurvePreferences(t *testing.T) {
 		{"server", pair.server.CurvePreferences},
 		{"client", pair.client.CurvePreferences},
 	} {
-		if len(tc.curves) != 1 {
-			t.Fatalf("%s: expected 1 curve preference, got %d", tc.name, len(tc.curves))
+		if len(tc.curves) == 0 {
+			t.Fatalf("%s: CurvePreferences is empty; an unpinned list re-enables "+
+				"ML-KEM hybrid negotiation", tc.name)
 		}
-		if tc.curves[0] != tls.X25519 {
-			t.Fatalf("%s: expected X25519, got %v", tc.name, tc.curves[0])
-		}
+		assertHandshakeCurves(t, tc.name, tc.curves)
 	}
 }
 

@@ -194,11 +194,20 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		}
 	}
 
-	// Use X25519-only key exchange to avoid the ~5% overhead of ML-KEM
-	// (post-quantum hybrid) negotiation. Intra-cluster traffic where we
-	// control both endpoints does not need post-quantum protection.
-	// X25519 provides 128-bit security and is the fastest ECDH curve.
-	curves := []tls.CurveID{tls.X25519}
+	// Naming the key-exchange groups explicitly is what suppresses ML-KEM
+	// (post-quantum hybrid) negotiation and its ~5% handshake cost, which
+	// intra-cluster traffic between endpoints we control does not need.
+	//
+	// WHICH groups is build-dependent, because X25519 is not FIPS 140-3
+	// approved and this list used to hold nothing else: every intra-cluster
+	// handshake — which carries all replicated user data — failed with
+	// `tls: no supported elliptic curves for ECDHE` under GODEBUG=fips140=on
+	// as well as =only, so the library could not run inside a FIPS process at
+	// all. A `-tags fips` build compiles the non-approved group out
+	// (tls_curves_fips.go); a standard build keeps it and adds the NIST curves
+	// so the two builds can still handshake with each other
+	// (tls_curves_nofips.go).
+	curves := handshakeCurves()
 
 	serverCfg := &tls.Config{
 		Certificates:     []tls.Certificate{cert},

@@ -1161,28 +1161,35 @@ not pass `GODEBUG=fips140=only` and this tag does not change that. QUIC's packet
 protection is arbitrary-IV AES-GCM by protocol definition (RFC 9001 §5.3 derives
 the nonce from the packet number), and OCSP's `CertID` is SHA-1 by protocol
 definition (RFC 6960 §4.1.1); both are in dependencies (`quic-go`,
-`golang.org/x/crypto/ocsp`) and neither can be made approved from here. Whether
-a FIPS build should ship without a network transport is an owner-level decision
-that has not been made — it is open on issue #5 together with the transport's
-X25519-only curve list — so those packages are unchanged and remain outside the
-gate.
+`golang.org/x/crypto/ocsp`) and neither can be made approved from here. The
+exemption is recorded, with its citations and its exact scope, in
+[quic-transport/architecture.md](../quic-transport/architecture.md#fips-140-3-exemption-record).
+
+What the tag DOES change on that path is the key exchange. The transport pinned
+an X25519-only curve list, which is not approved, and Go removes non-approved
+groups from the offer — so under `fips140=on` as well as `=only` the offer was
+empty and every intra-cluster handshake failed with `tls: no supported elliptic
+curves for ECDHE`. `-tags fips` now compiles X25519 out of the list
+(`tls_curves_fips.go`), leaving the NIST curves both builds share.
 
 So: **`-tags fips` makes go-quicraft FIPS at rest, not FIPS on the wire.** The
 seal layer, the WAL and snapshots execute only approved primitives and can be
 proven to under `fips140=only`; a process that opens a QUIC connection in a
 `fips140=only` environment still panics inside `quic-go`, exactly as it did
-before this tag existed. Two make targets keep those apart, and neither is
-allowed to speak for the other:
+before this tag existed. Three make targets keep the three claims apart, and
+none is allowed to speak for another:
 
 | Target | What it does | What it proves |
 |---|---|---|
 | `make build-fips` | `go build` (± `-tags fips`) under `GOFIPS140` | The tree **compiles**. Nothing more: this module is a library with no `main`, so no artifact is produced, and `GOFIPS140` alone never executes a cryptographic operation. |
 | `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package **except** `pkg/internal/transport/...` | Everything inside the boundary **runs** under approved-only enforcement. The exclusion is a deny-list of that one tree, so a package added later is inside the gate by default. |
+| `make verify-fips-transport` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly that excluded tree | The exempt tree still runs **with the module loaded**: its own key exchange is approved, and the two protocol-mandated primitives are the only reason it is not judged at `only`. |
 
 Do not read `build-fips` as a compliance gate or as a shippable FIPS artifact;
-it is a compile check, and `verify-fips` is the check that can actually fail on
-a non-approved primitive. Wiring `verify-fips` into CI as a required gate is
-issue #5's scope, not this tag's.
+it is a compile check, and the other two are the checks that can actually fail
+on a non-approved primitive. All three run in CI's `fips` job (issue #5), and
+`test/buildgates/fips_gate_test.go` fails if the mode is weakened from `only`,
+if the exclusion list grows, or if the excluded tree stops being gated.
 
 ### Hardware-Backed Strategies
 
@@ -1600,7 +1607,7 @@ There is exactly one TLS-config constructor, `buildMTLSTLS` (`pkg/internal/trans
 | `ClientAuth` | `RequireAndVerifyClientCert` against `ClientCAs` |
 | Server verification | `RootCAs` plus per-dial `ServerName`, so hostname verification against the cert SANs is active |
 | ALPN | `NextProtos: ["quicraft"]` |
-| Curve | `X25519` only |
+| Curve | `[X25519, P-256, P-384]`; `[P-256, P-384]` with `-tags fips`, which compiles the non-approved group out (`tls_curves_fips.go`). Both lists carry the NIST curves so the two builds share a group and a cluster can be converted to FIPS one node at a time. |
 
 `InsecureSkipVerify` appears nowhere in non-test `pkg/` code, and there is no TCP listener or dialer. `TransportConfig.TransportDisabled` (set by the `WithoutTransport()` host option) skips the mTLS validation, but it also prevents the QUIC transport being constructed at all — that is "no transport", not "QUIC without TLS".
 

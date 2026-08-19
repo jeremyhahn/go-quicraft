@@ -596,6 +596,7 @@ make ci         # fmt, no-mutants, vet, lint, security scans, build, test
 make ci-full    # ci plus the build-tagged suites: modules, errfs, fuzz, integration, netfault
 make build-fips  # Compile check under GOFIPS140, with and without -tags fips
 make verify-fips # Run the FIPS boundary under GODEBUG=fips140=only
+make verify-fips-transport # Run the one exempt tree under GODEBUG=fips140=on
 ```
 
 `make ci` runs `go test` with no build tags, which leaves out the integration,

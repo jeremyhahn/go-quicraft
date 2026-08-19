@@ -1037,12 +1037,20 @@ at-rest side.
   node's own certificate. `ServerName` is set per dial from the target host.
 - **ALPN**: `"quicraft"`.
 - **Minimum version**: TLS 1.3 (`MinVersion: tls.VersionTLS13`).
-- **Curve preference**: `X25519` only. ML-KEM hybrid post-quantum negotiation
-  costs roughly 5% for intra-cluster traffic where both endpoints are ours;
-  X25519 gives 128-bit security and is the fastest ECDH curve. No cipher suites
-  are configured explicitly — TLS 1.3 suite selection is left to `crypto/tls`.
-  FIPS-mode cipher selection is a *sealing-layer* concern, not a transport one;
-  see [Encryption](../seal-barrier/architecture.md).
+- **Curve preference**: `handshakeCurves()`, which is build-dependent —
+  `[X25519, P-256, P-384]` in a standard build (`tls_curves_nofips.go`),
+  `[P-256, P-384]` with `-tags fips` (`tls_curves_fips.go`). Pinning any list
+  is what suppresses ML-KEM hybrid negotiation, worth roughly 5% for
+  intra-cluster traffic where both endpoints are ours, and X25519 leads the
+  standard list because it is the fastest ECDH curve at 128-bit security.
+  X25519 is not FIPS 140-3 approved, so a FIPS build must not be able to name
+  it; the NIST curves are in BOTH lists so the two builds still share a group
+  and a cluster can be converted one node at a time. Do not trim either list to
+  one entry — `TestHandshakeCurves_InteroperateAcrossBuilds` fails, and a
+  single-entry list is how every intra-cluster handshake came to fail under
+  `GODEBUG=fips140=on`. No cipher suites are configured explicitly — TLS 1.3
+  suite selection is left to `crypto/tls`. FIPS-mode *cipher* selection is a
+  sealing-layer concern; see [Encryption](../seal-barrier/architecture.md).
 - **Session resumption**: the client keeps a
   `tls.NewLRUClientSessionCache(256)`, cutting a reconnect from two round trips
   to one. Revocation still applies on resumption, because the callback is
