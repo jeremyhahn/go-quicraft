@@ -16,8 +16,57 @@ AES-GCM data path. Pre-1.0, MINOR is where added API and breakage live.
 The headline for consumers is the FIPS section below. `pkg/seal` no longer
 constructs AES-GCM with a caller-supplied IV, which is what every downstream
 repo running `GODEBUG=fips140=only` was failing on — go-qrdb attributed 205 of
-its FIPS failures, across 14 packages, to this one construction. Stored bytes
-are unchanged in both directions.
+its FIPS failures, across 14 packages, to this one construction.
+
+**Read the BREAKING section first.** This is not a routine bump for a consumer
+that obtains a raw `cipher.AEAD` from this package.
+
+### BREAKING — the AEAD returned to consumers reports `NonceSize() == 0`
+
+Added retroactively on 2026-08-19, after go-qrdb took this release and found the
+break. The original notes for this version described the change as
+consumer-visible "in one place" and said stored bytes were unchanged. **The
+first was an understatement and the second is true only of this package's own
+frames.** The tag is immutable, so the correction lives here.
+
+`SoftwareAEADProvider.NewAEAD` — and any `cipher.AEAD` this package hands back
+for an AES-GCM algorithm — changed its calling convention, because
+`cipher.NewGCMWithRandomNonce` generates the nonce itself:
+
+| | before (`0.6.2-alpha`) | after (`0.7.0-alpha`) |
+|---|---|---|
+| `aead.NonceSize()` | 12 | **0** |
+| `aead.Overhead()` | 16 | **28** |
+| `len(aead.Seal(nil, nonce, pt5, nil))` | 21 | **33** |
+| `SymmetricAlgorithm.NonceSize()` | 12 | 12 — the WIRE width, unchanged |
+
+The two conventions are mutually exclusive: the old AEAD requires a 12-byte
+nonce, and the new one panics if handed any nonce at all.
+
+**The damage is to existing data, and it is silent.** A consumer that writes
+`nonce := make([]byte, aead.NonceSize())` and persists that nonce as a field
+beside the ciphertext now writes a ZERO-LENGTH nonce. New writes and new reads
+stay self-consistent, so a fresh store works and a smoke test passes — but a
+record written by `0.6.2-alpha` has a 12-byte nonce field and a nonce-less
+ciphertext, and a length check against `aead.NonceSize()` now rejects it. Where
+that record is a wrapped root key, the barrier does not unseal. That is the one
+blob whose loss costs the store.
+
+**Before taking this release, answer one question:** does the consumer obtain a
+`cipher.AEAD` from this package and either size a nonce from `aead.NonceSize()`
+or store the nonce separately from the ciphertext? It is a grep for
+`NonceSize()` and for any struct pairing a `Nonce` field with a `Ciphertext`
+field. A consumer that only calls `Barrier.Encrypt` / `Barrier.Decrypt` and
+never touches the raw AEAD is unaffected. Where the answer is yes, the fix is a
+dual-read migration accepting both the separate-nonce and embedded-nonce
+shapes; a straight bump loses the data.
+
+**This package's own frames are NOT affected**, which is why the break is easy
+to miss. `NewGCMWithRandomNonce` emits `nonce ‖ ciphertext ‖ tag`, byte-identical
+to the layout `pkg/seal` already wrote by hand, so the barrier frame and the
+sealed-root-key blob are unchanged in both directions and
+`pkg/seal/legacy_format_test.go` decrypts checked-in pre-migration bytes. The
+break is in the exported AEAD contract, not in the wire format.
 
 ### Added — Shamir share values in protected memory
 
@@ -170,11 +219,16 @@ are unchanged in both directions.
   envelopes. `pkg/seal/legacy_format_test.go` proves it against checked-in
   pre-migration bytes.
 
-  Consumer-visible behaviour changes in one place: `Barrier.Encrypt` no longer
-  draws the data-path nonce from `BarrierConfig`-adjacent randomness, so a
-  failing random source can no longer fail an AES-GCM encryption, and the
-  nonce-reuse tracker records the nonce after the `Seal` rather than before it
-  (still fail-closed — the ciphertext is never returned).
+  Inside the barrier, `Barrier.Encrypt` no longer draws the data-path nonce
+  from `BarrierConfig`-adjacent randomness, so a failing random source can no
+  longer fail an AES-GCM encryption, and the nonce-reuse tracker records the
+  nonce after the `Seal` rather than before it (still fail-closed — the
+  ciphertext is never returned).
+
+  This paragraph originally claimed consumer-visible behaviour changed "in one
+  place". It does not: the AEAD handed to consumers also changed its calling
+  convention, and for anyone persisting a nonce field that is a silent
+  data-compatibility break. See the BREAKING section at the top of this release.
 
 - **New `fips` build tag compiles out every non-approved algorithm.** Built
   with `-tags fips`, `pkg/seal` contains no ChaCha20-Poly1305 /
