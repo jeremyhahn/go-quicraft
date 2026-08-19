@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0-alpha] - 2026-08-19
+
 ### Fixed — use-after-destroy race on protected memory (#15)
 
 - **`MemoryEnclave` now serializes its accessors against teardown.** `Bytes`,
