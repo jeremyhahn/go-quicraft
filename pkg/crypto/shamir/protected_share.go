@@ -17,6 +17,7 @@ package shamir
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -364,10 +365,22 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// on every path out, so partially decoded and validation-rejected shares
 	// are wiped too. The reconstructed secret is a separate enclave, and is the
 	// only one that outlives this call.
+	// Every read of a share's value below goes through WithValue, which holds
+	// the share's borrow for the whole read. These slices alias caller-owned
+	// protected memory that another goroutine may Destroy at any moment — a
+	// cancelled or timed-out ceremony is exactly that shape — and a bare
+	// Value() would release the borrow before the decode consumed the bytes.
+	// Reconstruction obtains the slices itself, so a caller cannot make this
+	// safe from outside.
 	widest := 0
 	for _, share := range shares {
-		if n := len(share.value.Bytes()); n > widest {
-			widest = n
+		if err := share.WithValue(func(v []byte) error {
+			if len(v) > widest {
+				widest = len(v)
+			}
+			return nil
+		}); err != nil {
+			return nil, &CombineError{Reason: "share was destroyed during reconstruction"}
 		}
 	}
 	buf := enclave.NewMemoryEnclave(base64.StdEncoding.DecodedLen(widest))
@@ -383,14 +396,23 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	secretLen := -1
 	for i, share := range shares {
 		// Read in place: the share's own locked buffer is the source operand
-		// of the decode, never a copy of it.
-		n, err := base64.StdEncoding.Decode(buf.Bytes(), share.value.Bytes())
-		if err != nil {
-			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
-		}
-		x, y, err := parseRawShare(buf.Bytes()[:n], i, seenX, secretLen)
-		if err != nil {
-			return nil, err
+		// of the decode, never a copy of it. The decode and the parse both run
+		// inside the borrow, so the source cannot be unmapped mid-read.
+		var (
+			n   int
+			x   byte
+			y   []byte
+			err error
+		)
+		if werr := share.WithValue(func(v []byte) error {
+			n, err = base64.StdEncoding.Decode(buf.Bytes(), v)
+			if err != nil {
+				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+			}
+			x, y, err = parseRawShare(buf.Bytes()[:n], i, seenX, secretLen)
+			return err
+		}); werr != nil {
+			return nil, werr
 		}
 		secretLen = len(y)
 		xs[i] = x
@@ -402,16 +424,21 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	basis := gfLagrangeZero(xs)
 	secret := enclave.NewMemoryEnclave(secretLen)
 	for i, share := range shares {
-		n, err := base64.StdEncoding.Decode(buf.Bytes(), share.value.Bytes())
-		if err != nil {
-			// Unreachable: pass one decoded this same value, and a share's
-			// value is frozen read-only from the moment it is constructed.
-			// Handled rather than ignored so a future change to either of
-			// those cannot turn it into a silently wrong secret.
+		if werr := share.WithValue(func(v []byte) error {
+			n, err := base64.StdEncoding.Decode(buf.Bytes(), v)
+			if err != nil {
+				// Unreachable: pass one decoded this same value, and a share's
+				// value is frozen read-only from the moment it is constructed.
+				// Handled rather than ignored so a future change to either of
+				// those cannot turn it into a silently wrong secret.
+				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+			}
+			accumulateShareInto(secret.Bytes(), buf.Bytes()[rawShareOverhead:n], basis[i])
+			return nil
+		}); werr != nil {
 			secret.Destroy()
-			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+			return nil, werr
 		}
-		accumulateShareInto(secret.Bytes(), buf.Bytes()[rawShareOverhead:n], basis[i])
 	}
 	// Frozen for the same reason a share value is: the reconstructed key is
 	// final, and nothing should mutate it in place. Destroy still wipes it.
@@ -426,6 +453,14 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 // (Destroy zeroes and unmaps that memory), and it must not be written to: the
 // buffer is frozen read-only, so a write — including an attempt to wipe it —
 // faults. Release share material with Destroy, never by zeroing this slice.
+//
+// CONCURRENCY: this returns a slice and then releases its lock, so it cannot
+// guard the caller's USE of that slice against a concurrent Destroy — the
+// memory is unmapped, so losing that race segfaults rather than reading stale
+// bytes. Value is appropriate where the share is owned by one goroutine, which
+// is the ordinary custody shape. Where a ceremony may tear shares down while a
+// reader is still working — a cancelled or timed-out reconstruction — use
+// WithValue, which holds the lock across the callback. See issue #15.
 func (s *ProtectedShare) Value() []byte {
 	if s == nil || s.value == nil {
 		return nil
@@ -433,9 +468,35 @@ func (s *ProtectedShare) Value() []byte {
 	return s.value.Bytes()
 }
 
+// WithValue calls fn with the share's base64 value, holding the enclave's read
+// lock for the whole call so the value cannot be destroyed underneath it. It
+// returns fn's error, or an error without calling fn if the share is nil or
+// already destroyed.
+//
+// This is the accessor to use anywhere teardown may be concurrent with the
+// read. fn must not retain the slice beyond its own return, and must not
+// RE-ENTER the same share by any method — not Value, WithValue or Validate,
+// and not Destroy. Mutators take priority over readers in the underlying
+// enclave, so a nested read blocks on any mutator that queued after fn started
+// while that mutator waits on fn's own borrow; a nested Destroy waits on the
+// borrow directly. Reading a DIFFERENT share, or a different enclave, is fine
+// and is what CombineProtected's own callbacks do.
+func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
+	if s == nil || s.value == nil {
+		return enclave.ErrEnclaveDestroyed
+	}
+	return s.value.WithBytes(fn)
+}
+
 // Destroy wipes the share's value and releases its protected memory. It is
-// safe to call on a nil receiver, more than once, and concurrently with itself
-// — exactly one caller reaches memguard.
+// safe to call on a nil receiver, more than once, and concurrently with
+// itself, with Value and with WithValue — exactly one caller reaches memguard,
+// and the enclave's lock keeps teardown from interleaving with a read in
+// progress.
+//
+// What it cannot make safe is a slice a caller already took from Value and is
+// still using; that span is outside any lock this type holds. WithValue exists
+// for exactly that case.
 //
 // A ProtectedShare that is not destroyed holds an mlock'd, guard-paged
 // allocation for the life of the process; nothing reclaims it, because the
@@ -462,7 +523,20 @@ func (s *ProtectedShare) Validate() error {
 	if s.value == nil {
 		return &ValidationError{Field: "value", Reason: "cannot be empty"}
 	}
-	if len(s.value.Bytes()) == 0 {
+	// Through the borrow like every other read of the value. A bare
+	// len(s.value.Bytes()) could not actually fault — it inspects the slice
+	// header rather than the protected pages — but "no read of a share's value
+	// outside a borrow" is only a useful rule if it is mechanical, and an
+	// exception here is one a later change would copy without the reasoning.
+	// Taken from the parallel work on PR #16, whose argument this is.
+	empty := false
+	if err := s.WithValue(func(v []byte) error {
+		empty = len(v) == 0
+		return nil
+	}); err != nil {
+		return &ValidationError{Field: "value", Reason: "share has been destroyed"}
+	}
+	if empty {
 		return &ValidationError{Field: "value", Reason: "share has been destroyed"}
 	}
 	return nil
@@ -508,10 +582,6 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 	if s == nil {
 		return []byte("null"), nil
 	}
-	val := s.Value()
-	if len(val) == 0 {
-		return nil, &ValidationError{Field: "value", Reason: "share has been destroyed"}
-	}
 	var meta []byte
 	if len(s.Metadata) > 0 {
 		var err error
@@ -522,22 +592,51 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 	// Non-secret: the header carries only the unauthenticated metadata.
 	head := fmt.Sprintf(`{"index":%d,"threshold":%d,"total":%d,"value":"`, s.Index, s.Threshold, s.Total)
 	const metaKey = `,"metadata":`
-	size := len(head) + len(val) + len(`"}`)
-	if meta != nil {
-		size += len(metaKey) + len(meta)
+
+	// The WHOLE encoding happens inside the borrow, not just the read of the
+	// value. An earlier version took `val := s.Value()`, which ends the borrow
+	// at the point it returns, and then appended `val` into the output — a read
+	// of the aliasing slice after the enclave was free to be destroyed, which is
+	// the same use-after-destroy this change exists to close (issue #15,
+	// Codex round 3). Copying the value out first would be worse, not better:
+	// it would mint exactly the unprotected copy of share material this type
+	// holds an enclave to avoid. So the append runs where the bytes are still
+	// guaranteed mapped.
+	var out []byte
+	if err := s.WithValue(func(val []byte) error {
+		if len(val) == 0 {
+			return &ValidationError{Field: "value", Reason: "share has been destroyed"}
+		}
+		// Sized exactly, before the first append, so that no append reallocates
+		// and strands an un-wiped copy of the value on the heap.
+		size := len(head) + len(val) + len(`"}`)
+		if meta != nil {
+			size += len(metaKey) + len(meta)
+		}
+		out = make([]byte, 0, size)
+		out = append(out, head...)
+		// val holds only standard-base64 characters (NewProtectedShare rejects
+		// anything else and the buffer is immutable thereafter), none of which
+		// JSON escapes, so it is written into the string literal verbatim.
+		out = append(out, val...)
+		out = append(out, '"')
+		if meta != nil {
+			out = append(out, metaKey...)
+			out = append(out, meta...)
+		}
+		out = append(out, '}')
+		return nil
+	}); err != nil {
+		// A destroyed share reports the same ValidationError it always did.
+		// WithValue's own refusal for an already-destroyed share is
+		// enclave.ErrEnclaveDestroyed, which is translated rather than
+		// propagated so this method's error contract is unchanged.
+		if errors.Is(err, enclave.ErrEnclaveDestroyed) {
+			return nil, &ValidationError{Field: "value", Reason: "share has been destroyed"}
+		}
+		return nil, err
 	}
-	out := make([]byte, 0, size)
-	out = append(out, head...)
-	// val holds only standard-base64 characters (NewProtectedShare rejects
-	// anything else and the buffer is immutable thereafter), none of which
-	// JSON escapes, so it is written into the string literal verbatim.
-	out = append(out, val...)
-	out = append(out, '"')
-	if meta != nil {
-		out = append(out, metaKey...)
-		out = append(out, meta...)
-	}
-	return append(out, '}'), nil
+	return out, nil
 }
 
 // UnmarshalJSON implements json.Unmarshaler for the JSON shape Share and

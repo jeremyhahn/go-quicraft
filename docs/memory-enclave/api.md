@@ -73,6 +73,50 @@ func NewProtectedBufferFromBytes(data []byte) *ProtectedBuffer
 | Errors | none returned |
 | Permission | none |
 
+### Capability: read protected bytes with a bounded lifetime
+
+```go
+func (p *MemoryEnclave) Bytes() []byte
+func (p *MemoryEnclave) WithBytes(fn func([]byte) error) error
+```
+
+| | |
+|---|---|
+| Request | `Bytes`: none. `WithBytes`: `fn`, called with a slice aliasing the protected region. |
+| Response | `Bytes`: the slice, or `nil` once destroyed. `WithBytes`: `fn`'s error, unchanged. |
+| Errors | `WithBytes` returns `ErrEnclaveDestroyed` (`*DestroyedError`) without calling `fn` if the enclave is destroyed or has been consumed by `SealMemoryEnclave`. |
+| Permission | none |
+
+Both are safe to CALL concurrently with `Destroy`. They differ in what happens
+after the call: `Bytes` releases its read lock on return, so the slice it handed
+back stops being protected against a concurrent teardown, while `WithBytes`
+holds the lock for the whole of `fn` — a concurrent `Destroy` blocks until `fn`
+returns. Reach for `WithBytes` wherever teardown can race a reader, which is
+every barrier and custody-ceremony path.
+
+`fn` must not escape the slice. It MAY **write** to it while the enclave is
+still mutable: `NewMemoryEnclave` returns mutable storage precisely so material
+can be produced in place, and `Freeze` is a mutator serialized against
+`WithBytes`, so a callback that already holds its borrow cannot have the pages
+re-protected underneath it.
+
+That ordering is only against a `Freeze` the callback **races**, though — the
+borrow cannot order a callback against a `Freeze` that already won. A callback
+entered after the enclave is frozen receives read-only pages, and a write there
+faults. So writing inside `WithBytes` is sound for the producer's own
+allocate / fill / `Freeze` sequence, where nothing else freezes; if another
+goroutine may `Freeze` concurrently, the caller orders that externally. This
+type does not, and cannot, do it for them.
+
+`fn` must NOT re-enter the same enclave — no `Bytes`, `Size`, `WithBytes`,
+`Destroy`, `Freeze` or `SealMemoryEnclave` on the enclave whose borrow it holds.
+Mutators take priority over readers (the policy that stops a stream of readers
+starving a queued `Destroy`), so a nested borrow queues behind any mutator that
+arrived meanwhile, and that mutator is waiting on `fn`'s own borrow. Reads of a
+DIFFERENT enclave are fine.
+
+`shamir.ProtectedShare` mirrors the pair as `Value` / `WithValue`.
+
 ### Capability: promote a buffer to an encrypted-at-rest key
 
 ```go
@@ -114,18 +158,25 @@ key material that could not be avoided.
 ### Error vocabulary
 
 ```go
-var ErrEnclaveNil = &NilError{}   // "memprotect: enclave is nil"
+var ErrEnclaveNil       = &NilError{}       // "memprotect: enclave is nil"
+var ErrEnclaveDestroyed = &DestroyedError{} // "memprotect: enclave has been destroyed"
 
 type NilError struct{}
 func (e *NilError) Error() string
+
+type DestroyedError struct{}
+func (e *DestroyedError) Error() string
 
 type OpenError struct{ Err error }
 func (e *OpenError) Error() string
 func (e *OpenError) Unwrap() error
 ```
 
-Match with `errors.Is(err, enclave.ErrEnclaveNil)` and `errors.As(err,
-&openErr)`.
+Match with `errors.Is(err, enclave.ErrEnclaveNil)`, `errors.Is(err,
+enclave.ErrEnclaveDestroyed)` and `errors.As(err, &openErr)`. The two sentinels
+are distinct on purpose: `NilError` says a `ProtectedKey` was never given an
+enclave or has been `Clear`ed, `DestroyedError` says locked memory existed and
+has been wiped and unmapped.
 
 ## Re-exports
 

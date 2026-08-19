@@ -100,20 +100,79 @@ on `Enclave` (only its own tests do). An earlier version of this claim was wrong
 and is recorded here so it is not re-derived. The security argument that
 survives is the other one: the ciphertext is useless without the session key.
 
-### An `atomic.Pointer` reference, not a mutex
+### An `atomic.Pointer` for `ProtectedKey`, a borrow counter for `MemoryEnclave`
 
-Both types hold their memguard object in an `atomic.Pointer`. This makes
-`Destroy` and `Clear` single-shot and idempotent under concurrency — exactly one
-caller reaches memguard, the rest are no-ops.
+`ProtectedKey` holds its `memguard.Enclave` in an `atomic.Pointer`. `Open` sits
+on hot decrypt paths (per-frame DEK access in the seal barrier), the only shared
+state is a single reference, and `Open` hands memguard's own `Enclave.Open` a
+pointer it then owns — so a lock would add contention and protect no additional
+invariant.
 
-*Rejected: a `sync.Mutex` per key.* `Open` sits on hot decrypt paths (per-frame
-DEK access in the seal barrier). The only shared state is a single reference, so
-a lock would add contention and protect no additional invariant.
+`MemoryEnclave` used the same design and it was **wrong** (issue #15). An atomic
+makes the *pointer* race-free and says nothing about how long the thing it
+points at stays *mapped*: `Destroy` could unmap between an accessor's load and
+its dereference, and `memcall.Free` is a real `munmap`, so the consequence was a
+segfault rather than a stale read. memguard's own `core.Buffer` mutex carries the
+comment "TODO: this does not protect 'data' field" — the field `destroy()` nils
+— so the read side was unsynchronised however carefully the pointer was loaded.
 
-Note the asymmetry this leaves, which is deliberate and is a caller obligation:
-the **reference** is race-safe, the **contents** are not. `ProtectedBuffer` is
-single-owner — `Bytes` and `Size` must not run concurrently with `Destroy`, and
-the slice `Bytes` returns must not outlive the buffer.
+The general shape of the mistake, worth keeping: **an atomic on the handle is
+not a lifetime discipline for the thing it points at.** The fix has to make
+`Destroy` *wait*, which is what a lock does and what an atomic swap cannot.
+
+Methods therefore split by what they do to the region. `Bytes`, `Size` and
+`WithBytes` READ it and register a **borrow**; `Destroy`, `Freeze` and
+`SealMemoryEnclave` MUTATE it — releasing the memory or changing its page
+protection — and wait for every borrow to end first.
+
+**Mutators take priority.** Once one is queued, no new borrow is admitted until
+it finishes. This is not a polish on the fix, it is part of it: a counter that
+admits a reader whenever the region is merely non-empty lets a steady stream of
+overlapping callbacks hold the count above zero forever, and a `Destroy` parked
+behind them never wipes the secret. Unbounded starvation of the wipe is a
+security defect in a type whose entire purpose is that the wipe happens. Raised
+by Codex review of PR #17, after two rounds in which the counter had no fairness
+rule at all.
+
+*The price is reentrancy, and an earlier revision of this design advertised the
+opposite.* The counter was originally chosen over an `RWMutex` precisely because
+Go's `RWMutex` forbids recursive read locking, and it looked as though callbacks
+would need to re-enter. Two things turned out to be true. First, nothing in this
+repository nests: the reads inside `CombineProtected`'s and `MarshalJSON`'s
+callbacks are on a **different** enclave (the decode scratch buffer), which has
+its own lock. Second, the only admission policy that prevents starvation is
+precisely the one that forbids nesting — a queued mutator must block new
+borrows, and a nested borrow is a new borrow. The two properties are mutually
+exclusive, so the choice is which failure to have, and a deadlock is loud,
+reproducible and fixable at the call site where starvation is silent and
+unbounded.
+
+The counter is kept over an `RWMutex` (which would give the same policy) only
+because the mutator's park is an observable point, and the concurrency tests
+need it to assert the guarantee without using elapsed time as evidence.
+
+A callback must therefore not call `Bytes`, `Size` or `WithBytes` on the SAME
+enclave, and must not `Destroy` or `Freeze` it either.
+
+*Why `Freeze` is a mutator.* It changes page protection. `NewMemoryEnclave`
+returns deliberately mutable memory whose documented use is "allocate, write in
+place, freeze", so a `Freeze` that only borrowed could re-protect the pages
+midway through a callback still filling the buffer — and that callback's next
+write would fault, killing the process rather than returning an error.
+
+Measured cost of the borrow on the accessor, back to back on one machine:
+2.40 ns/op unsynchronised → 21.6 ns/op with the borrow, uncontended, against a
+`Barrier.Decrypt` 64B floor of ~123 ns/op. An `RWMutex` read lock would be
+cheaper (~9.6 ns/op when that variant was measured), because a borrow takes a
+full mutex twice where an `RLock` takes one; the difference buys the nesting
+property, which is what the internal call sites need.
+
+One asymmetry survives, deliberately, and is a caller obligation: the borrow
+bounds the buffer's lifetime against the accessor **call**, not against a slice
+the caller kept. `Bytes` returns a slice that aliases protected memory and is
+valid only until `Destroy`. `WithBytes(func([]byte) error) error` holds the
+borrow across the caller's own use and is the accessor for anywhere teardown can
+race a reader.
 
 ### Constructors wipe their input
 

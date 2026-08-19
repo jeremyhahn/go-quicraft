@@ -127,6 +127,10 @@ package never installs one, and a test asserts that. Look for a direct
 `memguard.CatchSignal` or `memguard.CatchInterrupt` call in your own code:
 those reset **every** handler in the process.
 
-**Tests are flaky under `-race` around key teardown** — you are sharing one
-`ProtectedBuffer`'s contents across goroutines. The buffer *reference* is
-race-safe; the contents are single-owner. Give each goroutine its own `Open`.
+**Tests are flaky under `-race` around key teardown** — you are almost certainly
+holding a slice returned by `Bytes` across a `Destroy` on another goroutine. The
+accessor CALL is race-safe (since `0.8.0-alpha`); the returned slice aliases
+protected memory and stops being valid the moment the call returns. Use
+`WithBytes` (or `ProtectedShare.WithValue`), which holds the enclave open for
+the whole callback so `Destroy` has to wait, or give each goroutine its own
+`Open`.

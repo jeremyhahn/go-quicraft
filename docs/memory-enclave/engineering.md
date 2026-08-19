@@ -10,31 +10,38 @@ Backed by `github.com/awnumar/memguard`.
 
 ```go
 // Types
-type ProtectedBuffer struct{ /* unexported */ }
+type MemoryEnclave struct{ /* unexported */ }
+type ProtectedBuffer = MemoryEnclave // Deprecated: alias, not a distinct type
 type ProtectedKey    struct{ /* unexported */ }
 
 // Constructors
-func NewProtectedBuffer(size int) *ProtectedBuffer
-func NewProtectedBufferFromBytes(data []byte) *ProtectedBuffer
+func NewMemoryEnclave(size int) *MemoryEnclave
+func NewMemoryEnclaveFromBytes(data []byte) *MemoryEnclave
 func NewProtectedKey(key []byte) *ProtectedKey
-func SealProtectedBuffer(buf *ProtectedBuffer) *ProtectedKey
+func SealMemoryEnclave(buf *MemoryEnclave) *ProtectedKey
+// Deprecated aliases: NewProtectedBuffer, NewProtectedBufferFromBytes,
+// SealProtectedBuffer — identical behaviour and return types.
 
-// ProtectedBuffer methods
-func (p *ProtectedBuffer) Bytes() []byte
-func (p *ProtectedBuffer) Size() int
-func (p *ProtectedBuffer) Destroy()
+// MemoryEnclave methods
+func (p *MemoryEnclave) Bytes() []byte
+func (p *MemoryEnclave) WithBytes(fn func([]byte) error) error
+func (p *MemoryEnclave) Size() int
+func (p *MemoryEnclave) Freeze()
+func (p *MemoryEnclave) Destroy()
 
 // ProtectedKey methods
-func (p *ProtectedKey) Open() (*ProtectedBuffer, error)
+func (p *ProtectedKey) Open() (*MemoryEnclave, error)
 func (p *ProtectedKey) Clear()
 
 // Free function
 func WipeBytes(b []byte)
 
 // Errors
-var ErrEnclaveNil = &NilError{}
-type NilError struct{}
-type OpenError struct{ Err error }
+var ErrEnclaveNil       = &NilError{}
+var ErrEnclaveDestroyed = &DestroyedError{}
+type NilError       struct{}
+type DestroyedError struct{}
+type OpenError      struct{ Err error }
 ```
 
 `pkg/seal/memprotect.go` re-exports `ProtectedBuffer`, `ProtectedKey`,
@@ -44,21 +51,40 @@ is no second implementation.
 
 ## 2. Invariants
 
-**Reference safety vs. content safety.** Both types hold their memguard object
-in an `atomic.Pointer`, so the *reference* is safe under concurrency. The
-*contents* are not.
+**Call safety vs. slice safety.** `ProtectedKey` holds its enclave in an
+`atomic.Pointer`; `MemoryEnclave` guards its locked buffer with a borrow counter
+(see the architecture note — the atomic was a defect here, issue #15). Readers
+register a borrow; mutators wait for the count to reach zero. Every *call* is
+safe under concurrency. A *slice* a caller retained after the call returned is
+not.
 
 | Operation | Concurrency | Idempotent |
 |---|---|---|
 | `ProtectedKey.Open` | safe with `Open`, `Clear` | n/a — each call returns a new buffer |
 | `ProtectedKey.Clear` | safe with `Open`, `Clear` | yes; only the winner of the pointer swap acts |
-| `ProtectedBuffer.Destroy` | safe with `Bytes`, `Size`, `Destroy` | yes; only the winner of the swap destroys |
-| `ProtectedBuffer.Bytes` / `Size` | **NOT** safe with `Destroy` | n/a |
+| `MemoryEnclave.Destroy` / `Freeze` / `SealMemoryEnclave` | mutators — safe with everything, and BLOCK until every borrow ends | `Destroy` yes; only the first caller reaches memguard |
+| `MemoryEnclave.Bytes` / `Size` | readers — safe with the mutators | n/a |
+| `MemoryEnclave.WithBytes` | reader — `Destroy` and `Freeze` cannot complete while the callback runs | n/a |
 
-- **`ProtectedBuffer` contents are single-owner.** memguard's `LockedBuffer` is
-  not safe for concurrent `Destroy`/read. The slice returned by `Bytes` must not
-  outlive the buffer: `Destroy` zeroes and unmaps that memory, so a retained
-  slice is a use-after-free.
+- **The lock bounds the CALL, not the slice.** `Destroy` zeroes and unmaps the
+  memory, so a slice retained past the accessor that returned it is a
+  use-after-free. Where teardown can race a reader — barrier and custody
+  ceremony paths — use `WithBytes` / `ProtectedShare.WithValue`, which hold the
+  read lock across the callback; `Destroy` then blocks until it returns.
+  `WithBytes` returns `ErrEnclaveDestroyed` (`*DestroyedError`) if the enclave
+  is already gone, and the callback's own error unchanged otherwise.
+- **Mutators take priority over readers.** A queued `Destroy`, `Freeze` or
+  `SealMemoryEnclave` blocks every new borrow until it completes, so readers
+  cannot starve the wipe. This is the same policy `sync.RWMutex` applies.
+- **A callback must NOT re-enter its own enclave** — no `Bytes`, `Size`,
+  `WithBytes`, `Destroy`, `Freeze` or `SealMemoryEnclave` on the enclave whose
+  borrow it holds. A nested borrow queues behind any mutator that arrived in the
+  meantime, and that mutator is waiting on the borrow the callback holds. Reads
+  of a DIFFERENT enclave are fine and are what the package's own callbacks do.
+- **Package-internal readers go through the accessor too.**
+  `CombineProtected` and `ProtectedShare.MarshalJSON` read share values inside
+  `WithValue`, not from a released alias. Both obtain the slices themselves, so
+  no caller-side discipline could have made them safe.
 - **Every `Open` is paired with a `Destroy`.** `Open` materializes plaintext
   into a fresh `ProtectedBuffer`; the caller owns it. A leaked buffer keeps
   plaintext resident for the life of the process and consumes `RLIMIT_MEMLOCK`,
@@ -87,6 +113,7 @@ in an `atomic.Pointer`, so the *reference* is safe under concurrency. The
 | Error | Type | Returned when | Fail-closed? |
 |---|---|---|---|
 | `ErrEnclaveNil` | `*NilError` | `Open` on a `ProtectedKey` whose enclave was never initialized or has been `Clear`ed | Yes — no key material is produced |
+| `ErrEnclaveDestroyed` | `*DestroyedError` | `WithBytes` on a `MemoryEnclave` that has been destroyed or consumed by `SealMemoryEnclave` | Yes — the callback is not called |
 | `OpenError{Err}` | `*OpenError` | memguard fails to open the enclave | Yes — returns `(nil, err)` |
 
 - `ErrEnclaveNil` is a package-level sentinel of concrete type `*NilError`;
@@ -134,6 +161,11 @@ What the suite pins, beyond happy-path lifecycle:
 | `TestProtectedKey_ClearAlreadyClearedNoPanic` | `Clear` idempotence |
 | `TestProtectedKey_ConcurrentOpenClear` | the `atomic.Pointer` invariant |
 | `TestProtectedBuffer_ConcurrentDestroy` | single-shot `Destroy` under race |
+| `TestMemoryEnclave_AccessorsAreSafeAgainstConcurrentDestroy` | issue #15: `Bytes`/`Size` vs `Destroy` — 200 unsynchronised pairs |
+| `TestMemoryEnclave_WithBytesIsSafeAgainstConcurrentDestroy` | the same for the scoped accessor |
+| `TestMemoryEnclave_WithBytesHoldsTheEnclaveOpen` | that `Destroy` cannot COMPLETE during the callback — the property an atomic could not give |
+| `TestMemoryEnclave_WithBytesOnDestroyed` / `_OnSealed` / `_PropagatesCallbackError` | the refusal reason, and that the callback's error is not wrapped |
+| `TestProtectedShare_ValueIsSafeAgainstConcurrentDestroy` and the `WithValue` set (`pkg/crypto/shamir`) | the same properties on the share surface that exposed the defect |
 | `TestProtectedBuffer_NilAfterDestroy` | post-`Destroy` accessors return nil/0 |
 | `TestSealProtectedBuffer_ConsumedBufferReturnsNil` | consumption semantics |
 | `TestSealProtectedBuffer_DestroyedBuffer` / `_NilBuffer` | `nil` return, not panic |
@@ -146,7 +178,15 @@ memguard is called directly. Failure modes that matter (`RLIMIT_MEMLOCK`
 exhaustion) abort the process by design and are not simulated in unit tests.
 
 The concurrency tests are the ones to run under `-race`; they are the reason the
-`atomic.Pointer` design is asserted rather than assumed.
+locking design is asserted rather than assumed. The issue-#15 probes were
+mutation-verified: with the borrow discipline stripped from `memprotect.go`,
+five enclave tests and two share tests fail under `-race`, and four of them fail
+on their OWN reason assertion — "Destroy completed while the callback held the
+enclave", "Freeze completed while a callback still held the enclave's bytes" —
+without `-race` at all. The `MarshalJSON` probe is the exception and says so in
+its own comment: it is probabilistic (measured 10/10 under `-race`, 0/10
+without), because `MarshalJSON` runs no caller-supplied code inside its borrow
+and so offers no hook a deterministic probe could use.
 
 ## 7. Observability
 

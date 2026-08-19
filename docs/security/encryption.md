@@ -1291,7 +1291,7 @@ size, not of how many shares were submitted.
 a caller that manages its own wipeable buffers; `ProtectedShare` is for the
 caller that wants the buffer managed for it.
 
-Two obligations come with the protected type:
+Three obligations come with the protected type:
 
 - **Every `ProtectedShare` must be `Destroy`ed, including one produced by
   `json.Unmarshal`** — decoding is a construction. An abandoned share holds a
@@ -1299,6 +1299,14 @@ Two obligations come with the protected type:
 - **Locked memory is a finite kernel resource** (`RLIMIT_MEMLOCK`), and each
   share is one locked allocation. Destroy shares as they are consumed rather
   than at the end of a ceremony.
+- **A slice from `Value` does not outlive the share.** `Value` and `Destroy`
+  are safe to CALL concurrently (since `0.8.0-alpha` — before that they raced,
+  and because memguard genuinely unmaps, the consequence was a segfault: issue
+  #15). What no lock can bound is a slice a caller kept after `Value` returned.
+  Where one goroutine tears shares down while another still reads them, which
+  is a ceremony's normal shape, use `WithValue(func([]byte) error) error`: it
+  holds the share open for the whole callback, so a concurrent `Destroy` blocks
+  until the callback returns.
 
 Because of the second one, the two calls that allocate a whole set price it
 first. `SplitProtected` rejects parameters whose footprint — coefficients,

@@ -209,7 +209,7 @@ func TestSealProtectedBuffer(t *testing.T) {
 	}
 
 	// The buffer's internal reference should be nil after sealing.
-	if pb.buf.Load() != nil {
+	if pb.buf != nil {
 		t.Fatal("buffer's internal reference should be nil after SealProtectedBuffer")
 	}
 
@@ -501,7 +501,7 @@ func TestMemoryEnclave_WriteInPlaceThenFreeze(t *testing.T) {
 	}
 	defer e.Destroy()
 
-	if !e.buf.Load().IsMutable() {
+	if !e.buf.IsMutable() {
 		t.Fatal("a freshly allocated enclave must be writable, or nothing can be produced in place")
 	}
 	copy(e.Bytes(), []byte("in-place"))
@@ -510,7 +510,7 @@ func TestMemoryEnclave_WriteInPlaceThenFreeze(t *testing.T) {
 	}
 
 	e.Freeze()
-	if e.buf.Load().IsMutable() {
+	if e.buf.IsMutable() {
 		t.Fatal("enclave is still mutable after Freeze")
 	}
 	if got := string(e.Bytes()); got != "in-place" {
@@ -552,7 +552,7 @@ func TestMemoryEnclave_FromBytesWipesSourceAndFreezes(t *testing.T) {
 			t.Fatalf("source slice was not wiped by NewMemoryEnclaveFromBytes: %x", source)
 		}
 	}
-	if e.buf.Load().IsMutable() {
+	if e.buf.IsMutable() {
 		t.Error("NewMemoryEnclaveFromBytes must return a frozen enclave")
 	}
 }

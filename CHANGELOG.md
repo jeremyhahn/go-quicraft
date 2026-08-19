@@ -7,6 +7,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — use-after-destroy race on protected memory (#15)
+
+- **`MemoryEnclave` now serializes its accessors against teardown.** `Bytes`,
+  `Size` and `WithBytes` register a borrow; `Destroy`, `Freeze` and
+  `SealMemoryEnclave` wait for every borrow to end before touching the region.
+  A reader observes either a live buffer or a destroyed one, never a buffer
+  mid-destruction. The buffer reference was previously an `atomic.Pointer`,
+  which was not enough: an atomic makes access to the POINTER race-free and says
+  nothing about the LIFETIME of what it addresses, so `Destroy` could unmap the
+  region between a reader's load and its dereference.
+
+  **Mutators take priority over readers**: once one is queued, no new borrow is
+  admitted until it finishes. That fairness rule is part of the fix, not a
+  polish on it. Without it a steady stream of overlapping `WithBytes` callbacks
+  holds the borrow count above zero indefinitely and a parked `Destroy` never
+  wipes the secret — unbounded starvation of the wipe, in a type whose entire
+  purpose is that the wipe happens. Raised by Codex review of PR #17.
+
+  **A callback must not re-enter its own enclave.** The counter was originally
+  chosen over an `RWMutex` on the belief that callbacks would need to nest, and
+  that turned out to be wrong twice over: nothing in this repository nests (the
+  reads inside `CombineProtected`'s and `MarshalJSON`'s callbacks are on a
+  *different* enclave, with its own lock), and the only admission policy that
+  prevents starvation is exactly the one that forbids nesting, since a nested
+  borrow is a new borrow. The properties are mutually exclusive; a deadlock is
+  loud, reproducible and fixable at the call site, where starvation is silent
+  and unbounded. The counter is kept over an `RWMutex` — which would give the
+  same policy — only because the mutator's park is an observable point the
+  concurrency tests need.
+
+- **`CombineProtected` reads every share through `WithValue`.** It previously
+  took the bare aliasing slice and decoded from it after the borrow had ended,
+  which is precisely the scenario #15 was filed about — a ceremony cancelled or
+  timed out mid-reconstruction — and a caller could not repair it from outside,
+  because reconstruction obtains the slices itself.
+
+- **`ProtectedShare.MarshalJSON` builds the document inside `WithValue`.** The
+  same defect one call site further on: it took `val := s.Value()`, ending the
+  borrow, and then appended `val` into its output buffer — reading protected
+  memory the enclave was free to unmap. Copying the value out first would have
+  been worse, not better, since that mints exactly the unprotected copy of share
+  material the type holds an enclave to avoid, so the encode moved inside the
+  borrow instead. The exact-capacity sizing that keeps an `append` from
+  reallocating and stranding an un-wiped copy is preserved. A destroyed share
+  still reports the same `ValidationError` it always did.
+
+  The race is real at the memguard layer, not merely theoretical. In v0.23.0
+  `core.Buffer` embeds a mutex carrying its author's own note that it "does not
+  protect 'data' field"; `Buffer.Data()` reads that field holding nothing while
+  `Buffer.destroy()` writes it under the lock and then `memcall.Free`s the
+  region. `-race` reports it, and because the memory is genuinely unmapped
+  rather than zeroed, losing the race is a SIGSEGV rather than a stale read.
+
+  Reported by the go-quicbaas agent from a Codex review of its PR #41.
+
+- **`MemoryEnclave.WithBytes` and `ProtectedShare.WithValue`**, scoped accessors
+  that hold the read lock across a callback. They exist because locking inside
+  `Bytes`/`Value` cannot close the second half of the defect: those return a
+  slice ALIASING the protected region, the lock is released on return, and the
+  caller then uses a slice `Destroy` may unmap at any moment. Holding the lock
+  across the callback makes the valid span exactly the callback. Use them
+  wherever teardown may be concurrent with the read; `Bytes` and `Value` remain
+  correct and cheaper under single-goroutine ownership, which is the shape the
+  seal barrier already uses.
+
+- **`Freeze` now takes the write lock.** It changes the region's page
+  protection, which is a mutation, not a read. A fresh `NewMemoryEnclave` is
+  deliberately mutable and `WithBytes` hands its callback a writable slice, so a
+  `Freeze` holding only a read lock could flip the pages read-only midway
+  through a callback still filling the buffer — and that callback's next write
+  would fault and take the process down. Found in review of PR #16, not by the
+  original report.
+
+- **`ErrEnclaveDestroyed`** distinguishes a destroyed enclave from a
+  zero-length secret, so a callback is never handed a nil slice it might read as
+  an empty value.
+
+- **Corrected `Destroy`'s doc comment**, which claimed it was "safe to call
+  concurrently with Bytes/Size" while the type's own OWNERSHIP paragraph said
+  the opposite. The claim is now true rather than removed, but it was a false
+  assurance sitting next to the hazard, which is what made the gap easy to read
+  past. `ProtectedShare.Destroy` documented the same adjacent property.
+
+### Testing
+
+`enclave.TestOnlyOnMutatorParked` and `TestOnlyOnReaderParked` are test-only
+observation hooks (gated by `testing.Testing()`, following
+`shamir.testOnlyRandReader`) that fire when a mutator, or a reader queued behind
+one, is about to block. It exists because the
+central guarantee — a mutator cannot COMPLETE while a reader holds a borrow —
+could otherwise only be tested by waiting a while and concluding the mutator was
+probably still blocked, which this repository's testing convention forbids: a
+sleep is never a synchronization primitive, because a loaded runner turns "give
+it 100ms" into a hang or a vacuous pass. The concurrency probes now learn that
+the mutator IS parked and assert from there. Raised by Codex review of PR #17.
+
+Both hooks pass the enclave to the callback and every caller filters on it. They
+are package-global, so a mutator parking on an unrelated enclave fires a hook a
+test installed for its own — a probe treating any notification as its own could
+conclude its target had parked when it had not, and pass against a broken
+implementation whose mutator merely ran late. The reader hook exists for the
+half of writer preference the mutator hook cannot reach: that the readmitting
+`Broadcast` actually happens. Without it the starvation probe released its
+borrow before the late readers had queued, and an implementation that blocks
+readers correctly and then never wakes them passed. Both found by the local
+Codex review before merge, after four hosted rounds had missed them.
+
+Two further gaps came out of the same review and are closed by
+`TestMemoryEnclave_TwoQueuedMutatorsBothComplete` and
+`TestMemoryEnclave_SealExcludesInFlightCallback`. Every other probe parks at
+most ONE mutator, and one waiter cannot tell `Broadcast` from `Signal` — the
+swap would have passed the whole suite and deadlocked in production. And
+`SealMemoryEnclave` ends the buffer's life exactly as `Destroy` does, but only
+`Destroy` and `Freeze` were exercised against an in-flight callback, so deleting
+Seal's exclusion passed too. Both mutation-verified.
+
+### Hardening found by the local review
+
+- **`lockIdle` is now panic/Goexit-safe.** It returns holding `mu` and the
+  CALLER installs the `unlockMutated` defer, so an abnormal exit between the two
+  left the mutex locked and `waiting` inflated — wedging the enclave for good.
+  Reachable through the park hook: a panic in it, or a `t.Fatal` from the
+  mutator's own goroutine, which is a `runtime.Goexit` and unwinds defers like a
+  panic. Cleanup now runs on the abnormal path only.
+- **The `CONCURRENCY` contract said a reader observes "a live, writable
+  buffer".** A frozen enclave is live and read-only, and the borrow orders a
+  callback only against a `Freeze` it races — not one that already won. Writing
+  inside `WithBytes` is sound for the producer's own allocate/fill/`Freeze`
+  sequence; concurrent freezing must be ordered by the caller. Corrected in the
+  type doc and `api.md`, which had the stronger claim.
+- **Test-hook lifetimes do not nest across goroutines** — restore puts back
+  whatever was installed at call time, so overlapping installs restore
+  incorrectly and can resurrect a stale hook. Documented as a one-goroutine,
+  no-parallel restriction rather than replaced with a registry.
+
+### Documentation
+
+The design rationale had to move with the code, because it argued for the thing
+being removed. `docs/memory-enclave/architecture.md` carried a section titled
+"An `atomic.Pointer` reference, not a mutex" that explicitly rejected a lock;
+`engineering.md`'s invariant table stated `Bytes`/`Size` were "**NOT** safe with
+`Destroy`" as though that were a design choice rather than the defect. Both now
+describe the borrow discipline, and the general lesson is recorded where the
+mistake was made: *an atomic on the handle is not a lifetime discipline for the
+thing it points at.* Also updated: `api.md` (the scoped accessors, the error
+vocabulary, and a §1 exported-surface listing that predated `MemoryEnclave` and
+`Freeze` entirely), `user.md`'s troubleshooting entry, and the custody
+obligations in `docs/security/encryption.md`.
+
+### Performance
+
+Accessor benchmarks are committed so the next argument about the barrier's hot
+path is with a measured figure rather than an assumption. Measured back to back
+on one machine (Core Ultra 9 285K, 5x3,000,000 iterations, best of five):
+
+| | `Bytes` | `WithBytes` |
+|---|---|---|
+| unsynchronised (the pre-fix shape) | 2.40 ns/op | 1.85 ns/op |
+| borrow counter (this change) | 21.6 ns/op | 22.1 ns/op |
+
+So the borrow costs roughly **20 ns per accessor call**, uncontended, against a
+`Barrier.Decrypt` 64B floor of ~123 ns/op on the same machine — about 16% on the
+smallest frame the barrier handles, and proportionally less on every larger one.
+
+That is more than a `sync.RWMutex` read lock would cost (~9.6 ns/op when the
+first version of this fix was measured, though on a differently loaded machine,
+so treat it as indicative rather than a like-for-like), because a borrow takes a
+full mutex twice — once to register, once to release — where an `RWMutex` takes
+one `RLock`. The extra ~10 ns buys the nesting property, and nesting is what
+makes `CombineProtected` and `MarshalJSON` fixable by reading *through* the
+accessor instead of being exempted from it. Correctness on a path that already
+spends an order of magnitude more is the right trade.
+
+`BenchmarkMemoryEnclave_BytesParallel` measures the contended case (112-138
+ns/op across 24 threads on one enclave), since both borrow and release serialize
+on the same mutex. Nothing in the current tree shares one enclave across
+goroutines on a hot path — the barrier's shape is `Open` / use / `defer Destroy`
+per frame, single-owner — but the number is committed so that if something ever
+does, the cost is already on record.
+
+### Note for whoever cuts the next tag — this is a MINOR, not a PATCH
+
+`WithBytes`, `WithValue`, `ErrEnclaveDestroyed` and `DestroyedError` are ADDED
+exported API. Under the pre-1.0 rule this repository follows — and exactly as
+`0.7.0-alpha` recorded for the same reason — added API takes the MINOR position.
+Nothing was removed or changed incompatibly, so no consumer needs to adapt, but
+the version is `0.8.0-alpha` rather than `0.7.1-alpha`.
+
 ## [0.7.0-alpha] - 2026-08-18
 
 MINOR, not PATCH: this release adds exported API (the `ProtectedShare` family,
