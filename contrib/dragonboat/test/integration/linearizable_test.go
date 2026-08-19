@@ -20,12 +20,12 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
 	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 )
 
@@ -247,6 +247,22 @@ func TestIntegration_DB_LinearizableRead_AfterLeaderFailover_NoManualWarmup(t *t
 	// The no-op is appended immediately on becomeLeader but needs a round
 	// of replication to commit. Retry SyncRead until the no-op commits
 	// and ReadIndex succeeds, up to the failover timeout.
+	//
+	// The retry predicate is dragonboat.IsTempError, NOT a match on
+	// "read index not ready". That string cannot reach this test: the
+	// adapter's error table maps quicraft.ErrReadIndexNotReady onto
+	// ErrShardNotReady (errors.go — dragonboat's documented "unknown leader"
+	// condition), so through the compatibility API the not-yet-committed
+	// no-op arrives as "quicraft: shard not ready". Matching the untranslated
+	// string made the retry loop unreachable: the test passed only when the
+	// FIRST SyncRead won the race with the no-op's replication round and
+	// failed outright otherwise, ~1.5s into a 30s budget it never spent. That
+	// is what made this suite load-sensitive.
+	//
+	// IsTempError keeps the assertion intact. If the no-op genuinely never
+	// commits — the defect this test exists to catch — every attempt returns
+	// a temporary error until the deadline expires and the test still fails,
+	// it just spends its whole budget first instead of failing instantly.
 	newLeaderHost := cluster.hosts[newLeaderIdx]
 	deadline := time.Now().Add(failoverTimeout)
 	for {
@@ -267,8 +283,8 @@ func TestIntegration_DB_LinearizableRead_AfterLeaderFailover_NoManualWarmup(t *t
 			return
 		}
 
-		// "read index not ready" means the no-op hasn't committed yet — retry.
-		if strings.Contains(err.Error(), "read index not ready") && time.Now().Before(deadline) {
+		// A temporary error means the no-op has not committed yet — retry.
+		if dragonboat.IsTempError(err) && time.Now().Before(deadline) {
 			retryTimer := time.NewTimer(50 * time.Millisecond)
 			<-retryTimer.C
 			retryTimer.Stop()
