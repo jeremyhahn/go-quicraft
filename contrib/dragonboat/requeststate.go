@@ -265,29 +265,28 @@ type RequestState struct {
 	CompletedC chan RequestResult
 
 	// notifyCommit records the host's NotifyCommit setting. It selects
-	// dragonboat's two-value ResultC contract and gates creation of the
-	// committed-notification bridge.
+	// dragonboat's two-value ResultC contract.
 	notifyCommit bool
 
-	// mu guards the lazily created committedC and aggrC bridges together
-	// with the released flag, so a bridge is never spawned after Release
-	// has begun waiting on wg.
+	// mu guards the lazily created aggrC bridge together with the released
+	// flag, so it is never spawned after Release has begun waiting on wg.
 	mu sync.Mutex
 
 	// released is set by Release under mu. Once set, no further bridge
 	// goroutine is spawned.
 	released bool
 
-	// committedC is the lazily created bridge that delivers the early
-	// WAL-durable notification. Only created when notifyCommit is set and
-	// CommittedC or ResultC is called, mirroring dragonboat, which spawns
-	// no commit-notification machinery until the caller asks for it.
-	committedC chan RequestResult
-
 	// aggrC is the lazily created cap-2 aggregate channel returned by
 	// ResultC when notifyCommit is set. It delivers the commit
 	// notification followed by the apply result, matching dragonboat's
-	// RequestState.ResultC.
+	// RequestState.ResultC. Its goroutine reads rs.inner.CommittedC()
+	// directly (the true source, written to synchronously by quicraft's
+	// own commit path) rather than through a separate translating bridge:
+	// an earlier version raced a bridge's OUTPUT here instead of the
+	// source, and the extra asynchronous hop between the two — the bridge
+	// goroutine not yet having been scheduled to relay a value that was
+	// already sitting in the source channel — is what dropped the commit
+	// notification (#13).
 	aggrC chan RequestResult
 
 	// shardID records the shard this request belongs to. This is used
@@ -341,12 +340,12 @@ type RequestState struct {
 
 // wrapRequestState is the single internal constructor behind the exported
 // Wrap* helpers. The notifyCommit flag threads the host's NotifyCommit
-// setting onto the wrapper: when false, CommittedC() returns nil and
-// ResultC() returns the apply-only channel, matching dragonboat.
+// setting onto the wrapper: when false, ResultC() returns the apply-only
+// channel, matching dragonboat.
 //
 // Only the apply bridge is spawned here. It cannot be deferred because
 // the deprecated CompletedC field is read directly by callers; the
-// commit bridge and the ResultC aggregate are created on first use.
+// ResultC aggregate is created on first use.
 func wrapRequestState(inner *quicraft.RequestState, shardID uint64, cancel context.CancelFunc, notifyCommit bool) *RequestState {
 	rs := &RequestState{
 		inner:        inner,
@@ -436,9 +435,24 @@ func (rs *RequestState) ResultC() chan RequestResult {
 	if rs.aggrC != nil {
 		return rs.aggrC
 	}
-	committed := rs.committedChanLocked()
 	rs.aggrC = make(chan RequestResult, 2)
-	if committed == nil || rs.released {
+	if rs.inner == nil || rs.released {
+		return rs.aggrC
+	}
+	// Read rs.inner.CommittedC() directly -- the true source, written to
+	// synchronously by quicraft's own commit path -- rather than through a
+	// separate translating bridge. See the aggrC field doc for why: an
+	// earlier version raced a bridge's translated OUTPUT here instead of
+	// the source, and the extra asynchronous hop between the two (the
+	// bridge goroutine not yet scheduled to relay a value already sitting
+	// in the source channel) is what dropped the commit notification
+	// (#13). This mirrors dragonboat's own RequestState.ResultC
+	// (request.go), which races r.committedC/r.CompletedC directly for
+	// the same reason -- they are the fields the raft engine itself
+	// writes into, with nothing relaying between the writer and this
+	// select.
+	committed := rs.inner.CommittedC()
+	if committed == nil {
 		return rs.aggrC
 	}
 
@@ -449,11 +463,11 @@ func (rs *RequestState) ResultC() chan RequestResult {
 	go func() {
 		defer rs.wg.Done()
 		select {
-		case cn, ok := <-committed:
+		case qcn, ok := <-committed:
 			if !ok {
 				return
 			}
-			out <- cn
+			out <- RequestResult{inner: qcn, code: RequestCommitted}
 			select {
 			case cc, ok := <-applied:
 				if ok {
@@ -466,12 +480,17 @@ func (rs *RequestState) ResultC() chan RequestResult {
 				return
 			}
 			// The apply result won the race, or the request failed before
-			// it was ever committed. Forward an already-buffered commit
-			// notification first so the caller still observes dragonboat's
+			// it was ever committed. rs.inner's own commitNotify always
+			// happens-before its complete for the same entry (raft
+			// commits before it applies), and both write directly into
+			// rs.inner's own fields -- so if this request actually
+			// committed, the value is already sitting in `committed`'s
+			// buffer by the time `applied` fires, needing no wait. Forward
+			// it if present so the caller still observes dragonboat's
 			// committed-then-applied order.
 			select {
-			case cn := <-committed:
-				out <- cn
+			case qcn := <-committed:
+				out <- RequestResult{inner: qcn, code: RequestCommitted}
 			default:
 			}
 			out <- cc
@@ -479,23 +498,6 @@ func (rs *RequestState) ResultC() chan RequestResult {
 		}
 	}()
 	return out
-}
-
-// CommittedC returns a channel that receives an early WAL-durable
-// notification when NotifyCommit is enabled on the host. The result
-// carries RequestCommitted as its code. When NotifyCommit is disabled on
-// the host, this returns nil.
-//
-// CommittedC is a quicraft extension: dragonboat keeps the equivalent
-// field unexported and exposes commit notification only through the
-// two-value ResultC channel.
-func (rs *RequestState) CommittedC() chan RequestResult {
-	if rs.resolved != nil || !rs.notifyCommit {
-		return nil
-	}
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	return rs.committedChanLocked()
 }
 
 // Release returns the RequestState to the pool and cancels any associated
@@ -566,47 +568,6 @@ func (rs *RequestState) completedResult() (RequestResult, bool) {
 		return *p, true
 	}
 	return RequestResult{}, false
-}
-
-// committedChanLocked returns the committed-notification bridge, creating
-// it on first use. rs.mu must be held. Returns nil when the inner
-// RequestState has no committed channel. The bridge goroutine is
-// registered on rs.wg so Release can wait for it to exit before the inner
-// RequestState is recycled; it is never spawned after Release.
-func (rs *RequestState) committedChanLocked() chan RequestResult {
-	if rs.committedC != nil {
-		return rs.committedC
-	}
-	if rs.inner == nil {
-		return nil
-	}
-	src := rs.inner.CommittedC()
-	if src == nil {
-		return nil
-	}
-	out := make(chan RequestResult, 1)
-	rs.committedC = out
-	if rs.released {
-		return out
-	}
-	done := rs.doneC
-	rs.wg.Add(1)
-	go func() {
-		defer rs.wg.Done()
-		select {
-		case qr, ok := <-src:
-			if !ok {
-				return
-			}
-			out <- RequestResult{
-				inner: qr,
-				code:  RequestCommitted,
-			}
-		case <-done:
-			return
-		}
-	}()
-	return out
 }
 
 // newAsyncOpRequestState runs op in its own goroutine and delivers its

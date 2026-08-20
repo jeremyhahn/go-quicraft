@@ -1046,7 +1046,7 @@ func TestSysOpState_DoubleRelease_NoPanic(t *testing.T) {
 }
 
 func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) {
-	// Verify the committed channel bridge goroutine also exits on Release.
+	// Verify the ResultC aggregate bridge goroutine also exits on Release.
 	runtime.GC()
 	stabilizeTimer := time.NewTimer(50 * time.Millisecond)
 	<-stabilizeTimer.C
@@ -1059,10 +1059,10 @@ func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) 
 		pool := quicraft.NewRequestStatePool()
 		inner := pool.Get().(*quicraft.RequestState)
 		states[i] = WrapRequestState(inner, true)
-		// Touch CommittedC so the bridge goroutine is actually created;
-		// it is spawned lazily on first use.
-		if states[i].CommittedC() == nil {
-			t.Fatalf("expected non-nil CommittedC for state %d", i)
+		// Touch ResultC so the aggregate bridge goroutine is actually
+		// created; it is spawned lazily on first use.
+		if states[i].ResultC() == nil {
+			t.Fatalf("expected non-nil ResultC for state %d", i)
 		}
 	}
 

@@ -28,9 +28,9 @@ import (
 
 // TestIntegration_DB_NotifyCommit_ProposalCommitted verifies that when
 // NotifyCommit is enabled on the NodeHost, an async Propose delivers a
-// Committed notification on CommittedC followed by a Completed
-// notification on ResultC. This validates the two-phase notification
-// pipeline: WAL-durable commit then state machine apply.
+// Committed notification followed by a Completed notification, both on
+// the ResultC aggregate channel. This validates the two-phase
+// notification pipeline: WAL-durable commit then state machine apply.
 func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	mtls := dbTestMTLSFiles(t)
 	addr := freePort(t)
@@ -67,26 +67,26 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	}
 	defer rs.Release()
 
-	// CommittedC must be non-nil when NotifyCommit is enabled.
-	committedCh := rs.CommittedC()
-	if committedCh == nil {
-		t.Fatal("CommittedC() returned nil; expected non-nil channel when NotifyCommit is enabled")
+	// ResultC must be non-nil when NotifyCommit is enabled, and its first
+	// delivery must be the committed notification (WAL-durable).
+	resultCh := rs.ResultC()
+	if resultCh == nil {
+		t.Fatal("ResultC() returned nil; expected non-nil channel when NotifyCommit is enabled")
 	}
 
-	// Wait for the committed notification (WAL-durable).
 	select {
-	case committedResult := <-committedCh:
+	case committedResult := <-resultCh:
 		if !committedResult.Committed() {
 			t.Fatalf("expected Committed() == true, got code %v", committedResult)
 		}
 		t.Logf("received committed notification: Committed()=%v", committedResult.Committed())
 	case <-time.After(defaultTimeout):
-		t.Fatal("timed out waiting for committed notification on CommittedC")
+		t.Fatal("timed out waiting for committed notification on ResultC")
 	}
 
 	// Wait for the completed notification (state machine applied).
 	select {
-	case completedResult := <-rs.ResultC():
+	case completedResult := <-resultCh:
 		if !completedResult.Completed() {
 			t.Fatalf("expected Completed() == true, got code %v", completedResult)
 		}
@@ -103,9 +103,10 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 }
 
 // TestIntegration_DB_NotifyCommit_Disabled verifies that when NotifyCommit
-// is NOT enabled (default), CommittedC returns nil and proposals still
-// complete normally via ResultC. This ensures the disabled path does not
-// produce spurious channels or block the apply pipeline.
+// is NOT enabled (default), ResultC is simply the applied channel — no
+// separate committed notification is ever delivered — and proposals still
+// complete normally. This ensures the disabled path does not produce a
+// spurious commit notification or block the apply pipeline.
 func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	mtls := dbTestMTLSFiles(t)
 	addr := freePort(t)
@@ -142,14 +143,15 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	}
 	defer rs.Release()
 
-	// When NotifyCommit is disabled, the committed channel must never
-	// deliver a notification. The proposal completes only via ResultC.
-	committedCh := rs.CommittedC()
+	// When NotifyCommit is disabled, ResultC must be exactly the applied
+	// channel — no separate committed notification is ever delivered.
+	if rs.ResultC() != rs.AppliedC() {
+		t.Fatal("ResultC() must equal AppliedC() when NotifyCommit is disabled")
+	}
 
-	// Wait for the proposal to complete via ResultC first.
-	var completedResult dragonboat.RequestResult
+	// Wait for the proposal to complete via ResultC.
 	select {
-	case completedResult = <-rs.ResultC():
+	case completedResult := <-rs.ResultC():
 		if !completedResult.Completed() {
 			t.Fatalf("expected Completed() == true, got code %v", completedResult)
 		}
@@ -162,19 +164,6 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 			completedResult.Completed(), smResult.Value)
 	case <-time.After(defaultTimeout):
 		t.Fatal("timed out waiting for completed notification on ResultC")
-	}
-
-	// After the proposal completed, the committed channel must not have
-	// delivered anything (NotifyCommit was disabled).
-	if committedCh != nil {
-		select {
-		case <-committedCh:
-			t.Fatal("committed channel delivered a value; expected no notification when NotifyCommit is disabled")
-		case <-time.After(100 * time.Millisecond):
-			t.Logf("committed channel correctly silent (NotifyCommit disabled)")
-		}
-	} else {
-		t.Logf("CommittedC() returned nil (NotifyCommit disabled)")
 	}
 }
 
