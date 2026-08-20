@@ -1967,7 +1967,16 @@ func TestSendBatch_MarshalFrameError(t *testing.T) {
 	t1.Send([]proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-	handler2.waitBatch(t, 10*time.Second)
+	// 30s, not the file's usual 10s (#24): under GODEBUG=fips140=on the
+	// dial's TLS/QUIC handshake loses X25519 from its offered groups and
+	// falls back to a FIPS-approved curve, which is measurably slower under
+	// -race, and this test was observed to occasionally exceed a 10s budget
+	// specifically in that mode under shared-runner contention (CI run 4070,
+	// FIPS job). The other ~20 waitBatch(t, 10*time.Second) callers in this
+	// file are unaffected -- this is the one whose real send-then-observe
+	// path (dial + handshake + frame write) sits closest to that budget, not
+	// a general widening.
+	handler2.waitBatch(t, 30*time.Second)
 
 	batches := handler2.getBatches()
 	if len(batches) != 1 {
