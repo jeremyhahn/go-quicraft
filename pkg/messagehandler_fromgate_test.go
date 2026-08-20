@@ -354,7 +354,7 @@ func TestHandleMessage_MemberAtAnUncoveredAddressIsRefused(t *testing.T) {
 // message, which is what makes the ack possible.
 func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	const leaderAddr = "127.0.0.1:5001"
-	_, handler, node := authorizationRigJoining(t, proto.Membership{})
+	handler, node, rec := authorizationRigRecordingJoining(t, proto.Membership{})
 
 	if node.IsMember(1) {
 		t.Fatal("fixture: a joining replica must know no members")
@@ -362,7 +362,6 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	if _, err := handler.host.registry.Resolve(1, 1); err == nil {
 		t.Fatal("fixture: a joining replica must start with no registered addresses")
 	}
-	before := node.DiagState().InboxLen
 
 	batch := proto.MessageBatch{
 		SourceAddress: leaderAddr,
@@ -374,9 +373,14 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 		t.Fatalf("HandleMessage: %v", err)
 	}
 
-	// Delivery is the half that matters: an address learned for a message that
-	// never reached raft buys the join nothing.
-	if node.DiagState().InboxLen == before {
+	// Delivery is the half that matters: an address learned for a message
+	// that never reached raft buys the join nothing. rec.DeliveredCount, not
+	// a DiagState().InboxLen re-read, because authorizationRig's engine runs
+	// a real background worker that can drain the message out of the live
+	// queue before a delayed read ever samples the increase -- the
+	// recording wrapper instead observes delivery synchronously at the
+	// DeliverMessage call itself (go-quicraft#26).
+	if rec.DeliveredCount() == 0 {
 		t.Fatal("the leader's Replicate never reached the raft inbox: the joining " +
 			"replica has nothing to append and nothing to ack, so the join never " +
 			"completes no matter what the registry holds")

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -2310,8 +2311,11 @@ func TestHandleSnapshot_LandsUnderNodeSnapshotDir(t *testing.T) {
 	}
 }
 
-// authorizationRig builds an engine + handler with shard 1 loaded under ms.
-func authorizationRig(t *testing.T, ms proto.Membership) (*engine.Engine, *hostMessageHandler, *engine.Node) {
+// authorizationRigCore builds the engine and node shared by authorizationRig
+// and authorizationRigRecording. The two differ only in which engineDeliverer
+// the handler is wired to, so the shared setup lives here rather than being
+// duplicated.
+func authorizationRigCore(t *testing.T, ms proto.Membership) (*engine.Engine, *engine.Node, *Host) {
 	t.Helper()
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -2331,6 +2335,13 @@ func authorizationRig(t *testing.T, ms proto.Membership) (*engine.Engine, *hostM
 	t.Cleanup(func() { eng.UnloadNode(1) })
 
 	h := &Host{cfg: cfg, registry: registry.NewRegistry()}
+	return eng, node, h
+}
+
+// authorizationRig builds an engine + handler with shard 1 loaded under ms.
+func authorizationRig(t *testing.T, ms proto.Membership) (*engine.Engine, *hostMessageHandler, *engine.Node) {
+	t.Helper()
+	eng, node, h := authorizationRigCore(t, ms)
 	return eng, &hostMessageHandler{engine: eng, host: h}, node
 }
 
@@ -2341,6 +2352,65 @@ func authorizationRigJoining(t *testing.T, ms proto.Membership) (*engine.Engine,
 	eng, handler, node := authorizationRig(t, ms)
 	node.Peer().MarkJoining()
 	return eng, handler, node
+}
+
+// recordingDeliverWrapper wraps a real engineDeliverer, synchronously
+// recording every message DeliverMessage accepts before delegating to the
+// wrapped implementation (go-quicraft#26).
+//
+// authorizationRig's eng.Start() runs a real background worker that
+// concurrently drains the same inbox queue a test would otherwise have to
+// poll (DiagState().InboxLen) to observe delivery -- and that queue-depth
+// snapshot is racy: under enough scheduling delay on the test goroutine, the
+// worker can drain the just-delivered message before the test ever samples
+// the length, so a later re-read (even a polled one tracking the maximum
+// seen) is indistinguishable from "never delivered" if the worker both
+// drains and stabilizes before the first sample. Recording synchronously at
+// the DeliverMessage call itself -- which HandleMessage invokes directly,
+// in the test's own goroutine, before it returns -- removes the race
+// entirely: delivery is observed at the moment it happens, not inferred
+// from a live counter a second goroutine is concurrently mutating.
+type recordingDeliverWrapper struct {
+	engineDeliverer
+	mu        sync.Mutex
+	delivered []proto.Message
+}
+
+func (w *recordingDeliverWrapper) DeliverMessage(shardID uint64, msg proto.Message) bool {
+	ok := w.engineDeliverer.DeliverMessage(shardID, msg)
+	if ok {
+		w.mu.Lock()
+		w.delivered = append(w.delivered, msg)
+		w.mu.Unlock()
+	}
+	return ok
+}
+
+// DeliveredCount returns the number of messages DeliverMessage has accepted
+// so far.
+func (w *recordingDeliverWrapper) DeliveredCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.delivered)
+}
+
+// authorizationRigRecording is authorizationRig with the handler's engine
+// wrapped in a recordingDeliverWrapper, for tests that must assert delivery
+// deterministically rather than by polling engine.Node's live queue depth.
+func authorizationRigRecording(t *testing.T, ms proto.Membership) (*hostMessageHandler, *engine.Node, *recordingDeliverWrapper) {
+	t.Helper()
+	eng, node, h := authorizationRigCore(t, ms)
+	rec := &recordingDeliverWrapper{engineDeliverer: eng}
+	return &hostMessageHandler{engine: rec, host: h}, node, rec
+}
+
+// authorizationRigRecordingJoining is authorizationRigRecording for a
+// replica that is still joining.
+func authorizationRigRecordingJoining(t *testing.T, ms proto.Membership) (*hostMessageHandler, *engine.Node, *recordingDeliverWrapper) {
+	t.Helper()
+	handler, node, rec := authorizationRigRecording(t, ms)
+	node.Peer().MarkJoining()
+	return handler, node, rec
 }
 
 // TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration is the
@@ -2359,14 +2429,13 @@ func authorizationRigJoining(t *testing.T, ms proto.Membership) (*engine.Engine,
 // only a "message from removed member") and hashicorp/raft (no sender-membership
 // test on appendEntries at all).
 func TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration(t *testing.T) {
-	_, handler, node := authorizationRig(t, proto.Membership{
+	handler, node, rec := authorizationRigRecording(t, proto.Membership{
 		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
 	})
 
 	if node.IsRemoved(5) {
 		t.Fatal("fixture: replica 5 must not carry a removal tombstone")
 	}
-	before := node.DiagState().InboxLen
 
 	batch := proto.MessageBatch{
 		SourceAddress: "127.0.0.1:5005",
@@ -2378,7 +2447,13 @@ func TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration(t *testin
 		t.Fatalf("HandleMessage: %v", err)
 	}
 
-	if node.DiagState().InboxLen == before {
+	// rec.DeliveredCount, not a DiagState().InboxLen re-read: the recording
+	// wrapper observes delivery synchronously at the DeliverMessage call
+	// HandleMessage makes directly, in this goroutine, before it returns --
+	// so there is no race against the engine's background worker draining
+	// the same message out of the live queue a re-read would otherwise poll
+	// (go-quicraft#26).
+	if rec.DeliveredCount() == 0 {
 		t.Fatal("the heartbeat from leader 5 was dropped because our configuration " +
 			"does not name it yet: this replica can never learn the config change " +
 			"that adds 5, so it stays deaf to its own leader permanently")
