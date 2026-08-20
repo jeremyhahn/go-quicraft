@@ -45,7 +45,14 @@ import (
 
 var (
 	makefilePath = filepath.Join("..", "..", "Makefile")
-	ciWorkflow   = filepath.Join("..", "..", ".github", "workflows", "ci.yml")
+
+	// The FIPS job moved from ci.yml to nightly.yml (go-quicraft#22, adopting
+	// ci-template v1.9): it is known-red under runner contention (#24) and a
+	// known-red job burning runner-minutes per push verifies nothing. It
+	// still runs -- nightly, plus on demand via workflow_dispatch -- so the
+	// gate this file protects is "some workflow still executes the FIPS
+	// targets," not "ci.yml specifically does."
+	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "nightly.yml")
 
 	// fipsModePattern captures the GODEBUG=fips140 mode as a WHOLE WORD. The
 	// word boundary is load-bearing: "on" is a prefix of "only", so a substring
@@ -204,10 +211,10 @@ func TestExcludedTreeIsStillGated(t *testing.T) {
 	}
 }
 
-// TestCIRunsTheFIPSGate pins that CI actually invokes the targets above. A
-// target no workflow calls protects nothing.
+// TestCIRunsTheFIPSGate pins that nightly.yml actually invokes the targets
+// above. A target no workflow calls protects nothing.
 func TestCIRunsTheFIPSGate(t *testing.T) {
-	workflow := readRepoFile(t, ciWorkflow)
+	workflow := readRepoFile(t, fipsWorkflow)
 
 	// Comments in this workflow quote the mode strings to explain them, so the
 	// search is over run: lines only -- otherwise deleting the job while
@@ -233,8 +240,8 @@ func TestCIRunsTheFIPSGate(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("no step in %s runs %q.\n\n"+
-				"The FIPS gate is only a gate if CI executes it; a Makefile target "+
-				"nothing calls is documentation.", ciWorkflow, target)
+				"The FIPS gate is only a gate if some workflow executes it; a "+
+				"Makefile target nothing calls is documentation.", fipsWorkflow, target)
 		}
 	}
 }

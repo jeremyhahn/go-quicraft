@@ -444,8 +444,8 @@ development, and it means nothing on the remote can perform a git operation
 against this repository's history.
 
 `make remote-tools` installs govulncheck, gosec, golangci-lint (pinned to
-`GOLANGCI_VERSION`, matching what quality.yml installs) and trivy, and seeds
-`known_hosts`. Every tool is installed unconditionally rather than "if absent",
+`GOLANGCI_VERSION`, matching what ci.yml's `lint`/`security` jobs install) and
+trivy (matching nightly.yml's `trivy` job), and seeds `known_hosts`. Every tool is installed unconditionally rather than "if absent",
 because the remote host had a v1 golangci-lint and a years-old gosec on PATH and
 `command -v` guards skipped both installs. An analyser of the wrong version
 gates on a different rule set from CI while looking like it passed.

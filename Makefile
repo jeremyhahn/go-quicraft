@@ -984,11 +984,13 @@ ci: fmt no-mutants check-tool-versions vet lint security build test
 # ============================================================================
 # Analyser-version guard
 #
-# GOLANGCI_VERSION is the single source of truth, but three files cannot read a
-# make variable — .github/workflows/quality.yml and the two devcontainer
-# Dockerfiles each carry a literal pin. They had drifted to THREE different
-# versions at once (Makefile/quality.yml v2.12.2, .devcontainer/Dockerfile
-# v2.11.1, Dockerfile.dev and install-tools v2.7.2), which is the failure mode
+# GOLANGCI_VERSION is the single source of truth, but the CI workflows and
+# devcontainer Dockerfiles cannot read a make variable — ci.yml, release.yml
+# (each installing it independently since quality.yml was retired,
+# go-quicraft#22) and the two devcontainer Dockerfiles each carry a literal
+# pin. They had once drifted to THREE different versions at once
+# (Makefile/quality.yml v2.12.2, .devcontainer/Dockerfile v2.11.1,
+# Dockerfile.dev and install-tools v2.7.2), which is the failure mode
 # the remote-tools comment describes: an analyser of the wrong version is worse
 # than none, because it gates on a different rule set while looking like it
 # passed. golangci-lint v2 also moved flags and changed which linters are on by

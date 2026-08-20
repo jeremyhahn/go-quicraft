@@ -14,6 +14,11 @@ on:
 
 permissions:
   contents: write
+  # Needed by the inlined lint/security/trivy jobs' SARIF uploads
+  # (github/codeql-action/upload-sarif), copied here from the retired
+  # quality.yml's own permissions block when those jobs moved into this file
+  # (go-quicraft#22).
+  security-events: write
 
 env:
   GO_VERSION: "1.26.6"
@@ -108,12 +113,124 @@ jobs:
   # on tags, so a tag published with no gosec, govulncheck, Trivy, gofmt, vet
   # or golangci-lint having run on that commit. Advisories are time-sensitive:
   # one published after the last branch build shipped unseen.
-  quality:
-    name: Gate - lint, security, trivy
+  #
+  # Inlined rather than a `uses: ./.github/workflows/quality.yml` call
+  # (go-quicraft#22, adopting ci-template v1.9): ci.yml's own quality.yml call
+  # was retired in the same change because a workflow_call is one opaque unit
+  # from the caller's side, which defeated ci.yml's staged fail-fast ordering.
+  # release.yml has no such ordering to protect — nothing here needs to start
+  # before lint/security/trivy finish — so these three are copied verbatim
+  # from the retired quality.yml rather than kept behind an indirection only
+  # one remaining caller uses.
+  lint:
+    name: Gate - lint
     needs: validate
-    uses: ./.github/workflows/quality.yml
-    with:
-      go-version: "1.26.6"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Check formatting
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "${UNFORMATTED}" ]; then
+            echo "Files not formatted:"
+            echo "${UNFORMATTED}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: golangci-lint
+        run: golangci-lint run --timeout=5m ./...
+
+  security:
+    name: Gate - security
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      # Keep this exclude list identical to ci.yml's security job and to
+      # GOSEC_EXCLUDE in the Makefile; see ci.yml for the per-rule
+      # justifications.
+      - name: Run gosec
+        run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
+
+      - name: Upload gosec SARIF
+        if: always() && github.server_url == 'https://github.com'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+          category: gosec-release
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  trivy:
+    name: Gate - trivy
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Trivy scan (SARIF for code scanning)
+        if: github.server_url == 'https://github.com'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy SARIF
+        if: always() && github.server_url == 'https://github.com'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-fs-release
+
+      - name: Trivy gate (fail on CRITICAL/HIGH)
+        if: github.server_url == 'https://github.com'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          format: table
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
+
+      - name: Install Trivy (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Trivy gate (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
 
   integration:
     name: Gate - integration suite
@@ -305,7 +422,7 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, quality, integration, netfault, errfs, fuzz, modules]
+    needs: [validate, lint, security, trivy, integration, netfault, errfs, fuzz, modules]
     timeout-minutes: 30
     steps:
       - name: Checkout

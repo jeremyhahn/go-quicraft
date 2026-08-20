@@ -1,10 +1,54 @@
+# ci-template: v1.9 (customized) — staged fail-fast pipeline.
+#
+# v1.9 (2026-08-20, owner ruling — FAIL-FAST STAGED PIPELINE, adopted here via
+# go-quicraft#22): a fast tier (lint + build, ~minutes) gates the expensive
+# tier (security, test, integration, netfault, errfs, fuzz-seeds,
+# contrib-dragonboat). Gitea cannot cancel in-flight jobs (no cancel route —
+# company task #90), so fail-fast comes from ORDERING: a broken push reports
+# in minutes and burns nothing downstream; a green push pays one fast-tier of
+# extra latency. `fips` and `trivy` move to nightly.yml (schedule +
+# workflow_dispatch, gating nothing): both were known-red on every push here
+# (fips: go-quicraft#24's runner-contention flake under GODEBUG=fips140=on;
+# trivy: shared the same class of concern portfolio-wide), and a known-red job
+# burning tens of runner-minutes per push verifies nothing.
+#
+# `quality.yml` (the old lint+security+trivy reusable workflow, called by both
+# this file and release.yml) is RETIRED by this change. A workflow_call is one
+# opaque unit from the caller's perspective — `needs: quality` waited for
+# lint, security AND trivy together, so nothing downstream could ever start
+# before the slowest of the three finished. That defeats the entire point of
+# staged fail-fast: lint and security are flattened directly into this file
+# instead, matching the template, so `needs: [lint, build]` genuinely gates on
+# the FAST tier alone. release.yml gained its own inline lint/security/trivy
+# steps in the same change, so a tag push keeps exactly the gates it had
+# before, without the now-removed indirection.
+#
+# CUSTOMIZE blocks preserved from the pre-v1.9 file: the `integration` /
+# `netfault` / `errfs` / `fuzz-seeds` tagged-suite jobs, the `modules`
+# nested-module matrix, and `contrib-dragonboat` (still `continue-on-error`
+# pending go-quicraft#3 — the flake that justified it, #13, is fixed and
+# merged, but arming the gate is that issue's decision, not this one's).
+# `integration`/`netfault`/`contrib-dragonboat` also keep their EXTRA
+# self-imposed `needs: [..., test]` / `needs: [..., integration]` ordering on
+# top of the fast-tier gate: multiple multi-node QUIC suites under `-race`
+# starve a contended runner if they overlap (see each job's own comment),
+# which is a repo-specific constraint the vanilla template does not have.
+#
+# Source of truth: software/templates/github-actions/ci.yml in the
+# automatethethings repo (v1.9, commit 2732bc0). Pushed directly per the
+# workflow/CI-configuration carve-out (conventions/sdlc.md §"What requires a
+# PR").
+
 name: CI
 
 on:
   push:
-    branches: [master, main, develop]
+    branches: [main]                    # trunk-based: main is the ONLY trunk
   pull_request:
-    branches: [master, main, develop]
+    branches: [main]
+  workflow_dispatch:                    # re-fire a whole workflow; also the
+                                        # only retry when a run was never
+                                        # created
 
 permissions:
   contents: read
@@ -22,24 +66,100 @@ env:
   GOWORK: "off"
 
 jobs:
-  # lint / security / trivy live in quality.yml so the RELEASE pipeline runs
-  # the identical gates. They were defined here, and release.yml never called
-  # them: a tag push ran no gosec, govulncheck, Trivy, gofmt, vet or lint at
-  # all. See quality.yml.
-  quality:
-    name: Quality
-    uses: ./.github/workflows/quality.yml
-    with:
-      go-version: "1.26.6"
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Check formatting
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "${UNFORMATTED}" ]; then
+            echo "Files not formatted:"
+            echo "${UNFORMATTED}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: golangci-lint
+        run: golangci-lint run --timeout=5m ./...
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    # STAGED FAIL-FAST (v1.9): gated on the fast tier like test/integration —
+    # a push that cannot lint or build should not spend a heavy gosec/
+    # govulncheck pass.
+    needs: [lint, build]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      # Writes SARIF (uploaded below) and still exits non-zero on findings to
+      # gate the build. Tests, examples and contrib adapters are excluded.
+      #
+      # Every -exclude rule below was checked against the code; record the
+      # reason here so the next person does not have to re-derive it. Keep this
+      # list identical to GOSEC_EXCLUDE in the Makefile.
+      #   G103 unsafe: the proto codec is a fixed-layout zero-copy encoding.
+      #   G104 unhandled error: fires on hash.Write, which never returns one.
+      #   G115 integer overflow on conversion: the conversions it flags sit
+      #        behind an explicit bounds check on the same value (frame and
+      #        entry sizes are validated against MaxFrameSize /
+      #        MaxReplicationPayloadBytes before the narrowing conversion).
+      #        NOT a blanket "we accept overflow" — a NEW conversion without a
+      #        preceding bound is a real finding this exclusion will hide, so
+      #        review narrowing conversions by hand.
+      #   G301/G306 file and directory permissions: 0755/0644 on data
+      #        directories and data files is the intended posture; secret
+      #        material is written 0600 explicitly.
+      #   G304 file inclusion via variable: every snapshot/WAL path is
+      #        constructed internally from (shard, replica, index), never from
+      #        a request.
+      #   G404 weak random: false positive. The only math/rand use is election
+      #        jitter in pkg/internal/raft/raft.go, and newRaft seeds it from
+      #        crypto/rand. Jitter must be fast and unpredictable-enough to
+      #        desynchronize campaigns; it is not a security primitive.
+      - name: Run gosec
+        run: gosec -fmt=sarif -out=gosec.sarif -exclude=G103,G104,G115,G301,G304,G306,G404 -exclude-dir=test -exclude-dir=examples -exclude-dir=contrib -severity=medium -confidence=medium ./...
+
+      - name: Upload gosec SARIF
+        # Gitea has no code-scanning API; the upload 404s and fails the job.
+        if: always() && github.server_url == 'https://github.com'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
 
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -49,76 +169,6 @@ jobs:
       - name: Build FIPS variant
         run: |
           GOFIPS140=v1.0.0 CGO_ENABLED=0 go build ./...
-
-  # ==========================================================================
-  # FIPS 140-3 gate
-  #
-  # The `Build FIPS variant` step above only COMPILES against the Go
-  # Cryptographic Module. GOFIPS140 is a build setting and GODEBUG=fips140 is a
-  # RUNTIME setting, so a compile-only check cannot observe a single
-  # cryptographic operation: it stayed green while the mTLS config pinned an
-  # X25519-only curve list, which no process with the module loaded can
-  # complete a handshake with. That defect survived every green `build` job in
-  # this repository's history and was found by the first run of this one.
-  #
-  # fips140=only, not fips140=on: `on` loads the module but still PERMITS
-  # non-approved algorithms, so MD5, SHA-1 and arbitrary-IV AES-GCM all succeed
-  # and the gate reports green on exactly the thing it exists to catch. `only`
-  # makes a non-approved operation error or panic. Ratified by the owner
-  # 2026-08-17 (conventions/configuration.md section 5) and carried by the
-  # portfolio ci-template.
-  #
-  # The steps below are `make` targets, not inline `go test` lines, for the
-  # reason stated on the tagged suites further down: the Makefile is where a
-  # developer reproduces CI, and the mode strings must have ONE definition.
-  # That is also what makes them testable — test/buildgates/fips_gate_test.go
-  # reads the Makefile and this file and fails if the mode is weakened to `on`,
-  # if the approved-only exclusion list grows beyond the one documented tree,
-  # or if that tree stops being covered by a step of its own.
-  #
-  # Do NOT weaken this to `on`, and do NOT add an exclusion to route around a
-  # failure: a red FIPS job is a compliance finding, and the finding is the
-  # deliverable.
-  # ==========================================================================
-  fips:
-    name: FIPS [GODEBUG=fips140=only]
-    runs-on: ubuntu-latest
-    # Last in the heavy chain, for the runner-contention reason documented on
-    # `integration`: this re-runs almost the whole unit suite AND the transport
-    # suite, which stands up QUIC listeners, and overlapping full suites on one
-    # self-hosted runner is what made the 30s snapshot waits flake. Nothing
-    # depends on this job, so the position costs wall clock and nothing else.
-    needs: [quality, build, test, integration, netfault, contrib-dragonboat]
-    # The per-package -timeout inside each make target is the real budget; this
-    # is the outer backstop, sized like `integration` because the same runner
-    # contention stretches it.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      # The transport suite in the last step starts real QUIC listeners.
-      - name: Tune QUIC UDP buffers
-        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
-
-      - name: Compile under the module, tagged and untagged
-        run: make build-fips
-
-      # GODEBUG=fips140=only over every package except pkg/internal/transport.
-      - name: Approved-only gate
-        run: make verify-fips
-
-      # pkg/internal/transport under GODEBUG=fips140=on. It is one notch lower
-      # because QUIC packet protection (RFC 9001 s5.3) and the OCSP CertID
-      # (RFC 6960 s4.1.1) are arbitrary-IV AES-GCM and SHA-1 by protocol
-      # definition, both inside dependencies. The exemption is recorded with its
-      # citations in docs/quic-transport/architecture.md; this step is what
-      # keeps the exempt tree gated rather than merely excluded.
-      - name: Exempt transport tree, FIPS mode
-        run: make verify-fips-transport
 
   # The untagged suite. Every job below this one exists because `go test ./...`
   # with NO build tags silently excludes whole test suites: the Go toolchain
@@ -135,12 +185,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [quality, build]
+    needs: [lint, build]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -202,30 +252,31 @@ jobs:
   integration:
     name: Integration [build tag integration]
     runs-on: ubuntu-latest
-    # `needs: test` is for ISOLATION, not ordering: it keeps the two heaviest
-    # jobs off the runner at the same time. Each of these jobs already
-    # serialises internally with -p 1 because concurrent multi-node QUIC
-    # packages under -race starve each other — but nothing was stopping the
-    # JOBS from overlapping, and on a 20-core self-hosted runner they did. In
-    # run 418, Integration (547s) overlapped the full unit suite (188s) AND
-    # contrib/dragonboat's own multi-node integration suite (130s), and a 30s
-    # snapshot-catch-up wait expired inside that window. The run before it lost
-    # a 30s rolling-restart wait the same way. Neither reproduces on a quiet
-    # machine — the rolling-restart case survived thirty local runs, twenty of
-    # them under deliberate twenty-way CPU contention.
+    # `needs: test`, on top of the fast-tier gate, is for ISOLATION, not
+    # ordering: it keeps the two heaviest jobs off the runner at the same
+    # time. Each of these jobs already serialises internally with -p 1
+    # because concurrent multi-node QUIC packages under -race starve each
+    # other — but nothing was stopping the JOBS from overlapping, and on a
+    # 20-core self-hosted runner they did. In run 418, Integration (547s)
+    # overlapped the full unit suite (188s) AND contrib/dragonboat's own
+    # multi-node integration suite (130s), and a 30s snapshot-catch-up wait
+    # expired inside that window. The run before it lost a 30s
+    # rolling-restart wait the same way. Neither reproduces on a quiet
+    # machine — the rolling-restart case survived thirty local runs, twenty
+    # of them under deliberate twenty-way CPU contention.
     #
     # This serialises the three heavy jobs and costs a few minutes of wall
     # clock. The short jobs (errfs, fuzz seeds) stay parallel; they finish in
     # seconds and contend with nothing.
-    needs: [quality, build, test]
+    needs: [lint, build, test]
     # 45, not 30: the suite is ~9 min on a quiet machine but every package runs
     # under -race with -p 1, so a loaded runner stretches it considerably. The
     # -timeout=1800s below is the real budget; this is only the outer backstop.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -246,12 +297,12 @@ jobs:
     # same reason: these stand up 3-to-5-node QUIC clusters under -race and wait
     # on election timeouts, so a contended runner turns a real timing assertion
     # into a flake.
-    needs: [quality, build, test, integration]
+    needs: [lint, build, test, integration]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -272,12 +323,12 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs]
     runs-on: ubuntu-latest
-    needs: [quality, build]
+    needs: [lint, build]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -290,12 +341,12 @@ jobs:
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz]
     runs-on: ubuntu-latest
-    needs: [quality, build]
+    needs: [lint, build]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -338,9 +389,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -429,7 +480,7 @@ jobs:
     # stands up multi-node QUIC clusters through the dragonboat compatibility
     # API, so running it beside the main integration suite is the same mistake
     # twice.
-    needs: [quality, build, integration]
+    needs: [lint, build, integration]
     # REPORT-ONLY, TEMPORARILY. This job still runs on every commit and its
     # result is still visible - dragonboat compatibility is verified, not
     # skipped - but it no longer fails the run.
@@ -450,33 +501,26 @@ jobs:
     # replica with an apply gap — is FIXED and merged (PR #4, commit 5bab86b),
     # and the suite passes: measured green in 76.2s on an idle host.
     #
-    # The flag stays for a DIFFERENT and independently measured reason.
-    # TestRequestState_ResultC_AggregatesCommittedThenApplied fails 1.33% of
-    # runs (4 in 300, unloaded machine) on a lost-notification defect in this
-    # adapter, NOT on timing: ResultC's aggregator drains a pending commit
-    # notification with a non-blocking select/default (requeststate.go), but
-    # that notification is fed by a separate bridge goroutine
-    # (committedChanLocked). When the apply result wins the race and the bridge
-    # has not yet been scheduled, `default` fires and the commit notification is
-    # dropped, so the caller sees RequestCompleted first.
+    # The flag stayed for a SECOND, independently measured reason —
+    # TestRequestState_ResultC_AggregatesCommittedThenApplied failing 1.33% of
+    # runs on a lost-notification defect in the adapter's ResultC aggregator —
+    # which is ALSO now fixed and merged (go-quicraft#13, PR #25): the
+    # aggregator reads the inner commit source directly instead of racing a
+    # since-removed relay bridge's output, and the regression test was
+    # rewritten to isolate the exact race window deterministically rather than
+    # depend on incidental scheduling.
     #
-    # That is a real API-contract violation and not merely a flake: a dragonboat
-    # consumer running the canonical NotifyCommit loop takes the apply result as
-    # its FIRST value and then parks forever on the second receive, because only
-    # one value is ever delivered.
-    #
-    # Arming this job as blocking before that is fixed would put a knowingly
-    # 1-in-75 red gate in front of every merge — and because every job here
-    # declares `needs: [quality, ...]`, a spurious red skips the whole
-    # downstream pipeline rather than just this job. Fix the defect, then arm
-    # the gate. go-quicraft#3 remains open for the arming; the defect itself is
-    # tracked separately. Do NOT drop either by deleting this comment.
+    # The flag itself stays armed here regardless: arming the gate is
+    # go-quicraft#3's decision (it also wants the suite verified in the
+    # release pipeline first), not a side effect of retiring the bug that
+    # justified it. Do NOT drop this comment by deleting it as "stale" — the
+    # history is what lets #3 be resolved on its own evidence.
     continue-on-error: true
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 

@@ -1,0 +1,144 @@
+# nightly-template: v1.0 (customized) — the known-red and long-horizon jobs,
+# off the push path.
+#
+# Owner ruling 2026-08-20 (fail-fast pipeline for iteration speed): jobs that
+# are known-red with tracked issues, or that verify a slow-moving property, do
+# NOT run per push — a known-red job burning runner-minutes per push produces
+# information we already have. They run here nightly, plus on demand via
+# workflow_dispatch, and are NOT in any merge gate. When their tracked issues
+# land (FIPS: go-quicraft#24's runner-contention flake; Trivy: the
+# install/log diagnosis), a job may move back to ci.yml — that move is
+# deliberate, not automatic. Adopted here via go-quicraft#22.
+#
+# CUSTOMIZE applied: the `fips` job mirrors go-quicraft's own two-tier FIPS
+# verification exactly as it ran in ci.yml before this move — `make
+# build-fips` (compile under the module, tagged and untagged), `make
+# verify-fips` (GODEBUG=fips140=only over every package except
+# pkg/internal/transport), and `make verify-fips-transport`
+# (GODEBUG=fips140=on, pkg/internal/transport only — one notch lower because
+# QUIC packet protection and OCSP CertID are arbitrary-IV AES-GCM and SHA-1 by
+# protocol definition; see Makefile:910-951 and
+# docs/quic-transport/architecture.md for the exemption record). A bare `go
+# test ./...` would drag in build-tag-gated suites the Test job deliberately
+# excludes and fail for reasons that have nothing to do with FIPS.
+#
+# The `trivy` job is copied verbatim from the retired quality.yml, including
+# go-quicraft's skip-dirs (test, examples, contrib — none of which ship in a
+# release; contrib's deps are tracked via Dependabot like the others).
+#
+# Source of truth: software/templates/github-actions/nightly.yml in the
+# automatethethings repo (v1.0, commit 2732bc0). Pushed directly per the
+# workflow/CI-configuration carve-out (conventions/sdlc.md §"What requires a
+# PR").
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.26.6"
+  GOWORK: "off"
+
+jobs:
+  fips:
+    name: FIPS
+    runs-on: ubuntu-latest
+    # needs: none — nightly runs standalone; build health is ci.yml's job.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The transport suite in the last step starts real QUIC listeners.
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Compile under the module, tagged and untagged
+        run: make build-fips
+
+      # GODEBUG=fips140=only over every package except pkg/internal/transport.
+      - name: Approved-only gate
+        run: make verify-fips
+
+      # pkg/internal/transport under GODEBUG=fips140=on. It is one notch lower
+      # because QUIC packet protection (RFC 9001 s5.3) and the OCSP CertID
+      # (RFC 6960 s4.1.1) are arbitrary-IV AES-GCM and SHA-1 by protocol
+      # definition, both inside dependencies. The exemption is recorded with
+      # its citations in docs/quic-transport/architecture.md; this step is
+      # what keeps the exempt tree gated rather than merely excluded. This is
+      # also the step tracked flaky by go-quicraft#24 (10s waitBatch timeout
+      # under runner contention, worse under fips140=on's non-X25519 key
+      # exchange) — moving here off the push path is that issue's mitigation;
+      # #24 remains open for a real fix.
+      - name: Exempt transport tree, FIPS mode
+        run: make verify-fips-transport
+
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # A fresh source-scoped scan is uploaded to GitHub code scanning on every
+      # run, so the dashboard never reflects a stale analysis. Benchmark
+      # harnesses (test/performance/*), examples, and contrib adapters are
+      # excluded — none ship in a release; their deps are tracked via Dependabot.
+      # NOTE: do NOT image-scan the .devcontainer dev image into code scanning;
+      # that surfaces base-OS/toolchain CVEs that are not go-quicraft source vulns.
+      - name: Trivy scan (SARIF for code scanning)
+        # trivy-action's setup checks out aquasecurity/trivy from github.com
+        # with the runner token, which a Gitea token cannot authenticate.
+        if: github.server_url == 'https://github.com'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy SARIF
+        if: always() && github.server_url == 'https://github.com'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-fs
+
+      - name: Trivy gate (fail on CRITICAL/HIGH)
+        if: github.server_url == 'https://github.com'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          format: table
+          skip-dirs: test,examples,contrib
+          trivyignores: .trivyignore
+
+      # Same gate on Gitea, via the trivy CLI installed from the release
+      # tarball (anonymous download — no github.com auth involved).
+      - name: Install Trivy (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Trivy gate (Gitea)
+        if: github.server_url != 'https://github.com'
+        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
+
+      # Misconfiguration scanning (owner ruling 2026-08-20, task #27): advisory
+      # exit code, so findings surface daily without a new finding class
+      # blocking merges.
+      - name: Trivy misconfiguration scan (advisory)
+        if: github.server_url != 'https://github.com'
+        run: trivy fs --scanners misconfig --exit-code 0 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
