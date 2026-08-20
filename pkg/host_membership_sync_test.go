@@ -17,10 +17,15 @@ package quicraft
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
 // startSingleVoterShard starts shard 1 with replica 1 as its only voter and
@@ -154,6 +159,687 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 				t.Fatalf("replica 4 removed from membership by an uncommitted config change: %+v", after.Nodes)
 			}
 		})
+	}
+}
+
+// TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention is a
+// regression test for #20: OnApplied used to complete a config-change
+// RequestState — unblocking the caller of SyncRequestAddObserver /
+// SyncRequestDeleteNode — before advancing ns.configChangeIndex for that
+// same entry. A caller that immediately round-tripped
+// SyncGetShardMembership's ConfigChangeID into the next config-change call,
+// exactly as host.go:2059-2063 documents, could then receive a
+// false-positive StaleConfigChangeError.
+//
+// Deliberately a SINGLE actor doing config changes, serially: PhD 4.1 allows
+// only one config change in flight per shard, so a second concurrent actor
+// would race its own changes in and legitimately advance
+// ConfigChangeID between this actor's read and write — a real stale
+// rejection that has nothing to do with #20. Isolating the round trip to one
+// actor means every StaleConfigChangeError this test sees is the bug and
+// nothing else. Scheduling contention — the ingredient that actually exposed
+// #20 — comes instead from unrelated goroutines hammering regular proposals
+// and membership reads concurrently in the background, which cannot
+// legitimately move ConfigChangeID.
+//
+// Mutation-verified: with the fix in pkg/host.go reverted, this failed 27/30
+// runs under `go test -race -count=30`, always on the expected
+// StaleConfigChangeError; with the fix applied, 30/30 pass. The narrower
+// TestSyncRequestDeleteNode_RemovesObserver above — one add/read/remove, no
+// background load — is not a reliable repro on its own: it passed 50/50 in
+// isolation despite being the exact test CI caught the bug on, because CI's
+// win came from the scheduling contention of the full `-race ./...` suite,
+// not from that test alone. The noise load above stands in for that
+// contention.
+func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *testing.T) {
+	h := startSingleVoterShard(t)
+
+	const iterations = 500
+	const noiseWorkers = 8
+
+	stopNoise := make(chan struct{})
+	var noiseWG sync.WaitGroup
+	noiseWG.Add(2 * noiseWorkers)
+	for n := 0; n < noiseWorkers; n++ {
+		go func() {
+			defer noiseWG.Done()
+			for {
+				select {
+				case <-stopNoise:
+					return
+				default:
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_, _ = h.SyncPropose(ctx, 1, []byte("noise"))
+				cancel()
+			}
+		}()
+		go func() {
+			defer noiseWG.Done()
+			for {
+				select {
+				case <-stopNoise:
+					return
+				default:
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_, _ = h.SyncGetShardMembership(ctx, 1)
+				cancel()
+			}
+		}()
+	}
+	defer func() {
+		close(stopNoise)
+		noiseWG.Wait()
+	}()
+
+	for i := 0; i < iterations; i++ {
+		// A removed replica ID is tombstoned and can never be reused, and an
+		// address may not be held by more than one member of the shard at
+		// once, so every iteration needs its own of each.
+		observerID := uint64(10 + i)
+		addr := fmt.Sprintf("127.0.0.1:%d", 20000+i)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		if err := h.SyncRequestAddObserver(ctx, 1, observerID, addr, 0); err != nil {
+			cancel()
+			t.Fatalf("iteration %d: SyncRequestAddObserver: %v", i, err)
+		}
+
+		added, err := h.SyncGetShardMembership(ctx, 1)
+		if err != nil {
+			cancel()
+			t.Fatalf("iteration %d: SyncGetShardMembership after add: %v", i, err)
+		}
+
+		if err := h.SyncRequestDeleteNode(ctx, 1, observerID, added.ConfigChangeID); err != nil {
+			cancel()
+			t.Fatalf("iteration %d: SyncRequestDeleteNode: %v", i, err)
+		}
+		cancel()
+	}
+}
+
+// TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt is a
+// deterministic regression test for the second finding on #20's PR: the
+// contention test above only exercises the original configChangeIndex race
+// and would keep passing even if OnApplied's pending-proposal claim
+// (LoadAndDelete) moved back to AFTER applyMembershipRouting — it never
+// forces the specific interleaving where that ordering matters.
+//
+// That interleaving is: applyMembershipRouting takes ns.nodesMu while
+// registering a new member's address. If a config-change proposal is still
+// sitting in ns.pendingProposals while routing runs, the deadline-based
+// sweep (sweepPendingProposals, driven independently on a timer) can claim
+// it out from under OnApplied, treat it as a timeout, and — via
+// pendingProposal.onFailure (rollbackPreRegister) — undo the very
+// registration applyMembershipRouting is in the middle of making durable.
+// The caller would then see ErrTimeout for a change that in fact committed
+// and applied.
+//
+// This test forces that interleaving instead of hoping for it: it holds
+// ns.nodesMu itself so applyMembershipRouting provably cannot proceed past
+// its Lock() call, confirms OnApplied's claim pass has already emptied
+// ns.pendingProposals while routing is stuck there, and only then invokes
+// sweepPendingProposals directly with a "now" far past the proposal's
+// deadline. sweepPendingProposals takes "now" as an explicit parameter
+// (host.go), so this needs no real waiting and no goroutine-scheduling luck.
+//
+// Mutation-verified: reverting OnApplied to claim proposals after
+// applyMembershipRouting (the ordering the PR's second commit replaced)
+// makes this test fail — the proposal is still visible when the sweep runs,
+// so it gets reaped as a timeout.
+func TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt(t *testing.T) {
+	h := startSingleVoterShard(t)
+	ns := testLoadNode(h, 1)
+
+	// Block applyMembershipRouting from ever reaching the point where it
+	// would register the new observer's address: it takes this exact mutex
+	// to do so. Holding it here means that once OnApplied's claim pass has
+	// run, routing is provably stalled — nothing further can happen until
+	// this goroutine releases it.
+	ns.nodesMu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			ns.nodesMu.Unlock()
+		}
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// RequestAddObserver (the async form SyncRequestAddObserver wraps)
+	// returns only once the proposal is stored in ns.pendingProposals and
+	// delivered to the engine — that Store happens strictly before its
+	// return, in program order within requestConfigChange, on THIS
+	// goroutine. So by the time this call returns, the proposal is
+	// registered: no goroutine, no polling, no scheduling race needed to
+	// know that — unlike waiting for the OPPOSITE transition (removed from
+	// the map) below, which genuinely does need to be observed, because it
+	// is OnApplied's apply-worker goroutine that performs it.
+	rs, err := h.RequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", 0)
+	if err != nil {
+		unlock()
+		t.Fatalf("RequestAddObserver: %v", err)
+	}
+	defer rs.Release()
+
+	pendingCount := func() int {
+		n := 0
+		ns.pendingProposals.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
+
+	// Wait for OnApplied's claim pass to remove it. It must do this before
+	// applyMembershipRouting can proceed, and applyMembershipRouting is
+	// provably blocked on ns.nodesMu, which this goroutine still holds — so
+	// once pendingProposals is empty, that emptiness cannot be explained by
+	// routing having finished; it can only be explained by the claim
+	// happening first. The proposal was proven registered above, so an
+	// empty map here is unambiguous.
+	claimed := false
+	ticker := time.NewTicker(time.Millisecond)
+	timeout := time.NewTimer(5 * time.Second)
+pollClaimed:
+	for {
+		if pendingCount() == 0 {
+			claimed = true
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			break pollClaimed
+		}
+	}
+	ticker.Stop()
+	timeout.Stop()
+	if !claimed {
+		unlock()
+		t.Fatal("proposal was not claimed out of ns.pendingProposals while routing was blocked on ns.nodesMu — " +
+			"claim must happen before applyMembershipRouting, not after")
+	}
+
+	// The proposal is claimed but routing is still stalled (ns.nodesMu is
+	// still held). Sweep with a "now" far past any deadline this proposal's
+	// 10-second context could have set. With the claim happening before
+	// routing, this must find nothing: the entry is already out of
+	// ns.pendingProposals. If claiming instead happened after routing, the
+	// entry would still be sitting here and this call would reap it as a
+	// timeout — rolling back the registration applyMembershipRouting is
+	// about to make once unblocked.
+	h.sweepPendingProposals(ns, time.Now().Add(24*time.Hour))
+
+	unlock()
+
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			t.Fatalf("RequestAddObserver: %v (the deadline sweep incorrectly reaped an already-claimed, "+
+				"already-committed config change)", result.Err)
+		}
+	case <-ctx.Done():
+		t.Fatal("RequestAddObserver never completed after routing unblocked")
+	}
+
+	members, err := h.GetShardMembership(1)
+	if err != nil {
+		t.Fatalf("GetShardMembership: %v", err)
+	}
+	if _, ok := members.Observers[10]; !ok {
+		t.Fatalf("observer 10 missing after a successful add — rollbackPreRegister ran on an applied, "+
+			"committed change: %+v", members.Observers)
+	}
+}
+
+// TestOnApplied_ClaimsProposalBeforeReadsSoTheSweeperCannotStealIt is a
+// sibling of TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt
+// for the sixth finding on #20's PR: fixing the fourth finding (pending reads
+// stranded by a routing panic) by moving the lastApplied/pendingReads block
+// to run before proposal claiming — instead of merely before routing, which
+// is all it actually needed — reopened the exact sweeper race the second and
+// third findings closed, one level up. The reads scan can itself take a
+// while (arbitrarily many confirmed reads, a metrics call per one), and
+// until a membership batch's proposal is claimed it is exposed to
+// sweepPendingProposals for that whole time.
+//
+// This forces the interleaving by holding ns.pendingReadsMu instead of
+// ns.nodesMu: the pending-reads block cannot proceed past its Lock() call
+// while this goroutine holds it, so if claiming happens first (correct),
+// ns.pendingProposals is already empty by the time this test's sweep runs;
+// if claiming were moved back to after the reads block (the finding), the
+// proposal is still sitting there and the sweep reaps it.
+//
+// Mutation-verified: moving proposal claiming to after the pending-reads
+// block makes this test fail 10/10, always on the sweep's ErrTimeout.
+func TestOnApplied_ClaimsProposalBeforeReadsSoTheSweeperCannotStealIt(t *testing.T) {
+	h := startSingleVoterShard(t)
+	ns := testLoadNode(h, 1)
+
+	// Block the pending-reads scan from ever running: it takes this exact
+	// mutex first thing. Holding it here means that once OnApplied's claim
+	// pass has run, the reads scan (and everything after it, including
+	// routing) is provably stalled — nothing further can happen until this
+	// goroutine releases it.
+	ns.pendingReadsMu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			ns.pendingReadsMu.Unlock()
+		}
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// See the sibling test above: RequestAddObserver returning proves the
+	// proposal is registered in ns.pendingProposals, in program order on
+	// this goroutine, with no polling needed.
+	rs, err := h.RequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", 0)
+	if err != nil {
+		unlock()
+		t.Fatalf("RequestAddObserver: %v", err)
+	}
+	defer rs.Release()
+
+	pendingCount := func() int {
+		n := 0
+		ns.pendingProposals.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
+
+	// Wait for OnApplied's claim pass to remove it. It must do this before
+	// the pending-reads scan can proceed, and that scan is provably blocked
+	// on ns.pendingReadsMu, which this goroutine still holds — so once
+	// pendingProposals is empty, that emptiness cannot be explained by the
+	// reads scan (or routing after it) having finished; it can only be
+	// explained by the claim happening first.
+	claimed := false
+	ticker := time.NewTicker(time.Millisecond)
+	timeout := time.NewTimer(5 * time.Second)
+pollClaimed:
+	for {
+		if pendingCount() == 0 {
+			claimed = true
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			break pollClaimed
+		}
+	}
+	ticker.Stop()
+	timeout.Stop()
+	if !claimed {
+		unlock()
+		t.Fatal("proposal was not claimed out of ns.pendingProposals while the pending-reads scan was blocked " +
+			"on ns.pendingReadsMu — claim must happen before that scan, not after")
+	}
+
+	// The proposal is claimed but the reads scan (and routing behind it) is
+	// still stalled. Sweep with a "now" far past any deadline this
+	// proposal's 10-second context could have set. With the claim happening
+	// first, this must find nothing. If claiming were moved back to after
+	// the reads scan, the entry would still be sitting here and this call
+	// would reap it as a timeout.
+	h.sweepPendingProposals(ns, time.Now().Add(24*time.Hour))
+
+	unlock()
+
+	select {
+	case result := <-rs.ResultC():
+		if result.Err != nil {
+			t.Fatalf("RequestAddObserver: %v (the deadline sweep incorrectly reaped an already-claimed, "+
+				"already-committed config change)", result.Err)
+		}
+	case <-ctx.Done():
+		t.Fatal("RequestAddObserver never completed after the reads scan unblocked")
+	}
+
+	members, err := h.GetShardMembership(1)
+	if err != nil {
+		t.Fatalf("GetShardMembership: %v", err)
+	}
+	if _, ok := members.Observers[10]; !ok {
+		t.Fatalf("observer 10 missing after a successful add — rollbackPreRegister ran on an applied, "+
+			"committed change: %+v", members.Observers)
+	}
+}
+
+// panicOnMembershipChangedHandler is an slog.Handler that panics on the
+// specific "membership changed" record applyMembershipRouting logs, and is a
+// well-behaved no-op handler for every other record — so shard startup and
+// leader-election logging (different messages) do not also panic and
+// obscure the one call this test targets.
+type panicOnMembershipChangedHandler struct{}
+
+func (panicOnMembershipChangedHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (panicOnMembershipChangedHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "membership changed" {
+		panic("injected panic: user-supplied slog.Handler blew up")
+	}
+	return nil
+}
+
+func (h panicOnMembershipChangedHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h panicOnMembershipChangedHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem is a
+// deterministic regression test for the third finding on #20's PR: claiming
+// proposals (LoadAndDelete) before applyMembershipRouting means a panic
+// inside routing can no longer be recovered by the apply worker's
+// OnProposalFailed (apply.go:605-633) the way it always could before —
+// OnProposalFailed only fails entries still present in ns.pendingProposals,
+// and these were already removed. Without a local recover, such a panic
+// would strand every already-claimed RequestState forever: no completion,
+// no releaseRef, no completePendingOp — so the caller hangs past any
+// deadline (the sweep cannot see them either) and Host.Drain never returns.
+//
+// applyMembershipRouting logs through a user-supplied slog.Logger
+// (WithLogger), whose Handler is arbitrary code and can panic. This test
+// installs one that does, on exactly the "membership changed" record
+// applyMembershipRouting emits for a committed config change, and verifies
+// the claimed proposal is still completed (with a typed error, not left
+// hanging) and every pendingOp is still balanced (Drain returns).
+//
+// It also covers the fifth finding on the same PR: the first version of this
+// recovery called pendingProposal.onFailure (rollbackPreRegister) for every
+// claimed proposal, the same cleanup sweepPendingProposals does. That is
+// wrong here — applyMembershipRouting's own per-entry log call (the one that
+// panics) runs AFTER that entry's registry.Register/ns.nodes update, so by
+// the time the panic fires, the AddNonVoting below has already landed. Every
+// entry OnApplied is invoked with is one raft's own authoritative fold has
+// already committed (Peer.Commit -> processConfigChanges, earlier in the
+// pipeline) — unlike sweepPendingProposals's case, a proposal that was
+// appended but never committed at all. Rolling back a committed change's
+// registration would revert real state on a plausible-looking error path, so
+// this asserts the registration SURVIVES the panic.
+func TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithLogger(slog.New(panicOnMembershipChangedHandler{})))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	scfg := testShardConfig(1, 1)
+	scfg.CheckQuorum = config.BoolPtr(false)
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	addErr := h.SyncRequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", 0)
+	if addErr == nil {
+		t.Fatal("SyncRequestAddObserver: expected the injected applyMembershipRouting panic to surface as an " +
+			"error, got nil — either the panic was not triggered or the claimed proposal completed as if nothing happened")
+	}
+	var panicErr *LoopPanicError
+	if !errors.As(addErr, &panicErr) {
+		t.Fatalf("SyncRequestAddObserver error = %T (%v), want a *LoopPanicError wrapping the recovered routing panic",
+			addErr, addErr)
+	}
+	if panicErr.LoopName != "OnApplied(membership)" {
+		t.Fatalf("LoopPanicError.LoopName = %q, want %q", panicErr.LoopName, "OnApplied(membership)")
+	}
+
+	// The claimed proposal's rs.releaseRef/completePendingOp must have run
+	// for the caller to see addErr at all (RequestState.complete alone does
+	// not unblock ResultC's buffer past a leak in the pool accounting), but
+	// Drain is the direct assertion on the pendingOps invariant the review
+	// finding was about: if the claimed proposal's completePendingOp were
+	// skipped, pendingOps would never reach zero and Drain would time out.
+	if drainErr := h.Drain(); drainErr != nil {
+		t.Fatalf("Drain did not complete — a claimed proposal's pendingOp was stranded by the routing panic: %v", drainErr)
+	}
+
+	// The AddNonVoting's registry.Register/ns.nodes update ran before the
+	// panicking log call in the same loop iteration, so it already landed
+	// when the panic fired. It must not have been rolled back.
+	ns := testLoadNode(h, 1)
+	ns.nodesMu.RLock()
+	addr, ok := ns.nodes[10]
+	ns.nodesMu.RUnlock()
+	if !ok || addr != "127.0.0.1:6000" {
+		t.Fatalf("ns.nodes[10] = (%q, %v), want (\"127.0.0.1:6000\", true) — the routing panic's recovery "+
+			"rolled back a registration that had already committed", addr, ok)
+	}
+	if resolved, resolveErr := h.registry.Resolve(1, 10); resolveErr != nil || resolved != "127.0.0.1:6000" {
+		t.Fatalf("registry.Resolve(1, 10) = (%q, %v), want (\"127.0.0.1:6000\", nil) — rollbackPreRegister "+
+			"reverted an already-committed config change's registration", resolved, resolveErr)
+	}
+}
+
+// TestOnApplied_RoutingPanicDoesNotStrandPendingReads is a deterministic
+// regression test for the fourth finding on #20's PR: the fix above only
+// covers pending PROPOSALS. A pending READ confirmed by the same applied
+// batch (ns.lastApplied advance + the pendingReads scan) used to be
+// processed before applyMembershipRouting could ever run — so a routing
+// panic never reached it. Moving proposal claiming ahead of routing did not
+// change that ordering for reads, but the review caught that it easily could
+// have (and very nearly did, in an earlier revision of this PR): if the
+// pendingReads block is ever moved back to AFTER the membership branch, a
+// routing panic strands every read this batch had just confirmed until its
+// own deadline, and holds Drain's pendingOps count with it.
+//
+// This calls hostEngineCallback.OnApplied directly against a manually
+// constructed nodeState — the same construction addTestNodeState uses,
+// deliberately NOT wired up via StartShard — with a synthetic committed
+// batch and an already-confirmed pending read. No real raft engine or apply
+// worker is ever started for this shard, so nothing but this one direct call
+// can touch ns.pendingReads: an earlier revision of this test used a real
+// StartShard'd shard, and the live background apply pipeline it starts
+// raced this test's own assertion (completing the read through its own,
+// unrelated batches), which is exactly the kind of nondeterminism a
+// regression test for an ordering bug cannot afford.
+func TestOnApplied_RoutingPanicDoesNotStrandPendingReads(t *testing.T) {
+	h := newTestHost(t)
+	h.logger = slog.New(panicOnMembershipChangedHandler{})
+
+	ns := &nodeState{
+		shardID:      1,
+		replicaID:    1,
+		nodes:        map[uint64]string{1: "127.0.0.1:5000"},
+		pendingReads: make(map[uint64]*pendingRead),
+		requestPool:  NewRequestStatePool(),
+		openStopper:  make(chan struct{}),
+	}
+	ns.health.Store(uint32(ShardHealthy))
+	h.nodes.Store(uint64(1), ns)
+	h.activeNodes.Add(1)
+
+	// Register a pending read exactly as ReadIndex does, pre-confirmed
+	// against an index this batch's entry will cover — the state OnApplied's
+	// pending-reads scan exists to complete.
+	const readKey = 999999
+	rs := newRequestState(ns.requestPool, readKey, time.Now().Add(time.Hour), false)
+	h.addPendingOp()
+	rs.acquireRef()
+	ns.pendingReadsMu.Lock()
+	ns.pendingReads[readKey] = &pendingRead{rs: rs, confirmed: true, readIndex: 1}
+	ns.pendingReadsMu.Unlock()
+
+	cc := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "127.0.0.1:6000"}
+	ccBuf := make([]byte, cc.Size())
+	n, err := cc.MarshalTo(ccBuf)
+	if err != nil {
+		t.Fatalf("ConfigChange.MarshalTo: %v", err)
+	}
+	entries := []proto.Entry{{Index: 5, Term: 1, Type: proto.EntryConfigChange, Cmd: ccBuf[:n]}}
+
+	cb := &hostEngineCallback{h: h}
+	func() {
+		// The routing panic is expected to propagate out of OnApplied by
+		// design (apply.go's own recover normally handles it in production;
+		// there is no apply worker here since OnApplied is invoked
+		// directly). This test only inspects the aftermath.
+		defer func() { recover() }()
+		cb.OnApplied(1, entries, []sm.Result{{}})
+	}()
+
+	select {
+	case <-rs.ResultC():
+	default:
+		rs.Release()
+		t.Fatal("the pending read was not completed before the routing panic propagated out of OnApplied — it was stranded")
+	}
+	rs.Release()
+
+	if drainErr := h.Drain(); drainErr != nil {
+		t.Fatalf("Drain did not complete — the pending read's pendingOp was stranded by the routing panic: %v", drainErr)
+	}
+}
+
+// panicOnSecondObserveProposalLatency panics on its second call and is a
+// no-op (via NoOpMetricsCollector) otherwise. Not concurrency-safe — only
+// meant for a test that drives calls from a single goroutine, as OnApplied's
+// completion loop does.
+type panicOnSecondObserveProposalLatency struct {
+	NoOpMetricsCollector
+	calls *int
+}
+
+func (p panicOnSecondObserveProposalLatency) ObserveProposalLatency(uint64, time.Duration) {
+	*p.calls++
+	if *p.calls == 2 {
+		panic("injected panic: second proposal completion blew up")
+	}
+}
+
+// TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims is a
+// regression test for the eighth finding on #20's PR (round 8 review): the
+// panic-recovery handler ranged over ALL of claimed unconditionally, so a
+// panic reaching it after the normal completeProposal loop had already
+// completed and released some of claimed's proposals would complete and
+// release those SAME proposals a second time. RequestState.complete is
+// idempotent (CAS-guarded), but releaseRef is not — it unconditionally
+// decrements a reference count and recycles the object at zero, so a second
+// call either underflows that count or touches an object already back in
+// the pool, potentially reused by an unrelated request by then.
+//
+// The review cited c.h.metrics.ObserveProposalLatency as the panic source.
+// That call is, in fact, already panic-safe in production —
+// pkg/metrics_safe.go wraps every WithMetrics collector so a panic in it
+// never reaches caller code (see the round-7 finding and fix, which found
+// and documented this for ObserveReadIndexLatency). This test does not
+// pretend otherwise: it reaches h.metrics directly (an unexported field,
+// same package) to install a raw, UNWRAPPED collector — deliberate fault
+// injection to exercise the recovery handler's own bookkeeping in
+// isolation, not a claim that a real, WithMetrics-registered collector can
+// panic through to here. The bookkeeping bug this proves is independent of
+// how the panic arrives: any future addition to the claimed-completion loop
+// that CAN panic would hit exactly this.
+//
+// Two claimed proposals, an ordinary one (index 0) and a membership one
+// (index 1): the collector panics on the second ObserveProposalLatency
+// call, i.e. while completing index 1, after index 0 has already completed
+// and released successfully. Asserts index 0's RequestState was not
+// recycled/reused (via its pool) as a side effect of the recovery handler
+// touching it again, and that both proposals' pendingOps are accounted for
+// exactly once (Drain balances).
+func TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims(t *testing.T) {
+	h := newTestHost(t)
+	calls := 0
+	h.metrics = panicOnSecondObserveProposalLatency{calls: &calls} // fault injection — see doc comment
+
+	ns := &nodeState{
+		shardID:      1,
+		replicaID:    1,
+		nodes:        map[uint64]string{1: "127.0.0.1:5000"},
+		pendingReads: make(map[uint64]*pendingRead),
+		requestPool:  NewRequestStatePool(),
+		openStopper:  make(chan struct{}),
+	}
+	ns.health.Store(uint32(ShardHealthy))
+	h.nodes.Store(uint64(1), ns)
+	h.activeNodes.Add(1)
+
+	const keyA, keyB uint64 = 1, 2
+	rsA := newRequestState(ns.requestPool, keyA, time.Now().Add(time.Hour), true)
+	h.addPendingOp()
+	rsA.acquireRef()
+	ns.pendingProposals.Store(keyA, &pendingProposal{rs: rsA})
+
+	rsB := newRequestState(ns.requestPool, keyB, time.Now().Add(time.Hour), true)
+	h.addPendingOp()
+	rsB.acquireRef()
+	ns.pendingProposals.Store(keyB, &pendingProposal{rs: rsB})
+
+	cc := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "127.0.0.1:6000"}
+	ccBuf := make([]byte, cc.Size())
+	n, err := cc.MarshalTo(ccBuf)
+	if err != nil {
+		t.Fatalf("ConfigChange.MarshalTo: %v", err)
+	}
+	entries := []proto.Entry{
+		{Index: 5, Term: 1, Key: keyA, Type: proto.EntryNormal},
+		{Index: 6, Term: 1, Key: keyB, Type: proto.EntryConfigChange, Cmd: ccBuf[:n]},
+	}
+
+	cb := &hostEngineCallback{h: h}
+	func() {
+		// Expected to propagate by design — see the sibling round-7/round-5
+		// tests. This test only inspects the aftermath.
+		defer func() { recover() }()
+		cb.OnApplied(1, entries, []sm.Result{{}, {}})
+	}()
+
+	// A completed normally (ObserveProposalLatency call #1, no panic). Its
+	// RequestState must have exactly one releaseRef's worth of effect: back
+	// in the pool, with a fresh newRequestState pull showing a clean slate
+	// rather than whatever double-release would have left behind (a
+	// negative outstanding count is the direct symptom, but that field
+	// is unexported and pool internals are not meant to be inspected
+	// directly — acquiring a new RequestState from the SAME pool and
+	// confirming it behaves normally is the black-box equivalent).
+	select {
+	case result := <-rsA.ResultC():
+		if result.Err != nil {
+			t.Fatalf("proposal A result.Err = %v, want nil (it completed before B's panic)", result.Err)
+		}
+	default:
+		t.Fatal("proposal A was never completed")
+	}
+
+	// B failed with the panic, via the recovery path.
+	select {
+	case result := <-rsB.ResultC():
+		var panicErr *LoopPanicError
+		if !errors.As(result.Err, &panicErr) {
+			t.Fatalf("proposal B result.Err = %T (%v), want a *LoopPanicError", result.Err, result.Err)
+		}
+	default:
+		t.Fatal("proposal B was never completed by the recovery path")
+	}
+
+	// h.pendingOps is NOT the right place to look for a double-release:
+	// completePendingOp has its own floor guard ("already at zero or
+	// below; do not decrement further", host.go), added for exactly this
+	// class of double-completion race, so a second call from a double
+	// release is silently absorbed and pendingOps still nets to a
+	// deceptively clean 0. rsA.outstanding is the field that actually
+	// catches it: acquireRef set it to 1, proposal A's single legitimate
+	// releaseRef (in the normal completion loop, before B's panic) must
+	// bring it to exactly 0 — a second releaseRef from the recovery
+	// handler touching A again would drive it to -1, which
+	// RequestState.releaseRef has no floor against.
+	if outstanding := rsA.outstanding.Load(); outstanding != 0 {
+		t.Fatalf("rsA.outstanding = %d, want exactly 0 — the recovery handler released proposal A's "+
+			"RequestState a second time after its normal completion had already done so", outstanding)
+	}
+
+	if drainErr := h.Drain(); drainErr != nil {
+		t.Fatalf("Drain did not complete: %v", drainErr)
 	}
 }
 

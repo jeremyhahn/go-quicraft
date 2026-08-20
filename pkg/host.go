@@ -1407,6 +1407,29 @@ type hostEngineCallback struct {
 	h *Host
 }
 
+// completeProposal delivers an applied entry's result to the caller waiting
+// on pp.rs, translating the reserved ResultSessionExpired value into an
+// error so clients can distinguish expired sessions from legitimate
+// zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
+// OnApplied's proposal completion so they cannot drift apart.
+func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
+	rs := pp.rs
+	// Record end-to-end proposal latency (Propose -> OnApplied).
+	if h.metrics != nil && !rs.createdAt.IsZero() {
+		h.metrics.ObserveProposalLatency(shardID, time.Since(rs.createdAt))
+	}
+	if result.Value == sm.ResultSessionExpired {
+		rs.complete(RequestResult{Err: &SessionExpiredError{
+			ShardID:  shardID,
+			ClientID: entry.ClientID,
+		}})
+	} else {
+		rs.complete(RequestResult{Value: result.Value, Data: result.Data})
+	}
+	rs.releaseRef()
+	h.completePendingOp()
+}
+
 // OnApplied completes pending proposals whose entries have been
 // applied to the state machine. entries and results are parallel
 // slices. For each entry with a registered RequestState, the result
@@ -1463,82 +1486,318 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		matched = entries[:len(results)]
 	}
 
-	// Complete pending proposals. Uses sync.Map for lock-free lookups
-	// on this hot path — no mutex contention with concurrent Propose.
+	// Claim every pending proposal in this batch — LoadAndDelete it out of
+	// ns.pendingProposals — before anything else in this function, including
+	// the pending-reads scan below and (for a membership-changing batch)
+	// applyMembershipRouting. pendingProposals is a lock-free sync.Map
+	// shared with the deadline sweep (sweepPendingProposals) and
+	// OnProposalFailed; whichever of them calls LoadAndDelete on a key first
+	// owns that entry. Two earlier versions of this fix got the relative
+	// position wrong in each direction: claiming AFTER applyMembershipRouting
+	// reopened the window #20 itself was about, one level down — an entry
+	// whose deadline expired while routing was still running could be
+	// claimed by the sweeper instead, which treats it as a timeout and, via
+	// pendingProposal.onFailure, could act on an already-committed change.
+	// Claiming after the pending-reads scan (rather than before it)
+	// reopened the SAME window one level up: the reads scan can itself take
+	// a while (arbitrarily many confirmed reads, a metrics call per one),
+	// and until claiming happens the config-change proposal is just as
+	// exposed to the sweeper. Claiming first, before any other work at all,
+	// closes both. Only the actual completion (rs.complete, inside
+	// completeProposal) is deferred until after routing, for the #20 reason
+	// below — and only for a membership-changing batch, which is the only
+	// case that has routing to defer it past.
+	type claimedProposal struct {
+		entry  proto.Entry
+		result sm.Result
+		pp     *pendingProposal
+	}
+	var claimed []claimedProposal
+	if hasMembershipChange {
+		claimed = make([]claimedProposal, 0, len(matched))
+	}
 	for i, entry := range matched {
-		// Match by entry.Key (the proposal tracking key set by Host.Propose)
-		// rather than entry.Index (assigned by the raft state machine).
+		// Match by entry.Key (the proposal tracking key set by
+		// Host.Propose) rather than entry.Index (assigned by the raft
+		// state machine).
 		v, ok := ns.pendingProposals.LoadAndDelete(entry.Key)
-		if ok {
-			pp, ppOK := v.(*pendingProposal)
-			if !ppOK {
-				slog.Error("OnApplied pendingProposal type assertion failed",
-					"shard_id", shardID,
-					"entry_key", entry.Key,
-					"error", &TypeAssertionError{
-						Context:      "OnApplied pendingProposal lookup",
-						ExpectedType: "*pendingProposal",
-						ActualValue:  v,
-					})
-				continue
-			}
-			rs := pp.rs
-			// Record end-to-end proposal latency (Propose -> OnApplied).
-			if c.h.metrics != nil && !rs.createdAt.IsZero() {
-				c.h.metrics.ObserveProposalLatency(shardID, time.Since(rs.createdAt))
-			}
-			// Translate reserved ResultSessionExpired into an error
-			// so clients can distinguish expired sessions from
-			// legitimate zero-value results (PhD Figure 6.1, step 3).
-			if results[i].Value == sm.ResultSessionExpired {
-				rs.complete(RequestResult{Err: &SessionExpiredError{
-					ShardID:  shardID,
-					ClientID: entry.ClientID,
-				}})
-			} else {
-				rs.complete(RequestResult{Value: results[i].Value, Data: results[i].Data})
-			}
-			rs.releaseRef()
-			c.h.completePendingOp()
+		if !ok {
+			continue
+		}
+		pp, ppOK := v.(*pendingProposal)
+		if !ppOK {
+			slog.Error("OnApplied pendingProposal type assertion failed",
+				"shard_id", shardID,
+				"entry_key", entry.Key,
+				"error", &TypeAssertionError{
+					Context:      "OnApplied pendingProposal lookup",
+					ExpectedType: "*pendingProposal",
+					ActualValue:  v,
+				})
+			continue
+		}
+		if hasMembershipChange {
+			// Staged for completion after routing below — see the
+			// claiming comment above for why. Confined to this branch so
+			// the ordinary path (the ELSE below) never pays for the
+			// staging allocation.
+			claimed = append(claimed, claimedProposal{entry: entry, result: results[i], pp: pp})
+		} else {
+			// Ordinary path (no config change in this batch, the
+			// overwhelming majority of apply traffic — regular client
+			// proposals and follower replication): there is no routing
+			// work to order around, so complete immediately, same as
+			// before #20.
+			completeProposal(c.h, shardID, entry, pp, results[i])
 		}
 	}
 
-	// Advance lastApplied and complete confirmed pending reads whose readIndex
-	// has been reached. The lastApplied store MUST happen under pendingReadsMu,
-	// before the read scan, and OnReadyToRead must read lastApplied under the
-	// same lock. Otherwise a read confirmed by OnReadyToRead in the window
-	// between this scan and a post-unlock store would be completed by neither
-	// path (OnReadyToRead sees a stale lastApplied; this scan ran before the
-	// read was confirmed) and would hang until its deadline.
-	if len(entries) > 0 {
-		newLastApplied := entries[len(entries)-1].Index
-		ns.pendingReadsMu.Lock()
-		ns.lastApplied.Store(newLastApplied)
-		for key, pr := range ns.pendingReads {
-			if pr.confirmed && newLastApplied >= pr.readIndex {
-				if c.h.metrics != nil && !pr.rs.createdAt.IsZero() {
-					c.h.metrics.ObserveReadIndexLatency(shardID, time.Since(pr.rs.createdAt))
+	// Everything below — the pending-reads scan, applyMembershipRouting, and
+	// completing the claimed proposals — runs inside ONE recover, installed
+	// before any of it, rather than one scoped only around
+	// applyMembershipRouting (an earlier version of this fix). Every piece
+	// in here calls at least one user-supplied callback that can panic:
+	// c.h.metrics.ObserveReadIndexLatency in the reads scan, c.h.logger in
+	// applyMembershipRouting's per-entry log call, c.h.metrics.
+	// ObserveProposalLatency in completeProposal. A narrower recover placed
+	// around just one of them protects claimed only from THAT one — the
+	// reads scan's own metrics call is exactly as capable of leaving
+	// claimed's proposals unclaimed-from-the-map-but-never-completed as
+	// applyMembershipRouting's logger call is, and a recover that only
+	// wraps the latter does nothing for the former (#20 review finding,
+	// round 6). One recover around the whole region means the next
+	// user-callback panic this function grows does not need its own
+	// bespoke guard rediscovered the same way three times running.
+	//
+	// This is harmless for a batch with no membership change: claimed is
+	// nil there (proposals were already claimed AND completed together, in
+	// the loop above, before this closure even starts), so the recover
+	// handler's range over claimed is a no-op and the reads scan's
+	// behavior is unchanged from every version of this code before #20 —
+	// a panic there still reaches the apply worker's own recover
+	// (apply.go:605-633) and fails the shard, exactly as it always has.
+	func() {
+		// completedClaims counts how many of claimed[0:] the normal
+		// completeProposal loop below has already finished — see the
+		// recover for why a panic handler needs this rather than ranging
+		// over all of claimed unconditionally.
+		completedClaims := 0
+		defer func() {
+			if r := recover(); r != nil {
+				// Capturing the stack and constructing the typed error are
+				// both safe: debug.Stack() is pure runtime introspection,
+				// and storing r in a struct field does not call any method
+				// on it. Nothing here is user code yet.
+				stack := debug.Stack()
+				panicErr := &LoopPanicError{
+					LoopName: "OnApplied(membership)",
+					Value:    r,
+					Stack:    stack,
 				}
-				pr.rs.complete(RequestResult{Value: pr.readIndex})
-				delete(ns.pendingReads, key)
-				pr.rs.releaseRef()
-				c.h.completePendingOp()
+
+				// Complete/release the NOT-yet-completed tail,
+				// claimed[completedClaims:], BEFORE any logging below —
+				// not after, which is where this was originally written.
+				// A panic value's concrete type is caller-controlled and
+				// may implement String/Error/Format with a bug of its own,
+				// and slog.Error here is the package-level default logger,
+				// which an embedder can replace wholesale via
+				// slog.SetDefault to a Handler that can also panic —
+				// unlike c.h.logger (WithLogger), it is not even this
+				// Host's own configured logger, so a Host built with no
+				// logger option at all is still exposed to it. Logging
+				// first meant a panic in fmt.Sprint(r) or the handler
+				// itself skipped this whole deferred function, recreating
+				// exactly the stranding this recovery exists to prevent —
+				// now one level further in (review finding, round 9).
+				//
+				// Only the NOT-yet-completed tail: a panic reaching here
+				// after the completeProposal loop below has already
+				// finished some of claimed would otherwise complete/
+				// release those a second time. RequestState.complete is
+				// idempotent (CAS-guarded) but releaseRef is not — it
+				// unconditionally decrements a reference count and
+				// recycles the object at zero, so a second call for an
+				// already-released RequestState underflows that count or
+				// touches an object already back in the pool and
+				// potentially reused by an unrelated request (review
+				// finding, round 8).
+				//
+				// This does NOT call pp.failed() (rollbackPreRegister) the
+				// way the deadline sweep does, and must not:
+				// rollbackPreRegister exists for a proposal that was
+				// appended but never committed at all (leader deposed, log
+				// truncated) — exactly sweepPendingProposals's case, where
+				// the entry never reaches OnApplied. Every entry in THIS
+				// batch, by contrast, is one OnApplied was invoked with,
+				// which only happens after raft's own authoritative fold
+				// (Peer.Commit -> processConfigChanges, earlier in the same
+				// pipeline) has already committed it — durably, regardless
+				// of whether this host-level mirror (registry, ns.nodes,
+				// whatever panicked) finishes reflecting it. Rolling back
+				// the speculative pre-registration for an already-committed
+				// change would revert a registry entry applyMembershipRouting
+				// had already correctly made, or a still-correct prior
+				// mapping for an entry whose turn in the loop simply had not
+				// come yet — the change is committed either way, and the
+				// shard failing after this recovers will re-derive ns.nodes
+				// and the registry from the persisted log on reload
+				// regardless (review finding, round 5).
+				for _, cp := range claimed[completedClaims:] {
+					cp.pp.rs.complete(RequestResult{Err: panicErr})
+					cp.pp.rs.releaseRef()
+					c.h.completePendingOp()
+				}
+
+				// Logging last, and self-contained: everything that must
+				// happen for correctness already has. If fmt.Sprint(r) or
+				// the default slog Handler panics here, this inner recover
+				// drops the log line rather than let that panic replace
+				// the one this whole function exists to report, or skip
+				// the re-panic below that fails the shard.
+				func() {
+					defer func() { _ = recover() }()
+					slog.Error("panic recovered completing a membership-changing batch; "+
+						"claimed proposals already completed and released",
+						"shard_id", shardID,
+						"panic", fmt.Sprint(r),
+						"stack", string(stack),
+					)
+				}()
+
+				panic(r)
+			}
+		}()
+
+		// Advance lastApplied and complete confirmed pending reads whose
+		// readIndex has been reached. This runs after proposal claiming
+		// above (see that comment for why claiming must go first) but
+		// before routing below — including before the membership branch's
+		// applyMembershipRouting. A read confirmed by this exact batch has
+		// nothing to do with routing or ns.configChangeIndex — it is keyed
+		// off entries[].Index alone — so there is no correctness reason to
+		// run it after routing, and every reason not to: leaving it later
+		// meant a routing panic stranded any read this batch had just
+		// confirmed until its own deadline, and held Drain's pendingOps
+		// count with it (#20 review finding, third round).
+		//
+		// The lastApplied store MUST happen under pendingReadsMu, before
+		// the read scan, and OnReadyToRead must read lastApplied under the
+		// same lock. Otherwise a read confirmed by OnReadyToRead in the
+		// window between this scan and a post-unlock store would be
+		// completed by neither path (OnReadyToRead sees a stale
+		// lastApplied; this scan ran before the read was confirmed) and
+		// would hang until its deadline.
+		//
+		// The unlock is deferred, not explicit-at-the-end: the loop calls
+		// c.h.metrics.ObserveReadIndexLatency, user-supplied code that can
+		// panic. An explicit Unlock() after the loop is skipped entirely if
+		// the loop panics, leaving pendingReadsMu locked forever — every
+		// future ReadIndex registration and every future sweepPendingReads
+		// call (which sweeps every shard's nodeState from one loop) would
+		// then hang acquiring it, well beyond just this shard. Scoped to
+		// its own closure so the lock is not held across routing below,
+		// which does not need it.
+		if len(entries) > 0 {
+			func() {
+				newLastApplied := entries[len(entries)-1].Index
+				ns.pendingReadsMu.Lock()
+				defer ns.pendingReadsMu.Unlock()
+				ns.lastApplied.Store(newLastApplied)
+				for key, pr := range ns.pendingReads {
+					if pr.confirmed && newLastApplied >= pr.readIndex {
+						if c.h.metrics != nil && !pr.rs.createdAt.IsZero() {
+							c.h.metrics.ObserveReadIndexLatency(shardID, time.Since(pr.rs.createdAt))
+						}
+						pr.rs.complete(RequestResult{Value: pr.readIndex})
+						delete(ns.pendingReads, key)
+						pr.rs.releaseRef()
+						c.h.completePendingOp()
+					}
+				}
+			}()
+		}
+
+		if hasMembershipChange {
+			// Update the Host routing table (ns.nodes + registry, and —
+			// critically — ns.configChangeIndex) BEFORE completing any
+			// claimed proposal in this batch, not after. rs.complete
+			// (inside completeProposal) is a cross-goroutine handoff: it
+			// can wake a caller blocked on RequestState.ResultC() while
+			// this function is still executing on the apply worker's
+			// goroutine. A caller unblocked by a config-change proposal's
+			// completion is documented (host.go:2059-2063) to be able to
+			// immediately call SyncGetShardMembership and round-trip its
+			// ConfigChangeID into the next config-change call; that
+			// round-trip is only race-free if ns.configChangeIndex already
+			// reflects this batch by the time completion is visible to the
+			// caller. Running applyMembershipRouting first — same
+			// goroutine, program order — makes that true; running it after
+			// (the original order) left a window where the caller's next
+			// call raced advanceConfigChangeIndex and lost, producing a
+			// false-positive StaleConfigChangeError (#20).
+			//
+			// This does NOT move the user-supplied OnMembershipChanged
+			// listener earlier too — see fireMembershipChanged below. Only
+			// the routing/index bookkeeping needs to happen before
+			// completion; the listener is arbitrary user code, and
+			// OnApplied runs on the apply worker's goroutine with no
+			// dispatch boundary of its own (engine.go's UnloadNode doc:
+			// synchronous engine-to-Host callbacks that fan out to user
+			// code must be dispatched by the Host, or the hazard returns
+			// through them). A panicking listener is caught by the apply
+			// worker's recover, which calls OnProposalFailed for this
+			// whole batch (apply.go:605-633) — but by the time the
+			// listener runs (after completion, below), every proposal in
+			// this batch has already been claimed, so that recovery path
+			// finds nothing left in pendingProposals to fail.
+			c.applyMembershipRouting(ns, shardID, entries)
+
+			for i, cp := range claimed {
+				completeProposal(c.h, shardID, cp.entry, cp.pp, cp.result)
+				completedClaims = i + 1
 			}
 		}
-		ns.pendingReadsMu.Unlock()
-	}
-	// Fire OnMembershipChanged when a config change entry was applied,
-	// then update the Host routing table (ns.nodes + registry) so that
-	// the transport can resolve the new/removed replica addresses.
+	}()
+
+	// Fire OnMembershipChanged last, after every pending proposal and read in
+	// this batch has been completed — its original position (this is why
+	// applyMembershipRouting above no longer fires it itself). See the
+	// comment on the early applyMembershipRouting call for why: the
+	// callback is arbitrary user code running synchronously on the apply
+	// worker's goroutine, so a panic here is caught by that goroutine's
+	// recover and turned into OnProposalFailed for this batch. Firing it
+	// only after pendingProposals has been drained means that recovery path
+	// has nothing left to fail — a panicking listener can no longer cause an
+	// already-applied, already-durable change to be reported to its caller
+	// as an error.
 	if hasMembershipChange {
-		c.applyMembershipRouting(ns, shardID, entries)
+		c.fireMembershipChanged(ns, shardID)
 	}
 }
 
-// applyMembershipRouting fires OnMembershipChanged and updates the host routing
-// table (ns.nodes + registry) from the committed membership entries in a batch,
+// fireMembershipChanged invokes the user-supplied OnMembershipChanged
+// listener, if configured, for a shard whose committed batch included a
+// config change or the bootstrap membership entry. Split out of
+// applyMembershipRouting so OnApplied can run the routing/configChangeIndex
+// update (applyMembershipRouting) before completing pending proposals, while
+// keeping this listener invocation after — see the comments at both call
+// sites in OnApplied.
+func (c *hostEngineCallback) fireMembershipChanged(ns *nodeState, shardID uint64) {
+	if el := c.h.cfg.EventListener; el != nil && el.OnMembershipChanged != nil {
+		el.OnMembershipChanged(config.EventShardInfo{
+			ShardID:   shardID,
+			ReplicaID: ns.replicaID,
+		})
+	}
+}
+
+// applyMembershipRouting updates the host routing table (ns.nodes + registry)
+// and ns.configChangeIndex from the committed membership entries in a batch,
 // so the transport can resolve new/removed replica addresses. It handles both
-// the bootstrap EntryInitialMembership and incremental config changes.
+// the bootstrap EntryInitialMembership and incremental config changes. It
+// does NOT fire OnMembershipChanged — see fireMembershipChanged and the two
+// call sites in OnApplied for why that is split out and called later.
 //
 // A DECODE FAILURE FAULTS THE SHARD. This is the host-side MIRROR of the
 // authoritative fold in raft (Peer.Commit -> processConfigChanges), which runs
@@ -1551,12 +1810,6 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 // treated these bytes as fatal (ReconstructMembership -> StartShard aborts);
 // this closes the last place the runtime failed open over the same input.
 func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint64, entries []proto.Entry) {
-	if el := c.h.cfg.EventListener; el != nil && el.OnMembershipChanged != nil {
-		el.OnMembershipChanged(config.EventShardInfo{
-			ShardID:   shardID,
-			ReplicaID: ns.replicaID,
-		})
-	}
 	for _, entry := range entries {
 		// The bootstrap membership entry carries the FULL initial configuration.
 		// Register every member's address so a replica that learned its
