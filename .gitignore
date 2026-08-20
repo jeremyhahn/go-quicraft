@@ -26,7 +26,5 @@ pkg/shard-*/
 resume.txt
 
 .serena
-.claude
-CLAUDE.md
 go.work
 go.work.sum
