@@ -13,12 +13,19 @@ Import paths:
 ### `pkg/crypto/shamir`
 
 ```go
-const MaxSecretBytes = 64 << 10   // 65536
+const MaxSecretBytes    = 64 << 10   // 65536
+const MaxShareSetBytes  = 1 << 20    // 1 MiB — whole-set footprint budget
 
-// Split / combine — struct form
+// Split / combine — struct form (DEPRECATED: string custody)
 func Split(secret []byte, threshold, total int) ([]*Share, error)
 func Combine(shares []*Share) ([]byte, error)
 func CombineUnverified(shares []*Share) ([]byte, error)
+
+// Split / combine — protected-memory form
+func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error)
+func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error)
+func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error)
 
 // Split / combine — wipeable bytes form
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
@@ -31,16 +38,34 @@ type Share struct {
     Index     int               `json:"index"`
     Threshold int               `json:"threshold"`
     Total     int               `json:"total"`
-    Value     string            `json:"value"`
+    Value     string            `json:"value"`   // DEPRECATED
     Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
 func (s *Share) Bytes() ([]byte, error)
+func (s *Share) Protect() (*ProtectedShare, error)
 func (s *Share) Validate() error
 func (s *Share) String() string
 func (s *Share) LogValue() slog.Value
 func (s *Share) MarshalJSON() ([]byte, error)
 func (s *Share) UnmarshalJSON(data []byte) error
+
+type ProtectedShare struct {
+    Index     int
+    Threshold int
+    Total     int
+    Metadata  map[string]string   // NOT protected memory — no secrets here
+    // value is unexported: it lives in an enclave.MemoryEnclave
+}
+
+func (s *ProtectedShare) Value() []byte
+func (s *ProtectedShare) WithValue(fn func([]byte) error) error
+func (s *ProtectedShare) Destroy()
+func (s *ProtectedShare) Validate() error
+func (s *ProtectedShare) String() string
+func (s *ProtectedShare) LogValue() slog.Value
+func (s *ProtectedShare) MarshalJSON() ([]byte, error)
+func (s *ProtectedShare) UnmarshalJSON(data []byte) error
 
 // Errors
 type SplitError      struct{ Reason string }
@@ -51,6 +76,49 @@ type IntegrityError  struct{}   // DEPRECATED — never returned
 
 `Combine` and `CombineUnverified` are **identical**. Both names are retained so
 a caller can express intent at the call site; neither verifies anything.
+
+### Share values in protected memory
+
+`Share.Value` is a Go `string`, and a string is immortal: it cannot be zeroed,
+so every share stays readable in the heap until the collector reclaims it. A
+ceremony holding all N shares at once is the widest exposure in the scheme.
+That field, and the `Split` / `Combine` / `CombineUnverified` functions that
+hand out and consume it, are **deprecated**.
+
+The replacement is `ProtectedShare`, whose value lives in an
+`enclave.MemoryEnclave` — mlock'd, guard-paged, canary-checked, and genuinely
+wiped by `Destroy`:
+
+| Deprecated (string custody) | Protected replacement |
+|---|---|
+| `Split` | `SplitProtected` |
+| `Combine`, `CombineUnverified` | `CombineProtected` (returns the secret in a `*enclave.MemoryEnclave`) |
+| `&Share{…, Value: v}` | `NewProtectedShare(index, threshold, total, value)` — wipes the source **on success only**; the caller wipes it on every error return |
+| an existing `*Share` | `(*Share).Protect()` |
+
+Both protected paths are **native**, not wrappers: `SplitProtected` reads the
+polynomial coefficients into locked memory and encodes each share value
+directly into the locked buffer that share will own, and `CombineProtected`
+decodes each share value in place and interpolates directly into the locked
+buffer it returns. Neither routes through `SplitBytes`/`CombineBytes`, which by
+contract return ordinary heap buffers, so no secret-derived byte is ever
+written to unprotected memory — not even to one that is wiped afterwards. The
+share x-coordinates and the Lagrange basis derived from them are the exception
+and stay on the ordinary heap: an x-coordinate is a published share index, not
+secret material.
+
+`CombineProtected` also holds only **one decoded share at a time**, walking the
+set twice against a single reused buffer rather than keeping every decoded
+payload: the peak locked memory of a reconstruction is a property of the share
+size, not of how many shares were submitted.
+
+`SplitBytes` and `CombineBytes` are unchanged and are still the right path for
+a caller that manages its own wipeable buffers; `ProtectedShare` is for the
+caller that wants the buffer managed for it.
+
+Nothing was removed and no signature changed: the JSON a `ProtectedShare`
+marshals is byte-for-byte what a `Share` marshals, so the two are
+interchangeable on the wire and a consumer can migrate one call site at a time.
 
 ### `pkg/seal` — the custody interfaces this repository declares but does not implement
 
@@ -129,11 +197,14 @@ accept.
 
 | Rule | Enforced in | Error |
 |---|---|---|
-| `threshold >= 2` | `Split`, `CombineBytes`, `Share.Validate` | `SplitError` / `CombineError` / `ValidationError` |
-| `total >= threshold` | `Split`, `Share.Validate` | as above |
-| `threshold <= 255`, `total <= 255` | `Split` | `SplitError` |
-| `len(secret) > 0` | `Split` | `SplitError` |
-| `len(secret) <= MaxSecretBytes` | `Split` | `SplitError` |
+| `threshold >= 2` | `Split`, `SplitProtected`, `CombineBytes`, `Share.Validate`, `ProtectedShare.Validate` | `SplitError` / `CombineError` / `ValidationError` |
+| `total >= threshold` | `Split`, `SplitProtected`, `Share.Validate`, `ProtectedShare.Validate` | as above |
+| `threshold <= 255`, `total <= 255` | `Split`, `SplitProtected` | `SplitError` |
+| `len(secret) > 0` | `Split`, `SplitProtected` | `SplitError` |
+| `len(secret) <= MaxSecretBytes` | `Split`, `SplitProtected` | `SplitError` |
+| whole-set footprint `<= MaxShareSetBytes` | `SplitProtected` | `SplitError` |
+| summed element length `<= MaxShareSetBytes` | `UnmarshalShareSet` | `ValidationError` |
+| `len(shares) <= 255` | `UnmarshalShareSet` | `ValidationError` |
 | `len(shares) <= 255` (`maxShares`) | `Combine`, `CombineBytes` | `CombineError` |
 | payload `<= MaxSecretBytes` | `parseRawShare` | `CombineError` |
 | `x != 0` | `parseRawShare` | `CombineError` |
@@ -165,6 +236,52 @@ them have been decoded and copied.
   partially decoded and validation-rejected shares. The caller still owns and
   must wipe the input buffers.
 
+**Protected-memory obligations**
+
+Three obligations come with `ProtectedShare`:
+
+- **Every `ProtectedShare` must be `Destroy`ed, including one produced by
+  `json.Unmarshal`** — decoding is a construction. An abandoned share holds a
+  locked allocation for the life of the process.
+- **Locked memory is a finite kernel resource** (`RLIMIT_MEMLOCK`), and each
+  share is one locked allocation. Destroy shares as they are consumed rather
+  than at the end of a ceremony.
+- **A slice from `Value` does not outlive the share.** `Value` and `Destroy`
+  are safe to CALL concurrently (since `0.8.0-alpha` — before that they raced,
+  and because memguard genuinely unmaps, the consequence was a segfault: issue
+  #15). What no lock can bound is a slice a caller kept after `Value` returned.
+  Where one goroutine tears shares down while another still reads them, which
+  is a ceremony's normal shape, use `WithValue(func([]byte) error) error`: it
+  holds the share open for the whole callback, so a concurrent `Destroy` blocks
+  until the callback returns.
+
+Because of the second one, the two calls that allocate a whole set price it
+first. `SplitProtected` rejects parameters whose footprint — coefficients,
+scratch and every returned share value — exceeds `MaxShareSetBytes` (1 MiB),
+since individually legal arguments multiply into one no host can lock (a 64 KiB
+secret split 255 ways needs ~16 MiB of coefficients alone) and a failed lock is
+a dead process rather than an error. A full 255-share ceremony over a 32-byte
+root key needs ~24 KiB of that budget; sharing a 4 KiB *payload* 255 ways does
+not fit and should be enveloped under a key that does.
+
+And **shares arriving from outside the process are decoded with
+`UnmarshalShareSet`, not `json.Unmarshal` into a `[]*ProtectedShare`.** Shares
+are unauthenticated by construction — nothing about one can be checked until
+the set is combined — so a recovery endpoint necessarily decodes whatever it is
+handed, and the generic decoder allocates one locked buffer per element as it
+visits them: the submission, not the service, would choose how much locked
+memory to take, and memguard answers a failed lock by terminating the process.
+`UnmarshalShareSet` bounds the element count (255, the scheme's own limit) and
+the **summed length of the raw JSON elements** against `MaxShareSetBytes`
+before it allocates any of it, and destroys the accepted prefix if a later
+element is rejected. The sum is taken over the elements rather than from
+`len(data)` deliberately: it is the same bound, but it cannot be evaded by
+whitespace accounting, and each element's length is an upper bound on the
+locked buffer it will produce. For scale, the full 255-share set of a 32-byte
+root key is ~24 KiB against the 1 MiB budget. A ceremony that legitimately
+needs more than the budget does its own accounting and decodes share by share
+with `NewProtectedShare`.
+
 **Constant time**
 
 `gfMul` and the GF(2^8) primitives in `gf256.go` are constant-time with respect
@@ -186,9 +303,9 @@ and `Share.Total` are unauthenticated caller-supplied metadata.
 
 | Type | Fields | Raised by |
 |---|---|---|
-| `*SplitError` | `Reason` | `Split`, `SplitBytes` — parameter and size violations, and RNG failure |
-| `*CombineError` | `Reason` | `Combine`, `CombineUnverified`, `CombineBytes` — set-level and per-share structural violations |
-| `*ValidationError` | `Field`, `Reason` | `Share.Validate`, `VerifyShare` — per-field violations, positionally named |
+| `*SplitError` | `Reason` | `Split`, `SplitBytes`, `SplitProtected` — parameter and size violations, RNG failure, and (protected only) a whole-set footprint above `MaxShareSetBytes` |
+| `*CombineError` | `Reason` | `Combine`, `CombineUnverified`, `CombineBytes`, `CombineProtected` — set-level and per-share structural violations |
+| `*ValidationError` | `Field`, `Reason` | `Share.Validate`, `ProtectedShare.Validate`, `VerifyShare`, `NewProtectedShare`, `UnmarshalShareSet` — per-field violations, positionally named |
 | `*IntegrityError` | — | **never**. Deprecated; retained for API/SDK compatibility only. |
 
 - All four are concrete pointer types; match with `errors.As`.

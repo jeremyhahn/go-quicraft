@@ -27,7 +27,8 @@
 // the same wrapping key. A FIPS build now answers ErrKDFUnsupportedVersion
 // instead. The migration is the same either way — unseal once with a non-FIPS
 // build and re-seal with NewSoftwareStrategyFIPS, which stamps KDFPbkdf2SHA256
-// into SealedRootKey.Metadata and unseals in either build. See docs/security/encryption.md ("FIPS builds").
+// into SealedRootKey.Metadata and unseals in either build. See
+// docs/seal-barrier/engineering.md ("FIPS: runtime mode vs. build tag").
 
 package seal
 

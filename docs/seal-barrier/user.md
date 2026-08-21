@@ -264,6 +264,13 @@ packet protection is arbitrary-IV AES-GCM by protocol definition and OCSP's
 opens a QUIC connection in a `fips140=only` environment still panics inside the
 QUIC library.
 
+That exemption is recorded, not assumed: which primitives, under which RFCs,
+and what it means for FedRAMP/PCI/HIPAA are in
+[`../quic-transport/architecture.md`](../quic-transport/architecture.md#fips-140-3-exemption-record).
+The excluded tree still runs under `make verify-fips-transport` at
+`GODEBUG=fips140=on`, so it is gated at a weaker mode rather than left
+unmeasured.
+
 To migrate an existing deployment into FIPS: unseal once with a non-FIPS build
 and re-seal with `NewSoftwareStrategyFIPS`, which stamps PBKDF2-SHA256 into the
 metadata and unseals identically in either build. A FIPS build cannot unseal a

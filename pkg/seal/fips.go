@@ -59,7 +59,8 @@ const (
 // because the deriver it names is not there. The AES-GCM data path is FIPS-approved in EVERY
 // build — newAESGCM uses cipher.NewGCMWithRandomNonce unconditionally, because
 // a module-generated IV is required (SP 800-38D) and costs a non-FIPS
-// deployment nothing. See docs/security/encryption.md ("FIPS builds").
+// deployment nothing. See docs/seal-barrier/engineering.md ("FIPS: runtime mode
+// vs. build tag").
 func FIPSEnabled() bool {
 	if fips140.Enabled() {
 		return true

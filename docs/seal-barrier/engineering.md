@@ -580,15 +580,22 @@ protection is arbitrary-IV AES-GCM by protocol definition (RFC 9001 §5.3) and
 OCSP's `CertID` is SHA-1 by protocol definition (RFC 6960 §4.1.1); both live in
 dependencies and neither can be made approved from here.
 
-So **`-tags fips` makes go-quicraft FIPS at rest, not FIPS on the wire.** Two
-make targets keep those apart and neither speaks for the other:
+So **`-tags fips` makes go-quicraft FIPS at rest, not FIPS on the wire.** Three
+make targets keep those apart and none speaks for the others:
 
 | Target | Does | Proves |
 |---|---|---|
 | `make build-fips` | `go build` (± `-tags fips`) under `GOFIPS140` | the tree **compiles**. Nothing more — this module has no `main`, so no artifact is produced, and `GOFIPS140` alone never executes a cryptographic operation. |
 | `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package **except** `pkg/internal/transport/...` | everything inside the boundary **runs** under approved-only enforcement. The exclusion is a deny-list of that one tree, so a package added later is inside the gate by default. |
+| `make verify-fips-transport` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly `pkg/internal/transport/...` | the excluded tree is still **gated**, just at `on` rather than `only` — the exemption buys a weaker mode, not an unmeasured one. |
 
 Do not read `build-fips` as a compliance gate or a shippable FIPS artifact.
+
+All three run in CI, and `test/buildgates/fips_gate_test.go` fails if the mode
+is weakened from `only`, if the exclusion list grows, or if the excluded tree
+stops being gated. The exemption itself — which primitives, under which RFCs,
+and what it means for FedRAMP/PCI/HIPAA — is recorded in
+[`../quic-transport/architecture.md`](../quic-transport/architecture.md#fips-140-3-exemption-record).
 
 ## 5. Persistence
 

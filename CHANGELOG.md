@@ -156,7 +156,8 @@ mistake was made: *an atomic on the handle is not a lifetime discipline for the
 thing it points at.* Also updated: `api.md` (the scoped accessors, the error
 vocabulary, and a §1 exported-surface listing that predated `MemoryEnclave` and
 `Freeze` entirely), `user.md`'s troubleshooting entry, and the custody
-obligations in `docs/security/encryption.md`.
+obligations in `docs/security/encryption.md` (that file has since been folded
+into `docs/shamir-primitive/engineering.md`; see #10).
 
 ### Performance
 

@@ -44,7 +44,67 @@ the same way.
 Do not wait for `IntegrityError`. It exists in the package and is never
 returned.
 
-## Task: split a root key
+## Task: run a ceremony in protected memory (preferred)
+
+`ProtectedShare` keeps each share value in an mlock'd, guard-paged buffer that
+`Destroy` genuinely wipes, so you never hold share material in a Go string or
+manage the wiping yourself:
+
+```go
+import "github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
+
+shares, err := shamir.SplitProtected(rootKey, 3, 5)
+if err != nil {
+    return err
+}
+// Destroy as each is consumed — locked memory is a finite kernel resource.
+defer func() {
+    for _, s := range shares {
+        s.Destroy()
+    }
+}()
+
+for _, s := range shares {
+    // WithValue holds the share open for the callback, so a concurrent
+    // Destroy blocks until it returns. Do NOT keep the slice past it.
+    if err := s.WithValue(func(v []byte) error {
+        return deliverToCustodian(s.Index, v)
+    }); err != nil {
+        return err
+    }
+}
+```
+
+Recovering is the mirror image:
+
+```go
+// Shares that arrived from outside the process — bounded decode, never
+// json.Unmarshal into a []*ProtectedShare.
+shares, err := shamir.UnmarshalShareSet(submitted)
+if err != nil {
+    return err
+}
+defer func() {
+    for _, s := range shares {
+        s.Destroy()
+    }
+}()
+
+secret, err := shamir.CombineProtected(shares)
+if err != nil {
+    return err
+}
+defer secret.Destroy()
+// ... authenticate the secret before trusting it. See above.
+```
+
+Three things to remember: every share must be `Destroy`ed (including one
+produced by `json.Unmarshal` — decoding is a construction), a slice from
+`Value` must not outlive the share (use `WithValue` where one goroutine tears
+shares down while another reads them), and a whole set is priced against
+`MaxShareSetBytes` before it is allocated.
+
+## Task: split a root key (bytes form)
 
 ```go
 import "github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
@@ -76,7 +136,7 @@ both values `<= 255`.
 ## Task: collect shares and recover
 
 ```go
-// values holds M-or-more raw share payloads collected from custodians.
+// values holds M-or-more base64-encoded share values from custodians.
 // threshold came from your own records — NOT from the shares.
 key, err := shamir.CombineBytes(values, threshold)
 if err != nil {

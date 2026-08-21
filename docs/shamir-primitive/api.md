@@ -27,7 +27,25 @@ in this repository would be the defect, not the fix.
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir`
 
-### Capability: split a secret into N shares (bytes form — preferred)
+### Capability: split a secret into N shares (protected form — preferred)
+
+```go
+func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error)
+```
+
+| | |
+|---|---|
+| Request | `secret` — 1..`MaxSecretBytes` (65536) bytes; `threshold` — 2..255; `total` — `threshold`..255 |
+| Response | `[]*ProtectedShare` in `Index` order. Each share's value lives in an `enclave.MemoryEnclave` — mlock'd, guard-paged, and genuinely wiped by `Destroy`. |
+| Errors | `*SplitError` on any bound violation or RNG failure, **including** a whole-set footprint above `MaxShareSetBytes` |
+| Permission | none — in-process call, no authorization boundary |
+| Caller obligation | **`Destroy` every share**, ideally as each is consumed rather than at the end of the ceremony |
+
+Native, not a wrapper: coefficients are read into locked memory and each share
+value is encoded directly into the locked buffer that share will own, so no
+secret-derived byte reaches an ordinary heap buffer.
+
+### Capability: split a secret into N shares (bytes form)
 
 ```go
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
@@ -36,7 +54,7 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
 | | |
 |---|---|
 | Request | `secret` — 1..`MaxSecretBytes` (65536) bytes; `threshold` — 2..255; `total` — `threshold`..255 |
-| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the raw `[version:1][x:1][y...]` payload — the same bytes `Share.Value` base64-encodes. |
+| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the **base64 encoding** of `[version:1][x:1][y...]` — byte-for-byte what `Share.Value` holds, not the pre-encoding payload. |
 | Errors | `*SplitError` on any bound violation or RNG failure |
 | Permission | none — in-process call, no authorization boundary |
 | Caller obligation | **wipe the returned buffers** once distributed |
@@ -51,9 +69,53 @@ Same parameters and errors. Returns `[]*Share` with `Index` 1..N.
 
 `Share.Value` is a Go **string** and cannot be zeroed; it stays readable in the
 heap until GC. A ceremony holds all N at once, so this is the point of widest
-exposure in the scheme. Prefer `SplitBytes` in new custody code.
+exposure in the scheme. Prefer `SplitProtected` in new custody code, or
+`SplitBytes` if the caller manages the wipeable buffers itself.
 
-### Capability: reconstruct a secret from M shares (bytes form — preferred)
+### Capability: reconstruct a secret from M shares (protected form — preferred)
+
+```go
+func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+```
+
+| | |
+|---|---|
+| Request | `shares` — at least `threshold` shares of one split; `Threshold` is taken from `shares[0]` and is unauthenticated |
+| Response | the reconstructed secret in a `*enclave.MemoryEnclave` |
+| Errors | `*CombineError` on any bound violation, duplicate/zero x-coordinate, or ragged share set |
+| Permission | none — in-process call, no authorization boundary |
+| Caller obligation | **`Destroy` the returned enclave**, and the input shares |
+
+Holds only **one decoded share at a time**, walking the set twice against a
+single reused buffer: peak locked memory is a property of the share size, not
+of how many shares were submitted.
+
+### Capability: decode a share set that arrived from outside the process
+
+```go
+func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error)
+func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error)
+```
+
+Use `UnmarshalShareSet` — **never** `json.Unmarshal` into a
+`[]*ProtectedShare`. Shares are unauthenticated by construction, so a recovery
+endpoint decodes whatever it is handed; the generic decoder allocates one locked
+buffer per element as it visits them, which lets the submission rather than the
+service choose how much locked memory to take, and memguard answers a failed
+lock by terminating the process. `UnmarshalShareSet` bounds the element count
+(255) and the document size (`MaxShareSetBytes`) *before* allocating, and
+destroys the accepted prefix if a later element is rejected.
+
+`NewProtectedShare` builds one share at a time. **It wipes the source buffer
+only on success** — ownership of the share material transfers to the returned
+share. On *any* error return (bad header, empty value, non-standard base64,
+oversized value) the source is deliberately left untouched, and **the caller
+must wipe it**. Validation runs before any locked memory is allocated, so an
+unauthenticated submission cannot size that allocation.
+A ceremony that legitimately needs more than the budget does its own accounting
+and decodes share by share with it.
+
+### Capability: reconstruct a secret from M shares (bytes form)
 
 ```go
 func CombineBytes(values [][]byte, threshold int) ([]byte, error)
@@ -61,7 +123,7 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error)
 
 | | |
 |---|---|
-| Request | `values` — M..255 raw share payloads; `threshold` — the true M, **from a trusted source** |
+| Request | `values` — M..255 base64-encoded share values (what `SplitBytes` returned); `threshold` — the true M, **from a trusted source** |
 | Response | the reconstructed secret |
 | Errors | `*CombineError` for structural violations: too few, too many, wrong format version, zero or duplicate x, mismatched payload length, oversized payload |
 | Permission | none |
@@ -143,10 +205,18 @@ digest, so no code path constructs one.
 ### Constants
 
 ```go
-const MaxSecretBytes = 64 << 10   // 65536
+const MaxSecretBytes   = 64 << 10   // 65536 — one secret
+const MaxShareSetBytes = 1 << 20    // 1 MiB — whole-set locked-memory budget
 ```
 
 The share-set maximum is 255, from the GF(2^8) x-coordinate space.
+
+`MaxShareSetBytes` exists because individually legal arguments multiply into a
+footprint no host can lock — a 64 KiB secret split 255 ways needs ~16 MiB of
+coefficients alone, and a failed lock is a dead process rather than an error. A
+full 255-share ceremony over a 32-byte root key needs ~24 KiB of the budget;
+sharing a 4 KiB *payload* 255 ways does not fit and should be enveloped under a
+key that does.
 
 ## Go API — the custody interfaces
 

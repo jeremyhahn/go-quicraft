@@ -91,16 +91,16 @@ each: ~340 MB of input and seconds of CPU, from unauthenticated material.
 a few megabytes and milliseconds. Large payloads are enveloped under a key that
 *is* this size; the payload itself is never shared.
 
-## Two APIs, and why there are two
+## Three APIs, and why there are three
 
 ```
-Split(secret, M, N) []*Share        SplitBytes(secret, M, N) [][]byte
-        |                                    |
-   Share.Value is a Go STRING          raw wipeable []byte buffers
-        |                                    |
-   immortal until GC                    caller wipes when distributed
-        |                                    |
-Combine([]*Share) []byte            CombineBytes([][]byte, M) []byte
+Split(secret, M, N) []*Share    SplitBytes(secret, M, N) [][]byte   SplitProtected(secret, M, N) []*ProtectedShare
+        |                                |                                      |
+  Share.Value is a Go STRING     raw wipeable []byte buffers          value in an enclave.MemoryEnclave
+        |                                |                                      |
+   immortal until GC             caller wipes when distributed        mlock'd; Destroy genuinely wipes
+        |                                |                                      |
+Combine([]*Share) []byte      CombineBytes([][]byte, M) []byte    CombineProtected([]*ProtectedShare) *MemoryEnclave
 ```
 
 `Share.Value` is a Go `string` and therefore cannot be zeroed: every share stays
@@ -116,8 +116,21 @@ have to materialize it as a string. `CombineBytes` wipes every decoded buffer on
 every return path, including partially-decoded and validation-rejected shares;
 the caller still owns and must wipe the inputs.
 
-**The struct API is the compatibility surface. The bytes API is the one to
-prefer in new custody code.**
+`SplitProtected`/`CombineProtected` go one step further and manage the wipeable
+buffer for the caller, holding each share value in an `enclave.MemoryEnclave`.
+Both are **native**, not wrappers over the bytes API: they encode and
+interpolate directly into locked memory, so no secret-derived byte is ever
+written to an ordinary heap buffer — not even one that is wiped afterwards.
+Only the share x-coordinates and the Lagrange basis derived from them stay on
+the ordinary heap, because a published share index is not secret material.
+
+**The struct API is the deprecated compatibility surface. `ProtectedShare` is
+the one to prefer in new custody code; the bytes API remains right for a caller
+that already manages its own wipeable buffers.** The three are interchangeable
+on the wire — a `ProtectedShare` marshals byte-for-byte what a `Share` does — so
+a consumer migrates one call site at a time. The full contract, including the
+three obligations that come with locked memory, is in
+[`engineering.md`](engineering.md#share-values-in-protected-memory).
 
 ## Data flow, and where it stops
 
