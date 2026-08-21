@@ -446,12 +446,52 @@ jobs:
             exit 1
           fi
 
+  contrib-dragonboat:
+    name: Gate - contrib/dragonboat compatibility [unit + integration]
+    runs-on: ubuntu-latest
+    # Runs after the other heavy suites rather than beside them: this stands up
+    # multi-node QUIC clusters through the dragonboat compatibility API under
+    # -race, and sharing a runner with `integration`/`netfault` starves CPU
+    # enough to flake 30s waits. Same reasoning as ci.yml's chaining.
+    needs: [validate, integration, netfault]
+    timeout-minutes: 45
+    # WHY THIS EXISTS (go-quicraft#3). CI proves the compatibility API works on
+    # a commit; this proves it for the ARTIFACT being shipped. The two are not
+    # the same claim — a tag is built from a tree that no CI run necessarily
+    # examined in this exact combination, and for a compatibility shim the
+    # thing consumers depend on is precisely that it still behaves like
+    # dragonboat at the released version.
+    #
+    # It runs the SAME two suites as ci.yml's contrib-dragonboat job, not a
+    # reduced smoke subset: a release gate that verifies less than the push
+    # gate would let a defect through exactly when it is most expensive to fix.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Run contrib/dragonboat unit tests
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -timeout=900s ./...
+
+      # -p 1 is load-bearing, not caution: every package here spins up
+      # multi-node QUIC clusters under -race, and running them concurrently
+      # starves runner CPU enough to flake the tests with 30s waits.
+      - name: Run contrib/dragonboat integration suite
+        working-directory: contrib/dragonboat
+        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
   release:
     name: Publish
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, lint, security, trivy, integration, netfault, errfs, fuzz, modules]
+    needs: [validate, lint, security, trivy, integration, netfault, errfs, fuzz, modules, contrib-dragonboat]
     timeout-minutes: 30
     steps:
       - name: Checkout

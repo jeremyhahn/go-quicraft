@@ -25,9 +25,10 @@
 #
 # CUSTOMIZE blocks preserved from the pre-v1.9 file: the `integration` /
 # `netfault` / `errfs` / `fuzz-seeds` tagged-suite jobs, the `modules`
-# nested-module matrix, and `contrib-dragonboat` (still `continue-on-error`
-# pending go-quicraft#3 — the flake that justified it, #13, is fixed and
-# merged, but arming the gate is that issue's decision, not this one's).
+# nested-module matrix, and `contrib-dragonboat` (now BLOCKING — go-quicraft#3
+# re-armed the gate on 2026-08-21 after both defects that justified the
+# report-only flag were fixed and the suite was measured stable under load;
+# see that job's own comment for the evidence).
 # `integration`/`netfault`/`contrib-dragonboat` also keep their EXTRA
 # self-imposed `needs: [..., test]` / `needs: [..., integration]` ordering on
 # top of the fast-tier gate: multiple multi-node QUIC suites under `-race`
@@ -527,41 +528,44 @@ jobs:
     # API, so running it beside the main integration suite is the same mistake
     # twice.
     needs: [lint, build, integration]
-    # REPORT-ONLY, TEMPORARILY. This job still runs on every commit and its
-    # result is still visible - dragonboat compatibility is verified, not
-    # skipped - but it no longer fails the run.
+    # BLOCKING. This job was report-only (`continue-on-error: true`) from
+    # 2026-08-17 until go-quicraft#3 re-armed it on 2026-08-21.
     #
-    # Why: contrib/dragonboat is a SEPARATE Go module
-    # (github.com/jeremyhahn/go-quicraft/contrib/dragonboat) that nothing in the
-    # portfolio consumes. go-qrdb, the only direct consumer of this repo,
-    # imports root-module packages only (pkg/batch, pkg/config,
-    # pkg/crypto/shamir, pkg/enclave, pkg/logdb, pkg/seal, pkg/sm) and carries
-    # no requirement on contrib at all. Gating the ROOT module's release on a
-    # contrib module with no consumers held the entire stack - qrdb, xkms,
-    # quicbaas, trusted-platform - behind a failure none of them could ever be
-    # affected by.
+    # That flag was an owner-approved SCOPING correction, not a silenced test:
+    # contrib/dragonboat is a separate Go module that nothing in the portfolio
+    # consumes — go-qrdb, the only direct consumer of this repo, imports
+    # root-module packages only — so gating the ROOT module's release on it
+    # held qrdb, xkms, quicbaas and trusted-platform behind a failure none of
+    # them could be affected by. It was granted on the explicit condition that
+    # it be reverted, which #3 tracked.
     #
-    # This is a scoping correction, not a silenced test.
+    # Both defects that justified it are fixed and merged:
+    #   * go-quicraft#2  — snapshot transfer left the new replica with an apply
+    #                      gap (PR #4, commit 5bab86b).
+    #   * go-quicraft#13 — TestRequestState_ResultC_AggregatesCommittedThenApplied
+    #                      failed 1.33% of runs on a lost notification in the
+    #                      adapter's ResultC aggregator (PR #25). The fix is
+    #                      causal, not a timing tweak: the aggregator now reads
+    #                      the inner commit source directly instead of racing a
+    #                      since-removed relay bridge's output.
     #
-    # The original reason — go-quicraft#2, snapshot transfer leaving the new
-    # replica with an apply gap — is FIXED and merged (PR #4, commit 5bab86b),
-    # and the suite passes: measured green in 76.2s on an idle host.
+    # #3 required the suite be shown "genuinely stable, not merely passing
+    # once", under contention. Measured 2026-08-21 on a host under real load
+    # (loadavg 31 -> 43 from concurrent CI), all under -race:
     #
-    # The flag stayed for a SECOND, independently measured reason —
-    # TestRequestState_ResultC_AggregatesCommittedThenApplied failing 1.33% of
-    # runs on a lost-notification defect in the adapter's ResultC aggregator —
-    # which is ALSO now fixed and merged (go-quicraft#13, PR #25): the
-    # aggregator reads the inner commit source directly instead of racing a
-    # since-removed relay bridge's output, and the regression test was
-    # rewritten to isolate the exact race window deterministically rather than
-    # depend on incidental scheduling.
+    #   | scope                          | runs | failures |
+    #   | previously-flaky ResultC test  | 3200 |        0 |
+    #   | full contrib unit suite        |   15 |        0 |
+    #   | contrib integration suite      |    8 |        0 |
     #
-    # The flag itself stays armed here regardless: arming the gate is
-    # go-quicraft#3's decision (it also wants the suite verified in the
-    # release pipeline first), not a side effect of retiring the bug that
-    # justified it. Do NOT drop this comment by deleting it as "stale" — the
-    # history is what lets #3 be resolved on its own evidence.
-    continue-on-error: true
+    # 3200 clean runs put the 95% upper bound on that test's failure rate at
+    # 0.094%, and make the old 1.33% rate essentially impossible (p ~ 2e-19).
+    # One green run would have proven very little here — the failures are
+    # load-sensitive and do not reproduce on a quiet machine — which is why
+    # the count is what it is.
+    #
+    # Do NOT drop this comment as "stale": the history is what justifies the
+    # gate being armed, and what a future report-only request must argue against.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
