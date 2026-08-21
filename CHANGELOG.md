@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `StorageBackend.CompareAndDelete` (#29)
+
+- **BREAKING for implementers of `seal.StorageBackend`.** The interface gains
+  `CompareAndDelete(ctx, key, expected) (deleted bool, err error)`, the release
+  half of the pair `PutIfAbsent` opens. Because the interface is satisfied by
+  duck typing, any store that does not grow the method stops satisfying it.
+  Pre-1.0 this takes the MINOR position at the next release.
+- **Why it is not optional.** A guarded create is only as strong as its
+  release. With `PutIfAbsent` to acquire and a plain `Delete` to release, two
+  releasers can both read holder `A`, the first deletes, `B` legitimately
+  claims the now-absent key, and the second executes its unguarded delete and
+  removes **`B`'s** value — `B` having acquired under the guarantee
+  `PutIfAbsent` advertises. Re-reading before the delete cannot close it: the
+  window is *between* the read and the delete. Reported by go-qrdb, where the
+  consequence was a tenant left holding a record no by-id operation could reach
+  (go-qrdb#41); consumers holding only the interface had been refusing with a
+  typed error rather than degrading to read-then-delete.
+- The contract records two obligations implementers get wrong: an encrypting
+  backend must guard on the ciphertext it read rather than a fresh encryption
+  of `expected` (with random-nonce GCM a re-encrypted guard refuses *every*
+  release), and a refused delete is a normal outcome reported through
+  `deleted=false`, never an error — while a failed guard *read* must refuse
+  rather than decide.
+
 ## [0.8.0-alpha] - 2026-08-19
 
 ### Fixed — use-after-destroy race on protected memory (#15)

@@ -21,8 +21,13 @@ import (
 
 // StorageBackend is a minimal context-aware interface for key-value storage
 // using string keys. go-qrdb's storage.Storage satisfies this via Go duck
-// typing (no circular deps). When set on a barrier, all Put/Get operations
-// are transparently encrypted.
+// typing (no circular deps).
+//
+// The barrier never calls this: it is a SHAPE, declared here so an embedder
+// that already has such a store can adapt it to a StatePersister in a few
+// lines. There is no field or option that installs one on a Barrier, and
+// nothing in this module implements it — which is also why the contract is
+// pinned by an executable conformance test rather than by prose alone.
 type StorageBackend interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, data []byte) error
@@ -42,6 +47,50 @@ type StorageBackend interface {
 	// distributed backends must use their native compare-and-set primitive
 	// (e.g., a Raft transaction) so the guarantee holds across nodes.
 	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
+
+	// CompareAndDelete atomically removes key only when its stored value still
+	// equals expected. It returns deleted=true when this call removed the key,
+	// and deleted=false (with a nil error) when the key was absent or held a
+	// different value — in that case the store is unchanged. A non-nil error
+	// means the outcome is unknown and the caller must not assume either way.
+	//
+	// This is the release half of the pair PutIfAbsent opens, and the halves
+	// are not independent: a guarded create is only as strong as its release.
+	// With PutIfAbsent to acquire and a plain Delete to release, two releasers
+	// can both read holder A, the first deletes, B legitimately claims the
+	// now-absent key, and the second executes its unguarded delete and removes
+	// B's value — B having acquired the key under the guarantee PutIfAbsent
+	// advertises, and lost it to a releaser that never observed it. Re-reading
+	// before the delete does not close this, because the window is BETWEEN the
+	// read and the delete. Only a delete conditioned on the value the caller
+	// last observed, evaluated where the store serializes writes, closes it.
+	//
+	// Atomicity is provided per consistency domain, exactly as for
+	// PutIfAbsent: single-process backends serialize the compare-then-delete
+	// internally, while distributed backends must evaluate the comparison in
+	// their native compare-and-set primitive — for a replicated state machine,
+	// at the entry's log position, so replicas cannot diverge.
+	//
+	// Two obligations that are easy to get wrong, both learned from
+	// implementing this downstream (go-qrdb#41):
+	//
+	//   - An ENCRYPTING backend must guard on the ciphertext it read, never on
+	//     a fresh encryption of expected. Since this package moved to
+	//     cipher.NewGCMWithRandomNonce, encrypting the same plaintext twice
+	//     produces different bytes, so a re-encrypted guard refuses EVERY
+	//     release — every release silently a no-op, which is worse than the
+	//     race it was meant to fix. Read the stored ciphertext, decrypt to
+	//     compare in plaintext, and guard the delete on those exact bytes: any
+	//     interleaved write replaces them, which is precisely the signal.
+	//
+	//   - A refused delete is a NORMAL OUTCOME, not an error, and must be
+	//     reported through deleted=false. In a replicated state machine an
+	//     error for a lost guard stalls consensus over a deterministic
+	//     consequence of valid input. A failed guard READ is the opposite and
+	//     must refuse rather than decide: treating a local read fault as
+	//     "value differs" leaves the key on one replica while peers that read
+	//     successfully removed it.
+	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 
 	Close() error
 }

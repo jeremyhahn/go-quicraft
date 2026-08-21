@@ -112,6 +112,7 @@ type StorageBackend interface {                 // shape only; the barrier never
     Exists(ctx context.Context, key string) (bool, error)
     Scan(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
     PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
+    CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
     Close() error
 }
 
@@ -655,6 +656,23 @@ primitive that turns the load-generation fence into something closer to a lock:
 it reports `stored=true` only when this call created the key, and a non-nil
 error means the outcome is **unknown** — do not assume either way. Atomicity is
 per consistency domain.
+
+`CompareAndDelete` is its release half, and the two are not independent — a
+guarded create is only as strong as its release. Pairing `PutIfAbsent` with a
+plain `Delete` lets two releasers both read holder `A`, the first delete, `B`
+legitimately claim the now-absent key, and the second remove **`B`'s** value.
+Re-reading before the delete does not close that window, because the window is
+*between* the read and the delete; only a delete conditioned on the value the
+caller last observed, evaluated where the store serializes writes, does.
+
+Two obligations for implementers, both learned downstream (go-qrdb#41):
+an **encrypting** backend must guard on the ciphertext it read rather than a
+fresh encryption of `expected` — with `cipher.NewGCMWithRandomNonce` the same
+plaintext encrypts to different bytes, so a re-encrypted guard refuses every
+release, silently turning each into a no-op; and a **refused delete is a normal
+outcome**, reported as `deleted=false`, not an error, since erroring on a lost
+guard stalls consensus over a deterministic consequence of valid input. A failed
+guard *read* is the opposite and must refuse rather than decide.
 
 ### Consumer frame formats
 
