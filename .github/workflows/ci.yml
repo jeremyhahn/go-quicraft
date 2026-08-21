@@ -55,7 +55,19 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.26.6"
+  # Latest 1.26 patch (owner ruling 2026-08-20, issue #23). Go 1.27.0 is
+  # BLOCKED: cockroachdb/swiss fails to compile under it (undefined
+  # fastrand64/hashFn, company task #121), so the portfolio holds at 1.26 and
+  # bumps within it as patches ship. Never "stable" — it flipped to 1.27.0
+  # mid-campaign and broke every repo riding it. Moving to 1.27 happens in the
+  # #121 wave, after the swiss/pebble chain is bumped (tracked here as #19).
+  #
+  # This pins only the toolchain CI installs. The `go` directive in go.mod
+  # stays at 1.26.6: that is the LANGUAGE FLOOR embedders must satisfy, a
+  # deliberately looser contract than the toolchain we test with, and raising
+  # it would narrow who can consume the library for no benefit. Sibling repos
+  # (go-qrdb, go-xkms) pin the same way.
+  GO_VERSION: "1.26.7"
   COVERAGE_THRESHOLD: 91
   # Builds never resolve through a workspace: modules come from tags
   # (dependency-resolution.md §2). CI checks out this repo alone so no go.work

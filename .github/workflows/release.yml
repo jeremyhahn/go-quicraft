@@ -21,7 +21,12 @@ permissions:
   security-events: write
 
 env:
-  GO_VERSION: "1.26.6"
+  # Kept in lockstep with ci.yml's pin (issue #23). This workflow ships no
+  # binaries (see the header): its job is to prove the tag is releasable. That
+  # proof is only meaningful if it runs on the same toolchain the push gate
+  # used — otherwise the tag is certified against a Go version nothing else
+  # verified. Must never drift from ci.yml.
+  GO_VERSION: "1.26.7"
   # Same rationale as the GOWORK=off inside the tag validation below, applied
   # to every job: nothing here may resolve through a workspace.
   GOWORK: "off"
