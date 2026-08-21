@@ -151,7 +151,17 @@ jobs:
         run: go vet ./...
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        # RETRIED (issue #31): same sum.golang.org flake class handled in
+        # ci.yml. A tag push is the worst place to lose a run to a network
+        # blip — the tag is the artifact and it is permanent, so a spurious
+        # gate failure here blocks a release that is actually sound. Full
+        # sumdb verification kept; pinned version must stay v2.12.2.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 && exit 0
+            echo "install attempt $i failed; retrying"; sleep 10
+          done
+          echo "golangci-lint install failed after 3 attempts"; exit 1
 
       - name: golangci-lint
         run: golangci-lint run --timeout=5m ./...
@@ -168,7 +178,14 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+        # RETRIED (issue #31): same sum.golang.org flake class handled in
+        # ci.yml. Full sumdb verification kept; never GOSUMDB=off.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/securego/gosec/v2/cmd/gosec@latest && exit 0
+            echo "install attempt $i failed; retrying"; sleep 10
+          done
+          echo "gosec install failed after 3 attempts"; exit 1
 
       # Keep this exclude list identical to ci.yml's security job and to
       # GOSEC_EXCLUDE in the Makefile; see ci.yml for the per-rule
@@ -184,7 +201,14 @@ jobs:
           category: gosec-release
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # RETRIED (issue #31): same sum.golang.org flake class handled in
+        # ci.yml. Full sumdb verification kept; never GOSUMDB=off.
+        run: |
+          for i in 1 2 3; do
+            go install golang.org/x/vuln/cmd/govulncheck@latest && exit 0
+            echo "install attempt $i failed; retrying"; sleep 10
+          done
+          echo "govulncheck install failed after 3 attempts"; exit 1
 
       - name: Run govulncheck
         run: govulncheck ./...
