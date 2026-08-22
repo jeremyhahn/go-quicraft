@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — protected-memory custody interfaces (#35)
+
+- **`seal.ProtectedShareSplitter` and `seal.ProtectedShareAccumulator`**, the
+  protected-memory counterparts of `ShareSplitter` and `ShareAccumulator`. The
+  string forms are now marked deprecated but keep working.
+- **Why they were needed.** 0.8.0-alpha deprecated the string-valued Shamir API
+  because a Go string cannot be zeroed — yet `ShareSplitter` returns
+  `[]string` and `ShareAccumulator.AddShare` takes one. A consumer could
+  therefore migrate to `SplitProtected`/`CombineProtected`, silence every
+  SA1019, and still have each share become an immortal heap string the moment
+  it crossed the interface. As go-qrdb put it when reporting this, a migration
+  that silences the linter while leaving the exposure intact is worse than not
+  migrating, because it removes honest signposts.
+- **Both ends are protected.** `AddProtectedShare` takes ownership of a share
+  already in locked memory, so a transport can decode into a wipeable buffer,
+  hand it over via `NewProtectedShare` (which wipes its source), and own
+  nothing afterwards. `ReconstructProtected` returns the secret in an
+  `enclave.MemoryEnclave` rather than an ordinary `[]byte`. Protecting only one
+  end would leave the exposure intact at the other.
+- **Additive, not a retype**, mirroring the precedent set by
+  `Split`/`SplitProtected`: every existing implementation still compiles, and
+  consumers migrate one call site at a time rather than in lockstep with a tag.
+
 ### Fixed — a process-wide memguard purge could unmap pages mid-borrow (#18)
 
 - **`pkg/enclave` gains a package-wide `purgeMu`.** memguard's failure path is

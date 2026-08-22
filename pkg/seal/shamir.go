@@ -17,6 +17,9 @@ package seal
 import (
 	"context"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
+	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // DefaultQuorumTTL is the default time-to-live for a quorum accumulator session.
@@ -28,10 +31,19 @@ const DefaultQuorumTTL = 5 * time.Minute
 // threshold is met. Implementations handle deduplication, ordering, and TTL
 // expiration. The accumulator is not safe for concurrent use without external
 // synchronization (the Barrier provides this via its mutex).
+//
+// Deprecated: every share crossing AddShare becomes an immortal Go string
+// before any protected buffer can exist, which defeats the whole point of the
+// ProtectedShare family. Implement ProtectedShareAccumulator instead. This
+// interface remains for consumers already compiled against it and its behaviour
+// is unchanged.
 type ShareAccumulator interface {
 	// AddShare adds a single share to the accumulator. Returns progress
 	// indicating how many shares have been submitted and whether the
 	// threshold has been reached.
+	//
+	// Deprecated: share is a Go string and cannot be zeroed. See
+	// ProtectedShareAccumulator.AddProtectedShare.
 	AddShare(ctx context.Context, share string) (*QuorumProgress, error)
 
 	// GetProgress returns the current quorum progress without modifying state.
@@ -51,11 +63,81 @@ type ShareAccumulator interface {
 }
 
 // ShareSplitter splits a secret into M-of-N Shamir secret shares.
+//
+// Deprecated: the []string it returns is un-wipeable, so an implementation that
+// splits into protected memory has to copy every share back out into an immortal
+// string to satisfy this signature. Implement ProtectedShareSplitter instead.
+// This interface remains for consumers already compiled against it and its
+// behaviour is unchanged.
 type ShareSplitter interface {
 	// Split divides the secret into the specified number of shares with the
 	// given threshold. At least threshold shares are required to reconstruct
 	// the original secret.
+	//
+	// Deprecated: returns un-wipeable strings. See
+	// ProtectedShareSplitter.SplitProtected.
 	Split(secret []byte, threshold, total int) ([]string, error)
+}
+
+// ProtectedShareSplitter is the protected-memory counterpart of ShareSplitter,
+// and the one to implement in new custody code.
+//
+// It exists because a `string` return type silently undoes the guarantee the
+// ProtectedShare family provides. An implementation can split into locked memory
+// and still hand every share back as an immortal heap string, one line later,
+// because that is what ShareSplitter's signature demands — so the exposure the
+// deprecation was written about survives a migration that satisfies the linter
+// (reported by go-qrdb, #35).
+//
+// This mirrors exactly what pkg/crypto/shamir did with Split/SplitProtected:
+// the string form stays for consumers compiled against it, the protected form
+// is additive, and a consumer migrates one call site at a time rather than in
+// lockstep with a tag.
+//
+// Nothing in this module implements or calls this — like ShareSplitter it is a
+// SHAPE for embedders. Custody itself lives in go-qrdb; see the package doc.
+type ProtectedShareSplitter interface {
+	// SplitProtected divides the secret into total shares with the given
+	// threshold, each share's value held in an mlock'd, guard-paged buffer.
+	//
+	// The caller owns the returned shares and MUST Destroy every one of them —
+	// including on the error paths of whatever it does next. Locked memory is a
+	// finite kernel resource and each share is one allocation of it.
+	SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
+}
+
+// ProtectedShareAccumulator is the protected-memory counterpart of
+// ShareAccumulator, and the one to implement in new custody code.
+//
+// Both ends are protected deliberately. AddProtectedShare takes ownership of a
+// share whose value already lives in locked memory, so a transport can decode
+// into a wipeable buffer, hand it over through NewProtectedShare (which wipes
+// its source), and own nothing afterwards — the share never becomes a string on
+// the way in. ReconstructProtected returns the secret in an enclave rather than
+// an ordinary []byte, so it never becomes an un-wipeable heap allocation on the
+// way out either. An accumulator that protected only one end would leave the
+// exposure intact at the other.
+type ProtectedShareAccumulator interface {
+	// AddProtectedShare adds one share to the accumulator, TAKING OWNERSHIP of
+	// it: the accumulator is responsible for Destroying it, whether or not the
+	// share is accepted and whether or not the quorum ever completes. A caller
+	// that keeps using the share after this returns is reading memory the
+	// accumulator may already have wiped.
+	AddProtectedShare(ctx context.Context, share *shamir.ProtectedShare) (*QuorumProgress, error)
+
+	// GetProgress returns the current quorum progress without modifying state.
+	GetProgress() *QuorumProgress
+
+	// ReconstructProtected reconstructs the secret from the accumulated shares
+	// into locked memory. It returns an error if the threshold has not been
+	// met. The caller owns the returned enclave and must Destroy it.
+	ReconstructProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+
+	// Reset destroys every accumulated share and resets the TTL timer.
+	Reset()
+
+	// Expired reports whether the accumulator session has exceeded its TTL.
+	Expired() bool
 }
 
 // ShamirConfig configures Shamir secret sharing for barrier operations.

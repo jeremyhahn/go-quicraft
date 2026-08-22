@@ -226,6 +226,7 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg/seal`
 either interface.
 
 ```go
+// DEPRECATED (#35): string-typed, so shares become un-wipeable crossing them.
 type ShareSplitter interface {
     Split(secret []byte, threshold, total int) ([]string, error)
 }
@@ -237,7 +238,31 @@ type ShareAccumulator interface {
     Reset()
     Expired() bool
 }
+
+// The replacements. Prefer these in new custody code.
+type ProtectedShareSplitter interface {
+    SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
+}
+
+type ProtectedShareAccumulator interface {
+    AddProtectedShare(ctx context.Context, share *shamir.ProtectedShare) (*QuorumProgress, error)
+    GetProgress() *QuorumProgress
+    ReconstructProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+    Reset()
+    Expired() bool
+}
 ```
+
+The string forms are deprecated because a Go string cannot be zeroed: an
+implementation that splits into locked memory must copy each share back out into
+an immortal heap string to satisfy `Split`'s return type, and `AddShare` receives
+a share that was un-wipeable before any protected buffer existed. The protected
+forms close both ends — `AddProtectedShare` **takes ownership** of the share it
+is given (and destroys it whether or not it is accepted, and whether or not the
+quorum completes), and `ReconstructProtected` returns the secret in an enclave.
+
+Both families are live: the deprecated ones still compile and work, so a consumer
+migrates one call site at a time.
 
 | Type | Role |
 |---|---|

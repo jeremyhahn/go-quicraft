@@ -135,6 +135,19 @@ type ShareAccumulator interface {
     Expired() bool
 }
 
+// Protected-memory counterparts — prefer these in new custody code (#35).
+type ProtectedShareSplitter interface {
+    SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
+}
+
+type ProtectedShareAccumulator interface {
+    AddProtectedShare(ctx context.Context, share *shamir.ProtectedShare) (*QuorumProgress, error)
+    GetProgress() *QuorumProgress
+    ReconstructProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+    Reset()
+    Expired() bool
+}
+
 type ShamirConfig struct {
     Threshold   int           `json:"threshold"`
     TotalShares int           `json:"total_shares"`
@@ -159,6 +172,26 @@ const DefaultQuorumTTL = 5 * time.Minute
 `ShareAccumulator` implementations handle deduplication, ordering and TTL
 expiration, and are **not** required to be safe for concurrent use — the
 `Barrier` provides that synchronization through its own mutex.
+
+**`ShareSplitter` and `ShareAccumulator` are DEPRECATED** (#35). Both are typed
+in `string`, and a Go string cannot be zeroed — so an implementation that splits
+into locked memory has to copy every share straight back out into an immortal
+heap string to satisfy the signature, and an accumulator receives a share that
+was already un-wipeable before any protected buffer existed. Migrating a
+consumer to `SplitProtected`/`CombineProtected` while these signatures stand
+silences the deprecation warnings without moving the exposure.
+
+`ProtectedShareSplitter` and `ProtectedShareAccumulator` are the replacements,
+and both ENDS are protected deliberately: `AddProtectedShare` **takes ownership**
+of a share already in locked memory (destroying it whether or not the share is
+accepted and whether or not the quorum completes), and `ReconstructProtected`
+returns the secret in an `enclave.MemoryEnclave` rather than an ordinary
+`[]byte`. Protecting one end only would leave the exposure intact at the other.
+
+They are additive: the string forms still compile and still work, so consumers
+migrate one call site at a time. Note that `ShamirInitResult.Shares` is still
+`[]string` and is tracked separately — a protected initialization result has no
+counterpart type yet.
 
 ## 2. Wire format of a share
 
