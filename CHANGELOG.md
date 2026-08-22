@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a process-wide memguard purge could unmap pages mid-borrow (#18)
+
+- **`pkg/enclave` gains a package-wide `purgeMu`.** memguard's failure path is
+  process-wide, not per-buffer: `core.Panic` calls `core.Purge` first, which
+  snapshots every live buffer and destroys each one, ending in `memcall.Free` —
+  the pages are UNMAPPED, not merely wiped — while holding none of this
+  package's locks. The per-enclave borrow discipline added in 0.8.0-alpha could
+  not see that. Goroutine A inside `WithBytes` on one enclave could have its
+  pages unmapped by goroutine B exhausting `RLIMIT_MEMLOCK` constructing an
+  *unrelated* one. Losing that race is a SIGSEGV, the same failure class as the
+  original use-after-destroy defect, and it shipped in 0.7.0-alpha too.
+- **Purge-capable operations take it exclusively; borrows take it shared.**
+  Which operations qualify was read out of memguard v0.23.0 rather than assumed:
+  `Panic` is reachable from `NewBuffer`, `Freeze`, `Melt`, `Scramble` and
+  `Destroy` in `core/buffer.go`, and from `NewEnclave` and `Open` in
+  `core/enclave.go`. So `Destroy` and `Freeze` are allocation-class operations,
+  not reads — releasing and re-protecting pages can purge too. Lock order is
+  always `purgeMu` then the enclave's own mutex, so the two cannot cycle.
+- **BEHAVIOUR CHANGE for callers: a `WithBytes` callback must not touch ANY
+  enclave, not merely its own.** Go's `RWMutex` refuses a new `RLock` once a
+  writer is queued, so a nested borrow of a *second* enclave deadlocks against
+  any purge-capable operation that queued after the outer borrow began. The
+  previous documentation explicitly permitted this, and `CombineProtected` in
+  `pkg/crypto/shamir` relied on it; it now materializes its decode buffer before
+  borrowing. The type doc, `WithBytes`' contract, `docs/memory-enclave/api.md`
+  and `docs/memory-enclave/engineering.md` are corrected in the same commit —
+  the overclaim they carried ("every method is safe to call concurrently") was
+  false from outside these locks in a way no caller could defend against.
+- Verified by two probes that interrogate the lock directly rather than waiting
+  on a crash. `-race` cannot see reads of memguard's region — `memcall.Alloc` is
+  `mmap`, which the detector does not instrument — so a green `-race` run is not
+  evidence for this class. Each probe carries a vacuity check and fails if it
+  never observes the coordination being exercised. Mutation-verified in both
+  directions, with and without `-race`.
+
 ### Added — `StorageBackend.CompareAndDelete` (#29)
 
 - **BREAKING for implementers of `seal.StorageBackend`.** The interface gains

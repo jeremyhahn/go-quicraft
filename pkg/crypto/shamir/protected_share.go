@@ -386,6 +386,21 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	buf := enclave.NewMemoryEnclave(base64.StdEncoding.DecodedLen(widest))
 	defer buf.Destroy()
 
+	// Materialized HERE, outside every WithValue below, and the reason is a
+	// deadlock rather than a preference. Borrowing is process-wide since
+	// go-quicraft#18 (enclave.purgeMu serializes borrows against any memguard
+	// operation that can purge the process), and Go's RWMutex blocks a new
+	// RLock once a writer is queued — so calling buf.Bytes() from INSIDE a
+	// share's borrow would deadlock against any allocation, Destroy or Freeze
+	// that queued in between, anywhere in the process. WithBytes' contract now
+	// forbids touching any enclave from a callback for exactly this reason.
+	//
+	// Safe to hold across the loop: buf is created here and never escapes, so
+	// no other goroutine can destroy it, and no purge can run while a share's
+	// borrow holds purgeMu shared — which is precisely when these slices are
+	// read.
+	bufBytes := buf.Bytes()
+
 	// Pass one: validate every share and collect the x-coordinates. Nothing
 	// secret is retained — a y-payload lives in buf only until the next share
 	// overwrites it, and the stale tail of a shorter decode is unreachable
@@ -405,11 +420,11 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 			err error
 		)
 		if werr := share.WithValue(func(v []byte) error {
-			n, err = base64.StdEncoding.Decode(buf.Bytes(), v)
+			n, err = base64.StdEncoding.Decode(bufBytes, v)
 			if err != nil {
 				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
 			}
-			x, y, err = parseRawShare(buf.Bytes()[:n], i, seenX, secretLen)
+			x, y, err = parseRawShare(bufBytes[:n], i, seenX, secretLen)
 			return err
 		}); werr != nil {
 			return nil, werr
@@ -423,9 +438,11 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// decoded and its payload immediately overwritten by the next.
 	basis := gfLagrangeZero(xs)
 	secret := enclave.NewMemoryEnclave(secretLen)
+	// Materialized outside the borrow for the same reason as bufBytes above.
+	secretBytes := secret.Bytes()
 	for i, share := range shares {
 		if werr := share.WithValue(func(v []byte) error {
-			n, err := base64.StdEncoding.Decode(buf.Bytes(), v)
+			n, err := base64.StdEncoding.Decode(bufBytes, v)
 			if err != nil {
 				// Unreachable: pass one decoded this same value, and a share's
 				// value is frozen read-only from the moment it is constructed.
@@ -433,7 +450,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 				// those cannot turn it into a silently wrong secret.
 				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
 			}
-			accumulateShareInto(secret.Bytes(), buf.Bytes()[rawShareOverhead:n], basis[i])
+			accumulateShareInto(secretBytes, bufBytes[rawShareOverhead:n], basis[i])
 			return nil
 		}); werr != nil {
 			secret.Destroy()
@@ -479,8 +496,16 @@ func (s *ProtectedShare) Value() []byte {
 // and not Destroy. Mutators take priority over readers in the underlying
 // enclave, so a nested read blocks on any mutator that queued after fn started
 // while that mutator waits on fn's own borrow; a nested Destroy waits on the
-// borrow directly. Reading a DIFFERENT share, or a different enclave, is fine
-// and is what CombineProtected's own callbacks do.
+// borrow directly.
+//
+// fn must ALSO not touch a DIFFERENT share or enclave, and that is a tightening
+// of what this comment previously said (go-quicraft#18). WithValue delegates to
+// MemoryEnclave.WithBytes, whose borrow now takes a process-wide lock shared;
+// Go's RWMutex refuses a new RLock once a writer is queued, so a nested borrow
+// of any second share deadlocks against an allocation, Destroy or Freeze that
+// queued after fn started — anywhere in the process, not just on this share.
+// Materialize what fn needs before calling: CombineProtected's callbacks used
+// to nest and now hoist their decode buffer for exactly this reason.
 func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
 	if s == nil || s.value == nil {
 		return enclave.ErrEnclaveDestroyed

@@ -76,11 +76,30 @@ not.
 - **Mutators take priority over readers.** A queued `Destroy`, `Freeze` or
   `SealMemoryEnclave` blocks every new borrow until it completes, so readers
   cannot starve the wipe. This is the same policy `sync.RWMutex` applies.
-- **A callback must NOT re-enter its own enclave** — no `Bytes`, `Size`,
-  `WithBytes`, `Destroy`, `Freeze` or `SealMemoryEnclave` on the enclave whose
-  borrow it holds. A nested borrow queues behind any mutator that arrived in the
-  meantime, and that mutator is waiting on the borrow the callback holds. Reads
-  of a DIFFERENT enclave are fine and are what the package's own callbacks do.
+- **A callback must NOT touch ANY enclave** — not its own and not a different
+  one. No `Bytes`, `Size`, `WithBytes`, `Destroy`, `Freeze` or
+  `SealMemoryEnclave` from inside a borrow.
+
+  For its own enclave the reason is the per-enclave rule: a nested borrow queues
+  behind any mutator that arrived meanwhile, and that mutator is waiting on the
+  borrow the callback holds.
+
+  For a DIFFERENT enclave the reason is the process-wide one, and this is a
+  TIGHTENING of what this document previously said (issue #18). Borrowing now
+  takes the package-level `purgeMu` shared, and Go's `RWMutex` refuses a new
+  `RLock` once a writer is queued — so a nested borrow of a second enclave
+  deadlocks against any purge-capable operation (an allocation, `Destroy`,
+  `Freeze`) that queued after the outer borrow began, anywhere in the process.
+  Materialize what the callback needs BEFORE borrowing; `CombineProtected` does
+  exactly that with its decode buffer.
+- **A process-wide purge is coordinated against every borrow.** memguard's
+  failure path is not per-buffer: `core.Panic` calls `core.Purge` first, which
+  unmaps *every* live buffer in the process while holding none of this package's
+  locks. The per-enclave borrow counter therefore cannot make a borrow safe on
+  its own — a failed allocation in one goroutine could unmap pages another was
+  reading, with no `Destroy` involved. `purgeMu` is the outer layer that closes
+  it: borrows take it shared, purge-capable operations take it exclusively, and
+  the order is always `purgeMu` then the enclave's own lock.
 - **Package-internal readers go through the accessor too.**
   `CombineProtected` and `ProtectedShare.MarshalJSON` read share values inside
   `WithValue`, not from a released alias. Both obtain the slices themselves, so

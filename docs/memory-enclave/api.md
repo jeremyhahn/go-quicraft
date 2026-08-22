@@ -108,12 +108,19 @@ allocate / fill / `Freeze` sequence, where nothing else freezes; if another
 goroutine may `Freeze` concurrently, the caller orders that externally. This
 type does not, and cannot, do it for them.
 
-`fn` must NOT re-enter the same enclave — no `Bytes`, `Size`, `WithBytes`,
-`Destroy`, `Freeze` or `SealMemoryEnclave` on the enclave whose borrow it holds.
-Mutators take priority over readers (the policy that stops a stream of readers
-starving a queued `Destroy`), so a nested borrow queues behind any mutator that
-arrived meanwhile, and that mutator is waiting on `fn`'s own borrow. Reads of a
-DIFFERENT enclave are fine.
+`fn` must NOT touch ANY enclave — no `Bytes`, `Size`, `WithBytes`, `Destroy`,
+`Freeze` or `SealMemoryEnclave`, on this enclave or any other.
+
+For the same enclave: mutators take priority over readers (the policy that stops
+a stream of readers starving a queued `Destroy`), so a nested borrow queues
+behind any mutator that arrived meanwhile, and that mutator is waiting on `fn`'s
+own borrow.
+
+For a **different** enclave — a tightening of what this page previously said
+(issue #18) — borrowing takes the package-wide `purgeMu` shared, and Go's
+`RWMutex` refuses a new `RLock` once a writer is queued, so a nested borrow
+deadlocks against any purge-capable operation that queued after the outer borrow
+began. Materialize what `fn` needs before borrowing.
 
 `shamir.ProtectedShare` mirrors the pair as `Value` / `WithValue`.
 

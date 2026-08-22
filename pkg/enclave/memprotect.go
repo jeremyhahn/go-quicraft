@@ -120,6 +120,49 @@ func (e *OpenError) Unwrap() error {
 	return e.Err
 }
 
+// purgeMu serializes every memguard operation that can PURGE THE PROCESS
+// against every borrow in it. It is the outer layer; each enclave's own mutex
+// is the inner one, and the order is always purgeMu first (issue #18).
+//
+// It exists because memguard's failure path is process-wide, not per-buffer.
+// When an operation fails it calls core.Panic, which calls core.Purge FIRST
+// (v0.23.0 core/exit.go:84-87). Purge snapshots every live buffer and destroys
+// each one, and destroy() ends in memcall.Free — the pages are UNMAPPED, not
+// merely wiped. Purge holds only memguard's own registry and key locks, so it
+// cannot see, and does not wait for, any MemoryEnclave's mutex.
+//
+// The per-enclave borrow discipline therefore cannot make a borrow safe, and
+// this is the gap it does not cover: goroutine A can be inside WithBytes on one
+// enclave, holding a slice into its locked pages, while goroutine B exhausts
+// RLIMIT_MEMLOCK constructing an UNRELATED enclave and unmaps A's pages
+// underneath it. Losing that race is a SIGSEGV, exactly as the original
+// use-after-destroy defect was. Reproduced on go-objstore, which is why this is
+// a fix rather than a theory.
+//
+// Panic is not an exotic path. It fires on ANY allocation failure, which is the
+// ordinary consequence of exhausting locked memory — a limit this package's own
+// documentation warns is reachable from operator-supplied input.
+//
+// WHICH OPERATIONS ARE PURGE-CAPABLE was read out of memguard v0.23.0 rather
+// than assumed. In core/buffer.go, Panic is reachable from NewBuffer (line 58),
+// Freeze (116), Melt (141), Scramble (165) and Destroy (182); in
+// core/enclave.go from NewEnclave (62) and Open (111), and core.Open allocates
+// through NewBuffer. So allocation is not the only exclusive class — RELEASING
+// and RE-PROTECTING pages can purge too, which is why Destroy and Freeze take
+// this lock exclusively rather than merely holding their own.
+//
+// Borrows take it SHARED, so they still run concurrently with each other; only
+// the purge-capable operations are exclusive, and those are setup and teardown
+// rather than steady state.
+//
+// THE COST, stated plainly because it is a real restriction and a silent one:
+// Go's RWMutex blocks a new RLock once a writer is QUEUED. A borrow taken from
+// inside another borrow's callback therefore deadlocks against any purge-capable
+// operation that queued in between — and unlike the per-enclave rule, this
+// applies across DIFFERENT enclaves, because the lock is process-wide. See
+// WithBytes: a callback must not touch any enclave at all.
+var purgeMu sync.RWMutex
+
 // MemoryEnclave is a region of locked, zeroized memory: it wraps
 // memguard.LockedBuffer for consistent memory protection across all platforms,
 // providing guard pages, core dump prevention, and guaranteed zeroing on
@@ -134,6 +177,21 @@ func (e *OpenError) Unwrap() error {
 // protection — and wait for every borrow to end first. A reader therefore
 // observes either a live buffer or a destroyed one, never a buffer whose memory
 // is being unmapped or re-protected underneath it.
+//
+// That guarantee holds against operations on THIS enclave through the borrow
+// counter below, and against a PROCESS-WIDE memguard purge through the
+// package-level purgeMu — see its comment. Both layers are required, and the
+// second is not optional: memguard's Purge unmaps every live buffer in the
+// process and holds none of this type's locks, so before purgeMu existed a
+// failed allocation anywhere could unmap pages a borrow was reading, with no
+// Destroy involved at all (issue #18).
+//
+// THE PRICE of the process-wide layer, and it is stricter than the per-enclave
+// rule: a WithBytes callback must not touch ANY enclave — not this one, and not
+// a different one. Go's RWMutex blocks a new RLock once a writer is queued, so
+// a nested borrow deadlocks against any purge-capable operation that queued
+// after the outer borrow began, even on an unrelated enclave. Materialize what
+// the callback needs BEFORE borrowing.
 //
 // "Live" does NOT imply "writable", and the difference is a real hazard rather
 // than pedantry. A frozen enclave is live and read-only. The borrow orders a
@@ -160,11 +218,14 @@ func (e *OpenError) Unwrap() error {
 // for the borrow the callback is holding. That is the same restriction
 // sync.RWMutex imposes, for the same reason, and it is a deliberate trade —
 // a deadlock is loud, reproducible and fixable at the call site, whereas
-// starvation is silent and unbounded. Nothing in this repository nests: the
-// reads inside CombineProtected's and MarshalJSON's callbacks are on a
-// DIFFERENT enclave, which has its own lock. A callback also must not Destroy
-// or Freeze its own enclave, which would wait on a borrow it is itself
-// holding.
+// starvation is silent and unbounded. A callback also must not Destroy or
+// Freeze its own enclave, which would wait on a borrow it is itself holding.
+//
+// Since #18 the restriction is WIDER than the same enclave: a callback must not
+// touch ANY enclave, because borrowing takes the process-wide purgeMu shared
+// and Go's RWMutex refuses a new RLock once a writer is queued. Nothing in this
+// repository nests any more — CombineProtected materializes its decode buffer
+// before borrowing, which is the shape callers should copy.
 //
 // This field was previously an atomic.Pointer, which was NOT sufficient, and
 // the reason is worth stating because the mistake is an easy one to repeat. An
@@ -298,6 +359,57 @@ func (p *MemoryEnclave) lockIdle() {
 	handedOff = true
 }
 
+// lockPurgeExclusiveFor takes purgeMu exclusively on behalf of a mutator acting
+// on p, and keeps that mutator's park OBSERVABLE at this blocking point.
+//
+// The hook has to fire here, not only in lockIdle, and the reason is a deadlock
+// that this package's own probes found. Since purge-capable operations take
+// purgeMu BEFORE the enclave's own lock, a Destroy racing a live borrow now
+// blocks at purgeMu and may never reach lockIdle's park at all. A probe that
+// holds a borrow and waits to observe the park — which is exactly how the
+// hold-off guarantee is asserted without using elapsed time as evidence — would
+// then wait forever for a signal that can no longer arrive, and the borrow it
+// is holding is what the mutator is waiting on.
+//
+// TryLock first, so the hook fires only when the lock was contended at that
+// instant. It is a BEST-EFFORT signal, not a proof of parking: the holder may
+// release between the failed TryLock and the blocking call, in which case the
+// hook fired for an acquisition that never actually parked. That is harmless
+// because the hook is observational — it exists so probes can wait on an event
+// instead of an interval — and a spurious fire only makes a probe proceed
+// earlier. The notify-then-block ordering matches lockIdle's own.
+func lockPurgeExclusiveFor(p *MemoryEnclave) {
+	if purgeMu.TryLock() {
+		return
+	}
+	notifyMutatorParked(p)
+	purgeMu.Lock()
+}
+
+// rLockPurgeFor takes purgeMu shared on behalf of a reader of p, keeping the
+// reader's park observable for the same reason lockPurgeExclusiveFor keeps the
+// mutator's.
+//
+// The writer-preference guarantee — a reader arriving while a mutator is queued
+// must WAIT for it rather than renew the borrow count the mutator is waiting to
+// see fall — is now enforced at TWO layers. Go's RWMutex already refuses a new
+// RLock once a writer is queued, so with purgeMu in place a late reader blocks
+// HERE and never reaches borrow's own readable.Wait. The property is unchanged;
+// the point at which it becomes observable moved outward, and a probe that
+// counts reader parks would otherwise wait forever for a signal the inner layer
+// no longer emits.
+//
+// Best-effort in the same way as lockPurgeExclusiveFor: a failed TryRLock means
+// the lock was contended at that instant, not that this reader is certain to
+// block.
+func rLockPurgeFor(p *MemoryEnclave) {
+	if purgeMu.TryRLock() {
+		return
+	}
+	notifyReaderParked(p)
+	purgeMu.RLock()
+}
+
 // unlockMutated ends the exclusive section lockIdle began, releasing mu and
 // readmitting readers once no mutator remains queued. Every lockIdle must be
 // paired with exactly one of these.
@@ -421,6 +533,11 @@ func newMemoryEnclave(buf *memguard.LockedBuffer) *MemoryEnclave {
 // final — which is what lets a producer build its output inside the enclave
 // instead of assembling it on the ordinary heap and copying it in.
 func NewMemoryEnclave(size int) *MemoryEnclave {
+	// EXCLUSIVE: memguard.NewBuffer purges the whole process if it cannot lock
+	// the pages, which would unmap every other enclave including ones being
+	// read right now (#18).
+	purgeMu.Lock()
+	defer purgeMu.Unlock()
 	return newMemoryEnclave(memguard.NewBuffer(size))
 }
 
@@ -431,6 +548,9 @@ func NewMemoryEnclave(size int) *MemoryEnclave {
 // Prefer NewMemoryEnclave and write into it where the material can be produced
 // in place: bytes that reach this constructor already existed unprotected.
 func NewMemoryEnclaveFromBytes(data []byte) *MemoryEnclave {
+	// EXCLUSIVE, as NewMemoryEnclave (#18).
+	purgeMu.Lock()
+	defer purgeMu.Unlock()
 	return newMemoryEnclave(memguard.NewBufferFromBytes(data))
 }
 
@@ -469,6 +589,9 @@ func (p *MemoryEnclave) Bytes() []byte {
 	if p == nil {
 		return nil
 	}
+	// purgeMu shared, then this enclave's own borrow — always this order (#18).
+	rLockPurgeFor(p)
+	defer purgeMu.RUnlock()
 	buf, ok := p.borrow()
 	if !ok {
 		return nil
@@ -500,13 +623,25 @@ func (p *MemoryEnclave) Bytes() []byte {
 // half deadlocks for the plainer reason that it waits on a borrow fn is
 // holding.
 //
-// Reading a DIFFERENT enclave from inside fn is fine and is what this package's
-// own callbacks do. Destroying this enclave AFTER WithBytes returns is correct
-// and ordinary.
+// Reading a DIFFERENT enclave from inside fn is ALSO forbidden, and that is a
+// tightening of what this comment used to promise. It was true while the only
+// lock was per-enclave; it stopped being true when purgeMu made borrowing
+// process-wide. Go's RWMutex blocks a new RLock once a writer is queued, so a
+// nested borrow of a second enclave deadlocks against any purge-capable
+// operation — an allocation, a Destroy, a Freeze, anywhere in the process —
+// that queued after the outer borrow began. Materialize what fn needs before
+// borrowing; CombineProtected in pkg/crypto/shamir does exactly that.
+//
+// Destroying this enclave AFTER WithBytes returns is correct and ordinary.
 func (p *MemoryEnclave) WithBytes(fn func([]byte) error) error {
 	if p == nil {
 		return ErrEnclaveDestroyed
 	}
+	// purgeMu shared, then this enclave's own borrow — always this order (#18).
+	// Held across fn, so no process-wide purge can unmap the pages fn is
+	// reading, which is the guarantee a per-enclave lock cannot give.
+	rLockPurgeFor(p)
+	defer purgeMu.RUnlock()
 	buf, ok := p.borrow()
 	if !ok {
 		return ErrEnclaveDestroyed
@@ -520,6 +655,10 @@ func (p *MemoryEnclave) Size() int {
 	if p == nil {
 		return 0
 	}
+	// Shared like the other reads: Size reads a slice header inside memguard,
+	// which a concurrent purge rewrites (#18).
+	rLockPurgeFor(p)
+	defer purgeMu.RUnlock()
 	buf, ok := p.borrow()
 	if !ok {
 		return 0
@@ -558,6 +697,13 @@ func (p *MemoryEnclave) Freeze() {
 	if p == nil {
 		return
 	}
+	// EXCLUSIVE, not shared, and not merely this enclave's own lock: Freeze
+	// re-protects pages through memcall.Protect, and core/buffer.go:116 calls
+	// Panic — hence Purge — when that fails. A Freeze on one enclave can
+	// therefore unmap another enclave's pages mid-borrow (#18). Order is
+	// purgeMu then p.mu, matching every other site, so the two cannot cycle.
+	lockPurgeExclusiveFor(p)
+	defer purgeMu.Unlock()
 	p.lockIdle()
 	defer p.unlockMutated()
 	if p.buf != nil {
@@ -577,6 +723,13 @@ func (p *MemoryEnclave) Destroy() {
 	if p == nil {
 		return
 	}
+	// EXCLUSIVE: Destroy is a purge-capable operation, not a read. memguard's
+	// Buffer.Destroy calls Panic — hence Purge — when releasing the pages fails
+	// (core/buffer.go:182), so a Destroy on ONE enclave can unmap ANOTHER
+	// enclave's pages while that one is being borrowed. Holding only p.mu left
+	// exactly the hole this lock exists to close (#18).
+	lockPurgeExclusiveFor(p)
+	defer purgeMu.Unlock()
 	p.lockIdle()
 	defer p.unlockMutated()
 	if p.buf != nil {
@@ -610,6 +763,9 @@ type ProtectedKey struct {
 // NewProtectedKey creates an encrypted-at-rest key from a byte slice.
 // The source slice is wiped after sealing into the enclave.
 func NewProtectedKey(key []byte) *ProtectedKey {
+	// EXCLUSIVE: core/enclave.go:62 shows NewEnclave on the Panic path (#18).
+	purgeMu.Lock()
+	defer purgeMu.Unlock()
 	p := &ProtectedKey{}
 	p.enclave.Store(memguard.NewEnclave(key))
 	return p
@@ -622,7 +778,22 @@ func (p *ProtectedKey) Open() (*MemoryEnclave, error) {
 	if enclave == nil {
 		return nil, ErrEnclaveNil
 	}
-	buf, err := enclave.Open()
+	// EXCLUSIVE: Open ALLOCATES — core.Open builds a Buffer through NewBuffer
+	// (core/enclave.go:109) — so it carries the same purge risk as any other
+	// allocation, and core/enclave.go:111 is on the Panic path directly (#18).
+	//
+	// DEFERRED, not unlocked inline, and this is load-bearing rather than style.
+	// The failure this whole lock exists for is core.Panic, which PANICS after
+	// purging — and memguard documents that panic as recoverable ("creates a new
+	// key so it is safe to recover from this panic"). An inline Unlock is
+	// skipped when the stack unwinds, so a recovered purge would leave purgeMu
+	// write-locked forever and wedge every borrow and every allocation in the
+	// process. Every other purge-capable site here defers for the same reason.
+	buf, err := func() (*memguard.LockedBuffer, error) {
+		purgeMu.Lock()
+		defer purgeMu.Unlock()
+		return enclave.Open()
+	}()
 	if err != nil {
 		return nil, &OpenError{Err: err}
 	}
@@ -661,6 +832,13 @@ func SealMemoryEnclave(buf *MemoryEnclave) *ProtectedKey {
 	}
 	// Exclusive, for the same reason Destroy is: sealing consumes the locked
 	// buffer, so it must not run while anything is reading it.
+	//
+	// purgeMu is held across the Seal as well, not just the swap: Seal
+	// allocates an Enclave and destroys the source buffer, both of which are on
+	// memguard's Panic path, so it is purge-capable and must not overlap a
+	// borrow anywhere in the process (#18). Order is purgeMu then buf.mu.
+	lockPurgeExclusiveFor(buf)
+	defer purgeMu.Unlock()
 	buf.lockIdle()
 	locked := buf.buf
 	buf.buf = nil
