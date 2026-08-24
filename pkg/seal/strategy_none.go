@@ -17,6 +17,8 @@ package seal
 import (
 	"context"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // NoneStrategy disables barrier encryption: SealRootKey records a marker
@@ -89,6 +91,55 @@ func (s *NoneStrategy) UnsealRootKey(_ context.Context, sealed *SealedRootKey, _
 		return nil, ErrStrategyMismatch
 	}
 	return []byte{}, nil
+}
+
+// SealRootKeyProtected records the same marker SealRootKey does. The enclave's
+// CONTENTS are never read — no-encryption mode wraps nothing — and it is NOT
+// destroyed either: ownership of a protected root key stays with the caller in
+// this interface, and a strategy that silently released one would break a caller
+// that seals with several strategies in turn.
+//
+// It is still VALIDATED, and that is a deliberate asymmetry with SealRootKey,
+// which accepts any slice including nil. The protected contract says a nil or
+// destroyed enclave is an error rather than an empty key, and a contract the
+// reference implementation ignores is not a contract. The failure this catches
+// is real: a caller that destroyed or lost its root key before sealing would
+// otherwise be handed a valid marker and a success, and would learn nothing
+// until an unseal it can no longer perform. Size alone answers all three cases
+// — nil, destroyed and wrong-sized all report a size that is not rootKeySize —
+// without reading a byte of the key.
+func (s *NoneStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, _ ProtectedCredentials) (*SealedRootKey, error) {
+	if rootKey.Size() != rootKeySize {
+		return nil, ErrInvalidRootKeySize
+	}
+	// Credentials are ignored in either form: this strategy wraps nothing, so it
+	// derives nothing and has no use for a passphrase.
+	return s.SealRootKey(ctx, nil, Credentials{})
+}
+
+// UnsealRootKeyProtected returns ErrNoRootKeyAvailable. This is the one place
+// the protected pair deliberately does NOT mirror its string-typed sibling:
+// UnsealRootKey returns an empty []byte because the barrier's no-encryption
+// branch wants a length-zero key it can carry through the same code path, and
+// there is no such thing as a protected buffer holding nothing — memguard
+// refuses a zero-length allocation by terminating the process, and an enclave
+// that "held" an empty key would be a protected wrapper around a fiction.
+//
+// So the honest answer to "give me the root key, protected" in no-encryption
+// mode is that there is no root key, which is exactly what ErrNoRootKeyAvailable
+// says and what Barrier.RootKey already returns in this mode. A caller reaching
+// for the protected path in None mode has a bug — it is about to use a key that
+// does not exist — and a typed error at that point is worth more than a
+// zero-length success it would carry two layers further.
+//
+// The sealed blob is still validated first, so a mismatched or nil blob reports
+// the same error it does through UnsealRootKey rather than being masked by this
+// one.
+func (s *NoneStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, _ ProtectedCredentials) (*enclave.MemoryEnclave, error) {
+	if _, err := s.UnsealRootKey(ctx, sealed, Credentials{}); err != nil {
+		return nil, err
+	}
+	return nil, ErrNoRootKeyAvailable
 }
 
 // Close is a no-op for NoneStrategy.

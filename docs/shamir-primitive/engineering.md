@@ -123,19 +123,6 @@ interchangeable on the wire and a consumer can migrate one call site at a time.
 ### `pkg/seal` — the custody interfaces this repository declares but does not implement
 
 ```go
-type ShareSplitter interface {
-    Split(secret []byte, threshold, total int) ([]string, error)
-}
-
-type ShareAccumulator interface {
-    AddShare(ctx context.Context, share string) (*QuorumProgress, error)
-    GetProgress() *QuorumProgress
-    Reconstruct(ctx context.Context) ([]byte, error)
-    Reset()
-    Expired() bool
-}
-
-// Protected-memory counterparts — prefer these in new custody code (#35).
 type ProtectedShareSplitter interface {
     SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
 }
@@ -155,10 +142,15 @@ type ShamirConfig struct {
 }
 
 type ShamirInitResult struct {
-    Shares      []string `json:"shares"`
-    Threshold   int      `json:"threshold"`
-    TotalShares int      `json:"total_shares"`
+    Shares      []*shamir.ProtectedShare `json:"shares"`
+    Threshold   int                      `json:"threshold"`
+    TotalShares int                      `json:"total_shares"`
 }
+
+// Destroy wipes and releases every share the result holds. Safe on a nil
+// receiver and safe to call twice, so a ceremony can `defer` it from the line
+// the result exists.
+func (r *ShamirInitResult) Destroy()
 
 type QuorumProgress struct {
     Required  int  `json:"required"`
@@ -169,29 +161,108 @@ type QuorumProgress struct {
 const DefaultQuorumTTL = 5 * time.Minute
 ```
 
-`ShareAccumulator` implementations handle deduplication, ordering and TTL
-expiration, and are **not** required to be safe for concurrent use — the
+`ProtectedShareAccumulator` implementations handle deduplication, ordering and
+TTL expiration, and are **not** required to be safe for concurrent use — the
 `Barrier` provides that synchronization through its own mutex.
 
-**`ShareSplitter` and `ShareAccumulator` are DEPRECATED** (#35). Both are typed
-in `string`, and a Go string cannot be zeroed — so an implementation that splits
-into locked memory has to copy every share straight back out into an immortal
-heap string to satisfy the signature, and an accumulator receives a share that
-was already un-wipeable before any protected buffer existed. Migrating a
-consumer to `SplitProtected`/`CombineProtected` while these signatures stand
-silences the deprecation warnings without moving the exposure.
+**There is no string-typed custody surface left.** `ShareSplitter`,
+`ShareAccumulator` and `ShamirInitResult.Shares []string` were removed in #37 on
+the owner's ruling, one release after #35 added the protected siblings. Both
+were typed in `string`, and a Go string cannot be zeroed — so an implementation
+that split into locked memory had to copy every share straight back out into an
+immortal heap string to satisfy the signature, and an accumulator received a
+share that was already un-wipeable before any protected buffer existed. Keeping
+them as deprecated siblings let a consumer migrate to
+`SplitProtected`/`CombineProtected`, silence every `SA1019`, and leave the
+exposure exactly where it was — which is worse than not migrating, because it
+removes the honest signposts.
 
-`ProtectedShareSplitter` and `ProtectedShareAccumulator` are the replacements,
-and both ENDS are protected deliberately: `AddProtectedShare` **takes ownership**
-of a share already in locked memory (destroying it whether or not the share is
-accepted and whether or not the quorum completes), and `ReconstructProtected`
-returns the secret in an `enclave.MemoryEnclave` rather than an ordinary
-`[]byte`. Protecting one end only would leave the exposure intact at the other.
+Both ENDS of the protected family are protected deliberately:
+`AddProtectedShare` **takes ownership** of a share already in locked memory
+(destroying it whether or not the share is accepted and whether or not the
+quorum completes), and `ReconstructProtected` returns the secret in an
+`enclave.MemoryEnclave` rather than an ordinary `[]byte`. Protecting one end only
+would leave the exposure intact at the other.
 
-They are additive: the string forms still compile and still work, so consumers
-migrate one call site at a time. Note that `ShamirInitResult.Shares` is still
-`[]string` and is tracked separately — a protected initialization result has no
-counterpart type yet.
+`ShamirInitResult` is the moment a ceremony holds all N shares at once. It OWNS
+them: `Destroy()` releases every one, and an abandoned result holds N locked
+allocations against `RLIMIT_MEMLOCK`, whose exhaustion memguard answers by
+terminating the process. Its `"shares"` JSON changed shape with the retype —
+from an array of bare values to the array of share OBJECTS every other share
+surface in the stack already uses.
+
+### The protected sealing pair
+
+`SealingStrategy.SealRootKey`/`UnsealRootKey` stay as they are, and #37 added an
+optional sibling interface beside them:
+
+```go
+type ProtectedSealingStrategy interface {
+    SealingStrategy
+
+    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
+}
+
+type ProtectedCredentials struct {
+    Secret *enclave.ProtectedKey
+}
+
+func NewProtectedCredentials(secret []byte) (ProtectedCredentials, error) // moves and WIPES secret
+```
+
+The reported defect it answers is go-qrdb's recovery strategy (go-qrdb PR #76,
+Codex round 4): it reconstructs the root key into an enclave and then copies it
+into a plain `[]byte` field purely to have something to return from
+`UnsealRootKey`, so the most sensitive value in the system sits in collectable,
+swappable memory for the whole barrier-unseal and is wiped only at `Close`. No
+care on the implementer's side can avoid that while the signature demands a
+`[]byte`; the fix belongs at the layer that owns the signature.
+
+Two implementation notes that are not obvious from the signatures:
+
+- **Order of operations.** `SoftwareStrategy` derives the wrapping key BEFORE it
+  borrows the root-key enclave, because deriving opens the passphrase enclave and
+  `pkg/enclave` holds a process-wide `purgeMu` across every borrow while
+  allocating locked memory takes it exclusively. Opening a second enclave inside
+  a borrow is a self-deadlock, not merely a documented hazard.
+- **The plaintext never exists on the heap.** GCM's plaintext length is known
+  before the decryption — payload minus nonce minus tag — so the enclave is
+  allocated at exactly that size and `aead.Open` is handed the enclave's own
+  storage as its append destination.
+- **That length is refused unless it is the root-key size, before anything is
+  locked.** It is derived from a blob the AEAD has not authenticated yet, and
+  memguard answers a lock it cannot take by terminating the process — so sizing
+  an `mlock`'d allocation from it would let whoever can write the blob take the
+  service down before the tag that rejects it is checked.
+
+`NoneStrategy` implements the pair too, and `UnsealRootKeyProtected` returns
+`ErrNoRootKeyAvailable`: no-encryption mode has no root key, memguard refuses a
+zero-length allocation by terminating the process, and an enclave "holding" an
+empty key would be a protected wrapper around a fiction. Its
+`SealRootKeyProtected` validates the enclave even though it never reads it —
+a contract the reference implementation ignores is not a contract.
+
+**Both sides of the boundary are protected**, which is why the pair takes
+`ProtectedCredentials` rather than `Credentials`. For a deferred-passphrase
+strategy the passphrase is not a lesser secret than the root key it wraps — it
+IS that key's protection — so accepting it in a plain `[]byte` would protect the
+wrong half. There is no overload taking `Credentials`: converting one to the
+other reintroduces the copy the signature removes. A consequence worth knowing is
+that the deferred protected paths derive straight from the credential's
+`ProtectedKey` instead of building a temporary inner strategy, so a
+FIPS-unapproved KDF is refused at `DeriveKey` rather than at that construction.
+
+`Credentials` itself is unchanged. Whether `SealingStrategy`'s own methods should
+move the same way is #41 (owner ruling) — that is a portfolio-wide interface
+change touching every strategy in go-xkms and go-qrdb, which the new pair was
+not, because it had no consumers yet.
+
+The `Barrier` still calls the `[]byte` pair. It needs raw bytes for HKDF epoch-DEK
+derivation and the sealed-state HMAC, wipes them on every path, and then holds
+the key in an `enclave.ProtectedKey`. Moving the barrier itself onto the
+protected pair is tracked separately (#39) — an enclave frozen read-only would
+fault under the `wipeBytes` calls that discipline currently depends on.
 
 ## 2. Wire format of a share
 

@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — BREAKING: every share and root-key surface is protected memory (#37)
+
+Owner-ruled 2026-08-23 on #37, and a breaking change by intent: pre-1.0, MINOR
+is where breakage lives, and a pre-release redesign lands clean rather than
+behind deprecated aliases.
+
+- **`ShareSplitter` and `ShareAccumulator` are REMOVED.** `ProtectedShareSplitter`
+  and `ProtectedShareAccumulator` — added one release ago by #35 — are now the
+  only custody interfaces this package declares. Keeping the string forms as
+  deprecated siblings preserved a shape whose only use was to undo the guarantee:
+  an implementation could split into locked memory and still have to copy every
+  share back out into an immortal heap string to satisfy `Split`, so a consumer
+  could migrate, silence every `SA1019`, and leave the exposure exactly where it
+  was.
+- **`ShamirInitResult.Shares` is `[]*shamir.ProtectedShare`**, and the result now
+  OWNS its shares: `Destroy()` wipes and releases every one, is safe on a nil
+  receiver, and is safe to call twice, so a ceremony can `defer` it from the line
+  the result exists. This was the last string-typed share surface in `pkg/seal`,
+  and it is the moment a ceremony holds all N shares at once.
+- **The `"shares"` WIRE SHAPE CHANGES with it**, which is the part to read twice:
+  it goes from an array of bare share values to an array of share OBJECTS — the
+  `{"index","threshold","total","value"}` encoding `shamir.Share` and
+  `shamir.ProtectedShare` already produce everywhere else. An init result written
+  by an older build does not decode into this type. No dual-format reader ships;
+  local state is wiped and re-bootstrapped.
+
+### Added — `ProtectedSealingStrategy`, the protected root-key pair (#37)
+
+- **`SealRootKeyProtected` and `UnsealRootKeyProtected`**, on a new optional
+  interface that embeds `SealingStrategy`. Sealing takes the root key in an
+  `enclave.MemoryEnclave` and borrows it; unsealing returns one the caller owns
+  and must `Destroy`.
+- **Why.** The `[]byte` signatures force an implementation to RETAIN the root key
+  in ordinary memory. go-qrdb's recovery strategy reconstructs it into an enclave
+  and then copies it into a plain field purely to have something to return from
+  `UnsealRootKey` — so the most sensitive value in the system sits in
+  collectable, swappable memory for the whole barrier-unseal and is wiped only at
+  `Close` (go-qrdb PR #76, Codex round 4). No care on the implementer's side can
+  avoid that while the signature demands a `[]byte`, which is why the review's own
+  conclusion was to fix the interface rather than assert protected custody above
+  it.
+- **Optional, and additive.** `SealingStrategy` is untouched, so every strategy in
+  the portfolio keeps compiling; a caller type-asserts for the protected pair.
+  There is no fallback, because a fallback is the unprotected copy wearing the
+  protected API's name.
+- **`SoftwareStrategy` implements both.** The plaintext root key never exists as
+  an ordinary heap allocation on the unseal path: GCM's plaintext length is known
+  in advance, so the enclave is allocated at exactly that size and `aead.Open`
+  writes into the enclave's own storage. That length is a function of a blob
+  nothing has authenticated yet, so it is refused unless it is exactly the
+  root-key size — before anything is locked. memguard answers a lock it cannot
+  take by terminating the process, which would otherwise make an oversized sealed
+  blob a remote kill switch that fires before the AEAD tag rejecting it is ever
+  checked. The KDF runs BEFORE the borrow, because opening the passphrase enclave
+  inside one would deadlock against `pkg/enclave`'s process-wide purge lock.
+- **`NoneStrategy` implements both too**, and `UnsealRootKeyProtected` returns
+  `ErrNoRootKeyAvailable`: no-encryption mode has no root key, and an enclave
+  cannot hold nothing — memguard answers a zero-length allocation by terminating
+  the process. Its `SealRootKeyProtected` still VALIDATES the enclave it never
+  reads, so a caller that destroyed or lost its root key before sealing learns so
+  there rather than at an unseal it can no longer perform.
+- **`ProtectedCredentials`, because both sides of the boundary have to be
+  protected.** The protected methods take a passphrase held in an
+  `enclave.ProtectedKey`, not `Credentials`' plain `[]byte`. For a
+  deferred-passphrase strategy the passphrase is not a lesser secret than the key
+  it wraps — it IS that key's protection — so a protected root-key API that
+  accepted an unprotected passphrase would be protecting the wrong half. There is
+  no overload taking `Credentials`: converting one to the other would reintroduce
+  the plain copy the signature exists to remove. `NewProtectedCredentials` moves
+  a secret into locked memory and WIPES the caller's slice; the caller owns the
+  result and releases it with `Clear`.
+- **The deferred protected paths no longer build a temporary inner strategy.**
+  That construction existed to copy a plain passphrase into locked memory, and a
+  `ProtectedCredentials` passphrase is already there. One behaviour moves with
+  it: a FIPS-unapproved KDF is refused at `DeriveKey` rather than at the inner
+  construction — same error, one frame later.
+- **`Credentials` itself is untouched**, and whether `SealingStrategy`'s own
+  methods should move to protected credentials is #41 (owner ruling): that one
+  is a portfolio-wide interface change touching every strategy in go-xkms and
+  go-qrdb, which the new pair is not — it had no consumers to break.
+- **The `Barrier` still uses the `[]byte` pair.** It needs raw bytes for HKDF
+  epoch-DEK derivation and the sealed-state HMAC and wipes them on every path.
+  Moving the barrier itself onto the protected pair is tracked as #39.
+
 ### Added — protected-memory custody interfaces (#35)
 
 - **`seal.ProtectedShareSplitter` and `seal.ProtectedShareAccumulator`**, the

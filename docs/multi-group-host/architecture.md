@@ -81,7 +81,8 @@ orchestration are the caller's problem. See [Cluster Formation](#cluster-formati
 - `pkg/logdb/waldb/` — WAL-based LogDB (16 directory shards, segment files)
 - `pkg/logdb/memdb/` — In-memory LogDB for testing
 - `pkg/seal/` — Barrier (epoch DEK, HKDF, AEAD, rotation), algorithm selection
-  and hardware detection, `SealingStrategy`/`ShareSplitter`/`ShareAccumulator`
+  and hardware detection, `SealingStrategy` (with its `ProtectedSealingStrategy`
+  sibling) and `ProtectedShareSplitter`/`ProtectedShareAccumulator`
 - `pkg/crypto/` — Type aliases re-exporting `pkg/seal` for backward
   compatibility. No implementation lives here.
 - `pkg/crypto/shamir/` — Pure GF(256) split/combine primitive. Share custody,

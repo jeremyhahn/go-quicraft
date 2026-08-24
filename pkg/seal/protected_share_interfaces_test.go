@@ -25,16 +25,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
-// Nothing in this module implements ShareSplitter/ShareAccumulator or their
-// protected counterparts — custody lives in go-qrdb, and these are shapes an
+// Nothing in this module implements ProtectedShareSplitter or
+// ProtectedShareAccumulator — custody lives in go-qrdb, and these are shapes an
 // embedder satisfies. That is exactly why the contract is pinned here: a
 // signature drifting away from what consumers implement would otherwise be
 // invisible from inside this repository until it broke their build.
 //
-// The fixtures below are also the answer to #35's first acceptance criterion,
-// "a consumer can implement the protected interface without ever materialising a
+// The fixtures below are also the answer to #37's acceptance criterion, "a
+// consumer can implement the custody interfaces without ever materialising a
 // share as a string" — demonstrated by construction rather than asserted in
-// prose. There is no `string` anywhere in this file's custody path.
+// prose. There is no `string` anywhere in this file's custody path, and after
+// #37 there is no string-valued interface left for one to leak through.
 
 // protectedSplitter implements ProtectedShareSplitter by delegating to the
 // primitive. Share values go from the polynomial straight into locked memory.
@@ -103,51 +104,11 @@ func (a *protectedAccumulator) Reset() {
 
 func (a *protectedAccumulator) Expired() bool { return time.Now().After(a.deadline) }
 
-// legacySplitter is the string-valued form. It is here to prove #35's second
-// acceptance criterion — that existing implementations still compile — which is
-// the whole reason this landed as additive siblings rather than a retype.
-type legacySplitter struct{}
-
-func (legacySplitter) Split(secret []byte, threshold, total int) ([]string, error) {
-	shares, err := shamir.Split(secret, threshold, total) //nolint:staticcheck // SA1019 deliberate: this fixture exists to prove the deprecated shape still compiles
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, len(shares))
-	for i, s := range shares {
-		out[i] = s.Value //nolint:staticcheck // SA1019 deliberate: same reason as above
-	}
-	return out, nil
-}
-
-// legacyAccumulator pins the other half of the deprecated surface. Without it
-// only ShareSplitter would be held in place, and a retype of ShareAccumulator
-// would break consumers with nothing here noticing.
-type legacyAccumulator struct{ shares []string }
-
-func (a *legacyAccumulator) AddShare(_ context.Context, share string) (*QuorumProgress, error) {
-	a.shares = append(a.shares, share)
-	return a.GetProgress(), nil
-}
-
-func (a *legacyAccumulator) GetProgress() *QuorumProgress {
-	return &QuorumProgress{Required: 2, Submitted: len(a.shares), Complete: len(a.shares) >= 2}
-}
-
-func (a *legacyAccumulator) Reconstruct(_ context.Context) ([]byte, error) {
-	return nil, errors.New("not needed for the conformance pin")
-}
-
-func (a *legacyAccumulator) Reset()        { a.shares = nil }
-func (a *legacyAccumulator) Expired() bool { return false }
-
-// Signature drift in either family fails the build here rather than in a
-// consumer that cannot change these interfaces.
+// Signature drift fails the build here rather than in a consumer that cannot
+// change these interfaces.
 var (
 	_ ProtectedShareSplitter    = protectedSplitter{}
 	_ ProtectedShareAccumulator = (*protectedAccumulator)(nil)
-	_ ShareSplitter             = legacySplitter{}
-	_ ShareAccumulator          = (*legacyAccumulator)(nil)
 )
 
 func TestProtectedCustodyRoundTripsWithoutEverBecomingAString(t *testing.T) {

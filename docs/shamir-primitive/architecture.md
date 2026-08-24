@@ -22,7 +22,7 @@ the design:
 | | Owner |
 |---|---|
 | GF(2^8) `Split` / `Combine` — the polynomial arithmetic | **go-quicraft** (this feature) |
-| The `ShareSplitter` / `ShareAccumulator` **interfaces**, `ShamirConfig`, `ShamirInitResult`, `QuorumProgress` | **go-quicraft** (`pkg/seal`) |
+| The `ProtectedShareSplitter` / `ProtectedShareAccumulator` **interfaces**, `ShamirConfig`, `ShamirInitResult`, `QuorumProgress` | **go-quicraft** (`pkg/seal`) |
 | The `shamir` **sealing strategy**, share custody, distribution, M-of-N quorum sessions, recovery, rekey, root tokens, the Security-Officer ceremony | **go-qrdb** |
 
 go-quicraft can split a secret and combine shares. It **never holds** a share.
@@ -170,9 +170,11 @@ custodian identity, session TTL and quorum accounting all happen above.
 
 - **`pkg/crypto/shamir`** — the primitive. No dependency on the rest of the
   repository.
-- **`pkg/seal/shamir.go`** — `ShareSplitter`, `ShareAccumulator`,
-  `ShamirConfig`, `ShamirInitResult`, `QuorumProgress`. Interfaces and value
-  types; **no implementation**.
+- **`pkg/seal/shamir.go`** — `ProtectedShareSplitter`,
+  `ProtectedShareAccumulator`, `ShamirConfig`, `ShamirInitResult`,
+  `QuorumProgress`. Interfaces and value types; **no implementation**. Every
+  share-valued surface here is protected memory (#37); there is no string-typed
+  sibling for a consumer to fall back to.
 - **Consumers**: go-qrdb implements the interfaces and owns the `shamir`
   strategy. go-xkms's `xkey` acts as a custodian client. Neither is documented
   here; each repository documents its own half.
@@ -183,8 +185,8 @@ custodian identity, session TTL and quorum accounting all happen above.
 - **No verifiable secret sharing.** No Feldman/Pedersen commitments, no proof
   that a dealer split honestly.
 - **No share storage, transport, or custodian identity.**
-- **No quorum session state.** `ShareAccumulator` is an interface this
-  repository calls, not one it implements.
+- **No quorum session state.** `ProtectedShareAccumulator` is an interface
+  this repository declares, not one it implements.
 - **No refresh or proactive resharing.** Rotating shares without changing the
   secret is a go-qrdb ceremony.
 - **No secrets larger than `MaxSecretBytes`.** Envelope them instead.

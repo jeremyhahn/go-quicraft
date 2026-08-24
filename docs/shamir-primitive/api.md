@@ -226,20 +226,6 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg/seal`
 either interface.
 
 ```go
-// DEPRECATED (#35): string-typed, so shares become un-wipeable crossing them.
-type ShareSplitter interface {
-    Split(secret []byte, threshold, total int) ([]string, error)
-}
-
-type ShareAccumulator interface {
-    AddShare(ctx context.Context, share string) (*QuorumProgress, error)
-    GetProgress() *QuorumProgress
-    Reconstruct(ctx context.Context) ([]byte, error)
-    Reset()
-    Expired() bool
-}
-
-// The replacements. Prefer these in new custody code.
 type ProtectedShareSplitter interface {
     SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
 }
@@ -253,26 +239,70 @@ type ProtectedShareAccumulator interface {
 }
 ```
 
-The string forms are deprecated because a Go string cannot be zeroed: an
-implementation that splits into locked memory must copy each share back out into
-an immortal heap string to satisfy `Split`'s return type, and `AddShare` receives
-a share that was un-wipeable before any protected buffer existed. The protected
-forms close both ends — `AddProtectedShare` **takes ownership** of the share it
-is given (and destroys it whether or not it is accepted, and whether or not the
-quorum completes), and `ReconstructProtected` returns the secret in an enclave.
+**These are the only custody interfaces.** The string-typed `ShareSplitter` and
+`ShareAccumulator` existed through `v0.8.0-alpha` and were removed in
+`v0.9.0-alpha` (#37, owner-ruled).
+A Go string cannot be zeroed: an implementation that split into locked memory
+still had to copy each share back out into an immortal heap string to satisfy
+`Split`'s return type, and `AddShare` received a share that was un-wipeable
+before any protected buffer could exist — so a consumer could migrate to the
+protected primitives, silence every `SA1019`, and leave the exposure exactly
+where it was. Keeping the string forms as deprecated siblings preserved a shape
+whose only use was to undo the guarantee.
 
-Both families are live: the deprecated ones still compile and work, so a consumer
-migrates one call site at a time.
+The protected forms close both ends: `AddProtectedShare` **takes ownership** of
+the share it is given (and destroys it whether or not it is accepted, and whether
+or not the quorum completes), and `ReconstructProtected` returns the secret in an
+enclave the caller owns and must `Destroy`.
 
 | Type | Role |
 |---|---|
 | `ShamirConfig{Threshold, TotalShares, QuorumTTL}` | configuration shape for an M-of-N setup; `QuorumTTL` defaults to `DefaultQuorumTTL` (5 minutes) when zero |
-| `ShamirInitResult{Shares, Threshold, TotalShares}` | output of a Shamir-based initialization |
+| `ShamirInitResult{Shares, Threshold, TotalShares}` | output of a Shamir-based initialization. `Shares` is `[]*shamir.ProtectedShare`; the result OWNS them and `Destroy()` releases them all |
 | `QuorumProgress{Required, Submitted, Complete}` | accumulator state |
 
-Implementer obligations: `ShareAccumulator` handles deduplication, ordering and
-TTL expiration, and is **not** required to be concurrency-safe — the `Barrier`
-serializes calls through its own mutex.
+`ShamirInitResult` is where a ceremony holds all N shares at once. Its JSON
+`"shares"` is an array of share OBJECTS — the same encoding `shamir.Share` and
+`shamir.ProtectedShare` produce — not the array of bare values the `[]string`
+field emitted before #37.
+
+Implementer obligations: `ProtectedShareAccumulator` handles deduplication,
+ordering and TTL expiration, and is **not** required to be concurrency-safe —
+the `Barrier` serializes calls through its own mutex.
+
+## Go API — the protected sealing pair
+
+`SealingStrategy` keeps its `[]byte` root-key methods. Alongside them, a strategy
+MAY implement the protected pair (#37):
+
+```go
+type ProtectedSealingStrategy interface {
+    SealingStrategy
+
+    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
+}
+
+// The passphrase is protected too. Built by NewProtectedCredentials, which
+// wipes the caller's slice; the caller owns it and releases it with Clear.
+type ProtectedCredentials struct {
+    Secret *enclave.ProtectedKey
+}
+```
+
+It exists because the `[]byte` signatures force an implementation to RETAIN the
+root key in ordinary memory: go-qrdb's recovery strategy reconstructs the key
+into an enclave and then copies it into a plain field solely to be able to return
+it (go-qrdb PR #76). Sealing borrows the caller's enclave and never copies the
+key out of it; unsealing decrypts straight into a fresh enclave the caller owns
+and must `Destroy`.
+
+Optional by design — a caller type-asserts for it, and there is no fallback,
+because a fallback is the unprotected copy wearing the protected API's name.
+`SoftwareStrategy` implements both; `NoneStrategy` implements
+`SealRootKeyProtected` and answers `UnsealRootKeyProtected` with
+`ErrNoRootKeyAvailable`, since no-encryption mode has no root key and an enclave
+cannot hold nothing.
 
 ## Versioning and deprecation
 
@@ -285,5 +315,6 @@ serializes calls through its own mutex.
   returned.
 - **`CombineUnverified`**: not deprecated. It is an intent-naming alias for
   `Combine` and both are supported.
-- A signature change to `ShareSplitter` or `ShareAccumulator` breaks go-qrdb's
-  implementations. Sequence such changes bottom-up.
+- A signature change to `ProtectedShareSplitter`, `ProtectedShareAccumulator` or
+  `ProtectedSealingStrategy` breaks go-qrdb's implementations. Sequence such
+  changes bottom-up.

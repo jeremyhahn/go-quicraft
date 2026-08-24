@@ -15,87 +15,37 @@
 package seal
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
+// jsonNull is the JSON literal a nil slice marshals to; an init result decoded
+// from it — or from an absent "shares" — holds no shares rather than being
+// rejected as an empty set.
+var jsonNull = []byte("null")
+
 // DefaultQuorumTTL is the default time-to-live for a quorum accumulator session.
 // If the threshold is not met within this duration, the accumulated shares are
 // discarded and custodians must restart the unseal process.
 const DefaultQuorumTTL = 5 * time.Minute
 
-// ShareAccumulator collects shares from individual custodians until the
-// threshold is met. Implementations handle deduplication, ordering, and TTL
-// expiration. The accumulator is not safe for concurrent use without external
-// synchronization (the Barrier provides this via its mutex).
+// ProtectedShareSplitter splits a secret into M-of-N Shamir secret shares whose
+// values live in protected memory.
 //
-// Deprecated: every share crossing AddShare becomes an immortal Go string
-// before any protected buffer can exist, which defeats the whole point of the
-// ProtectedShare family. Implement ProtectedShareAccumulator instead. This
-// interface remains for consumers already compiled against it and its behaviour
-// is unchanged.
-type ShareAccumulator interface {
-	// AddShare adds a single share to the accumulator. Returns progress
-	// indicating how many shares have been submitted and whether the
-	// threshold has been reached.
-	//
-	// Deprecated: share is a Go string and cannot be zeroed. See
-	// ProtectedShareAccumulator.AddProtectedShare.
-	AddShare(ctx context.Context, share string) (*QuorumProgress, error)
-
-	// GetProgress returns the current quorum progress without modifying state.
-	// This allows callers to check the accumulator's state without submitting
-	// a new share.
-	GetProgress() *QuorumProgress
-
-	// Reconstruct attempts to reconstruct the secret from accumulated
-	// shares. Returns an error if the threshold has not been met.
-	Reconstruct(ctx context.Context) ([]byte, error)
-
-	// Reset clears all accumulated shares and resets the TTL timer.
-	Reset()
-
-	// Expired reports whether the accumulator session has exceeded its TTL.
-	Expired() bool
-}
-
-// ShareSplitter splits a secret into M-of-N Shamir secret shares.
+// It is the ONLY splitter shape this package defines. A string-valued sibling
+// existed through v0.8.0-alpha and is gone: an implementation that split into
+// locked memory still had to copy every share back out into an immortal heap
+// string to satisfy that signature, so the exposure the ProtectedShare family
+// exists to close survived a migration that satisfied the linter (reported by
+// go-qrdb, #35; retyped under the owner ruling on #37).
 //
-// Deprecated: the []string it returns is un-wipeable, so an implementation that
-// splits into protected memory has to copy every share back out into an immortal
-// string to satisfy this signature. Implement ProtectedShareSplitter instead.
-// This interface remains for consumers already compiled against it and its
-// behaviour is unchanged.
-type ShareSplitter interface {
-	// Split divides the secret into the specified number of shares with the
-	// given threshold. At least threshold shares are required to reconstruct
-	// the original secret.
-	//
-	// Deprecated: returns un-wipeable strings. See
-	// ProtectedShareSplitter.SplitProtected.
-	Split(secret []byte, threshold, total int) ([]string, error)
-}
-
-// ProtectedShareSplitter is the protected-memory counterpart of ShareSplitter,
-// and the one to implement in new custody code.
-//
-// It exists because a `string` return type silently undoes the guarantee the
-// ProtectedShare family provides. An implementation can split into locked memory
-// and still hand every share back as an immortal heap string, one line later,
-// because that is what ShareSplitter's signature demands — so the exposure the
-// deprecation was written about survives a migration that satisfies the linter
-// (reported by go-qrdb, #35).
-//
-// This mirrors exactly what pkg/crypto/shamir did with Split/SplitProtected:
-// the string form stays for consumers compiled against it, the protected form
-// is additive, and a consumer migrates one call site at a time rather than in
-// lockstep with a tag.
-//
-// Nothing in this module implements or calls this — like ShareSplitter it is a
-// SHAPE for embedders. Custody itself lives in go-qrdb; see the package doc.
+// Nothing in this module implements or calls this — it is a SHAPE for
+// embedders. Custody itself lives in go-qrdb; see the package doc.
 type ProtectedShareSplitter interface {
 	// SplitProtected divides the secret into total shares with the given
 	// threshold, each share's value held in an mlock'd, guard-paged buffer.
@@ -106,8 +56,15 @@ type ProtectedShareSplitter interface {
 	SplitProtected(secret []byte, threshold, total int) ([]*shamir.ProtectedShare, error)
 }
 
-// ProtectedShareAccumulator is the protected-memory counterpart of
-// ShareAccumulator, and the one to implement in new custody code.
+// ProtectedShareAccumulator collects shares from individual custodians until the
+// threshold is met, holding every one of them in protected memory.
+// Implementations handle deduplication, ordering, and TTL expiration. The
+// accumulator is not safe for concurrent use without external synchronization
+// (the Barrier provides this via its mutex).
+//
+// It is the ONLY accumulator shape this package defines; the string-valued
+// sibling that existed through v0.8.0-alpha is gone for the reason given on
+// ProtectedShareSplitter.
 //
 // Both ends are protected deliberately. AddProtectedShare takes ownership of a
 // share whose value already lives in locked memory, so a transport can decode
@@ -154,16 +111,120 @@ type ShamirConfig struct {
 	QuorumTTL time.Duration `json:"quorum_ttl,omitempty"`
 }
 
-// ShamirInitResult contains the output of a Shamir-based initialization.
+// ShamirInitResult contains the output of a Shamir-based initialization — the
+// moment a ceremony holds all N shares at once, which is the point of widest
+// exposure in the whole scheme.
+//
+// The result OWNS its shares. Destroy it (or every share individually) as soon
+// as the shares have been distributed: each one is a locked allocation charged
+// against RLIMIT_MEMLOCK, whose exhaustion memguard answers by terminating the
+// process, and an abandoned result holds N of them for the life of it.
+//
+// SERIALISATION, stated rather than left to be inferred from the tags, in two
+// parts.
+//
+// The WIRE SHAPE CHANGES with this retype, and does not merely become
+// protected. Through v0.8.0-alpha this field was a []string and `"shares"`
+// marshalled as an array of bare share values; it is now an array of share
+// OBJECTS — the `{"index","threshold","total","value"}` encoding that
+// shamir.Share and shamir.ProtectedShare both already produce, which is the
+// shape shares are persisted and distributed in everywhere else in the stack.
+// So this result gains no third encoding, but a stored or in-flight init result
+// written by an older build does not decode into this type. Pre-release, that
+// change lands clean rather than behind a dual-format reader
+// (release-versioning.md §1); TestShamirInitResult_JSONMatchesTheShareObjectShape
+// pins what it now emits.
+//
+// The second part is what marshalling COSTS. It puts a copy of every share
+// value in an ordinary heap buffer: ProtectedShare.MarshalJSON is careful to
+// build its own output without minting a string, but encoding/json then appends
+// that output into its internal encode buffer, which grows by reallocation and
+// strands un-wiped copies of whatever it already held. So marshal at the
+// transport boundary, immediately before the bytes leave, wipe the marshalled
+// bytes once they are written, and Destroy the result on the next line. A
+// marshalled result held open is the share set held twice: once wipeable and
+// once not.
 type ShamirInitResult struct {
-	// Shares contains the generated Shamir shares, one per custodian.
-	Shares []string `json:"shares"`
+	// Shares contains the generated Shamir shares, one per custodian, each
+	// value in an mlock'd, guard-paged buffer. The result owns them; see
+	// Destroy.
+	Shares []*shamir.ProtectedShare `json:"shares"`
 
 	// Threshold is the minimum number of shares required for reconstruction.
 	Threshold int `json:"threshold"`
 
 	// TotalShares is the total number of shares generated.
 	TotalShares int `json:"total_shares"`
+}
+
+// Destroy wipes and releases every share the result holds, then clears the
+// slice so a second call — or a marshal — cannot reach freed memory. It is safe
+// on a nil receiver and safe to call more than once, which is what lets a
+// ceremony carry `defer result.Destroy()` from the line the result exists.
+func (r *ShamirInitResult) Destroy() {
+	if r == nil {
+		return
+	}
+	for _, s := range r.Shares {
+		s.Destroy()
+	}
+	r.Shares = nil
+}
+
+// UnmarshalJSON decodes an init result while keeping the share-set bound that a
+// generic decode of this type would bypass.
+//
+// Retyping Shares to []*shamir.ProtectedShare turned the default decoder into a
+// denial-of-service path: encoding/json calls ProtectedShare.UnmarshalJSON once
+// per array element AS IT VISITS THEM, and each call locks a page of memory, so
+// an attacker-controlled or malformed document with an oversized "shares" array
+// dictates how much of the finite RLIMIT_MEMLOCK budget is taken — and memguard
+// answers a failed lock by terminating the process. The scheme's own count
+// bound in shamir.CombineProtected runs on shares already allocated, far too
+// late to help. So the shares are held first as raw JSON and decoded through
+// shamir.UnmarshalShareSet, which bounds the set (at most maxShares elements and
+// MaxShareSetBytes of JSON) BEFORE it locks anything.
+//
+// Ownership: every step that can fail runs before the receiver is touched, and
+// UnmarshalShareSet destroys every share it built if a later element is rejected
+// — so a rejected document leaves the receiver unchanged and leaks no locked
+// memory. On success a receiver that already held shares (decoding into a reused
+// result) has them destroyed before the new set replaces them. The copy this
+// method makes of the "shares" bytes is share material and is wiped on the way
+// out; the caller's own data buffer is not this method's to wipe.
+func (r *ShamirInitResult) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Shares      json.RawMessage `json:"shares"`
+		Threshold   int             `json:"threshold"`
+		TotalShares int             `json:"total_shares"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	// aux.Shares is a heap copy of the shares array — share material — so it is
+	// wiped on every path out. UnmarshalShareSet wipes only the internal copies
+	// it makes, not the slice it is handed.
+	defer wipeBytes(aux.Shares)
+
+	var shares []*shamir.ProtectedShare
+	// An absent or explicitly null "shares" decodes to no shares, mirroring the
+	// zero-value round trip; an empty array is a malformed set and
+	// UnmarshalShareSet rejects it. Anything else is bounded and decoded there.
+	if trimmed := bytes.TrimSpace(aux.Shares); len(trimmed) > 0 && !bytes.Equal(trimmed, jsonNull) {
+		decoded, err := shamir.UnmarshalShareSet(aux.Shares)
+		if err != nil {
+			return err
+		}
+		shares = decoded
+	}
+
+	// Assign last: destroy anything a reused receiver already held so decoding
+	// into a non-empty result strands no locked buffer, then take the new set.
+	r.Destroy()
+	r.Shares = shares
+	r.Threshold = aux.Threshold
+	r.TotalShares = aux.TotalShares
+	return nil
 }
 
 // QuorumProgress reports the current state of a threshold quorum accumulator.

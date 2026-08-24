@@ -16,6 +16,7 @@ package seal
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -171,6 +172,21 @@ func NewDeferredSoftwareStrategy() *SoftwareStrategy {
 // warns rather than refuses.
 const minRecommendedPassphraseLen = 12
 
+// warnIfPassphraseWeak reports a passphrase shorter than the recommendation. It
+// takes the LENGTH rather than the secret: every caller already knows it, and a
+// helper that took the bytes would be one more place holding them.
+func warnIfPassphraseWeak(length int) {
+	if length >= minRecommendedPassphraseLen || allowWeakKDFParams.Load() {
+		return
+	}
+	slog.Warn("quicraft/seal: passphrase is shorter than the recommended minimum; "+
+		"the KDF work factor cannot compensate for a small guess space, and "+
+		"the sealed root key is an offline attack target",
+		"length", length,
+		"recommended_minimum", minRecommendedPassphraseLen,
+	)
+}
+
 func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams) (*SoftwareStrategy, error) {
 	if len(passphrase) == 0 {
 		return nil, ErrInvalidPassphrase
@@ -188,14 +204,7 @@ func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams
 	// their own data — a policy decision for the operator, not one this
 	// constructor should make silently. Making the weakness loud is the part
 	// that is unambiguously right.
-	if len(passphrase) < minRecommendedPassphraseLen && !allowWeakKDFParams.Load() {
-		slog.Warn("quicraft/seal: passphrase is shorter than the recommended minimum; "+
-			"the KDF work factor cannot compensate for a small guess space, and "+
-			"the sealed root key is an offline attack target",
-			"length", len(passphrase),
-			"recommended_minimum", minRecommendedPassphraseLen,
-		)
-	}
+	warnIfPassphraseWeak(len(passphrase))
 	if _, ok := kdfDispatchers[version]; !ok {
 		return nil, ErrKDFUnsupportedVersion
 	}
@@ -290,46 +299,36 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
-	// Open passphrase enclave for KDF derivation. The Destroy is DEFERRED: a
-	// panic inside the KDF (or anything a caller injects on that path) would
-	// otherwise strand an mlock'd buffer holding the PLAINTEXT passphrase for
-	// the life of the process, and leaked locked buffers consume RLIMIT_MEMLOCK,
-	// which memguard answers by aborting the process.
-	ppBuf, err := passphrase.Open()
-	if err != nil {
-		return nil, &Error{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
-	}
-	defer ppBuf.Destroy()
-
-	// Derive wrapping key from passphrase using the configured KDF.
-	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, s.kdfVersion, s.kdfParams)
-	if err != nil {
-		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
-	}
-	defer wipeBytes(wrappingKey)
-
-	// Create AES-256-GCM cipher. newAESGCM builds it with
-	// cipher.NewGCMWithRandomNonce, so the nonce below is generated inside the
-	// FIPS module boundary rather than drawn here and handed in — see newAESGCM
-	// for why SP 800-38D requires that, and why the bytes on disk do not move.
-	aead, err := newAESGCM(wrappingKey)
+	// Derive the wrapping key and build the AES-256-GCM cipher. The passphrase
+	// enclave is opened, used and destroyed inside this call; see
+	// wrappingCipher for why that is a separate step rather than inline here.
+	aead, err := wrappingCipher(passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build ciphertext: [KDFSalt | Nonce | EncryptedRootKey | Tag]
-	// The KDF salt is stored inside the ciphertext so that UnsealRootKey is
-	// self-contained and does not depend on the SealedRootKey.Salt field.
-	//
-	// The nonce is no longer appended here: aead.Seal emits it as the first
-	// wrappingGCMNonceSize bytes of its own output, in the same position the
-	// hand-written append used to put it, so this blob has the identical layout
-	// to every blob this strategy has ever written.
-	//
-	// AAD binds the strategy name to the ciphertext, preventing cross-context
-	// key substitution where a ciphertext sealed by one strategy could be
-	// presented to another.
-	aad := []byte(passphraseStrategyName)
+	return s.sealedFromCipher(aead, salt, rootKey), nil
+}
+
+// sealedFromCipher wraps rootKey under the prepared AEAD and assembles the
+// persisted blob. It is the half of sealRootKeyBound that touches key material,
+// split out so that the protected path can run exactly this and nothing else
+// inside its enclave borrow — the KDF above it opens a second enclave, which a
+// borrow may not do (see wrappingCipher).
+//
+// Ciphertext layout: [KDFSalt | Nonce | EncryptedRootKey | Tag]. The KDF salt is
+// stored inside the ciphertext so that UnsealRootKey is self-contained and does
+// not depend on the SealedRootKey.Salt field.
+//
+// The nonce is not appended by hand: aead.Seal emits it as the first
+// wrappingGCMNonceSize bytes of its own output, in the same position the
+// hand-written append used to put it, so this blob has the identical layout to
+// every blob this strategy has ever written.
+//
+// AAD binds the strategy name to the ciphertext, preventing cross-context key
+// substitution where a ciphertext sealed by one strategy could be presented to
+// another.
+func (s *SoftwareStrategy) sealedFromCipher(aead cipher.AEAD, salt, rootKey []byte) *SealedRootKey {
 	ciphertext := make([]byte, kdfSaltLen, kdfSaltLen+len(rootKey)+aead.Overhead())
 	copy(ciphertext, salt)
 	// G407 false positive: the nil nonce is not a hardcoded IV, it is the
@@ -338,16 +337,14 @@ func (s *SoftwareStrategy) sealRootKeyBound(rootKey []byte) (*SealedRootKey, err
 	// inside the FIPS module per Seal and prepends it to this output. A nonce
 	// literal here is the construction that rule exists to catch, and is exactly
 	// what this call site removed.
-	ciphertext = aead.Seal(ciphertext, nil, rootKey, aad) // #nosec G407 -- module-generated nonce; see newAESGCM
-
-	// Store KDF version in metadata for cross-version unsealing.
-	metadata := []byte{byte(s.kdfVersion)}
+	ciphertext = aead.Seal(ciphertext, nil, rootKey, []byte(passphraseStrategyName)) // #nosec G407 -- module-generated nonce; see newAESGCM
 
 	return &SealedRootKey{
 		Strategy:   StrategyPassphrase,
 		Ciphertext: ciphertext,
-		Metadata:   metadata,
-	}, nil
+		// The KDF version travels in metadata for cross-version unsealing.
+		Metadata: []byte{byte(s.kdfVersion)},
+	}
 }
 
 // UnsealRootKey derives the wrapping key from the passphrase and decrypts the root key.
@@ -381,18 +378,16 @@ func (s *SoftwareStrategy) unsealRootKeyDeferred(_ context.Context, sealed *Seal
 	return inner.unsealRootKeyBound(sealed)
 }
 
-// unsealRootKeyBound performs the unseal operation using the bound passphrase.
-func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, error) {
-	// Close() drops the passphrase enclave; calling Open on the nil
-	// *ProtectedKey would panic, so a closed (or never-bound) strategy
-	// fails with a typed error instead. The pointer is loaded ONCE so a
-	// concurrent Close cannot invalidate it after this check.
-	passphrase := s.passphrase.Load()
-	if passphrase == nil {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyClosed}
-	}
+// unsealCipher validates a sealed blob and prepares the AEAD that opens it,
+// under the passphrase its caller resolved,
+// returning the cipher alongside the [Nonce | EncryptedRootKey | Tag] payload
+// it applies to. It is everything unsealing does BEFORE the plaintext exists,
+// split out so the []byte and protected paths cannot drift in what they
+// validate — and so the protected path can prepare its cipher before it takes
+// an enclave borrow, which is the ordering wrappingCipher explains.
+func (s *SoftwareStrategy) unsealCipher(passphrase *enclave.ProtectedKey, sealed *SealedRootKey) (cipher.AEAD, []byte, error) {
 	if sealed == nil {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
+		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
 	}
 
 	// Reject a sealed blob that claims a different strategy. The Strategy
@@ -403,13 +398,13 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	// that leaves the barrier "unsealed" with no cipher. Empty is accepted
 	// for sealed data written before the field was populated.
 	if sealed.Strategy != "" && sealed.Strategy != StrategyPassphrase {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyMismatch}
+		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyMismatch}
 	}
 
 	// Minimum ciphertext: kdfSalt(32) + nonce(12) + tag(16) = 60 bytes.
 	minLen := kdfSaltLen + wrappingGCMNonceSize + wrappingGCMTagSize
 	if len(sealed.Ciphertext) < minLen {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
+		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
 	}
 
 	// Determine KDF version from metadata. Backward compatibility: absent
@@ -421,26 +416,11 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	salt := sealed.Ciphertext[:kdfSaltLen]
 	rest := sealed.Ciphertext[kdfSaltLen:]
 
-	// Open passphrase enclave for KDF derivation; Destroy is deferred for the
-	// same reason as in sealRootKeyBound — a stranded LockedBuffer holds the
-	// plaintext passphrase mlock'd for the process lifetime.
-	ppBuf, err := passphrase.Open()
+	// Derive the wrapping key from passphrase + KDF salt and build the AEAD
+	// (cipher.NewGCMWithRandomNonce; see newAESGCM).
+	aead, err := wrappingCipher(passphrase, salt, version, params, unsealStrategyError)
 	if err != nil {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: closedIfEnclaveGone(err)}
-	}
-	defer ppBuf.Destroy()
-
-	// Derive the wrapping key from passphrase + KDF salt.
-	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, version, params)
-	if err != nil {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
-	}
-	defer wipeBytes(wrappingKey)
-
-	// Create AES-256-GCM cipher (cipher.NewGCMWithRandomNonce; see newAESGCM).
-	aead, err := newAESGCM(wrappingKey)
-	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// rest is [Nonce | EncryptedRootKey | Tag]. The nonce is not sliced off
@@ -450,15 +430,34 @@ func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, er
 	// therefore open identically — see TestLegacyFormat_UnsealRootKey, which
 	// opens checked-in pre-migration bytes.
 	if len(rest) < wrappingGCMNonceSize+wrappingGCMTagSize {
-		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
+		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
+	}
+
+	return aead, rest, nil
+}
+
+// unsealRootKeyBound performs the unseal operation using the bound passphrase,
+// returning the root key as an ordinary slice the caller must wipe. The
+// protected sibling is unsealRootKeyBoundProtected.
+func (s *SoftwareStrategy) unsealRootKeyBound(sealed *SealedRootKey) ([]byte, error) {
+	// Close() drops the passphrase enclave; calling Open on the nil
+	// *ProtectedKey would panic, so a closed (or never-bound) strategy fails
+	// with a typed error instead. The pointer is loaded ONCE so a concurrent
+	// Close cannot invalidate it after this check.
+	passphrase := s.passphrase.Load()
+	if passphrase == nil {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyClosed}
+	}
+
+	aead, rest, err := s.unsealCipher(passphrase, sealed)
+	if err != nil {
+		return nil, err
 	}
 
 	// Decrypt. The AAD must match the strategy name used during SealRootKey to
 	// authenticate that this ciphertext was produced by the same strategy type,
 	// preventing cross-context key substitution.
-	aad := []byte(passphraseStrategyName)
-
-	plaintext, err := aead.Open(nil, nil, rest, aad)
+	plaintext, err := aead.Open(nil, nil, rest, []byte(passphraseStrategyName))
 	if err != nil {
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrDecryptionFailed}
 	}
@@ -508,6 +507,212 @@ func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersio
 		// The AES-GCM authentication will catch mismatches.
 		return s.kdfVersion, s.kdfParams
 	}
+}
+
+// sealStrategyError and unsealStrategyError are the two error shapes this
+// strategy reports its KDF and enclave failures in. They exist as functions so
+// that wrappingCipher — which is shared by the seal and unseal paths — wraps in
+// whichever one its caller uses, instead of the shared helper flattening two
+// distinct error types into one and changing what callers can match on.
+func sealStrategyError(err error) error {
+	return &Error{Strategy: passphraseStrategyName, Err: err}
+}
+
+func unsealStrategyError(err error) error {
+	return &UnsealError{Strategy: passphraseStrategyName, Err: err}
+}
+
+// wrappingCipher derives the wrapping key from the passphrase and the given KDF
+// salt and returns the AES-256-GCM cipher built from it. The passphrase enclave
+// is opened, read and destroyed inside this call, and the derived key is wiped
+// on the way out, so nothing it allocates outlives it.
+//
+// The Destroy and the wipe are DEFERRED: a panic inside the KDF (or anything a
+// caller injects on that path) would otherwise strand an mlock'd buffer holding
+// the PLAINTEXT passphrase for the life of the process, and leaked locked
+// buffers consume RLIMIT_MEMLOCK, which memguard answers by aborting the
+// process.
+//
+// It is a separate step, rather than inline in the seal/unseal bodies, for a
+// reason that outlives the deduplication: the protected paths run their
+// key-touching half inside a MemoryEnclave borrow, and a borrow may not open a
+// second enclave. pkg/enclave holds a process-wide purgeMu across every borrow,
+// and ProtectedKey.Open allocates locked memory, which takes that same mutex
+// exclusively — so opening the passphrase inside a root-key borrow is a
+// self-deadlock, not merely a documented hazard. Preparing the cipher first is
+// what makes the borrow that follows safe, and the AEAD itself holds only the
+// expanded key schedule in ordinary memory, which the borrow may touch freely.
+func wrappingCipher(passphrase *enclave.ProtectedKey, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
+	ppBuf, err := passphrase.Open()
+	if err != nil {
+		return nil, wrap(closedIfEnclaveGone(err))
+	}
+	defer ppBuf.Destroy()
+
+	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, version, params)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	defer wipeBytes(wrappingKey)
+
+	// newAESGCM's own error is returned unwrapped, as it always has been: a
+	// CipherError names its own origin and is not a strategy-level failure.
+	return newAESGCM(wrappingKey)
+}
+
+// protectedPassphrase resolves which ProtectedKey holds the passphrase for a
+// protected call: the credentials for a deferred strategy, the one bound at
+// construction otherwise. Neither is opened here and neither is ever copied out
+// — the returned pointer is handed straight to wrappingCipher.
+//
+// The deferred branch is why the protected paths do not build a temporary inner
+// strategy the way their []byte siblings do. That construction exists to copy a
+// plain passphrase into locked memory; a ProtectedCredentials passphrase is
+// already there, so building a strategy around it would allocate a second
+// enclave holding the same secret for the life of the call and buy nothing.
+//
+// One behaviour moves with it: newSoftwareStrategy refuses a FIPS-unapproved KDF
+// at construction, and without that construction the refusal lands at DeriveKey
+// instead. Same error, same call, one frame later.
+func (s *SoftwareStrategy) protectedPassphrase(creds ProtectedCredentials, wrap func(error) error) (*enclave.ProtectedKey, error) {
+	if s.deferPassphrase {
+		if creds.Secret == nil {
+			return nil, ErrEmptyCredentials
+		}
+		return creds.Secret, nil
+	}
+	// Close() drops the passphrase enclave; the pointer is loaded ONCE so a
+	// concurrent Close cannot invalidate it after this check.
+	passphrase := s.passphrase.Load()
+	if passphrase == nil {
+		return nil, wrap(ErrStrategyClosed)
+	}
+	return passphrase, nil
+}
+
+// SealRootKeyProtected is SealRootKey with BOTH secrets on the protected side —
+// the root key in the caller's enclave, the passphrase in the credentials'.
+// See ProtectedSealingStrategy for the contract; the produced blob is
+// byte-compatible with SealRootKey's and opens with either unseal method.
+//
+// The order of operations is the point of this function. The KDF runs FIRST,
+// outside any borrow, because it opens the passphrase enclave; only the AEAD
+// Seal — which touches no protected memory but the root key itself — runs
+// inside the borrow. The key is therefore never copied out of its enclave, and
+// the borrow cannot deadlock against a process-wide purge. See wrappingCipher.
+func (s *SoftwareStrategy) SealRootKeyProtected(_ context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error) {
+	passphrase, err := s.protectedPassphrase(creds, sealStrategyError)
+	if err != nil {
+		return nil, err
+	}
+	// A nil or already-destroyed enclave both report zero here. Neither is an
+	// empty root key: the size check refuses them before the KDF is paid for,
+	// and WithBytes below would refuse a destroyed one again.
+	if rootKey.Size() != rootKeySize {
+		return nil, ErrInvalidRootKeySize
+	}
+
+	salt := make([]byte, kdfSaltLen)
+	if _, err := io.ReadFull(s.randReader, salt); err != nil {
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
+	}
+
+	aead, err := wrappingCipher(passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
+	if err != nil {
+		return nil, err
+	}
+
+	// WithBytes rather than Bytes: it holds the region mapped across the whole
+	// call, so an owner destroying the enclave concurrently is reported as an
+	// error instead of unmapping memory the AEAD is reading. Its only failure
+	// is exactly that — the size is settled above and the callback cannot fail.
+	var sealed *SealedRootKey
+	if err := rootKey.WithBytes(func(key []byte) error {
+		sealed = s.sealedFromCipher(aead, salt, key)
+		return nil
+	}); err != nil {
+		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
+	}
+	return sealed, nil
+}
+
+// UnsealRootKeyProtected decrypts the root key straight into locked memory,
+// with the passphrase never leaving protected memory either. See
+// ProtectedSealingStrategy for the ownership contract: the caller owns the
+// returned enclave and must Destroy it.
+//
+// The plaintext root key never exists as an ordinary heap allocation, which is
+// the whole difference from UnsealRootKey. GCM's plaintext length is known
+// before the decryption — it is the payload minus the nonce and the tag — so
+// the enclave is allocated at exactly that size and aead.Open is handed the
+// enclave's own storage as its append destination. crypto/cipher writes into a
+// destination with sufficient capacity rather than allocating a new one, so the
+// bytes land inside the locked region and nowhere else.
+//
+// That length comes from an unauthenticated blob, so it is REFUSED unless it is
+// exactly the root-key size — before anything is locked. See below.
+//
+// The allocation happens BEFORE the borrow, because allocating locked memory is
+// a process-wide purge-exclusive operation that a borrow may not nest (see
+// wrappingCipher), and the KDF runs before that for the same reason.
+func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error) {
+	passphrase, err := s.protectedPassphrase(creds, unsealStrategyError)
+	if err != nil {
+		return nil, err
+	}
+
+	aead, rest, err := s.unsealCipher(passphrase, sealed)
+	if err != nil {
+		return nil, err
+	}
+
+	// Exact plaintext length for AES-GCM with a module-generated nonce: the
+	// payload carries the nonce ahead of the ciphertext and the tag after it.
+	//
+	// It must equal the root-key size, and the check runs BEFORE the allocation
+	// rather than after the decrypt. The length is a function of the sealed
+	// blob, which is UNAUTHENTICATED at this point — the AEAD has not run — so
+	// sizing an mlock'd allocation from it hands whoever can write the blob a
+	// way to demand an arbitrary amount of a finite kernel resource, and
+	// memguard answers a lock it cannot take by TERMINATING THE PROCESS. A
+	// corrupt or hostile blob would take the service down before the tag that
+	// would have rejected it was ever checked (Codex review of PR #40).
+	//
+	// Pinning it to rootKeySize rather than merely bounding it costs nothing:
+	// both seal paths refuse anything but a 32-byte key, so no blob this
+	// strategy has ever written has another length, and Barrier.Unseal refuses
+	// one that does immediately after the string-typed call returns.
+	plaintextLen := len(rest) - wrappingGCMNonceSize - wrappingGCMTagSize
+	if plaintextLen != rootKeySize {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrInvalidSealedKey}
+	}
+
+	out := enclave.NewMemoryEnclave(plaintextLen)
+	if err := out.WithBytes(func(dst []byte) error {
+		plaintext, oerr := aead.Open(dst[:0], nil, rest, []byte(passphraseStrategyName))
+		if oerr != nil {
+			return ErrDecryptionFailed
+		}
+		// If Open had needed more room than dst's capacity it would have
+		// allocated its own array, and the key would be sitting on the heap
+		// instead of in here. It cannot, given the length computed above — but
+		// "cannot" is what this check is for, and the escape hatch is to wipe
+		// what escaped rather than to return a half-protected key.
+		if len(plaintext) != len(dst) {
+			wipeBytes(plaintext)
+			return ErrDecryptionFailed
+		}
+		return nil
+	}); err != nil {
+		out.Destroy()
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
+	}
+
+	// Frozen once the material is final: the contract hands the caller a key to
+	// read and destroy, not a buffer to edit, and a read-only region faults on a
+	// stray write instead of silently corrupting the root key.
+	out.Freeze()
+	return out, nil
 }
 
 // closedIfEnclaveGone maps the enclave-nil error to ErrStrategyClosed. Close
