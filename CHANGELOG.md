@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0-alpha] - 2026-08-24
+
 ### Changed — BREAKING: every share and root-key surface is protected memory (#37)
 
 Owner-ruled 2026-08-23 on #37, and a breaking change by intent: pre-1.0, MINOR
