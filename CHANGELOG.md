@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UnsealRootKey` — that a nil error is not proof the supplied credentials were
   correct.
 
+### Security
+
+- **`golang.org/x/crypto` bumped to `v0.55.0` (#50)** — `v0.54.0` carries
+  CVE-2026-56854 (CRITICAL) in `golang.org/x/crypto/ssh`, which failed the
+  nightly Trivy gate on `main`. QuicRaft does not import `x/crypto/ssh`
+  (`go mod why` reports the main module does not need it), so govulncheck was
+  correctly green while Trivy was correctly red: the vulnerable module version
+  was present in the build list even though no vulnerable symbol was reachable.
+  The fixed version ships rather than a `.trivyignore` entry. Bumped in the root
+  module and in **every** nested module that carried it — `contrib/dragonboat`,
+  `test/performance/quicraft`, and `test/performance/dragonboat`, which was
+  further behind still at `v0.40.0`. No module in the tree now references a
+  pre-`v0.55.0` `x/crypto`.
+
 ## [0.9.0-alpha] - 2026-08-24
 
 ### Changed — BREAKING: every share and root-key surface is protected memory (#37)
