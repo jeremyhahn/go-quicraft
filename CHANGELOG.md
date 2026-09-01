@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
+  strategy binds its passphrase at Seal/Unseal time or at construction. The two
+  modes have opposite credential semantics (a bound strategy IGNORES the
+  `Credentials` handed to `UnsealRootKey`; a deferred one validates against
+  them), and until now the distinction was invisible from outside the package.
+  A consumer replacing a registered strategy therefore could not preserve the
+  mode of the one it replaced, and installing a bound strategy where a deferred
+  one stood turns a barrier that authenticates its unsealer into one that
+  accepts any passphrase for the lifetime of the process — measured on the
+  production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
+  exposing a construction-time property; no behaviour of either mode changes.
+
+### Documentation
+
+- **`SealingStrategy` now states that honouring `Credentials` is
+  implementation-defined (#43)**, that replacing a registered strategy can
+  silently change whether the barrier authenticates its unsealer, and — on
+  `UnsealRootKey` — that a nil error is not proof the supplied credentials were
+  correct.
+
 ## [0.9.0-alpha] - 2026-08-24
 
 ### Changed — BREAKING: every share and root-key surface is protected memory (#37)

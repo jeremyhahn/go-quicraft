@@ -239,6 +239,29 @@ func (s *SoftwareStrategy) HardwareBacked() bool { return false }
 // KDFVersion returns the KDF version this strategy uses for Seal operations.
 func (s *SoftwareStrategy) KDFVersion() KDFVersion { return s.kdfVersion }
 
+// DeferredPassphrase reports whether this strategy binds its passphrase at
+// Seal/Unseal time (true, NewDeferredSoftwareStrategy) or at construction
+// (false, every other constructor).
+//
+// The two modes have OPPOSITE credential semantics, which is why the
+// distinction is exported rather than inferred. A BOUND strategy ignores the
+// Credentials passed to SealRootKey and UnsealRootKey — it already holds the
+// passphrase — so an unseal attempt with the wrong secret SUCCEEDS. A DEFERRED
+// strategy takes the passphrase from Credentials.Secret on every call, so the
+// same attempt FAILS.
+//
+// A consumer that REPLACES a registered strategy (re-sealing the root key under
+// a new passphrase, say) must construct the replacement in the same mode as the
+// one it replaces. Installing a bound strategy where a deferred one stood turns
+// a barrier that authenticates its unsealer into one that accepts any
+// passphrase for the lifetime of the process — a silent authentication bypass,
+// measured on the production shape in go-qrdb #157. Without this accessor the
+// mode is invisible and the replacement is a coin flip.
+//
+// The mode is fixed at construction and never changes, so the value is stable
+// for the lifetime of the strategy and safe to read concurrently.
+func (s *SoftwareStrategy) DeferredPassphrase() bool { return s.deferPassphrase }
+
 // BarrierEncryptor returns (nil, nil) because the software strategy uses
 // epoch-based HKDF DEKs managed by the barrier itself.
 func (s *SoftwareStrategy) BarrierEncryptor(_ context.Context, _ []byte) (SymmetricEncrypter, error) {

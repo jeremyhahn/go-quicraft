@@ -84,6 +84,21 @@ type Credentials struct {
 // SealingStrategy defines the interface for wrapping and unwrapping the root key.
 // Implementations protect the root key at rest using different backends:
 // software (passphrase + Argon2id), PKCS#11 (HSM), TPM2, or cloud KMS.
+//
+// WHETHER AN IMPLEMENTATION HONOURS creds IS IMPLEMENTATION-DEFINED, and it is
+// part of the deployment's authentication posture rather than an internal
+// detail. A cloud-KMS strategy typically ignores Credentials and relies on
+// ambient credentials; SoftwareStrategy honours them only when constructed by
+// NewDeferredSoftwareStrategy, and ignores them when the passphrase was bound
+// at construction.
+//
+// So REPLACING a registered strategy with a differently-constructed one — when
+// rotating a passphrase, for instance — can silently change whether the barrier
+// authenticates the caller that unseals it, with no signature, error or type
+// change to notice. Preserve the mode of the strategy being replaced rather
+// than picking one; SoftwareStrategy exports DeferredPassphrase() so the mode
+// can be read off the strategy in hand. Where a passphrase can be rotated
+// without swapping the strategy, that is the safer path.
 type SealingStrategy interface {
 	// ID returns a unique identifier for this strategy (e.g., StrategyPassphrase
 	// or StrategyNone for the L1 strategies; higher layers define their own IDs
@@ -105,6 +120,11 @@ type SealingStrategy interface {
 
 	// UnsealRootKey decrypts the root key from a SealedRootKey. The returned
 	// byte slice is owned by the caller and must be zeroed after use.
+	//
+	// An implementation that ignores creds unseals successfully for ANY
+	// credentials, including wrong ones; see the credential note on
+	// SealingStrategy. A caller must not read a nil error from this method as
+	// proof that the supplied credentials were correct.
 	UnsealRootKey(ctx context.Context, sealed *SealedRootKey, creds Credentials) ([]byte, error)
 
 	// BarrierEncryptor returns a SymmetricEncrypter for hardware-backed strategies
