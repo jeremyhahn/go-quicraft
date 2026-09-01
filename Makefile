@@ -10,11 +10,37 @@ BUILD_DIR     := build
 DOCKER_DIR    := .devcontainer
 COVER_DIR     := $(BUILD_DIR)/coverage
 
-# Version injection
-VERSION       := $(shell cat VERSION 2>/dev/null || echo "0.0.1-alpha")
-GIT_COMMIT    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILD_DATE    := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
-LDFLAGS       := -X main.version=$(VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
+# Version injection.
+#
+# Two separate defences here, because renaming alone was not enough.
+#
+# 1. BUILD_VERSION, not VERSION. `VERSION` is the release-alpha ARGUMENT
+#    (`make release-alpha VERSION=vX.Y.Z-alpha`). A variable read in an
+#    immediate `:=` assignment is EXPANDED AT PARSE TIME, before any target is
+#    selected and before any recipe guard exists, so while this read was
+#    spelled $(VERSION), `make <anything> VERSION='$(shell ...)'` executed that
+#    function -- on `build`, on `release-alpha`, and on a target that does not
+#    exist at all.
+#
+# 2. `override`, because a command-line variable BEATS an ordinary makefile
+#    assignment. Renaming alone just moved the hole to the new name:
+#    `make build BUILD_VERSION='$(shell ...)'` reproduced it exactly, and so did
+#    GIT_COMMIT and BUILD_DATE, which LDFLAGS expands on the same line.
+#    `override` makes the assignment below win, so a command-line value for any
+#    of the three is discarded and never reaches an expansion.
+#
+# THE LINE THIS DRAWS, so the next reader can place a new variable correctly.
+# These three are DERIVED -- from a file, from git, from the clock. Nothing a
+# caller supplies for them could be meaningful, so they are `override`. A
+# documented knob (GO, BUILD_DIR) stays settable and is NOT covered here: naming
+# the program make should run is choosing a command on purpose, whereas
+# `VERSION=v1.2.3-alpha` looks like pure data and is the value someone copies
+# from an issue or a release note without reading it as code. The rule is that
+# no variable expanded at parse time may carry a value a caller supplies.
+override BUILD_VERSION := $(shell cat VERSION 2>/dev/null || echo "0.0.1-alpha")
+override GIT_COMMIT    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+override BUILD_DATE    := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+LDFLAGS       := -X main.version=$(BUILD_VERSION) -X main.gitCommit=$(GIT_COMMIT) -X main.buildDate=$(BUILD_DATE)
 
 # Go tooling
 export GOTOOLCHAIN := auto
@@ -1541,31 +1567,159 @@ help:
 	@echo "  docker-test                    Run unit tests in devcontainer"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
-SUBMODULE_TAGS :=
 # Builds never resolve through a workspace: modules come from published tags.
 # Immunizes against stray go.work files.
 export GOWORK=off
 
-# RELEASE_REMOTE is the git remote release-alpha pushes tags to. Defaults to
-# 'origin'; override for a mirror or a private staging remote:
-#   make release-alpha RELEASE_REMOTE=staging
+# ---------------------------------------------------------------------------
+# Release plumbing — software/templates/make/release-alpha.mk (template v2.3.3).
+#
+# The v1 recipe this replaces auto-incremented PATCH only (so an API addition
+# shipped labelled as a bugfix, and a breaking pre-1.0 MINOR could not be cut at
+# all -- v0.9.0-alpha had to be tagged by hand), created LIGHTWEIGHT UNSIGNED
+# tags as the OWNER's local git identity, pushed EVERY local tag with --tags,
+# and let `|| true` swallow a failed VERSION commit so a tag could disagree with
+# its own VERSION file. None of it failed loudly (#42, #44).
+#
+# v2 contract: the version is EXPLICIT -- `make release-alpha VERSION=vX.Y.Z-alpha`
+# -- because release-versioning.md decides patch-vs-minor and the recipe refuses
+# to guess; every git write goes through agent-git.sh for identity and SSH
+# signing; the tag is ANNOTATED; only the release commit and the one named tag
+# are pushed, atomically; and there is no `|| true` anywhere, so any failing
+# step aborts BEFORE the tag exists.
+#
+# NOTE, repo-specific: VERSION used to double as this Makefile's build-metadata
+# variable, expanded at parse time into LDFLAGS. That made every settable
+# `VERSION=` value a parse-time expansion -- a command-injection vector that no
+# guard in this recipe could reach, because it fired before target selection.
+# The build metadata now reads BUILD_VERSION (top of file) and VERSION belongs
+# to this target alone. A bare `make release-alpha` therefore finds VERSION
+# UNSET and stops on the first guard with the message that names the fix.
+#
+# SUBMODULE_TAGS is gone with the v1 recipe: it was empty in this repo, so the
+# tag loop it drove was dead code, and the nested modules under contrib/ and
+# test/ are not published for consumption.
+# ---------------------------------------------------------------------------
+
+# IDENTITY. The recipe's central claim is that every release git write goes
+# through agent-git.sh as agent-go-quicraft, signed. As plain `?=` variables
+# that claim was falsifiable from the command line: `make release-alpha
+# VERSION=v0.9.1-alpha AGENT_GIT=/path/to/anything REPO_NAME=whatever` passed
+# every guard -- the path only had to be executable and the name non-empty --
+# and then that executable ran add/commit/tag/push, producing a release commit
+# that could be unsigned or attributed to the wrong agent.
+#
+# The two are handled differently, because only one of them has a legitimate
+# reason to vary.
+#
+# REPO_NAME is `override`: it IS this repository's name, no caller value could
+# be correct, and it must never be $(notdir $(CURDIR)) -- deriving the signing
+# identity from the checkout directory signs a release as the wrong agent from
+# any worktree or CI workspace named something else.
+#
+# AGENT_GIT stays settable, because the company checkout is not at the same
+# absolute path on every machine and a hardcoded one makes the target unusable
+# elsewhere (and untestable anywhere without it). Its integrity is enforced by
+# VERIFYING THE OUTCOME instead of trusting the tool: after the commit and tag
+# are made, and BEFORE anything is pushed, the recipe checks that the release
+# commit is AUTHORED by agent-<repo> and that the commit and the annotated tag
+# both carry signatures that VERIFY against that agent's published key.
+#
+# Verification is real -- `git verify-commit` / `verify-tag` against
+# .release-allowed-signers, an IN-REPO trust anchor. Two earlier attempts were
+# both insufficient and are recorded so neither is reintroduced:
+#
+#   1. Grepping `cat-file` output for `gpgsig` / `SSH SIGNATURE`. Those are
+#      marker strings; a substituted helper puts either in a commit MESSAGE and
+#      sails past. Only asking git to check the cryptography answers it.
+#   2. Building the allowed-signers file from a key found under AGENT_GIT's own
+#      tree. That verifies nothing: the helper supplies the key it is checked
+#      against, so it signs with its own and drops the matching public half
+#      where the recipe looks. An anchor reachable from the thing it checks is
+#      not an anchor.
+#
+# A substituted AGENT_GIT therefore fails here, with everything it produced
+# still local and retractable. That is a stronger claim than any path check
+# could make -- it holds whatever produced the objects.
+AGENT_GIT      ?= /home/jhahn/sources/automatethethings/software/scripts/agent-git.sh
+override REPO_NAME := go-quicraft
+
+# RELEASE_SIGNERS is the TRUST ANCHOR, and it is `override` for the reason the
+# whole check exists. Deriving the verification key from AGENT_GIT's own tree --
+# the first attempt -- verified nothing: a substituted helper can ship its own
+# keypair, sign the release with it, and drop the matching public key exactly
+# where the recipe looked, and every pre-push check then passes against the
+# attacker's key. An anchor reachable from the thing it is meant to check is not
+# an anchor. This file is in-repo and settable only by a reviewed commit.
+override RELEASE_SIGNERS := $(CURDIR)/.release-allowed-signers
+
+# RELEASE_REMOTE is the git remote release-alpha pushes the release commit and
+# tag to. It is the GITEA remote, which in this repo -- as in every fleet repo
+# measured 2026-08-27 -- is named `origin`; there is no `github` remote in this
+# checkout at all. It stays a variable, not a renamed constant, so a future
+# dev-remote rollout is one line. Its existence is asserted before it is
+# trusted: an unreachable remote is not an absent tag.
 RELEASE_REMOTE ?= origin
 
-# SUBMODULE_TAGS lists nested modules tagged in lockstep with the root.
-# deps-latest runs before compiling in a consumer repo; release-alpha publishes
-# this repo's next -alpha tag. deps-latest picks the highest tag INCLUDING
-# -alpha prereleases — bare 'go get @latest' ignores prereleases and would
-# downgrade to legacy v0.0.0.
+# deps-latest runs before compiling in a consumer repo. It picks the highest tag
+# INCLUDING -alpha prereleases -- bare 'go get @latest' ignores prereleases and
+# would downgrade to legacy v0.0.0.
 
 .PHONY: release-alpha deps-latest
 
+# Every settable Make variable crosses into the recipe ONCE, via these
+# target-specific exports, and the body references only the shell parameters
+# ($$REL_*). Without that, the value would be expanded into double-quoted recipe
+# TEXT before the grammar guard ran, so a backtick inside it would execute at the
+# first guard line -- quoting is no boundary against a value that becomes recipe
+# source.
+#
+# ALL FOUR use $(value ...), which the company template (v2.3.3) applies to
+# VERSION alone. Measured on GNU Make 4.3: a plain $(RELEASE_REMOTE) EXECUTES a
+# $(shell ...) embedded in a command-line value, while $(value RELEASE_REMOTE)
+# does not -- so the three unwrapped reads were live make-function injection on
+# a release path. None of the in-file defaults contains a `$`, so taking their
+# raw text changes nothing for ordinary use.
+# $(origin ...) restricts VERSION to the COMMAND LINE. `$(value VERSION)` alone
+# also imports an ambient environment variable, so a bare `make release-alpha`
+# in a shell or CI job that happens to export VERSION would sail past the
+# explicit-version guard and cut whatever it inherited. An inherited value is
+# not an operator stating a version, which is the whole contract here.
+release-alpha: export REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release-alpha: export REL_REMOTE    := $(value RELEASE_REMOTE)
+release-alpha: export REL_REPO      := $(value REPO_NAME)
+release-alpha: export REL_AGENT_GIT := $(value AGENT_GIT)
 release-alpha:
-	@V=$$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo v0.0.0-alpha); \
-	NEXT=$$(echo $$V | awk -F'[.-]' '{printf "v%s.%s.%d-alpha", substr($$1,2), $$2, $$3+1}'); \
-	echo $${NEXT#v} > VERSION && git add VERSION && git commit -q -m "chore(release): $$NEXT" || true; \
-	git tag $$NEXT; \
-	for s in $(SUBMODULE_TAGS); do git tag "$$s/$$NEXT"; done; \
-	git push $(RELEASE_REMOTE) HEAD --tags && echo "Tagged $$NEXT"
+	@test -n "$$REL_VERSION" || { echo 'ERROR: state the version explicitly: make release-alpha VERSION=vX.Y.Z-alpha (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)'; exit 1; }
+	@printf '%s' "$$REL_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$' || { echo "ERROR: VERSION is not of the form vX.Y.Z-alpha (no leading zeroes): $$REL_VERSION"; exit 1; }
+	@test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). 'push $$REL_REMOTE HEAD' would publish this branch."; exit 1; }
+	@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty -- set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
+	@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh -- every git write in this recipe signs through it, and a bad path must fail before VERSION is written'; exit 1; }
+	@test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the Gitea remote'; exit 1; }
+	@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
+	@rc=0; git ls-remote --exit-code --tags "$$REL_REMOTE" "refs/tags/$$REL_VERSION" >/dev/null 2>&1 || rc=$$?; \
+	case "$$rc" in \
+	  0) echo "ERROR: tag $$REL_VERSION already exists on $$REL_REMOTE (a local check alone would miss this and fail the push AFTER committing VERSION)"; exit 1 ;; \
+	  2) : ;; \
+	  *) echo "ERROR: could not reach $$REL_REMOTE to check whether tag $$REL_VERSION exists. Refusing to continue: an unreachable remote is not an absent tag"; exit 1 ;; \
+	esac
+	@test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
+	@ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
+	@printf '%s\n' "$${REL_VERSION#v}" > VERSION
+	"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
+	"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
+	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
+	@want="agent-$$REL_REPO"; got="$$(git log -1 --format='%an')"; \
+	test "$$got" = "$$want" || { echo "ERROR: the release commit is authored by '$$got', not '$$want'. AGENT_GIT did not write as this repo's agent; nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; exit 1; }
+	@test "$$(git cat-file -t "$$REL_VERSION")" = tag || { echo "ERROR: $$REL_VERSION is a lightweight tag; releases are annotated and signed. Nothing has been pushed."; exit 1; }
+	@test -f "$(RELEASE_SIGNERS)" || { echo 'ERROR: $(RELEASE_SIGNERS) is missing. It is the trust anchor for release signature verification; without it a signature can only be observed, not TRUSTED. Nothing has been pushed.'; exit 1; }
+	@rc=0; \
+	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-commit HEAD >/dev/null 2>&1 || { echo "ERROR: the release commit's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
+	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-tag "$$REL_VERSION" >/dev/null 2>&1 || { echo "ERROR: tag $$REL_VERSION's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
+	exit $$rc
+	"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION"
+	@echo "Released $$REL_VERSION (signed, annotated, single tag pushed)"
 
 deps-latest:
 	@GOWORK=off sh -c ' \

@@ -48,13 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
   exposing a construction-time property; no behaviour of either mode changes.
 
-### Documentation
+### Changed
 
-- **`SealingStrategy` now states that honouring `Credentials` is
-  implementation-defined (#43)**, that replacing a registered strategy can
-  silently change whether the barrier authenticates its unsealer, and — on
-  `UnsealRootKey` — that a nil error is not proof the supplied credentials were
-  correct.
+- **`make release-alpha` replaced with template v2 (#44, #42)** — the v1 recipe
+  auto-incremented PATCH only (so `v0.9.0-alpha` had to be tagged by hand and an
+  API addition would have shipped labelled as a bugfix), created lightweight
+  UNSIGNED tags as the owner's local git identity, pushed **every** local tag
+  with `--tags`, and let `|| true` swallow a failed VERSION commit so a tag
+  could disagree with its own VERSION file. The version is now EXPLICIT
+  (`make release-alpha VERSION=vX.Y.Z-alpha`); every git write goes through
+  `agent-git.sh` for identity and SSH signing; the tag is annotated; only the
+  release commit and the one named tag are pushed, atomically; and there is no
+  `|| true` anywhere, so any failing step aborts before the tag exists.
+  `SUBMODULE_TAGS` is retired with the v1 recipe — it was empty, so the tag loop
+  it drove was dead code.
 
 ### Security
 
@@ -69,6 +76,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/performance/quicraft`, and `test/performance/dragonboat`, which was
   further behind still at `v0.40.0`. No module in the tree now references a
   pre-`v0.55.0` `x/crypto`.
+
+
+- **A settable `VERSION=` no longer executes make functions at parse time
+  (#44)** — the build-metadata variable was named `VERSION` and expanded into
+  `LDFLAGS` with an immediate `:=`, so `make <anything> VERSION='$(shell ...)'`
+  ran that shell function **before target selection and before any recipe guard
+  could exist**. It fired on `build`, on `release-alpha`, and on a target that
+  does not exist at all. The build metadata now reads `BUILD_VERSION` and
+  `VERSION` belongs to `release-alpha` alone. Additionally all four settable
+  release inputs cross into the recipe through `$(value ...)`, where the company
+  template guards `VERSION` only — measured on GNU Make 4.3, a plain
+  `$(RELEASE_REMOTE)` executes an embedded `$(shell ...)` and `$(value
+  RELEASE_REMOTE)` does not. The derived build-metadata variables
+  (`BUILD_VERSION`, `GIT_COMMIT`, `BUILD_DATE`) are declared `override`, because
+  a command-line variable beats an ordinary makefile assignment and the rename
+  alone would have moved the hole to the new name rather than closing it.
+  `VERSION` is accepted only from the **command line** (`$(origin ...)`), so an
+  ambient environment variable cannot drive a release, and the release commit
+  and tag must be **authored by this repo's agent and carry signatures that
+  verify against the key pinned in the new in-repo `.release-allowed-signers`**
+  before anything is pushed — checked with `git verify-commit`/`verify-tag`.
+  Two weaker forms were tried and rejected: grepping for `gpgsig`/`SSH
+  SIGNATURE` (marker strings a substituted helper plants in a commit message),
+  and building the allowed-signers file from a key under `AGENT_GIT`'s own tree
+  (which verifies nothing — the helper supplies the key it is checked against).
+  An anchor reachable from the thing it checks is not an anchor.
+
+### Documentation
+
+- **`SealingStrategy` now states that honouring `Credentials` is
+  implementation-defined (#43)**, that replacing a registered strategy can
+  silently change whether the barrier authenticates its unsealer, and — on
+  `UnsealRootKey` — that a nil error is not proof the supplied credentials were
+  correct.
 
 ## [0.9.0-alpha] - 2026-08-24
 
@@ -376,6 +417,7 @@ Seal's exclusion passed too. Both mutation-verified.
   no-parallel restriction rather than replaced with a registry.
 
 ### Documentation
+
 
 The design rationale had to move with the code, because it argued for the thing
 being removed. `docs/memory-enclave/architecture.md` carried a section titled
@@ -910,6 +952,7 @@ node and consuming service from one commit.
 
 ### Changed
 
+
 - **`sm.StateMachine`'s serialization promise is enforced rather than merely
   documented.** `rsm.StateMachine.Apply` now takes the adapter's `readGuard` for
   writing, so it excludes `Lookup`, `NALookup`, `NALookupBuf` and `GetHash`. The
@@ -1096,6 +1139,7 @@ simply never completed its release pipeline. Depend on 0.5.1-alpha.
 
 ### Added
 
+
 - **Unit tests for the fault injectors themselves**, in the ordinary build rather
   than behind the tags of the suites that consume them. `errfs`: that `injectAt`
   fires on the Nth operation exactly, that `OnlyOps` restricts which operation can
@@ -1204,6 +1248,7 @@ recognised once and restamped automatically on the next persist.
   per embedder-supplied `OwnerID`, enforced from replicated state.
 
 ### Added
+
 
 - **Quorum-loss recovery.** `WithImportMembership` reconstitutes a shard whose
   quorum is permanently lost — previously impossible, since removing a dead
@@ -1325,6 +1370,7 @@ checksummed would fail its build with a security error.
   before the call is not a race, and now neither submits nor reports success.
 
 ### Changed
+
 
 - A replication wait that times out in the host and e2e integration suites now
   prints each live node's view of the leader, its term, applied index, local
@@ -1617,6 +1663,7 @@ compile cleanly and fail at run time.
 
 ### Added
 
+
 - `proto.MaxMembershipEntries` is now **exported** (10000), joining
   `MaxMessagesPerBatch` and `MaxEntriesPerMessage`. These are properties of
   the wire format, not of the decoder: `Host.StartShard` takes the operator's
@@ -1631,6 +1678,7 @@ compile cleanly and fail at run time.
 - `SECURITY.md` (vulnerability reporting policy) and `CONTRIBUTING.md`.
 
 ### Changed
+
 
 - `Membership.UnmarshalFrom` is now **all or nothing**: decoding runs into a
   local value and the receiver is assigned only on success. Previously a v3
@@ -1650,6 +1698,7 @@ compile cleanly and fail at run time.
   instead of — its graceful shutdown path.
 
 ### Documentation
+
 
 This release corrects documentation that had drifted far enough from the code
 to produce broken integrations. The corrections are listed because several
@@ -1783,6 +1832,7 @@ were actively misleading, not merely stale.
 
 ### Changed
 
+
 - CI: SARIF uploads and `trivy-action` are GitHub-only (Gitea has no
   code-scanning API, and the action's setup cannot authenticate to
   github.com with a Gitea token); Gitea runs gate with the trivy CLI
@@ -1793,6 +1843,7 @@ were actively misleading, not merely stale.
 ## [0.3.0-alpha] - 2026-08-12
 
 ### Security
+
 
 - **A remote peer could force a term REGRESSION, breaking Election Safety.**
   `Term` is a plain uint64 in the wire encoding with nothing bounding it, and
@@ -1919,11 +1970,13 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 ### Changed
 
+
 - **A pending request made with a deadline-less context now expires.** A proposal, read, snapshot or config change registered under `context.Background()` recorded the zero time, which the sweeper skips by design, so the entry was never reclaimed: its `RequestState` never returned to the pool and `pendingOps` never fell back to zero, which made every later `Drain()` burn the full `ShutdownTimeout`. Such an entry is now clamped at registration, so `RequestState.Result()` returns `ErrTimeout` after 5 minutes for a proposal, read or config change instead of blocking indefinitely — a backstop for a request that can never complete (leader crash, partition, a lost apply), not a request SLA. Snapshots carry their own 1-hour backstop, matching the snapshot transfer ceiling, because serializing a multi-gigabyte state machine legitimately outruns the commit-path bound. A caller-supplied context deadline always wins
 - `ShardInfo.Health` reports `recovering` and `snapshotting` instead of `healthy` while those gates are up; `Host.DiagShardGates` exposes them directly. A replica invisible to consensus previously reported healthy
 - `BarrierConfig.Validate` is exported so a runtime-built config can be rejected instead of panicking
 
 ### Added
+
 
 - `config.MetricsConfig` and `quicraft.NewPrometheusMetricsCollectorWithConfig`, controlling metric label cardinality (see BREAKING above).
 - `quicraft_metrics_per_shard_enabled` gauge, reporting whether per-shard metric labels are enabled.
@@ -1936,9 +1989,11 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 ### Documentation
 
+
 - **The deferred `SessionExpiryEntries` decision was resolved, not carried forward.** This section previously recorded that the default had to stay 0 because the threshold was node-local configuration the apply path treated as replicated, and proposed replicating it as the alternative. That alternative shipped: see the session-policy entry under `0.3.0-alpha` BREAKING. `TestSessionExpiry_DisagreeingThresholdsDiverge`, which demonstrated the divergence, was replaced by `TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas`, which asserts that two replicas with different LOCAL configuration now apply identically — and, in a second subtest, that they both follow the shard's policy when it enables expiry rather than merely agreeing to do nothing.
 
 ### Security
+
 
 - **A delegated (hardware-backed) encryptor can now bind positional context, and a deployment can require it.** When a sealing strategy supplies its own encryptor the barrier hands off every operation and returns early, so that path had no positional binding — and, because it bypasses the barrier's own encryption entirely, no epoch AAD, no nonce-reuse tracking and no NIST SP 800-38D invocation counting either. The seam carried no AAD to bind with. A delegated encryptor may now implement the optional `seal.AADSymmetricEncrypter` to declare it authenticates caller-supplied AAD end to end, in which case context binding works exactly as it does in software mode (both paths build the AAD through the same helper, so they cannot drift). An encryptor that does not implement it still refuses a non-empty context rather than silently dropping it. Note this is a claim about end-to-end authentication: a backend that accepts an AAD parameter and discards it must not implement the interface, since advertising a binding that does not exist is worse than not having one.
 
@@ -1958,6 +2013,7 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 - **On-disk and wire formats changed; there is no migration from `0.1.0-alpha`.** Witness policy became replicated state: `MaxWitnesses` and `RequireFullReplicaMajority` now live in `proto.Membership` and travel through the log, snapshots, the WAL, and LogDB. `Membership` grew from an 8-byte base to 24, `ConfigChange` from a 36-byte fixed section to 52, and the WAL membership section by 9 bytes. `config.WitnessConfig` is now only a bootstrap seed; the policy is changed at runtime through `Host.RequestUpdateWitnessPolicy` (and its `Sync` variant). Wipe existing data directories before upgrading
 
 ### Security
+
 
 - **Sealed barriers no longer downgrade to plaintext.** A barrier that is configured but sealed means encryption is temporarily unavailable, not that the data is plaintext. Three paths conflated the two and durably wrote plaintext: `saveSnapshot` (reachable via `EmergencySeal`, so the control inverted during incident response), `ImportSnapshot` (recorded `Epoch: 0` unconditionally), and `ReencryptSnapshotFile`. All now fail closed with `ErrSnapshotBarrierSealed`. In `ReencryptSnapshotFile` a sealed *source* was worse than a downgrade: it copied ciphertext and recorded it as plaintext
 - Imported snapshots are re-encrypted under the importing host's own barrier, so they are encrypted at rest like every other snapshot for the shard
@@ -1982,11 +2038,13 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 ### Changed
 
+
 - Reads no longer block on a writer's fsync. The WAL shard mutex is split: segment file state keeps the existing lock, while the in-memory maps readers consult move to a separate `RWMutex` taken only for the brief commit. Previously every read for every raft group on a WAL shard waited out the fsync
 - Toolchain pinned to Go 1.26.5 across `go.mod`, Docker, and CI
 - `contrib/dragonboat` gained the `replace` directive it always needed; it previously resolved its parent only through a `go.work` outside the repo and could not be built or tested in CI
 
 ### Added
+
 
 - `BarrierConfig.Validate` is exported, so a caller assembling a barrier config at runtime (from a file, an API request, or per-tenant settings) can reject a bad algorithm — or a non-FIPS-approved cipher under FIPS mode — instead of taking the process down on `NewBarrier`'s panic
 - `BenchmarkThroughputQUIC`: the first end-to-end transport throughput benchmark. All prior transport benchmarks measured serialization only, so no test could observe a change to the QUIC receive window
@@ -1997,11 +2055,13 @@ embedders that IMPLEMENT those interfaces, which none of them do today.
 
 ### Changed
 
+
 - Host snapshot pool DEK purge now dispatches per-shard when `WithShardBarriers` is configured, preventing one tenant's barrier purge from removing epochs live under another tenant's barrier
 
 ## [0.1.0-alpha] - 2026-03-10
 
 ### Added
+
 
 - Multi-group Raft consensus with per-shard configuration and sharded ReadyMap (64 buckets) for O(1) dispatch
 - Full Raft specification compliance: leader election, log replication, membership changes, snapshots, PreVote, CheckQuorum, leadership transfer
