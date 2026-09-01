@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI no longer installs analysis tools at job time on the Gitea fabric
+  (#48)** — all six unpinned/retried `go install` steps (three in `ci.yml`,
+  three in `release.yml`) are gone from the self-hosted path; golangci-lint,
+  gosec and govulncheck are baked into the runner image at pinned versions.
+  The **public GitHub mirror** still provisions the same three at the **same
+  pins**, because there `ubuntu-latest` is GitHub's stock image and bakes none
+  of them — without that, the mirror's CI would fail before any analysis ran. They were a live flake, not a theoretical one: DNS returns
+  an AAAA record for `sum.golang.org` and the runner hosts have no default IPv6
+  route, so an install occasionally died with `ENETUNREACH`. Each site had
+  grown a hand-rolled 3-attempt retry loop around the flake. Two of the three
+  also installed `@latest`, so a scan could not be attributed to a scanner
+  version at all. A `Verify baked analysis tools` step now **asserts** presence
+  and version rather than trusting them, so a runner on an older image fails
+  loudly instead of gating on a rule set this repo never pinned. The assertion
+  runs **in every job that consumes a tool**, covering exactly the tools that
+  job runs (`lint` -> golangci-lint; `security` -> gosec + govulncheck), and
+  sits after `setup-go` so it describes the PATH the scanners are invoked with.
+  Jobs get separate runners, so an assertion made in `lint` says nothing about
+  the environment `security` actually scans in.
+- **`GOLANGCI_VERSION` moved `v2.12.2` -> `v2.13.2` (#48)** — the version
+  actually baked into the runner image. Bumped in the Makefile and both
+  devcontainer Dockerfiles in lockstep, so `make check-tool-versions` and
+  `test/buildgates` still see one version everywhere. Verified: v2.13.2 reports
+  **0 issues** on this tree.
+
 ### Added
 
 - **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a

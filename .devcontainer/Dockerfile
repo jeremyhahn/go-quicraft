@@ -17,9 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # is the single source of truth and which quality.yml also matches. Docker
 # cannot read a make variable, so `make check-tool-versions` asserts the pins
 # agree; it runs as part of `make ci`. This file said v2.11.1 while CI ran
-# v2.12.2 — a container that lints against a different rule set from CI passes
+# v2.13.2 — a container that lints against a different rule set from CI passes
 # while proving nothing.
-RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 && \
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 && \
     go install github.com/securego/gosec/v2/cmd/gosec@latest && \
     go install golang.org/x/vuln/cmd/govulncheck@latest && \
     go install github.com/sonatype-nexus-community/nancy@latest && \

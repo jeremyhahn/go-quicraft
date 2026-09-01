@@ -27,7 +27,7 @@ GOLINT        := golangci-lint
 # Must match the version quality.yml installs. A different MAJOR version is not
 # a cosmetic difference: v2 moved flags (`--timeout`) and changed which linters
 # are enabled by default, so a developer and CI would gate on different rules.
-GOLANGCI_VERSION := v2.12.2
+GOLANGCI_VERSION := v2.13.2
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 

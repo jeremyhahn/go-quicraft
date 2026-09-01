@@ -150,18 +150,76 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Install golangci-lint
-        # RETRIED (issue #31): same sum.golang.org flake class handled in
-        # ci.yml. A tag push is the worst place to lose a run to a network
-        # blip — the tag is the artifact and it is permanent, so a spurious
-        # gate failure here blocks a release that is actually sound. Full
-        # sumdb verification kept; pinned version must stay v2.12.2.
+      # The analysis tools are BAKED INTO THE RUNNER IMAGE at pinned versions
+      # (`/etc/ci-runner-tools.txt`; the image build fails closed if any tool's
+      # self-report disagrees with its pin), so there is nothing to install.
+      #
+      # This replaces `go install` steps that fetched over the network at job
+      # time. They were a live flake, not a theoretical one: DNS returns an AAAA
+      # record for sum.golang.org and the runner hosts have no default IPv6
+      # route, so the fallback occasionally fails to complete and the install
+      # dies with ENETUNREACH. Each had grown a hand-rolled 3-attempt retry loop
+      # — the flake worked around locally instead of removed. Two of the three
+      # also installed `@latest`, so a scan could not be attributed to a scanner
+      # version at all (gosec@latest self-reports "dev").
+      #
+      # THIS STEP IS PER-JOB ON PURPOSE. Each job gets its own runner, and
+      # nothing guarantees two jobs land on the same machine or the same image
+      # instance. A verification performed in `lint` says nothing about the
+      # environment `security` actually runs its scanners in — that job could
+      # find no tool at all, or a different version, with the assertion never
+      # applying. So every job asserts exactly the tools it itself runs.
+      #
+      # A tag push is the worst place to lose a run to a network blip: the tag is
+      # the artifact and it is permanent, so a spurious gate failure blocks a
+      # release that is actually sound.
+      #
+      # To change a version, do NOT add a `go install` back: ask agent-company
+      # to rebuild the image, then update the pins here and in the Makefile.
+      - name: Verify baked analysis tools
+        if: github.server_url != 'https://github.com'
         run: |
-          for i in 1 2 3; do
-            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
+          set -euo pipefail
+          rc=0
+          check() { # <tool> <expected> <actual>
+            if [ "$3" != "$2" ]; then
+              echo "FAIL $1: image has '$3', this repo pins '$2'"; rc=1
+            else
+              echo "OK   $1 $2"
+            fi
+          }
+          # Versions come from the binary's BUILD INFO, not its --version string.
+          # gosec self-reports "dev" unless its version is injected via ldflags
+          # at image-build time, so parsing --version would reject a correctly
+          # pinned binary built by a plain `go install`; govulncheck's first
+          # --version line is the Go version when go is on PATH and the scanner
+          # version otherwise. `go version -m` reads the module version recorded
+          # in the binary itself, which is uniform across all three tools and
+          # independent of how the image chose to build them.
+          modver() { go version -m "$(command -v "$1")" 2>/dev/null | awk '$1=="mod"{print $3; exit}'; }
+          for t in golangci-lint; do
+            command -v "$t" >/dev/null 2>&1 || { echo "FAIL $t: not in the runner image"; rc=1; }
           done
-          echo "golangci-lint install failed after 3 attempts"; exit 1
+          [ "$rc" -eq 0 ] || { echo "The runner image is missing a baked tool."; exit 1; }
+          check golangci-lint v2.13.2 "$(modver golangci-lint)"
+          exit $rc
+
+      # THE PUBLIC GITHUB MIRROR is a different machine entirely. There
+      # `ubuntu-latest` resolves to GitHub's stock Ubuntu image, which bakes none
+      # of these, so the verification above would fail before any analysis ran
+      # and the mirror's CI would be a false negative on every push. Provision
+      # them there, at the SAME pins, so the mirror gates on the same rule set.
+      #
+      # No retry loop, deliberately: the flake these steps were removed for is
+      # the AAAA-record/no-IPv6-route defect on OUR runner hosts, which is not a
+      # property of GitHub-hosted runners. Re-adding a retry here would be
+      # cargo-culting a workaround into the one environment that never had the
+      # problem.
+      - name: Provision analysis tools (GitHub-hosted)
+        if: github.server_url == 'https://github.com'
+        run: |
+          set -euo pipefail
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 
       - name: golangci-lint
         run: golangci-lint run --timeout=5m ./...
@@ -173,19 +231,83 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Install gosec
-        # RETRIED (issue #31): same sum.golang.org flake class handled in
-        # ci.yml. Full sumdb verification kept; never GOSUMDB=off.
+      # The analysis tools are BAKED INTO THE RUNNER IMAGE at pinned versions
+      # (`/etc/ci-runner-tools.txt`; the image build fails closed if any tool's
+      # self-report disagrees with its pin), so there is nothing to install.
+      #
+      # This replaces `go install` steps that fetched over the network at job
+      # time. They were a live flake, not a theoretical one: DNS returns an AAAA
+      # record for sum.golang.org and the runner hosts have no default IPv6
+      # route, so the fallback occasionally fails to complete and the install
+      # dies with ENETUNREACH. Each had grown a hand-rolled 3-attempt retry loop
+      # — the flake worked around locally instead of removed. Two of the three
+      # also installed `@latest`, so a scan could not be attributed to a scanner
+      # version at all (gosec@latest self-reports "dev").
+      #
+      # THIS STEP IS PER-JOB ON PURPOSE. Each job gets its own runner, and
+      # nothing guarantees two jobs land on the same machine or the same image
+      # instance. A verification performed in `lint` says nothing about the
+      # environment `security` actually runs its scanners in — that job could
+      # find no tool at all, or a different version, with the assertion never
+      # applying. So every job asserts exactly the tools it itself runs.
+      #
+      # A tag push is the worst place to lose a run to a network blip: the tag is
+      # the artifact and it is permanent, so a spurious gate failure blocks a
+      # release that is actually sound.
+      #
+      # To change a version, do NOT add a `go install` back: ask agent-company
+      # to rebuild the image, then update the pins here and in the Makefile.
+      - name: Verify baked analysis tools
+        if: github.server_url != 'https://github.com'
         run: |
-          for i in 1 2 3; do
-            go install github.com/securego/gosec/v2/cmd/gosec@latest && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
+          set -euo pipefail
+          rc=0
+          check() { # <tool> <expected> <actual>
+            if [ "$3" != "$2" ]; then
+              echo "FAIL $1: image has '$3', this repo pins '$2'"; rc=1
+            else
+              echo "OK   $1 $2"
+            fi
+          }
+          # Versions come from the binary's BUILD INFO, not its --version string.
+          # gosec self-reports "dev" unless its version is injected via ldflags
+          # at image-build time, so parsing --version would reject a correctly
+          # pinned binary built by a plain `go install`; govulncheck's first
+          # --version line is the Go version when go is on PATH and the scanner
+          # version otherwise. `go version -m` reads the module version recorded
+          # in the binary itself, which is uniform across all three tools and
+          # independent of how the image chose to build them.
+          modver() { go version -m "$(command -v "$1")" 2>/dev/null | awk '$1=="mod"{print $3; exit}'; }
+          for t in gosec govulncheck; do
+            command -v "$t" >/dev/null 2>&1 || { echo "FAIL $t: not in the runner image"; rc=1; }
           done
-          echo "gosec install failed after 3 attempts"; exit 1
+          [ "$rc" -eq 0 ] || { echo "The runner image is missing a baked tool."; exit 1; }
+          check gosec        v2.29.0 "$(modver gosec)"
+          check govulncheck  v1.7.0  "$(modver govulncheck)"
+          exit $rc
+
+      # THE PUBLIC GITHUB MIRROR is a different machine entirely. There
+      # `ubuntu-latest` resolves to GitHub's stock Ubuntu image, which bakes none
+      # of these, so the verification above would fail before any analysis ran
+      # and the mirror's CI would be a false negative on every push. Provision
+      # them there, at the SAME pins, so the mirror gates on the same rule set.
+      #
+      # No retry loop, deliberately: the flake these steps were removed for is
+      # the AAAA-record/no-IPv6-route defect on OUR runner hosts, which is not a
+      # property of GitHub-hosted runners. Re-adding a retry here would be
+      # cargo-culting a workaround into the one environment that never had the
+      # problem.
+      - name: Provision analysis tools (GitHub-hosted)
+        if: github.server_url == 'https://github.com'
+        run: |
+          set -euo pipefail
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 
       # Keep this exclude list identical to ci.yml's security job and to
       # GOSEC_EXCLUDE in the Makefile; see ci.yml for the per-rule
@@ -199,16 +321,6 @@ jobs:
         with:
           sarif_file: gosec.sarif
           category: gosec-release
-
-      - name: Install govulncheck
-        # RETRIED (issue #31): same sum.golang.org flake class handled in
-        # ci.yml. Full sumdb verification kept; never GOSUMDB=off.
-        run: |
-          for i in 1 2 3; do
-            go install golang.org/x/vuln/cmd/govulncheck@latest && exit 0
-            echo "install attempt $i failed; retrying"; sleep 10
-          done
-          echo "govulncheck install failed after 3 attempts"; exit 1
 
       - name: Run govulncheck
         run: govulncheck ./...
