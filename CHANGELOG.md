@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The barrier holds its root key in locked memory for the whole of
+  `Initialize` and `Unseal` (#39, owner-ruled option (b)).** Both functions used
+  to carry the root key in an ordinary heap slice — swappable and core-dumpable —
+  alive across sealing, MAC stamping, encryptor resolution, the load-generation
+  claim and one DEK derivation per known epoch, with **eleven** hand-written
+  `wipeBytes(rootKey)` calls standing on the error paths in between. The wipes
+  were correct; what they could not do was stop the pager writing the key to disk
+  or a core dump capturing it while it was in use.
+
+  `Initialize` now GENERATES the root key directly into a locked enclave, so on
+  that path it never exists outside protected memory at all. `Unseal` copies the
+  strategy's return into locked memory and wipes the heap slice immediately —
+  `SealingStrategy.UnsealRootKey` returns a plain `[]byte` and is deliberately
+  out of scope, so what changes there is how long the key is exposed, not
+  whether. Every `wipeBytes(rootKey)` is gone: the borrow's lifetime is the wipe,
+  and a deferred `Destroy` cannot be skipped by an error path a later edit adds.
+
+  **This was not implementable before the go-enclave adoption.** `pkg/enclave`
+  held a process-wide `purgeMu` shared across every borrow, so a borrow could not
+  enclose an allocation — across *different* enclaves, because the lock was
+  process-wide — and the barrier allocates seven `ProtectedKey`s inside the span
+  this change borrows over. It would have deadlocked.
+
+  No public signature changes: `SealingStrategy` is untouched, and a strategy
+  implementing only the `[]byte` pair — every hardware and cloud strategy in the
+  portfolio — keeps working, with a test that holds that line.
+
+
+### Changed
+
 - **BREAKING: locked memory is now `go-enclave`, not this repository's own
   implementation (#54, stage one).** `pkg/enclave` no longer implements `mlock`,
   guard pages, canaries or borrow tracking. `enclave.MemoryEnclave` and the

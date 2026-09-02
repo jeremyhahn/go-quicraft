@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	goenclave "github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 	"golang.org/x/crypto/hkdf"
 )
@@ -306,6 +307,22 @@ type Barrier struct {
 	// randReader is the source of cryptographic randomness. Defaults to
 	// crypto/rand.Reader. Injectable for testing error paths.
 	randReader io.Reader
+
+	// lockRootKey allocates the locked memory Initialize and Unseal hold the
+	// root key in. It is a FIELD rather than a package variable for the same
+	// reason randReader above is one: a mutable global on the root-key path is
+	// exactly what this package avoids, and a field cannot be reached from
+	// another test, another barrier, or production code that did not ask for it.
+	//
+	// It exists because the failure it stands in for cannot be produced
+	// otherwise. A refused mlock means RLIMIT_MEMLOCK is exhausted process-wide,
+	// which a test cannot arrange without taking every other enclave in the
+	// binary with it. What has to be provable is that the refusal is CLEAN: the
+	// barrier stays uninitialized or sealed, and on the unseal path the
+	// strategy's heap copy is still wiped.
+	//
+	// Defaults to goenclave.NewMemoryEnclaveSized; nothing but a test assigns it.
+	lockRootKey func(int) (*enclave.MemoryEnclave, error)
 }
 
 // EpochBarrier is an alias for Barrier. Use this name in new code to
@@ -386,6 +403,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		maxPlaintext:   config.Algorithm.MaxPlaintextSize(),
 		timeNow:        time.Now,
 		randReader:     rand.Reader,
+		lockRootKey:    goenclave.NewMemoryEnclaveSized,
 	}, nil
 }
 
@@ -457,16 +475,59 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 		return ErrBarrierAlreadyInit
 	}
 
-	// Generate root key from crypto/rand.
-	rootKey := make([]byte, rootKeySize)
-	if _, err := io.ReadFull(b.randReader, rootKey); err != nil {
+	// THE ROOT KEY IS GENERATED INTO LOCKED MEMORY AND NEVER EXISTS OUTSIDE IT.
+	//
+	// This used to be `rootKey := make([]byte, rootKeySize)` — an ordinary heap
+	// slice, swappable and core-dumpable, kept alive across sealing, MAC
+	// stamping, encryptor resolution and DEK derivation, and wiped by hand on
+	// each of the seven error paths that could return in between. The wipes were
+	// correct; what they could not do was stop the key being written to disk by
+	// the pager, or captured in a core file, while it was in use.
+	//
+	// A SIZED enclave, not a from-bytes one: the material is produced IN PLACE by
+	// the read below, so it never transits the heap on its way in. The pages stay
+	// writable for the enclave's life, which is what makes both the fill and the
+	// terminal NewProtectedKey wipe possible — go-enclave has no post-fill freeze
+	// (go-enclave #6). The borrowed slice never escapes initializeWithRootKey,
+	// which is the condition that makes a writable enclave safe.
+	//
+	// Destroy replaces every wipeBytes(rootKey) that used to stand on the error
+	// paths: it wipes and unmaps, and being deferred it cannot be skipped by a
+	// return that a later edit adds.
+	rootEnc, err := b.lockRootKey(rootKeySize)
+	if err != nil {
 		return &Error{Strategy: "initialize", Err: err}
 	}
+	defer rootEnc.Destroy()
 
-	// Generate HKDF salt.
+	// Everything that touches the root key runs inside the borrow, so a Destroy
+	// cannot unmap the pages underneath it. Nesting a second enclave operation in
+	// here — NewProtectedKey below does exactly that — is legal since the
+	// go-enclave adoption; under the old process-wide purgeMu it was a
+	// self-deadlock, which is why this issue could not be done before #54.
+	return rootEnc.WithBytes(func(rootKey []byte) error {
+		if _, err := io.ReadFull(b.randReader, rootKey); err != nil {
+			return &Error{Strategy: "initialize", Err: err}
+		}
+		return b.initializeWithRootKey(ctx, strategy, creds, rootKey)
+	})
+}
+
+// initializeWithRootKey is Initialize's body, running with b.mu held and with
+// rootKey aliasing the locked pages of the enclave its caller borrowed.
+//
+// It must not retain rootKey past its own return: the slice is only backed while
+// the borrow is open, and the enclave is destroyed immediately afterwards. It
+// must not destroy or re-borrow that enclave either — the caller owns it.
+//
+// There is deliberately no wipeBytes(rootKey) anywhere below. The borrow's
+// lifetime is the wipe now, which is the point of the change: an error path
+// added later cannot forget one.
+func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStrategy, creds Credentials, rootKey []byte) error {
+	// Generate HKDF salt. Not secret — it is stored in the sealed blob — so it
+	// stays an ordinary allocation.
 	salt := make([]byte, hkdfSaltSize)
 	if _, err := io.ReadFull(b.randReader, salt); err != nil {
-		wipeBytes(rootKey)
 		return &Error{Strategy: "initialize", Err: err}
 	}
 
@@ -475,7 +536,6 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// Seal the root key for persistent storage.
 	sealed, err := strategy.SealRootKey(ctx, rootKey, creds)
 	if err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 	sealed.Epoch = initialEpoch
@@ -503,7 +563,6 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	if strategy.ID() != StrategyNone {
 		mac, macErr := sealedStateMAC(rootKey, b.config.DeploymentID, sealed)
 		if macErr != nil {
-			wipeBytes(rootKey)
 			return macErr
 		}
 		sealed.StateMAC = mac
@@ -512,7 +571,6 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
 	if hwErr != nil {
-		wipeBytes(rootKey)
 		return hwErr
 	}
 
@@ -521,7 +579,6 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// than on its first context-bearing write.
 	binding := contextBindingFor(hwEnc, strategy.ID() == StrategyNone, b.randReader)
 	if err := b.checkContextAADPolicy(binding); err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 	b.binding = binding
@@ -551,7 +608,6 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// Derive initial DEK and cipher for epoch 1.
 	dek, aead, err := b.deriveEpochCipher(rootKey, salt, initialEpoch)
 	if err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 
@@ -662,7 +718,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	}
 
 	// Attempt to unseal the root key.
-	rootKey, err := strategy.UnsealRootKey(ctx, b.sealed, creds)
+	heapKey, err := strategy.UnsealRootKey(ctx, b.sealed, creds)
 	if err != nil {
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
@@ -689,12 +745,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// otherwise steer a passphrase deployment into this branch and leave the
 	// barrier "unsealed" with no cipher at all.
 	if strategy.ID() == StrategyNone {
-		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
+		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, heapKey)
 		if hwErr != nil {
-			wipeBytes(rootKey)
+			wipeBytes(heapKey)
 			return hwErr
 		}
-		wipeBytes(rootKey)
+		wipeBytes(heapKey)
 		// A nil encryptor here would leave state=unsealed with cipher==nil
 		// and hwEncryptor==nil, and the first Encrypt would nil-dereference.
 		if hwEnc == nil {
@@ -728,14 +784,53 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		return nil
 	}
 
-	if len(rootKey) != rootKeySize {
-		wipeBytes(rootKey)
+	if len(heapKey) != rootKeySize {
+		wipeBytes(heapKey)
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
 		b.persistBackoffState()
 		return ErrInvalidRootKeySize
 	}
 
+	// THE STRATEGY'S HEAP COPY DIES HERE, at the earliest point it can.
+	//
+	// SealingStrategy.UnsealRootKey returns an ordinary []byte and stays that way
+	// (this issue's scope note is explicit that the interface does not move), so
+	// the root key does reach the heap on this path — unlike Initialize, which
+	// generates straight into locked memory. What this controls is how LONG it
+	// stays there: it is copied into locked pages and wiped immediately, instead
+	// of living across MAC verification, encryptor resolution, the load-generation
+	// claim and one DEK derivation per known epoch, guarded by nine hand-written
+	// wipes on the error paths in between.
+	//
+	// Sized rather than from-bytes for the same reason as Initialize: the pages
+	// must stay writable so the terminal NewProtectedKey can wipe them, since
+	// go-enclave has no post-fill freeze (go-enclave #6).
+	rootEnc, encErr := b.lockRootKey(rootKeySize)
+	if encErr != nil {
+		wipeBytes(heapKey)
+		return &Error{Strategy: "unseal", Err: encErr}
+	}
+	defer rootEnc.Destroy()
+
+	return rootEnc.WithBytes(func(rootKey []byte) error {
+		copy(rootKey, heapKey)
+		wipeBytes(heapKey)
+		return b.unsealWithRootKey(ctx, strategy, rootKey)
+	})
+}
+
+// unsealWithRootKey is the rest of Unseal, running with b.mu held and with
+// rootKey aliasing the locked pages of the enclave its caller borrowed.
+//
+// Same contract as initializeWithRootKey: it must not retain rootKey past its
+// own return, and must not destroy or re-borrow the enclave, which the caller
+// owns. creds is not threaded through because nothing below this point needs it
+// — the credential was already spent by UnsealRootKey.
+//
+// There is deliberately no wipeBytes(rootKey) below. The borrow's lifetime is
+// the wipe.
+func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrategy, rootKey []byte) error {
 	// Authenticate the persisted metadata BEFORE deriving a single DEK from it.
 	// The passphrase (or HSM) has just proved the ciphertext is genuine; this
 	// proves that the Epoch, KnownEpochs, Salt, HKDFVersion and Algorithm
@@ -745,14 +840,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// and driving the brute-force backoff from a file an attacker can write
 	// would hand them a lockout primitive.
 	if err := b.verifySealedStateMAC(rootKey); err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 
 	// Check if strategy provides a hardware encryptor.
 	hwEnc, hwErr := strategy.BarrierEncryptor(ctx, rootKey)
 	if hwErr != nil {
-		wipeBytes(rootKey)
 		return hwErr
 	}
 
@@ -760,7 +853,6 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// deployment that requires positional binding must be refused at setup.
 	binding := contextBindingFor(hwEnc, false, b.randReader)
 	if err := b.checkContextAADPolicy(binding); err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 	b.binding = binding
@@ -789,14 +881,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// that a DEK was already used under it. A claim that cannot be persisted
 	// aborts the unseal with the barrier still sealed.
 	if err := b.claimLoadGenerationLocked(rootKey); err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 
 	// Derive DEK and cipher for the current epoch.
 	dek, aead, err := b.deriveEpochCipher(rootKey, b.salt, b.epoch)
 	if err != nil {
-		wipeBytes(rootKey)
 		return err
 	}
 
@@ -815,7 +905,6 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		}
 		d, a, derr := b.deriveEpochCipher(rootKey, b.salt, epoch)
 		if derr != nil {
-			wipeBytes(rootKey)
 			wipeBytes(dek)
 			for _, v := range plainDEKs {
 				wipeBytes(v)
