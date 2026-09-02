@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`release.yml` compares the VERSION file byte for byte (#55)** — it
+  normalized with `tr -d '[:space:]'`, which accepts `0.9. 1-alpha`, a file
+  split across lines, and a missing trailing newline, each publishing a VERSION
+  that does not match its own tag. The check is now the Makefile's
+  `printf '%s\n'` read backwards (`printf … | cmp -s - VERSION`), dumping
+  `od -c` on mismatch because the difference is usually invisible.
+
+
 - **The disabled Claude Review workflow no longer registers a status (#47)** —
   it was `on: pull_request` with `if: false` on the job, which does not disable
   a workflow: Gitea starts a run and registers a `Claude Review / Claude Review`
@@ -115,6 +123,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `github.com` per devops.md §1 so it is skipped rather than failed here.
 
 ### Security
+
+- **Every GitHub Action is pinned to a commit SHA (#55)** — 59 `uses:` refs
+  across all seven workflows. The worst was `aquasecurity/trivy-action@master`
+  in both `release.yml` and `nightly.yml`: not merely a mutable tag but a moving
+  **branch**, re-resolved on every run, in jobs holding write-scoped tokens that
+  upload SARIF. A `test/buildgates` gate now rejects any non-40-hex ref, so one
+  cannot come back. Note for bumping: `github/codeql-action@v3` is an
+  **annotated** tag, so its `^{}` peeled sha is the pin — the unpeeled one is
+  the tag object and fails at checkout.
+- **`release.yml` refuses a tag that moved after validation (#55)** — `validate`
+  and `release` are separate jobs on separate runners, each checking the tag out
+  independently, so a tag force-moved between them passed every self-consistency
+  check either made: tag and checkout agreed, on the **new** commit, with every
+  gate having validated a different tree. `validate` now exports the commit it
+  approved, and the publish job resolves **what the tag points at on the remote,
+  now** and requires it to match — peeling `^{}` first, since an annotated tag's
+  ref names the tag object rather than the commit. Comparing the job's own
+  checkout could not work: on a tag-push event `actions/checkout` pins both jobs
+  to the SHA in the triggering event, so that comparison passes by construction
+  while the publish step resolves `tag_name` by **name** at publish time. Fails
+  on missing, ambiguous, mismatched, or an **absent** approved value — an empty
+  guard is not a passing guard. It sits **immediately before the publishing
+  action**, with no executable step in between — position is part of the
+  control, since a TOCTOU guard covers only the window it precedes, and the
+  first version left the build, the race suite, coverage and release-note
+  generation between the check and the publish. It **fails rather than** re-checking-out the
+  approved commit, because quietly publishing the right tree would hide an
+  immutability breach a human needs to see.
+
 
 - **`golang.org/x/crypto` bumped to `v0.55.0` (#50)** — `v0.54.0` carries
   CVE-2026-56854 (CRITICAL) in `golang.org/x/crypto/ssh`, which failed the
