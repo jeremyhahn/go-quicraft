@@ -7,20 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **The release fuzz gate budgets by execution count, and no longer retries
-  (#66)** — `make ci-fuzz-mutation`, which `release.yml` runs on every tag and
-  which the publish job depends on, still spent a **duration** (`-fuzztime=10s`)
-  and so still met the Go coordinator's shutdown race: a clean timeout recorded
-  as `context deadline exceeded` with no reproducer, i.e. a failure that is not
-  a finding. It papered over that with a 3-attempt retry that classified its own
-  output — a filter on failure, on the one gate whose spurious red blocks a tag.
-  Budgets are now counts derived from the nightly's calibration divided by
-  `FUZZ_MUT_DIVISOR` (the release gate is a smoke gate, not a search), so no
-  deadline context is created and the retry is gone. `test/buildgates` asserts
-  the two budget tables agree, because two numbers in two files drift silently
-  and both gates would keep passing at a budget nobody chose.
+## [0.10.0-alpha] - 2026-09-01
 
 ### Added
 
@@ -48,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposing a construction-time property; no behaviour of either mode changes.
 
 ### Changed
+
+- **The release fuzz gate budgets by execution count, and no longer retries
+  (#66)** — `make ci-fuzz-mutation`, which `release.yml` runs on every tag and
+  which the publish job depends on, still spent a **duration** (`-fuzztime=10s`)
+  and so still met the Go coordinator's shutdown race: a clean timeout recorded
+  as `context deadline exceeded` with no reproducer, i.e. a failure that is not
+  a finding. It papered over that with a 3-attempt retry that classified its own
+  output — a filter on failure, on the one gate whose spurious red blocks a tag.
+  Budgets are now counts derived from the nightly's calibration divided by
+  `FUZZ_MUT_DIVISOR` (the release gate is a smoke gate, not a search), so no
+  deadline context is created and the retry is gone. `test/buildgates` asserts
+  the two budget tables agree, because two numbers in two files drift silently
+  and both gates would keep passing at a budget nobody chose.
+
 
 - **CI no longer installs analysis tools at job time on the Gitea fabric
   (#48)** — all six unpinned/retried `go install` steps (three in `ci.yml`,
@@ -108,7 +109,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trigger is now `workflow_dispatch` only; a workflow with no PR trigger
   registers no status at all.
 
-### Fixed
 
 - **The nightly fuzz workflow no longer fails on its own clock, and no longer
   throws away the reproducer when it finds one (#49).** Two independent defects
