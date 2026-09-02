@@ -223,7 +223,11 @@ interchangeable:
   so a new target in a seventh package cannot go unrun.
 - `make ci-fuzz-mutation` gives each target a 10s mutation budget. It is a
   release gate, not a campaign. The real search is `.github/workflows/fuzz.yml`
-  on a nightly cron with a 60s budget per target.
+  on a nightly cron, where the budget is an execution COUNT per target
+  (`-fuzztime=<N>x`), calibrated per package from measured throughput. It is a
+  count and not a duration because Go only installs a fuzzing deadline context
+  for a duration budget, and the shutdown path can record that deadline as a
+  test failure; see the header of that workflow (#49).
 
 The mutation gate retries, and the retry is not a weakening. Go's fuzzing
 coordinator can lose its shutdown RPC and report a bare "context deadline
@@ -234,6 +238,11 @@ writes a reproducer and prints "Failing input written to". That string present
 means fail immediately and never retry; absent, with only the deadline message,
 means retry; anything else fails. The retry is gated on the *absence* of the
 reproducer a real crash produces, so a real crash cannot be retried away.
+
+The nightly workflow no longer needs that classification. With an
+execution-count budget Go creates no deadline context at all and ends the run
+through an explicit `stop(nil)`, so the artefact has no way to occur there
+(#49). The release gate still spends a duration, so it still classifies.
 
 ### Linearizability
 

@@ -85,6 +85,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trigger is now `workflow_dispatch` only; a workflow with no PR trigger
   registers no status at all.
 
+### Fixed
+
+- **The nightly fuzz workflow no longer fails on its own clock, and no longer
+  throws away the reproducer when it finds one (#49).** Two independent defects
+  in `.github/workflows/fuzz.yml`, both measured on run 23893:
+  - `Fuzz ./pkg/proto` reported
+    `--- FAIL: FuzzSnapshotChunkRoundTrip (60.08s) / context deadline exceeded`
+    with no reproducer file — a clean end-of-budget recorded as a crash. Go
+    installs a fuzzing deadline context only for a *duration* `-fuzztime`, and
+    the suppression of the resulting `ctx.Err()` compares it against the
+    child context's `Err()`, which the parent's `Done()` can outrun. The
+    per-target budget is now an execution COUNT (`-fuzztime=<N>x`), for which
+    Go creates no deadline context at all and ends the run through an explicit
+    `stop(nil)`; the failure mode has no participants. It was reproduced twice
+    locally while calibrating: of 37 targets each given `-fuzztime=60s`, two
+    exited non-zero with no reproducer written. Counts are calibrated per
+    package by running every target for 60s and scaling by the runner's
+    measured relative speed; the throughput spread across the suite is 20,061
+    to 36,139,971 executions per minute, so five waldb and two transport
+    targets carry explicit overrides. A count bounds work and not time, so
+    `timeout-minutes` is now the only wall-clock bound and says so.
+  - The same run reported
+    `Failed to CreateArtifact: Unable to make request: ECONNREFUSED`: this
+    Gitea runner serves no artifact endpoint, so `actions/upload-artifact`
+    turned one fuzz failure into two and discarded the crash reproducer — the
+    entire deliverable of a fuzzing run. Reproducers are now printed into the
+    job log, which works on both hosts, and the upload is guarded to
+    `github.com` per devops.md §1 so it is skipped rather than failed here.
+
 ### Security
 
 - **`golang.org/x/crypto` bumped to `v0.55.0` (#50)** — `v0.54.0` carries

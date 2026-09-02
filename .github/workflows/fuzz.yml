@@ -2,8 +2,8 @@ name: Fuzz
 
 # Mutation fuzzing, deliberately separated from ci.yml.
 #
-# `go test -fuzz` is unbounded and nondeterministic: it explores until the
-# clock runs out, and a crash it finds is a property of the RNG schedule, not
+# `go test -fuzz` is unbounded and nondeterministic: it explores until its
+# budget runs out, and a crash it finds is a property of the RNG schedule, not
 # of the commit under test. Putting it on a PR would fail unrelated pull
 # requests at random and train everyone to re-run the job, which is how a gate
 # stops being a gate. So the PR gate in ci.yml (`fuzz-seeds`) runs the targets
@@ -13,6 +13,33 @@ name: Fuzz
 #
 # The committed corpora under pkg/*/testdata/fuzz/ are what carry findings from
 # here back into the PR gate: promote an interesting input by committing it.
+#
+# # The budget is a COUNT of executions, never a duration (issue #49)
+#
+# `-fuzztime=<duration>` makes Go's coordinator race itself at shutdown, and
+# the loser is this workflow. In Go 1.26.6 `internal/fuzz.CoordinateFuzzing`
+# installs a deadline context ONLY when a duration was given:
+#
+#     if opts.Timeout > 0 { ctx, cancel = context.WithTimeout(ctx, ...) }
+#     fuzzCtx, cancelWorkers := context.WithCancel(ctx)
+#
+# At the deadline `coordinate()` returns `ctx.Err()` and `stop()` tries to
+# suppress it with `if err == fuzzCtx.Err()`. But `fuzzCtx` is the CHILD: the
+# parent's `Done()` channel closes before the child's `Err()` is populated, so
+# the comparison can miss and a clean, expected timeout is recorded as a test
+# failure. That is exactly what run 23893 reported —
+# `--- FAIL: FuzzSnapshotChunkRoundTrip (60.08s)` / `context deadline exceeded`
+# with NO reproducer file, i.e. a failure Go itself does not consider a finding.
+#
+# With `-fuzztime=<N>x` the budget is an execution count: `opts.Timeout` is 0,
+# no deadline context is created at all, and the coordinator ends the run
+# through an explicit `stop(nil)` at `c.count >= c.opts.Limit`. The race has no
+# participants. A count is also the better unit for a regression-oriented
+# nightly: it makes the search depth reproducible across runners of different
+# speeds instead of varying with whatever the host was doing that night.
+#
+# Removing the deadline means Go no longer bounds the wall clock, so
+# `timeout-minutes` below IS the backstop. It is the only one.
 
 on:
   schedule:
@@ -21,10 +48,10 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
-      fuzztime:
-        description: "Per-target fuzzing budget (go -fuzztime syntax)"
+      execs:
+        description: "Per-target execution budget (a count, no suffix). Empty uses the calibrated per-package budgets."
         required: false
-        default: "60s"
+        default: ""
 
 permissions:
   contents: read
@@ -34,13 +61,20 @@ env:
   GO_VERSION: "1.26.7"
   # Same rationale as ci.yml: never resolve through a stray workspace.
   GOWORK: "off"
-  FUZZTIME: ${{ inputs.fuzztime || '60s' }}
 
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.package }}
     runs-on: ubuntu-latest
-    # 11 targets in pkg/proto at 60s each, plus build and corpus minimisation.
+    # The ONLY wall-clock bound on the run, because an execution budget bounds
+    # work and not time: per-exec cost climbs as the corpus grows, and running
+    # the calibration a second time on a loaded host moved two waldb targets by
+    # 40x. So the budgets below were also run end to end: on an idle 24-core
+    # host the largest package, pkg/proto with 13 targets, took 220s, which
+    # scales to roughly 12 minutes on the runner against the ~16 that 60s per
+    # target cost it. 60 minutes is therefore ~5x headroom, and a job that
+    # reaches it has a target whose per-exec cost exploded — worth reading, not
+    # worth hiding behind a tighter number.
     timeout-minutes: 60
     strategy:
       # A crash in one package must not cancel the search in the others.
@@ -65,28 +99,163 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Fuzz every target in the package
+        env:
+          PACKAGE: ${{ matrix.package }}
+          INPUT_EXECS: ${{ inputs.execs }}
         run: |
           set -euo pipefail
-          TARGETS="$(go test -tags=quicraft_fuzz -list='^Fuzz' '${{ matrix.package }}' | grep '^Fuzz' || true)"
+
+          # Per-package execution budgets, calibrated 2026-09-01 to land near a
+          # minute per target ON THE RUNNER — the same budget the duration they
+          # replace was worth.
+          #
+          # Method: every target was run once at -fuzztime=60s on an idle
+          # 24-core host and its execution count recorded. Run 23893 measured
+          # the runner at 4.2M execs/60s on FuzzSnapshotChunkRoundTrip against
+          # 18.6M here, so the runner is ~0.23x this host and the local counts
+          # are scaled by that. Each package's budget is derived from its
+          # SLOWEST target, so nothing overruns; a faster target in the same
+          # package simply finishes earlier.
+          #
+          # One global number cannot work: the measured spread is 20k to 36M
+          # execs per minute, a factor of 1800, and it is not aligned with
+          # package boundaries either — hence the per-target overrides below.
+          case "${PACKAGE}" in
+            # 13 targets, 18.2M–36.1M execs/min; slowest FuzzMembershipRoundTrip.
+            ./pkg/proto)              EXECS=4000000 ;;
+            # 5 targets. Three cluster at 7.7M–8.4M execs/min; the two below
+            # them are overridden rather than dragging the package down.
+            ./pkg/internal/transport) EXECS=1700000 ;;
+            # 4 targets, 14.9M–29.2M execs/min.
+            ./pkg/internal/session)   EXECS=3400000 ;;
+            # 2 targets; FuzzRaftStepSequence at 3.0M execs/min sets it.
+            ./pkg/internal/raft)      EXECS=680000 ;;
+            # 9 targets in two clusters 40x apart: four at 8.6M–13.6M execs/min
+            # set this budget, five are overridden below.
+            ./pkg/logdb/waldb)        EXECS=2000000 ;;
+            # 4 targets, 11.6k–13.8k execs/min: every exec derives a key and
+            # runs an AEAD seal or open.
+            ./pkg/seal)               EXECS=2500 ;;
+            *)
+              echo "FAIL: no execution budget is calibrated for ${PACKAGE} — add one before adding the package to the matrix"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "${INPUT_EXECS}" ]; then
+            # A POSITIVE integer: leading digit 1-9, then digits. The obvious
+            # `*[!0-9]*|0)` rejects non-digits and a literal "0" but accepts
+            # "00" and "000", which are neither positive nor rejected — the step
+            # would announce the override, pass `-fuzztime=00x`, and produce a
+            # GREEN RUN THAT FUZZED NOTHING. A suite that reports success having
+            # done no work is the exact failure this whole change exists to
+            # remove, so the validation has to be as strict as the claim.
+            case "${INPUT_EXECS}" in
+              [1-9]*[!0-9]*|*[!0-9]*|0*)
+                echo "FAIL: the execs input must be a positive integer with no leading zeroes, got '${INPUT_EXECS}'"
+                exit 1
+                ;;
+            esac
+            echo "workflow_dispatch override: ${INPUT_EXECS} execs for every target"
+          fi
+
+          # An explicit workflow_dispatch budget applies uniformly; it is a
+          # human asking for a specific depth, not a calibration.
+          budget() {
+            if [ -n "${INPUT_EXECS}" ]; then
+              echo "${INPUT_EXECS}"
+              return
+            fi
+            case "$1" in
+              # 714k execs/min: builds and decodes a whole message frame.
+              FuzzMessageFrameDecode) echo 160000 ;;
+              # 20.1k execs/min, 380x below the rest of its package. Measured
+              # twice, idle and under load, within 0.1% — this one is stable
+              # and genuinely that expensive.
+              FuzzFrameHeaderUnmarshalCrash) echo 4500 ;;
+              # 44k–176k execs/min: each of these opens or replays real WAL
+              # state rather than decoding a buffer.
+              FuzzRecordRoundTrip|FuzzRecordDecodeCrash|FuzzSegmentReplayCrash|\
+              FuzzUnmarshalAddrMapCrash|FuzzUnmarshalRemovedMapCrash) echo 20000 ;;
+              *) echo "${EXECS}" ;;
+            esac
+          }
+
+          # The listing is captured into a variable of its own so that a package
+          # that does not compile fails HERE, with the Go tool's own error. A
+          # command substitution consumed directly by `for` does not trip
+          # `set -e`, and a pipe into grep would hide it behind grep's exit
+          # status, so either would report the generic "no fuzz targets found"
+          # below for what is really a build failure.
+          LISTING="$(go test -tags=quicraft_fuzz -list='^Fuzz' "${PACKAGE}")"
+          # `go test -list` prints the matching names plus a trailing
+          # "ok <pkg> <time>" line, so the names are filtered out here.
+          TARGETS=""
+          for name in ${LISTING}; do
+            case "${name}" in
+              Fuzz*) TARGETS="${TARGETS} ${name}" ;;
+            esac
+          done
           if [ -z "${TARGETS}" ]; then
-            echo "FAIL: no fuzz targets found in ${{ matrix.package }} — the build tag or the package path is wrong"
+            echo "FAIL: no fuzz targets found in ${PACKAGE} — the build tag or the package path is wrong"
             exit 1
           fi
           echo "Targets: ${TARGETS}"
           for target in ${TARGETS}; do
-            echo "==> ${target} (${FUZZTIME})"
+            count="$(budget "${target}")"
+            echo "==> ${target} (${count} execs)"
             # -run='^$' suppresses the unit tests so the whole budget is spent
             # mutating. The seed pass is already covered by ci.yml's fuzz-seeds.
             go test -tags=quicraft_fuzz -count=1 -run='^$' \
-              -fuzz="^${target}\$" -fuzztime="${FUZZTIME}" '${{ matrix.package }}'
+              -fuzz="^${target}\$" -fuzztime="${count}x" "${PACKAGE}"
           done
 
       # A crash writes its reproducer to testdata/fuzz/<Target>/ in the working
       # tree, where it would otherwise be discarded with the runner. Preserving
       # it is the entire deliverable of a failed fuzzing run: commit the file
       # and ci.yml's fuzz-seeds job turns it into a permanent regression test.
-      - name: Preserve crash reproducers
+      #
+      # The job log is the primary channel because it is the only one that
+      # works on both hosts. A reproducer is a few lines of `go test fuzz v1`
+      # text, so the log holds it whole and it can be copied straight out of a
+      # failed nightly.
+      - name: Print crash reproducers
         if: failure()
+        run: |
+          set -euo pipefail
+          # Untracked, because the committed corpus lives in the same
+          # directories: the file Go just wrote is the one git does not know.
+          # Checked explicitly rather than inside the `for`, where a failure
+          # would look identical to "nothing was written".
+          if ! untracked="$(git ls-files --others --exclude-standard -- pkg)"; then
+            echo "FAIL: could not list untracked files, so a reproducer may exist and not be shown here"
+            exit 1
+          fi
+          reproducers=""
+          for f in ${untracked}; do
+            case "${f}" in
+              */testdata/fuzz/*) reproducers="${reproducers} ${f}" ;;
+            esac
+          done
+          if [ -z "${reproducers}" ]; then
+            echo "No new file under pkg/**/testdata/fuzz/: this failure wrote no reproducer, so Go did not find a crash. Read the fuzzing step's log."
+            exit 0
+          fi
+          for f in ${reproducers}; do
+            echo "----- BEGIN ${f} -----"
+            cat -- "${f}"
+            echo "----- END ${f} -----"
+          done
+          echo "Commit these files as-is: ci.yml's fuzz-seeds job replays every file under pkg/*/testdata/fuzz/, which turns each one into a permanent regression test."
+
+      # On top of the log, never instead of it. actions/upload-artifact@v4
+      # refuses to run against a non-github.com server (devops.md §1) and this
+      # Gitea runner serves no artifact endpoint at all: run 23893 reported
+      # "Failed to CreateArtifact: Unable to make request: ECONNREFUSED", so the
+      # upload turned one fuzz failure into two and discarded the reproducer
+      # anyway. Guarding it to github.com skips it here rather than failing it.
+      - name: Upload crash reproducers
+        if: failure() && github.server_url == 'https://github.com'
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crashers-${{ strategy.job-index }}
