@@ -553,39 +553,45 @@ ci-fuzz-seeds:
 
 FUZZ_MUT_PKGS ?= ./pkg/proto ./pkg/internal/transport ./pkg/internal/session \
                  ./pkg/internal/raft ./pkg/logdb/waldb ./pkg/seal
-FUZZ_MUT_TIME  ?= 10s
-FUZZ_MUT_TRIES ?= 3
+# The release gate is a SMOKE gate: the nightly's depth divided by
+# FUZZ_MUT_DIVISOR. It exists to catch a target that is broken outright on a
+# tag, not to search — the nightly does the searching.
+FUZZ_MUT_DIVISOR ?= 6
 
 .PHONY: ci-fuzz-mutation
 ci-fuzz-mutation:
 	@set -u; overall=0; \
+	budget() { \
+		case "$$1" in \
+		  ./pkg/proto)              base=4000000 ;; \
+		  ./pkg/internal/transport) base=1700000 ;; \
+		  ./pkg/internal/session)   base=3400000 ;; \
+		  ./pkg/internal/raft)      base=680000 ;; \
+		  ./pkg/logdb/waldb)        base=2000000 ;; \
+		  ./pkg/seal)               base=2500 ;; \
+		  *) echo "FAIL: no execution budget is calibrated for $$1 -- add one before adding the package to FUZZ_MUT_PKGS" >&2; return 1 ;; \
+		esac; \
+		case "$$2" in \
+		  FuzzMessageFrameDecode) base=160000 ;; \
+		  FuzzFrameHeaderUnmarshalCrash) base=4500 ;; \
+		  FuzzRecordRoundTrip|FuzzRecordDecodeCrash|FuzzSegmentReplayCrash|\
+		  FuzzUnmarshalAddrMapCrash|FuzzUnmarshalRemovedMapCrash) base=20000 ;; \
+		esac; \
+		n=$$((base / $(FUZZ_MUT_DIVISOR))); \
+		if [ "$$n" -lt 1 ]; then n=1; fi; \
+		echo "$$n"; \
+	}; \
 	for pkg in $(FUZZ_MUT_PKGS); do \
 		targets=$$($(GO) test $(FUZZ_TAGS) -list='^Fuzz' "$$pkg" | grep '^Fuzz' || true); \
 		if [ -z "$$targets" ]; then \
 			echo "FAIL: no fuzz targets found in $$pkg"; overall=1; continue; \
 		fi; \
 		for t in $$targets; do \
-			try=1; \
-			while : ; do \
-				out=$$($(GO) test $(FUZZ_TAGS) -count=1 -run='^$$' -parallel=2 \
-					-fuzz="^$$t\$$" -fuzztime=$(FUZZ_MUT_TIME) "$$pkg" 2>&1) && break; \
-				if echo "$$out" | grep -q 'Failing input written to'; then \
-					echo "FAIL: $$pkg $$t found a crash"; \
-					echo "$$out" | tail -20; overall=1; break; \
-				fi; \
-				if ! echo "$$out" | grep -q 'context deadline exceeded'; then \
-					echo "FAIL: $$pkg $$t failed for an unrecognised reason"; \
-					echo "$$out" | tail -20; overall=1; break; \
-				fi; \
-				if [ $$try -ge $(FUZZ_MUT_TRIES) ]; then \
-					echo "FAIL: $$pkg $$t hit the coordinator shutdown artefact $(FUZZ_MUT_TRIES) times"; \
-					echo "  No reproducer was written, so this is infrastructure, not a finding,"; \
-					echo "  but it is failing the gate rather than being silently ignored."; \
-					overall=1; break; \
-				fi; \
-				echo "  retry $$try/$(FUZZ_MUT_TRIES): $$pkg $$t (coordinator shutdown, no reproducer)"; \
-				try=$$((try+1)); \
-			done; \
+			n=$$(budget "$$pkg" "$$t") || { overall=1; break; }; \
+			if ! $(GO) test $(FUZZ_TAGS) -count=1 -run='^$$$$' -parallel=2 \
+				-fuzz="^$$t\$$$$" -fuzztime=$${n}x "$$pkg"; then \
+				echo "FAIL: $$pkg $$t"; overall=1; \
+			fi; \
 		done; \
 		echo "ok $$pkg"; \
 	done; \
