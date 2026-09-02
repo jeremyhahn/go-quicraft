@@ -1834,9 +1834,18 @@ func TestConnectionCleanupOnce_PanicReturnsTrueAndRecovers(t *testing.T) {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
 
-	// Set stopC to a channel we can control.
-	testStopC := make(chan struct{})
-	tr.stopC = testStopC
+	// Drive the sweep immediately instead of waiting a real tick.
+	//
+	// This test used to take THIRTY SECONDS, because connectionCleanupOnce
+	// tickered on the 30s production interval and the panic can only fire once
+	// the ticker fires. Its own comment said "we can't wait 30s" — in a branch
+	// that was only ever reached after waiting exactly that. So it paid the full
+	// interval and then asserted the fallback, and the panic path it is named
+	// for was never actually exercised. Both problems go away with the interval
+	// as a field (#71).
+	tr.cleanupInterval = time.Millisecond
+
+	tr.stopC = make(chan struct{})
 
 	// Inject a nil connection into the pool to cause a panic during
 	// cleanStaleConnections when it tries to read conn.Context().
@@ -1844,19 +1853,43 @@ func TestConnectionCleanupOnce_PanicReturnsTrueAndRecovers(t *testing.T) {
 	tr.conns["panic-target"] = nil
 	tr.connMu.Unlock()
 
-	// Run connectionCleanupOnce. The nil connection will panic when
-	// cleanStaleConnections iterates and calls conn.Context().Done().
-	// The deferred recover should catch it and return panicked=true.
-	panicked := tr.connectionCleanupOnce()
-	if !panicked {
-		// The ticker has 30s interval, so the panic only fires if
-		// the ticker fires. Since we can't wait 30s, verify the
-		// normal exit path instead by closing stopC.
-		close(testStopC)
-		panicked = tr.connectionCleanupOnce()
-		if panicked {
-			t.Fatal("expected panicked=false after stopC closed")
-		}
+	// The nil connection panics when cleanStaleConnections calls
+	// conn.Context().Done(); the deferred recover must catch it and report
+	// panicked=true. Deterministic now, not conditional on a 30s tick.
+	if panicked := tr.connectionCleanupOnce(); !panicked {
+		t.Fatal("connectionCleanupOnce did not report the recovered panic")
+	}
+}
+
+// TestConnectionCleanupOnce_StopCReturnsFalse covers the other exit: a clean
+// shutdown returns panicked=false and does not sweep.
+//
+// It used to be the FALLBACK half of the panic test above, reached only when
+// that test's 30-second tick had already elapsed without panicking — so it ran
+// only in the case the panic assertion had effectively failed. Split out, it
+// runs every time and says which path it is testing.
+func TestConnectionCleanupOnce_StopCReturnsFalse(t *testing.T) {
+	handler := newTestHandler()
+	reg := registry.NewRegistry()
+	tr, err := NewQUICTransport(Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+	}, handler, reg)
+	if err != nil {
+		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+
+	// Long interval on purpose: the stopC branch must win without racing a tick,
+	// so a pass cannot come from the sweep happening to run first.
+	tr.cleanupInterval = time.Hour
+
+	stopC := make(chan struct{})
+	tr.stopC = stopC
+	close(stopC)
+
+	if panicked := tr.connectionCleanupOnce(); panicked {
+		t.Fatal("a clean stopC shutdown reported a panic")
 	}
 }
 

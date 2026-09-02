@@ -947,7 +947,14 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 		}
 	}()
 
-	ticker := time.NewTicker(connectionCleanupInterval)
+	// The field, not the constant: see QUICTransport.cleanupInterval. A zero
+	// value means the transport was built without the constructor, so fall back
+	// rather than panicking in NewTicker.
+	interval := t.cleanupInterval
+	if interval <= 0 {
+		interval = connectionCleanupInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {

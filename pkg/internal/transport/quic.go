@@ -235,6 +235,23 @@ type QUICTransport struct {
 	stopC   chan struct{}
 	stopped atomic.Bool
 
+	// cleanupInterval is how often connectionCleanupOnce sweeps stale, revoked
+	// and idle connections. It defaults to connectionCleanupInterval and is a
+	// FIELD rather than a bare use of that constant so a test can drive the
+	// sweep without waiting for a real tick.
+	//
+	// It is per-instance for the reason this codebase gives elsewhere (see
+	// seal.Barrier.randReader): a mutable package global is reachable from
+	// production code and from every other test in the binary, and a field is
+	// reachable from neither.
+	//
+	// The unit test for the panic path used to wait a full 30-SECOND tick, and
+	// its own comment said "we can't wait 30s" in a branch that is only reached
+	// after doing exactly that. Thirty seconds of an otherwise fast package's
+	// runtime bought nothing, and a slower suite is a wider window for the
+	// load-induced timeouts tracked in #71.
+	cleanupInterval time.Duration
+
 	// stopOnce guards the teardown so exactly one caller runs it, and
 	// stopDone is closed when that teardown has finished. Stop documents that
 	// every goroutine has finished when it returns, so a second or concurrent
@@ -525,20 +542,21 @@ func NewQUICTransport(
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
 	t := &QUICTransport{
-		cfg:            cfg,
-		handler:        handler,
-		reg:            reg,
-		tlsPair:        pair,
-		quicCfg:        qcfg,
-		conns:          make(map[string]*quic.Conn),
-		connEpoch:      make(map[string]uint64),
-		bootEpoch:      newBootEpoch(),
-		peerEpoch:      make(map[string]*peerIncarnation),
-		sendQueues:     make(map[string]*sendQueue),
-		stopC:          make(chan struct{}),
-		stopDone:       make(chan struct{}),
-		shutdownCtx:    shutdownCtx,
-		shutdownCancel: shutdownCancel,
+		cfg:             cfg,
+		handler:         handler,
+		reg:             reg,
+		tlsPair:         pair,
+		quicCfg:         qcfg,
+		conns:           make(map[string]*quic.Conn),
+		connEpoch:       make(map[string]uint64),
+		bootEpoch:       newBootEpoch(),
+		peerEpoch:       make(map[string]*peerIncarnation),
+		sendQueues:      make(map[string]*sendQueue),
+		stopC:           make(chan struct{}),
+		cleanupInterval: connectionCleanupInterval,
+		stopDone:        make(chan struct{}),
+		shutdownCtx:     shutdownCtx,
+		shutdownCancel:  shutdownCancel,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, 0, cfg.SendBatchMaxSize+FrameHeaderSize)
