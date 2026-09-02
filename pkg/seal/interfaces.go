@@ -90,6 +90,22 @@ type StorageBackend interface {
 	//     must refuse rather than decide: treating a local read fault as
 	//     "value differs" leaves the key on one replica while peers that read
 	//     successfully removed it.
+	//
+	// A NIL expected IS A VALUE, NOT A WILDCARD, and this is stated explicitly
+	// because an adjacent guarded verb elsewhere in the portfolio reads it the
+	// other way. nil compares equal to a stored EMPTY value and to nothing else;
+	// an ABSENT key is refused whatever expected holds, because the compare has
+	// nothing to compare against. So nil never means "require the key absent",
+	// and there is no way to spell that request through this method — PutIfAbsent
+	// is the verb for an absence-guarded write.
+	//
+	// The conformance test in this package is the normative statement of that
+	// contract; the reference store compares with bytes.Equal after an existence
+	// check, which is exactly the behaviour described above. go-qrdb's engine
+	// (handleCompareAndDelete) matches it. go-xkms's CompareAndSwapper does NOT
+	// — it reads nil as "require the key ABSENT" — which is tracked as go-xkms
+	// #186; an implementer coming from that interface must not carry the
+	// assumption across (go-quicraft #45).
 	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 
 	Close() error

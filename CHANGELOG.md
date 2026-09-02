@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
   exposing a construction-time property; no behaviour of either mode changes.
 
+
+
+
+- **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
+  strategy binds its passphrase at Seal/Unseal time or at construction. The two
+  modes have opposite credential semantics (a bound strategy IGNORES the
+  `Credentials` handed to `UnsealRootKey`; a deferred one validates against
+  them), and until now the distinction was invisible from outside the package.
+  A consumer replacing a registered strategy therefore could not preserve the
+  mode of the one it replaced, and installing a bound strategy where a deferred
+  one stood turns a barrier that authenticates its unsealer into one that
+  accepts any passphrase for the lifetime of the process — measured on the
+  production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
+  exposing a construction-time property; no behaviour of either mode changes.
+
 ### Changed
 
 - **CI no longer installs analysis tools at job time on the Gitea fabric
@@ -104,6 +119,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **`StorageBackend.CompareAndDelete` states the nil contract explicitly, and a
+  conformance test enforces it (#45)** — nil `expected` is a **value, not a
+  wildcard**: it equals a stored empty value and nothing else, and an absent key
+  is refused whatever `expected` holds. Written down because a sibling interface
+  one layer up reads it the other way — go-xkms's `CompareAndSwapper` treats nil
+  as *"require the key ABSENT"* (go-xkms #186) — while go-qrdb's engine agrees
+  with the behaviour asserted here. An implementer arriving from that interface
+  would otherwise carry the assumption across and build a store that deletes on
+  absence, silently and only under the interleaving that matters.
 - **`SealingStrategy` now states that honouring `Credentials` is
   implementation-defined (#43)**, that replacing a registered strategy can
   silently change whether the barrier authenticates its unsealer, and — on

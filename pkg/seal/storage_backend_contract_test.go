@@ -230,6 +230,90 @@ func TestCompareAndDeleteStopsAStaleReleaserFromRemovingTheNextHolder(t *testing
 // The guarantee is only as good as its serialization: concurrent releasers all
 // holding the same observed value must produce exactly one winner, the same
 // property PutIfAbsent has on the acquire side.
+// TestCompareAndDeleteNilExpectedIsAValueNotAWildcard pins the nil semantics,
+// which is the one part of this contract an implementer is most likely to get
+// wrong by importing an assumption from elsewhere.
+//
+// nil is a VALUE: it compares equal to a stored EMPTY value and to nothing
+// else. It is NOT a wildcard, and it does NOT mean "require the key absent" —
+// an absent key is refused whatever expected holds, because the compare has
+// nothing to compare against. PutIfAbsent is the verb for an absence-guarded
+// write; there is deliberately no way to spell that request through this one.
+//
+// This is written down as a test rather than only as prose because a sibling
+// interface one layer up reads nil the opposite way: go-xkms's
+// CompareAndSwapper treats nil as "require the key ABSENT" (go-xkms #186).
+// go-qrdb's engine agrees with the behaviour asserted here. An implementer
+// arriving from the go-xkms interface would otherwise carry the assumption
+// across and produce a store that deletes on absence — silently, and only
+// under the interleaving that matters (go-quicraft #45).
+func TestCompareAndDeleteNilExpectedIsAValueNotAWildcard(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil matches a stored EMPTY value", func(t *testing.T) {
+		s := newReferenceStore()
+		if err := s.Put(ctx, "k", []byte{}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		deleted, err := s.CompareAndDelete(ctx, "k", nil)
+		if err != nil {
+			t.Fatalf("CompareAndDelete: %v", err)
+		}
+		if !deleted {
+			t.Fatal("nil expected did not match a stored empty value; nil is a value, " +
+				"and an empty stored value is the one thing it equals")
+		}
+	})
+
+	t.Run("nil does NOT match an ABSENT key", func(t *testing.T) {
+		s := newReferenceStore()
+		deleted, err := s.CompareAndDelete(ctx, "missing", nil)
+		if err != nil {
+			t.Fatalf("CompareAndDelete on an absent key must be an outcome, not an error: %v", err)
+		}
+		if deleted {
+			t.Fatal("nil expected matched an ABSENT key. nil is not a wildcard and not " +
+				"\"require absent\": a guarded delete on a key that is not there has " +
+				"nothing to compare, so it must refuse. Reporting deleted=true here " +
+				"tells a caller it released a claim it never held.")
+		}
+	})
+
+	t.Run("nil does NOT match a NON-EMPTY value", func(t *testing.T) {
+		s := newReferenceStore()
+		if err := s.Put(ctx, "k", []byte("held")); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		deleted, err := s.CompareAndDelete(ctx, "k", nil)
+		if err != nil {
+			t.Fatalf("CompareAndDelete: %v", err)
+		}
+		if deleted {
+			t.Fatal("nil expected deleted a key holding a non-empty value — that is the " +
+				"wildcard reading, and it turns every guarded release into an unguarded one")
+		}
+		if v, err := s.Get(ctx, "k"); err != nil || string(v) != "held" {
+			t.Fatalf("refused delete must leave the store unchanged; got %q, %v", v, err)
+		}
+	})
+
+	t.Run("an empty non-nil slice behaves identically to nil", func(t *testing.T) {
+		s := newReferenceStore()
+		if err := s.Put(ctx, "k", []byte{}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		deleted, err := s.CompareAndDelete(ctx, "k", []byte{})
+		if err != nil {
+			t.Fatalf("CompareAndDelete: %v", err)
+		}
+		if !deleted {
+			t.Fatal("an empty non-nil expected must behave exactly as nil does; the " +
+				"contract is about the VALUE, not about which of Go's two spellings " +
+				"of an empty slice the caller happened to pass")
+		}
+	})
+}
+
 func TestCompareAndDeleteHasExactlyOneWinnerUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	s := newReferenceStore()
