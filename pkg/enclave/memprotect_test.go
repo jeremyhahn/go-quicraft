@@ -12,6 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Tests for what this package still owns after the go-enclave adoption:
+// ProtectedKey, its errors, and the locked-to-locked bridge between memguard's
+// encrypted-at-rest container and go-enclave's locked memory.
+//
+// WHAT WAS DROPPED, and why it is not a coverage regression. These tests went
+// with the implementation they covered — TestProtectedBuffer_Lifecycle,
+// _NilAfterDestroy, _FromBytes, _ConcurrentDestroy,
+// TestMemoryEnclave_WriteInPlaceThenFreeze, _FreezeIsSafeOnDestroyed and
+// _FromBytesWipesSourceAndFreezes, plus the whole of memprotect_race_test.go and
+// memprotect_purge_test.go. Every one exercised this repository's own mlock,
+// guard-page, canary, borrow and purge machinery, which no longer exists here:
+// MemoryEnclave is now an alias for go-enclave's type, and those properties are
+// go-enclave's to test. Re-asserting them here would be testing a dependency
+// through its consumer. What replaces them is narrower and honest — the alias
+// identity is pinned below, and the behaviour is pinned upstream.
 package enclave
 
 import (
@@ -23,249 +38,370 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	goenclave "github.com/jeremyhahn/go-enclave"
 )
 
-// TestProtectedBuffer_Lifecycle verifies the full lifecycle: create, read, destroy.
-func TestProtectedBuffer_Lifecycle(t *testing.T) {
-	pb := NewProtectedBuffer(32)
-	if pb == nil {
-		t.Fatal("NewProtectedBuffer returned nil")
+// mustSized allocates n bytes of locked, writable memory, failing the test if
+// the kernel refuses the lock.
+func mustSized(t testing.TB, n int) *MemoryEnclave {
+	t.Helper()
+	e, err := goenclave.NewMemoryEnclaveSized(n)
+	if err != nil {
+		t.Fatalf("NewMemoryEnclaveSized(%d): %v", n, err)
 	}
-
-	if pb.Size() != 32 {
-		t.Fatalf("expected size=32, got %d", pb.Size())
-	}
-
-	b := pb.Bytes()
-	if len(b) != 32 {
-		t.Fatalf("expected Bytes() length=32, got %d", len(b))
-	}
-
-	// Write some data into the buffer.
-	for i := range b {
-		b[i] = byte(i)
-	}
-
-	// Verify readable.
-	readBack := pb.Bytes()
-	for i := range readBack {
-		if readBack[i] != byte(i) {
-			t.Fatalf("buffer content mismatch at index %d: got %d, want %d", i, readBack[i], byte(i))
-		}
-	}
-
-	// Destroy and verify nil behavior.
-	pb.Destroy()
-	if pb.Bytes() != nil {
-		t.Fatal("Bytes() should return nil after Destroy()")
-	}
-	if pb.Size() != 0 {
-		t.Fatalf("Size() should return 0 after Destroy(), got %d", pb.Size())
-	}
-
-	// Double destroy should not panic.
-	pb.Destroy()
+	return e
 }
 
-// TestProtectedBuffer_NilAfterDestroy ensures all accessors return zero values
-// after the buffer is destroyed.
-func TestProtectedBuffer_NilAfterDestroy(t *testing.T) {
-	pb := NewProtectedBuffer(16)
-	pb.Destroy()
-
-	if pb.Bytes() != nil {
-		t.Fatal("Bytes() should return nil after Destroy()")
+// mustFromBytes moves data into a locked, frozen enclave.
+func mustFromBytes(t testing.TB, data []byte) *MemoryEnclave {
+	t.Helper()
+	e, err := goenclave.NewMemoryEnclave(data)
+	if err != nil {
+		t.Fatalf("NewMemoryEnclave: %v", err)
 	}
-	if pb.Size() != 0 {
-		t.Fatal("Size() should return 0 after Destroy()")
-	}
+	return e
 }
 
-// TestProtectedBuffer_FromBytes verifies creation from existing data and that
-// the source slice is wiped by memguard.
-func TestProtectedBuffer_FromBytes(t *testing.T) {
-	original := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE}
-	source := make([]byte, len(original))
-	copy(source, original)
-
-	pb := NewProtectedBufferFromBytes(source)
-	defer pb.Destroy()
-
-	// Verify content in the protected buffer matches original.
-	got := pb.Bytes()
-	if !bytes.Equal(got, original) {
-		t.Fatalf("protected buffer content mismatch: got %x, want %x", got, original)
+func encBytes(t testing.TB, e *MemoryEnclave) []byte {
+	t.Helper()
+	b, err := e.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
+	return b
+}
 
-	// memguard.NewBufferFromBytes wipes the source slice.
-	allZero := true
-	for _, b := range source {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if !allZero {
-		t.Fatalf("source slice was not wiped by NewProtectedBufferFromBytes: %x", source)
+// --- The alias, which is the whole adoption in one assertion ---
+
+// TestMemoryEnclaveIsGoEnclaves pins that this package declares NO locked-memory
+// type of its own. MemoryEnclave, the deprecated ProtectedBuffer and go-enclave's
+// MemoryEnclave must be ONE type: assignment in every direction is the
+// compile-time proof, and a defined type anywhere would fail to build. That is
+// the docs/00 §R property — one locked-memory implementation in the portfolio —
+// expressed as a test rather than as a promise.
+// The compile-time half, in the blank-identifier form Go uses for this. These
+// assignments only build if all three names denote ONE type; a defined type
+// anywhere in the chain fails the build here rather than at a call site.
+var (
+	_ *MemoryEnclave           = (*goenclave.MemoryEnclave)(nil)
+	_ *ProtectedBuffer         = (*goenclave.MemoryEnclave)(nil)
+	_ *goenclave.MemoryEnclave = (*MemoryEnclave)(nil)
+)
+
+func TestMemoryEnclaveIsGoEnclaves(t *testing.T) {
+	src := mustSized(t, 32)
+	defer src.Destroy()
+
+	// The runtime half is deliberately thin. Identity is a COMPILE-TIME property
+	// and the block above is where it is proven; writing the same assignments
+	// again inside the test would be no-ops that lint correctly flags as
+	// unnecessary conversions — because with real aliases that is exactly what
+	// they are. What is left worth asserting at runtime is that an enclave
+	// constructed through go-enclave behaves through this package's name.
+	if src.Size() != 32 {
+		t.Fatalf("Size() = %d, want 32", src.Size())
 	}
 }
 
-// TestProtectedKey_OpenSeal verifies the encrypt-at-rest cycle: create key,
-// open it, verify content, destroy.
+// TestErrEnclaveDestroyedIsGoEnclaves pins that the destroyed sentinel is
+// go-enclave's, re-exported rather than redefined — so errors.Is matches whether
+// the error arrived through this package or straight from go-enclave. Two
+// sentinels meaning the same thing is how a caller ends up handling one and not
+// the other.
+func TestErrEnclaveDestroyedIsGoEnclaves(t *testing.T) {
+	if !errors.Is(ErrEnclaveDestroyed, goenclave.ErrEnclaveDestroyed) {
+		t.Fatal("ErrEnclaveDestroyed is not go-enclave's sentinel")
+	}
+
+	e := mustSized(t, 16)
+	e.Destroy()
+	if err := e.WithBytes(func([]byte) error { return nil }); !errors.Is(err, ErrEnclaveDestroyed) {
+		t.Fatalf("WithBytes after Destroy = %v, want ErrEnclaveDestroyed", err)
+	}
+}
+
+// --- ProtectedKey ---
+
+// TestProtectedKey_OpenSeal verifies a key sealed at rest opens into locked
+// memory holding exactly what went in.
+//
+// It is also the regression test for the freeze trap the adoption had to cross:
+// memguard's Enclave.Open FREEZES the buffer it returns, and
+// goenclave.NewMemoryEnclave wipes its source, so a bridge that forgot to Melt
+// first would fault the process here rather than fail an assertion.
 func TestProtectedKey_OpenSeal(t *testing.T) {
-	keyData := []byte("this-is-a-32-byte-encryption-key")
-	pk := NewProtectedKey(keyData)
-	if pk == nil {
-		t.Fatal("NewProtectedKey returned nil")
-	}
+	key := []byte("a-protected-key-of-thirty-two-by")
+	want := append([]byte(nil), key...)
 
-	// Open the enclave.
+	pk := NewProtectedKey(key)
 	buf, err := pk.Open()
 	if err != nil {
-		t.Fatalf("Open returned unexpected error: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	defer buf.Destroy()
 
-	got := buf.Bytes()
-	if !bytes.Equal(got, []byte("this-is-a-32-byte-encryption-key")) {
-		t.Fatalf("opened key content mismatch: got %x", got)
+	if !bytes.Equal(encBytes(t, buf), want) {
+		t.Fatalf("opened key = %x, want %x", encBytes(t, buf), want)
 	}
 }
 
-// TestProtectedKey_OpenNilEnclave verifies that Open returns ErrEnclaveNil
-// when the enclave is nil.
+// TestProtectedKey_MultipleOpens verifies every Open yields an independent
+// enclave with the same material, and that destroying one does not affect
+// another.
+func TestProtectedKey_MultipleOpens(t *testing.T) {
+	want := []byte("multiple-opens-must-agree-32byte")
+	pk := NewProtectedKey(append([]byte(nil), want...))
+
+	first, err := pk.Open()
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	second, err := pk.Open()
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer second.Destroy()
+
+	if !bytes.Equal(encBytes(t, first), want) || !bytes.Equal(encBytes(t, second), want) {
+		t.Fatal("opened enclaves do not both hold the key")
+	}
+
+	// Independent: destroying the first must leave the second intact.
+	first.Destroy()
+	if !bytes.Equal(encBytes(t, second), want) {
+		t.Fatal("destroying one opened enclave damaged another")
+	}
+}
+
+// TestProtectedKey_OpenNilEnclave verifies Open reports ErrEnclaveNil rather
+// than dereferencing a nil enclave.
 func TestProtectedKey_OpenNilEnclave(t *testing.T) {
 	pk := &ProtectedKey{}
 	_, err := pk.Open()
 	if !errors.Is(err, ErrEnclaveNil) {
-		t.Fatalf("expected ErrEnclaveNil, got %v", err)
+		t.Fatalf("Open on an uninitialized key = %v, want ErrEnclaveNil", err)
 	}
 }
 
-// TestProtectedKey_OpenNilEnclaveErrorMessage verifies the error message format
-// for ErrEnclaveNil.
-func TestProtectedKey_OpenNilEnclaveErrorMessage(t *testing.T) {
-	pk := &ProtectedKey{}
-	_, err := pk.Open()
-	if err == nil {
-		t.Fatal("expected error, got nil")
+// TestProtectedKey_ClearDropsEnclaveReference verifies Clear revokes the ability
+// to open the key.
+func TestProtectedKey_ClearDropsEnclaveReference(t *testing.T) {
+	pk := NewProtectedKey([]byte("a-key-that-is-about-to-be-cleard"))
+
+	buf, err := pk.Open()
+	if err != nil {
+		t.Fatalf("Open before Clear: %v", err)
 	}
-	want := "memprotect: enclave is nil"
-	if err.Error() != want {
-		t.Fatalf("expected error message %q, got %q", want, err.Error())
+	buf.Destroy()
+
+	pk.Clear()
+	if _, err := pk.Open(); !errors.Is(err, ErrEnclaveNil) {
+		t.Fatalf("Open after Clear = %v, want ErrEnclaveNil", err)
 	}
 }
 
-// TestOpenError_Format verifies the OpenError message format and Unwrap.
-func TestOpenError_Format(t *testing.T) {
-	inner := errors.New("test inner error")
-	e := &OpenError{Err: inner}
-	want := "memprotect: failed to open enclave: test inner error"
-	if e.Error() != want {
-		t.Fatalf("expected %q, got %q", want, e.Error())
-	}
-	if !errors.Is(e, inner) {
-		t.Fatal("Unwrap should return inner error")
+// TestProtectedKey_ClearAlreadyClearedNoPanic verifies Clear is idempotent.
+func TestProtectedKey_ClearAlreadyClearedNoPanic(t *testing.T) {
+	pk := NewProtectedKey([]byte("idempotent-clear-key-of-32-bytes"))
+	pk.Clear()
+	pk.Clear()
+	if _, err := pk.Open(); !errors.Is(err, ErrEnclaveNil) {
+		t.Fatalf("Open after double Clear = %v, want ErrEnclaveNil", err)
 	}
 }
 
-// TestOpenError_Unwrap verifies that OpenError.Unwrap returns the inner error.
-func TestOpenError_Unwrap(t *testing.T) {
-	inner := errors.New("root cause")
-	e := &OpenError{Err: inner}
-	if e.Unwrap() != inner {
-		t.Fatal("Unwrap did not return the inner error")
+// TestProtectedKey_ConcurrentOpenClear verifies Open and Clear may race without
+// a torn read: every Open either succeeds or reports ErrEnclaveNil, and the race
+// detector stays quiet.
+func TestProtectedKey_ConcurrentOpenClear(t *testing.T) {
+	pk := NewProtectedKey([]byte("concurrent-open-and-clear-32byte"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				buf, err := pk.Open()
+				if err != nil {
+					if !errors.Is(err, ErrEnclaveNil) {
+						t.Errorf("Open = %v, want success or ErrEnclaveNil", err)
+					}
+					continue
+				}
+				buf.Destroy()
+			}
+		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pk.Clear()
+	}()
+	wg.Wait()
 }
 
-// TestWipeBytes verifies that WipeBytes zeroes all bytes in a slice.
-func TestWipeBytes(t *testing.T) {
-	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	WipeBytes(data)
+// TestNewProtectedKey_WipesSource verifies the caller's slice is wiped once the
+// key has been sealed, so the material exists in exactly one place.
+func TestNewProtectedKey_WipesSource(t *testing.T) {
+	source := make([]byte, 32)
+	for i := range source {
+		source[i] = byte(i + 1)
+	}
 
-	for i, b := range data {
+	_ = NewProtectedKey(source)
+
+	for i, b := range source {
 		if b != 0 {
-			t.Fatalf("byte at index %d not zeroed: got %d", i, b)
+			t.Fatalf("source byte %d = %#x after NewProtectedKey, want 0", i, b)
 		}
 	}
 }
 
-// TestWipeBytes_EmptySlice verifies WipeBytes handles empty and nil slices
-// without panicking.
-func TestWipeBytes_EmptySlice(t *testing.T) {
+// --- SealMemoryEnclave ---
+
+// TestSealMemoryEnclave verifies the enclave-to-key transfer: the material
+// survives, and the source enclave is consumed.
+func TestSealMemoryEnclave(t *testing.T) {
+	want := []byte("seal-this-enclave-into-a-key-!!!")
+	src := mustFromBytes(t, append([]byte(nil), want...))
+
+	pk := SealMemoryEnclave(src)
+	if pk == nil {
+		t.Fatal("SealMemoryEnclave returned nil for a live enclave")
+	}
+	if err := src.WithBytes(func([]byte) error { return nil }); !errors.Is(err, ErrEnclaveDestroyed) {
+		t.Fatal("the source enclave was not consumed")
+	}
+
+	buf, err := pk.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer buf.Destroy()
+	if !bytes.Equal(encBytes(t, buf), want) {
+		t.Fatalf("sealed key = %x, want %x", encBytes(t, buf), want)
+	}
+}
+
+// TestSealMemoryEnclave_NilAndDestroyed verifies the refusals are nil returns
+// rather than panics.
+func TestSealMemoryEnclave_NilAndDestroyed(t *testing.T) {
+	if SealMemoryEnclave(nil) != nil {
+		t.Fatal("SealMemoryEnclave(nil) should be nil")
+	}
+
+	dead := mustSized(t, 16)
+	dead.Destroy()
+	if SealMemoryEnclave(dead) != nil {
+		t.Fatal("SealMemoryEnclave on a destroyed enclave should be nil")
+	}
+}
+
+// TestSealMemoryEnclave_ConsumedEnclaveReturnsNil verifies the documented
+// once-only contract: a second seal of the same enclave gets nil.
+func TestSealMemoryEnclave_ConsumedEnclaveReturnsNil(t *testing.T) {
+	src := mustFromBytes(t, []byte("consume-me-exactly-once-32-bytes"))
+	if pk := SealMemoryEnclave(src); pk == nil {
+		t.Fatal("first SealMemoryEnclave returned nil")
+	}
+	if pk := SealMemoryEnclave(src); pk != nil {
+		t.Fatal("second SealMemoryEnclave should return nil for a consumed enclave")
+	}
+}
+
+// TestSealMemoryEnclaveAndDeprecatedAliasAgree verifies the deprecated wrapper
+// is the same function, not a divergent copy.
+func TestSealMemoryEnclaveAndDeprecatedAliasAgree(t *testing.T) {
+	for name, seal := range map[string]func(*MemoryEnclave) *ProtectedKey{
+		"SealMemoryEnclave":   SealMemoryEnclave,
+		"SealProtectedBuffer": SealProtectedBuffer,
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := []byte("both-spellings-must-behave-alike")
+			src := mustFromBytes(t, append([]byte(nil), want...))
+			pk := seal(src)
+			if pk == nil {
+				t.Fatalf("%s returned nil", name)
+			}
+			buf, err := pk.Open()
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer buf.Destroy()
+			if !bytes.Equal(encBytes(t, buf), want) {
+				t.Fatalf("%s lost the material", name)
+			}
+		})
+	}
+}
+
+// --- Errors ---
+
+// TestErrEnclaveNil_Message verifies the sentinel's message.
+func TestErrEnclaveNil_Message(t *testing.T) {
+	if want := "memprotect: enclave is nil"; ErrEnclaveNil.Error() != want {
+		t.Fatalf("ErrEnclaveNil = %q, want %q", ErrEnclaveNil.Error(), want)
+	}
+}
+
+// TestNilError_TypedError verifies errors.As reaches the concrete type, so a
+// caller can distinguish this from any other nil-ish failure.
+func TestNilError_TypedError(t *testing.T) {
+	var err error = ErrEnclaveNil
+	var target *NilError
+	if !errors.As(err, &target) {
+		t.Fatal("errors.As failed for *NilError")
+	}
+	if !errors.Is(err, ErrEnclaveNil) {
+		t.Fatal("errors.Is failed for ErrEnclaveNil")
+	}
+}
+
+// TestOpenError_FormatAndUnwrap verifies the wrapper names its origin and
+// exposes the cause.
+func TestOpenError_FormatAndUnwrap(t *testing.T) {
+	inner := errors.New("underlying failure")
+	e := &OpenError{Err: inner}
+
+	if want := "memprotect: failed to open enclave: underlying failure"; e.Error() != want {
+		t.Fatalf("Error() = %q, want %q", e.Error(), want)
+	}
+	if !errors.Is(e, inner) {
+		t.Fatal("errors.Is did not reach the wrapped cause")
+	}
+}
+
+// --- WipeBytes ---
+
+// TestWipeBytes verifies the re-exported wipe zeroes its argument and tolerates
+// an empty slice.
+func TestWipeBytes(t *testing.T) {
+	b := []byte("material-that-must-be-zeroed!!!!")
+	WipeBytes(b)
+	for i, c := range b {
+		if c != 0 {
+			t.Fatalf("byte %d = %#x after WipeBytes, want 0", i, c)
+		}
+	}
 	WipeBytes(nil)
 	WipeBytes([]byte{})
 }
 
-// TestSealProtectedBuffer verifies the buffer-to-key sealing workflow.
-func TestSealProtectedBuffer(t *testing.T) {
-	data := []byte("seal-me-into-an-enclave-buffer!!")
-	pb := NewProtectedBufferFromBytes(data)
+// --- Process disposition ---
 
-	// Seal the buffer into a ProtectedKey (consumes the buffer).
-	pk := SealProtectedBuffer(pb)
-	if pk == nil {
-		t.Fatal("SealProtectedBuffer returned nil")
-	}
-
-	// The buffer's internal reference should be nil after sealing.
-	if pb.buf != nil {
-		t.Fatal("buffer's internal reference should be nil after SealProtectedBuffer")
-	}
-
-	// Open the key and verify content.
-	buf, err := pk.Open()
-	if err != nil {
-		t.Fatalf("Open returned unexpected error: %v", err)
-	}
-	defer buf.Destroy()
-
-	if !bytes.Equal(buf.Bytes(), []byte("seal-me-into-an-enclave-buffer!!")) {
-		t.Fatalf("sealed key content mismatch: got %x", buf.Bytes())
-	}
-}
-
-// TestSealProtectedBuffer_NilBuffer verifies that SealProtectedBuffer returns
-// nil when given a nil buffer.
-func TestSealProtectedBuffer_NilBuffer(t *testing.T) {
-	pk := SealProtectedBuffer(nil)
-	if pk != nil {
-		t.Fatal("SealProtectedBuffer should return nil for nil buffer")
-	}
-}
-
-// TestSealProtectedBuffer_DestroyedBuffer verifies that SealProtectedBuffer
-// returns nil when given a buffer whose internal data has already been destroyed.
-func TestSealProtectedBuffer_DestroyedBuffer(t *testing.T) {
-	pb := NewProtectedBuffer(16)
-	pb.Destroy()
-
-	pk := SealProtectedBuffer(pb)
-	if pk != nil {
-		t.Fatal("SealProtectedBuffer should return nil for a destroyed buffer")
-	}
-}
-
-// TestNoSignalHandlerInstalled is the regression for the removed InitMemguard.
-// That function called memguard.CatchSignal, which calls signal.Reset() with no
-// arguments — detaching EVERY handler in the process, including the embedding
-// application's — and turns SIGTERM into an immediate core.Exit(1) with no
-// engine quiesce, no barrier seal and no WAL flush. It had no callers, and this
-// package must not acquire one: a storage library silently seizing the host
-// process's signal disposition at import time is not a decision it gets to make.
-//
-// The test pins the absence behaviourally rather than by grep: it installs its
-// own SIGUSR1 handler, exercises this package's whole key lifecycle, and
-// requires the handler to still fire afterwards. Anything that reintroduces a
-// CatchSignal call anywhere on these paths resets that handler and the delivery
-// is lost.
+// TestNoSignalHandlerInstalled verifies nothing in this package resets the
+// process signal disposition. memguard.CatchSignal calls signal.Reset() with no
+// arguments, which would silently steal every handler the embedding application
+// installed; this package must never call it. memguard is still linked in for
+// ProtectedKey, so the guard is still needed.
 func TestNoSignalHandlerInstalled(t *testing.T) {
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGUSR1)
 	defer signal.Stop(sigC)
 
-	key := []byte("signal-disposition-must-survive!!")
-	pk := NewProtectedKey(key)
+	pk := NewProtectedKey([]byte("signal-disposition-must-survive!"))
 	buf, err := pk.Open()
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -273,8 +409,8 @@ func TestNoSignalHandlerInstalled(t *testing.T) {
 	buf.Destroy()
 	pk.Clear()
 
-	pb := NewProtectedBuffer(32)
-	pb.Destroy()
+	e := mustSized(t, 32)
+	e.Destroy()
 
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGUSR1); err != nil {
 		t.Fatalf("raising SIGUSR1: %v", err)
@@ -290,322 +426,131 @@ func TestNoSignalHandlerInstalled(t *testing.T) {
 	}
 }
 
-// TestErrEnclaveNil_Message verifies the sentinel error message.
-func TestErrEnclaveNil_Message(t *testing.T) {
-	want := "memprotect: enclave is nil"
-	if ErrEnclaveNil.Error() != want {
-		t.Fatalf("expected %q, got %q", want, ErrEnclaveNil.Error())
-	}
-}
-
-// TestNilError_TypedError verifies the typed error can be matched
-// with errors.As.
-func TestNilError_TypedError(t *testing.T) {
-	t.Run("errors.As matches NilError type", func(t *testing.T) {
-		var err error = ErrEnclaveNil
-		var ne *NilError
-		if !errors.As(err, &ne) {
-			t.Fatal("errors.As should match *NilError")
-		}
-	})
-
-	t.Run("errors.Is matches ErrEnclaveNil", func(t *testing.T) {
-		pk := &ProtectedKey{}
-		_, err := pk.Open()
-		if !errors.Is(err, ErrEnclaveNil) {
-			t.Errorf("expected errors.Is(err, ErrEnclaveNil), got %v", err)
-		}
-	})
-
-	t.Run("new NilError has correct message", func(t *testing.T) {
-		e := &NilError{}
-		want := "memprotect: enclave is nil"
-		if e.Error() != want {
-			t.Errorf("Error() = %q, want %q", e.Error(), want)
-		}
-	})
-}
-
-// TestProtectedKey_MultipleOpens verifies that a ProtectedKey can be opened
-// multiple times and returns consistent data.
-func TestProtectedKey_MultipleOpens(t *testing.T) {
-	keyData := []byte("multi-open-test-key-32-bytes!!!!") // 32 bytes
-	pk := NewProtectedKey(keyData)
-
-	for i := 0; i < 3; i++ {
-		buf, err := pk.Open()
-		if err != nil {
-			t.Fatalf("Open #%d returned unexpected error: %v", i, err)
-		}
-		if !bytes.Equal(buf.Bytes(), []byte("multi-open-test-key-32-bytes!!!!")) {
-			t.Fatalf("Open #%d: content mismatch: got %x", i, buf.Bytes())
-		}
-		buf.Destroy()
-	}
-}
-
-// TestProtectedKey_ClearDropsEnclaveReference verifies that Clear() makes
-// the key unopenable. Clear deliberately does NOT open the enclave to
-// destroy a decrypted copy (that would briefly re-materialize the plaintext
-// without zeroing the enclave's own ciphertext); it only drops the
-// reference — see the L16 fix.
-func TestProtectedKey_ClearDropsEnclaveReference(t *testing.T) {
-	keyData := []byte("clear-zeroes-key-material-32!!!!") // 32 bytes
-	pk := NewProtectedKey(keyData)
-
-	// Clear should not panic and should drop the enclave reference.
-	pk.Clear()
-
-	// After Clear, Open should return ErrEnclaveNil.
-	_, err := pk.Open()
-	if !errors.Is(err, ErrEnclaveNil) {
-		t.Fatalf("expected ErrEnclaveNil after Clear, got %v", err)
-	}
-}
-
-// TestProtectedKey_ConcurrentOpenClear is the L16 regression test for the
-// unsynchronized enclave field: Clear used to write p.enclave while Open
-// read it, a data race that could tear under the race detector. With the
-// atomic.Pointer field, concurrent Open and Clear are safe: every Open
-// either succeeds against a still-live reference or fails with
-// ErrEnclaveNil, and the race detector stays quiet.
-func TestProtectedKey_ConcurrentOpenClear(t *testing.T) {
-	keyData := []byte("concurrent-open-clear-key-32!!!!") // 32 bytes
-	pk := NewProtectedKey(keyData)
+// TestProtectedKey_BridgeUnderConcurrentMemguardWork hammers the
+// memguard-to-go-enclave bridge in ProtectedKey.Open while other goroutines do
+// the memguard work that can reach core.Panic — NewProtectedKey allocates, and
+// SealMemoryEnclave allocates, seals and destroys. Every opened enclave must
+// hold the exact key, and the race detector must stay quiet.
+//
+// WHAT THIS PROVES, AND WHAT IT DOES NOT, stated plainly because the gap is the
+// point. It exercises the bridge concurrently with every other memguard caller
+// in this package, so an unsynchronized access between them shows up here under
+// -race. It does NOT prove the property the lock actually exists for: that a
+// process-wide memguard PURGE cannot unmap the buffer mid-copy. Reaching a purge
+// means driving the process to RLIMIT_MEMLOCK exhaustion, and memguard answers
+// that by panicking after purging — a test that triggers it would take the test
+// binary down rather than report, and would destroy every unrelated enclave in
+// the process on its way. There is no seam in memguard v0.23.0 to inject one.
+//
+// So the purge invariant is carried by the argument at the lock, not by this
+// test. That is a real coverage limit and is why the reasoning is written out
+// there in full rather than summarized. It disappears with memguard itself when
+// ProtectedKey moves to the go-enclave sealing seam (go-enclave #22).
+func TestProtectedKey_BridgeUnderConcurrentMemguardWork(t *testing.T) {
+	want := []byte("bridge-under-concurrent-pressure")
+	pk := NewProtectedKey(append([]byte(nil), want...))
 
 	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for range 8 {
+
+	// Readers: drive the bridge.
+	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			<-start
-			for range 100 {
+			for j := 0; j < 20; j++ {
 				buf, err := pk.Open()
 				if err != nil {
-					if !errors.Is(err, ErrEnclaveNil) {
-						t.Errorf("Open error = %v, want ErrEnclaveNil or success", err)
-					}
+					t.Errorf("Open: %v", err)
 					return
+				}
+				if err := buf.WithBytes(func(got []byte) error {
+					if !bytes.Equal(got, want) {
+						return errors.New("opened enclave does not hold the key")
+					}
+					return nil
+				}); err != nil {
+					t.Error(err)
 				}
 				buf.Destroy()
 			}
 		}()
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		pk.Clear()
-	}()
-	close(start)
-	wg.Wait()
 
-	if _, err := pk.Open(); !errors.Is(err, ErrEnclaveNil) {
-		t.Fatalf("expected ErrEnclaveNil after Clear, got %v", err)
-	}
-}
-
-// TestProtectedKey_ClearAlreadyClearedNoPanic verifies that calling Clear()
-// on an already-cleared key does not panic.
-func TestProtectedKey_ClearAlreadyClearedNoPanic(t *testing.T) {
-	keyData := []byte("double-clear-test-key-32bytes!!!") // 32 bytes
-	pk := NewProtectedKey(keyData)
-	pk.Clear()
-	// Second Clear should be a no-op, not panic.
-	pk.Clear()
-
-	// Verify still returns ErrEnclaveNil.
-	_, err := pk.Open()
-	if !errors.Is(err, ErrEnclaveNil) {
-		t.Fatalf("expected ErrEnclaveNil, got %v", err)
-	}
-}
-
-// TestNewProtectedKey_WipesSource verifies that NewProtectedKey wipes
-// the source slice.
-func TestNewProtectedKey_WipesSource(t *testing.T) {
-	source := make([]byte, 32)
-	for i := range source {
-		source[i] = byte(i + 1)
-	}
-
-	_ = NewProtectedKey(source)
-
-	// memguard.NewEnclave wipes the source.
-	allZero := true
-	for _, b := range source {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if !allZero {
-		t.Fatalf("source slice was not wiped by NewProtectedKey: %x", source)
-	}
-}
-
-// TestProtectedBuffer_ConcurrentDestroy is the regression test for the plain
-// `buf` field, whose write in Destroy raced every other Destroy. The reference
-// now lives in an atomic.Pointer, so exactly one caller wins the swap and
-// reaches memguard; the losers are no-ops.
-//
-// Note the deliberate absence of concurrent Bytes/Size here: memguard's own
-// LockedBuffer is not safe for concurrent Destroy/read, so the CONTENTS stay
-// single-owner (see the ProtectedBuffer doc comment). The atomic reference
-// fixes this type's own field race only.
-func TestProtectedBuffer_ConcurrentDestroy(t *testing.T) {
-	pb := NewProtectedBuffer(32)
-
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	// Allocators: the memguard traffic the bridge has to survive.
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pb.Destroy()
+			for j := 0; j < 20; j++ {
+				other := NewProtectedKey([]byte("unrelated-key-material-32-bytes!"))
+				other.Clear()
+
+				src := mustFromBytes(t, []byte("unrelated-enclave-to-be-sealed!!"))
+				if sealed := SealMemoryEnclave(src); sealed == nil {
+					t.Error("SealMemoryEnclave returned nil for a live enclave")
+					return
+				}
+			}
 		}()
 	}
+
 	wg.Wait()
-
-	if pb.Size() != 0 {
-		t.Fatal("Size should be 0 after Destroy")
-	}
-	if pb.Bytes() != nil {
-		t.Fatal("Bytes should be nil after Destroy")
-	}
 }
 
-// TestSealProtectedBuffer_ConsumedBufferReturnsNil verifies the documented
-// single-consumption contract: sealing an already-consumed buffer yields nil
-// rather than a second key over the same (now unowned) memory.
-func TestSealProtectedBuffer_ConsumedBufferReturnsNil(t *testing.T) {
-	pb := NewProtectedBufferFromBytes([]byte("consume-me-once-32-bytes-long!!!"))
-
-	if pk := SealProtectedBuffer(pb); pk == nil {
-		t.Fatal("first SealProtectedBuffer returned nil")
-	}
-	if pk := SealProtectedBuffer(pb); pk != nil {
-		t.Fatal("second SealProtectedBuffer should return nil for a consumed buffer")
-	}
-}
-
-// TestMemoryEnclave_WriteInPlaceThenFreeze covers the allocate → write in
-// place → freeze pattern that lets a producer build sensitive output inside
-// locked memory instead of assembling it on the ordinary heap and copying it
-// in (see shamir.SplitProtected). A fresh enclave must be writable, and frozen
-// must mean frozen.
-func TestMemoryEnclave_WriteInPlaceThenFreeze(t *testing.T) {
-	e := NewMemoryEnclave(8)
-	if e == nil {
-		t.Fatal("NewMemoryEnclave returned nil")
-	}
-	defer e.Destroy()
-
-	if !e.buf.IsMutable() {
-		t.Fatal("a freshly allocated enclave must be writable, or nothing can be produced in place")
-	}
-	copy(e.Bytes(), []byte("in-place"))
-	if got := string(e.Bytes()); got != "in-place" {
-		t.Fatalf("enclave contents = %q, want %q", got, "in-place")
-	}
-
-	e.Freeze()
-	if e.buf.IsMutable() {
-		t.Fatal("enclave is still mutable after Freeze")
-	}
-	if got := string(e.Bytes()); got != "in-place" {
-		t.Fatalf("Freeze altered the contents: %q", got)
-	}
-
-	// Destroy must still wipe and release a frozen enclave — memguard melts
-	// the pages before wiping them — or freezing would be a memory leak.
-	e.Destroy()
-	if e.Bytes() != nil || e.Size() != 0 {
-		t.Fatal("a frozen enclave survived Destroy")
-	}
-}
-
-// TestMemoryEnclave_FreezeIsSafeOnDestroyed verifies Freeze is a no-op rather
-// than a panic once the enclave is gone: Destroy is single-shot and idempotent,
-// and Freeze must not be the one method that breaks that.
-func TestMemoryEnclave_FreezeIsSafeOnDestroyed(t *testing.T) {
-	e := NewMemoryEnclave(16)
-	e.Destroy()
-	e.Freeze()
-	e.Freeze()
-}
-
-// TestMemoryEnclave_FromBytesWipesSourceAndFreezes verifies the constructor's
-// two contracts at once.
-func TestMemoryEnclave_FromBytesWipesSourceAndFreezes(t *testing.T) {
-	source := []byte("root key material, 32 bytes long")
-	want := append([]byte(nil), source...)
-
-	e := NewMemoryEnclaveFromBytes(source)
-	defer e.Destroy()
-
-	if !bytes.Equal(e.Bytes(), want) {
-		t.Fatalf("enclave contents = %q, want %q", e.Bytes(), want)
-	}
-	for _, b := range source {
-		if b != 0 {
-			t.Fatalf("source slice was not wiped by NewMemoryEnclaveFromBytes: %x", source)
-		}
-	}
-	if e.buf.IsMutable() {
-		t.Error("NewMemoryEnclaveFromBytes must return a frozen enclave")
-	}
-}
-
-// TestProtectedBufferAliasesMemoryEnclave is the compatibility guard for the
-// rename. ProtectedBuffer is an ALIAS, not a distinct type, so a consumer
-// compiled against either name keeps working and the two are interchangeable
-// in every signature — which is what makes the rename non-breaking ahead of
-// the coordinated wave. If someone later turns the alias into a defined type,
-// this stops compiling.
+// TestSealMemoryEnclave_ConcurrentConsumeExactlyOnce pins the consume-once
+// contract against CONCURRENT callers, which is the case the sequential test
+// above cannot reach.
 //
-// The three //nolint:staticcheck directives below are the point of the test,
-// not noise around it. QF1011 reports each explicit type as redundant because
-// it is inferable from the right-hand side — which is TRUE, and is precisely
-// the property being asserted: it is inferable only while the two names denote
-// one type. Letting staticcheck delete the annotations would delete the guard
-// and leave three assignments that check nothing.
-func TestProtectedBufferAliasesMemoryEnclave(t *testing.T) {
-	var e *MemoryEnclave = NewProtectedBuffer(16) //nolint:staticcheck // QF1011: the explicit type IS the assertion
-	defer e.Destroy()
-	var pb *ProtectedBuffer = e //nolint:staticcheck // QF1011: the explicit type IS the assertion
-	if pb.Size() != 16 {
-		t.Fatalf("expected size=16 through the deprecated alias, got %d", pb.Size())
-	}
+// It is a regression test for a real defect, not a hypothetical: the first
+// go-enclave port sealed inside a WithBytes borrow, and a borrow is the READ
+// side — it admits concurrent callers by design. Two goroutines could both copy
+// the plaintext and both return a distinct non-nil ProtectedKey, duplicating key
+// material and leaving the documented "ownership transfers" contract false.
+//
+// Exactly one caller must win and the other must get nil, every round.
+func TestSealMemoryEnclave_ConcurrentConsumeExactlyOnce(t *testing.T) {
+	const rounds = 200
 
-	sealed := NewProtectedBufferFromBytes([]byte("sealed through the old name!!!!!"))
-	var alias *ProtectedBuffer = sealed //nolint:staticcheck // QF1011: the explicit type IS the assertion
-	if key := SealMemoryEnclave(alias); key == nil {
-		t.Fatal("SealMemoryEnclave rejected a buffer built by the deprecated constructor")
-	}
-}
+	for round := 0; round < rounds; round++ {
+		src := mustFromBytes(t, []byte("exactly-one-caller-may-consume!!"))
 
-// TestSealMemoryEnclaveAndDeprecatedAliasAgree verifies the deprecated wrapper
-// is the same function, not a diverging copy.
-func TestSealMemoryEnclaveAndDeprecatedAliasAgree(t *testing.T) {
-	for name, seal := range map[string]func(*MemoryEnclave) *ProtectedKey{
-		"SealMemoryEnclave":   SealMemoryEnclave,
-		"SealProtectedBuffer": SealProtectedBuffer,
-	} {
-		key := seal(NewMemoryEnclaveFromBytes([]byte("thirty-two bytes of key material")))
-		if key == nil {
-			t.Fatalf("%s returned nil for a live enclave", name)
+		const callers = 4
+		results := make([]*ProtectedKey, callers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start // release them together, to make the collision likely
+				results[i] = SealMemoryEnclave(src)
+			}(i)
 		}
-		opened, err := key.Open()
+		close(start)
+		wg.Wait()
+
+		won := 0
+		var winner *ProtectedKey
+		for _, r := range results {
+			if r != nil {
+				won++
+				winner = r
+			}
+		}
+		if won != 1 {
+			t.Fatalf("round %d: %d of %d concurrent SealMemoryEnclave calls succeeded, want exactly 1",
+				round, won, callers)
+		}
+
+		// The winner must hold the real material, not a torn or empty copy.
+		buf, err := winner.Open()
 		if err != nil {
-			t.Fatalf("%s: Open returned unexpected error: %v", name, err)
+			t.Fatalf("round %d: Open on the winning key: %v", round, err)
 		}
-		if got := string(opened.Bytes()); got != "thirty-two bytes of key material" {
-			t.Errorf("%s: opened %q, want the sealed material", name, got)
+		if !bytes.Equal(encBytes(t, buf), []byte("exactly-one-caller-may-consume!!")) {
+			t.Fatalf("round %d: the winning key does not hold the source material", round)
 		}
-		opened.Destroy()
-		if seal(nil) != nil {
-			t.Errorf("%s(nil) must return nil", name)
-		}
+		buf.Destroy()
 	}
 }

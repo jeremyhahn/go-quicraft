@@ -1,10 +1,19 @@
 # Memory Enclave — Engineering Contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/enclave`
-Backed by `github.com/awnumar/memguard`.
+Locked memory is `github.com/jeremyhahn/go-enclave`; `ProtectedKey`'s
+encrypted-at-rest container is still `github.com/awnumar/memguard`.
+
+> **Stale sections, flagged rather than left to mislead.** §2's borrow-counter,
+> `purgeMu` and process-wide-purge material describes machinery this repository
+> deleted when it adopted go-enclave. go-enclave maps its own memory, so nothing
+> can purge it, a borrow takes only that enclave's own read lock, and a nested
+> borrow of a second enclave is legal. §3's "constructors do not return errors"
+> is likewise reversed: go-enclave's constructors DO return errors, which is the
+> main reason the adoption was not a mechanical rename. Rewrite tracked at #68.
 
 ## 1. Exported surface
 
@@ -105,9 +114,10 @@ not.
   `WithValue`, not from a released alias. Both obtain the slices themselves, so
   no caller-side discipline could have made them safe.
 - **Every `Open` is paired with a `Destroy`.** `Open` materializes plaintext
-  into a fresh `ProtectedBuffer`; the caller owns it. A leaked buffer keeps
+  into a fresh `MemoryEnclave`; the caller owns it. A leaked enclave keeps
   plaintext resident for the life of the process and consumes `RLIMIT_MEMLOCK`,
-  which memguard answers by aborting.
+  which then makes later locks fail with a typed
+  `ErrLockedMemoryUnavailable` — it no longer aborts the process.
 - **Constructors wipe their input.** `NewProtectedKey(key)` and
   `NewProtectedBufferFromBytes(data)` wipe the source slice after copying.
   Callers must not rely on the argument being readable afterwards.
@@ -142,11 +152,13 @@ not.
 - `OpenError.Unwrap()` returns the underlying memguard error.
 - Messages are lowercase and origin-prefixed: `ErrEnclaveNil.Error()` is
   `"memprotect: enclave is nil"`.
-- Constructors do **not** return errors. `NewProtectedBuffer` and
-  `NewProtectedKey` return a usable value or memguard aborts the process — an
-  allocation failure of locked memory is not a condition this library can carry
-  on from. `SealProtectedBuffer` returns `nil` (not an error) for a `nil`,
-  consumed, or destroyed buffer.
+- Locked-memory constructors DO return errors, and this reverses what this
+  section said before the go-enclave adoption. `goenclave.NewMemoryEnclave` and
+  `NewMemoryEnclaveSized` return `(*MemoryEnclave, error)`: locking pages is a
+  syscall the kernel can decline, and a refusal is now a reportable condition
+  rather than a process abort. `NewProtectedKey` still returns a bare pointer.
+  `SealMemoryEnclave` returns `nil` (not an error) for a `nil`, consumed, or
+  destroyed enclave.
 
 **There is no error path that yields a partially-protected key.** Either the
 material is inside a protected container or the call failed.
@@ -157,9 +169,13 @@ material is inside a protected container or the call failed.
 and no files. Its behavior is fixed at compile time.
 
 The one environment interaction is operational rather than configured: locked
-buffers consume `RLIMIT_MEMLOCK`. A process (or container) with a low limit will
-see memguard abort once the limit is reached. Raise the limit rather than
-reducing the number of protected keys.
+memory consumes `RLIMIT_MEMLOCK`, and the kernel charges a whole PAGE per
+allocation — a 32-byte key costs 4096 bytes on a 4 KiB-page host. A process (or
+container) with a low limit sees allocations fail with a typed
+`ErrLockedMemoryUnavailable` once the limit is reached; since the go-enclave
+adoption this fails exactly the allocation that reached the ceiling and touches
+no other enclave, where memguard previously purged every live buffer and aborted.
+Raise the limit rather than reducing the number of protected keys.
 
 ## 5. Persistence
 

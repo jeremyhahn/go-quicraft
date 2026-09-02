@@ -1,6 +1,6 @@
 # Memory Enclave — Usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 Use this package whenever your code holds a key, password, passphrase, or token
@@ -11,7 +11,7 @@ in memory and you would otherwise reach for a `[]byte` or a `string`.
 - Go 1.26.6 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A process memory-lock limit (`RLIMIT_MEMLOCK`) large enough for the number of
   keys you will hold. Containers frequently ship with a small default; if the
-  process aborts with a memguard message about locked memory, raise the limit
+  process reports a locked-memory failure, raise the limit
   rather than reducing protection.
 - Nothing else. There is no configuration file, no environment variable, and no
   daemon.
@@ -113,7 +113,7 @@ or was never given material. Check for a `Clear` on a shutdown path racing your
 use, and check the constructor actually ran. Detect it with
 `errors.Is(err, enclave.ErrEnclaveNil)`.
 
-**The process aborts with a memguard message about locked memory** — you have
+**Locked-memory allocations start failing** — you have
 exhausted `RLIMIT_MEMLOCK`. Almost always this is leaked `ProtectedBuffer`s from
 a missing `Destroy`, not a genuinely large key set. Audit every `Open` for a
 paired `defer buf.Destroy()`. If the count is genuinely legitimate, raise the

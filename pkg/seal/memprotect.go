@@ -33,11 +33,17 @@ type ProtectedBuffer = enclave.MemoryEnclave
 type ProtectedKey = enclave.ProtectedKey
 
 // Function aliases for backward compatibility.
+//
+// NewProtectedBuffer and NewProtectedBufferFromBytes are GONE, not renamed.
+// Locked memory is go-enclave's now, and its constructors return an error
+// because locking pages is a syscall the kernel can refuse — something a
+// bare-pointer alias cannot express. Call goenclave.NewMemoryEnclaveSized (fill
+// in place) or goenclave.NewMemoryEnclave (move existing bytes in) directly and
+// handle the error; a local wrapper preserving the old shape would be the
+// removed-API shim that conventions/dependency-resolution.md §0 forbids.
 var (
-	NewProtectedBuffer          = enclave.NewMemoryEnclave
-	NewProtectedBufferFromBytes = enclave.NewMemoryEnclaveFromBytes
-	NewProtectedKey             = enclave.NewProtectedKey
-	SealProtectedBuffer         = enclave.SealMemoryEnclave
+	NewProtectedKey     = enclave.NewProtectedKey
+	SealProtectedBuffer = enclave.SealMemoryEnclave
 )
 
 // wipeBytes securely zeroes a byte slice using memguard's wiping mechanism.

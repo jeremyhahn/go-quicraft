@@ -1,6 +1,6 @@
 # Memory Enclave — Architecture
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -22,8 +22,16 @@ Two types, and the split between them is the whole design:
 
 | Type | Holds | Guarantee |
 |---|---|---|
-| `ProtectedKey` | key material **encrypted at rest** in process memory (a `memguard.Enclave`) | ciphertext is useless without memguard's per-process session key |
-| `ProtectedBuffer` | key material **in plaintext**, `mlock`'d, guard-paged, canary-checked (a `memguard.LockedBuffer`) | `Destroy` genuinely wipes the bytes before unmapping |
+| `ProtectedKey` | key material **encrypted at rest** in process memory (a `memguard.Enclave`). Owned by this package. | ciphertext is useless without memguard's per-process session key |
+| `MemoryEnclave` (`ProtectedBuffer` is the deprecated spelling) | key material **in plaintext**, `mlock`'d, guard-paged, canary-checked. **Owned by go-enclave**; this package only ALIASES the type. | `Destroy` genuinely wipes the bytes before unmapping |
+
+**The second row is not this repository's code.** `MemoryEnclave` is
+`github.com/jeremyhahn/go-enclave`'s type, per `docs/00 §R` — *"No project
+hand-rolls its own locked-memory handling."* Sections below that describe borrow
+counters, `purgeMu` and process-wide purge coordination are describing machinery
+this repository **no longer has**; go-enclave maps its own memory, nothing can
+purge it, and a borrow takes only that enclave's own read lock. Those sections
+are stale and are being rewritten (#68).
 
 A key lives as a `ProtectedKey` and is materialized into a `ProtectedBuffer`
 only for the window in which it must actually be used, then destroyed. Plaintext
@@ -65,9 +73,10 @@ package doc states it:
 
 **Guaranteed**
 
-- `ProtectedBuffer` memory is `mlock`'d (excluded from swap), fenced by guard
-  pages on both sides, canary-checked, and wiped by `Destroy` before unmapping.
-  That wipe is real and is the strongest guarantee in this package.
+- `MemoryEnclave` memory is `mlock`'d (excluded from swap), fenced by guard
+  pages on both sides, canary-checked, excluded from core dumps, and wiped by
+  `Destroy` before unmapping. That wipe is real and is the strongest guarantee
+  available here. It is go-enclave's guarantee, consumed rather than restated.
 - `ProtectedKey` material is AEAD-encrypted under a per-process session key that
   memguard itself keeps in a locked buffer, never writes out, and drops on exit.
   A memory disclosure capturing only the enclave's ciphertext yields nothing.

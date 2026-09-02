@@ -22,8 +22,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // Regression cover for issue #15 on the Shamir path specifically. The defect
@@ -248,7 +246,7 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 				// When reconstruction wins, it must produce the real secret —
 				// a torn read that still returned nil error would be the worst
 				// outcome, so check rather than discard.
-				if got := string(out.Bytes()); got != string(secret) {
+				if got := string(encBytes(out)); got != string(secret) {
 					t.Errorf("reconstructed %q, want %q", got, string(secret))
 				}
 				out.Destroy()
@@ -269,75 +267,22 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 	}
 }
 
-// --- Deterministic hold-off, and the MarshalJSON alias (Codex round 3) ---
-
-// shareHoldRounds mirrors the enclave-side deterministic probe. Repetition buys
-// scheduler variety only; the probe reaches the state under test every round.
-const shareHoldRounds = 20
-
-// TestProtectedShare_WithValueHoldsOffDestroyDeterministically pins on every
-// round what the hammer above samples: a Destroy already entered cannot
-// COMPLETE while a WithValue callback is running.
-func TestProtectedShare_WithValueHoldsOffDestroyDeterministically(t *testing.T) {
-	for i := 0; i < shareHoldRounds; i++ {
-		share := protectedTestShare(t)
-
-		entered := make(chan struct{})  // callback holds the borrow
-		parked := make(chan struct{})   // Destroy is blocked behind that borrow
-		released := make(chan struct{}) // Destroy returned
-		var didRelease atomic.Bool
-
-		var parkedOnce sync.Once
-		// The hook is package-global in pkg/enclave, so it fires for every
-		// enclave in the binary. The share's value enclave is the only one this
-		// probe may act on; anything else would let it conclude a park that
-		// belonged to some other test's buffer.
-		target := share.valueEnclaveForTest()
-		restore := enclave.TestOnlyOnMutatorParked(func(e *enclave.MemoryEnclave) {
-			if e == target {
-				parkedOnce.Do(func() { close(parked) })
-			}
-		})
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-entered
-			share.Destroy()
-			didRelease.Store(true)
-			close(released)
-		}()
-
-		err := share.WithValue(func(b []byte) error {
-			if len(b) == 0 {
-				return errors.New("callback saw an empty value")
-			}
-			close(entered)
-			// Observed, not assumed, and both-sided: whichever of "Destroy
-			// parked behind this borrow" and "Destroy finished" happens first is
-			// the answer. No interval, so nothing to tune and nothing to flake —
-			// and no hang against an implementation that never parks.
-			select {
-			case <-parked:
-			case <-released:
-			}
-			if didRelease.Load() {
-				return errors.New("Destroy completed while the callback held the share")
-			}
-			return nil
-		})
-		wg.Wait()
-		restore()
-
-		if err != nil {
-			t.Fatalf("round %d: %v", i, err)
-		}
-		if got := share.Value(); got != nil {
-			t.Fatalf("round %d: share survived the Destroy the callback held off", i)
-		}
-	}
-}
+// --- The MarshalJSON alias (Codex round 3) ---
+//
+// TestProtectedShare_WithValueHoldsOffDestroyDeterministically was DROPPED in the
+// go-enclave adoption, deliberately and not silently. It pinned "a Destroy
+// already entered cannot COMPLETE while a WithValue callback runs" by filtering
+// pkg/enclave's package-global park hooks (TestOnlyOnMutatorParked) down to one
+// target enclave. Those hooks were instrumentation on this repository's own
+// borrow machinery, and that machinery is gone: the property now belongs to
+// go-enclave, whose withLocked takes the enclave's read lock and whose Destroy
+// takes the write lock, and go-enclave tests it there. Re-implementing an
+// observation hook here to re-test it would be instrumenting a dependency
+// through its consumer.
+//
+// What survives is the behavioural coverage, which needed no hook:
+// TestProtectedShare_WithValueExcludesDestroy and
+// TestProtectedShare_ValueDestroyRace still run the same collision under -race.
 
 // TestProtectedShare_MarshalJSONRacesDestroy is the regression cover for the
 // third alias-lifetime finding. MarshalJSON used to take `val := s.Value()`,
@@ -449,9 +394,3 @@ func TestProtectedShare_MarshalJSONRacesDestroy(t *testing.T) {
 		}
 	}
 }
-
-// valueEnclaveForTest exposes the share's value enclave so a probe can filter
-// pkg/enclave's package-global park hooks down to its own target. It is in the
-// test file, not the production one: the identity is needed to make a test
-// honest, never to widen what a caller can reach.
-func (s *ProtectedShare) valueEnclaveForTest() *enclave.MemoryEnclave { return s.value }

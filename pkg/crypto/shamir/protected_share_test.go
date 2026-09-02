@@ -23,8 +23,6 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // destroyAll releases every share in a set. Locked memory is a finite kernel
@@ -73,11 +71,11 @@ func TestSplitProtected_RoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CombineProtected(%v) returned unexpected error: %v", subset, err)
 		}
-		if !bytes.Equal(buf.Bytes(), secret) {
-			t.Errorf("CombineProtected(%v) = %q, want %q", subset, buf.Bytes(), secret)
+		if !bytes.Equal(encBytes(buf), secret) {
+			t.Errorf("CombineProtected(%v) = %q, want %q", subset, encBytes(buf), secret)
 		}
 		buf.Destroy()
-		if buf.Bytes() != nil {
+		if encBytes(buf) != nil {
 			t.Errorf("subset %v: reconstructed secret survived Destroy", subset)
 		}
 	}
@@ -267,8 +265,8 @@ func TestProtectedShare_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer buf.Destroy()
-	if !bytes.Equal(buf.Bytes(), secret) {
-		t.Errorf("reconstructed %q, want %q", buf.Bytes(), secret)
+	if !bytes.Equal(encBytes(buf), secret) {
+		t.Errorf("reconstructed %q, want %q", encBytes(buf), secret)
 	}
 }
 
@@ -287,7 +285,7 @@ func TestProtectedShare_UnmarshalDestroysPreviousValue(t *testing.T) {
 	}
 	defer share.Destroy()
 
-	if previous.Bytes() != nil {
+	if encBytes(previous) != nil {
 		t.Error("the replaced value was not destroyed")
 	}
 	if share.Index != 2 {
@@ -316,7 +314,7 @@ func TestProtectedShare_UnmarshalJSON_Invalid(t *testing.T) {
 				share.Destroy()
 				t.Fatal("expected an error, got nil")
 			}
-			if share.value != nil && share.value.Bytes() != nil {
+			if share.value != nil && encBytes(share.value) != nil {
 				share.Destroy()
 				t.Error("a rejected share kept protected memory")
 			}
@@ -505,8 +503,8 @@ func TestShare_Protect(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer buf.Destroy()
-	if !bytes.Equal(buf.Bytes(), secret) {
-		t.Errorf("reconstructed %q, want %q", buf.Bytes(), secret)
+	if !bytes.Equal(encBytes(buf), secret) {
+		t.Errorf("reconstructed %q, want %q", encBytes(buf), secret)
 	}
 }
 
@@ -649,7 +647,7 @@ func TestNewProtectedShare_RejectsUndecodableBase64(t *testing.T) {
 				decoded.Destroy()
 				t.Fatalf("json.Unmarshal accepted value %q; want a validation error", value)
 			}
-			if decoded.value != nil && decoded.value.Bytes() != nil {
+			if decoded.value != nil && encBytes(decoded.value) != nil {
 				decoded.Destroy()
 				t.Error("a rejected share kept protected memory")
 			}
@@ -683,10 +681,10 @@ func TestSplitProtected_LeavesSecretToTheCaller(t *testing.T) {
 // has to remember to wipe.
 func TestSplitProtected_ProtectedSecretRoundTrip(t *testing.T) {
 	want := []byte("thirty-two bytes of key material")
-	held := enclave.NewMemoryEnclaveFromBytes(append([]byte(nil), want...))
+	held := mustFromBytes(t, append([]byte(nil), want...))
 	defer held.Destroy()
 
-	shares, err := SplitProtected(held.Bytes(), 3, 5)
+	shares, err := SplitProtected(encBytes(held), 3, 5)
 	if err != nil {
 		t.Fatalf("SplitProtected returned unexpected error: %v", err)
 	}
@@ -698,12 +696,12 @@ func TestSplitProtected_ProtectedSecretRoundTrip(t *testing.T) {
 	}
 	defer got.Destroy()
 
-	if !bytes.Equal(got.Bytes(), want) {
-		t.Errorf("reconstructed %q, want %q", got.Bytes(), want)
+	if !bytes.Equal(encBytes(got), want) {
+		t.Errorf("reconstructed %q, want %q", encBytes(got), want)
 	}
 	// The source enclave is untouched by the split.
-	if !bytes.Equal(held.Bytes(), want) {
-		t.Errorf("the caller's protected secret changed: %q", held.Bytes())
+	if !bytes.Equal(encBytes(held), want) {
+		t.Errorf("the caller's protected secret changed: %q", encBytes(held))
 	}
 }
 
@@ -740,8 +738,8 @@ func TestCombineProtected_LeavesSharesUsable(t *testing.T) {
 		t.Fatalf("second CombineProtected returned unexpected error: %v", err)
 	}
 	defer second.Destroy()
-	if !bytes.Equal(second.Bytes(), secret) {
-		t.Errorf("second reconstruction = %q, want %q", second.Bytes(), secret)
+	if !bytes.Equal(encBytes(second), secret) {
+		t.Errorf("second reconstruction = %q, want %q", encBytes(second), secret)
 	}
 }
 
@@ -853,7 +851,7 @@ func TestNewProtectedShare_AcceptsMaxSizeValue(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer got.Destroy()
-	if !bytes.Equal(got.Bytes(), secret) {
+	if !bytes.Equal(encBytes(got), secret) {
 		t.Error("max-size secret did not round trip through the protected path")
 	}
 }
@@ -904,8 +902,8 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer got.Destroy()
-	if !bytes.Equal(got.Bytes(), secret) {
-		t.Errorf("reconstructed %q, want %q", got.Bytes(), secret)
+	if !bytes.Equal(encBytes(got), secret) {
+		t.Errorf("reconstructed %q, want %q", encBytes(got), secret)
 	}
 }
 
@@ -1051,11 +1049,11 @@ func TestCombineProtected_MatchesCombineBytes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CombineProtected(%d bytes, %d/%d): %v", secretLen, threshold, total, err)
 			}
-			if !bytes.Equal(got.Bytes(), want) {
+			if !bytes.Equal(encBytes(got), want) {
 				t.Errorf("%d bytes, %d/%d: CombineProtected = %x, CombineBytes = %x",
-					secretLen, threshold, total, got.Bytes(), want)
+					secretLen, threshold, total, encBytes(got), want)
 			}
-			if !bytes.Equal(got.Bytes(), secret) {
+			if !bytes.Equal(encBytes(got), secret) {
 				t.Errorf("%d bytes, %d/%d: reconstruction does not match the secret", secretLen, threshold, total)
 			}
 			got.Destroy()
@@ -1086,8 +1084,8 @@ func TestCombineProtected_ReusedBufferDoesNotLeakBetweenShares(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CombineProtected(%v): %v", order, err)
 		}
-		if !bytes.Equal(got.Bytes(), secret) {
-			t.Errorf("CombineProtected(%v) = %q, want %q", order, got.Bytes(), secret)
+		if !bytes.Equal(encBytes(got), secret) {
+			t.Errorf("CombineProtected(%v) = %q, want %q", order, encBytes(got), secret)
 		}
 		got.Destroy()
 	}
@@ -1162,7 +1160,7 @@ func TestSplitProtected_AcceptsRealCeremonies(t *testing.T) {
 				t.Fatalf("CombineProtected returned unexpected error: %v", err)
 			}
 			defer got.Destroy()
-			if !bytes.Equal(got.Bytes(), secret) {
+			if !bytes.Equal(encBytes(got), secret) {
 				t.Error("the secret did not round trip")
 			}
 		})

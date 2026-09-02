@@ -1,7 +1,7 @@
 # Shamir Primitive — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-08-19
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -68,11 +68,19 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error)
 func (s *ProtectedShare) UnmarshalJSON(data []byte) error
 
 // Errors
-type SplitError      struct{ Reason string }
-type CombineError    struct{ Reason string }
-type ValidationError struct{ Field, Reason string }
-type IntegrityError  struct{}   // DEPRECATED — never returned
+type SplitError           struct{ Reason string }
+type CombineError         struct{ Reason string }
+type ValidationError      struct{ Field, Reason string }
+type ProtectedMemoryError struct{ Op string; Err error }  // Unwrap() error
+type IntegrityError       struct{}   // DEPRECATED — never returned
 ```
+
+Every locked-memory refusal in this package reports as `*ProtectedMemoryError`.
+It is deliberately distinct from `*ValidationError` because the two say different
+things about who owns the caller's buffer afterwards — see `api.md` §Error
+vocabulary. `SplitError` and `CombineError` remain for logic failures, including
+the `MaxShareSetBytes` budget refusal, which is a rejected request rather than an
+exhausted host.
 
 `Combine` and `CombineUnverified` are **identical**. Both names are retained so
 a caller can express intent at the call site; neither verifies anything.
@@ -186,8 +194,8 @@ would leave the exposure intact at the other.
 
 `ShamirInitResult` is the moment a ceremony holds all N shares at once. It OWNS
 them: `Destroy()` releases every one, and an abandoned result holds N locked
-allocations against `RLIMIT_MEMLOCK`, whose exhaustion memguard answers by
-terminating the process. Its `"shares"` JSON changed shape with the retype —
+allocations against `RLIMIT_MEMLOCK` for the life of the process, so later locks
+anywhere in it start failing. Its `"shares"` JSON changed shape with the retype —
 from an array of bare values to the array of share OBJECTS every other share
 surface in the stack already uses.
 
@@ -232,14 +240,17 @@ Two implementation notes that are not obvious from the signatures:
   storage as its append destination.
 - **That length is refused unless it is the root-key size, before anything is
   locked.** It is derived from a blob the AEAD has not authenticated yet, and
-  memguard answers a lock it cannot take by terminating the process — so sizing
-  an `mlock`'d allocation from it would let whoever can write the blob take the
-  service down before the tag that rejects it is checked.
+  locked memory is a finite process-wide resource — so sizing an `mlock`'d
+  allocation from it would let whoever can write the blob exhaust that resource
+  for every other caller, before the tag that rejects it is checked. Under
+  memguard this was worse still: a refused lock TERMINATED THE PROCESS. Since the
+  go-enclave adoption it fails exactly the allocation that hit the ceiling, which
+  lowers the stakes without removing the reason for the check.
 
 `NoneStrategy` implements the pair too, and `UnsealRootKeyProtected` returns
-`ErrNoRootKeyAvailable`: no-encryption mode has no root key, memguard refuses a
-zero-length allocation by terminating the process, and an enclave "holding" an
-empty key would be a protected wrapper around a fiction. Its
+`ErrNoRootKeyAvailable`: no-encryption mode has no root key, a zero-length
+allocation is refused (`ErrEmptyEnclave`), and an enclave "holding" an empty key
+would be a protected wrapper around a fiction. Its
 `SealRootKeyProtected` validates the enclave even though it never reads it —
 a contract the reference implementation ignores is not a contract.
 
@@ -361,10 +372,14 @@ Three obligations come with `ProtectedShare`:
 
 Because of the second one, the two calls that allocate a whole set price it
 first. `SplitProtected` rejects parameters whose footprint — coefficients,
-scratch and every returned share value — exceeds `MaxShareSetBytes` (1 MiB),
-since individually legal arguments multiply into one no host can lock (a 64 KiB
-secret split 255 ways needs ~16 MiB of coefficients alone) and a failed lock is
-a dead process rather than an error. A full 255-share ceremony over a 32-byte
+the reused scratch, the reused ENCODING scratch, and every returned share value —
+exceeds `MaxShareSetBytes` (1 MiB), since individually legal arguments multiply
+into one no host can lock (a 64 KiB secret split 255 ways needs ~16 MiB of
+coefficients alone). The encoding scratch is counted because it is live at the
+peak: go-enclave has no post-fill freeze, so a share's frozen value is built by
+copying out of the scratch and both exist during the copy. Omitting it made the
+cap stop being an upper bound, which is a defect rather than an approximation —
+`secretLen=1757` at 255-of-255 priced under the cap and exceeded it in fact. A full 255-share ceremony over a 32-byte
 root key needs ~24 KiB of that budget; sharing a 4 KiB *payload* 255 ways does
 not fit and should be enveloped under a key that does.
 
@@ -374,8 +389,8 @@ are unauthenticated by construction — nothing about one can be checked until
 the set is combined — so a recovery endpoint necessarily decodes whatever it is
 handed, and the generic decoder allocates one locked buffer per element as it
 visits them: the submission, not the service, would choose how much locked
-memory to take, and memguard answers a failed lock by terminating the process.
-`UnmarshalShareSet` bounds the element count (255, the scheme's own limit) and
+memory to take, exhausting a process-wide resource every other caller depends
+on. `UnmarshalShareSet` bounds the element count (255, the scheme's own limit) and
 the **summed length of the raw JSON elements** against `MaxShareSetBytes`
 before it allocates any of it, and destroys the accepted prefix if a later
 element is rejected. The sum is taken over the elements rather than from

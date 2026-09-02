@@ -1,6 +1,6 @@
 # Memory Enclave — API
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -25,7 +25,56 @@ feature exists to prevent, so a row here would be a defect, not a gap.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-quicraft/pkg/enclave`
+Import: `github.com/jeremyhahn/go-quicraft/pkg/enclave`, and — for locked memory
+itself — `github.com/jeremyhahn/go-enclave`.
+
+### Where the surface lives now
+
+**Locked memory is go-enclave's.** `pkg/enclave` declares no locked-memory type
+of its own: `MemoryEnclave` (and its deprecated spelling `ProtectedBuffer`) are
+type ALIASES for `goenclave.MemoryEnclave`, so the three names are one type and
+assignment between them compiles. This is `docs/00 §R` — *"No project hand-rolls
+its own locked-memory handling"* — and it is why the constructors below are
+go-enclave's rather than this package's.
+
+What `pkg/enclave` still owns is `ProtectedKey`: material held as CIPHERTEXT at
+rest, readable only inside an `Open` window. go-enclave has no released
+counterpart for that posture (tracked at go-enclave #22); when it does,
+`pkg/enclave` goes away entirely.
+
+### Capability: allocate locked memory
+
+```go
+func goenclave.NewMemoryEnclaveSized(n int) (*MemoryEnclave, error)  // writable, fill in place
+func goenclave.NewMemoryEnclave(data []byte) (*MemoryEnclave, error) // moves data in, FROZEN
+```
+
+| | |
+|---|---|
+| Request | `n int`, or `data []byte` (**wiped** on every return path, including failure) |
+| Response | `*MemoryEnclave` — `mlock`'d, guard-paged, canary-checked, excluded from core dumps |
+| Errors | `ErrInvalidSize`, `ErrEmptyEnclave`, and `ErrLockedMemoryUnavailable` when the kernel refuses the lock |
+| Permission | none — in-process call, no authorization boundary |
+
+**These return an error, and that is the point.** The bare-pointer constructors
+`enclave.NewMemoryEnclave(size)` and `enclave.NewMemoryEnclaveFromBytes(data)`
+are GONE, not renamed: locking pages is a syscall the kernel can decline, and a
+constructor that cannot say so leaves the caller asserting against a nil.
+
+Mutability differs between them and it matters. A **sized** enclave stays
+WRITABLE for its whole life — that is what makes filling it possible — so a
+slice retained past a borrow can silently corrupt the material. One built by
+`NewMemoryEnclave` is frozen read-only, where the same mistake faults. There is
+no post-fill seal yet (go-enclave #6), so the fill-then-freeze shape is a move:
+
+```go
+scratch, err := goenclave.NewMemoryEnclaveSized(n)
+defer scratch.Destroy()
+err = scratch.WithBytes(func(dst []byte) error { /* produce material here */ })
+final, err := goenclave.NewMemoryEnclave(dst) // locked-to-locked, freezes, wipes dst
+```
+
+Both endpoints are `mlock`'d, so the material never reaches the ordinary heap.
 
 ### Capability: hold a key encrypted at rest in process memory
 
@@ -36,104 +85,78 @@ func NewProtectedKey(key []byte) *ProtectedKey
 | | |
 |---|---|
 | Request | `key []byte` — the raw key material. **Wiped by the constructor.** |
-| Response | `*ProtectedKey`. Never `nil` on success; memguard aborts the process on locked-memory exhaustion rather than returning an error. |
+| Response | `*ProtectedKey`. Never `nil`. |
 | Errors | none returned |
-| Permission | none — in-process call, no authorization boundary |
+| Permission | none |
 
 ### Capability: materialize the plaintext for a bounded window
 
 ```go
-func (p *ProtectedKey) Open() (*ProtectedBuffer, error)
-func (p *ProtectedBuffer) Bytes() []byte
-func (p *ProtectedBuffer) Size() int
-func (p *ProtectedBuffer) Destroy()
+func (p *ProtectedKey) Open() (*MemoryEnclave, error)
 ```
 
 | | |
 |---|---|
 | Request | none |
-| Response | `*ProtectedBuffer` holding the plaintext, `mlock`'d and guard-paged. The caller **owns** it and must `Destroy` it. |
-| Errors | `ErrEnclaveNil` (`*NilError`) if the key was never initialized or has been `Clear`ed; `*OpenError` wrapping the memguard failure otherwise. Both fail closed — no material is returned. |
+| Response | `*MemoryEnclave` holding the plaintext, `mlock`'d, guard-paged and **frozen read-only**. The caller **owns** it and must `Destroy` it. |
+| Errors | `ErrEnclaveNil` (`*NilError`) if the key was never initialized or has been `Clear`ed; `*OpenError` wrapping the underlying failure otherwise. Both fail closed — no material is returned. |
 | Permission | none |
 
-`Bytes()` returns `nil` and `Size()` returns `0` after `Destroy`. The returned
-slice must not outlive the buffer.
-
-### Capability: allocate protected memory directly
-
-```go
-func NewProtectedBuffer(size int) *ProtectedBuffer
-func NewProtectedBufferFromBytes(data []byte) *ProtectedBuffer
-```
-
-| | |
-|---|---|
-| Request | `size int`, or `data []byte` (**wiped** after copying) |
-| Response | `*ProtectedBuffer` |
-| Errors | none returned |
-| Permission | none |
+The plaintext never reaches the ordinary Go heap: memguard decrypts into a locked
+buffer of its own, and `Open` copies from those locked pages straight into
+go-enclave's, wipes memguard's copy and hands its pages back.
 
 ### Capability: read protected bytes with a bounded lifetime
 
 ```go
-func (p *MemoryEnclave) Bytes() []byte
-func (p *MemoryEnclave) WithBytes(fn func([]byte) error) error
+func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error
+func (e *MemoryEnclave) Open() ([]byte, error)
+func (e *MemoryEnclave) Size() int
+func (e *MemoryEnclave) IsAlive() bool
+func (e *MemoryEnclave) EqualTo(other []byte) bool
+func (e *MemoryEnclave) Destroy()
 ```
 
 | | |
 |---|---|
-| Request | `Bytes`: none. `WithBytes`: `fn`, called with a slice aliasing the protected region. |
-| Response | `Bytes`: the slice, or `nil` once destroyed. `WithBytes`: `fn`'s error, unchanged. |
-| Errors | `WithBytes` returns `ErrEnclaveDestroyed` (`*DestroyedError`) without calling `fn` if the enclave is destroyed or has been consumed by `SealMemoryEnclave`. |
+| Request | `WithBytes`: `fn`, called with a slice aliasing the protected region. `Open`: none. |
+| Response | `WithBytes`: `fn`'s error, unchanged. `Open`: the aliasing slice. |
+| Errors | Both return `ErrEnclaveDestroyed` — go-enclave's sentinel, re-exported as `enclave.ErrEnclaveDestroyed` — if the enclave is destroyed. `WithBytes` does not call `fn`. |
 | Permission | none |
 
-Both are safe to CALL concurrently with `Destroy`. They differ in what happens
-after the call: `Bytes` releases its read lock on return, so the slice it handed
-back stops being protected against a concurrent teardown, while `WithBytes`
-holds the lock for the whole of `fn` — a concurrent `Destroy` blocks until `fn`
-returns. Reach for `WithBytes` wherever teardown can race a reader, which is
-every barrier and custody-ceremony path.
+`MemoryEnclave.Open` REPLACES the old `Bytes()` accessor, and the rename carries
+a contract change: it reports a destroyed enclave as an **error** where `Bytes`
+reported it as a `nil` slice.
 
-`fn` must not escape the slice. It MAY **write** to it while the enclave is
-still mutable: `NewMemoryEnclave` returns mutable storage precisely so material
-can be produced in place, and `Freeze` is a mutator serialized against
-`WithBytes`, so a callback that already holds its borrow cannot have the pages
-re-protected underneath it.
+`Open` is otherwise what `Bytes` was and carries the same warning: the slice
+aliases the locked pages and no lock is held once it returns, so a concurrent
+`Destroy` unmaps memory the caller is still reading and the read FAULTS. Use it
+only where the structure shows no concurrent teardown is possible — single
+goroutine ownership, the `defer e.Destroy()` shape used throughout the seal
+barrier. Everywhere teardown can race a reader, use `WithBytes`, which holds the
+read lock across `fn`.
 
-That ordering is only against a `Freeze` the callback **races**, though — the
-borrow cannot order a callback against a `Freeze` that already won. A callback
-entered after the enclave is frozen receives read-only pages, and a write there
-faults. So writing inside `WithBytes` is sound for the producer's own
-allocate / fill / `Freeze` sequence, where nothing else freezes; if another
-goroutine may `Freeze` concurrently, the caller orders that externally. This
-type does not, and cannot, do it for them.
-
-`fn` must NOT touch ANY enclave — no `Bytes`, `Size`, `WithBytes`, `Destroy`,
-`Freeze` or `SealMemoryEnclave`, on this enclave or any other.
-
-For the same enclave: mutators take priority over readers (the policy that stops
-a stream of readers starving a queued `Destroy`), so a nested borrow queues
-behind any mutator that arrived meanwhile, and that mutator is waiting on `fn`'s
-own borrow.
-
-For a **different** enclave — a tightening of what this page previously said
-(issue #18) — borrowing takes the package-wide `purgeMu` shared, and Go's
-`RWMutex` refuses a new `RLock` once a writer is queued, so a nested borrow
-deadlocks against any purge-capable operation that queued after the outer borrow
-began. Materialize what `fn` needs before borrowing.
+`fn` must not escape the slice, and must not re-enter THIS enclave. **`fn` MAY
+touch a different enclave** — a relaxation of what this page previously said.
+Under this repository's former borrow machinery a process-wide `purgeMu` was held
+shared across every borrow, so a nested borrow of any second enclave deadlocked
+against a purge-capable operation queued anywhere in the process. go-enclave
+holds only the borrowed enclave's own read lock, so that hazard is gone with the
+lock that created it.
 
 `shamir.ProtectedShare` mirrors the pair as `Value` / `WithValue`.
 
-### Capability: promote a buffer to an encrypted-at-rest key
+### Capability: promote an enclave to an encrypted-at-rest key
 
 ```go
-func SealProtectedBuffer(buf *ProtectedBuffer) *ProtectedKey
+func SealMemoryEnclave(buf *MemoryEnclave) *ProtectedKey
+func SealProtectedBuffer(buf *MemoryEnclave) *ProtectedKey // deprecated spelling
 ```
 
 | | |
 |---|---|
 | Request | `buf` — **consumed**; ownership transfers to the returned key |
-| Response | `*ProtectedKey`, or `nil` if `buf` was `nil`, already consumed, or destroyed. A concurrent second call gets `nil`. |
+| Response | `*ProtectedKey`, or `nil` if `buf` was `nil`, already consumed, or destroyed |
 | Errors | none returned; `nil` is the failure signal |
 | Permission | none |
 
@@ -159,20 +182,17 @@ ciphertext** — see [`engineering.md`](engineering.md) §2.
 func WipeBytes(b []byte)
 ```
 
-Zeroes `b` in place. Handles the empty slice. Use it on any transient copy of
-key material that could not be avoided.
+Zeroes `b` in place. Handles the empty slice. It is go-enclave's `Wipe`,
+re-exported so callers have one wiping primitive rather than two.
 
 ### Error vocabulary
 
 ```go
-var ErrEnclaveNil       = &NilError{}       // "memprotect: enclave is nil"
-var ErrEnclaveDestroyed = &DestroyedError{} // "memprotect: enclave has been destroyed"
+var ErrEnclaveNil       = &NilError{}                  // "memprotect: enclave is nil"
+var ErrEnclaveDestroyed = goenclave.ErrEnclaveDestroyed // go-enclave's sentinel, re-exported
 
 type NilError struct{}
 func (e *NilError) Error() string
-
-type DestroyedError struct{}
-func (e *DestroyedError) Error() string
 
 type OpenError struct{ Err error }
 func (e *OpenError) Error() string
@@ -180,25 +200,34 @@ func (e *OpenError) Unwrap() error
 ```
 
 Match with `errors.Is(err, enclave.ErrEnclaveNil)`, `errors.Is(err,
-enclave.ErrEnclaveDestroyed)` and `errors.As(err, &openErr)`. The two sentinels
-are distinct on purpose: `NilError` says a `ProtectedKey` was never given an
-enclave or has been `Clear`ed, `DestroyedError` says locked memory existed and
-has been wiped and unmapped.
+enclave.ErrEnclaveDestroyed)` and `errors.As(err, &openErr)`.
+
+`DestroyedError` is GONE as a type. `ErrEnclaveDestroyed` is now go-enclave's
+sentinel re-exported rather than a local one redefined, so `errors.Is` matches
+whether the error arrived through this package or straight from go-enclave —
+two sentinels meaning the same thing is how a caller ends up handling one and
+not the other.
+
+The two remaining sentinels are still distinct on purpose: `NilError` says a
+`ProtectedKey` was never given an enclave or has been `Clear`ed;
+`ErrEnclaveDestroyed` says locked memory existed and has been wiped and unmapped.
 
 ## Re-exports
 
-`pkg/seal` re-exports this surface as type aliases and function variables so
-`pkg/seal` consumers need not import `pkg/enclave` separately:
+`pkg/seal` re-exports what remains as type aliases and function variables:
 
 ```go
-type ProtectedBuffer = enclave.ProtectedBuffer
+type ProtectedBuffer = enclave.MemoryEnclave
 type ProtectedKey    = enclave.ProtectedKey
 
-var NewProtectedBuffer          = enclave.NewProtectedBuffer
-var NewProtectedBufferFromBytes = enclave.NewProtectedBufferFromBytes
-var NewProtectedKey             = enclave.NewProtectedKey
-var SealProtectedBuffer         = enclave.SealProtectedBuffer
+var NewProtectedKey     = enclave.NewProtectedKey
+var SealProtectedBuffer = enclave.SealMemoryEnclave
 ```
+
+`seal.NewProtectedBuffer` and `seal.NewProtectedBufferFromBytes` are GONE for the
+reason given above — call go-enclave's constructors and handle the error. A local
+wrapper preserving the old bare-pointer shape would be the removed-API shim
+`conventions/dependency-resolution.md` §0 forbids.
 
 These are aliases, not wrappers. There is no second implementation and no
 behavioral difference.

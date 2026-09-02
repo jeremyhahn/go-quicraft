@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
+	goenclave "github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
@@ -557,13 +558,14 @@ func unsealStrategyError(err error) error {
 // process.
 //
 // It is a separate step, rather than inline in the seal/unseal bodies, for a
-// reason that outlives the deduplication: the protected paths run their
-// key-touching half inside a MemoryEnclave borrow, and a borrow may not open a
-// second enclave. pkg/enclave holds a process-wide purgeMu across every borrow,
-// and ProtectedKey.Open allocates locked memory, which takes that same mutex
-// exclusively — so opening the passphrase inside a root-key borrow is a
-// self-deadlock, not merely a documented hazard. Preparing the cipher first is
-// what makes the borrow that follows safe, and the AEAD itself holds only the
+// reason that outlives the deduplication, though it is no longer a hard one: the
+// protected paths run their key-touching half inside a MemoryEnclave borrow.
+// Until the go-enclave adoption, pkg/enclave held a process-wide purgeMu across
+// every borrow and ProtectedKey.Open took it exclusively, so opening the
+// passphrase inside a root-key borrow was a self-deadlock rather than merely a
+// documented hazard. go-enclave borrows take only the borrowed enclave's own read
+// lock, so the nesting is now legal — but preparing the cipher first still keeps
+// the key-touching window as short as it can be, and the AEAD holds only the
 // expanded key schedule in ordinary memory, which the borrow may touch freely.
 func wrappingCipher(passphrase *enclave.ProtectedKey, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
 	ppBuf, err := passphrase.Open()
@@ -572,9 +574,13 @@ func wrappingCipher(passphrase *enclave.ProtectedKey, salt []byte, version KDFVe
 	}
 	defer ppBuf.Destroy()
 
-	wrappingKey, err := DeriveKey(ppBuf.Bytes(), salt, version, params)
-	if err != nil {
-		return nil, wrap(err)
+	var wrappingKey []byte
+	if berr := ppBuf.WithBytes(func(pp []byte) error {
+		var derr error
+		wrappingKey, derr = DeriveKey(pp, salt, version, params)
+		return derr
+	}); berr != nil {
+		return nil, wrap(berr)
 	}
 	defer wipeBytes(wrappingKey)
 
@@ -710,8 +716,12 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrInvalidSealedKey}
 	}
 
-	out := enclave.NewMemoryEnclave(plaintextLen)
-	if err := out.WithBytes(func(dst []byte) error {
+	scratch, err := goenclave.NewMemoryEnclaveSized(plaintextLen)
+	if err != nil {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
+	}
+	defer scratch.Destroy()
+	if err := scratch.WithBytes(func(dst []byte) error {
 		plaintext, oerr := aead.Open(dst[:0], nil, rest, []byte(passphraseStrategyName))
 		if oerr != nil {
 			return ErrDecryptionFailed
@@ -727,14 +737,25 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 		}
 		return nil
 	}); err != nil {
-		out.Destroy()
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
 
-	// Frozen once the material is final: the contract hands the caller a key to
-	// read and destroy, not a buffer to edit, and a read-only region faults on a
-	// stray write instead of silently corrupting the root key.
-	out.Freeze()
+	// Moved into a FROZEN region once the material is final: the contract hands
+	// the caller a key to read and destroy, not a buffer to edit, and a read-only
+	// region faults on a stray write instead of silently corrupting the root key.
+	//
+	// A sized enclave stays writable for its whole life, so the freeze has to come
+	// from the move. Both endpoints are mlock'd and NewMemoryEnclave wipes the
+	// scratch, so the root key never touches the ordinary heap. It collapses to a
+	// single region once go-enclave grows a post-fill seal (go-enclave #6).
+	var out *enclave.MemoryEnclave
+	if berr := scratch.WithBytes(func(src []byte) error {
+		var cerr error
+		out, cerr = goenclave.NewMemoryEnclave(src)
+		return cerr
+	}); berr != nil {
+		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: berr}
+	}
 	return out, nil
 }
 

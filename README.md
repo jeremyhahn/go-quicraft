@@ -691,7 +691,7 @@ Every feature has a folder with five documents — `architecture.md`,
 | [write-batching](docs/write-batching/architecture.md) | the proposal aggregator and the write-durability modes |
 | [seal-barrier](docs/seal-barrier/architecture.md) | at-rest encryption: epoch DEKs, sealing strategies, FIPS |
 | [shamir-primitive](docs/shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive |
-| [memory-enclave](docs/memory-enclave/architecture.md) | memguard-backed protection for key material |
+| [memory-enclave](docs/memory-enclave/architecture.md) | protection for key material: go-enclave locked memory, plus `ProtectedKey` at rest |
 | [observability](docs/observability/architecture.md) | metrics, logging, event notifications |
 
 **Cross-feature**

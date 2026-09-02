@@ -34,14 +34,11 @@ func protectedRootKey(t *testing.T) (*enclave.MemoryEnclave, []byte) {
 	if _, err := rand.Read(want); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	enc := enclave.NewMemoryEnclave(rootKeySize)
-	if err := enc.WithBytes(func(b []byte) error {
-		copy(b, want)
-		return nil
-	}); err != nil {
-		t.Fatalf("fill enclave: %v", err)
-	}
-	enc.Freeze()
+	// Frozen by construction: go-enclave has no post-fill seal (go-enclave #6),
+	// so a read-only enclave comes from NewMemoryEnclave rather than from
+	// sized-and-then-frozen. want is copied first because that constructor wipes
+	// its source.
+	enc := mustFromBytes(t, append([]byte(nil), want...))
 	t.Cleanup(enc.Destroy)
 	return enc, want
 }
@@ -174,7 +171,7 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 
 	recovered.Destroy()
 
-	if recovered.Bytes() != nil {
+	if encBytes(recovered) != nil {
 		t.Fatal("a destroyed root-key enclave must report no bytes")
 	}
 	if err := recovered.WithBytes(func([]byte) error { return nil }); !errors.Is(err, enclave.ErrEnclaveDestroyed) {
@@ -229,10 +226,10 @@ func TestSoftwareStrategy_ProtectedUnsealRefusesAnUnauthenticatedLength(t *testi
 func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 	ctx := context.Background()
 
-	destroyed := enclave.NewMemoryEnclave(rootKeySize)
+	destroyed := mustSized(t, rootKeySize)
 	destroyed.Destroy()
 
-	wrongSize := enclave.NewMemoryEnclave(rootKeySize - 1)
+	wrongSize := mustSized(t, rootKeySize-1)
 	t.Cleanup(wrongSize.Destroy)
 
 	tests := []struct {
@@ -484,9 +481,9 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 	// caller that destroyed or lost its root key before sealing must learn so
 	// here, not at an unseal it can no longer perform (Codex review of #40).
 	t.Run("refuses a root key it cannot vouch for", func(t *testing.T) {
-		destroyed := enclave.NewMemoryEnclave(rootKeySize)
+		destroyed := mustSized(t, rootKeySize)
 		destroyed.Destroy()
-		wrongSize := enclave.NewMemoryEnclave(rootKeySize - 1)
+		wrongSize := mustSized(t, rootKeySize-1)
 		t.Cleanup(wrongSize.Destroy)
 
 		for name, enc := range map[string]*enclave.MemoryEnclave{

@@ -1926,7 +1926,14 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 		return 0, err
 	}
 	defer rootBuf.Destroy()
-	dek, aead, err := b.deriveEpochCipher(rootBuf.Bytes(), b.salt, newEpoch)
+	// Aliases the locked pages for the rest of this function. rootBuf is opened
+	// and destroyed here and never escapes, so no concurrent Destroy can unmap it
+	// underneath the reads below — the condition go-enclave's Open requires.
+	rootBytes, err := rootBuf.Open()
+	if err != nil {
+		return 0, err
+	}
+	dek, aead, err := b.deriveEpochCipher(rootBytes, b.salt, newEpoch)
 	if err != nil {
 		// Nothing committed yet; the old epoch remains active. deriveEpochCipher
 		// already zeroed any partial key material on its own error path, but the
@@ -1945,7 +1952,7 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// Re-authenticate the metadata: Epoch and KnownEpochs both changed, and a
 	// blob whose MAC still covered the OLD values would be rejected by the next
 	// Unseal (correctly — it would be indistinguishable from an edited one).
-	if macErr := b.restampStateMACLocked(rootBuf.Bytes(), candidate); macErr != nil {
+	if macErr := b.restampStateMACLocked(rootBytes, candidate); macErr != nil {
 		wipeBytes(dek)
 		return 0, macErr
 	}
@@ -2257,12 +2264,18 @@ func (b *Barrier) RootKey() ([]byte, error) {
 		return nil, err
 	}
 	// Deferred rather than sequential: the copy below cannot panic today, but a
-	// stranded LockedBuffer holds the PLAINTEXT root key mlock'd for the life of
-	// the process and consumes RLIMIT_MEMLOCK, which memguard answers by
-	// aborting. The cleanup of key material must not depend on the happy path.
+	// stranded enclave holds the PLAINTEXT root key mlock'd for the life of the
+	// process and consumes RLIMIT_MEMLOCK, which then refuses later locks. The
+	// cleanup of key material must not depend on the happy path.
 	defer buf.Destroy()
 	keyCopy := make([]byte, buf.Size())
-	copy(keyCopy, buf.Bytes())
+	if err := buf.WithBytes(func(b []byte) error {
+		copy(keyCopy, b)
+		return nil
+	}); err != nil {
+		wipeBytes(keyCopy)
+		return nil, err
+	}
 	return keyCopy, nil
 }
 
@@ -2573,7 +2586,9 @@ func (b *Barrier) restampStateMACFromEnclaveLocked(s *SealedRootKey) error {
 		return err
 	}
 	defer rootBuf.Destroy()
-	return b.restampStateMACLocked(rootBuf.Bytes(), s)
+	return rootBuf.WithBytes(func(root []byte) error {
+		return b.restampStateMACLocked(root, s)
+	})
 }
 
 // StampSealedStateMAC re-authenticates a sealed blob's metadata under this

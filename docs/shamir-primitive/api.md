@@ -1,7 +1,7 @@
 # Shamir Primitive — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-08-19
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -101,17 +101,25 @@ Use `UnmarshalShareSet` — **never** `json.Unmarshal` into a
 `[]*ProtectedShare`. Shares are unauthenticated by construction, so a recovery
 endpoint decodes whatever it is handed; the generic decoder allocates one locked
 buffer per element as it visits them, which lets the submission rather than the
-service choose how much locked memory to take, and memguard answers a failed
-lock by terminating the process. `UnmarshalShareSet` bounds the element count
-(255) and the document size (`MaxShareSetBytes`) *before* allocating, and
+service choose how much locked memory to take, exhausting a process-wide
+resource every other caller depends on. `UnmarshalShareSet` bounds the element
+count (255) and the document size (`MaxShareSetBytes`) *before* allocating, and
 destroys the accepted prefix if a later element is rejected.
 
-`NewProtectedShare` builds one share at a time. **It wipes the source buffer
-only on success** — ownership of the share material transfers to the returned
-share. On *any* error return (bad header, empty value, non-standard base64,
-oversized value) the source is deliberately left untouched, and **the caller
-must wipe it**. Validation runs before any locked memory is allocated, so an
-unauthenticated submission cannot size that allocation.
+`NewProtectedShare` builds one share at a time, and where it wipes the source
+buffer follows the error type exactly:
+
+- **`*ValidationError`** (bad header, empty value, non-standard base64, oversized
+  value) — the source is **left untouched** and the caller must wipe it. Every
+  one of these checks runs before any locked memory is allocated, which is also
+  why an unauthenticated submission cannot size that allocation.
+- **Success, or `*ProtectedMemoryError`** — the source is **WIPED**. On success
+  ownership of the share material transfers to the returned share; on a refused
+  `mlock` the value is gone anyway, because the locked-memory constructor wipes
+  its source before reporting the refusal. Do not retry that error with the same
+  buffer.
+
+That split is the reason the two error types exist; see §Error vocabulary.
 A ceremony that legitimately needs more than the budget does its own accounting
 and decodes share by share with it.
 
@@ -193,14 +201,26 @@ distribution. See [`engineering.md`](engineering.md) §7.
 ### Error vocabulary
 
 ```go
-type SplitError      struct{ Reason string }
-type CombineError    struct{ Reason string }
-type ValidationError struct{ Field, Reason string }
-type IntegrityError  struct{}   // DEPRECATED — never returned
+type SplitError           struct{ Reason string }
+type CombineError         struct{ Reason string }
+type ValidationError      struct{ Field, Reason string }
+type ProtectedMemoryError struct{ Op string; Err error }  // Unwrap() error
+type IntegrityError       struct{}   // DEPRECATED — never returned
 ```
 
 Match with `errors.As`. Never branch on `*IntegrityError`: shares carry no
 digest, so no code path constructs one.
+
+**`ProtectedMemoryError` vs `ValidationError` is an OWNERSHIP contract, not a
+wording choice, and `NewProtectedShare` is where it bites.** A `*ValidationError`
+means the value never reached protected memory and is **left untouched** — every
+syntactic check runs before any locked memory is allocated. A
+`*ProtectedMemoryError` means the kernel refused the `mlock`, and by then the
+value has **already been wiped**: go-enclave's constructor wipes its source
+before it reports a refusal. Do not retry with the same buffer on that error; it
+is zeroes. It is also the one an operator can act on — it says the host or
+container is out of locked memory, not that the input was wrong. It unwraps to
+the allocator's own error, so `errors.Is` reaches go-enclave's sentinels.
 
 ### Constants
 

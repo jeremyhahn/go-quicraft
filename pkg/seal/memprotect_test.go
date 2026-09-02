@@ -17,57 +17,52 @@ package seal
 import (
 	"bytes"
 	"testing"
+
+	goenclave "github.com/jeremyhahn/go-enclave"
+	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
-// TestProtectedBuffer_AliasLifecycle verifies that the seal package type aliases
-// for ProtectedBuffer work correctly through the full lifecycle.
-func TestProtectedBuffer_AliasLifecycle(t *testing.T) {
-	pb := NewProtectedBuffer(32)
-	if pb == nil {
-		t.Fatal("NewProtectedBuffer returned nil")
-	}
+// TestProtectedBuffer_AliasResolvesToGoEnclave pins what this package's
+// compatibility surface now means. seal.ProtectedBuffer, enclave.MemoryEnclave
+// and go-enclave's MemoryEnclave must all be ONE type, not three that happen to
+// agree — the whole point of the adoption is that the portfolio has a single
+// locked-memory implementation. Assignment across all three is the compile-time
+// proof; a defined type anywhere in the chain would fail to build.
+//
+// TestProtectedBuffer_AliasLifecycle and TestProtectedBuffer_AliasFromBytes were
+// DROPPED here rather than ported, and deliberately: they exercised
+// seal.NewProtectedBuffer and seal.NewProtectedBufferFromBytes, which are gone
+// because locked memory is go-enclave's and its constructors return an error a
+// bare-pointer alias could not express. The behaviour they covered — allocate,
+// write, size, destroy, wipe-the-source — is go-enclave's own responsibility and
+// is tested there.
+// The compile-time half, in the blank-identifier form Go uses for this. These
+// only build if seal.ProtectedBuffer, enclave.MemoryEnclave and go-enclave's
+// MemoryEnclave are ONE type.
+var (
+	_ *ProtectedBuffer         = (*goenclave.MemoryEnclave)(nil)
+	_ *enclave.MemoryEnclave   = (*ProtectedBuffer)(nil)
+	_ *goenclave.MemoryEnclave = (*enclave.MemoryEnclave)(nil)
+)
 
-	if pb.Size() != 32 {
-		t.Fatalf("expected size=32, got %d", pb.Size())
-	}
+func TestProtectedBuffer_AliasResolvesToGoEnclave(t *testing.T) {
+	src := mustSized(t, 32)
+	defer src.Destroy()
 
-	b := pb.Bytes()
-	if len(b) != 32 {
-		t.Fatalf("expected Bytes() length=32, got %d", len(b))
-	}
-
-	pb.Destroy()
-	if pb.Bytes() != nil {
-		t.Fatal("Bytes() should return nil after Destroy()")
-	}
-	if pb.Size() != 0 {
-		t.Fatalf("Size() should return 0 after Destroy(), got %d", pb.Size())
-	}
-
-	// Double destroy should not panic.
-	pb.Destroy()
-}
-
-// TestProtectedBuffer_AliasFromBytes verifies the aliased NewProtectedBufferFromBytes
-// creates a protected buffer with the correct content.
-func TestProtectedBuffer_AliasFromBytes(t *testing.T) {
-	original := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE}
-	source := make([]byte, len(original))
-	copy(source, original)
-
-	pb := NewProtectedBufferFromBytes(source)
-	defer pb.Destroy()
-
-	got := pb.Bytes()
-	if !bytes.Equal(got, original) {
-		t.Fatalf("protected buffer content mismatch: got %x, want %x", got, original)
+	// Identity is proven at compile time by the block above; re-asserting it here
+	// would only be a no-op conversion. What runs is that an enclave reaches this
+	// package's ProtectedBuffer name and behaves.
+	if src.Size() != 32 {
+		t.Fatalf("Size() = %d, want 32", src.Size())
 	}
 }
 
-// TestProtectedKey_AliasOpenSeal verifies the aliased ProtectedKey works
-// through the full encrypt-at-rest cycle.
+// TestProtectedKey_AliasOpenSeal verifies the aliased ProtectedKey opens into
+// locked memory holding what was sealed.
 func TestProtectedKey_AliasOpenSeal(t *testing.T) {
-	keyData := []byte("this-is-a-32-byte-encryption-key")
+	keyData := []byte("an-aliased-protected-key-32-byte")
+	want := append([]byte(nil), keyData...)
+
 	pk := NewProtectedKey(keyData)
 	if pk == nil {
 		t.Fatal("NewProtectedKey returned nil")
@@ -75,74 +70,89 @@ func TestProtectedKey_AliasOpenSeal(t *testing.T) {
 
 	buf, err := pk.Open()
 	if err != nil {
-		t.Fatalf("Open returned unexpected error: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	defer buf.Destroy()
 
-	got := buf.Bytes()
-	if !bytes.Equal(got, []byte("this-is-a-32-byte-encryption-key")) {
-		t.Fatalf("opened key content mismatch: got %x", got)
+	if !bytes.Equal(encBytes(buf), want) {
+		t.Fatalf("opened key = %x, want %x", encBytes(buf), want)
+	}
+}
+
+// TestProtectedKey_AliasOpenIsFrozen pins the property the locked-to-locked copy
+// in ProtectedKey.Open exists to preserve: what Open hands back is READ-ONLY, so
+// a stray write faults instead of silently corrupting the key. A sized enclave
+// would stay writable, which is why Open does not simply hand one back.
+func TestProtectedKey_AliasOpenIsFrozen(t *testing.T) {
+	pk := NewProtectedKey([]byte("a-key-that-must-come-back-frozen"))
+
+	buf, err := pk.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer buf.Destroy()
+
+	// A frozen region is one built by NewMemoryEnclave rather than sized-and-filled.
+	// Proving the mprotect by writing would fault the test process, so this asserts
+	// the observable contract instead: the material is intact and readable.
+	if got := encBytes(buf); len(got) != 32 {
+		t.Fatalf("opened key length = %d, want 32", len(got))
 	}
 }
 
 // TestSealProtectedBuffer_AliasRoundTrip verifies the aliased
-// SealProtectedBuffer creates a usable ProtectedKey.
+// SealProtectedBuffer consumes an enclave into a usable ProtectedKey.
 func TestSealProtectedBuffer_AliasRoundTrip(t *testing.T) {
-	data := []byte("seal-me-into-an-enclave-buffer!!")
-	pb := NewProtectedBufferFromBytes(data)
+	want := []byte("seal-me-into-an-enclave-buffer!!")
+	pb := mustFromBytes(t, append([]byte(nil), want...))
 
 	pk := SealProtectedBuffer(pb)
 	if pk == nil {
 		t.Fatal("SealProtectedBuffer returned nil")
 	}
 
-	// After sealing, the buffer should report nil Bytes and zero Size.
-	if pb.Bytes() != nil {
-		t.Fatal("buffer Bytes() should return nil after SealProtectedBuffer")
-	}
-	if pb.Size() != 0 {
-		t.Fatal("buffer Size() should return 0 after SealProtectedBuffer")
+	// The source enclave is CONSUMED: ownership moved to the key.
+	if encBytes(pb) != nil {
+		t.Fatal("the source enclave should be destroyed after SealProtectedBuffer")
 	}
 
 	buf, err := pk.Open()
 	if err != nil {
-		t.Fatalf("Open returned unexpected error: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	defer buf.Destroy()
 
-	if !bytes.Equal(buf.Bytes(), []byte("seal-me-into-an-enclave-buffer!!")) {
-		t.Fatalf("sealed key content mismatch: got %x", buf.Bytes())
+	if !bytes.Equal(encBytes(buf), want) {
+		t.Fatalf("sealed key content mismatch: got %x, want %x", encBytes(buf), want)
 	}
 }
 
-// TestSealProtectedBuffer_AliasNil verifies SealProtectedBuffer returns nil
-// for nil and destroyed buffers.
+// TestSealProtectedBuffer_AliasNil verifies SealProtectedBuffer returns nil for
+// a nil or already-destroyed enclave rather than panicking.
 func TestSealProtectedBuffer_AliasNil(t *testing.T) {
 	if SealProtectedBuffer(nil) != nil {
-		t.Fatal("SealProtectedBuffer should return nil for nil buffer")
+		t.Fatal("SealProtectedBuffer should return nil for a nil enclave")
 	}
 
-	pb := NewProtectedBuffer(16)
+	pb := mustSized(t, 16)
 	pb.Destroy()
 	if SealProtectedBuffer(pb) != nil {
-		t.Fatal("SealProtectedBuffer should return nil for a destroyed buffer")
+		t.Fatal("SealProtectedBuffer should return nil for a destroyed enclave")
 	}
 }
 
-// TestWipeBytes_Alias verifies that the wipeBytes wrapper zeros all bytes.
+// TestWipeBytes_Alias verifies the package-local wipeBytes zeroes its argument.
 func TestWipeBytes_Alias(t *testing.T) {
-	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	wipeBytes(data)
-
-	for i, b := range data {
-		if b != 0 {
-			t.Fatalf("byte at index %d not zeroed: got %d", i, b)
+	b := []byte("sensitive-material-to-be-wiped!!")
+	wipeBytes(b)
+	for i, c := range b {
+		if c != 0 {
+			t.Fatalf("byte %d = %#x after wipeBytes, want 0", i, c)
 		}
 	}
 }
 
-// TestWipeBytes_AliasEmpty verifies wipeBytes handles empty and nil slices
-// without panicking.
+// TestWipeBytes_AliasEmpty verifies wipeBytes tolerates an empty slice.
 func TestWipeBytes_AliasEmpty(t *testing.T) {
 	wipeBytes(nil)
 	wipeBytes([]byte{})

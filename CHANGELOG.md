@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: locked memory is now `go-enclave`, not this repository's own
+  implementation (#54, stage one).** `pkg/enclave` no longer implements `mlock`,
+  guard pages, canaries or borrow tracking. `enclave.MemoryEnclave` and the
+  deprecated `enclave.ProtectedBuffer` are type ALIASES for
+  `github.com/jeremyhahn/go-enclave`'s `MemoryEnclave`, so the portfolio has one
+  locked-memory implementation rather than two incompatible ones. `docs/00 §R` is
+  normative on this — *"No project hand-rolls its own locked-memory handling"* —
+  and go-xkms already pinned `go-enclave v0.4.0-alpha`, so until now the stack
+  carried two `MemoryEnclave` types and this repository's flowed upward through
+  `pkg/seal`'s protected interfaces.
+
+  **This is go-quicraft's first portfolio dependency.** `CLAUDE.md` and the agent
+  file both said "no local dependencies", which contradicted §R; both are
+  corrected in this change, per §R's own precedence rule. Nothing else in the
+  portfolio becomes consumable.
+
+  **Removed, not renamed:** `enclave.NewMemoryEnclave(size)`,
+  `enclave.NewMemoryEnclaveFromBytes(data)`, `MemoryEnclave.Bytes()`,
+  `MemoryEnclave.Freeze()`, the `DestroyedError` type, and the
+  `seal.NewProtectedBuffer` / `seal.NewProtectedBufferFromBytes` re-exports.
+  Call `goenclave.NewMemoryEnclaveSized` (fill in place) or
+  `goenclave.NewMemoryEnclave` (move bytes in) and **handle the error** — locking
+  pages is a syscall the kernel can decline, which a bare-pointer constructor
+  could not express, and that is why this was not a mechanical rename. Read a
+  value with `MemoryEnclave.Open() ([]byte, error)` or `WithBytes`;
+  `enclave.ErrEnclaveDestroyed` is now go-enclave's sentinel re-exported, so
+  `errors.Is` matches errors from either package.
+
+  **What did not change is the locked-memory footprint.** The barrier still holds
+  ZERO resident locked pages: the root key and every epoch DEK remain ciphertext
+  at rest in a `ProtectedKey`, and locked pages exist only inside a borrow. There
+  are five such borrows in the repository, all on setup, rekey or rotation paths;
+  encrypt and decrypt run off a cached `cipher.AEAD` and open no enclave at all.
+
+  **What it removes is a self-deadlock.** `pkg/enclave` held a process-wide
+  `purgeMu` shared across every borrow to defend against memguard's process-wide
+  purge, so a borrow could not enclose an allocation — across different enclaves,
+  because the lock was process-wide. go-enclave maps its own memory and nothing
+  can purge it, so borrows take only that enclave's own read lock. That is what
+  unblocks #39, whose owner-ruled option (b) is a borrow spanning
+  `Barrier.Initialize`/`Unseal` and would have deadlocked against the old lock.
+
+- **`go` directive raised to 1.26.7** in the root module AND in all five nested
+  modules, forced by `go-enclave v0.4.0-alpha`'s own minimum. Go evaluates the
+  language version from the MAIN module, so a nested module left behind its
+  parent fails with `module ../.. requires go >= 1.26.7` rather than upgrading —
+  which `contrib/dragonboat/go.mod` has always warned about in a comment and CI
+  caught on the first push. It is within the 1.26 line CI already pins and is NOT
+  the Go 1.27 portfolio wave, which stays held (#19).
+
+### Added
+
+- **`shamir.ProtectedMemoryError`** — the typed error for a refused `mlock`,
+  separated from `ValidationError` because the two encode different OWNERSHIP
+  contracts, not different wording. `NewProtectedShare` leaves the caller's value
+  untouched on a `*ValidationError` (every syntactic check runs before any locked
+  memory is allocated), but by the time a `*ProtectedMemoryError` can be returned
+  the value has already been WIPED — go-enclave's constructor wipes its source
+  before reporting a refusal. A caller distinguishing them the way the docs say
+  to would otherwise retry a legitimate-looking failure with a buffer of zeroes.
+  It is also the error an operator can act on: it says the host is out of locked
+  memory, not that the input was wrong. Every locked-memory refusal in
+  `pkg/crypto/shamir` now reports as this type and unwraps to the allocator's own
+  error.
+
+### Notes
+
+- `ProtectedKey` — material encrypted at rest — still uses `memguard`, because no
+  released go-enclave tag has a counterpart for that posture. `pkg/enclave`
+  disappears entirely when the sealing seam lands (go-enclave #22); that is
+  stage two of #54, and it carries the `Credentials.Secret` retype (#41).
+
 ## [0.10.0-alpha] - 2026-09-01
 
 ### Added

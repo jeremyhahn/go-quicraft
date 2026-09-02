@@ -684,7 +684,7 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 		t.Fatalf("open DEK: %v", err)
 	}
 	defer buf.Destroy()
-	if !bytes.Equal(buf.Bytes(), wantV1) {
+	if !bytes.Equal(encBytes(buf), wantV1) {
 		t.Fatal("legacy blob did not derive its DEK with the v1 info layout")
 	}
 

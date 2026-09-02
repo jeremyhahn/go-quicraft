@@ -1,6 +1,6 @@
 # Memory Enclave — CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: this feature is reachable only as a Go package.**
@@ -23,5 +23,5 @@ documented in their own repositories.
 
 The one operational lever that is not a verb: locked buffers consume
 `RLIMIT_MEMLOCK`. A container running a consumer must be given a limit large
-enough for its protected keys, or memguard aborts the process. That is a
+enough for its protected keys, or locked allocations start failing. That is a
 deployment setting, not a flag.
