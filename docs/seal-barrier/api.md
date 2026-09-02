@@ -1,7 +1,7 @@
 # Seal & Barrier — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -280,7 +280,12 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error)
 func NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error)
 func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
 func NewDeferredSoftwareStrategy() *SoftwareStrategy
+func NewDeferredSoftwareStrategyWithParams(version KDFVersion, params KDFParams) (*SoftwareStrategy, error)
 func NewNoneStrategy() *NoneStrategy
+
+func (s *SoftwareStrategy) KDFVersion() KDFVersion  // which algorithm
+func (s *SoftwareStrategy) KDFParams() KDFParams    // which work factor
+func (s *SoftwareStrategy) DeferredPassphrase() bool
 ```
 
 - `NewSoftwareStrategy` auto-selects the KDF from `FIPSEnabled()`.
@@ -289,7 +294,31 @@ func NewNoneStrategy() *NoneStrategy
   and compiles but cannot succeed, answering `ErrKDFUnsupportedVersion`.
 - `NewDeferredSoftwareStrategy` takes no passphrase at construction and reads it
   from `Credentials.Secret` at seal/unseal time — for flows where the strategy
-  is built before an operator has supplied anything.
+  is built before an operator has supplied anything. It derives with the
+  **defaults**.
+- `NewDeferredSoftwareStrategyWithParams` is that constructor with an explicit
+  work factor. Deferred binding and tunability used to be disjoint — the two
+  tunable constructors are both *bound*, and the only deferred one took no
+  parameters — so a caller could have one or the other and never both.
+
+**Preserving a work factor across a strategy replacement.** `KDFParams()` reads
+the factor off the strategy in hand; `NewDeferredSoftwareStrategyWithParams`
+carries it into the replacement. They are designed to compose in one line, with
+no branch on the algorithm:
+
+```go
+replacement, err := seal.NewDeferredSoftwareStrategyWithParams(old.KDFVersion(), old.KDFParams())
+```
+
+This is not optional hardening. **A sealed blob records the KDF *version* byte
+and never the params**, so a blob sealed at a non-default factor can only be
+unsealed by a strategy carrying the same factor — the live strategy object is
+the only place that number exists. A replacement built at the defaults silently
+resets a hardened deployment toward the *weaker* setting, on the credential that
+wraps the root key. Taking `(version, params)` together, rather than mirroring
+the bound constructors' split signatures, is what stops a caller that is merely
+copying settings from picking the wrong algorithm and failing on the FIPS leg
+only.
 - Seal format: `[KDFSalt:32 ‖ Nonce:12 ‖ EncryptedRootKey ‖ Tag:16]`.
 
 **`tpm2`, `pkcs11`, `awskms`, `gcpkms`, `azurekv` and `vault` are go-xkms's;

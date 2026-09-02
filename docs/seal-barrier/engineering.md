@@ -1,7 +1,7 @@
 # Seal & Barrier — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-02
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/seal`
@@ -132,7 +132,18 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error)
 func NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error)
 func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
 func NewDeferredSoftwareStrategy() *SoftwareStrategy
+func NewDeferredSoftwareStrategyWithParams(version KDFVersion, params KDFParams) (*SoftwareStrategy, error)
+
+func (s *SoftwareStrategy) KDFVersion() KDFVersion
+func (s *SoftwareStrategy) KDFParams() KDFParams
+func (s *SoftwareStrategy) DeferredPassphrase() bool
 ```
+
+`KDFParams` and `NewDeferredSoftwareStrategyWithParams` exist as a pair, to let a
+consumer PRESERVE a work factor across a strategy replacement rather than reset
+it. Neither is useful alone: one reads the factor off the strategy in hand, the
+other carries it into the replacement. See `api.md` §Strategies for why a sealed
+blob cannot supply the factor instead.
 
 ### Algorithms, KDF, FIPS
 

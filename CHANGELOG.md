@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SoftwareStrategy.KDFParams()` and `NewDeferredSoftwareStrategyWithParams`
+  (#72, requested by go-qrdb #156).** Deferred passphrase binding and KDF
+  tunability used to be disjoint: both tunable constructors are *bound*, and the
+  only deferred one took no arguments. A consumer that must install a deferred
+  replacement strategy — which go-qrdb's `ChangePassword` has done since #43, so
+  the barrier keeps authenticating its unsealer — therefore had no way to carry a
+  tuned work factor across, and reset every hardened deployment to the defaults
+  on each password change.
+
+  Both halves are needed and neither is useful alone: `KDFParams()` reads the
+  work factor off the strategy in hand (its sibling `KDFVersion()` was already
+  exposed; this was the missing one), and the new constructor carries it into the
+  replacement. They compose in one line with no branch on the algorithm:
+
+  ```go
+  replacement, err := seal.NewDeferredSoftwareStrategyWithParams(old.KDFVersion(), old.KDFParams())
+  ```
+
+  **This is correctness, not only hardening.** A sealed blob records the KDF
+  *version* byte and never the params, so a blob sealed at a non-default factor
+  can only be unsealed by a strategy carrying that same factor — the live
+  strategy object is the only place the number exists. The drift was silent and
+  toward the *weaker* setting, on the credential that wraps the root key.
+
+  The constructor takes `(version, params)` together rather than mirroring the
+  bound constructors' split-by-algorithm signatures, so a caller merely copying
+  another strategy's settings cannot pick the wrong algorithm and fail on the
+  FIPS leg only. FIPS behaviour matches the bound constructors exactly: a
+  `-tags fips` build has no Argon2id deriver and answers
+  `ErrKDFUnsupportedVersion`; runtime FIPS answers `ErrKDFNotFIPSApproved`.
+
+  Purely additive — no existing signature, default or binding-mode semantic
+  changes, so no consumer cascade.
+
+
 ### Changed
 
 - **The barrier holds its root key in locked memory for the whole of

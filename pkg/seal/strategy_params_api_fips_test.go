@@ -65,3 +65,81 @@ func TestFIPSBuildRefusesWithParamsBeforeValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestFIPSBuildKeepsDeferredWithParamsConstructor is the deferred sibling of
+// TestFIPSBuildKeepsWithParamsConstructor, and it exists for the same reason:
+// compiling this file is half the assertion. NewDeferredSoftwareStrategyWithParams
+// claims in its doc comment to exist in EVERY build including -tags fips, and a
+// claim about cross-build availability is only worth making if a FIPS build
+// fails to compile when it stops being true.
+//
+// The in-package test of this constructor cannot make that assertion. It runs in
+// the normal binary, toggles GOFIPS140, and accepts either FIPS error — so it
+// would still pass if a later refactor put //go:build fips on the constructor and
+// removed the symbol from FIPS builds entirely. That would break every consumer
+// that merely MENTIONS the call, including one whose use is already guarded by
+// its own runtime FIPS check.
+func TestFIPSBuildKeepsDeferredWithParamsConstructor(t *testing.T) {
+	s, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFArgon2id, seal.DefaultKDFParams())
+	if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
+		t.Fatalf("NewDeferredSoftwareStrategyWithParams(Argon2id) in a FIPS build = %v, want ErrKDFUnsupportedVersion", err)
+	}
+	if s != nil {
+		t.Fatal("a refused constructor returned a strategy; nothing usable may escape a failed FIPS refusal")
+	}
+}
+
+// TestFIPSBuildAcceptsDeferredWithParamsPBKDF2 is the half that has no analogue
+// among the bound constructors, and it is the one a FIPS deployment depends on.
+//
+// NewSoftwareStrategyWithParams names Argon2id and can therefore NEVER succeed in
+// a FIPS build. This constructor takes the version as an argument, so it can —
+// and must, or preserving a tuned work factor across a strategy replacement would
+// be impossible in exactly the deployments most likely to have tuned one.
+//
+// It also pins the pair working end to end under -tags fips: KDFParams() reads
+// the factor back, and the result is still deferred.
+func TestFIPSBuildAcceptsDeferredWithParamsPBKDF2(t *testing.T) {
+	params := seal.DefaultFIPSKDFParams()
+	params.Iterations = 750_000 // deliberately not the default, so this proves carriage
+
+	s, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFPbkdf2SHA256, params)
+	if err != nil {
+		t.Fatalf("PBKDF2 must be accepted in a FIPS build: %v", err)
+	}
+	if s == nil {
+		t.Fatal("accepted constructor returned nil")
+	}
+	defer s.Close()
+
+	if got := s.KDFParams(); got != params {
+		t.Fatalf("KDFParams() = %+v, want %+v — the tuned factor was not carried", got, params)
+	}
+	if s.KDFVersion() != seal.KDFPbkdf2SHA256 {
+		t.Fatalf("KDFVersion() = %v, want PBKDF2", s.KDFVersion())
+	}
+	if !s.DeferredPassphrase() {
+		t.Fatal("the strategy is bound; the barrier would stop authenticating its unsealer")
+	}
+}
+
+// TestFIPSBuildRefusesDeferredWithParamsBeforeValidation guards the refusal ORDER
+// for the deferred constructor, exactly as its bound sibling above does: with no
+// Argon2id deriver the work factors are meaningless, so no parameter choice may
+// change the answer or hint that some other choice would have worked.
+func TestFIPSBuildRefusesDeferredWithParamsBeforeValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params seal.KDFParams
+	}{
+		{"production floor", seal.DefaultKDFParams()},
+		{"below every floor", seal.KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 1, SaltLen: 1}},
+		{"zero", seal.KDFParams{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFArgon2id, tc.params); !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
+				t.Fatalf("NewDeferredSoftwareStrategyWithParams(Argon2id, %+v) = %v, want ErrKDFUnsupportedVersion", tc.params, err)
+			}
+		})
+	}
+}

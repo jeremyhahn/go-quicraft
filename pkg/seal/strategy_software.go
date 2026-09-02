@@ -164,6 +164,81 @@ func NewDeferredSoftwareStrategy() *SoftwareStrategy {
 	}
 }
 
+// NewDeferredSoftwareStrategyWithParams creates a deferred SoftwareStrategy that
+// derives with an EXPLICIT KDF version and work factor, instead of the defaults
+// NewDeferredSoftwareStrategy selects.
+//
+// It closes the gap that deferred binding and tunability used to be disjoint:
+// the two tunable constructors above are both BOUND, and the only deferred one
+// took no parameters, so a caller could have a tuned strategy or a deferred one
+// and never both. A consumer that must preserve a work factor across a strategy
+// replacement — go-qrdb's ChangePassword, which since #43 always installs a
+// deferred strategy — therefore had nothing to preserve it WITH, and reset every
+// hardened deployment to defaults on each password change.
+//
+// # Why it takes the version as well as the params
+//
+// The two bound constructors split by algorithm: NewSoftwareStrategyWithParams
+// is Argon2id, NewSoftwareStrategyFIPS is PBKDF2. Mirroring that split here
+// would force a consumer that is merely COPYING another strategy's settings to
+// branch on the algorithm first — and a consumer that guessed wrong would
+// compile everywhere and fail at runtime on the FIPS leg only. Taking
+// (version, params) means KDFParams() and this constructor compose directly:
+//
+//	replacement, err := NewDeferredSoftwareStrategyWithParams(old.KDFVersion(), old.KDFParams())
+//
+// which is the whole point, and which cannot pick the wrong algorithm.
+//
+// # FIPS behaviour, which is the bound constructors' exactly
+//
+// Like NewSoftwareStrategyWithParams, this EXISTS IN EVERY BUILD including
+// -tags fips: the exported surface of a Layer 1 package must not move with a
+// build tag, or a consumer guarding the call behind its own runtime check fails
+// to COMPILE over a line it never executes.
+//
+// Which error you get depends on which FIPS you mean, and both are the same
+// mechanism the bound constructors use:
+//
+//   - In a -tags fips BUILD there is no Argon2id deriver (kdf_argon2.go is
+//     excluded), so KDFArgon2id is absent from kdfDispatchers and returns
+//     ErrKDFUnsupportedVersion. Absence of the algorithm refuses the call, not a
+//     policy branch.
+//   - With FIPS active at RUNTIME (GOFIPS140, fips140.Enabled) in a build that
+//     does have the deriver, KDFArgon2id returns ErrKDFNotFIPSApproved.
+//
+// KDFPbkdf2SHA256 is accepted in both.
+//
+// # Work-factor floors are NOT checked here, deliberately
+//
+// newSoftwareStrategy does not check them either; DeriveKey does, on every
+// derivation (see validateKDFParams). Validating at construction here alone
+// would make this constructor stricter than the three beside it, so a consumer
+// copying params off a bound strategy could be refused a configuration that
+// strategy was allowed to hold. Nothing escapes the floor either way — a weak
+// factor still cannot derive.
+//
+// The returned strategy takes its passphrase from Credentials.Secret on every
+// SealRootKey and UnsealRootKey call, exactly as NewDeferredSoftwareStrategy's
+// does. Note that a blob sealed at a non-default work factor can only be
+// unsealed by a strategy carrying the SAME factor, so preserving it is a
+// correctness requirement and not only a hardening one.
+func NewDeferredSoftwareStrategyWithParams(version KDFVersion, params KDFParams) (*SoftwareStrategy, error) {
+	// Same order, and the same two errors, as newSoftwareStrategy: absence of
+	// the deriver first, then the runtime policy.
+	if _, ok := kdfDispatchers[version]; !ok {
+		return nil, ErrKDFUnsupportedVersion
+	}
+	if err := checkKDFFIPS(version); err != nil {
+		return nil, err
+	}
+	return &SoftwareStrategy{
+		kdfVersion:      version,
+		kdfParams:       params,
+		randReader:      rand.Reader,
+		deferPassphrase: true,
+	}, nil
+}
+
 // newSoftwareStrategy is the shared constructor for all SoftwareStrategy variants.
 // minRecommendedPassphraseLen is the length below which a passphrase is
 // reported as weak. 12 bytes is the NIST SP 800-63B minimum for a memorized
@@ -239,6 +314,28 @@ func (s *SoftwareStrategy) HardwareBacked() bool { return false }
 
 // KDFVersion returns the KDF version this strategy uses for Seal operations.
 func (s *SoftwareStrategy) KDFVersion() KDFVersion { return s.kdfVersion }
+
+// KDFParams returns the key-derivation WORK FACTORS this strategy derives with.
+// KDFVersion above names the algorithm; this is the cost.
+//
+// It exists so a consumer replacing a strategy can PRESERVE the work factor it
+// finds rather than resetting it. That is not a hypothetical: go-qrdb's
+// ChangePassword installs a replacement strategy on every password change, and
+// without this the tuned factor of a hardened deployment was silently discarded
+// — drifting toward the WEAKER setting, on the credential that wraps the root
+// key. Pair it with NewDeferredSoftwareStrategyWithParams, which is the other
+// half: this reads the factor off the old strategy, that carries it into the new
+// one. Either alone is insufficient (go-qrdb #156).
+//
+// The work factor is not recoverable any other way. A sealed blob records only
+// the KDF VERSION byte, never the params — see unsealKDFVersionAndParams, whose
+// contract is that "a key sealed with non-default params can only be unsealed by
+// a strategy configured with matching params". So the live strategy object is
+// the only place the number exists, and this is the only way to read it.
+//
+// KDFParams is a plain value struct, so the caller gets a copy and cannot mutate
+// the strategy through it.
+func (s *SoftwareStrategy) KDFParams() KDFParams { return s.kdfParams }
 
 // DeferredPassphrase reports whether this strategy binds its passphrase at
 // Seal/Unseal time (true, NewDeferredSoftwareStrategy) or at construction
