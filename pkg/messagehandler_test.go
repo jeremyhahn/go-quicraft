@@ -392,17 +392,52 @@ var authorizeAllSenders = transport.PeerAuth{
 	AuthorizesAddress: func(string) bool { return true },
 }
 
+// The committed addresses authorizeSnapshotPath installs. They are named
+// because snapshotPathMembership has to reproduce them exactly: a chunk
+// Membership that disagrees with the configuration the fixture authorized
+// against is a REWRITE of it, which is the whole hazard the helper exists to
+// keep out of tests.
+const (
+	snapshotPathLocalAddr  = "127.0.0.1:6001"
+	snapshotPathSenderAddr = "127.0.0.1:6002"
+)
+
+// snapshotPathMembership is the committed configuration authorizeSnapshotPath
+// installs, in the form a snapshot chunk carries it. A test whose snapshot must
+// not REWRITE that configuration ships this as the chunk Membership.
+//
+// Shipping it is what a real sender does, not a convenience: forEachSnapshotChunk
+// and emptySnapshotChunk both stamp every chunk with the leader's committed
+// snap.Membership, so a chunk with an EMPTY Membership is a shape no sender
+// produces. Delivering one is not inert — HandleSnapshot forwards it to raft as
+// the InstallSnapshot's Snapshot.Membership, raft.Peer.Handle adopts it
+// wholesale on the restore path (p.membership = newMembership(ss.Membership)),
+// and the sender the fixture authorized is then a replica the committed
+// configuration does not name. Every later receive from it is refused
+// unknown_member. That adoption happens on the engine worker, ASYNCHRONOUSLY to
+// the HandleSnapshot that queued it, so a test that delivers an empty
+// membership and then authorizes anything else is a race, not a failure.
+// snapshot_durability_test.go's recvFixture carries the same guard.
+func snapshotPathMembership(localReplicaID, fromReplicaID uint64) proto.Membership {
+	return proto.Membership{
+		Addresses: map[uint64]string{
+			localReplicaID: snapshotPathLocalAddr,
+			fromReplicaID:  snapshotPathSenderAddr,
+		},
+	}
+}
+
 // authorizeSnapshotPath wires everything HandleSnapshot's fail-closed
 // authorization needs to admit a test sender: it loads an engine node for
 // shardID whose membership contains both the local replica and the
 // sender, and registers the sender's address in the host registry.
+//
+// The membership it installs is snapshotPathMembership; a snapshot delivered
+// through this path should carry that same value (see there).
 func authorizeSnapshotPath(t *testing.T, eng *engine.Engine, h *Host, shardID, localReplicaID, fromReplicaID uint64) {
 	t.Helper()
-	const fromAddr = "127.0.0.1:6002"
-	voters := map[uint64]string{
-		localReplicaID: "127.0.0.1:6001",
-		fromReplicaID:  fromAddr,
-	}
+	const fromAddr = snapshotPathSenderAddr
+	voters := snapshotPathMembership(localReplicaID, fromReplicaID).Addresses
 	node := newEngineNodeWithMembership(t, shardID, localReplicaID, voters)
 	eng.LoadNode(node)
 	t.Cleanup(func() { eng.UnloadNode(shardID) })

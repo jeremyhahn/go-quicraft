@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
+  strategy binds its passphrase at Seal/Unseal time or at construction. The two
+  modes have opposite credential semantics (a bound strategy IGNORES the
+  `Credentials` handed to `UnsealRootKey`; a deferred one validates against
+  them), and until now the distinction was invisible from outside the package.
+  A consumer replacing a registered strategy therefore could not preserve the
+  mode of the one it replaced, and installing a bound strategy where a deferred
+  one stood turns a barrier that authenticates its unsealer into one that
+  accepts any passphrase for the lifetime of the process — measured on the
+  production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
+  exposing a construction-time property; no behaviour of either mode changes.
+
 ### Changed
 
 - **CI no longer installs analysis tools at job time on the Gitea fabric
@@ -34,21 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/buildgates` still see one version everywhere. Verified: v2.13.2 reports
   **0 issues** on this tree.
 
-### Added
-
-- **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
-  strategy binds its passphrase at Seal/Unseal time or at construction. The two
-  modes have opposite credential semantics (a bound strategy IGNORES the
-  `Credentials` handed to `UnsealRootKey`; a deferred one validates against
-  them), and until now the distinction was invisible from outside the package.
-  A consumer replacing a registered strategy therefore could not preserve the
-  mode of the one it replaced, and installing a bound strategy where a deferred
-  one stood turns a barrier that authenticates its unsealer into one that
-  accepts any passphrase for the lifetime of the process — measured on the
-  production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
-  exposing a construction-time property; no behaviour of either mode changes.
-
-### Changed
 
 - **`make release-alpha` replaced with template v2 (#44, #42)** — the v1 recipe
   auto-incremented PATCH only (so `v0.9.0-alpha` had to be tagged by hand and an
@@ -110,6 +109,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently change whether the barrier authenticates its unsealer, and — on
   `UnsealRootKey` — that a nil error is not proof the supplied credentials were
   correct.
+
+### Testing
+
+- **`TestHandleSnapshot_ConcurrentSameIndexReceives` no longer ships a snapshot
+  no sender produces (#57)** — the test's chunks carried an EMPTY
+  `Membership`, and an InstallSnapshot's membership is not inert: `HandleSnapshot`
+  forwards it to raft, which adopts it wholesale on the restore path
+  (`raft.Peer.Handle`: `p.membership = newMembership(ss.Membership)`), on the
+  ENGINE WORKER and therefore asynchronously to the `HandleSnapshot` call that
+  queued it. The winning receiver was thus erasing the committed binding for
+  replica 2 while the other seven were still being authorized against it, and
+  each loser passed or was refused `unknown_member` purely on scheduling —
+  measured as 7 of 8 refused in the full `-race` suite, 12/12 green in
+  isolation. The chunks now carry the shard's own committed configuration, the
+  shape `forEachSnapshotChunk`/`emptySnapshotChunk` actually stamp (from the
+  leader's `snap.Membership`), so the restore changes nothing and all eight
+  receivers must return nil — the assertion is unchanged and untouched. A new
+  assertion on the persisted LogDB record's membership makes dropping it a hard
+  failure rather than a reappearing flake. The same guard already existed on
+  `snapshot_durability_test.go`'s `recvFixture`; the fixture is now shared as
+  `snapshotPathMembership`, beside the `authorizeSnapshotPath` whose
+  configuration it must match.
+- **`TestHandleSnapshot_RestoredMembershipGovernsLaterReceives` (#57)** — pins
+  the half of that contract that is NOT a defect, so the fix above cannot be
+  mistaken for one later: a snapshot REPLACES the committed membership, and the
+  replacement — not the configuration that authorized the snapshot carrying it —
+  governs every later receive. A sender that ships a configuration no longer
+  naming itself is refused afterwards, which is `committedSenderBinding`'s
+  documented fail-closed rule for a replica the configuration does not name, and
+  is exactly why `HandleSnapshot` re-reads committed membership per receive
+  instead of caching a verdict. No production code changed for #57.
 
 ## [0.9.0-alpha] - 2026-08-24
 

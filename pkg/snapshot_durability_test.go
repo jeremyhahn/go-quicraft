@@ -121,11 +121,10 @@ func (f *recvFixture) chunks(index, term uint64, payload []byte) []proto.Snapsho
 		Data:       payload,
 		// Carry the shard membership the fixture authorized against: the
 		// delivered InstallSnapshot replaces the raft membership, and an empty
-		// one would unauthorize the sender for any follow-up delivery.
-		Membership: proto.Membership{Addresses: map[uint64]string{
-			fixtureReplicaID: "127.0.0.1:6001",
-			fixtureFromID:    "127.0.0.1:6002",
-		}},
+		// one would unauthorize the sender for any follow-up delivery. It comes
+		// from the same helper authorizeSnapshotPath builds its configuration
+		// with, so the two cannot drift into disagreeing.
+		Membership: snapshotPathMembership(fixtureReplicaID, fixtureFromID),
 	}}
 }
 

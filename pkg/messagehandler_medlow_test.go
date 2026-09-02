@@ -16,10 +16,13 @@ package quicraft
 
 import (
 	"bytes"
+	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
@@ -124,6 +127,10 @@ func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 			Term:       9,
 			ChunkID:    0,
 			ChunkCount: 1,
+			// The shard's own committed configuration, as a real sender stamps
+			// it: the receive that completes below delivers this to raft, which
+			// adopts it wholesale. See snapshotPathMembership.
+			Membership: snapshotPathMembership(localReplicaID, fromReplicaID),
 			Data:       []byte("snapshot-body"),
 		},
 	}
@@ -171,6 +178,14 @@ func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 // must produce exactly one intact on-disk snapshot and a consistent LogDB
 // record — no interleaved snapshot.dat writes, and no loser cleanup
 // removing the directory the winner recorded in LogDB.
+//
+// Every receiver must return nil. Authorization runs BEFORE the serialization
+// claim, so a loser is refused only if the winner changed the committed
+// membership out from under it — and these eight deliveries carry ONE
+// membership, the shard's own, so there is nothing for the restore to change.
+// See snapshotPathMembership for why the chunk must carry it, and
+// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives for what a snapshot
+// that genuinely drops the sender does instead.
 func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	eng, h, handler := newMedlowHandlerFixture(t)
 
@@ -187,6 +202,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	}
 
 	payload := bytes.Repeat([]byte("concurrent-snapshot-payload-"), 1024)
+	membership := snapshotPathMembership(localReplicaID, fromReplicaID)
 	chunks := []proto.SnapshotChunk{
 		{
 			ShardID:    shardID,
@@ -196,6 +212,12 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 			Term:       11,
 			ChunkID:    0,
 			ChunkCount: 1,
+			// The shard's own committed configuration, exactly as a real
+			// sender stamps it. Leaving it empty is what made this test flaky:
+			// the winner's InstallSnapshot is adopted by raft on the engine
+			// worker, asynchronously, and an empty membership erases the very
+			// binding the losers are still being authorized against.
+			Membership: membership,
 			Data:       payload,
 		},
 	}
@@ -203,6 +225,13 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	const receivers = 8
 	var wg sync.WaitGroup
 	errs := make([]error, receivers)
+	// `i` is captured directly, with no `i := i` shadow. That is correct here
+	// and deliberately not "fixed": since Go 1.22 the for-clause variable is
+	// PER-ITERATION, and this module declares go 1.26.6, so each goroutine
+	// closes over its own copy. Under pre-1.22 semantics the same code writes
+	// through a shared variable and can panic on errs[8]; that is the footgun
+	// the language change removed, and it is why a reviewer reading this out of
+	// version context flags it (recorded here after it was raised on PR #59).
 	for i := 0; i < receivers; i++ {
 		wg.Add(1)
 		go func() {
@@ -229,6 +258,15 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	if ss.Index != snapIndex {
 		t.Fatalf("persisted snapshot index = %d, want %d", ss.Index, snapIndex)
 	}
+	// Guard the fixture itself, deterministically. The membership the chunks
+	// carry is what raft adopts, and dropping it reintroduces the flake as a
+	// scheduling-dependent failure that no single run reliably shows. Asserting
+	// it on the durable record turns that omission into a hard failure here.
+	if !maps.Equal(ss.Membership.Addresses, membership.Addresses) {
+		t.Fatalf("persisted snapshot membership = %v, want %v (the chunks must carry the "+
+			"shard's committed configuration; an empty one unauthorizes the sender)",
+			ss.Membership.Addresses, membership.Addresses)
+	}
 
 	node := eng.GetNode(shardID)
 	dataPath := filepath.Join(node.SnapshotSaveDir(snapIndex), "snapshot.dat")
@@ -238,5 +276,91 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("snapshot.dat corrupted: %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives pins the contract
+// the test above depends on, and states the half of it that is NOT a bug: a
+// snapshot REPLACES the committed membership, and the replacement — not the
+// configuration that authorized the snapshot carrying it — is what every later
+// receive is judged against.
+//
+// So a sender that ships a configuration no longer naming itself has, by that
+// act, given up its own admission. Refusing it afterwards is the documented
+// fail-closed rule (committedSenderBinding: a replica the configuration does
+// not name at all is a drop), not an ordering defect: the snapshot channel is
+// the one inbound path that rewrites the authorization source, which is exactly
+// why HandleSnapshot re-reads committed membership per receive instead of
+// caching a verdict.
+//
+// The adoption is asynchronous — HandleSnapshot queues the InstallSnapshot to
+// the engine worker and returns — so this waits for it rather than assuming it
+// has landed. That asynchrony is the flake's timing element: a concurrent
+// receive authorized before the adoption passes and one authorized after does
+// not, which is why a same-snapshot fixture must not change the configuration
+// at all.
+func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
+	eng, h, handler := newMedlowHandlerFixture(t)
+
+	const shardID, localReplicaID, fromReplicaID = uint64(32), uint64(1), uint64(2)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+
+	node := eng.GetNode(shardID)
+	if node == nil {
+		t.Fatal("engine node missing")
+	}
+	if _, bound := node.MemberBinding(fromReplicaID); !bound {
+		t.Fatalf("precondition: replica %d must be a committed member before the receive", fromReplicaID)
+	}
+
+	// A configuration that keeps this replica and DROPS the sender — the shape
+	// a snapshot taken after the sender was removed carries.
+	withoutSender := proto.Membership{
+		Addresses: map[uint64]string{localReplicaID: snapshotPathLocalAddr},
+	}
+	chunk := func(index uint64, ms proto.Membership) []proto.SnapshotChunk {
+		return []proto.SnapshotChunk{{
+			ShardID:    shardID,
+			ReplicaID:  localReplicaID,
+			From:       fromReplicaID,
+			Index:      index,
+			Term:       12,
+			ChunkID:    0,
+			ChunkCount: 1,
+			Membership: ms,
+			Data:       []byte("membership-rewriting-snapshot"),
+		}}
+	}
+
+	// Authorized against the configuration that still names the sender.
+	if err := handler.HandleSnapshot(chunk(600, withoutSender), authorizeAllSenders); err != nil {
+		t.Fatalf("first receive: %v", err)
+	}
+	if !waitUntil(5*time.Second, func() bool {
+		_, bound := node.MemberBinding(fromReplicaID)
+		return !bound
+	}) {
+		t.Fatalf("raft never adopted the snapshot's membership: replica %d is still bound", fromReplicaID)
+	}
+
+	// The sender is now a replica the committed configuration does not name, so
+	// its next snapshot is refused — on the membership IT installed.
+	err := handler.HandleSnapshot(chunk(601, withoutSender), authorizeAllSenders)
+	var unauthorized *UnauthorizedMessageError
+	if !errors.As(err, &unauthorized) {
+		t.Fatalf("second receive err = %v, want UnauthorizedMessageError", err)
+	}
+	if unauthorized.From != fromReplicaID || unauthorized.ShardID != shardID {
+		t.Fatalf("refusal names shard %d from %d, want shard %d from %d",
+			unauthorized.ShardID, unauthorized.From, shardID, fromReplicaID)
+	}
+	// Refused BEFORE anything is persisted: the durable record still names the
+	// snapshot that was authorized.
+	ss, err := h.logdb.GetSnapshot(shardID, localReplicaID)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if ss.Index != 600 {
+		t.Fatalf("persisted snapshot index = %d, want 600 (the refused receive must not persist)", ss.Index)
 	}
 }
