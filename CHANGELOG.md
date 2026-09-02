@@ -19,20 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `cancelled`), and `test/buildgates` asserts that every job is both in
   `needs` and covered by a `check` line — a job in one but not the other gates
   nothing, silently.
-- **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
-  strategy binds its passphrase at Seal/Unseal time or at construction. The two
-  modes have opposite credential semantics (a bound strategy IGNORES the
-  `Credentials` handed to `UnsealRootKey`; a deferred one validates against
-  them), and until now the distinction was invisible from outside the package.
-  A consumer replacing a registered strategy therefore could not preserve the
-  mode of the one it replaced, and installing a bound strategy where a deferred
-  one stood turns a barrier that authenticates its unsealer into one that
-  accepts any passphrase for the lifetime of the process — measured on the
-  production shape in go-qrdb #157. Follows the `KDFVersion()` precedent for
-  exposing a construction-time property; no behaviour of either mode changes.
-
-
-
 
 - **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
   strategy binds its passphrase at Seal/Unseal time or at construction. The two
@@ -67,12 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sits after `setup-go` so it describes the PATH the scanners are invoked with.
   Jobs get separate runners, so an assertion made in `lint` says nothing about
   the environment `security` actually scans in.
+
 - **`GOLANGCI_VERSION` moved `v2.12.2` -> `v2.13.2` (#48)** — the version
   actually baked into the runner image. Bumped in the Makefile and both
   devcontainer Dockerfiles in lockstep, so `make check-tool-versions` and
   `test/buildgates` still see one version everywhere. Verified: v2.13.2 reports
   **0 issues** on this tree.
-
 
 - **`make release-alpha` replaced with template v2 (#44, #42)** — the v1 recipe
   auto-incremented PATCH only (so `v0.9.0-alpha` had to be tagged by hand and an
@@ -113,7 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   further behind still at `v0.40.0`. No module in the tree now references a
   pre-`v0.55.0` `x/crypto`.
 
-
 - **A settable `VERSION=` no longer executes make functions at parse time
   (#44)** — the build-metadata variable was named `VERSION` and expanded into
   `LDFLAGS` with an immediate `:=`, so `make <anything> VERSION='$(shell ...)'`
@@ -150,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the behaviour asserted here. An implementer arriving from that interface
   would otherwise carry the assumption across and build a store that deletes on
   absence, silently and only under the interleaving that matters.
+
 - **`SealingStrategy` now states that honouring `Credentials` is
   implementation-defined (#43)**, that replacing a registered strategy can
   silently change whether the barrier authenticates its unsealer, and — on
@@ -177,6 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `snapshot_durability_test.go`'s `recvFixture`; the fixture is now shared as
   `snapshotPathMembership`, beside the `authorizeSnapshotPath` whose
   configuration it must match.
+
 - **`TestHandleSnapshot_RestoredMembershipGovernsLaterReceives` (#57)** — pins
   the half of that contract that is NOT a defect, so the fix above cannot be
   mistaken for one later: a snapshot REPLACES the committed membership, and the
