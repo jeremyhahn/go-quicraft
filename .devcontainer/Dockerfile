@@ -1,4 +1,4 @@
-FROM golang:1.26.3-bookworm
+FROM golang:1.27.1-bookworm
 
 # Install build, test, and debugging dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
