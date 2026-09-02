@@ -10,18 +10,42 @@
 # company repo.
 name: Claude Review
 
+# DISABLED 2026-08-24 (owner ruling): Codex is the sole designated peer
+# reviewer. The review:claude and review:dual labels were deleted from every
+# repo the same day, so this job has no reachable trigger left.
+#
+# It was previously `pull_request` with `if: false` on the job, which does not
+# disable the workflow -- Gitea still starts a run and registers a
+# `Claude Review / Claude Review` COMMIT STATUS for it, and that status stays
+# PENDING forever because the job it belongs to is skipped and never reports.
+#
+# Measured on go-quicraft PRs #51/#53/#56/#59/#60: every one carried a
+# permanently-pending Claude Review context. Harmless while nothing required
+# it, and NOT harmless from the moment branch protection starts requiring
+# status checks (#47) -- a context that can never resolve is a merge blocked on
+# silence. It also makes "are the checks green?" unanswerable by looking, which
+# is how a real red gets waved through.
+#
+# BOTH halves are needed, and neither alone is enough:
+#
+#   * the dispatch-only trigger is what stops the status being registered — a
+#     workflow with no PR trigger publishes no PR status at all;
+#   * `if: false` is what stops the job RUNNING. `workflow_dispatch` is an
+#     executable manual trigger, so without it this workflow became MORE
+#     reachable, not less: anyone could dispatch it and run
+#     /opt/claude-worker/claude-review.sh on the credential-bearing `claude`
+#     runner, with GITEA_CLAUDE_TOKEN supplied and PR_NUM empty, because a
+#     dispatch event carries no pull_request object.
+#
+# Re-enabling means restoring the `pull_request` trigger AND removing `if:
+# false`, deliberately, not flipping one of them.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 jobs:
   review:
     name: Claude Review
-    # DISABLED 2026-08-24 (owner ruling): Codex is the sole designated peer
-    # reviewer. The review:claude and review:dual labels were deleted from
-    # every repo the same day, so this job has no reachable trigger left --
-    # this gate states that outright rather than leaving it incidental to
-    # label state. codex-review.yml reviews every pull request.
+    # Not reachable even by a manual dispatch; see the note above.
     if: false
     runs-on: claude
     timeout-minutes: 40

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A `CI Gate` rollup job (#47)** — branch protection can require exactly one
+  status context, so an eleven-job pipeline needs a single place that speaks for
+  all of them. Until now this repo published no rollup, so
+  `enable_status_check` could not be turned on at all: requiring a context that
+  is never published blocks every merge, and requiring one leg leaves the other
+  ten advisory. Every peer repo already had this; go-quicraft was the outlier.
+  Fail-closed (`if: always()`, anything not `success` fails, including `skipped`
+  and `cancelled`), and `test/buildgates` asserts that every job is both in
+  `needs` and covered by a `check` line — a job in one but not the other gates
+  nothing, silently.
 - **`SoftwareStrategy.DeferredPassphrase() bool` (#43)** — reports whether a
   strategy binds its passphrase at Seal/Unseal time or at construction. The two
   modes have opposite credential semantics (a bound strategy IGNORES the
@@ -76,6 +86,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `|| true` anywhere, so any failing step aborts before the tag exists.
   `SUBMODULE_TAGS` is retired with the v1 recipe — it was empty, so the tag loop
   it drove was dead code.
+
+### Fixed
+
+- **The disabled Claude Review workflow no longer registers a status (#47)** —
+  it was `on: pull_request` with `if: false` on the job, which does not disable
+  a workflow: Gitea starts a run and registers a `Claude Review / Claude Review`
+  commit status that stays **pending forever**, because the skipped job never
+  reports. Measured on PRs #51, #53, #56, #59 and #60. Harmless while nothing
+  required status checks, and a permanent merge block from the moment #47's gate
+  is enforced — a merge blocked on silence rather than failed on a verdict. The
+  trigger is now `workflow_dispatch` only; a workflow with no PR trigger
+  registers no status at all.
 
 ### Security
 

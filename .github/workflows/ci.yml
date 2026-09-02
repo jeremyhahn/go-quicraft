@@ -681,3 +681,50 @@ jobs:
       - name: Run contrib/dragonboat integration suite
         working-directory: contrib/dragonboat
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+
+  # ==========================================================================
+  # The gate
+  #
+  # Branch protection can require exactly ONE status context, so a pipeline of
+  # eleven jobs needs a single place that speaks for all of them. Without this,
+  # `enable_status_check` cannot be turned on at all: requiring a context that
+  # is never published blocks every merge, and requiring one leg leaves the
+  # other ten advisory (go-quicraft#47). Every peer repo already has this job —
+  # go-frostdkg is the reference and this follows its shape.
+  #
+  # `if: always()` is what makes it a gate rather than a formality. Without it
+  # the job is SKIPPED when a dependency fails, a skipped required context
+  # never reports, and the merge blocks on silence instead of failing on a
+  # verdict — indistinguishable, from the outside, from a pipeline that never
+  # ran.
+  #
+  # FAIL-CLOSED: the check treats anything that is not `success` as failure,
+  # including `skipped` and `cancelled`. A job skipped because its own
+  # dependency failed has not passed, and neither has a cancelled one; reading
+  # either as acceptable is how a red pipeline reports green.
+  #
+  # Adding a job to this workflow means adding it BOTH to `needs` and to a
+  # `check` line. That duplication is deliberate — a job named in `needs` but
+  # not checked would gate nothing, silently — and the pairing is asserted by
+  # test/buildgates so a new job cannot be added to only one of them.
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [lint, security, build, test, integration, netfault, errfs, fuzz-seeds, modules, contrib-dragonboat]
+    steps:
+      - name: Fail closed on any non-success
+        run: |
+          BAD=0
+          check() { case "$2" in success) echo "OK   $1";; *) echo "FAIL $1 ($2)"; BAD=1;; esac; }
+          check lint              "${{ needs.lint.result }}"
+          check security          "${{ needs.security.result }}"
+          check build             "${{ needs.build.result }}"
+          check test              "${{ needs.test.result }}"
+          check integration       "${{ needs.integration.result }}"
+          check netfault          "${{ needs.netfault.result }}"
+          check errfs             "${{ needs.errfs.result }}"
+          check fuzz-seeds        "${{ needs.fuzz-seeds.result }}"
+          check modules           "${{ needs.modules.result }}"
+          check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}"
+          exit $BAD
