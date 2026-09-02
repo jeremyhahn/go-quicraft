@@ -232,6 +232,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rsm.StateMachine.Lookup` no longer boxes a typed nil on the `sm.NALookup`
+  fast path (#73, reported by go-qrdb #214).** A `[]byte` query answered by the
+  fast path returned the SM's `[]byte` result straight into the `interface{}`
+  return, so an absent key — a nil slice — arrived at the caller as a **non-nil**
+  interface carrying a nil `[]byte`. `result == nil` was false, the value read
+  back as a zero-length slice, and absence became indistinguishable from a key
+  holding an empty value. Measured downstream on go-qrdb with `sm_type: disk`:
+  `Exists` answered `true` for every key that had never been written, and stayed
+  `true` after a delete; the same shard on `sm_type: memory`, which has no
+  `NALookup` and so took the generic path, answered correctly.
+
+  Nothing failed loudly. A consumer branching on existence — an identity index
+  probing whether a claim is held, a DAO choosing insert versus update, a
+  first-boot path deciding whether to seed — simply took the other branch.
+  **Every `sm.NALookup` implementor was affected**, which is why this is fixed at
+  the adapter seam rather than at each consumer: the fast path is an
+  optimisation, and an optimisation must not change what a return value *means*.
+
+  A nil slice now folds to an untyped nil, so `result == nil` is the test for
+  absence on both paths. A non-nil zero-length slice is still boxed as it stands
+  — that is how an SM says "this key exists and its value is empty" — so the
+  distinction the fix restores is not immediately thrown away again. The generic
+  path is unchanged and was never the same bug: it forwards the user SM's own
+  interface value untouched.
+
+
 - **`release.yml` compares the VERSION file byte for byte (#55)** — it
   normalized with `tr -d '[:space:]'`, which accepts `0.9. 1-alpha`, a file
   split across lines, and a missing trailing newline, each publishing a VERSION

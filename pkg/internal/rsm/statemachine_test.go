@@ -2833,6 +2833,121 @@ func TestStateMachine_LookupNAFastPath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Lookup: absence must survive both paths
+// ---------------------------------------------------------------------------
+
+// testAbsenceSM distinguishes the three outcomes a byte-valued read can have,
+// so one SM can drive BOTH Lookup paths in the absence tests: a key that is
+// absent (nil), a key that exists and holds an EMPTY value (non-nil, zero
+// length), and a key that holds data.
+//
+// It exists rather than reusing testHasherSM/testKV because the assertion is
+// that the two paths AGREE, which needs a generic path that is itself right:
+// testKV.Lookup returns kv.data[key], so a miss comes back as the zero string
+// boxed in a non-nil interface, and comparing the fast path against that would
+// have "agreed" on the wrong answer.
+type testAbsenceSM struct {
+	testKV
+}
+
+// emptyValueKey is the key testAbsenceSM reports as PRESENT with an empty
+// value, on both paths. It is answered ahead of the map so the case cannot be
+// confused with a miss, which is the whole distinction under test.
+const emptyValueKey = "empty"
+
+// BytesLookup implements sm.NALookup, driving StateMachine.Lookup's fast path.
+// A miss returns a nil slice; emptyValueKey returns a non-nil empty slice.
+func (s *testAbsenceSM) BytesLookup(key []byte) ([]byte, error) {
+	if string(key) == emptyValueKey {
+		return []byte{}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	val, ok := s.data[string(key)]
+	if !ok {
+		return nil, nil
+	}
+	return []byte(val), nil
+}
+
+// Lookup overrides testKV.Lookup to answer a miss with an UNTYPED nil, which
+// is what a correct SM returns and what the fast path has to match.
+func (s *testAbsenceSM) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	key, ok := query.(string)
+	if !ok {
+		return nil, errors.New("query must be string")
+	}
+	if key == emptyValueKey {
+		return []byte{}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	val, ok := s.data[key]
+	if !ok {
+		return nil, nil
+	}
+	return []byte(val), nil
+}
+
+// TestStateMachineLookup_AbsenceSurvivesBothPaths pins the property that makes
+// sm.NALookup an optimisation rather than a semantic change: for the same key,
+// the fast path and the generic path must return interface values that a
+// caller's `result == nil` check classifies identically. A []byte query takes
+// the fast path, the equivalent string query takes the generic one.
+func TestStateMachineLookup_AbsenceSurvivesBothPaths(t *testing.T) {
+	kv := &testAbsenceSM{testKV: testKV{data: map[string]string{"hello": "world"}}}
+	createFn := func(shardID, replicaID uint64) interface{} {
+		return kv
+	}
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	tests := []struct {
+		name    string
+		query   interface{}
+		wantNil bool
+		want    string
+	}{
+		{"fast path, absent key", []byte("missing"), true, ""},
+		{"generic path, absent key", "missing", true, ""},
+		{"fast path, present key with empty value", []byte(emptyValueKey), false, ""},
+		{"generic path, present key with empty value", emptyValueKey, false, ""},
+		{"fast path, present key", []byte("hello"), false, "world"},
+		{"generic path, present key", "hello", false, "world"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, lookupErr := rsm.Lookup(context.Background(), tt.query)
+			if lookupErr != nil {
+				t.Fatalf("Lookup(%v) = %v", tt.query, lookupErr)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("Lookup(%s) = %#v (dynamic type %T), want a nil interface; "+
+						"an absent key that boxes as non-nil reads back as an empty value "+
+						"and every caller branching on existence takes the wrong branch",
+						tt.query, got, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("Lookup(%s) = nil, want a present value %q", tt.query, tt.want)
+			}
+			b, ok := got.([]byte)
+			if !ok {
+				t.Fatalf("Lookup(%s) returned %T, want []byte", tt.query, got)
+			}
+			if string(b) != tt.want {
+				t.Errorf("Lookup(%s) = %q, want %q", tt.query, b, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // GetHash through StateMachine
 // ---------------------------------------------------------------------------
 

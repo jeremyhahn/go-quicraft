@@ -928,6 +928,12 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 // tier. Note the earlier claim that the CALLER serialized this was never
 // true: Host.SyncRead, FollowerRead, QueryLocalNode and StaleRead all reach
 // this on their own goroutine while the apply worker runs.
+//
+// For a []byte query answered by the sm.NALookup fast path, an absent key is
+// reported as an untyped nil interface, so `result == nil` at the call site is
+// the test for absence on both paths. A key that exists holding an empty value
+// comes back as a non-nil interface wrapping a zero-length slice, and stays
+// distinguishable from absence.
 func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
 	s.readGuard.RLock()
 	defer s.readGuard.RUnlock()
@@ -941,6 +947,31 @@ func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface
 			return nil, err
 		}
 		if supported {
+			// Fold a nil slice into an UNTYPED nil. Returning the nil []byte
+			// directly boxes it, and a boxed typed nil is NOT equal to nil:
+			// the caller's `result == nil` is false, the value it then reads
+			// is a zero-length slice, and an absent key is indistinguishable
+			// from a key holding an empty value. Nothing fails loudly — a
+			// consumer branching on existence (an index probing whether a
+			// claim is held, a DAO choosing insert versus update, a first-boot
+			// path deciding whether to seed) simply takes the other branch and
+			// carries on.
+			//
+			// Only a nil slice is folded. A non-nil zero-length slice is boxed
+			// as it stands, because that is how an SM says "this key exists and
+			// its value is empty". Testing len(result) == 0 instead was
+			// rejected for exactly that reason: it erases the distinction this
+			// is here to preserve.
+			//
+			// The generic path below needs no equivalent and is not the same
+			// bug: it forwards the user SM's own interface value untouched, so
+			// how absence is represented there is that SM's choice. The boxing
+			// is the adapter's own, which makes this the one site where the
+			// fast path can be made indistinguishable from the generic one —
+			// the property an optimisation owes its caller.
+			if result == nil {
+				return nil, nil
+			}
 			return result, nil
 		}
 	}
