@@ -317,8 +317,18 @@ makes single-writer a guarantee.
 
 - **Root key** lives in an `enclave.ProtectedKey` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)),
-  opened into a guarded buffer only for derivation. Every epoch DEK is
-  individually protected the same way.
+  opened into a locked enclave only for derivation, export and unseal.
+  `Initialize` and `Unseal` generate or receive it directly into locked memory and
+  hold it there for their whole body, so it is never an ordinary heap slice on the
+  initialize path at all.
+- **Epoch DEKs are protected the same way and are never opened.** Each is held in
+  its own `ProtectedKey` so a DEK can be re-derived, but neither `Encrypt` nor
+  `Decrypt` touches one: both run off the `cipher.AEAD` cached per epoch in
+  `b.ciphers`. An older statement that `ProtectedKey.Open` sits on a per-frame
+  decrypt path was measured false in #54 and does not describe this barrier — the
+  key-opening cost is a setup, rotation and rekey cost. The AEAD cache is what
+  makes the DEK's protection free at steady state, and also what makes it
+  incomplete, which is the next bullet.
 - **Live `cipher.AEAD`s cannot be wiped.** Each holds a copy of the DEK in its
   key schedule, and neither the standard library nor `x/crypto` offers a wipe
   API. Dropping the barrier's reference on seal or purge makes it GC-eligible,
@@ -375,4 +385,6 @@ Capability rows in `docs/00 §R` this feature owns: the `Barrier` /
   [`../quic-transport/architecture.md`](../quic-transport/architecture.md).
   Snapshots travel as plaintext over the mTLS session and are re-encrypted at
   rest by the receiver.
-- **No hardware enclave.** `pkg/enclave` is memguard, not SGX/SEV/TrustZone.
+- **No hardware enclave.** `pkg/enclave` is `mlock`'d process memory —
+  go-enclave for plaintext, memguard for encrypted-at-rest — not
+  SGX/SEV/TrustZone.

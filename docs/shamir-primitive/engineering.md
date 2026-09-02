@@ -230,10 +230,14 @@ care on the implementer's side can avoid that while the signature demands a
 Two implementation notes that are not obvious from the signatures:
 
 - **Order of operations.** `SoftwareStrategy` derives the wrapping key BEFORE it
-  borrows the root-key enclave, because deriving opens the passphrase enclave and
-  `pkg/enclave` holds a process-wide `purgeMu` across every borrow while
-  allocating locked memory takes it exclusively. Opening a second enclave inside
-  a borrow is a self-deadlock, not merely a documented hazard.
+  borrows the root-key enclave. It had to: until the go-enclave adoption,
+  `pkg/enclave` held a process-wide `purgeMu` shared across every borrow while
+  allocating locked memory took it exclusively, so opening the passphrase enclave
+  inside a root-key borrow was a self-deadlock rather than a documented hazard.
+  That lock is gone and the nesting is now legal, but the ordering stays: it keeps
+  the key-touching window as short as it can be, and the AEAD it produces holds
+  only an expanded key schedule in ordinary memory, which a borrow may touch
+  freely.
 - **The plaintext never exists on the heap.** GCM's plaintext length is known
   before the decryption — payload minus nonce minus tag — so the enclave is
   allocated at exactly that size and `aead.Open` is handed the enclave's own

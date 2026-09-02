@@ -7,128 +7,140 @@ Import path: `github.com/jeremyhahn/go-quicraft/pkg/enclave`
 Locked memory is `github.com/jeremyhahn/go-enclave`; `ProtectedKey`'s
 encrypted-at-rest container is still `github.com/awnumar/memguard`.
 
-> **Stale sections, flagged rather than left to mislead.** §2's borrow-counter,
-> `purgeMu` and process-wide-purge material describes machinery this repository
-> deleted when it adopted go-enclave. go-enclave maps its own memory, so nothing
-> can purge it, a borrow takes only that enclave's own read lock, and a nested
-> borrow of a second enclave is legal. §3's "constructors do not return errors"
-> is likewise reversed: go-enclave's constructors DO return errors, which is the
-> main reason the adoption was not a mechanical rename. Rewrite tracked at #68.
-
 ## 1. Exported surface
 
 ```go
-// Types
-type MemoryEnclave struct{ /* unexported */ }
-type ProtectedBuffer = MemoryEnclave // Deprecated: alias, not a distinct type
+// Types. Locked memory is go-enclave's; these are ALIASES, not definitions.
+type MemoryEnclave   = goenclave.MemoryEnclave
+type ProtectedBuffer = goenclave.MemoryEnclave // Deprecated: spelling only
 type ProtectedKey    struct{ /* unexported */ }
 
-// Constructors
-func NewMemoryEnclave(size int) *MemoryEnclave
-func NewMemoryEnclaveFromBytes(data []byte) *MemoryEnclave
+// Owned here
 func NewProtectedKey(key []byte) *ProtectedKey
 func SealMemoryEnclave(buf *MemoryEnclave) *ProtectedKey
-// Deprecated aliases: NewProtectedBuffer, NewProtectedBufferFromBytes,
-// SealProtectedBuffer — identical behaviour and return types.
-
-// MemoryEnclave methods
-func (p *MemoryEnclave) Bytes() []byte
-func (p *MemoryEnclave) WithBytes(fn func([]byte) error) error
-func (p *MemoryEnclave) Size() int
-func (p *MemoryEnclave) Freeze()
-func (p *MemoryEnclave) Destroy()
-
-// ProtectedKey methods
+func SealProtectedBuffer(buf *MemoryEnclave) *ProtectedKey // Deprecated: spelling only
 func (p *ProtectedKey) Open() (*MemoryEnclave, error)
 func (p *ProtectedKey) Clear()
+func WipeBytes(b []byte) // go-enclave's Wipe, re-exported
 
-// Free function
-func WipeBytes(b []byte)
+// Locked memory is allocated with go-enclave's constructors, by name
+func goenclave.NewMemoryEnclaveSized(n int) (*MemoryEnclave, error)      // writable; fill in place
+func goenclave.NewMemoryEnclave(data []byte) (*MemoryEnclave, error)     // moves data in; FROZEN
+func goenclave.NewMemoryEnclaveFromString(s string) (*MemoryEnclave, error)
+
+// MemoryEnclave methods, all go-enclave's
+func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error
+func (e *MemoryEnclave) Open() ([]byte, error)       // UNSAFE: the slice outlives the lock
+func (e *MemoryEnclave) OpenString() (string, error) // unprotected copy; boundary use only
+func (e *MemoryEnclave) EqualTo(other []byte) bool
+func (e *MemoryEnclave) Size() int
+func (e *MemoryEnclave) IsAlive() bool
+func (e *MemoryEnclave) Destroy()
 
 // Errors
-var ErrEnclaveNil       = &NilError{}
-var ErrEnclaveDestroyed = &DestroyedError{}
-type NilError       struct{}
-type DestroyedError struct{}
-type OpenError      struct{ Err error }
+var ErrEnclaveNil       = &NilError{}                   // this package's
+var ErrEnclaveDestroyed = goenclave.ErrEnclaveDestroyed // re-exported, not redefined
+type NilError  struct{}
+type OpenError struct{ Err error }
 ```
 
-`pkg/seal/memprotect.go` re-exports `ProtectedBuffer`, `ProtectedKey`,
-`NewProtectedBuffer`, `NewProtectedBufferFromBytes`, `NewProtectedKey`,
-`SealProtectedBuffer` and `WipeBytes` as aliases. They are the same types; there
-is no second implementation.
+**What is gone rather than renamed**, because a reader coming from an older
+revision of this page will look for it: `enclave.NewMemoryEnclave(size int)`,
+`NewMemoryEnclaveFromBytes`, `MemoryEnclave.Bytes()`, `MemoryEnclave.Freeze()`
+and the `DestroyedError` type. Locking pages is a syscall the kernel can decline,
+so the constructors return an error and a bare-pointer alias could not express
+one; `Bytes` became go-enclave's `Open`, which reports a destroyed enclave as an
+error instead of as a `nil` slice; and there is no post-fill freeze at all
+(go-enclave #6), so the fill-then-freeze shape is a locked-to-locked move from a
+sized enclave into `NewMemoryEnclave`. `ErrEnclaveDestroyed` is now go-enclave's
+sentinel re-exported, so `errors.Is` matches whichever package the error came
+from — two sentinels meaning the same thing is how a caller ends up handling one
+and not the other.
+
+`pkg/seal/memprotect.go` re-exports two types (`ProtectedBuffer`,
+`ProtectedKey`) and two functions (`NewProtectedKey`, `SealProtectedBuffer`) as
+aliases. They are the same types and the same functions; there is no second
+implementation. `seal.NewProtectedBuffer` and `seal.NewProtectedBufferFromBytes`
+are gone for the reason above, and `WipeBytes` is not re-exported there — `pkg/seal`
+keeps an unexported `wipeBytes` wrapper for its own use.
 
 ## 2. Invariants
 
 **Call safety vs. slice safety.** `ProtectedKey` holds its enclave in an
-`atomic.Pointer`; `MemoryEnclave` guards its locked buffer with a borrow counter
-(see the architecture note — the atomic was a defect here, issue #15). Readers
-register a borrow; mutators wait for the count to reach zero. Every *call* is
-safe under concurrency. A *slice* a caller retained after the call returned is
-not.
+`atomic.Pointer`; a `MemoryEnclave` guards its mapping with its own
+`sync.RWMutex`, inside go-enclave. Readers hold that read lock for the duration
+of the call and `Destroy` takes the write lock, so teardown waits out in-flight
+readers instead of unmapping pages underneath them. Every *call* is therefore
+safe under concurrency. A *slice* that outlives the call is not — and
+`MemoryEnclave.Open` hands back exactly such a slice, on purpose.
 
 | Operation | Concurrency | Idempotent |
 |---|---|---|
-| `ProtectedKey.Open` | safe with `Open`, `Clear` | n/a — each call returns a new buffer |
-| `ProtectedKey.Clear` | safe with `Open`, `Clear` | yes; only the winner of the pointer swap acts |
-| `MemoryEnclave.Destroy` / `Freeze` / `SealMemoryEnclave` | mutators — safe with everything, and BLOCK until every borrow ends | `Destroy` yes; only the first caller reaches memguard |
-| `MemoryEnclave.Bytes` / `Size` | readers — safe with the mutators | n/a |
-| `MemoryEnclave.WithBytes` | reader — `Destroy` and `Freeze` cannot complete while the callback runs | n/a |
+| `ProtectedKey.Open` | safe with `Open`, `Clear`; serialized against this package's other memguard calls by `purgeMu` | n/a — each call returns a new enclave |
+| `ProtectedKey.Clear` | safe with `Open`, `Clear` | yes; it is a store of `nil` |
+| `SealMemoryEnclave` | safe; serialized on `purgeMu`, so exactly one concurrent caller consumes the enclave | yes — after the first, the source is destroyed and later calls return `nil` |
+| `MemoryEnclave.WithBytes` / `OpenString` / `EqualTo` / `Size` / `IsAlive` | readers — hold the enclave's read lock for the whole call; a concurrent `Destroy` blocks | n/a |
+| `MemoryEnclave.Destroy` | writer — blocks until every in-flight reader returns | yes; a `nil` receiver is a no-op |
+| `MemoryEnclave.Open` | returns a slice covered by **no** lock once it returns | n/a |
 
-- **The lock bounds the CALL, not the slice.** `Destroy` zeroes and unmaps the
+- **The lock bounds the CALL, not the slice.** `Destroy` wipes and unmaps the
   memory, so a slice retained past the accessor that returned it is a
-  use-after-free. Where teardown can race a reader — barrier and custody
-  ceremony paths — use `WithBytes` / `ProtectedShare.WithValue`, which hold the
-  read lock across the callback; `Destroy` then blocks until it returns.
-  `WithBytes` returns `ErrEnclaveDestroyed` (`*DestroyedError`) if the enclave
-  is already gone, and the callback's own error unchanged otherwise.
-- **Mutators take priority over readers.** A queued `Destroy`, `Freeze` or
-  `SealMemoryEnclave` blocks every new borrow until it completes, so readers
-  cannot starve the wipe. This is the same policy `sync.RWMutex` applies.
-- **A callback must NOT touch ANY enclave** — not its own and not a different
-  one. No `Bytes`, `Size`, `WithBytes`, `Destroy`, `Freeze` or
-  `SealMemoryEnclave` from inside a borrow.
-
-  For its own enclave the reason is the per-enclave rule: a nested borrow queues
-  behind any mutator that arrived meanwhile, and that mutator is waiting on the
-  borrow the callback holds.
-
-  For a DIFFERENT enclave the reason is the process-wide one, and this is a
-  TIGHTENING of what this document previously said (issue #18). Borrowing now
-  takes the package-level `purgeMu` shared, and Go's `RWMutex` refuses a new
-  `RLock` once a writer is queued — so a nested borrow of a second enclave
-  deadlocks against any purge-capable operation (an allocation, `Destroy`,
-  `Freeze`) that queued after the outer borrow began, anywhere in the process.
-  Materialize what the callback needs BEFORE borrowing; `CombineProtected` does
-  exactly that with its decode buffer.
-- **A process-wide purge is coordinated against every borrow.** memguard's
-  failure path is not per-buffer: `core.Panic` calls `core.Purge` first, which
-  unmaps *every* live buffer in the process while holding none of this package's
-  locks. The per-enclave borrow counter therefore cannot make a borrow safe on
-  its own — a failed allocation in one goroutine could unmap pages another was
-  reading, with no `Destroy` involved. `purgeMu` is the outer layer that closes
-  it: borrows take it shared, purge-capable operations take it exclusively, and
-  the order is always `purgeMu` then the enclave's own lock.
-- **Package-internal readers go through the accessor too.**
-  `CombineProtected` and `ProtectedShare.MarshalJSON` read share values inside
-  `WithValue`, not from a released alias. Both obtain the slices themselves, so
-  no caller-side discipline could have made them safe.
-- **Every `Open` is paired with a `Destroy`.** `Open` materializes plaintext
-  into a fresh `MemoryEnclave`; the caller owns it. A leaked enclave keeps
-  plaintext resident for the life of the process and consumes `RLIMIT_MEMLOCK`,
-  which then makes later locks fail with a typed
+  use-after-free that FAULTS rather than reading zeros. Where teardown can race a
+  reader — barrier and custody ceremony paths — use `WithBytes` /
+  `ProtectedShare.WithValue`, which hold the read lock across the callback.
+  `WithBytes` returns `ErrEnclaveDestroyed` if the enclave is already gone, and
+  the callback's own error unchanged otherwise. `Open` is for code that owns the
+  enclave outright and can show no concurrent teardown exists.
+- **A callback must not re-enter the SAME enclave** — no `WithBytes`, `Size`,
+  `IsAlive`, `EqualTo` or `Destroy` on the enclave it is borrowing. The read lock
+  is held for the call, so a nested `Destroy` deadlocks and a nested read
+  deadlocks whenever a `Destroy` is already queued for the write lock.
+- **A callback MAY touch a DIFFERENT enclave**, and this REVERSES what this
+  document said before the go-enclave adoption. Constructing, borrowing and
+  destroying other enclaves inside a live borrow is ordinary now. It used to be a
+  self-deadlock: a process-wide `purgeMu` was held shared across every borrow, and
+  Go's `RWMutex` refuses a new `RLock` once a writer is queued, so any
+  purge-capable operation anywhere in the process could park between the outer
+  borrow and the inner one (#18, #39). Call sites shaped around that restriction
+  are being unwound as they are touched; `Barrier.Initialize` already holds the
+  root key in a locked enclave across its whole body (`e694607`).
+- **There is no process-wide purge.** go-enclave maps its own memory, and an
+  allocation that fails fails alone. The old invariant — that a failed memguard
+  allocation in one goroutine could unmap pages another was reading, so per-buffer
+  locking could not be sufficient — applied to memguard-backed buffers and no
+  longer applies to any enclave. What remains of that hazard is confined to
+  `ProtectedKey`'s three memguard call sites and is covered by `purgeMu`; see
+  [`architecture.md`](architecture.md).
+- **`WipeAll` is the one other thing that can destroy an enclave.** go-enclave's
+  shutdown sweep destroys every live enclave in the process. This repository never
+  calls it, and an embedder that does must have stopped the goroutines holding
+  borrows first: the sweep skips a held enclave and reports it in its count rather
+  than waiting, and a constructor racing a sweep can return an already-destroyed
+  enclave.
+- **Every `Open` is paired with a `Destroy`.** `ProtectedKey.Open` materializes
+  plaintext into a fresh `MemoryEnclave`; the caller owns it. A leaked enclave
+  keeps plaintext resident for the life of the process and holds a whole page of
+  `RLIMIT_MEMLOCK`, which then makes later locks fail with a typed
   `ErrLockedMemoryUnavailable` — it no longer aborts the process.
-- **Constructors wipe their input.** `NewProtectedKey(key)` and
-  `NewProtectedBufferFromBytes(data)` wipe the source slice after copying.
-  Callers must not rely on the argument being readable afterwards.
-- **`SealProtectedBuffer` consumes its argument.** Ownership transfers to the
-  returned key; the argument is left empty (`Bytes()` returns `nil`, `Size()`
-  returns `0`). A concurrent second call gets `nil`.
+- **Constructors wipe their input.** `NewProtectedKey(key)` wipes `key`, and
+  `goenclave.NewMemoryEnclave(data)` wipes `data` on every return path including
+  its failures. Callers must not rely on the argument being readable afterwards.
+- **`SealMemoryEnclave` consumes its argument.** Ownership transfers to the
+  returned key and the source is destroyed: afterwards `Size()` is `0`,
+  `IsAlive()` is false, and `WithBytes` returns `ErrEnclaveDestroyed`. A
+  concurrent second call gets `nil`, and exactly one caller can ever win.
 - **`Clear` revokes, it does not erase.** After `Clear`, `Open` returns
   `ErrEnclaveNil`. The enclave's ciphertext persists on the ordinary heap until
   the GC reclaims it. Treat a cleared key as GC-bounded, not wiped.
-- **After `Destroy`**, `Bytes()` returns `nil` and `Size()` returns `0` rather
-  than panicking.
+- **`Destroy` panics on a canary failure**, and this is the one panic in the
+  path. go-enclave verifies the canary ahead of the data when it releases the
+  pages; a mismatch means something wrote into memory it did not own, which is
+  not a condition the caller can act on, because the state it would act on is the
+  state that is wrong. The material is wiped and the pages are released before the
+  panic, so nothing leaks either way.
+- **A `nil` `*MemoryEnclave` is a valid receiver.** It reports itself not alive,
+  reads with `ErrEnclaveDestroyed`, and destroys as a no-op, so an optional
+  enclave needs no guard at every use.
 - **No signal handler is installed.** This package never calls
   `memguard.CatchSignal` or `memguard.CatchInterrupt`. Those call
   `signal.Reset()` with no arguments, which detaches **every** signal handler in
@@ -142,13 +154,22 @@ not.
 | Error | Type | Returned when | Fail-closed? |
 |---|---|---|---|
 | `ErrEnclaveNil` | `*NilError` | `Open` on a `ProtectedKey` whose enclave was never initialized or has been `Clear`ed | Yes — no key material is produced |
-| `ErrEnclaveDestroyed` | `*DestroyedError` | `WithBytes` on a `MemoryEnclave` that has been destroyed or consumed by `SealMemoryEnclave` | Yes — the callback is not called |
+| `ErrEnclaveDestroyed` | sentinel (`errors.New`), go-enclave's | any read on a `MemoryEnclave` that has been destroyed or consumed by `SealMemoryEnclave` | Yes — the callback is not called |
 | `OpenError{Err}` | `*OpenError` | memguard fails to open the enclave | Yes — returns `(nil, err)` |
+| `ErrLockedMemoryUnavailable` | `*goenclave.LockedMemoryError` | the kernel refuses to map or lock the pages, usually at `RLIMIT_MEMLOCK` | Yes — that allocation alone fails; nothing else is touched |
+| `ErrEmptyEnclave` / `ErrInvalidSize` | sentinels, go-enclave's | an enclave over no material, or a size no enclave can have | Yes — refused before anything is mapped |
 
 - `ErrEnclaveNil` is a package-level sentinel of concrete type `*NilError`;
   compare with `errors.Is(err, enclave.ErrEnclaveNil)`. `pkg/seal` does exactly
   this in `strategy_software.go` to distinguish "the passphrase was cleared"
   from a real failure.
+- `ErrEnclaveDestroyed` has no type of its own any more. `DestroyedError` is
+  gone: the sentinel is go-enclave's, re-exported, so `errors.Is(err,
+  enclave.ErrEnclaveDestroyed)` matches whether the error arrived through this
+  package or straight from go-enclave. The two remaining sentinels stay distinct
+  on purpose — `NilError` says a `ProtectedKey` was never given an enclave or has
+  been `Clear`ed; `ErrEnclaveDestroyed` says locked memory existed and has been
+  wiped and unmapped.
 - `OpenError.Unwrap()` returns the underlying memguard error.
 - Messages are lowercase and origin-prefixed: `ErrEnclaveNil.Error()` is
   `"memprotect: enclave is nil"`.
@@ -175,7 +196,17 @@ container) with a low limit sees allocations fail with a typed
 `ErrLockedMemoryUnavailable` once the limit is reached; since the go-enclave
 adoption this fails exactly the allocation that reached the ceiling and touches
 no other enclave, where memguard previously purged every live buffer and aborted.
-Raise the limit rather than reducing the number of protected keys.
+Raise the limit rather than reducing the number of protected keys, and size it in
+PAGES rather than in key sizes — `goenclave.LockedSize` reports what one enclave
+actually costs. Guard and canary pages are mapped `PROT_NONE` and never locked,
+so they consume address space rather than the limit.
+
+go-enclave's `Allocator` bounds what one code path may hold against that ceiling,
+with a budget fixed at construction and returned enclave by enclave as they are
+destroyed. **This repository constructs none**: nothing here allocates locked
+memory for an unauthenticated peer, so there is no path to bound. A consumer that
+buffers key material before authenticating one should admit those allocations
+through an `Allocator` at its own layer.
 
 ## 5. Persistence
 
@@ -191,37 +222,49 @@ What the suite pins, beyond happy-path lifecycle:
 
 | Test | Pins |
 |---|---|
+| `TestMemoryEnclaveIsGoEnclaves`, `TestErrEnclaveDestroyedIsGoEnclaves` | that the type and the sentinel ARE go-enclave's — the property that makes every other guarantee upstream's to keep |
 | `TestNewProtectedKey_WipesSource` | the constructor's wipe of its argument |
-| `TestProtectedKey_ClearDropsEnclaveReference` | `Clear` → `Open` returns `ErrEnclaveNil` |
-| `TestProtectedKey_ClearAlreadyClearedNoPanic` | `Clear` idempotence |
+| `TestProtectedKey_OpenSeal`, `_MultipleOpens` | the round trip, and that each `Open` yields an independent enclave holding the same key |
+| `TestProtectedKey_OpenNilEnclave`, `_ClearDropsEnclaveReference`, `_ClearAlreadyClearedNoPanic` | `ErrEnclaveNil`, `Clear` → `Open`, and `Clear` idempotence |
 | `TestProtectedKey_ConcurrentOpenClear` | the `atomic.Pointer` invariant |
-| `TestProtectedBuffer_ConcurrentDestroy` | single-shot `Destroy` under race |
-| `TestMemoryEnclave_AccessorsAreSafeAgainstConcurrentDestroy` | issue #15: `Bytes`/`Size` vs `Destroy` — 200 unsynchronised pairs |
-| `TestMemoryEnclave_WithBytesIsSafeAgainstConcurrentDestroy` | the same for the scoped accessor |
-| `TestMemoryEnclave_WithBytesHoldsTheEnclaveOpen` | that `Destroy` cannot COMPLETE during the callback — the property an atomic could not give |
-| `TestMemoryEnclave_WithBytesOnDestroyed` / `_OnSealed` / `_PropagatesCallbackError` | the refusal reason, and that the callback's error is not wrapped |
-| `TestProtectedShare_ValueIsSafeAgainstConcurrentDestroy` and the `WithValue` set (`pkg/crypto/shamir`) | the same properties on the share surface that exposed the defect |
-| `TestProtectedBuffer_NilAfterDestroy` | post-`Destroy` accessors return nil/0 |
-| `TestSealProtectedBuffer_ConsumedBufferReturnsNil` | consumption semantics |
-| `TestSealProtectedBuffer_DestroyedBuffer` / `_NilBuffer` | `nil` return, not panic |
+| `TestProtectedKey_BridgeUnderConcurrentMemguardWork` | the memguard-to-go-enclave bridge under concurrent memguard traffic, under `-race` |
+| `TestSealMemoryEnclave`, `_NilAndDestroyed`, `_ConsumedEnclaveReturnsNil`, `TestSealMemoryEnclaveAndDeprecatedAliasAgree` | consumption semantics, the `nil` returns, and that the deprecated spelling is the same function |
+| `TestSealMemoryEnclave_ConcurrentConsumeExactlyOnce` | that exactly one of four concurrent callers consumes the enclave — a regression test for a real defect, not a hypothetical |
 | `TestNoSignalHandlerInstalled` | that no code path resets process signal handlers |
-| `TestWipeBytes`, `TestWipeBytes_EmptySlice` | `WipeBytes` including the empty case |
-| `TestOpenError_Format`, `TestOpenError_Unwrap`, `TestNilError_TypedError`, `TestErrEnclaveNil_Message` | the error vocabulary |
+| `TestWipeBytes` | `WipeBytes`, including the empty slice |
+| `TestErrEnclaveNil_Message`, `TestNilError_TypedError`, `TestOpenError_FormatAndUnwrap` | the error vocabulary |
 
-**Fault-injection seam:** none. There is no injectable allocator or FS here —
-memguard is called directly. Failure modes that matter (`RLIMIT_MEMLOCK`
-exhaustion) abort the process by design and are not simulated in unit tests.
+**What was deleted with the implementation, and why it is not a coverage
+regression.** `TestProtectedBuffer_Lifecycle`, `_NilAfterDestroy`, `_FromBytes`
+and `_ConcurrentDestroy`, `TestMemoryEnclave_WriteInPlaceThenFreeze`,
+`_FreezeIsSafeOnDestroyed` and `_FromBytesWipesSourceAndFreezes`, plus the whole
+of `memprotect_race_test.go` and `memprotect_purge_test.go`, went with the code
+they covered. Every one exercised this repository's own `mlock`, guard-page,
+canary, borrow and purge machinery, and that machinery no longer exists here.
+Re-asserting those properties would be testing a dependency through its consumer;
+they are pinned upstream instead — `enclave_lockfail_linux_test.go`,
+`registry_linux_test.go` and `admission_accounting_linux_test.go` in go-enclave.
+The issue-#15 accessor-vs-`Destroy` probes and their mutation verification belong
+to that set: the defect they pinned was in an implementation this repository no
+longer has.
 
-The concurrency tests are the ones to run under `-race`; they are the reason the
-locking design is asserted rather than assumed. The issue-#15 probes were
-mutation-verified: with the borrow discipline stripped from `memprotect.go`,
-five enclave tests and two share tests fail under `-race`, and four of them fail
-on their OWN reason assertion — "Destroy completed while the callback held the
-enclave", "Freeze completed while a callback still held the enclave's bytes" —
-without `-race` at all. The `MarshalJSON` probe is the exception and says so in
-its own comment: it is probabilistic (measured 10/10 under `-race`, 0/10
-without), because `MarshalJSON` runs no caller-supplied code inside its borrow
-and so offers no hook a deterministic probe could use.
+**Fault-injection seam: none in this package.** memguard is called directly and
+go-enclave's constructors are called by name, so there is nothing to substitute.
+The failure that matters — `RLIMIT_MEMLOCK` exhaustion — is driven upstream under
+a lowered limit in a subprocess, which is where it can be done without taking the
+test binary down with it. Consumers that need to see their own refusal path
+inject at their allocation site: `pkg/seal`'s `Barrier.lockRootKey` is a field
+defaulting to `goenclave.NewMemoryEnclaveSized` for exactly that reason, and
+`barrier_borrow_test.go` sets it to a function that refuses.
+
+`TestProtectedKey_BridgeUnderConcurrentMemguardWork` is the one to run under
+`-race`, and its own comment states the limit it cannot cross: it proves the
+bridge is race-clean against every other memguard caller in this package, not
+that a process-wide memguard purge cannot unmap the buffer mid-copy. Reaching a
+purge means driving the process to exhaustion, and memguard answers that by
+panicking after purging — so the purge invariant is carried by the argument at
+`purgeMu` rather than by a test. That gap closes with memguard itself, when
+`ProtectedKey` moves to go-enclave's sealing seam (go-enclave #22).
 
 ## 7. Observability
 
