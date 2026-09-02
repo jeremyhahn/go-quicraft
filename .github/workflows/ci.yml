@@ -69,7 +69,17 @@ env:
   # it would narrow who can consume the library for no benefit. Sibling repos
   # (go-qrdb, go-xkms) pin the same way.
   GO_VERSION: "1.26.7"
-  COVERAGE_THRESHOLD: 91
+  # Lowered 91 -> 90 on the owner's ruling, 2026-09-02, for a reason that is
+  # about SIGNAL rather than standards. Measured total is 91.3%, so the old gate
+  # left 0.30 points of headroom — and a `go test ./...` run where any package
+  # FAILS contributes NO coverage for that package. One flaked test therefore
+  # failed CI twice: once on the test result, and again as a "coverage
+  # regression" that did not exist. A gate that cannot absorb a single package's
+  # variance reports a fault it invented, and trains readers to disbelieve it.
+  #
+  # This does not license a decline. 90 is a floor, not a target; the measured
+  # figure stays above 91 and the flakes it was masking are tracked at #71.
+  COVERAGE_THRESHOLD: 90
   # Builds never resolve through a workspace: modules come from tags
   # (dependency-resolution.md §2). CI checks out this repo alone so no go.work
   # exists here today, but the module matrix below walks into nested modules
