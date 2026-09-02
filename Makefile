@@ -1654,12 +1654,20 @@ override REPO_NAME := go-quicraft
 override RELEASE_SIGNERS := $(CURDIR)/.release-allowed-signers
 
 # RELEASE_REMOTE is the git remote release-alpha pushes the release commit and
-# tag to. It is the GITEA remote, which in this repo -- as in every fleet repo
-# measured 2026-08-27 -- is named `origin`; there is no `github` remote in this
-# checkout at all. It stays a variable, not a renamed constant, so a future
-# dev-remote rollout is one line. Its existence is asserted before it is
-# trusted: an unreachable remote is not an absent tag.
-RELEASE_REMOTE ?= origin
+# tag to: the GITEA remote, named `dev` per conventions/version-control.md 1.
+#
+# This defaulted to `origin` until 2026-09-01, argued from a measurement of the
+# checkout rather than from the convention. The checkout has since been renamed
+# and the measurement expired, which is the general trap: a default justified by
+# "what the machine currently looks like" needs re-checking whenever the machine
+# changes, while a convention-based one does not (#63, reversing the position
+# taken on #42).
+#
+# It stays a VARIABLE, not a constant, so a checkout that has not been renamed
+# overrides it in one place. Its existence is asserted before it is trusted --
+# an unreachable remote is not an absent tag -- so a wrong value here is a clear
+# refusal before anything is written, never a half-completed release.
+RELEASE_REMOTE ?= dev
 
 # deps-latest runs before compiling in a consumer repo. It picks the highest tag
 # INCLUDING -alpha prereleases -- bare 'go get @latest' ignores prereleases and

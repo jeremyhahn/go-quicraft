@@ -54,6 +54,12 @@ var injectableInputs = []string{
 	"BUILD_VERSION", "GIT_COMMIT", "BUILD_DATE",
 }
 
+// fixtureRemote is the name the release fixtures give their throwaway bare
+// repository. Deliberately not "origin" or "dev": a test that borrows the
+// repo's real remote name breaks the day that name changes, which is exactly
+// what happened when the Gitea remote was renamed (#63).
+const fixtureRemote = "fixture-remote"
+
 // makeTargets are the three places the payload was observed to fire before the
 // fix: the release target itself, an unrelated target, and a target that does
 // not exist at all. The last two matter most — they prove the expansion was
@@ -329,6 +335,81 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 	}
 }
 
+// TestReleaseRemoteDefaultsToDev pins the DEFAULT, which is the only production
+// behaviour this file's other release tests do not cover.
+//
+// They all pass RELEASE_REMOTE explicitly — deliberately, so a rename of the
+// repo's real remote cannot break them — and that leaves the default itself
+// unverified: reverting it to `origin`, or to any other name, would keep the
+// suite green while `make release-alpha` selected the wrong remote.
+//
+// So this fixture gives its disposable repository exactly one remote, named
+// `dev`, and does NOT override RELEASE_REMOTE. If the default is `dev` the run
+// resolves it and stops at a later, read-only guard; if the default is anything
+// else the run stops at "no git remote named <that>", naming the wrong value.
+func TestReleaseRemoteDefaultsToDev(t *testing.T) {
+	dir := t.TempDir()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+
+	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", ".release-allowed-signers"} {
+		raw, err := os.ReadFile(filepath.Join(repoRoot, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	stub := filepath.Join(dir, "stub-agent-git.sh")
+	if err := os.WriteFile(stub, []byte("#!/usr/bin/env bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	git := func(args ...string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer initCancel()
+	bare := exec.CommandContext(initCtx, "git", "init", "-q", "--bare", remote)
+	bare.Dir = filepath.Dir(remote)
+	if out, err := bare.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	git("init", "-q", "-b", "main", ".")
+	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
+	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture")
+	// EXACTLY ONE remote, named dev. No RELEASE_REMOTE override below.
+	git("remote", "add", "dev", remote)
+
+	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer runCancel()
+	cmd := exec.CommandContext(runCtx, "make", "-C", dir, "release-alpha",
+		"VERSION=v99.0.0-alpha", "AGENT_GIT="+stub)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, _ := cmd.CombinedOutput()
+
+	if strings.Contains(string(out), "no git remote named") {
+		t.Errorf("release-alpha did not resolve the `dev` remote, so RELEASE_REMOTE does "+
+			"not default to `dev`. conventions/version-control.md 1 names the Gitea "+
+			"remote `dev`, and a default that points elsewhere makes the target "+
+			"unrunnable on a conforming checkout (#63).\n%s", out)
+	}
+	// It must still refuse — the fixture's CHANGELOG has no v99.0.0-alpha section
+	// — which is what proves the run got PAST remote resolution rather than
+	// succeeding for some unrelated reason.
+	if !strings.Contains(string(out), "CHANGELOG.md has no") {
+		t.Errorf("expected the run to reach the CHANGELOG guard, which sits after remote "+
+			"resolution; got:\n%s", out)
+	}
+}
+
 // TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease is the security
 // property behind AGENT_GIT staying settable.
 //
@@ -412,12 +493,15 @@ func TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease(t *testing.T) {
 	git("init", "-q", "-b", "main", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture")
-	git("remote", "add", "origin", remote)
+	// Named explicitly and passed below, so these tests do not depend on
+	// whatever RELEASE_REMOTE defaults to — that default has changed once
+	// already (origin -> dev, #63) and broke them.
+	git("remote", "add", fixtureRemote, remote)
 
 	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer runCancel()
 	cmd := exec.CommandContext(runCtx, "make", "-C", dir, "release-alpha",
-		"VERSION="+release, "AGENT_GIT="+shim)
+		"VERSION="+release, "AGENT_GIT="+shim, "RELEASE_REMOTE="+fixtureRemote)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
@@ -566,11 +650,14 @@ func TestReleaseAlphaRefusesAKeyItWasNotPinnedTo(t *testing.T) {
 	git("init", "-q", "-b", "main", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture")
-	git("remote", "add", "origin", remote)
+	// Named explicitly and passed below, so these tests do not depend on
+	// whatever RELEASE_REMOTE defaults to — that default has changed once
+	// already (origin -> dev, #63) and broke them.
+	git("remote", "add", fixtureRemote, remote)
 
 	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer runCancel()
-	cmd := exec.CommandContext(runCtx, "make", "-C", dir, "release-alpha", "VERSION="+release, "AGENT_GIT="+shim)
+	cmd := exec.CommandContext(runCtx, "make", "-C", dir, "release-alpha", "VERSION="+release, "AGENT_GIT="+shim, "RELEASE_REMOTE="+fixtureRemote)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
