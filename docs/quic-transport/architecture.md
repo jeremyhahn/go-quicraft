@@ -201,6 +201,62 @@ A peer must not be able to make this process allocate by asserting a size.
   a process that opens a QUIC connection under `GODEBUG=fips140=only` still
   panics inside the QUIC library.
 
+## Approved key exchange, and how a running cluster gets there
+
+The handshake groups are chosen at BUILD time, not negotiated at cluster
+formation, and the two builds are deliberately designed to interoperate:
+
+| build | groups offered (`handshakeCurves()`) |
+|---|---|
+| `-tags fips` | `P-256`, `P-384` |
+| standard | `X25519`, `P-256`, `P-384` |
+
+X25519 is **absent** from the FIPS list rather than deprioritised, which is the
+whole point: `GODEBUG=fips140=on` removes it from the offered groups anyway, and
+a list holding nothing else fails EVERY handshake with `tls: no supported
+elliptic curves for ECDHE`. That is not hypothetical — it is the defect the
+`fips140=only` gate caught, and the reason the list is split by build tag at all.
+
+### Why there is no cluster-formation negotiation
+
+Because TLS 1.3 already does it, per connection. Adding a second negotiation at
+cluster formation would duplicate the handshake's own group selection and give
+two places for a cluster to disagree about its own cryptography. The build tag
+decides what a node will OFFER; TLS decides what a given pair will USE.
+
+### Rolling migration, with no flag day
+
+The two lists intersect on `P-256` and `P-384`, so a `-tags fips` node and a
+standard node complete a handshake with each other in **either** direction. A
+cluster therefore migrates one node at a time:
+
+1. Replace nodes with `-tags fips` builds one by one, in any order. Each new
+   node handshakes with the remaining standard nodes on P-256, and with other
+   upgraded nodes on P-256 as well.
+2. No step requires quorum loss, a coordinated restart, or a window in which
+   part of the cluster cannot talk to the rest.
+3. Once every node is a `-tags fips` build, X25519 is offered by nobody and the
+   cluster's key exchange is approved end to end.
+
+Rolling BACK works the same way for the same reason. There is no persisted
+state keyed to the curve, so a node may move in either direction at any time —
+the choice lives entirely in the binary.
+
+`TestHandshakeCurves_InteroperateAcrossBuilds` pins all three directions (each
+build dialling the other, and itself), and `TestHandshakeCurves_DisjointListsFail`
+pins that the first test is not vacuous: a handshake between genuinely disjoint
+lists really does fail, so interoperability passing means an intersection exists
+rather than that the harness accepts anything.
+
+### What this migration does NOT achieve
+
+Approved KEY EXCHANGE, and nothing beyond it. Completing the rollout above does
+not make the transport approved-only: the packet protection and OCSP exemptions
+in the record below are properties of the QUIC and OCSP standards, not of the
+curve list, and no cluster configuration reaches them. A deployment that must be
+approved-only end to end still has to terminate this transport outside the
+boundary.
+
 ## FIPS 140-3 exemption record
 
 This is the authoritative record of why `pkg/internal/transport/...` is the one
