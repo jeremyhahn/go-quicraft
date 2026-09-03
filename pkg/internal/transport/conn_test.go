@@ -3087,6 +3087,7 @@ func TestCleanStaleConnections_EventListenerOnConnectionFailedDirect(t *testing.
 	if err := t2.Start(); err != nil {
 		t.Fatalf("t2.Start failed: %v", err)
 	}
+	defer func() { _ = t2.Stop() }()
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)
 
@@ -3103,7 +3104,10 @@ func TestCleanStaleConnections_EventListenerOnConnectionFailedDirect(t *testing.
 	if conn != nil {
 		conn.CloseWithError(0, "force stale for test")
 	}
-	time.Sleep(200 * time.Millisecond)
+	// cleanStaleConnections keys on the connection's context, so wait for that
+	// and not for a duration: the close has to be observed before the sweep
+	// runs or the sweep finds a live connection and reports nothing.
+	waitConnDown(t, t1, t2Addr, 5*time.Second)
 
 	// Call cleanStaleConnections directly.
 	t1.cleanStaleConnections()

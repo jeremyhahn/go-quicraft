@@ -117,6 +117,27 @@ func entriesOfSize(t *testing.T, n int, payload int, firstIndex uint64) []proto.
 	return entries
 }
 
+// compressibleEntriesOfSize builds entries exactly as entriesOfSize does but
+// fills each command with zeros instead of random bytes.
+//
+// A batch only splits across frames when its members total more than
+// MaxFrameSize, so a test of the split has to build 16MB+ of messages — there
+// is no smaller shape that reaches the branch. What that costs on the wire is
+// a free choice, because sendableGroup sizes the group on the UNCOMPRESSED
+// marshaled size (see frame.go) while sendFrame Snappy-compresses what it
+// writes. Zero-filled commands therefore produce byte-for-byte the same
+// grouping and the same number of frames as random ones, for a fraction of the
+// QUIC and race-detector work. Use entriesOfSize where the point is that the
+// payload is incompressible.
+func compressibleEntriesOfSize(t *testing.T, n int, payload int, firstIndex uint64) []proto.Entry {
+	t.Helper()
+	entries := entriesOfSize(t, n, 0, firstIndex)
+	for i := range entries {
+		entries[i].Cmd = make([]byte, payload)
+	}
+	return entries
+}
+
 // receivedEntries returns the total number of entries the handler observed.
 func receivedEntries(h *testHandler) int {
 	total := 0
@@ -221,9 +242,15 @@ func TestOversizedReplicateDoesNotStormDials(t *testing.T) {
 			LogIndex: 1, LogTerm: 1,
 			Entries: entriesOfSize(t, proto.MaxEntriesPerMessage+1, 0, 2),
 		}})
-		// Give the write, the peer's rejection and any teardown time to land
-		// before the next attempt, so each attempt is an independent trial.
-		time.Sleep(50 * time.Millisecond)
+		// Each attempt is an independent trial only once the previous one has
+		// been resolved. The message is unsendable, so the sender drops it and
+		// records the drop; that record is the event to wait for, and waiting
+		// for it is both faster and correct under load.
+		want := i + 1
+		pollUntil(t, 10*time.Second, time.Millisecond,
+			"an unsendable message was never recorded as dropped", func() bool {
+				return countDropsWithReason(p.metrics, dropReasonUnsendable) >= want
+			})
 	}
 
 	dials := p.dials.Load()
@@ -296,6 +323,10 @@ func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 
 	sendReg.Register(1, 2, receiver.Addr().String())
 
+	// As in TestPeerRejectedHeartbeatFrameKeepsConnection, this pacing cannot
+	// become a poll on PeerFrameRejections: the counter trails the sends by one
+	// write, so waiting for attempt i before making attempt i+1 deadlocks. See
+	// #71.
 	const attempts = 20
 	for i := 0; i < attempts; i++ {
 		sender.Send([]proto.Message{{
@@ -378,14 +409,17 @@ func TestCoalescedBatchSplitsAcrossFrames(t *testing.T) {
 	p.handler.waitBatch(t, 10*time.Second)
 
 	// Four 5MB messages: each fits a frame on its own, the four together
-	// (20MB) do not.
+	// (20MB) do not. The commands are compressible so the split decision —
+	// which is made on the uncompressed size — is unchanged while the bytes
+	// that actually cross the wire are not 20MB. Under -race on a loaded host
+	// that difference is the whole of this test's cost.
 	const msgCount = 4
 	msgs := make([]proto.Message, msgCount)
 	for i := range msgs {
 		msgs[i] = proto.Message{
 			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
 			LogIndex: uint64(i), LogTerm: 1,
-			Entries: entriesOfSize(t, 5, 1024*1024, uint64(10*i+1)),
+			Entries: compressibleEntriesOfSize(t, 5, 1024*1024, uint64(10*i+1)),
 		}
 	}
 	wantEntries := receivedEntries(p.handler) + msgCount*5

@@ -15,7 +15,9 @@
 package engine
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -619,6 +621,30 @@ func TestEngine_RequestSnapshot_WithPeer(t *testing.T) {
 	}
 }
 
+// heldSnapshotter is a Snapshotter that parks the pool worker inside
+// LastApplied until the test releases it. saveSnapshot consults LastApplied
+// before it touches the barrier or the filesystem, so parking there pins the
+// request in flight without creating any state to clean up. Returning 0 after
+// the release makes the save a no-op ("nothing applied yet").
+type heldSnapshotter struct {
+	release <-chan struct{}
+}
+
+func (s *heldSnapshotter) SaveSnapshot(_ context.Context, _ io.Writer, _ <-chan struct{}) error {
+	return nil
+}
+
+func (s *heldSnapshotter) RecoverFromSnapshot(_ context.Context, _ io.Reader, _ <-chan struct{}) error {
+	return nil
+}
+
+func (s *heldSnapshotter) LastApplied() uint64 {
+	<-s.release
+	return 0
+}
+
+var _ Snapshotter = (*heldSnapshotter)(nil)
+
 func TestEngine_RequestSnapshot_DuplicateRejected(t *testing.T) {
 	cfg := newTestHostConfig()
 	ldb := newTestLogDB()
@@ -627,10 +653,20 @@ func TestEngine_RequestSnapshot_DuplicateRejected(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
+	// The dedup this test asserts holds only WHILE the first request is in
+	// flight: the pool worker deletes the in-flight marker as its last act.
+	// With a nil snapshotter the worker rejects the request immediately, so on
+	// a loaded host it could finish before the second call and the second
+	// request would legitimately be accepted — the flake. Park the worker
+	// inside the snapshotter instead: the marker cannot be released until this
+	// test says so, and the assertion no longer depends on scheduling.
+	release := make(chan struct{})
+	defer close(release)
+
 	peer, lr := newTestPeer(t, 1, 1)
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
 	nodeCfg.SetDefaults()
-	node := NewNode(peer, nil, lr, nodeCfg, nil, "/tmp/snap", nil)
+	node := NewNode(peer, nil, lr, nodeCfg, &heldSnapshotter{release: release}, t.TempDir(), nil)
 	e.LoadNode(node)
 
 	// First request should succeed.

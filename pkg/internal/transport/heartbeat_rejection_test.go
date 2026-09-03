@@ -82,6 +82,13 @@ func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 
 	// A bare Heartbeat carries neither entries nor a snapshot, so Send routes
 	// it through the heartbeat fast path and its dedicated stream (index 0).
+	// The pacing here cannot be replaced by a poll on PeerFrameRejections:
+	// MEASURED, the sender learns of a rejection only when it NEXT writes to
+	// the stream the peer reset, so the counter trails the sends by one and
+	// waiting for attempt i to be counted before making attempt i+1 deadlocks
+	// (it ran the full 10s at i=0). The sleep also keeps the sends from being
+	// coalesced into one frame, which would leave a single write and therefore
+	// no second write to observe the rejection on. See #71.
 	const attempts = 20
 	for range attempts {
 		sender.Send([]proto.Message{{

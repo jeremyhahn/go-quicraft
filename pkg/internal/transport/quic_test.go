@@ -840,9 +840,11 @@ func TestBidirectionalSend(t *testing.T) {
 // in-flight SendSnapshot operations to complete before tearing down.
 func TestQUICTransport_Stop_WaitsForSnapshots(t *testing.T) {
 	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	// Don't use the cleanup function; we manually stop t1 to test
-	// the snapshot wait behavior. We still stop t2 at cleanup via defer.
-	_ = cleanup
+	// The body stops t1 itself, mid-test, to exercise the snapshot wait. Stop
+	// is idempotent, so the pair's cleanup still runs here and is what closes
+	// t2 — discarding it leaked t2's listener, accept loop and cleanup ticker
+	// into every test that ran after this one.
+	defer cleanup()
 
 	chunks := []proto.SnapshotChunk{
 		{
@@ -3665,11 +3667,15 @@ func TestSendQueueWorkerOnce_StopSignalCleanExit(t *testing.T) {
 		hbCh: make(chan proto.Message, 64),
 	}
 
-	// Signal stop so sendQueueWorkerOnce exits immediately.
-	tr.stopped.Store(true)
-	tr.shutdownCancel()
-	close(tr.stopC)
-	tr.wg.Wait()
+	// Signal stop so sendQueueWorkerOnce exits immediately. Stop is the real
+	// shutdown: open-coding its first four statements set the stop signal but
+	// left the QUIC listener, its send queue and the UDP socket running for the
+	// rest of the package. Calling Stop here also keeps the test honest — it
+	// asserts the worker's behaviour after a genuine shutdown, not after a
+	// hand-assembled approximation of one.
+	if err := tr.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
 
 	panicked := tr.sendQueueWorkerOnce("127.0.0.1:9999", sq)
 	if panicked {
@@ -5198,6 +5204,7 @@ func TestSendSnapshot_ChunkLoopWriteFailure(t *testing.T) {
 	if err := t2.Start(); err != nil {
 		t.Fatalf("t2.Start failed: %v", err)
 	}
+	defer func() { _ = t2.Stop() }()
 
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)
@@ -5291,6 +5298,7 @@ func TestSendSnapshotStreaming_ChunkWriteFailure(t *testing.T) {
 	if err := t2.Start(); err != nil {
 		t.Fatalf("t2.Start failed: %v", err)
 	}
+	defer func() { _ = t2.Stop() }()
 
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)

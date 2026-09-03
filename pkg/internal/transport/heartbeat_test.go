@@ -193,19 +193,11 @@ func TestSendHeartbeatBatch_MultipleMessages(t *testing.T) {
 
 	// The 3 heartbeats may arrive in 1-3 batches depending on framing
 	// and scheduling. Poll until all 3 are delivered.
-	deadline := time.Now().Add(5 * time.Second)
-	var totalMsgs int
-	for time.Now().Before(deadline) {
-		totalMsgs = 0
-		for _, b := range handler2.getBatches() {
-			totalMsgs += len(b.Requests)
-		}
-		if totalMsgs >= 3 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if totalMsgs != 3 {
+	pollUntil(t, 5*time.Second, 2*time.Millisecond,
+		"the 3 heartbeats were not all delivered", func() bool {
+			return countRequests(handler2) >= 3
+		})
+	if totalMsgs := countRequests(handler2); totalMsgs != 3 {
 		t.Fatalf("expected 3 messages total, got %d", totalMsgs)
 	}
 }
@@ -287,6 +279,15 @@ func TestSendHeartbeatBatch_StreamEvictionOnWriteError(t *testing.T) {
 	handler2.waitBatch(t, 10*time.Second)
 
 	// Stop t2 to break the stream.
+	//
+	// The delay here cannot be replaced by a poll on the sender's view of the
+	// connection: MEASURED, a peer's Stop is not observable from the sender.
+	// Stop closes the listener, its own outbound connections and the UDP
+	// socket, but the connection t2 ACCEPTED from t1 is never closed with an
+	// error, so no CONNECTION_CLOSE reaches t1 and t1's cached connection
+	// context stays live — a poll on it ran the full 10s and failed. Until the
+	// transport closes its inbound connections on shutdown there is no
+	// condition to wait for. Filed as #78.
 	t2.Stop()
 	time.Sleep(500 * time.Millisecond)
 
@@ -511,15 +512,10 @@ func TestSendHeartbeatBatch_ConcurrentSends(t *testing.T) {
 	wg.Wait()
 
 	// Wait for at least some messages to arrive.
-	deadline := time.After(10 * time.Second)
-	for handler2.batchCount.Load() < 1 {
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for any batch to arrive")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	pollUntil(t, 10*time.Second, 2*time.Millisecond,
+		"timeout waiting for any batch to arrive", func() bool {
+			return handler2.batchCount.Load() >= 1
+		})
 
 	totalMsgs := 0
 	for _, b := range handler2.getBatches() {
@@ -678,7 +674,10 @@ func TestSendHeartbeatBatch_WriteDeadlineErrorEvicts(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", initialConns)
 	}
 
-	// Stop t2 to break the connection.
+	// Stop t2 to break the connection. As in
+	// TestSendHeartbeatBatch_StreamEvictionOnWriteError, a peer's Stop is not
+	// observable from the sender, so there is no condition to poll on here.
+	// Filed as #78.
 	t2.Stop()
 	time.Sleep(500 * time.Millisecond)
 
@@ -717,18 +716,12 @@ func TestSendHeartbeatBatch_MarshalErrorPath(t *testing.T) {
 		})
 	}
 
-	// Wait for delivery.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		total := 0
-		for _, b := range handler2.getBatches() {
-			total += len(b.Requests)
-		}
-		if total >= 10 {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	// Wait for delivery. The old loop returned on success and fell out of the
+	// bottom on timeout, so a total failure to deliver anything PASSED.
+	pollUntil(t, 10*time.Second, 2*time.Millisecond,
+		"heartbeats sent through the batch path were not delivered", func() bool {
+			return countRequests(handler2) >= 10
+		})
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +772,8 @@ func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
 	})
 	handler2.waitBatch(t, 10*time.Second)
 
-	// Stop t2.
+	// Stop t2. As in TestSendHeartbeatBatch_StreamEvictionOnWriteError, a
+	// peer's Stop is not observable from the sender. Filed as #78.
 	t2.Stop()
 	time.Sleep(500 * time.Millisecond)
 

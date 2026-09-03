@@ -44,6 +44,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes, so no consumer cascade.
 
 
+### Fixed
+
+- **Two suite flakes fixed at their cause, and five leaked QUIC transports
+  closed (#71).** Neither flake was a Raft or transport defect; both were tests
+  reading a value that was not yet published and treating it as an observation.
+
+  `TestCancelledConfigChange_SubmitsNothing` captured its "before" last index
+  straight from `DiagRaftState`. That call is lazily armed — the FIRST call only
+  turns publication on, and until the step worker's next tick it returns an
+  all-zero placeholder indistinguishable from an empty log. The test therefore
+  recorded `lastIdxBefore = 0`, read the real index (2: the bootstrap entry plus
+  the leader's no-op) afterwards, and reported that a cancelled config change had
+  appended to the log. Measured directly: 8 probes of an idle single-node shard,
+  8 saw `term 0 -> 2, lastIdx 0 -> 2` with no proposal in flight. It now waits
+  for a published snapshot before taking the baseline.
+
+  `TestEngine_RequestSnapshot_DuplicateRejected` asserted that a second
+  `RequestSnapshot` is rejected while the first is in flight, but with a nil
+  snapshotter the pool worker rejected the first request and released the
+  in-flight marker immediately — so on a loaded host the second request was
+  legitimately accepted. Confirmed by forcing that order (wait for the pool's
+  completion, then request again: the duplicate returns nil). The test now parks
+  the worker in the snapshotter, so the marker cannot be released until the
+  assertion has been made.
+
+  **The leaks are a defect in their own right.** Five transports were started
+  and never stopped, so their QUIC listener, accept loop, connection-cleanup
+  ticker and UDP socket stayed live for the remainder of the package run: two
+  hand-rolled teardowns that open-coded the first statements of `Stop`, a pair
+  whose `cleanup` was assigned to `_`, and two second endpoints with no
+  `defer Stop`. Attributed by instrumenting `Start`/`stop` with the creating
+  stack; the goroutine profile taken last in the package went from 30 live
+  goroutines to 8, and the leaked-transport count from 5 to 0.
+
+  `TestCoalescedBatchSplitsAcrossFrames` — the third flake, and the only one
+  that reproduced locally — now fills its 20MB of test messages with
+  compressible data. Frame grouping is decided on the UNCOMPRESSED marshaled
+  size while the wire carries a Snappy-compressed payload, so the split under
+  test is byte-for-byte identical and the cost is not: 1.75s -> 0.65s per
+  iteration under `-race`. The 16MB frame ceiling means no smaller batch reaches
+  the branch at all, so cost was the only free variable. The budget was left
+  alone.
+
+  A third flake in the same family surfaced under the repetition this issue
+  asks for and is fixed with them: `TestStartShard_OnDiskSM_ImportBootstrap`
+  waited for raft's processed marker to equal exactly the seeded snapshot index.
+  Its first sample is always the warming-up placeholder — 12 probe runs, 12 saw
+  `processed=0` first — and by the second sample a single-node shard has elected
+  itself and appended a no-op, so the marker is already index+1 and exact
+  equality can never match again. The shared `waitDiagProcessed` helper now
+  waits for the marker to REACH the index, which is what the defect it guards
+  (a marker never seeded from the import, left at 0) actually violates.
+
+  Two sleeps that LOOK like the same problem were measured and left in place,
+  with the measurement recorded beside them. A peer's `Stop` is not observable
+  from the sender — a stopped transport never closes the connections it
+  accepted, so no `CONNECTION_CLOSE` arrives and the sender's cached connection
+  context stays live for at least 10s — filed as #78, since a graceful shutdown
+  that peers cannot see is a production defect and not only a test one. And
+  `PeerFrameRejections` trails the
+  sends by one write, because a reset stream is only discovered on the NEXT
+  write to it, so pacing sends on that counter deadlocks. Both are noted at the
+  call sites so the next reader does not re-derive them.
+
 ### Changed
 
 - **The barrier holds its root key in locked memory for the whole of

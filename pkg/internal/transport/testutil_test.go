@@ -61,6 +61,51 @@ func assertNever(t *testing.T, duration, interval time.Duration, msg string, con
 	}
 }
 
+// countDropsWithReason returns how many message drops carrying reason the
+// recorder has observed.
+func countDropsWithReason(d *dropRecorder, reason string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, s := range d.messageDrops {
+		if s.reason == reason {
+			n++
+		}
+	}
+	return n
+}
+
+// countRequests returns the total number of messages the handler has observed
+// across every batch it received.
+func countRequests(h *testHandler) int {
+	total := 0
+	for _, b := range h.getBatches() {
+		total += len(b.Requests)
+	}
+	return total
+}
+
+// waitConnDown blocks until tr's cached connection to target reports itself
+// torn down. The signal is the connection's own context, not the size of
+// tr.conns: quic-go cancels the context on close, but the map entry survives
+// until a later send or the cleanup sweep evicts it, so polling for an empty
+// pool waits for a different event that may never happen within the test.
+//
+// This is usable for a connection closed on THIS side. It is not usable to
+// wait for a peer's Stop: a stopped transport closes its listener, its own
+// outbound connections and its socket, but never the connections it accepted,
+// so no CONNECTION_CLOSE reaches the sender and its context stays live (#78).
+func waitConnDown(t *testing.T, tr *QUICTransport, target string, timeout time.Duration) {
+	t.Helper()
+	pollUntil(t, timeout, 2*time.Millisecond,
+		"peer connection to "+target+" was never observed closed", func() bool {
+			tr.connMu.RLock()
+			conn, ok := tr.conns[target]
+			tr.connMu.RUnlock()
+			return !ok || conn.Context().Err() != nil
+		})
+}
+
 // waitForChan waits for a channel to be closed or for timeout.
 func waitForChan(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string) {
 	t.Helper()

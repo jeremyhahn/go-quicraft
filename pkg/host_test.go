@@ -568,6 +568,32 @@ func newTestHost(t *testing.T) *Host {
 	return h
 }
 
+// waitForDiagLive waits until the step worker has PUBLISHED a diagnostics
+// snapshot for the shard, so DiagRaftState reports the shard's real state.
+//
+// DiagRaftState is lazily armed: the first call only turns publication on, and
+// until the next tick publishes it returns an all-zero placeholder that is
+// indistinguishable from a genuine empty log. A test that reads it as a
+// baseline records lastIdx=0 and then compares it against the real index a
+// moment later, reporting movement that never happened. A live snapshot always
+// carries a non-zero last index once the shard has a leader, because the
+// bootstrap entry is already in the log.
+func waitForDiagLive(t *testing.T, h *Host, shardID uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, _, lastIdx, _, _, err := h.DiagRaftState(shardID)
+		if err != nil {
+			t.Fatalf("waitForDiagLive: DiagRaftState: %v", err)
+		}
+		if lastIdx > 0 {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("waitForDiagLive: shard %d published no diagnostics snapshot", shardID)
+}
+
 // addTestNodeState stores a minimal nodeState into the Host's nodes sync.Map
 // for the given shard/replica pair. The node is marked as running (not stopped).
 func addTestNodeState(h *Host, shardID, replicaID uint64) {
@@ -21149,14 +21175,28 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	waitDiagProcessed(t, h, 1, 100)
 }
 
-// waitDiagProcessed polls DiagRaftState until the raft processed marker
-// reaches want, then asserts it. DiagRaftState is an eventually-consistent
-// snapshot published by the step worker under raftMu (reading Peer.r from
-// the caller's goroutine would race), so a direct read can briefly observe
-// the warming-up placeholder.
+// waitDiagProcessed polls DiagRaftState until the raft processed marker has
+// REACHED want, then asserts that it did. DiagRaftState is an
+// eventually-consistent snapshot published by the step worker under raftMu
+// (reading Peer.r from the caller's goroutine would race).
+//
+// It waits for "at least want" rather than "exactly want" because two things
+// make the exact value a moving target, both measured. The first DiagRaftState
+// call only ARMS publication and returns an all-zero placeholder: a 12-run
+// probe saw processed=0 on the first sample every single time. And a
+// single-node shard elects itself and appends a no-op straight after
+// StartShard, taking the marker to want+1. Exact equality therefore depended on
+// sampling in the gap between those two events; when the no-op landed inside
+// the poll interval the marker was already 81, could never match 80 again, and
+// the test failed with "raft processed = 81, want 80" having replayed nothing
+// wrong at all.
+//
+// "At least want" still catches the defect this guards. A marker that was not
+// seeded from the imported snapshot stays at 0 and the engine replays entries
+// the snapshot already covers, which is a failure by this test either way.
 func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var processed uint64
 	for {
 		_, _, p, _, _, _, drErr := h.DiagRaftState(shardID)
@@ -21164,13 +21204,14 @@ func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
 			t.Fatalf("DiagRaftState failed: %v", drErr)
 		}
 		processed = p
-		if processed == want || time.Now().After(deadline) {
+		if processed >= want || time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		runtime.Gosched()
 	}
-	if processed != want {
-		t.Errorf("raft processed = %d, want %d", processed, want)
+	if processed < want {
+		t.Errorf("raft processed = %d, want at least %d (the marker was not "+
+			"seeded from the imported snapshot)", processed, want)
 	}
 }
 

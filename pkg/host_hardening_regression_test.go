@@ -798,6 +798,14 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetShardMembership: %v", err)
 	}
+	// The baseline has to come from a PUBLISHED diagnostics snapshot. The first
+	// DiagRaftState call merely arms publication and returns zeros until the
+	// next tick, so reading it directly recorded lastIdxBefore=0 and then found
+	// the real index (2: bootstrap plus the leader's no-op) afterwards — a
+	// "cancelled config change appended to the log" that was nothing of the
+	// kind. On a loaded host the arming tick is slower, which is why this only
+	// ever failed in the full suite.
+	waitForDiagLive(t, h, 1)
 	_, _, _, lastIdxBefore, _, _, err := h.DiagRaftState(1)
 	if err != nil {
 		t.Fatalf("DiagRaftState: %v", err)
