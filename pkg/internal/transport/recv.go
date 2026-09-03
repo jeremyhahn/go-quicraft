@@ -145,6 +145,10 @@ func extractIP(addr net.Addr) string {
 // per-IP connection limit. The loop runs until the transport is stopped.
 func (t *QUICTransport) acceptLoop() {
 	defer t.wg.Done()
+	// Signalled separately from t.wg so stop() can wait for admissions to stop
+	// without waiting for the handlers, which cannot finish until their
+	// connections are closed. See QUICTransport.acceptWG.
+	defer t.acceptWG.Done()
 
 	sem := make(chan struct{}, t.cfg.MaxIncomingConnections)
 	ipTracker := newIPConnTracker(t.cfg.MaxConnectionsPerIP)
@@ -247,6 +251,26 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 	// Try to acquire global semaphore without blocking.
 	select {
 	case sem <- struct{}{}:
+		// Publish SYNCHRONOUSLY, on this goroutine, before the handler is
+		// launched. Publication used to happen inside handleConnection, which
+		// left every admitted connection invisible for as long as its goroutine
+		// took to be scheduled — and stop()'s inbound sweep walks exactly that
+		// map. A connection admitted just before a shutdown could therefore be
+		// missed by the sweep, have quicTr.Close() destroy it locally, and only
+		// then reach publication, by which point announcing anything on it is a
+		// no-op: the peer is left holding a dead connection, which is the whole
+		// defect this path exists to prevent.
+		//
+		// Publishing here is what lets stop() close that off for good, because
+		// it makes "the accept loop has returned" mean "every connection it
+		// admitted is in the map". See acceptWG.
+		//
+		// It is inside the semaphore branch and not above it deliberately: the
+		// limit-rejection paths close the connection without ever running a
+		// handler, and an entry published for one of them would have nothing
+		// left to call forgetInboundConnState and would pin the *quic.Conn for
+		// the process lifetime.
+		activity := t.publishInboundConn(conn)
 		t.wg.Add(1)
 		go func() {
 			defer func() {
@@ -254,7 +278,7 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 				ipTracker.release(ip)
 			}()
 			defer t.wg.Done()
-			t.handleConnection(conn)
+			t.handleConnection(conn, activity)
 		}()
 	default:
 		// At global connection limit, reject and release IP slot.
@@ -274,7 +298,15 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 // frame's flags. A channel-based semaphore limits concurrent stream-processing
 // goroutines to MaxStreamsPerConnection, preventing resource exhaustion from
 // peers opening excessive streams.
-func (t *QUICTransport) handleConnection(conn *quic.Conn) {
+//
+// activity is HANDED IN by acceptLoopIteration rather than created here, and
+// that is a guarantee, not a convenience: publication into inboundConns has to
+// happen on the accept loop's own goroutine for stop()'s join of that loop to
+// mean anything (see QUICTransport.acceptWG). Publishing here instead left every
+// admitted connection invisible until this goroutine was scheduled, which is a
+// window the shutdown sweep could fall into. The parameter is what stops that
+// regressing quietly: this function has no way to publish.
+func (t *QUICTransport) handleConnection(conn *quic.Conn, activity *inboundConnState) {
 	// Drop the per-connection caches when this inbound connection's handler
 	// returns, so they do not grow unbounded across connection churn.
 	//
@@ -294,18 +326,6 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn) {
 	// connection, which MaxConnectionsPerIP would otherwise multiply straight
 	// back out.
 	t.acquirePeerMsgBudgetRef(conn)
-
-	// Track the connection so the reclaim policies can reach it AFTER
-	// admission: revocation re-checks (revokeCheckConnections), the idle sweep
-	// (reapIdleInboundConns) and committed membership removal
-	// (closeInboundFromPeer). See QUICTransport.inboundConns.
-	//
-	// Stamped as active on admission so a connection that has only just
-	// completed its handshake is never reaped before it has had a chance to
-	// send anything.
-	activity := &inboundConnState{}
-	activity.touch(time.Now())
-	t.inboundConns.Store(conn, activity)
 
 	// streamWG tracks the per-connection stream goroutines. The transport-wide
 	// t.wg does not bound them to this connection's lifetime.

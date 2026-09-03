@@ -1155,6 +1155,48 @@ func (t *QUICTransport) closeInboundFromPeer(address string) int {
 	return closed
 }
 
+// closeInboundOnShutdown closes every live inbound connection with
+// QUICErrShutdown, and reports how many it closed.
+//
+// It is the SHUTDOWN member of the inbound reclaim family — closeInboundFromPeer
+// is the unauthorized half, reapIdleInboundConns the idle half and
+// revokeCheckConnections the revoked half — and the only one whose cause is this
+// node rather than the peer. It exists because stop() closed t.conns and nothing
+// else: a node that shut down GRACEFULLY was indistinguishable from one that had
+// vanished, because quic-go's Transport.Close destroys its connections locally
+// (handler.destroy) instead of emitting a CONNECTION_CLOSE.
+//
+// The reason phrase is NOT redacted, unlike the other three. closeReasonRedacted
+// exists because those closes are authorization verdicts ON THE PEER, and the
+// phrase travels to the peer verbatim; "transport shutdown" is a statement about
+// this node that the peer is entitled to and can observe anyway. It is the same
+// code and phrase the OUTBOUND half of stop() already sends, so a peer sees one
+// verdict for the event regardless of which side dialed.
+//
+// Entries are not deleted here, for the reason reapIdleInboundConns gives: the
+// close is what reclaims the rest — the connection context is cancelled,
+// AcceptStream fails, handleConnection returns and its deferred
+// forgetInboundConnState drops the entry — and stop()'s t.wg.Wait() is what
+// guarantees that has happened before Stop returns.
+func (t *QUICTransport) closeInboundOnShutdown() int {
+	closed := 0
+	t.inboundConns.Range(func(k, _ any) bool {
+		conn, ok := k.(*quic.Conn)
+		if !ok {
+			return true
+		}
+		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
+			slog.Debug("QUIC inbound connection close failed",
+				"remote", conn.RemoteAddr().String(),
+				"error", err,
+			)
+		}
+		closed++
+		return true
+	})
+	return closed
+}
+
 // cleanStaleConnections removes connections whose context is done and
 // evicts all pooled streams that targeted the dead connection. Without
 // stream eviction, subsequent getStream calls would return cached but
@@ -1667,6 +1709,36 @@ func (t *QUICTransport) inboundAuthorizedForCached(conn *quic.Conn, target strin
 	entry.slots[entry.next] = srcAddrAuthSlot{addr: target, authorized: authorized, valid: true}
 	entry.next = (entry.next + 1) % srcAddrAuthSlots
 	return authorized
+}
+
+// publishInboundConn makes an admitted inbound connection reachable to the
+// reclaim policies and returns its liveness record.
+//
+// Publication is what the policies act on: revocation re-checks
+// (revokeCheckConnections), the idle sweep (reapIdleInboundConns), committed
+// membership removal (closeInboundFromPeer) and the shutdown announcement
+// (closeInboundOnShutdown) can only reach a connection that is in the map. The
+// record is stamped active on admission so a connection that has only just
+// completed its handshake is never reaped before it has had a chance to send
+// anything.
+//
+// It is called from acceptLoopIteration, SYNCHRONOUSLY, before the connection's
+// handler goroutine is launched — not from the handler, where it used to live.
+// That is the load-bearing half of the shutdown guarantee, and it only works in
+// concert with stop() joining the accept loop: publishing on this goroutine is
+// what makes "the accept loop has returned" mean "every connection it admitted
+// is in the map", which is in turn what lets the shutdown sweep be complete
+// rather than best-effort. Published on the handler's goroutine instead, a
+// connection admitted just before a shutdown stayed invisible for as long as
+// that goroutine took to be scheduled, and the sweep could miss it. There is
+// deliberately no second t.stopped check here: two half-guarantees are how the
+// window survived, and the barrier in stop() is the whole one. See
+// QUICTransport.acceptWG.
+func (t *QUICTransport) publishInboundConn(conn *quic.Conn) *inboundConnState {
+	activity := &inboundConnState{}
+	activity.touch(time.Now())
+	t.inboundConns.Store(conn, activity)
+	return activity
 }
 
 // forgetInboundConnState removes the per-inbound-connection caches (the

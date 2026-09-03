@@ -278,18 +278,17 @@ func TestSendHeartbeatBatch_StreamEvictionOnWriteError(t *testing.T) {
 	})
 	handler2.waitBatch(t, 10*time.Second)
 
-	// Stop t2 to break the stream.
+	// Stop t2 to break the stream, then wait for t1 to actually SEE it.
 	//
-	// The delay here cannot be replaced by a poll on the sender's view of the
-	// connection: MEASURED, a peer's Stop is not observable from the sender.
-	// Stop closes the listener, its own outbound connections and the UDP
-	// socket, but the connection t2 ACCEPTED from t1 is never closed with an
-	// error, so no CONNECTION_CLOSE reaches t1 and t1's cached connection
-	// context stays live — a poll on it ran the full 10s and failed. Until the
-	// transport closes its inbound connections on shutdown there is no
-	// condition to wait for. Filed as #78.
+	// This was a fixed 500ms sleep because a peer's Stop was not observable
+	// from the sender: Stop closed the listener, its own outbound connections
+	// and the UDP socket, but never the connection t2 had ACCEPTED from t1, so
+	// no CONNECTION_CLOSE reached t1 and its cached connection context stayed
+	// live (a poll on it ran the full 10s and failed). Stop now announces
+	// itself on the inbound half (#78), so the real condition can be waited on.
+	t2Addr := t2.Addr().String()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitConnDown(t, t1, t2Addr, 10*time.Second)
 
 	// Send again. The write should fail, triggering stream eviction.
 	// Should not panic or block.
@@ -674,20 +673,26 @@ func TestSendHeartbeatBatch_WriteDeadlineErrorEvicts(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", initialConns)
 	}
 
-	// Stop t2 to break the connection. As in
-	// TestSendHeartbeatBatch_StreamEvictionOnWriteError, a peer's Stop is not
-	// observable from the sender, so there is no condition to poll on here.
-	// Filed as #78.
+	// Stop t2 to break the connection, then wait for t1 to see it. Stop now
+	// announces itself on the connection it accepted (#78), so this is a poll
+	// on the real condition rather than the fixed 500ms guess it replaces.
+	t2Addr := t2.Addr().String()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitConnDown(t, t1, t2Addr, 10*time.Second)
 
 	// Send another heartbeat. The write will fail, triggering eviction.
 	t1.Send([]proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
 
-	// Wait for eviction to occur.
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the eviction itself, which is what this test is named for. Send
+	// is asynchronous — the per-target worker is what discovers the dead stream
+	// — so the assertion is that the connection is eventually dropped from the
+	// pool, not merely that Send did not block. The old fixed sleep here
+	// asserted nothing at all: the test fell straight into cleanup.
+	pollUntil(t, 10*time.Second, 2*time.Millisecond,
+		"the failed write never evicted the dead connection from the pool",
+		func() bool { return t1.ConnectionCount() == 0 })
 
 	cleanup()
 }
@@ -772,10 +777,11 @@ func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
 	})
 	handler2.waitBatch(t, 10*time.Second)
 
-	// Stop t2. As in TestSendHeartbeatBatch_StreamEvictionOnWriteError, a
-	// peer's Stop is not observable from the sender. Filed as #78.
+	// Stop t2 and wait for t1 to see the connection go down. Observable since
+	// Stop began announcing itself on the inbound half (#78); this was a fixed
+	// 500ms sleep while it was not.
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitConnDown(t, t1, t2Addr, 10*time.Second)
 
 	// Call sendHeartbeatBatch directly. Should hit error paths.
 	t1.sendHeartbeatBatch(t2Addr, []proto.Message{

@@ -46,6 +46,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Stop()` now announces a graceful shutdown to the peers that dialed this
+  node (#78).** Consumer-observable: a node shutting down cleanly used to be
+  indistinguishable from one that had vanished.
+
+  `stop()` closed the revocation checker, the listener, every connection in
+  `t.conns` and the pooled streams, then `t.quicTr.Close()`. `t.conns` holds only
+  the connections this transport **dialed**, and quic-go's `Transport.Close`
+  destroys the rest LOCALLY (`handler.destroy`) without putting a
+  `CONNECTION_CLOSE` on the wire. Nothing ever closed a connection that arrived
+  through `acceptLoop`, so every peer that had dialed this node kept a connection
+  it still believed was live until `MaxIdleTimeout` (30s) expired or one of its
+  own writes happened to fail. For a leader that means it goes on enqueuing to a
+  follower that is already gone, its `cleanStaleConnections` cannot evict a
+  connection it never sees as stale, and the pooled streams to the dead peer stay
+  in the pool. Measured: a poll on the sender's cached `conn.Context()` ran its
+  full 10-second bound and never fired.
+
+  A crash cannot be announced; a planned shutdown can, and QUIC has one frame for
+  it. `stop()` now closes the accepted half too, with the same `QUICErrShutdown`
+  code and reason phrase the outbound half already sends, so a peer sees one
+  verdict for the event regardless of which side dialed. The close is sequenced
+  after the listener close and **before** `t.quicTr.Close()`: the transport close
+  destroys the connections and tears down the socket, so an announcement issued
+  below it would be a silent no-op.
+
+  Sweeping the map is not on its own enough, because `Listener.Close` does not
+  discard the connections already queued inside quic-go, so one can still be
+  admitted after the shutdown has begun. `stop()` therefore **joins the accept
+  loop** before it sweeps, and admitted connections are published into the
+  tracking map synchronously on that loop rather than on their handler's
+  goroutine. Together those mean "the accept loop has returned" is equivalent to
+  "every connection it admitted is visible", so the sweep is complete rather than
+  best-effort.
+
 - **Two suite flakes fixed at their cause, and five leaked QUIC transports
   closed (#71).** Neither flake was a Raft or transport defect; both were tests
   reading a value that was not yet published and treating it as an observation.

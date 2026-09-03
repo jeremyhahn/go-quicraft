@@ -262,6 +262,24 @@ type QUICTransport struct {
 	stopOnce sync.Once
 	stopDone chan struct{}
 
+	// acceptWG tracks the accept loop ALONE, separately from t.wg, so stop()
+	// can join it at a point where t.wg cannot yet be joined.
+	//
+	// t.wg covers the accept loop AND every connection handler, and those
+	// handlers only return once their connections are closed — so waiting on
+	// t.wg before closing anything would deadlock. The accept loop has no such
+	// dependency: the listener close and shutdownCancel are enough to end it.
+	//
+	// Joining it is what makes the inbound shutdown sweep COMPLETE rather than
+	// best-effort. Listener.Close does not discard the connections already
+	// queued inside quic-go (baseServer.accept drains connQueue after
+	// stopAccepting is closed), so the loop can still admit one after the
+	// shutdown has begun. Because acceptLoopIteration publishes into
+	// inboundConns synchronously, "the accept loop has returned" means "every
+	// connection it admitted is in the map", and a sweep after this join can no
+	// longer miss one and let quicTr.Close() destroy it unannounced.
+	acceptWG sync.WaitGroup
+
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	wg              sync.WaitGroup
@@ -682,6 +700,7 @@ func (t *QUICTransport) Start() error {
 	}
 
 	t.wg.Add(1)
+	t.acceptWG.Add(1)
 	go t.acceptLoop()
 
 	t.wg.Add(1)
@@ -711,7 +730,9 @@ func (t *QUICTransport) SetShardEpochTrackers(fn func(shardID uint64) EpochTrack
 // Stop gracefully shuts down the transport. It signals all per-target
 // sender goroutines to exit via stopC, waits for them to drain, stops
 // the accept loop, waits for in-flight snapshot transfers, closes all
-// connections, and waits for all goroutines to finish.
+// connections — BOTH the ones this transport dialed and the ones it accepted,
+// so the shutdown is announced to every peer rather than only to half of
+// them — and waits for all goroutines to finish.
 //
 // Stop is idempotent and safe to call concurrently: exactly one caller runs
 // the teardown and every other caller BLOCKS until it has completed. Returning
@@ -762,6 +783,23 @@ func (t *QUICTransport) stop() {
 		}
 	}
 
+	// Wait for the accept loop to return before touching any connection map.
+	// The listener close alone does not stop admissions: quic-go's
+	// baseServer.accept drains its connection queue after stopAccepting is
+	// closed, so a connection can still be handed to the loop here. Joining the
+	// loop is what makes the inbound sweep below COMPLETE — after this point no
+	// further connection can be admitted, and every one that was is already
+	// published in t.inboundConns (acceptLoopIteration publishes synchronously,
+	// before launching the handler). Without this join the sweep could miss a
+	// just-admitted connection, quicTr.Close() would destroy it locally, and
+	// the peer would be left holding it unannounced.
+	//
+	// This is not t.wg: that also covers the connection handlers, which cannot
+	// return until their connections are closed, so joining it here would
+	// deadlock. The accept loop has no such dependency — the listener close and
+	// shutdownCancel above are enough to end it.
+	t.acceptWG.Wait()
+
 	t.connMu.Lock()
 	for addr, conn := range t.conns {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
@@ -771,6 +809,29 @@ func (t *QUICTransport) stop() {
 		delete(t.connEpoch, addr)
 	}
 	t.connMu.Unlock()
+
+	// Announce the shutdown on the INBOUND half too. Closing only t.conns
+	// tells the peers this node DIALED that it is going away and leaves every
+	// peer that dialed US holding a connection it still believes is live:
+	// quic-go's Transport.Close below destroys those connections locally
+	// without emitting a CONNECTION_CLOSE, so the peer learns nothing until
+	// MaxIdleTimeout expires or one of its own writes fails. A leader keeps
+	// enqueuing to a dead follower for that whole window, and its
+	// cleanStaleConnections cannot evict a connection it never sees as stale.
+	//
+	// A crash cannot be announced; a planned shutdown can, and this is the one
+	// frame that says so. Ordering is load-bearing in BOTH directions — it must
+	// run after the listener close (so the set of connections to chase has
+	// stopped growing from the listener's side) and before t.quicTr.Close(),
+	// which destroys the connections locally and tears the socket down, making
+	// any close issued after it a silent no-op.
+	//
+	// It is complete rather than best-effort because of the acceptWG join
+	// above: no connection can be admitted after it, and every one that was is
+	// already in the map.
+	if n := t.closeInboundOnShutdown(); n > 0 {
+		slog.Debug("announced shutdown on inbound connections", "connections", n)
+	}
 
 	t.peerEpochMu.Lock()
 	clear(t.peerEpoch)
