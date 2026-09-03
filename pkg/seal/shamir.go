@@ -117,8 +117,11 @@ type ShamirConfig struct {
 //
 // The result OWNS its shares. Destroy it (or every share individually) as soon
 // as the shares have been distributed: each one is a locked allocation charged
-// against RLIMIT_MEMLOCK, whose exhaustion memguard answers by terminating the
-// process, and an abandoned result holds N of them for the life of it.
+// against RLIMIT_MEMLOCK for as long as it is held, and an abandoned result holds
+// N of them for the life of the process — N locked pages no other caller can
+// reclaim, and the next one to reach the ceiling is refused with
+// ErrLockedMemoryUnavailable. Under memguard reaching it terminated the process
+// outright.
 //
 // SERIALISATION, stated rather than left to be inferred from the tags, in two
 // parts.
@@ -178,10 +181,12 @@ func (r *ShamirInitResult) Destroy() {
 // denial-of-service path: encoding/json calls ProtectedShare.UnmarshalJSON once
 // per array element AS IT VISITS THEM, and each call locks a page of memory, so
 // an attacker-controlled or malformed document with an oversized "shares" array
-// dictates how much of the finite RLIMIT_MEMLOCK budget is taken — and memguard
-// answers a failed lock by terminating the process. The scheme's own count
-// bound in shamir.CombineProtected runs on shares already allocated, far too
-// late to help. So the shares are held first as raw JSON and decoded through
+// dictates how much of the finite RLIMIT_MEMLOCK budget is taken, denying it to
+// every other caller in the process until the decode is torn down — and under
+// memguard it was worse still, since a lock the kernel refused terminated the
+// process. The scheme's own count bound in shamir.CombineProtected runs on
+// shares already allocated, far too late to help. So the shares are held first
+// as raw JSON and decoded through
 // shamir.UnmarshalShareSet, which bounds the set (at most maxShares elements and
 // MaxShareSetBytes of JSON) BEFORE it locks anything.
 //

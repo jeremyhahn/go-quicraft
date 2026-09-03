@@ -88,9 +88,13 @@ type ProtectedSealingStrategy interface {
 	//
 	// The caller OWNS the returned enclave and MUST Destroy it — on every
 	// path, including the error paths of whatever it does next. Locked memory
-	// is a finite kernel resource whose exhaustion memguard answers by
-	// terminating the process. The enclave is returned frozen: its contents
-	// are final, and Destroy is what releases them.
+	// is a finite PROCESS-WIDE resource: an enclave that is never destroyed
+	// holds a whole locked page against RLIMIT_MEMLOCK for the life of the
+	// process, and the next caller to reach the ceiling is refused with
+	// ErrLockedMemoryUnavailable. Under memguard the bill was steeper still —
+	// a refused lock terminated the process — so the duty is less dire than it
+	// was and no less real. The enclave is returned frozen: its contents are
+	// final, and Destroy is what releases them.
 	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
 }
 
@@ -136,8 +140,11 @@ type ProtectedCredentials struct {
 // thing left worth doing about it is not leaving it there.
 //
 // An empty secret is refused rather than stored. A zero-length passphrase is not
-// a passphrase, and memguard answers a zero-length allocation by terminating the
-// process.
+// a passphrase, and the allocator refuses one in any case: go-enclave answers a
+// zero-length allocation with ErrEmptyEnclave. Refusing it here names the actual
+// fault (ErrInvalidPassphrase) at the point the caller can act on, rather than
+// surfacing an enclave-construction error two layers down. Under memguard the
+// same allocation terminated the process instead of returning.
 func NewProtectedCredentials(secret []byte) (ProtectedCredentials, error) {
 	if len(secret) == 0 {
 		return ProtectedCredentials{}, ErrInvalidPassphrase

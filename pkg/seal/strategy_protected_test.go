@@ -180,9 +180,10 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 }
 
 // The plaintext length is a function of a blob nobody has authenticated yet, and
-// the enclave allocation is sized from it. memguard answers a lock it cannot
-// take by terminating the process, so an oversized blob is a remote kill switch
-// unless the length is refused BEFORE anything is locked (Codex review of #40).
+// the enclave allocation is sized from it, so an oversized blob is a remote way
+// to drain a process-wide resource unless the length is refused BEFORE anything
+// is locked (Codex review of #40). Under memguard it was a remote kill switch: a
+// lock that could not be taken terminated the process.
 //
 // The ORDERING is what this test pins, not merely the refusal: the payload here
 // is zeroes, so a check placed after the decrypt would report

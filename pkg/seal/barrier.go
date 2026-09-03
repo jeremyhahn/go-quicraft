@@ -2006,10 +2006,14 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// The Destroy is DEFERRED rather than placed after the derivation call:
 	// deriveEpochCipher runs the caller-injected BarrierConfig.AEADProvider,
 	// i.e. arbitrary third-party code, on the plaintext root key. A panic there
-	// that some caller recovers would otherwise strand an mlock'd LockedBuffer
-	// holding the root key in the clear for the life of the process — and leaked
-	// locked buffers also consume RLIMIT_MEMLOCK, which memguard answers by
-	// aborting the process.
+	// that some caller recovers would otherwise strand an mlock'd buffer holding
+	// the root key in the clear for the life of the process — a whole locked page
+	// that is never released and never re-readable, charged against the process's
+	// RLIMIT_MEMLOCK for as long as it runs. Under memguard the leak was worse
+	// still: a later lock the kernel refused TERMINATED THE PROCESS. Since the
+	// go-enclave adoption that refusal is a returned ErrLockedMemoryUnavailable on
+	// exactly the allocation that hit the ceiling, which lowers the stakes without
+	// making a stranded root key acceptable.
 	rootBuf, err := b.rootKey.Open()
 	if err != nil {
 		return 0, err

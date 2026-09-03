@@ -650,9 +650,13 @@ func unsealStrategyError(err error) error {
 //
 // The Destroy and the wipe are DEFERRED: a panic inside the KDF (or anything a
 // caller injects on that path) would otherwise strand an mlock'd buffer holding
-// the PLAINTEXT passphrase for the life of the process, and leaked locked
-// buffers consume RLIMIT_MEMLOCK, which memguard answers by aborting the
-// process.
+// the PLAINTEXT passphrase for the life of the process — a whole locked page that
+// is never released, charged against RLIMIT_MEMLOCK for as long as the process
+// runs. Under memguard the consequence was harsher: a later lock the kernel
+// refused TERMINATED THE PROCESS. Since the go-enclave adoption it is a returned
+// ErrLockedMemoryUnavailable on that one allocation, so a stranded page degrades
+// the process rather than ending it — which is a reason to keep the defer, not to
+// drop it.
 //
 // It is a separate step, rather than inline in the seal/unseal bodies, for a
 // reason that outlives the deduplication, though it is no longer a hard one: the
@@ -799,10 +803,14 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 	// rather than after the decrypt. The length is a function of the sealed
 	// blob, which is UNAUTHENTICATED at this point — the AEAD has not run — so
 	// sizing an mlock'd allocation from it hands whoever can write the blob a
-	// way to demand an arbitrary amount of a finite kernel resource, and
-	// memguard answers a lock it cannot take by TERMINATING THE PROCESS. A
-	// corrupt or hostile blob would take the service down before the tag that
-	// would have rejected it was ever checked (Codex review of PR #40).
+	// way to demand an arbitrary amount of a finite process-wide resource,
+	// before the tag that would have rejected the blob is ever checked (Codex
+	// review of PR #40). Under memguard that was a remote kill switch: a lock
+	// the kernel refused TERMINATED THE PROCESS. Since the go-enclave adoption
+	// it fails exactly this allocation with ErrLockedMemoryUnavailable and
+	// leaves every enclave already held untouched — which lowers the stakes
+	// from a dead service to locked memory denied to every other caller, and
+	// leaves the reason for the check standing.
 	//
 	// Pinning it to rootKeySize rather than merely bounding it costs nothing:
 	// both seal paths refuse anything but a 32-byte key, so no blob this

@@ -34,12 +34,13 @@ import (
 // path must be provably unreachable from production code.
 //
 // It exists because the failure it stands in for cannot be produced otherwise.
-// Reaching a refused mlock for real means exhausting RLIMIT_MEMLOCK across the
-// whole process, which would take the test binary and every unrelated enclave
-// in it down rather than report. The ownership contract on that path — the
-// value is already wiped, and the error is a *ProtectedMemoryError rather than a
-// *ValidationError — is exactly what a caller gets wrong silently, so it is
-// worth being able to test.
+// Reaching a refused mlock for real means driving RLIMIT_MEMLOCK to its ceiling
+// across the whole process, which would fail allocations in every unrelated test
+// sharing the binary rather than the one under test — and under memguard it was
+// worse still, taking the binary down and destroying every enclave in it. The
+// ownership contract on that path — the value is already wiped, and the error is
+// a *ProtectedMemoryError rather than a *ValidationError — is exactly what a
+// caller gets wrong silently, so it is worth being able to test.
 var newProtectedMemory = goenclave.NewMemoryEnclave
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
@@ -221,12 +222,14 @@ func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedSha
 	//
 	// On the string path an oversized share costs an ordinary heap allocation
 	// and parseRawShare rejects it during combine. Here the allocation is
-	// mlock'd memory: a finite kernel resource (RLIMIT_MEMLOCK) whose
-	// exhaustion memguard answers by TERMINATING THE PROCESS. UnmarshalJSON
-	// constructs from operator-supplied JSON, which at a recovery ceremony is
-	// unauthenticated by construction, so a value made of arbitrarily many
-	// legal base64 characters must not be able to reach the locking allocator
-	// at all. parseRawShare's MaxSecretBytes check runs far too late to help:
+	// mlock'd memory: a finite PROCESS-WIDE resource (RLIMIT_MEMLOCK), so what
+	// one caller takes is denied to every other, and the next to reach the
+	// ceiling is refused with ErrLockedMemoryUnavailable. Under memguard the
+	// same exhaustion TERMINATED THE PROCESS. UnmarshalJSON constructs from
+	// operator-supplied JSON, which at a recovery ceremony is unauthenticated
+	// by construction, so a value made of arbitrarily many legal base64
+	// characters must not be able to reach the locking allocator at all.
+	// parseRawShare's MaxSecretBytes check runs far too late to help:
 	// it sees the payload only after CombineProtected has locked it.
 	//
 	// The bound is the encoded length of the largest share this package will
@@ -276,15 +279,20 @@ func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedSha
 // protected end to end. This function neither copies nor wipes it.
 //
 // Every returned share must be Destroyed. Each is one mlock'd allocation
-// against RLIMIT_MEMLOCK, and memguard terminates the process if a lock fails,
-// so a ceremony splitting into the full 255 shares should destroy them as they
-// are distributed rather than holding the set.
+// against a PROCESS-WIDE RLIMIT_MEMLOCK, so a ceremony splitting into the full
+// 255 shares should destroy them as they are distributed rather than holding
+// the set: what it holds is denied to every other caller until it lets go.
 //
-// Because that failure is fatal rather than reportable, the whole footprint —
-// coefficients, scratch and every returned value — is priced against
-// MaxShareSetBytes before the first allocation and refused with a *SplitError
-// if it does not fit. Arguments that are individually legal can multiply into
-// one that is not: see MaxShareSetBytes for what fits and what to do instead.
+// Because a refusal deep inside a half-built share set is a far worse answer
+// than a refusal before it, the whole footprint — coefficients, scratch and
+// every returned value — is priced against MaxShareSetBytes before the first
+// allocation and refused with a *SplitError if it does not fit. Arguments that
+// are individually legal can multiply into one that is not: see MaxShareSetBytes
+// for what fits and what to do instead. That pricing used to carry more weight
+// still: under memguard a lock the kernel refused terminated the process, so
+// there was no failure left to report. It is now an ErrLockedMemoryUnavailable
+// on the one allocation that hit the ceiling — recoverable, and still not what
+// this API should hand back for arguments it could have priced.
 func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error) {
 	if err := validateSplitParams(secret, threshold, total); err != nil {
 		return nil, err
@@ -292,9 +300,12 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// The individual bounds are each satisfiable and still multiply into a
 	// footprint no host can lock: a 64 KiB secret split 255 ways is ~16 MiB of
 	// coefficients before a single share exists. Priced and refused BEFORE the
-	// first allocation, because the allocation that would fail is the one
-	// memguard answers by terminating the process — a caller that asks for too
-	// much must get an error back, not lose the process.
+	// first allocation, so a caller that asks for too much gets a *SplitError
+	// naming the arithmetic rather than an ErrLockedMemoryUnavailable partway
+	// through a set it must then tear down — and rather than draining the
+	// process-wide locked-memory budget on its way to failing. Under memguard
+	// there was no error to get back at all: the lock that could not be taken
+	// terminated the process.
 	if need := splitLockedBytes(len(secret), threshold, total); need > MaxShareSetBytes {
 		return nil, &SplitError{Reason: fmt.Sprintf(
 			"%d shares of a %d-byte secret need %d bytes of locked memory, exceeding the %d-byte budget",
@@ -431,8 +442,11 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 // set. Holding a decoded copy of every share at once would make the peak
 // locked footprint of a reconstruction proportional to the submission — 255
 // shares of a MaxSecretBytes secret would be another ~16 MiB on top of the
-// shares themselves — and locked memory is the one allocation this process
-// cannot fail gracefully, since memguard answers a failed lock by terminating.
+// shares themselves — and locked memory is PROCESS-WIDE, so a peak taken here
+// is a peak denied to every other caller until this call returns. Under memguard
+// it could not be failed gracefully at all, since a refused lock terminated the
+// process; it is now an ErrLockedMemoryUnavailable, which is reportable and
+// still not something an untrusted share set should get to provoke.
 // So the shares are walked twice against a single reusable buffer: once to
 // validate them and collect the x-coordinates, then, with the Lagrange basis
 // those fix, once more to accumulate each share's contribution into the
@@ -875,11 +889,14 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 // construction: nothing about a share can be checked until the set is
 // combined, so a recovery endpoint necessarily decodes whatever it is handed.
 // The generic decoder allocates one mlock'd buffer per element AS IT VISITS
-// THEM, which lets the submission pick how much of a finite kernel resource to
-// take, and memguard answers a failed lock by terminating the process — so the
-// answer to an oversized submission would be a dead service rather than an
-// error. CombineProtected's 255-share bound cannot help: it runs on shares
-// that have already been allocated.
+// THEM, which lets the submission pick how much of a finite PROCESS-WIDE
+// resource to take: an oversized one starves every other caller of locked
+// memory, on a path that cannot authenticate the submitter. Under memguard the
+// answer to it was a dead service rather than an error, since a refused lock
+// terminated the process; it is now an ErrLockedMemoryUnavailable on whichever
+// allocation reaches the ceiling — a smaller loss, and still not one an
+// unauthenticated caller should get to choose. CombineProtected's 255-share
+// bound cannot help: it runs on shares that have already been allocated.
 //
 // Two checks run against the undecoded document, in this order and before the
 // first MemoryEnclave exists:

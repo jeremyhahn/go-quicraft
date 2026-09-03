@@ -121,9 +121,10 @@ func (s *NoneStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclav
 // the protected pair deliberately does NOT mirror its string-typed sibling:
 // UnsealRootKey returns an empty []byte because the barrier's no-encryption
 // branch wants a length-zero key it can carry through the same code path, and
-// there is no such thing as a protected buffer holding nothing — memguard
-// refuses a zero-length allocation by terminating the process, and an enclave
-// that "held" an empty key would be a protected wrapper around a fiction.
+// there is no such thing as a protected buffer holding nothing — go-enclave
+// refuses a zero-length allocation with ErrEmptyEnclave, where memguard used to
+// answer the same call by terminating outright, and an enclave that "held" an
+// empty key would be a protected wrapper around a fiction.
 //
 // So the honest answer to "give me the root key, protected" in no-encryption
 // mode is that there is no root key, which is exactly what ErrNoRootKeyAvailable

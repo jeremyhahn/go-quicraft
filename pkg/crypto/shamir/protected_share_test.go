@@ -774,10 +774,11 @@ func TestSplitProtected_RandomnessFailure(t *testing.T) {
 // perfect, so the alphabet check passes it: only the length bound stands
 // between an unauthenticated submission and an mlock'd allocation of the
 // submitter's choosing. That matters more here than on the string path —
-// RLIMIT_MEMLOCK is a finite kernel resource and memguard answers a failed
-// lock by terminating the process — and parseRawShare's MaxSecretBytes check
-// is far too late, since it only sees the payload after CombineProtected has
-// already locked it.
+// RLIMIT_MEMLOCK is a finite PROCESS-WIDE resource, so what the submission takes
+// is denied to every other caller, and under memguard a refused lock terminated
+// the process outright — and parseRawShare's MaxSecretBytes check is far too
+// late, since it only sees the payload after CombineProtected has already
+// locked it.
 func TestNewProtectedShare_RejectsOversizedValue(t *testing.T) {
 	// One base64 quantum past the largest share this package can produce.
 	oversized := bytes.Repeat([]byte("A"), maxProtectedValueBytes+4)
@@ -911,9 +912,9 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 // resource bound. Each element below is individually legal — the per-value
 // bound has nothing to say about any of them — and it is the SET that must be
 // refused, before the first locked buffer exists: locked memory is a finite
-// kernel resource and memguard answers a failed lock by killing the process,
-// so an unauthenticated submission must not get to choose how much of it to
-// take.
+// process-wide resource, and under memguard a refused lock killed the process
+// outright, so an unauthenticated submission must not get to choose how much of
+// it to take.
 func TestUnmarshalShareSet_BoundsTheSetBeforeAllocating(t *testing.T) {
 	small := base64.StdEncoding.EncodeToString([]byte{shareFormatVersion, 0x01, 0xab})
 	// Individually legal at exactly the per-share maximum: it takes only 13 of

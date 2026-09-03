@@ -188,10 +188,12 @@ func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
 
 // The retype also made the DEFAULT decoder a denial-of-service path: decoding a
 // []*shamir.ProtectedShare through encoding/json locks a page per element as the
-// elements are visited, so an oversized "shares" array chooses how much locked
-// memory to take and memguard terminates the process on a failed lock. This
-// pins that ShamirInitResult.UnmarshalJSON routes the set through the bounded
-// shamir.UnmarshalShareSet, which refuses the set BEFORE it locks anything.
+// elements are visited, so an oversized "shares" array chooses how much of the
+// process-wide locked-memory budget to take from every other caller — and under
+// memguard it chose whether the process survived at all, since a refused lock
+// terminated it. This pins that ShamirInitResult.UnmarshalJSON routes the set
+// through the bounded shamir.UnmarshalShareSet, which refuses the set BEFORE it
+// locks anything.
 //
 // The mutant this kills is a reversion to `json.Unmarshal(data, &plainStruct)`:
 // the generic decoder accepts 256 well-formed elements (nothing bounds the
