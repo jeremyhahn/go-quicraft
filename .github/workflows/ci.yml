@@ -348,29 +348,92 @@ jobs:
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
+      # THREE STEPS, NOT ONE, AND THE SPLIT IS THE POINT (#81).
+      #
+      # This job used to run the suite and gate coverage in a single step, so it
+      # reported one undifferentiated "failure" for three unrelated conditions: a
+      # real regression, a flaked test, or a coverage shortfall. Worse, the three
+      # were not independent — a `go test ./...` run where any package FAILS
+      # contributes NO coverage for that package, so one flake in a large package
+      # failed the step twice: once on the test result, and again as a "coverage
+      # regression" that did not exist. A gate that reports a fault it invented
+      # teaches readers to discount it.
+      #
+      # It also cost real diagnosis time. The runner's logs are NOT reachable
+      # from an agent token on this Gitea (`actions/{tasks,runs,jobs}/<id>/logs`
+      # all answer 404), so an agent seeing "CI / Test: failure" could not learn
+      # which test failed; one occurrence on 2026-09-02 is permanently
+      # unattributable for that reason. Hence: classify in-band, print the failing
+      # test names into the job output, and upload the log as an artifact.
+      #
+      # continue-on-error on the run step is load-bearing: it lets the classify
+      # step below decide the verdict instead of the job dying with a bare status.
+      # The classify step is what fails the job, and because a failed step stops
+      # the ones after it, the coverage gate CANNOT run on a broken suite — which
+      # is what stops a test failure masquerading as a coverage regression.
+      - name: Run tests with coverage
+        id: gotest
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./... 2>&1 | tee test-output.log
+
+      - name: Classify the test result
+        run: |
+          if [ "${{ steps.gotest.outcome }}" = "success" ]; then
+            echo "VERDICT: TESTS_PASSED"
+            exit 0
+          fi
+          echo "VERDICT: TEST_FAILURE"
+          echo "----- failing tests -----"
+          grep -E '^--- FAIL|^FAIL[[:space:]]' test-output.log | head -40 \
+            || echo "(no '--- FAIL' lines: the run panicked, timed out, or failed to build)"
+          echo "----- panics, races and timeouts -----"
+          grep -nE 'panic:|test timed out|DATA RACE|build failed' test-output.log | head -20 || true
+          echo
+          echo "The full log is attached to this run as the 'test-output' artifact."
+          exit 1
+
+      # Reached only when the suite passed, so COVERAGE is computed over a
+      # complete profile and a shortfall here means what it says.
+      #
       # The guards around the comparison mirror check-coverage in the Makefile,
       # and for the same reason: with an empty or missing profile COVERAGE is
       # the empty string, bc fails and prints nothing, the test degenerates to
       # `[ -eq 1 ]`, and the shell error sends the if down the else branch — so
       # the gate used to PASS exactly when it had no coverage data to judge.
-      - name: Run tests with coverage
+      - name: Gate on coverage
         run: |
-          go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./...
           if [ ! -s coverage.out ]; then
+            echo "VERDICT: NO_COVERAGE_DATA"
             echo "FAIL: coverage.out is missing or empty; the test run produced no coverage data"
             exit 1
           fi
           COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | sed 's/%//')
           case "${COVERAGE}" in
             '' | *[!0-9.]* )
+              echo "VERDICT: NO_COVERAGE_DATA"
               echo "FAIL: coverage could not be read from coverage.out (got '${COVERAGE}')"
               exit 1 ;;
           esac
           echo "Total coverage: ${COVERAGE}%"
           if [ $(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) -eq 1 ]; then
+            echo "VERDICT: COVERAGE_BELOW_THRESHOLD"
             echo "FAIL: coverage ${COVERAGE}% is below minimum ${{ env.COVERAGE_THRESHOLD }}%"
             exit 1
           fi
+          echo "VERDICT: COVERAGE_OK"
+
+      # always(), not failure(): a passing run's log is what you compare the next
+      # failure against, and it is the only copy an agent can reach at all.
+      - name: Upload the test log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-output
+          path: test-output.log
+          retention-days: 14
+          if-no-files-found: warn
 
   # ==========================================================================
   # Tagged suites
