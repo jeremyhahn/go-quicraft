@@ -626,7 +626,7 @@ The `Barrier` in `pkg/seal/barrier.go` provides AEAD encryption for WAL data at 
 - x86-64 with AES-NI or ARM64 with crypto extensions → AES-256-GCM
 - Otherwise → ChaCha20-Poly1305, or AES-256-GCM in a build with `-tags fips`,
   which does not compile the ChaCha20 family in at all
-  ([FIPS builds](../seal-barrier/architecture.md#fips-builds---tags-fips))
+  ([FIPS builds](../seal-barrier/engineering.md#fips-runtime-mode-vs-build-tag))
 - Configurable via `BarrierConfig.Algorithm`
 
 **Design**:

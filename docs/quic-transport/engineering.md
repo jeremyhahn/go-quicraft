@@ -1026,7 +1026,7 @@ exist as PEM bytes. `buildMTLSTLS` parses the leaf from DER when the pre-built
 certificate does not populate `Leaf`, and rejects one whose leaf cannot be parsed
 at all — the startup SAN-exclusivity precondition below cannot be evaluated
 without it. This is the transport's own key, separate from the barrier root key;
-see [Key Custody](../seal-barrier/user.md#delegated-hardware-mode) for the
+see [Key Custody](../seal-barrier/architecture.md#delegated-hardware-mode--total-by-design) for the
 at-rest side.
 
 **TLS properties** (`buildMTLSTLS`):

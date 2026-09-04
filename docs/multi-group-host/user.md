@@ -1278,7 +1278,7 @@ Source: `pkg/seal/kdf.go`, `pkg/seal/strategy_software.go`
 QuicRaft supports FIPS 140 compliant builds using Go's `GOFIPS140` mechanism,
 and `-tags fips` additionally removes the non-approved algorithms from the
 binary rather than declining them at runtime. See
-[Encryption > FIPS builds](../seal-barrier/architecture.md#fips-builds--tags-fips)
+[Encryption > FIPS builds](../seal-barrier/engineering.md#fips-runtime-mode-vs-build-tag)
 for what the tag removes.
 
 **Read the boundary before you claim compliance for a deployment.** `-tags fips`
