@@ -425,9 +425,27 @@ jobs:
           echo "VERDICT: COVERAGE_OK"
 
       # always(), not failure(): a passing run's log is what you compare the next
-      # failure against, and it is the only copy an agent can reach at all.
+      # failure against.
+      #
+      # GUARDED TO github.com, and this is the same lesson fuzz.yml already
+      # carries: actions/upload-artifact@v4 refuses to run against a
+      # non-github.com server (devops.md §1) and this Gitea runner serves no
+      # artifact endpoint at all, so the step emits `::error::Failed to
+      # CreateArtifact ... ECONNREFUSED` and exits 1. Under `if: always()` that
+      # failed EVERY Test job on the dev runner, including runs whose own output
+      # said `VERDICT: TESTS_PASSED` and `VERDICT: COVERAGE_OK` — it broke main
+      # at aca95e7 (run 10459) and every PR opened after it. An upload step must
+      # never be the thing that decides whether the suite passed.
+      #
+      # What the artifact was for is not lost here. The classify step above
+      # prints the `--- FAIL` lines and the panic/race/timeout greps into the JOB
+      # LOG, which the Gitea API serves at
+      # /api/v1/repos/:owner/:repo/actions/jobs/:id/logs — reachable by an agent
+      # without an artifact endpoint. The upload adds retention and the full
+      # untruncated file where the server supports it, and adds nothing where it
+      # does not.
       - name: Upload the test log
-        if: always()
+        if: always() && github.server_url == 'https://github.com'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-output
