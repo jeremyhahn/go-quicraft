@@ -54,16 +54,10 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, snapshotLoadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with SnapshotEntries=50, CompactionOverhead=10", leaderIdx)
 
 	// Warmup write to establish a committed entry at the current term.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	_, err := leaderHost.SyncPropose(ctx, shardID, encodeKVPut("warmup", "ok"))
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, shardID, encodeKVPut("warmup", "ok"), defaultTimeout)
 
 	const (
 		numWriters       = 4
@@ -104,9 +98,7 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 					defer retryTicker.Stop()
 					defer retryDeadlineTimer.Stop()
 					for {
-						wCtx, wCancel := context.WithTimeout(context.Background(), defaultTimeout)
-						_, wErr := leaderHost.SyncPropose(wCtx, shardID, encodeKVPut(key, value))
-						wCancel()
+						_, wErr := tryProposeToLeader(cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 						if wErr == nil {
 							successCount.Add(1)
 							pairsCh <- kvPair{key: key, val: value}
@@ -197,7 +189,7 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 
 	// Verify via SyncRead on the leader for linearizable correctness.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost = cluster.hosts[leaderIdx]
+	leaderHost := cluster.hosts[leaderIdx]
 	for key, expectedVal := range expected {
 		rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
 		got, rErr := leaderHost.SyncRead(rCtx, shardID, key)
@@ -232,7 +224,6 @@ func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, snapshotLoadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with SnapshotEntries=50", leaderIdx)
 
 	// Write enough entries to trigger multiple automatic snapshots.
@@ -270,7 +261,7 @@ func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 	// waits for the snapshot to COMPLETE — the request only being accepted
 	// proves nothing, because the save runs asynchronously.
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost = cluster.hosts[leaderIdx]
+	leaderHost := cluster.hosts[leaderIdx]
 	snapIndex := requestSnapshotIndex(t, leaderHost, shardID)
 	if snapIndex < uint64(totalEntries) {
 		t.Fatalf("explicit snapshot index = %d, want >= %d: the snapshot does not "+

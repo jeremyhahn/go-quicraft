@@ -45,6 +45,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // ---------------------------------------------------------------------------
@@ -720,6 +721,28 @@ func (c *testCluster) findFollower(shardID uint64) int {
 	return -1
 }
 
+// leaderHost returns the Host that currently leads shardID, or nil when no
+// live node reports leadership. Resolved under hostsMu and returned as a Host
+// rather than an index, so a caller cannot hold on to a position in a slice
+// that restartNode is free to replace.
+func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	for i, h := range c.hosts {
+		if c.stopped[i].Load() {
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			continue
+		}
+		if info.IsLeader {
+			return h
+		}
+	}
+	return nil
+}
+
 // waitForFollower waits until at least one follower node knows the leader
 // for the given shard, then returns that follower's index. Returns -1 and
 // calls t.Fatalf if no follower becomes aware of the leader before timeout.
@@ -1103,6 +1126,7 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 		leaderHost := cluster.hosts[leaderIdx]
 
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		//quicraft:direct-propose resolved at the top of this same retry iteration
 		_, err := leaderHost.Propose(ctx, shardID, cmd)
 		cancel()
 		if err != nil {
@@ -1144,6 +1168,32 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 		case <-retryTicker.C:
 		}
 	}
+}
+
+// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
+// OF THE CALL and returns the committed result. See package
+// test/proposer for why observing a leader does not pin it, and for the
+// callers that must NOT use this.
+func proposeToLeader(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+) quicraft.RequestResult {
+	t.Helper()
+	return proposer.ToLeader(t, cluster.leaderHost, shardID, cmd, timeout)
+}
+
+// tryProposeToLeader is proposeToLeader's error-returning form, for callers
+// that layer their own retry on top and for goroutines, which must not touch t.
+func tryProposeToLeader(
+	cluster *testCluster,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+) (quicraft.RequestResult, error) {
+	return proposer.Try(cluster.leaderHost, shardID, cmd, timeout)
 }
 
 // proposeNEntries proposes N entries through the leader and returns the

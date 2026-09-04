@@ -18,11 +18,14 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
 // TestE2E_Replication_SingleEntry verifies that a single key-value entry
@@ -32,21 +35,10 @@ func TestE2E_Replication_SingleEntry(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	cmd := encodeKVPut("hello", "world")
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result failed: %v", err)
-	}
-	rs.Release()
+	result := proposeToLeader(t, cluster, 1, cmd, defaultTimeout)
 
 	if result.Value != uint64(len("world")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("world"))
@@ -63,27 +55,14 @@ func TestE2E_Replication_MultipleEntries(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	const numEntries = 50
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
 
 	for i := range numEntries {
 		key := fmt.Sprintf("key-%03d", i)
 		value := fmt.Sprintf("value-%03d", i)
-		cmd := encodeKVPut(key, value)
-
-		rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-		if err != nil {
-			t.Fatalf("Propose[%d] failed: %v", i, err)
-		}
-		_, err = rs.Result()
-		if err != nil {
-			t.Fatalf("Result[%d] failed: %v", i, err)
-		}
-		rs.Release()
+		proposeToLeader(t, cluster, 1, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Verify all entries on all nodes.
@@ -156,9 +135,10 @@ func TestE2E_Replication_StaleReadFromFollower(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	// Write through the leader.
+	// Write through the leader. proposeAndWait re-resolves the leader itself;
+	// the index sampled above is deliberately not carried into the write.
 	proposeAndWait(t, cluster, trackers, 1, "stale-key", "stale-value")
 
 	// Wait for the follower to replicate.
@@ -198,8 +178,6 @@ func TestE2E_Replication_StaleReadFromFollower(t *testing.T) {
 	if val != "" {
 		t.Errorf("expected empty string for nonexistent key, got %q", val)
 	}
-
-	_ = leaderIdx // used implicitly by proposeAndWait
 }
 
 // TestE2E_Replication_LargeValue verifies that a 64KB value is correctly
@@ -209,24 +187,12 @@ func TestE2E_Replication_LargeValue(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Create a 64KB value.
 	largeValue := strings.Repeat("A", 64*1024)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("large-key", largeValue)
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose large value failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result for large value failed: %v", err)
-	}
-	rs.Release()
+	proposeToLeader(t, cluster, 1, encodeKVPut("large-key", largeValue), defaultTimeout)
 
 	// Verify replication on all nodes.
 	waitForReplication(t, cluster, trackers, 1, "large-key", largeValue, defaultTimeout)
@@ -262,21 +228,10 @@ func TestE2E_FiveNode_Replication_SingleEntry(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	cmd := encodeKVPut("five-hello", "five-world")
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result failed: %v", err)
-	}
-	rs.Release()
+	result := proposeToLeader(t, cluster, 1, cmd, defaultTimeout)
 
 	if result.Value != uint64(len("five-world")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("five-world"))
@@ -285,7 +240,7 @@ func TestE2E_FiveNode_Replication_SingleEntry(t *testing.T) {
 	// Verify all 5 nodes replicate the entry.
 	waitForReplication(t, cluster, trackers, 1, "five-hello", "five-world", defaultTimeout)
 
-	t.Logf("single entry replicated to all 5 nodes, leader at node[%d]", leaderIdx)
+	t.Logf("single entry replicated to all 5 nodes")
 }
 
 // TestE2E_FiveNode_Replication_MultipleEntries verifies that 50 entries
@@ -295,13 +250,22 @@ func TestE2E_FiveNode_Replication_MultipleEntries(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	const numEntries = 50
 
-	// Use a per-proposal context to avoid a single context timeout
-	// covering all 50 sequential proposals under resource contention.
-	// Retry on rate-limit errors with backoff for Docker CI load.
+	// Each proposal gets its own deadline so one context timeout does not cover
+	// all 50 sequential proposals under resource contention. tryProposeToLeader
+	// re-resolves the leader per attempt and absorbs the not-leader rejection;
+	// the rate-limit backoff below stays this test's own, because a busy
+	// pipeline is not a leadership problem.
+	//
+	// The predicate is the typed error rather than a substring of its message,
+	// and it now covers the commit half of the round trip as well as the
+	// submission — the helper reports one error for both, and a rate limiter
+	// that rejected at admission cannot be told apart here from one that did
+	// not. That is marginally more permissive than the previous version, which
+	// failed outright on a busy error raised after submission.
 	for i := range numEntries {
 		key := fmt.Sprintf("f5-key-%03d", i)
 		value := fmt.Sprintf("f5-value-%03d", i)
@@ -309,11 +273,9 @@ func TestE2E_FiveNode_Replication_MultipleEntries(t *testing.T) {
 
 		var proposed bool
 		for attempt := range 5 {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
+			_, err := tryProposeToLeader(cluster, 1, cmd, defaultTimeout)
 			if err != nil {
-				cancel()
-				if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "system busy") {
+				if errors.Is(err, quicraft.ErrSystemBusy) || errors.Is(err, quicraft.ErrBusy) {
 					backoffTimer := time.NewTimer(time.Duration(50*(attempt+1)) * time.Millisecond)
 					<-backoffTimer.C
 					backoffTimer.Stop()
@@ -321,17 +283,11 @@ func TestE2E_FiveNode_Replication_MultipleEntries(t *testing.T) {
 				}
 				t.Fatalf("Propose[%d] failed: %v", i, err)
 			}
-			_, err = rs.Result()
-			rs.Release()
-			cancel()
-			if err != nil {
-				t.Fatalf("Result[%d] failed: %v", i, err)
-			}
 			proposed = true
 			break
 		}
 		if !proposed {
-			t.Fatalf("Propose[%d] failed after 5 retries (rate limited)", i)
+			t.Fatalf("Propose[%d] never committed after 5 attempts under rate limiting", i)
 		}
 	}
 
@@ -378,7 +334,7 @@ func TestE2E_FiveNode_Replication_ConcurrentProposals(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	const (
 		numWorkers       = 5
@@ -422,7 +378,7 @@ func TestE2E_FiveNode_Replication_ConcurrentProposals(t *testing.T) {
 		}
 	}
 
-	t.Logf("5 workers x 10 entries replicated across 5-node cluster, leader at node[%d]", leaderIdx)
+	t.Logf("5 workers x 10 entries replicated across 5-node cluster")
 }
 
 // TestE2E_FiveNode_Replication_StaleReadFromFollower verifies that data
@@ -486,24 +442,12 @@ func TestE2E_FiveNode_Replication_LargeValue(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Create a 64KB value.
 	largeValue := strings.Repeat("B", 64*1024)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("f5-large-key", largeValue)
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose large value failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result for large value failed: %v", err)
-	}
-	rs.Release()
+	proposeToLeader(t, cluster, 1, encodeKVPut("f5-large-key", largeValue), defaultTimeout)
 
 	// Verify replication on all 5 nodes.
 	waitForReplication(t, cluster, trackers, 1, "f5-large-key", largeValue, defaultTimeout)

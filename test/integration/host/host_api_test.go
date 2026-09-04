@@ -34,16 +34,9 @@ func TestHostAPI_SyncPropose_ThreeNode(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	result, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("sp-key", "sp-value"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	result := proposeToLeader(t, cluster, 1, encodeKVPut("sp-key", "sp-value"), defaultTimeout)
 	if result.Value == 0 {
 		t.Error("SyncPropose result.Value is 0")
 	}
@@ -64,10 +57,7 @@ func TestHostAPI_SyncRead_ThreeNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("sr-key", "sr-value"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("sr-key", "sr-value"), defaultTimeout)
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
 	waitForCondition(t, defaultTimeout, "sr-key applied on leader", func() bool {
@@ -94,16 +84,12 @@ func TestHostAPI_StaleRead_FromFollower(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("stale-key", "stale-val"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("stale-key", "stale-val"), defaultTimeout)
 
 	followerIdx := cluster.findFollower(1)
 	if followerIdx < 0 {
@@ -137,10 +123,7 @@ func TestHostAPI_QueryLocalNode_ThreeNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("local-key", "local-val"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("local-key", "local-val"), defaultTimeout)
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
 	waitForCondition(t, defaultTimeout, "local-key applied", func() bool {
@@ -201,18 +184,12 @@ func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	// Write some data first.
 	for i := 0; i < 5; i++ {
-		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+		proposeToLeader(t, cluster, 1, encodeKVPut(
 			fmt.Sprintf("snap-key-%d", i),
 			fmt.Sprintf("snap-val-%d", i),
-		))
-		if err != nil {
-			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
-		}
+		), defaultTimeout)
 	}
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
@@ -231,13 +208,10 @@ func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 	// Write more entries and snapshot again: the second snapshot must cover
 	// the new entries, which is only true if a snapshot really happened.
 	for i := 5; i < 10; i++ {
-		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+		proposeToLeader(t, cluster, 1, encodeKVPut(
 			fmt.Sprintf("snap-key-%d", i),
 			fmt.Sprintf("snap-val-%d", i),
-		))
-		if err != nil {
-			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
-		}
+		), defaultTimeout)
 	}
 	waitForCondition(t, defaultTimeout, "10 entries applied", func() bool {
 		return leaderSM.Len() >= 10
@@ -295,11 +269,7 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 
 	// A transfer target must have an up-to-date log before the leader will
 	// hand over, so replicate one entry everywhere first.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	if _, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("lt-warmup", "ok")); err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("lt-warmup", "ok"), defaultTimeout)
 	waitForReplication(t, cluster, trackers, 1, "lt-warmup", "ok", defaultTimeout)
 
 	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
@@ -418,36 +388,21 @@ func TestHostAPI_MultipleShards_ThreeNode(t *testing.T) {
 	for shardID := uint64(1); shardID <= 3; shardID++ {
 		trackers := cluster.startShard(shardID)
 		shardTrackers[shardID] = trackers
-		leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+		cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 
 		// Warmup: propose and verify replication to establish QUIC
 		// connections between all nodes for this shard.
-		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), defaultTimeout)
 		warmupKey := fmt.Sprintf("warmup-shard%d", shardID)
-		_, err := cluster.hosts[leaderIdx].SyncPropose(warmupCtx, shardID,
-			encodeKVPut(warmupKey, "warmup"))
-		warmupCancel()
-		if err != nil {
-			t.Fatalf("warmup SyncPropose shard %d failed: %v", shardID, err)
-		}
+		proposeToLeader(t, cluster, shardID,
+			encodeKVPut(warmupKey, "warmup"), defaultTimeout)
 		waitForReplication(t, cluster, trackers, shardID, warmupKey, "warmup", defaultTimeout)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	// Write to each shard via its leader.
 	for shardID := uint64(1); shardID <= 3; shardID++ {
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			t.Fatalf("no leader for shard %d", shardID)
-		}
 		key := fmt.Sprintf("shard%d-key", shardID)
 		val := fmt.Sprintf("shard%d-val", shardID)
-		_, err := cluster.hosts[leaderIdx].SyncPropose(ctx, shardID, encodeKVPut(key, val))
-		if err != nil {
-			t.Fatalf("SyncPropose shard %d failed: %v", shardID, err)
-		}
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, val), defaultTimeout)
 	}
 
 	// Verify host info shows all 3 shards.
@@ -476,7 +431,6 @@ func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
 	numGoroutines := 5
 	proposalsPerGoroutine := 20
@@ -497,11 +451,9 @@ func TestHostAPI_ConcurrentProposals_ThreeNode(t *testing.T) {
 		go func(gID int) {
 			defer wg.Done()
 			for p := 0; p < proposalsPerGoroutine; p++ {
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 				key := fmt.Sprintf("conc-g%d-p%d", gID, p)
 				val := fmt.Sprintf("v-%d-%d", gID, p)
-				_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(key, val))
-				cancel()
+				_, err := tryProposeToLeader(cluster, 1, encodeKVPut(key, val), defaultTimeout)
 				if err != nil {
 					// Collected, not asserted here: this runs on a
 					// non-test goroutine, where t.Fatal would only stop
@@ -557,6 +509,7 @@ func TestHostAPI_ProposeToFollower_Forwarded(t *testing.T) {
 	defer cancel()
 
 	// Propose via follower — this should succeed via leader forwarding.
+	//quicraft:direct-propose the FOLLOWER is the subject: this asserts leader forwarding
 	_, err := cluster.hosts[followerIdx].SyncPropose(ctx, 1, encodeKVPut("fwd-key", "fwd-val"))
 	if err != nil {
 		t.Fatalf("SyncPropose via follower failed: %v", err)
@@ -572,18 +525,11 @@ func TestHostAPI_LargeValue_Replication(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Create a 64KB value.
 	largeVal := strings.Repeat("X", 64*1024)
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("large-key", largeVal))
-	if err != nil {
-		t.Fatalf("SyncPropose large value failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("large-key", largeVal), defaultTimeout)
 
 	// Verify replication. A node whose state machine has not registered is
 	// waited for, never skipped: skipping it drops it from the assertion.
@@ -610,16 +556,9 @@ func TestHostAPI_SyncPropose_FiveNode(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	result, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("sp5-key", "sp5-value"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	result := proposeToLeader(t, cluster, 1, encodeKVPut("sp5-key", "sp5-value"), defaultTimeout)
 	if result.Value == 0 {
 		t.Error("SyncPropose result.Value is 0")
 	}
@@ -640,10 +579,7 @@ func TestHostAPI_SyncRead_FiveNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("sr5-key", "sr5-value"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("sr5-key", "sr5-value"), defaultTimeout)
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
 	waitForCondition(t, defaultTimeout, "sr5-key applied on leader", func() bool {
@@ -671,16 +607,12 @@ func TestHostAPI_StaleRead_FiveNode(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("stale5-key", "stale5-val"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("stale5-key", "stale5-val"), defaultTimeout)
 
 	followerIdx := cluster.findFollower(1)
 	if followerIdx < 0 {
@@ -715,10 +647,7 @@ func TestHostAPI_QueryLocalNode_FiveNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("local5-key", "local5-val"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("local5-key", "local5-val"), defaultTimeout)
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
 	waitForCondition(t, defaultTimeout, "local5-key applied", func() bool {
@@ -775,18 +704,12 @@ func TestHostAPI_Snapshot_FiveNode(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	// Write data so the snapshot has content.
 	for i := 0; i < 5; i++ {
-		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+		proposeToLeader(t, cluster, 1, encodeKVPut(
 			fmt.Sprintf("snap5-key-%d", i),
 			fmt.Sprintf("snap5-val-%d", i),
-		))
-		if err != nil {
-			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
-		}
+		), defaultTimeout)
 	}
 
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
@@ -803,13 +726,10 @@ func TestHostAPI_Snapshot_FiveNode(t *testing.T) {
 	t.Logf("first snapshot taken at index %d", firstIndex)
 
 	for i := 5; i < 10; i++ {
-		_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(
+		proposeToLeader(t, cluster, 1, encodeKVPut(
 			fmt.Sprintf("snap5-key-%d", i),
 			fmt.Sprintf("snap5-val-%d", i),
-		))
-		if err != nil {
-			t.Fatalf("SyncPropose[%d] failed: %v", i, err)
-		}
+		), defaultTimeout)
 	}
 	waitForCondition(t, defaultTimeout, "10 entries applied", func() bool {
 		return leaderSM.Len() >= 10
@@ -865,11 +785,7 @@ func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 
 	// A transfer target must have an up-to-date log before the leader will
 	// hand over, so replicate one entry everywhere first.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	if _, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("lt5-warmup", "ok")); err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("lt5-warmup", "ok"), defaultTimeout)
 	waitForReplication(t, cluster, trackers, 1, "lt5-warmup", "ok", defaultTimeout)
 
 	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
@@ -1002,36 +918,21 @@ func TestHostAPI_MultipleShards_FiveNode(t *testing.T) {
 	for shardID := uint64(1); shardID <= 3; shardID++ {
 		trackers := cluster.startShard(shardID)
 		shardTrackers[shardID] = trackers
-		leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+		cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 
 		// Warmup: propose and verify replication to establish QUIC
 		// connections between all 5 nodes for this shard.
-		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), defaultTimeout)
 		warmupKey := fmt.Sprintf("warmup-shard%d", shardID)
-		_, err := cluster.hosts[leaderIdx].SyncPropose(warmupCtx, shardID,
-			encodeKVPut(warmupKey, "warmup"))
-		warmupCancel()
-		if err != nil {
-			t.Fatalf("warmup SyncPropose shard %d failed: %v", shardID, err)
-		}
+		proposeToLeader(t, cluster, shardID,
+			encodeKVPut(warmupKey, "warmup"), defaultTimeout)
 		waitForReplication(t, cluster, trackers, shardID, warmupKey, "warmup", defaultTimeout)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	// Write to each shard via its leader.
 	for shardID := uint64(1); shardID <= 3; shardID++ {
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			t.Fatalf("no leader for shard %d", shardID)
-		}
 		key := fmt.Sprintf("ms5-shard%d-key", shardID)
 		val := fmt.Sprintf("ms5-shard%d-val", shardID)
-		_, err := cluster.hosts[leaderIdx].SyncPropose(ctx, shardID, encodeKVPut(key, val))
-		if err != nil {
-			t.Fatalf("SyncPropose shard %d failed: %v", shardID, err)
-		}
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, val), defaultTimeout)
 	}
 
 	// Verify replication for each shard.
@@ -1064,7 +965,6 @@ func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 
 	numGoroutines := 5
 	proposalsPerGoroutine := 20
@@ -1082,11 +982,9 @@ func TestHostAPI_ConcurrentProposals_FiveNode(t *testing.T) {
 		go func(gID int) {
 			defer wg.Done()
 			for p := 0; p < proposalsPerGoroutine; p++ {
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 				key := fmt.Sprintf("conc5-g%d-p%d", gID, p)
 				val := fmt.Sprintf("v5-%d-%d", gID, p)
-				_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut(key, val))
-				cancel()
+				_, err := tryProposeToLeader(cluster, 1, encodeKVPut(key, val), defaultTimeout)
 				if err != nil {
 					// Collected, not asserted here: this runs on a
 					// non-test goroutine, where t.Fatal would only stop
@@ -1140,6 +1038,7 @@ func TestHostAPI_ProposeToFollower_FiveNode(t *testing.T) {
 	defer cancel()
 
 	// Propose via follower — this should succeed via leader forwarding.
+	//quicraft:direct-propose the FOLLOWER is the subject: this asserts leader forwarding
 	_, err := cluster.hosts[followerIdx].SyncPropose(ctx, 1, encodeKVPut("fwd5-key", "fwd5-val"))
 	if err != nil {
 		t.Fatalf("SyncPropose via follower failed: %v", err)
@@ -1155,18 +1054,11 @@ func TestHostAPI_LargeValue_FiveNode(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Create a 64KB value.
 	largeVal := strings.Repeat("Y", 64*1024)
-	_, err := leaderHost.SyncPropose(ctx, 1, encodeKVPut("large5-key", largeVal))
-	if err != nil {
-		t.Fatalf("SyncPropose large value failed: %v", err)
-	}
+	proposeToLeader(t, cluster, 1, encodeKVPut("large5-key", largeVal), defaultTimeout)
 
 	// Verify replication to all 5 nodes. A node whose state machine has not
 	// registered is waited for, never skipped.

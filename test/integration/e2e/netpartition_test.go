@@ -174,6 +174,7 @@ func TestNetPartition_TwoOfFourCannotElect(t *testing.T) {
 					// COMMIT — an incumbent that has not yet noticed the
 					// partition is expected and harmless. Prove it cannot.
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					//quicraft:direct-propose a minority-side incumbent must not be able to commit
 					_, err := cluster.hosts[idx].SyncPropose(ctx, 1,
 						encodeKVPut("split-brain", "committed"))
 					cancel()
@@ -244,6 +245,7 @@ func TestNetPartition_DeposedLeaderStaysAliveAndCannotCommit(t *testing.T) {
 	// The isolated old leader must not be able to commit. It may still report
 	// itself leader for up to an election timeout; committing is the violation.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	//quicraft:direct-propose the isolated deposed leader IS the subject: it must not commit
 	_, err := cluster.hosts[oldLeader].SyncPropose(ctx, 1,
 		encodeKVPut("ghost-write", "from-deposed-leader"))
 	cancel()
@@ -318,6 +320,7 @@ func TestNetPartition_AsymmetricLeaderCannotBeHeard(t *testing.T) {
 
 	// And it must not have committed anything in the meantime.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	//quicraft:direct-propose the leader that cannot hear a quorum IS the subject
 	_, err := cluster.hosts[leaderIdx].SyncPropose(ctx, 1,
 		encodeKVPut("asym-write", "unheard"))
 	cancel()

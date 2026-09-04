@@ -39,6 +39,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // ---------------------------------------------------------------------------
@@ -718,6 +719,42 @@ func (c *testCluster) findLeader(shardID uint64) int {
 		}
 	}
 	return -1
+}
+
+// leaderHost returns the Host that currently leads shardID, or nil when no
+// live replica reports leadership. Resolved under hostsMu and returned as a
+// Host rather than an index, so a caller cannot hold a position in a slice the
+// harness is free to replace.
+func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	for i, h := range c.hosts {
+		if c.stopped[i].Load() {
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			continue
+		}
+		if info.IsLeader {
+			return h
+		}
+	}
+	return nil
+}
+
+// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
+// OF THE CALL. See package test/proposer for why observing a leader
+// does not pin it.
+func proposeToLeader(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+) quicraft.RequestResult {
+	t.Helper()
+	return proposer.ToLeader(t, cluster.leaderHost, shardID, cmd, timeout)
 }
 
 // waitForClusterLeader waits until one node becomes leader for the shard.

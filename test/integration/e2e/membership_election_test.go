@@ -213,6 +213,7 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 				}
 
 				cmd := encodeKVPut(key, value)
+				//quicraft:direct-propose leaderHost is resolved at the top of this same loop iteration
 				rs, err := leaderHost.Propose(ctx, shardID, cmd)
 				if err != nil {
 					cancel()
@@ -382,6 +383,7 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 				}
 
 				cmd := encodeKVPut(key, value)
+				//quicraft:direct-propose leaderHost is resolved at the top of this same loop iteration
 				rs, propErr := leaderHost.Propose(ctx, shardID, cmd)
 				if propErr != nil {
 					cancel()
@@ -591,6 +593,7 @@ func TestE2E_LeaderTransfer_DuringConcurrentWrites(t *testing.T) {
 				}
 
 				cmd := encodeKVPut(key, value)
+				//quicraft:direct-propose leaderHost is resolved at the top of this same loop iteration
 				rs, propErr := leaderHost.Propose(ctx, shardID, cmd)
 				if propErr != nil {
 					cancel()

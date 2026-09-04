@@ -17,7 +17,6 @@
 package host_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -205,25 +204,14 @@ func TestHostAPI_RollingRestart_WritesDuringRestart(t *testing.T) {
 	t.Logf("stopping follower node[%d] while proposing entries", followerIdx)
 	cluster.stopNode(followerIdx)
 
-	// Propose entries while the follower is down.
+	// Propose entries while the follower is down. The surviving two nodes are
+	// a bare majority, so the leader can move between the lookup and the write;
+	// proposeToLeader resolves it at the point of use and waits for the commit,
+	// which is what "not lost" means for the assertions further down.
 	for i := range 10 {
 		key := fmt.Sprintf("during-down-%03d", i)
 		value := fmt.Sprintf("val-during-%03d", i)
-
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			cancel()
-			t.Fatal("no leader available while follower is down")
-		}
-		cmd := encodeKVPut(key, value)
-		rs, err := cluster.hosts[leaderIdx].Propose(ctx, shardID, cmd)
-		if err != nil {
-			cancel()
-			t.Fatalf("Propose(%q) while follower down failed: %v", key, err)
-		}
-		rs.Release()
-		cancel()
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 		expected[key] = value
 	}
 	t.Logf("proposed 10 entries while node[%d] was down", followerIdx)

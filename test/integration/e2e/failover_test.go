@@ -17,7 +17,6 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 )
@@ -123,19 +122,9 @@ func TestE2E_Failover_ProposalAfterFailover(t *testing.T) {
 	t.Logf("new leader at node[%d]", newLeaderIdx)
 
 	// Propose through the new leader.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("after-failover", "recovered")
-	rs, err := cluster.hosts[newLeaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose after failover failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result after failover failed: %v", err)
-	}
-	rs.Release()
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that newLeaderIdx specifically does. Resolve at the point of use.
+	proposeToLeader(t, cluster, 1, encodeKVPut("after-failover", "recovered"), defaultTimeout)
 
 	// Verify new data is replicated to all surviving nodes.
 	for i := range cluster.hosts {
@@ -211,19 +200,9 @@ func TestE2E_Failover_MinorityPartition(t *testing.T) {
 	t.Logf("active leader after minority failure: node[%d]", activeLeaderIdx)
 
 	// Propose through the active leader.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("minority-key", "minority-value")
-	rs, err := cluster.hosts[activeLeaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose with minority failure failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result with minority failure failed: %v", err)
-	}
-	rs.Release()
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that activeLeaderIdx specifically does. Resolve at the point of use.
+	proposeToLeader(t, cluster, 1, encodeKVPut("minority-key", "minority-value"), defaultTimeout)
 
 	// Verify data on surviving nodes.
 	for i := range cluster.hosts {
@@ -353,19 +332,9 @@ func TestE2E_FiveNode_Failover_ProposalAfterFailover(t *testing.T) {
 	t.Logf("new leader at node[%d]", newLeaderIdx)
 
 	// Propose through the new leader.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("f5-after-failover", "recovered")
-	rs, err := cluster.hosts[newLeaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose after failover failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result after failover failed: %v", err)
-	}
-	rs.Release()
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that newLeaderIdx specifically does. Resolve at the point of use.
+	proposeToLeader(t, cluster, 1, encodeKVPut("f5-after-failover", "recovered"), defaultTimeout)
 
 	// Verify new data is replicated to all surviving nodes.
 	for i := range cluster.hosts {
@@ -438,19 +407,9 @@ func TestE2E_FiveNode_Failover_MinorityLoss_OneFailed(t *testing.T) {
 	t.Logf("active leader after 1-node failure: node[%d]", activeLeaderIdx)
 
 	// Propose through the active leader.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("f5-one-down-key", "f5-one-down-value")
-	rs, err := cluster.hosts[activeLeaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose with 1 node down failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result with 1 node down failed: %v", err)
-	}
-	rs.Release()
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that activeLeaderIdx specifically does. Resolve at the point of use.
+	proposeToLeader(t, cluster, 1, encodeKVPut("f5-one-down-key", "f5-one-down-value"), defaultTimeout)
 
 	// Verify data on all 4 surviving nodes.
 	for i := range cluster.hosts {
@@ -529,19 +488,9 @@ func TestE2E_FiveNode_Failover_MinorityLoss_TwoFailed(t *testing.T) {
 	t.Logf("leader after 2-node failure: node[%d]", finalLeaderIdx)
 
 	// Propose through the leader at exact quorum.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("f5-two-down-key", "f5-two-down-value")
-	rs, err := cluster.hosts[finalLeaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose with 2 nodes down (exact quorum) failed: %v", err)
-	}
-	_, err = rs.Result()
-	if err != nil {
-		t.Fatalf("Result with 2 nodes down (exact quorum) failed: %v", err)
-	}
-	rs.Release()
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that finalLeaderIdx specifically does. Resolve at the point of use.
+	proposeToLeader(t, cluster, 1, encodeKVPut("f5-two-down-key", "f5-two-down-value"), defaultTimeout)
 
 	// Verify data on all 3 surviving nodes.
 	for i := range cluster.hosts {

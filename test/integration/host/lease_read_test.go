@@ -111,14 +111,10 @@ func TestHostAPI_LeaseRead_BasicLinearizable(t *testing.T) {
 	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Write a value.
-	_, err := leaderHost.SyncPropose(ctx, shardID, encodeKVPut("lr-key", "lr-value"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	// Write a value through whoever leads now. The index above is kept for the
+	// state machine assertion below, which is satisfied by replication and does
+	// not care which replica proposed.
+	proposeToLeader(t, cluster, shardID, encodeKVPut("lr-key", "lr-value"), defaultTimeout)
 
 	// Wait for the leader SM to apply.
 	leaderSM := trackers[leaderIdx].Get(shardID, uint64(leaderIdx+1))
@@ -126,6 +122,9 @@ func TestHostAPI_LeaseRead_BasicLinearizable(t *testing.T) {
 		_, ok := leaderSM.Get("lr-key")
 		return ok
 	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
 
 	// Perform a linearizable read via SyncRead (uses LeaseRead internally).
 	result, err := leaderHost.SyncRead(ctx, shardID, "lr-key")
@@ -161,12 +160,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 
 	// Warmup write to establish a committed entry at the current term
 	// (PhD 6.4 requirement for linearizable reads).
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	_, err := leaderHost.SyncPropose(ctx, shardID, encodeKVPut("warmup", "ok"))
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, shardID, encodeKVPut("warmup", "ok"), defaultTimeout)
 
 	const (
 		numWriters = 3
@@ -202,13 +196,11 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 				key := fmt.Sprintf("writer-%d-%03d", workerID, i)
 				value := fmt.Sprintf("val-%d-%03d", workerID, i)
 
-				wCtx, wCancel := context.WithTimeout(context.Background(), defaultTimeout)
-				_, wErr := leaderHost.SyncPropose(wCtx, shardID, encodeKVPut(key, value))
-				wCancel()
+				// tryProposeToLeader, not the t-fataling form: this runs on a
+				// non-test goroutine, where t.Fatal would only stop this
+				// goroutine and let the test continue. Errors go to errCh.
+				_, wErr := tryProposeToLeader(cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 				if wErr != nil {
-					// Errorf-style reporting via errCh, not t.Fatal: this
-					// runs on a non-test goroutine, where t.Fatal would only
-					// stop this goroutine and let the test continue.
 					errCh <- fmt.Errorf("writer %d entry %d: %w", workerID, i, wErr)
 					return
 				}
@@ -331,12 +323,7 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 		key := fmt.Sprintf("failover-key-%03d", i)
 		value := fmt.Sprintf("failover-val-%03d", i)
 
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		_, err := leaderHost.SyncPropose(ctx, shardID, encodeKVPut(key, value))
-		cancel()
-		if err != nil {
-			t.Fatalf("SyncPropose entry %d failed: %v", i, err)
-		}
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Wait for the last entry to replicate to all live nodes.
@@ -462,12 +449,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Warmup to establish committed entry in current term (PhD 6.4).
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	_, err := leaderHost.SyncPropose(warmupCtx, shardID, encodeKVPut("warmup", "ok"))
-	warmupCancel()
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	proposeToLeader(t, cluster, shardID, encodeKVPut("warmup", "ok"), defaultTimeout)
 
 	const (
 		numWriters  = 4
@@ -515,9 +497,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 				// The seq is per-writer and monotonically increasing.
 				value := fmt.Sprintf("%08d-%04d-%06d", workerID, keyIdx, seq)
 
-				wCtx, wCancel := context.WithTimeout(context.Background(), defaultTimeout)
-				_, wErr := leaderHost.SyncPropose(wCtx, shardID, encodeKVPut(key, value))
-				wCancel()
+				_, wErr := tryProposeToLeader(cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 				if wErr != nil {
 					if isLeaseReadRetryable(wErr) {
 						retryTimer := time.NewTimer(10 * time.Millisecond)
@@ -744,12 +724,7 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 		key := fmt.Sprintf("transfer-key-%03d", i)
 		value := fmt.Sprintf("transfer-val-%03d", i)
 
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		_, propErr := leaderHost.SyncPropose(ctx, shardID, encodeKVPut(key, value))
-		cancel()
-		if propErr != nil {
-			t.Fatalf("SyncPropose entry %d failed: %v", i, propErr)
-		}
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Wait for replication to all nodes.
@@ -761,12 +736,7 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	// Write a final value that we will verify after transfer.
 	finalKey := "transfer-final"
 	finalVal := "final-value"
-	finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	_, err := leaderHost.SyncPropose(finalCtx, shardID, encodeKVPut(finalKey, finalVal))
-	finalCancel()
-	if err != nil {
-		t.Fatalf("SyncPropose final entry failed: %v", err)
-	}
+	proposeToLeader(t, cluster, shardID, encodeKVPut(finalKey, finalVal), defaultTimeout)
 	waitForReplication(t, cluster, trackers, shardID, finalKey, finalVal, defaultTimeout)
 
 	// Find a follower to transfer leadership to.

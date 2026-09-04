@@ -125,6 +125,7 @@ func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	const lostKey = "should-fail"
 	const lostVal = "never-committed"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//quicraft:direct-propose the still-running old leader IS the subject: 2 of 5 must not commit
 	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, encodeKVPut(lostKey, lostVal))
 	if err == nil {
 		_, resErr := rs.Result()
@@ -183,6 +184,7 @@ noLeaderLoop:
 		// or context.DeadlineExceeded.
 		propCtx, propCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		cmd := encodeKVPut("should-fail-leaderless", "never-committed")
+		//quicraft:direct-propose every surviving node in turn must refuse; there is no leader to find
 		_, propErr := cluster.hosts[i].Propose(propCtx, 1, cmd)
 		propCancel()
 
@@ -296,6 +298,7 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	// value's absence from every live state machine is asserted as well.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	cmd := encodeKVPut("during-loss", "should-fail")
+	//quicraft:direct-propose the deposed leader IS the subject: it must not commit after quorum loss
 	rs, err := cluster.hosts[activeLeaderIdx].Propose(ctx, 1, cmd)
 	if err == nil {
 		_, resErr := rs.Result()

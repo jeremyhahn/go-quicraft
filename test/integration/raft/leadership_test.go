@@ -154,13 +154,25 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(shardID)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	warmupIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 
 	// A committed entry in the current term (PhD 6.4) before anything is
 	// measured, so the leader is fully established rather than mid-handover.
-	proposeCommitted(t, cluster.hosts[leaderIdx], shardID, "stability-warmup", "ok", defaultTimeout)
+	proposeCommitted(t, cluster.hosts[warmupIdx], shardID, "stability-warmup", "ok", defaultTimeout)
 	baselineLeader, baselineTerm := waitForUnanimousLeader(t, cluster, shardID, leaderElectionTimeout)
 	t.Logf("settled: replica %d leads term %d", baselineLeader, baselineTerm)
+
+	// The writers address the replica the baseline was actually taken from,
+	// not the index sampled before the warmup. Those are the same node in the
+	// common case and different whenever the warmup spanned an election — and
+	// when they differ, every write below is refused by a healthy cluster and
+	// the run fails the write floor while the term assertion, the real subject
+	// of this test, never fires. Members are numbered replicaID = index+1.
+	leaderIdx := int(baselineLeader) - 1
+	if leaderIdx < 0 || leaderIdx >= len(cluster.hosts) {
+		t.Fatalf("baseline leader replica %d has no host in a %d-node cluster",
+			baselineLeader, len(cluster.hosts))
+	}
 
 	stop := make(chan struct{})
 	var committed atomic.Int64
@@ -176,6 +188,7 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 				default:
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				//quicraft:direct-propose pinned to the baseline leader on purpose: the term assertion is the subject
 				_, err := cluster.hosts[leaderIdx].SyncPropose(ctx, shardID,
 					encodeKVPut(fmt.Sprintf("load-%d-%d", writer, n), "v"))
 				cancel()

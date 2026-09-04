@@ -725,6 +725,9 @@ func clientWorker(
 			rec := recorder.begin(clientID, kvInput{Op: "put", Key: key, Value: value})
 
 			ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+			//quicraft:direct-propose ANY live host on purpose: the client exercises forwarding and records
+			// each attempt individually, so a helper that transparently re-resolved
+			// and retried would erase the indeterminate outcomes the checker needs
 			result, err := host.SyncPropose(ctx, shardID, encodeKVPut(key, value))
 			cancel()
 
@@ -1015,26 +1018,30 @@ func proposeOnce(host *quicraft.Host, session *quicraft.Session, cmd []byte) (sm
 func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 	t.Helper()
 
-	leaderIdx := cluster.findLeader(shardID)
-	if leaderIdx < 0 {
+	if cluster.findLeader(shardID) < 0 {
 		t.Fatal("no leader found for warmup")
 	}
-	leader := cluster.hosts[leaderIdx]
 
+	// Each proposal resolves the leader again. Binding the host once and
+	// reusing it is the cached-leader defect: this helper runs at the start of
+	// nearly every linearizability test, immediately after an election, which
+	// is exactly when leadership is most likely to move.
 	for i := range 3 {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 		key := fmt.Sprintf("warmup-%d", i)
-		result, err := leader.SyncPropose(ctx, shardID, encodeKVPut(key, "ok"))
-		cancel()
-		if err != nil {
-			t.Fatalf("warmup proposal %d failed: %v", i, err)
-		}
+		result := proposeToLeader(t, cluster, shardID, encodeKVPut(key, "ok"), defaultTimeout)
 		if result.Value != uint64(len("ok")) {
 			t.Fatalf("warmup proposal %d returned Value=%d, want %d", i, result.Value, len("ok"))
 		}
 	}
 
-	// Verify linearizable read works after warmup.
+	// Verify linearizable read works after warmup. The leader is resolved once
+	// more here rather than reused from above: the writes may themselves have
+	// spanned an election, and a ReadIndex on a deposed replica proves nothing
+	// about the read path.
+	leader := cluster.leaderHost(shardID)
+	if leader == nil {
+		t.Fatal("no leader for the warmup read")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 	result, err := leader.SyncRead(ctx, shardID, encodeKVGet("warmup-0"))

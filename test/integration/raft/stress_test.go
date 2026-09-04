@@ -17,7 +17,6 @@
 package raft_test
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -46,8 +45,7 @@ func TestStress_MultiNode_ConcurrentProposals(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	const (
 		numGoroutines         = 5
@@ -75,30 +73,22 @@ func TestStress_MultiNode_ConcurrentProposals(t *testing.T) {
 				key := fmt.Sprintf("multi-g%d-p%d", goroutineID, p)
 				value := fmt.Sprintf("mval-%d-%d", goroutineID, p)
 
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-				rs, propErr := leaderHost.Propose(ctx, 1, encodeKVPut(key, value))
+				// tryProposeToLeader waits for the apply result, so a bare
+				// accepted-but-never-committed proposal is not counted as a
+				// success. It also re-resolves the leader per attempt: pinning
+				// the index sampled before the goroutines started sent every
+				// write to a deposed replica after any re-election, which
+				// failed the 90% floor below on a cluster that was never
+				// faulted.
+				//
+				// Recorded, not t.Fatal'd: this runs off the test goroutine,
+				// where t.Fatal only calls runtime.Goexit on this goroutine and
+				// lets the test continue with partial results. Failures are
+				// reported by the test goroutine after wg.Wait below.
+				_, propErr := tryProposeToLeader(cluster, 1, encodeKVPut(key, value), defaultTimeout)
 				if propErr != nil {
-					cancel()
-					// Recorded, not t.Fatal'd: this runs off the test
-					// goroutine, where t.Fatal only calls runtime.Goexit on
-					// this goroutine and lets the test continue with partial
-					// results. Failures are reported by the test goroutine
-					// after wg.Wait below.
 					mu.Lock()
 					failures = append(failures, fmt.Sprintf("%s: propose: %v", key, propErr))
-					mu.Unlock()
-					continue
-				}
-
-				// Result resolves from the state machine apply callback.
-				// Counting a bare Propose+Release as a success would count
-				// proposals that never committed.
-				_, resErr := rs.Result()
-				rs.Release()
-				cancel()
-				if resErr != nil {
-					mu.Lock()
-					failures = append(failures, fmt.Sprintf("%s: result: %v", key, resErr))
 					mu.Unlock()
 					continue
 				}

@@ -45,6 +45,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // ---------------------------------------------------------------------------
@@ -788,6 +789,7 @@ func proposeCommitted(t *testing.T, h *quicraft.Host, shardID uint64, key, value
 				timeout, key, value, shardID, lastErr)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		//quicraft:direct-propose h is the caller's chosen replica; see #97 on this loop's blanket retry
 		rs, err := h.Propose(ctx, shardID, cmd)
 		if err == nil {
 			_, lastErr = rs.Result()
@@ -806,6 +808,32 @@ func proposeCommitted(t *testing.T, h *quicraft.Host, shardID uint64, key, value
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
+// OF THE CALL and returns the committed result. See package
+// test/proposer for why observing a leader does not pin it, and for the
+// callers that must NOT use this.
+func proposeToLeader(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+) quicraft.RequestResult {
+	t.Helper()
+	return proposer.ToLeader(t, cluster.leaderHost, shardID, cmd, timeout)
+}
+
+// tryProposeToLeader is proposeToLeader's error-returning form, for callers
+// that layer their own retry on top and for goroutines, which must not touch t.
+func tryProposeToLeader(
+	cluster *testCluster,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+) (quicraft.RequestResult, error) {
+	return proposer.Try(cluster.leaderHost, shardID, cmd, timeout)
 }
 
 // ---------------------------------------------------------------------------

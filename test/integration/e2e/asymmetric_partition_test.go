@@ -234,17 +234,11 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority_ProposalsDuringParti
 	// Attempting to propose through a stopped node should not be
 	// possible (the host is closed). Verify the leader still works.
 	activeLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
-	leaderHost := cluster.hosts[activeLeaderIdx]
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("error-path-key", "error-path-val")
-	rs, err := leaderHost.Propose(ctx, shardID, cmd)
-	if err != nil {
-		t.Fatalf("Propose through leader during partition failed: %v", err)
-	}
-	rs.Release()
+	// "Verify the leader still works" is a statement about the cluster, not
+	// about activeLeaderIdx. The index is kept for the per-replica assertion
+	// below, which replication satisfies whoever proposed.
+	proposeToLeader(t, cluster, shardID, encodeKVPut("error-path-key", "error-path-val"), defaultTimeout)
 
 	// Verify the proposal was applied on the leader.
 	replicaID := uint64(activeLeaderIdx + 1)
@@ -543,6 +537,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommi
 	const isolatedKey = "isolated-leader-write"
 	const isolatedVal = "must-never-commit"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//quicraft:direct-propose the isolated old leader IS the subject: it must not commit
 	rs, err := cluster.hosts[oldLeaderIdx].Propose(ctx, shardID, encodeKVPut(isolatedKey, isolatedVal))
 	if err == nil {
 		_, resErr := rs.Result()

@@ -30,18 +30,13 @@ func TestIntegration_StaleRead_MultiNode_FromFollower(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+
+	// Write via whoever leads now. leaderIdx is kept only to pick a follower
+	// below; the write itself must not be pinned to it.
+	proposeToLeader(t, cluster, 1, encodeKVPut("multi-stale-key", "multi-stale-value"), defaultTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
-
-	// Write via leader.
-	cmd := encodeKVPut("multi-stale-key", "multi-stale-value")
-	rs, err := leaderHost.Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose to leader failed: %v", err)
-	}
-	rs.Release()
 
 	// Find a follower node.
 	followerIdx := -1

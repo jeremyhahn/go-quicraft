@@ -137,6 +137,22 @@ func (c *testCluster) findLeader(shardID uint64) int {
 	return -1
 }
 
+// leaderHost returns the Host that currently leads shardID, or nil when no
+// node reports leadership. Returned as a Host rather than an index so callers
+// resolve and address the leader in one step.
+func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
+	for _, h := range c.hosts {
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			continue
+		}
+		if info.IsLeader {
+			return h
+		}
+	}
+	return nil
+}
+
 // waitForClusterLeader waits until one of the nodes in the cluster
 // becomes leader for the given shard.
 func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration) int {
@@ -240,18 +256,10 @@ func TestMultiNode_ProposeAndReplicate(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Propose via leader.
-	cmd := encodeKVPut("replicated-key", "replicated-value")
-	rs, err := leaderHost.Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose to leader failed: %v", err)
-	}
-	rs.Release()
+	// Propose via whoever leads now, and wait for the commit: the old form
+	// released the RequestState without reading the result, so it asserted only
+	// that the proposal was accepted.
+	proposeToLeader(t, cluster, 1, encodeKVPut("replicated-key", "replicated-value"), defaultTimeout)
 
 	// Verify the leader's SM has the data.
 	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
@@ -322,23 +330,12 @@ func TestMultiNode_ProposeAndReplicate_MultipleEntries(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	numEntries := 10
 	for i := 0; i < numEntries; i++ {
 		key := fmt.Sprintf("key-%03d", i)
 		value := fmt.Sprintf("value-%03d", i)
-		cmd := encodeKVPut(key, value)
-
-		rs, propErr := leaderHost.Propose(ctx, 1, cmd)
-		if propErr != nil {
-			t.Fatalf("Propose[%d] failed: %v", i, propErr)
-		}
-		rs.Release()
+		proposeToLeader(t, cluster, 1, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Wait for all entries to be applied on all nodes.
@@ -400,18 +397,19 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 
 	// Warmup: write via leader so the follower learns the leader ID
 	// through the replication heartbeat.
+	// Bound for the StaleRead assertion at the end; the WRITE below goes
+	// through the current leader rather than this cached host.
 	leaderHost := cluster.hosts[leaderIdx]
-	warmupRS, warmupErr := leaderHost.Propose(ctx, 1, encodeKVPut("warmup", "init"))
-	if warmupErr != nil {
-		t.Fatalf("warmup Propose failed: %v", warmupErr)
-	}
-	warmupRS.Release()
+	proposeToLeader(t, cluster, 1, encodeKVPut("warmup", "init"), defaultTimeout)
 
 	// Wait until the follower knows who the leader is.
 	waitForLeader(t, cluster.hosts[followerIdx], 1, leaderElectionTimeout)
 
 	// Propose via follower — this should succeed via leader forwarding.
+	// The FOLLOWER is the subject of this assertion, so this one call must keep
+	// its cached host: routing it to the leader would test nothing.
 	followerHost := cluster.hosts[followerIdx]
+	//quicraft:direct-propose the follower is the subject: this asserts leader forwarding
 	rs, err := followerHost.Propose(ctx, 1, encodeKVPut("follower-forwarded", "value"))
 	if err != nil {
 		t.Fatalf("Propose via follower failed: %v", err)
@@ -575,18 +573,11 @@ func TestMultiNode_StaleRead_FromFollower(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	// Write via whoever leads now; leaderIdx below only picks a follower.
+	proposeToLeader(t, cluster, 1, encodeKVPut("follower-read-key", "follower-read-value"), defaultTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
-
-	// Write via leader.
-	cmd := encodeKVPut("follower-read-key", "follower-read-value")
-	rs, err := leaderHost.Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	rs.Release()
 
 	// Find a follower and wait for replication.
 	followerIdx := -1
@@ -760,31 +751,13 @@ func TestMultiNode_MultipleShards(t *testing.T) {
 		cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	}
 
-	// Propose to each shard via its leader. Await Result() to ensure
-	// the proposal is committed before checking replication.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	// Propose to each shard via its leader. proposeToLeader awaits Result() so
+	// the proposal is committed before replication is checked.
 	for s := 0; s < numShards; s++ {
 		shardID := uint64(s + 1)
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			t.Fatalf("no leader for shard %d", shardID)
-		}
-
 		key := fmt.Sprintf("multi-shard-%d", shardID)
 		value := fmt.Sprintf("value-%d", shardID)
-		cmd := encodeKVPut(key, value)
-
-		rs, err := cluster.hosts[leaderIdx].Propose(ctx, shardID, cmd)
-		if err != nil {
-			t.Fatalf("Propose to shard %d leader failed: %v", shardID, err)
-		}
-		_, err = rs.Result()
-		if err != nil {
-			t.Fatalf("Result for shard %d failed: %v", shardID, err)
-		}
-		rs.Release()
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Verify replication on all nodes for each shard.
@@ -896,18 +869,8 @@ func TestFiveNode_ProposeAndReplicate(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	cmd := encodeKVPut("five-node-key", "five-node-value")
-	rs, err := leaderHost.Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose to leader failed: %v", err)
-	}
-	rs.Release()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	proposeToLeader(t, cluster, 1, encodeKVPut("five-node-key", "five-node-value"), defaultTimeout)
 
 	// Verify the entry is applied on all 5 nodes.
 	for i := range cluster.hosts {
@@ -933,23 +896,12 @@ func TestFiveNode_ProposeAndReplicate_MultipleEntries(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	numEntries := 10
 	for i := 0; i < numEntries; i++ {
 		key := fmt.Sprintf("five-key-%03d", i)
 		value := fmt.Sprintf("five-val-%03d", i)
-		cmd := encodeKVPut(key, value)
-
-		rs, propErr := leaderHost.Propose(ctx, 1, cmd)
-		if propErr != nil {
-			t.Fatalf("Propose[%d] failed: %v", i, propErr)
-		}
-		rs.Release()
+		proposeToLeader(t, cluster, 1, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Wait for all entries to be applied on all 5 nodes.
@@ -1010,18 +962,19 @@ func TestFiveNode_ProposeToFollower(t *testing.T) {
 
 	// Warmup: write via leader so the follower learns the leader ID
 	// through the replication heartbeat.
+	// Bound for the StaleRead assertion at the end; the WRITE below goes
+	// through the current leader rather than this cached host.
 	leaderHost := cluster.hosts[leaderIdx]
-	warmupRS, warmupErr := leaderHost.Propose(ctx, 1, encodeKVPut("warmup-5n", "init"))
-	if warmupErr != nil {
-		t.Fatalf("warmup Propose failed: %v", warmupErr)
-	}
-	warmupRS.Release()
+	proposeToLeader(t, cluster, 1, encodeKVPut("warmup-5n", "init"), defaultTimeout)
 
 	// Wait until the follower knows who the leader is.
 	waitForLeader(t, cluster.hosts[followerIdx], 1, leaderElectionTimeout)
 
 	// Propose via follower — this should succeed via leader forwarding.
+	// The FOLLOWER is the subject of this assertion, so this one call must keep
+	// its cached host: routing it to the leader would test nothing.
 	followerHost := cluster.hosts[followerIdx]
+	//quicraft:direct-propose the follower is the subject: this asserts leader forwarding
 	rs, err := followerHost.Propose(ctx, 1, encodeKVPut("5n-follower-forwarded", "value5"))
 	if err != nil {
 		t.Fatalf("Propose via follower failed: %v", err)
@@ -1173,19 +1126,11 @@ func TestFiveNode_Failover_TwoNodesDown(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Warmup: write initial data to ensure all QUIC connections are
 	// fully established before stopping nodes.
-	cmd := encodeKVPut("warmup-2down", "warmup-value")
-	rs, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("warmup Propose failed: %v", err)
-	}
-	rs.Release()
+	proposeToLeader(t, cluster, 1, encodeKVPut("warmup-2down", "warmup-value"), defaultTimeout)
 
 	// Wait for warmup replication to all nodes.
 	for i := range cluster.hosts {
@@ -1203,7 +1148,14 @@ func TestFiveNode_Failover_TwoNodesDown(t *testing.T) {
 		)
 	}
 
-	// Stop 2 non-leader nodes to bring the cluster to 3 live nodes.
+	// Stop 2 non-leader nodes to bring the cluster to 3 live nodes. The leader
+	// is resolved here rather than reused from the election wait above: the
+	// warmup write may have spanned a re-election, and closing the node that
+	// is actually leading is not what this test set out to do.
+	leaderIdx := cluster.findLeader(1)
+	if leaderIdx < 0 {
+		t.Fatal("no leader for shard 1 before stopping followers")
+	}
 	stoppedNodes := make(map[int]bool)
 	stoppedCount := 0
 	for i := range cluster.hosts {
@@ -1218,14 +1170,11 @@ func TestFiveNode_Failover_TwoNodesDown(t *testing.T) {
 		stoppedCount++
 	}
 
-	// The leader should still be able to accept proposals with 3/5
-	// nodes alive (quorum = 3).
-	cmd2 := encodeKVPut("after-2down", "still-alive")
-	rs2, err := cluster.hosts[leaderIdx].Propose(ctx, 1, cmd2)
-	if err != nil {
-		t.Fatalf("Propose with 2 nodes down failed: %v", err)
-	}
-	rs2.Release()
+	// The shard should still be able to accept proposals with 3/5 nodes alive
+	// (quorum = 3). The property under test is that a majority of 3 suffices,
+	// not that the SAME replica keeps leading, so the write goes to whoever
+	// leads at this moment: closing two peers can itself trigger an election.
+	proposeToLeader(t, cluster, 1, encodeKVPut("after-2down", "still-alive"), defaultTimeout)
 
 	// Verify the entry is applied on all remaining live nodes.
 	for i := range cluster.hosts {
@@ -1259,18 +1208,11 @@ func TestFiveNode_StaleRead_FromFollower(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	// Write via whoever leads now; leaderIdx below only picks a follower.
+	proposeToLeader(t, cluster, 1, encodeKVPut("five-follower-read", "five-follower-value"), defaultTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
-
-	// Write via leader.
-	cmd := encodeKVPut("five-follower-read", "five-follower-value")
-	rs, err := leaderHost.Propose(ctx, 1, cmd)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	rs.Release()
 
 	// Find a follower and wait for replication.
 	followerIdx := -1
@@ -1434,31 +1376,13 @@ func TestFiveNode_MultipleShards(t *testing.T) {
 		cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	}
 
-	// Propose to each shard via its leader. Await Result() to ensure
-	// the proposal is committed before checking replication.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	// Propose to each shard via its leader. proposeToLeader awaits Result() so
+	// the proposal is committed before replication is checked.
 	for s := 0; s < numShards; s++ {
 		shardID := uint64(s + 1)
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			t.Fatalf("no leader for shard %d", shardID)
-		}
-
 		key := fmt.Sprintf("five-multi-shard-%d", shardID)
 		value := fmt.Sprintf("five-value-%d", shardID)
-		cmd := encodeKVPut(key, value)
-
-		rs, err := cluster.hosts[leaderIdx].Propose(ctx, shardID, cmd)
-		if err != nil {
-			t.Fatalf("Propose to shard %d leader failed: %v", shardID, err)
-		}
-		_, err = rs.Result()
-		if err != nil {
-			t.Fatalf("Result for shard %d failed: %v", shardID, err)
-		}
-		rs.Release()
+		proposeToLeader(t, cluster, shardID, encodeKVPut(key, value), defaultTimeout)
 	}
 
 	// Verify replication on all 5 nodes for each shard. Use extended
