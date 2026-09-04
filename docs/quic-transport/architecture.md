@@ -284,6 +284,44 @@ do mean is that go-quicraft is **FIPS at rest, not FIPS on the wire** — a
 deployment that must be approved-only end to end has to terminate this
 transport outside the boundary.
 
+### Acceptance — owner ruling, 2026-09-03
+
+**The two exemptions above are ACCEPTED for the FedRAMP claim.** Ruled by the
+owner on 2026-09-03, closing #27.
+
+The grounds are the ones the table states: neither exemption protects regulated
+data. Exemption 1 is the QUIC standard's own key-derivation construction, and
+exemption 2 is an issuer identifier matched against a responder's index. FedRAMP,
+PCI DSS and HIPAA govern the protection of regulated data; neither construction
+carries any.
+
+Recorded here rather than only in the issue tracker because this is the artifact
+an assessor reads. Three things an assessor should be able to check without
+taking anyone's word:
+
+1. **The scope is bounded and enforced.** `make verify-fips` excludes exactly one
+   package tree, by a deny-list keyed on a single Makefile variable, and
+   `test/buildgates/fips_gate_test.go` fails if that list grows, if the mode is
+   weakened from `only`, or if the excluded tree stops being run by
+   `make verify-fips-transport`.
+2. **The excluded tree is still gated**, one notch lower, at
+   `GODEBUG=fips140=on` — which is a real gate rather than a formality: it is
+   what proves the key exchange is approved, and it has already caught a defect
+   (an X25519-only curve list that failed every handshake under FIPS).
+3. **Everything else is approved-only.** The seal layer, the WAL and snapshots
+   run under `GODEBUG=fips140=only` and are proven to.
+
+**What this acceptance does NOT say.** It does not claim the transport is
+approved-only, and no configuration makes it so. go-quicraft is FIPS **at rest**,
+not FIPS **on the wire**. A deployment that must be approved-only end to end
+still has to terminate this transport outside the boundary — that sentence is
+unchanged by the ruling and remains the honest description.
+
+The alternative was considered and rejected on cost, not on principle:
+terminating the transport outside the boundary buys no cryptographic property
+these two exemptions lack, because neither protects anything an assessor
+regulates.
+
 The scope is exactly one tree and no more. `make verify-fips` filters it out by
 a deny-list keyed on a single Makefile variable, so a package added tomorrow is
 inside the approved-only gate by default, and
