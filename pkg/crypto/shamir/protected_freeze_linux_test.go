@@ -1,0 +1,110 @@
+// Copyright 2026 Jeremy Hahn
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build linux
+
+package shamir
+
+import (
+	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
+)
+
+// The two sites #54 stage two moved from fill-then-MOVE to fill-then-FREEZE.
+//
+// Both used to reach a read-only region by building a SECOND, from-bytes enclave
+// out of a writable one — a locked-to-locked copy, with both regions live for
+// its duration — because go-enclave had no post-fill freeze. go-enclave
+// v0.5.0-alpha's MemoryEnclave.Freeze (go-enclave #6) mprotects the region the
+// material was written into, so there is one region and no copy.
+//
+// The PROPERTY is unchanged and is what these pin: `Value` documents the
+// buffer as read-only, and callers rely on a stray write faulting rather than
+// silently corrupting a share or a reconstructed key. A missing Freeze is
+// invisible to every functional assertion — the share still decodes, the secret
+// still reconstructs — so the kernel's own view of the mapping is the witness.
+//
+// ProtectionOf reads the ADDRESS only and never dereferences it, which is what
+// makes it safe to ask about a region whose protections are the question.
+
+// TestSplitProtected_ShareValuesAreFrozen is a mutation target.
+//
+// Verified by mutation on 2026-09-03: deleting the `value.Freeze()` call in
+// SplitProtected fails here with
+//
+//	protected_freeze_linux_test.go:66: share 1's value is mapped "rw-p": it was
+//	handed back WRITABLE, so a stray write corrupts the share instead of faulting
+func TestSplitProtected_ShareValuesAreFrozen(t *testing.T) {
+	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer func() {
+		for _, s := range shares {
+			s.Destroy()
+		}
+	}()
+
+	for _, s := range shares {
+		prot, perr := lockedmem.ProtectionOf(s.Value())
+		if perr != nil {
+			t.Skipf("this kernel cannot report mapping protections: %v", perr)
+		}
+		if !prot.ReadOnly() {
+			t.Fatalf("share %d's value is mapped %q: it was handed back WRITABLE, "+
+				"so a stray write corrupts the share instead of faulting", s.Index, prot)
+		}
+	}
+}
+
+// TestCombineProtected_ReconstructedSecretIsFrozen is the other mutation target.
+//
+// Verified by mutation on 2026-09-03: deleting the `scratch.Freeze()` call in
+// CombineProtected fails here with
+//
+//	protected_freeze_linux_test.go:106: the reconstructed secret is mapped "rw-p":
+//	CombineProtected returned a WRITABLE region, so a stray write corrupts the
+//	recovered key instead of faulting
+func TestCombineProtected_ReconstructedSecretIsFrozen(t *testing.T) {
+	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer func() {
+		for _, s := range shares {
+			s.Destroy()
+		}
+	}()
+
+	secret, err := CombineProtected(shares[:2])
+	if err != nil {
+		t.Fatalf("CombineProtected: %v", err)
+	}
+	defer secret.Destroy()
+
+	view, err := secret.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	prot, err := lockedmem.ProtectionOf(view)
+	if err != nil {
+		t.Skipf("this kernel cannot report mapping protections: %v", err)
+	}
+	if !prot.ReadOnly() {
+		t.Fatalf("the reconstructed secret is mapped %q: CombineProtected returned "+
+			"a WRITABLE region, so a stray write corrupts the recovered key instead "+
+			"of faulting", prot)
+	}
+}

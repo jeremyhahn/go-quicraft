@@ -18,6 +18,8 @@ import (
 	"context"
 	"crypto/rand"
 	"testing"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // newBoundStrategies returns one strategy per BOUND constructor, each already
@@ -93,14 +95,14 @@ func TestSoftwareStrategy_DeferredPassphrase_PredictsCredentialSemantics(t *test
 	for name, s := range strategies {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			sealed, err := s.SealRootKey(ctx, rootKey, Credentials{Secret: []byte(correct)})
+			sealed, err := s.SealRootKey(ctx, rootKey, mustCreds(t, string(correct)))
 			if err != nil {
 				t.Fatalf("SealRootKey: %v", err)
 			}
 
-			got, err := s.UnsealRootKey(ctx, sealed, Credentials{Secret: []byte(wrong)})
+			got, err := s.UnsealRootKey(ctx, sealed, mustCreds(t, string(wrong)))
 			if err == nil {
-				wipeBytes(got)
+				enclave.Wipe(got)
 			}
 			acceptedWrongPassphrase := err == nil
 

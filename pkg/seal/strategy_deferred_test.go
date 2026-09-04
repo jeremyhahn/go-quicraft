@@ -20,6 +20,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"testing"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 func TestDeferredSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
@@ -31,7 +33,7 @@ func TestDeferredSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: []byte("my-deferred-passphrase")}
+	creds := mustCreds(t, "my-deferred-passphrase")
 
 	sealed, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {
@@ -49,7 +51,7 @@ func TestDeferredSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnsealRootKey failed: %v", err)
 	}
-	defer wipeBytes(decrypted)
+	defer enclave.Wipe(decrypted)
 
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("round-trip failed: decrypted root key does not match original")
@@ -80,7 +82,7 @@ func TestDeferredSoftwareStrategy_UnsealEmptyCreds(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: []byte("seal-passphrase")}
+	creds := mustCreds(t, "seal-passphrase")
 	sealed, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {
 		t.Fatalf("SealRootKey failed: %v", err)
@@ -101,13 +103,13 @@ func TestDeferredSoftwareStrategy_WrongCreds(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	sealCreds := Credentials{Secret: []byte("correct-passphrase")}
+	sealCreds := mustCreds(t, "correct-passphrase")
 	sealed, err := s.SealRootKey(context.Background(), rootKey, sealCreds)
 	if err != nil {
 		t.Fatalf("SealRootKey failed: %v", err)
 	}
 
-	wrongCreds := Credentials{Secret: []byte("wrong-passphrase")}
+	wrongCreds := mustCreds(t, "wrong-passphrase")
 	_, err = s.UnsealRootKey(context.Background(), sealed, wrongCreds)
 	if err == nil {
 		t.Fatal("expected error for wrong credentials, got nil")
@@ -157,7 +159,7 @@ func TestDeferredSoftwareStrategy_InvalidRootKeySize(t *testing.T) {
 	s := NewDeferredSoftwareStrategy()
 	defer s.Close()
 
-	creds := Credentials{Secret: []byte("some-passphrase")}
+	creds := mustCreds(t, "some-passphrase")
 
 	// Too short.
 	_, err := s.SealRootKey(context.Background(), []byte("short"), creds)
@@ -176,7 +178,7 @@ func TestDeferredSoftwareStrategy_UnsealNilSealed(t *testing.T) {
 	s := NewDeferredSoftwareStrategy()
 	defer s.Close()
 
-	creds := Credentials{Secret: []byte("some-passphrase")}
+	creds := mustCreds(t, "some-passphrase")
 	_, err := s.UnsealRootKey(context.Background(), nil, creds)
 	if err == nil {
 		t.Fatal("expected error for nil sealed, got nil")
@@ -196,7 +198,7 @@ func TestDeferredSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	creds := Credentials{Secret: []byte("deferred-multi-seal")}
+	creds := mustCreds(t, "deferred-multi-seal")
 
 	sealed1, err := s.SealRootKey(context.Background(), rootKey, creds)
 	if err != nil {
@@ -218,13 +220,13 @@ func TestDeferredSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T
 	if err != nil {
 		t.Fatalf("UnsealRootKey sealed1 failed: %v", err)
 	}
-	defer wipeBytes(dec1)
+	defer enclave.Wipe(dec1)
 
 	dec2, err := s.UnsealRootKey(context.Background(), sealed2, creds)
 	if err != nil {
 		t.Fatalf("UnsealRootKey sealed2 failed: %v", err)
 	}
-	defer wipeBytes(dec2)
+	defer enclave.Wipe(dec2)
 
 	if !bytes.Equal(dec1, dec2) {
 		t.Fatal("two unseals produced different root keys")

@@ -1,6 +1,6 @@
 # Memory Enclave — CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/enclave` · Last verified: 2026-09-02
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-09-03
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: this feature is reachable only as a Go package.**
@@ -12,9 +12,9 @@ it and implementing its interfaces, not by invoking a client.
 
 There is also no CLI surface *above* this feature. Memory protection is an
 internal property of whatever holds a key, not an operator verb: exposing "open
-this key into a buffer" as a command would defeat the point of the package. This
-feature therefore contributes **no** `CommandDefinition` to any integration
-parity suite, and that absence is not a gap.
+this key into a buffer" as a command would defeat the point of it. This feature
+therefore contributes **no** `CommandDefinition` to any integration parity suite,
+and that absence is not a gap.
 
 The operator-visible consequences appear under the surfaces of the projects that
 consume this library — the barrier and seal verbs of the database layer above,

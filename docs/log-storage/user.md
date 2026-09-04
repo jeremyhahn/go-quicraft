@@ -9,7 +9,7 @@ sizing and monitoring a data directory, and recovering one that came back wrong.
 
 ## Before you start
 
-- Go 1.26.6 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.0 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A directory on a filesystem whose `fdatasync` you trust. Everything below
   assumes it.
 - A decision about **block size**, because it cannot be changed later.

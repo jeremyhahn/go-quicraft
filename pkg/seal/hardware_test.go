@@ -631,16 +631,32 @@ func TestSealedRootKeyData_NilNonceAndPayload(t *testing.T) {
 
 // --- Credentials ---
 
+// TestCredentials_ZeroValue pins the contract every ambient-credential strategy
+// relies on: the zero value is legal and means "none supplied". #41 retyped
+// Secret from []byte to a *enclave.SealedEnclave, and a nil pointer has to keep
+// meaning what a nil slice meant.
 func TestCredentials_ZeroValue(t *testing.T) {
 	c := Credentials{}
-	if len(c.Secret) != 0 {
-		t.Fatalf("expected empty secret, got %q", c.Secret)
+	if c.Secret != nil {
+		t.Fatalf("the zero value must carry no secret, got %v", c.Secret)
 	}
 }
 
+// TestCredentials_WithSecret round-trips a passphrase through the protected
+// form. It reads the material back through the sealed enclave rather than off
+// the struct, which is the whole change: there is no plain copy on Credentials
+// to read any more.
 func TestCredentials_WithSecret(t *testing.T) {
-	c := Credentials{Secret: []byte("my-secret")}
-	if string(c.Secret) != "my-secret" {
-		t.Fatalf("expected 'my-secret', got %q", c.Secret)
+	c := mustCreds(t, "my-secret")
+	defer c.Secret.Destroy()
+
+	opened, err := c.Secret.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer opened.Destroy()
+
+	if !opened.EqualTo([]byte("my-secret")) {
+		t.Fatalf("the credential did not round-trip its passphrase")
 	}
 }

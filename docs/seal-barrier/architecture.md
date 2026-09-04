@@ -315,29 +315,32 @@ makes single-writer a guarantee.
 
 ## Trust boundaries
 
-- **Root key** lives in an `enclave.ProtectedKey` (see
+- **Root key** lives in an `enclave.SealedEnclave` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)),
   opened into a locked enclave only for derivation, export and unseal.
   `Initialize` and `Unseal` generate or receive it directly into locked memory and
   hold it there for their whole body, so it is never an ordinary heap slice on the
   initialize path at all.
 - **Epoch DEKs are protected the same way and are never opened.** Each is held in
-  its own `ProtectedKey` so a DEK can be re-derived, but neither `Encrypt` nor
+  its own `SealedEnclave` so a DEK can be re-derived, but neither `Encrypt` nor
   `Decrypt` touches one: both run off the `cipher.AEAD` cached per epoch in
-  `b.ciphers`. An older statement that `ProtectedKey.Open` sits on a per-frame
+  `b.ciphers`. An older statement that opening a DEK sits on a per-frame
   decrypt path was measured false in #54 and does not describe this barrier — the
   key-opening cost is a setup, rotation and rekey cost. The AEAD cache is what
   makes the DEK's protection free at steady state, and also what makes it
   incomplete, which is the next bullet.
-- **Live `cipher.AEAD`s cannot be wiped.** Each holds a copy of the DEK in its
-  key schedule, and neither the standard library nor `x/crypto` offers a wipe
-  API. Dropping the barrier's reference on seal or purge makes it GC-eligible,
-  and that is the only bound: a core dump taken before collection contains every
-  live and recently purged epoch DEK.
+- **Live `cipher.AEAD`s cannot be wiped, and they are now the ONLY un-erasable
+  copy.** Each holds a copy of the DEK in its key schedule, and neither the
+  standard library nor `x/crypto` offers a wipe API. Dropping the barrier's
+  reference on seal or purge makes it GC-eligible, and that is the only bound: a
+  core dump taken before collection contains every live and recently purged epoch
+  DEK. The sealed copies beside them ARE wiped — `SealedEnclave.Destroy` zeroes
+  the ciphertext, where the retired `ProtectedKey.Clear` could only drop a
+  reference (#54 stage two).
 - **A purge revokes capability; it is not crypto-shredding.** After
-  `PurgeEpochsBefore` returns, the barrier can no longer decrypt the epoch, but
-  DEK confidentiality against memory disclosure is GC-bounded, not
-  enclave-bounded.
+  `PurgeEpochsBefore` returns, the barrier can no longer decrypt the epoch, and
+  the epoch's sealed DEK has been wiped — but the cached AEAD's copy of it
+  remains GC-bounded.
 - **`Decrypt` returns one generic error** (`ErrDecryptionFailed`) for every
   failure mode — unknown epoch, authentication failure, corruption — so error
   type cannot be used as an oracle.
@@ -358,7 +361,9 @@ makes single-writer a guarantee.
   `pkg/seal`. No cipher code lives there.
 - **`pkg.Barrier`** (in `pkg/host.go`) — the interface the `Host` accepts,
   declared there to break an import cycle. `*seal.Barrier` satisfies it.
-- **`pkg/enclave`** — memory protection for all key material.
+- **`github.com/jeremyhahn/go-enclave`** (Layer 0) — memory protection for all
+  key material. This repository implements none of it; `pkg/enclave` was deleted
+  in #54.
 - **Consumers in this repo**: `pkg/logdb/waldb` through its own `WALBarrier`
   interface, and `pkg/internal/engine`'s snapshot pool. Neither imports
   `pkg/seal` directly.
@@ -385,6 +390,5 @@ Capability rows in `docs/00 §R` this feature owns: the `Barrier` /
   [`../quic-transport/architecture.md`](../quic-transport/architecture.md).
   Snapshots travel as plaintext over the mTLS session and are re-encrypted at
   rest by the receiver.
-- **No hardware enclave.** `pkg/enclave` is `mlock`'d process memory —
-  go-enclave for plaintext, memguard for encrypted-at-rest — not
-  SGX/SEV/TrustZone.
+- **No hardware enclave.** go-enclave is `mlock`'d process memory and in-process
+  AEAD, not SGX/SEV/TrustZone.

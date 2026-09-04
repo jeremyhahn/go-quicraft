@@ -24,8 +24,9 @@ import (
 	"testing"
 )
 
-// Regression cover for issue #15 on the Shamir path specifically. The defect
-// lives in pkg/enclave, but ProtectedShare is how a custody ceremony actually
+// Regression cover for issue #15 on the Shamir path specifically. The defect was
+// in the protected-memory layer — this repository's own, at the time; it is
+// go-enclave's now — but ProtectedShare is how a custody ceremony actually
 // reaches it, and that is the reachability the issue was filed about: a
 // ceremony tearing shares down while a reader is still walking them is a
 // realistic shape, not a contrived one.
@@ -94,10 +95,9 @@ func TestProtectedShare_ValueDestroyRace(t *testing.T) {
 //
 // It asserts the lifetime invariant — a callback must never be running once
 // Destroy has returned — rather than dereferencing the value and waiting for a
-// fault. See the long note on TestMemoryEnclave_WithBytesExcludesDestroy in
-// pkg/enclave for why the dereferencing form silently passes against a broken
-// implementation: -race does not instrument memguard's mmap'd region, so the
-// only signal there is an intermittent SIGSEGV.
+// fault. The dereferencing form silently passes against a broken implementation:
+// -race does not instrument an mmap'd region, so the only signal there is an
+// intermittent SIGSEGV.
 func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 	const iterations = 100
 
@@ -272,9 +272,10 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 // TestProtectedShare_WithValueHoldsOffDestroyDeterministically was DROPPED in the
 // go-enclave adoption, deliberately and not silently. It pinned "a Destroy
 // already entered cannot COMPLETE while a WithValue callback runs" by filtering
-// pkg/enclave's package-global park hooks (TestOnlyOnMutatorParked) down to one
-// target enclave. Those hooks were instrumentation on this repository's own
-// borrow machinery, and that machinery is gone: the property now belongs to
+// this repository's former pkg/enclave package-global park hooks
+// (TestOnlyOnMutatorParked) down to one target enclave. Those hooks were
+// instrumentation on this repository's own borrow machinery, and that machinery
+// is gone — the package with it: the property now belongs to
 // go-enclave, whose withLocked takes the enclave's read lock and whose Destroy
 // takes the write lock, and go-enclave tests it there. Re-implementing an
 // observation hook here to re-test it would be instrumenting a dependency

@@ -20,8 +20,7 @@ import (
 	"errors"
 	"testing"
 
-	goenclave "github.com/jeremyhahn/go-enclave"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // errLockRefused stands in for the kernel refusing an mlock.
@@ -31,7 +30,7 @@ var errLockRefused = errors.New("mlock refused")
 // the source before reporting the refusal. A stub that skipped the wipe would
 // make the test pass against an implementation that leaks the caller's bytes.
 func refuseProtectedMemory(data []byte) (*enclave.MemoryEnclave, error) {
-	goenclave.Wipe(data)
+	enclave.Wipe(data)
 	return nil, errLockRefused
 }
 
@@ -104,13 +103,17 @@ func TestSplitProtected_AllocationFailureDestroysPartialShares(t *testing.T) {
 	var built []*enclave.MemoryEnclave
 	calls := 0
 
-	restore := testOnlyProtectedMemory(func(data []byte) (*enclave.MemoryEnclave, error) {
+	// The SIZED seam, not the from-bytes one: a share's value is now encoded
+	// straight into locked pages and frozen there, so newProtectedMemory is no
+	// longer on this path at all (go-enclave #6 removed the copy through a
+	// scratch). Injecting on the old seam would refuse nothing and the test
+	// would pass by never exercising the teardown.
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
 		calls++
 		if calls > 1 {
-			goenclave.Wipe(data)
 			return nil, errLockRefused
 		}
-		e, err := goenclave.NewMemoryEnclave(data)
+		e, err := enclave.NewMemoryEnclaveSized(n)
 		if err == nil {
 			built = append(built, e)
 		}
@@ -161,57 +164,114 @@ func TestTestOnlyProtectedMemory_RestoresPrevious(t *testing.T) {
 	e.Destroy()
 }
 
-// TestSplitProtected_BudgetCountsTheEncodingScratch pins MaxShareSetBytes as a
-// true upper bound on the locked memory SplitProtected holds at its peak.
+// TestSplitProtected_BudgetIsATrueUpperBound pins MaxShareSetBytes as a true
+// upper bound on the locked memory SplitProtected holds at its peak, and pins
+// the accounting change that moved that peak.
 //
-// It is a regression test for a real gap: the go-enclave port added a reused
-// encoding scratch enclave (a share's frozen value is built by copying OUT of
-// it, so both are live during the copy) and did not add it to splitLockedBytes.
-// These exact dimensions are the boundary that exposed it — priced at 1,047,032
-// bytes they were ADMITTED, while the true peak of 1,049,380 is over the
-// 1,048,576 cap. Caught by Codex on PR #69.
+// HISTORY, because the numbers below only make sense with it. The go-enclave
+// port could not freeze a sized enclave after filling it, so each share's frozen
+// value was built by copying OUT of a reused writable encoding scratch — both
+// regions live during the copy, so the scratch was part of the PEAK. It was
+// missing from splitLockedBytes, and the gap was real rather than a rounding
+// error: these exact dimensions priced at 1,047,032 were ADMITTED while the true
+// peak was 1,049,380, over the 1,048,576 cap (caught by Codex on PR #69).
 //
-// The parameters are deliberately hard-coded rather than derived: a test that
-// recomputed the bound from the same helper it is checking would agree with any
-// accounting, including a wrong one.
-func TestSplitProtected_BudgetCountsTheEncodingScratch(t *testing.T) {
+// go-enclave v0.5.0-alpha grew MemoryEnclave.Freeze, so a share value is encoded
+// directly into the region it will keep and frozen there. The scratch is gone,
+// the term that counted it is gone with it, and 1,047,032 is now BOTH the price
+// and the true peak — so the same dimensions are admitted, correctly this time.
+//
+// The parameters and the expected figures are deliberately hard-coded rather
+// than derived: a test that recomputed the bound from the helper it is checking
+// would agree with any accounting, including a wrong one.
+func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 	const (
 		secretLen = 1757
 		threshold = 255
 		total     = 255
 
-		peakWithScratch    = 1049380 // true peak — must be refused
-		peakWithoutScratch = 1047032 // the old accounting — was admitted
+		peakWithoutScratch = 1047032 // today's accounting AND today's true peak
+		peakWithScratch    = 1049380 // what it cost while the scratch existed
 	)
 
 	got := splitLockedBytes(secretLen, threshold, total)
-	if got != peakWithScratch {
+	if got != peakWithoutScratch {
 		t.Fatalf("splitLockedBytes(%d,%d,%d) = %d, want %d",
-			secretLen, threshold, total, got, peakWithScratch)
+			secretLen, threshold, total, got, peakWithoutScratch)
 	}
-	if got <= MaxShareSetBytes {
-		t.Fatalf("splitLockedBytes = %d, which fits MaxShareSetBytes (%d): the "+
-			"encoding scratch is not counted, so the cap is not an upper bound",
-			got, MaxShareSetBytes)
-	}
-
-	// The missing term is exactly one encoded value, and this says so, so a
-	// future change that drops it fails here with a readable reason.
+	// One encoded value is the difference, and saying so here means a change that
+	// reintroduces a scratch — or drops a term it should keep — fails with a
+	// readable reason rather than an unexplained number.
 	encoded := base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen)
-	if got-encoded != peakWithoutScratch {
-		t.Fatalf("the scratch term is %d, want one encoded value (%d)",
-			got-peakWithoutScratch, encoded)
+	if peakWithScratch-got != encoded {
+		t.Fatalf("the retired scratch term is %d, want one encoded value (%d)",
+			peakWithScratch-got, encoded)
 	}
-	if peakWithoutScratch > MaxShareSetBytes {
-		t.Fatal("the fixture no longer straddles the cap, so it proves nothing")
+	if got > MaxShareSetBytes {
+		t.Fatalf("splitLockedBytes = %d, over MaxShareSetBytes (%d): the fixture no "+
+			"longer straddles the old boundary, so it proves nothing", got, MaxShareSetBytes)
 	}
 
-	// And the refusal must land BEFORE any locked memory is allocated, which is
-	// the whole point of pricing the operation up front.
+	// EVERY REGION THE SEAM HANDS OUT IS STILL ALIVE WHEN THE SPLIT RETURNS.
+	// That is what "there is no scratch" means operationally, and it is the half
+	// the arithmetic above cannot check: a transient region would be destroyed by
+	// the time the caller sees the shares, and would be missing from the price.
+	var handed []*enclave.MemoryEnclave
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+		e, err := enclave.NewMemoryEnclaveSized(n)
+		if err == nil {
+			handed = append(handed, e)
+		}
+		return e, err
+	})
+	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
+	restore()
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer func() {
+		for _, sh := range shares {
+			sh.Destroy()
+		}
+	}()
+	if len(handed) != len(shares) {
+		t.Fatalf("the sized seam produced %d regions for %d shares: a transient "+
+			"region is live at the peak and is not priced by splitLockedBytes",
+			len(handed), len(shares))
+	}
+	for i, e := range handed {
+		if !e.IsAlive() {
+			t.Fatalf("region %d was destroyed before SplitProtected returned, so it "+
+				"was a scratch: it is live at the peak and must be priced", i)
+		}
+	}
+}
+
+// TestSplitProtected_OverBudgetIsRefusedBeforeAllocating pins the other half of
+// the bound: a request whose priced footprint exceeds MaxShareSetBytes is a
+// rejected REQUEST, refused before a single locked page is taken.
+//
+// secretLen is the first length at these dimensions whose peak crosses the cap
+// (1,048,817 > 1,048,576). It is one step past the fixture above, which is what
+// makes the pair meaningful: the same shape, admitted on one side of the line
+// and refused on the other.
+func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
+	const (
+		secretLen = 1760
+		threshold = 255
+		total     = 255
+	)
+
+	if got := splitLockedBytes(secretLen, threshold, total); got <= MaxShareSetBytes {
+		t.Fatalf("splitLockedBytes(%d,%d,%d) = %d, which fits MaxShareSetBytes (%d): "+
+			"the fixture no longer straddles the cap, so it proves nothing",
+			secretLen, threshold, total, got, MaxShareSetBytes)
+	}
+
 	allocated := false
-	restore := testOnlyProtectedMemory(func(data []byte) (*enclave.MemoryEnclave, error) {
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
 		allocated = true
-		return goenclave.NewMemoryEnclave(data)
+		return enclave.NewMemoryEnclaveSized(n)
 	})
 	defer restore()
 

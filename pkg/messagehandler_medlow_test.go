@@ -227,7 +227,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	errs := make([]error, receivers)
 	// `i` is captured directly, with no `i := i` shadow. That is correct here
 	// and deliberately not "fixed": since Go 1.22 the for-clause variable is
-	// PER-ITERATION, and this module declares go 1.26.6, so each goroutine
+	// PER-ITERATION, and this module declares go 1.27.0, so each goroutine
 	// closes over its own copy. Under pre-1.22 semantics the same code writes
 	// through a shared variable and can panic on errs[8]; that is the footgun
 	// the language change removed, and it is why a reviewer reading this out of

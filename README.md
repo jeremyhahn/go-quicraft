@@ -1,7 +1,7 @@
 <img src="assets/logo.svg" width="600">
 
 
-[![Go](https://img.shields.io/badge/Go-1.26.6-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.27.0-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.6.1--alpha-orange.svg)](VERSION)
 
@@ -15,7 +15,7 @@ QuicRaft implements the [Raft consensus algorithm](https://raft.github.io/), aud
 go get github.com/jeremyhahn/go-quicraft
 ```
 
-Requires Go 1.26.6 or later. The public API lives under
+Requires Go 1.27.0 or later. The public API lives under
 `github.com/jeremyhahn/go-quicraft/pkg`.
 
 > **Alpha software.** This is a `0.x` release. The on-disk and on-wire formats
@@ -697,7 +697,7 @@ Every feature has a folder with five documents — `architecture.md`,
 | [write-batching](docs/write-batching/architecture.md) | the proposal aggregator and the write-durability modes |
 | [seal-barrier](docs/seal-barrier/architecture.md) | at-rest encryption: epoch DEKs, sealing strategies, FIPS |
 | [shamir-primitive](docs/shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive |
-| [memory-enclave](docs/memory-enclave/architecture.md) | protection for key material: go-enclave locked memory, plus `ProtectedKey` at rest |
+| [memory-enclave](docs/memory-enclave/architecture.md) | protection for key material: go-enclave locked memory and sealed enclaves |
 | [observability](docs/observability/architecture.md) | metrics, logging, event notifications |
 
 **Cross-feature**

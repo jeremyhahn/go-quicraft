@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // Nothing in this module implements ProtectedShareSplitter or

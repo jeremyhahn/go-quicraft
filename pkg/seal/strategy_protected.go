@@ -17,7 +17,7 @@ package seal
 import (
 	"context"
 
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // ProtectedSealingStrategy is the protected-memory counterpart of the root-key
@@ -47,27 +47,32 @@ import (
 // silent fallback, because a fallback would be the un-protected copy wearing
 // the protected API's name.
 //
-// BOTH SIDES OF THE BOUNDARY ARE PROTECTED, which is why these methods take
-// ProtectedCredentials rather than Credentials. A protected root-key API that
-// still accepted the passphrase in an ordinary []byte would protect the key it
-// derives while leaving the material that derives it collectable and swappable
-// — and for a deferred-passphrase strategy the passphrase IS the root key's
-// protection. There is deliberately no overload taking Credentials: an
-// implementation that converted one to the other would reintroduce exactly the
-// plain copy this signature exists to remove.
+// BOTH SIDES OF THE BOUNDARY ARE PROTECTED. A protected root-key API that still
+// accepted the passphrase in an ordinary []byte would protect the key it derives
+// while leaving the material that derives it collectable and swappable — and for
+// a deferred-passphrase strategy the passphrase IS the root key's protection.
+//
+// That used to require a SECOND credential type, because Credentials.Secret was
+// a []byte and these two methods were the only ones that could afford to break.
+// #41 retyped Credentials.Secret itself, so there is now exactly ONE credential
+// type in this package and these methods take it. ProtectedCredentials survives
+// only as a deprecated alias for the implementations that still name it; an
+// interface carrying two credential types was the defect #41 was filed against,
+// not a shape worth keeping.
 //
 // # What this does NOT change
 //
 // The Barrier still calls SealingStrategy.SealRootKey and UnsealRootKey. It
 // needs the raw key bytes for HKDF epoch-DEK derivation and for the sealed-state
-// HMAC, wipes them on every path (success and failure alike), and then holds the
-// key in an enclave.ProtectedKey for its lifetime. Switching the barrier itself
-// onto the protected pair is a larger change than this interface — the barrier's
-// own root-key handling is []byte end to end, and an enclave frozen read-only
-// would fault under the wipeBytes calls that discipline depends on — so it is
-// tracked separately (#39) rather than half-done here. What this interface buys
-// today is that an implementer no longer has to RETAIN an unprotected copy
-// between calls, which is the defect that was actually reported.
+// HMAC, holds them in a locked enclave for the whole of Initialize and Unseal
+// (#39), and then seals them into an enclave.SealedEnclave for the barrier's
+// lifetime. Switching the barrier itself onto the protected PAIR is a further
+// change and is deliberately not made here: the enclave it holds is filled in
+// place and its last act is to be consumed by enclave.NewSealed, which wipes what
+// it is handed — so those pages must stay WRITABLE, where this interface's
+// contract hands back a frozen one. What this interface buys today is that an
+// implementer no longer has to RETAIN an unprotected copy between calls, which is
+// the defect that was actually reported.
 type ProtectedSealingStrategy interface {
 	SealingStrategy
 
@@ -79,7 +84,7 @@ type ProtectedSealingStrategy interface {
 	// The caller retains ownership of rootKey — this method neither destroys
 	// it nor takes it over. Passing a nil or destroyed enclave is an error,
 	// not an empty key.
-	SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error)
+	SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error)
 
 	// UnsealRootKeyProtected decrypts the root key into locked memory and
 	// returns the enclave holding it. It is UnsealRootKey with the output on
@@ -93,9 +98,10 @@ type ProtectedSealingStrategy interface {
 	// process, and the next caller to reach the ceiling is refused with
 	// ErrLockedMemoryUnavailable. Under memguard the bill was steeper still —
 	// a refused lock terminated the process — so the duty is less dire than it
-	// was and no less real. The enclave is returned frozen: its contents are
-	// final, and Destroy is what releases them.
-	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
+	// was and no less real. The enclave is returned FROZEN: its contents are
+	// final, a stray write through a retained slice faults rather than
+	// corrupting the root key, and Destroy is what releases them.
+	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
 }
 
 // Compile-time assertions that both strategies this package implements satisfy
@@ -108,51 +114,22 @@ var (
 	_ ProtectedSealingStrategy = (*NoneStrategy)(nil)
 )
 
-// ProtectedCredentials is Credentials with the secret in protected memory: the
-// authentication material a deferred-passphrase strategy needs at call time,
-// held in an enclave.ProtectedKey — memguard-encrypted at rest, decrypted into
-// a locked, guard-paged buffer only for the moment a KDF reads it.
+// ProtectedCredentials is [Credentials].
 //
-// It exists because Credentials.Secret is an ordinary []byte, so the passphrase
-// that protects the root key lives in collectable, swappable memory that this
-// package can only ask the caller to wipe. For a deferred strategy that
-// passphrase is not a lesser secret than the key it wraps — it IS the key's
-// protection — so a protected root-key API that accepted an unprotected
-// passphrase would be protecting the wrong half (Codex review of PR #40).
+// Deprecated: use Credentials. The two were separate types only while
+// Credentials.Secret was an ordinary []byte — this one existed so the protected
+// root-key pair above could refuse a passphrase in collectable memory while the
+// []byte siblings kept compiling. #41 retyped Credentials.Secret onto the same
+// [enclave.SealedEnclave], so the distinction has nothing left to express.
 //
-// The zero value is valid and means "no credentials", which is what a
-// passphrase-bound strategy expects: it uses the passphrase given at
-// construction and ignores this entirely.
-//
-// The CALLER owns Secret. This package opens it, derives from it and destroys
-// the opened copy; it never clears the ProtectedKey itself, so one credential
-// can be used for many calls and is released by the caller's own Clear.
-type ProtectedCredentials struct {
-	// Secret is the passphrase, encrypted at rest in memory. Nil means the
-	// caller supplied none.
-	Secret *enclave.ProtectedKey // #nosec G117 -- this IS a secret field by design
-}
+// It is an ALIAS, not a defined type, so an implementation whose method
+// signatures still say ProtectedCredentials satisfies ProtectedSealingStrategy
+// unchanged. It is kept for exactly that reason and goes at the next breaking
+// release; new code names Credentials.
+type ProtectedCredentials = Credentials
 
-// NewProtectedCredentials moves a secret into protected memory and returns the
-// credentials holding it. The source slice is WIPED — that is the whole point,
-// and it is why this constructor exists rather than leaving callers to build the
-// struct: material that reaches here already existed unprotected, and the only
-// thing left worth doing about it is not leaving it there.
+// NewProtectedCredentials is [NewCredentials].
 //
-// An empty secret is refused rather than stored. A zero-length passphrase is not
-// a passphrase, and the allocator refuses one in any case: go-enclave answers a
-// zero-length allocation with ErrEmptyEnclave. Refusing it here names the actual
-// fault (ErrInvalidPassphrase) at the point the caller can act on, rather than
-// surfacing an enclave-construction error two layers down. Under memguard the
-// same allocation terminated the process instead of returning.
-func NewProtectedCredentials(secret []byte) (ProtectedCredentials, error) {
-	if len(secret) == 0 {
-		return ProtectedCredentials{}, ErrInvalidPassphrase
-	}
-	// The recommendation is warned about HERE, at construction, exactly as
-	// newSoftwareStrategy warns for a bound passphrase: the earliest point an
-	// operator can act on, and the only point at which the length is known
-	// without opening the enclave again.
-	warnIfPassphraseWeak(len(secret))
-	return ProtectedCredentials{Secret: enclave.NewProtectedKey(secret)}, nil
-}
+// Deprecated: use NewCredentials. Same function, and the name no longer
+// distinguishes anything now that there is one credential type.
+var NewProtectedCredentials = NewCredentials

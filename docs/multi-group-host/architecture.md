@@ -89,7 +89,6 @@ orchestration are the caller's problem. See [Cluster Formation](#cluster-formati
   M-of-N quorum and recovery ceremonies are owned by go-qrdb, not by this
   library.
 - `pkg/batch/` — Proposal batching aggregator
-- `pkg/enclave/` — Memory-protected key containers (memguard enclave, mlock)
 - `pkg/writemode/` — Write durability modes
 
 **Internal Implementation**
@@ -630,8 +629,8 @@ The `Barrier` in `pkg/seal/barrier.go` provides AEAD encryption for WAL data at 
 - Configurable via `BarrierConfig.Algorithm`
 
 **Design**:
-- Root key (32 bytes) from `crypto/rand`, held in a memguard enclave so it is
-  encrypted at rest in process memory
+- Root key (32 bytes) generated directly into locked memory by `crypto/rand`, then
+  held in a go-enclave `SealedEnclave` so it is encrypted at rest in process memory
 - Data Encryption Keys (DEKs) derived via HKDF-SHA256 with a 32-byte salt and
   per-epoch info strings. The v2 info layout binds the algorithm identifier and
   DEK length into the derivation; v1 remains readable.

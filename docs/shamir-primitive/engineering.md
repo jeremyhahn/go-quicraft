@@ -208,15 +208,19 @@ optional sibling interface beside them:
 type ProtectedSealingStrategy interface {
     SealingStrategy
 
-    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error)
-    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
+    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
 }
 
-type ProtectedCredentials struct {
-    Secret *enclave.ProtectedKey
+type Credentials struct {
+    Secret *enclave.SealedEnclave
 }
 
-func NewProtectedCredentials(secret []byte) (ProtectedCredentials, error) // moves and WIPES secret
+func NewCredentials(secret []byte) (Credentials, error) // moves and WIPES secret
+
+// Deprecated: aliases kept so implementations naming them still compile.
+type ProtectedCredentials = Credentials
+var  NewProtectedCredentials = NewCredentials
 ```
 
 The reported defect it answers is go-qrdb's recovery strategy (go-qrdb PR #76,
@@ -230,10 +234,11 @@ care on the implementer's side can avoid that while the signature demands a
 Two implementation notes that are not obvious from the signatures:
 
 - **Order of operations.** `SoftwareStrategy` derives the wrapping key BEFORE it
-  borrows the root-key enclave. It had to: until the go-enclave adoption,
-  `pkg/enclave` held a process-wide `purgeMu` shared across every borrow while
-  allocating locked memory took it exclusively, so opening the passphrase enclave
-  inside a root-key borrow was a self-deadlock rather than a documented hazard.
+  borrows the root-key enclave. It had to: until the go-enclave adoption, this
+  repository's own `pkg/enclave` (since deleted) held a process-wide `purgeMu`
+  shared across every borrow while allocating locked memory took it exclusively,
+  so opening the passphrase enclave inside a root-key borrow was a self-deadlock
+  rather than a documented hazard.
   That lock is gone and the nesting is now legal, but the ordering stays: it keeps
   the key-touching window as short as it can be, and the AEAD it produces holds
   only an expanded key schedule in ordinary memory, which a borrow may touch
@@ -258,26 +263,26 @@ would be a protected wrapper around a fiction. Its
 `SealRootKeyProtected` validates the enclave even though it never reads it —
 a contract the reference implementation ignores is not a contract.
 
-**Both sides of the boundary are protected**, which is why the pair takes
-`ProtectedCredentials` rather than `Credentials`. For a deferred-passphrase
-strategy the passphrase is not a lesser secret than the root key it wraps — it
-IS that key's protection — so accepting it in a plain `[]byte` would protect the
-wrong half. There is no overload taking `Credentials`: converting one to the
-other reintroduces the copy the signature removes. A consequence worth knowing is
-that the deferred protected paths derive straight from the credential's
-`ProtectedKey` instead of building a temporary inner strategy, so a
-FIPS-unapproved KDF is refused at `DeriveKey` rather than at that construction.
+**Both sides of the boundary are protected.** For a deferred-passphrase strategy
+the passphrase is not a lesser secret than the root key it wraps — it IS that
+key's protection — so accepting it in a plain `[]byte` would protect the wrong
+half. That used to require a second credential TYPE, because `Credentials.Secret`
+was a `[]byte` and only these two methods could afford to break. #41 retyped
+`Credentials.Secret` itself onto `*enclave.SealedEnclave`, so there is now one
+credential type and `ProtectedCredentials` is a deprecated alias for it.
 
-`Credentials` itself is unchanged. Whether `SealingStrategy`'s own methods should
-move the same way is #41 (owner ruling) — that is a portfolio-wide interface
-change touching every strategy in go-xkms and go-qrdb, which the new pair was
-not, because it had no consumers yet.
+One consequence is worth knowing: every root-key method now derives straight from
+the credential's sealed passphrase instead of building a temporary inner strategy
+from a plain slice, so a FIPS-unapproved KDF is refused at `DeriveKey` rather than
+at that construction. The protected pair has behaved that way since PR #40; #41
+made the `[]byte` siblings agree with it rather than changing them alone.
 
-The `Barrier` still calls the `[]byte` pair. It needs raw bytes for HKDF epoch-DEK
-derivation and the sealed-state HMAC, wipes them on every path, and then holds
-the key in an `enclave.ProtectedKey`. Moving the barrier itself onto the
-protected pair is tracked separately (#39) — an enclave frozen read-only would
-fault under the `wipeBytes` calls that discipline currently depends on.
+The `Barrier` still calls the `[]byte` root-key pair. It needs raw bytes for HKDF
+epoch-DEK derivation and the sealed-state HMAC, holds them in a locked enclave for
+the whole of `Initialize`/`Unseal`, and then seals them. Moving the barrier itself
+onto the protected pair is tracked separately (#39): the root-key enclave is
+deliberately left WRITABLE so `enclave.NewSealed` can consume it, and a wipe of
+frozen pages faults the process.
 
 ## 2. Wire format of a share
 

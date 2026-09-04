@@ -20,6 +20,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"testing"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 func TestNewSoftwareStrategy_ValidPassphrase(t *testing.T) {
@@ -60,7 +62,7 @@ func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 	}
 
 	// Zero the original slice.
-	wipeBytes(passphrase)
+	enclave.Wipe(passphrase)
 
 	// Strategy should still work since it made a copy.
 	rootKey := make([]byte, 32)
@@ -87,7 +89,7 @@ func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 		t.Fatal("round-trip failed: decrypted root key does not match original")
 	}
 
-	wipeBytes(decrypted)
+	enclave.Wipe(decrypted)
 	s.Close()
 	s2.Close()
 }
@@ -137,7 +139,7 @@ func TestSoftwareStrategy_SealUnsealRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unseal failed: %v", err)
 	}
-	defer wipeBytes(decrypted)
+	defer enclave.Wipe(decrypted)
 
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("round-trip failed: decrypted root key does not match original")
@@ -341,13 +343,13 @@ func TestSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unseal sealed1 failed: %v", err)
 	}
-	defer wipeBytes(dec1)
+	defer enclave.Wipe(dec1)
 
 	dec2, err := s.UnsealRootKey(context.Background(), sealed2, Credentials{})
 	if err != nil {
 		t.Fatalf("Unseal sealed2 failed: %v", err)
 	}
-	defer wipeBytes(dec2)
+	defer enclave.Wipe(dec2)
 
 	if !bytes.Equal(dec1, dec2) {
 		t.Fatal("two unseals produced different root keys")
@@ -356,7 +358,7 @@ func TestSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T) {
 
 func TestWipeBytes_AllZeroed(t *testing.T) {
 	data := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	wipeBytes(data)
+	enclave.Wipe(data)
 	for i, b := range data {
 		if b != 0 {
 			t.Fatalf("byte at index %d is %d, expected 0", i, b)
@@ -366,8 +368,8 @@ func TestWipeBytes_AllZeroed(t *testing.T) {
 
 func TestWipeBytes_EmptyAndNilSlice(t *testing.T) {
 	// Should not panic.
-	wipeBytes(nil)
-	wipeBytes([]byte{})
+	enclave.Wipe(nil)
+	enclave.Wipe([]byte{})
 }
 
 func TestWipeBytes_LargeSlice(t *testing.T) {
@@ -375,7 +377,7 @@ func TestWipeBytes_LargeSlice(t *testing.T) {
 	for i := range data {
 		data[i] = 0xFF
 	}
-	wipeBytes(data)
+	enclave.Wipe(data)
 	for i, b := range data {
 		if b != 0 {
 			t.Fatalf("byte at index %d is %d, expected 0", i, b)
@@ -522,7 +524,7 @@ func TestSoftwareStrategyFIPS_SealUnsealRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unseal failed: %v", err)
 	}
-	defer wipeBytes(decrypted)
+	defer enclave.Wipe(decrypted)
 
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("FIPS round-trip failed: decrypted root key does not match original")
@@ -559,7 +561,7 @@ func TestSoftwareStrategy_CrossKDFUnseal_MatchingParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unseal with matching Argon2id params failed: %v", err)
 	}
-	defer wipeBytes(decrypted)
+	defer enclave.Wipe(decrypted)
 
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("cross-KDF unseal: decrypted key does not match original")
@@ -595,7 +597,7 @@ func TestSoftwareStrategy_BackwardCompatibility_NoMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unseal with nil metadata (backward compat) failed: %v", err)
 	}
-	defer wipeBytes(decrypted)
+	defer enclave.Wipe(decrypted)
 
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("backward compatibility unseal: decrypted key does not match original")

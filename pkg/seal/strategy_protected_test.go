@@ -21,7 +21,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // protectedRootKey returns a 32-byte root key already in locked memory, plus
@@ -34,10 +34,11 @@ func protectedRootKey(t *testing.T) (*enclave.MemoryEnclave, []byte) {
 	if _, err := rand.Read(want); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	// Frozen by construction: go-enclave has no post-fill seal (go-enclave #6),
-	// so a read-only enclave comes from NewMemoryEnclave rather than from
-	// sized-and-then-frozen. want is copied first because that constructor wipes
-	// its source.
+	// Frozen by construction: NewMemoryEnclave freezes as the material moves in,
+	// which is the shape a CALLER of the protected pair would use for a key it
+	// already has. (A key it is about to produce belongs in a sized enclave that
+	// is filled and then Frozen; both end read-only.) want is copied first
+	// because this constructor wipes its source.
 	enc := mustFromBytes(t, append([]byte(nil), want...))
 	t.Cleanup(enc.Destroy)
 	return enc, want
@@ -115,7 +116,7 @@ func TestSoftwareStrategy_ProtectedAndStringPathsInteroperate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UnsealRootKey: %v", err)
 		}
-		defer wipeBytes(got)
+		defer enclave.Wipe(got)
 		if !bytes.Equal(got, want) {
 			t.Fatal("string unseal did not recover the key the protected seal wrapped")
 		}
@@ -139,7 +140,7 @@ func TestSoftwareStrategy_ProtectedAndStringPathsInteroperate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SealRootKey: %v", err)
 		}
-		wipeBytes(key)
+		enclave.Wipe(key)
 
 		recovered, err := s.UnsealRootKeyProtected(ctx, sealed, ProtectedCredentials{})
 		if err != nil {
@@ -364,7 +365,7 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	if err != nil {
 		t.Fatalf("NewProtectedCredentials: %v", err)
 	}
-	defer creds.Secret.Clear()
+	defer creds.Secret.Destroy()
 
 	rootKey, want := protectedRootKey(t)
 
@@ -380,7 +381,7 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	defer recovered.Destroy()
 	assertEnclaveHolds(t, recovered, want)
 
-	// The credentials are the CALLER's: many calls, one ProtectedKey, released
+	// The credentials are the CALLER's: many calls, one SealedEnclave, released
 	// by the caller's own Clear and never by the strategy.
 	again, err := s.UnsealRootKeyProtected(ctx, sealed, creds)
 	if err != nil {
@@ -400,7 +401,7 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	if err != nil {
 		t.Fatalf("NewProtectedCredentials: %v", err)
 	}
-	defer wrong.Secret.Clear()
+	defer wrong.Secret.Destroy()
 	if _, err := s.UnsealRootKeyProtected(ctx, sealed, wrong); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("UnsealRootKeyProtected with the wrong credentials = %v, want ErrDecryptionFailed", err)
 	}
@@ -419,7 +420,7 @@ func TestNewProtectedCredentials(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewProtectedCredentials: %v", err)
 		}
-		defer creds.Secret.Clear()
+		defer creds.Secret.Destroy()
 
 		for i, b := range secret {
 			if b != 0 {

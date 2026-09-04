@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // ContextBinding reports how a barrier treats the OPTIONAL caller-supplied
@@ -182,7 +184,7 @@ func verifyAADBinding(enc AADSymmetricEncrypter, rand io.Reader) error {
 	probe := make([]byte, aadProbeSize)
 	aadA := make([]byte, aadProbeSize)
 	aadB := make([]byte, aadProbeSize)
-	defer wipeBytes(probe)
+	defer enclave.Wipe(probe)
 	if _, err := io.ReadFull(rand, probe); err != nil {
 		return &AADBindingProbeError{Stage: "probe-entropy", Err: err}
 	}

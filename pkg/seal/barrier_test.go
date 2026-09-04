@@ -24,6 +24,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // testStrategy returns a SoftwareStrategy with fast KDF params for tests. The
@@ -214,7 +216,7 @@ func TestBarrier_RootKeyInEnclave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RootKey() failed: %v", err)
 	}
-	defer wipeBytes(rk)
+	defer enclave.Wipe(rk)
 	if len(rk) != rootKeySize {
 		t.Fatalf("expected root key length %d, got %d", rootKeySize, len(rk))
 	}
@@ -256,7 +258,7 @@ func TestBarrier_RotateOpensEnclave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RootKey() failed: %v", err)
 	}
-	defer wipeBytes(rkBefore)
+	defer enclave.Wipe(rkBefore)
 
 	newEpoch, err := b.Rotate()
 	if err != nil {
@@ -271,7 +273,7 @@ func TestBarrier_RotateOpensEnclave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RootKey() after rotate failed: %v", err)
 	}
-	defer wipeBytes(rkAfter)
+	defer enclave.Wipe(rkAfter)
 	if !bytes.Equal(rkBefore, rkAfter) {
 		t.Fatal("root key changed after Rotate")
 	}
@@ -3084,7 +3086,7 @@ func TestSoftwareStrategy_AADPreventsCrossStrategySubstitution(t *testing.T) {
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("round-trip mismatch")
 	}
-	wipeBytes(decrypted)
+	enclave.Wipe(decrypted)
 
 	// Corrupt one byte in the ciphertext to simulate a different AAD context.
 	// Since AAD is baked into GCM authentication, any ciphertext produced
@@ -3122,7 +3124,7 @@ func TestSoftwareStrategy_SealUnsealRoundTripWithAAD(t *testing.T) {
 	if !bytes.Equal(rootKey, decrypted) {
 		t.Fatal("round-trip failed with AAD binding")
 	}
-	wipeBytes(decrypted)
+	enclave.Wipe(decrypted)
 }
 
 // --- M2-sec: Epoch monotonicity validation in SetSealedRootKey ---

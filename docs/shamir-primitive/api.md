@@ -299,15 +299,20 @@ MAY implement the protected pair (#37):
 type ProtectedSealingStrategy interface {
     SealingStrategy
 
-    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error)
-    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error)
+    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
 }
 
-// The passphrase is protected too. Built by NewProtectedCredentials, which
-// wipes the caller's slice; the caller owns it and releases it with Clear.
-type ProtectedCredentials struct {
-    Secret *enclave.ProtectedKey
+// The passphrase is protected too, and since #41 it is the SAME Credentials
+// every strategy takes. Built by NewCredentials, which wipes the caller's
+// slice; the caller owns it and releases it with Destroy.
+type Credentials struct {
+    Secret *enclave.SealedEnclave
 }
+
+// Deprecated: aliases kept so implementations naming them still compile.
+type ProtectedCredentials = Credentials
+var  NewProtectedCredentials = NewCredentials
 ```
 
 It exists because the `[]byte` signatures force an implementation to RETAIN the

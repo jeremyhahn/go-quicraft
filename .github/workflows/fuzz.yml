@@ -58,7 +58,7 @@ permissions:
 
 env:
   # Kept in lockstep with ci.yml's pin (issue #23).
-  GO_VERSION: "1.26.7"
+  GO_VERSION: "1.27.0"
   # Same rationale as ci.yml: never resolve through a stray workspace.
   GOWORK: "off"
 

@@ -18,7 +18,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // NoneStrategy disables barrier encryption: SealRootKey records a marker

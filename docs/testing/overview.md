@@ -590,7 +590,6 @@ verification goes through the Makefile targets, on the remote host.
 | `test-server`     | `./pkg/internal/server/...`        |
 | `test-writemode`  | `./pkg/writemode/...`              |
 | `test-batch`      | `./pkg/batch/...`                  |
-| `test-enclave`    | `./pkg/enclave/...`                |
 | `test-crypto`     | `./pkg/crypto/...`                 |
 
 All unit test targets use `go test -race -count=1 -v`.

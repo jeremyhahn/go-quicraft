@@ -13,7 +13,7 @@
 # Usage (via Makefile):
 #   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat
 
-FROM golang:1.26.6 AS builder
+FROM golang:1.27.0 AS builder
 
 WORKDIR /build
 

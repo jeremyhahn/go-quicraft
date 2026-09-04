@@ -21,7 +21,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // This file implements Shamir's Secret Sharing over GF(2^8) (see
@@ -486,13 +486,16 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	return interpolateSecret(xs, ys, secretLen), nil
 }
 
-// wipe zeroes a byte slice. It delegates to enclave.WipeBytes (memguard),
-// whose zeroing is resistant to dead-store elimination; a plain range-assign
-// loop over a slice the compiler can prove dead may be optimized away.
-// pkg/enclave depends only on the standard library and memguard, so the
-// import cannot cycle back into pkg/crypto/shamir.
+// wipe zeroes a byte slice. It delegates to go-enclave's Wipe, whose zeroing is
+// resistant to dead-store elimination; a plain range-assign loop over a slice
+// the compiler can prove dead may be optimized away.
+//
+// It is a one-line adapter and stays one deliberately: the package-local name is
+// what every scratch buffer here is wiped through, so the primitive behind it
+// can move without touching forty call sites — which is exactly what happened
+// when this repository's own wrapper was deleted for go-enclave's (#54).
 func wipe(b []byte) {
-	enclave.WipeBytes(b)
+	enclave.Wipe(b)
 }
 
 // VerifyShare checks if a share is valid and consistent with other shares.

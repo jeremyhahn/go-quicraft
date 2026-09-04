@@ -16,7 +16,7 @@ the constraints are unusual enough that a design conversation saves a rewrite.
 
 ## Development Setup
 
-Requires Go **1.26.6** or later, and Docker for the integration suite.
+Requires Go **1.27.0** or later, and Docker for the integration suite.
 
 ```sh
 git clone https://github.com/jeremyhahn/go-quicraft

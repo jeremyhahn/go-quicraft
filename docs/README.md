@@ -38,7 +38,7 @@ be told apart from an unwritten one.
 | [write-batching](write-batching/architecture.md) | the proposal aggregator and the write-durability modes |
 | [seal-barrier](seal-barrier/architecture.md) | at-rest encryption: epoch DEKs, sealing strategies, the AEAD safety bounds |
 | [shamir-primitive](shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive and the share-custody interfaces |
-| [memory-enclave](memory-enclave/architecture.md) | memguard-backed protection for key material in process memory |
+| [memory-enclave](memory-enclave/architecture.md) | how this library holds key material: go-enclave locked memory and sealed enclaves |
 | [observability](observability/architecture.md) | metrics, logging and event notifications |
 
 ## Cross-feature documents

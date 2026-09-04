@@ -42,7 +42,7 @@ env:
   # Kept in lockstep with ci.yml's pin (issue #23) — a nightly FIPS/trivy
   # sweep that runs on a different toolchain than the push gate is not
   # verifying the thing the push gate ships.
-  GO_VERSION: "1.26.7"
+  GO_VERSION: "1.27.0"
   GOWORK: "off"
 
 jobs:

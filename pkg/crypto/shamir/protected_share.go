@@ -23,8 +23,7 @@ import (
 	"log/slog"
 	"testing"
 
-	goenclave "github.com/jeremyhahn/go-enclave"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // newProtectedMemory moves bytes into locked, frozen memory. It is
@@ -41,7 +40,18 @@ import (
 // ownership contract on that path — the value is already wiped, and the error is
 // a *ProtectedMemoryError rather than a *ValidationError — is exactly what a
 // caller gets wrong silently, so it is worth being able to test.
-var newProtectedMemory = goenclave.NewMemoryEnclave
+var newProtectedMemory = enclave.NewMemoryEnclave
+
+// newSizedProtectedMemory allocates locked, zeroed, still-WRITABLE memory for
+// its caller to fill in place and then freeze. It is the sibling seam to
+// newProtectedMemory, gated the same way and for the same reason.
+//
+// The two are not interchangeable and the split is the point. newProtectedMemory
+// brings material that already exists OUTSIDE an enclave in — a caller's share
+// value — and freezes it as it moves. This one is for material this package is
+// about to PRODUCE, which must never touch the ordinary heap at all: the encoded
+// share value is written straight into these pages and frozen there.
+var newSizedProtectedMemory = enclave.NewMemoryEnclaveSized
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
 // function restoring the previous one. It PANICS outside a test binary.
@@ -52,6 +62,19 @@ func testOnlyProtectedMemory(fn func([]byte) (*enclave.MemoryEnclave, error)) fu
 	prev := newProtectedMemory
 	newProtectedMemory = fn
 	return func() { newProtectedMemory = prev }
+}
+
+// testOnlySizedProtectedMemory is testOnlyProtectedMemory for the sized
+// allocator. Same gate, same restore contract, and separate because the two
+// constructors have different signatures and different callers: overriding one
+// must not silently change the behaviour of the other.
+func testOnlySizedProtectedMemory(fn func(int) (*enclave.MemoryEnclave, error)) func() {
+	if !testing.Testing() {
+		panic("shamir.testOnlySizedProtectedMemory: test-only allocator override called outside a test binary")
+	}
+	prev := newSizedProtectedMemory
+	newSizedProtectedMemory = fn
+	return func() { newSizedProtectedMemory = prev }
 }
 
 // maxProtectedValueBytes is the largest base64 share value NewProtectedShare
@@ -98,17 +121,19 @@ const MaxShareSetBytes = 1 << 20
 
 // splitLockedBytes reports the locked memory SplitProtected holds at its peak
 // for these parameters: the random polynomial coefficients, the per-share
-// coefficient vector and raw payload it reuses, the ENCODING SCRATCH it reuses,
-// and the encoded value of every share it returns.
+// coefficient vector and raw payload it reuses, and the encoded value of every
+// share it returns.
 //
-// The encoding scratch is one encoded value, and it is counted because it is
-// live AT THE PEAK: go-enclave has no post-fill freeze (go-enclave #6), so a
-// share's frozen value is built by copying OUT of the scratch, and for the
-// duration of that copy both exist. Leaving it out is not a rounding error, it
-// makes MaxShareSetBytes stop being an upper bound — secretLen=1757 with
-// threshold=total=255 priced at 1,047,032 and was admitted, while its true peak
-// is 1,049,380, over the 1,048,576 cap. Caught by Codex on PR #69. The term
-// disappears when the scratch does, at which point this comment should go too.
+// THE ENCODING SCRATCH USED TO BE A TERM HERE and no longer is, because the
+// scratch itself is gone. go-enclave had no post-fill freeze, so a share's
+// frozen value had to be built by copying OUT of a reused writable scratch, and
+// for the duration of that copy both regions were live — which made the scratch
+// part of the PEAK rather than an implementation detail. Omitting it was not a
+// rounding error: secretLen=1757 at threshold=total=255 priced at 1,047,032 and
+// was admitted while its true peak was 1,049,380, over the 1,048,576 cap (caught
+// by Codex on PR #69). Each share is now encoded directly into its own sized
+// enclave and frozen in place (go-enclave #6), so nothing is live that this does
+// not count.
 //
 // The multiplications cannot overflow because validateSplitParams runs first
 // and bounds each factor — the secret to MaxSecretBytes (64 KiB) and both
@@ -117,7 +142,7 @@ const MaxShareSetBytes = 1 << 20
 func splitLockedBytes(secretLen, threshold, total int) int {
 	encoded := base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen)
 	coefficients := secretLen * (threshold - 1)
-	scratch := threshold + rawShareOverhead + secretLen + encoded
+	scratch := threshold + rawShareOverhead + secretLen
 	values := total * encoded
 	return coefficients + scratch + values
 }
@@ -316,7 +341,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// bulk read of crypto/rand — as in SplitBytes, but read directly into
 	// locked memory. The coefficients are as sensitive as the secret: with
 	// them and one share, the secret follows.
-	randCoeffs, err := goenclave.NewMemoryEnclaveSized(len(secret) * (threshold - 1))
+	randCoeffs, err := enclave.NewMemoryEnclaveSized(len(secret) * (threshold - 1))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient memory", Err: err}
 	}
@@ -332,7 +357,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// and no secret digest is embedded in shares — see SplitBytes for why
 	// both of those are deliberate and must not be "fixed".
 
-	coeffs, err := goenclave.NewMemoryEnclaveSized(threshold) // [secret byte, c1..c_{t-1}]
+	coeffs, err := enclave.NewMemoryEnclaveSized(threshold) // [secret byte, c1..c_{t-1}]
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
 	}
@@ -345,7 +370,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// of it (version, x, and one y byte per secret byte) before it is read, so
 	// no share ever sees another's bytes, and Destroy wipes the last share's
 	// payload on the way out.
-	raw, err := goenclave.NewMemoryEnclaveSized(rawShareOverhead + len(secret))
+	raw, err := enclave.NewMemoryEnclaveSized(rawShareOverhead + len(secret))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking share payload", Err: err}
 	}
@@ -355,21 +380,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 		return nil, &ProtectedMemoryError{Op: "opening share payload", Err: err}
 	}
 
-	// One encoding scratch serves every share. It is SIZED — writable, so it can
-	// be encoded into — and each share's final value is then built from it with
-	// NewMemoryEnclave, which copies locked-to-locked, FREEZES the copy and wipes
-	// this scratch on the way. Both endpoints are mlock'd, so the encoded share
-	// never exists on the ordinary heap, and the value the share keeps faults on
-	// a stray write rather than corrupting silently.
-	//
-	// Two locked regions rather than one is the price of a frozen result until
-	// go-enclave grows a post-fill seal (go-enclave #6); the scratch is released
-	// here, so the steady-state cost is one region per share exactly as before.
-	encScratch, err := goenclave.NewMemoryEnclaveSized(base64.StdEncoding.EncodedLen(len(rw)))
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "locking share encoding scratch", Err: err}
-	}
-	defer encScratch.Destroy()
+	encodedLen := base64.StdEncoding.EncodedLen(len(rw))
 
 	shares := make([]*ProtectedShare, 0, total)
 	// A share built by an earlier iteration is locked memory NOTHING ELSE CAN
@@ -378,11 +389,14 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// So a mid-loop failure must tear down what it already built, or it leaks
 	// mlock'd pages for the life of the process.
 	//
-	// That matters most on exactly the path that reaches it. The failures below
-	// are locked-memory refusals, so they fire when locked memory is already
-	// scarce — and a leak there makes the shortage permanent rather than
-	// transient. Unreachable today (sb is never empty and the scratch is alive
-	// for the whole loop), which is what this cleanup is for.
+	// That matters most on exactly the path that reaches it. Every failure below
+	// is a locked-memory refusal — an allocation for a share value, or the
+	// mprotect that freezes it — so they fire when locked memory is already
+	// scarce, and a leak there makes the shortage permanent rather than
+	// transient. They are REACHABLE now, which they were not before the freeze
+	// collapse: the loop used to allocate nothing (a single scratch was hoisted
+	// above it) and the only per-share call was a copy that could not fail once
+	// the scratch existed.
 	failed := func(op string, err error) error {
 		for _, s := range shares {
 			s.Destroy()
@@ -398,17 +412,34 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 			copy(cf[1:], rc[b*(threshold-1):(b+1)*(threshold-1)])
 			rw[rawShareOverhead+b] = gfPolyEval(cf, x)
 		}
-		// The encoded value is written into locked scratch and moved into the
-		// locked, frozen buffer the share will own. The share material exists in
-		// exactly one place once this returns, and that place is wipeable.
-		sb, err := encScratch.Open()
-		if err != nil {
-			return nil, failed("opening share encoding scratch", err)
-		}
-		base64.StdEncoding.Encode(sb, rw)
-		value, err := newProtectedMemory(sb)
+		// Encoded DIRECTLY into the region the share will own, then frozen. The
+		// share material exists in exactly one place from the moment it exists at
+		// all, and that place is locked and wipeable.
+		//
+		// This used to go through a reused writable scratch and a
+		// NewMemoryEnclave copy out of it, because a sized enclave could not be
+		// frozen after the fill. go-enclave v0.5.0-alpha's Freeze (go-enclave #6)
+		// removed the copy, one whole locked region from the peak footprint (see
+		// splitLockedBytes), and the window in which two copies of a share value
+		// were live at once.
+		value, err := newSizedProtectedMemory(encodedLen)
 		if err != nil {
 			return nil, failed("locking share value", err)
+		}
+		if err := value.WithBytes(func(sb []byte) error {
+			base64.StdEncoding.Encode(sb, rw)
+			return nil
+		}); err != nil {
+			value.Destroy()
+			return nil, failed("encoding share value", err)
+		}
+		// A refused freeze leaves the region alive and WRITABLE. A share whose
+		// value can still be written is not the type this package hands out —
+		// Value documents the buffer as read-only and callers rely on a stray
+		// write faulting — so it is torn down rather than returned.
+		if err := value.Freeze(); err != nil {
+			value.Destroy()
+			return nil, failed("freezing share value", err)
 		}
 		shares = append(shares, &ProtectedShare{
 			Index:     i + 1,
@@ -521,7 +552,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 			return nil, &CombineError{Reason: "share was destroyed during reconstruction"}
 		}
 	}
-	buf, err := goenclave.NewMemoryEnclaveSized(base64.StdEncoding.DecodedLen(widest))
+	buf, err := enclave.NewMemoryEnclaveSized(base64.StdEncoding.DecodedLen(widest))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking decode buffer", Err: err}
 	}
@@ -532,11 +563,12 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// the loop runs — which is the condition go-enclave's Open documents as the
 	// one that makes an aliasing view safe.
 	//
-	// It used to be hoisted for a stronger reason: borrowing was process-wide
-	// (enclave.purgeMu serialized every borrow against any memguard operation
-	// that could purge the process), so touching a second enclave from inside a
-	// share's borrow DEADLOCKED. go-enclave holds only the borrowed enclave's own
-	// read lock, so nesting is merely unnecessary here rather than fatal.
+	// It used to be hoisted for a stronger reason: borrowing was process-wide —
+	// this repository's own pkg/enclave (since deleted) serialized every borrow
+	// against any memguard operation that could purge the process — so touching a
+	// second enclave from inside a share's borrow DEADLOCKED. go-enclave holds only
+	// the borrowed enclave's own read lock, so nesting is merely unnecessary here
+	// rather than fatal.
 	bufBytes, err := buf.Open()
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "opening decode buffer", Err: err}
@@ -578,14 +610,18 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// pass one fixed, so each share's contribution can be added as it is
 	// decoded and its payload immediately overwritten by the next.
 	basis := gfLagrangeZero(xs)
-	scratch, err := goenclave.NewMemoryEnclaveSized(secretLen)
+	// THE ENCLAVE THIS FUNCTION RETURNS, allocated before a single share is
+	// accumulated and written into in place. It is not a scratch — which is what
+	// it used to be, when a frozen result had to be copied out of it — so it is
+	// destroyed on every error path below and on none of the success path.
+	secret, err := enclave.NewMemoryEnclaveSized(secretLen)
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking secret buffer", Err: err}
 	}
 	// Materialized outside the borrow for the same reason as bufBytes above.
-	secretBytes, err := scratch.Open()
+	secretBytes, err := secret.Open()
 	if err != nil {
-		scratch.Destroy()
+		secret.Destroy()
 		return nil, &ProtectedMemoryError{Op: "opening secret buffer", Err: err}
 	}
 	for i, share := range shares {
@@ -601,18 +637,25 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 			accumulateShareInto(secretBytes, bufBytes[rawShareOverhead:n], basis[i])
 			return nil
 		}); werr != nil {
-			scratch.Destroy()
+			secret.Destroy()
 			return nil, werr
 		}
 	}
-	// Moved into a FROZEN region for the same reason a share value is: the
-	// reconstructed key is final, and nothing should mutate it in place. The copy
-	// is locked-to-locked and wipes the scratch, so the secret never reaches the
-	// ordinary heap. Destroy still wipes what is returned.
-	secret, err := newProtectedMemory(secretBytes)
-	scratch.Destroy()
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "locking reconstructed secret", Err: err}
+	// FROZEN for the same reason a share value is: the reconstructed key is final,
+	// and nothing should mutate it in place.
+	//
+	// It used to be a MOVE into a second, from-bytes enclave, because a sized
+	// enclave could not be frozen after its fill. That paid a locked-to-locked
+	// copy and held two regions holding the same secret for its duration.
+	// go-enclave v0.5.0-alpha's Freeze (go-enclave #6) mprotects the region the
+	// accumulation already wrote into, so the secret exists in exactly one place
+	// for its whole life and this function returns the enclave it built.
+	//
+	// A refused freeze is destroyed rather than returned: the caller is promised
+	// material it can read and destroy, not a buffer it can silently corrupt.
+	if ferr := secret.Freeze(); ferr != nil {
+		secret.Destroy()
+		return nil, &ProtectedMemoryError{Op: "freezing reconstructed secret", Err: ferr}
 	}
 	return secret, nil
 }

@@ -45,6 +45,8 @@ package seal
 import (
 	"context"
 	"time"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // StrategyID uniquely identifies a sealing strategy.
@@ -67,18 +69,76 @@ const (
 )
 
 // Credentials holds authentication material for sealing strategies. The Secret
-// field is interpreted differently by each strategy: the software strategy treats
-// it as an Argon2id passphrase, TPM2 may use it as an authorization value, and
-// cloud KMS strategies typically ignore it (relying on ambient credentials).
+// is interpreted differently by each strategy: the software strategy treats it
+// as an Argon2id (or PBKDF2) passphrase, TPM2 may use it as an authorization
+// value, and cloud KMS strategies typically ignore it, relying on ambient
+// credentials.
 //
-// Secret is a []byte rather than a string so callers can wipe it after use
-// (e.g. with crypto/subtle-style zeroing) — a Go string is immutable and
-// cannot be erased, leaving secret material resident in memory until GC.
-// The seal layer treats the passphrase as wipeable from this boundary
-// inward; callers that obtain the secret as a string should convert with
-// []byte(s) and wipe the copy when done.
+// # Secret is protected memory, and that is the whole point (#41)
+//
+// It used to be a []byte, documented as "wipeable from this boundary inward":
+// the seal layer copied it into protected memory and the caller's original
+// stayed the caller's obligation. Two things were wrong with that. The
+// passphrase spent the whole call in collectable, swappable, core-dumpable
+// memory — and for a deferred strategy the passphrase is not a lesser secret
+// than the root key it wraps, it IS that key's protection. And an obligation
+// written in a doc comment is weaker than a type that cannot be got wrong: every
+// strategy in the portfolio implements against this struct, so every one of them
+// had to remember.
+//
+// A [enclave.SealedEnclave] holds the passphrase as CIPHERTEXT at rest and
+// produces plaintext only inside an Open, which is the posture this material
+// wants: a credential is consulted once per seal or unseal and held for a long
+// time in between. A locked-plaintext [enclave.MemoryEnclave] would keep it
+// present-but-locked continuously and buy less.
+//
+// Build one with [NewCredentials], which CONSUMES the caller's slice — that is
+// the "wipeable from this boundary inward" contract made mechanical, since the
+// only thing left worth doing about material that already exists unprotected is
+// not leaving it there.
+//
+// The ZERO VALUE is valid and means "no credentials", which is what a
+// passphrase-bound or ambient-credential strategy expects; it ignores this
+// entirely. The CALLER owns Secret: this package opens it, derives from it and
+// destroys the opened copy, and never destroys the SealedEnclave itself, so one
+// credential serves many calls and is released by the caller's own Destroy.
 type Credentials struct {
-	Secret []byte // #nosec G117 -- this IS a secret field by design
+	// Secret is the authentication material, encrypted at rest in memory. Nil
+	// means the caller supplied none.
+	Secret *enclave.SealedEnclave // #nosec G117 -- this IS a secret field by design
+}
+
+// NewCredentials moves a secret into protected memory and returns the
+// credentials holding it. The source slice is WIPED — that is the whole point,
+// and it is why this constructor exists rather than leaving callers to build the
+// struct: material that reaches here already existed unprotected, and the only
+// thing left worth doing about it is not leaving it there.
+//
+// An empty secret is refused rather than stored. A zero-length passphrase is not
+// a passphrase, and the sealer refuses one in any case: go-enclave answers
+// zero-length material with ErrEmptyEnclave. Refusing it here names the actual
+// fault (ErrInvalidPassphrase) at the point the caller can act on, rather than
+// surfacing a construction error two layers down.
+func NewCredentials(secret []byte) (Credentials, error) {
+	if len(secret) == 0 {
+		return Credentials{}, ErrInvalidPassphrase
+	}
+	// Warned about HERE, at construction, exactly as newSoftwareStrategy warns
+	// for a bound passphrase: the earliest point an operator can act on, and the
+	// last point at which the length is known without opening the enclave again.
+	warnIfPassphraseWeak(len(secret))
+	// go-enclave's error is returned UNWRAPPED, for the reason wrappingCipher
+	// gives for newAESGCM's: it already names its own origin — a
+	// *LockedMemoryError matching ErrLockedMemoryUnavailable, or ErrSealFailed —
+	// and it is not a strategy-level failure. Wrapping it in a *seal.Error would
+	// print "seal failed (strategy=passphrase)" over a refused mlock, which is
+	// both untrue and specific to a strategy this constructor knows nothing
+	// about: Credentials is what a TPM2 or KMS strategy takes too.
+	sealed, err := enclave.NewSealed(secret)
+	if err != nil {
+		return Credentials{}, err
+	}
+	return Credentials{Secret: sealed}, nil
 }
 
 // SealingStrategy defines the interface for wrapping and unwrapping the root key.

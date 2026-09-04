@@ -1030,7 +1030,7 @@ func (zeroReader) Read(p []byte) (int, error) {
 }
 
 // TestWipe asserts the shared wipe helper zeroes its argument. wipe delegates
-// to enclave.WipeBytes (memguard), whose zeroing is resistant to dead-store
+// to go-enclave's Wipe, whose zeroing is resistant to dead-store
 // elimination; every secret-derived scratch buffer in this package — including
 // the per-share raw buffer Split builds before base64-encoding it — goes
 // through it.

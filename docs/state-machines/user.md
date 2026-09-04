@@ -10,7 +10,7 @@ replication, snapshotting and recovery.
 
 ## Before you start
 
-- Go 1.26.6 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.0 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A clear answer to one question: **is your `Update` deterministic?** Every
   replica applies the same entries in the same order and must reach the same
   state. No clock, no random source, no network call, no map iteration order.

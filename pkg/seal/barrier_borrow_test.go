@@ -20,8 +20,7 @@ import (
 	"errors"
 	"testing"
 
-	goenclave "github.com/jeremyhahn/go-enclave"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // errLockRefused stands in for the kernel refusing an mlock.
@@ -204,7 +203,7 @@ func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	}
 
 	// And a retry once the allocator recovers must behave like a first boot.
-	b.lockRootKey = goenclave.NewMemoryEnclaveSized
+	b.lockRootKey = enclave.NewMemoryEnclaveSized
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("retry after the refusal cleared: %v", err)
 	}

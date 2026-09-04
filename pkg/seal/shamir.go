@@ -20,8 +20,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
 )
 
 // jsonNull is the JSON literal a nil slice marshals to; an init result decoded
@@ -209,7 +209,7 @@ func (r *ShamirInitResult) UnmarshalJSON(data []byte) error {
 	// aux.Shares is a heap copy of the shares array — share material — so it is
 	// wiped on every path out. UnmarshalShareSet wipes only the internal copies
 	// it makes, not the slice it is handed.
-	defer wipeBytes(aux.Shares)
+	defer enclave.Wipe(aux.Shares)
 
 	var shares []*shamir.ProtectedShare
 	// An absent or explicitly null "shares" decodes to no shares, mirroring the

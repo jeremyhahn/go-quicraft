@@ -122,7 +122,6 @@ PKG_SM          := ./pkg/sm/...
 PKG_SERVER      := ./pkg/internal/server/...
 PKG_WRITEMODE   := ./pkg/writemode/...
 PKG_BATCH       := ./pkg/batch/...
-PKG_ENCLAVE     := ./pkg/enclave/...
 PKG_CRYPTO      := ./pkg/crypto/...
 
 # Integration test paths
@@ -245,10 +244,6 @@ test-writemode:
 .PHONY: test-batch
 test-batch:
 	$(GOTEST) $(PKG_BATCH)
-
-.PHONY: test-enclave
-test-enclave:
-	$(GOTEST) $(PKG_ENCLAVE)
 
 .PHONY: test-crypto
 test-crypto:
@@ -915,10 +910,6 @@ coverage-writemode: | $(COVER_DIR)
 .PHONY: coverage-batch
 coverage-batch: | $(COVER_DIR)
 	$(call run-coverage,batch,$(PKG_BATCH))
-
-.PHONY: coverage-enclave
-coverage-enclave: | $(COVER_DIR)
-	$(call run-coverage,enclave,$(PKG_ENCLAVE))
 
 .PHONY: coverage-crypto
 coverage-crypto: | $(COVER_DIR)

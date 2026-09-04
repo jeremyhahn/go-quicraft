@@ -164,7 +164,7 @@ func TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal(t *tes
 		t.Fatal("the fixture must differ from the defaults or it proves nothing")
 	}
 
-	creds := Credentials{Secret: []byte("the-deferred-passphrase-value")}
+	creds := mustCreds(t, "the-deferred-passphrase-value")
 	rootKey := make([]byte, rootKeySize)
 	for i := range rootKey {
 		rootKey[i] = byte(i + 1)

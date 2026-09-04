@@ -29,8 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	goenclave "github.com/jeremyhahn/go-enclave"
-	"github.com/jeremyhahn/go-quicraft/pkg/enclave"
+	"github.com/jeremyhahn/go-enclave"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -183,18 +182,18 @@ type Barrier struct {
 	config BarrierConfig // algorithm selection, deployment identity, tracking config
 
 	state   barrierState
-	rootKey *enclave.ProtectedKey // 32 bytes, encrypted at rest in memory via memguard enclave
-	salt    []byte                // 32 bytes, generated at Initialize, used for HKDF
+	rootKey *enclave.SealedEnclave // 32 bytes, held as ciphertext at rest; opened into locked memory
+	salt    []byte                 // 32 bytes, generated at Initialize, used for HKDF
 
 	// hkdfVersion is the DEK-derivation info layout in force. Set to
 	// currentHKDFVersion for a fresh barrier and overwritten from the
 	// persisted SealedRootKey by SetSealedRootKey.
 	hkdfVersion HKDFVersion
 
-	epoch      uint64                           // current key rotation epoch
-	currentDEK *enclave.ProtectedKey            // derived via HKDF from rootKey + epoch, encrypted at rest
-	cipher     cipher.AEAD                      // current epoch's AEAD cipher (cached, opaque)
-	deks       map[uint64]*enclave.ProtectedKey // epoch -> DEK encrypted at rest for re-derivation
+	epoch      uint64                            // current key rotation epoch
+	currentDEK *enclave.SealedEnclave            // derived via HKDF from rootKey + epoch, encrypted at rest
+	cipher     cipher.AEAD                       // current epoch's AEAD cipher (cached, opaque)
+	deks       map[uint64]*enclave.SealedEnclave // epoch -> DEK encrypted at rest for re-derivation
 	ciphers    map[uint64]cipher.AEAD
 
 	// knownEpochs tracks all epochs that have been used (via Initialize or
@@ -321,7 +320,7 @@ type Barrier struct {
 	// barrier stays uninitialized or sealed, and on the unseal path the
 	// strategy's heap copy is still wiped.
 	//
-	// Defaults to goenclave.NewMemoryEnclaveSized; nothing but a test assigns it.
+	// Defaults to enclave.NewMemoryEnclaveSized; nothing but a test assigns it.
 	lockRootKey func(int) (*enclave.MemoryEnclave, error)
 }
 
@@ -393,7 +392,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		config:         config,
 		state:          barrierUninitialized,
 		hkdfVersion:    currentHKDFVersion,
-		deks:           make(map[uint64]*enclave.ProtectedKey),
+		deks:           make(map[uint64]*enclave.SealedEnclave),
 		ciphers:        make(map[uint64]cipher.AEAD),
 		knownEpochs:    make(map[uint64]struct{}),
 		inFlightEpochs: make(map[uint64]int64),
@@ -403,7 +402,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		maxPlaintext:   config.Algorithm.MaxPlaintextSize(),
 		timeNow:        time.Now,
 		randReader:     rand.Reader,
-		lockRootKey:    goenclave.NewMemoryEnclaveSized,
+		lockRootKey:    enclave.NewMemoryEnclaveSized,
 	}, nil
 }
 
@@ -486,12 +485,14 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	//
 	// A SIZED enclave, not a from-bytes one: the material is produced IN PLACE by
 	// the read below, so it never transits the heap on its way in. The pages stay
-	// writable for the enclave's life, which is what makes both the fill and the
-	// terminal NewProtectedKey wipe possible — go-enclave has no post-fill freeze
-	// (go-enclave #6). The borrowed slice never escapes initializeWithRootKey,
-	// which is the condition that makes a writable enclave safe.
+	// writable for the enclave's life, and DELIBERATELY are not frozen even though
+	// MemoryEnclave.Freeze now exists — the terminal enclave.NewSealed wipes this
+	// slice as it consumes it, and a wipe of frozen read-only pages faults the
+	// process. Freezing here would trade a stray-write fault for a certain one.
+	// The borrowed slice never escapes initializeWithRootKey, which is the
+	// condition that makes a writable enclave safe.
 	//
-	// Destroy replaces every wipeBytes(rootKey) that used to stand on the error
+	// Destroy replaces every enclave.Wipe(rootKey) that used to stand on the error
 	// paths: it wipes and unmaps, and being deferred it cannot be skipped by a
 	// return that a later edit adds.
 	rootEnc, err := b.lockRootKey(rootKeySize)
@@ -502,9 +503,9 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 
 	// Everything that touches the root key runs inside the borrow, so a Destroy
 	// cannot unmap the pages underneath it. Nesting a second enclave operation in
-	// here — NewProtectedKey below does exactly that — is legal since the
-	// go-enclave adoption; under the old process-wide purgeMu it was a
-	// self-deadlock, which is why this issue could not be done before #54.
+	// here — enclave.NewSealed below does exactly that — is legal since the
+	// go-enclave adoption; under this repository's old process-wide purgeMu it
+	// was a self-deadlock, which is why this could not be written before #54.
 	return rootEnc.WithBytes(func(rootKey []byte) error {
 		if _, err := io.ReadFull(b.randReader, rootKey); err != nil {
 			return &Error{Strategy: "initialize", Err: err}
@@ -520,7 +521,7 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 // the borrow is open, and the enclave is destroyed immediately afterwards. It
 // must not destroy or re-borrow that enclave either — the caller owns it.
 //
-// There is deliberately no wipeBytes(rootKey) anywhere below. The borrow's
+// There is deliberately no enclave.Wipe(rootKey) anywhere below. The borrow's
 // lifetime is the wipe now, which is the point of the change: an error path
 // added later cannot forget one.
 func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStrategy, creds Credentials, rootKey []byte) error {
@@ -592,8 +593,17 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 
 	if hwEnc != nil {
 		// Hardware mode: skip DEK derivation, use hardware encryptor.
+		//
+		// Sealed BEFORE the first state assignment, so a refusal leaves the
+		// barrier uninitialized and retryable rather than half-installed. It
+		// consumes rootKey on EVERY path including this one, so a failure here
+		// still leaves nothing readable behind.
+		rootPK, sealErr := enclave.NewSealed(rootKey)
+		if sealErr != nil {
+			return &Error{Strategy: "initialize", Err: sealErr}
+		}
 		b.hwEncryptor = hwEnc
-		b.rootKey = enclave.NewProtectedKey(rootKey)
+		b.rootKey = rootPK
 		b.salt = salt
 		b.epoch = initialEpoch
 		b.knownEpochs[initialEpoch] = struct{}{}
@@ -611,11 +621,26 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 		return err
 	}
 
-	// Wrap key material in memguard enclaves (wipes the plain byte slices).
-	dekPK := enclave.NewProtectedKey(dek)
+	// Seal both keys BEFORE the first state assignment, so that everything below
+	// is infallible and a refused allocation cannot leave a barrier half in the
+	// unsealed state. enclave.NewSealed consumes its argument on every path, so
+	// the plain dek and the borrowed rootKey are wiped whether it succeeds or not
+	// — which is why neither needs a hand-written wipe on the error paths here.
+	//
+	// The root key goes LAST because deriveEpochCipher above still needed it in
+	// the clear, and sealing it is what takes it away.
+	dekPK, err := enclave.NewSealed(dek)
+	if err != nil {
+		return &Error{Strategy: "initialize", Err: err}
+	}
+	rootPK, err := enclave.NewSealed(rootKey)
+	if err != nil {
+		dekPK.Destroy()
+		return &Error{Strategy: "initialize", Err: err}
+	}
 
 	// Transition to unsealed state.
-	b.rootKey = enclave.NewProtectedKey(rootKey)
+	b.rootKey = rootPK
 	b.salt = salt
 	b.epoch = initialEpoch
 	b.currentDEK = dekPK
@@ -747,10 +772,10 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	if strategy.ID() == StrategyNone {
 		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, heapKey)
 		if hwErr != nil {
-			wipeBytes(heapKey)
+			enclave.Wipe(heapKey)
 			return hwErr
 		}
-		wipeBytes(heapKey)
+		enclave.Wipe(heapKey)
 		// A nil encryptor here would leave state=unsealed with cipher==nil
 		// and hwEncryptor==nil, and the first Encrypt would nil-dereference.
 		if hwEnc == nil {
@@ -785,7 +810,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	}
 
 	if len(heapKey) != rootKeySize {
-		wipeBytes(heapKey)
+		enclave.Wipe(heapKey)
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
 		b.persistBackoffState()
@@ -804,18 +829,19 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// wipes on the error paths in between.
 	//
 	// Sized rather than from-bytes for the same reason as Initialize: the pages
-	// must stay writable so the terminal NewProtectedKey can wipe them, since
-	// go-enclave has no post-fill freeze (go-enclave #6).
+	// must stay writable so the terminal enclave.NewSealed can wipe them as it
+	// consumes them. MemoryEnclave.Freeze exists now and is deliberately NOT used
+	// here — a wipe of frozen pages faults the process.
 	rootEnc, encErr := b.lockRootKey(rootKeySize)
 	if encErr != nil {
-		wipeBytes(heapKey)
+		enclave.Wipe(heapKey)
 		return &Error{Strategy: "unseal", Err: encErr}
 	}
 	defer rootEnc.Destroy()
 
 	return rootEnc.WithBytes(func(rootKey []byte) error {
 		copy(rootKey, heapKey)
-		wipeBytes(heapKey)
+		enclave.Wipe(heapKey)
 		return b.unsealWithRootKey(ctx, strategy, rootKey)
 	})
 }
@@ -828,7 +854,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 // owns. creds is not threaded through because nothing below this point needs it
 // — the credential was already spent by UnsealRootKey.
 //
-// There is deliberately no wipeBytes(rootKey) below. The borrow's lifetime is
+// There is deliberately no enclave.Wipe(rootKey) below. The borrow's lifetime is
 // the wipe.
 func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrategy, rootKey []byte) error {
 	// Authenticate the persisted metadata BEFORE deriving a single DEK from it.
@@ -862,8 +888,16 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 
 	if hwEnc != nil {
 		// Hardware mode: skip DEK re-derivation, use hardware encryptor.
+		//
+		// Sealed before the first state assignment, so a refused allocation leaves
+		// the barrier SEALED rather than half-unsealed. rootKey is consumed on
+		// every path, failure included.
+		rootPK, sealErr := enclave.NewSealed(rootKey)
+		if sealErr != nil {
+			return &Error{Strategy: "unseal", Err: sealErr}
+		}
 		b.hwEncryptor = hwEnc
-		b.rootKey = enclave.NewProtectedKey(rootKey)
+		b.rootKey = rootPK
 		b.state = barrierUnsealed
 		b.unsealed.Store(true)
 		b.failedAttempts = 0
@@ -892,40 +926,68 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 
 	// Re-derive DEKs for all known epochs (survives seal/unseal cycles).
 	// The current epoch is skipped: its DEK/cipher were already derived
-	// above and are installed below. Deriving it again here would wrap a
-	// second ProtectedKey enclave that the newDEKs[b.epoch] assignment
-	// silently overwrites, leaving an unwiped duplicate of the current
-	// epoch's DEK behind on every unseal.
-	newDEKs := make(map[uint64]*enclave.ProtectedKey)
+	// above and are installed below. Deriving it again here would seal a
+	// second enclave that the newDEKs[b.epoch] assignment silently
+	// overwrites, leaving an unreachable duplicate of the current epoch's
+	// DEK behind on every unseal.
+	//
+	// Every sealed enclave built in this function is UNREACHABLE by the caller
+	// until the commit below installs it, so any early return has to tear down
+	// what it already built or leak it for the life of the process. failed() is
+	// that teardown, and it is the whole of it: the plain per-epoch DEKs need no
+	// wipe of their own because enclave.NewSealed consumes each one on every
+	// path. The one plain slice that outlives a failure is `dek`, derived before
+	// this loop and not yet sealed, which is why the two returns below wipe it
+	// by hand.
+	newDEKs := make(map[uint64]*enclave.SealedEnclave)
 	newCiphers := make(map[uint64]cipher.AEAD)
-	var plainDEKs [][]byte // track for cleanup on error
+	failed := func(err error) error {
+		for _, pk := range newDEKs {
+			pk.Destroy()
+		}
+		return err
+	}
 	for epoch := range b.knownEpochs {
 		if epoch == b.epoch {
 			continue
 		}
 		d, a, derr := b.deriveEpochCipher(rootKey, b.salt, epoch)
 		if derr != nil {
-			wipeBytes(dek)
-			for _, v := range plainDEKs {
-				wipeBytes(v)
-			}
-			return derr
+			enclave.Wipe(dek)
+			return failed(derr)
 		}
-		plainDEKs = append(plainDEKs, d)
-		newDEKs[epoch] = enclave.NewProtectedKey(d)
+		// Consumes d on every path, so there is no plain DEK left to wipe by
+		// hand — which is what the plainDEKs slice this replaced was for.
+		pk, serr := enclave.NewSealed(d)
+		if serr != nil {
+			enclave.Wipe(dek)
+			return failed(&Error{Strategy: "unseal", Err: serr})
+		}
+		newDEKs[epoch] = pk
 		newCiphers[epoch] = a
 	}
 
-	// Wrap current epoch DEK in enclave (wipes dek).
-	dekPK := enclave.NewProtectedKey(dek)
+	// Seal the current epoch's DEK and then the root key, in that order and
+	// both BEFORE the first state assignment: the root key must stay in the
+	// clear until every derivation above has read it, and nothing below may be
+	// able to fail once the barrier starts calling itself unsealed.
+	dekPK, err := enclave.NewSealed(dek)
+	if err != nil {
+		return failed(&Error{Strategy: "unseal", Err: err})
+	}
 
 	// Install the current epoch (skipped by the loop above; this also
 	// covers the case where b.epoch is not in knownEpochs).
 	newDEKs[b.epoch] = dekPK
 	newCiphers[b.epoch] = aead
 
-	// Transition to unsealed state. Wrap root key last (wipes rootKey).
-	b.rootKey = enclave.NewProtectedKey(rootKey)
+	rootPK, err := enclave.NewSealed(rootKey)
+	if err != nil {
+		return failed(&Error{Strategy: "unseal", Err: err})
+	}
+
+	// Transition to unsealed state.
+	b.rootKey = rootPK
 	b.currentDEK = dekPK
 	b.cipher = aead
 	b.deks = newDEKs
@@ -1180,42 +1242,40 @@ func (b *Barrier) seal() error {
 		return ErrBarrierSealed
 	}
 
-	// Drop every live key enclave before dropping the map/field references.
+	// Destroy every live key enclave before dropping the map/field references.
 	//
-	// Precisely what this buys: enclave.ProtectedKey.Clear() releases the
-	// enclave reference so the key can no longer be OPENED — it does NOT zero
-	// the enclave's ciphertext, because memguard.Enclave exposes no API to do
-	// so (see enclave.ProtectedKey.Clear). After seal(), the encrypted DEK
-	// bytes and memguard's session coffer key therefore remain resident until
-	// the GC reclaims them; what is gone is the barrier's ability to decrypt
-	// them, and the plaintext key material (which lives only inside a
-	// short-lived LockedBuffer that Open's callers Destroy). Clear is
-	// idempotent and safe on an already-cleared key.
-	if b.rootKey != nil {
-		b.rootKey.Clear()
-	}
-	if b.currentDEK != nil {
-		b.currentDEK.Clear()
-	}
+	// WHAT THIS BUYS CHANGED WITH THE TYPE, and it changed for the better.
+	// pkg/enclave's ProtectedKey could only Clear — drop the reference, so the
+	// key could no longer be OPENED — because memguard.Enclave exposed no API to
+	// zero its ciphertext and registered no finalizer. The encrypted DEK bytes
+	// therefore stayed resident until the collector reclaimed them, and seal()
+	// could promise revocation but not erasure.
+	//
+	// enclave.SealedEnclave.Destroy WIPES the ciphertext and the wrapped-key blob
+	// before releasing them, under the value's write lock, waiting out any Open
+	// in flight. So after seal() the sealed copy of every key is gone rather than
+	// merely unreachable. Destroy is idempotent and safe on nil, and currentDEK
+	// is also present in b.deks — destroying it twice is deliberate and free.
+	//
+	// It does NOT touch an enclave a previous Open handed out: those belong to
+	// their callers, which Destroy them on their own paths.
+	b.rootKey.Destroy()
+	b.currentDEK.Destroy()
 	for epoch, dek := range b.deks {
-		if dek != nil {
-			dek.Clear()
-		}
+		dek.Destroy()
 		delete(b.deks, epoch)
 	}
 
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
-	b.deks = make(map[uint64]*enclave.ProtectedKey)
-	// Caveat: each cipher.AEAD below holds a COPY of its DEK inside its internal
-	// key schedule (AES expanded key / ChaCha key). Go's stdlib and x/crypto
-	// AEADs expose no key-wipe API, so dropping these references cannot zero
-	// that copy — it lingers in freed heap until GC reclaims it. Neither is the
-	// enclave copy above actively zeroed: Clear only drops the reference (see
-	// the comment on the Clear calls). What seal() guarantees is that no DEK can
-	// be OPENED afterwards; both remaining copies are GC-bounded, and the
-	// enclave one is additionally useless without memguard's session coffer key.
+	b.deks = make(map[uint64]*enclave.SealedEnclave)
+	// Caveat, and it is now the ONLY one: each cipher.AEAD below holds a COPY of
+	// its DEK inside its internal key schedule (AES expanded key / ChaCha key).
+	// Go's stdlib and x/crypto AEADs expose no key-wipe API, so dropping these
+	// references cannot zero that copy — it lingers in freed heap until GC
+	// reclaims it. The sealed copies above ARE zeroed now (see the Destroy calls),
+	// so what used to be two GC-bounded copies is one.
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.hwEncryptor = nil
 	// The encryptor is gone, so the capability it carried is gone with it. A
@@ -2031,8 +2091,26 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 		// Nothing committed yet; the old epoch remains active. deriveEpochCipher
 		// already zeroed any partial key material on its own error path, but the
 		// returned dek (if any) is wiped here for defense in depth.
-		wipeBytes(dek)
+		enclave.Wipe(dek)
 		return 0, err
+	}
+
+	// Step 1b: seal the new DEK BEFORE the state is persisted, so that step 3
+	// stays what its comment claims — a run of INFALLIBLE in-memory mutations.
+	//
+	// The ordering is load-bearing rather than tidy. Sealing allocates locked
+	// pages transiently and can be refused by the kernel, and a refusal after
+	// the persist would leave the durable blob describing an epoch this barrier
+	// never adopted: the old epoch keeps encrypting under a generation the disk
+	// says has moved on. Doing it here makes a refused allocation abort the
+	// rotation with nothing written, which is the same outcome as a failed
+	// persist and the one a caller already knows how to handle.
+	//
+	// It consumes dek on every path, which is why the two error paths below no
+	// longer wipe it by hand and destroy the sealed enclave instead.
+	dekPK, sealErr := enclave.NewSealed(dek)
+	if sealErr != nil {
+		return 0, &Error{Strategy: "rotate", Err: sealErr}
 	}
 
 	// Step 2: persist the new sealed state BEFORE any of it becomes active.
@@ -2046,22 +2124,19 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// blob whose MAC still covered the OLD values would be rejected by the next
 	// Unseal (correctly — it would be indistinguishable from an edited one).
 	if macErr := b.restampStateMACLocked(rootBytes, candidate); macErr != nil {
-		wipeBytes(dek)
+		dekPK.Destroy()
 		return 0, macErr
 	}
 	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
-		wipeBytes(dek)
+		dekPK.Destroy()
 		slog.Error("key rotation aborted: sealed state not persisted; previous epoch remains active",
 			"from_epoch", oldEpoch, "to_epoch", newEpoch, "error", perr)
 		return 0, &StatePersistError{Op: "rotate", Epoch: newEpoch, Err: perr}
 	}
 
-	// Step 3: commit the epoch switch. Wrap the DEK in an enclave (wipes dek)
-	// then perform the in-memory, infallible state mutations under the held write
-	// lock. After this point the NEW key is active and the rotation has
-	// succeeded; the trackers below are reset against the new epoch.
-	dekPK := enclave.NewProtectedKey(dek)
-
+	// Step 3: commit the epoch switch — in-memory, infallible state mutations
+	// under the held write lock. After this point the NEW key is active and the
+	// rotation has succeeded; the trackers below are reset against the new epoch.
 	b.epoch = newEpoch
 	b.currentDEK = dekPK
 	b.cipher = aead
@@ -2189,28 +2264,25 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	}
 
 	for _, epoch := range purgeable {
-		// Drop the purged epoch's key enclave and its AEAD.
+		// Destroy the purged epoch's key enclave and drop its AEAD.
 		//
-		// What this actually guarantees, stated the same way seal() states it:
-		// ProtectedKey.Clear() releases the enclave reference so the DEK can no
-		// longer be OPENED — it does not zero the enclave's ciphertext, because
-		// memguard exposes no API to do so. Deleting b.ciphers[epoch] likewise
-		// only drops a reference to a cipher.AEAD that still holds a verbatim
-		// copy of the DEK in its key schedule (x/crypto's ChaCha20-Poly1305
-		// keeps `key [32]byte`; AES-GCM keeps the expanded round keys, from
-		// which the key is recoverable), and neither stdlib nor x/crypto offers
-		// a key-wipe API.
+		// What this guarantees, stated the same way seal() states it:
+		// SealedEnclave.Destroy WIPES the epoch's sealed DEK, so that copy is
+		// gone rather than merely unreachable — which is what changed when
+		// ProtectedKey (memguard, no way to zero an Enclave's ciphertext) was
+		// replaced. Deleting b.ciphers[epoch] is still only a reference drop:
+		// the cipher.AEAD holds a verbatim copy of the DEK in its key schedule
+		// (x/crypto's ChaCha20-Poly1305 keeps `key [32]byte`; AES-GCM keeps the
+		// expanded round keys, from which the key is recoverable), and neither
+		// stdlib nor x/crypto offers a key-wipe API.
 		//
-		// So purge is a CAPABILITY revocation, not crypto-shredding: after it
-		// returns the barrier can no longer decrypt the epoch, but DEK
-		// confidentiality against memory disclosure (a core dump, a live
-		// process read) remains GC-bounded, not enclave-bounded. Callers that
-		// need the stronger property must bound it outside this process.
-		// Restructuring the cipher cache to hold wipeable key material is a
-		// hot-path change and is deliberately not made here.
-		if dek := b.deks[epoch]; dek != nil {
-			dek.Clear()
-		}
+		// So purge is still a CAPABILITY revocation rather than crypto-shredding:
+		// after it returns the barrier can no longer decrypt the epoch, but DEK
+		// confidentiality against memory disclosure (a core dump, a live process
+		// read) remains GC-bounded through the cipher cache. Restructuring that
+		// cache to hold wipeable key material is a hot-path change and is
+		// deliberately not made here.
+		b.deks[epoch].Destroy()
 		delete(b.deks, epoch)
 		delete(b.ciphers, epoch)
 		delete(b.knownEpochs, epoch)
@@ -2366,7 +2438,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 		copy(keyCopy, b)
 		return nil
 	}); err != nil {
-		wipeBytes(keyCopy)
+		enclave.Wipe(keyCopy)
 		return nil, err
 	}
 	return keyCopy, nil
@@ -2544,7 +2616,7 @@ func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *Seal
 	if _, err := io.ReadFull(hkdf.New(sha256.New, rootKey, nil, []byte(sealedStateMACInfo)), macKey); err != nil {
 		return nil, &Error{Strategy: "state-mac", Err: err}
 	}
-	defer wipeBytes(macKey)
+	defer enclave.Wipe(macKey)
 
 	mac := hmac.New(sha256.New, macKey)
 	var scratch [8]byte
@@ -3093,7 +3165,7 @@ func (b *Barrier) deriveEpochCipher(rootKey, salt []byte, epoch uint64) ([]byte,
 	}
 	aead, err := b.aeadProvider.NewAEAD(alg, dek)
 	if err != nil {
-		wipeBytes(dek)
+		enclave.Wipe(dek)
 		return nil, nil, err
 	}
 	return dek, aead, nil

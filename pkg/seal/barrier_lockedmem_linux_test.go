@@ -57,7 +57,7 @@ func vmLockedKB(t *testing.T) int {
 //
 // Initialize and Unseal each hold the root key in a locked enclave for the whole
 // of their body, and each releases it with a deferred Destroy that REPLACES the
-// eleven hand-written wipeBytes(rootKey) calls the old code carried on its error
+// eleven hand-written enclave.Wipe(rootKey) calls the old code carried on its error
 // paths. The wipes were visible in the diff; a missing Destroy is not — it leaks
 // silently, and every functional assertion in this package still passes.
 //
@@ -74,9 +74,10 @@ func TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
 
-	// Warm-up, OUTSIDE the measurement. memguard allocates its per-process
-	// session coffer in locked memory on first use, and the Go runtime may lock
-	// pages of its own; both are one-time and would otherwise read as a leak.
+	// Warm-up, OUTSIDE the measurement. go-enclave's process Sealer builds its
+	// root and KEK hierarchy in locked memory on the first seal, and the Go
+	// runtime may lock pages of its own; both are one-time and would otherwise
+	// read as a leak.
 	warm := MustNewBarrier(testBarrierConfig(1))
 	if err := warm.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("warm-up Initialize: %v", err)
@@ -93,8 +94,8 @@ func TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave(t *testing.T) {
 	before := vmLockedKB(t)
 
 	// Barriers are retained for the whole loop deliberately. A barrier holds its
-	// root key as a ProtectedKey — memguard ciphertext on the ordinary heap, not
-	// locked memory — so holding them must NOT move VmLck. Letting them be
+	// root key as a SealedEnclave — ciphertext on the ordinary heap, which owns no
+	// locked pages at all — so holding them must NOT move VmLck. Letting them be
 	// collected instead would let a GC cycle mask a real leak.
 	kept := make([]*Barrier, 0, cycles*2)
 	for i := 0; i < cycles; i++ {

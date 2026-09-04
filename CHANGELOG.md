@@ -142,6 +142,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write to it, so pacing sends on that counter deadlocks. Both are noted at the
   call sites so the next reader does not re-derive them.
 
+### Changed — BREAKING: `pkg/enclave` is deleted and `Credentials.Secret` is protected memory (#54, #41)
+
+**Every consumer cascades from this: go-qrdb, go-xkms, go-quicbaas and
+go-trusted-platform all take the `Credentials` retype AND Go 1.27 when they next
+bump.** It is the single breaking release the last two months of sequencing
+existed to buy — #54's stage two, #41's owner-ruled option (c) and #19's
+toolchain wave land together so the portfolio pays for ONE cascade, not three.
+
+- **`pkg/enclave` is GONE, and nothing replaced it in this repository (#54).**
+  Stage one adopted go-enclave's `MemoryEnclave` as an alias; what survived was
+  `ProtectedKey` — material encrypted at rest — which existed ONLY because no
+  released go-enclave tag had a counterpart. go-enclave `v0.5.0-alpha` ships
+  `SealedEnclave`, so `ProtectedKey` is retyped onto it and the package is
+  deleted outright rather than kept as an alias shell.
+
+  Deleting it, rather than aliasing, is the point of the issue: `docs/00 §R` is
+  that no project hand-rolls this, and a re-export is a second NAME for a type
+  that should have one. `pkg/seal/memprotect.go` and its four re-exports
+  (`seal.ProtectedBuffer`, `seal.ProtectedKey`, `seal.NewProtectedKey`,
+  `seal.SealProtectedBuffer`) go with it. `grep -rn "awnumar/memguard" pkg/`
+  returns **nothing** and `memguard` has left `go.mod` and `go.sum` — the
+  verification criterion #54 was filed with, deliberately unmet by stage one,
+  is met now.
+
+  The translation for a consumer is mechanical and total: `ProtectedKey` →
+  `enclave.SealedEnclave`, `NewProtectedKey(b)` → `enclave.NewSealed(b)` (which
+  now returns an error, because sealing allocates locked pages the kernel can
+  refuse), `Clear()` → `Destroy()`, `WipeBytes` → `enclave.Wipe`,
+  `ErrEnclaveNil`/`NilError`/`OpenError` → `enclave.ErrEnclaveDestroyed`.
+
+  **`Destroy` erases where `Clear` could not.** memguard exposed no API to zero
+  an `Enclave`'s ciphertext and registered no finalizer, so `Barrier.seal()`,
+  `PurgeEpochsBefore` and `SoftwareStrategy.Close` could revoke access to a key
+  but not remove it; every "GC-bounded ciphertext" caveat in those paths is
+  retired. The one un-erasable copy that remains is the DEK inside a cached
+  `cipher.AEAD`'s key schedule, which no stdlib or `x/crypto` API can wipe.
+
+  `purgeMu` — the process-wide lock that existed solely to defend against
+  memguard's process-wide purge — is gone with the last memguard call site, and
+  with it the last of the self-deadlock reasoning in `strategy_software.go`.
+
+- **`Credentials.Secret` is a `*enclave.SealedEnclave`, not a `[]byte` (#41,
+  owner-ruled option (c) 2026-09-01).** `Credentials` crosses `SealRootKey`,
+  `UnsealRootKey` and `BarrierEncryptor`, and every strategy in the portfolio
+  implements against it — go-xkms's TPM2, PKCS#11 and cloud-KMS strategies,
+  go-qrdb's shamir and recovery strategies, plus `NoneStrategy` and
+  `SoftwareStrategy` here. This is the portfolio-wide break the single cascade
+  exists to pay for.
+
+  Build one with `seal.NewCredentials([]byte)`, which CONSUMES the caller's
+  slice. That is the "wipeable from this boundary inward" contract the old doc
+  comment asked for, made mechanical: an obligation written in prose is weaker
+  than a type that cannot be got wrong, and for a deferred strategy the
+  passphrase is not a lesser secret than the root key it wraps — it IS that
+  key's protection. The zero value still means "no credentials supplied".
+
+  **`ProtectedCredentials` and `NewProtectedCredentials` are now DEPRECATED
+  ALIASES of `Credentials`/`NewCredentials`.** They existed only while
+  `Credentials.Secret` was a `[]byte`; with one credential type there is nothing
+  left for a second name to express. They are aliases rather than defined types
+  so an implementation whose method signatures name `ProtectedCredentials` still
+  satisfies `ProtectedSealingStrategy` unchanged, and they go at the next
+  breaking release. #41's own objection — *"one interface carrying two
+  credential types is worse than the gap it closes"* — is what this closes.
+
+  A behavioural consequence, stated because it is observable: the deferred
+  `SealRootKey`/`UnsealRootKey` paths no longer build a TEMPORARY INNER STRATEGY
+  from `creds.Secret`. That construction existed to copy a plain passphrase into
+  protected memory, and the passphrase now arrives already there. One check
+  moves with it — `newSoftwareStrategy` refused a FIPS-unapproved KDF at
+  construction, and the refusal now lands at `DeriveKey` instead. Same error,
+  same call, one frame later; the protected pair has behaved this way since PR
+  #40, so this makes the four methods agree rather than changing three of them.
+
+- **The fill-then-move workaround is retired at three sites (go-enclave #6).**
+  `MemoryEnclave.Freeze` did not exist in stage one, so a frozen result had to be
+  built by copying a filled sized enclave into a second from-bytes one — two
+  locked regions live at once and a copy between them. The unsealed root key
+  (`strategy_software.go`), a Shamir share value and a reconstructed secret
+  (`crypto/shamir/protected_share.go`) now fill one region and freeze it in
+  place.
+
+  In the Shamir split the saving is structural rather than cosmetic: the shared
+  encoding scratch was a term in `splitLockedBytes`, so removing it moves the
+  `MaxShareSetBytes` boundary. A 255-of-255 split of a 1757-byte secret now
+  prices at 1,047,032 and is admitted; the first refused length at those
+  dimensions is 1760. Both figures are pinned by test.
+
+  The root-key enclave `Initialize` and `Unseal` hold is deliberately NOT frozen:
+  its last act is to be consumed by `enclave.NewSealed`, which wipes what it is
+  handed, and a wipe of frozen pages faults the process. There is a test for
+  that counter-case so "freeze everything" cannot be applied as a rule.
+
+- **Go 1.27.0 (#19), forced by a Layer 0 dependency rather than chosen.**
+  go-enclave `v0.5.0-alpha`'s own `go` directive is `1.27.0`, so this repository
+  could not consume the sealing seam and stay behind. The owner lifted the hold
+  on 2026-09-03; the `cockroachdb/swiss` compile failure that pinned the
+  portfolio at 1.26 had already been cleared upstream on 2026-08-20, and this
+  repository never had swiss in its graph.
+
+  The `go` directive moves in the ROOT and all five nested modules
+  (`contrib/dragonboat`, `test/performance` and its three benchmark modules),
+  which is not optional: Go evaluates the language version from the MAIN module,
+  so a nested module left behind fails with `module ../.. requires go >= 1.27.0`
+  rather than upgrading. `GO_VERSION` moves to 1.27.0 across `ci.yml`,
+  `nightly.yml`, `release.yml` and `fuzz.yml`, and every `golang:1.26.6` base
+  image to `golang:1.27.0`. **The language floor consumers must satisfy is now
+  1.27.0.**
+
+- **Documentation.** The `docs/memory-enclave/` set is rewritten from "this
+  repository's `pkg/enclave`" to "how this repository consumes go-enclave", since
+  the package it documented no longer exists. `make test-enclave` and
+  `make coverage-enclave` are removed with the package they targeted; every
+  property they asserted belongs to go-enclave and is pinned there.
+
 ### Changed
 
 - **The barrier holds its root key in locked memory for the whole of
