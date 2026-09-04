@@ -135,8 +135,28 @@ func partitionByKey(history []porcupine.Event) [][]porcupine.Event {
 // power set construction explores both. A deterministic model would have to
 // pick one, and either choice turns a real lost write into a pass.
 func kvModel() porcupine.Model {
-	nm := porcupine.NondeterministicModel{
-		PartitionEvent: partitionByKey,
+	nm := kvSpec()
+	nm.PartitionEvent = partitionByKey
+	return nm.ToModel()
+}
+
+// kvSingleKeyModel returns the same specification over a history that has
+// ALREADY been reduced to one key. It exists so a failed whole-history check
+// can be re-run per partition: porcupine reports one verdict for the entire
+// history, which names no key, and the key is the only thing that makes an
+// undecidable or violating result actionable.
+func kvSingleKeyModel() porcupine.Model {
+	nm := kvSpec()
+	nm.PartitionEvent = func(events []porcupine.Event) [][]porcupine.Event {
+		return [][]porcupine.Event{events}
+	}
+	return nm.ToModel()
+}
+
+// kvSpec is the shared nondeterministic specification; the caller supplies the
+// partitioning.
+func kvSpec() porcupine.NondeterministicModel {
+	return porcupine.NondeterministicModel{
 		Init: func() []interface{} {
 			return []interface{}{""}
 		},
@@ -214,7 +234,6 @@ func kvModel() porcupine.Model {
 			return fmt.Sprintf("%q", val)
 		},
 	}
-	return nm.ToModel()
 }
 
 // ---------------------------------------------------------------------------
@@ -430,18 +449,25 @@ type LinearizabilityViolationError struct {
 // mean different things and calling both "a linearizability violation" sends
 // the reader looking for a bug the checker never found. Illegal is a proof that
 // no linearization exists. Unknown is the search budget running out, which on
-// this harness is driven by the INDETERMINATE operation count: the model is
-// deliberately nondeterministic, so each indeterminate write doubles the states
-// a partition's search has to explore. Both still fail the test — an
-// undecidable history is not a passing one — but only one of them is evidence
-// of a defect.
+// this harness is driven by BACKTRACKING, not by history size: a legal history
+// is linearized greedily and decides in milliseconds even with hundreds of
+// indeterminate operations spread over its keys, so a search that exhausts its
+// budget is one that kept failing to place an operation. Both still fail the
+// test — an undecidable history is not a passing one — and neither may be
+// dismissed without the per-partition diagnosis, because "expensive" and
+// "illegal" look identical from the aggregate result.
 func (e *LinearizabilityViolationError) Error() string {
 	if e.Result == porcupine.Unknown {
 		return fmt.Sprintf(
 			"linearizability check did not finish within %v: result=%s, ops=%d, "+
-				"indeterminate=%d. This is the search budget expiring, not a proof "+
-				"of a violation; the cost is exponential in the indeterminate count "+
-				"per key, so treat it as an intractable history rather than a defect",
+				"indeterminate=%d. The budget expired, which is NOT by itself "+
+				"evidence that the history is legal: porcupine finds a "+
+				"linearization quickly when one exists, so a search that runs "+
+				"long is one that is backtracking, and an illegal history is "+
+				"the most expensive case there is. Read the per-partition "+
+				"diagnosis above -- it names the key and gives it a definite "+
+				"verdict. Do not dismiss this as an intractable history until "+
+				"that diagnosis says every partition is Ok",
 			e.Duration, e.Result, e.NumOps, e.Indeterminate,
 		)
 	}
@@ -512,6 +538,144 @@ func floorFor(numClients int, active time.Duration) opsFloor {
 // Linearizability Check Helper
 // ---------------------------------------------------------------------------
 
+// logPartitionCensus reports the per-key shape porcupine actually searches:
+// the widest partition, the deepest concentration of indeterminate operations,
+// and how many partitions there are. These are the only three numbers that
+// explain a checker timeout.
+func logPartitionCensus(t *testing.T, events []porcupine.Event) {
+	t.Helper()
+
+	parts := partitionByKey(events)
+	if len(parts) == 0 {
+		return
+	}
+
+	type shape struct {
+		key   string
+		ops   int
+		indet int
+	}
+	shapes := make([]shape, 0, len(parts))
+	for _, p := range parts {
+		var sh shape
+		for _, ev := range p {
+			switch {
+			case ev.Kind == porcupine.CallEvent:
+				sh.ops++
+				sh.key = ev.Value.(kvInput).Key
+			case ev.Value.(kvOutput).Unknown:
+				sh.indet++
+			}
+		}
+		shapes = append(shapes, sh)
+	}
+	sort.Slice(shapes, func(i, j int) bool {
+		if shapes[i].indet != shapes[j].indet {
+			return shapes[i].indet > shapes[j].indet
+		}
+		return shapes[i].ops > shapes[j].ops
+	})
+
+	var sb strings.Builder
+	limit := min(len(shapes), 5)
+	for _, sh := range shapes[:limit] {
+		fmt.Fprintf(&sb, "\n  %s: %d ops, %d indeterminate", sh.key, sh.ops, sh.indet)
+	}
+	t.Logf("partition census: %d partitions; worst by indeterminate depth:%s", len(shapes), sb.String())
+}
+
+// perPartitionCheckTimeout bounds the per-key re-check that runs only after
+// the whole-history check has already failed. It is generous because it is
+// spent on ONE key, and buying a definite Ok/Illegal for that key is what
+// turns an unactionable timeout into a report.
+const perPartitionCheckTimeout = 60 * time.Second
+
+// diagnosePartitions re-checks every key independently and reports the ones
+// that did not come back Ok, with the operations porcupine could not place.
+//
+// A whole-history Unknown says only that the search ran out of budget; it does
+// not say on which key, and it does not distinguish "expensive but legal" from
+// "illegal and expensive to prove". Per-key verdicts separate those, and an
+// Illegal here is a genuine consensus defect that the aggregate result would
+// have reported as a mere timeout.
+func diagnosePartitions(events []porcupine.Event) (verdicts []partitionVerdict, decided, total int) {
+	model := kvSingleKeyModel()
+	parts := partitionByKey(events)
+	for _, part := range parts {
+		start := time.Now()
+		res := porcupine.CheckEventsTimeout(model, part, perPartitionCheckTimeout)
+		if res == porcupine.Ok {
+			decided++
+			continue
+		}
+		key, ops, indeterminate := partitionShape(part)
+		verdicts = append(verdicts, partitionVerdict{
+			Key:           key,
+			Result:        res,
+			Ops:           ops,
+			Indeterminate: indeterminate,
+			Elapsed:       time.Since(start),
+			Events:        part,
+		})
+	}
+	return verdicts, decided, len(parts)
+}
+
+// partitionVerdict is one key's independent result.
+type partitionVerdict struct {
+	Key           string
+	Result        porcupine.CheckResult
+	Ops           int
+	Indeterminate int
+	Elapsed       time.Duration
+	Events        []porcupine.Event
+}
+
+// reportPartitionDiagnosis runs the per-key re-check and fails the test with
+// the key-level detail the aggregate result cannot carry.
+func reportPartitionDiagnosis(t *testing.T, events []porcupine.Event) {
+	t.Helper()
+
+	verdicts, decided, total := diagnosePartitions(events)
+	t.Logf("per-partition diagnosis: %d of %d partitions decided Ok", decided, total)
+	for _, v := range verdicts {
+		t.Errorf("partition %s: result=%s after %v (%d ops, %d indeterminate)\n%s",
+			v.Key, v.Result, v.Elapsed.Round(time.Millisecond), v.Ops, v.Indeterminate,
+			formatPartition(v.Events))
+	}
+}
+
+// partitionShape returns the key a partition belongs to and its operation and
+// indeterminate counts.
+func partitionShape(part []porcupine.Event) (key string, ops, indeterminate int) {
+	for _, ev := range part {
+		if ev.Kind == porcupine.CallEvent {
+			ops++
+			key = ev.Value.(kvInput).Key
+			continue
+		}
+		if ev.Value.(kvOutput).Unknown {
+			indeterminate++
+		}
+	}
+	return key, ops, indeterminate
+}
+
+// formatPartition renders one key's history in the order porcupine sees it.
+// A partition is a few hundred events, so the whole thing is printed: a
+// truncated history cannot be replayed, and replaying it is the point.
+func formatPartition(part []porcupine.Event) string {
+	var sb strings.Builder
+	for _, ev := range part {
+		kind := "call  "
+		if ev.Kind == porcupine.ReturnEvent {
+			kind = "return"
+		}
+		fmt.Fprintf(&sb, "  client=%d id=%d %s %v\n", ev.ClientId, ev.Id, kind, ev.Value)
+	}
+	return sb.String()
+}
+
 // checkLinearizability runs porcupine on the recorded history and fails the
 // test if the result is not Ok, if the run recorded fewer operations than the
 // floor, or if any client observed a protocol violation.
@@ -520,6 +684,13 @@ func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
 
 	total, determinate, writes, reads := recorder.stats()
 	violations, census := recorder.report()
+
+	// Partition census. A check that returns Unknown does so because ONE
+	// partition was too expensive, never because the history was large in
+	// aggregate -- porcupine decides each key independently. Without this the
+	// only evidence a failure leaves is the total, which cannot distinguish a
+	// wide-but-shallow history from a single pathological key.
+	logPartitionCensus(t, recorder.events())
 
 	t.Logf("history: %d operations recorded, %d completed (%d writes, %d reads), %d indeterminate",
 		total, determinate, writes, reads, total-determinate)
@@ -563,20 +734,12 @@ func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
 	t.Logf("porcupine result: %s (checked %d events in %v)", result, len(events), checkDuration)
 
 	if result != porcupine.Ok {
-		sampleSize := len(events)
-		if sampleSize > 20 {
-			sampleSize = 20
-		}
-		var sb strings.Builder
-		for i := 0; i < sampleSize; i++ {
-			ev := events[i]
-			kind := "call"
-			if ev.Kind == porcupine.ReturnEvent {
-				kind = "return"
-			}
-			fmt.Fprintf(&sb, "  client=%d id=%d %s %v\n", ev.ClientId, ev.Id, kind, ev.Value)
-		}
-		t.Logf("first %d events:\n%s", sampleSize, sb.String())
+		// The whole-history verdict names no key, and the head of the history
+		// is warmup. Re-check each partition on its own: porcupine decides
+		// keys independently, so exactly the partitions that are undecidable
+		// or violating show up here, and their operations are few enough to
+		// print.
+		reportPartitionDiagnosis(t, events)
 		t.Fatalf("%v", &LinearizabilityViolationError{
 			Result:        result,
 			NumOps:        total,
