@@ -132,6 +132,101 @@ Single-node embedded deployments and tests. The QUIC transport is not
 constructed at all, and mTLS validation is skipped because there is nothing to
 validate.
 
+## Task: choose a FIPS mode
+
+If you are deploying into a FIPS-regulated environment, this is the decision to
+make, and it has one sharp edge.
+
+### The three modes
+
+`GODEBUG=fips140=` selects how Go's FIPS 140-3 module behaves:
+
+| mode | module active | non-approved API |
+|---|---|---|
+| `off` (default) | no | allowed |
+| `on` | **yes** | allowed |
+| `only` | **yes** | **refused** |
+
+### What works, measured
+
+| | `fips140=on` | `fips140=only` |
+|---|---|---|
+| seal layer, WAL, snapshots (at rest) | works | works |
+| TLS 1.3 handshake, approved curves | works | works |
+| **QUIC packet protection** | works | **panics** |
+
+**Run a cluster under `GODEBUG=fips140=only` and the process panics** while
+constructing the initial AEAD — before any handshake, so you get no connection
+at all rather than a degraded one. Use `fips140=on`.
+
+### Why `only` refuses it
+
+Not because QUIC uses weak or unapproved cryptography. QUIC protects packets
+with **AES-GCM**, and derives each nonce by XORing the packet number into a
+static IV (RFC 9001 §5.3). That deterministic construction is one NIST
+explicitly permits — SP 800-38D §8.2.1 — and is essentially what TLS 1.3 does
+for its own records.
+
+The refusal is about API surface, not algorithms. Go's module validates
+`cipher.NewGCMWithRandomNonce`; `cipher.NewGCM` with a caller-supplied IV is
+declined under `only`:
+
+```
+crypto/cipher: use of GCM with arbitrary IVs is not allowed in FIPS 140-only
+mode, use NewGCMWithRandomNonce
+```
+
+`crypto/tls` reaches an approved path internally for the same construction.
+`quic-go` cannot: it is third-party code and only public APIs are available to
+it. No configuration of this library changes that, and no QUIC implementation
+can differ — the wire format requires the construction.
+
+### Do NOT reach for GOEXPERIMENT=boringcrypto
+
+It looks like a fix and is a trap. BoringCrypto is a different validated module
+and it fails the *other* way round: `cipher.NewGCM` with a caller-supplied IV
+works, so QUIC is happy — but `NewGCMWithRandomNonce` fails with
+`cipher: NewGCMWithRandomNonce requires aes.Block`, which is what the **seal
+layer** uses. You trade a broken wire for broken data-at-rest.
+
+TLS 1.3 over TCP is clean under both modules; QUIC is clean under neither in
+`only`. That is the whole shape of the problem.
+
+### What we can and cannot tell you about compliance
+
+Stated plainly, because this is the part an auditor will ask about and we would
+rather you arrive prepared than surprised.
+
+**What is established:**
+
+- Under `fips140=on` the validated module is active, and AES-GCM executes
+  through it.
+- The IV construction QUIC uses is a permitted one under SP 800-38D §8.2.1.
+- Everything outside `pkg/internal/transport` runs and is tested under
+  `fips140=only` — `make verify-fips` proves it, continuously.
+
+**What is NOT established, and we will not claim:**
+
+- Whether Go's CMVP certificate lists **GCM with an externally-supplied IV** as
+  an approved *service* of the validated module. `only` declining it is evidence
+  that the module does not vouch for it, whatever SP 800-38D permits of the
+  construction in the abstract.
+
+That distinction is a question for your assessor and for Go's FIPS 140-3
+security policy, not for this project. **We are telling you exactly where the
+boundary of our knowledge is rather than asserting a compliance posture we are
+not qualified to grant.**
+
+The accurate summary: go-quicraft is **FIPS at rest, not FIPS on the wire.** If
+your assessment requires approved-only cryptography end to end on the wire, you
+must terminate this transport inside an approved tunnel or outside the boundary.
+If your assessment accepts `fips140=on` with the module active, nothing here
+blocks you.
+
+`docs/quic-transport/architecture.md` §FIPS 140-3 exemption record carries the
+full citations, the scope enforcement, and the owner's acceptance decision —
+that is the document to hand an assessor.
+
 ## Troubleshooting
 
 **The cluster never forms and the logs show only dial timeouts** — check UDP.

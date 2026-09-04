@@ -599,6 +599,12 @@ make verify-fips # Run the FIPS boundary under GODEBUG=fips140=only
 make verify-fips-transport # Run the one exempt tree under GODEBUG=fips140=on
 ```
 
+**Deploying under FIPS?** Use `GODEBUG=fips140=on`, not `only` — a clustered
+process panics inside the QUIC library under `only`, and
+`GOEXPERIMENT=boringcrypto` breaks the seal layer instead. See
+[Choose a FIPS mode](docs/quic-transport/user.md#task-choose-a-fips-mode) for
+what is established about compliance and what is not.
+
 `make ci` runs `go test` with no build tags, which leaves out the integration,
 fault-injection and fuzz suites. `make ci-full` is the one that matches CI.
 The security scans are gosec, govulncheck, `go mod verify` and trivy; nancy is
