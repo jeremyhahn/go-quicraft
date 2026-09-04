@@ -164,6 +164,42 @@ func seedLocalSnapshot(t *testing.T, db *mockLogDB, v snapshotVariant, barrier B
 	return dir
 }
 
+// quiescentMembers is the initial membership a recovery test starts its replica
+// with when it goes on to assert an EXACT ns.lastApplied: the replica under
+// test plus one peer that is never started.
+//
+// A SINGLE-member shard makes that assertion unwinnable. One voter is its own
+// quorum, so the replica campaigns on the step worker's first election tick,
+// wins uncontested, and appends the leader's empty no-op at snapshotIndex+1,
+// which the apply loop then applies and which advances ns.lastApplied off the
+// index recovery seeded it with. Measured on this fixture with a poll straight
+// after StartShard: the counter went 40 -> 41 within milliseconds on all four
+// artifact variants, so whether the assertion samples 40 or 41 is a race
+// against that tick. It was seen losing on CI (#84,
+// "ns.lastApplied = 41, want 40") while recoverCalled and the payload
+// comparison — the assertions the test exists for — passed in the same run.
+//
+// Two voters and no transport make the counter quiescent instead of merely
+// slow: the replica can never collect a second vote, so it never becomes
+// leader, never appends, and nothing can advance ns.lastApplied past the
+// recovered index. Measured: 40 held for a full 3s on every variant. This is
+// also the ordinary shape of the event under test — a replica restarting from
+// its local snapshot before its peers are back — and recovery itself is
+// membership-independent, running inside StartShard before raft does anything,
+// so what the test proves is unchanged.
+//
+// Widening the assertion to tolerate the no-op instead would have been weaker,
+// not just uglier. A replica whose applied marker was never seeded from the
+// snapshot sits at 0 and is then carried to snapshotIndex+1 by that same
+// no-op, so any bound that admits snapshotIndex+1 also admits the defect the
+// assertion exists to catch. Keeping the shard quiescent keeps the equality.
+//
+// A function rather than a package-level var so each subtest gets its own map
+// and no two of them can ever share mutable fixture state.
+func quiescentMembers() map[uint64]string {
+	return map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001"}
+}
+
 // recordingMemSM is an in-memory state machine that captures the bytes
 // RecoverFromSnapshot received and rejects any payload that is not the
 // plaintext it saved. The rejection is what turns "ciphertext (or compressed
@@ -239,7 +275,7 @@ func TestStartShard_LocalSnapshotRecovery_InMemorySM(t *testing.T) {
 
 			memSM := &recordingMemSM{want: payload}
 			create := func(_, _ uint64) interface{} { return memSM }
-			if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, create,
+			if startErr := h.StartShard(quiescentMembers(), false, create,
 				v.shardConfig(1, 1)); startErr != nil {
 				t.Fatalf("StartShard failed on a %s local snapshot: %v", v.name, startErr)
 			}
@@ -251,8 +287,12 @@ func TestStartShard_LocalSnapshotRecovery_InMemorySM(t *testing.T) {
 				t.Fatalf("state machine recovered %q, want %q (reader chain does not mirror the writer chain)",
 					memSM.recovered, payload)
 			}
+			// Exact, and safe to read the instant StartShard returns: the
+			// applied marker is seeded to the recovered index BEFORE the
+			// nodeState is published, and quiescentMembers keeps the shard
+			// from electing itself and moving it afterwards.
 			if got := testLoadNode(h, 1).lastApplied.Load(); got != 40 {
-				t.Errorf("ns.lastApplied = %d, want 40", got)
+				t.Errorf("ns.lastApplied = %d, want 40 (the recovered snapshot index)", got)
 			}
 			assertNoDecryptScratch(t, dir)
 		})
@@ -580,7 +620,7 @@ func TestExportImportSnapshot_RoundTripRecoversPlaintext(t *testing.T) {
 
 			memSM := &recordingMemSM{want: payload}
 			create := func(_, _ uint64) interface{} { return memSM }
-			if startErr := dst.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, create,
+			if startErr := dst.StartShard(quiescentMembers(), false, create,
 				v.shardConfig(1, 1)); startErr != nil {
 				t.Fatalf("StartShard(dst) after import: %v", startErr)
 			}
@@ -590,6 +630,10 @@ func TestExportImportSnapshot_RoundTripRecoversPlaintext(t *testing.T) {
 			if !bytes.Equal(memSM.recovered, payload) {
 				t.Fatalf("restored state machine recovered %q, want %q", memSM.recovered, payload)
 			}
+			// Exact for the same reason as the local-recovery test above; the
+			// single-member form of this assertion was measured going
+			// 1500 -> 1501 on every variant, it had simply not lost the race
+			// on CI yet.
 			if got := testLoadNode(dst, 1).lastApplied.Load(); got != 1500 {
 				t.Errorf("ns.lastApplied = %d, want 1500 (the exported snapshot index)", got)
 			}
