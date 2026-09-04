@@ -70,7 +70,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	// Use the correct ConfigChangeID to add a replica — should succeed.
 	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.0.0.1:59999", currentID); addErr != nil {
+	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.10.0.1:59999", currentID); addErr != nil {
 		t.Fatalf("SyncRequestAddReplica with correct ConfigChangeID failed: %v", addErr)
 	}
 	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d succeeded", currentID)
@@ -89,7 +89,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	// Using the OLD ConfigChangeID (which is now stale) should fail.
 	staleCtx, staleCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer staleCancel()
-	staleErr := leaderHost.SyncRequestAddReplica(staleCtx, 1, 11, "127.0.0.1:59998", currentID)
+	staleErr := leaderHost.SyncRequestAddReplica(staleCtx, 1, 11, "127.10.0.1:59998", currentID)
 	if staleErr == nil {
 		// If the initial ConfigChangeID was 0, the staleness check is skipped
 		// (0 means "don't check"). Use the freshID instead and verify that
@@ -107,7 +107,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 			// Now use freshID (which is stale after the second add).
 			stale2Ctx, stale2Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer stale2Cancel()
-			stale2Err := leaderHost.SyncRequestAddReplica(stale2Ctx, 1, 12, "127.0.0.1:59997", freshID)
+			stale2Err := leaderHost.SyncRequestAddReplica(stale2Ctx, 1, 12, "127.10.0.1:59997", freshID)
 			if stale2Err == nil {
 				t.Fatal("SyncRequestAddReplica with stale non-zero ConfigChangeID should return error")
 			}
@@ -206,7 +206,7 @@ func TestIntegration_DB_SyncRequestAddReplica(t *testing.T) {
 	// Add replica 10 at a dummy address.
 	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.0.0.1:59999", membership.ConfigChangeID); addErr != nil {
+	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.10.0.1:59999", membership.ConfigChangeID); addErr != nil {
 		t.Fatalf("SyncRequestAddReplica failed: %v", addErr)
 	}
 
@@ -250,7 +250,7 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	// Add non-voting replica 20 at a dummy address.
 	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddNonVoting(addCtx, 1, 20, "127.0.0.1:59998", membership.ConfigChangeID); addErr != nil {
+	if addErr := leaderHost.SyncRequestAddNonVoting(addCtx, 1, 20, "127.10.0.1:59998", membership.ConfigChangeID); addErr != nil {
 		t.Fatalf("SyncRequestAddNonVoting failed: %v", addErr)
 	}
 
@@ -369,7 +369,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	// FIRST config change. It appends to the leader's log immediately, which
 	// raises log.confChangeIndex; because processed is pinned below it by the
 	// gate, the pending-config-change latch now stays armed indefinitely.
-	rs1, err := leaderHost.RequestAddReplica(1, 10, "127.0.0.1:59990", configChangeID, defaultTimeout)
+	rs1, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59990", configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("first RequestAddReplica failed: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	settle.Stop()
 
 	// SECOND config change, overlapping the first. This must be rejected.
-	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.0.0.1:59991", configChangeID, defaultTimeout)
+	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.10.0.1:59991", configChangeID, defaultTimeout)
 	if secondErr != nil {
 		// The submission path may reject synchronously; it must still be a
 		// rejection and not some unrelated failure.
@@ -453,7 +453,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	// fails here.
 	seqCtx, seqCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer seqCancel()
-	if addErr := leaderHost.SyncRequestAddReplica(seqCtx, 1, 11, "127.0.0.1:59991",
+	if addErr := leaderHost.SyncRequestAddReplica(seqCtx, 1, 11, "127.10.0.1:59991",
 		updatedMembership.ConfigChangeID); addErr != nil {
 		t.Fatalf("sequential config change after the first applied must succeed, got: %v", addErr)
 	}

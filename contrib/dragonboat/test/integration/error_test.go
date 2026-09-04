@@ -264,7 +264,7 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRequestAddReplica", func(t *testing.T) {
-		err := leaderHost.SyncRequestAddReplica(ctx, 1, 99, "127.0.0.1:59999", 0)
+		err := leaderHost.SyncRequestAddReplica(ctx, 1, 99, "127.10.0.1:59999", 0)
 		if err == nil {
 			t.Fatal("SyncRequestAddReplica should reject context without deadline")
 		}
@@ -284,7 +284,7 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRequestAddNonVoting", func(t *testing.T) {
-		err := leaderHost.SyncRequestAddNonVoting(ctx, 1, 99, "127.0.0.1:59999", 0)
+		err := leaderHost.SyncRequestAddNonVoting(ctx, 1, 99, "127.10.0.1:59999", 0)
 		if err == nil {
 			t.Fatal("SyncRequestAddNonVoting should reject context without deadline")
 		}

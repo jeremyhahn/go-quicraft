@@ -54,7 +54,7 @@ func TestIntegration_DB_SyncRequestAddWitness(t *testing.T) {
 	// Add witness replica 30 at a dummy address.
 	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddWitness(addCtx, 1, 30, "127.0.0.1:59990", membership.ConfigChangeID); addErr != nil {
+	if addErr := leaderHost.SyncRequestAddWitness(addCtx, 1, 30, "127.10.0.1:59990", membership.ConfigChangeID); addErr != nil {
 		t.Fatalf("SyncRequestAddWitness failed: %v", addErr)
 	}
 
@@ -97,7 +97,7 @@ func TestIntegration_DB_RequestAddWitness_Async(t *testing.T) {
 	}
 
 	// Async add witness replica 31.
-	rs, addErr := leaderHost.RequestAddWitness(1, 31, "127.0.0.1:59991", membership.ConfigChangeID, defaultTimeout)
+	rs, addErr := leaderHost.RequestAddWitness(1, 31, "127.10.0.1:59991", membership.ConfigChangeID, defaultTimeout)
 	if addErr != nil {
 		t.Fatalf("RequestAddWitness failed: %v", addErr)
 	}

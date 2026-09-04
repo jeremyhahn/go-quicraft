@@ -51,7 +51,7 @@ func TestIntegration_DB_AsyncRequestAddReplica(t *testing.T) {
 
 	// Use async RequestAddReplica to add a replica ID 10 (non-existent
 	// address, but the config change should still commit).
-	rs, err := leaderHost.RequestAddReplica(1, 10, "127.0.0.1:59999", configChangeID, defaultTimeout)
+	rs, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59999", configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("RequestAddReplica failed: %v", err)
 	}
