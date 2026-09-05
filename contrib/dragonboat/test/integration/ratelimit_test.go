@@ -39,7 +39,7 @@ func TestIntegration_DB_ProposalsWorkWhenRateLimited(t *testing.T) {
 		return dbConfig.Config{
 			ShardID:         shardID,
 			ReplicaID:       replicaID,
-			ElectionRTT:     10,
+			ElectionRTT:     testElectionRTT,
 			HeartbeatRTT:    1,
 			CheckQuorum:     true,
 			MaxInMemLogSize: 10 * 1024 * 1024, // 10MB
@@ -89,7 +89,7 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	cfg := dbConfig.Config{
 		ShardID:         1,
 		ReplicaID:       1,
-		ElectionRTT:     10,
+		ElectionRTT:     testElectionRTT,
 		HeartbeatRTT:    1,
 		CheckQuorum:     true,
 		MaxInMemLogSize: 129, // smallest legal value -- extremely aggressive

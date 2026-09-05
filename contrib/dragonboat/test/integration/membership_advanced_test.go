@@ -42,7 +42,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 		return dbConfig.Config{
 			ShardID:             shardID,
 			ReplicaID:           replicaID,
-			ElectionRTT:         10,
+			ElectionRTT:         testElectionRTT,
 			HeartbeatRTT:        1,
 			CheckQuorum:         true,
 			OrderedConfigChange: true,
@@ -309,7 +309,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 		return dbConfig.Config{
 			ShardID:             shardID,
 			ReplicaID:           replicaID,
-			ElectionRTT:         10,
+			ElectionRTT:         testElectionRTT,
 			HeartbeatRTT:        1,
 			CheckQuorum:         true,
 			OrderedConfigChange: true,

@@ -326,33 +326,98 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 		return ok && val == "0"
 	})
 
-	const testDuration = 3 * time.Second
-
 	// minSuccessfulReads is the floor below which this test asserts nothing.
 	// The reader's monotonicity and non-empty checks only execute on a read
 	// that actually returned, so without a floor a run in which every single
-	// SyncRead errored — the reader spinning on `continue` for three seconds —
-	// reached the end of the test green. On a quiet machine the reader
-	// completes on the order of a thousand reads in the window; 50 is a floor
-	// that a working implementation clears by a wide margin and a broken one
-	// cannot.
+	// SyncRead errored — the reader spinning on `continue` — reached the end of
+	// the test green. 50 is a floor a working implementation clears by a wide
+	// margin and a broken one cannot.
 	const minSuccessfulReads = 50
+
+	// concurrentPhaseFloor is how long the concurrent phase runs REGARDLESS of
+	// how quickly the reader gets its 50 reads, and concurrentPhaseBudget is
+	// the point past which it gives up waiting for them.
+	//
+	// Three seconds used to be a DEADLINE: the phase ran for exactly that long
+	// and then asserted that at least 50 reads had landed inside it. That is a
+	// throughput assertion wearing a correctness assertion's clothes, and on a
+	// saturated host it fails without anything being wrong. Measured on 24
+	// cores at load average 170-205: the same reader that completes 700-1100
+	// reads in three seconds on a quiet box completed 4, 6, 9 and 24 — with
+	// ZERO errors. Every read succeeded; there were simply not many of them,
+	// because each one took most of a second. Nothing about linearizability
+	// was ever in question.
+	//
+	// So three seconds is now the floor and the budget is the deadline. On a
+	// quiet machine the phase is three seconds and roughly a thousand reads,
+	// exactly as before — the monotonicity check is a sampling check and this
+	// keeps its sample size. On a starved machine the phase runs on past three
+	// seconds until it has the 50 reads its conclusions rest on, instead of
+	// stopping on the clock and reporting the shortfall as a defect.
+	//
+	// The budget is what remains of the old assertion's teeth: an
+	// implementation that cannot produce 50 good reads and one observed write
+	// in this long fails, and says so in terms of the shard rather than of the
+	// clock. It is written in election rounds so that it tracks ElectionRTT
+	// and RTTMillisecond (see helpers_test.go), and it is the cold-start
+	// budget's length because the phase must be able to absorb one complete
+	// leaderless window — the shard losing and re-electing a leader mid-phase
+	// is normal under saturation — and still gather its evidence afterwards.
+	//
+	// The floor is shorter than the budget by construction; the wait below
+	// relies on it.
+	const concurrentPhaseFloor = 3 * time.Second
+	const concurrentPhaseBudget = coldStartElectionRounds * electionRound
+
+	// readRetryInterval is how long the reader waits after a failed read.
+	//
+	// A ReadIndex refused because the shard has no leader is refused in
+	// microseconds, so an un-throttled reader retries it tens of thousands of
+	// times per second. That is where "4252 errors against 85 successes" in
+	// #115 came from: not a 50:1 failure rate, but a tight loop measuring how
+	// fast it can spin through one leaderless window. One Raft tick is the
+	// finest granularity at which the shard's leadership can actually change,
+	// so retrying faster than that only burns a core the host has already run
+	// out of and inflates a counter into a number that looks like a defect.
+	const readRetryInterval = raftTick
 
 	var (
 		writeCounter atomic.Int64
 		readCount    atomic.Int64
 		readErrCount atomic.Int64
-		lastSeenRead atomic.Int64
-		writeErr     atomic.Value
-		readErr      atomic.Value
-		wg           sync.WaitGroup
-		stopCh       = make(chan struct{})
+		// readErrLedCount counts only the errors observed while the shard
+		// HAD a leader. See the final assertions for why the distinction is
+		// the whole assertion.
+		readErrLedCount atomic.Int64
+		lastSeenRead    atomic.Int64
+		writeErr        atomic.Value
+		readErr         atomic.Value
+		wg              sync.WaitGroup
+		stopCh          = make(chan struct{})
+		// phaseDoneCh is closed when running the concurrent phase any longer
+		// cannot change its outcome. That is either of:
+		//
+		//   - the reader has gathered what the final assertions need:
+		//     minSuccessfulReads successful linearizable reads, at least one
+		//     of which observed a value the writer produced during this phase.
+		//     Tying the exit condition to the assertions themselves is what
+		//     stops the phase ending just short of being able to conclude
+		//     anything;
+		//   - either goroutine has given up and stored an error. Waiting out
+		//     the remaining budget would only delay reporting a linearizability
+		//     violation that has already been found.
+		phaseDoneCh   = make(chan struct{})
+		phaseDoneOnce sync.Once
+		phaseDone     = func() { phaseDoneOnce.Do(func() { close(phaseDoneCh) }) }
 	)
 
 	// Writer goroutine: continuously proposes incrementing values for "counter".
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// A writer that has stopped can produce no further evidence, so the
+		// phase should not wait out its budget for evidence that is not coming.
+		defer phaseDone()
 		for {
 			select {
 			case <-stopCh:
@@ -387,14 +452,22 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer phaseDone()
 
 		var lastSeen int64
 
 		for {
 			select {
 			case <-stopCh:
-				t.Logf("reader completed %d successful reads (%d errored), last seen value: %d",
-					readCount.Load(), readErrCount.Load(), lastSeen)
+				// The errored count is reported split, because the two halves
+				// mean opposite things: an error taken while the shard had a
+				// leader is a signal about the engine, and one taken during a
+				// leaderless window is a signal about the host's scheduler.
+				errs := readErrCount.Load()
+				led := readErrLedCount.Load()
+				t.Logf("reader completed %d successful reads (%d errored: %d with a leader, "+
+					"%d during a leaderless window), last seen value: %d",
+					readCount.Load(), errs, led, errs-led, lastSeen)
 				return
 			default:
 			}
@@ -405,14 +478,23 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 
 			if err != nil {
 				// Transient errors during concurrent writes are expected, but
-				// they are COUNTED: the caller asserts that successful reads
-				// outnumber failed ones, so a reader that only ever errors can
-				// no longer reach the end of the test green.
+				// they are COUNTED, and classified: an error taken while the
+				// shard HAD a leader is the one the final assertion is about.
+				// findLeader takes the cluster's read lock and never touches
+				// t, so it is safe from this goroutine — tryProposeToLeader,
+				// which the writer above calls, resolves through it too.
 				readErrCount.Add(1)
+				if cluster.findLeader(shardID) >= 0 {
+					readErrLedCount.Add(1)
+				}
+				// Back off before retrying. A refusal costs microseconds; the
+				// condition behind it clears no faster than a Raft tick.
+				retry := time.NewTimer(readRetryInterval)
 				select {
 				case <-stopCh:
+					retry.Stop()
 					return
-				default:
+				case <-retry.C:
 				}
 				continue
 			}
@@ -447,16 +529,39 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 
 			lastSeen = num
 			lastSeenRead.Store(num)
-			readCount.Add(1)
+			n := readCount.Add(1)
+
+			// Signal once the evidence the final assertions need is in hand:
+			// enough successful reads, and at least one of them past the seed
+			// so "reads observed a concurrent write" can be concluded.
+			if n >= minSuccessfulReads && lastSeen > 0 {
+				phaseDone()
+			}
 		}
 	}()
 
-	// Let the concurrent phase run for the test duration.
-	testTimer := time.NewTimer(testDuration)
-	<-testTimer.C
-	testTimer.Stop()
+	// Run the concurrent phase for at least the floor, then on until the reader
+	// has what the assertions need or the budget expires.
+	phaseStart := time.Now()
+	floor := time.NewTimer(concurrentPhaseFloor)
+	<-floor.C
+	floor.Stop()
+
+	// concurrentPhaseFloor < concurrentPhaseBudget, so this is always positive.
+	if remaining := concurrentPhaseBudget - time.Since(phaseStart); remaining > 0 {
+		budget := time.NewTimer(remaining)
+		select {
+		case <-phaseDoneCh:
+		case <-budget.C:
+		}
+		budget.Stop()
+	}
+
+	phaseElapsed := time.Since(phaseStart)
 	close(stopCh)
 	wg.Wait()
+	t.Logf("concurrent phase took %v (floor %v, budget %v)",
+		phaseElapsed.Round(time.Millisecond), concurrentPhaseFloor, concurrentPhaseBudget)
 
 	// Check for errors from both goroutines.
 	if stored := writeErr.Load(); stored != nil {
@@ -475,16 +580,45 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 
 	reads := readCount.Load()
 	readFailures := readErrCount.Load()
+	ledFailures := readErrLedCount.Load()
 	if reads < minSuccessfulReads {
-		t.Fatalf("reader completed only %d successful linearizable reads in %v (want at least %d); "+
-			"%d reads returned an error. The monotonicity and non-empty checks only run on a read "+
-			"that returned, so a run this thin asserts nothing about linearizability",
-			reads, testDuration, minSuccessfulReads, readFailures)
+		t.Fatalf("reader completed only %d successful linearizable reads within %v (want at least %d); "+
+			"%d reads returned an error, %d of them while the shard had a leader. The monotonicity and "+
+			"non-empty checks only run on a read that returned, so a run this thin asserts nothing "+
+			"about linearizability",
+			reads, phaseElapsed.Round(time.Millisecond), minSuccessfulReads, readFailures, ledFailures)
 	}
-	if readFailures >= reads {
-		t.Fatalf("linearizable reads failed more often than they succeeded: %d errors vs %d successes; "+
-			"a leader serving a settled shard must complete the overwhelming majority of ReadIndex reads",
-			readFailures, reads)
+
+	// The failure-rate assertion counts only the errors taken while the shard
+	// HAD a leader, and that restriction is the assertion rather than a
+	// weakening of it.
+	//
+	// What it exists to catch is a leader that refuses reads it should serve:
+	// ReadIndex requests dropped under load, ErrReadIndexNotReady mishandled,
+	// a settled shard that will not answer. Every one of those shows up as an
+	// error taken while a leader is sitting right there, and every one is
+	// still caught.
+	//
+	// What it counted before, and must not, is a read refused because the
+	// shard genuinely had NO leader. Under CPU starvation a three-node shard
+	// on this configuration does lose its leader — an election timeout is 500ms
+	// of ticks, and a starved tick is late — and for the length of that window
+	// the correct answer to a linearizable read is a refusal. handleFollowerReadIndex
+	// returns NotLeaderError when r.leaderID is noLeader, quicraft's
+	// ErrNotLeader, which this adapter folds into ErrShardNotReady. Counting
+	// that against the engine asserts that Raft never holds an election, which
+	// is not a property Raft has.
+	//
+	// #115 measured the difference: of 6691 errors in one run, 6691 were taken
+	// with findLeader() == -1 — no replica anywhere considered itself leader —
+	// and 0 with a leader present. The old assertion was reading a leaderless
+	// window as an engine defect.
+	if ledFailures >= reads {
+		t.Fatalf("linearizable reads failed more often than they succeeded WHILE THE SHARD HAD A LEADER: "+
+			"%d such errors vs %d successes (%d errors total, so %d were taken during a leaderless "+
+			"window and are not counted); a leader serving a settled shard must complete the "+
+			"overwhelming majority of ReadIndex reads",
+			ledFailures, reads, readFailures, readFailures-ledFailures)
 	}
 
 	// Value assertion, not merely an absence-of-error assertion: the reads must

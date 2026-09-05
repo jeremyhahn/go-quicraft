@@ -46,17 +46,115 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Constants
+// Raft timing, and the wait budgets derived from it
+//
+// Every election budget below is DERIVED from the shard configuration these
+// tests actually start, and dbTestNodeHostConfig / dbTestShardConfig are
+// written in terms of the same constants. Neither side can be changed without
+// the other following, which is the entire point of the arrangement.
+//
+// A timeout literal is a value that is not pinned treated as though it were.
+// That is the class this repository has now been bitten by eight times (#84,
+// #88, #90, #91, #103, #105, #107, #112) — there the unpinned value is the
+// leader index; here it is the shard configuration the budget is supposed to
+// describe. #115 is what it looks like when it bites: ElectionRTT is 10 and
+// RTTMillisecond is 50, so a single election attempt can run a full second,
+// and the budget for a THREE-node cold start was five of them.
 // ---------------------------------------------------------------------------
 
-// defaultTimeout is the standard timeout for integration test operations.
+// testRTTMillisecond is the Raft tick interval, in milliseconds, that
+// dbTestNodeHostConfig gives every host in this suite. One tick is one
+// RTTMillisecond: engine.New computes its tick interval directly from this
+// field, so every timeout expressed in ticks is this many milliseconds each.
+const testRTTMillisecond = 50
+
+// testElectionRTT is the ElectionRTT dbTestShardConfig gives every shard: the
+// number of ticks a follower waits without hearing from a leader before it
+// stands for election.
+const testElectionRTT = 10
+
+// raftTick is one Raft tick in wall-clock time.
+const raftTick = testRTTMillisecond * time.Millisecond
+
+// electionRound is the longest a SINGLE election attempt can run before the
+// next candidate's timer fires and the attempt is superseded.
+//
+// It is TWICE ElectionRTT, not once: raft randomises each replica's election
+// timer over [electionTimeout, 2*electionTimeout) — see
+// raft.randomizedElectionTimeout, r.electionTimeout + r.rng.Intn(...) — so the
+// upper bound on one attempt is two election timeouts' worth of ticks. A
+// budget written against the un-randomised value is half the size it looks.
+const electionRound = 2 * testElectionRTT * raftTick
+
+// defaultTimeout is the standard budget for a single Raft operation that is
+// not an election: a proposal round trip, a linearizable read, a membership
+// query. It is deliberately NOT expressed in election rounds, because none of
+// those wait for an election.
 const defaultTimeout = 15 * time.Second
 
-// leaderElectionTimeout is the time to wait for a leader election.
-const leaderElectionTimeout = 5 * time.Second
+// coldStartElectionRounds is how many worst-case election rounds
+// leaderElectionTimeout allows a freshly started shard.
+//
+// FOUR of them are the protocol's own worst case for a cold start, and each is
+// bounded by electionRound:
+//
+//   - the QUIC handshake and mTLS exchange between all three hosts, which must
+//     complete before the first RequestVote can even be answered;
+//   - the PreVote round (dbTestShardConfig sets PreVote: true), which precedes
+//     the real one;
+//   - the vote round itself;
+//   - one split-vote retry. On a cold start a split is likely rather than
+//     exceptional: all three replicas arm their election timers within
+//     microseconds of each other, which is the one situation the randomised
+//     timer has the least room to separate.
+//
+// The remaining factor is host saturation, and it is a multiplier rather than
+// an addend. A Raft tick is a goroutine wakeup; on a host oversubscribed k
+// times, a 50ms tick lands roughly k times late, and the whole cold start
+// stretches with it.
+//
+// Measured, with this budget lifted to 120s so the tail was not truncated:
+// eight full runs of this suite under `-race -p 1`, on 24 cores at load
+// average 150-300 (6-12x oversubscribed), gave n=616 cold starts at p50 0.66s,
+// p90 1.09s, p95 1.55s, p99 5.2s and max 10.8s. The distribution is not merely
+// slow, it is heavy-tailed — the common case sits near the four rounds above
+// and a small minority runs an order of magnitude past it. 1.1% exceeded five
+// seconds, which across the ~77 cold starts in one run of this suite is about
+// one failure per run: the rate #115 reports.
+//
+// Thirty rounds is thirty seconds, nearly three times that observed maximum.
+// It is bounded on purpose: a shard that CANNOT elect — a lost quorum, a
+// broken transport, a misconfigured membership — is reported in half a minute
+// rather than at the 1800s suite timeout, and the derivation is verified
+// against exactly that case (a three-member shard with only one replica
+// running fails this wait in 30.0s).
+//
+// The same measurement is why this budget is LARGER than failoverTimeout even
+// though the names suggest otherwise: on the same runs a re-election after a
+// leader was stopped never exceeded 4.8s (n=40), because by then the transport
+// is established and the survivors already know one another. The cold start is
+// the harder of the two and had been given the smaller budget.
+const coldStartElectionRounds = 30
 
-// failoverTimeout is the extended timeout for failover scenarios.
-const failoverTimeout = 20 * time.Second
+// leaderElectionTimeout is the budget for a shard that has just been started
+// to produce its FIRST leader. See coldStartElectionRounds for the derivation.
+//
+// A cold start is not a re-election and must not be budgeted like one. Every
+// caller of this constant is waiting on a shard that was started moments
+// earlier, so this is the cold-start budget and nothing else; a wait for a
+// SUBSEQUENT leader takes failoverTimeout.
+const leaderElectionTimeout = coldStartElectionRounds * electionRound
+
+// failoverTimeout is the budget for a shard that has already been led to elect
+// a REPLACEMENT leader after the incumbent is stopped or partitioned.
+//
+// Its value is unchanged; it is written in election rounds so that it tracks
+// ElectionRTT and RTTMillisecond alongside leaderElectionTimeout instead of
+// drifting away from them. A failover needs one election timeout for the
+// survivors to notice the silence and one or two rounds to elect, over warm
+// connections — measured max 4.8s under the saturation described above, so
+// twenty rounds is roughly four times the observed worst case.
+const failoverTimeout = 20 * electionRound
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
@@ -933,7 +1031,7 @@ func dbTestNodeHostConfig(t *testing.T, listenAddr string, mtls dbMTLSFiles) dbC
 		NodeHostDir:    t.TempDir(),
 		RaftAddress:    listenAddr,
 		ListenAddress:  listenAddr,
-		RTTMillisecond: 50,
+		RTTMillisecond: testRTTMillisecond,
 		DeploymentID:   1,
 		MutualTLS:      true,
 		CAFile:         mtls.CAFile,
@@ -947,7 +1045,7 @@ func dbTestShardConfig(shardID, replicaID uint64) dbConfig.Config {
 	return dbConfig.Config{
 		ShardID:             shardID,
 		ReplicaID:           replicaID,
-		ElectionRTT:         10,
+		ElectionRTT:         testElectionRTT,
 		HeartbeatRTT:        1,
 		CheckQuorum:         true,
 		PreVote:             true,
@@ -961,7 +1059,7 @@ func dbTestShardConfigWithSnapshot(shardID, replicaID, snapshotEntries, compacti
 	return dbConfig.Config{
 		ShardID:             shardID,
 		ReplicaID:           replicaID,
-		ElectionRTT:         10,
+		ElectionRTT:         testElectionRTT,
 		HeartbeatRTT:        1,
 		CheckQuorum:         true,
 		PreVote:             true,

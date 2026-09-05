@@ -161,7 +161,7 @@ func TestIntegration_DB_StaleRead_Uninitialized(t *testing.T) {
 		NodeHostDir:    t.TempDir(),
 		RaftAddress:    addr,
 		ListenAddress:  addr,
-		RTTMillisecond: 50,
+		RTTMillisecond: testRTTMillisecond,
 		DeploymentID:   1,
 		MutualTLS:      true,
 		CAFile:         mtls.CAFile,
