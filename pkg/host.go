@@ -2254,7 +2254,27 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 				})
 			}
 		}
-		if err != nil && el.OnShardFailed != nil {
+		// A DECLINED stale recovery is NOT a failed shard, and reporting it as
+		// one is the same defect #113 fixed one layer down (#126).
+		//
+		// The engine refuses a recovery whose snapshot is not ahead of the
+		// apply frontier, and since #113 it DECLINES that refusal rather than
+		// failing the node: recoveryBlockedByLog produces it before the
+		// recovering gate is raised and before RecoverFromSnapshot runs, so the
+		// state machine is untouched and already at or past the snapshot index.
+		// engine.Node.Fail is never called and the replica keeps serving.
+		//
+		// The pool still reports the refusal as the completion's error, and
+		// must: a declined recovery is not a SUCCESSFUL one either, and
+		// treating it as success would fire OnSnapshotRecovered and reconcile
+		// membership from a snapshot nothing ever restored. What must not
+		// happen is handing that same error to OnShardFailed, which is the only
+		// outward report that a replica makes no further progress without an
+		// operator StopShard/StartShard. A false one is not cosmetic: an
+		// operator acts on it, and a harness that fast-fails on it aborts a
+		// healthy run — which is exactly how #126 was observed, with the
+		// engine's own "snapshot recovery declined" line in the same log.
+		if err != nil && el.OnShardFailed != nil && !declinedStaleRecovery(err) {
 			el.OnShardFailed(config.ShardFailedInfo{
 				ShardID:   shardID,
 				ReplicaID: ns.replicaID,
@@ -2262,6 +2282,20 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 			})
 		}
 	}
+}
+
+// declinedStaleRecovery reports whether a snapshot-pool completion error is a
+// stale state-machine recovery the engine DECLINED, as opposed to a fault that
+// finished the shard.
+//
+// It is deliberately the same match the engine makes before choosing not to
+// call Node.Fail, so the host's outward report cannot drift from the engine's
+// decision about whether the replica is alive. Every other error out of the
+// pool — including a failed RecoverFromSnapshot, which IS terminal — is
+// reported unchanged.
+func declinedStaleRecovery(err error) bool {
+	var stale *engine.SnapshotRecoveryStaleError
+	return errors.As(err, &stale)
 }
 
 // reconcileMembershipFromPeer reads the committed membership from the
