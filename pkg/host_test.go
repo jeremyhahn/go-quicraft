@@ -4231,6 +4231,19 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 
+	// A ReadIndex is leader-bound, so the shard has to HAVE a leader before
+	// one is issued. StartShard returns before the single-node self-election
+	// runs, and a ReadIndex that arrives first is refused outright since #153
+	// ("not leader, no leader currently known") rather than dropped and
+	// retried — which turns the race into a completed-with-error result this
+	// test rejects, and is #164.
+	//
+	// waitForLeader is the right wait rather than a sleep: it blocks until
+	// lastApplied >= 2, so the CURRENT term's no-op is committed, which is
+	// exactly ReadIndex's precondition (PhD 6.4). Waiting only for IsLeader
+	// would leave the read unready and narrow the race instead of closing it.
+	waitForLeader(t, h, 1)
+
 	rs, err := h.ReadIndex(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("ReadIndex failed: %v", err)
