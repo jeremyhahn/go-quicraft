@@ -365,6 +365,7 @@ func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, 
 
 	attempt, read := clusterMembershipAttempt(cluster, shardID,
 		func(ctx context.Context, h *quicraft.Host) error {
+			//quicraft:direct-config-change the single attempt driveMembershipChange is built from
 			return h.SyncRequestAddNode(ctx, shardID, replicaID, addr, 0)
 		})
 
@@ -381,6 +382,7 @@ func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint6
 
 	attempt, read := clusterMembershipAttempt(cluster, shardID,
 		func(ctx context.Context, h *quicraft.Host) error {
+			//quicraft:direct-config-change the single attempt driveMembershipChange is built from
 			return h.SyncRequestDeleteNode(ctx, shardID, replicaID, 0)
 		})
 

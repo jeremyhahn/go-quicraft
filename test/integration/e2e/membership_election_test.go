@@ -90,42 +90,21 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	}
 	t.Logf("new node started in join mode at %s", newAddr)
 
-	// Now request membership addition from the leader.
-	var addErr error
-	var addedViaNode int
-	retryTicker := time.NewTicker(50 * time.Millisecond)
-	defer retryTicker.Stop()
-	addDeadline := time.NewTimer(failoverTimeout)
-	defer addDeadline.Stop()
-addLoop:
-	for {
-		for i := range cluster.hosts {
-			if cluster.stopped[i].Load() {
-				continue
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			addErr = cluster.hosts[i].SyncRequestAddNode(ctx, shardID, newReplicaID, newAddr, 0)
-			cancel()
-			if addErr == nil {
-				addedViaNode = i
-				break addLoop
-			}
-			if isTransientLeadershipError(addErr) {
-				continue
-			}
-			t.Logf("SyncRequestAddNode via node[%d] returned unexpected error: %v", i, addErr)
-		}
-		select {
-		case <-addDeadline.C:
-			break addLoop
-		case <-retryTicker.C:
-		}
-	}
-
-	if addErr != nil {
-		t.Fatalf("membership change failed after leader election: %v", addErr)
-	}
-	t.Logf("membership change succeeded via node[%d]", addedViaNode)
+	// Now request membership addition, through whichever node is the leader
+	// AT THE POINT OF EACH ATTEMPT.
+	//
+	// The loop this replaces walked every live host with a two-second call
+	// each and retried transient errors until failoverTimeout. That reads "no
+	// answer" as "did not happen", which is false for a membership change: an
+	// add whose response was lost to a second leadership move had already
+	// committed, the next attempt was refused CORRECTLY with "already exists
+	// in membership", and the loop ran to its deadline reporting a failure
+	// the cluster never had (#112, #132). syncAddNode accepts that refusal
+	// only after an attempt in this same loop was genuinely submitted AND a
+	// linearizable membership read shows replica 4 as a voter at newAddr; an
+	// add that never lands still fails, within the same budget.
+	syncAddNode(t, cluster, shardID, newReplicaID, newAddr, failoverTimeout)
+	t.Logf("membership change succeeded after leader election")
 
 	// Wait for the cluster to stabilize with 4 members.
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
