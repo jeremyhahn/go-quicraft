@@ -78,9 +78,9 @@ import (
 //     satisfied there yet. It has its own reservation window already
 //     (test/performance/benchutil, the TCP twin of test/netport) and its
 //     remaining port-0 call site holds the socket open until the caller binds
-//     rather than closing it. Folding that module onto test/netport is tracked
-//     separately; until then a gate over it would be a rule with a hole in it,
-//     which is worse than a rule with a stated boundary.
+//     rather than closing it. Folding that module onto test/netport is #163;
+//     until then a gate over it would be a rule with a hole in it, which is
+//     worse than a rule with a stated boundary.
 //
 // # No marker
 //
