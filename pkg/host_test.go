@@ -670,6 +670,54 @@ func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 	t.Fatalf("timed out waiting for shard %d to elect leader", shardID)
 }
 
+// waitForApplied waits until the Host's applied mirror for the shard
+// (nodeState.lastApplied) has reached index, and fails the test if it does
+// not within the timeout. It exists because a returned Sync* proposal does
+// NOT pin that mirror: OnApplied completes the proposal (completeProposal,
+// which wakes the caller) in its claim loop and stores ns.lastApplied only
+// later in the same callback, and the engine stores node.lastApplied only
+// after OnApplied returns (apply.go). A read of either counter straight after
+// SyncPropose returns can therefore still see the pre-batch value (#141,
+// the host-layer instance of #139/#84).
+//
+// The caller supplies the bound. Two bounds are always available after a
+// completed proposal: the result's Value when the state machine reports the
+// entry's index (mockStateMachine does), and the engine's published commit
+// marker (engine.Node.CommittedIndex), which the step worker stores when it
+// extracts the batch — before the apply worker ever sees it — so a sample
+// taken after SyncPropose returns names the proposal's index or higher.
+// Waiting for the mirror to reach the commit marker is exactly the gate
+// FollowerRead uses to decide the apply worker has caught up.
+func waitForApplied(t *testing.T, h *Host, shardID, index uint64) {
+	t.Helper()
+	ns := testLoadNode(h, shardID)
+	if !waitUntil(5*time.Second, func() bool { return ns.lastApplied.Load() >= index }) {
+		t.Fatalf("shard %d applied mirror never reached %d: lastApplied=%d",
+			shardID, index, ns.lastApplied.Load())
+	}
+}
+
+// assertSeededApplied checks that StartShard seeded the Host's applied mirror
+// (nodeState.lastApplied) to want on an on-disk recovery. The seed itself is
+// synchronous — stored before the nodeState is published — so the value is
+// pinned the moment StartShard returns. It does not stay put: the
+// single-member shard elects itself and applies its term-opening no-op at
+// want+1 asynchronously, and under load that apply can land before the
+// caller's read (#141 observed 81 for want 80). The no-op is the only writer
+// that can move it, so want+1 is the one value above want that is not a
+// seeding regression; anything below want means the marker came from the
+// wrong source (the snapshot record, OnDiskIndex, or nothing), which is what
+// these tests exist to catch. Same bound TestStartShard_FreshStart_NoSeed
+// already applies to the bootstrap membership entry.
+func assertSeededApplied(t *testing.T, ns *nodeState, want uint64, why string) {
+	t.Helper()
+	got := ns.lastApplied.Load()
+	if got < want || got > want+1 {
+		t.Fatalf("ns.lastApplied = %d, want %d (%s), or %d once the restarted "+
+			"leader's no-op applies", got, want, why, want+1)
+	}
+}
+
 // waitForLogEntry waits until the shard's log range reports at least one
 // committed entry (LastIndex >= 1). After leader election the leader appends
 // a no-op entry, but it may not be visible through the LogReader immediately.
@@ -3764,16 +3812,25 @@ func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err = h.SyncPropose(ctx, 1, []byte("cmd"))
+	// waitForLeader already pinned lastApplied >= 2 (bootstrap@1, no-op@2),
+	// so a bare "lastApplied > 0" after the proposal would pass without the
+	// proposal's apply ever being observed. Record the marker first and
+	// require it to move past THIS entry.
+	ns := testLoadNode(h, 1)
+	appliedBefore := ns.lastApplied.Load()
+
+	result, err := h.SyncPropose(ctx, 1, []byte("cmd"))
 	if err != nil {
 		t.Fatalf("SyncPropose failed: %v", err)
 	}
-
-	// lastApplied should have been updated on the node state.
-	ns := testLoadNode(h, 1)
-	if ns.lastApplied.Load() == 0 {
-		t.Error("expected lastApplied > 0 after successful proposal")
+	// mockStateMachine sets Value = entry.Index, which is the exact index
+	// OnApplied must store. SyncPropose returning does not pin the mirror
+	// (see waitForApplied); the entry's own index does.
+	if result.Value <= appliedBefore {
+		t.Fatalf("entry index %d is not above the pre-proposal applied index %d",
+			result.Value, appliedBefore)
 	}
+	waitForApplied(t, h, 1, result.Value)
 }
 
 func TestHostEngineCallback_OnApplied_NonexistentShard(t *testing.T) {
@@ -12593,6 +12650,18 @@ func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 		t.Fatalf("empty proposal must be accepted, got: %v", err)
 	}
 
+	// SyncPropose returning does not pin the applied mirror (see
+	// waitForApplied). The barrier's own index is not in the result either:
+	// the apply path hands the user SM nothing for an empty entry, so its
+	// result is the zero sm.Result. The commit marker is the bound instead —
+	// published by the step worker when it extracted the batch, before the
+	// apply worker ran it, so it names the barrier's index or higher now.
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("engine node for shard 1 missing")
+	}
+	waitForApplied(t, h, 1, engNode.CommittedIndex())
+
 	// The barrier committed: the applied index moved even though the user
 	// state machine never saw the entry.
 	appliedAfter := appliedIndex()
@@ -21159,9 +21228,7 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 
 	// The recovered index is the SM's durable lastApplied, not the snapshot.
 	ns := testLoadNode(h, 1)
-	if got := ns.lastApplied.Load(); got != 100 {
-		t.Errorf("ns.lastApplied = %d, want 100", got)
-	}
+	assertSeededApplied(t, ns, 100, "the SM's durable marker, not the snapshot's 50")
 
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
@@ -21263,9 +21330,7 @@ func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
 	}
 
 	ns := testLoadNode(h, 1)
-	if got := ns.lastApplied.Load(); got != 75 {
-		t.Fatalf("ns.lastApplied = %d, want 75 (read gate would hang)", got)
-	}
+	assertSeededApplied(t, ns, 75, "read gate would hang")
 
 	// With markers seeded, a FollowerRead returns promptly under a deadline
 	// rather than polling until ctx expires. committed starts at 0 (no
@@ -21399,9 +21464,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 
 	// Markers are seeded to the snapshot's raft log INDEX (80), not OnDiskIndex.
 	ns := testLoadNode(h, 1)
-	if got := ns.lastApplied.Load(); got != 80 {
-		t.Errorf("ns.lastApplied = %d, want 80 (snapshot Index)", got)
-	}
+	assertSeededApplied(t, ns, 80, "snapshot Index, not OnDiskIndex 73")
 
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
