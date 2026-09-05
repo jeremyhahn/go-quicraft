@@ -705,6 +705,15 @@ const defaultTimeout = 10 * time.Second
 // give 5x headroom for CI environments.
 const leaderElectionTimeout = 5 * time.Second
 
+// pollInterval is the cadence of every retry loop in this file that waits on
+// something outside its own goroutine. It is one constant, and a ticker rather
+// than a sleep, because CLAUDE.md forbids time.Sleep and because a single
+// cadence is one thing to change when a runner turns out to be slower than
+// this. waitForLeader, waitForApplied and waitForCondition keep their own
+// tighter cadences: they poll cheap in-process state, not a network round trip
+// or a directory walk.
+const pollInterval = 20 * time.Millisecond
+
 // ---------------------------------------------------------------------------
 // Linearizable read assertions
 // ---------------------------------------------------------------------------
@@ -713,15 +722,23 @@ const leaderElectionTimeout = 5 * time.Second
 // a state machine lookup at the confirmed read index) and asserts the value is
 // exactly want.
 //
-// Transport-level failures are retried until the timeout: right after an
-// election the new leader may briefly reject ReadIndex while it commits its
-// no-op entry. A read that SUCCEEDS with the wrong value is never retried and
-// fails immediately — an entry that was committed before the read cannot
-// legally change or disappear, so retrying would only hide the violation
-// behind a timeout message.
+// Transient failures are retried until the timeout: right after an election the
+// new leader may briefly reject ReadIndex while it commits its no-op entry.
+// "Transient" is quicraft.Temporary, the same predicate proposeCommitted uses
+// and for the same reason — h is pinned, so the only remedy this loop has is to
+// wait and ask again, and that fixes exactly the conditions Temporary names.
+// A permanent error fails on its first occurrence naming itself.
+//
+// A read that SUCCEEDS with the wrong value is never retried and fails
+// immediately — an entry that was committed before the read cannot legally
+// change or disappear, so retrying would only hide the violation behind a
+// timeout message.
 func syncReadExact(t *testing.T, h *quicraft.Host, shardID uint64, key, want string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	retry := time.NewTicker(pollInterval)
+	defer retry.Stop()
 	var lastErr error
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -738,12 +755,16 @@ func syncReadExact(t *testing.T, h *quicraft.Host, shardID uint64, key, want str
 			}
 			return
 		}
+		if !quicraft.Temporary(err) {
+			t.Fatalf("linearizable read of %q on shard %d was rejected after %v and not retried: %v",
+				key, shardID, time.Since(start).Round(time.Millisecond), err)
+		}
 		lastErr = err
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out after %v waiting for a linearizable read of %q on shard %d to succeed: %v",
 				timeout, key, shardID, lastErr)
 		}
-		time.Sleep(20 * time.Millisecond)
+		<-retry.C
 	}
 }
 
@@ -771,43 +792,54 @@ func assertSMHasExact(t *testing.T, machine *kvStateMachine, label, key, want st
 // proposal entered the pipeline. Every write a test later makes an assertion
 // about goes through here.
 //
-// Transient rejections (a leader elected moments ago, a momentarily busy
-// pipeline) are retried until timeout; the timeout itself is a hard failure.
-// Retrying is safe because a put is idempotent under last-write-wins.
+// h is the caller's chosen replica and is NOT re-resolved — that is the whole
+// reason this helper exists alongside proposeToLeader, whose callers mean
+// "whoever leads right now". Pinning still commits through a replica that has
+// since lost leadership, because Host.Propose forwards to the leader once the
+// local replica knows who it is.
+//
+// Only errors quicraft.Temporary reports true for are retried: the conditions
+// that clear on their own while the caller waits and asks the same replica
+// again — a shard still coming up, a momentarily busy pipeline, the window
+// after an election before this replica learns the new leader. Everything else
+// fails on its FIRST occurrence, naming the error. Under the blanket retry this
+// replaced (#97) an ErrDiskFull or an ErrInvalidOperation was retried for the
+// full budget and then reported as "timed out", which reads as a slow cluster
+// rather than the deterministic rejection it is. See proposer.TryWith for why
+// this set and proposeToLeader's differ.
+//
+// Retrying is safe because a put is idempotent under last-write-wins, which
+// matters: a temporary error can arrive after the entry already reached the log
+// (quicraft.MaybeApplied), so a retry may apply the command twice.
 func proposeCommitted(t *testing.T, h *quicraft.Host, shardID uint64, key, value string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	cmd := encodeKVPut(key, value)
-	var lastErr error
-	for {
-		attemptTimeout := time.Until(deadline)
-		if attemptTimeout > 5*time.Second {
-			attemptTimeout = 5 * time.Second
-		}
-		if attemptTimeout <= 0 {
-			t.Fatalf("timed out after %v committing %q=%q on shard %d: %v",
-				timeout, key, value, shardID, lastErr)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
-		//quicraft:direct-propose h is the caller's chosen replica; see #97 on this loop's blanket retry
-		rs, err := h.Propose(ctx, shardID, cmd)
-		if err == nil {
-			_, lastErr = rs.Result()
-			rs.Release()
-			if lastErr == nil {
-				cancel()
-				return
-			}
-		} else {
-			lastErr = err
-		}
-		cancel()
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %v committing %q=%q on shard %d: %v",
-				timeout, key, value, shardID, lastErr)
-		}
-		time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	_, err := proposer.TryWith(proposer.Pinned(h), shardID, encodeKVPut(key, value),
+		timeout, quicraft.Temporary)
+	if err == nil {
+		return
 	}
+	// The policy itself says which of the two failures this was: a temporary
+	// error survived only because the budget ran out, and anything else was
+	// returned on its first occurrence without being retried at all.
+	if quicraft.Temporary(err) {
+		t.Fatalf("timed out after %v committing %q=%q on shard %d, still failing transiently: %v",
+			timeout, key, abbrev(value), shardID, err)
+	}
+	t.Fatalf("committing %q=%q on shard %d was rejected after %v and not retried: %v",
+		key, abbrev(value), shardID, time.Since(start).Round(time.Millisecond), err)
+}
+
+// abbrev bounds a value before it goes into a failure message. Values in these
+// suites are short, but the one case that reliably is not is an entry
+// deliberately sized past MaxEntrySize — and printing megabytes of it buries
+// the error it was written to produce.
+func abbrev(value string) string {
+	const max = 96
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + fmt.Sprintf("...(%d bytes)", len(value))
 }
 
 // proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
@@ -919,6 +951,8 @@ func findSnapshotArtifacts(t *testing.T, dir string, shardID, replicaID uint64) 
 func waitForSnapshotArtifact(t *testing.T, dir string, shardID, replicaID, index uint64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	retry := time.NewTicker(pollInterval)
+	defer retry.Stop()
 	for {
 		artifacts := findSnapshotArtifacts(t, dir, shardID, replicaID)
 		for _, a := range artifacts {
@@ -934,7 +968,7 @@ func waitForSnapshotArtifact(t *testing.T, dir string, shardID, replicaID, index
 			t.Fatalf("no snapshot artifact at index %d for shard %d replica %d under %s after %v (found %v): the snapshot request reported success without writing a durable snapshot",
 				index, shardID, replicaID, dir, timeout, artifacts)
 		}
-		time.Sleep(20 * time.Millisecond)
+		<-retry.C
 	}
 }
 
@@ -965,6 +999,8 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 	// every other error is fatal.
 	var rs *quicraft.RequestState
 	submitDeadline := time.Now().Add(defaultTimeout)
+	retry := time.NewTicker(pollInterval)
+	defer retry.Stop()
 	for {
 		rs, err = h.RequestSnapshot(ctx, shardID, quicraft.SnapshotOption{})
 		if err == nil {
@@ -977,7 +1013,7 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 			t.Fatalf("RequestSnapshot(shard %d) still reported a snapshot in progress after %v",
 				shardID, defaultTimeout)
 		}
-		time.Sleep(20 * time.Millisecond)
+		<-retry.C
 	}
 	if rs == nil {
 		t.Fatalf("RequestSnapshot(shard %d) returned nil", shardID)

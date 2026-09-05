@@ -41,6 +41,14 @@
 // of a retry loop is four places a fix has to land. The suites share nothing
 // but a way to name the current leader, so that is all this package asks for:
 // a Resolver.
+//
+// # The pinned callers share the same loop
+//
+// Some suite helpers deliberately do NOT re-resolve, because the test is about
+// the replica it addressed. They had a second copy of this retry loop, with a
+// blanket retry-on-any-error that reported a permanent rejection as a timeout
+// (#97). They now use the same loop through Pinned, differing only in the
+// Retryable they pass; TryWith documents why that one difference is real.
 package proposer
 
 import (
@@ -58,6 +66,23 @@ import (
 // the suites have in common, and because it forces the caller to hand over a
 // way to ask AGAIN rather than an answer taken once.
 type Resolver func(shardID uint64) *quicraft.Host
+
+// Pinned is the Resolver for a caller that has already chosen its target and
+// means THAT replica: it returns h for every shard, every time.
+//
+// It exists so the pinned callers share one retry loop with the re-resolving
+// ones instead of keeping a second copy of it. Re-resolution and retry are
+// separate remedies; Pinned gives up the first and keeps the second, and
+// TryWith explains which errors each remedy can actually fix.
+func Pinned(h *quicraft.Host) Resolver {
+	return func(uint64) *quicraft.Host { return h }
+}
+
+// Retryable reports whether an error from one attempt is worth another. It is
+// the ONE axis on which this package's retry loops differ; see TryWith.
+//
+// quicraft.Temporary satisfies it directly, and so does IsNotLeaderRejection.
+type Retryable func(error) bool
 
 // retryInterval is how long Try waits before re-resolving after a not-leader
 // rejection. An election completes in roughly one election timeout, so polling
@@ -108,11 +133,58 @@ func ToLeader(
 // (quicraft.MaybeApplied), so a retry may apply the command twice; every
 // command here is a last-write-wins KV put, which is idempotent under
 // re-proposal.
+//
+// A caller that addresses ONE replica on purpose wants TryWith with Pinned and
+// quicraft.Temporary instead; TryWith says why the two retry sets differ.
 func Try(
 	resolve Resolver,
 	shardID uint64,
 	cmd []byte,
 	timeout time.Duration,
+) (quicraft.RequestResult, error) {
+	return TryWith(resolve, shardID, cmd, timeout, IsNotLeaderRejection)
+}
+
+// TryWith is Try's general form: it re-resolves the target before every
+// attempt and retries exactly the errors retryable reports true for.
+//
+// # Why there are two policies and not one
+//
+// The suites need two retry sets, and the difference is NOT that one loop is
+// stricter for its own sake. A loop should retry an error when, and only when,
+// the thing it does between attempts can change that error's answer. The two
+// loops do different things between attempts, so they retry different sets:
+//
+//   - Try re-resolves the leader. Its remedy is "ask a DIFFERENT replica", and
+//     the only error that remedy fixes is the not-leader rejection. A timeout,
+//     a busy pipeline or a rejected entry came from the replica that genuinely
+//     leads the shard; asking it again through a fresh resolve changes nothing,
+//     so those are real results and must reach the test.
+//
+//   - A pinned caller (Pinned) has already chosen its replica because the test
+//     is ABOUT that replica. Its remedy is "wait, and ask the SAME replica
+//     again", which fixes the conditions that clear on their own: a shard still
+//     coming up, a momentarily full pipeline, an election in flight. That is
+//     exactly the set quicraft.Temporary names, and a pinned caller passes it.
+//
+// ErrNotLeader is in quicraft.Temporary, so the pinned set contains the
+// re-resolving one. That is not an inconsistency, it is the reason a pinned
+// caller keeps working: Host.Propose FORWARDS to the leader whenever the local
+// replica knows who that is, and ErrNotLeader is only the window before it
+// learns — a window that closes without any help from the caller.
+//
+// What neither policy is any longer is a blanket retry on every error. That is
+// the policy both of these replaced (#97): it reports ErrDiskFull,
+// ErrInvalidOperation or a state machine failure as "timed out", and burns the
+// whole budget to say so.
+//
+// retryable must not be nil.
+func TryWith(
+	resolve Resolver,
+	shardID uint64,
+	cmd []byte,
+	timeout time.Duration,
+	retryable Retryable,
 ) (quicraft.RequestResult, error) {
 	deadline := time.Now().Add(timeout)
 	retry := time.NewTicker(retryInterval)
@@ -120,8 +192,9 @@ func Try(
 	expiry := time.NewTimer(timeout)
 	defer expiry.Stop()
 
-	// Reported if the deadline passes without a leader ever being observed,
-	// which is itself a not-leader condition.
+	// Reported if the deadline passes without a target ever being resolved,
+	// which is itself a not-leader condition. A Pinned resolver never returns
+	// nil, so a pinned caller can only ever see an error an attempt produced.
 	lastErr := quicraft.ErrNotLeader
 
 	for {
@@ -134,7 +207,7 @@ func Try(
 			if err == nil {
 				return result, nil
 			}
-			if !IsNotLeaderRejection(err) {
+			if !retryable(err) {
 				return quicraft.RequestResult{}, err
 			}
 			lastErr = err
