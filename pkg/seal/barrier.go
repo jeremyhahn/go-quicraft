@@ -423,13 +423,20 @@ func MustNewBarrier(config BarrierConfig) *Barrier {
 	return b
 }
 
-// NewEpochBarrier is an alias for NewBarrier. Use this name in new code to
-// distinguish from go-qrdb's NewStorageBarrier.
-var NewEpochBarrier = NewBarrier
+// NewEpochBarrier calls NewBarrier. Use this name in new code to distinguish
+// from go-qrdb's NewStorageBarrier.
+//
+// These two are FUNCTIONS rather than `var NewEpochBarrier = NewBarrier`, for
+// the reason given at NewProtectedCredentials: an exported function variable in
+// a crypto package is writable by every importer, so an init() in a transitive
+// dependency can substitute the constructor for the barrier that holds the root
+// key. A named alias is worth having; a reassignable one is not (#95).
+func NewEpochBarrier(config BarrierConfig) (*Barrier, error) { return NewBarrier(config) }
 
-// MustNewEpochBarrier is an alias for MustNewBarrier, completing the
-// EpochBarrier alias set.
-var MustNewEpochBarrier = MustNewBarrier
+// MustNewEpochBarrier calls MustNewBarrier, completing the EpochBarrier alias
+// set. It panics on an invalid config; see MustNewBarrier for when that is the
+// right form and when it is not.
+func MustNewEpochBarrier(config BarrierConfig) *Barrier { return MustNewBarrier(config) }
 
 // InvocationCounter returns the barrier's AEAD invocation counter, or nil if
 // invocation counting is disabled.
@@ -744,6 +751,37 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 
 	// Attempt to unseal the root key.
 	heapKey, err := strategy.UnsealRootKey(ctx, b.sealed, creds)
+	// THE BACKSTOP FOR THE STRATEGY'S HEAP COPY, standing from the moment the
+	// call returns — before the error check, not after it. heapKey is the full
+	// plaintext root key on the ordinary Go heap, swappable and core-dumpable,
+	// and every return below this line has to leave it zeroed. Nothing in
+	// SealingStrategy.UnsealRootKey's contract forbids an implementation from
+	// returning partial material ALONGSIDE an error, and a backstop registered
+	// after the check would step over exactly that case.
+	//
+	// It replaces two of the five hand-written wipes this used to rely on. The
+	// one that mattered lived INSIDE the borrow at the bottom:
+	// MemoryEnclave.WithBytes returns ErrEnclaveDestroyed BEFORE it calls fn
+	// when the enclave is nil, destroyed OR wiped, so on that path the key was
+	// never wiped and survived to the collector (#95).
+	//
+	// That path is REACHABLE IN PRODUCTION, which an earlier draft of this
+	// comment denied. The (nil, nil) shape needs the lockRootKey seam, true —
+	// but enclave.NewMemoryEnclaveSized documents that a successful return can
+	// hand back an ALREADY-DESTROYED enclave when enclave.WipeAll runs between
+	// publication and return, and WipeAll is a shutdown sweep belonging to
+	// whoever owns the process (docs/memory-enclave/architecture.md). A consumer
+	// sweeping locked memory while a late Unseal is in flight is an ordinary
+	// shutdown race, not a contrived one.
+	//
+	// The three eager wipes below STAY. This defer is a floor, not a
+	// replacement: it fires at return, and each of those three has real work —
+	// a persister call, a consumer's slog handler, or the whole of
+	// unsealWithRootKey — standing between the point the key stops being needed
+	// and the point this fires. Wipe is idempotent, so the pair never conflicts:
+	// the second zeroes zeroes. Where a return is IMMEDIATE the eager wipe is
+	// redundant and is gone.
+	defer enclave.Wipe(heapKey)
 	if err != nil {
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
@@ -772,9 +810,14 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	if strategy.ID() == StrategyNone {
 		hwEnc, hwErr := strategy.BarrierEncryptor(ctx, heapKey)
 		if hwErr != nil {
-			enclave.Wipe(heapKey)
 			return hwErr
 		}
+		// Eager, because the defer does not fire until after the ten field
+		// assignments, the persister call and the two slog lines below — and
+		// slog handlers are the CONSUMER's code, which may do I/O. NoneStrategy
+		// returns an empty key so there is nothing here to erase, but this
+		// branch is gated on strategy.ID() precisely so a consumer's own
+		// no-encryption strategy can reach it, and that one's key is its own.
 		enclave.Wipe(heapKey)
 		// A nil encryptor here would leave state=unsealed with cipher==nil
 		// and hwEncryptor==nil, and the first Encrypt would nil-dereference.
@@ -810,6 +853,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	}
 
 	if len(heapKey) != rootKeySize {
+		// Eager for the same reason: persistBackoffState reaches the embedder's
+		// StatePersister, and a wrong-sized key is still key material.
 		enclave.Wipe(heapKey)
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
@@ -817,7 +862,8 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 		return ErrInvalidRootKeySize
 	}
 
-	// THE STRATEGY'S HEAP COPY DIES HERE, at the earliest point it can.
+	// THE STRATEGY'S HEAP COPY DIES HERE, at the earliest point it can — the
+	// defer above is only the floor under it.
 	//
 	// SealingStrategy.UnsealRootKey returns an ordinary []byte and stays that way
 	// (this issue's scope note is explicit that the interface does not move), so
@@ -834,7 +880,6 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// here — a wipe of frozen pages faults the process.
 	rootEnc, encErr := b.lockRootKey(rootKeySize)
 	if encErr != nil {
-		enclave.Wipe(heapKey)
 		return &Error{Strategy: "unseal", Err: encErr}
 	}
 	defer rootEnc.Destroy()
@@ -2454,6 +2499,42 @@ func (b *Barrier) RootKey() ([]byte, error) {
 // never paged to disk, and Destroy is a real wipe rather than a request to the
 // garbage collector. Returns ErrNoRootKeyAvailable in no-encryption mode, which
 // holds no root key at all.
+//
+// The enclave is returned FROZEN: it is a key to read and destroy, not a buffer
+// to edit, so a stray write through a slice retained past its borrow faults
+// instead of silently rewriting the caller's copy of the key. (Only the
+// caller's copy was ever at stake — SealedEnclave.Open decrypts into a fresh,
+// independent enclave each time, so the barrier's own root key was never
+// reachable through this.) SealedEnclave.Open hands back a
+// SIZED enclave, whose pages would otherwise stay writable for its whole
+// lifetime — the window MemoryEnclave.Freeze exists to close — and this accessor
+// has nothing left to fill. That makes it agree with
+// ProtectedSealingStrategy.UnsealRootKeyProtected, the other method in this
+// package that hands a caller a root key it owns; the two differed for no reason
+// anyone had stated (#95).
+//
+// A refused freeze destroys the enclave rather than returning it, for the reason
+// spelled out at that sibling: handing back a writable enclave from a method
+// whose documentation says the contents are final would report a guarantee that
+// was not established.
+//
+// DO NOT WIPE THE RETURNED BYTES YOURSELF. Destroy is the release, and it is
+// the only one: a defensive enclave.Wipe or hand-rolled zeroing of the borrowed
+// slice before Destroy is a WRITE to a read-only region and faults the process.
+// This is the one habit a careful caller is likely to bring to a key it owns,
+// and it is the one habit the freeze punishes. pkg/crypto/shamir's
+// ProtectedShare.Value carries the same warning for the same reason.
+//
+// THE TRADE, stated rather than left for a reader to find in go-enclave: a
+// frozen region has to be made writable again before Destroy can wipe it, so the
+// wipe now sits behind an mprotect the kernel can deny. On a kernel that denies
+// it the pages are released still holding the key, and MemoryEnclave.DestroyErr
+// reports ErrReleasedWithoutWipe — where an unfrozen region would have been
+// overwritten before anything deniable was attempted. Nothing leaks either way,
+// since the pages were mlock'd for their whole life and the kernel zeroes an
+// anonymous page before reuse; a caller that wants to know its environment is
+// denying mprotect calls DestroyErr rather than Destroy. This is the same trade
+// UnsealRootKeyProtected and every from-bytes enclave already make.
 func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -2463,7 +2544,20 @@ func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error) {
 	if b.rootKey == nil {
 		return nil, ErrNoRootKeyAvailable
 	}
-	return b.rootKey.Open()
+	out, err := b.rootKey.Open()
+	if err != nil {
+		return nil, err
+	}
+	if ferr := out.Freeze(); ferr != nil {
+		// Returned UNWRAPPED, as the Open failure above is, and for the reason
+		// NewCredentials gives for enclave.NewSealed's: it already names its own
+		// origin — a *LockedMemoryError matching ErrLockedMemoryUnavailable —
+		// and a refused mprotect is not a strategy-level failure. Wrapping it in
+		// a *seal.Error would print a strategy name over a kernel refusal.
+		out.Destroy()
+		return nil, ferr
+	}
+	return out, nil
 }
 
 // CurrentEpoch returns the current key rotation epoch. Returns 0 if the

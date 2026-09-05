@@ -240,19 +240,45 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 			"longer straddles the old boundary, so it proves nothing", got, MaxShareSetBytes)
 	}
 
-	// EVERY REGION THE SEAM HANDS OUT IS STILL ALIVE WHEN THE SPLIT RETURNS.
-	// That is what "there is no scratch" means operationally, and it is the half
-	// the arithmetic above cannot check: a transient region would be destroyed by
-	// the time the caller sees the shares, and would be missing from the price.
-	var handed []*enclave.MemoryEnclave
+	// EVERY REGION THE SEAM HANDS OUT IS ACCOUNTED FOR — which is the half the
+	// arithmetic above cannot check, because an allocation missing from
+	// splitLockedBytes is still live at the peak and still counts against
+	// RLIMIT_MEMLOCK.
+	//
+	// The seam sees all of them as of #95. It used to cover only the per-share
+	// value, so this block could assert the simpler thing — that the seam's
+	// output and the returned shares were the same set, hence nothing transient.
+	// SplitProtected's three pre-loop buffers went straight to
+	// enclave.NewMemoryEnclaveSized and were invisible here, which is exactly why
+	// their refusal paths were untestable. Now they arrive too, in allocation
+	// order: the coefficient pool, the coefficient vector and the raw share
+	// payload, then one region per share.
+	//
+	// The three ARE transient — each is deferred-Destroy'd — and each is PRICED,
+	// as `coefficients + scratch` in splitLockedBytes.
+	//
+	// So the assertion is the SUM, not the count. Every byte the seam hands out
+	// is added up and compared against splitLockedBytes for the same dimensions:
+	// an allocation that is unpriced, priced twice, or priced at the wrong size
+	// breaks it, and a count alone breaks for none of those. (A headcount plus a
+	// comment naming the buffers would prove only that three of something were
+	// allocated — the names would live in the comment and nowhere else.)
+	const preLoopRegions = 3
+
+	var (
+		handed    []*enclave.MemoryEnclave
+		handedSum int
+	)
 	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
 		e, err := enclave.NewMemoryEnclaveSized(n)
 		if err == nil {
 			handed = append(handed, e)
+			handedSum += lockedBytes(n)
 		}
 		return e, err
 	})
-	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
+	secret := []byte("a-secret-worth-splitting-32-byte")
+	shares, err := SplitProtected(secret, 2, 3)
 	restore()
 	if err != nil {
 		t.Fatalf("SplitProtected: %v", err)
@@ -262,16 +288,152 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 			sh.Destroy()
 		}
 	}()
-	if len(handed) != len(shares) {
-		t.Fatalf("the sized seam produced %d regions for %d shares: a transient "+
-			"region is live at the peak and is not priced by splitLockedBytes",
-			len(handed), len(shares))
+	if len(handed) != preLoopRegions+len(shares) {
+		t.Fatalf("the sized seam produced %d regions for %d shares, want %d + %d: "+
+			"an unpriced region is live at the peak, or a priced one no longer "+
+			"goes through the seam", len(handed), len(shares), preLoopRegions, len(shares))
 	}
-	for i, e := range handed {
-		if !e.IsAlive() {
-			t.Fatalf("region %d was destroyed before SplitProtected returned, so it "+
-				"was a scratch: it is live at the peak and must be priced", i)
+	// THE ACCOUNTING PROOF. 32-byte secret, 2-of-3 is six regions -- coefficient
+	// pool (32), coefficient vector (2), raw payload (34) and three encoded
+	// values (48 each) -- and the kernel charges each one a whole page, so the
+	// price is 6 pages, not 212 bytes (#94). The left side applies the same
+	// per-region rounding to the sizes the allocator was ACTUALLY asked for;
+	// the right side is the helper under test. Both round, neither shares the
+	// other's arithmetic, so agreement is a real check rather than a tautology:
+	// an allocation that is unpriced, double-priced, or priced at the wrong size
+	// still moves one side and not the other.
+	if want := splitLockedBytes(len(secret), 2, 3); handedSum != want {
+		t.Fatalf("the seam was asked for %d bytes but splitLockedBytes prices %d: "+
+			"an allocation is unpriced, double-priced, or priced at the wrong size",
+			handedSum, want)
+	}
+	for i, e := range handed[:preLoopRegions] {
+		if e.IsAlive() {
+			t.Fatalf("pre-loop region %d outlived SplitProtected: it is priced as "+
+				"transient scratch, so holding it past the return understates the "+
+				"caller's steady-state locked-memory cost", i)
 		}
+	}
+	for i, e := range handed[preLoopRegions:] {
+		if !e.IsAlive() {
+			t.Fatalf("share region %d was destroyed before SplitProtected returned, "+
+				"so it was a scratch: it is live at the peak and must be priced", i)
+		}
+	}
+}
+
+// TestSplitProtected_PreLoopAllocationRefusalsAreClean covers what routing the
+// pre-loop buffers through the seam bought (#95): each of SplitProtected's three
+// setup allocations can be refused by the kernel, and until they went through
+// newSizedProtectedMemory none of those three paths could be reached from a test.
+//
+// The property is that a refusal at ANY of them is a *ProtectedMemoryError
+// naming the buffer — not a *SplitError, and not a partially built share set the
+// caller has to guess the ownership of.
+func TestSplitProtected_PreLoopAllocationRefusalsAreClean(t *testing.T) {
+	// One case per pre-loop allocation, identified by the index of the seam call
+	// to refuse: 0 the coefficient pool, 1 the coefficient vector, 2 the raw
+	// share payload.
+	for _, tc := range []struct {
+		name    string
+		refuseN int
+		wantOp  string
+	}{
+		{"coefficient pool", 0, "locking coefficient memory"},
+		{"coefficient vector", 1, "locking coefficient vector"},
+		{"share payload", 2, "locking share payload"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+				defer func() { calls++ }()
+				if calls == tc.refuseN {
+					return nil, errLockRefused
+				}
+				return enclave.NewMemoryEnclaveSized(n)
+			})
+			shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
+			restore()
+
+			if shares != nil {
+				for _, sh := range shares {
+					sh.Destroy()
+				}
+				t.Fatal("SplitProtected returned shares alongside a refused allocation")
+			}
+			if !errors.Is(err, errLockRefused) {
+				t.Fatalf("error = %v, want it to wrap the allocator's refusal", err)
+			}
+			var pmErr *ProtectedMemoryError
+			if !errors.As(err, &pmErr) {
+				t.Fatalf("error = %T, want a *ProtectedMemoryError: a refused lock is "+
+					"not a caller's validation mistake", err)
+			}
+			if pmErr.Op != tc.wantOp {
+				t.Fatalf("ProtectedMemoryError.Op = %q, want %q", pmErr.Op, tc.wantOp)
+			}
+		})
+	}
+}
+
+// TestCombineProtected_AllocationRefusalsAreClean is the same coverage on the
+// reconstruction side, which had no injectable allocation at all before #95:
+// both of CombineProtected's regions — the base64 decode scratch and the enclave
+// holding the reconstructed secret — called enclave.NewMemoryEnclaveSized
+// directly.
+//
+// The secret buffer is the one that matters. It is not a scratch: it is what the
+// function RETURNS, so a refusal there must leave nothing for the caller to own
+// and must not surface as a *CombineError, which would read as "these shares do
+// not reconstruct" over a kernel that would not give out a page.
+func TestCombineProtected_AllocationRefusalsAreClean(t *testing.T) {
+	secret := []byte("a-secret-worth-splitting-32-byte")
+	shares, err := SplitProtected(secret, 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer func() {
+		for _, sh := range shares {
+			sh.Destroy()
+		}
+	}()
+
+	for _, tc := range []struct {
+		name    string
+		refuseN int
+		wantOp  string
+	}{
+		{"decode scratch", 0, "locking decode buffer"},
+		{"reconstructed secret", 1, "locking secret buffer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+				defer func() { calls++ }()
+				if calls == tc.refuseN {
+					return nil, errLockRefused
+				}
+				return enclave.NewMemoryEnclaveSized(n)
+			})
+			got, err := CombineProtected(shares[:2])
+			restore()
+
+			if got != nil {
+				got.Destroy()
+				t.Fatal("CombineProtected returned a secret alongside a refused allocation")
+			}
+			if !errors.Is(err, errLockRefused) {
+				t.Fatalf("error = %v, want it to wrap the allocator's refusal", err)
+			}
+			var pmErr *ProtectedMemoryError
+			if !errors.As(err, &pmErr) {
+				t.Fatalf("error = %T, want a *ProtectedMemoryError: a refused lock is "+
+					"not a reconstruction failure", err)
+			}
+			if pmErr.Op != tc.wantOp {
+				t.Fatalf("ProtectedMemoryError.Op = %q, want %q", pmErr.Op, tc.wantOp)
+			}
+		})
 	}
 }
 

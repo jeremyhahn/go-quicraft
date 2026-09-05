@@ -128,8 +128,22 @@ var (
 // release; new code names Credentials.
 type ProtectedCredentials = Credentials
 
-// NewProtectedCredentials is [NewCredentials].
+// NewProtectedCredentials calls [NewCredentials], including its contract:
+// the caller's slice is CONSUMED.
 //
 // Deprecated: use NewCredentials. Same function, and the name no longer
 // distinguishes anything now that there is one credential type.
-var NewProtectedCredentials = NewCredentials
+//
+// It is a FUNCTION, not `var NewProtectedCredentials = NewCredentials`. A
+// deprecation shim is the one place where the wrapper costs nothing, and an
+// exported function VARIABLE in a crypto package is writable by every package
+// that can import this one: an init() anywhere in a consumer's transitive graph
+// could reassign it and route every passphrase still reaching the deprecated
+// name through its own code, with no call site changed to notice (#95). That
+// this was continuity from the NewProtectedKey/SealProtectedBuffer vars in the
+// deleted memprotect.go is the reason it was written, not a reason to keep it.
+// staticcheck's SA1019 flags a deprecated func exactly as it flags a deprecated
+// var, so the deprecation still lands on consumers.
+func NewProtectedCredentials(secret []byte) (Credentials, error) {
+	return NewCredentials(secret)
+}

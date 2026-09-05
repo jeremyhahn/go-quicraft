@@ -513,3 +513,51 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 		t.Fatalf("UnsealRootKeyProtected(mismatched) = %v, want ErrStrategyMismatch", err)
 	}
 }
+
+// TestNewProtectedCredentials_IsNewCredentials holds the deprecated shim to the
+// contract it delegates to, now that it is a FUNCTION rather than
+// `var NewProtectedCredentials = NewCredentials` (#95).
+//
+// The reassignability the change removes has no runtime witness — a func value
+// and a declared func are indistinguishable once called — so the compile-time
+// half is verified out of band and recorded on the PR: a package assigning to
+// any of the five converted names now fails to build with "cannot assign to
+// seal.NewProtectedCredentials (neither addressable nor a map index
+// expression)", and the same file compiled cleanly against the previous commit.
+// What a test CAN hold is that turning the alias into a wrapper did not change
+// what it does, which is the half a future edit could plausibly get wrong.
+func TestNewProtectedCredentials_IsNewCredentials(t *testing.T) {
+	t.Run("moves the secret and wipes the caller's slice", func(t *testing.T) {
+		secret := []byte("a-passphrase-long-enough-to-pass")
+		creds, err := NewProtectedCredentials(secret)
+		if err != nil {
+			t.Fatalf("NewProtectedCredentials: %v", err)
+		}
+		if creds.Secret == nil {
+			t.Fatal("NewProtectedCredentials returned no sealed secret")
+		}
+		defer creds.Secret.Destroy()
+
+		for i, c := range secret {
+			if c != 0 {
+				t.Fatalf("byte %d of the caller's slice = %#x: the constructor "+
+					"must CONSUME it, as NewCredentials does", i, c)
+			}
+		}
+
+		opened, err := creds.Secret.Open()
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer opened.Destroy()
+		if !opened.EqualTo([]byte("a-passphrase-long-enough-to-pass")) {
+			t.Fatal("the sealed secret is not what was handed in")
+		}
+	})
+
+	t.Run("refuses an empty secret with the same error", func(t *testing.T) {
+		if _, err := NewProtectedCredentials(nil); !errors.Is(err, ErrInvalidPassphrase) {
+			t.Fatalf("NewProtectedCredentials(nil) = %v, want ErrInvalidPassphrase", err)
+		}
+	})
+}

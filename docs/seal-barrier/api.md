@@ -198,14 +198,20 @@ true for both `ContextBindingUnsupported` and `ContextBindingPlaintext`;
 
 ```go
 func (b *Barrier) RootKey() ([]byte, error)
-func (b *Barrier) RootKeyProtected() (*enclave.ProtectedBuffer, error)
+func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error)
 func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error
 func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error
 ```
 
 `RootKeyProtected` is the form to prefer: it returns a wiped-on-`Destroy`
-buffer. `RootKey` returns an ordinary slice the caller must zero itself, and
-returns `ErrNoRootKeyAvailable` in no-encryption mode.
+enclave, and it returns it FROZEN (#95) — a key to read and destroy, not a
+buffer to edit, so a write through a slice retained past the borrow faults
+instead of silently rewriting the caller's copy. (Only the caller's copy is ever
+at stake: `Open` decrypts into a fresh enclave each call, so the barrier's own
+root key is not reachable this way.) **Do not zero the borrowed bytes yourself
+before `Destroy`** — that is a write to a read-only region and faults; `Destroy`
+is the release. `RootKey` returns an ordinary slice the caller must zero itself.
+Both return `ErrNoRootKeyAvailable` in no-encryption mode.
 
 ### Interfaces you implement
 

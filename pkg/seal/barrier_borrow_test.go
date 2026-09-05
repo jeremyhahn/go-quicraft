@@ -40,6 +40,13 @@ type plainStrategy struct {
 	// lastUnsealed retains the exact slice header UnsealRootKey handed back, so
 	// a test can inspect that memory after Unseal has returned.
 	lastUnsealed []byte
+	// onBarrierEncryptor, when set, runs at the start of BarrierEncryptor.
+	//
+	// It is the only observation point INSIDE unsealWithRootKey that a test can
+	// reach without a new production seam, and it is what lets a test pin the
+	// ORDER of the heap-key wipe rather than only its end state. See
+	// TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns.
+	onBarrierEncryptor func()
 }
 
 func (p *plainStrategy) ID() StrategyID       { return p.inner.ID() }
@@ -58,6 +65,9 @@ func (p *plainStrategy) UnsealRootKey(ctx context.Context, sealed *SealedRootKey
 }
 
 func (p *plainStrategy) BarrierEncryptor(ctx context.Context, rootKey []byte) (SymmetricEncrypter, error) {
+	if p.onBarrierEncryptor != nil {
+		p.onBarrierEncryptor()
+	}
 	return p.inner.BarrierEncryptor(ctx, rootKey)
 }
 
@@ -253,6 +263,168 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 			t.Fatalf("byte %d of the strategy's heap key = %#x after a refused "+
 				"allocation: the root key was left readable on the heap on the "+
 				"error path", i, c)
+		}
+	}
+}
+
+// TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey is the sibling failure to
+// the one above, and the one the wipe used to miss (#95).
+//
+// The wipe of the strategy's heap key lived INSIDE the borrow that copies it
+// into locked memory. MemoryEnclave.WithBytes returns ErrEnclaveDestroyed
+// BEFORE it calls fn when the enclave is nil or wiped, so on that path fn never
+// ran and the full plaintext root key stayed on the ordinary Go heap —
+// swappable, core-dumpable, alive until the collector reclaimed it.
+//
+// A (nil, nil) allocator is the shape that reaches it. The default lockRootKey
+// is enclave.NewMemoryEnclaveSized, which cannot return one, so this is not
+// reachable in production — but lockRootKey is an injectable field, and the
+// comment at the borrow says the redesign exists precisely so "an error path
+// added later cannot forget one". An allocator whose refusal is a nil enclave
+// rather than an error is such a path, and it forgot.
+//
+// Verified by mutation on 2026-09-04: moving the wipe back inside the borrow —
+// deleting `defer enclave.Wipe(heapKey)` and restoring the four hand-written
+// calls — fails here with
+//
+//	barrier_borrow_test.go:319: byte 0 of the strategy's heap key = 0xa after
+//	Unseal returned through a short-circuited borrow: the plaintext root key was
+//	left readable on the ordinary heap
+func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
+	s := newPlainStrategy(t)
+	defer s.Close()
+
+	b := MustNewBarrier(testBarrierConfig(1))
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	blob := b.SealedRootKeyData()
+
+	b2 := MustNewBarrier(testBarrierConfig(1))
+	if err := b2.SetSealedRootKey(blob); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	// A refusal spelled as a nil enclave and a nil error. It is not a shape the
+	// default allocator produces; it is the shape the borrow's own early return
+	// is written to handle, and the point is that handling it must not skip the
+	// wipe.
+	b2.lockRootKey = func(int) (*enclave.MemoryEnclave, error) { return nil, nil }
+
+	err := b2.Unseal(context.Background(), s, Credentials{})
+	if err == nil {
+		t.Fatal("Unseal must fail when the allocator hands back no enclave")
+	}
+	if !errors.Is(err, enclave.ErrEnclaveDestroyed) {
+		t.Fatalf("error = %v, want the borrow's ErrEnclaveDestroyed", err)
+	}
+	if !b2.IsSealed() {
+		t.Fatal("the barrier is not sealed after a failed Unseal")
+	}
+
+	if len(s.lastUnsealed) != rootKeySize {
+		t.Fatalf("the strategy returned %d bytes, want %d", len(s.lastUnsealed), rootKeySize)
+	}
+	for i, c := range s.lastUnsealed {
+		if c != 0 {
+			t.Fatalf("byte %d of the strategy's heap key = %#x after Unseal "+
+				"returned through a short-circuited borrow: the plaintext root "+
+				"key was left readable on the ordinary heap", i, c)
+		}
+	}
+}
+
+// TestUnseal_NoEncryptionModeStillWipesTheHeapKey covers the branch that returns
+// before the borrow exists at all. NoneStrategy's key is empty, so the wipe has
+// nothing to erase — what this holds is that the defer introduced by #95 did not
+// change the branch's OUTCOME while retiring its two hand-written wipes.
+func TestUnseal_NoEncryptionModeStillWipesTheHeapKey(t *testing.T) {
+	none := NewNoneStrategy()
+
+	b := MustNewBarrier(testBarrierConfig(1))
+	if err := b.Initialize(context.Background(), none, Credentials{}); err != nil {
+		t.Fatalf("Initialize with NoneStrategy: %v", err)
+	}
+	blob := b.SealedRootKeyData()
+
+	b2 := MustNewBarrier(testBarrierConfig(1))
+	if err := b2.SetSealedRootKey(blob); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	if err := b2.Unseal(context.Background(), none, Credentials{}); err != nil {
+		t.Fatalf("Unseal in no-encryption mode: %v", err)
+	}
+	if b2.IsSealed() {
+		t.Fatal("the barrier is still sealed after a successful no-encryption unseal")
+	}
+}
+
+// TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns pins the ORDER of the
+// wipe, which no other test in this package does.
+//
+// TestUnseal_WipesTheStrategysHeapKey inspects s.lastUnsealed after Unseal
+// RETURNS, so it is satisfied by any wipe that happens at all — including the
+// deferred backstop #95 added. That made the eager wipe inside the borrow
+// deletable with a green suite, which is the reverse of what the backstop was
+// for: the defer is meant to be a floor UNDER the eager wipe, not a substitute
+// that quietly retires it. A future edit dropping the eager wipe as dead code
+// would restore the long plaintext-on-heap window #39 closed — across
+// verifySealedStateMAC, the load-generation claim (which calls the embedder's
+// StatePersister, so real I/O) and one DEK derivation per known epoch.
+//
+// BarrierEncryptor is the earliest point inside unsealWithRootKey a test can
+// observe without adding a production seam. It runs after verifySealedStateMAC
+// and long before the defer, so "already zero here" is a strictly stronger
+// statement than the end-state assertion, and it is the one that dies when the
+// eager wipe does.
+//
+// Verified by mutation on 2026-09-04: deleting the eager enclave.Wipe(heapKey)
+// from inside the borrow leaves TestUnseal_WipesTheStrategysHeapKey PASSING and
+// fails only here, with
+//
+//	barrier_borrow_test.go:425: byte 0 of the strategy's heap key = 0x8f when
+//	unsealWithRootKey called back into the strategy: the eager wipe inside the
+//	borrow is gone and only the deferred backstop is left
+func TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns(t *testing.T) {
+	s := newPlainStrategy(t)
+	defer s.Close()
+
+	b := MustNewBarrier(testBarrierConfig(1))
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	blob := b.SealedRootKeyData()
+
+	b2 := MustNewBarrier(testBarrierConfig(1))
+	if err := b2.SetSealedRootKey(blob); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+
+	var (
+		observed bool
+		snapshot []byte
+	)
+	s.onBarrierEncryptor = func() {
+		observed = true
+		snapshot = append([]byte(nil), s.lastUnsealed...)
+	}
+	if err := b2.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	s.onBarrierEncryptor = nil
+
+	// Without this the test would pass vacuously if the callback stopped being
+	// reached — which is exactly how the end-state test lost its teeth.
+	if !observed {
+		t.Fatal("BarrierEncryptor was never called, so nothing was observed")
+	}
+	if len(snapshot) != rootKeySize {
+		t.Fatalf("observed %d bytes, want %d", len(snapshot), rootKeySize)
+	}
+	for i, c := range snapshot {
+		if c != 0 {
+			t.Fatalf("byte %d of the strategy's heap key = %#x when "+
+				"unsealWithRootKey called back into the strategy: the eager wipe "+
+				"inside the borrow is gone and only the deferred backstop is left", i, c)
 		}
 	}
 }

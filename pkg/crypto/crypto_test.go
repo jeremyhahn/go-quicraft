@@ -15,6 +15,7 @@
 package crypto
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
@@ -77,13 +78,15 @@ func TestSealedRootKeyTypeAlias(t *testing.T) {
 	_ = sr
 }
 
-// TestNewBarrierReexport verifies that the NewBarrier function variable
-// is non-nil and returns a valid Barrier instance. This confirms the
-// re-export from pkg/seal is wired correctly.
+// TestNewBarrierReexport verifies that the re-exported NewBarrier returns a
+// valid Barrier instance, confirming the re-export from pkg/seal is wired
+// correctly.
+//
+// The nil check that stood here went with the var. These re-exports are declared
+// functions now (#95), so `NewBarrier == nil` is a vet failure — "comparison of
+// function NewBarrier == nil is always false" — and being unreassignable is the
+// whole point of the change.
 func TestNewBarrierReexport(t *testing.T) {
-	if NewBarrier == nil {
-		t.Fatal("NewBarrier should not be nil")
-	}
 	cfg := BarrierConfig{
 		Algorithm: seal.AlgAES256GCM,
 	}
@@ -99,8 +102,8 @@ func TestNewBarrierReexport(t *testing.T) {
 // TestNewBarrierReexport_InvalidConfig verifies that the re-exported
 // NewBarrier returns an error — never a panic — for an invalid (zero-value)
 // config, and that MustNewBarrier is the form that panics. The re-export is a
-// var holding the function value, so this also pins that it tracks the real
-// signature rather than an older one.
+// wrapper function, so this also pins that it tracks the real signature rather
+// than an older one: a drifted signature in pkg/seal fails to compile here.
 func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
 	t.Run("NewBarrier returns an error", func(t *testing.T) {
 		defer func() {
@@ -125,4 +128,43 @@ func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
 		}()
 		MustNewBarrier(BarrierConfig{})
 	})
+}
+
+// TestNewCredentialsReexport covers the gap #95 closed: Credentials is
+// re-exported above, but #41 retyped its Secret field to an
+// *enclave.SealedEnclave, and seal.NewCredentials — which was NOT re-exported —
+// became the only supported way to populate one. The shim therefore exposed a
+// type its own consumers could not construct.
+//
+// The delegation must carry NewCredentials's contract intact, including the part
+// a caller is most likely to depend on and least likely to notice missing: the
+// source slice is CONSUMED.
+func TestNewCredentialsReexport(t *testing.T) {
+	secret := []byte("a-passphrase-long-enough-to-pass")
+	creds, err := NewCredentials(secret)
+	if err != nil {
+		t.Fatalf("NewCredentials: %v", err)
+	}
+	if creds.Secret == nil {
+		t.Fatal("NewCredentials returned no sealed secret")
+	}
+	defer creds.Secret.Destroy()
+
+	for i, c := range secret {
+		if c != 0 {
+			t.Fatalf("byte %d of the caller's slice = %#x: the re-export must "+
+				"CONSUME it, as seal.NewCredentials does", i, c)
+		}
+	}
+
+	// And what it built is a seal.Credentials, not a look-alike: the alias is
+	// what makes the shim worth completing rather than replacing.
+	sc := creds
+	if sc.Secret != creds.Secret {
+		t.Fatal("the re-exported constructor did not produce a seal.Credentials")
+	}
+
+	if _, err := NewCredentials(nil); !errors.Is(err, seal.ErrInvalidPassphrase) {
+		t.Fatalf("NewCredentials(nil) = %v, want seal.ErrInvalidPassphrase", err)
+	}
 }

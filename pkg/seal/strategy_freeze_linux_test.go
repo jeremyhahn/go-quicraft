@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jeremyhahn/go-enclave"
 	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
 )
 
@@ -112,5 +113,97 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 		t.Fatalf("the root-key enclave is mapped %q: Initialize fills it in place "+
 			"and hands it to enclave.NewSealed, which WIPES it — a wipe of frozen "+
 			"pages faults the process", prot)
+	}
+}
+
+// TestRootKeyProtected_ReturnsFrozenPages is the same property on the barrier's
+// own accessor, which did not have it (#95).
+//
+// RootKeyProtected returned enclave.SealedEnclave.Open's result unchanged, and
+// Open allocates a SIZED enclave — writable for its whole lifetime, because a
+// sized enclave exists to be filled. This accessor has nothing to fill: it hands
+// a caller a key to read and destroy, exactly as UnsealRootKeyProtected above
+// does. The two differing was an inconsistency nobody had stated a reason for,
+// and the cost of it is not hypothetical: a consumer that retains the borrowed
+// slice past its window — the precise bug Freeze exists to turn into a fault —
+// rewrites the root key it is about to derive a wrapping key from, every read
+// succeeds, and the corruption surfaces as an unexplained ErrDecryptionFailed
+// somewhere else entirely.
+//
+// The kernel is the witness, for the reason given at the sibling above: a
+// missing Freeze is invisible to every other assertion, since the key still
+// round-trips and only a page protection differs.
+//
+// Verified by mutation on 2026-09-04: deleting the out.Freeze() call in
+// RootKeyProtected fails here with
+//
+//	strategy_freeze_linux_test.go:194: RootKeyProtected returned a region mapped
+//	"rw-p": a write through a slice retained past the borrow rewrites the root
+//	key instead of faulting
+func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
+	s := testStrategy(t)
+	defer s.Close()
+
+	b := MustNewBarrier(testBarrierConfig(1))
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	// THE CONTROL, and it is what makes this an A/B rather than an assertion
+	// about the accessor alone. b.rootKey.Open() is precisely what
+	// RootKeyProtected used to return; asking the kernel about THAT region shows
+	// the writable mapping the fix removes, so a reader can see both states in
+	// one run rather than taking the mutation note on trust.
+	unfrozen, err := b.rootKey.Open()
+	if err != nil {
+		t.Fatalf("opening the sealed root key directly: %v", err)
+	}
+	defer unfrozen.Destroy()
+	unfrozenView, err := unfrozen.Open()
+	if err != nil {
+		t.Fatalf("Open on the control enclave: %v", err)
+	}
+	controlProt, err := lockedmem.ProtectionOf(unfrozenView)
+	if err != nil {
+		t.Skipf("this kernel cannot report mapping protections: %v", err)
+	}
+	if controlProt.ReadOnly() {
+		t.Fatalf("the control region is mapped %q: SealedEnclave.Open has started "+
+			"returning frozen pages, so this test no longer distinguishes anything "+
+			"and the fix it guards can be deleted without failing it", controlProt)
+	}
+	// The control really is writable, which is the whole claim: this store would
+	// fault against the frozen mapping asserted below.
+	unfrozenView[0] ^= 0xFF
+
+	got, err := b.RootKeyProtected()
+	if err != nil {
+		t.Fatalf("RootKeyProtected: %v", err)
+	}
+	defer got.Destroy()
+
+	view, err := got.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	prot, err := lockedmem.ProtectionOf(view)
+	if err != nil {
+		t.Skipf("this kernel cannot report mapping protections: %v", err)
+	}
+	if !prot.ReadOnly() {
+		t.Fatalf("RootKeyProtected returned a region mapped %q: a write through a "+
+			"slice retained past the borrow rewrites the root key instead of "+
+			"faulting", prot)
+	}
+
+	// The freeze must not have cost the caller the key itself. A frozen region
+	// that reads as zeroes would satisfy the assertion above and be useless.
+	plain, err := b.RootKey()
+	if err != nil {
+		t.Fatalf("RootKey: %v", err)
+	}
+	defer enclave.Wipe(plain)
+	if !got.EqualTo(plain) {
+		t.Fatal("the frozen enclave does not hold the barrier's root key")
 	}
 }

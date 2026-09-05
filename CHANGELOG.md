@@ -101,6 +101,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the wrong accounting as readily as the right one. The witness is now a
   measured `VmLck` delta, which is the only one that cannot be fooled by the
   arithmetic under test.
+- **Four hardening gaps in the reshaped seal surface (#95).** None was a
+  regression; all four were in the surface #83 reshaped, and they close together.
+
+  - **`Barrier.RootKeyProtected` returns a FROZEN enclave.** It handed back the
+    result of `SealedEnclave.Open`, which is a *sized* enclave whose pages stay
+    writable for its whole lifetime — so a consumer that retained the borrowed
+    slice past its window could rewrite the root key it was about to derive a
+    wrapping key from, and every read would still succeed. The corruption would
+    have surfaced in a consumer as an unexplained `ErrDecryptionFailed`. The
+    method's documented promises (locked, guard-paged, non-swappable,
+    deterministically wiped) all held; what did not hold is that it agreed with
+    `UnsealRootKeyProtected`, the other method here that hands a caller a root key
+    it owns, which has frozen since PR #40. A refused freeze now destroys the
+    enclave rather than returning it, as at that sibling.
+
+    Only the CALLER's copy was ever at stake: `SealedEnclave.Open` decrypts into
+    a fresh, independent enclave on every call, so the barrier's own root key was
+    never reachable through this accessor.
+
+    **Consumer-visible, two ways.** A write through a slice retained past a
+    `RootKeyProtected` borrow now faults rather than corrupting — including a
+    DEFENSIVE write: a caller that zeroes the borrowed slice itself before
+    `Destroy`, a reasonable habit with a key you own, now faults. `Destroy` is
+    the release and the only one. And freezing moves the wipe at `Destroy` time
+    behind an `mprotect` that a seccomp profile or hardened kernel can deny; on
+    that path the pages are released still holding the material and
+    `MemoryEnclave.DestroyErr` reports `ErrReleasedWithoutWipe`, which this
+    accessor could not do before. Nothing leaks either way — the pages were
+    `mlock`'d for their whole life and the kernel zeroes an anonymous page before
+    reuse — but the "deterministically wiped" promise is narrowed, not merely
+    preserved, and a deployment that wants to know calls `DestroyErr` rather than
+    `Destroy`. This is the trade `UnsealRootKeyProtected` and every from-bytes
+    enclave already make.
+
+    No consumer in the portfolio calls `RootKeyProtected` today (go-qrdb uses
+    `RootKey()`), so the blast radius is nil at the time of writing.
+
+  - **`NewProtectedCredentials`, `NewEpochBarrier`, `MustNewEpochBarrier`,
+    `crypto.NewBarrier` and `crypto.MustNewBarrier` are functions, not
+    reassignable variables.** Each was `var X = Y`, which in an importable crypto
+    package means any package in a consumer's transitive graph could substitute
+    it from an `init()` — routing every passphrase reaching the deprecated
+    credential constructor, or every barrier holding a root key, through code the
+    call site has no way to notice. staticcheck's SA1019 flags a deprecated func
+    exactly as it flagged the deprecated var.
+
+    **Call expressions are unchanged, but two things do break for a consumer.**
+    Assignment to the names stops compiling, which is the point. And `X == nil`
+    on any of them becomes a `go vet` failure — *"comparison of function X == nil
+    is always false"* — which fails `go test` by default, since `nilfunc` is in
+    the standard vet-during-test set. That is not hypothetical: this repository's
+    own `pkg/crypto` test carried such a check and it had to go.
+
+  - **`Barrier.Unseal` cannot leave the plaintext root key on the heap.**
+    `SealingStrategy.UnsealRootKey` returns an ordinary `[]byte`, and the wipe of
+    it sat *inside* the borrow that follows — but `MemoryEnclave.WithBytes`
+    returns `ErrEnclaveDestroyed` **before** calling `fn` for a nil or wiped
+    enclave, so on that path the key was never wiped and survived to the
+    collector, swappable and core-dumpable.
+
+    **This was reachable in production**, which a first draft of this entry
+    denied. The `(nil, nil)` shape does need the injectable allocator seam — but
+    `WithBytes` short-circuits for a nil, destroyed **or wiped** enclave, and
+    `enclave.NewMemoryEnclaveSized` documents that a successful return can hand
+    back an already-destroyed enclave when `enclave.WipeAll` runs between
+    publication and return. `WipeAll` is a shutdown sweep belonging to whoever
+    owns the process, so a consumer sweeping locked memory while a late `Unseal`
+    is in flight is an ordinary shutdown race.
+
+    A `defer` now stands from the moment `UnsealRootKey` returns — registered
+    before the error check, so a strategy returning partial material alongside an
+    error is covered too — and it retires the two hand-written wipes whose
+    returns were immediate. Three eager wipes STAY, at the points where real work
+    (the embedder's `StatePersister`, a consumer's `slog` handler, or the whole
+    of `unsealWithRootKey`) stands between the key ceasing to be needed and the
+    defer firing. The defer is a floor under them, not a replacement: the eager
+    wipe inside the borrow is what keeps the heap copy from living across MAC
+    verification and DEK derivation, and it now has a test pinning that ORDER
+    rather than only the end state, because the end-state test passes without
+    it.
+
+  - **`pkg/crypto` re-exports `NewCredentials`.** #41 retyped `Credentials.Secret`
+    to an `*enclave.SealedEnclave`, which made `seal.NewCredentials` the only
+    supported way to populate one — leaving the compatibility shim exposing a type
+    its consumers could not construct. The break was deliberate; the gap was not.
+    The constructor gap is closed rather than the shim retired: deleting
+    `crypto.Credentials` would break external consumers where adding a
+    constructor cannot. The shim is **not** thereby complete — it still
+    re-exports no `Algorithm` constants, no error sentinels and no strategy
+    constructor, so a `pkg/crypto`-only consumer still cannot assemble a valid
+    `BarrierConfig` or `errors.Is` the new constructor's error. Widening it
+    further is a scope call for the owner, not a side effect of this fix.
+
+  Three documentation and test defects go with them.
+
+  `SoftwareStrategy.Close` said an operation that "already loaded the pointer"
+  completes against the passphrase. `resolvePassphrase` loads the pointer and
+  `wrappingCipher` `Open`s it later, so a holder of a live pointer can still lose
+  the race — and so can one already blocked inside `Open` on the enclave's read
+  lock behind `Destroy`'s pending write lock. The line is ACQUIRING the borrow.
+  Every one of those paths returns `ErrStrategyClosed`, so this over-promised in
+  prose rather than the code misbehaving.
+
+  Every sized allocation in `pkg/crypto/shamir` now goes through the
+  `newSizedProtectedMemory` seam — `SplitProtected`'s three pre-loop buffers and
+  both of `CombineProtected`'s bypassed it, so their locked-memory refusal paths
+  were the only ones the existing injection could not reach, and now each has a
+  test. Making them visible to the seam also let `TestSplitProtected_BudgetIsATrueUpperBound`
+  stop counting regions and start SUMMING them: it now compares the bytes the
+  allocator was actually asked for against `splitLockedBytes` for the same
+  dimensions, which catches an allocation that is unpriced, double-priced or
+  priced at the wrong size. `MaxShareSetBytes` and the pricing itself are
+  unchanged.
+
+  The `GOEXPERIMENT=boringcrypto` note added to the #54/#41 migration list above
+  was written for this issue; it lives there because that is the list a consumer
+  migrating will read.
 
 - **`Stop()` now announces a graceful shutdown to the peers that dialed this
   node (#78).** Consumer-observable: a node shutting down cleanly used to be
@@ -227,6 +344,21 @@ toolchain wave land together so the portfolio pays for ONE cascade, not three.
   now returns an error, because sealing allocates locked pages the kernel can
   refuse), `Clear()` → `Destroy()`, `WipeBytes` → `enclave.Wipe`,
   `ErrEnclaveNil`/`NilError`/`OpenError` → `enclave.ErrEnclaveDestroyed`.
+
+  **Under `GOEXPERIMENT=boringcrypto` that new error is not an edge case: it is
+  every call.** go-enclave seals with AES-GCM built through
+  `cipher.NewGCMWithRandomNonce`, which requires the standard library's own AES
+  block type, and boringcrypto's `aes.NewCipher` returns a different one — so
+  `enclave.NewSealed` ALWAYS returns `ErrSealFailed` there (go-enclave #34,
+  closed as deliberate). The failure therefore moves from seal time to
+  CONSTRUCTION time for a consumer on such a build: `NewSoftwareStrategy` —
+  usually the FIRST thing such a consumer constructs, since it seals the
+  passphrase it is handed — plus `seal.NewCredentials`, `Barrier.Initialize` and
+  `Barrier.Unseal` all seal, and all fail immediately rather than at first use. `ErrSealFailed` says nothing about boringcrypto, so
+  a consumer whose build suddenly cannot make a credential should check
+  `GOEXPERIMENT` before looking anywhere else. FIPS-certified crypto on Go 1.27
+  is `GOFIPS140=latest`, which uses the Go Cryptographic Module and is
+  unaffected; boringcrypto is not the route.
 
   **`Destroy` erases where `Clear` could not.** memguard exposed no API to zero
   an `Enclave`'s ciphertext and registered no finalizer, so `Barrier.seal()`,

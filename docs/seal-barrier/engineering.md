@@ -70,7 +70,7 @@ func (b *Barrier) NonceTracker() NonceTrackerProvider
 func (b *Barrier) SealedRootKeyData() *SealedRootKey
 func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error
 func (b *Barrier) RootKey() ([]byte, error)
-func (b *Barrier) RootKeyProtected() (*enclave.ProtectedBuffer, error)
+func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error)
 ```
 
 ### Interfaces this repository declares

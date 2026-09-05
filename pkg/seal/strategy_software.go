@@ -907,12 +907,27 @@ func closedIfEnclaveGone(err error) error {
 // erasure rather than revocation. Nothing about the caller's contract changes;
 // what changes is what is true afterwards.
 //
-// This method is idempotent and safe to call concurrently with Seal/Unseal: an
-// operation that already loaded the pointer completes against it — Destroy takes
-// the value's write lock and waits out an Open in flight — and any operation that
-// starts afterwards fails with ErrStrategyClosed. For deferred strategies (where
-// the passphrase arrives in the credentials) Close is a no-op, and the credential
-// is the caller's to Destroy.
+// This method is idempotent and safe to call concurrently with Seal/Unseal, and
+// every outcome is fail-closed. An operation that has ALREADY ACQUIRED the
+// borrow completes against the passphrase: Destroy takes the value's write lock
+// and waits that borrow out. An operation that starts after the swap sees a nil
+// pointer and fails with ErrStrategyClosed.
+//
+// Between those two is everything this comment used to fold into the first and
+// should not have. resolvePassphrase loads the pointer and wrappingCipher Opens
+// it later, so an operation can hold a live pointer and still lose the race —
+// and so can one already blocked inside Open on the enclave's read lock behind
+// Destroy's pending write lock, which is "in flight" by any ordinary reading of
+// the words but has not acquired anything. Both come back ErrEnclaveDestroyed,
+// which closedIfEnclaveGone reports as ErrStrategyClosed.
+//
+// ACQUIRING the borrow is the line, not loading the pointer and not entering
+// Open (#95). Nothing succeeds against a destroyed passphrase on any of these
+// paths, which is why this was a documentation defect and not a behavioural
+// one.
+//
+// For deferred strategies (where the passphrase arrives in the credentials)
+// Close is a no-op, and the credential is the caller's to Destroy.
 func (s *SoftwareStrategy) Close() error {
 	if passphrase := s.passphrase.Swap(nil); passphrase != nil {
 		passphrase.Destroy()

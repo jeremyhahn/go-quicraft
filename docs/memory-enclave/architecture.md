@@ -59,6 +59,7 @@ borrow, and `Freeze`d — see "Fill, freeze, hand over" below.
 | `seal.Credentials.Secret` | `*SealedEnclave` | the caller's passphrase, protected at the API boundary (#41) |
 | the root key inside `Initialize`/`Unseal` | `*MemoryEnclave` | live for the whole body, in continuous use |
 | `UnsealRootKeyProtected`'s result | `*MemoryEnclave` | the AEAD decrypts straight into it |
+| `Barrier.RootKeyProtected`'s result | `*MemoryEnclave` | opened from the sealed root key and frozen before it is handed over (#95) |
 | a `ProtectedShare`'s value, a reconstructed secret | `*MemoryEnclave` | read in place, frozen, caller-destroyed |
 
 `Barrier.Encrypt` and `Barrier.Decrypt` open **nothing**. They run off a
@@ -131,6 +132,15 @@ share value, and a reconstructed secret. go-enclave v0.5.0-alpha's `Freeze`
 (go-enclave #6) collapsed all three. In the Shamir split the saving is structural
 rather than cosmetic: the shared encoding scratch was a term in
 `splitLockedBytes`, so removing it moved the `MaxShareSetBytes` boundary.
+
+A FOURTH site joined them in #95, and it never had the move shape because it had
+no freeze at all: `Barrier.RootKeyProtected` returned `SealedEnclave.Open`'s
+result unchanged. `Open` allocates a *sized* enclave, so those pages stayed
+writable for the enclave's whole life — the exact window `Freeze` exists to
+close — while the method's sibling `UnsealRootKeyProtected` had frozen since #40.
+Both hand a caller a root key it owns, and they now agree. Only the caller's copy
+was ever exposed: `SealedEnclave.Open` decrypts into a fresh, independent enclave
+per call.
 
 *Not frozen, deliberately:* the root-key enclave that `Barrier.Initialize` and
 `Barrier.Unseal` hold. Its final act is to be **consumed** by `enclave.NewSealed`,

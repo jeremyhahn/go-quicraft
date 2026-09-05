@@ -51,6 +51,15 @@ var newProtectedMemory = enclave.NewMemoryEnclave
 // value — and freezes it as it moves. This one is for material this package is
 // about to PRODUCE, which must never touch the ordinary heap at all: the encoded
 // share value is written straight into these pages and frozen there.
+//
+// EVERY sized allocation in this package goes through it, not only the per-share
+// one in SplitProtected's loop. SplitProtected's three pre-loop buffers (the
+// coefficient pool, the coefficient vector and the share payload) and both of
+// CombineProtected's (the decode scratch and the returned secret) used to call
+// enclave.NewMemoryEnclaveSized directly, which left their refusal paths — a
+// kernel that denies the lock, and the *ProtectedMemoryError each maps it to —
+// as the only ones the errLockRefused injection could not reach, and the only
+// ones untested (#95). A seam half the call sites bypass is not a seam.
 var newSizedProtectedMemory = enclave.NewMemoryEnclaveSized
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
@@ -423,7 +432,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// bulk read of crypto/rand — as in SplitBytes, but read directly into
 	// locked memory. The coefficients are as sensitive as the secret: with
 	// them and one share, the secret follows.
-	randCoeffs, err := enclave.NewMemoryEnclaveSized(len(secret) * (threshold - 1))
+	randCoeffs, err := newSizedProtectedMemory(len(secret) * (threshold - 1))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient memory", Err: err}
 	}
@@ -439,7 +448,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// and no secret digest is embedded in shares — see SplitBytes for why
 	// both of those are deliberate and must not be "fixed".
 
-	coeffs, err := enclave.NewMemoryEnclaveSized(threshold) // [secret byte, c1..c_{t-1}]
+	coeffs, err := newSizedProtectedMemory(threshold) // [secret byte, c1..c_{t-1}]
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
 	}
@@ -452,7 +461,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// of it (version, x, and one y byte per secret byte) before it is read, so
 	// no share ever sees another's bytes, and Destroy wipes the last share's
 	// payload on the way out.
-	raw, err := enclave.NewMemoryEnclaveSized(rawShareOverhead + len(secret))
+	raw, err := newSizedProtectedMemory(rawShareOverhead + len(secret))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking share payload", Err: err}
 	}
@@ -643,7 +652,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 			return nil, &CombineError{Reason: "share was destroyed during reconstruction"}
 		}
 	}
-	buf, err := enclave.NewMemoryEnclaveSized(base64.StdEncoding.DecodedLen(widest))
+	buf, err := newSizedProtectedMemory(base64.StdEncoding.DecodedLen(widest))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking decode buffer", Err: err}
 	}
@@ -705,7 +714,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// accumulated and written into in place. It is not a scratch — which is what
 	// it used to be, when a frozen result had to be copied out of it — so it is
 	// destroyed on every error path below and on none of the success path.
-	secret, err := enclave.NewMemoryEnclaveSized(secretLen)
+	secret, err := newSizedProtectedMemory(secretLen)
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking secret buffer", Err: err}
 	}
