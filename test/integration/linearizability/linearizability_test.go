@@ -676,6 +676,70 @@ func formatPartition(part []porcupine.Event) string {
 	return sb.String()
 }
 
+// pruneNeverReadIndeterminatePuts drops every indeterminate PUT whose value no
+// determinate GET in the same partition ever returned. It is an EXACT
+// reduction: the pruned history is linearizable iff the original is.
+//
+//   - If the original has a linearization, each such put is either not applied
+//     or applied and overwritten before any get (otherwise some get would have
+//     returned it). Removing it preserves that linearization either way.
+//   - If the pruned history has a linearization, mark every removed put "not
+//     applied": the nondeterministic model allows that branch for an Unknown
+//     write, so the original linearizes too.
+//
+// Porcupine cannot know a branch is irrelevant; its power-set construction
+// explores both for every indeterminate write. A leader kill under load fails a
+// burst of writes that nobody reads, and 2^23 such branches is where a
+// 30-minute budget went on a history that decides in 1ms once they are gone
+// (#137). This removes the one shape of Unknown that is provably noise; a
+// history still Unknown AFTER pruning is backtracking on constraints that
+// matter, and the check must still fail on it.
+//
+// Only PUT is prunable. An indeterminate APPEND changes the accumulated value
+// later reads return even when its own token is never read alone, so it stays.
+func pruneNeverReadIndeterminatePuts(events []porcupine.Event) ([]porcupine.Event, int) {
+	type putRec struct {
+		key   string
+		value string
+	}
+	calls := make(map[int]kvInput, len(events)/2)
+	unknownPuts := make(map[int]putRec)
+	read := make(map[putRec]bool)
+	for _, ev := range events {
+		if ev.Kind == porcupine.CallEvent {
+			calls[ev.Id] = ev.Value.(kvInput)
+			continue
+		}
+		in, ok := calls[ev.Id]
+		if !ok {
+			continue
+		}
+		out := ev.Value.(kvOutput)
+		switch {
+		case in.Op == "put" && out.Unknown:
+			unknownPuts[ev.Id] = putRec{in.Key, in.Value}
+		case in.Op == "get" && !out.Unknown:
+			read[putRec{in.Key, out.Value}] = true
+		}
+	}
+	drop := make(map[int]bool)
+	for id, p := range unknownPuts {
+		if !read[p] {
+			drop[id] = true
+		}
+	}
+	if len(drop) == 0 {
+		return events, 0
+	}
+	kept := make([]porcupine.Event, 0, len(events)-2*len(drop))
+	for _, ev := range events {
+		if !drop[ev.Id] {
+			kept = append(kept, ev)
+		}
+	}
+	return kept, len(drop)
+}
+
 // checkLinearizability runs porcupine on the recorded history and fails the
 // test if the result is not Ok, if the run recorded fewer operations than the
 // floor, or if any client observed a protocol violation.
@@ -725,7 +789,11 @@ func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
 		t.Fatalf("read throughput collapsed: %d completed reads, floor is %d", reads, floor.reads)
 	}
 
-	events := recorder.events()
+	events, pruned := pruneNeverReadIndeterminatePuts(recorder.events())
+	if pruned > 0 {
+		t.Logf("pruned %d indeterminate put(s) whose value no get ever returned; "+
+			"see pruneNeverReadIndeterminatePuts for why that cannot change the verdict", pruned)
+	}
 	model := kvModel()
 	checkStart := time.Now()
 	result := porcupine.CheckEventsTimeout(model, events, checkTimeout)
