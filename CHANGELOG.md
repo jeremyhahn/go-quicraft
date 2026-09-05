@@ -447,6 +447,48 @@ toolchain wave land together so the portfolio pays for ONE cascade, not three.
 
 ### Changed
 
+- **Every direct dependency is on its current release, and something now
+  watches them (#86).** Four moved: `golang.org/x/crypto` v0.55.0 -> v0.56.0,
+  `github.com/anishathalye/porcupine` v1.1.0 -> v1.3.0,
+  `prometheus/client_golang` v1.23.2 -> v1.24.1, and
+  `prometheus/client_model` v0.6.2 -> v0.6.3. The `x/crypto` bump closes
+  **CVE-2026-56855** and **CVE-2026-78662** (GO-2026-6355 / GO-2026-6354), two
+  SSH channel deadlock DoS advisories fixed in v0.56.0. Neither is reachable
+  here — this repository imports `argon2`, `chacha20poly1305`, `hkdf`, `ocsp`
+  and `pbkdf2`, never `x/crypto/ssh` — but Trivy gates on the module version,
+  not the call graph, which is exactly how the near-identical #50 surfaced.
+
+  `porcupine` v1.3.0 is additive: `StepContext` and `Hash` are new optional
+  fields on `Model` / `NondeterministicModel`, while `CheckEvents`,
+  `CheckEventsTimeout`, `ToModel`, `PartitionEvent` and the
+  `Ok`/`Illegal`/`Unknown` results are unchanged, so #92's per-partition
+  diagnosis and its `LinearizabilityViolationError` timeout reasoning needed no
+  edit. All 17 linearizability tests pass on it, both `TestDiagnosePartitions_*`
+  included.
+
+  `test/performance/etcd` is the one module left behind, deliberately:
+  `go.etcd.io/raft/v3` v3.7.0 moves `raftpb` onto pointer-valued generated types
+  and does not compile against the benchmark. It carries a `DOCUMENTED PIN`
+  comment naming what breaks (conventions/devops.md §9) and #127 unpins it.
+
+- **`make deps-check`, run nightly, is what actually watches dependencies
+  (#86).** `.github/dependabot.yml` has existed since early in this repository's
+  history and has never run once — Dependabot is a github.com service and this
+  repository has no `github` remote at all. Worse, two comments in
+  `nightly.yml` cited it as the reason the contrib and benchmark trees needed no
+  dependency scanning, so a belief in coverage that did not exist suppressed
+  building the coverage that would have. Six dependencies drifted underneath it.
+
+  The replacement runs on the Gitea plane where the code actually lives:
+  `scripts/deps-check.sh` walks every `go.mod` with the exact `go list -m -u`
+  invocation CLAUDE.md documents, and fails when a direct dependency is behind
+  unless its `require` line carries a `DOCUMENTED PIN` comment — which makes
+  devops.md §9's "an undocumented pin is a defect" mechanical rather than
+  aspirational. It is in `nightly.yml`, not the push gate: an upstream release
+  is a fact about the world, not about the commit under review. The dependabot
+  config is kept, and annotated as inert, because it is exactly what should run
+  the day this repository is first mirrored.
+
 - **The QUIC transport is now inside the approved-only FIPS gate; `quic-go`
   moves v0.59.1 -> v0.62.0 (#85).** Packet protection was the larger of the two
   documented FIPS 140-3 exemptions, and it is gone rather than accepted.

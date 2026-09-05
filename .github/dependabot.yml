@@ -1,12 +1,38 @@
 version: 2
 
+# ###########################################################################
+# THIS FILE HAS NEVER RUN. It is correct, and it is inert. (go-quicraft#86)
+#
+# Dependabot is a github.com service. This repository has no `github` remote —
+# it has never been mirrored, and `git ls-remote github` answers "does not
+# appear to be a git repository". All development happens on the Gitea plane at
+# 198.51.100.91, where nothing reads this file. Zero pull requests have ever
+# come from it.
+#
+# The cost was not merely that it did nothing. Two comments in
+# .github/workflows/nightly.yml cited it as the reason the contrib and
+# benchmark trees needed no dependency scanning, so a belief in coverage that
+# did not exist actively suppressed building the coverage that would have. Six
+# direct dependencies drifted a release or more — including golang.org/x/crypto
+# through CVE-2026-56855 — before anyone measured.
+#
+# WHAT ACTUALLY WATCHES DEPENDENCIES: `make deps-check` (scripts/deps-check.sh),
+# run nightly by the `deps` job in .github/workflows/nightly.yml. Read that
+# script's header before changing anything here.
+#
+# This file is KEPT rather than deleted for one reason: it is exactly what
+# should run the day this repository is first published to the github.com
+# mirror, which version-control.md §3 makes an explicit owner decision. Deleting
+# it would mean rebuilding it then. Until that day it documents an intention,
+# not a mechanism — do not cite it as coverage.
+# ###########################################################################
+#
 # Keep every module on current, patched dependencies. The shipped library is
 # the repository root; the remaining modules are the dragonboat compatibility
 # adapter and the benchmark harnesses (etcd / dragonboat / openraft / quicraft
 # comparison rigs). They are not released, but they are tracked here so no
 # module accrues known-vulnerable dependencies. Trivy/gosec code scanning is
-# scoped to the shipped library only (see .github/workflows/ci.yml); Dependabot
-# is what keeps the non-shipped modules current.
+# scoped to the shipped library only (see .github/workflows/ci.yml).
 updates:
   # --- Go modules ---
   - package-ecosystem: gomod

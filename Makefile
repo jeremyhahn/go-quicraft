@@ -1386,6 +1386,24 @@ security: gosec vuln modverify trivy
 modverify:
 	$(GO) mod verify
 
+.PHONY: deps-check
+# Fail when a DIRECT dependency of any module here is behind its newest release
+# (#86). This is the freshness watcher; `deps-latest` beside it is the
+# first-party UPDATER, and they are not the same thing -- deps-latest only ever
+# looks at github.com/jeremyhahn/*, which is why six third-party dependencies
+# drifted a release or more without anything noticing.
+#
+# NOT a prerequisite of `security`, and not in ci.yml's gate. A dependency
+# publishing a release does not make this commit wrong, and a push-path gate
+# that fails for something no one in the PR did trains people to ignore it. It
+# runs in nightly.yml, which is the channel that actually caught the last two
+# (#50's CVE and #85's FIPS fix) -- see the script header for why this had to be
+# built on the Gitea plane rather than left to .github/dependabot.yml.
+#
+# Run it by hand any time; it needs only a go toolchain and network.
+deps-check:
+	@./scripts/deps-check.sh
+
 .PHONY: gosec
 # Deliberately scans MORE than the CI job does. ci.yml excludes test/, and
 # contrib/ wholesale; this excludes only test/performance (separate modules
@@ -1677,6 +1695,8 @@ help:
 	@echo "  gosec                  Run gosec security scanner"
 	@echo "  vuln                   Run govulncheck vulnerability scanner"
 	@echo "  modverify              Verify module integrity against go.sum"
+	@echo "  deps-check             Fail if a direct dependency of ANY module is behind"
+	@echo "                         its newest release (nightly; not in the push gate)"
 	@echo "  trivy                  Run Trivy filesystem scan (CRITICAL,HIGH)"
 	@echo "  trivy-image            Build and scan the local Docker images with Trivy"
 	@echo "                         (not part of 'security' -- needs Docker; run it"
