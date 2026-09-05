@@ -29,8 +29,9 @@
 # `require` line contains the words DOCUMENTED PIN. Nothing else exempts it --
 # there is no ignore list in this file and no flag to pass, because a pin
 # recorded anywhere but beside the version is a pin the next reader will not
-# find. Worked example: test/performance/etcd/go.mod holds go.etcd.io/raft/v3
-# at v3.6.0 (#127).
+# find. Worked example: test/performance/etcd/go.mod held go.etcd.io/raft/v3
+# at v3.6.0 under this marker from #86 until #127 migrated it to v3.7.0 and
+# retired the pin; the tree carries no DOCUMENTED PIN today.
 #
 # Exit 0 = every module current or documented. Exit 1 = at least one
 # undocumented lag. Exit 2 = the check could not run, which is NOT a pass.
