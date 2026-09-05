@@ -2267,14 +2267,28 @@ func newBarrierForNode(t *testing.T) *countingBarrier {
 // writing somewhere else entirely.
 const snapshotDataFileName = "snapshot.dat"
 
+// snapshotMetaFileName is the record the engine writes BESIDE each snapshot
+// payload once the save that produced it has finished. Like the payload name it
+// is duplicated here rather than read out of the engine, for the same reason.
+const snapshotMetaFileName = "snapshot.meta"
+
 // snapshotArtifacts returns every snapshot payload file beneath dir. The whole
 // tree is walked rather than the documented path being reconstructed so the
 // search still finds the artifacts if the layout changes.
+//
+// An entry that vanishes mid-walk is skipped rather than failed. Snapshot
+// garbage collection removes whole snapshot directories concurrently with the
+// walk, and a directory that no longer exists holds no bytes to assert over;
+// failing on it would report a deleted artifact as an unreadable one. Every
+// other walk error still fails.
 func snapshotArtifacts(t *testing.T, dir string) []string {
 	t.Helper()
 	var found []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
 			return walkErr
 		}
 		if !d.IsDir() && d.Name() == snapshotDataFileName {
@@ -2286,6 +2300,107 @@ func snapshotArtifacts(t *testing.T, dir string) []string {
 		t.Fatalf("walking %s for snapshot artifacts: %v", dir, err)
 	}
 	return found
+}
+
+// snapshotArtifactEpoch reads the at-rest encryption epoch out of the
+// snapshot.meta record at metaPath. ok is false when the record is not (yet) a
+// complete one, which is how a save that has not finished is recognised.
+//
+// The record is parsed positionally against its documented layout — an 8-byte
+// magic, a 2-byte body version, 2 reserved bytes, a 4-byte body length, then
+// little-endian uint64 body fields with Epoch sixth. The layout is restated
+// here rather than decoded with the engine's own reader for the reason the file
+// names are: a check that borrows the writer's decoder cannot notice the writer
+// recording something other than what it stored.
+//
+// An epoch of 0 is a VALID read and means the artifact was stored in the CLEAR.
+// It is never conflated with an unreadable record: the two are opposite in
+// consequence, and only one of them is a finding.
+func snapshotArtifactEpoch(metaPath string) (epoch uint64, ok bool, why string) {
+	const (
+		magic      = "QRSNAPMD"
+		headerLen  = 16
+		bodyLenOff = 12
+		epochOff   = 40
+		minBodyLen = epochOff + 8
+	)
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		return 0, false, fmt.Sprintf("%s: %v", snapshotMetaFileName, err)
+	}
+	if len(raw) < headerLen+minBodyLen {
+		return 0, false, fmt.Sprintf("%s holds %d bytes, short of the %d-byte minimum record",
+			snapshotMetaFileName, len(raw), headerLen+minBodyLen)
+	}
+	if string(raw[:len(magic)]) != magic {
+		return 0, false, fmt.Sprintf("%s does not start with the %q record magic", snapshotMetaFileName, magic)
+	}
+	bodyLen := int(binary.LittleEndian.Uint32(raw[bodyLenOff : bodyLenOff+4]))
+	if bodyLen < minBodyLen || headerLen+bodyLen > len(raw) {
+		return 0, false, fmt.Sprintf("%s declares a %d-byte body in a %d-byte file",
+			snapshotMetaFileName, bodyLen, len(raw))
+	}
+	return binary.LittleEndian.Uint64(raw[headerLen+epochOff : headerLen+epochOff+8]), true, ""
+}
+
+// unfinishedSnapshotArtifacts returns, for each path whose snapshot directory
+// does not yet describe itself, why it does not — a missing, empty, or
+// half-written snapshot.meta beside snapshot.dat.
+//
+// A complete metadata record is the completion marker of every path that writes
+// an artifact, and it is what separates "the save is still running" from "the
+// save is done". A local save writes snapshot.dat, fsyncs it, encrypts it IN
+// PLACE and only then creates snapshot.meta and writes the record into it; the
+// receive and import paths assemble both files in a staging directory and
+// publish them with one rename. So a payload with no complete record beside it
+// is a save in flight, and its bytes are whatever the encrypt step has not
+// replaced yet.
+//
+// The record must be COMPLETE, not merely present: writeSnapshotMetadata
+// creates the file with O_TRUNC and writes into it afterwards, so an empty
+// snapshot.meta is observable and means the same thing as no snapshot.meta.
+func unfinishedSnapshotArtifacts(paths []string) []string {
+	var pending []string
+	for _, p := range paths {
+		if _, ok, why := snapshotArtifactEpoch(filepath.Join(filepath.Dir(p), snapshotMetaFileName)); !ok {
+			pending = append(pending, fmt.Sprintf("%s (%s)", p, why))
+		}
+	}
+	return pending
+}
+
+// waitForFinishedSnapshotArtifacts blocks until dir holds at least one snapshot
+// artifact AND every artifact beneath it has finished being written, then
+// returns them all.
+//
+// Waiting for completion is NOT the same as ignoring what is incomplete. A
+// directory that never becomes self-describing is a leaked plaintext artifact —
+// the state a save killed between its plaintext fsync and its encrypt leaves
+// behind — so the timeout FAILS and names the directories with the reason each
+// was rejected, rather than dropping them from the search. The only thing the
+// wait removes is the window in which a save this node is running right now has
+// not finished.
+func waitForFinishedSnapshotArtifacts(t *testing.T, label, dir string, timeout time.Duration) []string {
+	t.Helper()
+	var paths, pending []string
+	waitForConditionDiag(t, timeout,
+		fmt.Sprintf("%s finishes every snapshot save under %s", label, dir),
+		func() bool {
+			paths = snapshotArtifacts(t, dir)
+			pending = unfinishedSnapshotArtifacts(paths)
+			return len(paths) > 0 && len(pending) == 0
+		},
+		func() string {
+			if len(paths) == 0 {
+				return fmt.Sprintf("%s: no snapshot artifact was written under %s", label, dir)
+			}
+			return fmt.Sprintf("%s: %d of %d snapshot artifact(s) under %s never became "+
+				"self-describing (a save killed between its plaintext fsync and its "+
+				"encrypt leaves exactly this): %v",
+				label, len(pending), len(paths), dir, pending)
+		},
+	)
+	return paths
 }
 
 // waitForSnapshotArtifact blocks until at least one snapshot payload file
@@ -2304,8 +2419,9 @@ func waitForSnapshotArtifact(t *testing.T, label, dir string, timeout time.Durat
 	return paths
 }
 
-// assertSnapshotsSealed fails unless dir holds at least one snapshot artifact
-// AND no artifact contains any of the plaintext needles.
+// assertSnapshotsSealed fails unless dir holds at least one snapshot artifact,
+// every artifact beneath it finished being written, each records a non-zero
+// at-rest epoch, and none contains any of the plaintext needles.
 //
 // This is deliberately a check of the BYTES ON DISK rather than a round trip.
 // A round trip through the engine reads back whatever it wrote, so it passes
@@ -2313,19 +2429,70 @@ func waitForSnapshotArtifact(t *testing.T, label, dir string, timeout time.Durat
 // is exactly the plaintext downgrade at-rest encryption exists to prevent. The
 // non-empty artifact count is part of the assertion: a search that finds no
 // files to search is vacuous, not a pass.
+//
+// EVERY artifact under the node's whole tree is searched, not just the newest.
+// A stale artifact left in the clear by an earlier save is exactly the leak an
+// at-rest check exists to catch, and narrowing the search to the most recent
+// index would step over it.
+//
+// The two checks per artifact are independent and neither implies the other.
+// The recorded epoch says the encrypt path RAN and under which DEK; a zero
+// epoch on a barrier-encrypted node is a plaintext downgrade whether or not
+// this particular snapshot happens to hold a needle. The byte search says what
+// reached the disk is not readable, which a recorded epoch alone would not
+// prove.
+//
+// What the completion wait buys, and what it costs: the engine's local save
+// path writes the state machine to snapshot.dat, fsyncs it, and encrypts it IN
+// PLACE afterwards, so between those steps the canonical name holds a COMPLETE
+// plaintext copy. Scanning during that window read a save in progress and
+// reported it as a downgrade — 4 of 41 runs of this suite on a 24-core box at
+// load average ~120 (issue #108). Waiting for every artifact to become
+// self-describing removes that window WITHOUT dropping anything from the
+// search: an artifact that never finishes fails the wait rather than being
+// skipped, which is what keeps a save killed inside the window a failure here.
+//
+// The window ITSELF is a property of the product, not of this test, and is
+// tracked as #116. Nothing about it is being asserted away: what this function
+// no longer does is report a save that is running right now as a downgrade.
 func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 	t.Helper()
 	if len(needles) == 0 {
 		t.Fatalf("%s: assertSnapshotsSealed called with no plaintext needles", label)
 	}
-	paths := waitForSnapshotArtifact(t, label, dir, membershipTimeout)
+	paths := waitForFinishedSnapshotArtifacts(t, label, dir, membershipTimeout)
+	checked := 0
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Snapshot garbage collection reclaimed the whole directory between
+			// the walk and this read. A path that no longer exists holds no
+			// bytes on disk, so there is nothing here to leak and nothing to
+			// assert over; every other read error still fails.
+			continue
+		}
 		if err != nil {
 			t.Fatalf("%s: reading snapshot artifact %s: %v", label, p, err)
 		}
 		if len(data) == 0 {
 			t.Fatalf("%s: snapshot artifact %s is empty", label, p)
+		}
+		metaPath := filepath.Join(filepath.Dir(p), snapshotMetaFileName)
+		epoch, ok, why := snapshotArtifactEpoch(metaPath)
+		if !ok {
+			if _, statErr := os.Stat(p); errors.Is(statErr, fs.ErrNotExist) {
+				continue // collected alongside its metadata; see above
+			}
+			// The wait above returned only when every record parsed, and the
+			// artifact is still here, so this is a record that decayed after
+			// that point rather than a save in flight.
+			t.Fatalf("%s: snapshot artifact %s has no readable at-rest epoch (%s), so it "+
+				"cannot be shown to be sealed", label, p, why)
+		}
+		if epoch == 0 {
+			t.Fatalf("%s: snapshot artifact %s (%d bytes) records at-rest epoch 0 in %s; "+
+				"the artifact was stored in the clear on a barrier-encrypted node",
+				label, p, len(data), metaPath)
 		}
 		for _, needle := range needles {
 			if bytes.Contains(data, []byte(needle)) {
@@ -2334,8 +2501,15 @@ func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 					label, p, len(data), needle)
 			}
 		}
+		checked++
 	}
-	t.Logf("%s: %d snapshot artifact(s) under %s, none containing plaintext", label, len(paths), dir)
+	if checked == 0 {
+		t.Fatalf("%s: %d snapshot artifact(s) were found under %s but every one was "+
+			"garbage-collected before it could be read; the at-rest check asserted nothing",
+			label, len(paths), dir)
+	}
+	t.Logf("%s: %d finished snapshot artifact(s) under %s, each sealed at a non-zero "+
+		"epoch and none containing plaintext", label, checked, dir)
 }
 
 // requestSnapshotSync asks host for an explicit snapshot of shardID and WAITS
