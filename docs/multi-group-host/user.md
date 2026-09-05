@@ -1277,7 +1277,7 @@ verified mTLS.
 ### Docker CI Image
 
 The CI Dockerfile (`.devcontainer/Dockerfile.dev`) pre-installs golangci-lint
-v2.7.2 (pinned), plus gosec, govulncheck, nancy and Trivy at `@latest`.
+v2.13.2 (pinned), plus gosec, govulncheck, nancy and Trivy at `@latest`.
 
 ## FIPS 140 Build
 
