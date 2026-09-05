@@ -66,6 +66,10 @@ func TestIntegration_DB_QuorumLoss_ProposalFails(t *testing.T) {
 
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("quorum-loss-key", "should-fail")
+	//quicraft:direct-propose the stranded INCUMBENT is the subject: it must fail to
+	// commit now that its two followers are gone. proposeToLeader would find no
+	// leader at all (CheckQuorum steps this replica down) and spin until its own
+	// deadline, turning the assertion into a timeout.
 	_, err := leaderHost.SyncPropose(ctx, session, cmd)
 	if err == nil {
 		t.Fatal("SyncPropose should fail when quorum is lost, but it succeeded")

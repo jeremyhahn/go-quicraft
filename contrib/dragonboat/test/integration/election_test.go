@@ -128,14 +128,8 @@ func TestIntegration_DB_PreVoteElection(t *testing.T) {
 
 	// Verify async propose also works with PreVote.
 	session := dbClient.NewNoOPSession(1, nil)
-	propCtx, propCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer propCancel()
-
 	cmd := encodeKVPut("prevote-async", "async-value")
-	syncResult, syncErr := leaderHost.SyncPropose(propCtx, session, cmd)
-	if syncErr != nil {
-		t.Fatalf("SyncPropose with PreVote enabled failed: %v", syncErr)
-	}
+	syncResult := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 	if syncResult.Value != uint64(len("async-value")) {
 		t.Fatalf("SyncPropose result.Value = %d, want %d", syncResult.Value, len("async-value"))
 	}

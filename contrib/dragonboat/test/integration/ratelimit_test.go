@@ -120,6 +120,10 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	for i := range maxAttempts {
 		// Use async Propose so proposals queue up without waiting for
 		// each to be applied.
+		//quicraft:direct-propose standalone single-voter shard, and the backpressure
+		// building up in THIS host's proposal pipeline is the subject; re-resolving
+		// would have nowhere else to go and a retry would drain the very queue the
+		// rate limiter is meant to notice.
 		rs, propErr := nh.Propose(session, cmd, defaultTimeout)
 		if propErr != nil {
 			if errors.Is(propErr, dragonboat.ErrSystemBusy) {
@@ -157,6 +161,8 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 		// proposal as a fallback check.
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 		defer cancel()
+		//quicraft:direct-propose standalone single-voter shard; the fallback probe
+		// must reach the same overloaded host as the async proposals above.
 		_, syncErr := nh.SyncPropose(ctx, session, cmd)
 		if syncErr != nil && errors.Is(syncErr, dragonboat.ErrSystemBusy) {
 			gotBusy = true
@@ -177,14 +183,10 @@ func TestIntegration_DB_UpdateResultIsReturned(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
 
 	session := dbClient.NewNoOPSession(1, nil)
 
@@ -200,10 +202,7 @@ func TestIntegration_DB_UpdateResultIsReturned(t *testing.T) {
 
 	for _, tc := range testCases {
 		cmd := encodeKVPut(tc.key, tc.value)
-		result, err := leaderHost.SyncPropose(ctx, session, cmd)
-		if err != nil {
-			t.Fatalf("SyncPropose(%q) failed: %v", tc.key, err)
-		}
+		result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 		if result.Value != tc.wantLen {
 			t.Errorf("SyncPropose(%q) result.Value = %d, want %d",
 				tc.key, result.Value, tc.wantLen)

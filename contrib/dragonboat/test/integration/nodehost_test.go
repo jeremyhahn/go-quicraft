@@ -142,7 +142,6 @@ func TestIntegration_DB_AsyncPropose(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
 	session := dbClient.NewNoOPSession(1, nil)
 
 	// Propose 10 entries using the async Propose + ResultC pattern.
@@ -154,10 +153,7 @@ func TestIntegration_DB_AsyncPropose(t *testing.T) {
 		expected[key] = value
 
 		cmd := encodeKVPut(key, value)
-		rs, err := leaderHost.Propose(session, cmd, defaultTimeout)
-		if err != nil {
-			t.Fatalf("Propose(%q) failed: %v", key, err)
-		}
+		rs := cluster.proposeAsyncToLeader(t, session, cmd, defaultTimeout).RS
 
 		// Wait for the result via ResultC (dragonboat async pattern).
 		select {

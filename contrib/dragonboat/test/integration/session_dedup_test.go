@@ -40,7 +40,11 @@ func TestIntegration_DB_TrackedSession_Deduplication(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
+	// Resolved AFTER the warmup above, not from the index read before it: the
+	// tracked session below is registered on this replica and every proposal in
+	// this test is deliberately addressed to it, so the one resolve that does
+	// happen must be as late as possible.
+	leaderHost := cluster.waitForLeaderHost(1, leaderElectionTimeout)
 
 	// Register a tracked session via SyncGetSession.
 	getCtx, getCancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -62,6 +66,12 @@ func TestIntegration_DB_TrackedSession_Deduplication(t *testing.T) {
 	prop1Ctx, prop1Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer prop1Cancel()
 	cmd1 := encodeKVPut("dedup-key1", "dedup-val1")
+	//quicraft:direct-propose the tracked session's SERIES ID is the subject here.
+	// tryProposeToLeader retries a not-leader rejection by re-proposing with the
+	// series unchanged, which is indistinguishable from the duplicate this suite
+	// exists to detect -- it would silently produce the cached-result outcome the
+	// test is trying to attribute to the RSM. The session was registered on this
+	// replica and every assertion here is about what it does next.
 	result1, prop1Err := leaderHost.SyncPropose(prop1Ctx, session, cmd1)
 	if prop1Err != nil {
 		t.Fatalf("first SyncPropose failed: %v", prop1Err)
@@ -98,6 +108,12 @@ func TestIntegration_DB_TrackedSession_Deduplication(t *testing.T) {
 	prop2Ctx, prop2Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer prop2Cancel()
 	cmd2 := encodeKVPut("dedup-key2", "dedup-val2")
+	//quicraft:direct-propose the tracked session's SERIES ID is the subject here.
+	// tryProposeToLeader retries a not-leader rejection by re-proposing with the
+	// series unchanged, which is indistinguishable from the duplicate this suite
+	// exists to detect -- it would silently produce the cached-result outcome the
+	// test is trying to attribute to the RSM. The session was registered on this
+	// replica and every assertion here is about what it does next.
 	result2, prop2Err := leaderHost.SyncPropose(prop2Ctx, session, cmd2)
 	if prop2Err != nil {
 		t.Fatalf("second SyncPropose failed: %v", prop2Err)
@@ -160,7 +176,11 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
+	// Resolved AFTER the warmup above, not from the index read before it: the
+	// tracked session below is registered on this replica and every proposal in
+	// this test is deliberately addressed to it, so the one resolve that does
+	// happen must be as late as possible.
+	leaderHost := cluster.waitForLeaderHost(1, leaderElectionTimeout)
 
 	// Register a tracked session.
 	getCtx, getCancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -179,6 +199,12 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	prop1Ctx, prop1Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer prop1Cancel()
 	cmd1 := encodeKVPut("dup-reject-key", "dup-reject-val")
+	//quicraft:direct-propose the tracked session's SERIES ID is the subject here.
+	// tryProposeToLeader retries a not-leader rejection by re-proposing with the
+	// series unchanged, which is indistinguishable from the duplicate this suite
+	// exists to detect -- it would silently produce the cached-result outcome the
+	// test is trying to attribute to the RSM. The session was registered on this
+	// replica and every assertion here is about what it does next.
 	result1, prop1Err := leaderHost.SyncPropose(prop1Ctx, session, cmd1)
 	if prop1Err != nil {
 		t.Fatalf("first SyncPropose failed: %v", prop1Err)
@@ -194,6 +220,12 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	dup1Ctx, dup1Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer dup1Cancel()
 	cmd2 := encodeKVPut("dup-reject-key2", "dup-reject-val2")
+	//quicraft:direct-propose the tracked session's SERIES ID is the subject here.
+	// tryProposeToLeader retries a not-leader rejection by re-proposing with the
+	// series unchanged, which is indistinguishable from the duplicate this suite
+	// exists to detect -- it would silently produce the cached-result outcome the
+	// test is trying to attribute to the RSM. The session was registered on this
+	// replica and every assertion here is about what it does next.
 	dupResult, dupErr := leaderHost.SyncPropose(dup1Ctx, session, cmd2)
 
 	if dupErr != nil {
@@ -243,6 +275,12 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	prop3Ctx, prop3Cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer prop3Cancel()
 	cmd3 := encodeKVPut("dup-post-key", "dup-post-val")
+	//quicraft:direct-propose the tracked session's SERIES ID is the subject here.
+	// tryProposeToLeader retries a not-leader rejection by re-proposing with the
+	// series unchanged, which is indistinguishable from the duplicate this suite
+	// exists to detect -- it would silently produce the cached-result outcome the
+	// test is trying to attribute to the RSM. The session was registered on this
+	// replica and every assertion here is about what it does next.
 	result3, prop3Err := leaderHost.SyncPropose(prop3Ctx, session, cmd3)
 	if prop3Err != nil {
 		t.Fatalf("post-advance SyncPropose failed: %v", prop3Err)

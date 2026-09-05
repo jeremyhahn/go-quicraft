@@ -344,6 +344,11 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	// Park the leader's apply loop on a gate entry. Propose is asynchronous;
 	// the entry commits and then blocks inside the state machine's Update.
 	gateSession := dbClient.NewNoOPSession(1, nil)
+	//quicraft:direct-propose the gate entry must park THIS leader's apply loop --
+	// the one whose gated state machine is waited on below and whose
+	// RequestAddReplica calls the rest of the test makes. A re-resolving helper
+	// could park a different replica, leaving the pending-config-change latch this
+	// test exists to exercise unarmed.
 	gateRS, gateErr := leaderHost.Propose(gateSession, encodeKVPut("gate-hold", "1"), defaultTimeout)
 	if gateErr != nil {
 		t.Fatalf("Propose(gate entry) failed: %v", gateErr)

@@ -52,20 +52,16 @@ func TestIntegration_DB_LinearizableRead_ImmediateAfterPropose(t *testing.T) {
 	// Warmup entry required after election (PhD 6.4).
 	proposeAndWait(t, cluster, trackers, shardID, "warmup", "ok")
 
-	leaderHost := cluster.hosts[leaderIdx]
-
 	// Propose a key-value pair through SyncPropose on the leader. SyncPropose
 	// returns once the entry is committed (majority replicated), but the local
 	// state machine application is asynchronous and may lag behind.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	//
+	// The read below must hit the replica that ACCEPTED this entry -- that is the
+	// node whose state machine may lag -- so it is taken from the proposal rather
+	// than from leaderIdx, which was read before the warmup above.
 	session := dbClient.NewNoOPSession(shardID, nil)
 	cmd := encodeKVPut("lin-key", "lin-value")
-	_, err := leaderHost.SyncPropose(ctx, session, cmd)
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	leaderHost := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Host
 
 	// IMMEDIATELY call SyncRead on the SAME leader without calling
 	// waitForReplication. If the implementation correctly uses the ReadIndex
@@ -132,17 +128,11 @@ func TestIntegration_DB_LinearizableRead_FollowerWithoutExplicitWait(t *testing.
 	}
 	t.Logf("using follower node[%d] for immediate read", followerIdx)
 
-	// Propose a key-value pair on the leader.
-	leaderHost := cluster.hosts[leaderIdx]
-	proposeCtx, proposeCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer proposeCancel()
-
+	// Propose a key-value pair on the leader. The FOLLOWER read below is the
+	// assertion, so the proposal only has to reach whichever replica leads now.
 	session := dbClient.NewNoOPSession(shardID, nil)
 	cmd := encodeKVPut("follower-lin-key", "follower-lin-value")
-	_, err := leaderHost.SyncPropose(proposeCtx, session, cmd)
-	if err != nil {
-		t.Fatalf("SyncPropose on leader failed: %v", err)
-	}
+	cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 
 	// IMMEDIATELY read from the follower without waiting for replication.
 	followerHost := cluster.hosts[followerIdx]
@@ -316,16 +306,11 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// Warmup entry required after election (PhD 6.4).
 	proposeAndWait(t, cluster, trackers, shardID, "warmup", "ok")
 
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Seed the initial value so reads never see an empty string.
-	seedCtx, seedCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer seedCancel()
+	// Seed the initial value so reads never see an empty string. The reader
+	// below polls the replica that accepted the seed, so take it from the
+	// proposal rather than from leaderIdx.
 	session := dbClient.NewNoOPSession(shardID, nil)
-	_, err := leaderHost.SyncPropose(seedCtx, session, encodeKVPut("counter", "0"))
-	if err != nil {
-		t.Fatalf("SyncPropose seed failed: %v", err)
-	}
+	leaderHost := cluster.proposeToLeader(t, session, encodeKVPut("counter", "0"), defaultTimeout).Host
 
 	// Wait for the seed to be readable via SyncRead before starting the
 	// concurrent phase. This ensures the test does not fail due to the
@@ -378,10 +363,12 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 			next := writeCounter.Add(1)
 			val := strconv.FormatInt(next, 10)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// tryProposeToLeader, not proposeToLeader: this runs off the test
+			// goroutine and must not touch t. It re-resolves the leader on every
+			// attempt, so a mid-run election is survived rather than reported as
+			// a write failure.
 			session := dbClient.NewNoOPSession(shardID, nil)
-			_, err := leaderHost.SyncPropose(ctx, session, encodeKVPut("counter", val))
-			cancel()
+			_, err := cluster.tryProposeToLeader(session, encodeKVPut("counter", val), 5*time.Second)
 
 			if err != nil {
 				// Check if we were told to stop during the propose.

@@ -36,24 +36,22 @@ func TestIntegration_DB_SyncIOAPIs(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
 	session := dbClient.NewNoOPSession(1, nil)
 
-	// Propose.
+	// Propose. The read below is the other half of the round trip and must go to
+	// the replica that accepted the entry, so take the host from the proposal.
 	cmd := encodeKVPut("sync-key", "sync-value")
-	result, err := leaderHost.SyncPropose(ctx, session, cmd)
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
+	proposal := cluster.proposeToLeader(t, session, cmd, defaultTimeout)
+	leaderHost, result := proposal.Host, proposal.Result
 	if result.Value != uint64(len("sync-value")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("sync-value"))
 	}
@@ -84,16 +82,11 @@ func TestIntegration_DB_ConcurrentSMLookup(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("concurrent SM leader at node[%d]", leaderIdx)
 
-	leaderHost := cluster.hosts[leaderIdx]
 	session := dbClient.NewNoOPSession(1, nil)
 
-	// Warmup entry.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	_, err := leaderHost.SyncPropose(ctx, session, encodeKVPut("warmup", "ok"))
-	if err != nil {
-		t.Fatalf("warmup failed: %v", err)
-	}
+	// Warmup entry. The SyncRead at the end of the test reads back from the
+	// replica that accepted it, so keep the host the proposal actually used.
+	leaderHost := cluster.proposeToLeader(t, session, encodeKVPut("warmup", "ok"), defaultTimeout).Host
 	for i := range cluster.hosts {
 		if cluster.stopped[i].Load() || concTrackers[i] == nil {
 			continue
@@ -113,12 +106,7 @@ func TestIntegration_DB_ConcurrentSMLookup(t *testing.T) {
 		key := fmt.Sprintf("conc-lookup-%03d", i)
 		value := fmt.Sprintf("val-%03d", i)
 		cmd := encodeKVPut(key, value)
-		propCtx, propCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		_, propErr := leaderHost.SyncPropose(propCtx, session, cmd)
-		propCancel()
-		if propErr != nil {
-			t.Fatalf("SyncPropose(%q) failed: %v", key, propErr)
-		}
+		cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 	}
 
 	// Verify via SyncRead (exercises the Lookup path on concurrent SM).
@@ -197,6 +185,9 @@ func TestIntegration_DB_DroppedRequestsOnInvalidShard(t *testing.T) {
 
 	// Propose on shard that doesn't exist.
 	session := dbClient.NewNoOPSession(999, nil)
+	//quicraft:direct-propose the NON-EXISTENT shard is the subject. There is no
+	// cluster and no shard 999 to resolve a leader for; the rejection is the
+	// assertion.
 	_, propErr := nh.SyncPropose(ctx, session, encodeKVPut("k", "v"))
 	if propErr == nil {
 		t.Fatal("SyncPropose on non-existent shard should fail")
@@ -224,7 +215,9 @@ func TestIntegration_DB_TimeoutCanBeReturned(t *testing.T) {
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 
-	leaderHost := cluster.hosts[cluster.findLeader(1)]
+	// waitForLeaderHost, not cluster.hosts[cluster.findLeader(1)]: findLeader
+	// returns -1 between two leaders, and indexing hosts with it panics.
+	leaderHost := cluster.waitForLeaderHost(1, leaderElectionTimeout)
 
 	// Use an already-expired context.
 	expiredCtx, expiredCancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
@@ -235,6 +228,9 @@ func TestIntegration_DB_TimeoutCanBeReturned(t *testing.T) {
 	defer expiredCancel()
 
 	session := dbClient.NewNoOPSession(1, nil)
+	//quicraft:direct-propose the EXPIRED context is the subject. SyncPropose
+	// rejects it before the proposal is routed, and proposeToLeader takes a
+	// timeout rather than a context so it cannot express this input.
 	_, propErr := leaderHost.SyncPropose(expiredCtx, session, encodeKVPut("k", "v"))
 	if propErr == nil {
 		t.Fatal("SyncPropose with expired context should return error")
@@ -476,17 +472,13 @@ func TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
 	session := dbClient.NewNoOPSession(1, nil)
 
 	key := "snap-idx-key"
 	value := "snap-idx-value"
 	cmd := encodeKVPut(key, value)
 
-	rs, err := leaderHost.Propose(session, cmd, defaultTimeout)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
+	rs := cluster.proposeAsyncToLeader(t, session, cmd, defaultTimeout).RS
 
 	select {
 	case result := <-rs.ResultC():

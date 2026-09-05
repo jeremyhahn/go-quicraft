@@ -33,6 +33,57 @@ import (
 // marker sits on the line that needs it and carries its own reason.
 const directProposeMarker = "//quicraft:direct-propose"
 
+// proposalRoot is one test tree this gate walks, with the smallest number of
+// files it must find there.
+type proposalRoot struct {
+	dir      string
+	minFiles int
+}
+
+// proposalRoots are the trees scanned by TestIntegrationProposalsResolveTheLeader.
+//
+// # Why contrib/dragonboat is scanned from here, and not by its own gate
+//
+// contrib/dragonboat is a separate Go module with its own CI job, so the
+// obvious move is a second copy of this gate inside it. That would be ~180
+// lines of AST walking duplicated into a second module, and the duplication is
+// not incidental: the marker convention, the bare-marker rule, the
+// comment-block resolution and the empty-set floor all have to agree exactly
+// between the copies or the rule quietly differs between the two trees, which
+// is how a class like this survives a fix.
+//
+// It does not need to be duplicated, because the gate PARSES rather than
+// compiles. go/parser reads files by path; it never resolves an import, loads a
+// package or evaluates a build tag, so a module boundary is invisible to it —
+// contrib/dragonboat's files are ordinary files in the same repository at a
+// known relative path. Both trees are therefore checked by the one
+// implementation, and a change to the rule lands in both at once.
+//
+// The cost is that a violation in contrib/dragonboat fails the PARENT module's
+// job rather than the contrib job. That is the right way round: a violation
+// fails CI either way, and one gate means there is exactly one place to fix the
+// rule and no way for the two trees to drift apart.
+//
+// # What is NOT scanned, and why
+//
+// Only the multi-replica integration trees. Neither module's root-package unit
+// tests are here, and neither should be: every shard in
+// contrib/dragonboat/nodehost_test.go and nodehost_defects_test.go is a
+// single-voter configuration (map[uint64]Target{replicaID: nh.RaftAddress()}),
+// where the addressed host is the only replica that can lead and there is no
+// successor for a proposal to be redirected to. The class this gate exists to
+// catch cannot occur there, and marking 41 such calls would be noise that
+// devalues the marker everywhere it does matter.
+var proposalRoots = []proposalRoot{
+	// The parent module's integration suites (e2e, host, linearizability, raft).
+	{dir: filepath.Join("..", "integration"), minFiles: 20},
+	// The dragonboat adapter's integration suite. Its helpers are the module's
+	// own — see the "Leader-resolving proposals" section of
+	// contrib/dragonboat/test/integration/helpers_test.go for why the parent's
+	// test/proposer package cannot be reused across that API boundary.
+	{dir: filepath.Join("..", "..", "contrib", "dragonboat", "test", "integration"), minFiles: 20},
+}
+
 // proposalCalls are the methods that submit an entry to Raft. Both must reach
 // the shard's CURRENT leader, and neither forwards when the addressed replica
 // has lost leadership without yet learning its successor.
@@ -82,20 +133,16 @@ var proposalCalls = map[string]bool{
 // suite are in it; the marker is how the judgement gets recorded next to the
 // code instead of in a commit message nobody will find.
 func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
-	roots := []string{
-		filepath.Join("..", "integration"),
-	}
-
 	type finding struct {
 		pos  string
 		call string
 	}
 	var findings []finding
 	var bare []string
-	scanned := 0
 
-	for _, root := range roots {
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	for _, root := range proposalRoots {
+		scanned := 0
+		err := filepath.WalkDir(root.dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -186,18 +233,19 @@ func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 			return nil
 		})
 		if err != nil {
-			t.Fatalf("walking %s: %v", root, err)
+			t.Fatalf("walking %s: %v", root.dir, err)
 		}
-	}
 
-	// A gate over an empty set passes for the wrong reason. If the integration
-	// tree moves and this stops finding files, that must fail rather than go
-	// quietly green.
-	const minScanned = 20
-	if scanned < minScanned {
-		t.Fatalf("scanned only %d integration test files, expected at least %d: "+
-			"the tree moved and this gate is now checking almost nothing",
-			scanned, minScanned)
+		// A gate over an empty set passes for the wrong reason. If a tree
+		// moves and this stops finding files, that must fail rather than go
+		// quietly green. Counted PER ROOT: a total would let the parent
+		// module's 34 files cover for a contrib tree that had vanished.
+		if scanned < root.minFiles {
+			t.Fatalf("scanned only %d test files under %s, expected at least %d: "+
+				"the tree moved and this gate is now checking almost nothing",
+				scanned, root.dir, root.minFiles)
+		}
+		t.Logf("scanned %d test files under %s", scanned, root.dir)
 	}
 
 	if len(bare) > 0 {
@@ -208,7 +256,7 @@ func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 	}
 
 	if len(findings) == 0 {
-		t.Logf("scanned %d integration test files: every proposal resolves the leader", scanned)
+		t.Log("every integration proposal resolves the leader")
 		return
 	}
 

@@ -364,21 +364,12 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	}
 	t.Logf("4th node caught up with all %d entries via snapshot transfer", len(expected))
 
-	// Verify the new node can serve reads via SyncRead.
-	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer readCancel()
-
 	session := dbClient.NewNoOPSession(1, nil)
 
 	// Propose a new entry through the leader and verify the 4th node
 	// receives it, confirming full cluster participation.
 	postCmd := encodeKVPut("post-transfer", "verified")
-	_, propErr := leaderHost.SyncPropose(
-		readCtx, session, postCmd,
-	)
-	if propErr != nil {
-		t.Fatalf("SyncPropose after 4th node join failed: %v", propErr)
-	}
+	cluster.proposeToLeader(t, session, postCmd, defaultTimeout)
 
 	waitForCondition(t, defaultTimeout, "4th node has post-transfer key", func() bool {
 		got, ok := newSM.Get("post-transfer")

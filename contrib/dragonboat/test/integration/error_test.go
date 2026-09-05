@@ -56,6 +56,9 @@ func TestIntegration_DB_ProposeOnClosedNodeHost(t *testing.T) {
 
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("key", "value")
+	//quicraft:direct-propose the CLOSED host is the subject; it is a standalone
+	// single-voter shard with no other replica to resolve to, and resolving would
+	// defeat the assertion by finding a live leader.
 	_, proposeErr := nh.SyncPropose(ctx, session, cmd)
 	if proposeErr == nil {
 		t.Fatal("SyncPropose on closed NodeHost should return error")
@@ -111,6 +114,9 @@ func TestIntegration_DB_InvalidContextDeadline(t *testing.T) {
 	ctx := context.Background()
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("key", "value")
+	//quicraft:direct-propose the deadline-less CONTEXT is the subject. SyncPropose
+	// rejects it before the proposal is routed anywhere, and proposeToLeader takes
+	// a timeout rather than a context so it cannot express this input at all.
 	_, proposeErr := leaderHost.SyncPropose(ctx, session, cmd)
 	if proposeErr == nil {
 		t.Fatal("SyncPropose with no-deadline context should return an error")
@@ -203,6 +209,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	t.Run("SyncPropose", func(t *testing.T) {
 		session := dbClient.NewNoOPSession(1, nil)
 		cmd := encodeKVPut("dp-key", "dp-val")
+		//quicraft:direct-propose the deadline-less CONTEXT is the subject, as in
+		// TestIntegration_DB_InvalidContextDeadline above; the rejection happens
+		// before routing and proposeToLeader cannot express a context at all.
 		_, err := leaderHost.SyncPropose(ctx, session, cmd)
 		if err == nil {
 			t.Fatal("SyncPropose should reject context without deadline")
@@ -414,6 +423,9 @@ func TestIntegration_DB_SyncRemoveData(t *testing.T) {
 
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("sync-remove-key", "sync-remove-value")
+	//quicraft:direct-propose standalone single-voter shard: nh is the only replica
+	// in the configuration, so there is no successor for leadership to move to and
+	// no cluster to resolve against.
 	_, propErr := nh.SyncPropose(propCtx, session, cmd)
 	if propErr != nil {
 		t.Fatalf("SyncPropose failed: %v", propErr)

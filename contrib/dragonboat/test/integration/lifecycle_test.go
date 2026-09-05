@@ -119,6 +119,8 @@ func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 	session := dbClient.NewNoOPSession(1, nil)
+	//quicraft:direct-propose standalone single-voter shard: nh is the only replica
+	// in the configuration, so leadership has nowhere to move.
 	_, propErr := nh.SyncPropose(ctx, session, encodeKVPut("key", "val"))
 	if propErr != nil {
 		t.Fatalf("SyncPropose failed: %v", propErr)
@@ -401,8 +403,6 @@ func TestIntegration_DB_StartReplicaWaitForReadiness(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("leader elected at node[%d]", leaderIdx)
 
-	leaderHost := cluster.hosts[leaderIdx]
-
 	// Verify that the shard can serve a SyncRead. A successful
 	// linearizable read confirms: (1) a leader exists, (2) the leader
 	// has committed a no-op entry to establish its term (PhD 6.4),
@@ -412,15 +412,11 @@ func TestIntegration_DB_StartReplicaWaitForReadiness(t *testing.T) {
 	// The warmup proposal ensures the leader has committed at least
 	// one entry in its term, which is required for ReadIndex to work
 	// correctly per the Raft specification.
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer warmupCancel()
-
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("readiness-check", "ready")
-	_, warmupErr := leaderHost.SyncPropose(warmupCtx, session, warmupCmd)
-	if warmupErr != nil {
-		t.Fatalf("SyncPropose warmup failed: %v", warmupErr)
-	}
+	// The read below must go to the replica that accepted the warmup entry, so
+	// take the host back from the proposal rather than from an earlier index.
+	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
 
 	// Verify the warmup entry replicated to all nodes, confirming
 	// cluster-wide readiness.

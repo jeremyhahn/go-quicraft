@@ -51,16 +51,14 @@ func TestIntegration_DB_NoOPSession(t *testing.T) {
 		t.Fatalf("session.ShardID = %d, want 1", session.ShardID)
 	}
 
-	// Use the session for SyncPropose through the dragonboat adapter.
-	leaderHost := cluster.hosts[leaderIdx]
+	// Use the session for SyncPropose through the dragonboat adapter. The read
+	// below is on "the leader", so keep the replica the proposal actually used.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
 	cmd := encodeKVPut("session-key", "session-value")
-	result, err := leaderHost.SyncPropose(ctx, session, cmd)
-	if err != nil {
-		t.Fatalf("SyncPropose with NoOPSession failed: %v", err)
-	}
+	proposal := cluster.proposeToLeader(t, session, cmd, defaultTimeout)
+	leaderHost, result := proposal.Host, proposal.Result
 	if result.Value != uint64(len("session-value")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("session-value"))
 	}
@@ -110,9 +108,6 @@ func TestIntegration_DB_GetNoOPSession(t *testing.T) {
 	}
 
 	// Use it for multiple proposals.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	expected := make(map[string]string, 5)
 	for i := range 5 {
 		key := "getnoop-" + string(rune('a'+i))
@@ -120,10 +115,7 @@ func TestIntegration_DB_GetNoOPSession(t *testing.T) {
 		expected[key] = value
 
 		cmd := encodeKVPut(key, value)
-		result, err := leaderHost.SyncPropose(ctx, session, cmd)
-		if err != nil {
-			t.Fatalf("SyncPropose(%q) failed: %v", key, err)
-		}
+		result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 		if result.Value != uint64(len(value)) {
 			t.Errorf("result.Value = %d, want %d", result.Value, len(value))
 		}
@@ -169,14 +161,8 @@ func TestIntegration_DB_TrackedSession_Lifecycle(t *testing.T) {
 	}
 
 	// Use the tracked session for a proposal.
-	propCtx, propCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer propCancel()
-
 	cmd := encodeKVPut("tracked-key", "tracked-value")
-	result, propErr := leaderHost.SyncPropose(propCtx, session, cmd)
-	if propErr != nil {
-		t.Fatalf("SyncPropose with tracked session failed: %v", propErr)
-	}
+	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 	if result.Value != uint64(len("tracked-value")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("tracked-value"))
 	}
@@ -319,14 +305,8 @@ func TestIntegration_DB_OnDiskStateMachine_RejectsTrackedSession(t *testing.T) {
 	// First, verify that NoOP sessions work correctly with the
 	// on-disk state machine.
 	session := dbClient.NewNoOPSession(1, nil)
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer warmupCancel()
-
 	warmupCmd := encodeKVPut("ondisk-warmup", "ok")
-	_, warmupErr := leaderHost.SyncPropose(warmupCtx, session, warmupCmd)
-	if warmupErr != nil {
-		t.Fatalf("SyncPropose with NoOPSession on on-disk SM failed: %v", warmupErr)
-	}
+	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
 	t.Logf("NoOP session proposal succeeded on on-disk SM")
 
 	// Attempt to register a tracked session on the on-disk SM shard.

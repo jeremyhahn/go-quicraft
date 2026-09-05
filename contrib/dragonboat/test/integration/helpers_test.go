@@ -25,6 +25,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -1251,6 +1252,301 @@ func (c *dbTestCluster) waitForClusterLeader(shardID uint64, timeout time.Durati
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Leader-resolving proposals
+// ---------------------------------------------------------------------------
+//
+// Observing a leader does not pin it. A test that writes
+//
+//	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+//	leaderHost := cluster.hosts[leaderIdx]
+//	...
+//	_, err := leaderHost.SyncPropose(ctx, session, cmd)
+//
+// has read a value that was true when it looked and treated it as fixed. Raft
+// is free to hold an election in the gap, and the proposal is then refused
+// CORRECTLY while the test reports a failure the cluster never had. This is the
+// sixth confirmed instance of that class in this repository (#84, #88, #90,
+// #91, #103, #105).
+//
+// The refusal is narrow, which is why the pattern survives most runs and fails
+// a loaded one. quicraft's Host.Propose FORWARDS to the leader whenever the
+// local replica knows who that is; it fails fast only when leadership has moved
+// and the addressed replica does not yet know the successor.
+//
+// It is harder to recognise through this adapter than through quicraft
+// directly, because translateError folds quicraft's
+// "not leader for shard N, leader unknown" into the bare ErrShardNotReady
+// sentinel (see contrib/dragonboat/errors.go). The failure that reaches a test
+// here says only "shard not ready", with no mention of leadership at all.
+//
+// These helpers are this module's own rather than the parent module's
+// test/proposer package. That package is typed on *quicraft.Host, a raw
+// shardID and quicraft.RequestResult, and its retry predicate is
+// quicraft.NotLeader; every one of those is wrong here. This module
+// deliberately mirrors the dragonboat API, whose proposal takes a
+// *dbClient.Session carrying its own ShardID and whose not-leader rejection has
+// already been translated away. The shared part -- resolve at the point of use,
+// retry only the not-leader rejection -- is the rule, and the rule is enforced
+// for both trees by the one gate in test/buildgates.
+
+// dbProposal is what a leader-resolving proposal produces: the state machine's
+// result, and the replica the entry was actually accepted by.
+//
+// The replica is returned because these tests routinely address it again --
+// a linearizable read on the node that just proposed, a tracker lookup for the
+// leader's state machine. Handing it back is what lets a caller keep that
+// pairing without re-introducing a cached leader index to do it.
+type dbProposal struct {
+	// Result is the value the state machine's Update returned.
+	Result dbSM.Result
+	// Host is the NodeHost that accepted the entry.
+	Host *dragonboat.NodeHost
+	// Index is Host's position in the cluster's hosts slice, for callers
+	// that need the matching replica ID or state-machine tracker.
+	Index int
+}
+
+// dbAsyncProposal is dbProposal for the asynchronous Propose path, which
+// returns a RequestState the caller polls instead of a Result.
+type dbAsyncProposal struct {
+	// RS is the in-flight request. The caller owns it and must Release it.
+	RS *dragonboat.RequestState
+	// Host is the NodeHost that accepted the entry.
+	Host *dragonboat.NodeHost
+	// Index is Host's position in the cluster's hosts slice.
+	Index int
+}
+
+// proposeRetryInterval is how long a proposal helper waits before re-resolving
+// after a not-leader rejection. An election completes in roughly one election
+// timeout, so polling faster than this only burns CPU.
+const proposeRetryInterval = 20 * time.Millisecond
+
+// minProposeAttempt is the smallest budget an attempt will be started with.
+// Below it the attempt would time out on arrival and overwrite the real cause
+// with ErrTimeout, reporting leadership churn as a slow shard.
+const minProposeAttempt = 200 * time.Millisecond
+
+// leaderHost returns the NodeHost that leads shardID at the moment of the call
+// together with its index in the cluster, or (nil, -1) when no live replica
+// reports leadership.
+//
+// This is the resolver the proposal helpers call on every attempt. It is
+// deliberately NOT a value a test should hold on to.
+func (c *dbTestCluster) leaderHost(shardID uint64) (*dragonboat.NodeHost, int) {
+	idx := c.findLeader(shardID)
+	if idx < 0 {
+		return nil, -1
+	}
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	return c.hosts[idx], idx
+}
+
+// waitForLeaderHost waits for a leader on shardID and returns that NodeHost.
+//
+// It exists for the sites that must address ONE specific replica on purpose --
+// a deposed incumbent that must not commit, a leader whose apply loop is about
+// to be parked -- and that therefore cannot route through proposeToLeader. It
+// replaces cluster.hosts[cluster.findLeader(id)], which panics with index -1
+// when the read lands between two leaders.
+func (c *dbTestCluster) waitForLeaderHost(shardID uint64, timeout time.Duration) *dragonboat.NodeHost {
+	c.t.Helper()
+	idx := c.waitForClusterLeader(shardID, timeout)
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	return c.hosts[idx]
+}
+
+// isNotLeaderRejection reports whether err is this adapter's form of the
+// not-leader rejection, and nothing else. It is the ONLY error the proposal
+// helpers retry.
+//
+// The adapter has no not-leader error on its public surface. translateError
+// folds quicraft.ErrNotLeader into ErrShardNotReady, which is dragonboat's
+// documented "unknown leader is the most common cause" error and, unlike
+// ErrNotLeader, satisfies IsTempError in a migrated retry loop
+// (contrib/dragonboat/errors.go). ErrShardNotReady is therefore the only shape
+// a not-leader rejection can have here.
+//
+// Two other quicraft errors fold into the same sentinel: ErrDropped (the leader
+// is unavailable or not ready) and ErrReadIndexNotReady (the leader has not yet
+// committed an entry in its term). From the caller's side all three are one
+// condition -- the addressed replica cannot get this entry committed because it
+// is not, or not yet, a working leader -- and re-resolving is the correct
+// response to every one of them.
+//
+// Everything else is returned unchanged on its FIRST occurrence: ErrTimeout,
+// ErrSystemBusy, ErrRejected, ErrAborted, ErrPayloadTooBig, ErrInvalidSession,
+// ErrCanceled, a state machine failure. A blanket retry-on-any-error would mask
+// exactly the defects these suites exist to catch.
+func isNotLeaderRejection(err error) bool {
+	return errors.Is(err, dragonboat.ErrShardNotReady) ||
+		// A raw quicraft error can still reach a test through a path that
+		// does not run translateError.
+		errors.Is(err, quicraft.ErrNotLeader)
+}
+
+// proposeOnce submits cmd to nh and waits for the entry to commit. It does NOT
+// resolve the leader and does NOT retry: it is the single attempt the retrying
+// helpers are built from, and the way a test addresses one specific replica on
+// purpose.
+func proposeOnce(
+	nh *dragonboat.NodeHost,
+	session *dbClient.Session,
+	cmd []byte,
+	timeout time.Duration,
+) (dbSM.Result, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	//quicraft:direct-propose the single attempt tryProposeToLeader is built from
+	return nh.SyncPropose(ctx, session, cmd)
+}
+
+// proposeToLeader proposes cmd to whichever replica leads the session's shard
+// at the moment of the call, waits for the entry to commit, and fails the test
+// on any error.
+//
+// Callers that mean "the current leader" use this. Callers that mean one
+// SPECIFIC replica -- the incumbent that must NOT commit once quorum is gone,
+// the leader whose apply loop a gate entry has to park, a tracked session whose
+// series ID is itself under test -- must NOT: for them the addressed node is
+// the subject of the assertion, and re-resolving would test something else.
+// Those sites keep their own direct call and say so with a
+// quicraft:direct-propose marker (see test/buildgates in the parent module).
+func (c *dbTestCluster) proposeToLeader(
+	t *testing.T,
+	session *dbClient.Session,
+	cmd []byte,
+	timeout time.Duration,
+) dbProposal {
+	t.Helper()
+	proposal, err := c.tryProposeToLeader(session, cmd, timeout)
+	if err != nil {
+		t.Fatalf("propose to the leader of shard %d failed within %v: %v",
+			session.ShardID, timeout, err)
+	}
+	return proposal
+}
+
+// tryProposeToLeader is proposeToLeader's error-returning form, for callers
+// that layer their own assertion on the error and for goroutines, which must
+// not touch a *testing.T.
+//
+// ONLY the not-leader rejection is retried, and it is retried by RE-RESOLVING
+// the leader rather than by re-sending to the same replica.
+//
+// Re-proposal is safe for the commands these suites write. A no-op session
+// carries no at-most-once state and every command here is a last-write-wins KV
+// put, which is idempotent under re-proposal. A TRACKED session is re-proposed
+// with its series ID unchanged, because ProposalCompleted is the caller's to
+// call and a failed attempt must not advance the series; the RSM's duplicate
+// detection then either rejects the retry or returns the first attempt's cached
+// result. That is correct for a caller asserting on the VALUE, and wrong for
+// one asserting on the DEDUPLICATION -- which is why the session-dedup tests
+// keep their direct calls.
+func (c *dbTestCluster) tryProposeToLeader(
+	session *dbClient.Session,
+	cmd []byte,
+	timeout time.Duration,
+) (dbProposal, error) {
+	shardID := session.ShardID
+	deadline := time.Now().Add(timeout)
+	retry := time.NewTicker(proposeRetryInterval)
+	defer retry.Stop()
+	expiry := time.NewTimer(timeout)
+	defer expiry.Stop()
+
+	// Reported if the deadline passes without a leader ever being observed,
+	// which is itself a not-leader condition.
+	var lastErr error = dragonboat.ErrShardNotReady
+
+	for {
+		if nh, idx := c.leaderHost(shardID); nh != nil {
+			remaining := time.Until(deadline)
+			if remaining < minProposeAttempt {
+				return dbProposal{}, lastErr
+			}
+			result, err := proposeOnce(nh, session, cmd, remaining)
+			if err == nil {
+				return dbProposal{Result: result, Host: nh, Index: idx}, nil
+			}
+			if !isNotLeaderRejection(err) {
+				return dbProposal{}, err
+			}
+			lastErr = err
+		}
+		select {
+		case <-expiry.C:
+			return dbProposal{}, lastErr
+		case <-retry.C:
+		}
+	}
+}
+
+// proposeAsyncToLeader is proposeToLeader for the asynchronous Propose path.
+// It returns the RequestState, which the caller owns and must Release.
+//
+// Only the SUBMISSION is retried. Once Propose has accepted the entry the
+// outcome belongs to the returned RequestState, and whatever the caller reads
+// from ResultC -- Completed, Dropped, Rejected, a timeout -- is the test's own
+// assertion to make. Re-submitting on the strength of a result code would
+// silently paper over a dropped proposal.
+func (c *dbTestCluster) proposeAsyncToLeader(
+	t *testing.T,
+	session *dbClient.Session,
+	cmd []byte,
+	timeout time.Duration,
+) dbAsyncProposal {
+	t.Helper()
+	proposal, err := c.tryProposeAsyncToLeader(session, cmd, timeout)
+	if err != nil {
+		t.Fatalf("async propose to the leader of shard %d failed within %v: %v",
+			session.ShardID, timeout, err)
+	}
+	return proposal
+}
+
+// tryProposeAsyncToLeader is proposeAsyncToLeader's error-returning form.
+func (c *dbTestCluster) tryProposeAsyncToLeader(
+	session *dbClient.Session,
+	cmd []byte,
+	timeout time.Duration,
+) (dbAsyncProposal, error) {
+	shardID := session.ShardID
+	deadline := time.Now().Add(timeout)
+	retry := time.NewTicker(proposeRetryInterval)
+	defer retry.Stop()
+	expiry := time.NewTimer(timeout)
+	defer expiry.Stop()
+
+	var lastErr error = dragonboat.ErrShardNotReady
+
+	for {
+		if nh, idx := c.leaderHost(shardID); nh != nil {
+			remaining := time.Until(deadline)
+			if remaining < minProposeAttempt {
+				return dbAsyncProposal{}, lastErr
+			}
+			//quicraft:direct-propose the single attempt this loop is built from
+			rs, err := nh.Propose(session, cmd, remaining)
+			if err == nil {
+				return dbAsyncProposal{RS: rs, Host: nh, Index: idx}, nil
+			}
+			if !isNotLeaderRejection(err) {
+				return dbAsyncProposal{}, err
+			}
+			lastErr = err
+		}
+		select {
+		case <-expiry.C:
+			return dbAsyncProposal{}, lastErr
+		case <-retry.C:
+		}
+	}
+}
+
 // stopNode stops the host at the given index.
 func (c *dbTestCluster) stopNode(idx int) {
 	c.t.Helper()
@@ -1383,35 +1679,25 @@ func waitForReplication(t *testing.T, cluster *dbTestCluster, trackers []*dbSMTr
 	}
 }
 
-// proposeAndWait proposes a key-value pair through the dragonboat adapter
-// leader using SyncPropose and waits for it to appear on the leader SM.
+// proposeAndWait proposes a key-value pair through the shard's CURRENT leader
+// and waits for it to appear on that leader's state machine.
+//
+// The leader is resolved inside tryProposeToLeader, on every attempt, so this
+// helper cannot go stale between the resolve and the call the way its previous
+// version could. The state machine it then waits on is the one belonging to the
+// replica that actually accepted the entry, not to an index read earlier.
 func proposeAndWait(t *testing.T, cluster *dbTestCluster, trackers []*dbSMTracker, shardID uint64, key, value string) {
 	t.Helper()
-	leaderIdx := cluster.findLeader(shardID)
-	if leaderIdx < 0 {
-		t.Fatal("no leader found for proposal")
-	}
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
 
 	session := dbClient.NewNoOPSession(shardID, nil)
 	cmd := encodeKVPut(key, value)
-	_, err := leaderHost.SyncPropose(ctx, session, cmd)
-	if err != nil {
-		t.Fatalf("SyncPropose(%q=%q) failed: %v", key, value, err)
-	}
+	proposal := cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 
-	// Wait for the leader's SM to apply.
-	replicaID := uint64(leaderIdx + 1)
-	leaderTracker := trackers[leaderIdx]
-	if leaderTracker == nil {
-		t.Fatalf("no tracker for leader node[%d]", leaderIdx)
-	}
-	leaderSM := leaderTracker.Get(shardID, replicaID)
+	// Wait for the SM of the replica that accepted the entry to apply it.
+	leaderIdx := proposal.Index
+	leaderSM := resolveStateMachine(cluster, trackers, shardID, leaderIdx)
 	if leaderSM == nil {
-		t.Fatal("leader state machine not found")
+		t.Fatalf("no state machine for leader node[%d] on shard %d", leaderIdx, shardID)
 	}
 	waitForCondition(t, defaultTimeout,
 		fmt.Sprintf("leader applies key=%q", key),

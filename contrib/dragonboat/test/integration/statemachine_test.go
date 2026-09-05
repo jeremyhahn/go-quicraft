@@ -36,18 +36,11 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("concurrent SM cluster leader at node[%d]", leaderIdx)
 
-	// Warmup entry required after election (PhD 6.4).
-	leaderHost := cluster.hosts[leaderIdx]
+	// Warmup entry required after election (PhD 6.4). The SyncRead pass at the
+	// end reads back from the replica that accepted it, so keep that host.
 	session := dbClient.NewNoOPSession(1, nil)
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	warmupCmd := encodeKVPut("warmup", "ok")
-	_, err := leaderHost.SyncPropose(ctx, session, warmupCmd)
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
 
 	// Wait for warmup to replicate to all concurrent SMs.
 	for i := range cluster.hosts {
@@ -73,12 +66,7 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 		expected[key] = value
 
 		cmd := encodeKVPut(key, value)
-		propCtx, propCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		_, propErr := leaderHost.SyncPropose(propCtx, session, cmd)
-		propCancel()
-		if propErr != nil {
-			t.Fatalf("SyncPropose(%q) failed: %v", key, propErr)
-		}
+		cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 	}
 
 	// Verify all entries replicated to all nodes' concurrent SMs.
@@ -131,18 +119,11 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("on-disk SM cluster leader at node[%d]", leaderIdx)
 
-	// Warmup entry required after election (PhD 6.4).
-	leaderHost := cluster.hosts[leaderIdx]
+	// Warmup entry required after election (PhD 6.4). The SyncRead pass at the
+	// end reads back from the replica that accepted it, so keep that host.
 	session := dbClient.NewNoOPSession(1, nil)
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	warmupCmd := encodeKVPut("warmup", "ok")
-	_, err := leaderHost.SyncPropose(ctx, session, warmupCmd)
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
+	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
 
 	// Wait for warmup to replicate to all on-disk SMs.
 	for i := range cluster.hosts {
@@ -168,12 +149,7 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 		expected[key] = value
 
 		cmd := encodeKVPut(key, value)
-		propCtx, propCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		_, propErr := leaderHost.SyncPropose(propCtx, session, cmd)
-		propCancel()
-		if propErr != nil {
-			t.Fatalf("SyncPropose(%q) failed: %v", key, propErr)
-		}
+		cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 	}
 
 	// Verify all entries replicated to all nodes' on-disk SMs.

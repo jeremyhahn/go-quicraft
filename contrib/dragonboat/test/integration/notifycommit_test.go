@@ -61,6 +61,9 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	// Submit an async proposal with NotifyCommit enabled.
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("nc-key", "nc-val")
+	//quicraft:direct-propose standalone single-voter shard: nh is the only replica
+	// in the configuration, so leadership has nowhere to move, and the
+	// NotifyCommit wiring on THIS host is the subject.
 	rs, proposeErr := nh.Propose(session, cmd, defaultTimeout)
 	if proposeErr != nil {
 		t.Fatalf("Propose failed: %v", proposeErr)
@@ -137,6 +140,9 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	// Submit an async proposal without NotifyCommit.
 	session := dbClient.NewNoOPSession(1, nil)
 	cmd := encodeKVPut("disabled-key", "disabled-val")
+	//quicraft:direct-propose standalone single-voter shard: nh is the only replica
+	// in the configuration, and the NotifyCommit-disabled wiring on THIS host is
+	// the subject.
 	rs, proposeErr := nh.Propose(session, cmd, defaultTimeout)
 	if proposeErr != nil {
 		t.Fatalf("Propose failed: %v", proposeErr)
