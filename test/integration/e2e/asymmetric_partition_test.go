@@ -169,9 +169,14 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 		if cluster.stopped[i].Load() {
 			continue
 		}
-		replicaID := uint64(i + 1)
-		if i >= 3 {
-			replicaID = uint64(10 + (i - 3))
+		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// that reports no replica for this shard never started it or has
+		// already lost it, which this loop fails on a line below when the SM
+		// lookup comes back nil -- so it fails here too, rather than becoming
+		// a node quietly dropped from a convergence check.
+		replicaID, ok := cluster.replicaIDAt(shardID, i)
+		if !ok {
+			t.Fatalf("node[%d] is live but reports no replica for shard %d", i, shardID)
 		}
 
 		tracker := cluster.trackers[i]
@@ -419,9 +424,14 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 			continue
 		}
 
-		replicaID := uint64(i + 1)
-		if i >= 5 {
-			replicaID = uint64(10 + (i - 5))
+		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// that reports no replica for this shard never started it or has
+		// already lost it, which this loop fails on a line below when the SM
+		// lookup comes back nil -- so it fails here too, rather than becoming
+		// a node quietly dropped from a convergence check.
+		replicaID, ok := cluster.replicaIDAt(shardID, i)
+		if !ok {
+			t.Fatalf("node[%d] is live but reports no replica for shard %d", i, shardID)
 		}
 
 		tracker := cluster.trackers[i]
@@ -688,9 +698,14 @@ func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 			continue
 		}
 
-		replicaID := uint64(i + 1)
-		if i >= 5 {
-			replicaID = uint64(10 + (i - 5))
+		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// that reports no replica for this shard never started it or has
+		// already lost it, which this loop fails on a line below when the SM
+		// lookup comes back nil -- so it fails here too, rather than becoming
+		// a node quietly dropped from a convergence check.
+		replicaID, ok := cluster.replicaIDAt(shardID, i)
+		if !ok {
+			t.Fatalf("node[%d] is live but reports no replica for shard %d", i, shardID)
 		}
 
 		tracker := cluster.trackers[i]

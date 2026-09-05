@@ -296,11 +296,13 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 		}
 		liveCount++
 
-		replicaID := uint64(i + 1)
-		// For replacement nodes (indices >= 5), look up the correct
-		// replica ID from the addNodeToCluster sequence.
-		if i >= 5 {
-			replicaID = uint64(10 + (i - 5))
+		// Ask the host which replica it runs. The index-derived form this
+		// replaced ("i+1, except >=5 which is 10+(i-5)") restated
+		// addNodeToCluster's argument list as a rule, so it went stale the
+		// moment the sequence changed. See replicaIDAt (#121).
+		replicaID, ok := cluster.replicaIDAt(1, i)
+		if !ok {
+			t.Fatalf("node[%d] is live but reports no replica for shard 1", i)
 		}
 
 		tracker := cluster.trackers[i]
@@ -350,9 +352,12 @@ func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 			continue
 		}
 
-		replicaID := uint64(i + 1)
-		if i >= 5 {
-			replicaID = uint64(10 + (i - 5))
+		// See replicaIDAt (#121): the host's own answer, not i+1. This loop
+		// tolerates a missing tracker and a missing state machine below, so
+		// it tolerates a host with no replica here for the same reason.
+		replicaID, ok := cluster.replicaIDAt(1, i)
+		if !ok {
+			continue
 		}
 
 		tracker := cluster.trackers[i]

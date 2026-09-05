@@ -50,22 +50,128 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Constants
+// Raft timing, and the election budgets derived from it
+//
+// Every election budget below is DERIVED from the shard configuration these
+// tests actually start, and the config builders are written in terms of the
+// same constants: testHostConfig reads testRTTMillisecond, and testShardConfig
+// leaves ElectionRTT to config.Config.SetDefaults, which is the value
+// testElectionRTT names rather than restates. Neither side can be changed
+// without the other following, and TestBudgetsDescribeTheClusterTheyBudgetFor
+// pins that they still agree.
+//
+// A budget written as a literal is a value that is not pinned treated as
+// though it were — the class this repository has now been bitten by nine times
+// (#84, #88, #90, #91, #103, #105, #107, #112, #121). In those the unpinned
+// value was a leader index or a replica ID; here it is the shard configuration
+// the budget is supposed to describe. A literal cannot follow a config change
+// and gives no signal when it stops matching; a derivation cannot drift at all.
+//
+// This is the root module's twin of what #115 fixed in contrib/dragonboat
+// (PR #124), and it mirrors that derivation on purpose. The two suites keep
+// separate copies because contrib/dragonboat is a separate module that owns its
+// own helpers; the shape is shared, the constants are not.
 // ---------------------------------------------------------------------------
 
-// defaultTimeout is the standard timeout for E2E test operations.
-// 15s gives headroom for QUIC connection establishment under
-// Docker/CI resource contention.
+// defaultTimeout is the standard budget for a single Raft operation that is
+// NOT an election: a proposal round trip, a lookup, a membership query. 15s
+// gives headroom for QUIC connection establishment under Docker/CI resource
+// contention. It is deliberately not expressed in election rounds, because
+// none of its callers is waiting for an election.
 const defaultTimeout = 15 * time.Second
 
-// leaderElectionTimeout is the time to wait for a leader election.
-// With RTT=50ms and ElectionRTT=10, election timeout is ~500ms.
-// We give generous headroom for container/CI environments.
-const leaderElectionTimeout = 5 * time.Second
+// testRTTMillisecond is the Raft tick interval, in milliseconds, that
+// testHostConfig gives every host in this suite. One tick is one
+// RTTMillisecond, so every timeout the engine expresses in ticks is this many
+// milliseconds per tick.
+const testRTTMillisecond = 50
 
-// failoverTimeout is extended timeout for failover scenarios where
-// the old leader must time out before a new election starts.
-const failoverTimeout = 20 * time.Second
+// testElectionRTT is the number of ticks a follower waits without hearing from
+// a leader before it stands for election.
+//
+// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
+// This reads THAT value rather than restating it, so the budgets below follow
+// the default if it ever moves.
+const testElectionRTT = config.DefaultElectionRTT
+
+// raftTick is one Raft tick in wall-clock time.
+const raftTick = testRTTMillisecond * time.Millisecond
+
+// electionRound is the longest a SINGLE election attempt can run before the
+// next candidate's timer fires and supersedes it.
+//
+// It is TWICE ElectionRTT, not once. Raft randomises each replica's election
+// timer over [electionTimeout, 2*electionTimeout) —
+// randomizedElectionTimeout = electionTimeout + rng.Intn(electionTimeout), see
+// pkg/internal/raft — so the upper bound on one attempt is two election
+// timeouts' worth of ticks. A budget written against the un-randomised value
+// is half the size it appears to be, which is how a "10x headroom" constant
+// turns out to be 5x. Here: 2 * 10 * 50ms = 1s.
+const electionRound = 2 * time.Duration(testElectionRTT) * raftTick
+
+// coldStartElectionRounds is how many worst-case election rounds
+// leaderElectionTimeout allows a shard that was started moments ago to produce
+// its FIRST leader.
+//
+// FOUR of them are the protocol's own worst case for a cold start, each
+// bounded by electionRound:
+//
+//   - the QUIC handshake and mTLS exchange between all the hosts, which must
+//     complete before the first RequestVote can even be answered;
+//   - the PreVote round (SetDefaults turns PreVote on), which precedes the
+//     real one;
+//   - the vote round itself;
+//   - one split-vote retry. On a cold start a split is likely rather than
+//     exceptional: every replica arms its election timer within microseconds
+//     of the others, which is the one situation the randomised timer has least
+//     room to separate.
+//
+// The remaining factor is host saturation, and it is a MULTIPLIER rather than
+// an addend. A Raft tick is a goroutine wakeup; on a box oversubscribed k
+// times a 50ms tick lands roughly k times late, and the whole cold start
+// stretches with it.
+//
+// Measured with this budget lifted to 120s so the tail was not truncated:
+// full runs of this suite under -race on 24 cores at load average 120-190
+// (5-8x oversubscribed, the CI runners this box hosts). The distribution is
+// not merely slow, it is heavy-tailed — the common case sits near the four
+// rounds above and a small minority runs an order of magnitude past it. The
+// distribution is recorded on #111.
+//
+// Thirty rounds is thirty seconds. It is BOUNDED on purpose, and the bound is
+// the point of the number rather than an afterthought: a shard that CANNOT
+// elect — a lost quorum, a broken transport, a membership that does not agree
+// — is still reported in half a minute, naming the shard, instead of running
+// to the suite timeout. That case is verified directly rather than assumed:
+// a three-member shard with only one replica running fails this wait in 30.0s.
+//
+// This budget is LARGER than failoverTimeout even though the names suggest the
+// opposite, and that is the correction. A cold start is the HARDER of the two
+// waits: a failover happens over transport that is already established between
+// survivors that already know one another, while a cold start pays for the
+// handshakes first. The easier case had 20s and the harder one had 5s.
+const coldStartElectionRounds = 30
+
+// leaderElectionTimeout is the budget for a freshly started shard to produce
+// its FIRST leader. See coldStartElectionRounds for the derivation.
+//
+// It is a SETUP budget and nothing else. Every one of its call sites waits on
+// a shard started moments earlier, before the test's subject is reached, so a
+// test that exhausts it has asserted nothing at all — which is what made #111
+// worth fixing rather than merely worth widening. A wait for a SUBSEQUENT
+// leader, after one has been stopped or partitioned away, is a different
+// question and takes failoverTimeout.
+const leaderElectionTimeout = coldStartElectionRounds * electionRound
+
+// failoverTimeout is the budget for a shard that has already been led to elect
+// a REPLACEMENT leader after the incumbent is stopped or partitioned away.
+//
+// Its value is unchanged at 20s; it is re-expressed in election rounds so that
+// it tracks ElectionRTT and RTTMillisecond alongside leaderElectionTimeout
+// instead of drifting away from them. A failover needs one election timeout for
+// the survivors to notice the silence and a round or two to elect, over warm
+// connections.
+const failoverTimeout = 20 * electionRound
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
@@ -730,7 +836,7 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		NodeHostDir:           t.TempDir(),
 		RaftAddress:           listenAddr,
 		ListenAddress:         listenAddr,
-		RTTMillisecond:        50,
+		RTTMillisecond:        testRTTMillisecond,
 		DeploymentID:          1,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
@@ -975,6 +1081,50 @@ func (c *testCluster) findLeader(shardID uint64) int {
 		}
 	}
 	return -1
+}
+
+// replicaIDAt returns the Raft replica ID that the node at idx runs for
+// shardID, as the host itself reports it, and whether there is one.
+//
+// It is the suite's ONE index-to-replica-ID mapping, and it exists because
+// idx+1 is not that mapping. idx+1 holds for the FOUNDING members only:
+// startShard numbers them 1..N in slice order. Every replica added later by
+// addNodeToCluster takes an explicit ID its caller chose, and this suite
+// deliberately chooses IDs that do not follow the index —
+// TestE2E_Partition_HealAndReconverge uses 10 and 11 for the hosts it appends
+// at indices 5 and 6, "to avoid collision with original replica IDs".
+//
+// A helper that computes idx+1 therefore asks for a replica that never existed
+// the moment a replacement node is the subject. proposeAndWait did exactly
+// that and reported "leader state machine not found" for a proposal that had
+// committed perfectly (#121).
+//
+// This is the repository's recurring flake class — a value that is not pinned
+// treated as if it were (#84, #88, #90, #91, #103, #107, #112, #115) — with the
+// slice index treated as the replica ID. The remedy is the one those took: read
+// the value from whatever owns it instead of recomputing it. A host's replica
+// ID for a shard is fixed when StartShard is called and never changes while the
+// host runs, so GetShardInfo is authoritative here and — unlike IsLeader — is
+// not a value that can move between the look and the use.
+//
+// ok is false when idx is out of range, the node is stopped, or the host is not
+// running that shard. Each of those means "no replica here", which is a
+// different answer from "replica idx+1", and callers that conflated the two are
+// what #121 is about.
+func (c *testCluster) replicaIDAt(shardID uint64, idx int) (uint64, bool) {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	if idx < 0 || idx >= len(c.hosts) {
+		return 0, false
+	}
+	if c.stopped[idx].Load() {
+		return 0, false
+	}
+	info, err := c.hosts[idx].GetShardInfo(shardID)
+	if err != nil {
+		return 0, false
+	}
+	return info.ReplicaID, true
 }
 
 // findFollower returns the index of a follower node for the given shard,
@@ -1307,8 +1457,19 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 // from before those changes and points at state machines that no longer run.
 // The caller's slice is the fallback, which covers a shard whose trackers were
 // never stored on the cluster.
+//
+// The replica ID comes from replicaIDAt — the host's own answer — and falls
+// back to i+1 only when the host cannot be asked at all (it was stopped, or it
+// never started the shard). Deriving it arithmetically was #121.
 func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
-	replicaID := uint64(i + 1)
+	replicaID, ok := cluster.replicaIDAt(shardID, i)
+	if !ok {
+		// A stopped host answers nothing, and its state machine is still in
+		// the tracker for a caller that wants to read what it applied before
+		// it went down. i+1 is the founding convention and is the best guess
+		// available here; the forShard fallback below covers the rest.
+		replicaID = uint64(i + 1)
+	}
 
 	cluster.hostsMu.RLock()
 	live := make([]*smTracker, len(cluster.trackers))
@@ -1459,19 +1620,20 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 		}
 
 		// Proposal committed. Wait for the leader's SM to apply.
-		replicaID := uint64(leaderIdx + 1)
-		var leaderTracker *smTracker
-		if leaderIdx < len(trackers) {
-			leaderTracker = trackers[leaderIdx]
-		} else if leaderIdx < len(cluster.trackers) {
-			leaderTracker = cluster.trackers[leaderIdx]
-		}
-		if leaderTracker == nil {
-			t.Fatalf("no tracker for leader node[%d]", leaderIdx)
-		}
-		leaderSM := leaderTracker.Get(shardID, replicaID)
+		//
+		// The lookup goes through resolveStateMachine, which asks the host
+		// which replica it runs (replicaIDAt) instead of computing leaderIdx+1.
+		// The arithmetic held only for the founding members, so when a node
+		// added by addNodeToCluster won the election this asked the tracker for
+		// a replica that never existed, got nil, and failed the test with
+		// "leader state machine not found" for a proposal that had just
+		// committed (#121).
+		leaderSM := resolveStateMachine(cluster, trackers, shardID, leaderIdx)
 		if leaderSM == nil {
-			t.Fatal("leader state machine not found")
+			replicaID, ok := cluster.replicaIDAt(shardID, leaderIdx)
+			t.Fatalf("leader state machine not found: node[%d] (replica=%d known=%t) leads shard %d "+
+				"and committed key=%q, but no tracker holds its state machine",
+				leaderIdx, replicaID, ok, shardID, key)
 		}
 		waitForCondition(t, defaultTimeout,
 			fmt.Sprintf("leader applies key=%q", key),
@@ -1637,63 +1799,64 @@ func addNodeToCluster(
 // change already delivered to raft is false.
 
 // proposeUntilCommitted proposes one key/value through whichever node is
-// CURRENTLY the leader, retrying transient leadership errors until the entry
-// commits or the deadline passes. It returns nil on success and an error the
-// caller should treat as fatal otherwise.
+// CURRENTLY the leader and returns nil once the entry commits, or an error the
+// caller should treat as fatal.
 //
-// It exists for the concurrent-writer goroutines, which pinned the leader index
-// captured at the start of the test and treated every error — including
+// It exists for the concurrent-writer goroutines, which used to pin the leader
+// index captured at the start of the test and treat every error — including
 // ErrNotLeader from a perfectly ordinary re-election — as a hard failure. That
 // is not a weaker assertion than "no errors": every entry must still commit,
 // and the caller still verifies all of them replicated afterwards. It only
 // stops a legal leadership change from being reported as a lost write.
 //
 // Safe to call from a non-test goroutine: it never touches t.
+//
+// # Which retry policy this needs, and why it is not a third one
+//
+// This was the FOURTH copy of the propose-retry loop, and the fourth place a
+// change to the retry policy had to be remembered (#110). It now runs on the
+// same proposer.TryWith as the rest, and the predicate is chosen against the
+// principle #97/#109 settled on: retry an error when, and only when, what the
+// loop does between attempts can change that error's answer.
+//
+// Between attempts this loop does BOTH of the things the package's two
+// remedies name. It re-resolves the leader, which is proposer.Try's remedy and
+// fixes a not-leader rejection. And it waits, which is the pinned callers'
+// remedy and fixes the conditions that clear on their own — a shard still
+// coming up, a momentarily full pipeline, an election in flight. Its retryable
+// set is therefore the union of the two, and because ErrNotLeader is itself
+// inside quicraft.Temporary, that union IS quicraft.Temporary.
+//
+// So this needs no third predicate. It needs the SECOND one, paired with a
+// re-resolving resolver — the combination neither of TryWith's original two
+// callers uses, and the reason TryWith takes the resolver and the predicate as
+// separate parameters rather than bundling them. Try's narrowness is right for
+// Try because a caller asserting on one proposal wants a busy pipeline to
+// reach it; this helper's callers assert that every entry commits WITHIN the
+// budget, across partitions and heals, so a condition that clears on its own
+// is something to wait through rather than to report.
+//
+// quicraft.Temporary is also narrower than the isTransientLeadershipError it
+// replaces here, and deliberately so: that predicate retried ErrCanceled and a
+// bare context cancellation, which no amount of waiting or re-resolving fixes,
+// and matched "transfer in progress" by substring.
+//
+// Re-proposal is safe for what this writes. A not-leader error can arrive after
+// the entry already reached the log (quicraft.MaybeApplied — the form observed
+// in practice here), so a retry may apply the command twice; every command this
+// helper carries is a last-write-wins KV put.
 func proposeUntilCommitted(cluster *testCluster, shardID uint64, key, value string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	cmd := encodeKVPut(key, value)
-	var lastErr error
-
-	for time.Now().Before(deadline) {
-		leaderHost := cluster.leaderHost(shardID)
-		if leaderHost == nil {
-			lastErr = quicraft.ErrNotLeader
-			timer := time.NewTimer(20 * time.Millisecond)
-			<-timer.C
-			timer.Stop()
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		//quicraft:direct-propose resolved at the top of this same retry iteration
-		rs, err := leaderHost.Propose(ctx, shardID, cmd)
-		if err != nil {
-			cancel()
-			if !isTransientLeadershipError(err) {
-				return fmt.Errorf("propose %q: %w", key, err)
-			}
-			lastErr = err
-			timer := time.NewTimer(20 * time.Millisecond)
-			<-timer.C
-			timer.Stop()
-			continue
-		}
-
-		_, resErr := rs.Result()
-		rs.Release()
-		cancel()
-		if resErr == nil {
-			return nil
-		}
-		if !isTransientLeadershipError(resErr) {
-			return fmt.Errorf("commit %q: %w", key, resErr)
-		}
-		lastErr = resErr
-		timer := time.NewTimer(20 * time.Millisecond)
-		<-timer.C
-		timer.Stop()
+	_, err := proposer.TryWith(cluster.leaderHost, shardID, encodeKVPut(key, value),
+		timeout, quicraft.Temporary)
+	if err != nil {
+		// Not "never committed within <timeout>": that phrasing was true only
+		// for the deadline case and reported a permanent rejection as a slow
+		// shard, which is the misdiagnosis #97 named. TryWith returns a
+		// permanent error on its first occurrence, so the budget is context
+		// here rather than a claim about how long this took.
+		return fmt.Errorf("%q did not commit (budget %v): %w", key, timeout, err)
 	}
-	return fmt.Errorf("%q never committed within %v: %w", key, timeout, lastErr)
+	return nil
 }
 
 // proposeNEntries proposes N entries through the leader and returns the
@@ -2487,4 +2650,40 @@ func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint
 	t.Fatalf("RequestSnapshot(shard=%d) never completed: a snapshot was in progress for %v",
 		shardID, time.Duration(maxSnapRetries)*snapRetryInterval)
 	return 0
+}
+
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation at the top of
+// this file to the configuration the suite actually starts.
+//
+// The constants are only worth having if the config builders keep reading
+// them. If a future change gives testShardConfig an explicit ElectionRTT, or
+// hands testHostConfig a different RTTMillisecond, electionRound silently
+// starts describing a cluster that no longer exists and every budget built on
+// it is wrong by that factor — which is exactly the drift the derivation
+// replaced a literal to prevent. This is the only place that can notice.
+func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
+	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
+		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+
+			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
+			"thinks it is", got, uint64(testRTTMillisecond), electionRound)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  config.Config
+	}{
+		{"testShardConfig", testShardConfig(1, 1)},
+		{"testShardConfigWithSnapshot", testShardConfigWithSnapshot(1, 1, 10, 5)},
+	} {
+		if got := tc.cfg.ElectionRTT; got != testElectionRTT {
+			t.Fatalf("%s sets ElectionRTT=%d but the budgets are derived from "+
+				"testElectionRTT=%d; electionRound (%v) and every budget built on it "+
+				"are wrong by a factor of %.2f", tc.name, got, testElectionRTT,
+				electionRound, float64(got)/float64(testElectionRTT))
+		}
+	}
+	if electionRound != 2*time.Duration(testElectionRTT)*raftTick {
+		t.Fatalf("electionRound=%v is not 2*ElectionRTT*tick", electionRound)
+	}
+	t.Logf("tick=%v electionRound=%v leaderElectionTimeout=%v (%d rounds) failoverTimeout=%v",
+		raftTick, electionRound, leaderElectionTimeout, coldStartElectionRounds, failoverTimeout)
 }
