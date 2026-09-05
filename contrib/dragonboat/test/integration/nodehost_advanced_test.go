@@ -195,6 +195,8 @@ func TestIntegration_DB_DroppedRequestsOnInvalidShard(t *testing.T) {
 	t.Logf("SyncPropose on non-existent shard: %v", propErr)
 
 	// Read on shard that doesn't exist.
+	//quicraft:direct-read the NON-EXISTENT shard is the subject, as for SyncPropose above:
+	// there is no cluster and no shard 999 to resolve a leader for
 	_, readErr := nh.SyncRead(ctx, 999, encodeKVGet("k"))
 	if readErr == nil {
 		t.Fatal("SyncRead on non-existent shard should fail")

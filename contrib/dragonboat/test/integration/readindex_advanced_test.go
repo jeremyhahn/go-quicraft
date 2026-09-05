@@ -59,6 +59,8 @@ func TestIntegration_DB_SyncRead_FromFollower(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
+	//quicraft:direct-read the FOLLOWER is the subject: this test exists to assert that a
+	// follower serves a linearizable read by forwarding its ReadIndex
 	result, err := followerHost.SyncRead(ctx, 1, encodeKVGet("follower-read-key"))
 	if err != nil {
 		t.Fatalf("SyncRead from follower failed: %v", err)
@@ -89,6 +91,8 @@ func TestIntegration_DB_SyncRead_FromFollower(t *testing.T) {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), defaultTimeout)
 		defer cancel2()
 
+		//quicraft:direct-read the SECOND follower is the subject, for the same reason as the
+		// first: forwarding, not the value, is the assertion
 		result2, err2 := secondFollowerHost.SyncRead(ctx2, 1, encodeKVGet("follower-read-key2"))
 		if err2 != nil {
 			t.Fatalf("SyncRead from second follower failed: %v", err2)
@@ -211,6 +215,8 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 		ctx4, cancel4 := context.WithTimeout(context.Background(), defaultTimeout)
 		defer cancel4()
 
+		//quicraft:direct-read the FOLLOWER is the subject: its forwarding after the leader change
+		// is what is asserted, not the value
 		followerResult, followerErr := followerHost.SyncRead(ctx4, 1, encodeKVGet("post-leader-change"))
 		if followerErr != nil {
 			t.Fatalf("SyncRead from follower after leader change failed: %v", followerErr)

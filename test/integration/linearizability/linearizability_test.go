@@ -32,6 +32,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // ---------------------------------------------------------------------------
@@ -995,6 +996,9 @@ func clientWorker(
 			rec := recorder.begin(clientID, kvInput{Op: "get", Key: key})
 
 			ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+			//quicraft:direct-read ANY live host on purpose: the client reads
+			// from whichever replica it was given, and a transparent re-resolve
+			// would erase the indeterminate outcomes the checker needs.
 			result, err := host.SyncRead(ctx, shardID, encodeKVGet(key))
 			cancel()
 
@@ -1119,6 +1123,9 @@ func sessionClientWorker(
 			rec := recorder.begin(clientID, kvInput{Op: "get", Key: key})
 
 			ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+			//quicraft:direct-read ANY live host on purpose: the client reads
+			// from whichever replica it was given, and a transparent re-resolve
+			// would erase the indeterminate outcomes the checker needs.
 			result, err := host.SyncRead(ctx, shardID, encodeKVGet(key))
 			cancel()
 
@@ -1269,16 +1276,14 @@ func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 	// more here rather than reused from above: the writes may themselves have
 	// spanned an election, and a ReadIndex on a deposed replica proves nothing
 	// about the read path.
-	leader := cluster.leaderHost(shardID)
-	if leader == nil {
-		t.Fatal("no leader for the warmup read")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	result, err := leader.SyncRead(ctx, shardID, encodeKVGet("warmup-0"))
-	if err != nil {
-		t.Fatalf("warmup read failed: %v", err)
-	}
+	//
+	// Resolving it ON THIS LINE was still not enough, which is why the read
+	// goes through proposer.Read now. One resolution and one attempt leaves
+	// the same gap the proposals above closed, only narrower: this helper runs
+	// at the start of nearly every test in this package, immediately after an
+	// election, which is exactly when leadership is most likely to move (#147,
+	// #154).
+	result := proposer.Read(t, cluster.leaderHost, shardID, encodeKVGet("warmup-0"), defaultTimeout)
 	val, ok := result.(string)
 	if !ok || val != "ok" {
 		t.Fatalf("warmup read returned unexpected value: %v", result)

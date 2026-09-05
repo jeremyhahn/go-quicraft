@@ -17,11 +17,11 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // barrierSnapshotConfig is the shard config every barrier test uses.
@@ -123,17 +123,15 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	verifyAllData(t, cluster.testCluster, trackers, 1, expected)
 	t.Logf("all 30 entries replicated to 3 barrier-encrypted nodes")
 
-	// Perform a linearizable SyncRead from the leader for one of the keys.
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	// Perform a linearizable read for one of the keys. The subject is the
+	// value the barrier-encrypted cluster returns, not the replica that
+	// serves it, so the leader is resolved at the point of the read rather
+	// than reused from the election above: thirty proposals and a
+	// verifyAllData walk have run since then, any of which can span an
+	// election (#147).
 	targetKey := "barrier-rw-005"
 	expectedValue := expected[targetKey]
-	result, err := leaderHost.SyncRead(ctx, 1, encodeKVGet(targetKey))
-	if err != nil {
-		t.Fatalf("SyncRead(%q) failed: %v", targetKey, err)
-	}
+	result := proposer.Read(t, cluster.leaderHost, 1, encodeKVGet(targetKey), defaultTimeout)
 
 	val, ok := result.(string)
 	if !ok {
@@ -143,6 +141,11 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 		t.Fatalf("SyncRead(%q) = %q, want %q", targetKey, val, expectedValue)
 	}
 	t.Logf("SyncRead(%q) = %q (correct)", targetKey, val)
+
+	// The snapshot below is deliberately still addressed to one replica: it
+	// forces the at-rest write this test then greps for, so it must happen on
+	// a host whose data directory the assertion knows.
+	leaderHost := cluster.hosts[leaderIdx]
 
 	// Force a snapshot on the leader and WAIT for it, so the at-rest assertion
 	// does not depend on the automatic trigger having already fired there.

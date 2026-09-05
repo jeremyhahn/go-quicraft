@@ -330,6 +330,8 @@ func TestIntegration_DB_UsingClosedNodeHost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
+	//quicraft:direct-read the CLOSED host is the subject: it belongs to no cluster, there is
+	// no leader to resolve, and its refusal is the assertion
 	_, readErr := nh.SyncRead(ctx, 1, []byte("key"))
 	if readErr == nil {
 		t.Fatal("SyncRead on closed host should return error")
@@ -448,6 +450,8 @@ func TestIntegration_DB_StartReplicaWaitForReadiness(t *testing.T) {
 			continue
 		}
 		followerCtx, followerCancel := context.WithTimeout(context.Background(), defaultTimeout)
+		//quicraft:direct-read every live replica IS the subject: this walk asserts that each
+		// follower can serve a linearizable read by forwarding its ReadIndex
 		followerResult, followerErr := nh.SyncRead(followerCtx, 1, encodeKVGet("readiness-check"))
 		followerCancel()
 		if followerErr != nil {

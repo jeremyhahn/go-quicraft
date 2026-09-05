@@ -71,6 +71,9 @@ func TestIntegration_DB_LinearizableRead_ImmediateAfterPropose(t *testing.T) {
 	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer readCancel()
 
+	//quicraft:direct-read the replica that ACCEPTED the entry is the subject: reading
+	// immediately from that same host is what proves ReadIndex waits for
+	// the local state machine instead of returning empty
 	result, err := leaderHost.SyncRead(readCtx, shardID, encodeKVGet("lin-key"))
 	if err != nil {
 		t.Fatalf("SyncRead immediately after propose failed: %v", err)
@@ -139,6 +142,8 @@ func TestIntegration_DB_LinearizableRead_FollowerWithoutExplicitWait(t *testing.
 	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer readCancel()
 
+	//quicraft:direct-read the FOLLOWER is the subject: the assertion is that its ReadIndex
+	// waits for state-machine catch-up rather than serving local state
 	result, err := followerHost.SyncRead(readCtx, shardID, encodeKVGet("follower-lin-key"))
 
 	// A correct implementation must either return the right value (ReadIndex
@@ -156,6 +161,8 @@ func TestIntegration_DB_LinearizableRead_FollowerWithoutExplicitWait(t *testing.
 			func() bool {
 				retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer retryCancel()
+				//quicraft:direct-read the same FOLLOWER is the subject: this retry must stay on the
+				// replica whose immediate read was allowed to fail
 				retryResult, retryErr := followerHost.SyncRead(retryCtx, shardID, encodeKVGet("follower-lin-key"))
 				if retryErr != nil {
 					return false

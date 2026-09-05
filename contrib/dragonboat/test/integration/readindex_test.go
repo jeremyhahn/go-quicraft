@@ -43,6 +43,9 @@ func TestIntegration_DB_ReadIndex_ReadLocalNode(t *testing.T) {
 
 	// Step 1: ReadIndex to get a RequestState.
 	leaderHost := cluster.hosts[leaderIdx]
+	//quicraft:direct-read the rs and the ReadLocalNode below it must be the SAME replica's:
+	// resolving the leader again between them could split the pair, and
+	// the ReadIndex/ReadLocalNode contract is what this test asserts
 	rs, err := leaderHost.ReadIndex(1, defaultTimeout)
 	if err != nil {
 		t.Fatalf("ReadIndex failed: %v", err)
@@ -98,6 +101,8 @@ func TestIntegration_DB_ReadIndex_InvalidShard(t *testing.T) {
 	}
 	leaderHost := cluster.hosts[leaderIdx]
 
+	//quicraft:direct-read the NON-EXISTENT shard is the subject: there is no shard 99999 to
+	// resolve a leader for and the refusal is the assertion
 	_, err := leaderHost.ReadIndex(99999, 2*time.Second)
 	if err == nil {
 		t.Fatal("ReadIndex on non-existent shard should return error")

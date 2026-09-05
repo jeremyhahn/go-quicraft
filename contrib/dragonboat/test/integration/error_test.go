@@ -83,6 +83,8 @@ func TestIntegration_DB_ReadOnInvalidShard(t *testing.T) {
 	defer cancel()
 
 	// SyncRead on shard 99999 which does not exist.
+	//quicraft:direct-read the NON-EXISTENT shard is the subject: there is no shard 99999 to
+	// resolve a leader for and the refusal is the assertion
 	_, readErr := leaderHost.SyncRead(ctx, 99999, encodeKVGet("key"))
 	if readErr == nil {
 		t.Fatal("SyncRead on non-existent shard should return error")
@@ -222,6 +224,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRead", func(t *testing.T) {
+		//quicraft:direct-read the deadline-less CONTEXT is the subject, exactly as for
+		// SyncPropose above; the rejection happens before any routing and a
+		// leader-resolving helper cannot express a context at all
 		_, err := leaderHost.SyncRead(ctx, 1, encodeKVGet("key"))
 		if err == nil {
 			t.Fatal("SyncRead should reject context without deadline")

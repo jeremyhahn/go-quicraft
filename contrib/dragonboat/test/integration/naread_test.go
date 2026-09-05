@@ -85,6 +85,8 @@ func TestIntegration_DB_NAReadLocalNode_AllNodes(t *testing.T) {
 			continue
 		}
 
+		//quicraft:direct-read every live node IS the subject: the assertion is that
+		// NAReadLocalNode returns ErrNotImplemented on each of them
 		rs, rsErr := nh.ReadIndex(1, 2*time.Second)
 		if rsErr != nil {
 			t.Fatalf("ReadIndex on node[%d] failed: %v", i, rsErr)

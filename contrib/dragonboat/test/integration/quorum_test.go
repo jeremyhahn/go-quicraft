@@ -81,6 +81,9 @@ func TestIntegration_DB_QuorumLoss_ProposalFails(t *testing.T) {
 	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer readCancel()
 
+	//quicraft:direct-read the incumbent that LOST QUORUM is the subject: a linearizable read
+	// it cannot confirm must fail, and re-resolving would look for a
+	// leader this partition is not allowed to have
 	_, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet("warmup"))
 	if readErr == nil {
 		t.Fatal("SyncRead should fail when quorum is lost, but it succeeded")

@@ -40,6 +40,12 @@ const directProposeMarker = "//quicraft:direct-propose"
 // reason, and a bare marker is rejected rather than honoured.
 const directConfigChangeMarker = "//quicraft:direct-config-change"
 
+// directReadMarker opts one call site out of
+// TestIntegrationReadsResolveTheLeader. Same shape and same rule as the two
+// above: it sits on the line that needs it, it carries its own reason, and a
+// bare marker is rejected rather than honoured.
+const directReadMarker = "//quicraft:direct-read"
+
 // integrationRoot is one test tree these gates walk, with the smallest number
 // of files they must find there.
 type integrationRoot struct {
@@ -133,6 +139,37 @@ var configChangeCalls = map[string]bool{
 	"SyncRequestDeleteReplica": true,
 }
 
+// linearizableReadCalls are the methods that serve a read THROUGH the leader,
+// in both modules' spellings — quicraft.Host and dragonboat.NodeHost spell
+// both of them the same.
+//
+// A linearizable read is bound to the leader exactly as a proposal is.
+// SyncRead is a ReadIndex plus a local lookup at the confirmed index;
+// handleFollowerReadIndex forwards when the addressed follower knows the
+// leader and refuses with a not-leader carrying LeaderID 0 when it does not;
+// and a read pending on a replica that loses the shard is failed with the same
+// MaybeApplied-wrapped not-leader a pending proposal is. Same class, same
+// remedy, so it gets a gate on the same terms.
+//
+// # What is deliberately NOT in this set
+//
+// StaleRead, StaleReadBuf and FollowerRead are served from the addressed
+// replica's own applied state and need no leader at all. A test that calls one
+// has already chosen a specific replica — that IS the subject — so requiring a
+// marker on every such site would be noise that devalues the marker where it
+// matters. There are nine of them across the two trees and not one is the
+// class.
+//
+// SyncReadBuf is leader-bound and belongs here by the same reasoning as
+// SyncRead, but #154 fixed this call set at SyncRead and ReadIndex and it is
+// not this change's call to widen it. There is currently no SyncReadBuf call
+// in either integration tree (verified by the same AST walk), so the set is
+// complete against the trees as they stand; see the PR for the follow-up.
+var linearizableReadCalls = map[string]bool{
+	"SyncRead":  true,
+	"ReadIndex": true,
+}
+
 // directCall is one call to a gated method that no marker excuses.
 type directCall struct {
 	// file is the repository-relative, slash-separated path, so a site keys
@@ -193,6 +230,7 @@ func scanDirectCalls(t *testing.T, marker string, calls map[string]bool) directC
 
 			excused, bare := excusedLines(fset, file, marker)
 			scan.bare = append(scan.bare, bare...)
+			pkgs := importedPackageNames(file)
 
 			for _, decl := range file.Decls {
 				fn := ""
@@ -210,9 +248,23 @@ func scanDirectCalls(t *testing.T, marker string, calls map[string]bool) directC
 					}
 					// A method on the suite's own cluster helper is the fixed
 					// version, not a violation: cluster.proposeToLeader style
-					// wrappers never appear as a bare Propose selector, so
-					// anything reaching here is a call on a *quicraft.Host or
-					// a *dragonboat.NodeHost.
+					// wrappers never appear as a bare Propose selector.
+					//
+					// A PACKAGE-qualified call is not a method call at all, so
+					// it is not the class either. proposalCalls and
+					// configChangeCalls never needed this — test/proposer and
+					// test/membership spell their entry points ToLeader, Try,
+					// AddNode and so on, none of which collide. The read set
+					// does: the fixed form of a gated ReadIndex is
+					// proposer.ReadIndex, whose selector is the identical
+					// bare ReadIndex. Skipping the receiver on the strength of
+					// its NAME would be a hole; skipping it because the file
+					// imports a package by that name is a fact about the file,
+					// and it is what makes the read gate share this scanner
+					// instead of forking it.
+					if ident, ok := sel.X.(*ast.Ident); ok && pkgs[ident.Name] {
+						return true
+					}
 					// A call spanning several lines carries its marker above
 					// the statement, so check the statement's first line as
 					// well as the selector's.
@@ -269,6 +321,40 @@ func repoRelative(path string) (string, error) {
 		return "", err
 	}
 	return filepath.ToSlash(rel), nil
+}
+
+// importedPackageNames returns the identifiers by which file refers to the
+// packages it imports: the explicit alias where there is one, otherwise the
+// last element of the import path.
+//
+// Using the path's last element is an approximation — a package whose name
+// differs from its directory would be missed — and it is deliberately the
+// conservative direction. A miss leaves a package-qualified call in the
+// findings, which is a false POSITIVE that a human reads and fixes; the
+// opposite error would silently excuse a real one.
+//
+// The residual hole is a local variable that shadows an imported package name
+// AND is a Host: `proposer := cluster.hosts[i]; proposer.SyncRead(...)` would
+// slip through. Nothing in either tree does that, go vet's shadow analysis
+// would not love it, and the alternative — full type resolution — means
+// loading both modules' packages, which is what this gate exists to avoid (see
+// integrationRoots on why it parses rather than compiles).
+func importedPackageNames(file *ast.File) map[string]bool {
+	names := make(map[string]bool, len(file.Imports))
+	for _, imp := range file.Imports {
+		if imp.Name != nil {
+			// A blank or dot import qualifies nothing.
+			if imp.Name.Name != "_" && imp.Name.Name != "." {
+				names[imp.Name.Name] = true
+			}
+			continue
+		}
+		path := strings.Trim(imp.Path.Value, `"`)
+		if base := path[strings.LastIndex(path, "/")+1:]; base != "" {
+			names[base] = true
+		}
+	}
+	return names
 }
 
 // excusedLines resolves every marker in file to the lines it excuses, and
@@ -396,10 +482,9 @@ func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 		len(scan.direct), formatDirectCalls(scan.direct), directProposeMarker)
 }
 
-// pendingConfigChangeSite is one direct config-change call that
-// TestIntegrationConfigChangesAreIdempotent knows about and has deferred to a
+// pendingSite is one direct call that a gate knows about and has deferred to a
 // tracking issue, because the file it sits in was owned by an in-flight pull
-// request when the gate was installed and could not be edited from #132.
+// request when the gate was installed and could not be edited.
 //
 // # Why this is a ratchet and not an allowlist
 //
@@ -417,9 +502,13 @@ func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 //   - a second direct call under an existing key is a fresh violation, not a
 //     free ride, because count is exact.
 //
-// The alternative was to leave this gate red on main until #123 and #135 land,
+// The alternative was to leave a gate red on main until every follow-up lands,
 // which is the same information with CI switched off for everyone in between.
-type pendingConfigChangeSite struct {
+//
+// The type and the machinery below it are shared by every gate in this file
+// for the same reason the scanner is: a second copy of a ratchet is a second
+// place for the rule to drift.
+type pendingSite struct {
 	file  string
 	fn    string
 	call  string
@@ -427,15 +516,66 @@ type pendingConfigChangeSite struct {
 	issue int
 }
 
-// pendingConfigChangeSites is the deferred table. It is expected to shrink to
-// nothing; see pendingConfigChangeSite for why each entry exists and how it
-// leaves.
-var pendingConfigChangeSites = []pendingConfigChangeSite{
+// pendingConfigChangeSites is TestIntegrationConfigChangesAreIdempotent's
+// deferred table. It is expected to shrink to nothing; see pendingSite for why
+// each entry exists and how it leaves.
+var pendingConfigChangeSites = []pendingSite{
 	// Empty since #123 retired the dragonboat adapter's fourteen rows: every
 	// contrib site is now either routed through that suite's idempotent
 	// helper or marked with its reason. #135 retired the six root-module
 	// rows before it. The type and the ratchet stay so the next deferred
 	// site, if there is one, has somewhere to go that fails when it is fixed.
+}
+
+// pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table.
+//
+// Every entry is a CONVERSION that needs a file this change could not edit.
+// The waivers found by the same audit are not here — a waiver is a marker in
+// the file that needs it, and every file needing one was writable, so all 15
+// landed with this change. Deferring a waiver would have recorded "known
+// violation" for a site that is not one.
+var pendingReadSites = []pendingSite{
+	// #161 — the dragonboat adapter's 21 conversions. They cannot be made
+	// here: the contrib module is a separate module that cannot import the
+	// parent's test/proposer across the NodeHost API boundary (see
+	// integrationRoots), so it needs its own readFromLeader /
+	// tryReadFromLeader beside its proposeToLeader — and
+	// contrib/dragonboat/test/integration/helpers_test.go is owned by #131
+	// while that is open. The dispositions are written down on #161; this
+	// table is only the ratchet that makes the gate notice when they land.
+	{file: "contrib/dragonboat/test/integration/election_test.go", fn: "TestIntegration_DB_PreVoteElection", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/lifecycle_test.go", fn: "TestIntegration_DB_StartReplicaWaitForReadiness", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/linearizable_test.go", fn: "TestIntegration_DB_LinearizableRead_AfterLeaderFailover_NoManualWarmup", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/linearizable_test.go", fn: "TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads", call: "SyncRead", count: 3, issue: 161},
+	{file: "contrib/dragonboat/test/integration/multishard_test.go", fn: "TestIntegration_DB_MultiShard", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/naread_test.go", fn: "TestIntegration_DB_NAReadLocalNode", call: "ReadIndex", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/nodehost_advanced_test.go", fn: "TestIntegration_DB_ConcurrentSMLookup", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/nodehost_advanced_test.go", fn: "TestIntegration_DB_SyncIOAPIs", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/nodehost_test.go", fn: "TestIntegration_DB_ProposeAndRead", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/readindex_advanced_test.go", fn: "TestIntegration_DB_SyncRead_AfterLeaderChange", call: "SyncRead", count: 3, issue: 161},
+	{file: "contrib/dragonboat/test/integration/session_dedup_test.go", fn: "TestIntegration_DB_TrackedSession_Deduplication", call: "SyncRead", count: 2, issue: 161},
+	{file: "contrib/dragonboat/test/integration/session_dedup_test.go", fn: "TestIntegration_DB_TrackedSession_DuplicateRejection", call: "SyncRead", count: 2, issue: 161},
+	{file: "contrib/dragonboat/test/integration/session_test.go", fn: "TestIntegration_DB_NoOPSession", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/statemachine_test.go", fn: "TestIntegration_DB_ConcurrentStateMachine", call: "SyncRead", count: 1, issue: 161},
+	{file: "contrib/dragonboat/test/integration/statemachine_test.go", fn: "TestIntegration_DB_OnDiskStateMachine", call: "SyncRead", count: 1, issue: 161},
+
+	// #162 — syncReadExact in the raft suite's helpers. It is the read twin
+	// of proposer.Pinned: a caller hands it ONE replica and the loop retries
+	// quicraft.Temporary against that replica on purpose, because the
+	// assertion is about that replica's own applied state (Leader
+	// Completeness).
+	//
+	// It is deferred for a reason no other row here has: not a file this
+	// change could not edit, but a disposition that is not this change's to
+	// pick. A waiver records the site as deliberate; growing
+	// proposer.TryReadWith and routing it there gives the pinned-retry loop
+	// ONE home the way #96 and #133 gave the propose and election budgets one
+	// home each. Both are defensible, they diverge on where the retry lives
+	// rather than on whether this site is correct, and choosing between them
+	// under a gate installation would settle a one-home question as a side
+	// effect of an unrelated change. #162 holds that decision; this row keeps
+	// the gate green and the debt visible until it lands.
+	{file: "test/integration/raft/helpers_test.go", fn: "syncReadExact", call: "SyncRead", count: 1, issue: 162},
 }
 
 // TestIntegrationConfigChangesAreIdempotent fails when an integration test
@@ -496,40 +636,8 @@ func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 	scan := scanDirectCalls(t, directConfigChangeMarker, configChangeCalls)
 	reportBareMarkers(t, directConfigChangeMarker, scan.bare)
 
-	seen := make([]int, len(pendingConfigChangeSites))
-	var violations []directCall
-	var deferred []string
-	for _, c := range scan.direct {
-		i := pendingSiteFor(c, seen)
-		if i < 0 {
-			violations = append(violations, c)
-			continue
-		}
-		seen[i]++
-		deferred = append(deferred, fmt.Sprintf("%s: %s (#%d)", c.pos, c.call, pendingConfigChangeSites[i].issue))
-	}
-
-	// An entry that no longer matches has been fixed or moved. Either way it
-	// must leave the table now, or the table starts to be the allowlist it
-	// was designed not to be.
-	var rotted []string
-	for i, p := range pendingConfigChangeSites {
-		if seen[i] != p.count {
-			rotted = append(rotted, fmt.Sprintf("%s %s.%s: expected %d direct call(s), found %d (#%d)",
-				p.file, p.fn, p.call, p.count, seen[i], p.issue))
-		}
-	}
-	if len(rotted) > 0 {
-		t.Errorf("%d deferred config-change entr(y/ies) no longer match the tree:\n  %s\n\n"+
-			"A site that was converted or moved must take its pendingConfigChangeSites "+
-			"entry with it. Delete the entry (or correct its count) in the same change.",
-			len(rotted), strings.Join(rotted, "\n  "))
-	}
-
-	if len(deferred) > 0 {
-		t.Logf("%d direct config change(s) deferred to their tracking issue:\n  %s",
-			len(deferred), strings.Join(deferred, "\n  "))
-	}
+	violations := matchPending(t, "config change", "pendingConfigChangeSites",
+		scan.direct, pendingConfigChangeSites)
 
 	if len(violations) == 0 {
 		t.Log("every untracked integration config change goes through the idempotent helper")
@@ -554,15 +662,130 @@ func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 		len(violations), formatDirectCalls(violations), directConfigChangeMarker)
 }
 
-// pendingSiteFor returns the index of the deferred entry c still counts
-// against, or -1 when no entry matches or the matching entry is already full.
-// An over-full entry is deliberately a miss: the (count+1)th direct call under
-// a tracked key is new, and new is a violation.
-func pendingSiteFor(c directCall, seen []int) int {
-	for i, p := range pendingConfigChangeSites {
+// matchPending splits direct into the findings a gate must fail on and the
+// ones its deferred table still accounts for, logs the deferred sites with
+// their tracking issue, and fails (without stopping the test) for any entry
+// that no longer matches the tree.
+//
+// kind names the class for the messages ("config change", "read"); table names
+// the variable a reader has to edit.
+func matchPending(t *testing.T, kind, tableName string, direct []directCall, table []pendingSite) []directCall {
+	t.Helper()
+
+	seen := make([]int, len(table))
+	var violations []directCall
+	var deferred []string
+	for _, c := range direct {
+		i := pendingSiteFor(c, table, seen)
+		if i < 0 {
+			violations = append(violations, c)
+			continue
+		}
+		seen[i]++
+		deferred = append(deferred, fmt.Sprintf("%s: %s (#%d)", c.pos, c.call, table[i].issue))
+	}
+
+	// An entry that no longer matches has been fixed or moved. Either way it
+	// must leave the table now, or the table starts to be the allowlist it
+	// was designed not to be.
+	var rotted []string
+	for i, p := range table {
+		if seen[i] != p.count {
+			rotted = append(rotted, fmt.Sprintf("%s %s.%s: expected %d direct call(s), found %d (#%d)",
+				p.file, p.fn, p.call, p.count, seen[i], p.issue))
+		}
+	}
+	if len(rotted) > 0 {
+		t.Errorf("%d deferred %s entr(y/ies) no longer match the tree:\n  %s\n\n"+
+			"A site that was converted or moved must take its %s entry with it. "+
+			"Delete the entry (or correct its count) in the same change.",
+			len(rotted), kind, strings.Join(rotted, "\n  "), tableName)
+	}
+
+	if len(deferred) > 0 {
+		t.Logf("%d direct %s(s) deferred to their tracking issue:\n  %s",
+			len(deferred), kind, strings.Join(deferred, "\n  "))
+	}
+	return violations
+}
+
+// pendingSiteFor returns the index of the deferred entry in table that c still
+// counts against, or -1 when no entry matches or the matching entry is already
+// full. An over-full entry is deliberately a miss: the (count+1)th direct call
+// under a tracked key is new, and new is a violation.
+func pendingSiteFor(c directCall, table []pendingSite, seen []int) int {
+	for i, p := range table {
 		if p.file == c.file && p.fn == c.fn && p.call == c.call && seen[i] < p.count {
 			return i
 		}
 	}
 	return -1
+}
+
+// TestIntegrationReadsResolveTheLeader fails when an integration test issues a
+// LINEARIZABLE read — SyncRead or ReadIndex — through a Host it addressed
+// directly, instead of through the suite's leader-resolving read helper.
+//
+// # Why this gate exists
+//
+// This is the READ half of the class the two gates above cover. #147 found
+// fifteen sites in the host suite where a leader was observed once
+//
+//	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
+//	leaderHost := cluster.hosts[leaderIdx]
+//	...
+//	got, err := leaderHost.SyncRead(ctx, shardID, key)
+//
+// and then read from across a loop. One of them
+// (TestHostAPI_MembershipChange_AddNodeWhileWriting) failed CI under the
+// runners' own load with "not leader for shard 1, leader unknown" — refused
+// CORRECTLY by an engine that had held an election in the gap, reporting a
+// defect the cluster never had.
+//
+// #155 converted those fifteen and marked five. Nothing stopped the next test
+// from reintroducing the pattern, which is precisely how the propose class came
+// back twice after being "fixed" (#91, #103). So, like the two gates above,
+// this is a rule about the CALL rather than about how the receiver was
+// obtained, and no binding can hide from it.
+//
+// # What a failure means
+//
+// Route the read through the suite's helper — readFromLeader /
+// readIndexFromLeader, or the error-returning tryReadFromLeader off the test
+// goroutine — which resolves the leader at the point of use and retries ONLY
+// the not-leader rejection. Re-issuing a refused read is always safe: a read
+// that was refused was never answered.
+//
+// If the addressed replica IS the subject — a deposed incumbent whose refusal
+// is the assertion, a follower whose forwarding is what is under test, the
+// target of a leadership transfer whose own lease is the point, a shard that
+// does not exist — keep the direct call and put directReadMarker and a reason
+// on the line above. That is a real category: twenty of the sites across the
+// two trees are in it.
+func TestIntegrationReadsResolveTheLeader(t *testing.T) {
+	scan := scanDirectCalls(t, directReadMarker, linearizableReadCalls)
+	reportBareMarkers(t, directReadMarker, scan.bare)
+
+	violations := matchPending(t, "read", "pendingReadSites", scan.direct, pendingReadSites)
+
+	if len(violations) == 0 {
+		t.Log("every untracked integration linearizable read resolves the leader")
+		return
+	}
+
+	t.Fatalf("%d integration linearizable read(s) address a Host directly "+
+		"instead of resolving the leader at the point of use:%s\n\n"+
+		"A linearizable read is bound to the leader exactly as a proposal is: "+
+		"SyncRead is a ReadIndex plus a local lookup, and a replica that has "+
+		"lost the shard without yet learning its successor refuses both on the "+
+		"same terms (#147). Observing a leader does not pin it. Route these "+
+		"through the suite's readFromLeader / readIndexFromLeader (or "+
+		"tryReadFromLeader off the test goroutine), which resolves the leader "+
+		"when the call is made and retries the not-leader rejection.\n\n"+
+		"If a read is deliberately aimed at one specific replica — a deposed "+
+		"incumbent that must refuse it, a follower whose forwarding is the "+
+		"assertion — put %q and the reason on the line above it. A StaleRead or "+
+		"a FollowerRead needs no marker: neither is in this gate's call set, "+
+		"because neither needs a leader.",
+		len(violations), formatDirectCalls(violations), directReadMarker)
 }
