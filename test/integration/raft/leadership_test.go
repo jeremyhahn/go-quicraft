@@ -136,6 +136,29 @@ func waitForUnanimousLeader(t *testing.T, c *testCluster, shardID uint64, timeou
 // The write floor at the end is what stops this from passing vacuously: with
 // no traffic at all, a leader trivially remains leader, and this test would be
 // asserting nothing about behaviour under load.
+//
+// The property has a precondition the test did not used to check: Raft keeps
+// a healthy leader only while heartbeats are delivered well inside the
+// election timeout, which here is ElectionRTT (10) ticks of 50ms randomised
+// up to twice that — 500ms to 1s. A follower cannot tell a leader whose
+// process is not being scheduled from a dead one, so once the host freezes
+// goroutines for longer than that, forgetting the leader and campaigning is
+// the protocol working, not failing. #143 reproduced exactly this on a
+// 24-core box at load ~200 with per-send and per-receive timestamps: in two
+// losses the leader sent on every tick while nothing crossed to one follower
+// for 0.6-1.3s; in the third the leader's own step worker was frozen
+// mid-iteration for 1.6s, `runnable`, holding no lock, with no I/O in its
+// path. Nothing in the engine stopped; the kernel stopped running it.
+//
+// The scheduling probe below measures that freeze directly. A follower that
+// forgets the leader, a term that advances, or a write floor that is missed
+// is a verdict on the engine unless a freeze of followerStallCeiling or more
+// ended inside the electionRound before it (the whole window, for the
+// floor); a forgotten leader after such a freeze is then pinned over one
+// electionRound rather than read at an instant, because a leader that never
+// stopped sending re-joins its follower at the same term as soon as delivery
+// resumes. Two replicas leading one term is a safety violation and is never
+// excused by the environment.
 func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 	const (
 		shardID     = uint64(1)
@@ -174,6 +197,9 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 			baselineLeader, len(cluster.hosts))
 	}
 
+	probe := startSchedulingProbe()
+	defer probe.stop()
+
 	stop := make(chan struct{})
 	var committed atomic.Int64
 	var wg sync.WaitGroup
@@ -199,54 +225,284 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 		}(w)
 	}
 
+	stopWriters := func() {
+		close(stop)
+		wg.Wait()
+	}
+
 	deadline := time.Now().Add(loadWindow)
-	var samples int
+	var samples, flickers int
+	// forgottenSince is the instant a follower was first seen without a
+	// leader after a qualifying stall, and zero while every node names the
+	// baseline. See the default case below.
+	var forgottenSince time.Time
+	var forgottenStall time.Duration
 	for time.Now().Before(deadline) {
+		allBaseline := true
 		for _, v := range observeLeaderViews(cluster, shardID) {
 			samples++
 			switch {
-			case !v.known || v.leaderID == 0:
-				close(stop)
-				wg.Wait()
-				t.Fatalf("node[%d] lost track of the leader while replica %d was "+
-					"healthy and leading term %d. A follower that forgets its "+
-					"leader has stopped receiving heartbeats and is one election "+
-					"timeout away from campaigning against a working leader.",
-					v.index, baselineLeader, baselineTerm)
+			case v.known && v.leaderID == baselineLeader && v.term == baselineTerm:
+				continue
 			case v.term != baselineTerm:
-				close(stop)
-				wg.Wait()
-				t.Fatalf("node[%d] reports term %d, but the shard was in term %d "+
+				stopWriters()
+				failUnlessStalled(t, probe, time.Now(), electionRound, "node[%d] reports term %d, but the shard was in term %d "+
 					"with replica %d leading and no fault was injected. The term "+
 					"only advances when a replica campaigns: the cluster held an "+
 					"election under nothing but its own write traffic.",
 					v.index, v.term, baselineTerm, baselineLeader)
-			case v.leaderID != baselineLeader:
-				close(stop)
-				wg.Wait()
+			case v.known && v.leaderID != baselineLeader:
+				stopWriters()
 				t.Fatalf("node[%d] reports replica %d as leader of term %d; "+
 					"replica %d led that term. Two replicas cannot lead one term.",
 					v.index, v.leaderID, v.term, baselineLeader)
+			default:
+				// A follower with no leader at the baseline term: its election
+				// timer fired and it is a pre-candidate. That is the instant
+				// read this test used to fail on outright. It is still a
+				// failure unless a stall that could have fired the timer
+				// preceded it — and even then it is not yet a verdict: a
+				// leader that never stopped sending re-joins the follower at
+				// the SAME term as soon as delivery resumes, which a dead or
+				// wedged leader cannot do. So the observation is pinned over
+				// one electionRound: restored, and the run continues with the
+				// flicker on record; not restored, or restored by an election,
+				// and the run is inconclusive or failed above.
+				allBaseline = false
+				if !forgottenSince.IsZero() {
+					if time.Since(forgottenSince) > electionRound {
+						stopWriters()
+						t.Skipf("INCONCLUSIVE, not a pass. node[%d] forgot replica %d "+
+							"after a %v goroutine stall and was not re-joined to it "+
+							"at term %d within %v. The stall exceeds the %v ceiling, "+
+							"so the host, not the engine, is the first suspect; "+
+							"re-run on a host that is not oversubscribed. #143 has "+
+							"the per-heartbeat timestamps for the CI box.",
+							v.index, baselineLeader, forgottenStall, baselineTerm,
+							electionRound, followerStallCeiling)
+					}
+					continue
+				}
+				now := time.Now()
+				forgottenStall = stallExcusing(t, probe, now, electionRound, stopWriters,
+					fmt.Sprintf("node[%d] lost track of the leader while replica %d was "+
+						"healthy and leading term %d. A follower that forgets its "+
+						"leader has stopped receiving heartbeats and is one election "+
+						"timeout away from campaigning against a working leader.",
+						v.index, baselineLeader, baselineTerm))
+				forgottenSince = now
+				flickers++
+				t.Logf("node[%d] forgot replica %d after a %v goroutine stall (ceiling %v); "+
+					"allowing %v for it to be re-joined at term %d",
+					v.index, baselineLeader, forgottenStall, followerStallCeiling,
+					electionRound, baselineTerm)
 			}
+		}
+		if allBaseline && !forgottenSince.IsZero() {
+			t.Logf("every node names replica %d at term %d again, %v after the stall",
+				baselineLeader, baselineTerm, time.Since(forgottenSince))
+			forgottenSince = time.Time{}
 		}
 		time.Sleep(samplePause)
 	}
 
-	close(stop)
-	wg.Wait()
+	stopWriters()
 
 	if n := committed.Load(); n < writeFloor {
-		t.Fatalf("only %d writes committed in %v across %d writers (floor %d): "+
+		failUnlessStalled(t, probe, time.Now(), loadWindow, "only %d writes committed in %v across %d writers (floor %d): "+
 			"the leader was never actually put under load, so its stability "+
 			"proves nothing", n, loadWindow, numWriters, writeFloor)
 	}
-	t.Logf("replica %d held term %d across %d observations while committing %d writes",
-		baselineLeader, baselineTerm, samples, committed.Load())
+	t.Logf("replica %d held term %d across %d observations while committing %d writes "+
+		"(%d stall-excused flickers; longest goroutine freeze %v over %d probe samples, ceiling %v)",
+		baselineLeader, baselineTerm, samples, committed.Load(), flickers,
+		probe.longestFreeze(), probe.sampleCount(), followerStallCeiling)
 
 	// The data written under load must be on the leader's state machine, so
 	// that "stable" cannot mean "wedged but still heartbeating".
 	assertSMHasExact(t, trackers[leaderIdx].Get(shardID, uint64(leaderIdx+1)),
 		fmt.Sprintf("node[%d]", leaderIdx), "stability-warmup", "ok")
+}
+
+// electionTimeoutFloor is the SHORTEST election timeout a follower in this
+// suite can draw: ElectionRTT ticks, before randomisation adds up to another
+// ElectionRTT on top (see electionRound). A follower that hears nothing from
+// its leader for this long may, correctly, forget it and campaign.
+const electionTimeoutFloor = time.Duration(testElectionRTT) * raftTick
+
+// followerStallCeiling is the longest a single goroutine wake-up may be seen
+// to lag during the load window before a lost leader stops being evidence
+// about the engine and becomes evidence about the host.
+//
+// It is HALF the floor, and the half is not headroom. A heartbeat needs one
+// wake-up on the leader's side to be sent and one on the follower's side to
+// be delivered, so two stalls of this size back to back — one per side of
+// the wire, with every other goroutine running perfectly — are a whole
+// election timeout of silence, and the follower's timer fires on a leader
+// that never stopped sending. #143 recorded stalls of 0.37s to 1.6s on the
+// CI box against this 0.5s floor; the losses they produced were all of that
+// shape.
+//
+// Derived, not chosen: it follows the shard configuration through
+// electionTimeoutFloor, and TestBudgetsDescribeTheClusterTheyBudgetFor pins
+// that configuration to the constants the derivation reads.
+const followerStallCeiling = electionTimeoutFloor / 2
+
+// schedulingProbe measures the one thing the stability assertion assumes and
+// cannot control: that a goroutine in this process which is RUNNING keeps
+// running. It is a goroutine that does nothing but timestamp its own
+// progress; the longest gap between two consecutive timestamps is the
+// longest this process had a running goroutine frozen, which is the
+// situation the step worker that owns the shard is in when the kernel parks
+// the thread underneath it mid-iteration.
+//
+// It spins on purpose, for the length of the load window, on one core. A
+// probe that sleeps on a ticker measures something else — how long a
+// wake-up waits for a P — and the first cut of this gate used one: it
+// reported a worst lag of 188ms, under the ceiling, in a run where a
+// follower had just lost a leader whose step worker had been frozen for
+// longer than the election timeout with no lock held and no I/O in its
+// path. A sleeping probe is never the goroutine that gets parked.
+type schedulingProbe struct {
+	stopC   chan struct{}
+	doneC   chan struct{}
+	maxGap  atomic.Int64
+	samples atomic.Int64
+
+	// stalls records every gap of followerStallCeiling or more, with the
+	// instant the probe resumed, so a loss can be checked against the stalls
+	// that PRECEDED it rather than against the worst moment of the whole
+	// window. A stall after the loss cannot have caused it, and neither can
+	// one that ended a full election timeout before.
+	mu     sync.Mutex
+	stalls []probeStall
+}
+
+// probeStall is one freeze of at least followerStallCeiling.
+type probeStall struct {
+	at  time.Time
+	gap time.Duration
+}
+
+// startSchedulingProbe starts the probe; it runs until stop.
+func startSchedulingProbe() *schedulingProbe {
+	p := &schedulingProbe{
+		stopC: make(chan struct{}),
+		doneC: make(chan struct{}),
+	}
+	go p.run()
+	return p
+}
+
+func (p *schedulingProbe) run() {
+	defer close(p.doneC)
+	last := time.Now()
+	for {
+		select {
+		case <-p.stopC:
+			return
+		default:
+		}
+		now := time.Now()
+		gap := now.Sub(last)
+		if gap > time.Duration(p.maxGap.Load()) {
+			p.maxGap.Store(int64(gap))
+		}
+		if gap >= followerStallCeiling {
+			p.mu.Lock()
+			p.stalls = append(p.stalls, probeStall{at: now, gap: gap})
+			p.mu.Unlock()
+		}
+		p.samples.Add(1)
+		last = now
+	}
+}
+
+// stop ends sampling and waits for the probe goroutine to exit.
+func (p *schedulingProbe) stop() {
+	close(p.stopC)
+	<-p.doneC
+}
+
+// longestFreeze is the longest gap between consecutive samples so far.
+func (p *schedulingProbe) longestFreeze() time.Duration {
+	return time.Duration(p.maxGap.Load())
+}
+
+// sampleCount is how many timestamps the probe has taken.
+func (p *schedulingProbe) sampleCount() int64 {
+	return p.samples.Load()
+}
+
+// worstStallBefore is the largest ceiling-exceeding freeze that ended within
+// lookback of at, and zero if there was none. A freeze that ended after at is
+// not counted.
+func (p *schedulingProbe) worstStallBefore(at time.Time, lookback time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var worst time.Duration
+	for _, st := range p.stalls {
+		if st.at.After(at) || at.Sub(st.at) > lookback {
+			continue
+		}
+		if st.gap > worst {
+			worst = st.gap
+		}
+	}
+	return worst
+}
+
+// stallExcusing returns the stall that could have produced the finding on
+// its own, or fails the test with the finding if there was none.
+//
+// The stall has to be one that could have done it: it must have ended
+// within lookback of the observation at observed. For a lost leader or an
+// advanced term the lookback is electionRound, the longest a follower's
+// randomised timer can run without leader traffic, because a stall that
+// ended earlier than that had already been followed by a whole timeout's
+// worth of heartbeats. A missed write floor looks back over the entire
+// window, since a stall anywhere in it lowers throughput. A stall that
+// merely happened somewhere in the window does not excuse a loss it could
+// not have caused; the first cut of this gate did exactly that and pardoned
+// a leader that had been deliberately closed.
+//
+// beforeFailing runs before t.Fatalf so the caller can stop its writers.
+func stallExcusing(t *testing.T, probe *schedulingProbe, observed time.Time, lookback time.Duration, beforeFailing func(), finding string) time.Duration {
+	t.Helper()
+	stall := probe.worstStallBefore(observed, lookback)
+	if stall < followerStallCeiling {
+		if beforeFailing != nil {
+			beforeFailing()
+		}
+		t.Fatalf("%s No running goroutine in this process was frozen for the %v "+
+			"ceiling in the %v before the observation (longest freeze over the "+
+			"whole window: %v), so the host ran this process well enough for "+
+			"the loss to be the engine's doing.", finding, followerStallCeiling,
+			lookback, probe.longestFreeze())
+	}
+	return stall
+}
+
+// failUnlessStalled fails the test with the finding unless the probe saw a
+// stall that could have produced it (see stallExcusing), in which case the
+// finding is still reported, in full, and the run is declared inconclusive
+// rather than passed.
+//
+// Only outcomes an election timeout can produce go through here. A safety
+// violation never does.
+func failUnlessStalled(t *testing.T, probe *schedulingProbe, observed time.Time, lookback time.Duration, format string, args ...any) {
+	t.Helper()
+	finding := fmt.Sprintf(format, args...)
+	stall := stallExcusing(t, probe, observed, lookback, nil, finding)
+	t.Skipf("INCONCLUSIVE, not a pass. %s A running goroutine in this process was "+
+		"frozen for %v within the %v before the observation (ceiling %v: half "+
+		"the %v election-timeout floor of ElectionRTT %d x %v tick). Two such "+
+		"stalls, one on each side of the wire, are a full election timeout of "+
+		"silence from a leader that never stopped sending, so a follower's "+
+		"timer firing here says nothing about the engine. Re-run on a host that "+
+		"is not oversubscribed; #143 has the per-heartbeat timestamps for the "+
+		"CI box.", finding, stall, lookback, followerStallCeiling,
+		electionTimeoutFloor, testElectionRTT, raftTick)
 }
 
 // requestTransferUntilLeader asks the current leader to hand leadership to
