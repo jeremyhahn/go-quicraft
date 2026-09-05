@@ -51,6 +51,9 @@ func TestIntegration_DB_AsyncRequestAddReplica(t *testing.T) {
 
 	// Use async RequestAddReplica to add a replica ID 10 (non-existent
 	// address, but the config change should still commit).
+	//quicraft:direct-config-change the async RequestState/ResultC contract is under
+	// test: the assertion reads the result the request produces, which a synchronous
+	// idempotent helper would consume
 	rs, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59999", configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("RequestAddReplica failed: %v", err)
@@ -169,28 +172,13 @@ func TestIntegration_DB_RequestLeaderTransfer(t *testing.T) {
 	targetReplicaID := uint64(targetIdx + 1)
 	t.Logf("requesting transfer to node[%d] (replicaID=%d)", targetIdx, targetReplicaID)
 
-	// Request leader transfer from the current leader.
-	leaderHost := cluster.hosts[leaderIdx]
-	if err := leaderHost.RequestLeaderTransfer(1, targetReplicaID); err != nil {
-		t.Fatalf("RequestLeaderTransfer failed: %v", err)
-	}
-
-	// Wait for the target to become leader.
-	waitForCondition(t, failoverTimeout, "target becomes leader", func() bool {
-		for i, nh := range cluster.hosts {
-			if cluster.stopped[i].Load() {
-				continue
-			}
-			leaderID, _, valid, err := nh.GetLeaderID(1)
-			if err != nil || !valid {
-				continue
-			}
-			if leaderID == targetReplicaID {
-				return true
-			}
-		}
-		return false
-	})
+	// Request the transfer of whichever replica leads at the moment, and
+	// again of whoever leads later if the request is lost: a transfer is a
+	// request the engine does not retry, and the budget is derived from what
+	// one attempt is bounded by (see leaderTransferRounds in helpers_test.go).
+	// The host observed above is not used: leadership is not pinned by having
+	// been observed (#123).
+	cluster.transferLeadershipTo(t, 1, targetReplicaID, leaderTransferTimeout)
 
 	// Verify via GetLeaderID from the target host.
 	targetHost := cluster.hosts[targetIdx]

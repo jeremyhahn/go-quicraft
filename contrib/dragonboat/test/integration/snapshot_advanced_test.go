@@ -307,13 +307,9 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 		t.Fatalf("SyncRequestSnapshot failed after %d retries", maxSnapRetries)
 	}
 
-	// Get current membership to obtain the ConfigChangeID.
-	memCtx, memCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer memCancel()
-	membership, memErr := leaderHost.SyncGetShardMembership(memCtx, 1)
-	if memErr != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", memErr)
-	}
+	// Get current membership to obtain the ConfigChangeID, through whichever
+	// replica leads now (#123).
+	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
 	// Create the 4th node on a new NodeHost.
 	newAddr := freePort(t)
@@ -326,14 +322,13 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	}
 	defer newHost.Close()
 
-	// Add the 4th replica to the cluster's membership via the leader.
+	// Add the 4th replica to the cluster's membership through the current
+	// leader, confirmed by a linearizable read showing it as a voter at
+	// newAddr. The address half of that confirmation is what this site needs
+	// most: the replica is about to be STARTED at that address, so an
+	// "already exists" for replica 4 elsewhere would be a real conflict.
 	const newReplicaID = 4
-	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer addCancel()
-	addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, newReplicaID, newAddr, membership.ConfigChangeID)
-	if addErr != nil {
-		t.Fatalf("SyncRequestAddReplica for 4th node failed: %v", addErr)
-	}
+	cluster.addReplicaToLeader(t, 1, newReplicaID, newAddr, membership.ConfigChangeID, membershipTimeout)
 	t.Logf("replica %d added to membership at address %s", newReplicaID, newAddr)
 
 	// Start the replica on the new NodeHost (join=true since it was

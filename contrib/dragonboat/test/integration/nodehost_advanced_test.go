@@ -440,18 +440,34 @@ func TestIntegration_DB_SnapshotRecoveryAfterRestart(t *testing.T) {
 	}
 	trackers[followerIdx] = newTracker
 
-	// Verify the restarted follower catches up via snapshot recovery.
+	// Verify the restarted follower catches up: its own snapshot and log
+	// first, then whatever tail the leader has to ship it. One wait for the
+	// whole recovery, bounded by catchUpTimeout (see helpers_test.go for what
+	// it bounds and why defaultTimeout was the wrong unit), and then every
+	// key checked exactly.
 	sm := newTracker.Get(1, replicaID)
 	if sm == nil {
 		t.Fatal("restarted follower has no state machine")
 	}
+	recoveryStarted := time.Now()
+	waitForCondition(t, catchUpTimeout,
+		fmt.Sprintf("restarted follower node[%d] holds all %d entries", followerIdx, len(expected)),
+		func() bool {
+			for key, val := range expected {
+				if got, ok := sm.Get(key); !ok || got != val {
+					return false
+				}
+			}
+			return true
+		},
+	)
 	for key, val := range expected {
-		waitForCondition(t, defaultTimeout, "follower recovers: "+key, func() bool {
-			got, ok := sm.Get(key)
-			return ok && got == val
-		})
+		if got, ok := sm.Get(key); !ok || got != val {
+			t.Fatalf("restarted follower has %q=%q (present=%v), want %q", key, got, ok, val)
+		}
 	}
-	t.Logf("follower recovered all %d entries after snapshot-based restart", len(expected))
+	t.Logf("follower recovered all %d entries %v after snapshot-based restart",
+		len(expected), time.Since(recoveryStarted).Round(time.Millisecond))
 }
 
 // TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult verifies the

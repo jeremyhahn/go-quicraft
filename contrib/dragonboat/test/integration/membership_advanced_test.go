@@ -56,67 +56,64 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
+	// Every membership read and change below goes through whichever replica
+	// leads AT THAT MOMENT, never through the host observed above. Observing
+	// a leader does not pin it (#123): a config change on a host that has
+	// since been re-elected is refused correctly, and through this adapter
+	// that refusal reads only "shard not ready".
+	initialID := cluster.membershipFromLeader(t, 1, membershipTimeout).ConfigChangeID
 
-	// Get the current ConfigChangeID.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-	currentID := membership.ConfigChangeID
+	// A change against the current ConfigChangeID must land. On a freshly
+	// bootstrapped shard that ID is 0, which the adapter documents as "do not
+	// check", so this first change is the unchecked path and produces the
+	// first non-zero ID.
+	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", initialID, membershipTimeout)
+	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d landed", initialID)
 
-	// Use the correct ConfigChangeID to add a replica — should succeed.
-	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.10.0.1:59999", currentID); addErr != nil {
-		t.Fatalf("SyncRequestAddReplica with correct ConfigChangeID failed: %v", addErr)
+	freshID := cluster.membershipFromLeader(t, 1, membershipTimeout).ConfigChangeID
+	if freshID == initialID {
+		t.Fatalf("ConfigChangeID is still %d after a committed config change; it must advance to that change's log index", initialID)
 	}
-	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d succeeded", currentID)
-
-	// Re-read membership to get the updated (non-zero) ConfigChangeID
-	// after the first config change was applied.
-	updCtx, updCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer updCancel()
-	updatedMembership, updErr := leaderHost.SyncGetShardMembership(updCtx, 1)
-	if updErr != nil {
-		t.Fatalf("SyncGetShardMembership after add failed: %v", updErr)
-	}
-	freshID := updatedMembership.ConfigChangeID
 	t.Logf("fresh ConfigChangeID after first add: %d", freshID)
 
-	// Using the OLD ConfigChangeID (which is now stale) should fail.
-	staleCtx, staleCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer staleCancel()
-	staleErr := leaderHost.SyncRequestAddReplica(staleCtx, 1, 11, "127.10.0.1:59998", currentID)
+	// A change against the fresh, non-zero ID must land. This is the ordered
+	// path proper, and it leaves freshID stale.
+	cluster.addReplicaToLeader(t, 1, 11, "127.10.0.1:59998", freshID, membershipTimeout)
+	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d landed", freshID)
+
+	// A change against the now-stale ID must be refused, and refused FOR
+	// STALENESS. This probe is direct on purpose: the refusal is the
+	// assertion, and the idempotent helper would treat it as an answer to
+	// re-resolve past. The probe is re-issued only while the answer is about
+	// leadership rather than staleness -- a not-leader refusal from a replica
+	// that was leading a moment ago says nothing about the ID -- and it is
+	// addressed to the replica leading at the moment of each issue.
+	var staleErr error
+	waitForCondition(t, failoverTimeout, "the stale-ConfigChangeID probe reaches a leader", func() bool {
+		staleCtx, staleCancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer staleCancel()
+		//quicraft:direct-config-change a stale ConfigChangeID must be REFUSED; the refusal is the assertion, and a helper that re-resolved and retried would retry the very answer under test
+		staleErr = cluster.waitForLeaderHost(1, failoverTimeout).SyncRequestAddReplica(staleCtx, 1, 12, "127.10.0.1:59997", freshID)
+		return !isNotLeaderRejection(staleErr)
+	})
 	if staleErr == nil {
-		// If the initial ConfigChangeID was 0, the staleness check is skipped
-		// (0 means "don't check"). Use the freshID instead and verify that
-		// a truly stale (non-zero) ID is rejected.
-		if currentID == 0 {
-			t.Logf("initial ConfigChangeID was 0 (skip check); retrying with stale freshID=%d", freshID)
-			// The second add succeeded with currentID=0, so re-read again.
-			rereadCtx, rereadCancel := context.WithTimeout(context.Background(), defaultTimeout)
-			defer rereadCancel()
-			reMembership, reErr := leaderHost.SyncGetShardMembership(rereadCtx, 1)
-			if reErr != nil {
-				t.Fatalf("SyncGetShardMembership re-read failed: %v", reErr)
-			}
-			_ = reMembership // new ID after second add
-			// Now use freshID (which is stale after the second add).
-			stale2Ctx, stale2Cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			defer stale2Cancel()
-			stale2Err := leaderHost.SyncRequestAddReplica(stale2Ctx, 1, 12, "127.10.0.1:59997", freshID)
-			if stale2Err == nil {
-				t.Fatal("SyncRequestAddReplica with stale non-zero ConfigChangeID should return error")
-			}
-			t.Logf("SyncRequestAddReplica with stale ConfigChangeID=%d correctly returned: %v", freshID, stale2Err)
-		} else {
-			t.Fatal("SyncRequestAddReplica with stale ConfigChangeID should return error")
+		t.Fatalf("SyncRequestAddReplica with stale ConfigChangeID=%d was accepted; it must be refused", freshID)
+	}
+	if !errors.Is(staleErr, dragonboat.ErrStaleConfigChange) {
+		t.Fatalf("SyncRequestAddReplica with stale ConfigChangeID=%d was refused with %v, want ErrStaleConfigChange", freshID, staleErr)
+	}
+	t.Logf("SyncRequestAddReplica with stale ConfigChangeID=%d correctly returned: %v", freshID, staleErr)
+
+	// The refusal refused: the two ordered changes are in the membership and
+	// the stale one is not.
+	final := cluster.membershipFromLeader(t, 1, membershipTimeout)
+	for _, id := range []uint64{10, 11} {
+		if _, exists := final.Nodes[id]; !exists {
+			t.Fatalf("replica %d not found in membership after its ordered add landed: %v", id, final.Nodes)
 		}
-	} else {
-		t.Logf("SyncRequestAddReplica with stale ConfigChangeID correctly returned: %v", staleErr)
+	}
+	if _, exists := final.Nodes[12]; exists {
+		t.Fatalf("replica 12 IS in the membership; the stale config change must not have entered the log: %v", final.Nodes)
 	}
 }
 
@@ -135,15 +132,8 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Get current membership.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
+	// Get current membership, through whichever replica leads now (#123).
+	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if len(membership.Nodes) != 3 {
 		t.Fatalf("expected 3 nodes, got %d", len(membership.Nodes))
 	}
@@ -157,21 +147,14 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 		}
 	}
 
-	// Delete the follower.
-	delCtx, delCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer delCancel()
-	if delErr := leaderHost.SyncRequestDeleteReplica(delCtx, 1, targetReplicaID, membership.ConfigChangeID); delErr != nil {
-		t.Fatalf("SyncRequestDeleteReplica failed: %v", delErr)
-	}
+	// Delete the follower. The change is applied through the current leader
+	// and confirmed by a linearizable read; see the idempotent config-change
+	// section of helpers_test.go.
+	cluster.deleteReplicaToLeader(t, 1, targetReplicaID, membership.ConfigChangeID, membershipTimeout)
 	t.Logf("SyncRequestDeleteReplica removed replica %d", targetReplicaID)
 
 	// Verify the membership no longer includes the removed replica.
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer verifyCancel()
-	updatedMembership, mErr := leaderHost.SyncGetShardMembership(verifyCtx, 1)
-	if mErr != nil {
-		t.Fatalf("SyncGetShardMembership after delete failed: %v", mErr)
-	}
+	updatedMembership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updatedMembership.Nodes[targetReplicaID]; exists {
 		t.Fatalf("replica %d should not be in membership after delete", targetReplicaID)
 	}
@@ -193,30 +176,15 @@ func TestIntegration_DB_SyncRequestAddReplica(t *testing.T) {
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 
-	leaderHost := cluster.hosts[leaderIdx]
+	// Get current membership, through whichever replica leads now (#123).
+	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
-	// Get current membership.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-
-	// Add replica 10 at a dummy address.
-	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 10, "127.10.0.1:59999", membership.ConfigChangeID); addErr != nil {
-		t.Fatalf("SyncRequestAddReplica failed: %v", addErr)
-	}
+	// Add replica 10 at a dummy address, through the current leader, and
+	// confirmed by a linearizable read.
+	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", membership.ConfigChangeID, membershipTimeout)
 
 	// Verify the membership now includes replica 10.
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer verifyCancel()
-	updated, mErr := leaderHost.SyncGetShardMembership(verifyCtx, 1)
-	if mErr != nil {
-		t.Fatalf("SyncGetShardMembership after add failed: %v", mErr)
-	}
+	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updated.Nodes[10]; !exists {
 		t.Fatalf("replica 10 not found in membership after add")
 	}
@@ -237,30 +205,16 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 
-	leaderHost := cluster.hosts[leaderIdx]
+	// Get current membership, through whichever replica leads now (#123).
+	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
-	// Get current membership.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-
-	// Add non-voting replica 20 at a dummy address.
-	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddNonVoting(addCtx, 1, 20, "127.10.0.1:59998", membership.ConfigChangeID); addErr != nil {
-		t.Fatalf("SyncRequestAddNonVoting failed: %v", addErr)
-	}
+	// Add non-voting replica 20 at a dummy address, through the current
+	// leader, and confirmed by a linearizable read showing it NON-VOTING at
+	// that address -- a voter or a witness at the same ID is a conflict.
+	cluster.addNonVotingToLeader(t, 1, 20, "127.10.0.1:59998", membership.ConfigChangeID, membershipTimeout)
 
 	// Verify the membership now includes non-voting replica 20.
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer verifyCancel()
-	updated, mErr := leaderHost.SyncGetShardMembership(verifyCtx, 1)
-	if mErr != nil {
-		t.Fatalf("SyncGetShardMembership after add non-voting failed: %v", mErr)
-	}
+	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updated.NonVotings[20]; !exists {
 		t.Fatalf("non-voting replica 20 not found in membership after add")
 	}
@@ -374,6 +328,9 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	// FIRST config change. It appends to the leader's log immediately, which
 	// raises log.confChangeIndex; because processed is pinned below it by the
 	// gate, the pending-config-change latch now stays armed indefinitely.
+	//quicraft:direct-config-change this change must enter THIS leader's log, the one
+	// whose apply loop is parked: it is the first half of the overlap under test, and
+	// a helper that re-resolved could submit it to a replica whose latch is not armed
 	rs1, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59990", configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("first RequestAddReplica failed: %v", err)
@@ -393,6 +350,9 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	settle.Stop()
 
 	// SECOND config change, overlapping the first. This must be rejected.
+	//quicraft:direct-config-change the overlap's REJECTION is the test; an idempotent
+	// helper retries ErrRejected (a pending config change clears on its own) and would
+	// wait out the very latch this assertion exists to observe
 	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.10.0.1:59991", configChangeID, defaultTimeout)
 	if secondErr != nil {
 		// The submission path may reject synchronously; it must still be a
@@ -458,6 +418,9 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	// fails here.
 	seqCtx, seqCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer seqCancel()
+	//quicraft:direct-config-change positive control: an ErrRejected here means the latch
+	// stuck armed after the rejection, which is the finding, and the idempotent helper
+	// would retry it away as a pending config change
 	if addErr := leaderHost.SyncRequestAddReplica(seqCtx, 1, 11, "127.10.0.1:59991",
 		updatedMembership.ConfigChangeID); addErr != nil {
 		t.Fatalf("sequential config change after the first applied must succeed, got: %v", addErr)

@@ -156,6 +156,86 @@ const leaderElectionTimeout = coldStartElectionRounds * electionRound
 // twenty rounds is roughly four times the observed worst case.
 const failoverTimeout = 20 * electionRound
 
+// membershipTimeout is the budget for one membership change to LAND: to be
+// accepted by whichever replica leads at the time, committed, and confirmed by
+// a linearizable read of the membership.
+//
+// It is failoverTimeout plus defaultTimeout, in sequence, because that is what
+// the loop behind it has to absorb: a leadership change in progress when the
+// change is submitted (a failover is what a mid-test leader gap is, and under
+// saturation CheckQuorum produces them with nothing stopped), and then the
+// commit itself, which is an ordinary operation. The linearizability suite
+// derives its membershipTimeout the same way. Each single attempt inside the
+// loop still gets at most defaultTimeout, the budget the converted sites gave
+// their one direct call.
+const membershipTimeout = failoverTimeout + defaultTimeout
+
+// leaderTransferRounds is how many worst-case election rounds ONE requested
+// leadership transfer is given to produce the target as leader before the
+// request is made again.
+//
+// A transfer that is going to complete does so within TWO rounds, and one
+// that is not never completes on its own:
+//
+//   - the leader keeps a transfer open for ONE election timeout of its own
+//     ticks and then drops it without retrying (raft.tickLeader:
+//     transferElapsed >= electionTimeout clears transferTarget). That is
+//     ElectionRTT ticks -- HALF an electionRound, because the round is the
+//     randomised upper bound and this timer is not randomised. Within it the
+//     target must be caught up (it is, by waitForReplication, so TimeoutNow
+//     is sent on the request itself) and TimeoutNow delivered;
+//   - TimeoutNow makes the target campaign at once, bypassing PreVote and
+//     carrying the transfer hint that lets peers holding a live leader lease
+//     grant the vote (raft.handleTimeoutNow, broadcastTransferVote). That is
+//     one vote round, bounded by electionRound; the incumbent steps down when
+//     it sees the higher term;
+//   - the survivors learn the new leader from its first heartbeat, one
+//     HeartbeatRTT tick, well inside the same round.
+//
+// Half a round, a round, and a tick: two rounds. RequestLeaderTransfer
+// promises nothing past the request ("There is no guarantee the transfer
+// completes", nodehost.go), and under saturation a transfer IS lost -- the
+// incumbent steps down on CheckQuorum before TimeoutNow is answered, or the
+// target's vote round is contested and a third replica wins -- so a request
+// that has not produced the target within two rounds is made again, of
+// whichever replica leads by then. Measured: at load average 120-335 on 24
+// cores the target led 100-140ms after the request in every run, so the two
+// rounds are ~15x the observed time and the re-request is for the lost case,
+// not the slow one.
+const leaderTransferRounds = 2
+
+// leaderTransferRound is the wall-clock form of leaderTransferRounds.
+const leaderTransferRound = leaderTransferRounds * electionRound
+
+// leaderTransferTimeout bounds the WHOLE transfer, re-requests included: one
+// failover's worth of rounds for the disturbance that lost a request (a
+// CheckQuorum step-down and the re-election behind it are exactly a
+// failover), and one clean attempt on top of it. A transfer that can never
+// complete -- a target that will not campaign -- fails here, in this many
+// seconds, rather than at the suite timeout; that case is what the bound is
+// verified against.
+const leaderTransferTimeout = failoverTimeout + leaderTransferRound
+
+// catchUpTimeout is the budget for a replica that rejoins a led shard -- a
+// restarted follower, in TestIntegration_DB_SnapshotRecoveryAfterRestart --
+// to hold every committed entry again.
+//
+// What it bounds. The rejoining replica replays its own snapshot and log
+// first, which is local and not Raft-timed, and then holds nothing it can
+// vouch for (GetShardInfo reports it Pending) until the leader reaches it:
+// the leader's next heartbeat, one HeartbeatRTT tick, draws the response
+// that tells the leader where the replica's log ends, after which the leader
+// ships the tail as entries or, if the tail was compacted, as a snapshot. Each
+// of those is a message exchange -- an ordinary operation, the unit
+// defaultTimeout is for -- and none is an election. But the leader that has to
+// do the shipping is itself under the same saturation: a CheckQuorum
+// step-down and re-election while the replica rejoins is exactly a failover,
+// and until it completes there is no leader to ship anything. So: one
+// failover, then one ordinary operation, in sequence, which is the same sum
+// membershipTimeout is for the same reason. defaultTimeout alone was the
+// second half without the first.
+const catchUpTimeout = failoverTimeout + defaultTimeout
+
 // ---------------------------------------------------------------------------
 // KV Command Encoding
 // ---------------------------------------------------------------------------
@@ -1641,6 +1721,578 @@ func (c *dbTestCluster) tryProposeAsyncToLeader(
 		case <-expiry.C:
 			return dbAsyncProposal{}, lastErr
 		case <-retry.C:
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Idempotent, leader-resolving config changes
+// ---------------------------------------------------------------------------
+//
+// A config change has TWO values a test is tempted to pin and must not, and
+// this adapter hides the second.
+//
+// The first is leadership -- the class the proposal helpers above exist for.
+// #123 is its config-change instance: a SyncRequestAddReplica on a host
+// observed leading seconds earlier, refused CORRECTLY after an election and
+// reported as "shard not ready". The second is whether the change COMMITTED:
+// a change is submitted, leadership moves before the response, the entry is in
+// the log and can still commit under the new leader (Leader Completeness
+// guarantees it if it reached a quorum), and a retry is then refused CORRECTLY
+// with "already exists" or "not found" while the test reports a failure the
+// cluster never had (#112, #132).
+//
+// The parent module's test/membership package (#149) is the decision core for
+// this and is not reusable here, for the reason test/proposer was not (#114):
+// its predicates read signals this adapter erases. Its submission bit is
+// quicraft.MaybeApplied, and translateError returns the bare mapped sentinel
+// for anything that errors.Is a mapped error, so the *quicraft.MaybeAppliedError
+// wrapping the post-delivery NotLeaderError arrives here as ErrShardNotReady
+// with the wrapper gone, indistinguishable from the pre-flight refusal. Its
+// resolver is typed on *quicraft.Host, which NodeHost does not expose; its
+// Confirm on *quicraft.Membership rather than this adapter's; and it carries
+// no ConfigChangeID, which every converted site here passes. What IS the same
+// is the rule, and the rule is what this section mirrors:
+//
+//	"already exists" / "not found" is success ONLY when (a) an earlier attempt
+//	in the SAME loop was submitted to Raft, AND (b) a LINEARIZABLE membership
+//	read shows the exact change asked for: the replica present in exactly the
+//	requested role at exactly the requested address, or holding no role at all.
+//
+// A stale-ConfigChangeID refusal after a submitted attempt is treated the same
+// way. The ID the caller supplied describes the configuration BEFORE its own
+// change, so once that change commits the ID is stale by construction, and
+// only the linearizable read can say whether it committed. A stale ID with no
+// submitted attempt behind it, or one whose change the read cannot find, is
+// the caller's own error and is reported as such.
+//
+// Half (a) is where this module's rule is WIDER than the parent's, by exactly
+// one error, and it has to be. In the parent, submission is quicraft's own bit
+// or an ErrTimeout, which Sync{Add,Delete}Node can only return after delivery.
+// Here the only shape the post-delivery leadership change has is
+// ErrShardNotReady, so ErrShardNotReady arms the bit as well. The cost is
+// precise: an engine that applied a change it had reported as refused
+// pre-flight would be caught by the parent's helper and not by this one. That
+// is the adapter's erasure rather than this helper's choice, and it is filed
+// against contrib/dragonboat/errors.go. Half (b) is unchanged and carries the
+// weight: a replica ID found in a different role, at a different address, or a
+// delete target still present fails regardless of (a).
+
+// configChangeKind selects one of the adapter's four synchronous membership
+// calls.
+type configChangeKind int
+
+const (
+	addReplica configChangeKind = iota
+	addNonVoting
+	addWitness
+	deleteReplica
+)
+
+// membershipRole is where a replica ID sits in a Membership.
+type membershipRole int
+
+const (
+	roleNone membershipRole = iota
+	roleVoter
+	roleNonVoting
+	roleWitness
+)
+
+// membershipRoleNames renders a membershipRole for a failure message.
+var membershipRoleNames = map[membershipRole]string{
+	roleNone:      "no role",
+	roleVoter:     "voting member",
+	roleNonVoting: "non-voting member",
+	roleWitness:   "witness",
+}
+
+// configChangeRoles is the role each kind of change must leave the replica ID
+// in for the change to count as landed.
+var configChangeRoles = map[configChangeKind]membershipRole{
+	addReplica:    roleVoter,
+	addNonVoting:  roleNonVoting,
+	addWitness:    roleWitness,
+	deleteReplica: roleNone,
+}
+
+// configChangeNames are the adapter methods each kind submits through, for
+// failure messages that read like the call the test made.
+var configChangeNames = map[configChangeKind]string{
+	addReplica:    "SyncRequestAddReplica",
+	addNonVoting:  "SyncRequestAddNonVoting",
+	addWitness:    "SyncRequestAddWitness",
+	deleteReplica: "SyncRequestDeleteReplica",
+}
+
+// configChange is one requested membership change: what to do to which
+// replica, at which address, against which configuration.
+type configChange struct {
+	kind           configChangeKind
+	shardID        uint64
+	replicaID      uint64
+	addr           dragonboat.Target
+	configChangeID uint64
+}
+
+// String renders the change the way the converted sites used to log it.
+func (cc configChange) String() string {
+	if cc.kind == deleteReplica {
+		return fmt.Sprintf("%s(shard=%d, replica=%d, configChangeID=%d)",
+			configChangeNames[cc.kind], cc.shardID, cc.replicaID, cc.configChangeID)
+	}
+	return fmt.Sprintf("%s(shard=%d, replica=%d, addr=%s, configChangeID=%d)",
+		configChangeNames[cc.kind], cc.shardID, cc.replicaID, cc.addr, cc.configChangeID)
+}
+
+// configChangeSubmitters dispatches a configChange to the adapter method that
+// submits it. Each is the single attempt driveConfigChange is built from; the
+// gate in test/buildgates knows them by the marker.
+var configChangeSubmitters = map[configChangeKind]func(context.Context, *dragonboat.NodeHost, configChange) error{
+	addReplica: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
+		return nh.SyncRequestAddReplica(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+	},
+	addNonVoting: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
+		return nh.SyncRequestAddNonVoting(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+	},
+	addWitness: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
+		return nh.SyncRequestAddWitness(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+	},
+	deleteReplica: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
+		return nh.SyncRequestDeleteReplica(ctx, cc.shardID, cc.replicaID, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+	},
+}
+
+// roleOf reports the role replicaID holds in m and the address recorded for
+// it. A nil membership holds nobody.
+func roleOf(m *dragonboat.Membership, replicaID uint64) (membershipRole, dragonboat.Target) {
+	if m == nil {
+		return roleNone, ""
+	}
+	if addr, ok := m.Nodes[replicaID]; ok {
+		return roleVoter, addr
+	}
+	if addr, ok := m.NonVotings[replicaID]; ok {
+		return roleNonVoting, addr
+	}
+	if addr, ok := m.Witnesses[replicaID]; ok {
+		return roleWitness, addr
+	}
+	return roleNone, ""
+}
+
+// membershipConflictError reports a replica ID present in the membership in a
+// state INCOMPATIBLE with the change that requested it: a different role, or
+// the requested role at a different address. It names what actually holds
+// the ID so a replica-ID collision is diagnosable from the failure alone.
+type membershipConflictError struct {
+	change configChange
+	role   membershipRole
+	addr   dragonboat.Target
+}
+
+func (e *membershipConflictError) Error() string {
+	return fmt.Sprintf("replica %d is a %s at %q, not the %s at %q that %s requested: "+
+		"the replica ID is held in a state this change did not produce, which is a "+
+		"membership conflict and not a landed retry",
+		e.change.replicaID, membershipRoleNames[e.role], e.addr,
+		membershipRoleNames[configChangeRoles[e.change.kind]], e.change.addr, e.change)
+}
+
+// landed reports whether m shows cc in effect.
+//
+// For an add, the replica ID must be present in exactly the requested role at
+// exactly the requested address; found in any other role, or at any other
+// address, it is a conflict. Peer.validateAddNode answers "already exists"
+// from the replica ID alone, so "already exists" is also what a genuine
+// replica-ID collision looks like, and confirming the ID without the address
+// would turn that membership bug into a green test. For a delete, the replica
+// ID must hold no role at all -- absence alone is weak evidence, since a
+// replica that was never a member is also absent, which is exactly why
+// driveConfigChange consults this only after an attempt was submitted.
+func (cc configChange) landed(m *dragonboat.Membership) (bool, error) {
+	role, addr := roleOf(m, cc.replicaID)
+	want := configChangeRoles[cc.kind]
+	if want == roleNone {
+		return role == roleNone, nil
+	}
+	if role == roleNone {
+		return false, nil
+	}
+	if role != want || addr != cc.addr {
+		return false, &membershipConflictError{change: cc, role: role, addr: addr}
+	}
+	return true, nil
+}
+
+// configChangeFailedError is a membership change driveConfigChange gave up
+// on: a non-retryable refusal from an attempt, or a conflict in the
+// membership read.
+type configChangeFailedError struct {
+	change configChange
+	err    error
+}
+
+func (e *configChangeFailedError) Error() string {
+	return fmt.Sprintf("%s failed: %v", e.change, e.err)
+}
+
+func (e *configChangeFailedError) Unwrap() error { return e.err }
+
+// configChangeExhaustedError is a membership change that never landed within
+// its budget. last is what the final attempt produced.
+type configChangeExhaustedError struct {
+	change configChange
+	budget time.Duration
+	last   error
+}
+
+func (e *configChangeExhaustedError) Error() string {
+	return fmt.Sprintf("%s never landed within %v: %v", e.change, e.budget, e.last)
+}
+
+func (e *configChangeExhaustedError) Unwrap() error { return e.last }
+
+// errNoLeaderObserved is what an attempt reports when no live replica claims
+// leadership at the moment of the call. It is this helper's own, NOT the
+// adapter's ErrShardNotReady, because nothing was sent anywhere: it must be
+// retried, and it must never arm the submission bit.
+var errNoLeaderObserved = errors.New("integration: no live replica reports leadership")
+
+// leaderTransferInProgress is the text of the engine's raft.ErrTransferInProgress,
+// which handleLeaderPropose returns for EVERY proposal, config changes
+// included, while a leadership transfer is in flight. translateError has no
+// mapping for it, so it reaches a test wrapped in AdapterError and can only be
+// matched by text (#146 asks for the mapping). It is produced before the entry
+// enters the log, so it is retryable and never a submission.
+const leaderTransferInProgress = "transfer in progress"
+
+// configChangeMaybeSubmitted reports whether err could have been produced
+// AFTER the change was delivered to Raft, so the entry may still commit.
+//
+// Two errors carry that meaning through this adapter:
+//
+//   - ErrTimeout. The adapter's Sync* methods refuse a context that has no
+//     deadline or an expired one BEFORE calling quicraft (timeoutFromContext),
+//     and every attempt here is given a fresh context of at least
+//     minProposeAttempt, so an ErrTimeout can only be quicraft's own: the
+//     select on ctx.Done() after RequestX returned a live RequestState, or the
+//     deadline sweep completing a registered pending proposal. Both are after
+//     delivery.
+//   - ErrShardNotReady. This is the fold: quicraft's post-delivery
+//     *MaybeAppliedError{NotLeaderError} and its pre-flight NotLeaderError both
+//     translate to this bare sentinel, and so does ErrDropped. The submission
+//     bit therefore has to be armed for all of them; see the section comment
+//     for what that costs and why it is the adapter's to fix.
+//
+// ErrCanceled is deliberately NOT here: an attempt's context is cancelled
+// only after the attempt has returned, so a cancellation seen here submitted
+// nothing.
+func configChangeMaybeSubmitted(err error) bool {
+	return errors.Is(err, dragonboat.ErrTimeout) || errors.Is(err, dragonboat.ErrShardNotReady)
+}
+
+// configChangeRetryableSentinels are the errors one more attempt can change
+// the answer to. Every one of them clears on its own: an election completes,
+// a pipeline drains, a deadline that was too short gets a fresh one, a pending
+// config change commits, a transfer finishes.
+//
+// ErrRejected is here for membership calls specifically: on this path its
+// producer is raft.ErrPendingConfigChange, which Host.translateProposalError
+// maps and documents as retryable -- nothing entered the log, so re-proposing
+// once the pending change commits succeeds. It is NOT retried by the proposal
+// helpers, where ErrRejected is also what an expired session maps to.
+//
+// ErrStaleConfigChange, "already exists" and "not found" are deliberately
+// absent: they are real answers, and driveConfigChange's submission-and-
+// confirmation gate is the only thing that may turn one into a success.
+var configChangeRetryableSentinels = [...]error{
+	dragonboat.ErrShardNotReady,
+	dragonboat.ErrSystemBusy,
+	dragonboat.ErrTimeout,
+	dragonboat.ErrRejected,
+	errNoLeaderObserved,
+}
+
+// configChangeRetryable reports whether one more attempt at a membership
+// change is worth making after err.
+func configChangeRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, s := range configChangeRetryableSentinels {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), leaderTransferInProgress)
+}
+
+// driveConfigChange runs attempt until cc is in effect, the budget runs out,
+// or something non-retryable comes back.
+//
+// It is separated from the cluster it usually drives so the decision logic
+// can be tested without one -- see config_change_helper_test.go, which is
+// where "already exists at a DIFFERENT address must still fail" and "already
+// exists WITHOUT a submission must still fail" are pinned.
+//
+// attempt performs one membership RPC. readMembership performs one
+// LINEARIZABLE membership read. Both resolve the leader themselves at the
+// point of use, and both may report a transient error, which is treated as
+// "ask again".
+func driveConfigChange(
+	cc configChange,
+	budget time.Duration,
+	attempt func(context.Context) error,
+	readMembership func(context.Context) (*dragonboat.Membership, error),
+) error {
+	deadline := time.Now().Add(budget)
+	retry := time.NewTicker(proposeRetryInterval)
+	defer retry.Stop()
+	expiry := time.NewTimer(budget)
+	defer expiry.Stop()
+
+	submitted := false
+	lastErr := errNoLeaderObserved
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining < minProposeAttempt {
+			return &configChangeExhaustedError{change: cc, budget: budget, last: lastErr}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), min(remaining, defaultTimeout))
+		err := attempt(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+
+		// Latch the bit for the whole loop, not just this attempt: the entry
+		// an earlier attempt submitted is what a later "already exists" is
+		// reporting.
+		if configChangeMaybeSubmitted(err) {
+			submitted = true
+		}
+
+		if submitted {
+			landed, conflict, readErr := observeConfigChange(cc, deadline, readMembership)
+			if conflict != nil {
+				return &configChangeFailedError{change: cc, err: conflict}
+			}
+			if landed {
+				return nil
+			}
+			// A read that failed transiently is not evidence either way, so
+			// a refusal it was meant to check is not final yet: ask again.
+			if readErr != nil {
+				err = readErr
+			}
+		}
+
+		if !configChangeRetryable(err) {
+			return &configChangeFailedError{change: cc, err: err}
+		}
+		lastErr = err
+		select {
+		case <-expiry.C:
+			return &configChangeExhaustedError{change: cc, budget: budget, last: lastErr}
+		case <-retry.C:
+		}
+	}
+}
+
+// observeConfigChange takes one linearizable membership read and asks whether
+// cc has landed in it. A read that fails is reported as readErr rather than
+// as an answer.
+func observeConfigChange(
+	cc configChange,
+	deadline time.Time,
+	readMembership func(context.Context) (*dragonboat.Membership, error),
+) (landed bool, conflict, readErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), max(min(time.Until(deadline), defaultTimeout), minProposeAttempt))
+	defer cancel()
+
+	m, err := readMembership(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	landed, conflict = cc.landed(m)
+	return landed, conflict, nil
+}
+
+// leaderResolver names the replica leading shardID at the moment of the
+// call, with its index, or (nil, -1). dbTestCluster.leaderHost is the one the
+// suite uses; the type exists so the decision core's "resolved on EVERY
+// attempt" property can be pinned with a counting resolver and no cluster.
+type leaderResolver func(shardID uint64) (*dragonboat.NodeHost, int)
+
+// configChangeVia applies cc through whichever replica resolve names at each
+// attempt, and returns nil once a linearizable read of the membership shows
+// it in effect. Both the attempt and the confirming read resolve at the
+// point of use; a moment with no leader is errNoLeaderObserved, which the
+// loop treats as "ask again" and never as a submission.
+func configChangeVia(resolve leaderResolver, cc configChange, budget time.Duration) error {
+	attempt := func(ctx context.Context) error {
+		nh, _ := resolve(cc.shardID)
+		if nh == nil {
+			return errNoLeaderObserved
+		}
+		return configChangeSubmitters[cc.kind](ctx, nh, cc)
+	}
+	return driveConfigChange(cc, budget, attempt, membershipReaderVia(resolve, cc.shardID))
+}
+
+// tryConfigChangeToLeader is configChangeVia over the cluster's own leader
+// resolution. It is the error-returning form, for callers with resources to
+// release before failing the test.
+func (c *dbTestCluster) tryConfigChangeToLeader(cc configChange, budget time.Duration) error {
+	return configChangeVia(c.leaderHost, cc, budget)
+}
+
+// membershipReaderVia returns a linearizable membership read that resolves
+// the leader through resolve at the point of use.
+func membershipReaderVia(resolve leaderResolver, shardID uint64) func(context.Context) (*dragonboat.Membership, error) {
+	return func(ctx context.Context) (*dragonboat.Membership, error) {
+		nh, _ := resolve(shardID)
+		if nh == nil {
+			return nil, errNoLeaderObserved
+		}
+		return nh.SyncGetShardMembership(ctx, shardID)
+	}
+}
+
+// configChangeToLeader is tryConfigChangeToLeader for the test goroutine: it
+// fails the test on any error.
+func (c *dbTestCluster) configChangeToLeader(t *testing.T, cc configChange, budget time.Duration) {
+	t.Helper()
+	if err := c.tryConfigChangeToLeader(cc, budget); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// addReplicaToLeader adds replicaID as a voting member at addr, against
+// configChangeID, and fails the test unless the change lands.
+func (c *dbTestCluster) addReplicaToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+	t.Helper()
+	c.configChangeToLeader(t, configChange{kind: addReplica, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+}
+
+// addNonVotingToLeader adds replicaID as a non-voting member at addr, against
+// configChangeID, and fails the test unless the change lands.
+func (c *dbTestCluster) addNonVotingToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+	t.Helper()
+	c.configChangeToLeader(t, configChange{kind: addNonVoting, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+}
+
+// addWitnessToLeader adds replicaID as a witness at addr, against
+// configChangeID, and fails the test unless the change lands.
+func (c *dbTestCluster) addWitnessToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+	t.Helper()
+	c.configChangeToLeader(t, configChange{kind: addWitness, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+}
+
+// deleteReplicaToLeader removes replicaID, against configChangeID, and fails
+// the test unless the change lands.
+func (c *dbTestCluster) deleteReplicaToLeader(t *testing.T, shardID, replicaID, configChangeID uint64, budget time.Duration) {
+	t.Helper()
+	c.configChangeToLeader(t, configChange{kind: deleteReplica, shardID: shardID, replicaID: replicaID, configChangeID: configChangeID}, budget)
+}
+
+// membershipFromLeader takes one linearizable membership read through
+// whichever replica leads shardID at the moment of each attempt, retrying the
+// not-leader refusal by re-resolving, and fails the test on anything else.
+//
+// It is the read half of the same class: a SyncGetShardMembership on a host
+// bound seconds earlier is refused outright when that host's r.leaderID is
+// noLeader, which under saturation is a real and recurring window. Every
+// converted site reads the ConfigChangeID it passes, and verifies the result,
+// through this.
+func (c *dbTestCluster) membershipFromLeader(t *testing.T, shardID uint64, budget time.Duration) *dragonboat.Membership {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	retry := time.NewTicker(proposeRetryInterval)
+	defer retry.Stop()
+	expiry := time.NewTimer(budget)
+	defer expiry.Stop()
+	read := membershipReaderVia(c.leaderHost, shardID)
+
+	lastErr := errNoLeaderObserved
+	for {
+		remaining := time.Until(deadline)
+		if remaining < minProposeAttempt {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), min(remaining, defaultTimeout))
+		m, err := read(ctx)
+		cancel()
+		if err == nil {
+			return m
+		}
+		if !isNotLeaderRejection(err) && !errors.Is(err, errNoLeaderObserved) {
+			t.Fatalf("SyncGetShardMembership(shard=%d) failed: %v", shardID, err)
+		}
+		lastErr = err
+		select {
+		case <-expiry.C:
+			t.Fatalf("SyncGetShardMembership(shard=%d) never succeeded within %v: %v", shardID, budget, lastErr)
+		case <-retry.C:
+		}
+	}
+	t.Fatalf("SyncGetShardMembership(shard=%d) never succeeded within %v: %v", shardID, budget, lastErr)
+	return nil
+}
+
+// transferLeadershipTo moves shardID's leadership to targetReplicaID and
+// returns once the target itself reports leading.
+//
+// RequestLeaderTransfer is a request, not a guarantee, and the engine does
+// not retry one (see leaderTransferRounds), so this does what a caller that
+// means "the target must lead" has to do: request the transfer of whichever
+// replica leads at the moment, give the request leaderTransferRound to
+// produce the target, and request again of whoever leads by then. Only the
+// not-leader refusal and a transfer already in flight are absorbed; any other
+// error is the test's to see. Every request is logged with the replica it was
+// made of, so a transfer that needed several is visible in the output.
+func (c *dbTestCluster) transferLeadershipTo(t *testing.T, shardID, targetReplicaID uint64, budget time.Duration) {
+	t.Helper()
+	targetIdx := int(targetReplicaID) - 1
+	started := time.Now()
+	expiry := time.NewTimer(budget)
+	defer expiry.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+
+	var nextRequest time.Time
+	requests := 0
+	var lastRefusal error
+	for {
+		if c.findLeader(shardID) == targetIdx {
+			t.Logf("replica %d leads shard %d after %v and %d transfer request(s)",
+				targetReplicaID, shardID, time.Since(started).Round(time.Millisecond), requests)
+			return
+		}
+		if !time.Now().Before(nextRequest) {
+			if nh, idx := c.leaderHost(shardID); nh != nil {
+				requests++
+				err := nh.RequestLeaderTransfer(shardID, targetReplicaID)
+				if err == nil {
+					t.Logf("transfer request %d to replica %d accepted by node[%d] at %v",
+						requests, targetReplicaID, idx, time.Since(started).Round(time.Millisecond))
+				} else if isNotLeaderRejection(err) || strings.Contains(err.Error(), leaderTransferInProgress) {
+					lastRefusal = err
+				} else {
+					t.Fatalf("RequestLeaderTransfer(shard=%d, target=%d) on node[%d] failed: %v",
+						shardID, targetReplicaID, idx, err)
+				}
+				nextRequest = time.Now().Add(leaderTransferRound)
+			}
+		}
+		select {
+		case <-expiry.C:
+			t.Fatalf("replica %d never led shard %d within %v: %d transfer request(s), "+
+				"leader now node[%d], last refusal: %v",
+				targetReplicaID, shardID, budget, requests, c.findLeader(shardID), lastRefusal)
+		case <-poll.C:
 		}
 	}
 }

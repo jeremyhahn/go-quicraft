@@ -38,33 +38,19 @@ func TestIntegration_DB_SyncRequestAddWitness(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Get current membership.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
+	// Get current membership, through whichever replica leads now (#123).
+	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if len(membership.Witnesses) != 0 {
 		t.Fatalf("expected 0 witnesses initially, got %d", len(membership.Witnesses))
 	}
 
-	// Add witness replica 30 at a dummy address.
-	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer addCancel()
-	if addErr := leaderHost.SyncRequestAddWitness(addCtx, 1, 30, "127.10.0.1:59990", membership.ConfigChangeID); addErr != nil {
-		t.Fatalf("SyncRequestAddWitness failed: %v", addErr)
-	}
+	// Add witness replica 30 at a dummy address, through the current leader,
+	// and confirmed by a linearizable read showing it as a WITNESS at that
+	// address -- a voter or a non-voting member at the same ID is a conflict.
+	cluster.addWitnessToLeader(t, 1, 30, "127.10.0.1:59990", membership.ConfigChangeID, membershipTimeout)
 
 	// Re-read membership and verify witness replica 30 is present.
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer verifyCancel()
-	updated, mErr := leaderHost.SyncGetShardMembership(verifyCtx, 1)
-	if mErr != nil {
-		t.Fatalf("SyncGetShardMembership after add witness failed: %v", mErr)
-	}
+	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updated.Witnesses[30]; !exists {
 		t.Fatalf("witness replica 30 not found in membership.Witnesses after add; Witnesses=%v", updated.Witnesses)
 	}
@@ -97,6 +83,9 @@ func TestIntegration_DB_RequestAddWitness_Async(t *testing.T) {
 	}
 
 	// Async add witness replica 31.
+	//quicraft:direct-config-change the async RequestState/ResultC contract is under
+	// test: the assertion reads the result the request produces, which a synchronous
+	// idempotent helper would consume
 	rs, addErr := leaderHost.RequestAddWitness(1, 31, "127.10.0.1:59991", membership.ConfigChangeID, defaultTimeout)
 	if addErr != nil {
 		t.Fatalf("RequestAddWitness failed: %v", addErr)

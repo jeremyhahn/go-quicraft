@@ -431,28 +431,11 @@ type pendingConfigChangeSite struct {
 // nothing; see pendingConfigChangeSite for why each entry exists and how it
 // leaves.
 var pendingConfigChangeSites = []pendingConfigChangeSite{
-
-	// #123: the dragonboat adapter's suite, owned by PR #124 while in flight.
-	// #123 already carries the cached-leader config change this gate is
-	// about (OrderedMembershipChange's first add) and the site-by-site
-	// disposition — which convert, which get the marker because the direct
-	// call IS the assertion (a deadline-less context, an invalid address, a
-	// stale ConfigChangeID, an overlapping change whose rejection is the
-	// test, an async RequestState contract).
-	{file: "contrib/dragonboat/test/integration/error_test.go", fn: "TestIntegration_DB_InvalidContextDeadline_AllSyncMethods", call: "SyncRequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/error_test.go", fn: "TestIntegration_DB_InvalidContextDeadline_AllSyncMethods", call: "SyncRequestDeleteReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/error_test.go", fn: "TestIntegration_DB_InvalidContextDeadline_AllSyncMethods", call: "SyncRequestAddNonVoting", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/error_test.go", fn: "TestIntegration_DB_InvalidAddressIsRejected", call: "SyncRequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_OrderedMembershipChange", call: "SyncRequestAddReplica", count: 3, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_SyncRequestDeleteReplica", call: "SyncRequestDeleteReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_SyncRequestAddReplica", call: "SyncRequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_SyncRequestAddNonVoting", call: "SyncRequestAddNonVoting", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_ConcurrentConfigChangeRejected", call: "RequestAddReplica", count: 2, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_advanced_test.go", fn: "TestIntegration_DB_ConcurrentConfigChangeRejected", call: "SyncRequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/membership_test.go", fn: "TestIntegration_DB_AsyncRequestAddReplica", call: "RequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/snapshot_advanced_test.go", fn: "TestIntegration_DB_SnapshotTransferToNewNode", call: "SyncRequestAddReplica", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/witness_test.go", fn: "TestIntegration_DB_SyncRequestAddWitness", call: "SyncRequestAddWitness", count: 1, issue: 123},
-	{file: "contrib/dragonboat/test/integration/witness_test.go", fn: "TestIntegration_DB_RequestAddWitness_Async", call: "RequestAddWitness", count: 1, issue: 123},
+	// Empty since #123 retired the dragonboat adapter's fourteen rows: every
+	// contrib site is now either routed through that suite's idempotent
+	// helper or marked with its reason. #135 retired the six root-module
+	// rows before it. The type and the ratchet stay so the next deferred
+	// site, if there is one, has somewhere to go that fails when it is fixed.
 }
 
 // TestIntegrationConfigChangesAreIdempotent fails when an integration test

@@ -273,6 +273,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRequestAddReplica", func(t *testing.T) {
+		//quicraft:direct-config-change the deadline-less CONTEXT is the subject: the
+		// adapter refuses it before anything is routed, and the idempotent helper
+		// builds its own bounded context per attempt so it cannot express this input
 		err := leaderHost.SyncRequestAddReplica(ctx, 1, 99, "127.10.0.1:59999", 0)
 		if err == nil {
 			t.Fatal("SyncRequestAddReplica should reject context without deadline")
@@ -283,6 +286,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRequestDeleteReplica", func(t *testing.T) {
+		//quicraft:direct-config-change the deadline-less CONTEXT is the subject: the
+		// adapter refuses it before anything is routed, and the idempotent helper
+		// builds its own bounded context per attempt so it cannot express this input
 		err := leaderHost.SyncRequestDeleteReplica(ctx, 1, 99, 0)
 		if err == nil {
 			t.Fatal("SyncRequestDeleteReplica should reject context without deadline")
@@ -293,6 +299,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	})
 
 	t.Run("SyncRequestAddNonVoting", func(t *testing.T) {
+		//quicraft:direct-config-change the deadline-less CONTEXT is the subject: the
+		// adapter refuses it before anything is routed, and the idempotent helper
+		// builds its own bounded context per attempt so it cannot express this input
 		err := leaderHost.SyncRequestAddNonVoting(ctx, 1, 99, "127.10.0.1:59999", 0)
 		if err == nil {
 			t.Fatal("SyncRequestAddNonVoting should reject context without deadline")
@@ -330,6 +339,9 @@ func TestIntegration_DB_InvalidAddressIsRejected(t *testing.T) {
 	addCtx, addCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer addCancel()
 
+	//quicraft:direct-config-change an address without a port must be REFUSED by the
+	// adapter before anything is routed (dbConfig.IsValidAddress): nothing is ever
+	// submitted, so there is nothing for an idempotent helper to retry or confirm
 	addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 100, "a1", membership.ConfigChangeID)
 	if addErr == nil {
 		t.Fatal("SyncRequestAddReplica with invalid address should return error")
