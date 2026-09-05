@@ -52,10 +52,6 @@ func TestHostAPI_SyncRead_ThreeNode(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
 
 	proposeToLeader(t, cluster, 1, encodeKVPut("sr-key", "sr-value"), defaultTimeout)
 
@@ -65,10 +61,7 @@ func TestHostAPI_SyncRead_ThreeNode(t *testing.T) {
 		return ok
 	})
 
-	result, err := leaderHost.SyncRead(ctx, 1, "sr-key")
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
+	result := readFromLeader(t, cluster, 1, "sr-key", defaultTimeout)
 	val, ok := result.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned unexpected type: %T", result)
@@ -226,26 +219,29 @@ func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 	t.Logf("second snapshot taken at index %d", secondIndex)
 }
 
-// TestHostAPI_ReadIndex_ThreeNode verifies ReadIndex on leader.
+// TestHostAPI_ReadIndex_ThreeNode verifies that a ReadIndex issued to the
+// leader resolves to a confirmed index.
+//
+// The previous version submitted the ReadIndex to a pinned host and released
+// the RequestState without reading it, which asserted only that a request was
+// accepted: a not-leader outcome, or a read index that never resolved, would
+// have surfaced in the result it never read. The warmup write is load-bearing
+// too — a leader serves ReadIndex only once it has committed an entry in its
+// own term (ErrReadIndexNotReady before that), and waitForClusterLeader
+// returns as soon as a replica claims leadership, before that entry commits.
 func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	proposeToLeader(t, cluster, 1, encodeKVPut("ri-warmup", "ok"), defaultTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	rs, err := leaderHost.ReadIndex(ctx, 1)
-	if err != nil {
-		t.Fatalf("ReadIndex failed: %v", err)
+	index := readIndexFromLeader(t, cluster, 1, defaultTimeout)
+	if index == 0 {
+		t.Fatal("ReadIndex resolved to index 0 after a committed write; the " +
+			"confirmed index must be at least the warmup entry's")
 	}
-	if rs == nil {
-		t.Fatal("ReadIndex returned nil")
-	}
-	rs.Release()
 }
 
 // TestHostAPI_LeaderTransfer_ThreeNode requests leadership transfer to a
@@ -574,10 +570,6 @@ func TestHostAPI_SyncRead_FiveNode(t *testing.T) {
 
 	trackers := cluster.startShard(1)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
 
 	proposeToLeader(t, cluster, 1, encodeKVPut("sr5-key", "sr5-value"), defaultTimeout)
 
@@ -587,10 +579,7 @@ func TestHostAPI_SyncRead_FiveNode(t *testing.T) {
 		return ok
 	})
 
-	result, err := leaderHost.SyncRead(ctx, 1, "sr5-key")
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
+	result := readFromLeader(t, cluster, 1, "sr5-key", defaultTimeout)
 	val, ok := result.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned unexpected type: %T", result)
@@ -744,27 +733,23 @@ func TestHostAPI_Snapshot_FiveNode(t *testing.T) {
 	t.Logf("second snapshot taken at index %d", secondIndex)
 }
 
-// TestHostAPI_ReadIndex_FiveNode verifies ReadIndex on the leader of a
-// 5-node cluster.
+// TestHostAPI_ReadIndex_FiveNode verifies that a ReadIndex issued to the
+// leader of a 5-node cluster resolves to a confirmed index. See
+// TestHostAPI_ReadIndex_ThreeNode for why the result is read and why the
+// warmup write precedes it.
 func TestHostAPI_ReadIndex_FiveNode(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	proposeToLeader(t, cluster, 1, encodeKVPut("ri5-warmup", "ok"), defaultTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	rs, err := leaderHost.ReadIndex(ctx, 1)
-	if err != nil {
-		t.Fatalf("ReadIndex failed: %v", err)
+	index := readIndexFromLeader(t, cluster, 1, defaultTimeout)
+	if index == 0 {
+		t.Fatal("ReadIndex resolved to index 0 after a committed write; the " +
+			"confirmed index must be at least the warmup entry's")
 	}
-	if rs == nil {
-		t.Fatal("ReadIndex returned nil")
-	}
-	rs.Release()
 }
 
 // TestHostAPI_LeaderTransfer_FiveNode requests leadership transfer to a

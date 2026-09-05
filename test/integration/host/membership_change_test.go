@@ -128,6 +128,7 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 				func() bool {
 					rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
 					defer rCancel()
+					//quicraft:direct-read every live replica IS the subject: a follower's SyncRead must forward its ReadIndex to the leader
 					got, err := host.SyncRead(rCtx, shardID, key)
 					if err != nil {
 						return false
@@ -199,16 +200,12 @@ func TestHostAPI_MembershipChange_AddNodeWhileWriting(t *testing.T) {
 	// Verify the new node has caught up to all data.
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, allData, membershipTimeout)
 
-	// Verify consistency via SyncRead on the leader.
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	// Verify consistency via a linearizable read through whoever leads at
+	// each read. This loop is where #147 failed CI: a leader observed once
+	// above the loop, refused CORRECTLY thirty reads later when the election
+	// storm that followed the membership change moved leadership.
 	for key, expectedVal := range allData {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		got, err := leaderHost.SyncRead(ctx, shardID, key)
-		cancel()
-		if err != nil {
-			t.Fatalf("SyncRead(%q) failed: %v", key, err)
-		}
+		got := readFromLeader(t, cluster, shardID, key, defaultTimeout)
 		val, ok := got.(string)
 		if !ok || val != expectedVal {
 			t.Fatalf("SyncRead(%q) = %q, want %q", key, val, expectedVal)
@@ -294,6 +291,7 @@ func TestHostAPI_MembershipChange_RemoveFollower(t *testing.T) {
 				func() bool {
 					rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
 					defer rCancel()
+					//quicraft:direct-read every live replica IS the subject: a follower's SyncRead must forward its ReadIndex to the leader
 					got, err := host.SyncRead(rCtx, shardID, key)
 					if err != nil {
 						return false

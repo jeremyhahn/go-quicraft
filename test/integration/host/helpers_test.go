@@ -1312,6 +1312,45 @@ func tryProposeToLeader(
 	return proposer.Try(cluster.leaderHost, shardID, cmd, timeout)
 }
 
+// readFromLeader issues a linearizable read of query against whichever node
+// leads shardID AT THE MOMENT OF THE CALL and returns the value. See package
+// test/proposer for why observing a leader does not pin it, and for the
+// callers that must NOT use this — those keep a direct SyncRead and carry a
+// quicraft:direct-read marker saying why the addressed replica is the subject.
+func readFromLeader(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) interface{} {
+	t.Helper()
+	return proposer.Read(t, cluster.leaderHost, shardID, query, timeout)
+}
+
+// tryReadFromLeader is readFromLeader's error-returning form, for callers that
+// layer their own retry on top and for goroutines, which must not touch t.
+func tryReadFromLeader(
+	cluster *testCluster,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) (interface{}, error) {
+	return proposer.TryRead(cluster.leaderHost, shardID, query, timeout)
+}
+
+// readIndexFromLeader obtains a confirmed read index from whichever node leads
+// shardID at the moment of the call, waits for it to resolve, and returns it.
+func readIndexFromLeader(
+	t *testing.T,
+	cluster *testCluster,
+	shardID uint64,
+	timeout time.Duration,
+) uint64 {
+	t.Helper()
+	return proposer.ReadIndex(t, cluster.leaderHost, shardID, timeout)
+}
+
 // proposeNEntries proposes N entries through the leader and returns the
 // expected key-value map. Keys are formatted as "<prefix>-NNN".
 func proposeNEntries(

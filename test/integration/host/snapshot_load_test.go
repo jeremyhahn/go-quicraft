@@ -187,16 +187,9 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 		t.Logf("node[%d] automatic snapshot artifacts at indexes %v", i, indexes)
 	}
 
-	// Verify via SyncRead on the leader for linearizable correctness.
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	// Verify via a linearizable read through whoever leads at each read.
 	for key, expectedVal := range expected {
-		rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		got, rErr := leaderHost.SyncRead(rCtx, shardID, key)
-		rCancel()
-		if rErr != nil {
-			t.Fatalf("SyncRead(%q) failed: %v", key, rErr)
-		}
+		got := readFromLeader(t, cluster, shardID, key, defaultTimeout)
 		val, ok := got.(string)
 		if !ok || val != expectedVal {
 			t.Fatalf("SyncRead(%q) = %q, want %q", key, val, expectedVal)
@@ -315,6 +308,7 @@ func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 				func() bool {
 					rCtx, rCancel := context.WithTimeout(context.Background(), syncReadAttemptTimeout)
 					defer rCancel()
+					//quicraft:direct-read every live replica IS the subject: a follower's SyncRead must forward its ReadIndex to the leader
 					got, rErr := host.SyncRead(rCtx, shardID, key)
 					if rErr != nil {
 						return false
@@ -397,13 +391,9 @@ func TestHostAPI_SnapshotUnderLoad_NewNodeCatchUp(t *testing.T) {
 	}
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
 
-	// Linearizable verification via SyncRead on the new node.
-	newNodeHost := cluster.hosts[result.idx]
-	// SyncRead on a follower may not work (requires leader), so read
-	// from the leader instead and verify the new node's SM directly.
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
+	// Linearizable verification of the data the new node caught up on. The
+	// new node's own state machine was verified directly above; the read
+	// goes through whoever leads at each call.
 	spotKeys := []string{
 		"catchup-000",
 		fmt.Sprintf("catchup-%03d", totalEntries/2),
@@ -412,21 +402,12 @@ func TestHostAPI_SnapshotUnderLoad_NewNodeCatchUp(t *testing.T) {
 	}
 	for _, key := range spotKeys {
 		expectedVal := expected[key]
-		rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		got, rErr := leaderHost.SyncRead(rCtx, shardID, key)
-		rCancel()
-		if rErr != nil {
-			t.Fatalf("SyncRead(%q) failed: %v", key, rErr)
-		}
+		got := readFromLeader(t, cluster, shardID, key, defaultTimeout)
 		val, ok := got.(string)
 		if !ok || val != expectedVal {
 			t.Fatalf("SyncRead(%q) = %q, want %q", key, val, expectedVal)
 		}
 	}
-
-	// Suppress unused variable warning for newNodeHost (used for
-	// documentation clarity about which node is the new one).
-	_ = newNodeHost
 
 	t.Logf("new node snapshot catch-up verified: %d total entries consistent", len(expected))
 }

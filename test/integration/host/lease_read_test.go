@@ -108,7 +108,6 @@ func TestHostAPI_LeaseRead_BasicLinearizable(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Write a value through whoever leads now. The index above is kept for the
@@ -123,14 +122,9 @@ func TestHostAPI_LeaseRead_BasicLinearizable(t *testing.T) {
 		return ok
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// Perform a linearizable read via SyncRead (uses LeaseRead internally).
-	result, err := leaderHost.SyncRead(ctx, shardID, "lr-key")
-	if err != nil {
-		t.Fatalf("SyncRead with LeaseRead failed: %v", err)
-	}
+	// Perform a linearizable read via SyncRead (uses LeaseRead internally)
+	// through whoever leads now.
+	result := readFromLeader(t, cluster, shardID, "lr-key", defaultTimeout)
 	val, ok := result.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned unexpected type: %T", result)
@@ -155,7 +149,6 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Warmup write to establish a committed entry at the current term
@@ -214,10 +207,10 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 		}(w)
 	}
 
-	// Launch readers that perform SyncRead on the leader. Each reader reads a
-	// fixed key that writer-0 will have written, verifying that a read issued
-	// after that key was committed never comes back empty and that values
-	// never regress.
+	// Launch readers that perform SyncRead through whoever leads at the moment
+	// of each read. Each reader reads a fixed key that writer-0 will have
+	// written, verifying that a read issued after that key was committed never
+	// comes back empty and that values never regress.
 	for r := range numReaders {
 		readerWg.Add(1)
 		go func(readerID int) {
@@ -229,9 +222,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
 				// it, so an empty value is a stale read and not a race.
 				committedBeforeRead := pollKeyWritten.Load()
 
-				rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
-				result, rErr := leaderHost.SyncRead(rCtx, shardID, pollKey)
-				rCancel()
+				result, rErr := tryReadFromLeader(cluster, shardID, pollKey, defaultTimeout)
 				if rErr != nil {
 					continue
 				}
@@ -314,7 +305,6 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Write several entries to establish committed state.
@@ -332,13 +322,8 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 	waitForReplication(t, cluster, trackers, shardID, lastKey, lastVal, defaultTimeout)
 	t.Logf("all %d entries replicated to all nodes", numEntries)
 
-	// Verify the leader can read the last entry before failover.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	result, err := leaderHost.SyncRead(ctx, shardID, lastKey)
-	cancel()
-	if err != nil {
-		t.Fatalf("pre-failover SyncRead failed: %v", err)
-	}
+	// Verify the last entry is readable through the leader before failover.
+	result := readFromLeader(t, cluster, shardID, lastKey, defaultTimeout)
 	preFailoverVal, ok := result.(string)
 	if !ok || preFailoverVal != lastVal {
 		t.Fatalf("pre-failover read: got %q, want %q", preFailoverVal, lastVal)
@@ -350,20 +335,19 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 
 	// Wait for a new leader to be elected from the surviving nodes.
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
-	newLeaderHost := cluster.hosts[newLeaderIdx]
 	t.Logf("new leader elected at node[%d]", newLeaderIdx)
 
-	// Immediately issue reads against the new leader. During lease
+	// Immediately issue reads against whoever leads now. During lease
 	// establishment, some reads may fail with retriable errors. Track
-	// the highest observed value to verify monotonicity.
+	// the highest observed value to verify monotonicity. Monotonicity is a
+	// property of the values, not of the replica that served them, so the
+	// reads follow leadership if the survivors hold a second election.
 	var lastObserved string
 	var successCount, retryCount int
 
 	readDeadline := time.Now().Add(defaultTimeout)
 	for time.Now().Before(readDeadline) {
-		readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		readResult, readErr := newLeaderHost.SyncRead(readCtx, shardID, lastKey)
-		readCancel()
+		readResult, readErr := tryReadFromLeader(cluster, shardID, lastKey, 3*time.Second)
 
 		if readErr != nil {
 			if isLeaseReadRetryable(readErr) {
@@ -414,9 +398,7 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 		key := fmt.Sprintf("failover-key-%03d", i)
 		expectedVal := fmt.Sprintf("failover-val-%03d", i)
 
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		verifyResult, verifyErr := newLeaderHost.SyncRead(verifyCtx, shardID, key)
-		verifyCancel()
+		verifyResult, verifyErr := tryReadFromLeader(cluster, shardID, key, defaultTimeout)
 		if verifyErr != nil {
 			t.Errorf("post-stabilization read key=%q failed: %v", key, verifyErr)
 			continue
@@ -445,7 +427,6 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Warmup to establish committed entry in current term (PhD 6.4).
@@ -548,9 +529,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 					// race with the writer.
 					committedBeforeRead := keyWritten[keyIdx].Load()
 
-					rCtx, rCancel := context.WithTimeout(context.Background(), 3*time.Second)
-					result, rErr := leaderHost.SyncRead(rCtx, shardID, key)
-					rCancel()
+					result, rErr := tryReadFromLeader(cluster, shardID, key, 3*time.Second)
 					if rErr != nil {
 						// Retriable errors are expected during normal
 						// operation under load; skip and retry.
@@ -641,10 +620,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 		var lastVal string
 		var lastErr error
 		ok := waitForConditionNoFatal(failoverTimeout, func() bool {
-			readerIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-			finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
-			result, readErr := cluster.hosts[readerIdx].SyncRead(finalCtx, shardID, key)
-			finalCancel()
+			result, readErr := tryReadFromLeader(cluster, shardID, key, defaultTimeout)
 			if readErr != nil {
 				lastErr = readErr
 				return false
@@ -775,10 +751,16 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	// Immediately read from the new leader. The new leader must not
 	// serve reads until it has a valid lease. We retry retriable errors
 	// (expected during lease establishment) but fail on stale values.
+	//
+	// Pinned on purpose. The transfer target was just verified to lead, and
+	// the assertion is about THAT replica's lease: a read through whoever
+	// leads now would still be linearizable, but it would no longer be a
+	// test of read-after-transfer on the transferee.
 	var readVal string
 	readDeadline := time.Now().Add(defaultTimeout)
 	for time.Now().Before(readDeadline) {
 		readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		//quicraft:direct-read the transfer target IS the subject: it must serve the committed value only once its own lease is valid
 		result, readErr := newLeaderHost.SyncRead(readCtx, shardID, finalKey)
 		readCancel()
 
@@ -811,6 +793,7 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	// Verify the old leader rejects reads (it should no longer be leader).
 	// After transferring leadership, its lease should be invalidated.
 	oldLeaderReadCtx, oldLeaderReadCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	//quicraft:direct-read the deposed incumbent IS the subject: its refusal after the transfer is the assertion
 	_, oldLeaderErr := leaderHost.SyncRead(oldLeaderReadCtx, shardID, finalKey)
 	oldLeaderReadCancel()
 	if oldLeaderErr == nil {
@@ -824,14 +807,13 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 		t.Logf("old leader correctly rejected read after transfer: %v", oldLeaderErr)
 	}
 
-	// Final verification: read all entries from the new leader.
+	// Final verification: every entry is readable through whoever leads now.
+	// The transfer target was the subject above; here only the data is.
 	for i := range numEntries {
 		key := fmt.Sprintf("transfer-key-%03d", i)
 		expectedVal := fmt.Sprintf("transfer-val-%03d", i)
 
-		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		verifyResult, verifyErr := newLeaderHost.SyncRead(verifyCtx, shardID, key)
-		verifyCancel()
+		verifyResult, verifyErr := tryReadFromLeader(cluster, shardID, key, defaultTimeout)
 		if verifyErr != nil {
 			t.Errorf("post-transfer read key=%q failed: %v", key, verifyErr)
 			continue

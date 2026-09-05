@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proposer submits test proposals to whichever replica leads a shard
-// AT THE MOMENT OF THE CALL.
+// Package proposer submits test proposals and linearizable reads to whichever
+// replica leads a shard AT THE MOMENT OF THE CALL.
 //
 // # Why this exists
 //
@@ -41,6 +41,25 @@
 // of a retry loop is four places a fix has to land. The suites share nothing
 // but a way to name the current leader, so that is all this package asks for:
 // a Resolver.
+//
+// # Reads share the loop, and for the same reason
+//
+// A linearizable read is bound to the leader exactly as a proposal is. SyncRead
+// is a ReadIndex followed by a local lookup, and handleFollowerReadIndex
+// forwards a ReadIndex whenever the follower knows the leader and refuses it
+// with the same "not leader ... leader unknown" when it does not. A pending
+// read on a leader that loses the shard is failed the same way a pending
+// proposal is. So the twelve host-suite reads that pinned a leaderHost binding
+// (#147) failed on the same election the proposals used to fail on, and they
+// are fixed by the same loop: Read / TryRead and ReadIndex / TryReadIndex
+// re-resolve before every attempt and retry ONLY the not-leader rejection.
+//
+// Re-issuing a refused read is safe unconditionally — a read that was refused
+// was never answered, so there is no "applied twice" to reason about — but the
+// retry set stays as narrow as it is for proposals. A timeout, a busy pipeline
+// or ErrReadIndexNotReady comes from the replica that genuinely leads the
+// shard; re-resolving changes nothing about it, so it is a real result that
+// must reach the test.
 //
 // # The pinned callers share the same loop
 //
@@ -186,6 +205,29 @@ func TryWith(
 	timeout time.Duration,
 	retryable Retryable,
 ) (quicraft.RequestResult, error) {
+	return drive(resolve, shardID, timeout, retryable,
+		func(h *quicraft.Host, budget time.Duration) (quicraft.RequestResult, error) {
+			return Once(h, shardID, cmd, budget)
+		})
+}
+
+// drive is the ONE retry loop in this package. Every exported form — proposal
+// or read, fatal or error-returning, re-resolving or pinned — is drive with a
+// different attempt and a different retryable, so the resolve-before-every-
+// attempt rule, the minimum attempt budget and the deadline arithmetic cannot
+// drift between them.
+//
+// attempt is handed the Host resolved for THIS attempt and the budget left for
+// it. drive never calls attempt with a nil Host and never starts an attempt
+// with less than minAttempt.
+func drive[T any](
+	resolve Resolver,
+	shardID uint64,
+	timeout time.Duration,
+	retryable Retryable,
+	attempt func(h *quicraft.Host, budget time.Duration) (T, error),
+) (T, error) {
+	var zero T
 	deadline := time.Now().Add(timeout)
 	retry := time.NewTicker(retryInterval)
 	defer retry.Stop()
@@ -201,20 +243,20 @@ func TryWith(
 		if h := resolve(shardID); h != nil {
 			remaining := time.Until(deadline)
 			if remaining < minAttempt {
-				return quicraft.RequestResult{}, lastErr
+				return zero, lastErr
 			}
-			result, err := Once(h, shardID, cmd, remaining)
+			result, err := attempt(h, remaining)
 			if err == nil {
 				return result, nil
 			}
 			if !retryable(err) {
-				return quicraft.RequestResult{}, err
+				return zero, err
 			}
 			lastErr = err
 		}
 		select {
 		case <-expiry.C:
-			return quicraft.RequestResult{}, lastErr
+			return zero, lastErr
 		case <-retry.C:
 		}
 	}
@@ -245,8 +287,121 @@ func Once(
 	return result, nil
 }
 
+// Read issues a linearizable read of query against whichever replica leads
+// shardID at the moment of the call and fails the test on any error.
+//
+// The same rule as ToLeader decides who may use it: a caller that means "the
+// current leader" does; a caller that means one SPECIFIC replica — a deposed
+// incumbent whose refusal is the assertion, a follower whose forwarding is the
+// subject, the target of a leadership transfer whose own lease is under test
+// — keeps its direct call and says so with a quicraft:direct-read marker.
+func Read(
+	t *testing.T,
+	resolve Resolver,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) interface{} {
+	t.Helper()
+	result, err := TryRead(resolve, shardID, query, timeout)
+	if err != nil {
+		t.Fatalf("linearizable read of %v on shard %d failed within %v: %v",
+			query, shardID, timeout, err)
+	}
+	return result
+}
+
+// TryRead is Read's error-returning form, for callers that layer their own
+// retry on top and for goroutines, which must not touch a *testing.T.
+//
+// ONLY the not-leader rejection is retried, by RE-RESOLVING the leader. A read
+// that was refused was never answered, so re-issuing it cannot violate
+// linearizability; a read that was answered returns on the spot and is never
+// re-issued.
+func TryRead(
+	resolve Resolver,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) (interface{}, error) {
+	return drive(resolve, shardID, timeout, IsNotLeaderRejection,
+		func(h *quicraft.Host, budget time.Duration) (interface{}, error) {
+			return readOnce(h, shardID, query, budget)
+		})
+}
+
+// readOnce is the single attempt TryRead is built from: one SyncRead against h
+// with its own deadline, no resolve, no retry.
+func readOnce(
+	h *quicraft.Host,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return h.SyncRead(ctx, shardID, query) //quicraft:direct-read the single attempt TryRead is built from
+}
+
+// ReadIndex obtains a confirmed read index from whichever replica leads
+// shardID at the moment of the call, waits for it to resolve, and fails the
+// test on any error. It returns the confirmed index.
+//
+// It exists for the tests whose subject is the ReadIndex API itself. Those
+// used to submit a ReadIndex to a pinned host and release the RequestState
+// without reading it, which asserted only that a request was accepted; a
+// not-leader outcome would have surfaced in the result they never read.
+func ReadIndex(
+	t *testing.T,
+	resolve Resolver,
+	shardID uint64,
+	timeout time.Duration,
+) uint64 {
+	t.Helper()
+	index, err := TryReadIndex(resolve, shardID, timeout)
+	if err != nil {
+		t.Fatalf("read index on shard %d failed within %v: %v", shardID, timeout, err)
+	}
+	return index
+}
+
+// TryReadIndex is ReadIndex's error-returning form. It retries exactly what
+// TryRead retries, for exactly the same reason.
+func TryReadIndex(
+	resolve Resolver,
+	shardID uint64,
+	timeout time.Duration,
+) (uint64, error) {
+	return drive(resolve, shardID, timeout, IsNotLeaderRejection,
+		func(h *quicraft.Host, budget time.Duration) (uint64, error) {
+			return readIndexOnce(h, shardID, budget)
+		})
+}
+
+// readIndexOnce is the single attempt TryReadIndex is built from: one
+// ReadIndex against h, resolved and released, no resolve, no retry.
+func readIndexOnce(
+	h *quicraft.Host,
+	shardID uint64,
+	timeout time.Duration,
+) (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	rs, err := h.ReadIndex(ctx, shardID) //quicraft:direct-read the single attempt TryReadIndex is built from
+	if err != nil {
+		return 0, err
+	}
+	result, err := rs.Result()
+	rs.Release()
+	if err != nil {
+		return 0, err
+	}
+	return result.Value, nil
+}
+
 // IsNotLeaderRejection reports whether err is the not-leader rejection and
-// nothing else. It is the ONLY error Try retries.
+// nothing else. It is the ONLY error Try, TryRead and TryReadIndex retry.
 //
 // quicraft.NotLeader matches both the bare ErrNotLeader sentinel and a
 // *quicraft.NotLeaderError, wrapped or not — including one wrapped in
