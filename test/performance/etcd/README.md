@@ -135,3 +135,52 @@ WINNER (WAL)                   etcd-io/raft (see Architecture Notes above)
 | Propose (Concurrent/8) | QuicRaft | 3.05x |
 | Commit Latency | QuicRaft | 2.53x |
 | Election Time | etcd-io/raft | 0.84x (one-time startup cost) |
+
+## Baseline version
+
+The numbers above were taken against `go.etcd.io/raft/v3` **v3.6.0**. The
+harness now builds against **v3.7.0** (#127), and that release changes what
+the etcd column measures on its own, before anything QuicRaft-side moves:
+`raftpb` left gogo-protobuf for `google.golang.org/protobuf` generated types,
+so every proto2 scalar is a heap-allocated pointer, `Ready` carries
+`[]*raftpb.Entry` / `*raftpb.HardState` / `[]*raftpb.Message`, and
+`appendEntry` `proto.Clone`s each proposed entry.
+
+The migration was measured before and after on one machine, same binary
+shape (`-benchtime 2s -benchmem`, pinned to four cores, before/after
+interleaved, 14 rounds; a shared CI host at load 7-100 on 24 cores, so the
+timing intervals are wide). Every allocation metric moved, deterministically,
+and three timing metrics moved outside noise. Everything else was `~`
+(benchstat, p > 0.05).
+
+| Benchmark | allocs/op v3.6.0 → v3.7.0 | B/op | Timing |
+|---|---|---|---|
+| Propose (Sequential, WAL) | 15 → 45 (+200%) | +85% | ~ |
+| Propose (Sequential, Memory) | 13 → 43 (+231%) | +82% | **P50 6 → 8 µs (+33%)** |
+| Propose (Concurrent/8, WAL) | 13 → 32 (+146%) | +21% | ~ |
+| Propose (Concurrent/8, Memory) | 12 → 39 (+225%) | +60% | **P50 30 → 41 µs (+37%)** |
+| Commit Latency (WAL) | 15 → 45 (+200%) | +84% | ~ |
+| Commit Latency (Memory) | 13 → 43 (+231%) | +80% | **P50 6 → 8 µs (+33%)** |
+| Election (single, WAL / Memory) | +22% / +23% | +9% | ~ |
+| 3N propose / commit (TLS + WAL) | +198% to +229% | +37% to +60% | ~ |
+| 5N propose / commit (TLS + WAL) | +210% to +256% | +37% to +41% (concurrent −12%) | ~ |
+| 3N / 5N election | +30% / +57% | ~ / +9% | ~ |
+
+A `-memprofilerate=1` profile of the sequential in-memory proposal attributes
+all thirty added allocations to the library: `raft.hardState` (+5, one
+`HardState` plus a `new()` per field), `newStorageAppendRespMsg` (+4),
+`appendEntry` (+3, `proto.Clone` plus `new(Term)`/`new(Index)`),
+`node.Propose` (+2), `newStorageApplyRespMsg` (+2), `raft.send` (+1),
+`MessageType.Enum` (+2), and the protobuf runtime's `unsafe_New`/`mergeBytes`
+(+2). The harness's own per-proposal allocations, the wait-timer and the state
+machine's value copy, are identical in both profiles: the adaptation in this
+directory is value-to-pointer at each call site and adds nothing on the hot
+path.
+
+What that means for the tables above: the etcd **Memory** rows would read
+roughly 2 µs higher at P50 on v3.7.0, which is the cost of ~30 extra small heap
+allocations per proposal; the **WAL** and **3N/5N** rows are fsync- and
+TLS-bound and did not move within measurement noise. The QuicRaft column is
+untouched by this change. The absolute numbers are from different hardware
+and are left as recorded; refresh them with `make perf-run` rather than
+scaling them.

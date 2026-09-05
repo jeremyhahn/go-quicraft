@@ -470,7 +470,11 @@ Totals: QuicRaft 26 scenarios, Dragonboat 18, etcd 16, OpenRaft 16.
 
 ### Version pins
 
-`etcd/go.mod` pins `go.etcd.io/raft/v3 v3.6.0`. `dragonboat/go.mod` pins
+`etcd/go.mod` pinned `go.etcd.io/raft/v3 v3.6.0` when this dataset was taken; the
+tree has since moved to v3.7.0 (#127), whose pointer-valued `raftpb` types
+change the etcd harness's own allocation profile, so the etcd column here is
+not directly comparable to a fresh run without re-measuring (see
+`etcd/README.md`, "Baseline version"). `dragonboat/go.mod` pins
 `github.com/jeremyhahn/dragonboat/v4 v4.0.1`, which is a **fork** of upstream
 `lni/dragonboat`, not upstream itself; it exists because the benchmark needs a
 Dragonboat that compiles against PebbleDB v1.1.5. `openraft/Cargo.toml` requests

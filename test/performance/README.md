@@ -157,7 +157,7 @@ test/performance/
 | System | Version | Language | Type | WAL | Memory | Reads | Multi-Group | TLS |
 |--------|---------|----------|------|-----|--------|-------|-------------|-----|
 | **QuicRaft** | this tree | Go | Engine | waldb (sharded) | memdb | SyncRead, StaleRead | Yes (10K+ shards) | QUIC mTLS (always on) |
-| **etcd-io/raft** | v3.6.0 | Go | Library | User-provided | MemoryStorage | User-implemented | No | TCP mutual TLS (3N/5N only) |
+| **etcd-io/raft** | v3.7.0 | Go | Library | User-provided | MemoryStorage | User-implemented | No | TCP mutual TLS (3N/5N only) |
 | **Dragonboat** | jeremyhahn fork v4.0.1 | Go | Engine | Tan (custom log-file DB) | N/A | SyncRead, StaleRead | Yes | TCP MutualTLS |
 | **OpenRaft** | 0.9.21 | Rust | Library | Disk WAL, write-only (benchmark) | BTreeMap | User-implemented | No | TCP mutual TLS, 3N/5N only |
 
