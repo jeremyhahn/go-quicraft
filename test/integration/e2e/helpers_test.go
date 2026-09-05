@@ -46,6 +46,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
@@ -1792,11 +1793,32 @@ func addNodeToCluster(
 	}
 }
 
-// syncAddNode and syncDeleteNode used to live here. They moved to
-// membership_idempotence_test.go when #112 showed that retrying the leadership
-// error was only half of what a membership change needs: the retry also
-// assumed an error meant the config change had NOT happened, which for a
-// change already delivered to raft is false.
+// syncAddNode adds a voting replica through whichever node is CURRENTLY the
+// leader and does not mistake a retry of an already-committed add for a
+// failure.
+//
+// The decision is test/membership's, not this suite's: the leader is resolved
+// at the point of each attempt, and a duplicate refusal ("already exists in
+// membership") is accepted ONLY after an attempt in the same loop was
+// genuinely submitted to raft AND a linearizable membership read shows the
+// replica as a full voter at exactly addr. #112 found the second half missing
+// from the loop that lived here; #122 wrote the decision for this suite, #135
+// moved it to test/membership so the host and linearizability suites could
+// share it, and #145 retired this suite's copy. This is the binding of that
+// decision to testCluster.leaderHost, nothing more.
+func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr string, timeout time.Duration) {
+	t.Helper()
+	membership.AddNode(t, cluster.leaderHost, shardID, replicaID, addr, timeout)
+}
+
+// syncDeleteNode removes a replica through whichever node is CURRENTLY the
+// leader, with the same idempotence as syncAddNode: "target node not found"
+// is accepted only after a genuine submission and a linearizable read showing
+// the replica holding no role at all.
+func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, timeout time.Duration) {
+	t.Helper()
+	membership.DeleteNode(t, cluster.leaderHost, shardID, replicaID, timeout)
+}
 
 // proposeUntilCommitted proposes one key/value through whichever node is
 // CURRENTLY the leader and returns nil once the entry commits, or an error the

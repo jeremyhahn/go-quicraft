@@ -475,13 +475,15 @@ var pendingConfigChangeSites = []pendingConfigChangeSite{
 // "did not happen" then re-issues it, the engine refuses the duplicate
 // correctly, and the test fails with "node already exists in membership" or
 // "target node not found in membership" (#112, and #132 on the delete path).
-// PR #122 fixed that in syncAddNode / syncDeleteNode: the refusal is accepted
-// ONLY after an attempt in the same loop was genuinely submitted AND a
-// linearizable SyncGetShardMembership confirms the exact requested state —
-// replica present as a full voter at the requested address, or absent in every
-// role. A blanket "not found is fine" is the wrong fix, and
-// TestMembershipRetry_AlreadyExistsAtDifferentAddressStillFails is where that
-// line is pinned.
+// PR #122 fixed that in the e2e suite's syncAddNode / syncDeleteNode, and
+// #135 moved the decision into test/membership so every suite shares one copy
+// (#145 retired the e2e original): the refusal is accepted ONLY after an
+// attempt in the same loop was genuinely submitted AND a linearizable
+// SyncGetShardMembership confirms the exact requested state — replica present
+// as a full voter at the requested address, or absent in every role. A blanket
+// "not found is fine" is the wrong fix, and
+// TestRetry_AlreadyExistsAtDifferentAddressStillFails in test/membership is
+// where that line is pinned.
 //
 // #122 alone did not end the class, for the same reason #91 did not end the
 // propose class: it fixed the sites that happened to use its helper. Any test
@@ -491,9 +493,10 @@ var pendingConfigChangeSites = []pendingConfigChangeSite{
 //
 // # What a failure means
 //
-// Route the change through syncAddNode / syncDeleteNode (the decision core is
-// driveMembershipChange in test/integration/e2e/membership_idempotence_test.go;
-// a suite without a copy gets one that keeps BOTH halves of the gate).
+// Route the change through test/membership — AddNode / DeleteNode, or the
+// error-returning TryAddNode / TryDeleteNode — with the suite's leader
+// resolver; the decision core is membership.Drive, and every suite binds the
+// same one rather than keeping a copy.
 //
 // If the direct call IS the assertion — a deadline-less context that must be
 // refused, an invalid address, a stale ConfigChangeID, an overlapping change
@@ -557,9 +560,9 @@ func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 		"whether it COMMITTED. A retry that reads \"no answer\" as \"did not "+
 		"happen\" turns a slow success into \"already exists in membership\" or "+
 		"\"target node not found in membership\" (#112, #132). Route these "+
-		"through syncAddNode / syncDeleteNode (driveMembershipChange in "+
-		"test/integration/e2e/membership_idempotence_test.go), which resolve the "+
-		"leader at the point of use and accept a duplicate refusal only after an "+
+		"through test/membership (AddNode / DeleteNode, or TryAddNode / "+
+		"TryDeleteNode, over the suite's leader resolver), which resolves the "+
+		"leader at the point of use and accepts a duplicate refusal only after an "+
 		"attempt was genuinely submitted AND a linearizable membership read "+
 		"confirms the requested state.\n\n"+
 		"If the direct call IS the assertion — a stale ConfigChangeID that must "+

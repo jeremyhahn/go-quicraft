@@ -67,13 +67,13 @@
 //
 // # Why it is one package and not one copy per suite
 //
-// The decision core was written for the e2e suite in #122
-// (test/integration/e2e/membership_idempotence_test.go), in package e2e_test,
-// which no other suite can import. The host and linearizability suites needed
-// the same core (#135), and CLAUDE.md forbids a second copy. test/proposer is
-// the precedent: the suites share nothing but a way to name the current
-// leader, so that is all this package asks for — the same proposer.Resolver.
-// The e2e copy is retired once its files are free; that is #145.
+// The decision core was written for the e2e suite in #122, in package
+// e2e_test, which no other suite can import. The host and linearizability
+// suites needed the same core (#135), and CLAUDE.md forbids a second copy.
+// test/proposer is the precedent: the suites share nothing but a way to name
+// the current leader, so that is all this package asks for — the same
+// proposer.Resolver. The e2e copy was retired in #145; every suite now binds
+// this package to its own resolver.
 package membership
 
 import (
